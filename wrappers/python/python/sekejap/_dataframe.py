@@ -62,9 +62,9 @@ class DataFrameAccessor:
 
             # PATH_* aggregates
             db.df.query(\"\"\"
-                MATCH (a:venues)-[r:route_to*1..3]->(b:venues)
+                SELECT b._key AS dest, PATH_PRODUCT(r._path_strength) AS reliability
+                FROM MATCH (a:venues)-[r:route_to*1..3]->(b:venues)
                 WHERE a._key = 'melbourne_cbd'
-                RETURN b._key AS dest, PATH_PRODUCT(r._path_strength) AS reliability
             \"\"\")
 
             # Vector search
@@ -136,7 +136,11 @@ class DataFrameAccessor:
                 record[field] = _coerce(val)
 
             key_field = mapping.get(id_col, id_col)
-            raw_key = record.get(key_field) or record.get(id_col)
+            raw_key = record.get(key_field)
+            if raw_key is None:
+                raw_key = record.get(id_col)
+            # Only skip when the key is genuinely absent; a falsy but valid key
+            # (0, "", False) is a real identifier and must not be dropped.
             if raw_key is None:
                 continue
             key = str(raw_key)
