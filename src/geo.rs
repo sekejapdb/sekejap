@@ -107,11 +107,38 @@ pub fn area_km2(geom: &Value) -> Option<f64> {
     Some(area_deg2 * lat_factor * lon_factor)
 }
 
+// ── Geometry field discovery ─────────────────────────────────────────────────
+
+/// Find the GeoJSON geometry value in a payload, regardless of the field name.
+///
+/// Prefers a field literally named `geometry` (the common case, fast path);
+/// otherwise scans object fields and returns the first whose value parses as a
+/// GeoJSON geometry. This lets spatial queries work on any GEO column name
+/// (e.g. `geo`, `location`), not only one called `geometry`.
+fn find_geometry(payload: &Value) -> Option<&Value> {
+    if let Some(g) = payload.get("geometry") {
+        if !extract_geojson_coords(g).is_empty() {
+            return Some(g);
+        }
+    }
+    if let Value::Object(map) = payload {
+        for (name, v) in map {
+            if name == "geometry" || !v.is_object() {
+                continue;
+            }
+            if !extract_geojson_coords(v).is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 // ── Centroid extraction ──────────────────────────────────────────────────────
 
 /// Extract `(lat, lon)` centroid from a node payload via GeoJSON geometry.
 pub fn extract_centroid(payload: &Value) -> Option<(f64, f64)> {
-    let geom = payload.get("geometry")?;
+    let geom = find_geometry(payload)?;
     let coords = extract_geojson_coords(geom);
     if coords.is_empty() {
         return None;
@@ -137,7 +164,7 @@ pub struct SpatialMeta {
 
 /// Extract spatial metadata from a node payload via GeoJSON geometry.
 pub fn extract_spatial_meta(payload: &Value) -> Option<SpatialMeta> {
-    let geom = payload.get("geometry")?;
+    let geom = find_geometry(payload)?;
     let coords = extract_geojson_coords(geom);
     if coords.is_empty() {
         return None;
@@ -568,7 +595,7 @@ fn extract_polygon_rings(geom: &Value) -> Vec<Vec<[f64; 2]>> {
 /// For Polygon: point-in-polygon test.
 /// For MultiPolygon: any polygon contains the point.
 pub fn geom_contains_point(payload: &Value, lat: f64, lon: f64) -> bool {
-    let geom = match payload.get("geometry") {
+    let geom = match find_geometry(payload) {
         Some(g) => g,
         None => return false,
     };
@@ -581,7 +608,7 @@ pub fn geom_contains_point(payload: &Value, lat: f64, lon: f64) -> bool {
 /// For Point: centroid inside ring.
 /// For Polygon/LineString: all vertices inside ring.
 pub fn geom_within_polygon(payload: &Value, ring: &[[f64; 2]]) -> bool {
-    let geom = match payload.get("geometry") {
+    let geom = match find_geometry(payload) {
         Some(g) => g,
         None => return false,
     };
@@ -597,7 +624,7 @@ pub fn geom_within_polygon(payload: &Value, ring: &[[f64; 2]]) -> bool {
 /// True if: any vertex of node inside query, or any vertex of query inside node,
 /// or any edge of node crosses any edge of query.
 pub fn geom_intersects_polygon(payload: &Value, ring: &[[f64; 2]]) -> bool {
-    let geom = match payload.get("geometry") {
+    let geom = match find_geometry(payload) {
         Some(g) => g,
         None => return false,
     };
@@ -641,7 +668,7 @@ pub fn geom_intersects_polygon(payload: &Value, ring: &[[f64; 2]]) -> bool {
 ///
 /// All query polygon vertices must be inside the node's geometry.
 pub fn geom_contains_polygon(payload: &Value, ring: &[[f64; 2]]) -> bool {
-    let geom = match payload.get("geometry") {
+    let geom = match find_geometry(payload) {
         Some(g) => g,
         None => return false,
     };

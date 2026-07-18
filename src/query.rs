@@ -2,6 +2,7 @@
 
 use crate::{sk_hash, CoreDB, FieldKey};
 use crate::vector::VectorAccess;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -19,7 +20,7 @@ pub struct Hit {
 // ── VecMetric ─────────────────────────────────────────────────────────────────
 
 /// Which vector distance metric to use.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VecMetric {
     /// Cosine distance (`<=>`, `VECTOR_COSINE`). Lower = more similar.
     Cosine,
@@ -41,7 +42,7 @@ pub enum VecMetric {
 /// ORDER BY BM25(title, 'rust') * 0.7 + BM25(body, 'rust') * 0.3 DESC
 /// ORDER BY VECTOR_COSINE(embedding, [0.1, 0.2]) * 0.5 + popularity * 0.5 DESC
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ScoreExpr {
     /// Numeric literal, e.g. `0.7`.
     Lit(f64),
@@ -49,6 +50,10 @@ pub enum ScoreExpr {
     Field(String),
     /// BM25 relevance score: `BM25(field, 'query')`.
     Bm25 { field: String, query: String },
+    /// BM25 squashed to `[0, 1]` via saturation `s / (s + k)`. Same famous
+    /// BM25 relevance, but bounded and intuitive like cosine — so it blends
+    /// cleanly in a hybrid score. `k` is the midpoint (BM25 == k → 0.5).
+    Bm25Norm { field: String, query: String, k: f64 },
     /// Positional search relevance: `SEARCH_SCORE('query')`.
     SearchScore { query: String },
     /// Cosine similarity (1 − cosine distance): `VECTOR_COSINE(field, [vec])`.
@@ -81,7 +86,10 @@ pub enum ScoreExpr {
 /// A single pipeline step.
 ///
 /// Steps are accumulated in `Set` and executed lazily on `.collect()` / `.count()`.
-#[derive(Clone, Debug)]
+///
+/// Serializable so logical WAL entries (`WalEntry::Update`) can store the
+/// compiled filter pipeline and re-execute it deterministically on replay.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Step {
     // ── Starters (always the first step) ──────────────────────────────────────
     /// Resolve a single node by slug hash.
@@ -158,8 +166,6 @@ pub enum Step {
     SearchFilter(String),
     /// BM25 score > min_score on field.
     Bm25Filter(String, String, f64),
-    /// Sort by BM25 score (field, query, ascending).
-    Bm25Sort(String, String, bool),
     /// Add score projection columns to result (expr, alias).
     ScoreProject(Vec<(ScoreExpr, String)>),
 
@@ -247,7 +253,6 @@ pub fn describe_step(step: &Step, db: &CoreDB) -> serde_json::Map<String, Value>
         Step::VectorNear { field, k, .. } => ("Vector Scan", format!("{field} top-{k} nearest")),
         Step::SearchFilter(q) => ("Search Filter", format!("SEARCH('{q}')")),
         Step::Bm25Filter(f, q, s) => ("BM25 Filter", format!("{f} match '{q}' score > {s}")),
-        Step::Bm25Sort(f, q, asc) => ("BM25 Sort", format!("{f} match '{q}' {}", if *asc { "ASC" } else { "DESC" })),
         Step::ScoreProject(projs) => ("Score Project", format!("{} projection(s)", projs.len())),
         Step::WhereIsNull(f, neg) => {
             let op = if *neg { "IS NOT NULL" } else { "IS NULL" };
@@ -658,12 +663,20 @@ fn field_output_key(expr: &str) -> String {
         }
     }
     if let Some(rest) = expr.strip_prefix("__AGG__") {
-        // __AGG__FUNC__field  → lowercase(FUNC)
+        // __AGG__FUNC__field  → lowercase(FUNC).  COUNTD (COUNT DISTINCT) is
+        // surfaced as the plain "count" column, matching PostgreSQL.
         let func = rest.split("__").next().unwrap_or("agg");
+        if func.eq_ignore_ascii_case("COUNTD") {
+            return "count".to_string();
+        }
         return func.to_lowercase();
     }
     if expr.starts_with("__JP_TEXT__") || expr.starts_with("__JP_OBJ__") {
         return expr.rsplit("__").next().unwrap_or(expr).to_string();
+    }
+    // Unaliased CASE → column name "case" (PostgreSQL convention).
+    if expr.starts_with("__CASE__") {
+        return "case".to_string();
     }
     // ST_AsGeoJSON(field) — default output key is the inner field name.
     // e.g. __ST_AsGeoJSON__geometry → "geometry"
@@ -749,6 +762,15 @@ fn eval_field_expr(expr: &str, payload: &serde_json::Value) -> Option<serde_json
     if expr.starts_with("__AGG__") {
         return None;
     }
+    // CASE WHEN … END — decode the JSON-encoded expression and evaluate it
+    // against this row.  The rest after `__CASE__` is one opaque JSON blob, so
+    // internal `__`/quotes never collide with the sentinel scheme.
+    if let Some(rest) = expr.strip_prefix("__CASE__") {
+        return match serde_json::from_str::<PlainCase>(rest) {
+            Ok(pc) => Some(pc.eval(payload)),
+            Err(_) => Some(Value::Null),
+        };
+    }
     // JSON path operators (-> / ->>) — handled first.
     if expr.starts_with("__JP_TEXT__") || expr.starts_with("__JP_OBJ__") {
         return json_path_get(expr, payload);
@@ -826,6 +848,10 @@ fn agg_inner(expr: &str) -> Option<&str> {
 }
 
 /// Running accumulator for a single aggregate column.
+///
+/// `func == "COUNTD"` is the internal token for `COUNT(DISTINCT arg)`: it tracks
+/// the set of distinct non-null values (canonicalised via `Value::to_string`, so
+/// `1` and `"1"` are correctly treated as different) and finalises to the count.
 struct AggAccum {
     func: String,
     arg: String,
@@ -834,18 +860,22 @@ struct AggAccum {
     count_notnull: usize,
     min: Option<f64>,
     max: Option<f64>,
+    distinct: Option<HashSet<String>>,
 }
 
 impl AggAccum {
     fn new(func: &str, arg: &str) -> Self {
+        let func = func.to_uppercase();
+        let distinct = if func == "COUNTD" { Some(HashSet::new()) } else { None };
         Self {
-            func: func.to_uppercase(),
+            func,
             arg: arg.to_string(),
             all_count: 0,
             sum: 0.0,
             count_notnull: 0,
             min: None,
             max: None,
+            distinct,
         }
     }
 
@@ -854,7 +884,19 @@ impl AggAccum {
         if self.arg == "*" {
             return;
         }
-        if let Some(f) = payload.get(&self.arg).and_then(|v| v.as_f64()) {
+        let field_val = payload.get(&self.arg);
+        if self.func == "COUNTD" {
+            // COUNT(DISTINCT arg): ignore absent/null values (SQL semantics).
+            if let Some(v) = field_val {
+                if !v.is_null() {
+                    if let Some(set) = self.distinct.as_mut() {
+                        set.insert(v.to_string());
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(f) = field_val.and_then(|v| v.as_f64()) {
             self.count_notnull += 1;
             self.sum += f;
             self.min = Some(self.min.map_or(f, |m: f64| m.min(f)));
@@ -864,6 +906,10 @@ impl AggAccum {
 
     fn finalize(&self) -> Value {
         match self.func.as_str() {
+            "COUNTD" => {
+                let n = self.distinct.as_ref().map_or(0, |s| s.len());
+                Value::Number(serde_json::Number::from(n as i64))
+            }
             "COUNT" => {
                 let n = if self.arg == "*" { self.all_count } else { self.count_notnull };
                 Value::Number(serde_json::Number::from(n as i64))
@@ -924,6 +970,9 @@ impl<'db> Set<'db> {
                 let mut parts = rest.splitn(2, "__");
                 let func = parts.next().unwrap_or("").to_uppercase();
                 let arg = parts.next().unwrap_or("*").to_string();
+                // COUNT(DISTINCT) can't be answered from this per-value btree
+                // scan — fall through to the payload-scanning group path.
+                if func == "COUNTD" { return None; }
                 has_agg = true;
                 agg_fields.push(AggField { func, arg, out_key: field_output_key(f) });
             } else if out != gf.as_str() {
@@ -1132,6 +1181,19 @@ impl<'db> Set<'db> {
                 }
             }
         }
+    }
+
+    /// Execute the pipeline and return matching slug hashes only — no payload
+    /// reads, no JSON parsing, no Hit materialization.
+    ///
+    /// Used by mutation paths (UPDATE fast path) that re-read raw payload
+    /// bytes themselves; going through `collect()` would parse every payload
+    /// into a `Value` just to throw it away.
+    pub(crate) fn collect_hashes(self) -> Vec<u64> {
+        if let Some(hits) = self.precomputed {
+            return hits.into_iter().map(|h| h.slug_hash).collect();
+        }
+        execute(self.db, &self.steps)
     }
 
     pub fn collect(self) -> Vec<Hit> {
@@ -1424,19 +1486,20 @@ impl<'db> Set<'db> {
                 // Parse all aggregate fields and verify they're all indexable.
                 struct AggInfo { func: String, arg: String, out_key: String }
                 let mut agg_infos: Vec<AggInfo> = Vec::new();
-                let mut has_non_agg = false;
                 for f in fields {
                     if let Some(agg_expr) = agg_inner(f) {
                         let rest = agg_expr.strip_prefix("__AGG__").unwrap_or(agg_expr);
                         let mut parts = rest.splitn(2, "__");
                         let func = parts.next().unwrap_or("COUNT").to_uppercase();
                         let arg = parts.next().unwrap_or("*").to_string();
+                        // COUNT(DISTINCT) needs distinct-value tracking — the
+                        // index accumulator can't do it, so scan payloads.
+                        if func == "COUNTD" { break 'index_agg; }
                         if arg != "*" && self.db.field_index(coll_hash, &arg).is_none() {
                             break 'index_agg; // no index for this arg
                         }
                         agg_infos.push(AggInfo { func, arg, out_key: field_output_key(f) });
                     } else {
-                        has_non_agg = true;
                         break 'index_agg; // non-agg fields need payloads
                     }
                 }
@@ -1771,19 +1834,6 @@ fn resolve_field(field: &str, payload: &Value) -> Option<Value> {
 }
 
 // ── Fast raw-byte JSON field extractor ────────────────────────────────────────
-
-/// Advance `i` past the closing `"`, handling `\` escape sequences.
-/// Expects `i` to point to the first byte INSIDE the string (after the opening `"`).
-fn scan_string_end(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"'  => return i + 1,
-            b'\\' => i += 2,
-            _     => i += 1,
-        }
-    }
-    i
-}
 
 /// Find the last occurrence of `needle` in `haystack`.
 fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2123,6 +2173,7 @@ fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool {
 fn gather_bm25_keys(expr: &ScoreExpr, out: &mut HashSet<(String, String)>) {
     match expr {
         ScoreExpr::Bm25 { field, query } => { out.insert((field.clone(), query.clone())); }
+        ScoreExpr::Bm25Norm { field, query, .. } => { out.insert((field.clone(), query.clone())); }
         ScoreExpr::Add(a, b) | ScoreExpr::Sub(a, b)
         | ScoreExpr::Mul(a, b) | ScoreExpr::Div(a, b) => {
             gather_bm25_keys(a, out);
@@ -2182,6 +2233,15 @@ fn eval_score(
                 .and_then(|m| m.get(&hash))
                 .copied()
                 .unwrap_or(0.0)
+        }
+        ScoreExpr::Bm25Norm { field, query, k } => {
+            let raw = bm25_maps
+                .get(&(field.clone(), query.clone()))
+                .and_then(|m| m.get(&hash))
+                .copied()
+                .unwrap_or(0.0);
+            // Saturation to [0,1): 0 stays 0, raw==k → 0.5, large → ~1.
+            if raw <= 0.0 { 0.0 } else { raw / (raw + k) }
         }
         ScoreExpr::SearchScore { query } => {
             for idx in db.search_indexes.values() {
@@ -3205,24 +3265,6 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     }
                 });
             }
-            Step::Bm25Sort(field, query, ascending) => {
-                if let Some(index) = db.bm25_indexes.get(field) {
-                    let hits = index.search(query, candidates.len().max(100));
-                    let asc = *ascending;
-                    let score_map: HashMap<u64, f64> =
-                        hits.iter().map(|h| (h.doc_id, h.score)).collect();
-                    candidates.sort_by(|&a, &b| {
-                        let sa = score_map.get(&a).copied().unwrap_or(0.0);
-                        let sb = score_map.get(&b).copied().unwrap_or(0.0);
-                        let ord = sa.partial_cmp(&sb).unwrap();
-                        if asc {
-                            ord
-                        } else {
-                            ord.reverse()
-                        }
-                    });
-                }
-            }
             Step::ScoreProject(_) => {
                 // Score projection annotation happens in collect(), not execute()
             }
@@ -3528,7 +3570,7 @@ impl MathExpr {
 }
 
 /// Comparison operator for CASE WHEN conditions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CmpOp {
     Eq,
     Neq,
@@ -3578,7 +3620,11 @@ impl CmpOp {
 }
 
 /// A single CASE WHEN condition: `var.field op literal`.
-#[derive(Clone, Debug)]
+///
+/// In `SELECT … FROM MATCH`, `var` names a bound pattern variable. In plain
+/// `SELECT … FROM table`, `var` is empty and `field` is looked up directly on
+/// the row payload (see [`PlainCase`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaseCond {
     pub var: String,
     pub field: String,
@@ -3589,6 +3635,31 @@ pub struct CaseCond {
 impl CaseCond {
     pub fn references_var(&self, var: &str) -> bool {
         self.var == var
+    }
+}
+
+/// A `CASE WHEN … THEN … [ELSE …] END` expression in a plain (non-MATCH)
+/// SELECT list.  It is serialised to JSON and carried inside the projection
+/// sentinel `__CASE__<json>` (see `Step::Select`), so no structural change to
+/// the flat `Vec<String>` projection representation is needed.  Each branch's
+/// condition is evaluated against the current row; the first match wins, else
+/// `else_val` (defaulting to NULL).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlainCase {
+    pub branches: Vec<(CaseCond, Value)>,
+    pub else_val: Value,
+}
+
+impl PlainCase {
+    /// Evaluate against a single row payload, returning the chosen value.
+    pub fn eval(&self, payload: &Value) -> Value {
+        for (cond, then_val) in &self.branches {
+            let actual = payload.get(cond.field.as_str()).cloned().unwrap_or(Value::Null);
+            if eval_cmp(&actual, &cond.op, &cond.val) {
+                return then_val.clone();
+            }
+        }
+        self.else_val.clone()
     }
 }
 
@@ -3616,7 +3687,7 @@ pub enum PathPredicate {
 /// A compiled `SELECT … FROM MATCH SHORTEST` statement.
 #[derive(Clone, Debug)]
 pub struct ShortestSelectStmt {
-    /// Full slug of the start node (e.g. `"characters/coby"`).
+    /// Full slug of the start node (e.g. `"places/seminyak"`).
     pub from_slug:  String,
     /// Full slug of the end node.
     pub to_slug:    String,
@@ -3652,6 +3723,9 @@ pub enum FromSource {
 pub struct MultiFromStmt {
     pub sources:  Vec<FromSource>,
     pub returns:  Vec<(MatchAggReturn, String)>,
+    /// Top-level `WHERE` conditions (`var.field OP value`) applied to the joined
+    /// rows — each condition references a source variable / collection alias.
+    pub where_clauses: Vec<DestWhere>,
     pub order_by: Option<(String, bool)>,
     pub limit:    Option<usize>,
 }
@@ -3661,6 +3735,13 @@ pub struct MultiFromStmt {
 pub enum MatchAggReturn {
     /// `var.field` — scalar field from a bound variable (takes first row in group)
     Field { var: String, field: String },
+    /// `var.*` — spread the whole bound node payload into the result row's
+    /// top-level fields.  The one-surface replacement for the old
+    /// `MATCH … RETURN var` form.
+    AllFields { var: String },
+    /// `COUNT(DISTINCT var.field)` — number of distinct values of `var.field`
+    /// across the group.
+    CountDistinct { var: String, field: String },
     /// `SUM(math_expr)`
     Sum(MathExpr),
     /// `COUNT(*)`
@@ -3712,7 +3793,9 @@ impl MatchAggReturn {
             | MatchAggReturn::PathLast  { var: v, .. }
             | MatchAggReturn::AgeDays   { var: v, .. }
             | MatchAggReturn::AgeHours  { var: v, .. }
-            | MatchAggReturn::JsonArrayLen { var: v, .. } => v == var,
+            | MatchAggReturn::JsonArrayLen { var: v, .. }
+            | MatchAggReturn::CountDistinct { var: v, .. }
+            | MatchAggReturn::AllFields { var: v } => v == var,
             // MathExpr-based aggregates may reference the var inside their expression.
             MatchAggReturn::Sum(e) | MatchAggReturn::Avg(e)
             | MatchAggReturn::Min(e) | MatchAggReturn::Max(e) => e.references_var(var),
@@ -3732,6 +3815,22 @@ impl MatchAggReturn {
                 .and_then(|v| v.get(field.as_str()))
                 .cloned()
                 .unwrap_or(Value::Null),
+            // Whole-node value (used as a fallback; the projection loop spreads
+            // AllFields into top-level result keys directly).
+            MatchAggReturn::AllFields { var } => rows
+                .first()
+                .and_then(|r| r.get(var.as_str()))
+                .cloned()
+                .unwrap_or(Value::Null),
+            MatchAggReturn::CountDistinct { var, field } => {
+                let mut seen: HashSet<String> = HashSet::new();
+                for r in rows {
+                    if let Some(v) = r.get(var.as_str()).and_then(|o| o.get(field.as_str())) {
+                        seen.insert(v.to_string());
+                    }
+                }
+                serde_json::json!(seen.len() as i64)
+            }
             MatchAggReturn::Sum(expr) => {
                 let sum: f64 = rows.iter().map(|r| expr.eval(r)).sum();
                 serde_json::json!(sum)
@@ -3884,11 +3983,24 @@ fn cmp_ordered(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     None
 }
 
-/// Convert a JSON value (Unix int or "YYYY-MM-DD" string) to a Unix epoch (seconds).
+/// Convert a JSON value to a Unix epoch (seconds).  Accepts a Unix int, an
+/// ISO-8601 / RFC3339 timestamp (`2020-01-01T00:00:00Z`), a naive datetime
+/// (`2024-06-06T18:31:00`, assumed UTC), or a date (`YYYY-MM-DD`).
 fn field_as_epoch(v: &Value) -> Option<i64> {
     if let Some(n) = v.as_i64() { return Some(n); }
     if let Some(n) = v.as_f64() { return Some(n as i64); }
     if let Some(s) = v.as_str() {
+        // RFC3339 / ISO-8601 with a timezone offset.
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Some(dt.timestamp());
+        }
+        // Naive datetime (no offset) — treat as UTC.
+        for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"] {
+            if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+                return Some(ndt.and_utc().timestamp());
+            }
+        }
+        // Date only "YYYY-MM-DD".
         if s.len() == 10 {
             let parts: Vec<&str> = s.splitn(3, '-').collect();
             if parts.len() == 3 {
@@ -3952,6 +4064,9 @@ pub struct HopSpec {
     /// Collection label on the destination node pattern (e.g. `"boundary"` from `(b:boundary)`).
     /// Used by [`try_reverse_anchor`] to validate collection membership.
     pub node_label: Option<String>,
+    /// Edge direction. `false` = forward `-[:e]->` (traverse `fwd_edges`);
+    /// `true` = backward `<-[:e]-` (traverse `rev_edges`, i.e. against the arrow).
+    pub backward: bool,
 }
 
 // ── DestWhere / WhereValue ────────────────────────────────────────────────────
@@ -3972,6 +4087,17 @@ pub enum WhereValue {
     Literal(Value),
     /// Reference to a prior WITH alias (row key).
     RowRef(String),
+}
+
+/// A function-based WHERE filter on the destination node of a MATCH pattern
+/// (`WHERE ST_DWithin(b.geo, POINT(...), km)` / `WHERE BM25(b.body,'q') > n`).
+/// Applied post-traversal against each result node.
+#[derive(Clone, Debug)]
+pub enum MatchFuncFilter {
+    /// Destination centroid within `km` of `(lat, lon)`.
+    StDWithin { lat: f64, lon: f64, km: f64 },
+    /// BM25 relevance of the destination on `field` for `query`, compared to `threshold`.
+    Bm25 { field: String, query: String, op: CmpOp, threshold: f64 },
 }
 
 // ── WithStage / WithOutExpr / WithExpr ───────────────────────────────────────
@@ -4081,16 +4207,26 @@ pub struct MatchAggStmt {
     /// `GROUP BY`: list of `(var, field)` pairs — supports multi-field grouping,
     /// e.g. `GROUP BY a.city, b.role`.
     pub group_by: Option<Vec<(String, String)>>,
-    /// `ORDER BY`: `(alias, ascending)`.
+    /// `ORDER BY`: `(alias, ascending)` — sort by a projected column / dest field.
     pub order_by: Option<(String, bool)>,
+    /// `ORDER BY <score expr>`: rank by a scoring expression (BM25_NORM,
+    /// VECTOR_COSINE, ST_DISTANCE_KM, blends) evaluated against the destination
+    /// node. Takes precedence over `order_by` when set.
+    pub order_score: Option<(ScoreExpr, bool)>,
     /// `LIMIT n`.
     pub limit: Option<usize>,
     /// Post-traversal filters on hop-bound variables.
     /// `WHERE b.level = 1` → `DestWhere { var: "b", field: "level", op: Eq, value: Literal(1) }`.
     /// Applied after topology traversal, before grouping.
     pub dest_where: Vec<DestWhere>,
+    /// Function-based WHERE filters on the destination node (spatial/text).
+    pub func_filters: Vec<MatchFuncFilter>,
     /// Optional WITH stages for multi-stage queries.
     pub with_stages: Option<Vec<WithStage>>,
+    /// `SELECT DISTINCT` — de-duplicate result rows by their projected tuple.
+    /// Default (`false`) yields one row per matched path (graph-standard, and
+    /// required for `SUM`/`COUNT` over traversals).
+    pub distinct: bool,
 }
 
 /// Topology-only path skeleton returned by [`collect_raw_paths`].
@@ -4098,8 +4234,15 @@ pub struct MatchAggStmt {
 pub(crate) struct RawPath {
     pub start_hash:        u64,
     pub dest_per_hop:      Vec<u64>,
+    /// Full physical node path: `[start, n1, n2, …, final_dest]`.  For single
+    /// hops this is one node per hop; for variable-length hops it includes every
+    /// intermediate node (only when full-path tracking is on — see `track`).
     pub slugs_per_hop:     Vec<String>,
+    /// Full physical edge strengths, one per physical edge in `slugs_per_hop`.
     pub strengths_per_hop: Vec<f32>,
+    /// `hop_end[i]` = index in `slugs_per_hop` of HopSpec `i`'s destination node,
+    /// so a hop's `_path_keys`/`_path_strength`/`_depth` slice by real position.
+    pub hop_end:           Vec<usize>,
 }
 
 /// Phase 1 of [`collect_paths`]: traverse the graph and return topology skeletons only.
@@ -4112,6 +4255,7 @@ pub(crate) fn collect_raw_paths(
     starts: &[u64],
     hops: &[HopSpec],
     limit: Option<usize>,
+    track: bool,
 ) -> Vec<RawPath> {
     if hops.is_empty() || starts.is_empty() {
         return vec![];
@@ -4123,6 +4267,7 @@ pub(crate) fn collect_raw_paths(
         dest_so_far:      Vec<u64>,
         slugs_so_far:     Vec<String>,
         strengths_so_far: Vec<f32>,
+        hop_ends:         Vec<usize>,
     }
 
     let mut in_flight: Vec<Partial> = starts
@@ -4135,6 +4280,7 @@ pub(crate) fn collect_raw_paths(
                 dest_so_far:      Vec::new(),
                 slugs_so_far:     vec![node.slug.clone()],
                 strengths_so_far: Vec::new(),
+                hop_ends:         Vec::new(),
             })
         })
         .collect();
@@ -4144,7 +4290,9 @@ pub(crate) fn collect_raw_paths(
 
         if hop.max_depth == 1 {
             'single: for partial in in_flight {
-                if let Some(edges) = db.fwd_edges(partial.current_hash) {
+                let adj = if hop.backward { db.rev_edges(partial.current_hash) }
+                          else { db.fwd_edges(partial.current_hash) };
+                if let Some(edges) = adj {
                     for e in edges {
                         if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                             continue;
@@ -4153,15 +4301,18 @@ pub(crate) fn collect_raw_paths(
                             let mut d = partial.dest_so_far.clone();
                             let mut s = partial.slugs_so_far.clone();
                             let mut st = partial.strengths_so_far.clone();
+                            let mut he = partial.hop_ends.clone();
                             d.push(e.other);
                             s.push(node.slug.clone());
                             st.push(e.strength);
+                            he.push(s.len() - 1);
                             next_in_flight.push(Partial {
                                 start_hash:       partial.start_hash,
                                 current_hash:     e.other,
                                 dest_so_far:      d,
                                 slugs_so_far:     s,
                                 strengths_so_far: st,
+                                hop_ends:         he,
                             });
                             if limit.map_or(false, |l| next_in_flight.len() >= l) {
                                 break 'single;
@@ -4170,10 +4321,68 @@ pub(crate) fn collect_raw_paths(
                     }
                 }
             }
+        } else if track {
+            // Multi-depth WITH full-path tracking: carry the sub-path (nodes +
+            // strengths) so `_path_keys` / `_path_strength` / `_depth` are correct.
+            let mut pairs: Vec<(usize, u64, Vec<u64>, Vec<f32>)> = in_flight
+                .iter()
+                .enumerate()
+                .map(|(idx, p)| (idx, p.current_hash, Vec::new(), Vec::new()))
+                .collect();
+
+            let mut result: Vec<(usize, u64, Vec<u64>, Vec<f32>)> = Vec::new();
+
+            for depth in 1..=hop.max_depth {
+                let mut next_pairs: Vec<(usize, u64, Vec<u64>, Vec<f32>)> = Vec::new();
+                for (pidx, current_h, sub_n, sub_s) in &pairs {
+                    let adj = if hop.backward { db.rev_edges(*current_h) } else { db.fwd_edges(*current_h) };
+                    if let Some(edges) = adj {
+                        for e in edges {
+                            if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                                continue;
+                            }
+                            if db.node_data(e.other).is_some() {
+                                let mut nn = sub_n.clone(); nn.push(e.other);
+                                let mut ns = sub_s.clone(); ns.push(e.strength);
+                                next_pairs.push((*pidx, e.other, nn, ns));
+                            }
+                        }
+                    }
+                }
+                if depth >= hop.min_depth {
+                    result.extend(next_pairs.iter().cloned());
+                    if limit.map_or(false, |l| result.len() >= l) {
+                        result.truncate(limit.unwrap());
+                        break;
+                    }
+                }
+                pairs = next_pairs;
+                if pairs.is_empty() { break; }
+            }
+
+            for (pidx, dest_h, sub_n, sub_s) in result {
+                let prior = &in_flight[pidx];
+                let mut d = prior.dest_so_far.clone();
+                d.push(dest_h);
+                let mut s = prior.slugs_so_far.clone();
+                for &n in &sub_n {
+                    s.push(db.node_data(n).map(|nd| nd.slug.clone()).unwrap_or_default());
+                }
+                let mut st = prior.strengths_so_far.clone();
+                st.extend_from_slice(&sub_s);
+                let mut he = prior.hop_ends.clone();
+                he.push(s.len() - 1);
+                next_in_flight.push(Partial {
+                    start_hash:       prior.start_hash,
+                    current_hash:     dest_h,
+                    dest_so_far:      d,
+                    slugs_so_far:     s,
+                    strengths_so_far: st,
+                    hop_ends:         he,
+                });
+            }
         } else {
-            // Multi-depth flat pair propagation.
-            // Propagate ALL partials simultaneously as (partial_idx, current_hash) pairs.
-            // No per-start visited set; no String cloning until result materialisation.
+            // Multi-depth flat pair propagation (fast; path intrinsics not needed).
             let mut pairs: Vec<(usize, u64)> = in_flight
                 .iter()
                 .enumerate()
@@ -4185,7 +4394,8 @@ pub(crate) fn collect_raw_paths(
             for depth in 1..=hop.max_depth {
                 let mut next_pairs: Vec<(usize, u64)> = Vec::new();
                 for &(pidx, current_h) in &pairs {
-                    if let Some(edges) = db.fwd_edges(current_h) {
+                    let adj = if hop.backward { db.rev_edges(current_h) } else { db.fwd_edges(current_h) };
+                    if let Some(edges) = adj {
                         for e in edges {
                             if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                                 continue;
@@ -4220,12 +4430,15 @@ pub(crate) fn collect_raw_paths(
                 s.push(dest_slug);
                 let mut st = prior.strengths_so_far.clone();
                 st.push(1.0);
+                let mut he = prior.hop_ends.clone();
+                he.push(s.len() - 1);
                 next_in_flight.push(Partial {
                     start_hash:       prior.start_hash,
                     current_hash:     dest_h,
                     dest_so_far:      d,
                     slugs_so_far:     s,
                     strengths_so_far: st,
+                    hop_ends:         he,
                 });
             }
         }
@@ -4241,6 +4454,7 @@ pub(crate) fn collect_raw_paths(
             dest_per_hop:      p.dest_so_far,
             slugs_per_hop:     p.slugs_so_far,
             strengths_per_hop: p.strengths_so_far,
+            hop_end:           p.hop_ends,
         })
         .collect()
 }
@@ -4285,7 +4499,8 @@ fn collect_final_dest_counts(
         for depth in 1u32..=hop.max_depth {
             let mut next: HashMap<u64, usize> = HashMap::new();
             for (&current_h, &count) in &depth_frontier {
-                if let Some(edges) = db.fwd_edges(current_h) {
+                let adj = if hop.backward { db.rev_edges(current_h) } else { db.fwd_edges(current_h) };
+                if let Some(edges) = adj {
                     for e in edges {
                         if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                             continue;
@@ -4335,8 +4550,9 @@ fn try_reverse_anchor(
     hops: &[HopSpec],
     dest_where: &[DestWhere],
 ) -> Option<Vec<RawPath>> {
-    // Guard: single hop only, max_depth == 1.
-    if hops.len() != 1 || hops[0].max_depth != 1 {
+    // Guard: single forward hop only, max_depth == 1.  Backward hops already
+    // anchor at the destination side, so this reversal optimisation doesn't apply.
+    if hops.len() != 1 || hops[0].max_depth != 1 || hops[0].backward {
         return None;
     }
     let hop = &hops[0];
@@ -4403,6 +4619,7 @@ fn try_reverse_anchor(
                 dest_per_hop: vec![dest_hash],
                 slugs_per_hop: vec![source_node.slug.clone(), dest_slug.clone()],
                 strengths_per_hop: vec![e.strength],
+                hop_end: vec![1], // single hop: dest is at slug index 1
             });
         }
     }
@@ -4424,11 +4641,12 @@ pub(crate) fn build_path_rows_from_raw(
     raw_paths: &[RawPath],
     hops: &[HopSpec],
     start_var: Option<&str>,
+    needs_edge_meta: bool,
 ) -> Vec<PathRow> {
     if raw_paths.is_empty() { return vec![]; }
 
     // Collect unique hashes, sort by payload offset for sequential I/O.
-    let mut needed: Vec<u64> = {
+    let needed: Vec<u64> = {
         let mut set: HashSet<u64> = HashSet::new();
         if start_var.is_some() {
             for rp in raw_paths { set.insert(rp.start_hash); }
@@ -4462,25 +4680,63 @@ pub(crate) fn build_path_rows_from_raw(
                 let dest_payload = payload_cache.get(&dest_h).unwrap_or(&null).clone();
 
                 if let Some(ref edge_bind) = hop.edge_bind {
+                    // `hop_end[hop_idx]` is the real index of this hop's dest in the
+                    // physical path (correct for variable-length hops, not just
+                    // `hop_idx + 1`).
+                    let end = rp.hop_end.get(hop_idx).copied().unwrap_or(hop_idx + 1);
                     let path_slugs: Vec<&str> = rp.slugs_per_hop
                         .iter()
-                        .take(hop_idx + 2)
+                        .take(end + 1)
                         .map(|s| s.as_str())
                         .collect();
-                    let path_strengths: &[f32] = &rp.strengths_per_hop[..=hop_idx];
+                    let end_s = end.min(rp.strengths_per_hop.len());
+                    let path_strengths: &[f32] = &rp.strengths_per_hop[..end_s];
+                    let depth = end; // physical hop count to this hop's dest
                     let n = path_strengths.len() as f64;
                     let sum: f64 = path_strengths.iter().map(|&s| s as f64).sum();
                     let avg = if n > 0.0 { sum / n } else { 0.0 };
                     let min_s = path_strengths.iter().cloned().fold(f32::INFINITY, f32::min);
                     let max_s = path_strengths.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    row.insert(edge_bind.clone(), serde_json::json!({
-                        "_depth":         hop_idx + 1,
-                        "_path_keys":     path_slugs,
-                        "_path_strength": path_strengths,
-                        "_avg_strength":  avg,
-                        "_min_strength":  if min_s.is_infinite() { 0.0_f32 } else { min_s },
-                        "_max_strength":  if max_s.is_infinite() { 0.0_f32 } else { max_s },
-                    }));
+
+                    let mut obj = serde_json::Map::new();
+
+                    // Per-edge properties — only for a fixed single hop, and only when
+                    // the query references an edge-bound field (lazy: one adjacency
+                    // scan + at most one metadata read per surviving edge).
+                    if needs_edge_meta && hop.max_depth == 1 {
+                        let prev_h = if hop_idx == 0 {
+                            rp.start_hash
+                        } else {
+                            rp.dest_per_hop[hop_idx - 1]
+                        };
+                        // The stored edge always runs from→to along its own arrow.
+                        // Forward hop: prev→dest.  Backward hop: dest→prev.
+                        let (edge_from, edge_to) = if hop.backward {
+                            (dest_h, prev_h)
+                        } else {
+                            (prev_h, dest_h)
+                        };
+                        if let Some((strength, meta)) =
+                            db.edge_props_between(edge_from, edge_to, hop.edge_type_hash)
+                        {
+                            if let Some(Value::Object(m)) = meta {
+                                for (k, v) in m { obj.insert(k, v); }
+                            }
+                            obj.insert("strength".to_string(), serde_json::json!(strength));
+                        }
+                    }
+
+                    // Path intrinsics — always present; overwrite any colliding meta key.
+                    obj.insert("_depth".to_string(), serde_json::json!(depth));
+                    obj.insert("_path_keys".to_string(), serde_json::json!(path_slugs));
+                    obj.insert("_path_strength".to_string(), serde_json::json!(path_strengths));
+                    obj.insert("_avg_strength".to_string(), serde_json::json!(avg));
+                    obj.insert("_min_strength".to_string(),
+                        serde_json::json!(if min_s.is_infinite() { 0.0_f32 } else { min_s }));
+                    obj.insert("_max_strength".to_string(),
+                        serde_json::json!(if max_s.is_infinite() { 0.0_f32 } else { max_s }));
+
+                    row.insert(edge_bind.clone(), Value::Object(obj));
                 }
 
                 row.insert(hop.node_bind.clone(), dest_payload);
@@ -4499,6 +4755,42 @@ pub(crate) fn build_path_rows_from_raw(
 ///
 /// Conditions referencing variables not in `var_to_hop` (e.g. start variable)
 /// are skipped here — callers must filter those separately on PathRows.
+/// Filter raw paths by destination-node function filters (spatial/text), before
+/// grouping. The destination is the final hop's node. BM25 score maps are built
+/// once. Used by the GROUP BY paths so counts/aggregates respect the filter.
+fn filter_raw_by_func_filters(
+    db: &CoreDB,
+    raw: Vec<RawPath>,
+    filters: &[MatchFuncFilter],
+) -> Vec<RawPath> {
+    if filters.is_empty() { return raw; }
+    let mut bm25_maps: HashMap<(String, String), HashMap<u64, f64>> = HashMap::new();
+    for f in filters {
+        if let MatchFuncFilter::Bm25 { field, query, .. } = f {
+            bm25_maps.entry((field.clone(), query.clone())).or_insert_with(|| {
+                db.bm25_indexes.get(field)
+                    .map(|idx| idx.search(query, 10000).iter().map(|h| (h.doc_id, h.score)).collect())
+                    .unwrap_or_default()
+            });
+        }
+    }
+    raw.into_iter().filter(|rp| {
+        let dest = *rp.dest_per_hop.last().unwrap_or(&0);
+        filters.iter().all(|f| match f {
+            MatchFuncFilter::StDWithin { lat, lon, km } => {
+                db.node_data(dest).and_then(|n| n.spatial_meta.as_ref())
+                    .map_or(false, |m| crate::geo::haversine_km(
+                        m.centroid_lat, m.centroid_lon, *lat, *lon) <= *km)
+            }
+            MatchFuncFilter::Bm25 { field, query, op, threshold } => {
+                let s = bm25_maps.get(&(field.clone(), query.clone()))
+                    .and_then(|m| m.get(&dest)).copied().unwrap_or(0.0);
+                cmp_f64(op, s, *threshold)
+            }
+        })
+    }).collect()
+}
+
 fn filter_raw_by_dest_where(
     db: &CoreDB,
     raw: Vec<RawPath>,
@@ -4754,20 +5046,14 @@ pub fn collect_paths(
     hops: &[HopSpec],
     start_var: Option<&str>,
     limit: Option<usize>,
+    track: bool,
 ) -> Vec<PathRow> {
     if hops.is_empty() || starts.is_empty() { return vec![]; }
-    let raw = collect_raw_paths(db, starts, hops, limit);
-    build_path_rows_from_raw(db, &raw, hops, start_var)
+    let raw = collect_raw_paths(db, starts, hops, limit, track);
+    build_path_rows_from_raw(db, &raw, hops, start_var, false)
 }
 
 // ── Multi-stage executor (WITH chaining) ─────────────────────────────────────
-
-/// Check if a node belongs to a collection (by collection name hash).
-fn node_in_collection(db: &CoreDB, hash: u64, col_hash: u64) -> bool {
-    db.node_data(hash)
-        .map(|n| !n.collection.is_empty() && crate::sk_hash(&n.collection) == col_hash)
-        .unwrap_or(false)
-}
 
 /// Resolve starting node hashes for a `MatchAggStart`.
 fn resolve_match_start(db: &CoreDB, start: &MatchAggStart) -> Vec<u64> {
@@ -4784,6 +5070,16 @@ fn resolve_match_start(db: &CoreDB, start: &MatchAggStart) -> Vec<u64> {
 
 /// Expand a MATCH stage: for each existing row, resolve the start nodes,
 /// then DFS through the hop chain binding node payloads.
+/// Reconstruct a node's hash from a bound row value (its payload's
+/// `_collection`/`_key`).  Used by WITH stages that continue from a prior
+/// binding (`WITH x MATCH (x)-[:e]->...`).
+fn node_hash_from_row_value(v: &Value) -> Option<u64> {
+    let obj = v.as_object()?;
+    let coll = obj.get("_collection")?.as_str()?;
+    let key = obj.get("_key")?.as_str()?;
+    Some(sk_hash(&format!("{coll}/{key}")))
+}
+
 fn expand_match_stage(
     db: &CoreDB,
     rows: Vec<WithRow>,
@@ -4795,8 +5091,17 @@ fn expand_match_stage(
     let mut result = Vec::new();
 
     for row in &rows {
-        // Resolve starts — may be filtered by inline WHERE (RowRef checks).
-        let starts = resolve_match_start(db, start);
+        // If the stage starts from a variable already bound by a prior stage
+        // (`WITH peer MATCH (peer)-[:e]->...`), traverse from THAT row's node
+        // rather than treating the bare name as a literal slug.
+        let starts: Vec<u64> = match start_var {
+            Some(sv) if row.contains_key(sv.as_str()) => row
+                .get(sv.as_str())
+                .and_then(node_hash_from_row_value)
+                .into_iter()
+                .collect(),
+            _ => resolve_match_start(db, start),
+        };
 
         for &start_h in &starts {
             // Check inline WHERE (on start node).
@@ -4856,11 +5161,9 @@ fn expand_match_stage(
                     if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                         continue;
                     }
-                    // Optional collection filter on endpoint.
-                    if let Some(node_data) = db.node_data(e.other) {
-                        // No collection filter in HopSpec for pipeline-style;
-                        // accept all nodes (collection filtering is by label in the pattern).
-                    } else {
+                    // Endpoint must be a real node; collection filtering happens
+                    // by label in the pattern, so accept any existing node here.
+                    if db.node_data(e.other).is_none() {
                         continue;
                     }
 
@@ -5017,7 +5320,7 @@ fn execute_match_agg_with_stages(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             Some(row)
         }).collect()
     } else {
-        let paths = collect_paths(db, &starts, &stmt.hops, stmt.start_var.as_deref(), None);
+        let paths = collect_paths(db, &starts, &stmt.hops, stmt.start_var.as_deref(), None, stmt_needs_var_path(&stmt));
         paths
     };
 
@@ -5220,8 +5523,349 @@ fn eval_math_on_with_row(expr: &MathExpr, row: &WithRow) -> f64 {
 
 /// Execute a [`MatchAggStmt`] and return synthetic result [`Hit`]s.
 ///
-/// Each Hit has an empty slug and a payload equal to one result row.
-pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
+/// Build BM25 + vector score maps for a scoring expression (mirrors `collect()`).
+fn build_score_maps(
+    db: &CoreDB,
+    expr: &ScoreExpr,
+) -> (HashMap<(String, String), HashMap<u64, f64>>, HashMap<(VecMetric, String), HashMap<u64, f32>>) {
+    use crate::vector::{CosineDistance, L2Distance, DotProduct, L1Distance, Distance};
+    let mut bm25_keys: HashSet<(String, String)> = HashSet::new();
+    let mut vec_keys: HashMap<(VecMetric, String), Vec<f32>> = HashMap::new();
+    gather_bm25_keys(expr, &mut bm25_keys);
+    gather_vector_keys(expr, &mut vec_keys);
+
+    let bm25_maps = bm25_keys.into_iter().filter_map(|(field, query)| {
+        let index = db.bm25_indexes.get(&field)?;
+        let m: HashMap<u64, f64> = index.search(&query, 10000).iter()
+            .map(|h| (h.doc_id, h.score)).collect();
+        Some(((field, query), m))
+    }).collect();
+
+    let vec_maps = vec_keys.into_iter().filter_map(|((metric, field), q)| {
+        let field_vecs = db.vector_field(&field)?;
+        let m: HashMap<u64, f32> = field_vecs.iter().map(|(h, v)| {
+            let s = match &metric {
+                VecMetric::Cosine => 1.0 - CosineDistance::eval(&q, v),
+                VecMetric::L2     => L2Distance::eval(&q, v),
+                VecMetric::Dot    => DotProduct::eval(&q, v),
+                VecMetric::L1     => L1Distance::eval(&q, v),
+            };
+            (h, s)
+        }).collect();
+        Some(((metric, field), m))
+    }).collect();
+
+    (bm25_maps, vec_maps)
+}
+
+/// Rank a MATCH result by a scoring expression evaluated on the destination node.
+///
+/// The score is a function of the last-hop node: we project the dest `_key`
+/// (hidden) to reconstruct its hash, build the same BM25/vector maps the plain
+/// SELECT scorer uses, evaluate once per row, then sort. Keys are computed once
+/// (not per comparison). Only runs when `ORDER BY <score>` is present.
+/// Compare two f64s with a `CmpOp` (for BM25 threshold filters).
+fn cmp_f64(op: &CmpOp, a: f64, b: f64) -> bool {
+    match op {
+        CmpOp::Eq => a == b,
+        CmpOp::Neq => a != b,
+        CmpOp::Lt => a < b,
+        CmpOp::Gt => a > b,
+        CmpOp::Lte => a <= b,
+        CmpOp::Gte => a >= b,
+        CmpOp::ILike => false,
+    }
+}
+
+/// Execute a MATCH aggregate/select statement, applying WHERE function filters
+/// (spatial/text), ORDER BY (field or score expression), and LIMIT after
+/// materialization. The inner traversal runs exactly once; each post-processing
+/// stage is O(rows) and only engages when a filter / order / limit is present,
+/// so plain traversal is a zero-cost passthrough.
+pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
+    // GROUP BY collapses rows, so its function filters must run pre-grouping
+    // inside the inner (left in stmt). For row queries, post-filter here on the
+    // individual destination nodes.
+    let post_filters = if stmt.group_by.is_some() {
+        Vec::new()
+    } else {
+        std::mem::take(&mut stmt.func_filters)
+    };
+    let order_score = stmt.order_score.take();
+    let field_order = stmt.order_by.take();
+    let limit = stmt.limit.take();
+    let distinct = stmt.distinct;
+
+    // Fast path: nothing to post-process → inner handles it all.
+    // DISTINCT needs to dedup before LIMIT, so it can't take this shortcut.
+    if post_filters.is_empty() && order_score.is_none() && field_order.is_none() && !distinct {
+        stmt.limit = limit;
+        return execute_match_agg_inner(db, stmt);
+    }
+
+    // Destination var + collection label (to resolve node hashes for filters/score).
+    let dest = stmt.hops.last()
+        .and_then(|h| h.node_label.clone().map(|l| (h.node_bind.clone(), l)));
+    let needs_hash = !post_filters.is_empty() || order_score.is_some();
+
+    // Hidden dest _key projection → lets us rebuild each row's node hash.
+    let key_alias = "__pp_key__";
+    let mut strip_key = false;
+    if needs_hash {
+        if let Some((ref dvar, _)) = dest {
+            if !stmt.returns.iter().any(|(_, a)| a == key_alias) {
+                stmt.returns.push((
+                    MatchAggReturn::Field { var: dvar.clone(), field: "_key".to_string() },
+                    key_alias.to_string(),
+                ));
+                strip_key = true;
+            }
+        }
+    }
+
+    // Field-order: resolve `var.field` to a projected alias (inject if absent).
+    let mut strip_order = false;
+    let field_sort: Option<(String, bool)> = field_order.map(|(key, asc)| {
+        let alias = if let Some((var, field)) = key.split_once('.') {
+            let existing = stmt.returns.iter().find_map(|(r, a)| match r {
+                MatchAggReturn::Field { var: v, field: f } if v == var && f == field => Some(a.clone()),
+                _ => None,
+            });
+            match existing {
+                Some(a) => a,
+                None => {
+                    stmt.returns.push((
+                        MatchAggReturn::Field { var: var.to_string(), field: field.to_string() },
+                        "__order_key__".to_string(),
+                    ));
+                    strip_order = true;
+                    "__order_key__".to_string()
+                }
+            }
+        } else { key };
+        (alias, asc)
+    });
+
+    stmt.order_by = None;
+    stmt.limit = None;
+    let mut hits = execute_match_agg_inner(db, stmt);
+
+    let hash_of = |h: &Hit| -> u64 {
+        dest.as_ref().and_then(|(_, label)| {
+            h.payload.as_ref()
+                .and_then(|p| p.get(key_alias))
+                .and_then(|v| v.as_str())
+                .map(|k| sk_hash(&format!("{label}/{k}")))
+        }).unwrap_or(0)
+    };
+
+    // ── 1. Function filters (spatial / text) ──────────────────────────────
+    if !post_filters.is_empty() {
+        let mut bm25_maps: HashMap<(String, String), HashMap<u64, f64>> = HashMap::new();
+        for f in &post_filters {
+            if let MatchFuncFilter::Bm25 { field, query, .. } = f {
+                bm25_maps.entry((field.clone(), query.clone())).or_insert_with(|| {
+                    db.bm25_indexes.get(field)
+                        .map(|idx| idx.search(query, 10000).iter().map(|h| (h.doc_id, h.score)).collect())
+                        .unwrap_or_default()
+                });
+            }
+        }
+        hits.retain(|h| {
+            let hash = hash_of(h);
+            post_filters.iter().all(|f| match f {
+                MatchFuncFilter::StDWithin { lat, lon, km } => {
+                    db.node_data(hash).and_then(|n| n.spatial_meta.as_ref())
+                        .map_or(false, |m| crate::geo::haversine_km(
+                            m.centroid_lat, m.centroid_lon, *lat, *lon) <= *km)
+                }
+                MatchFuncFilter::Bm25 { field, query, op, threshold } => {
+                    let s = bm25_maps.get(&(field.clone(), query.clone()))
+                        .and_then(|m| m.get(&hash)).copied().unwrap_or(0.0);
+                    cmp_f64(op, s, *threshold)
+                }
+            })
+        });
+    }
+
+    // ── 1b. DISTINCT: de-duplicate rows by projected tuple (before ORDER/LIMIT) ─
+    // Dedup on the VISIBLE projection only — hidden helper columns (`__pp_key__`,
+    // `__order_key__`) injected for filtering/ordering must not affect identity.
+    if distinct {
+        let mut seen: HashSet<String> = HashSet::new();
+        hits.retain(|h| {
+            let key = match h.payload.as_ref() {
+                Some(Value::Object(m)) => {
+                    let visible: std::collections::BTreeMap<&String, &Value> =
+                        m.iter().filter(|(k, _)| !k.starts_with("__")).collect();
+                    serde_json::to_string(&visible).unwrap_or_default()
+                }
+                Some(v) => v.to_string(),
+                None => String::new(),
+            };
+            seen.insert(key)
+        });
+    }
+
+    // ── 2. Ordering (score expression, else field) ────────────────────────
+    if let Some((expr, ascending)) = order_score {
+        let (bm25_maps, vec_maps) = build_score_maps(db, &expr);
+        let mut keyed: Vec<(f64, Hit)> = hits.into_iter().map(|h| {
+            let hash = hash_of(&h);
+            let payload = db.get_payload(hash).unwrap_or(Value::Null);
+            let score = eval_score(&expr, hash, &payload, db, &bm25_maps, &vec_maps);
+            (score, h)
+        }).collect();
+        keyed.sort_by(|a, b| {
+            let o = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+            if ascending { o } else { o.reverse() }
+        });
+        hits = keyed.into_iter().map(|(_, h)| h).collect();
+    } else if let Some((alias, ascending)) = field_sort {
+        let mut keyed: Vec<(Option<f64>, String, Hit)> = hits.drain(..).map(|h| {
+            let v = h.payload.as_ref().and_then(|p| p.get(alias.as_str()));
+            (v.and_then(|x| x.as_f64()), v.map(|x| x.to_string()).unwrap_or_default(), h)
+        }).collect();
+        keyed.sort_by(|a, b| {
+            use std::cmp::Ordering;
+            let o = match (a.0, b.0) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (None, None) => a.1.cmp(&b.1),
+            };
+            if ascending { o } else { o.reverse() }
+        });
+        hits = keyed.into_iter().map(|(_, _, h)| h).collect();
+    }
+
+    // ── 3. LIMIT + strip hidden columns ───────────────────────────────────
+    if let Some(n) = limit { hits.truncate(n); }
+    if strip_key || strip_order {
+        for h in &mut hits {
+            if let Some(Value::Object(m)) = h.payload.as_mut() {
+                if strip_key { m.remove(key_alias); }
+                if strip_order { m.remove("__order_key__"); }
+            }
+        }
+    }
+    hits
+}
+
+/// The six reserved path-intrinsic keys on an edge-bound variable.  A reference
+/// to any of these does NOT require reading edge metadata.
+const EDGE_INTRINSICS: [&str; 6] = [
+    "_depth", "_path_keys", "_path_strength",
+    "_avg_strength", "_min_strength", "_max_strength",
+];
+
+/// True if a math expression references an edge-bound variable's non-intrinsic
+/// field (e.g. `SUM(s.kwh)`), meaning per-edge metadata must be materialised.
+fn math_refs_edge_field(m: &MathExpr, edge_binds: &[&str]) -> bool {
+    match m {
+        MathExpr::VarField { var, field } =>
+            edge_binds.contains(&var.as_str()) && !EDGE_INTRINSICS.contains(&field.as_str()),
+        MathExpr::Mul(a, b) | MathExpr::Add(a, b)
+        | MathExpr::Sub(a, b) | MathExpr::Div(a, b) =>
+            math_refs_edge_field(a, edge_binds) || math_refs_edge_field(b, edge_binds),
+        MathExpr::Literal(_) => false,
+    }
+}
+
+/// Does any clause of the statement reference an edge-bound variable's
+/// non-intrinsic field (`r.kwh`, `r.strength`, …)?  Such queries must
+/// materialise edge metadata via the general PathRow path, so this predicate
+/// also gates the GROUP BY fast paths (which only understand node fields).
+/// An edge variable that is bound but never referenced returns `false`, so
+/// ordinary traversals keep every fast path and pay nothing.
+fn stmt_needs_edge_meta(stmt: &MatchAggStmt) -> bool {
+    let edge_binds: Vec<&str> = stmt.hops.iter()
+        .filter_map(|h| h.edge_bind.as_deref())
+        .collect();
+    if edge_binds.is_empty() { return false; }
+
+    let is_edge_field = |var: &str, field: &str| -> bool {
+        edge_binds.contains(&var) && !EDGE_INTRINSICS.contains(&field)
+    };
+
+    let in_returns = stmt.returns.iter().any(|(r, _)| match r {
+        MatchAggReturn::Field { var, field }
+        | MatchAggReturn::PathAvg { var, field }
+        | MatchAggReturn::PathSum { var, field }
+        | MatchAggReturn::PathMin { var, field }
+        | MatchAggReturn::PathMax { var, field } => is_edge_field(var, field),
+        MatchAggReturn::Sum(m) | MatchAggReturn::Avg(m)
+        | MatchAggReturn::Min(m) | MatchAggReturn::Max(m) =>
+            math_refs_edge_field(m, &edge_binds),
+        _ => false,
+    });
+    let in_where = stmt.dest_where.iter().any(|dw| is_edge_field(&dw.var, &dw.field));
+    let in_group = stmt.group_by.as_ref().map_or(false, |gk|
+        gk.iter().any(|(v, f)| is_edge_field(v, f)));
+
+    in_returns || in_where || in_group
+}
+
+/// True when a variable-length hop (`*a..b`) binds an edge whose path intrinsics
+/// (`_path_keys`, `_path_strength`, `_depth`, …) or metadata are referenced — such
+/// queries need full-path tracking during traversal to be correct.  Ordinary
+/// var-length traversals (projecting dest fields only) keep the fast flat path.
+fn stmt_needs_var_path(stmt: &MatchAggStmt) -> bool {
+    let var_binds: Vec<&str> = stmt.hops.iter()
+        .filter(|h| h.max_depth > 1)
+        .filter_map(|h| h.edge_bind.as_deref())
+        .collect();
+    if var_binds.is_empty() { return false; }
+    let referenced = |bind: &str| -> bool {
+        stmt.returns.iter().any(|(r, _)| r.references_var(bind))
+            || stmt.dest_where.iter().any(|dw| dw.var == bind)
+            || stmt.group_by.as_ref().map_or(false, |g| g.iter().any(|(v, _)| v == bind))
+            || stmt.order_by.as_ref().map_or(false, |(k, _)|
+                k.split_once('.').map_or(false, |(v, _)| v == bind))
+    };
+    var_binds.iter().any(|b| referenced(b))
+}
+
+/// Project one return expression into a result map.  `AllFields { var }`
+/// (`SELECT var.*`) spreads the bound node's payload into top-level keys — the
+/// replacement for the old `MATCH … RETURN var`.  Everything else is inserted
+/// under its alias.
+fn spread_or_insert(
+    map: &mut serde_json::Map<String, Value>,
+    ret_expr: &MatchAggReturn,
+    alias: &str,
+    rows: &[PathRow],
+) {
+    if let MatchAggReturn::AllFields { var } = ret_expr {
+        if let Some(Value::Object(obj)) = rows.first().and_then(|r| r.get(var.as_str())) {
+            for (k, v) in obj { map.insert(k.clone(), v.clone()); }
+        }
+    } else {
+        map.insert(alias.to_string(), ret_expr.eval_group(rows));
+    }
+}
+
+/// Execute a `SELECT … FROM MATCH … UNION SELECT … FROM MATCH …` — run each arm
+/// and concatenate results, de-duplicating identical rows (UNION = distinct).
+pub fn execute_match_agg_union(db: &CoreDB, stmts: Vec<MatchAggStmt>) -> Vec<Hit> {
+    let mut out: Vec<Hit> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for stmt in stmts {
+        for hit in execute_match_agg(db, stmt) {
+            let key = hit.payload.as_ref()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| hit.slug.clone());
+            if seen.insert(key) {
+                out.push(hit);
+            }
+        }
+    }
+    out
+}
+
+fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
+    let needs_edge_meta = stmt_needs_edge_meta(&stmt);
+    let needs_var_path = stmt_needs_var_path(&stmt);
     // Multi-stage queries (WITH chaining) or no-hop queries use the stages executor.
     if stmt.with_stages.is_some() || stmt.hops.is_empty() {
         return execute_match_agg_with_stages(db, stmt);
@@ -5244,6 +5888,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     if stmt.group_by.is_none()
         && stmt.returns.iter().all(|(r, _)| matches!(r, MatchAggReturn::Count))
         && stmt.dest_where.is_empty()
+        && !needs_edge_meta
     {
         let total: usize = collect_final_dest_counts(db, &starts, &stmt.hops)
             .values()
@@ -5291,13 +5936,16 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     // (Field/Count/Now), uses get_payload_head_tail + extract_fields_by_search instead
     // of loading and parsing the full JSON blob.
     if let Some(ref group_keys) = stmt.group_by {
+        // CountDistinct needs full per-path rows (to see every value in the
+        // group), so it forces the general path just like Sum/Avg/Min/Max.
         let needs_row_scan = stmt.returns.iter().any(|(e, _)| matches!(e,
             MatchAggReturn::Sum(_) | MatchAggReturn::Avg(_) |
-            MatchAggReturn::Min(_) | MatchAggReturn::Max(_)));
+            MatchAggReturn::Min(_) | MatchAggReturn::Max(_) |
+            MatchAggReturn::CountDistinct { .. }));
         let start_in_group = stmt.start_var.as_ref()
             .map_or(false, |sv| group_keys.iter().any(|(gvar, _)| gvar == sv));
 
-        if !needs_row_scan && !start_in_group {
+        if !needs_row_scan && !start_in_group && stmt.func_filters.is_empty() && !needs_edge_meta {
             // ── Shared: field list (used by both fast paths) ──
             let all_returns_simple = stmt.returns.iter().all(|(ret, _)|
                 matches!(ret, MatchAggReturn::Count | MatchAggReturn::Field { .. }
@@ -5604,7 +6252,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             let raw = if let Some(reversed) = try_reverse_anchor(db, &starts, &stmt.hops, &stmt.dest_where) {
                 reversed
             } else {
-                collect_raw_paths(db, &starts, &stmt.hops, None)
+                collect_raw_paths(db, &starts, &stmt.hops, None, needs_var_path)
             };
             if raw.is_empty() { return vec![]; }
 
@@ -5762,7 +6410,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
         //   2. Group by start_hash → count paths per start node
         //   3. Load start-node fields from btree index or payloads
         //   4. Merge groups with identical field values
-        if start_in_group && !needs_row_scan {
+        if start_in_group && !needs_row_scan && stmt.func_filters.is_empty() && !needs_edge_meta {
             let start_var = stmt.start_var.as_deref().unwrap_or("");
             // Verify ALL group keys and return fields reference the start var or are COUNT.
             let all_start_or_count = group_keys.iter().all(|(gvar, _)| gvar == start_var)
@@ -5777,7 +6425,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 let raw = if let Some(reversed) = try_reverse_anchor(db, &starts, &stmt.hops, &stmt.dest_where) {
                     reversed
                 } else {
-                    collect_raw_paths(db, &starts, &stmt.hops, None)
+                    collect_raw_paths(db, &starts, &stmt.hops, None, needs_var_path)
                 };
                 if raw.is_empty() { return vec![]; }
 
@@ -5948,19 +6596,33 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
         None
     };
 
+    // An aggregate query without GROUP BY must yield exactly ONE row even when
+    // nothing matches (PostgreSQL: COUNT→0, others→NULL).  When set, empty input
+    // is allowed to flow through to the single-row collapse branch instead of
+    // short-circuiting to zero rows.
+    let is_bare_agg = stmt.group_by.is_none() && stmt.returns.iter().any(|(e, _)| matches!(e,
+        MatchAggReturn::Count | MatchAggReturn::CountDistinct { .. } |
+        MatchAggReturn::Sum(_) | MatchAggReturn::Avg(_) |
+        MatchAggReturn::Min(_) | MatchAggReturn::Max(_)));
+
     // Phase 1: topology.
     let mut raw = if let Some(reversed) = try_reverse_anchor(db, &starts, &stmt.hops, &stmt.dest_where) {
         reversed
     } else {
-        collect_raw_paths(db, &starts, &stmt.hops, traversal_limit)
+        collect_raw_paths(db, &starts, &stmt.hops, traversal_limit, needs_var_path)
     };
-    if raw.is_empty() { return vec![]; }
+    if raw.is_empty() && !is_bare_agg { return vec![]; }
 
     // Phase 2: filter by hop-variable conditions (topology-first, efficient).
     // Conditions on the start variable are skipped here and applied in Phase 5.
     if !stmt.dest_where.is_empty() {
         raw = filter_raw_by_dest_where(db, raw, &stmt.dest_where, &var_to_hop);
-        if raw.is_empty() { return vec![]; }
+        if raw.is_empty() && !is_bare_agg { return vec![]; }
+    }
+    // Function filters (spatial/text) on the destination — applied pre-grouping.
+    if !stmt.func_filters.is_empty() {
+        raw = filter_raw_by_func_filters(db, raw, &stmt.func_filters);
+        if raw.is_empty() && !is_bare_agg { return vec![]; }
     }
 
     // Phase 3: truncate to LIMIT before paying for payload reads.
@@ -5973,8 +6635,8 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     }
 
     // Phase 4: read payloads only for the surviving raw paths.
-    let all_paths = build_path_rows_from_raw(db, &raw, &stmt.hops, effective_start_var);
-    if all_paths.is_empty() { return vec![]; }
+    let all_paths = build_path_rows_from_raw(db, &raw, &stmt.hops, effective_start_var, needs_edge_meta);
+    if all_paths.is_empty() && !is_bare_agg { return vec![]; }
 
     // Phase 5: filter start-variable conditions (requires PathRow payload).
     let paths: Vec<PathRow> = if !has_start_conditions {
@@ -5994,7 +6656,7 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 })
         }).collect()
     };
-    if paths.is_empty() { return vec![]; }
+    if paths.is_empty() && !is_bare_agg { return vec![]; }
 
     // 3. GROUP BY or flat pass-through
     let mut result_rows: Vec<Value> = if let Some(ref group_keys) = stmt.group_by {
@@ -6026,19 +6688,29 @@ pub fn execute_match_agg(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 let group_rows = &groups[&key];
                 let mut map = serde_json::Map::new();
                 for (ret_expr, alias) in &stmt.returns {
-                    map.insert(alias.clone(), ret_expr.eval_group(group_rows));
+                    spread_or_insert(&mut map, ret_expr, alias, group_rows);
                 }
                 Value::Object(map)
             })
             .collect()
+    } else if stmt.returns.iter().any(|(e, _)| matches!(e,
+        MatchAggReturn::Count | MatchAggReturn::CountDistinct { .. } |
+        MatchAggReturn::Sum(_) | MatchAggReturn::Avg(_) |
+        MatchAggReturn::Min(_) | MatchAggReturn::Max(_))) {
+        // Aggregates without GROUP BY — collapse all paths into a single row.
+        let mut map = serde_json::Map::new();
+        for (ret_expr, alias) in &stmt.returns {
+            spread_or_insert(&mut map, ret_expr, alias, &paths);
+        }
+        vec![Value::Object(map)]
     } else {
-        // No GROUP BY — one result row per complete path
+        // No GROUP BY, no aggregates — one result row per complete path.
         paths
             .into_iter()
             .map(|row| {
                 let mut map = serde_json::Map::new();
                 for (ret_expr, alias) in &stmt.returns {
-                    map.insert(alias.clone(), ret_expr.eval_group(std::slice::from_ref(&row)));
+                    spread_or_insert(&mut map, ret_expr, alias, std::slice::from_ref(&row));
                 }
                 Value::Object(map)
             })
@@ -6272,7 +6944,7 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
                 MatchAggStart::Collection(h) => db.collection_members(h).cloned().unwrap_or_default(),
                 MatchAggStart::All           => db.all_hashes(),
             };
-            collect_paths(db, &starts, &agg.hops, agg.start_var.as_deref(), None)
+            collect_paths(db, &starts, &agg.hops, agg.start_var.as_deref(), None, stmt_needs_var_path(&agg))
         }
         FromSource::Shortest(s) => {
             match build_shortest_path_row(db, &s) {
@@ -6296,9 +6968,25 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
         }
     }).collect();
 
-    let all_rows = cartesian_product(source_rows);
+    let mut all_rows = cartesian_product(source_rows);
     if all_rows.is_empty() {
         return vec![];
+    }
+
+    // Apply top-level WHERE across the joined rows.
+    if !stmt.where_clauses.is_empty() {
+        all_rows.retain(|row| {
+            stmt.where_clauses.iter().all(|dw| {
+                let lit = match &dw.value {
+                    WhereValue::Literal(v) => v,
+                    WhereValue::RowRef(_) => return true,
+                };
+                row.get(dw.var.as_str())
+                    .and_then(|v| v.get(dw.field.as_str()))
+                    .map_or(false, |v| dw.op.apply(v, lit))
+            })
+        });
+        if all_rows.is_empty() { return vec![]; }
     }
 
     let result_rows: Vec<Value> = all_rows.into_iter().map(|row| {

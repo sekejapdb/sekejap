@@ -25,7 +25,6 @@
 //! UPDATE collection SET field = val [, ...] [WHERE ...]
 //! DELETE FROM collection | ALL [WHERE ...]
 //! DELETE ('from')-[:KIND]->('to')
-//! MATCH (node)-[edge]->(node) [WHERE ...] RETURN vars [LIMIT n]   -- simple traversal
 //! SELECT expr AS alias [, ...] FROM MATCH (a)-[r]->(b) [WHERE ...] [GROUP BY] [ORDER BY] [LIMIT]
 //! SELECT expr AS alias [, ...] FROM MATCH SHORTEST (a)-[r*]->(b) WHERE a._key='x' AND b._key='y'
 //! SELECT expr FROM MATCH (a)-[:e]->(b), collection AS alias   -- multi-FROM cross-join
@@ -279,6 +278,8 @@ enum Kw {
     Begin,
     Commit,
     Rollback,
+    // Storage management
+    Compact,
 }
 
 fn kw_to_str(kw: &Kw) -> &'static str {
@@ -355,6 +356,7 @@ fn kw_to_str(kw: &Kw) -> &'static str {
         Kw::Begin => "begin",
         Kw::Commit => "commit",
         Kw::Rollback => "rollback",
+        Kw::Compact => "compact",
     }
 }
 
@@ -432,6 +434,7 @@ fn keyword(s: &str) -> Option<Kw> {
         "BEGIN" => Some(Kw::Begin),
         "COMMIT" => Some(Kw::Commit),
         "ROLLBACK" => Some(Kw::Rollback),
+        "COMPACT" => Some(Kw::Compact),
         _ => None,
     }
 }
@@ -777,7 +780,6 @@ enum CondExpr {
 enum OrderKey {
     /// One or more `field [ASC|DESC]` columns, evaluated left-to-right.
     Fields(Vec<(String, bool)>),
-    Bm25(String, String, bool),
     /// `field <op> [f32, ...]` — sort by vector distance (nearest first, Dot negated).
     Vector { field: String, query: Vec<f32>, metric: crate::query::VecMetric },
     /// Arithmetic score expression, e.g. `BM25(title,'q') * 0.7 + popularity * 0.3`.
@@ -913,6 +915,19 @@ pub enum CompiledMutation {
     Commit,
     /// ROLLBACK: discard all buffered mutations.
     Rollback,
+    /// COMPACT: flush snapshot and truncate WAL.
+    Compact,
+    /// SET WAL_FORMAT = json|binary: change WAL encoding and compact.
+    SetWalFormat(crate::WalFormat),
+    /// SET WAL_MODE = physical|logical: choose UPDATE logging strategy.
+    /// `true` = logical (one command entry per statement),
+    /// `false` = physical (one Put entry per affected row — the default).
+    SetWalMode(bool),
+    /// SET WAL_SYNC = full|barrier|os: choose fsync strength.
+    /// `full` = F_FULLFSYNC-class (default, power-loss durable),
+    /// `barrier` = write-ordering barrier, `os` = plain fsync
+    /// (matches SQLite's actual synchronous=FULL durability on macOS).
+    SetWalSync(crate::storage::wal::SyncLevel),
 }
 
 /// The specific alteration to apply in an `ALTER TABLE` statement.
@@ -933,38 +948,14 @@ pub enum AlterTableOp {
 
 // ── MATCH AST ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
-enum EdgeDir {
-    Forward,
-    Backward,
-}
-
 struct MatchNode {
     var: Option<String>,         // (a:artist) → var="a"
     label: Option<String>,       // (a:artist) → label="artist"
     props: Vec<(String, Value)>, // (:genre {_key: 'rock'}) → inline WHERE
 }
 
-struct MatchEdge {
-    var: Option<String>,  // [r:has_genre] → var="r"
-    kind: Option<String>, // [r:has_genre] → kind="has_genre"
-    dir: EdgeDir,
-    depth: Option<(u32, u32)>, // *1..5 → Some((1,5))
-}
-
-struct MatchStmt {
-    start: MatchNode,
-    edge: MatchEdge,
-    end: MatchNode,
-    conditions: Vec<MatchCond>,
-    #[allow(dead_code)]
-    return_vars: Vec<String>, // kept for future RETURN projection
-    limit: Option<usize>,
-}
-
 enum MatchCond {
     NodeField {
-        var: String,
         field: String,
         op: CompareOp,
         value: Value,
@@ -1272,6 +1263,95 @@ impl Parser {
                 expected: ":",
                 got: format!("{other:?}"),
             }),
+        }
+    }
+
+    /// True if the next token starts a MATCH `WHERE` filter function.
+    fn peek_is_match_filter_fn(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(n)
+            if matches!(n.to_ascii_uppercase().as_str(), "ST_DWITHIN" | "BM25"))
+    }
+
+    /// Parse a MATCH `WHERE` filter function on a hop variable:
+    /// `ST_DWithin(var.geo, POINT(lon lat), km)` or `BM25(var.field,'q') op n`.
+    fn parse_match_func_filter(&mut self) -> Result<crate::query::MatchFuncFilter, SqlError> {
+        use crate::query::MatchFuncFilter;
+        let name = self.expect_ident()?.to_ascii_uppercase();
+        match name.as_str() {
+            "ST_DWITHIN" => {
+                self.expect_lparen()?;
+                let _field = self.expect_score_field()?; // var.geo → geo (spatial is field-agnostic)
+                self.expect_comma()?;
+                let (lon, lat) = self.parse_point_literal()?;
+                self.expect_comma()?;
+                let km = self.expect_num()?;
+                self.expect_rparen()?;
+                Ok(MatchFuncFilter::StDWithin { lat, lon, km })
+            }
+            "BM25" => {
+                self.expect_lparen()?;
+                let field = self.expect_score_field()?;
+                self.expect_comma()?;
+                let query = self.expect_str()?;
+                self.expect_rparen()?;
+                let op = self.parse_cmp_op()?;
+                let threshold = self.expect_num()?;
+                Ok(MatchFuncFilter::Bm25 { field, query, op, threshold })
+            }
+            _ => unreachable!("peek_is_match_filter_fn gates this"),
+        }
+    }
+
+    /// True if the next token starts a scoring function call.
+    fn peek_is_score_fn(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(name) if matches!(name.to_ascii_uppercase().as_str(),
+            "BM25" | "BM25_NORM" | "VECTOR_COSINE" | "VECTOR_L2" | "VECTOR_DOT"
+            | "VECTOR_L1" | "ST_DISTANCE_KM" | "SEARCH_SCORE"))
+    }
+
+    /// Consume an optional `ASC`/`DESC`; returns `true` for ascending (default).
+    fn parse_sort_dir(&mut self) -> bool {
+        if matches!(self.peek(), Tok::Kw(Kw::Desc)) { self.advance(); false }
+        else { if matches!(self.peek(), Tok::Kw(Kw::Asc)) { self.advance(); } true }
+    }
+
+    /// Parse a MATCH `ORDER BY` clause → `(field_order, score_order)`:
+    /// a bare/`var.field` column sort, or a scoring-expression rank.
+    fn parse_match_order(&mut self)
+        -> Result<(Option<(String, bool)>, Option<(crate::query::ScoreExpr, bool)>), SqlError>
+    {
+        if !matches!(self.peek(), Tok::Kw(Kw::Order)) {
+            return Ok((None, None));
+        }
+        self.advance();
+        self.expect_kw(Kw::By, "BY")?;
+        if self.peek_is_score_fn() {
+            let expr = self.parse_score_expr()?;
+            let asc = self.parse_sort_dir();
+            Ok((None, Some((expr, asc))))
+        } else {
+            let mut alias = self.expect_ident()?;
+            if matches!(self.peek(), Tok::Dot) {
+                self.advance();
+                let field = self.expect_ident()?;
+                alias = format!("{alias}.{field}");
+            }
+            let asc = self.parse_sort_dir();
+            Ok((Some((alias, asc)), None))
+        }
+    }
+
+    /// Parse a field name that may be variable-qualified: `var.field` → `field`.
+    /// Lets score functions work both in plain SELECT (`BM25(body,'q')`) and in
+    /// MATCH (`BM25(b.body,'q')`) — the `var` qualifier selects the hop node and
+    /// is resolved by the executor; only the bare field name is kept here.
+    fn expect_score_field(&mut self) -> Result<String, SqlError> {
+        let first = self.expect_ident()?;
+        if matches!(self.peek(), Tok::Dot) {
+            self.advance();
+            self.expect_ident() // keep the field, drop the var qualifier
+        } else {
+            Ok(first)
         }
     }
 
@@ -1637,13 +1717,18 @@ impl Parser {
     }
 
     fn parse_field_or_bm25(&mut self) -> Result<FieldOrBm25, SqlError> {
+        // CASE WHEN … END — must be intercepted before expect_ident(), which
+        // would otherwise swallow the CASE keyword as a bare field name.
+        if matches!(self.peek(), Tok::Kw(Kw::Case)) {
+            return self.parse_plain_case_projection();
+        }
         let ident = self.expect_ident()?;
         // Score functions → parse as full ScoreExpr, optional AS alias
         if matches!(self.peek(), Tok::LParen) {
             let upper = ident.to_uppercase();
             if matches!(upper.as_str(),
-                "BM25" | "VECTOR_COSINE" | "VECTOR_L2"
-                | "VECTOR_DOT" | "VECTOR_L1" | "ST_DISTANCE_KM"
+                "BM25" | "BM25_NORM" | "VECTOR_COSINE" | "VECTOR_L2"
+                | "VECTOR_DOT" | "VECTOR_L1" | "ST_DISTANCE_KM" | "SEARCH_SCORE"
             ) {
                 // Back up so parse_score_expr can consume the ident
                 self.pos -= 1;
@@ -1742,11 +1827,18 @@ impl Parser {
             if func_upper == "NOW" {
                 self.advance();
                 self.expect_rparen()?;
-                return Ok(FieldOrBm25::Field("__FUNC__NOW__".to_string()));
+                let expr = "__FUNC__NOW__".to_string();
+                let expr = if matches!(self.peek(), Tok::Kw(Kw::As)) {
+                    self.advance();
+                    let alias = self.expect_ident()?;
+                    format!("__AS__{}\x01{}", alias, expr)
+                } else { expr };
+                return Ok(FieldOrBm25::Field(expr));
             }
             if matches!(
                 func_upper.as_str(),
                 "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "DOW" | "QUARTER"
+                | "AGE_DAYS" | "AGE_HOURS" | "JSON_ARRAY_LENGTH"
             ) {
                 self.advance();
                 let arg = self.expect_ident()?;
@@ -1795,14 +1887,21 @@ impl Parser {
                 "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
             ) {
                 self.advance(); // consume (
+                let mut distinct = false;
                 let arg = if func_upper == "COUNT" && matches!(self.peek(), Tok::Star) {
                     self.advance(); // consume *
                     "*".to_string()
                 } else {
+                    // COUNT(DISTINCT field) — consume the DISTINCT keyword first.
+                    if func_upper == "COUNT" && matches!(self.peek(), Tok::Kw(Kw::Distinct)) {
+                        self.advance();
+                        distinct = true;
+                    }
                     self.expect_ident()?
                 };
                 self.expect_rparen()?;
-                let expr = format!("__AGG__{}__{}", func_upper, arg);
+                let func_token = if distinct { "COUNTD" } else { func_upper.as_str() };
+                let expr = format!("__AGG__{}__{}", func_token, arg);
                 // Check for AS alias
                 let expr = if matches!(self.peek(), Tok::Kw(Kw::As)) {
                     self.advance();
@@ -1825,6 +1924,58 @@ impl Parser {
             ident
         };
         Ok(FieldOrBm25::Field(ident))
+    }
+
+    /// Parse a `CASE WHEN <field> <op> <literal> THEN <literal> [ … ] [ELSE
+    /// <literal>] END [AS alias]` expression in a plain (non-MATCH) SELECT list.
+    ///
+    /// Conditions reference bare row fields (no `var.` qualifier).  The whole
+    /// expression is JSON-encoded into the `__CASE__<json>` projection sentinel
+    /// so it rides inside the existing flat `Vec<String>` field list; the
+    /// executor decodes and evaluates it per row (see `PlainCase`).  THEN/ELSE
+    /// values are literals, matching the MATCH surface's CASE.
+    fn parse_plain_case_projection(&mut self) -> Result<FieldOrBm25, SqlError> {
+        use crate::query::{CaseCond, CmpOp, PlainCase};
+        self.advance(); // consume CASE
+        let mut branches: Vec<(CaseCond, Value)> = Vec::new();
+        let mut else_val = Value::Null;
+        loop {
+            match self.peek().clone() {
+                Tok::Kw(Kw::When) => {
+                    self.advance(); // consume WHEN
+                    let field = self.expect_ident()?;
+                    let op: CmpOp = self.parse_cmp_op()?;
+                    let val = self.parse_value()?;
+                    self.expect_kw(Kw::Then, "THEN")?;
+                    let then_val = self.parse_value()?;
+                    branches.push((CaseCond { var: String::new(), field, op, val }, then_val));
+                }
+                Tok::Kw(Kw::Else) => {
+                    self.advance(); // consume ELSE
+                    else_val = self.parse_value()?;
+                }
+                _ => break,
+            }
+        }
+        self.expect_kw(Kw::End, "END")?;
+        if branches.is_empty() {
+            return Err(SqlError::InvalidValue(
+                "CASE requires at least one WHEN branch".into(),
+            ));
+        }
+        let pc = PlainCase { branches, else_val };
+        let json = serde_json::to_string(&pc)
+            .map_err(|e| SqlError::InvalidValue(format!("CASE encoding failed: {e}")))?;
+        let encoded = format!("__CASE__{}", json);
+        // Optional AS alias — otherwise the output column defaults to "case".
+        let encoded = if matches!(self.peek(), Tok::Kw(Kw::As)) {
+            self.advance();
+            let alias = self.expect_ident()?;
+            format!("__AS__{}\x01{}", alias, encoded)
+        } else {
+            encoded
+        };
+        Ok(FieldOrBm25::Field(encoded))
     }
 
     fn parse_source(&mut self) -> Result<Source, SqlError> {
@@ -2087,14 +2238,20 @@ impl Parser {
             && matches!(self.peek(), Tok::LParen)
         {
             self.advance(); // consume (
+            let mut distinct = false;
             let arg = if upper == "COUNT" && matches!(self.peek(), Tok::Star) {
                 self.advance();
                 "*".to_string()
             } else {
+                if upper == "COUNT" && matches!(self.peek(), Tok::Kw(Kw::Distinct)) {
+                    self.advance();
+                    distinct = true;
+                }
                 self.expect_ident()?
             };
             self.expect_rparen()?;
-            let agg_key = format!("__AGG__{}__{}", upper, arg);
+            let func_token = if distinct { "COUNTD" } else { upper.as_str() };
+            let agg_key = format!("__AGG__{}__{}", func_token, arg);
             // Parse comparison operator + value (same logic as normal field below)
             return match self.peek().clone() {
                 Tok::Gt => {
@@ -2231,7 +2388,7 @@ impl Parser {
     /// Parse a spatial function call after the function name has been consumed.
     fn parse_spatial_function(&mut self, func: &str) -> Result<CondExpr, SqlError> {
         self.expect_lparen()?;
-        let _geom_field = self.expect_ident()?; // "geometry" — consumed but ignored
+        let geom_field = self.expect_ident()?; // the geometry field
         self.expect_comma()?;
 
         match func {
@@ -2282,34 +2439,29 @@ impl Parser {
             }
             "ST_DISTANCE" => {
                 // ST_Distance(geometry, POINT(lon lat), max_km)
-                let field = self.expect_ident()?;
-                self.expect_comma()?;
+                // The field was already consumed by the shared prefix.
                 let (lon, lat) = self.parse_point_literal()?;
                 self.expect_comma()?;
                 let max_km = self.expect_num()?;
                 self.expect_rparen()?;
                 Ok(CondExpr::StDistance {
-                    field,
+                    field: geom_field,
                     lat,
                     lon,
                     max_km,
                 })
             }
             "ST_LENGTH" => {
-                // ST_Length(geometry) < min_km
-                let field = self.expect_ident()?;
-                self.expect_comma()?;
+                // ST_Length(geometry, min_km)
                 let min_km = self.expect_num()?;
                 self.expect_rparen()?;
-                Ok(CondExpr::StLength { field, min_km })
+                Ok(CondExpr::StLength { field: geom_field, min_km })
             }
             "ST_AREA" => {
-                // ST_Area(geometry) > min_km2
-                let field = self.expect_ident()?;
-                self.expect_comma()?;
+                // ST_Area(geometry, min_km2)
                 let min_km2 = self.expect_num()?;
                 self.expect_rparen()?;
-                Ok(CondExpr::StArea { field, min_km2 })
+                Ok(CondExpr::StArea { field: geom_field, min_km2 })
             }
             _ => Err(SqlError::UnexpectedToken {
                 expected: "spatial function",
@@ -2496,11 +2648,29 @@ impl Parser {
                 match name.to_ascii_uppercase().as_str() {
                     "BM25" => {
                         self.expect_lparen()?;
-                        let field = self.expect_ident()?;
+                        let field = self.expect_score_field()?;
                         self.expect_comma()?;
                         let query = self.expect_str()?;
                         self.expect_rparen()?;
                         Ok(ScoreExpr::Bm25 { field, query })
+                    }
+                    "BM25_NORM" => {
+                        // BM25_NORM(field, 'query' [, k]) → BM25 saturated to [0,1].
+                        self.expect_lparen()?;
+                        let field = self.expect_score_field()?;
+                        self.expect_comma()?;
+                        let query = self.expect_str()?;
+                        // Optional midpoint k. Default 1.0 — sekejap's BM25
+                        // scores run small (sub-1 to low single digits), so a
+                        // small k gives a usable [0,1] spread. Tune per corpus.
+                        let k = if matches!(self.peek(), Tok::Comma) {
+                            self.advance();
+                            self.expect_num()?
+                        } else {
+                            1.0
+                        };
+                        self.expect_rparen()?;
+                        Ok(ScoreExpr::Bm25Norm { field, query, k })
                     }
                     "SEARCH_SCORE" => {
                         self.expect_lparen()?;
@@ -2510,7 +2680,7 @@ impl Parser {
                     }
                     "VECTOR_COSINE" => {
                         self.expect_lparen()?;
-                        let field = self.expect_ident()?;
+                        let field = self.expect_score_field()?;
                         self.expect_comma()?;
                         let query = self.parse_f32_array_or_param()?;
                         self.expect_rparen()?;
@@ -2518,7 +2688,7 @@ impl Parser {
                     }
                     "VECTOR_L2" => {
                         self.expect_lparen()?;
-                        let field = self.expect_ident()?;
+                        let field = self.expect_score_field()?;
                         self.expect_comma()?;
                         let query = self.parse_f32_array_or_param()?;
                         self.expect_rparen()?;
@@ -2526,7 +2696,7 @@ impl Parser {
                     }
                     "VECTOR_DOT" => {
                         self.expect_lparen()?;
-                        let field = self.expect_ident()?;
+                        let field = self.expect_score_field()?;
                         self.expect_comma()?;
                         let query = self.parse_f32_array_or_param()?;
                         self.expect_rparen()?;
@@ -2534,7 +2704,7 @@ impl Parser {
                     }
                     "VECTOR_L1" => {
                         self.expect_lparen()?;
-                        let field = self.expect_ident()?;
+                        let field = self.expect_score_field()?;
                         self.expect_comma()?;
                         let query = self.parse_f32_array_or_param()?;
                         self.expect_rparen()?;
@@ -2543,7 +2713,7 @@ impl Parser {
                     "ST_DISTANCE_KM" => {
                         // ST_DISTANCE_KM(field, POINT(lon lat))
                         self.expect_lparen()?;
-                        let field = self.expect_ident()?;
+                        let field = self.expect_score_field()?;
                         self.expect_comma()?;
                         let (lon, lat) = self.parse_point_literal()?;
                         self.expect_rparen()?;
@@ -3240,104 +3410,9 @@ impl Parser {
         }
     }
 
-    fn parse_with_options(&mut self) -> Result<IndexHint, SqlError> {
-        self.expect_lparen()?;
-        let mut hints = IndexHint::default();
-        loop {
-            let ident = self.expect_ident()?;
-            match ident.to_lowercase().as_str() {
-                "hash" => {
-                    self.expect_colon()?;
-                    hints.hash = self.parse_string_list()?;
-                }
-                "range" => {
-                    self.expect_colon()?;
-                    hints.range = self.parse_string_list()?;
-                }
-                "fulltext" => {
-                    self.expect_colon()?;
-                    hints.fulltext = self.parse_string_list()?;
-                }
-                "bm25" => {
-                    self.expect_colon()?;
-                    hints.bm25 = self.parse_string_list()?;
-                }
-                "spatial" => {
-                    self.expect_colon()?;
-                    hints.spatial = self.parse_string_list()?;
-                }
-                "vector" => {
-                    self.expect_colon()?;
-                    hints.vector = self.parse_string_list()?;
-                }
-                _ => {
-                    return Err(SqlError::UnexpectedToken {
-                        expected: "hash, range, fulltext, bm25, spatial, or vector",
-                        got: ident,
-                    })
-                }
-            }
-            if matches!(self.peek(), Tok::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        self.expect_rparen()?;
-        Ok(hints)
-    }
-
-    fn parse_string_list(&mut self) -> Result<Vec<String>, SqlError> {
-        self.expect_lbracket()?;
-        let mut items = Vec::new();
-        loop {
-            let s = self.expect_str()?;
-            items.push(s);
-            if matches!(self.peek(), Tok::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        self.expect_rbracket()?;
-        Ok(items)
-    }
-
     // ── MATCH parser ─────────────────────────────────────────────────────────
 
     /// Parse: MATCH (node)-[edge]->(node) [WHERE ...] RETURN vars [LIMIT n]
-    fn parse_match(&mut self) -> Result<MatchStmt, SqlError> {
-        self.expect_kw(Kw::Match, "MATCH")?;
-
-        let start = self.parse_match_node()?;
-        let edge = self.parse_match_edge()?;
-        let end = self.parse_match_node()?;
-
-        let mut conditions = Vec::new();
-        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
-            self.advance();
-            conditions = self.parse_match_conditions()?;
-        }
-
-        self.expect_kw(Kw::Return, "RETURN")?;
-        let return_vars = self.parse_return_list()?;
-
-        let mut limit = None;
-        if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
-            self.advance();
-            limit = Some(self.expect_usize()?);
-        }
-
-        Ok(MatchStmt {
-            start,
-            edge,
-            end,
-            conditions,
-            return_vars,
-            limit,
-        })
-    }
-
     /// Parse: MATCH (src) [WHERE conditions] INSERT (src)-[:kind]->(tgt)
     fn parse_match_insert(&mut self) -> Result<CompiledMutation, SqlError> {
         self.expect_kw(Kw::Match, "MATCH")?;
@@ -3463,7 +3538,6 @@ impl Parser {
         for cond in conditions {
             match cond {
                 MatchCond::NodeField {
-                    var: _,
                     field,
                     op,
                     value,
@@ -3490,7 +3564,6 @@ impl Parser {
                         }
                     }
                     CompareOp::Neq => match_steps.push(Step::WhereNeq(field, value)),
-                    _ => {}
                 },
             }
         }
@@ -3585,133 +3658,6 @@ impl Parser {
     /// Parse edge pattern + direction:
     ///   Forward:  -[var:kind *min..max]->
     ///   Backward: <-[var:kind]-
-    fn parse_match_edge(&mut self) -> Result<MatchEdge, SqlError> {
-        let dir;
-        // Detect direction by looking at first token
-        if matches!(self.peek(), Tok::BackArrow) {
-            // <-[...]- (backward)
-            dir = EdgeDir::Backward;
-            self.advance(); // consume <-
-        } else if matches!(self.peek(), Tok::Dash) {
-            // -[...]-> (forward)
-            dir = EdgeDir::Forward;
-            self.advance(); // consume -
-        } else {
-            return Err(SqlError::UnexpectedToken {
-                expected: "- or <-",
-                got: format!("{:?}", self.peek()),
-            });
-        }
-
-        // [var:kind *min..max]
-        match self.peek() {
-            Tok::LBracket => {
-                self.advance();
-            }
-            Tok::Eof => return Err(SqlError::UnexpectedEnd { expected: "[" }),
-            other => {
-                return Err(SqlError::UnexpectedToken {
-                    expected: "[",
-                    got: format!("{other:?}"),
-                })
-            }
-        }
-
-        let mut var = None;
-        let mut kind = None;
-        let mut depth = None;
-
-        // Empty edge []
-        if !matches!(self.peek(), Tok::RBracket) {
-            // Optional var or :kind
-            if matches!(self.peek(), Tok::Colon) {
-                self.advance();
-                kind = Some(self.expect_ident()?);
-            } else if matches!(self.peek(), Tok::Ident(_) | Tok::Str(_)) {
-                let name = self.expect_ident()?;
-                if matches!(self.peek(), Tok::Colon) {
-                    self.advance();
-                    var = Some(name);
-                    kind = Some(self.expect_ident()?);
-                } else {
-                    // just var, no kind
-                    var = Some(name);
-                }
-            }
-
-            // Optional depth: *min..max
-            if matches!(self.peek(), Tok::Star) {
-                self.advance();
-                let min = self.expect_num()? as u32;
-                match self.peek() {
-                    Tok::DotDot => {
-                        self.advance();
-                    }
-                    Tok::Eof => return Err(SqlError::UnexpectedEnd { expected: ".." }),
-                    other => {
-                        return Err(SqlError::UnexpectedToken {
-                            expected: "..",
-                            got: format!("{other:?}"),
-                        })
-                    }
-                }
-                let max = self.expect_num()? as u32;
-                depth = Some((min, max));
-            }
-        }
-
-        match self.peek() {
-            Tok::RBracket => {
-                self.advance();
-            }
-            Tok::Eof => return Err(SqlError::UnexpectedEnd { expected: "]" }),
-            other => {
-                return Err(SqlError::UnexpectedToken {
-                    expected: "]",
-                    got: format!("{other:?}"),
-                })
-            }
-        }
-
-        // Consume trailing direction marker
-        if dir == EdgeDir::Forward {
-            // expect ->
-            match self.peek() {
-                Tok::Arrow => {
-                    self.advance();
-                }
-                Tok::Eof => return Err(SqlError::UnexpectedEnd { expected: "->" }),
-                other => {
-                    return Err(SqlError::UnexpectedToken {
-                        expected: "->",
-                        got: format!("{other:?}"),
-                    })
-                }
-            }
-        } else {
-            // backward: expect trailing -
-            match self.peek() {
-                Tok::Dash => {
-                    self.advance();
-                }
-                Tok::Eof => return Err(SqlError::UnexpectedEnd { expected: "-" }),
-                other => {
-                    return Err(SqlError::UnexpectedToken {
-                        expected: "-",
-                        got: format!("{other:?}"),
-                    })
-                }
-            }
-        }
-
-        Ok(MatchEdge {
-            var,
-            kind,
-            dir,
-            depth,
-        })
-    }
-
     /// Parse WHERE conditions: var.field OP value [AND var.field OP value]*
     fn parse_match_conditions(&mut self) -> Result<Vec<MatchCond>, SqlError> {
         let mut conds = vec![self.parse_match_cond()?];
@@ -3724,7 +3670,7 @@ impl Parser {
 
     /// Parse: var.field OP value
     fn parse_match_cond(&mut self) -> Result<MatchCond, SqlError> {
-        let var = self.expect_ident()?;
+        self.expect_ident()?; // consume the `var` name before the dot (a.field)
         match self.peek() {
             Tok::Dot => {
                 self.advance();
@@ -3777,7 +3723,6 @@ impl Parser {
         };
         let value = self.parse_value()?;
         Ok(MatchCond::NodeField {
-            var,
             field,
             op,
             value,
@@ -3785,15 +3730,6 @@ impl Parser {
     }
 
     /// Parse: RETURN a, g, r
-    fn parse_return_list(&mut self) -> Result<Vec<String>, SqlError> {
-        let mut vars = vec![self.expect_ident()?];
-        while matches!(self.peek(), Tok::Comma) {
-            self.advance();
-            vars.push(self.expect_ident()?);
-        }
-        Ok(vars)
-    }
-
     // ── Aggregate MATCH parser ────────────────────────────────────────────────
 
     /// Parse a MATCH path in aggregate mode and build a [`MatchAggStmt`].
@@ -3808,209 +3744,6 @@ impl Parser {
     /// [ORDER BY alias [ASC|DESC]]
     /// [LIMIT n]
     /// ```
-    fn parse_match_agg_path(&mut self) -> Result<crate::query::MatchAggStmt, SqlError> {
-        use crate::query::{HopSpec, MatchAggStart, MatchAggStmt};
-
-        // ── Start node ────────────────────────────────────────────────────
-        let start_node = self.parse_match_node()?;
-        let start_var:   Option<String> = start_node.var.clone();
-        let start_label: Option<String> = start_node.label.clone();
-        let mut start = match start_node.label {
-            Some(ref lbl) => MatchAggStart::Collection(sk_hash(lbl)),
-            None => match start_node.var {
-                Some(ref v) => MatchAggStart::Slug(sk_hash(v)),
-                None => MatchAggStart::All,
-            },
-        };
-
-        // ── Hop chain ─────────────────────────────────────────────────────
-        // Edge pattern forms:
-        //   -[r:edge_type]->   edge_bind="r", type=edge_type
-        //   -[:edge_type]->    edge_bind=None, type=edge_type
-        //   -[r*]->            edge_bind="r", type=any (0)
-        //   -[r*1..3]->        edge_bind="r", type=any (range ignored by executor for now)
-        //   -[*]->             edge_bind=None, type=any
-        let mut hops: Vec<HopSpec> = Vec::new();
-        while matches!(self.peek(), Tok::Dash) {
-            self.advance(); // consume '-'
-            self.expect_lbracket()?;
-
-            // Determine edge_bind and edge_type_hash from the pattern inside [...]
-            let mut edge_bind: Option<String> = None;
-            let mut edge_type_hash: u64 = 0; // 0 = any
-
-            match self.peek().clone() {
-                Tok::Ident(name) => {
-                    self.advance(); // consume ident (potential bind name)
-                    match self.peek() {
-                        Tok::Colon => {
-                            // r:edge_type
-                            self.advance(); // consume ':'
-                            let et = self.expect_ident()?;
-                            edge_bind = Some(name);
-                            edge_type_hash = sk_hash(&et);
-                        }
-                        _ => {
-                            // r* or r alone — edge bind, any type
-                            edge_bind = Some(name);
-                        }
-                    }
-                }
-                Tok::Colon => {
-                    // :edge_type — no bind name
-                    self.advance(); // consume ':'
-                    let et = self.expect_ident()?;
-                    edge_type_hash = sk_hash(&et);
-                }
-                _ => { /* * or ] — anonymous, any type */ }
-            }
-
-            // Optional depth: *min..max  (e.g. *1..3, *3..3)
-            let (mut min_depth, mut max_depth) = (1u32, 1u32);
-            if matches!(self.peek(), Tok::Star) {
-                self.advance(); // consume '*'
-                if let Tok::Num(_) = self.peek().clone() {
-                    let mn = self.expect_num()? as u32;
-                    if matches!(self.peek(), Tok::DotDot) {
-                        self.advance(); // consume '..'
-                        let mx = self.expect_num()? as u32;
-                        min_depth = mn;
-                        max_depth = mx;
-                    } else {
-                        // *N alone means exactly N hops
-                        min_depth = mn;
-                        max_depth = mn;
-                    }
-                }
-                // bare '*' (no number) → keep defaults (1..1 single hop)
-            }
-            // Consume any remaining tokens until ']' (forward-compat)
-            loop {
-                match self.peek() {
-                    Tok::RBracket | Tok::Eof => break,
-                    _ => { self.advance(); }
-                }
-            }
-            self.expect_rbracket()?;
-
-            if !matches!(self.peek(), Tok::Arrow) {
-                return Err(SqlError::UnexpectedToken {
-                    expected: "->",
-                    got: format!("{:?}", self.peek()),
-                });
-            }
-            self.advance(); // consume '->'
-            self.expect_lparen()?;
-            let node_bind = self.expect_ident()?;
-            let node_label = if matches!(self.peek(), Tok::Colon) { self.advance(); Some(self.expect_ident()?) } else { None };
-            self.expect_rparen()?;
-            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label });
-        }
-
-        // ── WHERE clause (optional) ───────────────────────────────────────
-        // Two kinds of conditions:
-        //   1. start_var._key = 'value'  → upgrades MatchAggStart to Slug (fast seed)
-        //   2. any_var.field op value    → stored in dest_where for post-traversal filter
-        let mut dest_where: Vec<crate::query::DestWhere> = Vec::new();
-        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
-            self.advance(); // consume WHERE
-            loop {
-                let cond_var = self.expect_ident()?;
-                self.expect_dot()?;
-                let cond_field = self.expect_ident()?;
-                let op = self.parse_cmp_op()?;
-                let cond_val = self.parse_value()?;
-
-                let is_start_key = cond_field == "_key"
-                    && op == crate::query::CmpOp::Eq
-                    && start_var.as_ref().map_or(false, |sv| *sv == cond_var);
-
-                if is_start_key {
-                    if let Some(key_val) = cond_val.as_str() {
-                        let full_slug = match start_label {
-                            Some(ref lbl) => format!("{}/{}", lbl, key_val),
-                            None => key_val.to_string(),
-                        };
-                        start = MatchAggStart::Slug(sk_hash(&full_slug));
-                    }
-                } else {
-                    dest_where.push(crate::query::DestWhere {
-                        var: cond_var, field: cond_field, op,
-                        value: crate::query::WhereValue::Literal(cond_val),
-                    });
-                }
-
-                if matches!(self.peek(), Tok::Kw(Kw::And)) {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // ── RETURN clause ─────────────────────────────────────────────────
-        self.expect_kw(Kw::Return, "RETURN")?;
-        let returns = self.parse_agg_return_list()?;
-
-        // ── GROUP BY ──────────────────────────────────────────────────────
-        // Supports multiple keys: GROUP BY a.city, b.role
-        let group_by = if matches!(self.peek(), Tok::Kw(Kw::Group)) {
-            self.advance();
-            self.expect_kw(Kw::By, "BY")?;
-            let mut keys: Vec<(String, String)> = Vec::new();
-            loop {
-                let var = self.expect_ident()?;
-                self.expect_dot()?;
-                let field = self.expect_ident()?;
-                keys.push((var, field));
-                if matches!(self.peek(), Tok::Comma) { self.advance(); } else { break; }
-            }
-            Some(keys)
-        } else {
-            None
-        };
-
-        // PG enforcement: Field returns (var.field) must appear in GROUP BY.
-        if let Some(ref gkeys) = group_by {
-            for (ret_expr, _alias) in &returns {
-                if let crate::query::MatchAggReturn::Field { var, field } = ret_expr {
-                    if field != "*" && !gkeys.iter().any(|(gv, gf)| gv == var && gf == field) {
-                        return Err(SqlError::GroupByViolation(format!("{var}.{field}")));
-                    }
-                }
-            }
-        }
-
-        // ── ORDER BY ──────────────────────────────────────────────────────
-        let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
-            self.advance(); // ORDER
-            self.expect_kw(Kw::By, "BY")?;
-            let alias = self.expect_ident()?;
-            let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
-                self.advance();
-                false
-            } else {
-                if matches!(self.peek(), Tok::Kw(Kw::Asc)) {
-                    self.advance();
-                }
-                true
-            };
-            Some((alias, ascending))
-        } else {
-            None
-        };
-
-        // ── LIMIT ─────────────────────────────────────────────────────────
-        let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
-            self.advance();
-            Some(self.expect_usize()?)
-        } else {
-            None
-        };
-
-        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where, with_stages: None })
-    }
-
     /// Parse `SELECT return_list FROM MATCH (start)-[edge]->(node)... [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`
     ///
     /// The SELECT list acts as the RETURN clause; no RETURN keyword is present.
@@ -4018,6 +3751,12 @@ impl Parser {
         use crate::query::{HopSpec, MatchAggStart, MatchAggStmt};
 
         self.expect_kw(Kw::Select, "SELECT")?;
+        let distinct = if matches!(self.peek(), Tok::Kw(Kw::Distinct)) {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let returns = self.parse_agg_return_list()?;
 
         self.expect_kw(Kw::From, "FROM")?;
@@ -4035,80 +3774,22 @@ impl Parser {
             },
         };
 
-        // ── Hop chain (same as parse_match_agg_path) ──────────────────────
-        let mut hops: Vec<HopSpec> = Vec::new();
-        while matches!(self.peek(), Tok::Dash) {
-            self.advance(); // consume '-'
-            self.expect_lbracket()?;
-
-            let mut edge_bind: Option<String> = None;
-            let mut edge_type_hash: u64 = 0;
-
-            match self.peek().clone() {
-                Tok::Ident(name) => {
-                    self.advance();
-                    match self.peek() {
-                        Tok::Colon => {
-                            self.advance();
-                            let et = self.expect_ident()?;
-                            edge_bind = Some(name);
-                            edge_type_hash = sk_hash(&et);
-                        }
-                        _ => { edge_bind = Some(name); }
-                    }
-                }
-                Tok::Colon => {
-                    self.advance();
-                    let et = self.expect_ident()?;
-                    edge_type_hash = sk_hash(&et);
-                }
-                _ => {}
-            }
-
-            // Optional depth: *min..max or *N
-            let (mut min_depth, mut max_depth) = (1u32, 1u32);
-            if matches!(self.peek(), Tok::Star) {
-                self.advance();
-                if let Tok::Num(_) = self.peek().clone() {
-                    let mn = self.expect_num()? as u32;
-                    if matches!(self.peek(), Tok::DotDot) {
-                        self.advance();
-                        let mx = self.expect_num()? as u32;
-                        min_depth = mn;
-                        max_depth = mx;
-                    } else {
-                        min_depth = mn;
-                        max_depth = mn;
-                    }
-                }
-            }
-            loop {
-                match self.peek() {
-                    Tok::RBracket | Tok::Eof => break,
-                    _ => { self.advance(); }
-                }
-            }
-            self.expect_rbracket()?;
-
-            if !matches!(self.peek(), Tok::Arrow) {
-                return Err(SqlError::UnexpectedToken {
-                    expected: "->",
-                    got: format!("{:?}", self.peek()),
-                });
-            }
-            self.advance();
-            self.expect_lparen()?;
-            let node_bind = self.expect_ident()?;
-            let node_label = if matches!(self.peek(), Tok::Colon) { self.advance(); Some(self.expect_ident()?) } else { None };
-            self.expect_rparen()?;
-            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label });
-        }
+        // ── Hop chain (forward `-[:e]->` and backward `<-[:e]-`) ──────────
+        // Inline props on destination nodes become equality WHERE conditions.
+        let (hops, base_inline): (Vec<HopSpec>, _) = self.parse_hop_chain()?;
 
         // ── WHERE (same as parse_match_agg_path) ──────────────────────────
-        let mut dest_where: Vec<crate::query::DestWhere> = Vec::new();
+        let mut dest_where: Vec<crate::query::DestWhere> = base_inline;
+        let mut func_filters: Vec<crate::query::MatchFuncFilter> = Vec::new();
         if matches!(self.peek(), Tok::Kw(Kw::Where)) {
             self.advance();
             loop {
+                // Function filter (spatial/text) on a hop variable?
+                if self.peek_is_match_filter_fn() {
+                    func_filters.push(self.parse_match_func_filter()?);
+                    if matches!(self.peek(), Tok::Kw(Kw::And)) { self.advance(); continue; }
+                    else { break; }
+                }
                 let cond_var = self.expect_ident()?;
                 self.expect_dot()?;
                 let cond_field = self.expect_ident()?;
@@ -4149,19 +3830,15 @@ impl Parser {
             let outputs = self.parse_with_output_list()?;
             self.expect_kw(Kw::Match, "MATCH")?;
 
-            let sn = self.parse_match_node()?;
-            let sv = sn.var.clone();
-            let sl = sn.label.clone();
-            let mut ms = match sn.label {
-                Some(ref lbl) => MatchAggStart::Collection(sk_hash(lbl)),
-                None => match sn.var {
-                    Some(ref v) => MatchAggStart::Slug(sk_hash(v)),
-                    None => MatchAggStart::All,
-                },
-            };
-
-            let mh = self.parse_hop_chain()?;
-            let wc = self.parse_match_where_clauses(&sv, &sl, &mut ms)?;
+            // Mirror parse_match_return_with: capture the stage's inline node
+            // WHERE (e.g. `(c:clos WHERE _key = clo)`, which may reference a
+            // prior WITH alias as a RowRef) alongside any trailing WHERE.
+            let (mut ms, sv, sl, mut stage_inline_where) =
+                self.parse_match_start_with_inline_where()?;
+            let (mh, mut hop_inline) = self.parse_hop_chain()?;
+            let mut wc = self.parse_match_where_clauses(&sv, &sl, &mut ms)?;
+            wc.append(&mut stage_inline_where);
+            wc.append(&mut hop_inline);
 
             with_stages_vec.push(crate::query::WithStage {
                 outputs,
@@ -4203,21 +3880,7 @@ impl Parser {
         }
 
         // ── ORDER BY ──────────────────────────────────────────────────────
-        let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
-            self.advance();
-            self.expect_kw(Kw::By, "BY")?;
-            let alias = self.expect_ident()?;
-            let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
-                self.advance();
-                false
-            } else {
-                if matches!(self.peek(), Tok::Kw(Kw::Asc)) { self.advance(); }
-                true
-            };
-            Some((alias, ascending))
-        } else {
-            None
-        };
+        let (order_by, order_score) = self.parse_match_order()?;
 
         // ── LIMIT ─────────────────────────────────────────────────────────
         let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
@@ -4227,7 +3890,7 @@ impl Parser {
             None
         };
 
-        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where, with_stages })
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, order_score, limit, dest_where, func_filters, with_stages, distinct })
     }
 
     /// Parse `SELECT return_list FROM MATCH SHORTEST (a[:col])-[r*]->(b[:col])
@@ -4378,7 +4041,14 @@ impl Parser {
         let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
             self.advance();
             self.expect_kw(Kw::By, "BY")?;
-            let alias = self.expect_ident()?;
+            let mut alias = self.expect_ident()?;
+            // Support `ORDER BY var.field` (destination field), not only a bare
+            // SELECT alias. Stored as "var.field"; resolved at execution time.
+            if matches!(self.peek(), Tok::Dot) {
+                self.advance();
+                let field = self.expect_ident()?;
+                alias = format!("{alias}.{field}");
+            }
             let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
                 self.advance(); false
             } else {
@@ -4504,50 +4174,7 @@ impl Parser {
                                 None => MatchAggStart::All,
                             },
                         };
-                        let mut hops = Vec::new();
-                        while matches!(self.peek(), Tok::Dash) {
-                            self.advance();
-                            self.expect_lbracket()?;
-                            let mut edge_bind: Option<String> = None;
-                            let mut edge_type_hash: u64 = 0;
-                            match self.peek().clone() {
-                                Tok::Ident(name) => {
-                                    self.advance();
-                                    match self.peek() {
-                                        Tok::Colon => { self.advance(); let et = self.expect_ident()?; edge_bind = Some(name); edge_type_hash = sk_hash(&et); }
-                                        _ => { edge_bind = Some(name); }
-                                    }
-                                }
-                                Tok::Colon => { self.advance(); let et = self.expect_ident()?; edge_type_hash = sk_hash(&et); }
-                                _ => {}
-                            }
-                            // Optional depth: *min..max or *N
-                            let (mut min_depth, mut max_depth) = (1u32, 1u32);
-                            if matches!(self.peek(), Tok::Star) {
-                                self.advance();
-                                if let Tok::Num(_) = self.peek().clone() {
-                                    let mn = self.expect_num()? as u32;
-                                    if matches!(self.peek(), Tok::DotDot) {
-                                        self.advance();
-                                        let mx = self.expect_num()? as u32;
-                                        min_depth = mn; max_depth = mx;
-                                    } else {
-                                        min_depth = mn; max_depth = mn;
-                                    }
-                                }
-                            }
-                            loop { match self.peek() { Tok::RBracket | Tok::Eof => break, _ => { self.advance(); } } }
-                            self.expect_rbracket()?;
-                            if !matches!(self.peek(), Tok::Arrow) {
-                                return Err(SqlError::UnexpectedToken { expected: "->", got: format!("{:?}", self.peek()) });
-                            }
-                            self.advance();
-                            self.expect_lparen()?;
-                            let node_bind = self.expect_ident()?;
-                            let node_label = if matches!(self.peek(), Tok::Colon) { self.advance(); Some(self.expect_ident()?) } else { None };
-                            self.expect_rparen()?;
-                            hops.push(crate::query::HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label });
-                        }
+                        let (hops, hop_inline) = self.parse_hop_chain()?;
                         // Optional WHERE (only _key on start var acted on)
                         if matches!(self.peek(), Tok::Kw(Kw::Where)) {
                             self.advance();
@@ -4579,7 +4206,7 @@ impl Parser {
                             }
                         }
                         FromSource::Match(MatchAggStmt {
-                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, limit: None, dest_where: vec![], with_stages: None,
+                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, order_score: None, limit: None, dest_where: hop_inline, func_filters: vec![], with_stages: None, distinct: false,
                         })
                     }
                 }
@@ -4610,11 +4237,36 @@ impl Parser {
             }
         }
 
+        // Top-level WHERE — `var.field OP value [AND …]` across the joined sources.
+        let mut where_clauses: Vec<crate::query::DestWhere> = Vec::new();
+        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
+            self.advance();
+            loop {
+                let var = self.expect_ident()?;
+                if matches!(self.peek(), Tok::Dot) { self.advance(); }
+                let field = self.expect_ident()?;
+                let op = self.parse_cmp_op()?;
+                let value = self.parse_value()?;
+                where_clauses.push(crate::query::DestWhere {
+                    var, field, op,
+                    value: crate::query::WhereValue::Literal(value),
+                });
+                if matches!(self.peek(), Tok::Kw(Kw::And)) { self.advance(); } else { break; }
+            }
+        }
+
         // ORDER BY
         let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
             self.advance();
             self.expect_kw(Kw::By, "BY")?;
-            let alias = self.expect_ident()?;
+            let mut alias = self.expect_ident()?;
+            // Support `ORDER BY var.field` (destination field), not only a bare
+            // SELECT alias. Stored as "var.field"; resolved at execution time.
+            if matches!(self.peek(), Tok::Dot) {
+                self.advance();
+                let field = self.expect_ident()?;
+                alias = format!("{alias}.{field}");
+            }
             let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
                 self.advance(); false
             } else {
@@ -4630,7 +4282,7 @@ impl Parser {
             Some(self.expect_usize()?)
         } else { None };
 
-        Ok(MultiFromStmt { sources, returns, order_by, limit })
+        Ok(MultiFromStmt { sources, returns, where_clauses, order_by, limit })
     }
 
     /// Parse the aggregate RETURN list: `expr AS alias [, expr AS alias ...]`
@@ -4655,19 +4307,29 @@ impl Parser {
             Tok::Kw(Kw::Count) => {
                 self.advance();
                 self.expect_lparen()?;
-                // Accept `*` or a var.field argument — result is always COUNT
-                match self.peek() {
-                    Tok::Star => { self.advance(); }
+                // `COUNT(DISTINCT var.field)` counts unique values; otherwise
+                // `COUNT(*)` / `COUNT(var.field)` is a plain row count.
+                let is_distinct = matches!(self.peek(), Tok::Kw(Kw::Distinct));
+                if is_distinct { self.advance(); }
+                let ret = match self.peek() {
+                    Tok::Star => { self.advance(); MatchAggReturn::Count }
                     _ => {
-                        let _ = self.expect_ident()?;
-                        if matches!(self.peek(), Tok::Dot) {
+                        let var = self.expect_ident()?;
+                        let field = if matches!(self.peek(), Tok::Dot) {
                             self.advance();
-                            let _ = self.expect_ident()?;
+                            self.expect_ident()?
+                        } else {
+                            "*".to_string()
+                        };
+                        if is_distinct {
+                            MatchAggReturn::CountDistinct { var, field }
+                        } else {
+                            MatchAggReturn::Count
                         }
                     }
-                }
+                };
                 self.expect_rparen()?;
-                MatchAggReturn::Count
+                ret
             }
             Tok::Kw(ref kw) if matches!(kw, Kw::Sum | Kw::Avg | Kw::Min | Kw::Max) => {
                 let func = kw.clone();
@@ -4704,8 +4366,13 @@ impl Parser {
                     let var = self.expect_ident()?;
                     if matches!(self.peek(), Tok::Dot) {
                         self.advance();
-                        let field = self.expect_ident()?;
-                        MatchAggReturn::Field { var, field }
+                        if matches!(self.peek(), Tok::Star) {
+                            self.advance();
+                            MatchAggReturn::AllFields { var }
+                        } else {
+                            let field = self.expect_ident()?;
+                            MatchAggReturn::Field { var, field }
+                        }
                     } else {
                         // Bare identifier — reference to a bound variable or WITH alias.
                         // Represented as Field { var, field: "*" } to signal "whole value".
@@ -4754,6 +4421,8 @@ impl Parser {
             MatchAggReturn::Field { var, field } => {
                 if field == "*" { var.clone() } else { format!("{}.{}", var, field) }
             }
+            MatchAggReturn::AllFields { var } => var.clone(),
+            MatchAggReturn::CountDistinct { .. } => "count".to_string(),
             MatchAggReturn::Sum(_) => "sum".to_string(),
             MatchAggReturn::Count => "count".to_string(),
             MatchAggReturn::Avg(_) => "avg".to_string(),
@@ -4873,7 +4542,7 @@ impl Parser {
         }
     }
 
-    // ── WITH expression parser (for SELECT FROM MATCH ... WITH ... MATCH ... and MATCH...RETURN) ──
+    // ── WITH expression parser (for SELECT FROM MATCH ... WITH ... MATCH ...) ──
 
     /// Parse WITH output list: `expr AS alias [, expr AS alias]*`
     fn parse_with_output_list(&mut self) -> Result<Vec<(crate::query::WithOutExpr, String)>, SqlError> {
@@ -5092,108 +4761,6 @@ impl Parser {
     /// Parse a MATCH...RETURN (with optional WITH stages) into a MatchAggStmt.
     /// Called from `parse_match_or_agg_inner` when MATCH...WITH or MATCH...RETURN with
     /// projections is detected.
-    fn parse_match_return_with(&mut self) -> Result<crate::query::MatchAggStmt, SqlError> {
-        use crate::query::{MatchAggStmt, WithStage};
-
-        // ── First MATCH ──
-        self.expect_kw(Kw::Match, "MATCH")?;
-        let (mut start, start_var, start_label, mut inline_where) =
-            self.parse_match_start_with_inline_where()?;
-
-        // ── Hop chain ──
-        let hops = self.parse_hop_chain()?;
-
-        // ── WHERE (after hops) ──
-        let mut dest_where = self.parse_match_where_clauses(&start_var, &start_label, &mut start)?;
-        // Merge inline WHERE (from inside start node parens) into dest_where
-        dest_where.append(&mut inline_where);
-
-        // ── WITH stages ──
-        let mut with_stages: Vec<WithStage> = Vec::new();
-        while matches!(self.peek(), Tok::Kw(Kw::With)) {
-            self.advance(); // consume WITH
-            let outputs = self.parse_with_output_list()?;
-
-            // WITH may not be followed by MATCH if it's followed by RETURN
-            // (e.g., `WITH ... RETURN ...` without another MATCH)
-            if !matches!(self.peek(), Tok::Kw(Kw::Match)) {
-                // No further MATCH — the WITH outputs just feed into the RETURN clause.
-                // We need a dummy stage with no hops to hold the projection.
-                with_stages.push(WithStage {
-                    outputs,
-                    match_start: crate::query::MatchAggStart::All,
-                    match_start_var: None,
-                    match_hops: vec![],
-                    where_clauses: vec![],
-                });
-                break;
-            }
-            self.advance(); // consume MATCH
-
-            let (mut ms, sv, sl, mut stage_inline_where) =
-                self.parse_match_start_with_inline_where()?;
-            let mh = self.parse_hop_chain()?;
-            let mut wc = self.parse_match_where_clauses(&sv, &sl, &mut ms)?;
-            wc.append(&mut stage_inline_where);
-
-            with_stages.push(WithStage {
-                outputs,
-                match_start: ms,
-                match_start_var: sv,
-                match_hops: mh,
-                where_clauses: wc,
-            });
-        }
-
-        // ── RETURN ──
-        self.expect_kw(Kw::Return, "RETURN")?;
-        let returns = self.parse_agg_return_list()?;
-
-        // ── GROUP BY ──
-        let group_by = if matches!(self.peek(), Tok::Kw(Kw::Group)) {
-            self.advance();
-            self.expect_kw(Kw::By, "BY")?;
-            let mut keys: Vec<(String, String)> = Vec::new();
-            loop {
-                let var = self.expect_ident()?;
-                self.expect_dot()?;
-                let field = self.expect_ident()?;
-                keys.push((var, field));
-                if matches!(self.peek(), Tok::Comma) { self.advance(); } else { break; }
-            }
-            Some(keys)
-        } else {
-            None
-        };
-
-        // ── ORDER BY ──
-        let order_by = if matches!(self.peek(), Tok::Kw(Kw::Order)) {
-            self.advance();
-            self.expect_kw(Kw::By, "BY")?;
-            let alias = self.expect_ident()?;
-            let ascending = if matches!(self.peek(), Tok::Kw(Kw::Desc)) {
-                self.advance(); false
-            } else {
-                if matches!(self.peek(), Tok::Kw(Kw::Asc)) { self.advance(); }
-                true
-            };
-            Some((alias, ascending))
-        } else {
-            None
-        };
-
-        // ── LIMIT ──
-        let limit = if matches!(self.peek(), Tok::Kw(Kw::Limit)) {
-            self.advance();
-            Some(self.expect_usize()?)
-        } else {
-            None
-        };
-
-        let ws = if with_stages.is_empty() { None } else { Some(with_stages) };
-        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, limit, dest_where, with_stages: ws })
-    }
-
     /// Parse a MATCH start node that may contain inline WHERE conditions inside the parens.
     /// Returns (MatchAggStart, start_var, start_label, inline_where_clauses).
     /// Handles patterns like: `('slug')`, `(var:col)`, `(var:col WHERE _key = ref)`
@@ -5303,12 +4870,20 @@ impl Parser {
         Ok((start, Some(name), Some(label), inline_where))
     }
 
-    /// Parse hop chain: `-[edge_spec]->(node)` repeated.
-    fn parse_hop_chain(&mut self) -> Result<Vec<crate::query::HopSpec>, SqlError> {
-        use crate::query::HopSpec;
+    /// Parse hop chain: `-[edge_spec]->(node)` (forward) or `<-[edge_spec]-(node)`
+    /// (backward), repeated.  Destination nodes may be anonymous (`(:label)`),
+    /// carry inline props (`(:label {f: 'v'})`), or both — inline props are
+    /// returned as equality WHERE conditions on that node.
+    fn parse_hop_chain(&mut self)
+        -> Result<(Vec<crate::query::HopSpec>, Vec<crate::query::DestWhere>), SqlError>
+    {
+        use crate::query::{HopSpec, DestWhere, WhereValue, CmpOp};
         let mut hops: Vec<HopSpec> = Vec::new();
-        while matches!(self.peek(), Tok::Dash) {
-            self.advance(); // consume '-'
+        let mut inline_conds: Vec<DestWhere> = Vec::new();
+        while matches!(self.peek(), Tok::Dash | Tok::BackArrow) {
+            // `<-[...]-` is a backward hop; `-[...]->` is forward.
+            let backward = matches!(self.peek(), Tok::BackArrow);
+            self.advance(); // consume '-' or '<-'
             self.expect_lbracket()?;
 
             let mut edge_bind: Option<String> = None;
@@ -5359,226 +4934,42 @@ impl Parser {
             }
             self.expect_rbracket()?;
 
-            if !matches!(self.peek(), Tok::Arrow) {
+            // Closing arrow: forward hops end with `->`, backward hops end with `-`.
+            let (want, ok) = if backward {
+                ("-", matches!(self.peek(), Tok::Dash))
+            } else {
+                ("->", matches!(self.peek(), Tok::Arrow))
+            };
+            if !ok {
                 return Err(SqlError::UnexpectedToken {
-                    expected: "->",
-                    got: format!("{:?}", self.peek()),
+                    expected: if backward { "-" } else { "->" },
+                    got: format!("{:?} (expected `{want}` to close {} hop)",
+                        self.peek(), if backward { "backward" } else { "forward" }),
                 });
             }
             self.advance();
-            self.expect_lparen()?;
-            let node_bind = self.expect_ident()?;
-            let node_label = if matches!(self.peek(), Tok::Colon) { self.advance(); Some(self.expect_ident()?) } else { None };
-            self.expect_rparen()?;
-            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label });
+            // Destination node — reuse the full node parser so it accepts
+            // anonymous `(:label)`, inline props `(:label {f: 'v'})`, and bare `(v)`.
+            let node = self.parse_match_node()?;
+            let node_label = node.label.clone();
+            let node_bind = node.var.clone()
+                .unwrap_or_else(|| format!("__anon_hop{}", hops.len()));
+            for (field, val) in node.props {
+                inline_conds.push(DestWhere {
+                    var: node_bind.clone(),
+                    field,
+                    op: CmpOp::Eq,
+                    value: WhereValue::Literal(val),
+                });
+            }
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label, backward });
         }
-        Ok(hops)
+        Ok((hops, inline_conds))
     }
 
 }
 
 // ── Compiler ──────────────────────────────────────────────────────────────────
-
-fn compile_match(stmt: MatchStmt) -> Vec<Step> {
-    let mut steps: Vec<Step> = Vec::new();
-
-    // 1. Starter — check if WHERE has _key on start var for O(1) lookup
-    let start_var = stmt.start.var.as_deref().unwrap_or("");
-    let key_cond_idx = stmt.conditions.iter().position(|c| {
-        let MatchCond::NodeField {
-            var,
-            field,
-            op,
-            value,
-        } = c;
-        var == start_var && field == "_key" && matches!(op, CompareOp::Eq) && value.is_string()
-    });
-
-    if let Some(idx) = key_cond_idx {
-        let MatchCond::NodeField { value, .. } = &stmt.conditions[idx];
-        let key = value.as_str().unwrap();
-        // Construct full slug: collection/_key if label present, else just _key
-        let slug = match &stmt.start.label {
-            Some(label) => format!("{}/{}", label, key),
-            None => key.to_string(),
-        };
-        steps.push(Step::One(sk_hash(&slug)));
-    } else if let Some(label) = &stmt.start.label {
-        steps.push(Step::Collection(sk_hash(label)));
-    } else {
-        steps.push(Step::All);
-    }
-
-    // 2. Start node filters from WHERE (skip the _key condition already used)
-    for (i, cond) in stmt.conditions.iter().enumerate() {
-        if Some(i) == key_cond_idx {
-            continue;
-        }
-        let MatchCond::NodeField {
-            var,
-            field,
-            op,
-            value,
-        } = cond;
-        if var == start_var && field != "strength" {
-            let step = match op {
-                CompareOp::Eq => Step::WhereEq(field.clone(), value.clone()),
-                CompareOp::Neq => Step::WhereNeq(field.clone(), value.clone()),
-                CompareOp::Gt => Step::WhereGt(field.clone(), value.as_f64().unwrap_or(0.0)),
-                CompareOp::Lt => Step::WhereLt(field.clone(), value.as_f64().unwrap_or(0.0)),
-                CompareOp::Gte => Step::WhereGte(field.clone(), value.as_f64().unwrap_or(0.0)),
-                CompareOp::Lte => Step::WhereLte(field.clone(), value.as_f64().unwrap_or(0.0)),
-            };
-            steps.push(step);
-        }
-    }
-
-    // 3. Start inline props → WhereEq
-    for (key, val) in &stmt.start.props {
-        steps.push(Step::WhereEq(key.clone(), val.clone()));
-    }
-
-    // 4. Traversal
-    if let Some(depth) = stmt.edge.depth {
-        // Multi-hop typed BFS
-        if let Some(kind) = &stmt.edge.kind {
-            steps.push(Step::HopsTyped {
-                type_hash: sk_hash(kind),
-                min_depth: depth.0,
-                max_depth: depth.1,
-            });
-        } else {
-            // Untyped multi-hop → use regular Hops
-            steps.push(Step::Hops(depth.1));
-        }
-    } else if let Some(kind) = &stmt.edge.kind {
-        // Single hop, typed
-        match stmt.edge.dir {
-            EdgeDir::Forward => steps.push(Step::Forward(sk_hash(kind))),
-            EdgeDir::Backward => steps.push(Step::Backward(sk_hash(kind))),
-        }
-    }
-
-    // 5. Edge filters (r.strength >= N)
-    let edge_var = stmt.edge.var.as_deref().unwrap_or("");
-    for cond in &stmt.conditions {
-        let MatchCond::NodeField {
-            var,
-            field,
-            op,
-            value,
-        } = cond;
-        if var == edge_var && field == "strength" {
-            if let (CompareOp::Gte, Some(n)) = (op, value.as_f64()) {
-                steps.push(Step::MinStrength(n as f32));
-            }
-        }
-    }
-
-    // 6-8. End node — build Intersect with all filters inside.
-    //
-    // Moving end filters inside the Intersect lets `btree_seed` fire on the inner
-    // Collection step (same optimisation that already applies to SELECT … WHERE).
-    // When the end node has `_key = 'X'` we go one step further and replace the
-    // Collection with a O(1) `One()` lookup, mirroring the start-node path above.
-    let end_var = stmt.end.var.as_deref().unwrap_or("");
-
-    // _key condition on end var (WHERE b._key = 'X')
-    let end_key_cond_idx = stmt.conditions.iter().position(|c| {
-        let MatchCond::NodeField { var, field, op, value } = c;
-        !end_var.is_empty()
-            && var == end_var
-            && field == "_key"
-            && matches!(op, CompareOp::Eq)
-            && value.is_string()
-    });
-
-    // _key in end inline props  (:genre {_key: 'X'})
-    let end_inline_key: Option<String> = stmt.end.props.iter()
-        .find(|(k, _)| k == "_key")
-        .and_then(|(_, v)| v.as_str().map(str::to_string));
-
-    let has_end_label   = stmt.end.label.is_some();
-    let has_end_starter = has_end_label
-        || end_key_cond_idx.is_some()
-        || end_inline_key.is_some();
-
-    if has_end_starter {
-        let mut end_steps: Vec<Step> = Vec::new();
-
-        // ── Starter ───────────────────────────────────────────────────
-        if let Some(idx) = end_key_cond_idx {
-            let MatchCond::NodeField { value, .. } = &stmt.conditions[idx];
-            let key = value.as_str().unwrap();
-            let slug = match &stmt.end.label {
-                Some(label) => format!("{}/{}", label, key),
-                None        => key.to_string(),
-            };
-            end_steps.push(Step::One(sk_hash(&slug)));
-        } else if let Some(ref key) = end_inline_key {
-            let slug = match &stmt.end.label {
-                Some(label) => format!("{}/{}", label, key),
-                None        => key.clone(),
-            };
-            end_steps.push(Step::One(sk_hash(&slug)));
-        } else if let Some(label) = &stmt.end.label {
-            end_steps.push(Step::Collection(sk_hash(label)));
-        }
-
-        // ── End WHERE filters (skip _key already consumed above) ──────
-        for (i, cond) in stmt.conditions.iter().enumerate() {
-            if Some(i) == end_key_cond_idx { continue; }
-            let MatchCond::NodeField { var, field, op, value } = cond;
-            if !end_var.is_empty() && var == end_var {
-                let step = match op {
-                    CompareOp::Eq  => Step::WhereEq(field.clone(), value.clone()),
-                    CompareOp::Neq => Step::WhereNeq(field.clone(), value.clone()),
-                    CompareOp::Gt  => Step::WhereGt(field.clone(), value.as_f64().unwrap_or(0.0)),
-                    CompareOp::Lt  => Step::WhereLt(field.clone(), value.as_f64().unwrap_or(0.0)),
-                    CompareOp::Gte => Step::WhereGte(field.clone(), value.as_f64().unwrap_or(0.0)),
-                    CompareOp::Lte => Step::WhereLte(field.clone(), value.as_f64().unwrap_or(0.0)),
-                };
-                end_steps.push(step);
-            }
-        }
-
-        // ── End inline props (skip _key already consumed above) ───────
-        for (key, val) in &stmt.end.props {
-            if end_inline_key.is_some() && key == "_key" { continue; }
-            end_steps.push(Step::WhereEq(key.clone(), val.clone()));
-        }
-
-        steps.push(Step::Intersect(end_steps));
-    } else {
-        // No label and no _key on end var — Intersect without a Collection/One
-        // starter would just be an O(N) full scan with no benefit.  Fall back to
-        // plain filter steps appended after the traversal.
-        for cond in &stmt.conditions {
-            let MatchCond::NodeField { var, field, op, value } = cond;
-            if !end_var.is_empty() && var == end_var {
-                let step = match op {
-                    CompareOp::Eq  => Step::WhereEq(field.clone(), value.clone()),
-                    CompareOp::Neq => Step::WhereNeq(field.clone(), value.clone()),
-                    CompareOp::Gt  => Step::WhereGt(field.clone(), value.as_f64().unwrap_or(0.0)),
-                    CompareOp::Lt  => Step::WhereLt(field.clone(), value.as_f64().unwrap_or(0.0)),
-                    CompareOp::Gte => Step::WhereGte(field.clone(), value.as_f64().unwrap_or(0.0)),
-                    CompareOp::Lte => Step::WhereLte(field.clone(), value.as_f64().unwrap_or(0.0)),
-                };
-                steps.push(step);
-            }
-        }
-        for (key, val) in &stmt.end.props {
-            steps.push(Step::WhereEq(key.clone(), val.clone()));
-        }
-    }
-
-    // 9. LIMIT
-    if let Some(n) = stmt.limit {
-        steps.push(Step::Take(n));
-    }
-
-    steps
-}
 
 /// Convert a single CondExpr to a Step.
 fn compile_cond(cond: CondExpr) -> Step {
@@ -5648,9 +5039,6 @@ fn append_tail(
         match order_key {
             OrderKey::Fields(cols) => {
                 steps.push(Step::Sort(cols));
-            }
-            OrderKey::Bm25(field, query, ascending) => {
-                steps.push(Step::Bm25Sort(field, query, ascending));
             }
             OrderKey::Vector { field, query, metric } => {
                 steps.push(Step::SortByVector { field, query, metric });
@@ -5935,6 +5323,9 @@ pub enum MatchOrAgg {
     Steps(Vec<Step>),
     /// Aggregate MATCH — must be executed via `execute_match_agg`.
     Agg(crate::query::MatchAggStmt),
+    /// `SELECT … FROM MATCH … UNION SELECT … FROM MATCH …` — each arm executed
+    /// via `execute_match_agg`, results concatenated and de-duplicated.
+    AggUnion(Vec<crate::query::MatchAggStmt>),
     /// `SELECT … FROM MATCH SHORTEST` — must be executed via `execute_shortest_select`.
     Shortest(crate::query::ShortestSelectStmt),
     /// `SELECT … FROM source1, source2, …` — must be executed via `execute_multi_from`.
@@ -5956,36 +5347,34 @@ fn parse_match_or_agg_inner(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg,
             let stmt = Parser::with_params(tokens, params).parse_select_from_match_shortest()?;
             return Ok(MatchOrAgg::Shortest(stmt));
         }
-        let stmt = Parser::with_params(tokens, params).parse_select_from_match()?;
-        return Ok(MatchOrAgg::Agg(stmt));
-    }
-
-    // Non-MATCH SQL goes through the regular pipeline.
-    if !matches!(tokens.first(), Some(Tok::Kw(Kw::Match))) {
         let mut parser = Parser::with_params(tokens, params);
-        let stmt = parser.parse()?;
-        return Ok(MatchOrAgg::Steps(compile(stmt)));
+        let first = parser.parse_select_from_match()?;
+        if matches!(parser.peek(), Tok::Kw(Kw::Union)) {
+            let mut stmts = vec![first];
+            while matches!(parser.peek(), Tok::Kw(Kw::Union)) {
+                parser.advance();
+                stmts.push(parser.parse_select_from_match()?);
+            }
+            return Ok(MatchOrAgg::AggUnion(stmts));
+        }
+        return Ok(MatchOrAgg::Agg(first));
     }
 
-    // MATCH...WITH or MATCH...RETURN with projections → unified aggregate path.
-    // Detected by: tokens start with MATCH and contain WITH or RETURN keyword.
-    if is_match_with_or_return(&tokens) {
-        let mut parser = Parser::with_params(tokens, params);
-        let stmt = parser.parse_match_return_with()?;
-        return Ok(MatchOrAgg::Agg(stmt));
+    // Bare `MATCH ...` (Cypher-style `MATCH ... RETURN` / `MATCH ... WITH`) is no
+    // longer a valid surface.  Graph queries must be written as
+    // `SELECT ... FROM MATCH (...)`, which is a strict superset (projection,
+    // WHERE, GROUP BY, ORDER BY, aggregation, edge properties, UNION, WITH).
+    if matches!(tokens.first(), Some(Tok::Kw(Kw::Match))) {
+        return Err(SqlError::UnexpectedToken {
+            expected: "SELECT ... FROM MATCH (...)",
+            got: "bare MATCH statement — write it as `SELECT ... FROM MATCH (...)`".into(),
+        });
     }
 
-    // Simple MATCH — compile to Steps.
+    // Everything else goes through the regular SELECT/DML pipeline.
     let mut parser = Parser::with_params(tokens, params);
-    let stmt = parser.parse_match()?;
-    let mut all_steps = compile_match(stmt);
-    while matches!(parser.peek(), Tok::Kw(Kw::Union)) {
-        parser.advance();
-        let next_stmt = parser.parse_match()?;
-        let next_steps = compile_match(next_stmt);
-        all_steps.push(Step::Union(next_steps));
-    }
-    Ok(MatchOrAgg::Steps(all_steps))
+    let stmt = parser.parse()?;
+    Ok(MatchOrAgg::Steps(compile(stmt)))
 }
 
 /// Parse a MATCH statement and determine whether it is a simple graph query
@@ -6010,55 +5399,6 @@ pub fn parse_match_or_agg_params(sql: &str, params: Vec<Value>) -> Result<MatchO
 /// Simple `MATCH (a)-[:e]->(b) RETURN a, b` does NOT match — it routes through
 /// `parse_match` instead.  `MATCH ... WITH ...` or `MATCH ... RETURN b._key AS k`
 /// matches and routes through `parse_match_return_with`.
-fn is_match_with_or_return(tokens: &[Tok]) -> bool {
-    if !matches!(tokens.first(), Some(Tok::Kw(Kw::Match))) {
-        return false;
-    }
-    // WITH keyword is unambiguous.
-    if tokens.iter().any(|t| matches!(t, Tok::Kw(Kw::With))) {
-        return true;
-    }
-    // Inline WHERE inside start node parens: `(s:col WHERE ...)` — route through
-    // parse_match_return_with which handles this via parse_match_start_with_inline_where.
-    // Detect: WHERE between the opening `(` and the first `-` or RETURN.
-    {
-        let mut depth = 0i32;
-        for tok in tokens.iter().skip(1) {
-            match tok {
-                Tok::LParen => depth += 1,
-                Tok::RParen => depth -= 1,
-                Tok::Kw(Kw::Where) if depth > 0 => return true,
-                Tok::Dash | Tok::Kw(Kw::Return) => break,
-                _ => {}
-            }
-        }
-    }
-    // Check for RETURN with var.field projection or aggregate function.
-    for (i, tok) in tokens.iter().enumerate() {
-        if matches!(tok, Tok::Kw(Kw::Return)) {
-            // Check what follows RETURN: if next-next is Dot (i.e. RETURN var.field)
-            // or next is an aggregate keyword (SUM, COUNT, etc.), it's an aggregate.
-            if let Some(next) = tokens.get(i + 1) {
-                // Aggregate function keyword right after RETURN
-                if matches!(next, Tok::Kw(Kw::Count) | Tok::Kw(Kw::Sum) | Tok::Kw(Kw::Avg) |
-                    Tok::Kw(Kw::Min) | Tok::Kw(Kw::Max)) {
-                    return true;
-                }
-                // var.field pattern: RETURN ident DOT ident
-                if matches!(next, Tok::Ident(_)) {
-                    if let Some(dot) = tokens.get(i + 2) {
-                        if matches!(dot, Tok::Dot) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            return false;
-        }
-    }
-    false
-}
-
 /// Return `true` when the SQL is `SELECT … FROM MATCH (…)-[…]->(…) …`.
 fn is_select_from_match(tokens: &[Tok]) -> bool {
     if !matches!(tokens.first(), Some(Tok::Kw(Kw::Select))) {
@@ -6133,35 +5473,6 @@ fn path_func_variant(
 
 /// Look at the token stream to determine if a MATCH statement has an
 /// aggregate RETURN clause (var.field or SUM/AVG/MIN/MAX/COUNT).
-fn is_agg_match(tokens: &[Tok]) -> bool {
-    // Find the RETURN keyword position.
-    let return_pos = tokens.iter().position(|t| matches!(t, Tok::Kw(Kw::Return)));
-    let pos = match return_pos {
-        Some(p) => p + 1,
-        None => return false,
-    };
-    // Skip to the token after RETURN.
-    match tokens.get(pos) {
-        // COUNT/SUM/AVG/MIN/MAX → aggregate
-        Some(Tok::Kw(Kw::Count))
-        | Some(Tok::Kw(Kw::Sum))
-        | Some(Tok::Kw(Kw::Avg))
-        | Some(Tok::Kw(Kw::Min))
-        | Some(Tok::Kw(Kw::Max)) => true,
-        // CASE WHEN → aggregate
-        Some(Tok::Kw(Kw::Case)) => true,
-        // identifier followed by `.` → var.field (aggregate field ref)
-        // identifier that is a PATH_* or time function → aggregate
-        Some(Tok::Ident(name)) => {
-            let upper = name.to_ascii_uppercase();
-            matches!(tokens.get(pos + 1), Some(Tok::Dot))
-                || upper.starts_with("PATH_")
-                || matches!(upper.as_str(), "AGE_DAYS" | "AGE_HOURS" | "JSON_ARRAY_LENGTH" | "NOW")
-        }
-        _ => false,
-    }
-}
-
 /// Parse an SQL SELECT string and compile it to a `Vec<Step>`.
 ///
 /// This is a pure function — no DB access required.
@@ -6176,6 +5487,10 @@ pub fn parse_and_compile(sql: &str) -> Result<Vec<Step>, SqlError> {
         MatchOrAgg::Agg(_) => Err(SqlError::UnexpectedToken {
             expected: "simple MATCH or SELECT (not aggregate MATCH)",
             got: "aggregate SELECT FROM MATCH".into(),
+        }),
+        MatchOrAgg::AggUnion(_) => Err(SqlError::UnexpectedToken {
+            expected: "simple MATCH or SELECT (not aggregate MATCH UNION)",
+            got: "aggregate SELECT FROM MATCH UNION".into(),
         }),
         MatchOrAgg::Shortest(_) => Err(SqlError::UnexpectedToken {
             expected: "simple MATCH or SELECT (not MATCH SHORTEST)",
@@ -6356,11 +5671,64 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
             parser.advance();
             Ok(CompiledMutation::Rollback)
         }
+        Tok::Kw(Kw::Compact) => {
+            parser.advance();
+            Ok(CompiledMutation::Compact)
+        }
+        Tok::Kw(Kw::Set) => {
+            parser.advance(); // consume SET
+            let var = parser.expect_ident()?;
+            let var_upper = var.to_uppercase();
+            if var_upper != "WAL_FORMAT" && var_upper != "WAL_MODE" && var_upper != "WAL_SYNC" {
+                return Err(SqlError::UnexpectedToken {
+                    expected: "WAL_FORMAT, WAL_MODE, or WAL_SYNC",
+                    got: var,
+                });
+            }
+            if !matches!(parser.peek(), Tok::Eq) {
+                return Err(SqlError::UnexpectedToken { expected: "=", got: format!("{:?}", parser.peek()) });
+            }
+            parser.advance();
+            let val = parser.expect_ident()?;
+            if var_upper == "WAL_MODE" {
+                let logical = match val.to_lowercase().as_str() {
+                    "logical"  => true,
+                    "physical" => false,
+                    other => return Err(SqlError::UnexpectedToken {
+                        expected: "physical or logical",
+                        got: other.to_string(),
+                    }),
+                };
+                return Ok(CompiledMutation::SetWalMode(logical));
+            }
+            if var_upper == "WAL_SYNC" {
+                use crate::storage::wal::SyncLevel;
+                let level = match val.to_lowercase().as_str() {
+                    "full"    => SyncLevel::Full,
+                    "barrier" => SyncLevel::Barrier,
+                    "os"      => SyncLevel::Os,
+                    other => return Err(SqlError::UnexpectedToken {
+                        expected: "full, barrier, or os",
+                        got: other.to_string(),
+                    }),
+                };
+                return Ok(CompiledMutation::SetWalSync(level));
+            }
+            let format = match val.to_lowercase().as_str() {
+                "json"   => crate::WalFormat::Json,
+                "binary" => crate::WalFormat::Binary,
+                other => return Err(SqlError::UnexpectedToken {
+                    expected: "json or binary",
+                    got: other.to_string(),
+                }),
+            };
+            Ok(CompiledMutation::SetWalFormat(format))
+        }
         Tok::Eof => Err(SqlError::UnexpectedEnd {
-            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, REINDEX, BEGIN, COMMIT, or ROLLBACK",
+            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, REINDEX, COMPACT, SET, BEGIN, COMMIT, or ROLLBACK",
         }),
         other => Err(SqlError::UnexpectedToken {
-            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, REINDEX, BEGIN, COMMIT, or ROLLBACK",
+            expected: "INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, REINDEX, COMPACT, SET, BEGIN, COMMIT, or ROLLBACK",
             got: format!("{other:?}"),
         }),
     }
@@ -6443,7 +5811,6 @@ mod tests {
                 Step::VectorNear { .. } => "VectorNear",
                 Step::SearchFilter(..) => "SearchFilter",
                 Step::Bm25Filter(..) => "Bm25Filter",
-                Step::Bm25Sort(..) => "Bm25Sort",
                 Step::ScoreProject(..) => "ScoreProject",
                 Step::Intersect(_) => "Intersect",
                 Step::Union(_) => "Union",
@@ -6760,7 +6127,7 @@ mod tests {
     #[test]
     fn tokenize_match_forward() {
         let tokens = tokenize(
-            "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g",
+            "SELECT g.* FROM MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines'",
         )
         .unwrap();
         // Should contain: Match LParen Ident Colon Ident RParen Dash LBracket Colon Ident RBracket Arrow ...
@@ -6787,114 +6154,6 @@ mod tests {
         assert_eq!(tokens[3], Tok::Num(5.0));
     }
 
-    #[test]
-    fn match_forward_with_key() {
-        let steps = parse_and_compile(
-            "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g",
-        )
-        .unwrap();
-        assert_eq!(step_names(&steps), ["One", "Forward", "Intersect"]);
-    }
-
-    #[test]
-    fn match_backward_with_key() {
-        let steps = parse_and_compile(
-            "MATCH (g:genre)<-[:has_genre]-(a:artist) WHERE g._key = 'garage-rock' RETURN a",
-        )
-        .unwrap();
-        // Backward from genre, then Intersect to filter by artist collection
-        assert_eq!(step_names(&steps), ["One", "Backward", "Intersect"]);
-    }
-
-    #[test]
-    fn match_typed_multihop() {
-        let steps = parse_and_compile(
-            "MATCH (e:event)-[:caused_by*1..5]->(root) WHERE e._key = 'maribyrnong-flood' RETURN root"
-        ).unwrap();
-        assert_eq!(step_names(&steps), ["One", "HopsTyped"]);
-    }
-
-    #[test]
-    fn match_edge_strength_filter() {
-        let steps = parse_and_compile(
-            "MATCH (a:artist)-[r:has_genre]->(g:genre) WHERE a._key = 'the-vines' AND r.strength >= 7 RETURN g"
-        ).unwrap();
-        assert_eq!(
-            step_names(&steps),
-            ["One", "Forward", "MinStrength", "Intersect"]
-        );
-    }
-
-    #[test]
-    fn match_inline_props() {
-        let steps = parse_and_compile(
-            "MATCH (a:artist)-[:has_genre]->(:genre {_key: 'garage-rock'}) RETURN a",
-        )
-        .unwrap();
-        // {_key: 'garage-rock'} inline prop → One() inside the Intersect (no outer WhereEq)
-        assert_eq!(
-            step_names(&steps),
-            ["Collection", "Forward", "Intersect"]
-        );
-    }
-
-    #[test]
-    fn match_collection_scan_start() {
-        let steps = parse_and_compile("MATCH (a:artist)-[:has_genre]->(g:genre) RETURN g").unwrap();
-        assert_eq!(step_names(&steps), ["Collection", "Forward", "Intersect"]);
-    }
-
-    /// End-node _key in WHERE → One() inside Intersect (O(1) end-node lookup).
-    #[test]
-    fn match_end_node_key_becomes_one() {
-        let steps = parse_and_compile(
-            "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' AND g._key = 'garage-rock' RETURN g",
-        ).unwrap();
-        // Start: One (a._key), Forward, Intersect([One(g._key)])
-        assert_eq!(step_names(&steps), ["One", "Forward", "Intersect"]);
-        // Verify the sub-step inside Intersect is also a One
-        if let Step::Intersect(sub) = &steps[2] {
-            assert_eq!(step_names(sub), ["One"]);
-        } else {
-            panic!("expected Intersect");
-        }
-    }
-
-    /// End-node WHERE filters move inside Intersect (enables btree_seed on Collection).
-    #[test]
-    fn match_end_node_filter_inside_intersect() {
-        let steps = parse_and_compile(
-            "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE g.name = 'Garage Rock' RETURN g",
-        ).unwrap();
-        // Collection(artist), Forward, Intersect([Collection(genre), WhereEq(name)])
-        assert_eq!(step_names(&steps), ["Collection", "Forward", "Intersect"]);
-        if let Step::Intersect(sub) = &steps[2] {
-            assert_eq!(step_names(sub), ["Collection", "WhereEq"]);
-        } else {
-            panic!("expected Intersect");
-        }
-    }
-
-    /// End-node without a label but with plain filters: fall back to outer WhereEq.
-    #[test]
-    fn match_end_no_label_filter_stays_outer() {
-        let steps = parse_and_compile(
-            "MATCH (a:artist)-[:rel]->(b) WHERE a._key = 'x' AND b.price > 10 RETURN b",
-        ).unwrap();
-        // One, Forward — then WhereGt outside (no Collection to hang an Intersect on)
-        assert_eq!(step_names(&steps), ["One", "Forward", "WhereGt"]);
-    }
-
-    #[test]
-    fn match_union() {
-        let steps = parse_and_compile(
-            "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g \
-             UNION \
-             MATCH (a:artist)-[:origin]->(c:city) WHERE a._key = 'the-vines' RETURN c",
-        )
-        .unwrap();
-        assert!(step_names(&steps).contains(&"Union"));
-    }
 
     #[test]
     fn parse_ilike() {
@@ -6907,14 +6166,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn match_with_limit() {
-        let steps = parse_and_compile(
-            "MATCH (a:artist)-[:has_genre]->(g:genre) WHERE a._key = 'the-vines' RETURN g LIMIT 10",
-        )
-        .unwrap();
-        assert_eq!(step_names(&steps), ["One", "Forward", "Intersect", "Take"]);
-    }
 
     // ── Spatial SQL tests ────────────────────────────────────────────────────
 

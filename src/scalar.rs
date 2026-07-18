@@ -161,6 +161,18 @@ pub fn eval_scalar_func(
             Value::String(result)
         }
         "NOW" => Value::String(now()),
+        "AGE_DAYS" => match args.get(0).and_then(|v| val_to_epoch(v)) {
+            Some(epoch) => Value::Number(Number::from((now_unix() - epoch) / 86400)),
+            None => Value::Null,
+        },
+        "AGE_HOURS" => match args.get(0).and_then(|v| val_to_epoch(v)) {
+            Some(epoch) => Value::Number(Number::from((now_unix() - epoch) / 3600)),
+            None => Value::Null,
+        },
+        "JSON_ARRAY_LENGTH" => match args.get(0) {
+            Some(Value::Array(a)) => Value::Number(Number::from(a.len() as u64)),
+            _ => Value::Null,
+        },
         "YEAR" => {
             if let Some(Value::String(s)) = args.get(0) {
                 Value::Number(Number::from(year(s).unwrap_or(0) as u64))
@@ -275,6 +287,31 @@ fn parse_iso_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Convert a JSON value to a Unix epoch (seconds): Unix int, RFC3339, naive
+/// datetime (UTC), or `YYYY-MM-DD`.
+fn val_to_epoch(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() { return Some(n); }
+    if let Some(n) = v.as_f64() { return Some(n as i64); }
+    let s = v.as_str()?;
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) { return Some(dt.timestamp()); }
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(ndt.and_utc().timestamp());
+        }
+    }
+    if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(nd.and_hms_opt(0, 0, 0)?.and_utc().timestamp());
+    }
+    None
 }
 
 pub fn hour(date_str: &str) -> Option<u32> {
