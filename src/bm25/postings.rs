@@ -12,10 +12,7 @@
 //! - Deltas: [1000, 5, 5, 990]
 //! - Varint encoding: [0xE8, 0x07, 0x05, 0x7E, 0x0F] vs 16 bytes for absolute
 
-use std::io::{Read, Write};
-
 const VARINT_CONTINUATION_BIT: u8 = 0x80;
-const VARINT_MASK: u8 = 0x7F;
 
 /// Encode a u64 as varint bytes.
 pub fn encode_varint(mut value: u64) -> Vec<u8> {
@@ -78,6 +75,10 @@ pub fn encode_postings(postings: &[Posting]) -> Vec<u8> {
 }
 
 /// Decode postings from bytes (with delta decoding).
+///
+/// Test-only inverse of [`encode_postings`]; the live read path uses
+/// [`decode_postings_from_bytes`] against the mmap'd postings file.
+#[cfg(test)]
 pub fn decode_postings(bytes: &[u8]) -> Vec<Posting> {
     let mut postings = Vec::new();
     let mut prev_doc_id: u64 = 0;
