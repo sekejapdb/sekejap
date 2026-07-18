@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/flutter", "skcli"]
 
 [workspace.package]
-version = "0.11.3"
+version = "0.12.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -14,6 +14,7 @@ sekejap = { path = "." }
 
 [package]
 name = "sekejap"
+autobenches = false  # benches parked while being reworked — see commented [[bench]] section below
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -47,38 +48,40 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile  = "3"
 rusqlite  = { version = "0.32", features = ["bundled"] }
 
-[[bench]]
-name = "sql_vs_atomic"
-harness = false
-
-[[bench]]
-name = "sekejap_vs_sqlite"
-harness = false
-
-[[bench]]
-name = "spatial"
-harness = false
-
-[[bench]]
-name = "ilike_bench"
-harness = false
-
-[[bench]]
-name = "vector_bench"
-harness = false
-
-[[bench]]
-name = "graph_traversal"
-harness = false
-
-[[bench]]
-name = "hybrid_query"
-harness = false
-
-[[bench]]
-name = "mega_benchmark"
-harness = false
-
-[[bench]]
-name = "vector_10k_4096"
-harness = false
+# Benches parked (autobenches = false above). Uncomment when reworked; ensure each
+# named file exists in benches/ before re-enabling, or the manifest won't parse.
+# [[bench]]
+# name = "sql_vs_atomic"
+# harness = false
+#
+# [[bench]]
+# name = "sekejap_vs_sqlite"
+# harness = false
+#
+# [[bench]]
+# name = "spatial"
+# harness = false
+#
+# [[bench]]
+# name = "ilike_bench"
+# harness = false
+#
+# [[bench]]
+# name = "vector_bench"
+# harness = false
+#
+# [[bench]]
+# name = "graph_traversal"
+# harness = false
+#
+# [[bench]]
+# name = "hybrid_query"
+# harness = false
+#
+# [[bench]]
+# name = "mega_benchmark"
+# harness = false
+#
+# [[bench]]
+# name = "vector_10k_4096"
+# harness = false
