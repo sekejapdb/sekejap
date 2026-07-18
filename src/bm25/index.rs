@@ -234,8 +234,6 @@ impl Bm25Index {
             offset += postings_bytes.len() as u64;
         }
 
-        dict.build_index();
-
         let meta = Bm25Meta {
             num_docs,
             avg_doc_len,
@@ -274,7 +272,10 @@ impl Bm25Index {
                 if let Some(entry) = self.dict.get(t) {
                     let postings = self.get_postings(entry);
                     let df = postings.len() as f64;
-                    let idf = ((self.meta.num_docs as f64 - df + 0.5) / (df + 0.5)).ln();
+                    // Smoothed IDF (Lucene / BM25+ variant): `ln(1 + …)` stays
+                    // positive even when a term appears in >50% of docs, instead
+                    // of the classic RSJ form which floors to 0 for common terms.
+                    let idf = (1.0 + (self.meta.num_docs as f64 - df + 0.5) / (df + 0.5)).ln();
                     Some((t.as_str(), idf.max(0.0)))
                 } else {
                     None
@@ -473,15 +474,6 @@ impl Bm25Index {
     fn doc_id_to_index(&self, doc_id: u64) -> Option<usize> {
         self.doc_id_to_idx.get(&doc_id).copied()
     }
-}
-
-/// BM25 result with a resolved document slug.
-///
-/// Returned by higher-level helpers in `lib.rs` that map `doc_id`
-/// back through the node map.
-pub struct Bm25SearchResult {
-    pub slug: String,
-    pub score: f64,
 }
 
 #[cfg(test)]
