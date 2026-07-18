@@ -5,7 +5,6 @@ use pyo3::prelude::*;
 use serde_json::Value;
 
 use ::sekejap::CoreDB;
-use ::sekejap::EdgeHit;
 use ::sekejap::Hit;
 
 // ── PyHit ─────────────────────────────────────────────────────────────────────
@@ -76,16 +75,6 @@ impl PyEdgeHit {
             "EdgeHit(from={:?}, to={:?}, type={:?}, strength={})",
             self.from_slug, self.to_slug, self.edge_type, self.strength
         )
-    }
-}
-
-fn to_pyedgehit(e: EdgeHit) -> PyEdgeHit {
-    PyEdgeHit {
-        from_slug: e.from_slug,
-        to_slug: e.to_slug,
-        edge_type: e.edge_type,
-        strength: e.strength,
-        meta_json: e.meta.as_ref().map(|v| v.to_string()),
     }
 }
 
@@ -215,6 +204,31 @@ impl PyDB {
         Ok(Self { inner: Some(inner) })
     }
 
+    /// Fallback when the wheel was built without the ``s3`` feature.
+    ///
+    /// The method still exists so callers get a clear, actionable message
+    /// instead of a bare ``AttributeError``.
+    #[cfg(not(feature = "s3"))]
+    #[staticmethod]
+    #[pyo3(signature = (url, access_key_id, secret_access_key, region, cache_budget_bytes, cache_dir=None, endpoint=None, allow_http=false))]
+    #[allow(unused_variables)]
+    fn open_s3(
+        url: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        region: &str,
+        cache_budget_bytes: u64,
+        cache_dir: Option<&str>,
+        endpoint: Option<&str>,
+        allow_http: bool,
+    ) -> PyResult<Self> {
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "S3-backed storage is not available in this build. Reinstall sekejap \
+             with the 's3' feature enabled (build the wheel with \
+             `maturin build --features s3`).",
+        ))
+    }
+
     // ── Nodes ─────────────────────────────────────────────────────────────────
 
     /// Store a node. ``json`` must contain ``_collection`` and ``_key``.
@@ -265,57 +279,56 @@ impl PyDB {
     /// Supported forms::
     ///
     ///     # Standard SELECT
-    ///     db.query("SELECT * FROM characters WHERE bounty >= 1000000000")
+    ///     db.query("SELECT * FROM dishes WHERE price <= 90000")
     ///
     ///     # Graph aggregate
     ///     db.query("""
-    ///         SELECT b._key AS name, COUNT(a) AS rivals
-    ///         FROM MATCH (a:characters)-[r:rival]->(b:characters)
-    ///         GROUP BY b._key ORDER BY rivals DESC LIMIT 10
+    ///         SELECT p._key AS place, COUNT(*) AS visits
+    ///         FROM MATCH (p:places)<-[:visited]-(t:tourists)
+    ///         GROUP BY p._key ORDER BY visits DESC LIMIT 10
     ///     """)
     ///
     ///     # Multi-stage graph query with WITH chaining
     ///     db.query("""
-    ///         SELECT c.name AS city, COUNT(*) AS friends
-    ///         FROM MATCH (a:users)-[:knows*1..3]->(b:users)
-    ///         WHERE a._key = 'alice'
-    ///         WITH b
-    ///         MATCH (b)-[:lives_in]->(c:cities)
-    ///         WHERE c.population > 100000
-    ///         GROUP BY c.name ORDER BY friends DESC LIMIT 10
+    ///         SELECT d.name AS dish, COUNT(*) AS orders
+    ///         FROM MATCH (c:tourists)-[:similar_taste]->(peer:tourists)
+    ///         WHERE c._key = 'chloe'
+    ///         WITH peer
+    ///         MATCH (peer)-[:ate]->(d:dishes)
+    ///         GROUP BY d.name ORDER BY orders DESC LIMIT 10
     ///     """)
     ///
-    ///     # MATCH...RETURN (Cypher-style syntax, also via query())
+    ///     # SELECT ... FROM MATCH (also via query())
     ///     db.query("""
-    ///         MATCH (a:characters)-[:rival]->(b:characters)
-    ///         RETURN a._key AS name, b.bounty AS rival_bounty
+    ///         SELECT t._key AS tourist, p.name AS place
+    ///         FROM MATCH (t:tourists)-[:visited]->(p:places)
     ///     """)
     ///
     ///     # PATH_* aggregates — operate on path intrinsic arrays
     ///     db.query("""
     ///         SELECT c._key AS dest, PATH_PRODUCT(r2._path_strength) AS reliability
-    ///         FROM MATCH (a:islands)-[r:route_to]->(b:islands)-[r2:route_to]->(c:islands)
-    ///         WHERE a._key = 'marineford'
+    ///         FROM MATCH (a:places)-[r:route_to]->(b:places)-[r2:route_to]->(c:places)
+    ///         WHERE a._key = 'seminyak'
     ///     """)
     ///
     ///     # CASE WHEN
     ///     db.query("""
-    ///         SELECT b._key AS name,
-    ///                CASE WHEN r._depth = 1 THEN 'direct' ELSE 'indirect' END AS tier
-    ///         FROM MATCH (a:characters)-[r:rival]->(b:characters)
+    ///         SELECT d.name AS dish,
+    ///                CASE WHEN d.protein_g >= 30 THEN 'high protein' ELSE 'light' END AS tier
+    ///         FROM MATCH (r:restaurants)-[:serves]->(d:dishes)
     ///     """)
     ///
     ///     # MATCH SHORTEST — returns a row with path fields
     ///     db.query("""
     ///         SELECT a.name AS from_name, b.name AS to_name, r.length AS hops
     ///         FROM MATCH SHORTEST (a)-[r*]->(b)
-    ///         WHERE a._key = 'characters/coby' AND b._key = 'characters/sabo'
+    ///         WHERE a._key = 'places/seminyak' AND b._key = 'places/uluwatu'
     ///     """)
     ///
     ///     # Multi-FROM cross-join
     ///     db.query("""
-    ///         SELECT a._key AS island, b._key AS character
-    ///         FROM islands AS a, MATCH ('crews/straw_hats')-[:includes]->(b)
+    ///         SELECT a._key AS place, b._key AS tourist
+    ///         FROM places AS a, MATCH ('tours/sunrise-batur')-[:includes]->(b)
     ///     """)
     ///
     /// Optionally pass ``params`` for ``$1``, ``$2``, … bindings.
@@ -330,6 +343,26 @@ impl PyDB {
             self.db()?.query_params(sql, &vals).map_err(db_err)?.collect()
         } else {
             self.db()?.query(sql).map_err(db_err)?.collect()
+        };
+        Ok(hits.into_iter().map(to_pyhit).collect())
+    }
+
+    /// Return the query plan for a ``SELECT`` / ``MATCH`` statement without running it.
+    ///
+    /// Each hit's ``payload`` is a JSON string describing one plan step. Use
+    /// ``analyze=True`` to actually execute the query and include per-step row
+    /// counts and timings (``EXPLAIN ANALYZE`` semantics).
+    ///
+    /// Example::
+    ///
+    ///     for step in db.explain("SELECT * FROM users WHERE age > 30"):
+    ///         print(step.payload)
+    #[pyo3(signature = (sql, analyze=false))]
+    fn explain(&self, sql: &str, analyze: bool) -> PyResult<Vec<PyHit>> {
+        let hits = if analyze {
+            self.db()?.explain_analyze(sql).map_err(db_err)?
+        } else {
+            self.db()?.explain(sql).map_err(db_err)?
         };
         Ok(hits.into_iter().map(to_pyhit).collect())
     }

@@ -243,7 +243,7 @@ fn run_sql(db: &mut CoreDB, sql: &str) -> bool {
                 Ok(hits) => print_table(hits, t0.elapsed().as_nanos()),
             }
         }
-        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" | "REINDEX" => match db.execute(sql) {
+        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" | "REINDEX" | "COMPACT" | "SET" => match db.execute(sql) {
             Err(e) => eprintln!("error: {e}"),
             Ok(n) => {
                 let timing = format_duration(t0.elapsed().as_nanos());
@@ -423,7 +423,9 @@ DELETE ('from')-[:KIND]->('to');
 
 Graph traversal (MATCH)
 ───────────────────────
-MATCH (a:col)-[:rel*1..3]->(b:col) WHERE a._key = 'x' RETURN b;
+SELECT b.* FROM MATCH (a:col)-[:rel*1..3]->(b:col) WHERE a._key = 'x';
+SELECT a.* FROM MATCH (a:col)<-[:rel]-(b:col) WHERE b._key = 'x';   -- backward
+SELECT DISTINCT b._key FROM MATCH (a:col)-[:rel]->(b:col);          -- dedup rows
 
 Graph aggregation
 ─────────────────
@@ -439,7 +441,7 @@ FROM MATCH (a:col)-[:edge]->(b), collection_name AS alias;
 SELECT list expressions
 ───────────────────────
 var.field AS alias
-COUNT(*) | SUM(expr) | AVG(expr) | MIN(expr) | MAX(expr)
+COUNT(*) | COUNT(DISTINCT var.field) | SUM(expr) | AVG(expr) | MIN(expr) | MAX(expr)
 PATH_AVG(r.field) | PATH_SUM | PATH_MIN | PATH_MAX | PATH_PRODUCT
 PATH_FIRST(r.field) | PATH_LAST(r.field)
 CASE WHEN r.field = val THEN 'x' WHEN ... ELSE 'y' END AS alias

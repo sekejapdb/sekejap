@@ -131,7 +131,20 @@ def _run_sql(db: DB, sql: str) -> None:
             _print_table(hits, elapsed)
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
-    elif first in ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "REINDEX"):
+    elif first == "EXPLAIN":
+        try:
+            rest = sql[len("EXPLAIN"):].lstrip()
+            analyze = rest.split()[0].upper() == "ANALYZE" if rest.split() else False
+            plan_sql = rest[len("ANALYZE"):].lstrip() if analyze else rest
+            hits = db.explain(plan_sql, analyze)
+            elapsed = time.perf_counter_ns() - t0
+            _print_table(hits, elapsed)
+        except Exception as e:
+            print(f"error: {e}", file=sys.stderr)
+    elif first in (
+        "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "REINDEX",
+        "COMPACT", "SET", "BEGIN", "COMMIT", "ROLLBACK",
+    ):
         try:
             n = db.execute(sql)
             elapsed = time.perf_counter_ns() - t0
@@ -153,8 +166,8 @@ def _run_sql(db: DB, sql: str) -> None:
             print(f"error: {e}", file=sys.stderr)
     else:
         print(
-            "unknown statement — supported: SELECT MATCH SHOW INSERT UPDATE DELETE"
-            " CREATE DROP ALTER REINDEX",
+            "unknown statement — supported: SELECT MATCH EXPLAIN SHOW INSERT UPDATE"
+            " DELETE CREATE DROP ALTER REINDEX COMPACT SET BEGIN COMMIT ROLLBACK",
             file=sys.stderr,
         )
 
@@ -193,13 +206,6 @@ ALTER TABLE collection DROP COLUMN field;
 ALTER TABLE collection RENAME COLUMN old TO new;
 ALTER TABLE collection RENAME TO new_name;
 REINDEX ON collection USING method (field);
-
-SQL — graph aggregate — RETURN form
-────────────────────────────────────
-MATCH (a:col)-[r:rel]->(b:col)
-    [WHERE a._key = 'val']
-    RETURN expr AS alias [, ...]
-    [GROUP BY col] [ORDER BY col [DESC]] [LIMIT n];
 
 SQL — graph aggregate — SELECT FROM MATCH form
 ───────────────────────────────────────────────
