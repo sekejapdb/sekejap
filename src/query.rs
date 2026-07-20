@@ -4642,17 +4642,29 @@ pub(crate) fn build_path_rows_from_raw(
     hops: &[HopSpec],
     start_var: Option<&str>,
     needs_edge_meta: bool,
+    // Hop variables whose node payload the query actually reads. Vars NOT in the
+    // set are traversal-only (walked through but never referenced) and their
+    // payloads are skipped entirely — a large saving for deep multi-hop patterns.
+    // `None` = materialise every var (conservative default for generic callers).
+    needed_vars: Option<&HashSet<String>>,
 ) -> Vec<PathRow> {
     if raw_paths.is_empty() { return vec![]; }
 
+    let var_needed = |name: &str| needed_vars.map_or(true, |s| s.contains(name));
+
     // Collect unique hashes, sort by payload offset for sequential I/O.
+    // Only referenced hop vars are fetched; traversal-only vars are skipped.
     let needed: Vec<u64> = {
         let mut set: HashSet<u64> = HashSet::new();
         if start_var.is_some() {
             for rp in raw_paths { set.insert(rp.start_hash); }
         }
         for rp in raw_paths {
-            for &h in &rp.dest_per_hop { set.insert(h); }
+            for (hop_idx, hop) in hops.iter().enumerate() {
+                if var_needed(&hop.node_bind) {
+                    if let Some(&h) = rp.dest_per_hop.get(hop_idx) { set.insert(h); }
+                }
+            }
         }
         let mut v: Vec<u64> = set.into_iter().collect();
         v.sort_unstable_by_key(|&h| db.node_data(h).map(|nd| nd.payload_offset).unwrap_or(0));
@@ -4677,7 +4689,6 @@ pub(crate) fn build_path_rows_from_raw(
 
             for (hop_idx, hop) in hops.iter().enumerate() {
                 let dest_h = rp.dest_per_hop[hop_idx];
-                let dest_payload = payload_cache.get(&dest_h).unwrap_or(&null).clone();
 
                 if let Some(ref edge_bind) = hop.edge_bind {
                     // `hop_end[hop_idx]` is the real index of this hop's dest in the
@@ -4739,7 +4750,12 @@ pub(crate) fn build_path_rows_from_raw(
                     row.insert(edge_bind.clone(), Value::Object(obj));
                 }
 
-                row.insert(hop.node_bind.clone(), dest_payload);
+                // Only the referenced hop vars get their (parsed) payload; a
+                // traversal-only var contributes nothing to the row.
+                if var_needed(&hop.node_bind) {
+                    let dest_payload = payload_cache.get(&dest_h).unwrap_or(&null).clone();
+                    row.insert(hop.node_bind.clone(), dest_payload);
+                }
             }
 
             row
@@ -5050,7 +5066,7 @@ pub fn collect_paths(
 ) -> Vec<PathRow> {
     if hops.is_empty() || starts.is_empty() { return vec![]; }
     let raw = collect_raw_paths(db, starts, hops, limit, track);
-    build_path_rows_from_raw(db, &raw, hops, start_var, false)
+    build_path_rows_from_raw(db, &raw, hops, start_var, false, None)
 }
 
 // ── Multi-stage executor (WITH chaining) ─────────────────────────────────────
@@ -6634,8 +6650,36 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
         if let Some(n) = stmt.limit { raw.truncate(n); }
     }
 
-    // Phase 4: read payloads only for the surviving raw paths.
-    let all_paths = build_path_rows_from_raw(db, &raw, &stmt.hops, effective_start_var, needs_edge_meta);
+    // Phase 4: read payloads only for the surviving raw paths — and only for the
+    // hop vars the query actually references (returns / GROUP BY / dest_where).
+    // Traversal-only vars (walked through but never read) are skipped, avoiding
+    // a full JSON parse per node for every intermediate hop.
+    //
+    // Conservative: `dest_where`/`func_filters` field values were already resolved
+    // in Phase 2, but a cross-var (`RowRef`) comparison or a function filter could
+    // reference a var we don't scan here — in those cases materialise everything.
+    let needed_hop_vars: Option<HashSet<String>> = {
+        let rowref_dw = stmt.dest_where.iter()
+            .any(|dw| matches!(dw.value, WhereValue::RowRef(_)));
+        if !stmt.func_filters.is_empty() || rowref_dw {
+            None
+        } else {
+            let mut set: HashSet<String> = HashSet::new();
+            for hop in &stmt.hops {
+                let v = &hop.node_bind;
+                let referenced = stmt.returns.iter().any(|(r, _)| r.references_var(v))
+                    || stmt.group_by.as_ref()
+                        .map_or(false, |g| g.iter().any(|(gv, _)| gv == v))
+                    || stmt.dest_where.iter().any(|dw| &dw.var == v);
+                if referenced { set.insert(v.clone()); }
+            }
+            Some(set)
+        }
+    };
+    let all_paths = build_path_rows_from_raw(
+        db, &raw, &stmt.hops, effective_start_var, needs_edge_meta,
+        needed_hop_vars.as_ref(),
+    );
     if all_paths.is_empty() && !is_bare_agg { return vec![]; }
 
     // Phase 5: filter start-variable conditions (requires PathRow payload).
