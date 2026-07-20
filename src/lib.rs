@@ -63,7 +63,39 @@ use text_index::gist::GiSTIndex;
 
 /// Bump when the snapshot schema changes in a backwards-incompatible way.
 /// Old binaries that encounter a higher version return an error on open().
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+///
+/// v1 = legacy headerless JSON (pre-2026-07 builds).
+/// v2 = 16-byte `[magic][version][flags]` header (see below) followed by the
+///      JSON body. The header lets a future reader detect the encoding *before*
+///      committing to a parser, so a later binary/compressed snapshot (v3+) is
+///      an additive dispatch arm rather than a breaking change. Mirrors the WAL.
+const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+
+/// Magic prefix identifying a versioned (v2+) snapshot file. Legacy v1 files
+/// start with `{` (JSON) and are auto-detected as headerless.
+const SNAPSHOT_MAGIC: [u8; 8] = *b"SKSNAP\0\0";
+/// `[magic 8][version u32 LE][flags u32 LE]`.
+const SNAPSHOT_HEADER_LEN: usize = 16;
+
+/// Build the 16-byte snapshot header for the given format version.
+fn snapshot_header_bytes(version: u32) -> [u8; SNAPSHOT_HEADER_LEN] {
+    let mut h = [0u8; SNAPSHOT_HEADER_LEN];
+    h[0..8].copy_from_slice(&SNAPSHOT_MAGIC);
+    h[8..12].copy_from_slice(&version.to_le_bytes());
+    // h[12..16] = flags, reserved (0).
+    h
+}
+
+/// Inspect a snapshot's leading bytes. Returns `(format_version, body_offset)`.
+/// A headerless legacy file reports `(1, 0)`.
+fn snapshot_probe(head: &[u8]) -> (u32, usize) {
+    if head.len() >= SNAPSHOT_HEADER_LEN && head[0..8] == SNAPSHOT_MAGIC {
+        let version = u32::from_le_bytes(head[8..12].try_into().unwrap());
+        (version, SNAPSHOT_HEADER_LEN)
+    } else {
+        (1, 0)
+    }
+}
 
 /// Bump each constant when the corresponding index algorithm changes in a way
 /// that makes indexes built by the previous version produce wrong results.
@@ -645,7 +677,14 @@ impl CoreDB {
         // Fetch snapshot.json via RemoteSync (reuses its existing Runtime/connection).
         let snap_bytes = remote.fetch_file("snapshot.json")?;
 
-        let snap: Snapshot = serde_json::from_slice(&snap_bytes)
+        // Strip the versioned header (v2+) if present; legacy files start at 0.
+        let (fmt_version, body_offset) = snapshot_probe(&snap_bytes);
+        if fmt_version > SNAPSHOT_FORMAT_VERSION {
+            return Err(format!(
+                "snapshot version {fmt_version} requires a newer sekejap (max supported: {SNAPSHOT_FORMAT_VERSION})"
+            ));
+        }
+        let snap: Snapshot = serde_json::from_slice(&snap_bytes[body_offset..])
             .map_err(|e| format!("parsing snapshot: {e}"))?;
 
         let mut block_cache = if cache_dir.is_some() {
@@ -792,7 +831,28 @@ impl CoreDB {
             // This handles legacy snapshots that embedded gin_indexes (multi-GB).
             // serde_json::from_reader reads incrementally; IgnoredAny skips gin_indexes
             // without allocating, so a 2.3GB legacy snapshot costs <1 MB to parse.
-            let file = std::fs::File::open(&snap_path)?;
+            let mut file = std::fs::File::open(&snap_path)?;
+            // Probe the fixed header (16 bytes) before committing to a parser, so
+            // a future binary/compressed snapshot is refused cleanly rather than
+            // mis-parsed. Legacy headerless JSON reports (1, 0) and streams from 0.
+            use std::io::{Read, Seek, SeekFrom};
+            let mut head = [0u8; SNAPSHOT_HEADER_LEN];
+            let n = file.read(&mut head).unwrap_or(0);
+            let (fmt_version, body_offset) = snapshot_probe(&head[..n]);
+            if fmt_version > SNAPSHOT_FORMAT_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "snapshot version {} requires a newer sekejap (max supported: {})",
+                        fmt_version, SNAPSHOT_FORMAT_VERSION
+                    ),
+                ));
+            }
+            file.seek(SeekFrom::Start(body_offset as u64))?;
+            // Stream-parse rather than loading the whole file into RAM.
+            // This handles legacy snapshots that embedded gin_indexes (multi-GB).
+            // serde_json::from_reader reads incrementally; IgnoredAny skips gin_indexes
+            // without allocating, so a 2.3GB legacy snapshot costs <1 MB to parse.
             match serde_json::from_reader::<_, Snapshot>(std::io::BufReader::new(file)) {
                 Ok(s) if s.version > SNAPSHOT_FORMAT_VERSION => {
                     return Err(io::Error::new(
@@ -860,7 +920,8 @@ impl CoreDB {
             if let Ok(snap_json) = serde_json::to_vec(&db.build_snapshot()) {
                 let snap_tmp = snap_path.with_extension("json.tmp");
                 if let Ok(mut sf) = std::fs::File::create(&snap_tmp) {
-                    if std::io::Write::write_all(&mut sf, &snap_json).is_ok()
+                    if std::io::Write::write_all(&mut sf, &snapshot_header_bytes(SNAPSHOT_FORMAT_VERSION)).is_ok()
+                        && std::io::Write::write_all(&mut sf, &snap_json).is_ok()
                         && sf.sync_all().is_ok()
                     {
                         let _ = std::fs::rename(&snap_tmp, &snap_path);
@@ -2347,6 +2408,7 @@ impl CoreDB {
         let snap_path = dir.join("snapshot.json");
         {
             let mut sf = std::fs::File::create(&snap_tmp)?;
+            std::io::Write::write_all(&mut sf, &snapshot_header_bytes(SNAPSHOT_FORMAT_VERSION))?;
             std::io::Write::write_all(&mut sf, &snap_json)?;
             sf.sync_all()?;
         }
