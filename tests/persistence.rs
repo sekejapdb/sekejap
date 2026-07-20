@@ -5,6 +5,28 @@ fn tmpdir() -> TempDir {
     tempfile::tempdir().unwrap()
 }
 
+/// snapshot.json layout (v2+): `[8B magic "SKSNAP\0\0"][u32 version][u32 flags]`
+/// followed by the JSON body. These helpers let tests patch the JSON while
+/// preserving the header (legacy headerless files are also accepted on read).
+fn read_snapshot_json(path: &std::path::Path) -> serde_json::Value {
+    let bytes = std::fs::read(path).unwrap();
+    let body: &[u8] = if bytes.len() >= 16 && &bytes[0..8] == b"SKSNAP\0\0" {
+        &bytes[16..]
+    } else {
+        &bytes[..]
+    };
+    serde_json::from_slice(body).unwrap()
+}
+
+fn write_snapshot_json(path: &std::path::Path, v: &serde_json::Value) {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"SKSNAP\0\0");
+    out.extend_from_slice(&2u32.to_le_bytes()); // format version
+    out.extend_from_slice(&0u32.to_le_bytes()); // flags (reserved)
+    out.extend_from_slice(&serde_json::to_vec(v).unwrap());
+    std::fs::write(path, out).unwrap();
+}
+
 #[test]
 fn open_empty_dir_creates_db() {
     let dir = tmpdir();
@@ -445,6 +467,29 @@ fn snapshot_version_too_new_rejected() {
     }
 }
 
+/// A versioned (header) snapshot whose HEADER version is too new must be refused
+/// at the header — before any body parse. The body here is deliberately not JSON
+/// to prove the rejection happens on the header, not on a failed parse. This is
+/// what lets a future binary/compressed format (v3+) be an additive change.
+#[test]
+fn snapshot_header_version_too_new_rejected() {
+    let dir = tmpdir();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"SKSNAP\0\0");
+    bytes.extend_from_slice(&9999u32.to_le_bytes()); // far-future header version
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(b"\x00\x01\x02 definitely not json");
+    std::fs::write(dir.path().join("snapshot.json"), bytes).unwrap();
+
+    match CoreDB::open(dir.path()) {
+        Err(e) => assert!(
+            e.to_string().contains("version"),
+            "must reject on header version, got: {e}"
+        ),
+        Ok(_) => panic!("must reject header version > supported max"),
+    }
+}
+
 /// GIN index version mismatch (stored 0, compiled-in > 0) must trigger rebuild.
 #[test]
 fn gin_version_mismatch_triggers_rebuild() {
@@ -462,8 +507,7 @@ fn gin_version_mismatch_triggers_rebuild() {
 
     // Step 2: Patch snapshot — set gin:name build_version to 0 so it looks stale.
     let snap_path = dir.path().join("snapshot.json");
-    let raw = std::fs::read_to_string(&snap_path).unwrap();
-    let mut snap: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let mut snap = read_snapshot_json(&snap_path);
     if let Some(schemas) = snap["schemas"].as_array_mut() {
         for schema in schemas.iter_mut() {
             if schema["collection"].as_str() == Some("venues") {
@@ -472,7 +516,7 @@ fn gin_version_mismatch_triggers_rebuild() {
             }
         }
     }
-    std::fs::write(&snap_path, serde_json::to_vec(&snap).unwrap()).unwrap();
+    write_snapshot_json(&snap_path, &snap);
 
     // Step 3: Reopen — version mismatch must trigger auto-rebuild.
     {
@@ -505,14 +549,13 @@ fn hnsw_version_mismatch_triggers_rebuild() {
 
     // Step 2: Patch snapshot — set hnsw_indexes[0].version to 0.
     let snap_path = dir.path().join("snapshot.json");
-    let raw = std::fs::read_to_string(&snap_path).unwrap();
-    let mut snap: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let mut snap = read_snapshot_json(&snap_path);
     if let Some(hnsw_list) = snap["hnsw_indexes"].as_array_mut() {
         for entry in hnsw_list.iter_mut() {
             entry["version"] = serde_json::json!(0u32);
         }
     }
-    std::fs::write(&snap_path, serde_json::to_vec(&snap).unwrap()).unwrap();
+    write_snapshot_json(&snap_path, &snap);
 
     // Step 3: Reopen — version mismatch must trigger rebuild from stored vectors.
     {

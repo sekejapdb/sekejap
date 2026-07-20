@@ -182,21 +182,21 @@ fn run_queries(db: &CoreDB, label: &str) {
     // Q4 — MATCH 1-hop: who does c01234 follow?
     let t = Instant::now();
     let n = db.query(
-        "MATCH (a:citizens)-[:follows]->(b:citizens) WHERE a._key = 'c01234' RETURN b"
+        "SELECT b.* FROM MATCH (a:citizens)-[:follows]->(b:citizens) WHERE a._key = 'c01234'"
     ).unwrap().count();
     log_query("Q4  MATCH follows 1-hop from c01234", n, t.elapsed().as_secs_f64() * 1e6);
 
     // Q5 — MATCH 2-hop: friends-of-friends
     let t = Instant::now();
     let n = db.query(
-        "MATCH (a:citizens)-[:follows*1..2]->(b:citizens) WHERE a._key = 'c01234' RETURN b LIMIT 500"
+        "SELECT b.* FROM MATCH (a:citizens)-[:follows*1..2]->(b:citizens) WHERE a._key = 'c01234' LIMIT 500"
     ).unwrap().count();
     log_query("Q5  MATCH follows*1..2 (fof) LIMIT 500", n, t.elapsed().as_secs_f64() * 1e6);
 
     // Q6 — MATCH 1-hop with end-node filter (MATCH optimisation)
     let t = Instant::now();
     let n = db.query(
-        "MATCH (a:citizens)-[:follows]->(b:citizens) WHERE a._key = 'c01234' AND b.verified = true RETURN b"
+        "SELECT b.* FROM MATCH (a:citizens)-[:follows]->(b:citizens) WHERE a._key = 'c01234' AND b.verified = true"
     ).unwrap().count();
     log_query("Q6  MATCH follows → verified followers", n, t.elapsed().as_secs_f64() * 1e6);
 
@@ -239,7 +239,7 @@ fn run_queries(db: &CoreDB, label: &str) {
     // Q12 — MATCH backward: who follows c00100?
     let t = Instant::now();
     let n = db.query(
-        "MATCH (b:citizens)<-[:follows]-(a:citizens) WHERE b._key = 'c00100' RETURN a"
+        "SELECT a.* FROM MATCH (b:citizens)<-[:follows]-(a:citizens) WHERE b._key = 'c00100'"
     ).unwrap().count();
     log_query("Q12 MATCH backward: who follows c00100?", n, t.elapsed().as_secs_f64() * 1e6);
 
