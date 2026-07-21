@@ -35,11 +35,21 @@ const MAGIC_SLUG: [u8; 8] = *b"SKSLUG\0\0";
 const MAGIC_DICT: [u8; 8] = *b"SKDICT\0\0";
 
 /// Topology format version (independent of the snapshot version).
-const TOPO_VERSION: u32 = 1;
+/// v1 = 24 B node records (no hash — derived from the slug on read).
+/// v2 = 32 B node records with the slug hash inline, giving O(1) `id → hash`
+///      (needed to serve the hash-keyed engine API from mmap without re-hashing
+///      slug strings on every edge).
+const TOPO_VERSION: u32 = 2;
 const HEADER_LEN: usize = 16;
-const NODE_RECSIZE: usize = 24;
+const NODE_RECSIZE_V1: usize = 24;
+const NODE_RECSIZE_V2: usize = 32;
 /// Sentinel for "no collection" / "no edge metadata".
 pub const NO_ID: u32 = u32::MAX;
+
+#[inline]
+fn node_recsize(version: u32) -> usize {
+    if version >= 2 { NODE_RECSIZE_V2 } else { NODE_RECSIZE_V1 }
+}
 
 // ── Input (what the builder consumes) ─────────────────────────────────────────
 
@@ -278,7 +288,7 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
     let mut colls = Interner::default();
     let mut types = Interner::default();
 
-    // nodes.bin
+    // nodes.bin — v2 records (32 B): hash inline for O(1) id → hash.
     let mut nodes_buf = Vec::new();
     write_header(&mut nodes_buf, &MAGIC_NODES, 0);
     nodes_buf.extend_from_slice(&(n as u64).to_le_bytes());
@@ -288,12 +298,13 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
         } else {
             colls.intern(&node.collection)
         };
+        nodes_buf.extend_from_slice(&node.hash.to_le_bytes()); // 8
         nodes_buf.extend_from_slice(&node.payload_offset.to_le_bytes()); // 8
         nodes_buf.extend_from_slice(&node.payload_len.to_le_bytes()); // 4
         nodes_buf.extend_from_slice(&coll_id.to_le_bytes()); // 4
         nodes_buf.extend_from_slice(&NO_ID.to_le_bytes()); // spatial_ref 4
         nodes_buf.extend_from_slice(&0u16.to_le_bytes()); // flags 2
-        nodes_buf.extend_from_slice(&[0u8, 0u8]); // pad → 24
+        nodes_buf.extend_from_slice(&[0u8, 0u8]); // pad → 32
     }
 
     // Adjacency (fwd by from, rev by to), neighbors sorted.
@@ -385,6 +396,8 @@ fn read_string_table(b: &[u8], mut pos: usize) -> (Vec<String>, usize) {
 // ── Reader (a view over the byte buffers — mmap-ready) ─────────────────────────
 
 pub struct NodeRec {
+    /// `sk_hash(slug)` — inline since v2 (v1 readers derive it from the slug).
+    pub hash: u64,
     pub payload_offset: u64,
     pub payload_len: u32,
     pub collection_id: u32,
@@ -405,44 +418,67 @@ pub struct TopologyView<'a> {
     collections: Vec<String>,
     edge_types: Vec<String>,
     node_count: usize,
+    /// Format version of `nodes.bin` (decides the record size / hash presence).
+    version: u32,
 }
 
 impl<'a> TopologyView<'a> {
     pub fn new(blob: &'a TopologyBlob) -> Result<Self, String> {
-        check_header(&blob.nodes, &MAGIC_NODES)?;
-        check_header(&blob.fwd, &MAGIC_ADJF)?;
-        check_header(&blob.rev, &MAGIC_ADJR)?;
-        check_header(&blob.idx, &MAGIC_IDX)?;
-        check_header(&blob.slugs, &MAGIC_SLUG)?;
-        check_header(&blob.dict, &MAGIC_DICT)?;
+        Self::from_slices(&blob.nodes, &blob.fwd, &blob.rev, &blob.idx, &blob.slugs, &blob.dict)
+    }
 
-        let (collections, pos) = read_string_table(&blob.dict, HEADER_LEN);
-        let (edge_types, _) = read_string_table(&blob.dict, pos);
-        let node_count = rd_u64(&blob.nodes, HEADER_LEN) as usize;
+    /// Build a view over raw slices — the mmap path hands in mapped byte ranges.
+    pub fn from_slices(
+        nodes: &'a [u8],
+        fwd: &'a [u8],
+        rev: &'a [u8],
+        idx: &'a [u8],
+        slugs: &'a [u8],
+        dict: &'a [u8],
+    ) -> Result<Self, String> {
+        check_header(nodes, &MAGIC_NODES)?;
+        check_header(fwd, &MAGIC_ADJF)?;
+        check_header(rev, &MAGIC_ADJR)?;
+        check_header(idx, &MAGIC_IDX)?;
+        check_header(slugs, &MAGIC_SLUG)?;
+        check_header(dict, &MAGIC_DICT)?;
+
+        let (collections, pos) = read_string_table(dict, HEADER_LEN);
+        let (edge_types, _) = read_string_table(dict, pos);
+        let node_count = rd_u64(nodes, HEADER_LEN) as usize;
+        let version = rd_u32(nodes, 8);
 
         Ok(Self {
-            nodes: &blob.nodes,
-            fwd: &blob.fwd,
-            rev: &blob.rev,
-            idx: &blob.idx,
-            slugs: &blob.slugs,
+            nodes,
+            fwd,
+            rev,
+            idx,
+            slugs,
             collections,
             edge_types,
             node_count,
+            version,
         })
+    }
+
+    /// O(1) `dense id → slug hash`. v2 reads it from the record; v1 derives it
+    /// from the slug string.
+    pub fn hash_of(&self, id: u64) -> Option<u64> {
+        if self.version >= 2 {
+            let k = id as usize;
+            if k >= self.node_count {
+                return None;
+            }
+            Some(rd_u64(self.nodes, HEADER_LEN + 8 + k * NODE_RECSIZE_V2))
+        } else {
+            self.slug(id).map(crate::sk_hash)
+        }
     }
 
     /// `dense id → slug` — the reverse of [`resolve`](Self::resolve). Touched only
     /// when building results or disambiguating collisions, never during hops.
     pub fn slug(&self, id: u64) -> Option<&'a str> {
-        let k = id as usize;
-        if k >= self.node_count {
-            return None;
-        }
-        let offsets = HEADER_LEN + 8;
-        let start = rd_u64(self.slugs, offsets + k * 8) as usize;
-        let end = rd_u64(self.slugs, offsets + (k + 1) * 8) as usize;
-        std::str::from_utf8(&self.slugs[start..end]).ok()
+        slug_in(self.slugs, self.node_count, id)
     }
 
     pub fn node_count(&self) -> usize {
@@ -451,35 +487,31 @@ impl<'a> TopologyView<'a> {
 
     /// `hash → dense id` via binary search over `idx.bin`. Touched only at query roots.
     pub fn resolve(&self, hash: u64) -> Option<u64> {
-        let count = rd_u64(self.idx, HEADER_LEN) as usize;
-        let base = HEADER_LEN + 8;
-        let (mut lo, mut hi) = (0usize, count);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let h = rd_u64(self.idx, base + mid * 16);
-            if h < hash {
-                lo = mid + 1;
-            } else if h > hash {
-                hi = mid;
-            } else {
-                return Some(rd_u64(self.idx, base + mid * 16 + 8));
-            }
-        }
-        None
+        resolve_in(self.idx, hash, None)
     }
 
-    /// Fixed-size node record via arithmetic: `record(k) = data_start + k*24`.
+    /// Fixed-size node record via arithmetic: `record(k) = data_start + k*recsize`.
     pub fn node_record(&self, id: u64) -> Option<NodeRec> {
         let k = id as usize;
         if k >= self.node_count {
             return None;
         }
-        let o = HEADER_LEN + 8 + k * NODE_RECSIZE;
-        Some(NodeRec {
-            payload_offset: rd_u64(self.nodes, o),
-            payload_len: rd_u32(self.nodes, o + 8),
-            collection_id: rd_u32(self.nodes, o + 12),
-        })
+        let o = HEADER_LEN + 8 + k * node_recsize(self.version);
+        if self.version >= 2 {
+            Some(NodeRec {
+                hash: rd_u64(self.nodes, o),
+                payload_offset: rd_u64(self.nodes, o + 8),
+                payload_len: rd_u32(self.nodes, o + 16),
+                collection_id: rd_u32(self.nodes, o + 20),
+            })
+        } else {
+            Some(NodeRec {
+                hash: self.slug(id).map(crate::sk_hash).unwrap_or(0),
+                payload_offset: rd_u64(self.nodes, o),
+                payload_len: rd_u32(self.nodes, o + 8),
+                collection_id: rd_u32(self.nodes, o + 12),
+            })
+        }
     }
 
     pub fn fwd_edges(&self, id: u64) -> Vec<EdgeRec> {
@@ -540,6 +572,249 @@ impl<'a> TopologyView<'a> {
     }
     pub fn edge_type_name(&self, id: u32) -> Option<&str> {
         self.edge_types.get(id as usize).map(|s| s.as_str())
+    }
+}
+
+// ── Shared low-level readers (used by TopologyView and MappedTopology) ─────────
+
+/// Binary search `idx.bin` for `hash`. With a sparse index (every
+/// `SPARSE_STRIDE`-th hash, resident in RAM), the search is first narrowed to one
+/// stride-sized window so a cold lookup touches ~1 page instead of ~log2(n).
+fn resolve_in(idx: &[u8], hash: u64, sparse: Option<&[u64]>) -> Option<u64> {
+    let count = rd_u64(idx, HEADER_LEN) as usize;
+    let base = HEADER_LEN + 8;
+    let (mut lo, mut hi) = match sparse {
+        Some(s) if !s.is_empty() => {
+            // First window whose leading hash is > target starts after our window.
+            let w = s.partition_point(|&h| h <= hash);
+            let lo = w.saturating_sub(1) * SPARSE_STRIDE;
+            let hi = (w * SPARSE_STRIDE).min(count);
+            (lo, hi)
+        }
+        _ => (0usize, count),
+    };
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let h = rd_u64(idx, base + mid * 16);
+        if h < hash {
+            lo = mid + 1;
+        } else if h > hash {
+            hi = mid;
+        } else {
+            return Some(rd_u64(idx, base + mid * 16 + 8));
+        }
+    }
+    None
+}
+
+fn slug_in(slugs: &[u8], node_count: usize, id: u64) -> Option<&str> {
+    let k = id as usize;
+    if k >= node_count {
+        return None;
+    }
+    let offsets = HEADER_LEN + 8;
+    let start = rd_u64(slugs, offsets + k * 8) as usize;
+    let end = rd_u64(slugs, offsets + (k + 1) * 8) as usize;
+    std::str::from_utf8(&slugs[start..end]).ok()
+}
+
+/// Entries per sparse-index bucket for `idx.bin` (16 B/entry → 4 KB pages hold 256;
+/// 256 keeps each narrowed window within ~1 page).
+const SPARSE_STRIDE: usize = 256;
+
+// ── MappedTopology — the Phase 1 store: files served via mmap ─────────────────
+
+/// One topology file, mmap'd when possible (unix), owned bytes otherwise. The OS
+/// page cache then holds hot pages and evicts cold ones — RAM adapts automatically.
+enum Backing {
+    #[cfg(unix)]
+    Map {
+        /// Kept open for the lifetime of the mapping.
+        _file: std::fs::File,
+        map: super::mmap::MmapView,
+    },
+    Owned(Vec<u8>),
+}
+
+impl Backing {
+    fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let file = std::fs::File::open(path)?;
+            let len = file.metadata()?.len() as usize;
+            if let Some(map) = super::mmap::MmapView::try_new(&file, len) {
+                return Ok(Backing::Map { _file: file, map });
+            }
+        }
+        Ok(Backing::Owned(std::fs::read(path)?))
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            #[cfg(unix)]
+            Backing::Map { map, .. } => map.slice(0, map.len()).unwrap_or(&[]),
+            Backing::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+/// An edge as the hash-keyed engine sees it: neighbor + edge-type as slug hashes.
+pub struct MappedEdge {
+    pub other_hash: u64,
+    pub edge_type_hash: u64,
+    pub strength: f32,
+}
+
+/// mmap-backed topology store with a **hash-keyed** API mirroring the engine's
+/// (`fwd_edges(hash)` / `rev_edges(hash)` / `node lookup`), so it can slot behind
+/// the existing executor. Per call: one `idx.bin` resolve (sparse-narrowed binary
+/// search), then pure offset arithmetic + StreamVByte decode.
+pub struct MappedTopology {
+    nodes: Backing,
+    fwd: Backing,
+    rev: Backing,
+    idx: Backing,
+    slugs: Backing,
+    node_count: usize,
+    version: u32,
+    collections: Vec<String>,
+    edge_types: Vec<String>,
+    /// `edge_type_id → sk_hash(name)` — precomputed so edges convert in O(1).
+    type_hashes: Vec<u64>,
+    /// Every `SPARSE_STRIDE`-th hash from `idx.bin`, resident (~16 B per 256 nodes).
+    sparse: Vec<u64>,
+}
+
+impl MappedTopology {
+    pub fn open(dir: &std::path::Path) -> std::io::Result<Self> {
+        let nodes = Backing::open(&dir.join("nodes.bin"))?;
+        let fwd = Backing::open(&dir.join("adj_fwd.bin"))?;
+        let rev = Backing::open(&dir.join("adj_rev.bin"))?;
+        let idx = Backing::open(&dir.join("idx.bin"))?;
+        let slugs = Backing::open(&dir.join("slugs.bin"))?;
+        let dict = std::fs::read(dir.join("dict.bin"))?; // tiny — parsed once, not kept
+
+        // Validate headers + parse dictionaries via the existing view logic.
+        let view = TopologyView::from_slices(
+            nodes.bytes(),
+            fwd.bytes(),
+            rev.bytes(),
+            idx.bytes(),
+            slugs.bytes(),
+            &dict,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let node_count = view.node_count();
+        let version = view.version;
+        let collections = view.collections.clone();
+        let edge_types = view.edge_types.clone();
+        let type_hashes = edge_types.iter().map(|t| crate::sk_hash(t)).collect();
+
+        // Resident sparse index over idx.bin (every SPARSE_STRIDE-th hash).
+        let idx_bytes = idx.bytes();
+        let count = rd_u64(idx_bytes, HEADER_LEN) as usize;
+        let base = HEADER_LEN + 8;
+        let sparse: Vec<u64> = (0..count)
+            .step_by(SPARSE_STRIDE)
+            .map(|i| rd_u64(idx_bytes, base + i * 16))
+            .collect();
+
+        Ok(Self {
+            nodes,
+            fwd,
+            rev,
+            idx,
+            slugs,
+            node_count,
+            version,
+            collections,
+            edge_types,
+            type_hashes,
+            sparse,
+        })
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    /// `slug hash → dense id` (sparse-narrowed binary search over the mmap'd idx).
+    pub fn resolve(&self, hash: u64) -> Option<u64> {
+        resolve_in(self.idx.bytes(), hash, Some(&self.sparse))
+    }
+
+    pub fn slug_of(&self, id: u64) -> Option<&str> {
+        slug_in(self.slugs.bytes(), self.node_count, id)
+    }
+
+    pub fn node_record(&self, id: u64) -> Option<NodeRec> {
+        let k = id as usize;
+        if k >= self.node_count {
+            return None;
+        }
+        let b = self.nodes.bytes();
+        let o = HEADER_LEN + 8 + k * node_recsize(self.version);
+        if self.version >= 2 {
+            Some(NodeRec {
+                hash: rd_u64(b, o),
+                payload_offset: rd_u64(b, o + 8),
+                payload_len: rd_u32(b, o + 16),
+                collection_id: rd_u32(b, o + 20),
+            })
+        } else {
+            Some(NodeRec {
+                hash: self.slug_of(id).map(crate::sk_hash).unwrap_or(0),
+                payload_offset: rd_u64(b, o),
+                payload_len: rd_u32(b, o + 8),
+                collection_id: rd_u32(b, o + 12),
+            })
+        }
+    }
+
+    pub fn collection_name(&self, id: u32) -> Option<&str> {
+        if id == NO_ID {
+            None
+        } else {
+            self.collections.get(id as usize).map(|s| s.as_str())
+        }
+    }
+
+    /// Outgoing edges of the node with this slug hash, converted to the engine's
+    /// hash-keyed shape. `None` = node unknown.
+    pub fn fwd_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>> {
+        self.edges_by_hash(hash, /*fwd=*/ true)
+    }
+    pub fn rev_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>> {
+        self.edges_by_hash(hash, /*fwd=*/ false)
+    }
+
+    fn edges_by_hash(&self, hash: u64, fwd: bool) -> Option<Vec<MappedEdge>> {
+        let id = self.resolve(hash)?;
+        let csr = if fwd { self.fwd.bytes() } else { self.rev.bytes() };
+        let recs = TopologyView::edges_of(csr, id, self.node_count);
+        Some(
+            recs.into_iter()
+                .filter_map(|e| {
+                    let other_hash = self.hash_of(e.neighbor)?;
+                    let edge_type_hash =
+                        self.type_hashes.get(e.edge_type_id as usize).copied()?;
+                    Some(MappedEdge { other_hash, edge_type_hash, strength: e.strength })
+                })
+                .collect(),
+        )
+    }
+
+    /// O(1) `dense id → slug hash` (v2 records carry it inline).
+    pub fn hash_of(&self, id: u64) -> Option<u64> {
+        let k = id as usize;
+        if k >= self.node_count {
+            return None;
+        }
+        if self.version >= 2 {
+            Some(rd_u64(self.nodes.bytes(), HEADER_LEN + 8 + k * NODE_RECSIZE_V2))
+        } else {
+            self.slug_of(id).map(crate::sk_hash)
+        }
     }
 }
 
