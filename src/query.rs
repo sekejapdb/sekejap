@@ -2332,7 +2332,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     candidates = sorted;
                     skip_set.insert(i + 1 + sort_j);
                 } else {
-                    candidates = db.collection_members(*hash).cloned().unwrap_or_default();
+                    candidates = db.collection_members(*hash).map(|m| m.into_owned()).unwrap_or_default();
                 }
             }
             Step::All => {
@@ -5078,7 +5078,7 @@ fn resolve_match_start(db: &CoreDB, start: &MatchAggStart) -> Vec<u64> {
             if db.node_data(*h).is_some() { vec![*h] } else { vec![] }
         }
         MatchAggStart::Collection(h) => {
-            db.collection_members(*h).cloned().unwrap_or_default()
+            db.collection_members(*h).map(|m| m.into_owned()).unwrap_or_default()
         }
         MatchAggStart::All => db.all_hashes(),
     }
@@ -5892,7 +5892,7 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             if db.node_data(h).is_some() { vec![h] } else { vec![] }
         }
         MatchAggStart::Collection(h) => {
-            db.collection_members(h).cloned().unwrap_or_default()
+            db.collection_members(h).map(|m| m.into_owned()).unwrap_or_default()
         }
         MatchAggStart::All => db.all_hashes(),
     };
@@ -6985,7 +6985,7 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
         FromSource::Match(agg) => {
             let starts: Vec<u64> = match agg.start {
                 MatchAggStart::Slug(h)       => if db.node_data(h).is_some() { vec![h] } else { vec![] },
-                MatchAggStart::Collection(h) => db.collection_members(h).cloned().unwrap_or_default(),
+                MatchAggStart::Collection(h) => db.collection_members(h).map(|m| m.into_owned()).unwrap_or_default(),
                 MatchAggStart::All           => db.all_hashes(),
             };
             collect_paths(db, &starts, &agg.hops, agg.start_var.as_deref(), None, stmt_needs_var_path(&agg))
@@ -6998,7 +6998,7 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
         }
         FromSource::Collection { alias, name_hash } => {
             db.collection_members(name_hash)
-                .cloned()
+                .map(|m| m.into_owned())
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|h| {

@@ -455,6 +455,10 @@ pub struct CoreDB {
     slug_map: HashMap<String, u64>,
     /// Graph edges (forward + reverse adjacency, edge type names, metadata).
     edges: storage::edgestore::EdgeStore,
+    /// Paged-topology base (mmap'd files written at compact). `None` = resident
+    /// mode (default). When `Some`, the resident maps above act as the **write
+    /// overlay** since open, and the topology accessors merge overlay-over-base.
+    topo_base: Option<storage::topology::MappedTopology>,
     /// collection_hash → member slug hashes
     collections: HashMap<u64, Vec<u64>>,
     /// collection_hash → collection name (for O(1) SHOW TABLES without node scan)
@@ -552,6 +556,17 @@ pub struct Config {
     /// Existing WAL files keep their detected format (auto-detected from
     /// the file header). To switch an existing database, compact first.
     pub wal_format: WalFormat,
+    /// **Experimental.** Serve topology (nodes + edges) from the mmap'd files
+    /// written at `compact()` instead of loading it into RAM. The OS page cache
+    /// keeps the hot working set resident and pages the rest — topology size is
+    /// no longer bounded by RAM. Writes since open live in a RAM overlay merged
+    /// with the mapped base on every read; `compact()` folds them together.
+    ///
+    /// Current limitations (documented, to be lifted): spatial metadata and edge
+    /// metadata are not served from the base (spatial/meta-dependent queries see
+    /// only overlay data); `remove`/`unlink` of base data does not take effect
+    /// until tombstones land.
+    pub paged_topology: bool,
 }
 
 impl Default for Config {
@@ -560,6 +575,7 @@ impl Default for Config {
             edge_mode: EdgeMode::Compact,
             read_only: false,
             wal_format: WalFormat::Binary,
+            paged_topology: false,
         }
     }
 }
@@ -578,6 +594,7 @@ impl CoreDB {
         Self {
             nodes: HashMap::new(),
             slug_map: HashMap::new(),
+            topo_base: None,
             edges: storage::edgestore::EdgeStore::new_fat(),
             collections: HashMap::new(),
             collection_names_map: HashMap::new(),
@@ -615,6 +632,15 @@ impl CoreDB {
     /// [`open_with_config`](Self::open_with_config) with [`EdgeMode::Fat`].
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         Self::open_with_config(dir, Config::default())
+    }
+
+    /// **Experimental.** Open with paged topology: nodes + edges are served from
+    /// the mmap'd files written at the last `compact()` (OS page cache holds the
+    /// hot working set), while writes since open live in a RAM overlay. Falls
+    /// back to a normal resident open when the topology files are absent.
+    /// See [`Config::paged_topology`] for current limitations.
+    pub fn open_paged(dir: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_config(dir, Config { paged_topology: true, ..Config::default() })
     }
 
     /// Open a database in read-only mode (no lock, no WAL writer).
@@ -877,6 +903,14 @@ impl CoreDB {
         // data loss (the WAL was truncated). The healthy-snapshot path is unchanged.
         let topo_recovery = snap.is_none() && dir.join("nodes.bin").exists();
 
+        // Paged topology (experimental, opt-in): mmap the topology files as the
+        // read base instead of loading nodes+edges into RAM. Requires the files
+        // from a prior compact(); falls back to resident loading when absent.
+        let paged = config.paged_topology
+            && snap.is_some()
+            && dir.join("nodes.bin").exists()
+            && dir.join("collections.bin").exists();
+
         // Open payload store: preserve existing payloads.bin for disk-backed snapshots
         // (and for topology recovery, which reads payloads in place), truncate to zero
         // otherwise (WAL replay or legacy snapshot will refill it).
@@ -891,7 +925,16 @@ impl CoreDB {
         }
 
         if let Some(snap) = snap {
-            db.load_snapshot(snap);
+            if paged {
+                // Attach the mmap'd base; the snapshot supplies everything else
+                // (schemas, vectors, HNSW, btree indexes). Nodes + edges are NOT
+                // loaded into RAM — the resident maps stay empty and act as the
+                // write overlay. WAL replay below adds post-compact writes to it.
+                db.topo_base = Some(storage::topology::MappedTopology::open(dir)?);
+                db.load_snapshot_parts(snap, /*load_topology=*/ false);
+            } else {
+                db.load_snapshot(snap);
+            }
         } else if topo_recovery {
             // Best-effort: a failure here degrades to the old behavior (WAL replay).
             let _ = db.load_topology_files(dir);
@@ -1113,7 +1156,10 @@ impl CoreDB {
         // already stored per node, so this is a cheap lookup + string compare that
         // turns a rare-but-catastrophic silent merge into a loud, recoverable error.
         // (Re-putting the *same* slug is a normal update and passes through.)
-        if let Some(existing) = self.nodes.get(&hash) {
+        // `node_data` (not `self.nodes.get`) so both checks also cover the mapped
+        // base in paged mode — collisions with base nodes must be caught, and
+        // updates of base nodes must see their old collection/offsets.
+        if let Some(existing) = self.node_data(hash) {
             if existing.slug != slug {
                 return Err(serde_json::Error::io(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
@@ -1126,8 +1172,8 @@ impl CoreDB {
             }
         }
 
-        let old_info: Option<(String, u64, u32)> = self.nodes
-            .get(&hash)
+        let old_info: Option<(String, u64, u32)> = self
+            .node_data(hash)
             .map(|n| (n.collection.clone(), n.payload_offset, n.payload_len));
 
         // Splice timestamps into raw bytes (avoids re-serialize).
@@ -2530,6 +2576,7 @@ impl CoreDB {
         Self::write_atomic(dir, "idx.bin", &blob.idx)?;
         Self::write_atomic(dir, "slugs.bin", &blob.slugs)?;
         Self::write_atomic(dir, "dict.bin", &blob.dict)?;
+        Self::write_atomic(dir, "collections.bin", &blob.colls)?;
         Ok(())
     }
 
@@ -2549,6 +2596,9 @@ impl CoreDB {
             idx: rd("idx.bin")?,
             slugs: rd("slugs.bin")?,
             dict: rd("dict.bin")?,
+            // Older Phase-0 dirs may lack collections.bin — the recovery path
+            // derives collections from node records, so an empty blob is fine.
+            colls: rd("collections.bin").unwrap_or_default(),
         };
         let view = TopologyView::new(&blob)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -2815,7 +2865,16 @@ impl CoreDB {
     }
 
     fn load_snapshot(&mut self, snap: Snapshot) {
-        for n in snap.nodes {
+        self.load_snapshot_parts(snap, true)
+    }
+
+    /// Load a snapshot, optionally skipping nodes + edges (`load_topology =
+    /// false`) — used by paged mode, where topology is served from the mmap'd
+    /// files and the snapshot only supplies schemas / vectors / HNSW / btrees.
+    fn load_snapshot_parts(&mut self, snap: Snapshot, load_topology: bool) {
+        let nodes = if load_topology { snap.nodes } else { Vec::new() };
+        let edges = if load_topology { snap.edges } else { Vec::new() };
+        for n in nodes {
             if snap.is_disk_backed {
                 // Disk-backed: restore NodeData from metadata; payload bytes are
                 // already in payloads.bin at the stored offset.
@@ -2840,7 +2899,7 @@ impl CoreDB {
                 let _ = self.put_raw(&n.slug, &payload.to_string());
             }
         }
-        for e in snap.edges {
+        for e in edges {
             if let Some(meta) = e.meta {
                 let _ =
                     self.link_meta_raw(&e.from, &e.to, &e.edge_type, e.strength, &meta.to_string());
@@ -2944,17 +3003,29 @@ impl CoreDB {
 
     /// Get raw JSON payload for a slug. Returns `None` if not found.
     pub fn get(&self, slug: &str) -> Option<String> {
-        let node = self.nodes.get(&sk_hash(slug))?;
+        let (off, len) = self.payload_loc(sk_hash(slug))?;
         self.payload_store
-            .get_raw(node.payload_offset, node.payload_len)
+            .get_raw(off, len)
             .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// Where a node's payload lives in the payload store — overlay first, then
+    /// the mapped base. Lean (no string materialization): this sits on the
+    /// payload-read hot path.
+    pub(crate) fn payload_loc(&self, hash: u64) -> Option<(u64, u32)> {
+        if let Some(n) = self.nodes.get(&hash) {
+            return Some((n.payload_offset, n.payload_len));
+        }
+        let base = self.topo_base.as_ref()?;
+        let rec = base.node_record(base.resolve(hash)?)?;
+        Some((rec.payload_offset, rec.payload_len))
     }
 
     /// Parse and return the JSON payload for a node hash. Returns `None` if
     /// the node does not exist or the payload cannot be parsed.
     pub(crate) fn get_payload(&self, hash: u64) -> Option<Value> {
-        let node = self.nodes.get(&hash)?;
-        self.payload_store.get(node.payload_offset, node.payload_len)
+        let (off, len) = self.payload_loc(hash)?;
+        self.payload_store.get(off, len)
     }
 
     /// For large payloads, read just a head slice and a tail slice to extract fields
@@ -2965,9 +3036,9 @@ impl CoreDB {
         head_bytes: usize,
         tail_bytes: usize,
     ) -> Option<(Vec<u8>, Vec<u8>)> {
-        let node = self.nodes.get(&hash)?;
-        let len = node.payload_len as usize;
-        let off = node.payload_offset;
+        let (p_off, p_len) = self.payload_loc(hash)?;
+        let len = p_len as usize;
+        let off = p_off;
         let head_size = head_bytes.min(len);
         let tail_size = tail_bytes.min(len);
         // If the ranges overlap (small payload), just read the full thing once.
@@ -2984,12 +3055,12 @@ impl CoreDB {
     /// Zero-copy tail slice for a single node (mmap path only).
     #[cfg(unix)]
     pub(crate) fn payload_tail_slice(&self, hash: u64, tail_bytes: usize) -> Option<&[u8]> {
-        let node = self.nodes.get(&hash)?;
-        let len = node.payload_len as usize;
+        let (p_off, p_len) = self.payload_loc(hash)?;
+        let len = p_len as usize;
         if len <= tail_bytes {
-            self.payload_store.get_slice(node.payload_offset, len)
+            self.payload_store.get_slice(p_off, len)
         } else {
-            let tail_off = node.payload_offset + (len - tail_bytes) as u64;
+            let tail_off = p_off + (len - tail_bytes) as u64;
             self.payload_store.get_slice(tail_off, tail_bytes)
         }
     }
@@ -3070,7 +3141,9 @@ impl CoreDB {
 
     /// Check if a node exists.
     pub fn contains(&self, slug: &str) -> bool {
-        self.nodes.contains_key(&sk_hash(slug))
+        let h = sk_hash(slug);
+        self.nodes.contains_key(&h)
+            || self.topo_base.as_ref().map_or(false, |b| b.resolve(h).is_some())
     }
 
     /// Total number of nodes.
@@ -4376,23 +4449,80 @@ impl CoreDB {
     // `self.nodes` / `self.edges` access outside lib.rs.
 
     pub(crate) fn node_data(&self, hash: u64) -> Option<std::borrow::Cow<'_, NodeData>> {
-        self.nodes.get(&hash).map(std::borrow::Cow::Borrowed)
+        // Overlay first: anything written since open (or everything, in resident
+        // mode) lives in the resident map and wins over the mapped base.
+        if let Some(n) = self.nodes.get(&hash) {
+            return Some(std::borrow::Cow::Borrowed(n));
+        }
+        let base = self.topo_base.as_ref()?;
+        let id = base.resolve(hash)?;
+        let rec = base.node_record(id)?;
+        Some(std::borrow::Cow::Owned(NodeData {
+            slug: base.slug_of(id)?.to_string(),
+            collection: base
+                .collection_name(rec.collection_id)
+                .unwrap_or("")
+                .to_string(),
+            // Not stored in the topology files yet (spatial side-table pending).
+            spatial_meta: None,
+            payload_offset: rec.payload_offset,
+            payload_len: rec.payload_len,
+        }))
     }
 
     pub(crate) fn collection_name(&self, coll_hash: u64) -> Option<&str> {
-        self.collection_names_map.get(&coll_hash).map(|s| s.as_str())
+        if let Some(s) = self.collection_names_map.get(&coll_hash) {
+            return Some(s.as_str());
+        }
+        self.topo_base.as_ref()?.collection_name_by_hash(coll_hash)
     }
 
     pub(crate) fn all_hashes(&self) -> Vec<u64> {
-        self.nodes.keys().copied().collect()
+        match &self.topo_base {
+            None => self.nodes.keys().copied().collect(),
+            Some(base) => {
+                // Base ∪ overlay (the overlay may hold updates of base nodes —
+                // dedup keeps each hash once).
+                let mut set: HashSet<u64> = base.all_hashes().into_iter().collect();
+                set.extend(self.nodes.keys().copied());
+                set.into_iter().collect()
+            }
+        }
     }
 
     pub(crate) fn fwd_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>> {
-        self.edges.fwd_edges(hash).map(std::borrow::Cow::Borrowed)
+        Self::merged_edges(self.edges.fwd_edges(hash), || {
+            self.topo_base.as_ref().and_then(|b| b.fwd_by_hash(hash))
+        })
     }
 
     pub(crate) fn rev_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>> {
-        self.edges.rev_edges(hash).map(std::borrow::Cow::Borrowed)
+        Self::merged_edges(self.edges.rev_edges(hash), || {
+            self.topo_base.as_ref().and_then(|b| b.rev_by_hash(hash))
+        })
+    }
+
+    /// Merge overlay edges (resident, written since open) with base edges (mapped).
+    /// Resident-only mode short-circuits to a zero-copy borrow.
+    fn merged_edges<'a>(
+        overlay: Option<&'a [Edge]>,
+        base: impl FnOnce() -> Option<Vec<storage::topology::MappedEdge>>,
+    ) -> Option<std::borrow::Cow<'a, [Edge]>> {
+        let base_edges = base();
+        match (overlay, base_edges) {
+            (Some(o), None) => Some(std::borrow::Cow::Borrowed(o)),
+            (overlay, Some(b)) => {
+                let mut v: Vec<Edge> = b
+                    .into_iter()
+                    .map(|e| Edge::plain(e.other_hash, e.edge_type_hash, e.strength))
+                    .collect();
+                if let Some(o) = overlay {
+                    v.extend_from_slice(o);
+                }
+                Some(std::borrow::Cow::Owned(v))
+            }
+            (None, None) => None,
+        }
     }
 
     pub(crate) fn resolve_edge_type(&self, hash: u64) -> Option<String> {
@@ -4423,8 +4553,29 @@ impl CoreDB {
         None
     }
 
-    pub(crate) fn collection_members(&self, hash: u64) -> Option<&Vec<u64>> {
-        self.collections.get(&hash)
+    pub(crate) fn collection_members(&self, hash: u64) -> Option<std::borrow::Cow<'_, [u64]>> {
+        let overlay = self.collections.get(&hash);
+        let base = self
+            .topo_base
+            .as_ref()
+            .and_then(|b| b.members_by_coll_hash(hash));
+        match (overlay, base) {
+            (Some(o), None) => Some(std::borrow::Cow::Borrowed(o.as_slice())),
+            (overlay, Some(mut b)) => {
+                if let Some(o) = overlay {
+                    // Updates of base nodes re-appear in the overlay — dedup so a
+                    // collection scan sees each node once.
+                    let seen: HashSet<u64> = b.iter().copied().collect();
+                    for &h in o {
+                        if !seen.contains(&h) {
+                            b.push(h);
+                        }
+                    }
+                }
+                Some(std::borrow::Cow::Owned(b))
+            }
+            (None, None) => None,
+        }
     }
 
     /// Return the btree index for `(collection_hash, field)` if one exists.
@@ -5725,8 +5876,8 @@ impl CoreDB {
     /// ```
     pub fn centroid(&self, slug: &str) -> Option<(f64, f64)> {
         let hash = *self.slug_map.get(slug)?;
-        let node = self.nodes.get(&hash)?;
-        let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+        let (off, len) = self.payload_loc(hash)?;
+        let payload = self.payload_store.get(off, len)?;
         geo::extract_centroid(&payload)
     }
 }
@@ -5907,6 +6058,7 @@ mod hybrid_query_tests {
             idx: rd("idx.bin"),
             slugs: rd("slugs.bin"),
             dict: rd("dict.bin"),
+            colls: rd("collections.bin"),
         };
         let view = TopologyView::new(&blob).unwrap();
         assert_eq!(view.node_count(), 3);
@@ -6012,6 +6164,102 @@ mod hybrid_query_tests {
         // Unknown hash resolves to nothing.
         assert!(mapped.resolve(sk_hash("nope/nope")).is_none());
         assert!(mapped.fwd_by_hash(sk_hash("nope/nope")).is_none());
+    }
+
+    #[test]
+    fn paged_open_query_results_match_resident() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            for (slug, coll, extra) in [
+                ("tourist/chloe", "tourist", r#""home":"Melbourne""#),
+                ("tourist/milan", "tourist", r#""home":"Toronto""#),
+                ("place/uluwatu", "place", r#""city":"Bali","kind":"temple""#),
+                ("place/ubud", "place", r#""city":"Bali","kind":"town""#),
+                ("place/canggu", "place", r#""city":"Bali","kind":"beach""#),
+            ] {
+                let key = slug.split('/').nth(1).unwrap();
+                db.put(slug, &format!(r#"{{"_collection":"{coll}","_key":"{key}",{extra}}}"#)).unwrap();
+            }
+            db.link("tourist/chloe", "place/uluwatu", "visited", 0.9);
+            db.link("tourist/chloe", "place/ubud", "visited", 0.7);
+            db.link("tourist/milan", "place/canggu", "visited", 0.5);
+            db.compact().unwrap();
+        }
+
+        // Identical results for point reads, scans, filters and MATCH traversal.
+        // (Sequential opens — the exclusive file lock allows one writer at a time.)
+        let queries = [
+            "SELECT * FROM place ORDER BY _key ASC",
+            "SELECT * FROM place WHERE kind = 'temple'",
+            "SELECT _key FROM tourist ORDER BY _key ASC",
+            "SELECT b._key AS k FROM MATCH (a:tourist)-[:visited]->(b:place) \
+             WHERE a._key='chloe' ORDER BY k ASC",
+            "SELECT a._key AS k FROM MATCH (a:tourist)-[:visited]->(b:place) \
+             WHERE b._key='canggu'",
+            "SELECT COUNT(*) AS n FROM MATCH (a:tourist)-[:visited]->(b:place)",
+        ];
+        let (resident_results, resident_ubud) = {
+            let resident = CoreDB::open(dir.path()).unwrap();
+            let results: Vec<Vec<_>> = queries.iter().map(|q| {
+                resident.query(q).unwrap().collect()
+                    .iter().map(|h| h.payload.clone()).collect()
+            }).collect();
+            (results, resident.get("place/ubud"))
+        };
+
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert!(paged.topo_base.is_some(), "paged open must attach the mmap base");
+        assert!(paged.nodes.is_empty(), "paged open must not load nodes into RAM");
+        for (q, expected) in queries.iter().zip(&resident_results) {
+            let p: Vec<_> = paged.query(q).unwrap().collect()
+                .iter().map(|h| h.payload.clone()).collect();
+            assert_eq!(expected, &p, "paged != resident for: {q}");
+        }
+        // Point get through the payload store.
+        assert_eq!(resident_ubud, paged.get("place/ubud"));
+    }
+
+    #[test]
+    fn paged_open_writes_merge_with_base() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe","v":1}"#).unwrap();
+            db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
+            db.link("tourist/chloe", "place/uluwatu", "visited", 1.0);
+            db.compact().unwrap();
+        }
+
+        let mut db = CoreDB::open_paged(dir.path()).unwrap();
+
+        // 1. New node + new edge land in the overlay and merge with base edges.
+        db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
+        db.link("tourist/chloe", "place/ubud", "visited", 0.5);
+        let hits = db.query(
+            "SELECT b._key AS k FROM MATCH (a:tourist)-[:visited]->(b:place) \
+             WHERE a._key='chloe' ORDER BY k ASC"
+        ).unwrap().collect();
+        let keys: Vec<&str> = hits.iter()
+            .map(|h| h.payload.as_ref().unwrap()["k"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["ubud", "uluwatu"], "base + overlay edges must merge");
+
+        // 2. Collection scan sees base + overlay members, deduped.
+        assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 2);
+
+        // 3. Updating a BASE node: overlay version wins, no duplicate in scans.
+        db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe","v":2}"#).unwrap();
+        let chloe: Value = serde_json::from_str(&db.get("tourist/chloe").unwrap()).unwrap();
+        assert_eq!(chloe["v"].as_f64().unwrap(), 2.0, "overlay update must win over base");
+        assert_eq!(db.query("SELECT * FROM tourist").unwrap().collect().len(), 1,
+            "updated base node must not appear twice");
+
+        // 4. Collision guard also fires against the mapped base.
+        let base_hash = sk_hash("place/uluwatu");
+        assert!(db.nodes.get(&base_hash).is_none(), "uluwatu must live only in the base");
+        // (a real collision can't be forged against the base without breaking the
+        // idx invariant, so we just assert same-slug base update passes)
+        db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu","u":1}"#).unwrap();
     }
 
     #[test]

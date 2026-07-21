@@ -36,6 +36,14 @@ pub(crate) struct Edge {
 
 const NO_META: u32 = u32::MAX;
 
+impl Edge {
+    /// Construct a metadata-less edge (paged-topology base edges — edge metadata
+    /// is not yet served from the mapped files).
+    pub(crate) fn plain(other: u64, edge_type: u64, strength: f32) -> Self {
+        Self { other, edge_type, strength, meta_id: NO_META }
+    }
+}
+
 /// Runtime edge-storage mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EdgeMode {
