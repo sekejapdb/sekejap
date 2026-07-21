@@ -5928,6 +5928,86 @@ mod hybrid_query_tests {
     }
 
     #[test]
+    fn mapped_topology_equivalent_to_resident_graph() {
+        use crate::storage::topology::MappedTopology;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        // A small but non-trivial Bali graph: multiple collections, edge types,
+        // strengths, fan-out and fan-in.
+        for (slug, coll) in [
+            ("tourist/chloe", "tourist"), ("tourist/milan", "tourist"),
+            ("place/uluwatu", "place"), ("place/ubud", "place"), ("place/canggu", "place"),
+            ("area/south", "area"),
+        ] {
+            let key = slug.split('/').nth(1).unwrap();
+            db.put(slug, &format!(r#"{{"_collection":"{coll}","_key":"{key}"}}"#)).unwrap();
+        }
+        db.link("tourist/chloe", "place/uluwatu", "visited", 0.9);
+        db.link("tourist/chloe", "place/ubud", "visited", 0.7);
+        db.link("tourist/milan", "place/ubud", "visited", 0.5);
+        db.link("tourist/milan", "place/canggu", "stayed_at", 1.0);
+        db.link("place/uluwatu", "area/south", "in_area", 1.0);
+        db.link("place/canggu", "area/south", "in_area", 1.0);
+        db.compact().unwrap();
+
+        let mapped = MappedTopology::open(dir.path()).unwrap();
+        assert_eq!(mapped.node_count(), db.nodes.len());
+
+        // For EVERY node: identity, slug, payload location, and both edge
+        // directions must match the resident graph exactly.
+        for (&hash, node) in &db.nodes {
+            let id = mapped.resolve(hash).expect("mapped resolve");
+            assert_eq!(mapped.slug_of(id), Some(node.slug.as_str()));
+            assert_eq!(mapped.hash_of(id), Some(hash));
+            let rec = mapped.node_record(id).unwrap();
+            assert_eq!(rec.hash, hash);
+            assert_eq!(rec.payload_offset, node.payload_offset);
+            assert_eq!(rec.payload_len, node.payload_len);
+            assert_eq!(
+                mapped.collection_name(rec.collection_id).unwrap_or(""),
+                node.collection
+            );
+
+            // Edge sets (other, type, strength-in-milli) as multisets.
+            let to_set = |edges: Option<Vec<crate::storage::topology::MappedEdge>>| {
+                let mut v: Vec<(u64, u64, i64)> = edges
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| (e.other_hash, e.edge_type_hash, (e.strength * 1000.0) as i64))
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            let resident = |edges: Option<&[crate::storage::edgestore::Edge]>| {
+                let mut v: Vec<(u64, u64, i64)> = edges
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|e| (e.other, e.edge_type, (e.strength * 1000.0) as i64))
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(
+                to_set(mapped.fwd_by_hash(hash)),
+                resident(db.fwd_edges(hash)),
+                "fwd mismatch for {}",
+                node.slug
+            );
+            assert_eq!(
+                to_set(mapped.rev_by_hash(hash)),
+                resident(db.rev_edges(hash)),
+                "rev mismatch for {}",
+                node.slug
+            );
+        }
+
+        // Unknown hash resolves to nothing.
+        assert!(mapped.resolve(sk_hash("nope/nope")).is_none());
+        assert!(mapped.fwd_by_hash(sk_hash("nope/nope")).is_none());
+    }
+
+    #[test]
     fn open_recovers_from_topology_files_when_snapshot_lost() {
         let dir = tempfile::tempdir().unwrap();
         {
