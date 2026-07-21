@@ -33,6 +33,7 @@ const MAGIC_ADJR: [u8; 8] = *b"SKADJR\0\0";
 const MAGIC_IDX: [u8; 8] = *b"SKIDX\0\0\0";
 const MAGIC_SLUG: [u8; 8] = *b"SKSLUG\0\0";
 const MAGIC_DICT: [u8; 8] = *b"SKDICT\0\0";
+const MAGIC_COLL: [u8; 8] = *b"SKCOLL\0\0";
 
 /// Topology format version (independent of the snapshot version).
 /// v1 = 24 B node records (no hash — derived from the slug on read).
@@ -77,6 +78,10 @@ pub struct TopologyBlob {
     pub idx: Vec<u8>,
     pub slugs: Vec<u8>,
     pub dict: Vec<u8>,
+    /// `collections.bin` — per-collection posting lists of member dense ids
+    /// (sorted, delta+StreamVByte encoded like adjacency), so collection scans in
+    /// paged mode don't require a full `nodes.bin` sweep.
+    pub colls: Vec<u8>,
 }
 
 // ── Little-endian read helpers ────────────────────────────────────────────────
@@ -355,6 +360,49 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
         slugs_buf.extend_from_slice(node.slug.as_bytes());
     }
 
+    // collections.bin — per-collection posting lists of member dense ids.
+    // Members are ascending (nodes iterated in dense-id order) → delta + SVB.
+    let mut coll_members: Vec<Vec<u64>> = vec![Vec::new(); colls.list.len()];
+    for (i, node) in nodes.iter().enumerate() {
+        if !node.collection.is_empty() {
+            if let Some(&cid) = colls.map.get(&node.collection) {
+                coll_members[cid as usize].push(i as u64);
+            }
+        }
+    }
+    let coll_blocks: Vec<Vec<u8>> = coll_members
+        .iter()
+        .map(|members| {
+            let mut block = Vec::new();
+            write_varint(&mut block, members.len() as u64);
+            let mut deltas = Vec::with_capacity(members.len());
+            let mut prev = 0u64;
+            for &m in members {
+                deltas.push(m - prev);
+                prev = m;
+            }
+            let mut control = Vec::new();
+            let mut data = Vec::new();
+            svb_encode(&deltas, &mut control, &mut data);
+            block.extend_from_slice(&control);
+            block.extend_from_slice(&data);
+            block
+        })
+        .collect();
+    let mut colls_buf = Vec::new();
+    write_header(&mut colls_buf, &MAGIC_COLL, 0);
+    let ncolls = coll_blocks.len();
+    colls_buf.extend_from_slice(&(ncolls as u64).to_le_bytes());
+    let mut cursor = (HEADER_LEN + 8 + (ncolls + 1) * 8) as u64;
+    for b in &coll_blocks {
+        colls_buf.extend_from_slice(&cursor.to_le_bytes());
+        cursor += b.len() as u64;
+    }
+    colls_buf.extend_from_slice(&cursor.to_le_bytes());
+    for b in &coll_blocks {
+        colls_buf.extend_from_slice(b);
+    }
+
     // dict.bin — collections then edge types
     let mut dict_buf = Vec::new();
     write_header(&mut dict_buf, &MAGIC_DICT, 0);
@@ -368,6 +416,7 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
         idx: idx_buf,
         slugs: slugs_buf,
         dict: dict_buf,
+        colls: colls_buf,
     }
 }
 
@@ -683,6 +732,10 @@ pub struct MappedTopology {
     type_hashes: Vec<u64>,
     /// Every `SPARSE_STRIDE`-th hash from `idx.bin`, resident (~16 B per 256 nodes).
     sparse: Vec<u64>,
+    /// `collections.bin` — per-collection member posting lists.
+    colls: Backing,
+    /// `sk_hash(collection name) → collection_id` (tiny; one entry per collection).
+    coll_hash_to_id: std::collections::HashMap<u64, u32>,
 }
 
 impl MappedTopology {
@@ -709,6 +762,14 @@ impl MappedTopology {
         let collections = view.collections.clone();
         let edge_types = view.edge_types.clone();
         let type_hashes = edge_types.iter().map(|t| crate::sk_hash(t)).collect();
+        let colls = Backing::open(&dir.join("collections.bin"))?;
+        check_header(colls.bytes(), &MAGIC_COLL)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let coll_hash_to_id = collections
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (crate::sk_hash(name), i as u32))
+            .collect();
 
         // Resident sparse index over idx.bin (every SPARSE_STRIDE-th hash).
         let idx_bytes = idx.bytes();
@@ -731,11 +792,57 @@ impl MappedTopology {
             edge_types,
             type_hashes,
             sparse,
+            colls,
+            coll_hash_to_id,
         })
     }
 
     pub fn node_count(&self) -> usize {
         self.node_count
+    }
+
+    /// Member node *hashes* of the collection with this name hash. Decodes the
+    /// posting list (delta+SVB dense ids) and maps each to its slug hash in O(1).
+    pub fn members_by_coll_hash(&self, coll_hash: u64) -> Option<Vec<u64>> {
+        let cid = *self.coll_hash_to_id.get(&coll_hash)? as usize;
+        let b = self.colls.bytes();
+        let ncolls = rd_u64(b, HEADER_LEN) as usize;
+        if cid >= ncolls {
+            return None;
+        }
+        let offsets = HEADER_LEN + 8;
+        let start = rd_u64(b, offsets + cid * 8) as usize;
+        let end = rd_u64(b, offsets + (cid + 1) * 8) as usize;
+        let block = &b[start..end];
+        let (count, mut pos) = read_varint(block, 0);
+        let count = count as usize;
+        let ctrl_len = (count + 3) / 4;
+        let control = &block[pos..pos + ctrl_len];
+        pos += ctrl_len;
+        let (deltas, _) = svb_decode(control, &block[pos..], count);
+        let mut acc = 0u64;
+        let mut out = Vec::with_capacity(count);
+        for d in deltas {
+            acc += d;
+            if let Some(h) = self.hash_of(acc) {
+                out.push(h);
+            }
+        }
+        Some(out)
+    }
+
+    /// All node hashes in the store (iterates `nodes.bin` records — O(n), used by
+    /// `SELECT … FROM ALL` style scans).
+    pub fn all_hashes(&self) -> Vec<u64> {
+        (0..self.node_count as u64).filter_map(|id| self.hash_of(id)).collect()
+    }
+
+    /// `sk_hash(collection name) → name` (for collection_name lookups in paged mode).
+    pub fn collection_name_by_hash(&self, coll_hash: u64) -> Option<&str> {
+        self.coll_hash_to_id
+            .get(&coll_hash)
+            .and_then(|&id| self.collections.get(id as usize))
+            .map(|s| s.as_str())
     }
 
     /// `slug hash → dense id` (sparse-narrowed binary search over the mmap'd idx).
