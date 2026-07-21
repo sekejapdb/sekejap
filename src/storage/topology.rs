@@ -31,6 +31,7 @@ const MAGIC_NODES: [u8; 8] = *b"SKNODE\0\0";
 const MAGIC_ADJF: [u8; 8] = *b"SKADJF\0\0";
 const MAGIC_ADJR: [u8; 8] = *b"SKADJR\0\0";
 const MAGIC_IDX: [u8; 8] = *b"SKIDX\0\0\0";
+const MAGIC_SLUG: [u8; 8] = *b"SKSLUG\0\0";
 const MAGIC_DICT: [u8; 8] = *b"SKDICT\0\0";
 
 /// Topology format version (independent of the snapshot version).
@@ -64,6 +65,7 @@ pub struct TopologyBlob {
     pub fwd: Vec<u8>,
     pub rev: Vec<u8>,
     pub idx: Vec<u8>,
+    pub slugs: Vec<u8>,
     pub dict: Vec<u8>,
 }
 
@@ -326,6 +328,22 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
         idx_buf.extend_from_slice(&id.to_le_bytes());
     }
 
+    // slugs.bin — dense_id → slug string (reverse of idx.bin).
+    // Layout: header, count, offsets[(n+1)] into the blob, then the UTF-8 blob.
+    let mut slugs_buf = Vec::new();
+    write_header(&mut slugs_buf, &MAGIC_SLUG, 0);
+    slugs_buf.extend_from_slice(&(n as u64).to_le_bytes());
+    let blob_start = (HEADER_LEN + 8 + (n + 1) * 8) as u64;
+    let mut cursor = blob_start;
+    for node in nodes {
+        slugs_buf.extend_from_slice(&cursor.to_le_bytes());
+        cursor += node.slug.len() as u64;
+    }
+    slugs_buf.extend_from_slice(&cursor.to_le_bytes()); // sentinel end
+    for node in nodes {
+        slugs_buf.extend_from_slice(node.slug.as_bytes());
+    }
+
     // dict.bin — collections then edge types
     let mut dict_buf = Vec::new();
     write_header(&mut dict_buf, &MAGIC_DICT, 0);
@@ -337,6 +355,7 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
         fwd: fwd_buf,
         rev: rev_buf,
         idx: idx_buf,
+        slugs: slugs_buf,
         dict: dict_buf,
     }
 }
@@ -382,6 +401,7 @@ pub struct TopologyView<'a> {
     fwd: &'a [u8],
     rev: &'a [u8],
     idx: &'a [u8],
+    slugs: &'a [u8],
     collections: Vec<String>,
     edge_types: Vec<String>,
     node_count: usize,
@@ -393,6 +413,7 @@ impl<'a> TopologyView<'a> {
         check_header(&blob.fwd, &MAGIC_ADJF)?;
         check_header(&blob.rev, &MAGIC_ADJR)?;
         check_header(&blob.idx, &MAGIC_IDX)?;
+        check_header(&blob.slugs, &MAGIC_SLUG)?;
         check_header(&blob.dict, &MAGIC_DICT)?;
 
         let (collections, pos) = read_string_table(&blob.dict, HEADER_LEN);
@@ -404,10 +425,24 @@ impl<'a> TopologyView<'a> {
             fwd: &blob.fwd,
             rev: &blob.rev,
             idx: &blob.idx,
+            slugs: &blob.slugs,
             collections,
             edge_types,
             node_count,
         })
+    }
+
+    /// `dense id → slug` — the reverse of [`resolve`](Self::resolve). Touched only
+    /// when building results or disambiguating collisions, never during hops.
+    pub fn slug(&self, id: u64) -> Option<&'a str> {
+        let k = id as usize;
+        if k >= self.node_count {
+            return None;
+        }
+        let offsets = HEADER_LEN + 8;
+        let start = rd_u64(self.slugs, offsets + k * 8) as usize;
+        let end = rd_u64(self.slugs, offsets + (k + 1) * 8) as usize;
+        std::str::from_utf8(&self.slugs[start..end]).ok()
     }
 
     pub fn node_count(&self) -> usize {
@@ -548,11 +583,14 @@ mod tests {
         let view = TopologyView::new(&blob).unwrap();
         assert_eq!(view.node_count(), 4);
 
-        // Name resolution round-trips to the dense id assigned in `nodes` order.
+        // Name resolution round-trips to the dense id assigned in `nodes` order,
+        // and slugs.bin gives the reverse mapping back.
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(view.resolve(node.hash), Some(i as u64), "resolve {}", node.slug);
+            assert_eq!(view.slug(i as u64), Some(node.slug.as_str()), "slug of id {i}");
         }
         assert_eq!(view.resolve(h("does/not/exist")), None);
+        assert_eq!(view.slug(99), None);
 
         // Node records carry payload offset/len + collection.
         let chloe = view.resolve(h("t/chloe")).unwrap();
