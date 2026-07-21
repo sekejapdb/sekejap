@@ -2344,7 +2344,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 let mut next: HashSet<u64> = HashSet::new();
                 for &node in &candidates {
                     if let Some(edges) = db.fwd_edges(node) {
-                        for e in edges {
+                        for e in edges.iter() {
                             if e.edge_type == *type_hash {
                                 next.insert(e.other);
                             }
@@ -2361,7 +2361,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 let mut next: HashSet<u64> = HashSet::new();
                 for &node in &candidates {
                     if let Some(edges) = db.rev_edges(node) {
-                        for e in edges {
+                        for e in edges.iter() {
                             if e.edge_type == *type_hash {
                                 next.insert(e.other);
                             }
@@ -2381,7 +2381,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     let mut next: Vec<u64> = Vec::new();
                     for &node in &frontier {
                         if let Some(edges) = db.fwd_edges(node) {
-                            for e in edges {
+                            for e in edges.iter() {
                                 if visited.insert(e.other) {
                                     next.push(e.other);
                                 }
@@ -2412,7 +2412,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     let mut next: Vec<u64> = Vec::new();
                     for &node in &frontier {
                         if let Some(edges) = db.fwd_edges(node) {
-                            for e in edges {
+                            for e in edges.iter() {
                                 if e.edge_type == *type_hash && visited.insert(e.other) {
                                     next.push(e.other);
                                 }
@@ -4293,7 +4293,7 @@ pub(crate) fn collect_raw_paths(
                 let adj = if hop.backward { db.rev_edges(partial.current_hash) }
                           else { db.fwd_edges(partial.current_hash) };
                 if let Some(edges) = adj {
-                    for e in edges {
+                    for e in edges.iter() {
                         if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                             continue;
                         }
@@ -4337,7 +4337,7 @@ pub(crate) fn collect_raw_paths(
                 for (pidx, current_h, sub_n, sub_s) in &pairs {
                     let adj = if hop.backward { db.rev_edges(*current_h) } else { db.fwd_edges(*current_h) };
                     if let Some(edges) = adj {
-                        for e in edges {
+                        for e in edges.iter() {
                             if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                                 continue;
                             }
@@ -4396,7 +4396,7 @@ pub(crate) fn collect_raw_paths(
                 for &(pidx, current_h) in &pairs {
                     let adj = if hop.backward { db.rev_edges(current_h) } else { db.fwd_edges(current_h) };
                     if let Some(edges) = adj {
-                        for e in edges {
+                        for e in edges.iter() {
                             if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                                 continue;
                             }
@@ -4501,7 +4501,7 @@ fn collect_final_dest_counts(
             for (&current_h, &count) in &depth_frontier {
                 let adj = if hop.backward { db.rev_edges(current_h) } else { db.fwd_edges(current_h) };
                 if let Some(edges) = adj {
-                    for e in edges {
+                    for e in edges.iter() {
                         if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                             continue;
                         }
@@ -4603,7 +4603,7 @@ fn try_reverse_anchor(
             Some(r) => r,
             None => continue,
         };
-        for e in rev {
+        for e in rev.iter() {
             if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                 continue;
             }
@@ -4794,9 +4794,9 @@ fn filter_raw_by_func_filters(
         let dest = *rp.dest_per_hop.last().unwrap_or(&0);
         filters.iter().all(|f| match f {
             MatchFuncFilter::StDWithin { lat, lon, km } => {
-                db.node_data(dest).and_then(|n| n.spatial_meta.as_ref())
+                db.node_data(dest).map_or(false, |n| n.spatial_meta.as_ref()
                     .map_or(false, |m| crate::geo::haversine_km(
-                        m.centroid_lat, m.centroid_lon, *lat, *lon) <= *km)
+                        m.centroid_lat, m.centroid_lon, *lat, *lon) <= *km))
             }
             MatchFuncFilter::Bm25 { field, query, op, threshold } => {
                 let s = bm25_maps.get(&(field.clone(), query.clone()))
@@ -5173,7 +5173,7 @@ fn expand_match_stage(
                 let hop = &hops[hop_idx];
                 let Some(edges) = db.fwd_edges(current_h) else { continue };
 
-                for e in edges {
+                for e in edges.iter() {
                     if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
                         continue;
                     }
@@ -5691,9 +5691,9 @@ pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
             let hash = hash_of(h);
             post_filters.iter().all(|f| match f {
                 MatchFuncFilter::StDWithin { lat, lon, km } => {
-                    db.node_data(hash).and_then(|n| n.spatial_meta.as_ref())
+                    db.node_data(hash).map_or(false, |n| n.spatial_meta.as_ref()
                         .map_or(false, |m| crate::geo::haversine_km(
-                            m.centroid_lat, m.centroid_lon, *lat, *lon) <= *km)
+                            m.centroid_lat, m.centroid_lon, *lat, *lon) <= *km))
                 }
                 MatchFuncFilter::Bm25 { field, query, op, threshold } => {
                     let s = bm25_maps.get(&(field.clone(), query.clone()))

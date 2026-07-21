@@ -399,6 +399,7 @@ impl PayloadStore {
     }
 }
 
+#[derive(Clone)]
 pub struct NodeData {
     pub slug: String,
     /// Cached `_collection` field value (empty string if no collection).
@@ -4368,8 +4369,14 @@ impl CoreDB {
 
     // ── Internal accessors for the query executor ─────────────────────────────
 
-    pub(crate) fn node_data(&self, hash: u64) -> Option<&NodeData> {
-        self.nodes.get(&hash)
+    // Topology accessors return `Cow` so the backing can be either the resident
+    // HashMaps (`Cow::Borrowed` — zero cost, current default) or, in the upcoming
+    // paged mode, values decoded on demand from the mmap'd topology files
+    // (`Cow::Owned`). The whole query executor goes through these — no direct
+    // `self.nodes` / `self.edges` access outside lib.rs.
+
+    pub(crate) fn node_data(&self, hash: u64) -> Option<std::borrow::Cow<'_, NodeData>> {
+        self.nodes.get(&hash).map(std::borrow::Cow::Borrowed)
     }
 
     pub(crate) fn collection_name(&self, coll_hash: u64) -> Option<&str> {
@@ -4380,12 +4387,12 @@ impl CoreDB {
         self.nodes.keys().copied().collect()
     }
 
-    pub(crate) fn fwd_edges(&self, hash: u64) -> Option<&[Edge]> {
-        self.edges.fwd_edges(hash)
+    pub(crate) fn fwd_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>> {
+        self.edges.fwd_edges(hash).map(std::borrow::Cow::Borrowed)
     }
 
-    pub(crate) fn rev_edges(&self, hash: u64) -> Option<&[Edge]> {
-        self.edges.rev_edges(hash)
+    pub(crate) fn rev_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>> {
+        self.edges.rev_edges(hash).map(std::borrow::Cow::Borrowed)
     }
 
     pub(crate) fn resolve_edge_type(&self, hash: u64) -> Option<String> {
@@ -4408,7 +4415,7 @@ impl CoreDB {
         edge_type_hash: u64,
     ) -> Option<(f32, Option<Value>)> {
         let edges = self.fwd_edges(from)?;
-        for e in edges {
+        for e in edges.iter() {
             if e.other == to && (edge_type_hash == 0 || e.edge_type == edge_type_hash) {
                 return Some((e.strength, self.edge_meta(e)));
             }
@@ -5990,13 +5997,13 @@ mod hybrid_query_tests {
             };
             assert_eq!(
                 to_set(mapped.fwd_by_hash(hash)),
-                resident(db.fwd_edges(hash)),
+                resident(db.fwd_edges(hash).as_deref()),
                 "fwd mismatch for {}",
                 node.slug
             );
             assert_eq!(
                 to_set(mapped.rev_by_hash(hash)),
-                resident(db.rev_edges(hash)),
+                resident(db.rev_edges(hash).as_deref()),
                 "rev mismatch for {}",
                 node.slug
             );
