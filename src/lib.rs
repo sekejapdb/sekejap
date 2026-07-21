@@ -870,10 +870,17 @@ impl CoreDB {
             None
         };
 
-        // Open payload store: preserve existing payloads.bin for disk-backed snapshots,
-        // truncate to zero otherwise (WAL replay or legacy snapshot will refill it).
+        // Phase 0 recovery: if the snapshot is missing/corrupt but the topology
+        // files written at compact() exist, we can rebuild nodes + edges from them
+        // (plus payloads.bin). Without this, a lost snapshot after compact() meant
+        // data loss (the WAL was truncated). The healthy-snapshot path is unchanged.
+        let topo_recovery = snap.is_none() && dir.join("nodes.bin").exists();
+
+        // Open payload store: preserve existing payloads.bin for disk-backed snapshots
+        // (and for topology recovery, which reads payloads in place), truncate to zero
+        // otherwise (WAL replay or legacy snapshot will refill it).
         let pay_path = dir.join("payloads.bin");
-        let preserve      = snap.as_ref().map_or(false, |s| s.is_disk_backed);
+        let preserve      = snap.as_ref().map_or(false, |s| s.is_disk_backed) || topo_recovery;
         let has_vec_files = snap.as_ref().map_or(false, |s| s.has_vector_files);
         if preserve && pay_path.exists() {
             let existing_len = std::fs::metadata(&pay_path)?.len();
@@ -884,6 +891,9 @@ impl CoreDB {
 
         if let Some(snap) = snap {
             db.load_snapshot(snap);
+        } else if topo_recovery {
+            // Best-effort: a failure here degrades to the old behavior (WAL replay).
+            let _ = db.load_topology_files(dir);
         }
 
         // Open disk-backed vector stores directly from .bin files.
@@ -1094,6 +1104,25 @@ impl CoreDB {
                 std::io::ErrorKind::InvalidData,
                 "payload must be a JSON object",
             )));
+        }
+
+        // Collision guard: node identity is `sk_hash(slug)` (u64). Two *different*
+        // slugs that hash to the same value must never share a node — that would
+        // silently merge two unrelated entities and their edges. The slug is
+        // already stored per node, so this is a cheap lookup + string compare that
+        // turns a rare-but-catastrophic silent merge into a loud, recoverable error.
+        // (Re-putting the *same* slug is a normal update and passes through.)
+        if let Some(existing) = self.nodes.get(&hash) {
+            if existing.slug != slug {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "hash collision: '{slug}' and existing '{}' both hash to {hash}; \
+                         refusing to overwrite (rename one key)",
+                        existing.slug
+                    ),
+                )));
+            }
         }
 
         let old_info: Option<(String, u64, u32)> = self.nodes
@@ -2414,6 +2443,14 @@ impl CoreDB {
         }
         std::fs::rename(&snap_tmp, &snap_path)?;
 
+        // Phase 0: additionally write the offset-addressable topology files
+        // (nodes.bin + CSR adj_fwd/rev + idx.bin + dict.bin). ADDITIVE — `open()`
+        // still reads `snapshot.json`, so behavior is unchanged. This exercises the
+        // write path and keeps the files in sync, so the Phase 1 mmap flip becomes a
+        // read-only change. Runs after payload compaction, so node records reference
+        // the post-compaction payload offsets.
+        self.write_topology_files(&dir)?;
+
         // 3. Truncate WAL: close current writer → rename → open fresh → delete old
         self.wal = None;
         let wal_path = dir.join("wal.log");
@@ -2437,6 +2474,143 @@ impl CoreDB {
             let _ = self.save_search_binary(search_bin_path);
         }
 
+        Ok(())
+    }
+
+    /// Phase 0: write the offset-addressable topology files from the live graph.
+    /// Builds `TopoNode`/`TopoEdge` from `self.nodes` + `self.edges` (dense ids
+    /// assigned in hash order for deterministic output), then writes the five files
+    /// atomically. Not yet read by `open()` — see `docs/internals/topology-format-v2.md`.
+    fn write_topology_files(&self, dir: &Path) -> io::Result<()> {
+        use storage::topology::{self, TopoEdge, TopoNode};
+
+        // Nodes — sorted by hash so dense-id assignment is deterministic.
+        let mut topo_nodes: Vec<TopoNode> = self
+            .nodes
+            .iter()
+            .map(|(&h, n)| TopoNode {
+                hash: h,
+                slug: n.slug.clone(),
+                collection: n.collection.clone(),
+                payload_offset: n.payload_offset,
+                payload_len: n.payload_len,
+            })
+            .collect();
+        topo_nodes.sort_by_key(|n| n.hash);
+
+        // Edges — forward adjacency; skip any dangling endpoints.
+        let mut topo_edges: Vec<TopoEdge> = Vec::new();
+        for (&from_h, edge_list) in self.edges.iter_fwd() {
+            if !self.nodes.contains_key(&from_h) {
+                continue;
+            }
+            for e in edge_list {
+                if !self.nodes.contains_key(&e.other) {
+                    continue;
+                }
+                let edge_type = self
+                    .edges
+                    .type_name(e.edge_type)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{:016x}", e.edge_type));
+                topo_edges.push(TopoEdge {
+                    from_hash: from_h,
+                    to_hash: e.other,
+                    edge_type,
+                    strength: e.strength,
+                });
+            }
+        }
+
+        let blob = topology::build(&topo_nodes, &topo_edges);
+        Self::write_atomic(dir, "nodes.bin", &blob.nodes)?;
+        Self::write_atomic(dir, "adj_fwd.bin", &blob.fwd)?;
+        Self::write_atomic(dir, "adj_rev.bin", &blob.rev)?;
+        Self::write_atomic(dir, "idx.bin", &blob.idx)?;
+        Self::write_atomic(dir, "slugs.bin", &blob.slugs)?;
+        Self::write_atomic(dir, "dict.bin", &blob.dict)?;
+        Ok(())
+    }
+
+    /// Phase 0 read path: rebuild the resident graph (nodes + edges + collections)
+    /// from the topology files written by `write_topology_files`. Used at `open()`
+    /// when the snapshot is missing/corrupt (recovery). Schemas / vectors / HNSW are
+    /// not stored in topology files and are not recovered here; GIN/search load from
+    /// their own sidecars as usual.
+    fn load_topology_files(&mut self, dir: &Path) -> io::Result<()> {
+        use storage::topology::{TopologyBlob, TopologyView};
+
+        let rd = |name: &str| std::fs::read(dir.join(name));
+        let blob = TopologyBlob {
+            nodes: rd("nodes.bin")?,
+            fwd: rd("adj_fwd.bin")?,
+            rev: rd("adj_rev.bin")?,
+            idx: rd("idx.bin")?,
+            slugs: rd("slugs.bin")?,
+            dict: rd("dict.bin")?,
+        };
+        let view = TopologyView::new(&blob)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Nodes: identity + payload location from the records; spatial metadata is
+        // re-derived from the payload (recovery-only cost, not a hot path).
+        for id in 0..view.node_count() as u64 {
+            let (Some(slug), Some(rec)) = (view.slug(id), view.node_record(id)) else {
+                continue;
+            };
+            let hash = sk_hash(slug);
+            let coll = view
+                .collection_name(rec.collection_id)
+                .unwrap_or("")
+                .to_string();
+            let spatial_meta = self
+                .payload_store
+                .get_raw(rec.payload_offset, rec.payload_len)
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|p| geo::extract_spatial_meta(&p));
+            self.nodes.insert(hash, NodeData {
+                slug: slug.to_string(),
+                collection: coll.clone(),
+                spatial_meta,
+                payload_offset: rec.payload_offset,
+                payload_len: rec.payload_len,
+            });
+            if !coll.is_empty() {
+                let coll_hash = sk_hash(&coll);
+                self.collections.entry(coll_hash).or_default().push(hash);
+                self.collection_names_map
+                    .entry(coll_hash)
+                    .or_insert_with(|| coll.clone());
+            }
+        }
+
+        // Edges: forward adjacency only — link_raw rebuilds both directions.
+        for id in 0..view.node_count() as u64 {
+            let Some(from_slug) = view.slug(id) else { continue };
+            let from_slug = from_slug.to_string();
+            for e in view.fwd_edges(id) {
+                let (Some(to_slug), Some(ty)) =
+                    (view.slug(e.neighbor), view.edge_type_name(e.edge_type_id))
+                else {
+                    continue;
+                };
+                let (to_slug, ty) = (to_slug.to_string(), ty.to_string());
+                self.link_raw(&from_slug, &to_slug, &ty, e.strength);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` to `dir/name` durably: tmp file → fsync → atomic rename.
+    fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let path = dir.join(name);
+        let tmp = dir.join(format!("{name}.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -5673,6 +5847,115 @@ struct SnapBtree {
 #[cfg(test)]
 mod hybrid_query_tests {
     use super::*;
+
+    #[test]
+    fn hash_collision_is_rejected_not_silently_merged() {
+        let mut db = CoreDB::new();
+
+        // Re-putting the SAME slug is a normal update, never a collision.
+        db.put("things/alpha", r#"{"_collection":"things","_key":"alpha","v":1}"#).unwrap();
+        db.put("things/alpha", r#"{"_collection":"things","_key":"alpha","v":2}"#)
+            .expect("re-putting the same slug must be a normal update");
+
+        // Simulate a hash collision: make the slot at alpha's hash claim a *different*
+        // slug (in reality this happens when two distinct slugs hash to the same u64).
+        let h = sk_hash("things/alpha");
+        db.nodes.get_mut(&h).unwrap().slug = "things/beta".to_string();
+
+        // A real put of "things/alpha" now lands on a slot owned by a different slug.
+        // It must be a LOUD error, not a silent overwrite/merge.
+        let err = db
+            .put("things/alpha", r#"{"_collection":"things","_key":"alpha","v":3}"#)
+            .expect_err("a hash collision must be rejected, not silently merged");
+        assert!(
+            err.to_string().contains("collision"),
+            "error must mention collision, got: {err}"
+        );
+
+        // And the existing (different-slug) node is untouched — no merge happened.
+        assert_eq!(db.nodes.get(&h).unwrap().slug, "things/beta");
+    }
+
+    #[test]
+    fn compact_writes_readable_topology_files() {
+        use crate::storage::topology::{TopologyBlob, TopologyView};
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
+            db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
+            db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
+            db.link("tourist/chloe", "place/uluwatu", "visited", 1.0);
+            db.link("tourist/chloe", "place/ubud", "visited", 0.5);
+            db.compact().unwrap();
+        }
+
+        // Read the topology files written by compact() and verify they round-trip.
+        let rd = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+        let blob = TopologyBlob {
+            nodes: rd("nodes.bin"),
+            fwd: rd("adj_fwd.bin"),
+            rev: rd("adj_rev.bin"),
+            idx: rd("idx.bin"),
+            slugs: rd("slugs.bin"),
+            dict: rd("dict.bin"),
+        };
+        let view = TopologyView::new(&blob).unwrap();
+        assert_eq!(view.node_count(), 3);
+        // Reverse mapping: dense id → slug.
+        let chloe_id = view.resolve(sk_hash("tourist/chloe")).unwrap();
+        assert_eq!(view.slug(chloe_id), Some("tourist/chloe"));
+
+        let chloe = view.resolve(sk_hash("tourist/chloe")).expect("resolve chloe");
+        let rec = view.node_record(chloe).unwrap();
+        assert_eq!(view.collection_name(rec.collection_id), Some("tourist"));
+
+        let ulu = view.resolve(sk_hash("place/uluwatu")).unwrap();
+        let ubud = view.resolve(sk_hash("place/ubud")).unwrap();
+        let out = view.fwd_edges(chloe);
+        assert_eq!(out.len(), 2, "chloe visited two places");
+        let neigh: std::collections::HashSet<u64> = out.iter().map(|e| e.neighbor).collect();
+        assert_eq!(neigh, [ulu, ubud].into_iter().collect());
+        for e in &out {
+            assert_eq!(view.edge_type_name(e.edge_type_id), Some("visited"));
+        }
+
+        // Reverse adjacency: uluwatu has exactly one incoming edge, from chloe.
+        let rin = view.rev_edges(ulu);
+        assert_eq!(rin.len(), 1);
+        assert_eq!(rin[0].neighbor, chloe);
+    }
+
+    #[test]
+    fn open_recovers_from_topology_files_when_snapshot_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe","name":"Chloe"}"#).unwrap();
+            db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu","city":"Bali"}"#).unwrap();
+            db.link("tourist/chloe", "place/uluwatu", "visited", 0.9);
+            db.compact().unwrap(); // WAL truncated → snapshot + topology files hold everything
+        }
+
+        // Disaster: snapshot.json is lost. Pre-Phase 0 this meant total data loss
+        // (empty WAL + no snapshot → empty DB). Now open() rebuilds from topology
+        // files + payloads.bin.
+        std::fs::remove_file(dir.path().join("snapshot.json")).unwrap();
+
+        let db = CoreDB::open(dir.path()).unwrap();
+        // Nodes + payloads intact.
+        let chloe: Value = serde_json::from_str(&db.get("tourist/chloe").unwrap()).unwrap();
+        assert_eq!(chloe["name"].as_str().unwrap(), "Chloe");
+        // Collections intact (SQL scan works).
+        assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 1);
+        // Edges intact, both directions, with type + strength.
+        let hits = db.query(
+            "SELECT b.city AS c FROM MATCH (a:tourist)-[:visited]->(b:place) WHERE a._key='chloe'"
+        ).unwrap().collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].payload.as_ref().unwrap()["c"].as_str().unwrap(), "Bali");
+    }
 
     #[test]
     fn test_hybrid_graph_spatial_range_query() {
