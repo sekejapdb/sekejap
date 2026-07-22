@@ -163,6 +163,11 @@ pub(crate) fn sk_hash(s: &str) -> u64 {
 /// bytes on disk and out of RAM. Only `NodeData` metadata (≈ 100 B per node)
 /// stays in the `HashMap`.
 pub(crate) struct PayloadStore {
+    /// Compress new records (zstd + first-byte tag). Read side always
+    /// auto-detects per record, so mixed files and legacy raw files need no
+    /// migration. Records > PAYLOAD_COMPRESS_MAX stay raw (preserves the
+    /// head/tail extraction fast paths for huge payloads).
+    compress: bool,
     inner: PayloadInner,
 }
 
@@ -184,9 +189,45 @@ enum PayloadInner {
     },
 }
 
+/// Records larger than this are never compressed — the large-payload head/tail
+/// extraction fast paths depend on raw bytes at arbitrary offsets, and they are
+/// only taken for records above `FAST_PATH_THRESHOLD` (64 KB). Keeping the two
+/// thresholds equal preserves that invariant.
+const PAYLOAD_COMPRESS_MAX: usize = 64 * 1024;
+/// First-byte tag for a zstd-compressed record. Raw JSON records always start
+/// with `{` (0x7B), so legacy files auto-detect with zero migration.
+const PAYLOAD_TAG_ZSTD: u8 = 0x01;
+
+/// Encode one record for storage under the given policy. Compressed output is
+/// used only when it actually shrinks the record.
+fn encode_payload_record(bytes: &[u8], compress: bool) -> std::borrow::Cow<'_, [u8]> {
+    if compress && bytes.len() <= PAYLOAD_COMPRESS_MAX && bytes.first() == Some(&b'{') {
+        if let Ok(mut z) = zstd::bulk::compress(bytes, 3) {
+            if z.len() + 1 < bytes.len() {
+                let mut out = Vec::with_capacity(z.len() + 1);
+                out.push(PAYLOAD_TAG_ZSTD);
+                out.append(&mut z);
+                return std::borrow::Cow::Owned(out);
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(bytes)
+}
+
+/// Decode a stored record: zstd-tagged records decompress; anything starting
+/// with `{` is raw JSON (legacy or above-threshold).
+fn decode_payload_record(stored: Vec<u8>) -> Option<Vec<u8>> {
+    match stored.first() {
+        Some(&PAYLOAD_TAG_ZSTD) => {
+            zstd::bulk::decompress(&stored[1..], PAYLOAD_COMPRESS_MAX * 4).ok()
+        }
+        _ => Some(stored),
+    }
+}
+
 impl PayloadStore {
     fn new() -> Self {
-        Self { inner: PayloadInner::Memory { data: Vec::new() } }
+        Self { compress: false, inner: PayloadInner::Memory { data: Vec::new() } }
     }
 
     /// Open (or create) a disk-backed store, truncating to zero.
@@ -197,7 +238,7 @@ impl PayloadStore {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(Self { inner: PayloadInner::Disk {
+        Ok(Self { compress: false, inner: PayloadInner::Disk {
             file,
             total_len: 0,
             #[cfg(unix)]
@@ -213,7 +254,7 @@ impl PayloadStore {
             .open(path)?;
         #[cfg(unix)]
         let mmap = MmapView::try_new(&file, total_len as usize);
-        Ok(Self { inner: PayloadInner::Disk {
+        Ok(Self { compress: false, inner: PayloadInner::Disk {
             file,
             total_len,
             #[cfg(unix)]
@@ -237,6 +278,7 @@ impl PayloadStore {
             budget,
         )?;
         Ok(Self {
+            compress: false, // remote store is read-only; records self-describe
             inner: PayloadInner::Remote {
                 cache: std::sync::Mutex::new(cache),
             },
@@ -250,6 +292,8 @@ impl PayloadStore {
     /// Append raw bytes; returns `(offset, len)`.
     /// Panics on disk write failure (disk-full etc.) — callers do not recover.
     fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+        let stored = encode_payload_record(bytes, self.compress);
+        let bytes: &[u8] = &stored;
         match &mut self.inner {
             PayloadInner::Memory { data } => {
                 let offset = data.len() as u64;
@@ -284,6 +328,12 @@ impl PayloadStore {
 
     fn append_batch(&mut self, items: &[&[u8]]) -> Vec<(u64, u32)> {
         if items.is_empty() { return vec![]; }
+        let encoded: Vec<std::borrow::Cow<'_, [u8]>> = items
+            .iter()
+            .map(|b| encode_payload_record(b, self.compress))
+            .collect();
+        let items: Vec<&[u8]> = encoded.iter().map(|c| c.as_ref()).collect();
+        let items = items.as_slice();
         match &mut self.inner {
             PayloadInner::Memory { data } => {
                 items.iter().map(|bytes| {
@@ -331,9 +381,11 @@ impl PayloadStore {
             .and_then(|b| serde_json::from_slice(&b).ok())
     }
 
-    /// Return raw JSON bytes at the given position (owned copy).
+    /// Return raw JSON bytes at the given position (owned copy), transparently
+    /// decompressing zstd-tagged records.
     pub(crate) fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
         self.get_raw_at(offset, len as usize)
+            .and_then(decode_payload_record)
     }
 
     /// Read `read_len` bytes starting at an arbitrary absolute byte offset.
@@ -547,6 +599,7 @@ pub struct CoreDB {
 }
 
 /// Configuration for [`CoreDB::open_with_config`].
+#[derive(Clone)]
 pub struct Config {
     /// How edges are stored.  [`EdgeMode::Fat`] keeps metadata in RAM
     /// (original behaviour); [`EdgeMode::Compact`] puts metadata on disk
@@ -559,6 +612,12 @@ pub struct Config {
     /// Existing WAL files keep their detected format (auto-detected from
     /// the file header). To switch an existing database, compact first.
     pub wal_format: WalFormat,
+    /// Compress payload records with zstd (first-byte tag; records > 64 KB stay
+    /// raw so large-payload fast paths keep working). Read side auto-detects per
+    /// record — mixed/legacy files need no migration; `compact()` transcodes the
+    /// whole store to the current setting. Default off pending the read-latency
+    /// gate (see benchmarks).
+    pub payload_compression: bool,
     /// **Experimental.** Serve topology (nodes + edges) from the mmap'd files
     /// written at `compact()` instead of loading it into RAM. The OS page cache
     /// keeps the hot working set resident and pages the rest — topology size is
@@ -578,6 +637,7 @@ impl Default for Config {
             edge_mode: EdgeMode::Compact,
             read_only: false,
             wal_format: WalFormat::Binary,
+            payload_compression: false,
             paged_topology: false,
         }
     }
@@ -745,6 +805,7 @@ impl CoreDB {
 
         let mut db = Self::new();
         db.payload_store = PayloadStore {
+            compress: false,
             inner: PayloadInner::Remote {
                 cache: std::sync::Mutex::new(block_cache),
             },
@@ -948,6 +1009,7 @@ impl CoreDB {
         } else {
             db.payload_store = PayloadStore::open_file(&pay_path)?;
         }
+        db.payload_store.compress = config.payload_compression;
 
         if let Some(snap) = snap {
             if paged {
@@ -2460,9 +2522,13 @@ impl CoreDB {
                             if let Some(bytes) = self.payload_store.get_raw(
                                 node.payload_offset, node.payload_len)
                             {
-                                tmp_file.write_all_at(&bytes, write_cursor)?;
-                                node_new_offsets.push((h, write_cursor, bytes.len() as u32));
-                                write_cursor += bytes.len() as u64;
+                                // get_raw decoded; re-encode under the current
+                                // compression policy (transcode both directions).
+                                let stored = encode_payload_record(
+                                    &bytes, self.payload_store.compress);
+                                tmp_file.write_all_at(&stored, write_cursor)?;
+                                node_new_offsets.push((h, write_cursor, stored.len() as u32));
+                                write_cursor += stored.len() as u64;
                             }
                         }
                     }
@@ -2480,7 +2546,9 @@ impl CoreDB {
             }
             // Atomically replace file, then reopen.
             std::fs::rename(&pay_tmp, &pay_path)?;
+            let keep_compress = self.payload_store.compress;
             self.payload_store = PayloadStore::open_existing(&pay_path, write_cursor)?;
+            self.payload_store.compress = keep_compress;
         } else {
             // Memory DB: rebuild Vec<u8> without touching disk.
             let mut new_slab: Vec<u8> = Vec::new();
@@ -6493,6 +6561,63 @@ mod hybrid_query_tests {
         // And paged open over the same manifest dir.
         let paged = CoreDB::open_paged(dir.path()).unwrap();
         assert_eq!(paged.query("SELECT * FROM place").unwrap().collect().len(), 2);
+    }
+
+    #[test]
+    fn payload_compression_roundtrips_and_shrinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config { payload_compression: true, ..Config::default() };
+        let body = "Uluwatu temple sunset ".repeat(30); // compressible text
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+            for i in 0..50 {
+                db.put(&format!("place/p{i}"),
+                    &format!(r#"{{"_collection":"place","_key":"p{i}","score":{i},"desc":"{body}"}}"#)).unwrap();
+            }
+            db.link("place/p0", "place/p1", "near", 1.0);
+            db.compact().unwrap();
+        }
+        let compressed_size = std::fs::metadata(dir.path().join("payloads.bin")).unwrap().len();
+
+        // Reopen (compressed store) — reads decode transparently; queries intact.
+        {
+            let db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+            let p: Value = serde_json::from_str(&db.get("place/p7").unwrap()).unwrap();
+            assert!(p["desc"].as_str().unwrap().starts_with("Uluwatu temple"));
+            assert_eq!(db.query("SELECT * FROM place WHERE score > 40").unwrap().collect().len(), 9);
+            let hits = db.query(
+                "SELECT b._key AS k FROM MATCH (a:place)-[:near]->(b:place) WHERE a._key='p0'"
+            ).unwrap().collect();
+            assert_eq!(hits[0].payload.as_ref().unwrap()["k"].as_str().unwrap(), "p1");
+        }
+
+        // Same data uncompressed → compare sizes; then reopening WITHOUT the flag
+        // still reads the compressed records (auto-detect) and compact() transcodes
+        // back to raw.
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir2.path()).unwrap();
+            for i in 0..50 {
+                db.put(&format!("place/p{i}"),
+                    &format!(r#"{{"_collection":"place","_key":"p{i}","score":{i},"desc":"{body}"}}"#)).unwrap();
+            }
+            db.link("place/p0", "place/p1", "near", 1.0);
+            db.compact().unwrap();
+        }
+        let raw_size = std::fs::metadata(dir2.path().join("payloads.bin")).unwrap().len();
+        assert!(compressed_size * 2 < raw_size,
+            "compressed store must be at least 2x smaller ({compressed_size} vs {raw_size})");
+
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap(); // no compression flag
+            let p: Value = serde_json::from_str(&db.get("place/p3").unwrap()).unwrap();
+            assert_eq!(p["_key"].as_str().unwrap(), "p3", "auto-detect must read compressed records");
+            db.compact().unwrap(); // transcodes to raw under current (off) policy
+        }
+        let transcoded = std::fs::metadata(dir.path().join("payloads.bin")).unwrap().len();
+        assert!(transcoded > compressed_size * 2, "compact without flag must transcode back to raw");
+        let db = CoreDB::open(dir.path()).unwrap();
+        assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 50);
     }
 
     #[test]
