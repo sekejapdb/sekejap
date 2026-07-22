@@ -3094,6 +3094,7 @@ impl CoreDB {
         self.payload_store.get(off, len)
     }
 
+
     /// For large payloads, read just a head slice and a tail slice to extract fields
     /// without loading the full payload (e.g. avoids reading a 12 MB geometry blob).
     pub(crate) fn get_payload_head_tail(
