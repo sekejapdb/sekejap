@@ -510,6 +510,14 @@ pub struct CoreDB {
     slug_map: HashMap<String, u64>,
     /// Graph edges (forward + reverse adjacency, edge type names, metadata).
     edges: storage::edgestore::EdgeStore,
+    /// Auto-compaction mode + thresholds (copied from `Config` at open).
+    auto_compact: AutoCompact,
+    compact_thresholds: CompactThresholds,
+    compact_on_close: bool,
+    /// Amortises the WAL-size stat: thresholds are checked every N writes.
+    writes_since_compact_check: u32,
+    /// Reentrancy guard for the on-write hook.
+    autocompacting: bool,
     /// Paged-topology base (mmap'd files written at compact). `None` = resident
     /// mode (default). When `Some`, the resident maps above act as the **write
     /// overlay** since open, and the topology accessors merge overlay-over-base.
@@ -599,6 +607,32 @@ pub struct CoreDB {
 }
 
 /// Configuration for [`CoreDB::open_with_config`].
+/// Auto-compaction execution mode. See [`Config::auto_compact`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoCompact {
+    /// Never compact automatically (app calls `compact()` itself).
+    Off,
+    /// Track thresholds only; the app calls [`CoreDB::maybe_compact`] at idle.
+    Manual,
+    /// SQLite-style: the write that crosses a threshold compacts inline.
+    OnWrite,
+}
+
+/// Thresholds that make compaction eligible.
+#[derive(Clone, Copy, Debug)]
+pub struct CompactThresholds {
+    /// Compact when `wal.log` exceeds this many bytes (bounds reopen + disk).
+    pub wal_bytes: u64,
+    /// Paged mode: compact when the RAM write-overlay holds this many nodes.
+    pub overlay_entries: usize,
+}
+
+impl Default for CompactThresholds {
+    fn default() -> Self {
+        Self { wal_bytes: 64 << 20, overlay_entries: 200_000 }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     /// How edges are stored.  [`EdgeMode::Fat`] keeps metadata in RAM
@@ -612,6 +646,19 @@ pub struct Config {
     /// Existing WAL files keep their detected format (auto-detected from
     /// the file header). To switch an existing database, compact first.
     pub wal_format: WalFormat,
+    /// When compaction runs automatically. `OnWrite` (default) mirrors SQLite's
+    /// auto-checkpoint: a write that crosses a threshold runs `compact()` inline
+    /// on that call (occasional seconds-scale stall, zero-ops). `Manual` only
+    /// tracks thresholds — the app calls [`CoreDB::maybe_compact`] at idle
+    /// moments (request-loop gaps, robot sleep). `Off` disables both.
+    pub auto_compact: AutoCompact,
+    /// Thresholds that make compaction *eligible* (used by both `OnWrite` and
+    /// `maybe_compact`): WAL size bounds reopen-replay time and disk; overlay
+    /// entries bounds RAM growth in paged mode.
+    pub compact_thresholds: CompactThresholds,
+    /// Run a final `compact()` when the database is dropped (only if the WAL is
+    /// non-trivial). Off by default — drops should not stall unexpectedly.
+    pub compact_on_close: bool,
     /// Compress payload records with zstd (first-byte tag; records > 64 KB stay
     /// raw so large-payload fast paths keep working). Read side auto-detects per
     /// record — mixed/legacy files need no migration; `compact()` transcodes the
@@ -637,6 +684,9 @@ impl Default for Config {
             edge_mode: EdgeMode::Compact,
             read_only: false,
             wal_format: WalFormat::Binary,
+            auto_compact: AutoCompact::OnWrite,
+            compact_thresholds: CompactThresholds::default(),
+            compact_on_close: false,
             payload_compression: false,
             paged_topology: false,
         }
@@ -649,6 +699,27 @@ impl Default for CoreDB {
     }
 }
 
+impl Drop for CoreDB {
+    fn drop(&mut self) {
+        // Optional final checkpoint for an instant next open. Only when opted in,
+        // only when the WAL is non-trivial, and never during a panic unwind.
+        if self.compact_on_close
+            && self.data_dir.is_some()
+            && !std::thread::panicking()
+        {
+            let wal_len = self
+                .data_dir
+                .as_ref()
+                .and_then(|d| std::fs::metadata(d.join("wal.log")).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if wal_len > 4096 {
+                let _ = self.compact();
+            }
+        }
+    }
+}
+
 impl CoreDB {
     // ── Constructors ──────────────────────────────────────────────────────────
 
@@ -657,6 +728,11 @@ impl CoreDB {
         Self {
             nodes: HashMap::new(),
             slug_map: HashMap::new(),
+            auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
+            compact_thresholds: CompactThresholds::default(),
+            compact_on_close: false,
+            writes_since_compact_check: 0,
+            autocompacting: false,
             topo_base: None,
             edges: storage::edgestore::EdgeStore::new_fat(),
             collections: HashMap::new(),
@@ -1010,6 +1086,9 @@ impl CoreDB {
             db.payload_store = PayloadStore::open_file(&pay_path)?;
         }
         db.payload_store.compress = config.payload_compression;
+        db.auto_compact = config.auto_compact;
+        db.compact_thresholds = config.compact_thresholds;
+        db.compact_on_close = config.compact_on_close;
 
         if let Some(snap) = snap {
             if paged {
@@ -2029,6 +2108,64 @@ impl CoreDB {
         }
     }
 
+    /// SQLite-style inline auto-compaction: the write that crosses a threshold
+    /// pays for the compact. MUST only be called at the END of a fully-applied
+    /// public mutation (maps + WAL both updated) — never from inside `wal_write`,
+    /// where the WAL entry precedes the map update and an inline compact would
+    /// snapshot pre-mutation state while truncating the entry (data loss; caught
+    /// by test auto_compact_on_write_fires_and_truncates_wal). Guards: bulk loads
+    /// and transactions run with `defer_wal_sync = true` and are never
+    /// interrupted; reentrancy is blocked; the WAL stat is amortised to every
+    /// 64th write.
+    fn autocompact_after_write(&mut self) {
+        if self.auto_compact != AutoCompact::OnWrite
+            || self.defer_wal_sync
+            || self.autocompacting
+        {
+            return;
+        }
+        self.writes_since_compact_check += 1;
+        if self.writes_since_compact_check < 64 {
+            return;
+        }
+        self.writes_since_compact_check = 0;
+        if self.compact_eligible() {
+            self.autocompacting = true;
+            // Best-effort: a failed auto-compact leaves the WAL intact (safe);
+            // persistent failures surface on the next explicit compact().
+            let _ = self.compact();
+            self.autocompacting = false;
+        }
+    }
+
+    /// Have the auto-compaction thresholds been crossed?
+    fn compact_eligible(&self) -> bool {
+        let Some(dir) = &self.data_dir else { return false };
+        if self.auto_compact == AutoCompact::Off {
+            return false;
+        }
+        let wal_len = std::fs::metadata(dir.join("wal.log"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if wal_len > self.compact_thresholds.wal_bytes {
+            return true;
+        }
+        // Paged mode: the resident maps are the RAM write-overlay.
+        self.topo_base.is_some() && self.nodes.len() >= self.compact_thresholds.overlay_entries
+    }
+
+    /// Compact **iff** the auto-compaction thresholds are crossed. The idle-time
+    /// companion to [`Config::auto_compact`]`::Manual`: the engine decides *if*,
+    /// the app decides *when* (call this in request-loop gaps / device idle).
+    /// Returns `Ok(true)` when a compaction ran.
+    pub fn maybe_compact(&mut self) -> io::Result<bool> {
+        if !self.compact_eligible() {
+            return Ok(false);
+        }
+        self.compact()?;
+        Ok(true)
+    }
+
     fn wal_flush(&mut self) {
         if let Some(wal) = &mut self.wal {
             wal.sync()
@@ -2403,6 +2540,7 @@ impl CoreDB {
             }
         }
 
+        self.autocompact_after_write();
         Ok(hash)
     }
 
@@ -2424,6 +2562,7 @@ impl CoreDB {
         self.defer_wal_sync = false;
         self.wal_flush();
         self.flush_deferred_indexes();
+        self.autocompact_after_write();
         result
     }
 
@@ -2433,6 +2572,7 @@ impl CoreDB {
             slug: slug.to_string(),
         });
         self.remove_raw(slug);
+        self.autocompact_after_write();
     }
 
     /// Create a directed edge: `from` → `to` with a type label and strength.
@@ -2445,6 +2585,7 @@ impl CoreDB {
             strength,
         });
         self.link_raw(from, to, edge_type, strength);
+        self.autocompact_after_write();
     }
 
     /// Like `link` but attaches a JSON metadata object to the edge.
@@ -2465,6 +2606,7 @@ impl CoreDB {
             meta: meta_json.to_string(),
         });
         self.link_meta_raw(from, to, edge_type, strength, meta_json)?;
+        self.autocompact_after_write();
         Ok(())
     }
 
@@ -2476,6 +2618,7 @@ impl CoreDB {
             edge_type: edge_type.to_string(),
         });
         self.unlink_raw(from, to, edge_type);
+        self.autocompact_after_write();
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────
@@ -6618,6 +6761,70 @@ mod hybrid_query_tests {
         assert!(transcoded > compressed_size * 2, "compact without flag must transcode back to raw");
         let db = CoreDB::open(dir.path()).unwrap();
         assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 50);
+    }
+
+    #[test]
+    fn auto_compact_on_write_fires_and_truncates_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            auto_compact: AutoCompact::OnWrite,
+            compact_thresholds: CompactThresholds { wal_bytes: 2048, overlay_entries: usize::MAX },
+            ..Config::default()
+        };
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        // >64 writes (check cadence) with WAL well past 2 KB → must auto-compact.
+        for i in 0..150 {
+            db.put(&format!("t/n{i}"),
+                &format!(r#"{{"_collection":"t","_key":"n{i}","pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}"#)).unwrap();
+        }
+        let wal_len = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        assert!(wal_len < 2048 + 4096,
+            "auto-compact must have truncated the WAL (len = {wal_len})");
+        assert!(dir.path().join("nodes.bin").exists(), "compaction wrote topology files");
+        // All data intact after the inline compaction(s).
+        assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 150);
+        drop(db);
+        let db = CoreDB::open(dir.path()).unwrap();
+        assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 150);
+    }
+
+    #[test]
+    fn maybe_compact_manual_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            auto_compact: AutoCompact::Manual,
+            compact_thresholds: CompactThresholds { wal_bytes: 512, overlay_entries: usize::MAX },
+            ..Config::default()
+        };
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        for i in 0..20 {
+            db.put(&format!("t/n{i}"), &format!(r#"{{"_collection":"t","_key":"n{i}"}}"#)).unwrap();
+        }
+        // Manual mode: nothing fired automatically…
+        let wal_before = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        assert!(wal_before > 512, "WAL must have grown past the threshold");
+        // …but the idle call compacts, and a second call is a no-op.
+        assert!(db.maybe_compact().unwrap(), "thresholds crossed → must compact");
+        assert!(!db.maybe_compact().unwrap(), "fresh WAL → no-op");
+        assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 20);
+    }
+
+    #[test]
+    fn compact_on_close_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config { compact_on_close: true, auto_compact: AutoCompact::Off, ..Config::default() };
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+            for i in 0..80 {
+                db.put(&format!("t/n{i}"),
+                    &format!(r#"{{"_collection":"t","_key":"n{i}","pad":"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}}"#)).unwrap();
+            }
+        } // drop → final checkpoint
+        let wal_len = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        assert!(wal_len <= 16, "close must have checkpointed the WAL (len = {wal_len})");
+        assert!(dir.path().join("nodes.bin").exists());
+        let db = CoreDB::open(dir.path()).unwrap();
+        assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 80);
     }
 
     #[test]
