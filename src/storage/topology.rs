@@ -34,6 +34,8 @@ const MAGIC_IDX: [u8; 8] = *b"SKIDX\0\0\0";
 const MAGIC_SLUG: [u8; 8] = *b"SKSLUG\0\0";
 const MAGIC_DICT: [u8; 8] = *b"SKDICT\0\0";
 const MAGIC_COLL: [u8; 8] = *b"SKCOLL\0\0";
+const MAGIC_EMET: [u8; 8] = *b"SKEMET\0\0";
+const MAGIC_SPAT: [u8; 8] = *b"SKSPAT\0\0";
 
 /// Topology format version (independent of the snapshot version).
 /// v1 = 24 B node records (no hash — derived from the slug on read).
@@ -60,6 +62,10 @@ pub struct TopoNode {
     pub collection: String,
     pub payload_offset: u64,
     pub payload_len: u32,
+    /// Spatial metadata, if the node has geometry: 6 f64s =
+    /// [centroid_lat, centroid_lon, bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon].
+    /// Stored in the `spatial.bin` side-table; `NodeRecord.spatial_ref` points at it.
+    pub spatial: Option<[f64; 6]>,
 }
 
 pub struct TopoEdge {
@@ -67,6 +73,8 @@ pub struct TopoEdge {
     pub to_hash: u64,
     pub edge_type: String,
     pub strength: f32,
+    /// Raw JSON edge metadata, if any (stored sparsely in `edgemeta.bin`).
+    pub meta: Option<String>,
 }
 
 /// The five topology files as owned byte buffers (Phase 0). In Phase 1 the reader
@@ -78,6 +86,12 @@ pub struct TopologyBlob {
     pub idx: Vec<u8>,
     pub slugs: Vec<u8>,
     pub dict: Vec<u8>,
+    /// `spatial.bin` — sparse side-table of 48-byte spatial records
+    /// (`NodeRecord.spatial_ref` → 6×f64), so paged mode and recovery get spatial
+    /// metadata without parsing payloads.
+    pub spat: Vec<u8>,
+    /// `edgemeta.bin` — sparse edge-metadata blobs (`meta_ref` → JSON bytes).
+    pub emeta: Vec<u8>,
     /// `collections.bin` — per-collection posting lists of member dense ids
     /// (sorted, delta+StreamVByte encoded like adjacency), so collection scans in
     /// paged mode don't require a full `nodes.bin` sweep.
@@ -219,7 +233,9 @@ impl Interner {
 }
 
 /// Serialize one node's edge block: `[count][SVB neighbor deltas][types][strengths][metas]`.
-fn encode_block(sorted: &[(u64, u32, f32)]) -> Vec<u8> {
+/// Tuple = `(neighbor_id, edge_type_id, strength, meta_ref)`; `meta_ref` indexes
+/// `edgemeta.bin` (`NO_ID` = no metadata).
+fn encode_block(sorted: &[(u64, u32, f32, u32)]) -> Vec<u8> {
     let n = sorted.len();
     let mut out = Vec::new();
     write_varint(&mut out, n as u64);
@@ -227,7 +243,7 @@ fn encode_block(sorted: &[(u64, u32, f32)]) -> Vec<u8> {
     // Neighbor ids → deltas → StreamVByte.
     let mut deltas = Vec::with_capacity(n);
     let mut prev = 0u64;
-    for &(nid, _, _) in sorted {
+    for &(nid, _, _, _) in sorted {
         deltas.push(nid - prev);
         prev = nid;
     }
@@ -238,19 +254,19 @@ fn encode_block(sorted: &[(u64, u32, f32)]) -> Vec<u8> {
     out.extend_from_slice(&data);
 
     // Parallel attribute arrays.
-    for &(_, tid, _) in sorted {
+    for &(_, tid, _, _) in sorted {
         out.extend_from_slice(&tid.to_le_bytes());
     }
-    for &(_, _, s) in sorted {
+    for &(_, _, s, _) in sorted {
         out.extend_from_slice(&s.to_le_bytes());
     }
-    for _ in 0..n {
-        out.extend_from_slice(&NO_ID.to_le_bytes()); // meta_ref (Phase 0: none)
+    for &(_, _, _, m) in sorted {
+        out.extend_from_slice(&m.to_le_bytes());
     }
     out
 }
 
-fn serialize_csr(magic: &[u8; 8], per_node: &[Vec<(u64, u32, f32)>]) -> Vec<u8> {
+fn serialize_csr(magic: &[u8; 8], per_node: &[Vec<(u64, u32, f32, u32)>]) -> Vec<u8> {
     let n = per_node.len();
     // Encode each block, remembering its length.
     let blocks: Vec<Vec<u8>> = per_node.iter().map(|e| encode_block(e)).collect();
@@ -294,8 +310,13 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
     let mut types = Interner::default();
 
     // nodes.bin — v2 records (32 B): hash inline for O(1) id → hash.
+    // spatial.bin — sparse 48-byte records; spatial_ref indexes into it.
     let mut nodes_buf = Vec::new();
+    let mut spat_buf = Vec::new();
     write_header(&mut nodes_buf, &MAGIC_NODES, 0);
+    write_header(&mut spat_buf, &MAGIC_SPAT, 0);
+    let mut spat_count: u64 = 0;
+    spat_buf.extend_from_slice(&spat_count.to_le_bytes()); // patched below
     nodes_buf.extend_from_slice(&(n as u64).to_le_bytes());
     for node in nodes {
         let coll_id = if node.collection.is_empty() {
@@ -303,18 +324,32 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
         } else {
             colls.intern(&node.collection)
         };
+        let spatial_ref = match &node.spatial {
+            Some(vals) => {
+                let r = spat_count as u32;
+                for v in vals {
+                    spat_buf.extend_from_slice(&v.to_le_bytes());
+                }
+                spat_count += 1;
+                r
+            }
+            None => NO_ID,
+        };
         nodes_buf.extend_from_slice(&node.hash.to_le_bytes()); // 8
         nodes_buf.extend_from_slice(&node.payload_offset.to_le_bytes()); // 8
         nodes_buf.extend_from_slice(&node.payload_len.to_le_bytes()); // 4
         nodes_buf.extend_from_slice(&coll_id.to_le_bytes()); // 4
-        nodes_buf.extend_from_slice(&NO_ID.to_le_bytes()); // spatial_ref 4
+        nodes_buf.extend_from_slice(&spatial_ref.to_le_bytes()); // 4
         nodes_buf.extend_from_slice(&0u16.to_le_bytes()); // flags 2
         nodes_buf.extend_from_slice(&[0u8, 0u8]); // pad → 32
     }
+    spat_buf[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&spat_count.to_le_bytes());
 
-    // Adjacency (fwd by from, rev by to), neighbors sorted.
-    let mut fwd: Vec<Vec<(u64, u32, f32)>> = vec![Vec::new(); n];
-    let mut rev: Vec<Vec<(u64, u32, f32)>> = vec![Vec::new(); n];
+    // Adjacency (fwd by from, rev by to), neighbors sorted. Edge metadata is
+    // interned into edgemeta.bin; both directions share one meta_ref.
+    let mut fwd: Vec<Vec<(u64, u32, f32, u32)>> = vec![Vec::new(); n];
+    let mut rev: Vec<Vec<(u64, u32, f32, u32)>> = vec![Vec::new(); n];
+    let mut meta_blobs: Vec<&str> = Vec::new();
     for e in edges {
         let (Some(&fid), Some(&tid)) =
             (hash_to_id.get(&e.from_hash), hash_to_id.get(&e.to_hash))
@@ -322,11 +357,34 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
             continue; // dangling edge — skip
         };
         let type_id = types.intern(&e.edge_type);
-        fwd[fid as usize].push((tid, type_id, e.strength));
-        rev[tid as usize].push((fid, type_id, e.strength));
+        let meta_ref = match &e.meta {
+            Some(m) => {
+                let r = meta_blobs.len() as u32;
+                meta_blobs.push(m.as_str());
+                r
+            }
+            None => NO_ID,
+        };
+        fwd[fid as usize].push((tid, type_id, e.strength, meta_ref));
+        rev[tid as usize].push((fid, type_id, e.strength, meta_ref));
     }
     for v in fwd.iter_mut().chain(rev.iter_mut()) {
-        v.sort_by_key(|&(nid, _, _)| nid);
+        v.sort_by_key(|&(nid, _, _, _)| nid);
+    }
+
+    // edgemeta.bin — sparse blobs: header, count, offsets[(m+1)], JSON bytes.
+    let mut emeta_buf = Vec::new();
+    write_header(&mut emeta_buf, &MAGIC_EMET, 0);
+    let m = meta_blobs.len();
+    emeta_buf.extend_from_slice(&(m as u64).to_le_bytes());
+    let mut cursor = (HEADER_LEN + 8 + (m + 1) * 8) as u64;
+    for b in &meta_blobs {
+        emeta_buf.extend_from_slice(&cursor.to_le_bytes());
+        cursor += b.len() as u64;
+    }
+    emeta_buf.extend_from_slice(&cursor.to_le_bytes());
+    for b in &meta_blobs {
+        emeta_buf.extend_from_slice(b.as_bytes());
     }
 
     let fwd_buf = serialize_csr(&MAGIC_ADJF, &fwd);
@@ -416,6 +474,8 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
         idx: idx_buf,
         slugs: slugs_buf,
         dict: dict_buf,
+        spat: spat_buf,
+        emeta: emeta_buf,
         colls: colls_buf,
     }
 }
@@ -450,12 +510,16 @@ pub struct NodeRec {
     pub payload_offset: u64,
     pub payload_len: u32,
     pub collection_id: u32,
+    /// Index into `spatial.bin` (`NO_ID` = no geometry).
+    pub spatial_ref: u32,
 }
 
 pub struct EdgeRec {
     pub neighbor: u64, // dense id
     pub edge_type_id: u32,
     pub strength: f32,
+    /// Index into `edgemeta.bin` (`NO_ID` = no metadata).
+    pub meta_ref: u32,
 }
 
 pub struct TopologyView<'a> {
@@ -552,6 +616,7 @@ impl<'a> TopologyView<'a> {
                 payload_offset: rd_u64(self.nodes, o + 8),
                 payload_len: rd_u32(self.nodes, o + 16),
                 collection_id: rd_u32(self.nodes, o + 20),
+                spatial_ref: rd_u32(self.nodes, o + 24),
             })
         } else {
             Some(NodeRec {
@@ -559,6 +624,7 @@ impl<'a> TopologyView<'a> {
                 payload_offset: rd_u64(self.nodes, o),
                 payload_len: rd_u32(self.nodes, o + 8),
                 collection_id: rd_u32(self.nodes, o + 12),
+                spatial_ref: rd_u32(self.nodes, o + 16),
             })
         }
     }
@@ -601,13 +667,14 @@ impl<'a> TopologyView<'a> {
 
         let types_at = pos;
         let strengths_at = types_at + count * 4;
-        // meta array follows strengths (unused in Phase 0)
+        let metas_at = strengths_at + count * 4;
 
         (0..count)
             .map(|i| EdgeRec {
                 neighbor: neighbors[i],
                 edge_type_id: rd_u32(block, types_at + i * 4),
                 strength: rd_f32(block, strengths_at + i * 4),
+                meta_ref: rd_u32(block, metas_at + i * 4),
             })
             .collect()
     }
@@ -671,6 +738,42 @@ fn slug_in(slugs: &[u8], node_count: usize, id: u64) -> Option<&str> {
 /// 256 keeps each narrowed window within ~1 page).
 const SPARSE_STRIDE: usize = 256;
 
+/// Read one 48-byte spatial record out of raw `spatial.bin` bytes.
+/// Returns the 6 f64s or `None` on `NO_ID`/OOB/absent file.
+pub(crate) fn spatial_at(spat: &[u8], spatial_ref: u32) -> Option<[f64; 6]> {
+    if spatial_ref == NO_ID || spat.len() < HEADER_LEN + 8 {
+        return None;
+    }
+    let count = rd_u64(spat, HEADER_LEN) as usize;
+    let k = spatial_ref as usize;
+    if k >= count {
+        return None;
+    }
+    let o = HEADER_LEN + 8 + k * 48;
+    let mut vals = [0f64; 6];
+    for (i, v) in vals.iter_mut().enumerate() {
+        *v = f64::from_le_bytes(spat[o + i * 8..o + i * 8 + 8].try_into().ok()?);
+    }
+    Some(vals)
+}
+
+/// Read one edge-metadata blob out of raw `edgemeta.bin` bytes (free-standing so
+/// the recovery path can use it over an owned buffer). `None` on absence/OOB.
+pub(crate) fn emeta_bytes_at(emeta: &[u8], meta_ref: u32) -> Option<&[u8]> {
+    if meta_ref == NO_ID || emeta.len() < HEADER_LEN + 8 {
+        return None;
+    }
+    let count = rd_u64(emeta, HEADER_LEN) as usize;
+    let k = meta_ref as usize;
+    if k >= count {
+        return None;
+    }
+    let offsets = HEADER_LEN + 8;
+    let start = rd_u64(emeta, offsets + k * 8) as usize;
+    let end = rd_u64(emeta, offsets + (k + 1) * 8) as usize;
+    emeta.get(start..end)
+}
+
 // ── MappedTopology — the Phase 1 store: files served via mmap ─────────────────
 
 /// One topology file, mmap'd when possible (unix), owned bytes otherwise. The OS
@@ -712,6 +815,8 @@ pub struct MappedEdge {
     pub other_hash: u64,
     pub edge_type_hash: u64,
     pub strength: f32,
+    /// Index into `edgemeta.bin` (`NO_ID` = none).
+    pub meta_ref: u32,
 }
 
 /// mmap-backed topology store with a **hash-keyed** API mirroring the engine's
@@ -736,6 +841,10 @@ pub struct MappedTopology {
     colls: Backing,
     /// `sk_hash(collection name) → collection_id` (tiny; one entry per collection).
     coll_hash_to_id: std::collections::HashMap<u64, u32>,
+    /// `edgemeta.bin` — sparse edge-metadata JSON blobs.
+    emeta: Backing,
+    /// `spatial.bin` — sparse 48-byte spatial records.
+    spat: Backing,
 }
 
 impl MappedTopology {
@@ -765,6 +874,22 @@ impl MappedTopology {
         let colls = Backing::open(&dir.join("collections.bin"))?;
         check_header(colls.bytes(), &MAGIC_COLL)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // edgemeta.bin: tolerate absence (dirs compacted by earlier builds) —
+        // synthesize an empty, valid blob so meta lookups just return None.
+        let emeta = match Backing::open(&dir.join("edgemeta.bin")) {
+            Ok(b) => {
+                check_header(b.bytes(), &MAGIC_EMET)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                b
+            }
+            Err(_) => {
+                let mut empty = Vec::new();
+                write_header(&mut empty, &MAGIC_EMET, 0);
+                empty.extend_from_slice(&0u64.to_le_bytes()); // count
+                empty.extend_from_slice(&((HEADER_LEN + 16) as u64).to_le_bytes()); // sentinel
+                Backing::Owned(empty)
+            }
+        };
         let coll_hash_to_id = collections
             .iter()
             .enumerate()
@@ -780,6 +905,21 @@ impl MappedTopology {
             .map(|i| rd_u64(idx_bytes, base + i * 16))
             .collect();
 
+        // spatial.bin: tolerate absence (older dirs) — empty blob → no spatial.
+        let spat = match Backing::open(&dir.join("spatial.bin")) {
+            Ok(b) => {
+                check_header(b.bytes(), &MAGIC_SPAT)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                b
+            }
+            Err(_) => {
+                let mut empty = Vec::new();
+                write_header(&mut empty, &MAGIC_SPAT, 0);
+                empty.extend_from_slice(&0u64.to_le_bytes());
+                Backing::Owned(empty)
+            }
+        };
+
         Ok(Self {
             nodes,
             fwd,
@@ -794,6 +934,8 @@ impl MappedTopology {
             sparse,
             colls,
             coll_hash_to_id,
+            emeta,
+            spat,
         })
     }
 
@@ -829,6 +971,17 @@ impl MappedTopology {
             }
         }
         Some(out)
+    }
+
+        /// Raw JSON bytes of an edge-metadata blob (`meta_ref` from a [`MappedEdge`]).
+    pub fn edge_meta_bytes(&self, meta_ref: u32) -> Option<&[u8]> {
+        emeta_bytes_at(self.emeta.bytes(), meta_ref)
+    }
+
+    /// Spatial record for a node (6 f64s), or `None` if it has no geometry.
+    pub fn spatial(&self, id: u64) -> Option<[f64; 6]> {
+        let rec = self.node_record(id)?;
+        spatial_at(self.spat.bytes(), rec.spatial_ref)
     }
 
     /// All node hashes in the store (iterates `nodes.bin` records — O(n), used by
@@ -867,6 +1020,7 @@ impl MappedTopology {
                 payload_offset: rd_u64(b, o + 8),
                 payload_len: rd_u32(b, o + 16),
                 collection_id: rd_u32(b, o + 20),
+                spatial_ref: rd_u32(b, o + 24),
             })
         } else {
             Some(NodeRec {
@@ -874,6 +1028,7 @@ impl MappedTopology {
                 payload_offset: rd_u64(b, o),
                 payload_len: rd_u32(b, o + 8),
                 collection_id: rd_u32(b, o + 12),
+                spatial_ref: rd_u32(b, o + 16),
             })
         }
     }
@@ -905,7 +1060,12 @@ impl MappedTopology {
                     let other_hash = self.hash_of(e.neighbor)?;
                     let edge_type_hash =
                         self.type_hashes.get(e.edge_type_id as usize).copied()?;
-                    Some(MappedEdge { other_hash, edge_type_hash, strength: e.strength })
+                    Some(MappedEdge {
+                        other_hash,
+                        edge_type_hash,
+                        strength: e.strength,
+                        meta_ref: e.meta_ref,
+                    })
                 })
                 .collect(),
         )
@@ -950,15 +1110,15 @@ mod tests {
     fn topology_roundtrip_nodes_edges_names() {
         // Bali-themed mini graph: tourists → places, places → area.
         let nodes = vec![
-            TopoNode { hash: h("t/chloe"),  slug: "t/chloe".into(),  collection: "tourist".into(), payload_offset: 0,   payload_len: 10 },
-            TopoNode { hash: h("p/uluwatu"),slug: "p/uluwatu".into(),collection: "place".into(),   payload_offset: 10,  payload_len: 20 },
-            TopoNode { hash: h("p/ubud"),   slug: "p/ubud".into(),   collection: "place".into(),   payload_offset: 30,  payload_len: 15 },
-            TopoNode { hash: h("a/south"),  slug: "a/south".into(),  collection: "area".into(),    payload_offset: 45,  payload_len: 5  },
+            TopoNode { hash: h("t/chloe"),  slug: "t/chloe".into(),  collection: "tourist".into(), payload_offset: 0,   payload_len: 10, spatial: None },
+            TopoNode { hash: h("p/uluwatu"),slug: "p/uluwatu".into(),collection: "place".into(),   payload_offset: 10,  payload_len: 20, spatial: None },
+            TopoNode { hash: h("p/ubud"),   slug: "p/ubud".into(),   collection: "place".into(),   payload_offset: 30,  payload_len: 15, spatial: None },
+            TopoNode { hash: h("a/south"),  slug: "a/south".into(),  collection: "area".into(),    payload_offset: 45,  payload_len: 5, spatial: None  },
         ];
         let edges = vec![
-            TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/uluwatu"), edge_type: "visited".into(), strength: 1.0 },
-            TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/ubud"),    edge_type: "visited".into(), strength: 0.5 },
-            TopoEdge { from_hash: h("p/uluwatu"), to_hash: h("a/south"),   edge_type: "in_area".into(), strength: 1.0 },
+            TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/uluwatu"), edge_type: "visited".into(), strength: 1.0, meta: None },
+            TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/ubud"),    edge_type: "visited".into(), strength: 0.5, meta: None },
+            TopoEdge { from_hash: h("p/uluwatu"), to_hash: h("a/south"),   edge_type: "in_area".into(), strength: 1.0, meta: None },
         ];
 
         let blob = build(&nodes, &edges);
