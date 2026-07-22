@@ -69,7 +69,10 @@ use text_index::gist::GiSTIndex;
 ///      JSON body. The header lets a future reader detect the encoding *before*
 ///      committing to a parser, so a later binary/compressed snapshot (v3+) is
 ///      an additive dispatch arm rather than a breaking change. Mirrors the WAL.
-const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// v3 = manifest snapshots: on disk-backed DBs the snapshot no longer carries
+/// nodes/edges (they live in the topology files, the single source of truth);
+/// `topology_in_files = true` marks it. v2 (full JSON topology) is still read.
+const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// Magic prefix identifying a versioned (v2+) snapshot file. Legacy v1 files
 /// start with `{` (JSON) and are auto-detected as headerless.
@@ -747,7 +750,29 @@ impl CoreDB {
             },
         };
 
-        db.load_snapshot(snap);
+        if snap.topology_in_files {
+            // v3 manifest: fetch the topology files (small vs payloads) and
+            // rebuild the resident graph from them. Payloads stay remote.
+            let fetch = |name: &str| -> Result<Vec<u8>, String> {
+                remote.fetch_file(name).map_err(|e| format!("fetching {name}: {e}"))
+            };
+            let blob = storage::topology::TopologyBlob {
+                nodes: fetch("nodes.bin")?,
+                fwd: fetch("adj_fwd.bin")?,
+                rev: fetch("adj_rev.bin")?,
+                idx: fetch("idx.bin")?,
+                slugs: fetch("slugs.bin")?,
+                dict: fetch("dict.bin")?,
+                spat: fetch("spatial.bin").unwrap_or_default(),
+                emeta: fetch("edgemeta.bin").unwrap_or_default(),
+                colls: fetch("collections.bin").unwrap_or_default(),
+            };
+            db.load_snapshot_parts(snap, /*load_topology=*/ false);
+            db.load_topology_blob(&blob)
+                .map_err(|e| format!("loading topology files: {e}"))?;
+        } else {
+            db.load_snapshot(snap);
+        }
 
         // Download small index files (GIN, search) if they exist on remote,
         // then load them to restore full-text search capability.
@@ -932,6 +957,10 @@ impl CoreDB {
                 // write overlay. WAL replay below adds post-compact writes to it.
                 db.topo_base = Some(storage::topology::MappedTopology::open(dir)?);
                 db.load_snapshot_parts(snap, /*load_topology=*/ false);
+            } else if snap.topology_in_files {
+                // v3 manifest: nodes + edges live in the topology files.
+                db.load_snapshot_parts(snap, /*load_topology=*/ false);
+                db.load_topology_files(dir)?;
             } else {
                 db.load_snapshot(snap);
             }
@@ -971,6 +1000,8 @@ impl CoreDB {
         // The legacy bloated variant (gin_indexes embedded as JSON) was 1-10 GB.
         // Use 500 MB as the threshold — safely above any real snapshot, far below bloated ones.
         if snap_file_size > 500 * 1024 * 1024 {
+            // v3 snapshots are manifests — the topology files must exist first.
+            if db.write_topology_files(dir).is_ok() {
             if let Ok(snap_json) = serde_json::to_vec(&db.build_snapshot()) {
                 let snap_tmp = snap_path.with_extension("json.tmp");
                 if let Ok(mut sf) = std::fs::File::create(&snap_tmp) {
@@ -979,6 +1010,7 @@ impl CoreDB {
                         && sf.sync_all().is_ok()
                     {
                         let _ = std::fs::rename(&snap_tmp, &snap_path);
+                    }
                     }
                 }
             }
@@ -2478,6 +2510,12 @@ impl CoreDB {
 
         // 3. Write snapshot atomically (tmp → rename) — AFTER payload compaction
         //    so disk-backed SnapNode offsets match the new payloads.bin layout.
+        // Topology files FIRST — the v3 snapshot is a manifest that assumes they
+        // exist. Crash between the two leaves the OLD snapshot + NEW topology
+        // files, which reopens fine (old snapshot is still self-sufficient or
+        // points at the previous, still-valid files; WAL not yet truncated).
+        self.write_topology_files(&dir)?;
+
         let snap_json = serde_json::to_vec(&self.build_snapshot())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let snap_tmp = dir.join("snapshot.json.tmp");
@@ -2489,14 +2527,6 @@ impl CoreDB {
             sf.sync_all()?;
         }
         std::fs::rename(&snap_tmp, &snap_path)?;
-
-        // Phase 0: additionally write the offset-addressable topology files
-        // (nodes.bin + CSR adj_fwd/rev + idx.bin + dict.bin). ADDITIVE — `open()`
-        // still reads `snapshot.json`, so behavior is unchanged. This exercises the
-        // write path and keeps the files in sync, so the Phase 1 mmap flip becomes a
-        // read-only change. Runs after payload compaction, so node records reference
-        // the post-compaction payload offsets.
-        self.write_topology_files(&dir)?;
 
         // 3. Truncate WAL: close current writer → rename → open fresh → delete old
         self.wal = None;
@@ -2541,6 +2571,11 @@ impl CoreDB {
                 collection: n.collection.clone(),
                 payload_offset: n.payload_offset,
                 payload_len: n.payload_len,
+                spatial: n.spatial_meta.as_ref().map(|m| [
+                    m.centroid_lat, m.centroid_lon,
+                    m.bbox_min_lat, m.bbox_min_lon,
+                    m.bbox_max_lat, m.bbox_max_lon,
+                ]),
             })
             .collect();
         topo_nodes.sort_by_key(|n| n.hash);
@@ -2565,6 +2600,7 @@ impl CoreDB {
                     to_hash: e.other,
                     edge_type,
                     strength: e.strength,
+                    meta: self.edges.edge_meta(e).map(|v| v.to_string()),
                 });
             }
         }
@@ -2576,6 +2612,8 @@ impl CoreDB {
         Self::write_atomic(dir, "idx.bin", &blob.idx)?;
         Self::write_atomic(dir, "slugs.bin", &blob.slugs)?;
         Self::write_atomic(dir, "dict.bin", &blob.dict)?;
+        Self::write_atomic(dir, "spatial.bin", &blob.spat)?;
+        Self::write_atomic(dir, "edgemeta.bin", &blob.emeta)?;
         Self::write_atomic(dir, "collections.bin", &blob.colls)?;
         Ok(())
     }
@@ -2586,8 +2624,7 @@ impl CoreDB {
     /// not stored in topology files and are not recovered here; GIN/search load from
     /// their own sidecars as usual.
     fn load_topology_files(&mut self, dir: &Path) -> io::Result<()> {
-        use storage::topology::{TopologyBlob, TopologyView};
-
+        use storage::topology::TopologyBlob;
         let rd = |name: &str| std::fs::read(dir.join(name));
         let blob = TopologyBlob {
             nodes: rd("nodes.bin")?,
@@ -2596,11 +2633,20 @@ impl CoreDB {
             idx: rd("idx.bin")?,
             slugs: rd("slugs.bin")?,
             dict: rd("dict.bin")?,
-            // Older Phase-0 dirs may lack collections.bin — the recovery path
-            // derives collections from node records, so an empty blob is fine.
+            // Older Phase-0 dirs may lack these — recovery tolerates their absence
+            // (collections are derived from node records; metadata is then empty).
+            spat: rd("spatial.bin").unwrap_or_default(),
+            emeta: rd("edgemeta.bin").unwrap_or_default(),
             colls: rd("collections.bin").unwrap_or_default(),
         };
-        let view = TopologyView::new(&blob)
+        self.load_topology_blob(&blob)
+    }
+
+    /// Rebuild the resident graph from an in-memory set of topology file bytes.
+    /// Used by local open (manifest snapshots + recovery) and the S3 open path.
+    fn load_topology_blob(&mut self, blob: &storage::topology::TopologyBlob) -> io::Result<()> {
+        use storage::topology::TopologyView;
+        let view = TopologyView::new(blob)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Nodes: identity + payload location from the records; spatial metadata is
@@ -2614,11 +2660,23 @@ impl CoreDB {
                 .collection_name(rec.collection_id)
                 .unwrap_or("")
                 .to_string();
-            let spatial_meta = self
-                .payload_store
-                .get_raw(rec.payload_offset, rec.payload_len)
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|p| geo::extract_spatial_meta(&p));
+            // Side-table first (48-byte read); payload parse only for legacy dirs
+            // written before spatial.bin existed.
+            let spatial_meta = storage::topology::spatial_at(&blob.spat, rec.spatial_ref)
+                .map(|v| geo::SpatialMeta {
+                    centroid_lat: v[0], centroid_lon: v[1],
+                    bbox_min_lat: v[2], bbox_min_lon: v[3],
+                    bbox_max_lat: v[4], bbox_max_lon: v[5],
+                })
+                .or_else(|| {
+                    if !blob.spat.is_empty() {
+                        return None; // side-table present: NO_ID really means no geometry
+                    }
+                    self.payload_store
+                        .get_raw(rec.payload_offset, rec.payload_len)
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .and_then(|p| geo::extract_spatial_meta(&p))
+                });
             self.nodes.insert(hash, NodeData {
                 slug: slug.to_string(),
                 collection: coll.clone(),
@@ -2636,6 +2694,7 @@ impl CoreDB {
         }
 
         // Edges: forward adjacency only — link_raw rebuilds both directions.
+        // Edge metadata (if the blob is present) is restored via link_meta_raw.
         for id in 0..view.node_count() as u64 {
             let Some(from_slug) = view.slug(id) else { continue };
             let from_slug = from_slug.to_string();
@@ -2646,7 +2705,14 @@ impl CoreDB {
                     continue;
                 };
                 let (to_slug, ty) = (to_slug.to_string(), ty.to_string());
-                self.link_raw(&from_slug, &to_slug, &ty, e.strength);
+                let meta_json = storage::topology::emeta_bytes_at(&blob.emeta, e.meta_ref)
+                    .and_then(|b| std::str::from_utf8(b).ok().map(|s| s.to_string()));
+                match meta_json {
+                    Some(m) => {
+                        let _ = self.link_meta_raw(&from_slug, &to_slug, &ty, e.strength, &m);
+                    }
+                    None => self.link_raw(&from_slug, &to_slug, &ty, e.strength),
+                }
             }
         }
         Ok(())
@@ -2745,15 +2811,11 @@ impl CoreDB {
     fn build_snapshot(&self) -> Snapshot {
         let is_disk = self.payload_store.is_disk();
         let nodes: Vec<SnapNode> = if is_disk {
-            // Disk-backed: payloads live in payloads.bin — only store metadata.
-            self.nodes.values().map(|n| SnapNode {
-                slug:           n.slug.clone(),
-                payload:        None,
-                payload_offset: Some(n.payload_offset),
-                payload_len:    Some(n.payload_len),
-                collection:     Some(n.collection.clone()),
-                spatial_meta:   n.spatial_meta.clone(),
-            }).collect()
+            // Disk-backed → MANIFEST snapshot (v3): nodes + edges live in the
+            // topology files written alongside (`write_topology_files`, always
+            // called before the snapshot at compact). The snapshot carries only
+            // schemas / vectors / HNSW / btree metadata.
+            Vec::new()
         } else {
             self.nodes
                 .values()
@@ -2774,6 +2836,9 @@ impl CoreDB {
 
         let mut edges: Vec<SnapEdge> = Vec::new();
         for (&from_h, edge_list) in self.edges.iter_fwd() {
+            if is_disk {
+                break; // manifest: edges live in the topology files
+            }
             let from_slug = match self.nodes.get(&from_h) {
                 Some(n) => n.slug.clone(),
                 None => continue, // dangling edge, skip
@@ -2853,6 +2918,7 @@ impl CoreDB {
         Snapshot {
             version: SNAPSHOT_FORMAT_VERSION,
             is_disk_backed: is_disk,
+            topology_in_files: is_disk,
             has_vector_files,
             nodes,
             edges,
@@ -4463,8 +4529,11 @@ impl CoreDB {
                 .collection_name(rec.collection_id)
                 .unwrap_or("")
                 .to_string(),
-            // Not stored in the topology files yet (spatial side-table pending).
-            spatial_meta: None,
+            spatial_meta: base.spatial(id).map(|v| geo::SpatialMeta {
+                centroid_lat: v[0], centroid_lon: v[1],
+                bbox_min_lat: v[2], bbox_min_lon: v[3],
+                bbox_max_lat: v[4], bbox_max_lon: v[5],
+            }),
             payload_offset: rec.payload_offset,
             payload_len: rec.payload_len,
         }))
@@ -4514,7 +4583,9 @@ impl CoreDB {
             (overlay, Some(b)) => {
                 let mut v: Vec<Edge> = b
                     .into_iter()
-                    .map(|e| Edge::plain(e.other_hash, e.edge_type_hash, e.strength))
+                    .map(|e| Edge::from_base(
+                        e.other_hash, e.edge_type_hash, e.strength, e.meta_ref,
+                    ))
                     .collect();
                 if let Some(o) = overlay {
                     v.extend_from_slice(o);
@@ -4530,6 +4601,12 @@ impl CoreDB {
     }
 
     pub(crate) fn edge_meta(&self, edge: &Edge) -> Option<Value> {
+        // Base edges carry an edgemeta.bin reference (high bit); overlay edges
+        // resolve through the resident meta store.
+        if let Some(meta_ref) = edge.base_meta_ref() {
+            let bytes = self.topo_base.as_ref()?.edge_meta_bytes(meta_ref)?;
+            return serde_json::from_slice(bytes).ok();
+        }
         self.edges.edge_meta(edge)
     }
 
@@ -4618,9 +4695,26 @@ impl CoreDB {
     }
 
     fn rebuild_spatial_grid(&mut self) {
-        let items: Vec<(u64, geo::SpatialMeta)> = self.nodes.iter()
+        let mut items: Vec<(u64, geo::SpatialMeta)> = self.nodes.iter()
             .filter_map(|(&hash, node)| node.spatial_meta.clone().map(|m| (hash, m)))
             .collect();
+        // Paged mode: base nodes live in the mmap, not in self.nodes — pull their
+        // spatial records from the side-table (48 B each; only geometry nodes).
+        if let Some(base) = &self.topo_base {
+            for id in 0..base.node_count() as u64 {
+                if let Some(v) = base.spatial(id) {
+                    if let Some(h) = base.hash_of(id) {
+                        if !self.nodes.contains_key(&h) {
+                            items.push((h, geo::SpatialMeta {
+                                centroid_lat: v[0], centroid_lon: v[1],
+                                bbox_min_lat: v[2], bbox_min_lon: v[3],
+                                bbox_max_lat: v[4], bbox_max_lon: v[5],
+                            }));
+                        }
+                    }
+                }
+            }
+        }
         self.spatial_grid = Some(geo::SpatialGrid::build(items.into_iter()));
     }
 
@@ -5922,6 +6016,10 @@ struct Snapshot {
     /// instead of parsing vectors from JSON and migrating to disk.
     #[serde(default)]
     has_vector_files: bool,
+    /// true (v3+) = manifest snapshot: nodes/edges live in the topology files;
+    /// the arrays below are empty. v2 snapshots deserialize as false.
+    #[serde(default)]
+    topology_in_files: bool,
     nodes: Vec<SnapNode>,
     edges: Vec<SnapEdge>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6058,6 +6156,8 @@ mod hybrid_query_tests {
             idx: rd("idx.bin"),
             slugs: rd("slugs.bin"),
             dict: rd("dict.bin"),
+            spat: rd("spatial.bin"),
+            emeta: rd("edgemeta.bin"),
             colls: rd("collections.bin"),
         };
         let view = TopologyView::new(&blob).unwrap();
@@ -6260,6 +6360,138 @@ mod hybrid_query_tests {
         // (a real collision can't be forged against the base without breaking the
         // idx invariant, so we just assert same-slug base update passes)
         db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu","u":1}"#).unwrap();
+    }
+
+    #[test]
+    fn paged_mode_serves_edge_metadata_from_base() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
+            db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
+            db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
+            db.link_meta("tourist/chloe", "place/uluwatu", "visited", 0.9,
+                r#"{"days":3,"season":"dry"}"#).unwrap();
+            db.link("tourist/chloe", "place/ubud", "visited", 0.5); // no meta
+            db.compact().unwrap();
+        }
+
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert!(paged.nodes.is_empty(), "must be served from base");
+
+        // r.<meta field> from the mapped base.
+        let hits = paged.query(
+            "SELECT b._key AS k, r.days AS d, r.strength AS s \
+             FROM MATCH (a:tourist)-[r:visited]->(b:place) \
+             WHERE a._key='chloe' ORDER BY k ASC"
+        ).unwrap().collect();
+        assert_eq!(hits.len(), 2);
+        let ubud = hits[0].payload.as_ref().unwrap();
+        let ulu = hits[1].payload.as_ref().unwrap();
+        assert_eq!(ulu["k"].as_str().unwrap(), "uluwatu");
+        assert_eq!(ulu["d"].as_i64().or(ulu["d"].as_f64().map(|f| f as i64)).unwrap(), 3,
+            "edge metadata must be served from edgemeta.bin");
+        assert!((ulu["s"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+        assert!(ubud["d"].is_null(), "meta-less edge stays meta-less");
+
+        // And recovery (snapshot lost) restores edge metadata too.
+        drop(paged);
+        std::fs::remove_file(dir.path().join("snapshot.json")).unwrap();
+        let recovered = CoreDB::open(dir.path()).unwrap();
+        let hits = recovered.query(
+            "SELECT r.season AS se FROM MATCH (a:tourist)-[r:visited]->(b:place) \
+             WHERE a._key='chloe' AND b._key='uluwatu'"
+        ).unwrap().collect();
+        assert_eq!(hits[0].payload.as_ref().unwrap()["se"].as_str().unwrap(), "dry",
+            "recovery must restore edge metadata from edgemeta.bin");
+    }
+
+    #[test]
+    fn paged_mode_serves_spatial_from_side_table() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            // Two Bali places with geometry, one without.
+            db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu",
+                "geometry":{"type":"Point","coordinates":[115.0849,-8.8291]}}"#).unwrap();
+            db.put("place/ubud", r#"{"_collection":"place","_key":"ubud",
+                "geometry":{"type":"Point","coordinates":[115.2625,-8.5069]}}"#).unwrap();
+            db.put("place/nowhere", r#"{"_collection":"place","_key":"nowhere"}"#).unwrap();
+            db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
+            db.link("tourist/chloe", "place/uluwatu", "visited", 1.0);
+            db.link("tourist/chloe", "place/ubud", "visited", 1.0);
+            db.compact().unwrap();
+        }
+
+        // Resident results first (sequential opens — single-writer lock).
+        let q_grid = "SELECT _key FROM place WHERE ST_DWithin(geometry, POINT(115.08 -8.83), 5.0) ORDER BY _key ASC";
+        let q_match = "SELECT b._key AS k FROM MATCH (a:tourist)-[:visited]->(b:place) \
+                       WHERE a._key='chloe' AND ST_DWithin(b.geometry, POINT(115.08 -8.83), 5.0)";
+        let (r_grid, r_match) = {
+            let resident = CoreDB::open(dir.path()).unwrap();
+            let g: Vec<_> = resident.query(q_grid).unwrap().collect()
+                .iter().map(|h| h.payload.clone()).collect();
+            let m: Vec<_> = resident.query(q_match).unwrap().collect()
+                .iter().map(|h| h.payload.clone()).collect();
+            (g, m)
+        };
+        assert!(!r_grid.is_empty(), "resident spatial query must match uluwatu");
+
+        // Paged: same results, spatial served from spatial.bin (nodes map empty).
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert!(paged.nodes.is_empty());
+        let p_grid: Vec<_> = paged.query(q_grid).unwrap().collect()
+            .iter().map(|h| h.payload.clone()).collect();
+        let p_match: Vec<_> = paged.query(q_match).unwrap().collect()
+            .iter().map(|h| h.payload.clone()).collect();
+        assert_eq!(r_grid, p_grid, "grid-path spatial must match resident");
+        assert_eq!(r_match, p_match, "MATCH-filter spatial must match resident");
+    }
+
+    #[test]
+    fn manifest_snapshot_shrinks_and_reopens_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.execute("CREATE TABLE place (_key TEXT PRIMARY KEY, city TEXT)").unwrap();
+            db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
+            db.execute("INSERT INTO place (_key, city) VALUES ('uluwatu', 'Bali')").unwrap();
+            db.link_meta("tourist/chloe", "place/uluwatu", "visited", 0.9, r#"{"days":3}"#).unwrap();
+            db.compact().unwrap();
+        }
+
+        // v3 manifest: no nodes/edges arrays in the snapshot.
+        let snap = std::fs::read(dir.path().join("snapshot.json")).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&snap[16..]).unwrap();
+        assert_eq!(body["topology_in_files"], serde_json::json!(true));
+        assert!(body["nodes"].as_array().unwrap().is_empty(), "manifest must not carry nodes");
+        assert!(body["edges"].as_array().unwrap().is_empty(), "manifest must not carry edges");
+
+        // Reopen resident: everything intact — nodes, edges, edge meta, schema.
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 1);
+            let hits = db.query(
+                "SELECT b.city AS c, r.days AS d FROM MATCH (a:tourist)-[r:visited]->(b:place) \
+                 WHERE a._key='chloe'"
+            ).unwrap().collect();
+            let p = hits[0].payload.as_ref().unwrap();
+            assert_eq!(p["c"].as_str().unwrap(), "Bali");
+            assert_eq!(p["d"].as_f64().unwrap() as i64, 3, "edge meta must survive manifest reopen");
+            assert!(db.schema_ddl("place").is_some(), "schema must survive (still in snapshot)");
+
+            // Post-compact write → WAL → survives another reopen.
+            db.put("place/ubud", r#"{"_collection":"place","_key":"ubud","city":"Bali"}"#).unwrap();
+        }
+        {
+            let db = CoreDB::open(dir.path()).unwrap();
+            assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 2,
+                "WAL write after manifest compact must survive reopen");
+        }
+
+        // And paged open over the same manifest dir.
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert_eq!(paged.query("SELECT * FROM place").unwrap().collect().len(), 2);
     }
 
     #[test]

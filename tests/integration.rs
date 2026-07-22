@@ -3838,9 +3838,10 @@ fn snapshot_v2_header_present_and_reopens() {
         db.compact().unwrap();
     }
     // The compacted snapshot must carry the versioned magic header.
+    // (v3 = manifest snapshot: topology lives in the topology files.)
     let snap = std::fs::read(dir.path().join("snapshot.json")).unwrap();
-    assert_eq!(&snap[0..8], b"SKSNAP\0\0", "snapshot must start with the v2 magic");
-    assert_eq!(u32::from_le_bytes(snap[8..12].try_into().unwrap()), 2, "format version");
+    assert_eq!(&snap[0..8], b"SKSNAP\0\0", "snapshot must start with the magic");
+    assert_eq!(u32::from_le_bytes(snap[8..12].try_into().unwrap()), 3, "format version");
 
     // Reopen straight from the headered snapshot — data intact, header transparently stripped.
     let db = CoreDB::open(dir.path()).unwrap();
