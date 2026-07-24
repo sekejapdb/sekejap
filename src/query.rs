@@ -4758,9 +4758,17 @@ pub(crate) fn build_path_rows_from_raw(
 
                     let mut obj = serde_json::Map::new();
 
-                    // Per-edge properties — only for a fixed single hop, and only when
-                    // the query references an edge-bound field (lazy: one adjacency
-                    // scan + at most one metadata read per surviving edge).
+                    // `strength` is a typed column already in the CSR — serve it
+                    // from the path, never via a metadata read.
+                    if hop.max_depth == 1 {
+                        if let Some(&s) = path_strengths.last() {
+                            obj.insert("strength".to_string(), serde_json::json!(s));
+                        }
+                    }
+
+                    // Per-edge JSON metadata — only for a fixed single hop, and only
+                    // when the query references a non-intrinsic edge field (lazy: one
+                    // adjacency scan + one metadata read per surviving edge).
                     if needs_edge_meta && hop.max_depth == 1 {
                         let prev_h = if hop_idx == 0 {
                             rp.start_hash
@@ -4774,13 +4782,12 @@ pub(crate) fn build_path_rows_from_raw(
                         } else {
                             (prev_h, dest_h)
                         };
-                        if let Some((strength, meta)) =
+                        if let Some((_strength, meta)) =
                             db.edge_props_between(edge_from, edge_to, hop.edge_type_hash)
                         {
                             if let Some(Value::Object(m)) = meta {
                                 for (k, v) in m { obj.insert(k, v); }
                             }
-                            obj.insert("strength".to_string(), serde_json::json!(strength));
                         }
                     }
 
@@ -5815,11 +5822,14 @@ pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
     hits
 }
 
-/// The six reserved path-intrinsic keys on an edge-bound variable.  A reference
-/// to any of these does NOT require reading edge metadata.
-const EDGE_INTRINSICS: [&str; 6] = [
+/// Reserved edge-bound keys that are served WITHOUT reading edge metadata:
+/// the six path intrinsics plus `strength`, which is a typed column already
+/// present in the CSR (`strengths_per_hop`). Referencing only these never
+/// triggers a JSON meta parse.
+const EDGE_INTRINSICS: [&str; 7] = [
     "_depth", "_path_keys", "_path_strength",
     "_avg_strength", "_min_strength", "_max_strength",
+    "strength",
 ];
 
 /// True if a math expression references an edge-bound variable's non-intrinsic
