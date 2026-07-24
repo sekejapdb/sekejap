@@ -36,11 +36,31 @@ pub(crate) struct Edge {
 
 const NO_META: u32 = u32::MAX;
 
+/// High bit of `meta_id` marks a paged-topology base metadata reference
+/// (an index into `edgemeta.bin`) rather than an index into this store's
+/// `MetaStore`. `NO_META` (all ones) is checked first, so it never collides.
+const BASE_META_BIT: u32 = 0x8000_0000;
+
 impl Edge {
-    /// Construct a metadata-less edge (paged-topology base edges — edge metadata
-    /// is not yet served from the mapped files).
-    pub(crate) fn plain(other: u64, edge_type: u64, strength: f32) -> Self {
-        Self { other, edge_type, strength, meta_id: NO_META }
+    /// Construct an edge for the paged-topology base. `base_meta_ref` is the
+    /// `edgemeta.bin` index (`u32::MAX` = no metadata).
+    pub(crate) fn from_base(other: u64, edge_type: u64, strength: f32, base_meta_ref: u32) -> Self {
+        let meta_id = if base_meta_ref == u32::MAX {
+            NO_META
+        } else {
+            base_meta_ref | BASE_META_BIT
+        };
+        Self { other, edge_type, strength, meta_id }
+    }
+
+    /// If this edge's metadata lives in the paged base (`edgemeta.bin`), return
+    /// the base index. `None` = no metadata or resident-store metadata.
+    pub(crate) fn base_meta_ref(&self) -> Option<u32> {
+        if self.meta_id != NO_META && self.meta_id & BASE_META_BIT != 0 {
+            Some(self.meta_id & !BASE_META_BIT)
+        } else {
+            None
+        }
     }
 }
 
@@ -292,7 +312,9 @@ impl EdgeStore {
     /// Resolve metadata for an edge.  Returns `None` if the edge has no meta
     /// or if the meta could not be read.
     pub fn edge_meta(&self, edge: &Edge) -> Option<Value> {
-        if edge.meta_id == NO_META {
+        if edge.meta_id == NO_META || edge.base_meta_ref().is_some() {
+            // Base-bit ids belong to the paged topology's edgemeta.bin —
+            // resolved by CoreDB::edge_meta, never by this store.
             return None;
         }
         match &self.meta {
@@ -301,18 +323,26 @@ impl EdgeStore {
             }
             #[cfg(unix)]
             MetaStore::Disk {
-                offsets, mmap, ..
+                offsets, mmap, file, ..
             } => {
                 let &(offset, len) = offsets.get(edge.meta_id as usize)?;
                 if len == 0 {
                     return None;
                 }
-                if let Some(ref m) = mmap {
-                    let bytes = m.slice(offset as usize, len as usize)?;
-                    serde_json::from_slice(bytes).ok()
-                } else {
-                    None
+                // Fast path: mmap. Fallback: pread — the mapping can be absent or
+                // stale (shorter than the file) for metas appended since open;
+                // without this fallback such metas silently read as None (which
+                // previously made compact() drop them from snapshot + topology).
+                if let Some(bytes) = mmap
+                    .as_ref()
+                    .and_then(|m| m.slice(offset as usize, len as usize))
+                {
+                    return serde_json::from_slice(bytes).ok();
                 }
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; len as usize];
+                file.read_exact_at(&mut buf, offset as u64).ok()?;
+                serde_json::from_slice(&buf).ok()
             }
         }
     }
