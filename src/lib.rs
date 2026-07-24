@@ -2566,6 +2566,24 @@ impl CoreDB {
         result
     }
 
+    /// Bulk edge insert — the edge counterpart of [`put_many`](Self::put_many).
+    /// Defers the per-edge WAL fsync and flushes once at the end, turning an
+    /// O(N) fsync storm into a single sync. Essential for graph bulk-load: on a
+    /// disk DB, individual `link()` calls fsync each edge (correct for
+    /// incremental durability, but ~ms/edge → minutes for tens of thousands).
+    pub fn link_many<'a>(
+        &mut self,
+        edges: impl IntoIterator<Item = (&'a str, &'a str, &'a str, f32)>,
+    ) {
+        self.defer_wal_sync = true;
+        for (from, to, edge_type, strength) in edges {
+            self.link(from, to, edge_type, strength);
+        }
+        self.defer_wal_sync = false;
+        self.wal_flush();
+        self.autocompact_after_write();
+    }
+
     /// Remove a node by slug. Also removes its collection membership and edges.
     pub fn remove(&mut self, slug: &str) {
         self.wal_write(WalEntry::Remove {
