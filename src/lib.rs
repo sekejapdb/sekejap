@@ -4871,36 +4871,23 @@ impl CoreDB {
     /// per-edge properties (`r.field`) in `SELECT … FROM MATCH`.  Reads edge
     /// metadata lazily — only called when a query actually references an
     /// edge-bound variable's field.
-    pub(crate) fn edge_props_between(
+    /// Locate one forward edge ONCE and return its `(fast-lane slot, JSON meta)`.
+    /// The slot indexes the resident columns directly (`None` for a base/paged
+    /// edge, whose attributes live in the JSON meta). One adjacency scan, so the
+    /// hot path pays a single locate per edge instead of one per attribute source.
+    pub(crate) fn edge_locate(
         &self,
         from: u64,
         to: u64,
         edge_type_hash: u64,
-    ) -> Option<Value> {
+    ) -> Option<(Option<u32>, Option<Value>)> {
         let edges = self.fwd_edges(from)?;
         for e in edges.iter() {
             if e.other == to && (edge_type_hash == 0 || e.edge_type == edge_type_hash) {
-                return self.edge_meta(e);
+                return Some((e.attr_slot(), self.edge_meta(e)));
             }
         }
         None
-    }
-
-    /// Fast-lane column values for the edge `from -[type]-> to`, as (name, value).
-    pub(crate) fn edge_cols_between(
-        &self,
-        from: u64,
-        to: u64,
-        edge_type_hash: u64,
-    ) -> Vec<(String, Value)> {
-        if let Some(edges) = self.fwd_edges(from) {
-            for e in edges.iter() {
-                if e.other == to && (edge_type_hash == 0 || e.edge_type == edge_type_hash) {
-                    return self.edges.edge_cols(e);
-                }
-            }
-        }
-        Vec::new()
     }
 
     /// Create an edge carrying attributes, auto-routed by value type: primitives
@@ -6192,7 +6179,12 @@ impl<'db> Transaction<'db> {
                 }
             }
         }
-        // Write all ops to WAL in one sequential batch
+        // Write all ops to the WAL as one batch with a SINGLE fsync at the end.
+        // A transaction is atomic-or-nothing, so per-op fsync is both wrong
+        // (partial durability) and catastrophically slow (fsync/edge). Defer the
+        // sync across the batch, then flush once — crash before the flush loses
+        // the whole transaction, which is exactly the contract.
+        self.db.defer_wal_sync = true;
         for op in self.ops {
             match op {
                 TxnOp::Put(slug, payload) => {
@@ -6215,6 +6207,8 @@ impl<'db> Transaction<'db> {
                 }
             }
         }
+        self.db.defer_wal_sync = false;
+        self.db.wal_flush();
         Ok(count)
     }
 
@@ -6723,6 +6717,45 @@ mod hybrid_query_tests {
         let ap = agg[0].payload.as_ref().unwrap();
         assert_eq!(ap["n"].as_i64().unwrap(), 2);
         assert!((ap["avg_c"].as_f64().unwrap() - 0.6).abs() < 1e-9, "avg over column = (0.8+0.4)/2");
+    }
+
+    #[test]
+    fn stream_edge_agg_matches_semantics() {
+        let mut db = CoreDB::new();
+        db.put("n/a", r#"{"_collection":"n","_key":"a"}"#).unwrap();
+        for (k, s) in [("x", 0.2), ("y", 0.8), ("z", 0.5)] {
+            db.put(&format!("n/{k}"), &format!(r#"{{"_collection":"n","_key":"{k}"}}"#)).unwrap();
+            db.link_meta("n/a", &format!("n/{k}"), "rated", &format!(r#"{{"score":{s}}}"#)).unwrap();
+        }
+        // SUM/AVG/MIN/MAX/COUNT over an edge attribute, no GROUP BY → streaming path.
+        let hits = db.query(
+            "SELECT COUNT(*) AS c, SUM(r.score) AS s, AVG(r.score) AS a, \
+                    MIN(r.score) AS mn, MAX(r.score) AS mx \
+             FROM MATCH (a:n)-[r:rated]->(b:n)"
+        ).unwrap().collect();
+        let p = hits[0].payload.as_ref().unwrap();
+        assert_eq!(p["c"].as_i64().unwrap(), 3);
+        assert!((p["s"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+        assert!((p["a"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        assert!((p["mn"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert!((p["mx"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+
+        // An arithmetic expression over the edge var also streams.
+        let doubled = db.query(
+            "SELECT SUM(r.score * 2) AS s2 FROM MATCH (a:n)-[r:rated]->(b:n)"
+        ).unwrap().collect();
+        assert!((doubled[0].payload.as_ref().unwrap()["s2"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+
+        // Empty match → Count 0, Sum 0, Avg/Min/Max Null (matches general path).
+        let empty = db.query(
+            "SELECT COUNT(*) AS c, SUM(r.score) AS s, AVG(r.score) AS a, MIN(r.score) AS mn \
+             FROM MATCH (a:n)-[r:no_such_type]->(b:n)"
+        ).unwrap().collect();
+        let ep = empty[0].payload.as_ref().unwrap();
+        assert_eq!(ep["c"].as_i64().unwrap(), 0);
+        assert!((ep["s"].as_f64().unwrap() - 0.0).abs() < 1e-9);
+        assert!(ep["a"].is_null());
+        assert!(ep["mn"].is_null());
     }
 
     #[test]

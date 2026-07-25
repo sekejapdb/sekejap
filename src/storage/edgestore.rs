@@ -343,6 +343,18 @@ impl EdgeStore {
             .collect()
     }
 
+    /// Resolve ALL fast-lane columns for one edge type ONCE — `(name, &column)`.
+    /// The hot path calls this a single time per query (not per edge), then reads
+    /// `col.at(slot)` per edge: a direct array index, no HashMap scan, no clone.
+    /// This is how the fast lane keeps its promise on aggregations.
+    pub(crate) fn columns_for_type(&self, edge_type: u64) -> Vec<(&str, &EdgeColumn)> {
+        self.columns
+            .iter()
+            .filter(|((et, _), _)| *et == edge_type)
+            .map(|((_, name), col)| (name.as_str(), col))
+            .collect()
+    }
+
     /// Store metadata and return its id.
     fn store_meta(&mut self, meta: Value) -> u32 {
         match &mut self.meta {

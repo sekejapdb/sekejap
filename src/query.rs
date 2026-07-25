@@ -4661,6 +4661,20 @@ pub(crate) fn build_path_rows_from_raw(
         .filter_map(|h| db.get_payload(h).map(|p| (h, p)))
         .collect();
 
+    // Resolve each hop's fast-lane columns ONCE (name + &column), not per edge.
+    // Per-edge reads then index the column array directly via the edge's slot —
+    // the resolve-once hot path that gives the fast lane its speed on scans.
+    let hop_cols: Vec<Vec<(&str, &crate::storage::edgestore::EdgeColumn)>> = hops
+        .iter()
+        .map(|hop| {
+            if needs_edge_meta && hop.max_depth == 1 && hop.edge_bind.is_some() {
+                db.edges.columns_for_type(hop.edge_type_hash)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+
     let null = Value::Null;
     raw_paths
         .iter()
@@ -4705,15 +4719,22 @@ pub(crate) fn build_path_rows_from_raw(
                         } else {
                             (prev_h, dest_h)
                         };
-                        if let Some(Value::Object(m)) =
-                            db.edge_props_between(edge_from, edge_to, hop.edge_type_hash)
+                        // Locate the edge ONCE → its JSON meta + fast-lane slot.
+                        if let Some((slot, json)) =
+                            db.edge_locate(edge_from, edge_to, hop.edge_type_hash)
                         {
-                            for (k, v) in m { obj.insert(k, v); }
-                        }
-                        // Fast-lane columnar attributes (primitives) — read direct,
-                        // no parse; override any JSON key of the same name.
-                        for (k, v) in db.edge_cols_between(edge_from, edge_to, hop.edge_type_hash) {
-                            obj.insert(k, v);
+                            if let Some(Value::Object(m)) = json {
+                                for (k, v) in m { obj.insert(k, v); }
+                            }
+                            // Fast-lane columns — direct array index by slot, no
+                            // parse, no scan; override any JSON key of the same name.
+                            if let Some(slot) = slot {
+                                for (name, col) in &hop_cols[hop_idx] {
+                                    if let Some(v) = col.at(slot) {
+                                        obj.insert((*name).to_string(), v);
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -5836,6 +5857,148 @@ fn spread_or_insert(
     }
 }
 
+/// Evaluate a `MathExpr` directly against one edge's referenced field values —
+/// no `PathRow`, no JSON object. `vals` is `(field_name, numeric_value)` for the
+/// fields this expression reads on the edge variable. Mirrors `MathExpr::eval`.
+fn eval_edge_math(expr: &MathExpr, edge_var: &str, vals: &[(&str, f64)]) -> f64 {
+    match expr {
+        MathExpr::VarField { var, field } => {
+            if var == edge_var {
+                vals.iter().find(|(f, _)| *f == field.as_str()).map(|(_, v)| *v).unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        }
+        MathExpr::Literal(n) => *n,
+        MathExpr::Mul(a, b) => eval_edge_math(a, edge_var, vals) * eval_edge_math(b, edge_var, vals),
+        MathExpr::Add(a, b) => eval_edge_math(a, edge_var, vals) + eval_edge_math(b, edge_var, vals),
+        MathExpr::Sub(a, b) => eval_edge_math(a, edge_var, vals) - eval_edge_math(b, edge_var, vals),
+        MathExpr::Div(a, b) => {
+            let d = eval_edge_math(b, edge_var, vals);
+            if d == 0.0 { 0.0 } else { eval_edge_math(a, edge_var, vals) / d }
+        }
+    }
+}
+
+/// Streaming aggregate fast path for `SELECT <aggs> FROM MATCH (a)-[r:t]->(b)`
+/// where the aggregates read ONLY the edge variable's attributes and there is no
+/// GROUP BY. Instead of materialising one `RawPath` + `PathRow` + JSON object per
+/// edge and then folding, it folds each edge straight into accumulators as it is
+/// traversed — reading attributes from the fast-lane column by direct slot index.
+/// Returns `None` (fall back to the general path) when the shape isn't supported.
+fn try_stream_edge_agg(db: &CoreDB, stmt: &MatchAggStmt, starts: &[u64]) -> Option<Vec<Hit>> {
+    // Shape guards: exactly one fixed hop, an edge binding, no grouping/filtering/
+    // multi-stage/distinct, and a limit that keeps the single aggregate row.
+    if stmt.with_stages.is_some() || stmt.hops.len() != 1 { return None; }
+    if stmt.group_by.is_some() || !stmt.dest_where.is_empty() || !stmt.func_filters.is_empty() {
+        return None;
+    }
+    if stmt.distinct || stmt.order_score.is_some() { return None; }
+    if matches!(stmt.limit, Some(0)) { return None; }
+    let hop = &stmt.hops[0];
+    if hop.max_depth != 1 { return None; }
+    let edge_var = hop.edge_bind.as_deref()?;
+    if stmt.returns.is_empty() { return None; }
+
+    // Every return must be streamable, and every aggregate must read ONLY the edge
+    // variable's real attributes (no node vars, no `_intrinsics`).
+    let mut refs: Vec<(String, String)> = Vec::new();
+    for (ret, _) in &stmt.returns {
+        match ret {
+            MatchAggReturn::Count | MatchAggReturn::Now => {}
+            MatchAggReturn::Sum(e) | MatchAggReturn::Avg(e)
+            | MatchAggReturn::Min(e) | MatchAggReturn::Max(e) => e.collect_fields(&mut refs),
+            _ => return None,
+        }
+    }
+    if refs.iter().any(|(v, f)| v != edge_var || f.starts_with('_')) {
+        return None;
+    }
+    // Unique referenced field names (usually one).
+    let mut fields: Vec<String> = refs.into_iter().map(|(_, f)| f).collect();
+    fields.sort();
+    fields.dedup();
+
+    // Resolve each referenced field's fast-lane column ONCE (None → JSON fallback).
+    let cols: Vec<Option<&crate::storage::edgestore::EdgeColumn>> =
+        fields.iter().map(|f| db.edges.edge_column(hop.edge_type_hash, f)).collect();
+
+    enum Acc { Count, Now, Sum(f64), Avg(f64), Min(f64), Max(f64) }
+    let mut accs: Vec<Acc> = stmt.returns.iter().map(|(ret, _)| match ret {
+        MatchAggReturn::Now => Acc::Now,
+        MatchAggReturn::Sum(_) => Acc::Sum(0.0),
+        MatchAggReturn::Avg(_) => Acc::Avg(0.0),
+        MatchAggReturn::Min(_) => Acc::Min(f64::INFINITY),
+        MatchAggReturn::Max(_) => Acc::Max(f64::NEG_INFINITY),
+        _ => Acc::Count,
+    }).collect();
+
+    // ── Stream: fold every matching edge, no per-edge materialization ──────────
+    let mut count: i64 = 0;
+    let mut vals: Vec<(&str, f64)> = Vec::with_capacity(fields.len());
+    let type_h = hop.edge_type_hash;
+    for &start in starts {
+        let adj = if hop.backward { db.rev_edges(start) } else { db.fwd_edges(start) };
+        let Some(edges) = adj else { continue };
+        for e in edges.iter() {
+            if type_h != 0 && e.edge_type != type_h { continue; }
+            if db.node_data(e.other).is_none() { continue; }
+            count += 1;
+
+            // Read the referenced attributes for this edge (column slot, else JSON).
+            vals.clear();
+            let slot = e.attr_slot();
+            let mut json_meta: Option<Value> = None;
+            for (fi, fname) in fields.iter().enumerate() {
+                let v = match (cols[fi], slot) {
+                    (Some(col), Some(s)) => col.at(s).and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    _ => {
+                        if json_meta.is_none() {
+                            json_meta = Some(db.edge_meta(e).unwrap_or(Value::Null));
+                        }
+                        json_meta.as_ref()
+                            .and_then(|m| m.get(fname.as_str()))
+                            .and_then(|x| x.as_f64())
+                            .unwrap_or(0.0)
+                    }
+                };
+                vals.push((fname.as_str(), v));
+            }
+
+            for (ai, (ret, _)) in stmt.returns.iter().enumerate() {
+                match (&mut accs[ai], ret) {
+                    (Acc::Sum(s), MatchAggReturn::Sum(ex)) => *s += eval_edge_math(ex, edge_var, &vals),
+                    (Acc::Avg(s), MatchAggReturn::Avg(ex)) => *s += eval_edge_math(ex, edge_var, &vals),
+                    (Acc::Min(m), MatchAggReturn::Min(ex)) => {
+                        let x = eval_edge_math(ex, edge_var, &vals);
+                        if x < *m { *m = x; }
+                    }
+                    (Acc::Max(m), MatchAggReturn::Max(ex)) => {
+                        let x = eval_edge_math(ex, edge_var, &vals);
+                        if x > *m { *m = x; }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // ── Emit the single aggregate row ──────────────────────────────────────────
+    let mut map = serde_json::Map::new();
+    for (ai, (_, alias)) in stmt.returns.iter().enumerate() {
+        let v = match &accs[ai] {
+            Acc::Count => serde_json::json!(count),
+            Acc::Now => serde_json::json!(chrono::Utc::now().timestamp()),
+            Acc::Sum(s) => serde_json::json!(*s),
+            Acc::Avg(s) => if count == 0 { Value::Null } else { serde_json::json!(*s / count as f64) },
+            Acc::Min(m) => if m.is_infinite() { Value::Null } else { serde_json::json!(*m) },
+            Acc::Max(m) => if m.is_infinite() { Value::Null } else { serde_json::json!(*m) },
+        };
+        map.insert(alias.clone(), v);
+    }
+    Some(vec![Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }])
+}
+
 /// Execute a `SELECT … FROM MATCH … UNION SELECT … FROM MATCH …` — run each arm
 /// and concatenate results, de-duplicating identical rows (UNION = distinct).
 pub fn execute_match_agg_union(db: &CoreDB, stmts: Vec<MatchAggStmt>) -> Vec<Hit> {
@@ -5889,6 +6052,13 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             map.insert(alias.clone(), serde_json::json!(total as i64));
         }
         return vec![Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }];
+    }
+
+    // ── Streaming edge-attribute aggregate (no GROUP BY) ───────────────────────
+    // SUM/AVG/MIN/MAX/COUNT over the edge variable's own attributes: fold each
+    // edge straight into accumulators as it's traversed — no per-edge PathRow.
+    if let Some(hits) = try_stream_edge_agg(db, &stmt, &starts) {
+        return hits;
     }
 
     // 2. Collect all path rows.
