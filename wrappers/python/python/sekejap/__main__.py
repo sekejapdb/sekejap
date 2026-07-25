@@ -224,8 +224,7 @@ MIN(var.field)              minimum
 MAX(var.field)              maximum
 r._depth                    hop depth of edge bind
 r._path_keys                JSON array of slug keys along path
-r._path_strength            JSON array of edge strengths along path
-PATH_PRODUCT(r._path_strength)   product of all values in array
+PATH_PRODUCT(r.weight)      product of a named edge attribute along the path
 PATH_AVG / PATH_SUM / PATH_MIN / PATH_MAX(r.field)
 PATH_FIRST(r._path_keys)    first element of path array
 PATH_LAST(r._path_keys)     last element of path array

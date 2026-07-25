@@ -58,8 +58,8 @@ pub fn db_remove(db: &SekejapDb, slug: String) {
 }
 
 /// Create a directed edge: `from -[edge_type]-> to`.
-pub fn db_link(db: &SekejapDb, from: String, to: String, edge_type: String, strength: f32) {
-    db.0.lock().unwrap().link(&from, &to, &edge_type, strength);
+pub fn db_link(db: &SekejapDb, from: String, to: String, edge_type: String) {
+    db.0.lock().unwrap().link(&from, &to, &edge_type);
 }
 
 /// Remove a directed edge between two nodes.

@@ -50,7 +50,6 @@ fn to_pyhit(h: Hit) -> PyHit {
 ///     from_slug (str | None): Slug of the source node.
 ///     to_slug (str | None): Slug of the target node.
 ///     edge_type (str | None): Human-readable edge type label, e.g. ``"route_to"``.
-///     strength (float): Edge weight.
 ///     meta_json (str | None): Raw JSON string of edge metadata, or ``None``.
 ///         Parse with ``json.loads(hit.meta_json)``.
 #[pyclass(name = "EdgeHit")]
@@ -63,8 +62,6 @@ pub struct PyEdgeHit {
     #[pyo3(get)]
     pub edge_type: Option<String>,
     #[pyo3(get)]
-    pub strength: f32,
-    #[pyo3(get)]
     pub meta_json: Option<String>,
 }
 
@@ -72,8 +69,8 @@ pub struct PyEdgeHit {
 impl PyEdgeHit {
     fn __repr__(&self) -> String {
         format!(
-            "EdgeHit(from={:?}, to={:?}, type={:?}, strength={})",
-            self.from_slug, self.to_slug, self.edge_type, self.strength
+            "EdgeHit(from={:?}, to={:?}, type={:?})",
+            self.from_slug, self.to_slug, self.edge_type
         )
     }
 }
@@ -113,7 +110,7 @@ fn py_list_to_values(py: Python<'_>, objs: Vec<PyObject>) -> PyResult<Vec<Value>
 ///     db = DB("./data")       # persistent (WAL-backed)
 ///
 ///     db.put("students/ali", '{"_collection":"students","name":"Ali"}')
-///     db.link("cls/math", "lec/ali", "taught_by", 1.0)
+///     db.link("cls/math", "lec/ali", "taught_by")
 ///
 ///     hits = db.query("SELECT * FROM students")
 ///     for h in hits:
@@ -254,15 +251,16 @@ impl PyDB {
     // ── Edges ─────────────────────────────────────────────────────────────────
 
     /// Create a directed edge: ``from -[edge_type]-> to``.
-    fn link(&mut self, from: &str, to: &str, edge_type: &str, strength: f32) {
+    fn link(&mut self, from: &str, to: &str, edge_type: &str) {
         if let Some(db) = self.inner.as_mut() {
-            db.link(from, to, edge_type, strength);
+            db.link(from, to, edge_type);
         }
     }
 
-    /// Create a directed edge with JSON metadata.
-    fn link_meta(&mut self, from: &str, to: &str, edge_type: &str, strength: f32, meta_json: &str) -> PyResult<()> {
-        self.db_mut()?.link_meta(from, to, edge_type, strength, meta_json).map_err(db_err)
+    /// Create a directed edge with JSON metadata. Primitive attributes route to
+    /// the fast lane; the rest ride the JSON bag.
+    fn link_meta(&mut self, from: &str, to: &str, edge_type: &str, meta_json: &str) -> PyResult<()> {
+        self.db_mut()?.link_meta(from, to, edge_type, meta_json).map_err(db_err)
     }
 
     /// Remove a directed edge.
@@ -306,7 +304,7 @@ impl PyDB {
     ///
     ///     # PATH_* aggregates — operate on path intrinsic arrays
     ///     db.query("""
-    ///         SELECT c._key AS dest, PATH_PRODUCT(r2._path_strength) AS reliability
+    ///         SELECT c._key AS dest, PATH_PRODUCT(r2.weight) AS reliability
     ///         FROM MATCH (a:places)-[r:route_to]->(b:places)-[r2:route_to]->(c:places)
     ///         WHERE a._key = 'seminyak'
     ///     """)

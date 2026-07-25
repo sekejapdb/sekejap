@@ -7,7 +7,7 @@
 //!   topology.  Same as the original sekejap representation.  Used for
 //!   in-memory databases and when maximum edge-meta read speed is needed.
 //!
-//! - **Compact** — only the topology (other, type, strength) lives in RAM;
+//! - **Compact** — only the topology (other, type) lives in RAM;
 //!   edge metadata is stored in an append-only `edge_meta.bin` file read via
 //!   mmap.  Cuts RAM ~2.7× per edge (64 → 24 bytes) and moves bulky JSON
 //!   metadata to disk.
@@ -21,7 +21,11 @@ use std::path::Path;
 
 use serde_json::Value;
 
-/// Compact edge stored in adjacency lists.  24 bytes on 64-bit.
+/// Compact edge stored in adjacency lists. 20 bytes on 64-bit.
+///
+/// An edge is a naked connector: who it points to and what type it is. Nothing
+/// else — a relation is not a body. Any weight/attribute is opt-in, and rides
+/// beside the edge in a fast-lane column or the JSON bag, never inside it.
 ///
 /// Used by both Fat and Compact modes — the only difference is where
 /// metadata lives (RAM vs disk), pointed to by `meta_id`.
@@ -29,7 +33,6 @@ use serde_json::Value;
 pub(crate) struct Edge {
     pub other: u64,
     pub edge_type: u64,
-    pub strength: f32,
     /// Index into the meta store.  `u32::MAX` = no metadata.
     meta_id: u32,
 }
@@ -44,13 +47,24 @@ const BASE_META_BIT: u32 = 0x8000_0000;
 impl Edge {
     /// Construct an edge for the paged-topology base. `base_meta_ref` is the
     /// `edgemeta.bin` index (`u32::MAX` = no metadata).
-    pub(crate) fn from_base(other: u64, edge_type: u64, strength: f32, base_meta_ref: u32) -> Self {
+    pub(crate) fn from_base(other: u64, edge_type: u64, base_meta_ref: u32) -> Self {
         let meta_id = if base_meta_ref == u32::MAX {
             NO_META
         } else {
             base_meta_ref | BASE_META_BIT
         };
-        Self { other, edge_type, strength, meta_id }
+        Self { other, edge_type, meta_id }
+    }
+
+    /// The edge's attribute slot (its index into the resident columns + JSON
+    /// store), or `None` if it has no resident attributes (no meta, or a base
+    /// edge). The hot path uses this to index a resolved column directly.
+    pub(crate) fn attr_slot(&self) -> Option<u32> {
+        if self.meta_id == NO_META || self.base_meta_ref().is_some() {
+            None
+        } else {
+            Some(self.meta_id)
+        }
     }
 
     /// If this edge's metadata lives in the paged base (`edgemeta.bin`), return
@@ -80,8 +94,59 @@ pub(crate) struct EdgeStore {
     rev: HashMap<u64, Vec<Edge>>,
     /// edge_type_hash → human-readable name.
     type_names: HashMap<u64, String>,
-    /// Metadata backend.
+    /// Metadata backend (the JSON bag — the slow lane).
     meta: MetaStore,
+    /// The FAST LANE: columnar primitive edge attributes, keyed by
+    /// `(edge_type_hash, attr_name)`, each a dense `Vec<f64>` indexed by the
+    /// edge's attribute slot (its `meta_id`). Read = one arithmetic array index,
+    /// no parse — a direct-indexed weight lane, opt-in, for any
+    /// user-named primitive column. `NaN` = unset for that edge.
+    columns: HashMap<(u64, String), EdgeColumn>,
+}
+
+/// One fast-lane column. `vals` is dense over the attribute-slot space; `is_bool`
+/// records whether values were booleans (so reads return `true/false`, not `1.0`).
+pub(crate) struct EdgeColumn {
+    vals: Vec<f64>,
+    is_bool: bool,
+}
+
+impl EdgeColumn {
+    fn new(is_bool: bool) -> Self {
+        Self { vals: Vec::new(), is_bool }
+    }
+    /// Set this edge's value at its slot, growing with NaN (unset) as needed.
+    fn set(&mut self, slot: u32, v: f64) {
+        let slot = slot as usize;
+        if slot >= self.vals.len() {
+            self.vals.resize(slot + 1, f64::NAN);
+        }
+        self.vals[slot] = v;
+    }
+    /// Read the value at a slot as JSON, or `None` if unset/out-of-range.
+    /// Direct array index — the fast-lane read (no lookup, no parse).
+    pub(crate) fn at(&self, slot: u32) -> Option<Value> {
+        let v = *self.vals.get(slot as usize)?;
+        if v.is_nan() {
+            return None;
+        }
+        if self.is_bool {
+            Some(Value::Bool(v != 0.0))
+        } else if v.fract() == 0.0 && v.abs() < 9.007_199_254_740_992e15 {
+            // Whole numbers round-trip as JSON integers so consumers using
+            // `.as_i64()` (year, count, kWh) see an int, not `30.0`. Bounded to
+            // the exact-integer f64 range to avoid precision surprises.
+            Some(Value::Number((v as i64).into()))
+        } else {
+            serde_json::Number::from_f64(v).map(Value::Number)
+        }
+    }
+}
+
+/// A primitive edge-attribute value, routed to the fast lane by its type.
+pub(crate) enum ColVal {
+    Num(f64),
+    Bool(bool),
 }
 
 enum MetaStore {
@@ -111,6 +176,7 @@ impl EdgeStore {
             rev: HashMap::new(),
             type_names: HashMap::new(),
             meta: MetaStore::Ram { metas: Vec::new() },
+            columns: HashMap::new(),
         }
     }
 
@@ -134,6 +200,7 @@ impl EdgeStore {
                 total_len: 0,
                 mmap: None,
             },
+            columns: HashMap::new(),
         })
     }
 
@@ -158,6 +225,7 @@ impl EdgeStore {
                     total_len: file_len,
                     mmap,
                 },
+                columns: HashMap::new(),
             })
         } else {
             Self::new_compact(dir)
@@ -173,20 +241,17 @@ impl EdgeStore {
         to_hash: u64,
         edge_type: u64,
         edge_type_name: &str,
-        strength: f32,
     ) {
         self.type_names
             .insert(edge_type, edge_type_name.to_string());
         let edge_fwd = Edge {
             other: to_hash,
             edge_type,
-            strength,
             meta_id: NO_META,
         };
         let edge_rev = Edge {
             other: from_hash,
             edge_type,
-            strength,
             meta_id: NO_META,
         };
         self.fwd.entry(from_hash).or_default().push(edge_fwd);
@@ -200,7 +265,6 @@ impl EdgeStore {
         to_hash: u64,
         edge_type: u64,
         edge_type_name: &str,
-        strength: f32,
         meta: Value,
     ) {
         self.type_names
@@ -209,17 +273,74 @@ impl EdgeStore {
         let edge_fwd = Edge {
             other: to_hash,
             edge_type,
-            strength,
             meta_id: mid,
         };
         let edge_rev = Edge {
             other: from_hash,
             edge_type,
-            strength,
             meta_id: mid,
         };
         self.fwd.entry(from_hash).or_default().push(edge_fwd);
         self.rev.entry(to_hash).or_default().push(edge_rev);
+    }
+
+    /// Insert an edge carrying fast-lane columns and/or a JSON bag. One attribute
+    /// slot is shared by both: primitives ride the columns, the rest the JSON.
+    pub fn link_with_attrs(
+        &mut self,
+        from_hash: u64,
+        to_hash: u64,
+        edge_type: u64,
+        edge_type_name: &str,
+        cols: &[(String, ColVal)],
+        json: Option<Value>,
+    ) {
+        self.type_names.insert(edge_type, edge_type_name.to_string());
+        // One slot in the meta store's slot space, shared by columns + json.
+        let slot = self.store_meta(json.unwrap_or(Value::Null));
+        for (name, val) in cols {
+            let (v, is_bool) = match val {
+                ColVal::Num(n) => (*n, false),
+                ColVal::Bool(b) => (if *b { 1.0 } else { 0.0 }, true),
+            };
+            self.columns
+                .entry((edge_type, name.clone()))
+                .or_insert_with(|| EdgeColumn::new(is_bool))
+                .set(slot, v);
+        }
+        let fwd = Edge { other: to_hash, edge_type, meta_id: slot };
+        let rev = Edge { other: from_hash, edge_type, meta_id: slot };
+        self.fwd.entry(from_hash).or_default().push(fwd);
+        self.rev.entry(to_hash).or_default().push(rev);
+    }
+
+    /// Resolve a fast-lane column ONCE for `(edge_type, attr)`. The hot path calls
+    /// this once per query, then reads `col.at(edge.attr_slot())` per edge — a
+    /// direct array index, no lookup, no parse. `None` = no such column.
+    /// (Reserved for the hot-path read optimisation; the general path currently
+    /// uses `edge_cols`.)
+    #[allow(dead_code)]
+    pub fn edge_column(&self, edge_type: u64, attr: &str) -> Option<&EdgeColumn> {
+        self.columns.get(&(edge_type, attr.to_string()))
+    }
+
+    /// Convenience per-edge column read (does the resolve + index each call —
+    /// use `edge_column()` + `EdgeColumn::at()` on the hot path instead).
+    #[allow(dead_code)]
+    pub fn edge_col(&self, edge: &Edge, attr: &str) -> Option<Value> {
+        let slot = edge.attr_slot()?;
+        self.edge_column(edge.edge_type, attr)?.at(slot)
+    }
+
+    /// All set fast-lane column values for this edge, as `(name, value)` pairs.
+    /// Used to materialise an edge's attributes into a query row.
+    pub fn edge_cols(&self, edge: &Edge) -> Vec<(String, Value)> {
+        let Some(slot) = edge.attr_slot() else { return Vec::new() };
+        self.columns
+            .iter()
+            .filter(|((et, _), _)| *et == edge.edge_type)
+            .filter_map(|((_, name), col)| col.at(slot).map(|v| (name.clone(), v)))
+            .collect()
     }
 
     /// Store metadata and return its id.

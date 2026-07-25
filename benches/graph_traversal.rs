@@ -70,7 +70,7 @@ fn populate_core(dataset: &[Node]) -> sekejap::CoreDB {
     // edges
     for node in dataset {
         for nbr in &node.neighbours {
-            db.link(&node.slug, nbr, "related_to", 1.0);
+            db.link(&node.slug, nbr, "related_to");
         }
     }
     db
@@ -93,7 +93,7 @@ fn populate_sekejap(dataset: &[Node]) -> (sekejap::CoreDB, tempfile::TempDir) {
     }
     for n in dataset {
         for nbr in &n.neighbours {
-            db.link(&n.slug, nbr, "related_to", 1.0);
+            db.link(&n.slug, nbr, "related_to");
         }
     }
     (db, dir)
@@ -136,7 +136,7 @@ fn populate_sqlite(dataset: &[Node]) -> rusqlite::Connection {
 
 fn run_core_sql(db: &sekejap::CoreDB, source_id: &str) -> usize {
     db.query(&format!(
-        "MATCH (a:memories)-[:related_to*1..{HOPS}]->(b) WHERE a._key = '{source_id}' RETURN b LIMIT {LIMIT}"
+        "SELECT b._key AS k FROM MATCH (a:memories)-[:related_to*1..{HOPS}]->(b) WHERE a._key = '{source_id}' GROUP BY b._key LIMIT {LIMIT}"
     ))
     .unwrap()
     .count()
@@ -151,7 +151,7 @@ fn run_core_atom(db: &sekejap::CoreDB, source_slug: &str) -> usize {
 
 fn run_sekejap_sql(sk: &sekejap::CoreDB, source_id: &str) -> usize {
     sk.query(&format!(
-        "MATCH (a:memories)-[:related_to*1..{HOPS}]->(b) WHERE a._key = '{source_id}' RETURN b LIMIT {LIMIT}"
+        "SELECT b._key AS k FROM MATCH (a:memories)-[:related_to*1..{HOPS}]->(b) WHERE a._key = '{source_id}' GROUP BY b._key LIMIT {LIMIT}"
     ))
     .unwrap()
     .count()

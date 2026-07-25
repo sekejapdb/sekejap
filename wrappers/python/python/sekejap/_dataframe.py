@@ -62,7 +62,7 @@ class DataFrameAccessor:
 
             # PATH_* aggregates
             db.df.query(\"\"\"
-                SELECT b._key AS dest, PATH_PRODUCT(r._path_strength) AS reliability
+                SELECT b._key AS dest, PATH_PRODUCT(r.weight) AS reliability
                 FROM MATCH (a:venues)-[r:route_to*1..3]->(b:venues)
                 WHERE a._key = 'melbourne_cbd'
             \"\"\")
@@ -226,12 +226,22 @@ class DataFrameAccessor:
                 tgt = f"{target_collection}/{tgt}"
 
             etype = edge_type if edge_type else str(row[edge_type_col])
-            weight = float(row[weight_col]) if weight_col and weight_col in row else 1.0
 
+            # Edges are naked by default. A weight column (if any) becomes an
+            # ordinary "weight" attribute; a meta column merges in alongside it.
+            attrs: dict[str, Any] = {}
+            if weight_col and weight_col in row:
+                attrs["weight"] = float(row[weight_col])
             if meta_col and meta_col in row and row[meta_col]:
-                self._db.link_meta(src, tgt, etype, weight, str(row[meta_col]))
+                try:
+                    attrs.update(json.loads(str(row[meta_col])))
+                except (ValueError, TypeError):
+                    pass
+
+            if attrs:
+                self._db.link_meta(src, tgt, etype, json.dumps(attrs))
             else:
-                self._db.link(src, tgt, etype, weight)
+                self._db.link(src, tgt, etype)
 
             count += 1
         return count

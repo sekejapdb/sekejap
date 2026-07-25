@@ -47,8 +47,8 @@ fn forward_traversal() {
     db.put("alice", r#"{"name":"Alice"}"#).unwrap();
     db.put("bob",   r#"{"name":"Bob"}"#).unwrap();
     db.put("carol", r#"{"name":"Carol"}"#).unwrap();
-    db.link("alice", "bob",   "follows", 1.0);
-    db.link("alice", "carol", "follows", 1.0);
+    db.link("alice", "bob",   "follows");
+    db.link("alice", "carol", "follows");
 
     let hits = db.one("alice").forward("follows").collect();
     let names: Vec<&str> = hits.iter()
@@ -63,7 +63,7 @@ fn backward_traversal() {
     let mut db = CoreDB::new();
     db.put("alice", r#"{"name":"Alice"}"#).unwrap();
     db.put("bob",   r#"{"name":"Bob"}"#).unwrap();
-    db.link("alice", "bob", "follows", 1.0);
+    db.link("alice", "bob", "follows");
 
     let hits = db.one("bob").backward("follows").collect();
     assert_eq!(hits.len(), 1);
@@ -76,9 +76,9 @@ fn hops_bfs() {
     for n in ["a","b","c","d"] {
         db.put(n, &format!(r#"{{"id":"{}"}}"#, n)).unwrap();
     }
-    db.link("a", "b", "e", 1.0);
-    db.link("b", "c", "e", 1.0);
-    db.link("c", "d", "e", 1.0);
+    db.link("a", "b", "e");
+    db.link("b", "c", "e");
+    db.link("c", "d", "e");
 
     // 2 hops from "a" should reach "a","b","c" but not "d"
     let reached = db.one("a").hops(2).count();
@@ -95,8 +95,8 @@ fn roots_and_leaves() {
     db.put("root",  r#"{}"#).unwrap();
     db.put("mid",   r#"{}"#).unwrap();
     db.put("leaf",  r#"{}"#).unwrap();
-    db.link("root", "mid",  "e", 1.0);
-    db.link("mid",  "leaf", "e", 1.0);
+    db.link("root", "mid",  "e");
+    db.link("mid",  "leaf", "e");
 
     assert_eq!(db.all().roots().count(), 1);
     assert_eq!(db.all().roots().first().unwrap().slug, "root");
@@ -109,7 +109,7 @@ fn unlink_removes_edge() {
     let mut db = CoreDB::new();
     db.put("a", r#"{}"#).unwrap();
     db.put("b", r#"{}"#).unwrap();
-    db.link("a", "b", "e", 1.0);
+    db.link("a", "b", "e");
     db.unlink("a", "b", "e");
 
     assert_eq!(db.one("a").forward("e").count(), 0);
@@ -267,12 +267,13 @@ fn edges_from_and_to() {
     let mut db = CoreDB::new();
     db.put("a", r#"{}"#).unwrap();
     db.put("b", r#"{}"#).unwrap();
-    db.link("a", "b", "edge", 0.5);
+    db.link("a", "b", "edge");
 
     let fwd = db.edges_from("a");
     assert_eq!(fwd.len(), 1);
     assert_eq!(fwd[0].to_slug.as_deref(), Some("b"));
-    assert!((fwd[0].strength - 0.5).abs() < 1e-6);
+    // A naked edge carries no attributes.
+    assert!(fwd[0].meta.is_none());
 
     let rev = db.edges_to("b");
     assert_eq!(rev.len(), 1);
@@ -284,7 +285,7 @@ fn link_meta_stores_metadata() {
     let mut db = CoreDB::new();
     db.put("a", r#"{}"#).unwrap();
     db.put("b", r#"{}"#).unwrap();
-    db.link_meta("a", "b", "knows", 1.0, r#"{"since":2020}"#).unwrap();
+    db.link_meta("a", "b", "knows", r#"{"since":2020}"#).unwrap();
 
     let edges = db.edges_from("a");
     let meta = edges[0].meta.as_ref().unwrap();
@@ -384,9 +385,10 @@ fn setup_music_db() -> CoreDB {
     db.put("genre/garage-rock", r#"{"_collection":"genre","_key":"garage-rock","name":"Garage Rock"}"#).unwrap();
     db.put("genre/alternative", r#"{"_collection":"genre","_key":"alternative","name":"Alternative"}"#).unwrap();
     db.put("city/melbourne", r#"{"_collection":"city","_key":"melbourne","name":"Melbourne"}"#).unwrap();
-    db.link("artist/the-vines", "genre/garage-rock", "has_genre", 10.0);
-    db.link("artist/the-vines", "genre/alternative", "has_genre", 5.0);
-    db.link("artist/the-vines", "city/melbourne", "origin", 1.0);
+    // `strength` is now an ordinary edge attribute, not a privileged field.
+    db.link_meta("artist/the-vines", "genre/garage-rock", "has_genre", r#"{"strength":10}"#).unwrap();
+    db.link_meta("artist/the-vines", "genre/alternative", "has_genre", r#"{"strength":5}"#).unwrap();
+    db.link("artist/the-vines", "city/melbourne", "origin");
     db
 }
 
@@ -424,9 +426,9 @@ fn match_backward_multihop_descendants() {
     db.put("district/melb", r#"{"_collection":"district","_key":"melb"}"#).unwrap();
     db.put("village/cbd",   r#"{"_collection":"village","_key":"cbd"}"#).unwrap();
     db.put("village/docklands", r#"{"_collection":"village","_key":"docklands"}"#).unwrap();
-    db.link("district/melb", "province/vic", "child_of", 1.0);
-    db.link("village/cbd",   "district/melb", "child_of", 1.0);
-    db.link("village/docklands", "district/melb", "child_of", 1.0);
+    db.link("district/melb", "province/vic", "child_of");
+    db.link("village/cbd",   "district/melb", "child_of");
+    db.link("village/docklands", "district/melb", "child_of");
 
     // Everything under vic (1..2 hops backward): melb, cbd, docklands
     let hits = db.query(
@@ -481,9 +483,9 @@ fn match_typed_multihop_bfs() {
     db.put("event/drainage", r#"{"_collection":"event","_key":"drainage","name":"Drainage Failure"}"#).unwrap();
     db.put("event/budget", r#"{"_collection":"event","_key":"budget","name":"Budget Cut"}"#).unwrap();
     db.put("event/policy", r#"{"_collection":"event","_key":"policy","name":"Policy Change"}"#).unwrap();
-    db.link("event/flood", "event/drainage", "caused_by", 0.9);
-    db.link("event/drainage", "event/budget", "caused_by", 0.8);
-    db.link("event/budget", "event/policy", "caused_by", 0.7);
+    db.link("event/flood", "event/drainage", "caused_by");
+    db.link("event/drainage", "event/budget", "caused_by");
+    db.link("event/budget", "event/policy", "caused_by");
 
     let hits = db.query(
         "SELECT root.* FROM MATCH (e:event)-[:caused_by*1..5]->(root) WHERE e._key = 'flood'"
@@ -530,10 +532,10 @@ fn setup_diamond() -> CoreDB {
     for k in ["a", "b", "c", "d"] {
         db.put(&format!("n/{k}"), &format!(r#"{{"_collection":"n","_key":"{k}"}}"#)).unwrap();
     }
-    db.link("n/a", "n/b", "e", 1.0);
-    db.link("n/a", "n/c", "e", 1.0);
-    db.link("n/b", "n/d", "e", 1.0);
-    db.link("n/c", "n/d", "e", 1.0);
+    db.link("n/a", "n/b", "e");
+    db.link("n/a", "n/c", "e");
+    db.link("n/b", "n/d", "e");
+    db.link("n/c", "n/d", "e");
     db
 }
 
@@ -565,7 +567,7 @@ fn match_count_distinct() {
     db.put("a/a", r#"{"_collection":"a","_key":"a"}"#).unwrap();
     for (k, g) in [("b", "rock"), ("c", "rock"), ("d", "jazz")] {
         db.put(&format!("s/{k}"), &format!(r#"{{"_collection":"s","_key":"{k}","genre":"{g}"}}"#)).unwrap();
-        db.link("a/a", &format!("s/{k}"), "e", 1.0);
+        db.link("a/a", &format!("s/{k}"), "e");
     }
     // COUNT(*) counts paths (3 songs); COUNT(DISTINCT genre) counts unique genres (2).
     let hits = db.query(
@@ -585,7 +587,7 @@ fn match_count_distinct_with_group_by() {
     db.put("places/uluwatu", r#"{"_collection":"places","_key":"uluwatu"}"#).unwrap();
     for (t, city) in [("chloe", "Melbourne"), ("aiym", "Melbourne"), ("giulia", "Milan")] {
         db.put(&format!("tourists/{t}"), &format!(r#"{{"_collection":"tourists","_key":"{t}","home_city":"{city}"}}"#)).unwrap();
-        db.link(&format!("tourists/{t}"), "places/uluwatu", "visited", 1.0);
+        db.link(&format!("tourists/{t}"), "places/uluwatu", "visited");
     }
     let hits = db.query(
         "SELECT p._key AS place, COUNT(*) AS visitors, COUNT(DISTINCT t.home_city) AS cities \
@@ -622,9 +624,9 @@ fn match_with_chaining_from_bound_var() {
     db.put("users/giulia", r#"{"_collection":"users","_key":"giulia"}"#).unwrap();
     db.put("dishes/ayam",  r#"{"_collection":"dishes","_key":"ayam","name":"Ayam"}"#).unwrap();
     db.put("dishes/babi",  r#"{"_collection":"dishes","_key":"babi","name":"Babi"}"#).unwrap();
-    db.link("users/chloe",  "users/giulia", "similar", 1.0);
-    db.link("users/giulia", "dishes/ayam",  "ate", 1.0);
-    db.link("users/giulia", "dishes/babi",  "ate", 1.0);
+    db.link("users/chloe",  "users/giulia", "similar");
+    db.link("users/giulia", "dishes/ayam",  "ate");
+    db.link("users/giulia", "dishes/babi",  "ate");
 
     let hits = db.query(
         "SELECT d.name AS dish, COUNT(*) AS n \
@@ -647,9 +649,9 @@ fn match_anonymous_and_inline_props_nodes() {
     for k in ["chloe", "aiym", "giulia"] {
         db.put(&format!("tourists/{k}"), &format!(r#"{{"_collection":"tourists","_key":"{k}"}}"#)).unwrap();
     }
-    db.link("tourists/chloe",  "places/uluwatu", "visited", 1.0);
-    db.link("tourists/aiym",   "places/uluwatu", "reviewed", 1.0);
-    db.link("tourists/giulia", "places/uluwatu", "reviewed", 1.0);
+    db.link("tourists/chloe",  "places/uluwatu", "visited");
+    db.link("tourists/aiym",   "places/uluwatu", "reviewed");
+    db.link("tourists/giulia", "places/uluwatu", "reviewed");
 
     // anonymous middle node with inline props + forward→backward:
     // a visitor of Uluwatu, paired with everyone who reviewed it
@@ -675,14 +677,13 @@ fn match_varlength_path_intrinsics_correct() {
     for k in ["seminyak", "kuta", "canggu", "uluwatu"] {
         db.put(&format!("places/{k}"), &format!(r#"{{"_collection":"places","_key":"{k}"}}"#)).unwrap();
     }
-    db.link("places/seminyak", "places/kuta",    "route", 0.9);
-    db.link("places/kuta",     "places/canggu",  "route", 0.8);
-    db.link("places/canggu",   "places/uluwatu", "route", 0.7);
+    db.link("places/seminyak", "places/kuta",    "route");
+    db.link("places/kuta",     "places/canggu",  "route");
+    db.link("places/canggu",   "places/uluwatu", "route");
 
     let hits = db.query(
         "SELECT dest._key AS dest, r._depth AS depth, \
-                JSON_ARRAY_LENGTH(r._path_keys) AS stops, \
-                PATH_SUM(r._path_strength) AS trust \
+                JSON_ARRAY_LENGTH(r._path_keys) AS stops \
          FROM MATCH (a:places)-[r:route*1..3]->(dest:places) WHERE a._key = 'seminyak'"
     ).unwrap().collect();
     let ulu = hits.iter().find(|h|
@@ -690,7 +691,6 @@ fn match_varlength_path_intrinsics_correct() {
     ).expect("uluwatu row").payload.as_ref().unwrap();
     assert_eq!(ulu.get("depth").unwrap().as_i64(), Some(3));   // 3 physical hops
     assert_eq!(ulu.get("stops").unwrap().as_i64(), Some(4));   // 4 nodes on the path
-    assert!((ulu.get("trust").unwrap().as_f64().unwrap() - (0.9 + 0.8 + 0.7)).abs() < 1e-5);
 }
 
 // ── Release audit fixes (Tier 1) ─────────────────────────────────────────────
@@ -702,7 +702,7 @@ fn multi_from_where_is_applied() {
     let mut db = CoreDB::new();
     db.put("places/uluwatu", r#"{"_collection":"places","_key":"uluwatu"}"#).unwrap();
     db.put("places/kuta",    r#"{"_collection":"places","_key":"kuta"}"#).unwrap();
-    db.link("places/uluwatu", "places/kuta", "near", 1.0);
+    db.link("places/uluwatu", "places/kuta", "near");
     for (k, c) in [("chloe", "Melbourne"), ("aiym", "Almaty"), ("giulia", "Melbourne")] {
         db.put(&format!("tourists/{k}"), &format!(r#"{{"_collection":"tourists","_key":"{k}","home":"{c}"}}"#)).unwrap();
     }
@@ -781,7 +781,7 @@ fn raw_put_key_is_filterable_on_destination() {
     let mut db = CoreDB::new();
     db.put("h/x", r#"{"_collection":"h","name":"X"}"#).unwrap();
     db.put("h/y", r#"{"_collection":"h","name":"Y"}"#).unwrap();
-    db.link("h/x", "h/y", "near", 1.0);
+    db.link("h/x", "h/y", "near");
     let hits = db.query(
         "SELECT b.name AS n FROM MATCH (a:h)-[:near]->(b:h) WHERE a._key = 'x' AND b._key = 'y'"
     ).unwrap().collect();
@@ -810,10 +810,11 @@ fn setup_ev_db() -> CoreDB {
     db.put("vehicles/ev2", r#"{"_collection":"vehicles","_key":"ev2","name":"EV Two"}"#).unwrap();
     db.put("chargers/c1", r#"{"_collection":"chargers","_key":"c1","name":"Charger 1"}"#).unwrap();
     db.put("chargers/c2", r#"{"_collection":"chargers","_key":"c2","name":"Charger 2"}"#).unwrap();
-    // charged_at edges carry strength + JSON meta {kwh, price}
-    db.link_meta("vehicles/ev1", "chargers/c1", "charged_at", 0.9, r#"{"kwh":50,"price":20}"#).unwrap();
-    db.link_meta("vehicles/ev1", "chargers/c2", "charged_at", 0.5, r#"{"kwh":30,"price":12}"#).unwrap();
-    db.link_meta("vehicles/ev2", "chargers/c1", "charged_at", 0.7, r#"{"kwh":45,"price":18}"#).unwrap();
+    // charged_at edges carry attributes {kwh, price, strength} — strength is now
+    // just an ordinary named attribute, no longer privileged.
+    db.link_meta("vehicles/ev1", "chargers/c1", "charged_at", r#"{"kwh":50,"price":20,"strength":0.9}"#).unwrap();
+    db.link_meta("vehicles/ev1", "chargers/c2", "charged_at", r#"{"kwh":30,"price":12,"strength":0.5}"#).unwrap();
+    db.link_meta("vehicles/ev2", "chargers/c1", "charged_at", r#"{"kwh":45,"price":18,"strength":0.7}"#).unwrap();
     db
 }
 
@@ -890,21 +891,6 @@ fn match_edge_property_group_aggregate() {
     }).collect();
     got.sort();
     assert_eq!(got, vec![("c1".to_string(), 95), ("c2".to_string(), 30)]);
-}
-
-#[test]
-fn match_edge_intrinsic_still_works() {
-    // Regression: intrinsic path-strength access must be unaffected by the
-    // edge-property change (uses the same edge-bind object).
-    let db = setup_ev_db();
-    let hits = db.query(
-        "SELECT c._key AS charger, s._path_strength AS ps \
-         FROM MATCH (v:vehicles)-[s:charged_at]->(c:chargers) \
-         WHERE v._key = 'ev1'"
-    ).unwrap().collect();
-    assert_eq!(hits.len(), 2);
-    // _path_strength is an array of per-hop strengths.
-    assert!(hits[0].payload.as_ref().unwrap().get("ps").unwrap().is_array());
 }
 
 // ── MATCH optimisation integration tests ─────────────────────────────────────
@@ -991,8 +977,8 @@ fn match_reverse_anchor_not_applicable() {
     db.put("person/alice", r#"{"_collection":"person","_key":"alice","name":"Alice"}"#).unwrap();
     db.put("team/rockets", r#"{"_collection":"team","_key":"rockets","name":"Rockets"}"#).unwrap();
     db.put("league/nbl", r#"{"_collection":"league","_key":"nbl","name":"NBL"}"#).unwrap();
-    db.link("person/alice", "team/rockets", "member_of", 1.0);
-    db.link("team/rockets", "league/nbl", "plays_in", 1.0);
+    db.link("person/alice", "team/rockets", "member_of");
+    db.link("team/rockets", "league/nbl", "plays_in");
 
     // Multi-hop: reverse anchor should NOT apply (hops.len() == 2).
     // Forward traversal should still find the path.
@@ -1358,8 +1344,9 @@ fn insert_edge_with_meta() {
 
     let edges = db.edges_from("city/melbourne");
     assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0].strength, 1.0);
     let meta = edges[0].meta.as_ref().unwrap();
+    // strength and distance are both ordinary attributes now.
+    assert_eq!(meta["strength"], 1);
     assert_eq!(meta["distance"], 3.2);
 }
 
@@ -1390,7 +1377,7 @@ fn insert_edge_multiple() {
 }
 
 #[test]
-fn insert_edge_default_strength() {
+fn insert_edge_default_is_naked() {
     let mut db = CoreDB::new();
     db.put("x", r#"{"_collection":"node"}"#).unwrap();
     db.put("y", r#"{"_collection":"node"}"#).unwrap();
@@ -1399,7 +1386,8 @@ fn insert_edge_default_strength() {
 
     let edges = db.edges_from("x");
     assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0].strength, 1.0);
+    // The default edge is zero — no attributes.
+    assert!(edges[0].meta.is_none());
 }
 
 #[test]
@@ -1407,7 +1395,7 @@ fn delete_edge_removes_edge() {
     let mut db = CoreDB::new();
     db.put("a", r#"{"_collection":"node"}"#).unwrap();
     db.put("b", r#"{"_collection":"node"}"#).unwrap();
-    db.link("a", "b", "knows", 1.0);
+    db.link("a", "b", "knows");
 
     // Verify edge exists
     assert_eq!(db.one("a").forward("knows").count(), 1);
@@ -2342,7 +2330,7 @@ fn transaction_commit_returns_op_count() {
     txn.put("a/1", r#"{"_collection":"a"}"#).unwrap();
     txn.put("a/2", r#"{"_collection":"a"}"#).unwrap();
     txn.remove("a/99"); // remove of non-existent — still counted
-    txn.link("a/1", "a/2", "rel", 1.0);
+    txn.link("a/1", "a/2", "rel");
     let n = txn.commit().unwrap();
     assert_eq!(n, 4);
 }
@@ -2366,7 +2354,7 @@ fn transaction_with_link_and_remove() {
     db.put("nodes/c", r#"{"_collection":"nodes"}"#).unwrap();
 
     let mut txn = db.begin();
-    txn.link("nodes/a", "nodes/b", "knows", 1.0);
+    txn.link("nodes/a", "nodes/b", "knows");
     txn.unlink("nodes/a", "nodes/b", "knows"); // cancel the link above
     txn.remove("nodes/c");
     txn.commit().unwrap();
@@ -3097,7 +3085,7 @@ fn delete_node_removes_outgoing_edges() {
     let mut db = CoreDB::new();
     db.put("artists/dewa19", r#"{"_collection":"artists","_key":"dewa19"}"#).unwrap();
     db.put("songs/kangen",   r#"{"_collection":"songs",  "_key":"kangen"}"#).unwrap();
-    db.link("artists/dewa19", "songs/kangen", "has_song", 1.0);
+    db.link("artists/dewa19", "songs/kangen", "has_song");
 
     // Sanity: edge exists
     assert_eq!(db.edges_from("artists/dewa19").len(), 1);
@@ -3118,7 +3106,7 @@ fn delete_node_removes_incoming_edges() {
     let mut db = CoreDB::new();
     db.put("artists/dewa19", r#"{"_collection":"artists","_key":"dewa19"}"#).unwrap();
     db.put("songs/kangen",   r#"{"_collection":"songs",  "_key":"kangen"}"#).unwrap();
-    db.link("artists/dewa19", "songs/kangen", "has_song", 1.0);
+    db.link("artists/dewa19", "songs/kangen", "has_song");
 
     db.remove("songs/kangen");
 
@@ -3136,8 +3124,8 @@ fn sql_delete_cascades_edges() {
     db.put("a/1", r#"{"_collection":"a","_key":"1"}"#).unwrap();
     db.put("a/2", r#"{"_collection":"a","_key":"2"}"#).unwrap();
     db.put("a/3", r#"{"_collection":"a","_key":"3"}"#).unwrap();
-    db.link("a/1", "a/2", "rel", 1.0);
-    db.link("a/2", "a/3", "rel", 1.0);
+    db.link("a/1", "a/2", "rel");
+    db.link("a/2", "a/3", "rel");
 
     // Delete middle node via SQL
     db.execute("DELETE FROM a WHERE _key = '2'").unwrap();
@@ -3156,8 +3144,8 @@ fn traverse_single_hop_flat() {
     db.put("students/budi", r#"{"_collection":"students","_key":"budi","name":"Budi"}"#).unwrap();
     db.put("answers/a1", r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
     db.put("answers/a2", r#"{"_collection":"answers","_key":"a2","score":0.6}"#).unwrap();
-    db.link("students/budi", "answers/a1", "answered", 1.0);
-    db.link("students/budi", "answers/a2", "answered", 1.0);
+    db.link("students/budi", "answers/a1", "answered");
+    db.link("students/budi", "answers/a2", "answered");
 
     let hits = db.query(
         "SELECT a.score AS score FROM MATCH ('students/budi')-[:answered]->(a)"
@@ -3184,13 +3172,13 @@ fn traverse_two_hop_group_sum() {
     db.put("questions/q3",   r#"{"_collection":"questions","_key":"q3","weight":1.0,"clo":"c2"}"#).unwrap();
 
     // Student answered questions
-    db.link("students/budi", "answers/a1", "answered", 1.0);
-    db.link("students/budi", "answers/a2", "answered", 1.0);
-    db.link("students/budi", "answers/a3", "answered", 1.0);
+    db.link("students/budi", "answers/a1", "answered");
+    db.link("students/budi", "answers/a2", "answered");
+    db.link("students/budi", "answers/a3", "answered");
     // Answers → questions
-    db.link("answers/a1", "questions/q1", "for", 1.0);
-    db.link("answers/a2", "questions/q2", "for", 1.0);
-    db.link("answers/a3", "questions/q3", "for", 1.0);
+    db.link("answers/a1", "questions/q1", "for");
+    db.link("answers/a2", "questions/q2", "for");
+    db.link("answers/a3", "questions/q3", "for");
 
     let hits = db.query(
         "SELECT q.clo AS clo, SUM(a.score * q.weight) AS clo_score \
@@ -3229,9 +3217,9 @@ fn traverse_match_group_by_multi_field() {
     db.put("roles/r2", r#"{"_collection":"roles","_key":"r2","role":"viewer","tier":"low"}"#).unwrap();
     db.put("roles/r3", r#"{"_collection":"roles","_key":"r3","role":"admin","tier":"high"}"#).unwrap();
 
-    db.link("users/u1", "roles/r1", "has", 1.0);
-    db.link("users/u2", "roles/r2", "has", 1.0);
-    db.link("users/u3", "roles/r3", "has", 1.0);
+    db.link("users/u1", "roles/r1", "has");
+    db.link("users/u2", "roles/r2", "has");
+    db.link("users/u3", "roles/r3", "has");
 
     let hits = db.query(
         "SELECT b.role AS role, b.tier AS tier, COUNT(*) AS cnt \
@@ -3261,7 +3249,7 @@ fn traverse_count_and_avg() {
             &format!("answers/a{i}"),
             &format!(r#"{{"_collection":"answers","_key":"a{i}","score":{}}}"#, i as f64 * 0.25)
         ).unwrap();
-        db.link("students/budi", &format!("answers/a{i}"), "answered", 1.0);
+        db.link("students/budi", &format!("answers/a{i}"), "answered");
     }
 
     let hits = db.query(
@@ -3284,7 +3272,7 @@ fn traverse_with_limit() {
     db.put("s/root", r#"{"_collection":"s","_key":"root"}"#).unwrap();
     for i in 1..=10 {
         db.put(&format!("t/n{i}"), &format!(r#"{{"_collection":"t","_key":"n{i}","val":{i}}}"#)).unwrap();
-        db.link("s/root", &format!("t/n{i}"), "to", 1.0);
+        db.link("s/root", &format!("t/n{i}"), "to");
     }
 
     let hits = db.query(
@@ -3300,7 +3288,7 @@ fn traverse_from_collection() {
     for s in ["alice", "bob"] {
         db.put(&format!("students/{s}"), &format!(r#"{{"_collection":"students","_key":"{s}"}}"#)).unwrap();
         db.put(&format!("answers/{s}_ans"), &format!(r#"{{"_collection":"answers","_key":"{s}_ans","score":0.9}}"#)).unwrap();
-        db.link(&format!("students/{s}"), &format!("answers/{s}_ans"), "answered", 1.0);
+        db.link(&format!("students/{s}"), &format!("answers/{s}_ans"), "answered");
     }
 
     let hits = db.query(
@@ -3316,7 +3304,7 @@ fn traverse_min_max() {
     db.put("root/r", r#"{"_collection":"root","_key":"r"}"#).unwrap();
     for (k, v) in [("a", 10.0f64), ("b", 5.0), ("c", 8.0)] {
         db.put(&format!("vals/{k}"), &format!(r#"{{"_collection":"vals","_key":"{k}","v":{v}}}"#)).unwrap();
-        db.link("root/r", &format!("vals/{k}"), "link", 1.0);
+        db.link("root/r", &format!("vals/{k}"), "link");
     }
 
     let hits = db.query(
@@ -3340,8 +3328,8 @@ fn pipeline_single_match_scalar_return() {
     db.put("users/bob",   r#"{"_collection":"users","_key":"bob","score":20.0}"#).unwrap();
     db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hello"}"#).unwrap();
     db.put("posts/p2",    r#"{"_collection":"posts","_key":"p2","title":"world"}"#).unwrap();
-    db.link("users/alice", "posts/p1", "wrote", 1.0);
-    db.link("users/alice", "posts/p2", "wrote", 1.0);
+    db.link("users/alice", "posts/p1", "wrote");
+    db.link("users/alice", "posts/p2", "wrote");
 
     let hits = db.query(
         "SELECT p._key AS post_key FROM MATCH ('users/alice')-[:wrote]->(p)",
@@ -3374,12 +3362,12 @@ fn pipeline_match_with_group_sum() {
     db.put("questions/q3", r#"{"_collection":"questions","_key":"q3","clo":"clo2","weight":1.0}"#).unwrap();
 
     // Edges
-    db.link("students/budi", "answers/a1", "answered", 1.0);
-    db.link("students/budi", "answers/a2", "answered", 1.0);
-    db.link("students/budi", "answers/a3", "answered", 1.0);
-    db.link("answers/a1", "questions/q1", "for", 1.0);
-    db.link("answers/a2", "questions/q2", "for", 1.0);
-    db.link("answers/a3", "questions/q3", "for", 1.0);
+    db.link("students/budi", "answers/a1", "answered");
+    db.link("students/budi", "answers/a2", "answered");
+    db.link("students/budi", "answers/a3", "answered");
+    db.link("answers/a1", "questions/q1", "for");
+    db.link("answers/a2", "questions/q2", "for");
+    db.link("answers/a3", "questions/q3", "for");
 
     let hits = db.query(
         "SELECT q.clo AS clo, SUM(a.score * q.weight) AS clo_score \
@@ -3416,10 +3404,10 @@ fn pipeline_two_level_clo_plo() {
     db.put("answers/a2", r#"{"_collection":"answers","_key":"a2","score":1.0}"#).unwrap();
     db.put("questions/q1", r#"{"_collection":"questions","_key":"q1","clo":"clo1","weight":1.0}"#).unwrap();
     db.put("questions/q2", r#"{"_collection":"questions","_key":"q2","clo":"clo2","weight":1.0}"#).unwrap();
-    db.link("students/budi", "answers/a1", "answered", 1.0);
-    db.link("students/budi", "answers/a2", "answered", 1.0);
-    db.link("answers/a1", "questions/q1", "for", 1.0);
-    db.link("answers/a2", "questions/q2", "for", 1.0);
+    db.link("students/budi", "answers/a1", "answered");
+    db.link("students/budi", "answers/a2", "answered");
+    db.link("answers/a1", "questions/q1", "for");
+    db.link("answers/a2", "questions/q2", "for");
 
     // CLOs (weight for PLO contribution)
     db.put("clos/clo1", r#"{"_collection":"clos","_key":"clo1","weight":0.5}"#).unwrap();
@@ -3429,8 +3417,8 @@ fn pipeline_two_level_clo_plo() {
     db.put("plos/plo1", r#"{"_collection":"plos","_key":"plo1"}"#).unwrap();
 
     // Edges: CLOs contribute to PLO
-    db.link("clos/clo1", "plos/plo1", "contributes_to", 1.0);
-    db.link("clos/clo2", "plos/plo1", "contributes_to", 1.0);
+    db.link("clos/clo1", "plos/plo1", "contributes_to");
+    db.link("clos/clo2", "plos/plo1", "contributes_to");
 
     // Stage 1 — CLO scores from the graph: SUM(answer.score * question.weight)
     // grouped per CLO.  clo1: 0.8*1.0 = 0.8 ; clo2: 1.0*1.0 = 1.0
@@ -3470,7 +3458,7 @@ fn pipeline_with_limit() {
         let slug = format!("items/i{i}");
         let pay = format!(r#"{{"_collection":"items","_key":"i{i}","val":{i}}}"#);
         db.put(&slug, &pay).unwrap();
-        db.link("root", &slug, "has", 1.0);
+        db.link("root", &slug, "has");
     }
 
     let hits = db.query(
@@ -3492,7 +3480,7 @@ fn pipeline_count_aggregate() {
     for i in 1..=4u32 {
         let slug = format!("dst/d{i}");
         db.put(&slug, &format!(r#"{{"_collection":"dst","_key":"d{i}","grp":"g{}"}}"#, if i <= 2 {"1"} else {"2"})).unwrap();
-        db.link("src", &slug, "points_to", 1.0);
+        db.link("src", &slug, "points_to");
     }
 
     let hits = db.query(
@@ -3518,8 +3506,8 @@ fn pipeline_collection_start() {
     db.put("cats/b", r#"{"_collection":"cats","_key":"b"}"#).unwrap();
     db.put("items/x", r#"{"_collection":"items","_key":"x","val":5.0}"#).unwrap();
     db.put("items/y", r#"{"_collection":"items","_key":"y","val":10.0}"#).unwrap();
-    db.link("cats/a", "items/x", "has", 1.0);
-    db.link("cats/b", "items/y", "has", 1.0);
+    db.link("cats/a", "items/x", "has");
+    db.link("cats/b", "items/y", "has");
 
     let hits = db.query(
         "SELECT c._key AS cat, item.val AS val FROM MATCH (c:cats)-[:has]->(item:items) ORDER BY val ASC",
@@ -3540,8 +3528,8 @@ fn traversal_after_delete_skips_deleted_node() {
     for k in ["a", "b", "c"] {
         db.put(&format!("n/{k}"), &format!(r#"{{"_collection":"n","_key":"{k}"}}"#)).unwrap();
     }
-    db.link("n/a", "n/b", "e", 1.0);
-    db.link("n/b", "n/c", "e", 1.0);
+    db.link("n/a", "n/b", "e");
+    db.link("n/b", "n/c", "e");
 
     // 2-hop from a reaches b and c
     assert_eq!(db.one("n/a").hops_typed("e", 2).count(), 2);
@@ -3616,9 +3604,9 @@ fn edges_from_collection_and_between() {
         }).to_string()).unwrap();
     }
 
-    db.link("cls/math",    "lec/ali",  "taught_by", 1.0);
-    db.link("cls/physics", "lec/budi", "taught_by", 1.0);
-    db.link("lec/ali",     "dept/sci", "belongs_to", 1.0);
+    db.link("cls/math",    "lec/ali",  "taught_by");
+    db.link("cls/physics", "lec/budi", "taught_by");
+    db.link("lec/ali",     "dept/sci", "belongs_to");
 
     // ── edges_from_collection: all edges leaving classrooms ───────────────────
     let edges = db.edges_from_collection("classrooms");
@@ -3651,9 +3639,9 @@ fn show_edges_sql() {
     ] {
         db.put(key, &serde_json::json!({"_collection": col, "_key": key}).to_string()).unwrap();
     }
-    db.link("cls/math",    "lec/ali",  "taught_by",  1.0);
-    db.link("cls/physics", "lec/ali",  "taught_by",  1.0);
-    db.link("lec/ali",     "dept/sci", "belongs_to", 1.0);
+    db.link("cls/math",    "lec/ali",  "taught_by");
+    db.link("cls/physics", "lec/ali",  "taught_by");
+    db.link("lec/ali",     "dept/sci", "belongs_to");
 
     // Full schema — 2 distinct triples
     let hits = db.show("SHOW EDGES").unwrap();
@@ -4172,9 +4160,9 @@ fn edge_intrinsic_depth() {
     db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
     db.put("suburbs/hawthorn",  r#"{"_collection":"suburbs","_key":"hawthorn"}"#).unwrap();
     db.put("suburbs/box-hill",  r#"{"_collection":"suburbs","_key":"box-hill"}"#).unwrap();
-    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent", 1.0);
-    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent", 1.0);
-    db.link("suburbs/hawthorn",  "suburbs/box-hill", "adjacent", 1.0);
+    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent");
+    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent");
+    db.link("suburbs/hawthorn",  "suburbs/box-hill", "adjacent");
 
     // 2-hop path: melbourne -[r1]-> richmond -[r2]-> hawthorn
     let hits = db.query(
@@ -4195,8 +4183,8 @@ fn edge_intrinsic_path_keys() {
     db.put("suburbs/fitzroy",   r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
     db.put("suburbs/collingwood", r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
     db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
-    db.link("suburbs/fitzroy",    "suburbs/collingwood", "borders", 1.0);
-    db.link("suburbs/collingwood","suburbs/richmond",    "borders", 1.0);
+    db.link("suburbs/fitzroy",    "suburbs/collingwood", "borders");
+    db.link("suburbs/collingwood","suburbs/richmond",    "borders");
 
     let hits = db.query(
         "SELECT c._key AS dest, r2._path_keys AS path \
@@ -4210,31 +4198,6 @@ fn edge_intrinsic_path_keys() {
     assert_eq!(path.len(), 3, "3 nodes in path: fitzroy, collingwood, richmond");
     assert_eq!(path[0].as_str().unwrap(), "suburbs/fitzroy");
     assert_eq!(path[2].as_str().unwrap(), "suburbs/richmond");
-}
-
-/// `r._avg_strength` and `r._min_strength` reflect edge weights along the path.
-#[test]
-fn edge_intrinsic_strength_aggregates() {
-    let mut db = CoreDB::new();
-    db.put("events/flood", r#"{"_collection":"events","_key":"flood"}"#).unwrap();
-    db.put("suburbs/west", r#"{"_collection":"suburbs","_key":"west"}"#).unwrap();
-    db.put("streets/main", r#"{"_collection":"streets","_key":"main"}"#).unwrap();
-    db.link("events/flood", "suburbs/west",  "affects",  0.8);
-    db.link("suburbs/west", "streets/main",  "contains", 0.4);
-
-    let hits = db.query(
-        "SELECT st._key AS street, r._avg_strength AS avg_s, r._min_strength AS min_s \
-         FROM MATCH (e:events)-[:affects]->(s:suburbs)-[r:contains]->(st:streets) \
-         WHERE e._key = 'flood'"
-    ).unwrap().collect();
-
-    assert!(!hits.is_empty());
-    let p = hits[0].payload.as_ref().unwrap();
-    // avg = (0.8 + 0.4) / 2 = 0.6
-    let avg = p["avg_s"].as_f64().unwrap();
-    assert!((avg - 0.6).abs() < 1e-4, "avg_strength should be ~0.6, got {avg}");
-    let min = p["min_s"].as_f64().unwrap();
-    assert!((min - 0.4).abs() < 1e-4, "min_strength should be 0.4, got {min}");
 }
 
 // ── MATCH SHORTEST ───────────────────────────────────────────────────────────
@@ -4261,13 +4224,13 @@ fn setup_path_db() -> CoreDB {
     db.put("places/canggu",   r#"{"_collection":"places","name":"Canggu"}"#).unwrap();
     db.put("places/uluwatu",  r#"{"_collection":"places","name":"Uluwatu"}"#).unwrap();
 
-    db.link("places/seminyak", "places/kuta",    "bus_to",     1.0);
-    db.link("places/seminyak", "places/ubud",    "shuttle_to", 1.0);
-    db.link("places/ubud",     "places/kuta",    "scooter_to", 1.0);
-    db.link("places/kuta",     "places/canggu",  "walk_to",    1.0);
-    db.link("places/ubud",     "places/canggu",  "taxi_to",    1.0);
-    db.link("places/canggu",   "places/uluwatu", "ferry_to",   1.0);
-    db.link("places/kuta",     "places/uluwatu", "taxi_to",    1.0);
+    db.link("places/seminyak", "places/kuta",    "bus_to");
+    db.link("places/seminyak", "places/ubud",    "shuttle_to");
+    db.link("places/ubud",     "places/kuta",    "scooter_to");
+    db.link("places/kuta",     "places/canggu",  "walk_to");
+    db.link("places/ubud",     "places/canggu",  "taxi_to");
+    db.link("places/canggu",   "places/uluwatu", "ferry_to");
+    db.link("places/kuta",     "places/uluwatu", "taxi_to");
 
     db
 }
@@ -4373,8 +4336,8 @@ fn select_from_match() {
     db.put("suburbs/melbourne", r#"{"_collection":"suburbs","_key":"melbourne"}"#).unwrap();
     db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
     db.put("suburbs/hawthorn",  r#"{"_collection":"suburbs","_key":"hawthorn"}"#).unwrap();
-    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent", 1.0);
-    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent", 1.0);
+    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent");
+    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent");
 
     // Start variable (s) is not bound in path rows; use destination (n) and edge (r).
     let hits = db.query(
@@ -4392,29 +4355,6 @@ fn select_from_match() {
 
 // ── Target 9: PATH_* aggregates ───────────────────────────────────────────────
 
-/// PATH_PRODUCT multiplies all elements in the path strength array.
-/// Graph: flood -[0.8]-> west -[0.4]-> main-st  →  product = 0.32
-#[test]
-fn path_product() {
-    let mut db = CoreDB::new();
-    db.put("events/flood", r#"{"_collection":"events","_key":"flood"}"#).unwrap();
-    db.put("suburbs/west", r#"{"_collection":"suburbs","_key":"west"}"#).unwrap();
-    db.put("streets/main", r#"{"_collection":"streets","_key":"main"}"#).unwrap();
-    db.link("events/flood", "suburbs/west",  "affects",  0.8);
-    db.link("suburbs/west", "streets/main",  "contains", 0.4);
-
-    let hits = db.query(
-        "SELECT PATH_PRODUCT(r._path_strength) AS prod \
-         FROM MATCH (e:events)-[:affects]->(s:suburbs)-[r:contains]->(st:streets) \
-         WHERE e._key = 'flood'"
-    ).unwrap().collect();
-
-    assert!(!hits.is_empty(), "should have at least one path row");
-    let p = hits[0].payload.as_ref().unwrap();
-    let prod = p["prod"].as_f64().unwrap();
-    assert!((prod - 0.32).abs() < 1e-6, "PATH_PRODUCT should be ~0.32, got {prod}");
-}
-
 /// PATH_FIRST and PATH_LAST return the first/last element of a path array field.
 /// Uses r._path_keys which contains the full slug list from start to current node.
 #[test]
@@ -4423,8 +4363,8 @@ fn path_first_last() {
     db.put("suburbs/fitzroy",    r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
     db.put("suburbs/collingwood",r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
     db.put("suburbs/richmond",   r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
-    db.link("suburbs/fitzroy",     "suburbs/collingwood", "borders", 1.0);
-    db.link("suburbs/collingwood", "suburbs/richmond",    "borders", 1.0);
+    db.link("suburbs/fitzroy",     "suburbs/collingwood", "borders");
+    db.link("suburbs/collingwood", "suburbs/richmond",    "borders");
 
     let hits = db.query(
         "SELECT PATH_FIRST(r2._path_keys) AS first_stop, PATH_LAST(r2._path_keys) AS last_stop \
@@ -4447,8 +4387,8 @@ fn case_when_depth() {
     db.put("suburbs/melbourne", r#"{"_collection":"suburbs","_key":"melbourne"}"#).unwrap();
     db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
     db.put("suburbs/hawthorn",  r#"{"_collection":"suburbs","_key":"hawthorn"}"#).unwrap();
-    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent", 1.0);
-    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent", 1.0);
+    db.link("suburbs/melbourne", "suburbs/richmond", "adjacent");
+    db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent");
 
     // Two-hop path ends at hawthorn with r2._depth = 2
     let hits = db.query(
@@ -4470,7 +4410,7 @@ fn now_returns_integer() {
     let mut db = CoreDB::new();
     db.put("suburbs/fitzroy",    r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
     db.put("suburbs/collingwood",r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
-    db.link("suburbs/fitzroy", "suburbs/collingwood", "borders", 1.0);
+    db.link("suburbs/fitzroy", "suburbs/collingwood", "borders");
 
     let hits = db.query(
         "SELECT NOW() AS ts \
@@ -4491,8 +4431,8 @@ fn json_array_length() {
     db.put("suburbs/fitzroy",    r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
     db.put("suburbs/collingwood",r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
     db.put("suburbs/richmond",   r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
-    db.link("suburbs/fitzroy",     "suburbs/collingwood", "borders", 1.0);
-    db.link("suburbs/collingwood", "suburbs/richmond",    "borders", 1.0);
+    db.link("suburbs/fitzroy",     "suburbs/collingwood", "borders");
+    db.link("suburbs/collingwood", "suburbs/richmond",    "borders");
 
     let hits = db.query(
         "SELECT JSON_ARRAY_LENGTH(r2._path_keys) AS path_len \
@@ -4552,11 +4492,11 @@ fn multi_from_two_matches() {
     db.put("root2/r2", r#"{"_collection":"root2","_key":"r2"}"#).unwrap();
     for i in 1..=2 {
         db.put(&format!("alpha/a{i}"), &format!(r#"{{"_collection":"alpha","_key":"a{i}"}}"#)).unwrap();
-        db.link("root1/r1", &format!("alpha/a{i}"), "has", 1.0);
+        db.link("root1/r1", &format!("alpha/a{i}"), "has");
     }
     for i in 1..=3 {
         db.put(&format!("beta/b{i}"), &format!(r#"{{"_collection":"beta","_key":"b{i}"}}"#)).unwrap();
-        db.link("root2/r2", &format!("beta/b{i}"), "has", 1.0);
+        db.link("root2/r2", &format!("beta/b{i}"), "has");
     }
 
     let hits = db.query(
@@ -4574,7 +4514,7 @@ fn multi_from_match_and_collection() {
     db.put("root/r", r#"{"_collection":"root","_key":"r"}"#).unwrap();
     for k in ["flood", "storm"] {
         db.put(&format!("events/{k}"), &format!(r#"{{"_collection":"events","_key":"{k}"}}"#)).unwrap();
-        db.link("root/r", &format!("events/{k}"), "caused", 1.0);
+        db.link("root/r", &format!("events/{k}"), "caused");
     }
     for s in ["fitzroy", "richmond", "hawthorn"] {
         db.put(&format!("suburbs/{s}"), &format!(r#"{{"_collection":"suburbs","_key":"{s}"}}"#)).unwrap();
@@ -4595,8 +4535,8 @@ fn multi_from_match_and_shortest() {
     db.put("towns/mel", r#"{"_collection":"towns","_key":"mel"}"#).unwrap();
     db.put("towns/syd", r#"{"_collection":"towns","_key":"syd"}"#).unwrap();
     db.put("root_n/r",  r#"{"_collection":"root_n","_key":"r"}"#).unwrap();
-    db.link("root_n/r", "towns/mel", "near", 1.0);
-    db.link("root_n/r", "towns/syd", "near", 1.0);
+    db.link("root_n/r", "towns/mel", "near");
+    db.link("root_n/r", "towns/syd", "near");
 
     let hits = db.query(
         "SELECT t._key AS town, p.length AS hops \
@@ -4795,7 +4735,7 @@ fn match_start_var_is_bound() {
         r#"{"_collection":"tags","_key":"t1","name":"programming"}"#,
     )
     .unwrap();
-    db.link("posts/p1", "tags/t1", "tagged_with", 1.0);
+    db.link("posts/p1", "tags/t1", "tagged_with");
 
     let hits = db
         .query(
@@ -5218,8 +5158,8 @@ fn param_math_expr_in_select_from_match() {
     db.put("users/alice", r#"{"_collection":"users","_key":"alice","score":10}"#).unwrap();
     db.put("users/bob",   r#"{"_collection":"users","_key":"bob","score":20}"#).unwrap();
     db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","weight":5}"#).unwrap();
-    db.link("users/alice", "posts/p1", "wrote", 1.0);
-    db.link("users/bob",   "posts/p1", "wrote", 1.0);
+    db.link("users/alice", "posts/p1", "wrote");
+    db.link("users/bob",   "posts/p1", "wrote");
 
     // SUM(a.score * $1) — param in math expression, GROUP BY b._key
     let hits = db.query_params(
@@ -5243,8 +5183,8 @@ fn param_pipeline_where_string() {
     db.put("users/alice", r#"{"_collection":"users","_key":"alice","name":"Alice"}"#).unwrap();
     db.put("users/bob",   r#"{"_collection":"users","_key":"bob","name":"Bob"}"#).unwrap();
     db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hello"}"#).unwrap();
-    db.link("users/alice", "posts/p1", "wrote", 1.0);
-    db.link("users/bob",   "posts/p1", "wrote", 1.0);
+    db.link("users/alice", "posts/p1", "wrote");
+    db.link("users/bob",   "posts/p1", "wrote");
 
     // Pipeline with param in WHERE
     let hits = db.query_params(
@@ -5263,8 +5203,8 @@ fn param_pipeline_where_number() {
     db.put("items/a", r#"{"_collection":"items","_key":"a","score":10}"#).unwrap();
     db.put("items/b", r#"{"_collection":"items","_key":"b","score":20}"#).unwrap();
     db.put("items/c", r#"{"_collection":"items","_key":"c","score":30}"#).unwrap();
-    db.link("items/b", "items/a", "back", 1.0);
-    db.link("items/c", "items/a", "back", 1.0);
+    db.link("items/b", "items/a", "back");
+    db.link("items/c", "items/a", "back");
 
     // WHERE on start node — filter by score > $1, then traverse
     let hits = db.query_params(
@@ -5287,8 +5227,8 @@ fn param_pipeline_start_slug() {
     db.put("users/alice", r#"{"_collection":"users","_key":"alice"}"#).unwrap();
     db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hi"}"#).unwrap();
     db.put("posts/p2",    r#"{"_collection":"posts","_key":"p2","title":"bye"}"#).unwrap();
-    db.link("users/alice", "posts/p1", "wrote", 1.0);
-    db.link("users/alice", "posts/p2", "wrote", 1.0);
+    db.link("users/alice", "posts/p1", "wrote");
+    db.link("users/alice", "posts/p2", "wrote");
 
     let hits = db.query_params(
         "SELECT p._key AS pk FROM MATCH ($1)-[:wrote]->(p)",
@@ -5305,8 +5245,8 @@ fn param_pipeline_math_literal() {
     db.put("students/budi", r#"{"_collection":"students","_key":"budi"}"#).unwrap();
     db.put("answers/a1",    r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
     db.put("questions/q1",  r#"{"_collection":"questions","_key":"q1","weight":0.5}"#).unwrap();
-    db.link("students/budi", "answers/a1", "answered", 1.0);
-    db.link("answers/a1",    "questions/q1", "for", 1.0);
+    db.link("students/budi", "answers/a1", "answered");
+    db.link("answers/a1",    "questions/q1", "for");
 
     // Use $1 as a multiplier in pipeline math expression
     let hits = db.query_params(
@@ -5387,7 +5327,7 @@ fn param_delete_edge() {
     let mut db = CoreDB::new();
     db.put("users/alice", r#"{"name":"Alice","_collection":"users"}"#).unwrap();
     db.put("users/bob", r#"{"name":"Bob","_collection":"users"}"#).unwrap();
-    db.link("users/alice", "users/bob", "follows", 1.0);
+    db.link("users/alice", "users/bob", "follows");
 
     // Verify edge exists
     let hits = db.query(
@@ -5416,8 +5356,8 @@ fn param_match_slug_start() {
     db.put("users/alice", r#"{"_collection":"users","_key":"alice","name":"Alice"}"#).unwrap();
     db.put("users/bob",   r#"{"_collection":"users","_key":"bob","name":"Bob"}"#).unwrap();
     db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hello"}"#).unwrap();
-    db.link("users/alice", "posts/p1", "wrote", 1.0);
-    db.link("users/bob",   "posts/p1", "wrote", 1.0);
+    db.link("users/alice", "posts/p1", "wrote");
+    db.link("users/bob",   "posts/p1", "wrote");
 
     // MATCH ($1) — param as the start node slug (SELECT FROM MATCH supports projections)
     let hits = db.query_params(
@@ -5437,8 +5377,8 @@ fn param_match_where_key() {
     db.put("users/bob",   r#"{"_collection":"users","_key":"bob","name":"Bob"}"#).unwrap();
     db.put("posts/p1",    r#"{"_collection":"posts","_key":"p1","title":"hello"}"#).unwrap();
     db.put("posts/p2",    r#"{"_collection":"posts","_key":"p2","title":"bye"}"#).unwrap();
-    db.link("users/alice", "posts/p1", "wrote", 1.0);
-    db.link("users/bob",   "posts/p2", "wrote", 1.0);
+    db.link("users/alice", "posts/p1", "wrote");
+    db.link("users/bob",   "posts/p2", "wrote");
 
     // WHERE a._key = $1 — param in MATCH WHERE condition
     let hits = db.query_params(
@@ -5458,8 +5398,8 @@ fn param_match_where_value() {
     db.put("items/a", r#"{"_collection":"items","_key":"a","label":"hot"}"#).unwrap();
     db.put("items/b", r#"{"_collection":"items","_key":"b","label":"cold"}"#).unwrap();
     db.put("tags/t1", r#"{"_collection":"tags","_key":"t1"}"#).unwrap();
-    db.link("items/a", "tags/t1", "tagged", 1.0);
-    db.link("items/b", "tags/t1", "tagged", 1.0);
+    db.link("items/a", "tags/t1", "tagged");
+    db.link("items/b", "tags/t1", "tagged");
 
     // SELECT FROM MATCH with WHERE field = $1 — param as a comparison value
     let hits = db.query_params(
@@ -5479,8 +5419,8 @@ fn param_select_from_match_where_key() {
     db.put("students/budi", r#"{"_collection":"students","_key":"budi"}"#).unwrap();
     db.put("answers/a1",    r#"{"_collection":"answers","_key":"a1","score":0.8}"#).unwrap();
     db.put("answers/a2",    r#"{"_collection":"answers","_key":"a2","score":0.9}"#).unwrap();
-    db.link("students/budi", "answers/a1", "answered", 1.0);
-    db.link("students/budi", "answers/a2", "answered", 1.0);
+    db.link("students/budi", "answers/a1", "answered");
+    db.link("students/budi", "answers/a2", "answered");
 
     // SELECT FROM MATCH with WHERE a._key = $1
     let hits = db.query_params(
