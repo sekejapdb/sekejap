@@ -39,6 +39,9 @@ fn setup_core() -> sekejap::CoreDB {
             1.0,
         );
     }
+    // Btree indexes — match SQLite's CREATE INDEX idx_cat/idx_price
+    db.execute("CREATE INDEX ON products USING btree (category)").unwrap();
+    db.execute("CREATE INDEX ON products USING btree (price)").unwrap();
     db
 }
 
@@ -69,6 +72,9 @@ fn setup_sekejap() -> (sekejap::CoreDB, tempfile::TempDir) {
             1.0,
         );
     }
+    // Btree indexes — match SQLite's CREATE INDEX idx_cat/idx_price
+    db.execute("CREATE INDEX ON products USING btree (category)").unwrap();
+    db.execute("CREATE INDEX ON products USING btree (price)").unwrap();
     (db, dir)
 }
 
@@ -240,7 +246,7 @@ fn bench_forward_1hop(c: &mut Criterion) {
     group.bench_function("core_match", |b| {
         b.iter(|| black_box(
             core_db.query(
-                "MATCH (a:products)-[:related]->(b) WHERE a._key = 'p0' RETURN b"
+                "SELECT b.* FROM MATCH (a:products)-[:related]->(b) WHERE a._key = 'p0'"
             ).unwrap().count()
         ))
     });
@@ -257,7 +263,7 @@ fn bench_forward_1hop(c: &mut Criterion) {
     group.bench_function("sekejap_match", |b| {
         b.iter(|| black_box(
             sk_db.query(
-                "MATCH (a:products)-[:related]->(b) WHERE a._key = 'p0' RETURN b"
+                "SELECT b.* FROM MATCH (a:products)-[:related]->(b) WHERE a._key = 'p0'"
             ).unwrap().count()
         ))
     });
@@ -288,7 +294,7 @@ fn bench_multihop_bfs(c: &mut Criterion) {
     group.bench_function("core_match", |b| {
         b.iter(|| black_box(
             core_db.query(
-                "MATCH (a:products)-[:related*1..3]->(b) WHERE a._key = 'p0' RETURN b"
+                "SELECT b.* FROM MATCH (a:products)-[:related*1..3]->(b) WHERE a._key = 'p0'"
             ).unwrap().count()
         ))
     });
@@ -297,7 +303,7 @@ fn bench_multihop_bfs(c: &mut Criterion) {
     group.bench_function("sekejap_match", |b| {
         b.iter(|| black_box(
             sk_db.query(
-                "MATCH (a:products)-[:related*1..3]->(b) WHERE a._key = 'p0' RETURN b"
+                "SELECT b.* FROM MATCH (a:products)-[:related*1..3]->(b) WHERE a._key = 'p0'"
             ).unwrap().count()
         ))
     });
@@ -464,6 +470,41 @@ fn bench_bulk_insert_1k(c: &mut Criterion) {
     group.finish();
 }
 
+fn setup_sqlite_disk() -> (rusqlite::Connection, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("bench.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=FULL;
+        CREATE TABLE products (
+            key TEXT PRIMARY KEY,
+            category TEXT,
+            price REAL,
+            in_stock INTEGER,
+            name TEXT
+        );
+        CREATE INDEX idx_cat ON products(category);
+        CREATE INDEX idx_price ON products(price);"
+    ).unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    {
+        let mut stmt = conn.prepare(
+            "INSERT INTO products (key, category, price, in_stock, name) VALUES (?1, ?2, ?3, ?4, ?5)"
+        ).unwrap();
+        for i in 0..10_000usize {
+            let cat = format!("cat{}", i % 10);
+            let price = (i % 200) as f64 + 10.0;
+            let in_stock: i32 = if i % 3 != 0 { 1 } else { 0 };
+            stmt.execute(rusqlite::params![
+                format!("p{i}"), cat, price, in_stock, format!("Product {i}")
+            ]).unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    (conn, dir)
+}
+
 fn bench_update(c: &mut Criterion) {
     let mut group = c.benchmark_group("update");
 
@@ -477,16 +518,75 @@ fn bench_update(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("sqlite", |b| {
+    group.bench_function("sqlite_memory", |b| {
         let sqlite = setup_sqlite();
         b.iter(|| {
             black_box(
-                sqlite
-                    .execute(
-                        "UPDATE products SET name = 'Updated' WHERE category = 'cat3'",
-                        [],
-                    )
+                sqlite.execute(
+                    "UPDATE products SET name = 'Updated' WHERE category = 'cat3'", [],
+                ).unwrap(),
+            )
+        })
+    });
+
+    group.sample_size(10);
+
+    group.bench_function("sekejap_disk", |b| {
+        let (mut db, _dir) = setup_sekejap();
+        b.iter(|| {
+            black_box(
+                db.execute("UPDATE products SET name = 'Updated' WHERE category = 'cat3'")
                     .unwrap(),
+            )
+        })
+    });
+
+    group.bench_function("sekejap_disk_logical", |b| {
+        let (mut db, _dir) = setup_sekejap();
+        db.execute("SET WAL_MODE = logical").unwrap();
+        b.iter(|| {
+            black_box(
+                db.execute("UPDATE products SET name = 'Updated' WHERE category = 'cat3'")
+                    .unwrap(),
+            )
+        })
+    });
+
+    // Durability-matched variant: SQLite's synchronous=FULL uses plain fsync
+    // on macOS (fullfsync defaults OFF), which is sekejap's WAL_SYNC=os level.
+    group.bench_function("sekejap_disk_logical_os_sync", |b| {
+        let (mut db, _dir) = setup_sekejap();
+        db.execute("SET WAL_MODE = logical").unwrap();
+        db.execute("SET WAL_SYNC = os").unwrap();
+        b.iter(|| {
+            black_box(
+                db.execute("UPDATE products SET name = 'Updated' WHERE category = 'cat3'")
+                    .unwrap(),
+            )
+        })
+    });
+
+    // The reverse: SQLite at TRUE power-loss durability (F_FULLFSYNC),
+    // matching sekejap's default WAL_SYNC=full.
+    group.bench_function("sqlite_disk_fullfsync", |b| {
+        let (sqlite, _dir) = setup_sqlite_disk();
+        sqlite.execute_batch("PRAGMA fullfsync=ON;").unwrap();
+        b.iter(|| {
+            black_box(
+                sqlite.execute(
+                    "UPDATE products SET name = 'Updated' WHERE category = 'cat3'", [],
+                ).unwrap(),
+            )
+        })
+    });
+
+    group.bench_function("sqlite_disk", |b| {
+        let (sqlite, _dir) = setup_sqlite_disk();
+        b.iter(|| {
+            black_box(
+                sqlite.execute(
+                    "UPDATE products SET name = 'Updated' WHERE category = 'cat3'", [],
+                ).unwrap(),
             )
         })
     });
@@ -496,6 +596,7 @@ fn bench_update(c: &mut Criterion) {
 
 fn bench_delete(c: &mut Criterion) {
     let mut group = c.benchmark_group("delete");
+    group.sample_size(10);
 
     group.bench_function("sekejap_memory", |b| {
         b.iter_batched(
@@ -510,10 +611,36 @@ fn bench_delete(c: &mut Criterion) {
         )
     });
 
-    group.bench_function("sqlite", |b| {
+    group.bench_function("sqlite_memory", |b| {
         b.iter_batched(
             setup_sqlite,
             |conn| {
+                black_box(
+                    conn.execute("DELETE FROM products WHERE category = 'cat9'", [])
+                        .unwrap(),
+                )
+            },
+            criterion::BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("sekejap_disk", |b| {
+        b.iter_batched(
+            setup_sekejap,
+            |(mut db, _dir)| {
+                black_box(
+                    db.execute("DELETE FROM products WHERE category = 'cat9'")
+                        .unwrap(),
+                )
+            },
+            criterion::BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("sqlite_disk", |b| {
+        b.iter_batched(
+            setup_sqlite_disk,
+            |(conn, _dir)| {
                 black_box(
                     conn.execute("DELETE FROM products WHERE category = 'cat9'", [])
                         .unwrap(),

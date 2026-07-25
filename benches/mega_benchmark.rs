@@ -157,6 +157,12 @@ fn setup_sekejap() -> (CoreDB, tempfile::TempDir) {
     db.build_spatial_index();
     db.build_gin_index("content");
     db.build_hnsw_index("emb", 16, 200).unwrap();
+    // Field indexes — mirror the SQLite B-tree indexes so btree_seed /
+    // btree_sorted_seed_from_steps fast paths activate for filter + sort cases.
+    db.build_field_index("venues", "category");
+    db.build_field_index("venues", "suburb");
+    db.build_field_index("venues", "rating");
+    db.build_field_index("venues", "price");
 
     (db, dir)
 }
@@ -430,7 +436,7 @@ fn bench_08_graph_1hop(c: &mut Criterion) {
     let mut g = c.benchmark_group("08_graph_1hop");
     g.bench_function("sekejap_sql", |b| b.iter(|| black_box(
         sk.query(
-            "MATCH (a:venues)-[:related_to]->(b) WHERE a._key = 'v5000' RETURN b"
+            "SELECT b.* FROM MATCH (a:venues)-[:related_to]->(b) WHERE a._key = 'v5000'"
         ).unwrap().count()
     )));
     g.bench_function("sekejap_atomic", |b| b.iter(|| black_box(
@@ -453,7 +459,7 @@ fn bench_09_graph_5hop_bfs(c: &mut Criterion) {
     let mut g = c.benchmark_group("09_graph_5hop_bfs");
     g.bench_function("sekejap_sql", |b| b.iter(|| black_box(
         sk.query(
-            "MATCH (a:venues)-[:related_to*1..5]->(b) WHERE a._key = 'v1234' RETURN b LIMIT 5000"
+            "SELECT b.* FROM MATCH (a:venues)-[:related_to*1..5]->(b) WHERE a._key = 'v1234' LIMIT 5000"
         ).unwrap().count()
     )));
     g.bench_function("sekejap_atomic", |b| b.iter(|| black_box(
@@ -483,7 +489,7 @@ fn bench_10_root_cause(c: &mut Criterion) {
     let mut g = c.benchmark_group("10_root_cause_bfs_leaves");
     g.bench_function("sekejap_sql", |b| b.iter(|| black_box(
         sk.query(
-            "MATCH (a:services)-[:depends_on*1..8]->(b) WHERE a._key = 'svc200' RETURN b"
+            "SELECT b.* FROM MATCH (a:services)-[:depends_on*1..8]->(b) WHERE a._key = 'svc200'"
         ).unwrap().count()
     )));
     g.bench_function("sekejap_atomic", |b| b.iter(|| black_box(

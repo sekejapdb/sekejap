@@ -98,13 +98,11 @@ pub enum WalEntry {
         from: String,
         to: String,
         edge_type: String,
-        strength: f32,
     },
     LinkMeta {
         from: String,
         to: String,
         edge_type: String,
-        strength: f32,
         meta: String,
     },
     Unlink {
@@ -220,10 +218,6 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
-fn put_f32(buf: &mut Vec<u8>, v: f32) {
-    buf.extend_from_slice(&v.to_le_bytes());
-}
-
 fn put_i64(buf: &mut Vec<u8>, v: i64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
@@ -319,19 +313,17 @@ pub fn binary_encode(entry: &WalEntry) -> Vec<u8> {
             buf.push(TAG_REMOVE);
             put_str(&mut buf, slug);
         }
-        WalEntry::Link { from, to, edge_type, strength } => {
+        WalEntry::Link { from, to, edge_type } => {
             buf.push(TAG_LINK);
             put_str(&mut buf, from);
             put_str(&mut buf, to);
             put_str(&mut buf, edge_type);
-            put_f32(&mut buf, *strength);
         }
-        WalEntry::LinkMeta { from, to, edge_type, strength, meta } => {
+        WalEntry::LinkMeta { from, to, edge_type, meta } => {
             buf.push(TAG_LINK_META);
             put_str(&mut buf, from);
             put_str(&mut buf, to);
             put_str(&mut buf, edge_type);
-            put_f32(&mut buf, *strength);
             put_str(&mut buf, meta);
         }
         WalEntry::Unlink { from, to, edge_type } => {
@@ -400,13 +392,11 @@ pub fn binary_decode(data: &[u8]) -> Option<WalEntry> {
             from: r.read_str()?,
             to: r.read_str()?,
             edge_type: r.read_str()?,
-            strength: r.read_f32()?,
         }),
         TAG_LINK_META => Some(WalEntry::LinkMeta {
             from: r.read_str()?,
             to: r.read_str()?,
             edge_type: r.read_str()?,
-            strength: r.read_f32()?,
             meta: r.read_str()?,
         }),
         TAG_UNLINK => Some(WalEntry::Unlink {
@@ -753,8 +743,8 @@ mod tests {
         vec![
             WalEntry::Put { slug: "users/alice".into(), payload: r#"{"name":"Alice","age":30}"#.into() },
             WalEntry::Remove { slug: "users/bob".into() },
-            WalEntry::Link { from: "users/alice".into(), to: "users/bob".into(), edge_type: "follows".into(), strength: 0.75 },
-            WalEntry::LinkMeta { from: "a".into(), to: "b".into(), edge_type: "rated".into(), strength: 1.0, meta: r#"{"score":5}"#.into() },
+            WalEntry::Link { from: "users/alice".into(), to: "users/bob".into(), edge_type: "follows".into() },
+            WalEntry::LinkMeta { from: "a".into(), to: "b".into(), edge_type: "rated".into(), meta: r#"{"score":5}"#.into() },
             WalEntry::Unlink { from: "a".into(), to: "b".into(), edge_type: "follows".into() },
             WalEntry::CreateTable { collection: "users".into(), schema_json: r#"{"fields":[{"name":"name","type":"text"}]}"#.into() },
             WalEntry::PutVector { slug: "docs/d1".into(), field: "embedding".into(), data: vec![0.1, 0.2, 0.3, 0.4] },
@@ -784,7 +774,7 @@ mod tests {
     fn write_multiple_ops() {
         let (entries, corrupted) = roundtrip(vec![
             WalEntry::Put { slug: "alice".into(), payload: "{}".into() },
-            WalEntry::Link { from: "alice".into(), to: "bob".into(), edge_type: "follows".into(), strength: 1.0 },
+            WalEntry::Link { from: "alice".into(), to: "bob".into(), edge_type: "follows".into() },
             WalEntry::Remove { slug: "alice".into() },
         ]);
         assert!(!corrupted);
@@ -866,7 +856,7 @@ mod tests {
         assert!(matches!(&entries[0], WalEntry::Put { slug, payload }
             if slug == "users/alice" && payload.contains("Alice")));
         assert!(matches!(&entries[1], WalEntry::Remove { slug } if slug == "users/bob"));
-        assert!(matches!(&entries[2], WalEntry::Link { strength, .. } if (*strength - 0.75).abs() < 1e-6));
+        assert!(matches!(&entries[2], WalEntry::Link { from, edge_type, .. } if from == "users/alice" && edge_type == "follows"));
         assert!(matches!(&entries[6], WalEntry::PutVector { data, .. } if data.len() == 4));
         assert!(matches!(&entries[7], WalEntry::CreateIndex { fields, .. } if fields.len() == 2));
         assert!(matches!(&entries[11], WalEntry::TxnBegin));

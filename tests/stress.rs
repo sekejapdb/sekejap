@@ -298,7 +298,7 @@ fn stress_iteration(db: &mut CoreDB, round: usize, base_idx: usize) {
             let target_idx = r.range(CITIZENS);
             let target = format!("citizens/c{:05}", target_idx);
             if target != slug {
-                db.link(&slug, &target, "follows", 1.0);
+                db.link(&slug, &target, "follows");
             }
         }
     }
@@ -381,7 +381,7 @@ fn citizen_stress_test() {
             let dst = r.range(CITIZENS);
             if dst != src {
                 let dst_slug = format!("citizens/c{:05}", dst);
-                db.link(&src_slug, &dst_slug, "follows", 1.0);
+                db.link(&src_slug, &dst_slug, "follows");
                 edge_count += 1;
             }
         }

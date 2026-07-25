@@ -17,7 +17,7 @@
 //! - `dict.bin` — collection-name and edge-type-name dictionaries (`id → string`).
 //!
 //! ## Per-node edge block
-//! `[count varint][neighbor deltas: StreamVByte][type_ids u32×n][strengths f32×n][meta u32×n]`
+//! `[count varint][neighbor deltas: StreamVByte][type_ids u32×n][meta u32×n]`
 //! Neighbor ids are sorted, delta-encoded, then StreamVByte-packed with 2-bit length
 //! classes {1,2,4,8} bytes — compact (~1–2 B/neighbor), decode-4-at-a-time, and
 //! *unbounded* (a delta widens as needed, so there is no `u32` node ceiling).
@@ -72,7 +72,6 @@ pub struct TopoEdge {
     pub from_hash: u64,
     pub to_hash: u64,
     pub edge_type: String,
-    pub strength: f32,
     /// Raw JSON edge metadata, if any (stored sparsely in `edgemeta.bin`).
     pub meta: Option<String>,
 }
@@ -108,11 +107,6 @@ fn rd_u32(b: &[u8], o: usize) -> u32 {
 fn rd_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
-#[inline]
-fn rd_f32(b: &[u8], o: usize) -> f32 {
-    f32::from_le_bytes(b[o..o + 4].try_into().unwrap())
-}
-
 fn write_header(out: &mut Vec<u8>, magic: &[u8; 8], flags: u32) {
     out.extend_from_slice(magic);
     out.extend_from_slice(&TOPO_VERSION.to_le_bytes());
@@ -232,10 +226,11 @@ impl Interner {
     }
 }
 
-/// Serialize one node's edge block: `[count][SVB neighbor deltas][types][strengths][metas]`.
-/// Tuple = `(neighbor_id, edge_type_id, strength, meta_ref)`; `meta_ref` indexes
-/// `edgemeta.bin` (`NO_ID` = no metadata).
-fn encode_block(sorted: &[(u64, u32, f32, u32)]) -> Vec<u8> {
+/// Serialize one node's edge block: `[count][SVB neighbor deltas][types][metas]`.
+/// Tuple = `(neighbor_id, edge_type_id, meta_ref)`; `meta_ref` indexes
+/// `edgemeta.bin` (`NO_ID` = no metadata). Edges are naked — no weight in the
+/// topology; any weight is an opt-in JSON/column attribute in `edgemeta.bin`.
+fn encode_block(sorted: &[(u64, u32, u32)]) -> Vec<u8> {
     let n = sorted.len();
     let mut out = Vec::new();
     write_varint(&mut out, n as u64);
@@ -243,7 +238,7 @@ fn encode_block(sorted: &[(u64, u32, f32, u32)]) -> Vec<u8> {
     // Neighbor ids → deltas → StreamVByte.
     let mut deltas = Vec::with_capacity(n);
     let mut prev = 0u64;
-    for &(nid, _, _, _) in sorted {
+    for &(nid, _, _) in sorted {
         deltas.push(nid - prev);
         prev = nid;
     }
@@ -254,19 +249,16 @@ fn encode_block(sorted: &[(u64, u32, f32, u32)]) -> Vec<u8> {
     out.extend_from_slice(&data);
 
     // Parallel attribute arrays.
-    for &(_, tid, _, _) in sorted {
+    for &(_, tid, _) in sorted {
         out.extend_from_slice(&tid.to_le_bytes());
     }
-    for &(_, _, s, _) in sorted {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    for &(_, _, _, m) in sorted {
+    for &(_, _, m) in sorted {
         out.extend_from_slice(&m.to_le_bytes());
     }
     out
 }
 
-fn serialize_csr(magic: &[u8; 8], per_node: &[Vec<(u64, u32, f32, u32)>]) -> Vec<u8> {
+fn serialize_csr(magic: &[u8; 8], per_node: &[Vec<(u64, u32, u32)>]) -> Vec<u8> {
     let n = per_node.len();
     // Encode each block, remembering its length.
     let blocks: Vec<Vec<u8>> = per_node.iter().map(|e| encode_block(e)).collect();
@@ -347,8 +339,8 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
 
     // Adjacency (fwd by from, rev by to), neighbors sorted. Edge metadata is
     // interned into edgemeta.bin; both directions share one meta_ref.
-    let mut fwd: Vec<Vec<(u64, u32, f32, u32)>> = vec![Vec::new(); n];
-    let mut rev: Vec<Vec<(u64, u32, f32, u32)>> = vec![Vec::new(); n];
+    let mut fwd: Vec<Vec<(u64, u32, u32)>> = vec![Vec::new(); n];
+    let mut rev: Vec<Vec<(u64, u32, u32)>> = vec![Vec::new(); n];
     let mut meta_blobs: Vec<&str> = Vec::new();
     for e in edges {
         let (Some(&fid), Some(&tid)) =
@@ -365,11 +357,11 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
             }
             None => NO_ID,
         };
-        fwd[fid as usize].push((tid, type_id, e.strength, meta_ref));
-        rev[tid as usize].push((fid, type_id, e.strength, meta_ref));
+        fwd[fid as usize].push((tid, type_id, meta_ref));
+        rev[tid as usize].push((fid, type_id, meta_ref));
     }
     for v in fwd.iter_mut().chain(rev.iter_mut()) {
-        v.sort_by_key(|&(nid, _, _, _)| nid);
+        v.sort_by_key(|&(nid, _, _)| nid);
     }
 
     // edgemeta.bin — sparse blobs: header, count, offsets[(m+1)], JSON bytes.
@@ -517,7 +509,6 @@ pub struct NodeRec {
 pub struct EdgeRec {
     pub neighbor: u64, // dense id
     pub edge_type_id: u32,
-    pub strength: f32,
     /// Index into `edgemeta.bin` (`NO_ID` = no metadata).
     pub meta_ref: u32,
 }
@@ -666,14 +657,12 @@ impl<'a> TopologyView<'a> {
         }
 
         let types_at = pos;
-        let strengths_at = types_at + count * 4;
-        let metas_at = strengths_at + count * 4;
+        let metas_at = types_at + count * 4;
 
         (0..count)
             .map(|i| EdgeRec {
                 neighbor: neighbors[i],
                 edge_type_id: rd_u32(block, types_at + i * 4),
-                strength: rd_f32(block, strengths_at + i * 4),
                 meta_ref: rd_u32(block, metas_at + i * 4),
             })
             .collect()
@@ -814,7 +803,6 @@ impl Backing {
 pub struct MappedEdge {
     pub other_hash: u64,
     pub edge_type_hash: u64,
-    pub strength: f32,
     /// Index into `edgemeta.bin` (`NO_ID` = none).
     pub meta_ref: u32,
 }
@@ -1063,7 +1051,6 @@ impl MappedTopology {
                     Some(MappedEdge {
                         other_hash,
                         edge_type_hash,
-                        strength: e.strength,
                         meta_ref: e.meta_ref,
                     })
                 })
@@ -1116,9 +1103,9 @@ mod tests {
             TopoNode { hash: h("a/south"),  slug: "a/south".into(),  collection: "area".into(),    payload_offset: 45,  payload_len: 5, spatial: None  },
         ];
         let edges = vec![
-            TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/uluwatu"), edge_type: "visited".into(), strength: 1.0, meta: None },
-            TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/ubud"),    edge_type: "visited".into(), strength: 0.5, meta: None },
-            TopoEdge { from_hash: h("p/uluwatu"), to_hash: h("a/south"),   edge_type: "in_area".into(), strength: 1.0, meta: None },
+            TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/uluwatu"), edge_type: "visited".into(), meta: None },
+            TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/ubud"),    edge_type: "visited".into(), meta: None },
+            TopoEdge { from_hash: h("p/uluwatu"), to_hash: h("a/south"),   edge_type: "in_area".into(), meta: None },
         ];
 
         let blob = build(&nodes, &edges);

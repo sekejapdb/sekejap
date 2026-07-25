@@ -94,16 +94,16 @@ fn test_full_feature_parity() {
         }
 
         // Graph edges: cities → countries
-        db.link("cities/jkt", "countries/id", "in_country", 1.0);
-        db.link("cities/sby", "countries/id", "in_country", 1.0);
-        db.link("cities/bdg", "countries/id", "in_country", 1.0);
-        db.link("cities/kl", "countries/my", "in_country", 1.0);
-        db.link("cities/jb", "countries/my", "in_country", 1.0);
-        db.link("cities/sgc", "countries/sg", "in_country", 1.0);
+        db.link("cities/jkt", "countries/id", "in_country");
+        db.link("cities/sby", "countries/id", "in_country");
+        db.link("cities/bdg", "countries/id", "in_country");
+        db.link("cities/kl", "countries/my", "in_country");
+        db.link("cities/jb", "countries/my", "in_country");
+        db.link("cities/sgc", "countries/sg", "in_country");
 
         // Sister city links
-        db.link("cities/jkt", "cities/kl", "sister_city", 0.8);
-        db.link("cities/sgc", "cities/jkt", "sister_city", 0.9);
+        db.link("cities/jkt", "cities/kl", "sister_city");
+        db.link("cities/sgc", "cities/jkt", "sister_city");
 
         db.compact().unwrap();
     }

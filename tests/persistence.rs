@@ -75,7 +75,7 @@ fn link_survives_reopen() {
         let mut db = CoreDB::open(dir.path()).unwrap();
         db.put("alice", r#"{"name":"Alice"}"#).unwrap();
         db.put("bob",   r#"{"name":"Bob"}"#).unwrap();
-        db.link("alice", "bob", "follows", 1.0);
+        db.link("alice", "bob", "follows");
     }
 
     let db2 = CoreDB::open(dir.path()).unwrap();
@@ -92,7 +92,7 @@ fn link_meta_survives_reopen() {
         let mut db = CoreDB::open(dir.path()).unwrap();
         db.put("alice", r#"{"name":"Alice"}"#).unwrap();
         db.put("bob",   r#"{"name":"Bob"}"#).unwrap();
-        db.link_meta("alice", "bob", "knows", 0.9, r#"{"since":2020}"#).unwrap();
+        db.link_meta("alice", "bob", "knows", r#"{"since":2020}"#).unwrap();
     }
 
     let db2 = CoreDB::open(dir.path()).unwrap();
@@ -110,7 +110,7 @@ fn unlink_survives_reopen() {
         let mut db = CoreDB::open(dir.path()).unwrap();
         db.put("a", "{}").unwrap();
         db.put("b", "{}").unwrap();
-        db.link("a", "b", "rel", 1.0);
+        db.link("a", "b", "rel");
         db.unlink("a", "b", "rel");
     }
 
@@ -239,7 +239,7 @@ fn transaction_survives_wal_replay() {
         let mut txn = db.begin();
         txn.put("users/alice", r#"{"_collection":"users","name":"Alice"}"#).unwrap();
         txn.put("users/bob",   r#"{"_collection":"users","name":"Bob"}"#).unwrap();
-        txn.link("users/alice", "users/bob", "follows", 1.0);
+        txn.link("users/alice", "users/bob", "follows");
         txn.commit().unwrap();
         // No compact — all data lives in WAL
     }

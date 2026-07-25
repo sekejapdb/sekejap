@@ -276,7 +276,6 @@ fn wire__crate__api__db_link_impl(
             let api_from = <String>::sse_decode(&mut deserializer);
             let api_to = <String>::sse_decode(&mut deserializer);
             let api_edge_type = <String>::sse_decode(&mut deserializer);
-            let api_strength = <f32>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, ()>((move || {
@@ -300,7 +299,6 @@ fn wire__crate__api__db_link_impl(
                             api_from,
                             api_to,
                             api_edge_type,
-                            api_strength,
                         );
                     })?;
                     Ok(output_ok)

@@ -29,7 +29,7 @@ fn setup_db() -> CoreDB {
 
     // 250 linear edges for graph traversal tests
     for i in 0..250usize {
-        db.link(&format!("products/{i}"), &format!("products/{}", i + 1), "related", 1.0);
+        db.link(&format!("products/{i}"), &format!("products/{}", i + 1), "related");
     }
 
     db

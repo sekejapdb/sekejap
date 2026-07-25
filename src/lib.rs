@@ -10,7 +10,7 @@
 //! let mut db = CoreDB::new();
 //! db.put("alice", r#"{"name":"Alice","age":30,"_collection":"users"}"#).unwrap();
 //! db.put("bob",   r#"{"name":"Bob",  "age":25,"_collection":"users"}"#).unwrap();
-//! db.link("alice", "bob", "follows", 1.0); // strength = 1.0
+//! db.link("alice", "bob", "follows"); // a naked, weightless edge
 //!
 //! let hits = db.one("alice").forward("follows").collect();
 //! assert_eq!(hits[0].slug, "bob");
@@ -482,7 +482,8 @@ pub struct EdgeHit {
     /// Human-readable edge type label (e.g. `"taught_by"`), if recorded.
     pub edge_type: Option<String>,
     pub edge_type_hash: u64,
-    pub strength: f32,
+    /// All edge attributes (fast-lane columns + JSON bag), merged. `None` if the
+    /// edge is naked. A weight, if any, is a user-named attribute in here.
     pub meta: Option<Value>,
 }
 
@@ -2065,11 +2066,11 @@ impl CoreDB {
         }
     }
 
-    fn link_raw(&mut self, from: &str, to: &str, edge_type: &str, strength: f32) {
+    fn link_raw(&mut self, from: &str, to: &str, edge_type: &str) {
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
-        self.edges.link(from_h, to_h, type_h, edge_type, strength);
+        self.edges.link(from_h, to_h, type_h, edge_type);
     }
 
     fn link_meta_raw(
@@ -2077,14 +2078,29 @@ impl CoreDB {
         from: &str,
         to: &str,
         edge_type: &str,
-        strength: f32,
         meta_json: &str,
     ) -> Result<(), serde_json::Error> {
         let meta: Value = serde_json::from_str(meta_json)?;
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
-        self.edges.link_meta(from_h, to_h, type_h, edge_type, strength, meta);
+        // Route by value type: primitives → fast-lane columns, the rest → JSON
+        // bag. This is the ONE routing site — the public `link_meta`, `link_attr`,
+        // the SQL edge-insert, and WAL replay all funnel through here, so a routed
+        // edge rebuilds identically on reopen (persistence for free).
+        match meta {
+            Value::Object(m) => {
+                let (cols, json) =
+                    Self::route_edge_attrs(m.into_iter().collect());
+                self.edges
+                    .link_with_attrs(from_h, to_h, type_h, edge_type, &cols, json);
+            }
+            // Non-object meta (rare): keep whole in the JSON bag as before.
+            other => {
+                self.edges
+                    .link_meta(from_h, to_h, type_h, edge_type, other);
+            }
+        }
         Ok(())
     }
 
@@ -2403,18 +2419,16 @@ impl CoreDB {
                 from,
                 to,
                 edge_type,
-                strength,
             } => {
-                self.link_raw(&from, &to, &edge_type, strength);
+                self.link_raw(&from, &to, &edge_type);
             }
             WalEntry::LinkMeta {
                 from,
                 to,
                 edge_type,
-                strength,
                 meta,
             } => {
-                let _ = self.link_meta_raw(&from, &to, &edge_type, strength, &meta);
+                let _ = self.link_meta_raw(&from, &to, &edge_type, &meta);
             }
             WalEntry::Unlink {
                 from,
@@ -2573,11 +2587,11 @@ impl CoreDB {
     /// incremental durability, but ~ms/edge → minutes for tens of thousands).
     pub fn link_many<'a>(
         &mut self,
-        edges: impl IntoIterator<Item = (&'a str, &'a str, &'a str, f32)>,
+        edges: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
     ) {
         self.defer_wal_sync = true;
-        for (from, to, edge_type, strength) in edges {
-            self.link(from, to, edge_type, strength);
+        for (from, to, edge_type) in edges {
+            self.link(from, to, edge_type);
         }
         self.defer_wal_sync = false;
         self.wal_flush();
@@ -2593,26 +2607,26 @@ impl CoreDB {
         self.autocompact_after_write();
     }
 
-    /// Create a directed edge: `from` → `to` with a type label and strength.
-    /// Nodes do not need to exist before linking.
-    pub fn link(&mut self, from: &str, to: &str, edge_type: &str, strength: f32) {
+    /// Create a directed edge: `from` → `to` with a type label. The edge is a
+    /// naked connector — no weight. Nodes do not need to exist before linking.
+    /// For a weighted or attributed edge use [`link_attr`] or [`link_meta`].
+    pub fn link(&mut self, from: &str, to: &str, edge_type: &str) {
         self.wal_write(WalEntry::Link {
             from: from.to_string(),
             to: to.to_string(),
             edge_type: edge_type.to_string(),
-            strength,
         });
-        self.link_raw(from, to, edge_type, strength);
+        self.link_raw(from, to, edge_type);
         self.autocompact_after_write();
     }
 
-    /// Like `link` but attaches a JSON metadata object to the edge.
+    /// Like `link` but attaches a JSON metadata object to the edge. Primitive
+    /// attributes route to the fast lane; the rest ride the JSON bag.
     pub fn link_meta(
         &mut self,
         from: &str,
         to: &str,
         edge_type: &str,
-        strength: f32,
         meta_json: &str,
     ) -> Result<(), serde_json::Error> {
         serde_json::from_str::<Value>(meta_json)?;
@@ -2620,10 +2634,9 @@ impl CoreDB {
             from: from.to_string(),
             to: to.to_string(),
             edge_type: edge_type.to_string(),
-            strength,
             meta: meta_json.to_string(),
         });
-        self.link_meta_raw(from, to, edge_type, strength, meta_json)?;
+        self.link_meta_raw(from, to, edge_type, meta_json)?;
         self.autocompact_after_write();
         Ok(())
     }
@@ -2828,8 +2841,11 @@ impl CoreDB {
                     from_hash: from_h,
                     to_hash: e.other,
                     edge_type,
-                    strength: e.strength,
-                    meta: self.edges.edge_meta(e).map(|v| v.to_string()),
+                    // Fold fast-lane columns back into the JSON meta so they ride
+                    // edgemeta.bin. On load the same routing re-splits primitives
+                    // into columns — so columns survive compaction without a
+                    // topology-format change. (Disk-columnar is a later optimisation.)
+                    meta: self.edge_all_attrs(e).map(|v| v.to_string()),
                 });
             }
         }
@@ -2938,9 +2954,9 @@ impl CoreDB {
                     .and_then(|b| std::str::from_utf8(b).ok().map(|s| s.to_string()));
                 match meta_json {
                     Some(m) => {
-                        let _ = self.link_meta_raw(&from_slug, &to_slug, &ty, e.strength, &m);
+                        let _ = self.link_meta_raw(&from_slug, &to_slug, &ty, &m);
                     }
-                    None => self.link_raw(&from_slug, &to_slug, &ty, e.strength),
+                    None => self.link_raw(&from_slug, &to_slug, &ty),
                 }
             }
         }
@@ -3086,8 +3102,7 @@ impl CoreDB {
                     from: from_slug.clone(),
                     to: to_slug,
                     edge_type,
-                    strength: e.strength,
-                    meta: self.edges.edge_meta(e),
+                    meta: self.edge_all_attrs(e),
                 });
             }
         }
@@ -3197,9 +3212,9 @@ impl CoreDB {
         for e in edges {
             if let Some(meta) = e.meta {
                 let _ =
-                    self.link_meta_raw(&e.from, &e.to, &e.edge_type, e.strength, &meta.to_string());
+                    self.link_meta_raw(&e.from, &e.to, &e.edge_type, &meta.to_string());
             } else {
-                self.link_raw(&e.from, &e.to, &e.edge_type, e.strength);
+                self.link_raw(&e.from, &e.to, &e.edge_type);
             }
         }
         if let Some(schemas) = snap.schemas {
@@ -3510,8 +3525,7 @@ impl CoreDB {
                         to_slug: self.nodes.get(&e.other).map(|n| n.slug.clone()),
                         edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
-                        strength: e.strength,
-                        meta: self.edges.edge_meta(e),
+                        meta: self.edge_all_attrs(e),
                     })
                     .collect()
             })
@@ -3531,8 +3545,7 @@ impl CoreDB {
                         to_slug: Some(slug.to_string()),
                         edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
-                        strength: e.strength,
-                        meta: self.edges.edge_meta(e),
+                        meta: self.edge_all_attrs(e),
                     })
                     .collect()
             })
@@ -3552,8 +3565,7 @@ impl CoreDB {
                         to_slug: self.nodes.get(&e.other).map(|n| n.slug.clone()),
                         edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
-                        strength: e.strength,
-                        meta: self.edges.edge_meta(e),
+                        meta: self.edge_all_attrs(e),
                     });
                 }
             }
@@ -3583,7 +3595,7 @@ impl CoreDB {
     /// # let mut db = CoreDB::new();
     /// # db.put("cls/math", r#"{"_collection":"classrooms"}"#).unwrap();
     /// # db.put("lec/ali",  r#"{"_collection":"lecturers"}"#).unwrap();
-    /// # db.link("cls/math", "lec/ali", "taught_by", 1.0);
+    /// # db.link("cls/math", "lec/ali", "taught_by");
     /// let types = db.edge_types_from("cls/math");
     /// assert_eq!(types, vec!["taught_by"]);
     /// ```
@@ -3611,7 +3623,7 @@ impl CoreDB {
     /// # let mut db = CoreDB::new();
     /// # db.put("cls/math", r#"{"_collection":"classrooms"}"#).unwrap();
     /// # db.put("lec/ali",  r#"{"_collection":"lecturers"}"#).unwrap();
-    /// # db.link("cls/math", "lec/ali", "taught_by", 1.0);
+    /// # db.link("cls/math", "lec/ali", "taught_by");
     /// let types = db.edge_types_from_collection("classrooms");
     /// assert_eq!(types, vec!["taught_by"]);
     /// ```
@@ -3644,7 +3656,7 @@ impl CoreDB {
     /// # let mut db = CoreDB::new();
     /// # db.put("cls/math", r#"{"_collection":"classrooms"}"#).unwrap();
     /// # db.put("lec/ali",  r#"{"_collection":"lecturers"}"#).unwrap();
-    /// # db.link("cls/math", "lec/ali", "taught_by", 1.0);
+    /// # db.link("cls/math", "lec/ali", "taught_by");
     /// let schema = db.edge_schema();
     /// assert_eq!(schema, vec![("classrooms".into(), "taught_by".into(), "lecturers".into())]);
     /// ```
@@ -3903,8 +3915,8 @@ impl CoreDB {
         // Sentinel: parent for the start node points to itself with a zero
         // edge_type hash so we can detect "we are at the root" during
         // reconstruction without a separate visited set.
-        // (from_hash, edge_type_hash, strength, meta)
-        let mut parent: HashMap<u64, (u64, u64, f32, Option<Value>)> = HashMap::new();
+        // (from_hash, edge_type_hash, meta)
+        let mut parent: HashMap<u64, (u64, u64, Option<Value>)> = HashMap::new();
 
         // Same-node degenerate case
         if start == end {
@@ -3925,7 +3937,7 @@ impl CoreDB {
             return None;
         }
 
-        parent.insert(start, (start, 0, 0.0, None)); // sentinel
+        parent.insert(start, (start, 0, None)); // sentinel
         let mut queue: VecDeque<u64> = VecDeque::new();
         queue.push_back(start);
 
@@ -3935,14 +3947,14 @@ impl CoreDB {
                     if parent.contains_key(&e.other) {
                         continue; // already visited
                     }
-                    parent.insert(e.other, (current, e.edge_type, e.strength, self.edges.edge_meta(e)));
+                    parent.insert(e.other, (current, e.edge_type, self.edges.edge_meta(e)));
                     if e.other == end {
                         // Reconstruct path: walk parent map from end → start, then reverse.
                         let mut node_hashes: Vec<u64> = Vec::new();
                         let mut cur = end;
                         loop {
                             node_hashes.push(cur);
-                            let (prev, _, _, _) = parent[&cur];
+                            let (prev, _, _) = parent[&cur];
                             if prev == cur {
                                 break; // reached the sentinel (start node)
                             }
@@ -3966,13 +3978,12 @@ impl CoreDB {
                         let edges: Vec<EdgeHit> = node_hashes
                             .windows(2)
                             .map(|w| {
-                                let (_, edge_type_hash, strength, meta) = parent[&w[1]].clone();
+                                let (_, edge_type_hash, meta) = parent[&w[1]].clone();
                                 EdgeHit {
                                     from_slug: self.nodes.get(&w[0]).map(|n| n.slug.clone()),
                                     to_slug: self.nodes.get(&w[1]).map(|n| n.slug.clone()),
                                     edge_type: self.edges.type_name(edge_type_hash).map(|s| s.to_string()),
                                     edge_type_hash,
-                                    strength,
                                     meta,
                                 }
                             })
@@ -4527,11 +4538,14 @@ impl CoreDB {
                 let count = edges.len();
                 self.defer_wal_sync = true;
                 for edge in edges {
+                    // Props route by value type inside link_meta_raw (primitives →
+                    // fast lane, rest → JSON bag); the WAL LinkMeta carries the full
+                    // props so replay re-routes identically.
                     match edge.props_json {
                         Some(json) => self
-                            .link_meta(&edge.from, &edge.to, &edge.edge_type, edge.strength, &json)
+                            .link_meta(&edge.from, &edge.to, &edge.edge_type, &json)
                             .map_err(|e| SqlError::InvalidValue(e.to_string()))?,
-                        None => self.link(&edge.from, &edge.to, &edge.edge_type, edge.strength),
+                        None => self.link(&edge.from, &edge.to, &edge.edge_type),
                     }
                 }
                 self.defer_wal_sync = false;
@@ -4552,7 +4566,6 @@ impl CoreDB {
                 match_steps,
                 target,
                 edge_type,
-                strength,
                 props,
             } => {
                 let source_slugs: Vec<String> = Set::from_steps(self, match_steps.clone())
@@ -4565,11 +4578,11 @@ impl CoreDB {
                 for src_slug in source_slugs {
                     match &props {
                         Some(json) => {
-                            self.link_meta(&src_slug, &target, &edge_type, strength, json)
+                            self.link_meta(&src_slug, &target, &edge_type, json)
                                 .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
                         }
                         None => {
-                            self.link(&src_slug, &target, &edge_type, strength);
+                            self.link(&src_slug, &target, &edge_type);
                         }
                     }
                 }
@@ -4814,7 +4827,7 @@ impl CoreDB {
                 let mut v: Vec<Edge> = b
                     .into_iter()
                     .map(|e| Edge::from_base(
-                        e.other_hash, e.edge_type_hash, e.strength, e.meta_ref,
+                        e.other_hash, e.edge_type_hash, e.meta_ref,
                     ))
                     .collect();
                 if let Some(o) = overlay {
@@ -4830,6 +4843,19 @@ impl CoreDB {
         self.edges.type_name(hash).map(|s| s.to_string())
     }
 
+    /// All of an edge's attributes merged: fast-lane columns + JSON bag, as one
+    /// object. This is what read-side views expose — routing is internal.
+    pub(crate) fn edge_all_attrs(&self, edge: &Edge) -> Option<Value> {
+        let mut map = match self.edge_meta(edge) {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in self.edges.edge_cols(edge) {
+            map.insert(k, v);
+        }
+        if map.is_empty() { None } else { Some(Value::Object(map)) }
+    }
+
     pub(crate) fn edge_meta(&self, edge: &Edge) -> Option<Value> {
         // Base edges carry an edgemeta.bin reference (high bit); overlay edges
         // resolve through the resident meta store.
@@ -4841,23 +4867,83 @@ impl CoreDB {
     }
 
     /// Look up a single forward edge `from → to` of the given type (`0` = any)
-    /// and return its `(strength, metadata)`.  Used by the MATCH executor to
-    /// expose per-edge properties (`r.field`, `r.strength`) in
-    /// `SELECT … FROM MATCH`.  Reads edge metadata lazily — only called when a
-    /// query actually references an edge-bound variable's field.
+    /// and return its JSON metadata.  Used by the MATCH executor to expose
+    /// per-edge properties (`r.field`) in `SELECT … FROM MATCH`.  Reads edge
+    /// metadata lazily — only called when a query actually references an
+    /// edge-bound variable's field.
     pub(crate) fn edge_props_between(
         &self,
         from: u64,
         to: u64,
         edge_type_hash: u64,
-    ) -> Option<(f32, Option<Value>)> {
+    ) -> Option<Value> {
         let edges = self.fwd_edges(from)?;
         for e in edges.iter() {
             if e.other == to && (edge_type_hash == 0 || e.edge_type == edge_type_hash) {
-                return Some((e.strength, self.edge_meta(e)));
+                return self.edge_meta(e);
             }
         }
         None
+    }
+
+    /// Fast-lane column values for the edge `from -[type]-> to`, as (name, value).
+    pub(crate) fn edge_cols_between(
+        &self,
+        from: u64,
+        to: u64,
+        edge_type_hash: u64,
+    ) -> Vec<(String, Value)> {
+        if let Some(edges) = self.fwd_edges(from) {
+            for e in edges.iter() {
+                if e.other == to && (edge_type_hash == 0 || e.edge_type == edge_type_hash) {
+                    return self.edges.edge_cols(e);
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Create an edge carrying attributes, auto-routed by value type: primitives
+    /// (number/bool) → the columnar FAST LANE; everything else → the JSON bag.
+    pub fn link_attr(
+        &mut self,
+        from: &str,
+        to: &str,
+        edge_type: &str,
+        attrs: Vec<(String, Value)>,
+    ) {
+        // Persist through the WAL like every other edge write: serialise the attrs
+        // to a JSON object and hand them to link_meta, which routes primitives to
+        // the fast lane and the rest to the JSON bag. On reopen the WAL LinkMeta
+        // replays through the same routing, so the columns rebuild exactly.
+        let obj: serde_json::Map<String, Value> = attrs.into_iter().collect();
+        let json = Value::Object(obj).to_string();
+        let _ = self.link_meta(from, to, edge_type, &json);
+    }
+
+    /// Auto-route edge attributes by value type: number/bool → fast-lane columns,
+    /// everything else → the JSON bag. Shared by the API and the SQL edge-insert.
+    fn route_edge_attrs(
+        attrs: Vec<(String, Value)>,
+    ) -> (Vec<(String, storage::edgestore::ColVal)>, Option<Value>) {
+        use storage::edgestore::ColVal;
+        let mut cols: Vec<(String, ColVal)> = Vec::new();
+        let mut bag = serde_json::Map::new();
+        for (name, v) in attrs {
+            match v {
+                Value::Number(n) => {
+                    if let Some(f) = n.as_f64() {
+                        cols.push((name, ColVal::Num(f)));
+                    }
+                }
+                Value::Bool(b) => cols.push((name, ColVal::Bool(b))),
+                other => {
+                    bag.insert(name, other);
+                }
+            }
+        }
+        let json = if bag.is_empty() { None } else { Some(Value::Object(bag)) };
+        (cols, json)
     }
 
     pub(crate) fn collection_members(&self, hash: u64) -> Option<std::borrow::Cow<'_, [u64]>> {
@@ -5974,7 +6060,6 @@ fn is_filter_or_traversal(s: &Step) -> bool {
             | Step::Backward(..)
             | Step::Hops(..)
             | Step::HopsTyped { .. }
-            | Step::MinStrength(..)
             | Step::Leaves
             | Step::Roots
             | Step::StDWithin(..)
@@ -6017,8 +6102,8 @@ pub struct Transaction<'db> {
 enum TxnOp {
     Put(String, String),
     Remove(String),
-    Link(String, String, String, f32),
-    LinkMeta(String, String, String, f32, String),
+    Link(String, String, String),
+    LinkMeta(String, String, String, String),
     Unlink(String, String, String),
     PutVector(String, String, Vec<f32>),
 }
@@ -6046,9 +6131,9 @@ impl<'db> Transaction<'db> {
     }
 
     /// Queue an edge creation.
-    pub fn link(&mut self, from: &str, to: &str, edge_type: &str, strength: f32) {
+    pub fn link(&mut self, from: &str, to: &str, edge_type: &str) {
         self.ops.push(TxnOp::Link(
-            from.to_string(), to.to_string(), edge_type.to_string(), strength,
+            from.to_string(), to.to_string(), edge_type.to_string(),
         ));
     }
 
@@ -6058,12 +6143,11 @@ impl<'db> Transaction<'db> {
         from: &str,
         to: &str,
         edge_type: &str,
-        strength: f32,
         meta_json: &str,
     ) -> Result<(), serde_json::Error> {
         serde_json::from_str::<Value>(meta_json)?;
         self.ops.push(TxnOp::LinkMeta(
-            from.to_string(), to.to_string(), edge_type.to_string(), strength, meta_json.to_string(),
+            from.to_string(), to.to_string(), edge_type.to_string(), meta_json.to_string(),
         ));
         Ok(())
     }
@@ -6094,11 +6178,11 @@ impl<'db> Transaction<'db> {
             match op {
                 TxnOp::Put(slug, json) => { self.db.put_raw(slug, json)?; }
                 TxnOp::Remove(slug) => { self.db.remove_raw(slug); }
-                TxnOp::Link(from, to, et, strength) => {
-                    self.db.link_raw(from, to, et, *strength);
+                TxnOp::Link(from, to, et) => {
+                    self.db.link_raw(from, to, et);
                 }
-                TxnOp::LinkMeta(from, to, et, strength, meta) => {
-                    self.db.link_meta_raw(from, to, et, *strength, meta)?;
+                TxnOp::LinkMeta(from, to, et, meta) => {
+                    self.db.link_meta_raw(from, to, et, meta)?;
                 }
                 TxnOp::Unlink(from, to, et) => { self.db.unlink_raw(from, to, et); }
                 TxnOp::PutVector(slug, field, data) => {
@@ -6117,11 +6201,11 @@ impl<'db> Transaction<'db> {
                 TxnOp::Remove(slug) => {
                     self.db.wal_write(WalEntry::Remove { slug });
                 }
-                TxnOp::Link(from, to, edge_type, strength) => {
-                    self.db.wal_write(WalEntry::Link { from, to, edge_type, strength });
+                TxnOp::Link(from, to, edge_type) => {
+                    self.db.wal_write(WalEntry::Link { from, to, edge_type });
                 }
-                TxnOp::LinkMeta(from, to, edge_type, strength, meta) => {
-                    self.db.wal_write(WalEntry::LinkMeta { from, to, edge_type, strength, meta });
+                TxnOp::LinkMeta(from, to, edge_type, meta) => {
+                    self.db.wal_write(WalEntry::LinkMeta { from, to, edge_type, meta });
                 }
                 TxnOp::Unlink(from, to, edge_type) => {
                     self.db.wal_write(WalEntry::Unlink { from, to, edge_type });
@@ -6309,7 +6393,6 @@ struct SnapEdge {
     from: String,
     to: String,
     edge_type: String,
-    strength: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     meta: Option<Value>,
 }
@@ -6372,8 +6455,8 @@ mod hybrid_query_tests {
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
             db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
             db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
-            db.link("tourist/chloe", "place/uluwatu", "visited", 1.0);
-            db.link("tourist/chloe", "place/ubud", "visited", 0.5);
+            db.link("tourist/chloe", "place/uluwatu", "visited");
+            db.link("tourist/chloe", "place/ubud", "visited");
             db.compact().unwrap();
         }
 
@@ -6423,7 +6506,7 @@ mod hybrid_query_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = CoreDB::open(dir.path()).unwrap();
         // A small but non-trivial Bali graph: multiple collections, edge types,
-        // strengths, fan-out and fan-in.
+        // fan-out and fan-in.
         for (slug, coll) in [
             ("tourist/chloe", "tourist"), ("tourist/milan", "tourist"),
             ("place/uluwatu", "place"), ("place/ubud", "place"), ("place/canggu", "place"),
@@ -6432,12 +6515,12 @@ mod hybrid_query_tests {
             let key = slug.split('/').nth(1).unwrap();
             db.put(slug, &format!(r#"{{"_collection":"{coll}","_key":"{key}"}}"#)).unwrap();
         }
-        db.link("tourist/chloe", "place/uluwatu", "visited", 0.9);
-        db.link("tourist/chloe", "place/ubud", "visited", 0.7);
-        db.link("tourist/milan", "place/ubud", "visited", 0.5);
-        db.link("tourist/milan", "place/canggu", "stayed_at", 1.0);
-        db.link("place/uluwatu", "area/south", "in_area", 1.0);
-        db.link("place/canggu", "area/south", "in_area", 1.0);
+        db.link("tourist/chloe", "place/uluwatu", "visited");
+        db.link("tourist/chloe", "place/ubud", "visited");
+        db.link("tourist/milan", "place/ubud", "visited");
+        db.link("tourist/milan", "place/canggu", "stayed_at");
+        db.link("place/uluwatu", "area/south", "in_area");
+        db.link("place/canggu", "area/south", "in_area");
         db.compact().unwrap();
 
         let mapped = MappedTopology::open(dir.path()).unwrap();
@@ -6458,21 +6541,21 @@ mod hybrid_query_tests {
                 node.collection
             );
 
-            // Edge sets (other, type, strength-in-milli) as multisets.
+            // Edge sets (other, type) as multisets.
             let to_set = |edges: Option<Vec<crate::storage::topology::MappedEdge>>| {
-                let mut v: Vec<(u64, u64, i64)> = edges
+                let mut v: Vec<(u64, u64)> = edges
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|e| (e.other_hash, e.edge_type_hash, (e.strength * 1000.0) as i64))
+                    .map(|e| (e.other_hash, e.edge_type_hash))
                     .collect();
                 v.sort_unstable();
                 v
             };
             let resident = |edges: Option<&[crate::storage::edgestore::Edge]>| {
-                let mut v: Vec<(u64, u64, i64)> = edges
+                let mut v: Vec<(u64, u64)> = edges
                     .unwrap_or(&[])
                     .iter()
-                    .map(|e| (e.other, e.edge_type, (e.strength * 1000.0) as i64))
+                    .map(|e| (e.other, e.edge_type))
                     .collect();
                 v.sort_unstable();
                 v
@@ -6511,9 +6594,9 @@ mod hybrid_query_tests {
                 let key = slug.split('/').nth(1).unwrap();
                 db.put(slug, &format!(r#"{{"_collection":"{coll}","_key":"{key}",{extra}}}"#)).unwrap();
             }
-            db.link("tourist/chloe", "place/uluwatu", "visited", 0.9);
-            db.link("tourist/chloe", "place/ubud", "visited", 0.7);
-            db.link("tourist/milan", "place/canggu", "visited", 0.5);
+            db.link("tourist/chloe", "place/uluwatu", "visited");
+            db.link("tourist/chloe", "place/ubud", "visited");
+            db.link("tourist/milan", "place/canggu", "visited");
             db.compact().unwrap();
         }
 
@@ -6557,7 +6640,7 @@ mod hybrid_query_tests {
             let mut db = CoreDB::open(dir.path()).unwrap();
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe","v":1}"#).unwrap();
             db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
-            db.link("tourist/chloe", "place/uluwatu", "visited", 1.0);
+            db.link("tourist/chloe", "place/uluwatu", "visited");
             db.compact().unwrap();
         }
 
@@ -6565,7 +6648,7 @@ mod hybrid_query_tests {
 
         // 1. New node + new edge land in the overlay and merge with base edges.
         db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
-        db.link("tourist/chloe", "place/ubud", "visited", 0.5);
+        db.link("tourist/chloe", "place/ubud", "visited");
         let hits = db.query(
             "SELECT b._key AS k FROM MATCH (a:tourist)-[:visited]->(b:place) \
              WHERE a._key='chloe' ORDER BY k ASC"
@@ -6593,6 +6676,102 @@ mod hybrid_query_tests {
     }
 
     #[test]
+    fn sql_edge_insert_routes_props_to_fast_lane() {
+        let mut db = CoreDB::new();
+        db.put("a/x", r#"{"_collection":"a","_key":"x"}"#).unwrap();
+        db.put("b/y", r#"{"_collection":"b","_key":"y"}"#).unwrap();
+        // SQL edge insert with mixed props: number+bool -> fast lane, string -> JSON
+        db.execute("INSERT ('a/x')-[:rel {confidence: 0.9, active: true, note: 'hi'}]->('b/y')").unwrap();
+        let r = db.query(
+            "SELECT r.confidence AS c, r.active AS act, r.note AS n \
+             FROM MATCH (a:a)-[r:rel]->(b:b) WHERE a._key='x'"
+        ).unwrap().collect();
+        let p = r[0].payload.as_ref().unwrap();
+        assert!((p["c"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+        assert_eq!(p["act"].as_bool().unwrap(), true);
+        assert_eq!(p["n"].as_str().unwrap(), "hi");
+    }
+
+    #[test]
+    fn edge_fast_lane_routes_by_type_and_reads() {
+        let mut db = CoreDB::new();
+        db.put("a/x", r#"{"_collection":"a","_key":"x"}"#).unwrap();
+        db.put("b/y", r#"{"_collection":"b","_key":"y"}"#).unwrap();
+        // number -> fast lane, bool -> fast lane, string -> JSON bag
+        db.link_attr("a/x", "b/y", "rel", vec![
+            ("confidence".to_string(), serde_json::json!(0.8)),
+            ("active".to_string(), serde_json::json!(true)),
+            ("note".to_string(), serde_json::json!("hello")),
+        ]);
+        let r = db.query(
+            "SELECT b._key AS k, r.confidence AS c, r.active AS act, r.note AS n \
+             FROM MATCH (a:a)-[r:rel]->(b:b) WHERE a._key='x'"
+        ).unwrap().collect();
+        assert_eq!(r.len(), 1);
+        let p = r[0].payload.as_ref().unwrap();
+        assert!((p["c"].as_f64().unwrap() - 0.8).abs() < 1e-9, "number column read");
+        assert_eq!(p["act"].as_bool().unwrap(), true, "bool column read");
+        assert_eq!(p["n"].as_str().unwrap(), "hello", "string -> JSON bag read");
+        // aggregate over a fast-lane column across DISTINCT edges (parallel-edge
+        // attribute disambiguation is a separate per-edge-identity concern).
+        db.put("b/z", r#"{"_collection":"b","_key":"z"}"#).unwrap();
+        db.link_attr("a/x", "b/z", "rel", vec![("confidence".to_string(), serde_json::json!(0.4))]);
+        let agg = db.query(
+            "SELECT AVG(r.confidence) AS avg_c, COUNT(*) AS n \
+             FROM MATCH (a:a)-[r:rel]->(b:b) WHERE a._key='x'"
+        ).unwrap().collect();
+        let ap = agg[0].payload.as_ref().unwrap();
+        assert_eq!(ap["n"].as_i64().unwrap(), 2);
+        assert!((ap["avg_c"].as_f64().unwrap() - 0.6).abs() < 1e-9, "avg over column = (0.8+0.4)/2");
+    }
+
+    #[test]
+    fn edge_fast_lane_columns_survive_reopen_and_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = "SELECT r.confidence AS c, r.active AS act, r.note AS n \
+                 FROM MATCH (a:a)-[r:rel]->(b:b) WHERE a._key='x'";
+        let check = |db: &CoreDB| {
+            let r = db.query(q).unwrap().collect();
+            assert_eq!(r.len(), 1, "edge must survive");
+            let p = r[0].payload.as_ref().unwrap();
+            assert!((p["c"].as_f64().unwrap() - 0.9).abs() < 1e-9, "number column");
+            assert_eq!(p["act"].as_bool().unwrap(), true, "bool column");
+            assert_eq!(p["n"].as_str().unwrap(), "hi", "string -> JSON bag");
+        };
+
+        // Write with fast-lane attrs, DON'T compact — forces WAL replay on reopen.
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("a/x", r#"{"_collection":"a","_key":"x"}"#).unwrap();
+            db.put("b/y", r#"{"_collection":"b","_key":"y"}"#).unwrap();
+            db.execute("INSERT ('a/x')-[:rel {confidence: 0.9, active: true, note: 'hi'}]->('b/y')").unwrap();
+            check(&db);
+        }
+        // Reopen via WAL replay: link_meta_raw re-routes primitives into columns.
+        {
+            let db = CoreDB::open(dir.path()).unwrap();
+            check(&db); // WAL-replay path
+        }
+        // Compact folds columns into edgemeta.bin, truncates WAL, then reopen.
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.compact().unwrap();
+            check(&db);
+        }
+        // Resident reopen after compact (loads from topology files, no WAL).
+        {
+            let db = CoreDB::open(dir.path()).unwrap();
+            check(&db);
+        }
+        // Paged reopen after compact (columns served from edgemeta.bin base).
+        {
+            let db = CoreDB::open_paged(dir.path()).unwrap();
+            assert!(db.nodes.is_empty(), "paged must serve from base");
+            check(&db);
+        }
+    }
+
+    #[test]
     fn paged_mode_serves_edge_metadata_from_base() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -6600,9 +6779,9 @@ mod hybrid_query_tests {
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
             db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
             db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
-            db.link_meta("tourist/chloe", "place/uluwatu", "visited", 0.9,
+            db.link_meta("tourist/chloe", "place/uluwatu", "visited",
                 r#"{"days":3,"season":"dry"}"#).unwrap();
-            db.link("tourist/chloe", "place/ubud", "visited", 0.5); // no meta
+            db.link("tourist/chloe", "place/ubud", "visited"); // no meta
             db.compact().unwrap();
         }
 
@@ -6611,7 +6790,7 @@ mod hybrid_query_tests {
 
         // r.<meta field> from the mapped base.
         let hits = paged.query(
-            "SELECT b._key AS k, r.days AS d, r.strength AS s \
+            "SELECT b._key AS k, r.days AS d \
              FROM MATCH (a:tourist)-[r:visited]->(b:place) \
              WHERE a._key='chloe' ORDER BY k ASC"
         ).unwrap().collect();
@@ -6621,7 +6800,6 @@ mod hybrid_query_tests {
         assert_eq!(ulu["k"].as_str().unwrap(), "uluwatu");
         assert_eq!(ulu["d"].as_i64().or(ulu["d"].as_f64().map(|f| f as i64)).unwrap(), 3,
             "edge metadata must be served from edgemeta.bin");
-        assert!((ulu["s"].as_f64().unwrap() - 0.9).abs() < 1e-6);
         assert!(ubud["d"].is_null(), "meta-less edge stays meta-less");
 
         // And recovery (snapshot lost) restores edge metadata too.
@@ -6648,8 +6826,8 @@ mod hybrid_query_tests {
                 "geometry":{"type":"Point","coordinates":[115.2625,-8.5069]}}"#).unwrap();
             db.put("place/nowhere", r#"{"_collection":"place","_key":"nowhere"}"#).unwrap();
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
-            db.link("tourist/chloe", "place/uluwatu", "visited", 1.0);
-            db.link("tourist/chloe", "place/ubud", "visited", 1.0);
+            db.link("tourist/chloe", "place/uluwatu", "visited");
+            db.link("tourist/chloe", "place/ubud", "visited");
             db.compact().unwrap();
         }
 
@@ -6686,7 +6864,7 @@ mod hybrid_query_tests {
             db.execute("CREATE TABLE place (_key TEXT PRIMARY KEY, city TEXT)").unwrap();
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
             db.execute("INSERT INTO place (_key, city) VALUES ('uluwatu', 'Bali')").unwrap();
-            db.link_meta("tourist/chloe", "place/uluwatu", "visited", 0.9, r#"{"days":3}"#).unwrap();
+            db.link_meta("tourist/chloe", "place/uluwatu", "visited", r#"{"days":3}"#).unwrap();
             db.compact().unwrap();
         }
 
@@ -6735,7 +6913,7 @@ mod hybrid_query_tests {
                 db.put(&format!("place/p{i}"),
                     &format!(r#"{{"_collection":"place","_key":"p{i}","score":{i},"desc":"{body}"}}"#)).unwrap();
             }
-            db.link("place/p0", "place/p1", "near", 1.0);
+            db.link("place/p0", "place/p1", "near");
             db.compact().unwrap();
         }
         let compressed_size = std::fs::metadata(dir.path().join("payloads.bin")).unwrap().len();
@@ -6762,7 +6940,7 @@ mod hybrid_query_tests {
                 db.put(&format!("place/p{i}"),
                     &format!(r#"{{"_collection":"place","_key":"p{i}","score":{i},"desc":"{body}"}}"#)).unwrap();
             }
-            db.link("place/p0", "place/p1", "near", 1.0);
+            db.link("place/p0", "place/p1", "near");
             db.compact().unwrap();
         }
         let raw_size = std::fs::metadata(dir2.path().join("payloads.bin")).unwrap().len();
@@ -6852,7 +7030,7 @@ mod hybrid_query_tests {
             let mut db = CoreDB::open(dir.path()).unwrap();
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe","name":"Chloe"}"#).unwrap();
             db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu","city":"Bali"}"#).unwrap();
-            db.link("tourist/chloe", "place/uluwatu", "visited", 0.9);
+            db.link("tourist/chloe", "place/uluwatu", "visited");
             db.compact().unwrap(); // WAL truncated → snapshot + topology files hold everything
         }
 
@@ -6867,7 +7045,7 @@ mod hybrid_query_tests {
         assert_eq!(chloe["name"].as_str().unwrap(), "Chloe");
         // Collections intact (SQL scan works).
         assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 1);
-        // Edges intact, both directions, with type + strength.
+        // Edges intact, both directions, with type.
         let hits = db.query(
             "SELECT b.city AS c FROM MATCH (a:tourist)-[:visited]->(b:place) WHERE a._key='chloe'"
         ).unwrap().collect();
@@ -6905,7 +7083,6 @@ mod hybrid_query_tests {
                 &format!("places/shop{}", i),
                 &format!("places/shop{}", i + 1),
                 "nearby",
-                1.0,
             );
         }
 

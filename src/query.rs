@@ -114,8 +114,6 @@ pub enum Step {
         min_depth: u32,
         max_depth: u32,
     },
-    /// Filter: only traverse edges whose strength >= threshold (applied after Forward/Backward).
-    MinStrength(f32),
     /// Keep only nodes with no outgoing edges.
     Leaves,
     /// Keep only nodes with no incoming edges.
@@ -223,7 +221,6 @@ pub fn describe_step(step: &Step, db: &CoreDB) -> serde_json::Map<String, Value>
         Step::HopsTyped { type_hash, min_depth, max_depth } => {
             ("BFS Typed", format!("type {type_hash} depth {min_depth}..{max_depth}"))
         }
-        Step::MinStrength(s) => ("Filter", format!("edge strength >= {s}")),
         Step::Leaves => ("Filter", "leaf nodes only".into()),
         Step::Roots => ("Filter", "root nodes only".into()),
         Step::WhereEq(f, v) => {
@@ -351,13 +348,6 @@ impl<'db> Set<'db> {
 
     pub fn backward(mut self, edge_type: &str) -> Self {
         self.steps.push(Step::Backward(sk_hash(edge_type)));
-        self
-    }
-
-    /// Filter traversal results to only nodes reached via edges with strength >= threshold.
-    /// Place this after `.forward()` or `.backward()`.
-    pub fn min_strength(mut self, threshold: f32) -> Self {
-        self.steps.push(Step::MinStrength(threshold));
         self
     }
 
@@ -573,10 +563,9 @@ impl<'db> Set<'db> {
     /// let mut db = CoreDB::new();
     /// db.put("a", "{}").unwrap();
     /// db.put("b", "{}").unwrap();
-    /// db.link("a", "b", "rel", 0.9);
+    /// db.link("a", "b", "rel");
     /// let pairs = db.one("a").forward("rel").edge_collect();
     /// assert_eq!(pairs[0].0.slug, "b");
-    /// assert!((pairs[0].1.strength - 0.9).abs() < 1e-6);
     /// ```
     pub fn edge_collect(self) -> Vec<(Hit, crate::EdgeHit)> {
         // Find the last Forward or Backward step to determine edge type and direction.
@@ -619,8 +608,7 @@ impl<'db> Set<'db> {
                             to_slug: Some(dest_node.slug.clone()),
                             edge_type: db.resolve_edge_type(e.edge_type),
                             edge_type_hash: e.edge_type,
-                            strength: e.strength,
-                            meta: db.edge_meta(e),
+                            meta: db.edge_all_attrs(e),
                         })
                 } else {
                     // Backward: look in fwd_edges of dest for a source
@@ -632,8 +620,7 @@ impl<'db> Set<'db> {
                             to_slug: db.node_data(e.other).map(|n| n.slug.clone()),
                             edge_type: db.resolve_edge_type(e.edge_type),
                             edge_type_hash: e.edge_type,
-                            strength: e.strength,
-                            meta: db.edge_meta(e),
+                            meta: db.edge_all_attrs(e),
                         })
                 }?;
                 let hit = Hit {
@@ -2432,39 +2419,6 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     .filter(|&h| db.node_data(h).is_some())
                     .collect();
             }
-            Step::MinStrength(threshold) => {
-                // Find the most recent Forward/Backward step to know which edge type to check.
-                // Walk backwards through the step list up to (but not including) this step.
-                let this_pos = steps
-                    .iter()
-                    .position(|s| {
-                        if let Step::MinStrength(t) = s {
-                            *t == *threshold
-                        } else {
-                            false
-                        }
-                    })
-                    .unwrap_or(0);
-                let edge_type_hash = steps[..this_pos].iter().rev().find_map(|s| match s {
-                    Step::Forward(h) | Step::Backward(h) => Some(*h),
-                    _ => None,
-                });
-                if let Some(type_h) = edge_type_hash {
-                    let thr = *threshold;
-                    candidates.retain(|&dest| {
-                        // dest is reachable — check that at least one incoming edge of the
-                        // correct type has strength >= threshold.
-                        db.rev_edges(dest)
-                            .map(|edges| {
-                                edges
-                                    .iter()
-                                    .any(|e| e.edge_type == type_h && e.strength >= thr)
-                            })
-                            .unwrap_or(false)
-                    });
-                }
-                // If no prior Forward/Backward found, MinStrength is a no-op.
-            }
             Step::Leaves => {
                 candidates.retain(|&h| {
                     db.fwd_edges(h)
@@ -4066,8 +4020,8 @@ pub struct HopSpec {
     /// Name to bind the destination node in [`PathRow`].
     pub node_bind: String,
     /// Optional edge binding — if set, that name is bound in [`PathRow`] to a JSON
-    /// object exposing path intrinsics: `_depth`, `_path_keys`, `_path_strength`,
-    /// `_avg_strength`, `_min_strength`, `_max_strength`.
+    /// object exposing path intrinsics (`_depth`, `_path_keys`) plus the edge's
+    /// own attributes (fast-lane columns + JSON bag).
     pub edge_bind: Option<String>,
     /// Minimum traversal depth (inclusive). 1 for a plain single-hop `-[:e]->`.
     pub min_depth: u32,
@@ -4251,10 +4205,8 @@ pub(crate) struct RawPath {
     /// hops this is one node per hop; for variable-length hops it includes every
     /// intermediate node (only when full-path tracking is on — see `track`).
     pub slugs_per_hop:     Vec<String>,
-    /// Full physical edge strengths, one per physical edge in `slugs_per_hop`.
-    pub strengths_per_hop: Vec<f32>,
     /// `hop_end[i]` = index in `slugs_per_hop` of HopSpec `i`'s destination node,
-    /// so a hop's `_path_keys`/`_path_strength`/`_depth` slice by real position.
+    /// so a hop's `_path_keys`/`_depth` slice by real position.
     pub hop_end:           Vec<usize>,
 }
 
@@ -4294,7 +4246,6 @@ pub(crate) fn collect_raw_paths_opts(
         current_hash:     u64,
         dest_so_far:      Vec<u64>,
         slugs_so_far:     Vec<String>,
-        strengths_so_far: Vec<f32>,
         hop_ends:         Vec<usize>,
         /// Physical node count incl. start (drives hop_end when slugs are off).
         phys_len:         usize,
@@ -4309,7 +4260,6 @@ pub(crate) fn collect_raw_paths_opts(
                 current_hash:     h,
                 dest_so_far:      Vec::new(),
                 slugs_so_far:     if with_slugs { vec![node.slug.clone()] } else { Vec::new() },
-                strengths_so_far: Vec::new(),
                 hop_ends:         Vec::new(),
                 phys_len:         1,
             })
@@ -4331,13 +4281,11 @@ pub(crate) fn collect_raw_paths_opts(
                         if let Some(node) = db.node_data(e.other) {
                             let mut d = partial.dest_so_far.clone();
                             let mut s = partial.slugs_so_far.clone();
-                            let mut st = partial.strengths_so_far.clone();
                             let mut he = partial.hop_ends.clone();
                             d.push(e.other);
                             if with_slugs {
                                 s.push(node.slug.clone());
                             }
-                            st.push(e.strength);
                             let phys_len = partial.phys_len + 1;
                             he.push(phys_len - 1);
                             next_in_flight.push(Partial {
@@ -4345,7 +4293,6 @@ pub(crate) fn collect_raw_paths_opts(
                                 current_hash:     e.other,
                                 dest_so_far:      d,
                                 slugs_so_far:     s,
-                                strengths_so_far: st,
                                 hop_ends:         he,
                                 phys_len,
                             });
@@ -4357,19 +4304,19 @@ pub(crate) fn collect_raw_paths_opts(
                 }
             }
         } else if track {
-            // Multi-depth WITH full-path tracking: carry the sub-path (nodes +
-            // strengths) so `_path_keys` / `_path_strength` / `_depth` are correct.
-            let mut pairs: Vec<(usize, u64, Vec<u64>, Vec<f32>)> = in_flight
+            // Multi-depth WITH full-path tracking: carry the sub-path nodes so
+            // `_path_keys` / `_depth` are correct.
+            let mut pairs: Vec<(usize, u64, Vec<u64>)> = in_flight
                 .iter()
                 .enumerate()
-                .map(|(idx, p)| (idx, p.current_hash, Vec::new(), Vec::new()))
+                .map(|(idx, p)| (idx, p.current_hash, Vec::new()))
                 .collect();
 
-            let mut result: Vec<(usize, u64, Vec<u64>, Vec<f32>)> = Vec::new();
+            let mut result: Vec<(usize, u64, Vec<u64>)> = Vec::new();
 
             for depth in 1..=hop.max_depth {
-                let mut next_pairs: Vec<(usize, u64, Vec<u64>, Vec<f32>)> = Vec::new();
-                for (pidx, current_h, sub_n, sub_s) in &pairs {
+                let mut next_pairs: Vec<(usize, u64, Vec<u64>)> = Vec::new();
+                for (pidx, current_h, sub_n) in &pairs {
                     let adj = if hop.backward { db.rev_edges(*current_h) } else { db.fwd_edges(*current_h) };
                     if let Some(edges) = adj {
                         for e in edges.iter() {
@@ -4378,8 +4325,7 @@ pub(crate) fn collect_raw_paths_opts(
                             }
                             if db.node_data(e.other).is_some() {
                                 let mut nn = sub_n.clone(); nn.push(e.other);
-                                let mut ns = sub_s.clone(); ns.push(e.strength);
-                                next_pairs.push((*pidx, e.other, nn, ns));
+                                next_pairs.push((*pidx, e.other, nn));
                             }
                         }
                     }
@@ -4395,7 +4341,7 @@ pub(crate) fn collect_raw_paths_opts(
                 if pairs.is_empty() { break; }
             }
 
-            for (pidx, dest_h, sub_n, sub_s) in result {
+            for (pidx, dest_h, sub_n) in result {
                 let prior = &in_flight[pidx];
                 let mut d = prior.dest_so_far.clone();
                 d.push(dest_h);
@@ -4405,8 +4351,6 @@ pub(crate) fn collect_raw_paths_opts(
                         s.push(db.node_data(n).map(|nd| nd.slug.clone()).unwrap_or_default());
                     }
                 }
-                let mut st = prior.strengths_so_far.clone();
-                st.extend_from_slice(&sub_s);
                 let mut he = prior.hop_ends.clone();
                 let phys_len = prior.phys_len + sub_n.len();
                 he.push(phys_len - 1);
@@ -4415,7 +4359,6 @@ pub(crate) fn collect_raw_paths_opts(
                     current_hash:     dest_h,
                     dest_so_far:      d,
                     slugs_so_far:     s,
-                    strengths_so_far: st,
                     hop_ends:         he,
                     phys_len,
                 });
@@ -4469,8 +4412,6 @@ pub(crate) fn collect_raw_paths_opts(
                         .unwrap_or_default();
                     s.push(dest_slug);
                 }
-                let mut st = prior.strengths_so_far.clone();
-                st.push(1.0);
                 let mut he = prior.hop_ends.clone();
                 let phys_len = prior.phys_len + 1;
                 he.push(phys_len - 1);
@@ -4479,7 +4420,6 @@ pub(crate) fn collect_raw_paths_opts(
                     current_hash:     dest_h,
                     dest_so_far:      d,
                     slugs_so_far:     s,
-                    strengths_so_far: st,
                     hop_ends:         he,
                     phys_len,
                 });
@@ -4496,7 +4436,6 @@ pub(crate) fn collect_raw_paths_opts(
             start_hash:        p.start_hash,
             dest_per_hop:      p.dest_so_far,
             slugs_per_hop:     p.slugs_so_far,
-            strengths_per_hop: p.strengths_so_far,
             hop_end:           p.hop_ends,
         })
         .collect()
@@ -4661,7 +4600,6 @@ fn try_reverse_anchor(
                 start_hash: e.other,
                 dest_per_hop: vec![dest_hash],
                 slugs_per_hop: vec![source_node.slug.clone(), dest_slug.clone()],
-                strengths_per_hop: vec![e.strength],
                 hop_end: vec![1], // single hop: dest is at slug index 1
             });
         }
@@ -4747,24 +4685,9 @@ pub(crate) fn build_path_rows_from_raw(
                         .take(end + 1)
                         .map(|s| s.as_str())
                         .collect();
-                    let end_s = end.min(rp.strengths_per_hop.len());
-                    let path_strengths: &[f32] = &rp.strengths_per_hop[..end_s];
                     let depth = end; // physical hop count to this hop's dest
-                    let n = path_strengths.len() as f64;
-                    let sum: f64 = path_strengths.iter().map(|&s| s as f64).sum();
-                    let avg = if n > 0.0 { sum / n } else { 0.0 };
-                    let min_s = path_strengths.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max_s = path_strengths.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
                     let mut obj = serde_json::Map::new();
-
-                    // `strength` is a typed column already in the CSR — serve it
-                    // from the path, never via a metadata read.
-                    if hop.max_depth == 1 {
-                        if let Some(&s) = path_strengths.last() {
-                            obj.insert("strength".to_string(), serde_json::json!(s));
-                        }
-                    }
 
                     // Per-edge JSON metadata — only for a fixed single hop, and only
                     // when the query references a non-intrinsic edge field (lazy: one
@@ -4782,24 +4705,21 @@ pub(crate) fn build_path_rows_from_raw(
                         } else {
                             (prev_h, dest_h)
                         };
-                        if let Some((_strength, meta)) =
+                        if let Some(Value::Object(m)) =
                             db.edge_props_between(edge_from, edge_to, hop.edge_type_hash)
                         {
-                            if let Some(Value::Object(m)) = meta {
-                                for (k, v) in m { obj.insert(k, v); }
-                            }
+                            for (k, v) in m { obj.insert(k, v); }
+                        }
+                        // Fast-lane columnar attributes (primitives) — read direct,
+                        // no parse; override any JSON key of the same name.
+                        for (k, v) in db.edge_cols_between(edge_from, edge_to, hop.edge_type_hash) {
+                            obj.insert(k, v);
                         }
                     }
 
                     // Path intrinsics — always present; overwrite any colliding meta key.
                     obj.insert("_depth".to_string(), serde_json::json!(depth));
                     obj.insert("_path_keys".to_string(), serde_json::json!(path_slugs));
-                    obj.insert("_path_strength".to_string(), serde_json::json!(path_strengths));
-                    obj.insert("_avg_strength".to_string(), serde_json::json!(avg));
-                    obj.insert("_min_strength".to_string(),
-                        serde_json::json!(if min_s.is_infinite() { 0.0_f32 } else { min_s }));
-                    obj.insert("_max_strength".to_string(),
-                        serde_json::json!(if max_s.is_infinite() { 0.0_f32 } else { max_s }));
 
                     row.insert(edge_bind.clone(), Value::Object(obj));
                 }
@@ -5823,13 +5743,11 @@ pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
 }
 
 /// Reserved edge-bound keys that are served WITHOUT reading edge metadata:
-/// the six path intrinsics plus `strength`, which is a typed column already
-/// present in the CSR (`strengths_per_hop`). Referencing only these never
-/// triggers a JSON meta parse.
-const EDGE_INTRINSICS: [&str; 7] = [
-    "_depth", "_path_keys", "_path_strength",
-    "_avg_strength", "_min_strength", "_max_strength",
-    "strength",
+/// the path intrinsics computed during traversal. Referencing only these never
+/// triggers a JSON meta parse. A weight is no longer an intrinsic — it's an
+/// ordinary user-named attribute, served from the fast lane / JSON bag.
+const EDGE_INTRINSICS: [&str; 2] = [
+    "_depth", "_path_keys",
 ];
 
 /// True if a math expression references an edge-bound variable's non-intrinsic
@@ -5846,7 +5764,7 @@ fn math_refs_edge_field(m: &MathExpr, edge_binds: &[&str]) -> bool {
 }
 
 /// Does any clause of the statement reference an edge-bound variable's
-/// non-intrinsic field (`r.kwh`, `r.strength`, …)?  Such queries must
+/// non-intrinsic field (`r.kwh`, `r.weight`, …)?  Such queries must
 /// materialise edge metadata via the general PathRow path, so this predicate
 /// also gates the GROUP BY fast paths (which only understand node fields).
 /// An edge variable that is bound but never referenced returns `false`, so
@@ -5880,7 +5798,7 @@ fn stmt_needs_edge_meta(stmt: &MatchAggStmt) -> bool {
 }
 
 /// True when a variable-length hop (`*a..b`) binds an edge whose path intrinsics
-/// (`_path_keys`, `_path_strength`, `_depth`, …) or metadata are referenced — such
+/// (`_path_keys`, `_depth`, …) or metadata are referenced — such
 /// queries need full-path tracking during traversal to be correct.  Ordinary
 /// var-length traversals (projecting dest fields only) keep the fast flat path.
 fn stmt_needs_var_path(stmt: &MatchAggStmt) -> bool {
@@ -7163,23 +7081,25 @@ fn build_shortest_path_row(
         let node_slugs: Vec<Value> = pr.nodes.iter()
             .map(|n| Value::String(n.slug.clone()))
             .collect();
-        let strengths: Vec<Value> = pr.edges.iter()
-            .map(|e| serde_json::json!(e.strength))
-            .collect();
         let edges_arr: Vec<Value> = pr.edges.iter()
-            .map(|e| serde_json::json!({
-                "from":     e.from_slug,
-                "to":       e.to_slug,
-                "type":     e.edge_type,
-                "strength": e.strength,
-            }))
+            .map(|e| {
+                // A path edge is naked — from/to/type only. Any attributes ride in
+                // `attrs` (the merged fast-lane + JSON bag), opt-in, never assumed.
+                let mut o = serde_json::Map::new();
+                o.insert("from".into(), serde_json::json!(e.from_slug));
+                o.insert("to".into(), serde_json::json!(e.to_slug));
+                o.insert("type".into(), serde_json::json!(e.edge_type));
+                if let Some(attrs) = &e.meta {
+                    o.insert("attrs".into(), attrs.clone());
+                }
+                Value::Object(o)
+            })
             .collect();
         let path_obj = serde_json::json!({
-            "nodes":          &node_slugs,
-            "edges":          &edges_arr,
-            "length":         pr.length,
-            "_path_keys":     &node_slugs,
-            "_path_strength": &strengths,
+            "nodes":      &node_slugs,
+            "edges":      &edges_arr,
+            "length":     pr.length,
+            "_path_keys": &node_slugs,
         });
         row.insert(pb.clone(), path_obj);
     }

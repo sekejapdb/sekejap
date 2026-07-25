@@ -822,7 +822,6 @@ pub struct EdgeInsert {
     pub from: String,
     pub to: String,
     pub edge_type: String,
-    pub strength: f32,
     pub props_json: Option<String>,
 }
 
@@ -868,7 +867,6 @@ pub enum CompiledMutation {
         match_steps: Vec<Step>,
         target: String,
         edge_type: String,
-        strength: f32,
         props: Option<String>,
     },
     /// CREATE TABLE: define schema for a collection.
@@ -2872,7 +2870,6 @@ impl Parser {
             }
             let edge_type = self.expect_ident()?;
             // Optional {props}
-            let mut strength = 1.0f32;
             let mut props_json = None;
             if matches!(self.peek(), Tok::LBrace) {
                 self.advance();
@@ -2903,10 +2900,8 @@ impl Parser {
                     }
                     _ => return Err(SqlError::UnexpectedEnd { expected: "}" }),
                 }
-                // Extract strength from props, default 1.0
-                if let Some(s) = map.remove("strength") {
-                    strength = s.as_f64().unwrap_or(1.0) as f32;
-                }
+                // No privileged keys: every prop (including any `strength`) rides
+                // through to the edge as an ordinary attribute, routed by value type.
                 if !map.is_empty() {
                     props_json = Some(
                         serde_json::to_string(&Value::Object(map))
@@ -2948,7 +2943,6 @@ impl Parser {
                 from,
                 to,
                 edge_type,
-                strength,
                 props_json,
             });
 
@@ -3457,8 +3451,8 @@ impl Parser {
             self.advance();
         }
         let edge_kind = self.expect_ident()?;
-        // Optional edge props
-        let mut strength = 1.0;
+        // Optional edge props — every prop rides through as an ordinary attribute
+        // (routed by value type); no privileged `strength` key.
         let mut props_json = None;
         if matches!(self.peek(), Tok::LBrace) {
             self.advance();
@@ -3471,13 +3465,7 @@ impl Parser {
                 let key = self.expect_ident()?;
                 self.expect_colon()?;
                 let value = self.parse_value()?;
-                if key == "strength" {
-                    if let Some(n) = value.as_f64() {
-                        strength = n as f32;
-                    }
-                } else {
-                    props_map.insert(key, value);
-                }
+                props_map.insert(key, value);
                 if matches!(self.peek(), Tok::Comma) {
                     self.advance();
                 }
@@ -3572,7 +3560,6 @@ impl Parser {
             match_steps,
             target: target_slug,
             edge_type: edge_kind,
-            strength,
             props: props_json,
         })
     }
@@ -5787,7 +5774,6 @@ mod tests {
                 Step::Backward(_) => "Backward",
                 Step::Hops(_) => "Hops",
                 Step::HopsTyped { .. } => "HopsTyped",
-                Step::MinStrength(_) => "MinStrength",
                 Step::Leaves => "Leaves",
                 Step::Roots => "Roots",
                 Step::WhereEq(..) => "WhereEq",
@@ -6372,7 +6358,7 @@ mod tests {
                 assert_eq!(edges[0].from, "a");
                 assert_eq!(edges[0].to, "b");
                 assert_eq!(edges[0].edge_type, "KNOWS");
-                assert_eq!(edges[0].strength, 1.0);
+                // A naked edge carries no props.
                 assert!(edges[0].props_json.is_none());
             }
             other => panic!("expected InsertEdge, got {other:?}"),
@@ -6380,15 +6366,15 @@ mod tests {
     }
 
     #[test]
-    fn insert_edge_with_strength() {
+    fn insert_edge_strength_is_an_ordinary_prop() {
+        // `strength` is no longer privileged — it rides through as a normal
+        // attribute like any other primitive.
         let m = parse_mutation("INSERT ('a')-[:KNOWS {strength: 10}]->('b')").unwrap();
         match m {
             CompiledMutation::InsertEdge(edges) => {
-                assert_eq!(edges[0].strength, 10.0);
-                assert!(
-                    edges[0].props_json.is_none(),
-                    "strength should be extracted, not in props"
-                );
+                let props: Value =
+                    serde_json::from_str(edges[0].props_json.as_ref().unwrap()).unwrap();
+                assert_eq!(props["strength"], 10.0);
             }
             other => panic!("expected InsertEdge, got {other:?}"),
         }
@@ -6399,14 +6385,11 @@ mod tests {
         let m = parse_mutation("INSERT ('a')-[:KNOWS {strength: 5, since: 2024}]->('b')").unwrap();
         match m {
             CompiledMutation::InsertEdge(edges) => {
-                assert_eq!(edges[0].strength, 5.0);
                 let props: Value =
                     serde_json::from_str(edges[0].props_json.as_ref().unwrap()).unwrap();
                 assert_eq!(props["since"], 2024.0);
-                assert!(
-                    props.get("strength").is_none(),
-                    "strength should not be in props"
-                );
+                // strength stays in props now — nothing is extracted.
+                assert_eq!(props["strength"], 5.0);
             }
             other => panic!("expected InsertEdge, got {other:?}"),
         }
@@ -6430,11 +6413,12 @@ mod tests {
     }
 
     #[test]
-    fn insert_edge_default_strength() {
+    fn insert_edge_default_is_naked() {
         let m = parse_mutation("INSERT ('x')-[:links]->('y')").unwrap();
         match m {
             CompiledMutation::InsertEdge(edges) => {
-                assert_eq!(edges[0].strength, 1.0);
+                // No props at all — the default edge is zero.
+                assert!(edges[0].props_json.is_none());
             }
             other => panic!("expected InsertEdge, got {other:?}"),
         }
@@ -6473,12 +6457,10 @@ mod debug_tests {
                 match_steps,
                 target,
                 edge_type,
-                strength,
                 props,
             } => {
                 assert_eq!(target, "classroom/A");
                 assert_eq!(edge_type, "member_of");
-                assert!((strength - 1.0).abs() < f32::EPSILON);
                 assert!(props.is_none());
                 // Should have Collection step + WhereLt step
                 assert_eq!(match_steps.len(), 2);
@@ -6495,16 +6477,16 @@ mod debug_tests {
             CompiledMutation::MatchInsert {
                 target,
                 edge_type,
-                strength,
                 props,
                 ..
             } => {
                 assert_eq!(target, "classroom/A");
                 assert_eq!(edge_type, "member_of");
-                assert!((strength - 0.8).abs() < f32::EPSILON);
                 assert!(props.is_some());
                 let p: serde_json::Value = serde_json::from_str(props.as_ref().unwrap()).unwrap();
                 assert_eq!(p["semester"], "fall");
+                // strength is just another prop now.
+                assert_eq!(p["strength"], 0.8);
             }
             other => panic!("expected MatchInsert, got {other:?}"),
         }

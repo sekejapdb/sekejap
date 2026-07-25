@@ -233,7 +233,7 @@ fn setup_spatial_graph_core() -> CoreDB {
                 .to_string(),
             )
             .unwrap();
-            db.link(&format!("sites/s{i}"), &bkey, "powers", 1.0);
+            db.link(&format!("sites/s{i}"), &bkey, "powers");
         }
     }
 

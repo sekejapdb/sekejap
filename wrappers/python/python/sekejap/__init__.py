@@ -20,7 +20,7 @@ class DB(_NativeDB):
 
         db.put("venues/fitzroy_town_hall",
                '{"_collection":"venues","_key":"fitzroy_town_hall","suburb":"Fitzroy"}')
-        db.link("bands/the_vines", "venues/fitzroy_town_hall", "played_at", 1.0)
+        db.link("bands/the_vines", "venues/fitzroy_town_hall", "played_at")
 
     Standard SELECT::
 
@@ -36,10 +36,10 @@ class DB(_NativeDB):
             GROUP BY b._key ORDER BY performances DESC LIMIT 10
         ''')
 
-    PATH_* aggregates (operate on path intrinsic arrays)::
+    PATH_* aggregates (operate on a named edge attribute along the path)::
 
         hits = db.query('''
-            SELECT b._key AS dest, PATH_PRODUCT(r._path_strength) AS reliability
+            SELECT b._key AS dest, PATH_PRODUCT(r.weight) AS reliability
             FROM MATCH (a:venues)-[r:route_to*1..3]->(b:venues)
             WHERE a._key = 'melbourne_cbd'
         ''')
