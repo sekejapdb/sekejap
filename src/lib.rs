@@ -198,6 +198,13 @@ enum PayloadInner {
     },
 }
 
+/// The SKBIN field table — the only shared decode state — is written to these
+/// redundant, self-checksummed copies. On load the first copy that passes its
+/// CRC wins; on a bad primary we recover from a backup. This protects the
+/// "metadata is recoverable" guarantee the whole format rests on.
+const FIELD_TABLE_COPIES: [&str; 3] =
+    ["field_table.bin", "field_table.bin.1", "field_table.bin.2"];
+
 /// Records larger than this are never compressed — the large-payload head/tail
 /// extraction fast paths depend on raw bytes at arbitrary offsets, and they are
 /// only taken for records above `FAST_PATH_THRESHOLD` (64 KB). Keeping the two
@@ -386,10 +393,15 @@ impl PayloadStore {
         }
     }
 
-    /// Parse JSON at the given position. Returns `None` if invalid.
+    /// Decode the payload at the given position to a `Value` — the hot path for
+    /// the query engine. SKBIN records decode DIRECTLY to `Value` (binary decode,
+    /// no JSON round-trip — faster than parsing text); raw/zstd records parse.
     fn get(&self, offset: u64, len: u32) -> Option<Value> {
-        self.get_raw(offset, len)
-            .and_then(|b| serde_json::from_slice(&b).ok())
+        let stored = self.get_raw_at(offset, len as usize)?;
+        if storage::skbin::is_skbin(&stored) {
+            return storage::skbin::decode(&stored, &self.field_table);
+        }
+        decode_payload_record(stored).and_then(|b| serde_json::from_slice(&b).ok())
     }
 
     /// Return raw JSON bytes at the given position (owned copy), transparently
@@ -1114,11 +1126,15 @@ impl CoreDB {
         }
         db.payload_store.compress = config.payload_compression;
         db.payload_store.binary = config.payload_binary;
-        // Load the SKBIN field table if a prior compaction wrote one. Records
-        // decode against it; absent → no SKBIN records exist yet.
-        if let Ok(bytes) = std::fs::read(dir.join("field_table.bin")) {
-            if let Some(ft) = storage::skbin::FieldTable::from_bytes(&bytes) {
-                db.payload_store.field_table = ft;
+        // Load the SKBIN field table if a prior compaction wrote one. Try each
+        // redundant copy in turn; the first that passes its CRC wins (a corrupt
+        // primary is recovered from a backup). Absent → no SKBIN records yet.
+        for name in FIELD_TABLE_COPIES {
+            if let Ok(bytes) = std::fs::read(dir.join(name)) {
+                if let Some(ft) = storage::skbin::FieldTable::from_frame(&bytes) {
+                    db.payload_store.field_table = ft;
+                    break;
+                }
             }
         }
         db.auto_compact = config.auto_compact;
@@ -2770,8 +2786,10 @@ impl CoreDB {
             // and new records — a crash between this write and the rename can
             // never mis-decode anything.
             if self.payload_store.binary && !self.payload_store.field_table.is_empty() {
-                Self::write_atomic(&dir, "field_table.bin",
-                    &self.payload_store.field_table.to_bytes())?;
+                let frame = self.payload_store.field_table.to_frame();
+                for name in FIELD_TABLE_COPIES {
+                    Self::write_atomic(&dir, name, &frame)?;
+                }
             }
             // Atomically replace file, then reopen (preserving policy + table).
             std::fs::rename(&pay_tmp, &pay_path)?;
@@ -3395,6 +3413,19 @@ impl CoreDB {
     pub(crate) fn get_payload(&self, hash: u64) -> Option<Value> {
         let (off, len) = self.payload_loc(hash)?;
         self.payload_store.get(off, len)
+    }
+
+    /// Extract ONE field from a stored (undecoded) payload record, dispatching on
+    /// its encoding: SKBIN → `get_field` skip-scan (no full decode); raw JSON →
+    /// byte-search. The filter fast paths read stored bytes in batches, so this
+    /// keeps single-field filters fast on SKBIN without materialising the record.
+    pub(crate) fn extract_stored_field(&self, stored: &[u8], field: &str) -> Option<Value> {
+        if storage::skbin::is_skbin(stored) {
+            storage::skbin::get_field(stored, field, &self.payload_store.field_table)
+        } else {
+            let fq = [field.to_string()];
+            query::extract_fields_by_search(stored, &fq).remove(field)
+        }
     }
 
 
@@ -7052,6 +7083,39 @@ mod hybrid_query_tests {
     }
 
     #[test]
+    fn skbin_field_table_recovers_from_corrupt_primary_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config { payload_binary: true, ..Config::default() };
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+            for i in 0..20 {
+                db.put(&format!("orders/o{i}"),
+                    &format!(r#"{{"_collection":"orders","_key":"o{i}","amount":{i},"note":"row {i}"}}"#)).unwrap();
+            }
+            db.compact().unwrap();
+        }
+        // All three redundant copies must exist.
+        for name in FIELD_TABLE_COPIES {
+            assert!(dir.path().join(name).exists(), "{name} must be written");
+        }
+        // Corrupt the PRIMARY copy (flip a byte in its payload).
+        {
+            let p = dir.path().join("field_table.bin");
+            let mut bytes = std::fs::read(&p).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xff;
+            std::fs::write(&p, &bytes).unwrap();
+        }
+        // Reopen must recover from a backup copy and read every record intact.
+        let db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        for i in 0..20 {
+            let v: Value = serde_json::from_str(&db.get(&format!("orders/o{i}")).unwrap()).unwrap();
+            assert_eq!(v["amount"], i, "record o{i} must survive a corrupt primary field table");
+            assert_eq!(v["note"], format!("row {i}"));
+        }
+    }
+
+    #[test]
     fn skbin_payload_roundtrips_shrinks_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config { payload_binary: true, ..Config::default() };
@@ -7083,8 +7147,11 @@ mod hybrid_query_tests {
                 let got: Value = serde_json::from_str(&db.get(&format!("orders/ord-{i:05}")).unwrap()).unwrap();
                 assert_eq!(got, before[i], "record {i} must roundtrip through SKBIN");
             }
-            // Queries read SKBIN payloads transparently.
+            // Queries read SKBIN payloads transparently — numeric, boolean, and
+            // string filters all go through the SKBIN-aware field extractor.
             assert_eq!(db.query("SELECT * FROM orders WHERE qty >= 3").unwrap().collect().len(), 60);
+            assert_eq!(db.query("SELECT * FROM orders WHERE active = true").unwrap().collect().len(), 50);
+            assert_eq!(db.query("SELECT _key, qty FROM orders WHERE customer = 'cust-7'").unwrap().collect().len(), 1);
             let hits = db.query(
                 "SELECT b._key AS k FROM MATCH (a:orders)-[:next]->(b:orders) WHERE a._key='ord-00000'"
             ).unwrap().collect();
