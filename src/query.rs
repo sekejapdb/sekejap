@@ -2458,12 +2458,9 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         const FILTER_BATCH_MIN: usize = 64;
                         if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
                             let raw_map = db.read_raw_payloads_batched(&candidates);
-                            let fq = vec![field.clone()];
                             candidates.retain(|&h| {
                                 raw_map.get(&h)
-                                    .and_then(|bytes| {
-                                        extract_fields_by_search(bytes, &fq).remove(field.as_str())
-                                    })
+                                    .and_then(|bytes| db.extract_stored_field(bytes, field))
                                     .map(|v| values_eq(&v, value))
                                     .unwrap_or(false)
                             });
@@ -2481,12 +2478,9 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     const FILTER_BATCH_MIN: usize = 64;
                     if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
                         let raw_map = db.read_raw_payloads_batched(&candidates);
-                        let fq = vec![field.clone()];
                         candidates.retain(|&h| {
                             raw_map.get(&h)
-                                .and_then(|bytes| {
-                                    extract_fields_by_search(bytes, &fq).remove(field.as_str())
-                                })
+                                .and_then(|bytes| db.extract_stored_field(bytes, field))
                                 .map(|v| values_eq(&v, value))
                                 .unwrap_or(false)
                         });
@@ -2504,13 +2498,11 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 const FILTER_BATCH_MIN: usize = 64;
                 if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
                     let raw_map = db.read_raw_payloads_batched(&candidates);
-                    let fq = vec![field.clone()];
                     candidates.retain(|&h| {
                         // field absent → keep (same semantics as individual path)
                         raw_map.get(&h)
                             .map(|bytes| {
-                                extract_fields_by_search(bytes, &fq)
-                                    .remove(field.as_str())
+                                db.extract_stored_field(bytes, field)
                                     .map(|v| !values_eq(&v, value))
                                     .unwrap_or(true)
                             })

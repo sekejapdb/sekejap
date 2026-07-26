@@ -104,7 +104,38 @@ impl FieldTable {
         }
         Some(t)
     }
+
+    /// Serialize into a SELF-VERIFYING frame for on-disk storage:
+    /// `["SKFT"][version u8][crc32 LE][payload]`. Written to several redundant
+    /// files; corruption is detected by CRC and recovered from another copy.
+    pub fn to_frame(&self) -> Vec<u8> {
+        let payload = self.to_bytes();
+        let crc = crc32fast::hash(&payload);
+        let mut out = Vec::with_capacity(payload.len() + 9);
+        out.extend_from_slice(FT_MAGIC);
+        out.push(FT_VERSION);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Parse + verify a frame written by [`to_frame`]. `None` if magic/version
+    /// wrong, truncated, or CRC mismatch (corruption) — so a bad copy is skipped.
+    pub fn from_frame(b: &[u8]) -> Option<Self> {
+        if b.len() < 9 || &b[..4] != FT_MAGIC || b[4] != FT_VERSION {
+            return None;
+        }
+        let crc = u32::from_le_bytes([b[5], b[6], b[7], b[8]]);
+        let payload = &b[9..];
+        if crc32fast::hash(payload) != crc {
+            return None; // corruption detected — try another copy
+        }
+        Self::from_bytes(payload)
+    }
 }
+
+const FT_MAGIC: &[u8; 4] = b"SKFT";
+const FT_VERSION: u8 = 1;
 
 // ── varint ────────────────────────────────────────────────────────────────
 fn put_uv(o: &mut Vec<u8>, mut v: u64) {
@@ -400,6 +431,25 @@ mod tests {
         assert_eq!(get_field(&rec, "z", &ft), Some(json!(9.5)));
         assert_eq!(get_field(&rec, "a", &ft), Some(json!(1)));
         assert_eq!(get_field(&rec, "missing", &ft), None);
+    }
+
+    #[test]
+    fn field_table_frame_verifies_and_rejects_corruption() {
+        let mut ft = FieldTable::new();
+        ft.intern("_collection");
+        ft.intern("customer_id");
+        ft.intern("qty");
+        let frame = ft.to_frame();
+        let back = FieldTable::from_frame(&frame).expect("valid frame");
+        assert_eq!(back.id_of("customer_id"), Some(1));
+        // corrupt the payload → CRC must reject
+        let mut bad = frame.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert!(FieldTable::from_frame(&bad).is_none(), "corrupt frame must be rejected");
+        // wrong magic → rejected
+        assert!(FieldTable::from_frame(b"XXXX\x01\0\0\0\0").is_none());
+        assert!(FieldTable::from_frame(&[]).is_none());
     }
 
     #[test]
