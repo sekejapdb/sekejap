@@ -49,6 +49,24 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile  = "3"
 rusqlite  = { version = "0.32", features = ["bundled"] }
 
+# Concurrency examples use the `engine` feature; gate them so the default
+# `cargo test` / `cargo build` (no features) doesn't try to compile them.
+[[example]]
+name = "concurrency_bench"
+required-features = ["engine"]
+
+[[example]]
+name = "concurrency_vs_sqlite"
+required-features = ["engine"]
+
+[[example]]
+name = "write_stress"
+required-features = ["engine"]
+
+[[example]]
+name = "write_scaling"
+required-features = ["engine"]
+
 # Benches parked (autobenches = false above). Uncomment when reworked; ensure each
 # named file exists in benches/ before re-enabling, or the manifest won't parse.
 # [[bench]]

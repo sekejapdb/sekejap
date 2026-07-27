@@ -74,6 +74,20 @@ use text_index::gist::GiSTIndex;
 /// `topology_in_files = true` marks it. v2 (full JSON topology) is still read.
 const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
+/// Friendly, actionable message when an on-disk format is NEWER than this build
+/// understands. Distinguishes "version skew" from "corruption" and points at both
+/// the upgrade path and the `sekejap migrate` toolkit. Used for every format /
+/// version mismatch surfaced on open so users always get a clear next step.
+fn newer_format_msg(kind: &str, found: u32, max: u32) -> String {
+    format!(
+        "this database was written by a newer sekejap ({kind} format v{found}; \
+this build supports up to v{max}). Your data is intact — this is a version check, \
+not corruption.\n  → Upgrade sekejap to the version that wrote it, then open normally.\n  \
+→ Or open it with that newer sekejap and run `sekejap migrate <db>` to rewrite it \
+in a format this build can read."
+    )
+}
+
 /// Magic prefix identifying a versioned (v2+) snapshot file. Legacy v1 files
 /// start with `{` (JSON) and are auto-detected as headerless.
 const SNAPSHOT_MAGIC: [u8; 8] = *b"SKSNAP\0\0";
@@ -177,6 +191,10 @@ pub(crate) struct PayloadStore {
     /// superset table written before a payload swap never mis-decodes old
     /// records. Empty when no SKBIN records exist.
     field_table: storage::skbin::FieldTable,
+    /// zstd-compress long SKBIN string values in place at compaction (opt-in).
+    /// Self-contained per value (no shared dictionary), so 1-record isolation and
+    /// "no user data in shared state" both hold. Off keeps strings literal.
+    zstd_strings: bool,
     inner: PayloadInner,
 }
 
@@ -243,7 +261,7 @@ fn decode_payload_record(stored: Vec<u8>) -> Option<Vec<u8>> {
 
 impl PayloadStore {
     fn new() -> Self {
-        Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), inner: PayloadInner::Memory { data: Vec::new() } }
+        Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), zstd_strings: false, inner: PayloadInner::Memory { data: Vec::new() } }
     }
 
     /// Open (or create) a disk-backed store, truncating to zero.
@@ -254,7 +272,7 @@ impl PayloadStore {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), inner: PayloadInner::Disk {
+        Ok(Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), zstd_strings: false, inner: PayloadInner::Disk {
             file,
             total_len: 0,
             #[cfg(unix)]
@@ -270,7 +288,7 @@ impl PayloadStore {
             .open(path)?;
         #[cfg(unix)]
         let mmap = MmapView::try_new(&file, total_len as usize);
-        Ok(Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), inner: PayloadInner::Disk {
+        Ok(Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), zstd_strings: false, inner: PayloadInner::Disk {
             file,
             total_len,
             #[cfg(unix)]
@@ -296,7 +314,7 @@ impl PayloadStore {
         Ok(Self {
             compress: false, // remote store is read-only; records self-describe
             binary: false,
-            field_table: storage::skbin::FieldTable::new(),
+            field_table: storage::skbin::FieldTable::new(), zstd_strings: false,
             inner: PayloadInner::Remote {
                 cache: std::sync::Mutex::new(cache),
             },
@@ -411,7 +429,7 @@ impl PayloadStore {
     pub(crate) fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
         let stored = self.get_raw_at(offset, len as usize)?;
         if storage::skbin::is_skbin(&stored) {
-            // SKBIN → reconstruct JSON bytes using the shared field table.
+            // SKBIN → reconstruct JSON bytes using the shared field-name table.
             let v = storage::skbin::decode(&stored, &self.field_table)?;
             return serde_json::to_vec(&v).ok();
         }
@@ -611,6 +629,9 @@ pub struct CoreDB {
     /// When true, `wal_write` appends without fsync.
     /// Used by batch operations (UPDATE, DELETE, COMMIT) to coalesce syncs.
     defer_wal_sync: bool,
+    /// When `Some`, `put_raw_inner` uses this timestamp instead of calling
+    /// `chrono::Utc::now()` per row — set once per batch to skip N time syscalls.
+    batch_now: Option<i64>,
     /// When true, expensive index rebuilds (BM25, GIN) are deferred until
     /// `flush_deferred_indexes()`. Avoids O(N²) cost of per-row BM25 rebuild
     /// during batch inserts.
@@ -701,6 +722,12 @@ pub struct Config {
     /// reads, 1-record corruption isolation (values never leave their record).
     /// Incremental writes stay raw JSON until the next `compact()`. Default off.
     pub payload_binary: bool,
+    /// On top of `payload_binary`, zstd-compress long SKBIN string values in
+    /// place at compaction. Self-contained per value (no shared dictionary or
+    /// symbol table), so corruption isolation stays 1-record and no user data
+    /// enters shared state. Big win on long text (article bodies, geometry);
+    /// short strings stay literal. Requires `payload_binary`. Default off.
+    pub payload_zstd: bool,
     /// **Experimental.** Serve topology (nodes + edges) from the mmap'd files
     /// written at `compact()` instead of loading it into RAM. The OS page cache
     /// keeps the hot working set resident and pages the rest — topology size is
@@ -710,7 +737,8 @@ pub struct Config {
     /// Current limitations (documented, to be lifted): spatial metadata and edge
     /// metadata are not served from the base (spatial/meta-dependent queries see
     /// only overlay data); `remove`/`unlink` of base data does not take effect
-    /// until tombstones land.
+    /// until tombstones land. (Compatible with `payload_binary` (SKBIN): base
+    /// payload reads resolve offsets via the mmap base and decode SKBIN.)
     pub paged_topology: bool,
 }
 
@@ -724,7 +752,13 @@ impl Default for Config {
             compact_thresholds: CompactThresholds::default(),
             compact_on_close: false,
             payload_compression: false,
-            payload_binary: false,
+            // SKBIN Level-1 is the official default payload format: schema-aware
+            // binary (~1.2–2x smaller on structured data, faster field reads,
+            // 1-record corruption isolation, zero user data in shared state).
+            // Fuzzed decoder, integrated across DML/DDL + resident/paged. Set
+            // false for legacy raw-JSON payloads.
+            payload_binary: true,
+            payload_zstd: false,
             paged_topology: false,
         }
     }
@@ -791,6 +825,7 @@ impl CoreDB {
             replaying: false,
             pending_txn: None,
             defer_wal_sync: false,
+            batch_now: None,
             defer_index_rebuild: false,
             dirty_bm25: HashSet::new(),
             dirty_gin: HashSet::new(),
@@ -883,9 +918,7 @@ impl CoreDB {
         // Strip the versioned header (v2+) if present; legacy files start at 0.
         let (fmt_version, body_offset) = snapshot_probe(&snap_bytes);
         if fmt_version > SNAPSHOT_FORMAT_VERSION {
-            return Err(format!(
-                "snapshot version {fmt_version} requires a newer sekejap (max supported: {SNAPSHOT_FORMAT_VERSION})"
-            ));
+            return Err(newer_format_msg("snapshot", fmt_version, SNAPSHOT_FORMAT_VERSION));
         }
         let snap: Snapshot = serde_json::from_slice(&snap_bytes[body_offset..])
             .map_err(|e| format!("parsing snapshot: {e}"))?;
@@ -920,7 +953,7 @@ impl CoreDB {
         db.payload_store = PayloadStore {
             compress: false,
             binary: false,
-            field_table: storage::skbin::FieldTable::new(),
+            field_table: storage::skbin::FieldTable::new(), zstd_strings: false,
             inner: PayloadInner::Remote {
                 cache: std::sync::Mutex::new(block_cache),
             },
@@ -1070,10 +1103,7 @@ impl CoreDB {
             if fmt_version > SNAPSHOT_FORMAT_VERSION {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "snapshot version {} requires a newer sekejap (max supported: {})",
-                        fmt_version, SNAPSHOT_FORMAT_VERSION
-                    ),
+                    newer_format_msg("snapshot", fmt_version, SNAPSHOT_FORMAT_VERSION),
                 ));
             }
             file.seek(SeekFrom::Start(body_offset as u64))?;
@@ -1085,10 +1115,7 @@ impl CoreDB {
                 Ok(s) if s.version > SNAPSHOT_FORMAT_VERSION => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "snapshot version {} requires a newer sekejap (max supported: {})",
-                            s.version, SNAPSHOT_FORMAT_VERSION
-                        ),
+                        newer_format_msg("snapshot", s.version, SNAPSHOT_FORMAT_VERSION),
                     ));
                 }
                 Ok(s) => Some(s),
@@ -1126,6 +1153,7 @@ impl CoreDB {
         }
         db.payload_store.compress = config.payload_compression;
         db.payload_store.binary = config.payload_binary;
+        db.payload_store.zstd_strings = config.payload_zstd;
         // Load the SKBIN field table if a prior compaction wrote one. Try each
         // redundant copy in turn; the first that passes its CRC wins (a corrupt
         // primary is recovered from a backup). Absent → no SKBIN records yet.
@@ -1365,7 +1393,8 @@ impl CoreDB {
 
     fn put_raw_inner(&mut self, slug: &str, raw: &[u8], payload: Value) -> Result<u64, serde_json::Error> {
         let hash = sk_hash(slug);
-        let now = chrono::Utc::now().timestamp_millis();
+        // In a batch, all rows share one timestamp — skip a per-row time syscall.
+        let now = self.batch_now.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
         if !payload.is_object() {
             return Err(serde_json::Error::io(std::io::Error::new(
@@ -2630,6 +2659,211 @@ impl CoreDB {
         result
     }
 
+    /// Insert/update from an already-parsed `Value` — skips the `from_str` parse
+    /// that [`put`](Self::put) does. Serializes once (for the WAL + payload store).
+    /// The fast path for prepared inserts / programmatic writes.
+    pub fn put_value(&mut self, slug: &str, payload: Value) -> Result<u64, serde_json::Error> {
+        let raw = serde_json::to_string(&payload)?;
+        self.wal_write(WalEntry::Put { slug: slug.to_string(), payload: raw.clone() });
+        self.put_raw_inner(slug, raw.as_bytes(), payload)
+    }
+
+    /// Bulk `put_value`: one shared timestamp, deferred index rebuild, and a single
+    /// WAL fsync for the whole batch — no per-row `from_str` parse and no per-row
+    /// `now()` syscall. This is the prepared-insert / IoT ingest throughput path.
+    pub fn put_value_many(&mut self, rows: Vec<(String, Value)>) -> Result<usize, serde_json::Error> {
+        self.defer_wal_sync = true;
+        self.defer_index_rebuild = true;
+        self.batch_now = Some(chrono::Utc::now().timestamp_millis());
+        let mut n = 0usize;
+        let mut err = None;
+        for (slug, val) in rows {
+            match self.put_value(&slug, val) {
+                Ok(_) => n += 1,
+                Err(e) => { err = Some(e); break; }
+            }
+        }
+        self.batch_now = None;
+        self.defer_wal_sync = false;
+        self.wal_flush();
+        self.flush_deferred_indexes();
+        self.autocompact_after_write();
+        match err { Some(e) => Err(e), None => Ok(n) }
+    }
+
+    /// True bulk insert for prepared/programmatic writes — the IoT ingest fast path.
+    /// One shared timestamp, one batched WAL write + single fsync, one batched
+    /// payload write, and — crucially — no per-row JSON splicing and no O(N)
+    /// `contains` scan of collection membership (new keys are appended directly).
+    /// Payloads are enriched via cheap Map inserts, not byte-rewrites.
+    ///
+    /// Fast path applies to index-free collections; if the collection has
+    /// BM25/GIN/search indexes, per-row rebuild markers are set (rebuilt once at
+    /// the end), matching `put_many` semantics.
+    pub fn put_value_bulk(&mut self, rows: Vec<(String, Value)>) -> Result<usize, serde_json::Error> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let now = self.batch_now.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let now_val: Value = now.into();
+
+        let mut wal_entries: Vec<WalEntry> = Vec::with_capacity(rows.len());
+        // (slug, hash, collection, spatial_meta, is_new)
+        let mut metas: Vec<(String, u64, String, Option<geo::SpatialMeta>, bool)> =
+            Vec::with_capacity(rows.len());
+
+        for (slug, mut val) in rows {
+            let hash = sk_hash(&slug);
+            let is_new = match self.node_data(hash) {
+                None => true,
+                Some(e) => {
+                    if e.slug != slug {
+                        return Err(serde_json::Error::io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("hash collision: '{slug}' and existing '{}' both hash to {hash}", e.slug),
+                        )));
+                    }
+                    false
+                }
+            };
+            // Preserve the original _created_unix on update (matches put semantics).
+            let old_created: Option<Value> = if is_new {
+                None
+            } else {
+                self.payload_loc(hash)
+                    .and_then(|(o, l)| self.payload_store.get(o, l))
+                    .and_then(|v| v.get("_created_unix").cloned())
+            };
+            let coll = match val {
+                Value::Object(ref mut m) => {
+                    m.entry("_id".to_string()).or_insert_with(|| Value::String(slug.clone()));
+                    let key = slug.split_once('/').map(|(_, k)| k).unwrap_or(&slug).to_string();
+                    m.entry("_key".to_string()).or_insert_with(|| Value::String(key));
+                    match old_created {
+                        Some(c) => { m.insert("_created_unix".to_string(), c); }
+                        None => { m.entry("_created_unix".to_string()).or_insert_with(|| now_val.clone()); }
+                    }
+                    m.insert("_updated_unix".to_string(), now_val.clone());
+                    m.get("_collection").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                }
+                _ => return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData, "payload must be a JSON object"))),
+            };
+            let spatial_meta = geo::extract_spatial_meta(&val);
+            // Serialize once; the String is MOVED into the WAL entry (no clone) and
+            // its bytes are borrowed for the payload append below.
+            let s = serde_json::to_string(&val)?;
+            wal_entries.push(WalEntry::Put { slug: slug.clone(), payload: s });
+            metas.push((slug, hash, coll, spatial_meta, is_new));
+        }
+
+        // WAL first (durable), then payloads (payloads.bin is rebuilt from the WAL
+        // on open, so this ordering is crash-safe). One batch each, one fsync.
+        if let Some(wal) = &mut self.wal {
+            wal.append_batch(&wal_entries).expect("sekejap: WAL batch append failed");
+            if !self.defer_wal_sync {
+                wal.sync().expect("sekejap: WAL fsync failed");
+            }
+        }
+        // Payload bytes borrowed straight from the WAL entries — no extra copy.
+        let refs: Vec<&[u8]> = wal_entries.iter().map(|e| match e {
+            WalEntry::Put { payload, .. } => payload.as_bytes(),
+            _ => &[][..],
+        }).collect();
+        let offsets = self.payload_store.append_batch(&refs);
+
+        // Which index kinds need refreshing? Track touched collections only when a
+        // search index exists (zero overhead for the common index-free IoT case).
+        let have_bm25_gin = !self.bm25_indexes.is_empty() || !self.gin_indexes.is_empty();
+        let has_any_search = self.schemas.values().any(|s| !s.indexes.search.is_empty());
+        let mut colls_touched: HashSet<String> = HashSet::new();
+
+        for (i, (slug, hash, coll, spatial_meta, is_new)) in metas.into_iter().enumerate() {
+            let (offset, len) = offsets[i];
+            if !coll.is_empty() {
+                let coll_hash = sk_hash(&coll);
+                let members = self.collections.entry(coll_hash).or_default();
+                // New key ⇒ provably absent (collision-checked) ⇒ skip the O(N) scan.
+                if is_new || !members.contains(&hash) {
+                    members.push(hash);
+                }
+                self.collection_names_map.entry(coll_hash).or_insert_with(|| coll.clone());
+                if has_any_search {
+                    colls_touched.insert(coll.clone());
+                }
+            }
+            self.slug_map.insert(slug.clone(), hash);
+            self.nodes.insert(hash, NodeData {
+                slug,
+                collection: coll,
+                spatial_meta: spatial_meta.clone(),
+                payload_offset: offset,
+                payload_len: len,
+            });
+            if let Some(grid) = &mut self.spatial_grid {
+                grid.remove(hash);
+                if let Some(m) = spatial_meta {
+                    grid.insert(hash, m);
+                }
+            }
+        }
+
+        // Index freshness: mark dirty once; rebuild now unless a nesting caller
+        // (InsertBatch / txn) deferred it. Covers BM25, GIN, and the positional
+        // search index (matching put_raw_inner's per-row touch_search_index).
+        if have_bm25_gin {
+            let bm: Vec<String> = self.bm25_indexes.keys().cloned().collect();
+            for f in bm { self.dirty_bm25.insert(f); }
+            let gin: Vec<String> = self.gin_indexes.keys().cloned().collect();
+            for f in gin { self.dirty_gin.insert(f); }
+        }
+        if has_any_search {
+            for c in &colls_touched {
+                if self.collection_has_search_index(c) {
+                    self.dirty_search.insert(c.clone());
+                }
+            }
+        }
+        if (have_bm25_gin || has_any_search) && !self.defer_index_rebuild {
+            self.flush_deferred_indexes();
+        }
+
+        // Only autocompact when standalone — a nesting caller (e.g. InsertBatch,
+        // a transaction) that set defer_wal_sync finalizes/compacts itself.
+        if !self.defer_wal_sync {
+            self.autocompact_after_write();
+        }
+        Ok(wal_entries.len())
+    }
+
+    /// Execute several SQL statements as ONE group-commit: defer the per-statement
+    /// WAL fsync and sync exactly once at the end. This is the concurrent-writer /
+    /// IoT throughput lever — N buffered writes cost 1 fsync instead of N.
+    ///
+    /// Durability is unchanged in kind: the batch is the durability unit, exactly
+    /// like a single statement (a crash before the final sync loses the whole
+    /// un-synced batch — the same all-or-nothing guarantee, per-record CRC intact).
+    /// Nesting-safe: the previous defer state is saved and restored, so an inner
+    /// batch (e.g. a multi-row INSERT) never prematurely flushes an outer group.
+    #[cfg(feature = "engine")]
+    pub(crate) fn execute_batch_grouped(&mut self, stmts: &[String]) -> Result<usize, SqlError> {
+        let prev = self.defer_wal_sync;
+        self.defer_wal_sync = true;
+        let mut total = 0usize;
+        let mut result = Ok(());
+        for s in stmts {
+            match self.execute(s) {
+                Ok(n) => total += n,
+                Err(e) => { result = Err(e); break; }
+            }
+        }
+        self.defer_wal_sync = prev;
+        if !prev {
+            self.wal_flush(); // single fsync for the whole group
+        }
+        result.map(|_| total)
+    }
+
     /// Bulk edge insert — the edge counterpart of [`put_many`](Self::put_many).
     /// Defers the per-edge WAL fsync and flushes once at the end, turning an
     /// O(N) fsync storm into a single sync. Essential for graph bulk-load: on a
@@ -2734,6 +2968,11 @@ impl CoreDB {
             let pay_path = dir.join("payloads.bin");
             let mut node_new_offsets: Vec<(u64, u64, u32)> = Vec::new(); // (hash, off, len)
             let mut write_cursor = 0u64;
+
+            // Per-field zstd for this compaction: long string values are
+            // compressed in place (each independently — no shared dictionary, so
+            // 1-record isolation and "no user data in shared state" both hold).
+            let zstd_strings = self.payload_store.zstd_strings;
             {
                 #[cfg(unix)]
                 {
@@ -2756,7 +2995,8 @@ impl CoreDB {
                             {
                                 match serde_json::from_slice::<Value>(&bytes) {
                                     Ok(v) => storage::skbin::encode(
-                                        &v, &mut self.payload_store.field_table),
+                                        &v, &mut self.payload_store.field_table,
+                                        zstd_strings),
                                     Err(_) => encode_payload_record(
                                         &bytes, self.payload_store.compress).into_owned(),
                                 }
@@ -2795,10 +3035,12 @@ impl CoreDB {
             std::fs::rename(&pay_tmp, &pay_path)?;
             let keep_compress = self.payload_store.compress;
             let keep_binary = self.payload_store.binary;
+            let keep_zstd = self.payload_store.zstd_strings;
             let keep_ft = std::mem::take(&mut self.payload_store.field_table);
             self.payload_store = PayloadStore::open_existing(&pay_path, write_cursor)?;
             self.payload_store.compress = keep_compress;
             self.payload_store.binary = keep_binary;
+            self.payload_store.zstd_strings = keep_zstd;
             self.payload_store.field_table = keep_ft;
         } else {
             // Memory DB: rebuild Vec<u8> without touching disk.
@@ -3422,10 +3664,71 @@ impl CoreDB {
     pub(crate) fn extract_stored_field(&self, stored: &[u8], field: &str) -> Option<Value> {
         if storage::skbin::is_skbin(stored) {
             storage::skbin::get_field(stored, field, &self.payload_store.field_table)
+        } else if stored.first() == Some(&PAYLOAD_TAG_ZSTD) {
+            // Whole-record zstd: decompress before byte-search (else the search
+            // scans compressed bytes and finds nothing).
+            let raw = decode_payload_record(stored.to_vec())?;
+            let fq = [field.to_string()];
+            query::extract_fields_by_search(&raw, &fq).remove(field)
         } else {
             let fq = [field.to_string()];
             query::extract_fields_by_search(stored, &fq).remove(field)
         }
+    }
+
+    /// Extract SEVERAL fields from a stored (undecoded) FULL-record payload,
+    /// dispatching on encoding: SKBIN → per-field skip-scan (no full materialise);
+    /// raw JSON → byte-search. Returned map is keyed by raw field name (same shape
+    /// as `extract_fields_by_search`). `stored` MUST be a whole record (starts at
+    /// the frame header) — do not pass a tail slice.
+    pub(crate) fn extract_stored_fields(
+        &self,
+        stored: &[u8],
+        fields: &[String],
+    ) -> serde_json::Map<String, Value> {
+        if storage::skbin::is_skbin(stored) {
+            let mut m = serde_json::Map::new();
+            for f in fields {
+                if let Some(v) =
+                    storage::skbin::get_field(stored, f, &self.payload_store.field_table)
+                {
+                    m.insert(f.clone(), v);
+                }
+            }
+            m
+        } else if stored.first() == Some(&PAYLOAD_TAG_ZSTD) {
+            // Whole-record zstd: decompress before byte-search.
+            match decode_payload_record(stored.to_vec()) {
+                Some(raw) => query::extract_fields_by_search(&raw, fields),
+                None => serde_json::Map::new(),
+            }
+        } else {
+            query::extract_fields_by_search(stored, fields)
+        }
+    }
+
+    /// If node `hash`'s stored payload is a SKBIN record, extract `fields` from it
+    /// (reading the full record — SKBIN records are always ≤ 64 KB). Returns
+    /// `None` for non-SKBIN records so callers keep their raw-JSON tail-slice fast
+    /// path for large geometry blobs.
+    pub(crate) fn try_skbin_node_fields(
+        &self,
+        hash: u64,
+        fields: &[String],
+    ) -> Option<serde_json::Map<String, Value>> {
+        let (off, len) = self.payload_loc(hash)?;
+        // Cheap SKBIN probe: check the first byte before reading the whole record.
+        if self.payload_store.get_raw_at(off, 1)?.first() != Some(&storage::skbin::TAG_SKBIN) {
+            return None;
+        }
+        let full = self.payload_store.get_raw_at(off, len as usize)?;
+        let mut m = serde_json::Map::new();
+        for f in fields {
+            if let Some(v) = storage::skbin::get_field(&full, f, &self.payload_store.field_table) {
+                m.insert(f.clone(), v);
+            }
+        }
+        Some(m)
     }
 
 
@@ -3484,13 +3787,11 @@ impl CoreDB {
         const MAX_BATCH: usize = 32 * 1024 * 1024;
 
         // Sort candidates by payload_offset for sequential I/O.
+        // Resolve via payload_loc (not self.nodes) so paged-topology opens — where
+        // nodes live in the mmap base, not the resident map — still batch-read.
         let mut sorted: Vec<(u64, u64, u32)> = hashes
             .iter()
-            .filter_map(|&h| {
-                self.nodes
-                    .get(&h)
-                    .map(|nd| (h, nd.payload_offset, nd.payload_len))
-            })
+            .filter_map(|&h| self.payload_loc(h).map(|(off, len)| (h, off, len)))
             .collect();
         sorted.sort_unstable_by_key(|&(_, off, _)| off);
 
@@ -3550,6 +3851,15 @@ impl CoreDB {
     /// Total number of nodes.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Every node's slug (resident overlay ∪ mmap base). Order is unspecified.
+    /// Used by tooling (e.g. `sekejap migrate`) to iterate + verify all records.
+    pub fn all_slugs(&self) -> Vec<String> {
+        self.all_hashes()
+            .into_iter()
+            .filter_map(|h| self.node_data(h).map(|n| n.slug.clone()))
+            .collect()
     }
 
     /// Returns the number of directed edges currently stored.
@@ -4517,10 +4827,16 @@ impl CoreDB {
                 let schema = self.schemas.get(&collection).cloned();
                 let mut affected_vec_fields: HashSet<String> = HashSet::new();
                 let count = items.len();
+                // Process each row to its final payload Value + slug, collecting into
+                // a single bulk write (skips per-row splice + the O(N) collection
+                // membership scan) instead of N slow `put` calls. Vectors are applied
+                // after the nodes exist. defer_wal_sync = one fsync for the batch.
                 self.defer_wal_sync = true;
                 self.defer_index_rebuild = true;
+                let mut bulk_rows: Vec<(String, Value)> = Vec::with_capacity(count);
+                let mut vector_ops: Vec<(String, String, Vec<f32>)> = Vec::new();
                 for (mut slug, payload_json, mut vectors) in items {
-                    let payload_json = if let Some(ref schema) = schema {
+                    let payload: Value = if let Some(ref schema) = schema {
                         let mut payload: Value = serde_json::from_str(&payload_json)
                             .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
                         if let Value::Object(ref mut map) = payload {
@@ -4545,15 +4861,9 @@ impl CoreDB {
                                     continue;
                                 }
                                 if field.default_uuid4 {
-                                    map.insert(
-                                        field.name.clone(),
-                                        Value::String(crate::scalar::uuid_v4()),
-                                    );
+                                    map.insert(field.name.clone(), Value::String(crate::scalar::uuid_v4()));
                                 } else if let Some((ns, nm)) = &field.default_uuid5 {
-                                    map.insert(
-                                        field.name.clone(),
-                                        Value::String(crate::scalar::uuid_v5(ns, nm)),
-                                    );
+                                    map.insert(field.name.clone(), Value::String(crate::scalar::uuid_v5(ns, nm)));
                                 }
                             }
                             if slug.is_empty() {
@@ -4562,41 +4872,39 @@ impl CoreDB {
                                         slug = format!("{}/{}", collection, key_val);
                                         map.insert("_id".into(), Value::String(slug.clone()));
                                     }
-                                    None => {
-                                        return Err(SqlError::MissingField { field: "_key" });
-                                    }
+                                    None => return Err(SqlError::MissingField { field: "_key" }),
                                 }
                             }
                         }
                         if let Some(err) = validate_payload_against_schema(schema, &payload) {
                             return Err(err);
                         }
-                        serde_json::to_string(&payload)
-                            .map_err(|e| SqlError::InvalidValue(e.to_string()))?
+                        payload
                     } else if slug.is_empty() {
                         return Err(SqlError::MissingField { field: "_key" });
                     } else {
-                        payload_json
+                        serde_json::from_str(&payload_json)
+                            .map_err(|e| SqlError::InvalidValue(e.to_string()))?
                     };
-                    self.put(&slug, &payload_json)
-                        .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
-                    // Store vectors without HNSW rebuild — defer to end
                     for (field, data) in vectors {
-                        self.wal_write(WalEntry::PutVector {
-                            slug: slug.clone(),
-                            field: field.clone(),
-                            data: data.clone(),
-                        });
-                        let hash = sk_hash(&slug);
-                        self.ensure_vector_store(&field);
-                        self.vectors.get_mut(&field).unwrap().put(hash, data);
+                        vector_ops.push((slug.clone(), field.clone(), data));
                         affected_vec_fields.insert(field);
                     }
+                    bulk_rows.push((slug, payload));
+                }
+                // Fast bulk payload write (deferred sync — one fsync for the batch).
+                self.put_value_bulk(bulk_rows)
+                    .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+                // Vectors: nodes now exist; WAL + store, HNSW rebuilt once below.
+                for (slug, field, data) in vector_ops {
+                    self.wal_write(WalEntry::PutVector { slug: slug.clone(), field: field.clone(), data: data.clone() });
+                    let hash = sk_hash(&slug);
+                    self.ensure_vector_store(&field);
+                    self.vectors.get_mut(&field).unwrap().put(hash, data);
                 }
                 self.defer_wal_sync = false;
                 self.wal_flush();
                 self.flush_deferred_indexes();
-                // Single HNSW rebuild per affected vector field
                 for field in &affected_vec_fields {
                     let hnsw_declared = self.schemas.values()
                         .any(|s| s.indexes.vector.contains(field));
@@ -7028,7 +7336,9 @@ mod hybrid_query_tests {
     #[test]
     fn payload_compression_roundtrips_and_shrinks() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config { payload_compression: true, ..Config::default() };
+        // Pure whole-record zstd (SKBIN is now the default, so disable it here to
+        // exercise the payload_compression path in isolation).
+        let cfg = Config { payload_compression: true, payload_binary: false, ..Config::default() };
         let body = "Uluwatu temple sunset ".repeat(30); // compressible text
         {
             let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
@@ -7058,7 +7368,8 @@ mod hybrid_query_tests {
         // back to raw.
         let dir2 = tempfile::tempdir().unwrap();
         {
-            let mut db = CoreDB::open(dir2.path()).unwrap();
+            // Explicit RAW baseline (default is now SKBIN) for the size comparison.
+            let mut db = CoreDB::open_with_config(dir2.path(), Config { payload_binary: false, ..Config::default() }).unwrap();
             for i in 0..50 {
                 db.put(&format!("place/p{i}"),
                     &format!(r#"{{"_collection":"place","_key":"p{i}","score":{i},"desc":"{body}"}}"#)).unwrap();
@@ -7070,16 +7381,66 @@ mod hybrid_query_tests {
         assert!(compressed_size * 2 < raw_size,
             "compressed store must be at least 2x smaller ({compressed_size} vs {raw_size})");
 
+        let raw_cfg = Config { payload_binary: false, ..Config::default() };
         {
-            let mut db = CoreDB::open(dir.path()).unwrap(); // no compression flag
+            // Reopen with RAW policy (no compression, no SKBIN): auto-detect still
+            // reads the compressed records, and compact() transcodes back to raw.
+            let mut db = CoreDB::open_with_config(dir.path(), raw_cfg.clone()).unwrap();
             let p: Value = serde_json::from_str(&db.get("place/p3").unwrap()).unwrap();
             assert_eq!(p["_key"].as_str().unwrap(), "p3", "auto-detect must read compressed records");
             db.compact().unwrap(); // transcodes to raw under current (off) policy
         }
         let transcoded = std::fs::metadata(dir.path().join("payloads.bin")).unwrap().len();
         assert!(transcoded > compressed_size * 2, "compact without flag must transcode back to raw");
-        let db = CoreDB::open(dir.path()).unwrap();
+        let db = CoreDB::open_with_config(dir.path(), raw_cfg).unwrap();
         assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 50);
+    }
+
+    #[test]
+    fn skbin_zstd_strings_roundtrip_shrink_and_recover() {
+        // Records with a long, compressible text body → per-field zstd (T_ZSTR).
+        let dir_bin = tempfile::tempdir().unwrap();
+        let dir_zst = tempfile::tempdir().unwrap();
+        let long = |i: usize| {
+            let body: String = std::iter::repeat(format!("document {i} processed at the facility. "))
+                .take(40).collect();
+            format!(r#"{{"_collection":"docs","_key":"d{i:05}","status":"shipped","body":"{body}"}}"#)
+        };
+        let build = |dir: &std::path::Path, zstd: bool| {
+            let cfg = Config { payload_binary: true, payload_zstd: zstd, ..Config::default() };
+            let mut before: Vec<Value> = Vec::new();
+            {
+                let mut db = CoreDB::open_with_config(dir, cfg.clone()).unwrap();
+                for i in 0..80 { db.put(&format!("docs/d{i:05}"), &long(i)).unwrap(); }
+                for i in 0..80 { before.push(serde_json::from_str(&db.get(&format!("docs/d{i:05}")).unwrap()).unwrap()); }
+                db.compact().unwrap();
+            }
+            // Reopen: every record decodes back byte-identical, filters work.
+            let db = CoreDB::open_with_config(dir, cfg).unwrap();
+            for i in 0..80 {
+                let got: Value = serde_json::from_str(&db.get(&format!("docs/d{i:05}")).unwrap()).unwrap();
+                assert_eq!(got, before[i], "record {i} must roundtrip (zstd={zstd})");
+            }
+            assert_eq!(db.query("SELECT _key FROM docs WHERE status = 'shipped'").unwrap().collect().len(), 80);
+            std::fs::metadata(dir.join("payloads.bin")).unwrap().len()
+        };
+        let plain = build(dir_bin.path(), false);
+        let zsize = build(dir_zst.path(), true);
+        assert!(zsize < plain, "per-field zstd must shrink payloads.bin ({zsize} < {plain})");
+
+        // No fsst symbol table is ever written — zstd values are self-contained.
+        assert!(!dir_zst.path().join("fsst_table.bin").exists(), "no shared symbol table for zstd");
+        // Corrupt the primary field table → reopen still recovers from a backup.
+        {
+            let p = dir_zst.path().join("field_table.bin");
+            let mut b = std::fs::read(&p).unwrap();
+            let last = b.len() - 1; b[last] ^= 0xff;
+            std::fs::write(&p, &b).unwrap();
+            let cfg = Config { payload_binary: true, payload_zstd: true, ..Config::default() };
+            let db = CoreDB::open_with_config(dir_zst.path(), cfg).unwrap();
+            let v: Value = serde_json::from_str(&db.get("docs/d00042").unwrap()).unwrap();
+            assert_eq!(v["_key"], "d00042", "must recover from a backup field-table copy");
+        }
     }
 
     #[test]
@@ -7177,7 +7538,8 @@ mod hybrid_query_tests {
         // Size: strictly smaller than the same data stored raw.
         let dir2 = tempfile::tempdir().unwrap();
         {
-            let mut db = CoreDB::open(dir2.path()).unwrap();
+            // Explicit RAW baseline (default is now SKBIN) for the size comparison.
+            let mut db = CoreDB::open_with_config(dir2.path(), Config { payload_binary: false, ..Config::default() }).unwrap();
             for i in 0..100 { db.put(&format!("orders/ord-{i:05}"), &mk(i)).unwrap(); }
             db.compact().unwrap();
         }

@@ -5361,6 +5361,18 @@ fn parse_match_or_agg_inner(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg,
     // Everything else goes through the regular SELECT/DML pipeline.
     let mut parser = Parser::with_params(tokens, params);
     let stmt = parser.parse()?;
+    // Guard: a trailing UNION on a PLAIN SELECT was previously dropped silently,
+    // returning only the first branch (wrong, no error). UNION is supported only
+    // between MATCH patterns. Fail loudly rather than serve a partial result.
+    if matches!(parser.peek(), Tok::Kw(Kw::Union)) {
+        return Err(SqlError::UnexpectedToken {
+            expected: "end of query",
+            got: "UNION — plain `SELECT … UNION SELECT …` is not supported; use \
+                   `SELECT … FROM MATCH … UNION SELECT … FROM MATCH …`, or run the \
+                   two SELECTs separately and merge"
+                .into(),
+        });
+    }
     Ok(MatchOrAgg::Steps(compile(stmt)))
 }
 
