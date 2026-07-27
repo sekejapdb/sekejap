@@ -42,7 +42,7 @@ Every file starts with the same 16-byte header as `snapshot.json` already uses:
 
 | File | Contents | Indexed by |
 |---|---|---|
-| `payloads.bin` | raw node JSON (exists today) | `(offset, len)` from node record |
+| `payloads.bin` | SKBIN records (schema-aware binary; exists today) | `(offset, len)` from node record |
 | `nodes.bin` | fixed-size node records | dense id (arithmetic) |
 | `adj_fwd.bin` | CSR: offset array + edge array (outgoing) | dense id |
 | `adj_rev.bin` | CSR: offset array + edge array (incoming) | dense id |
@@ -190,11 +190,12 @@ compaction. No extra RAM beyond the id map (which can spill-sort for billion-sca
 - **Topology stays raw** (fixed-size records + CSR) — traversal is direct-seek, so
   raw = fastest. Dense `u32` ids already make it compact (4 B/neighbor). A delta/varint
   CSR to shrink it further is an *optional later* pass, not v1.
-- **Payloads get block compression (zstd), not topology.** Payloads are the size bulk
-  and compress well. Compress in **fixed blocks** so `(offset, len)` random reads still
-  work under mmap; a per-record encoding tag (`raw` vs `zstd`) lets `compact()` transcode
-  incrementally and old raw records coexist. (This is the payloads-side analogue of the
-  topology format lock.)
+- **Payloads carry the encoding, not topology.** Payloads are the size bulk; they use
+  **SKBIN** (schema-aware binary, size + recoverability). A per-record first-byte tag
+  (`raw` `{` vs `0x02` SKBIN) lets `compact()` transcode incrementally and old raw records
+  coexist. Whole-payload block-zstd was evaluated and dropped (worse ratio on real data,
+  no faster, shared dictionary breaks the ≤1-record blast radius). See
+  [payload-binary-format.md](payload-binary-format.md).
 - **Compression is invisible to crash recovery.** The **WAL is uncompressed**; all
   checkpoint files (topology + payloads) are written **atomically** (tmp → `fsync` →
   rename) and are **rebuildable from WAL + payloads**. A blackout mid-write leaves the
@@ -244,8 +245,9 @@ compaction. No extra RAM beyond the id map (which can spill-sort for billion-sca
 4. ✅ **Spatial meta → `spatial_ref` side-table** so `NodeRecord` stays fixed-size.
 5. ✅ **`idx.bin` = sorted array + binary search + a resident sparse index** (§3.3);
    on-disk hash table deferred.
-6. ✅ **Topology neighbor ids StreamVByte-delta; payloads block-zstd** (§5b). Attribute
-   arrays (type/strength/meta) and any further CSR compression are optional later passes.
+6. ✅ **Topology neighbor ids StreamVByte-delta; payloads SKBIN** (schema-aware binary;
+   block-zstd was evaluated and dropped for payloads). Attribute arrays (type/strength/meta)
+   and any further CSR compression are optional later passes.
 7. ✅ **Access = `mmap`** (OS page cache), not a hand-rolled buffer pool; `BlockCache` for S3.
 
 ---

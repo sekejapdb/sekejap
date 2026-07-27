@@ -66,9 +66,9 @@ An embedded DB runs in someone else's process. These come before features.
 
 ## Storage strategy — THE foundational decision
 
-**Topology = binary, mmap'd, StreamVByte-delta neighbor ids. Payloads = block-zstd.
-Recovery = WAL + atomic rename.** The sweet-spot row below — fast *and* compact *and*
-power-loss-safe *and* unbounded.
+**Topology = binary, mmap'd, StreamVByte-delta neighbor ids. Payloads = SKBIN
+(schema-aware binary). Recovery = WAL + atomic rename.** The sweet-spot row below —
+fast *and* compact *and* power-loss-safe *and* unbounded.
 
 - **Topology is binary, never JSON** — fixed-size node records (`nodes.bin`) + CSR
   adjacency. JSON is impossible at a billion (size + parse cost).
@@ -77,7 +77,8 @@ power-loss-safe *and* unbounded.
   Raspberry-Pi-friendly (uses whatever RAM exists). S3 = same format via `BlockCache`.
 - **Neighbor ids = StreamVByte-delta** — sorted, gap-encoded, SIMD-decoded (~1–2 B
   each). Compact *and* ceiling-free (logically `u64`, no `u32` limit) *and* fast
-  (branch-free 4-at-a-time decode ≈ a raw array read). Payloads get **block-zstd**.
+  (branch-free 4-at-a-time decode ≈ a raw array read). Payloads use **SKBIN**
+  (schema-aware binary — see [payload-binary-format.md](payload-binary-format.md)).
 - **Compression is invisible to crash recovery.** The WAL is uncompressed; checkpoints
   (topology/payload files) are written atomically (tmp→fsync→rename) and are
   rebuildable from WAL + payloads. Blackout-safe regardless of compression.
@@ -88,7 +89,7 @@ power-loss-safe *and* unbounded.
 |---|---|---|---|---|---|---|
 | All-in-RAM (HashMaps) | — | ⚡⚡⚡ | n/a | WAL replay | ~15–20 M | **sekejap today** |
 | mmap raw binary (fixed-id CSR) | big | ⚡⚡⚡ | fast (SSD fault) | WAL + atomic | 34 B (legacy) | Neo4j |
-| **mmap + StreamVByte-delta CSR + zstd payloads** | **small** | **⚡⚡⚡** | fast (fewer faults) | **WAL + atomic** | **unbounded** | **← sekejap target** |
+| **mmap + StreamVByte-delta CSR + SKBIN payloads** | **small** | **⚡⚡⚡** | fast (fewer faults) | **WAL + atomic** | **unbounded** | **← sekejap target** |
 | LSM KV (RocksDB/Badger) | small | ⚡ (KV lookup/hop) | slower | LSM WAL | 2⁶⁴ / unbounded | Arango, Surreal, Dgraph |
 
 The open corner nobody occupies: **Neo4j-class traversal speed + Dgraph-class compact &
@@ -131,7 +132,7 @@ At 1 B nodes / ~5 edges each: ~124 GB topology on disk (24 GB nodes + 8 GB offse
   index instead of parsing payloads (extend plain-SELECT `index_agg` to MATCH).
 - **Finer `EXPLAIN ANALYZE`** — per-phase timing (traverse/materialize/extract/group).
 - **Smallest-bitmap-first AND ordering** — order predicates by exact `RoaringBitmap::len()`
-  (cheap; a differentiator PG's estimates can't match). See [foundations.md](foundations.md).
+  (cheap; a differentiator PG's estimates can't match).
 - *(Later, if measured need)* typed column cache + dense group-by kernel.
 
 ### Correctness hardening (pre-publication)
@@ -155,14 +156,19 @@ At 1 B nodes / ~5 edges each: ~124 GB topology on disk (24 GB nodes + 8 GB offse
   (sequential); index-free traversal; smaller *and* faster than fixed-width.
 - **Access = `mmap` (OS page cache), not a hand-rolled buffer pool.** One format,
   swappable block source: mmap for local, `BlockCache` for S3.
-- **Payloads get block-zstd (size).** Edge attribute (type/strength/meta) compression
-  is an optional later pass.
+- **Payloads = SKBIN (schema-aware binary; size + recoverability).** Block-zstd was
+  evaluated and dropped for payloads — worse ratio on real data, no faster, and a
+  shared symbol/dictionary violates the ≤1-record blast-radius rule. See
+  [payload-binary-format.md](payload-binary-format.md). Edge attribute
+  (type/strength/meta) compression is an optional later pass.
 - **Name resolution = sorted `hash→id` + a resident sparse index** (~1 fault/root).
 - **Recovery is compression-invisible:** WAL uncompressed + atomic tmp→fsync→rename.
 - **Resident load stays the default** until mmap ships; no perf regression is a hard gate.
 
 ## Current version
 
-`0.12.1`. Shipped since 0.12.0: unified `SELECT … FROM MATCH` surface, plain-SELECT
+`0.13.0`. Shipped since 0.12.0: unified `SELECT … FROM MATCH` surface, plain-SELECT
 `CASE`/`COUNT(DISTINCT)`, Python `EXPLAIN`, versioned snapshot header, selective
-materialization. See [architecture.md](architecture.md).
+materialization, **SKBIN default payload format**, concurrent bulk write path,
+on-demand RAM reclaim (`trim_memory`), and SQL resource guardrails. See
+[architecture.md](architecture.md). Detail on payloads: [payload-binary-format.md](payload-binary-format.md).
