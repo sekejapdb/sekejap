@@ -100,3 +100,6 @@ target
 bench_sekejap_db/
 sekejap-benchmark/bench_sekejap_db/
 sekejap-benchmark/bench_sqlite.db
+# internal dev workbench + private domain notes (never committed)
+.workbench/
+.sekejap.cases.raw.md

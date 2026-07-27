@@ -3090,7 +3090,44 @@ impl CoreDB {
             let _ = self.save_search_binary(search_bin_path);
         }
 
+        // Reclaim excess RAM capacity as part of compaction (so auto-compact also
+        // trims memory automatically, not just disk).
+        self.shrink_maps();
+
         Ok(())
+    }
+
+    /// Return excess CAPACITY of the in-RAM index maps to the allocator. Pure
+    /// reclaim: no data and no index is dropped, so query results are unchanged and
+    /// correctness is unaffected. Run automatically at the end of `compact()` and
+    /// on demand via [`trim_memory`](Self::trim_memory).
+    fn shrink_maps(&mut self) {
+        self.nodes.shrink_to_fit();
+        self.slug_map.shrink_to_fit();
+        self.collections.shrink_to_fit();
+        for members in self.collections.values_mut() {
+            members.shrink_to_fit();
+        }
+        self.collection_names_map.shrink_to_fit();
+        self.field_indexes.shrink_to_fit();
+        for bt in self.field_indexes.values_mut() {
+            for ids in bt.values_mut() {
+                ids.shrink_to_fit();
+            }
+        }
+    }
+
+    /// Downstream-callable RAM reclaim WITHOUT a full compaction: hands excess
+    /// capacity of the in-memory index maps back to the allocator (e.g. after a
+    /// large batch of deletes/updates left the maps over-allocated). Cheap and
+    /// SAFE — never drops data or indexes, so query results are unchanged.
+    ///
+    /// For deeper reclaim (payload/vector dead space + WAL truncation), call
+    /// [`compact`](Self::compact) — which also shrinks the maps. Disk-backed
+    /// payloads/vectors are mmap'd, so their cold pages are already reclaimed by
+    /// the OS under memory pressure.
+    pub fn trim_memory(&mut self) {
+        self.shrink_maps();
     }
 
     /// Phase 0: write the offset-addressable topology files from the live graph.

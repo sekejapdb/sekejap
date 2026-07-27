@@ -1079,6 +1079,33 @@ enum FieldOrBm25 {
     ScoreProjection { expr: ScoreExpr, alias: String },
 }
 
+// ── Safety caps on user-controlled query resources ─────────────────────────────
+// Reject-with-error (never silent). Generous enough that no legitimate query is
+// affected; they only stop pathological/adversarial input from exhausting
+// CPU / RAM / the parser stack. Injection is already prevented by typed `$N`
+// params (no string interpolation); these guard the DoS surface.
+const MAX_HOP_DEPTH: u32 = 100_000;           // graph traversal `*min..max`
+const MAX_IN_LIST: usize = 1_000_000;         // `IN (...)` list size
+const MAX_INSERT_ROWS: usize = 1_000_000;     // multi-row INSERT tuples
+const MAX_VECTOR_K: usize = 1_000_000;        // VECTOR_NEAR k
+const MAX_SUBSTRING_LEN: usize = 100_000_000; // SUBSTRING length
+const MAX_NEST_DEPTH: usize = 256;            // paren/bracket nesting → parser recursion
+
+/// Max parenthesis/bracket nesting in the token stream. Bounding this before
+/// parsing prevents a deeply-nested query from overflowing the recursive-descent
+/// parser's stack (the recursion consumes an opening token per level).
+fn max_nesting(tokens: &[Tok]) -> usize {
+    let (mut depth, mut max) = (0usize, 0usize);
+    for t in tokens {
+        match t {
+            Tok::LParen | Tok::LBracket => { depth += 1; if depth > max { max = depth; } }
+            Tok::RParen | Tok::RBracket => { depth = depth.saturating_sub(1); }
+            _ => {}
+        }
+    }
+    max
+}
+
 struct Parser {
     tokens: Vec<Tok>,
     pos: usize,
@@ -1793,6 +1820,13 @@ impl Parser {
                 self.expect_comma()?;
                 let len = self.expect_num()?;
                 self.expect_rparen()?;
+                if !start.is_finite() || !len.is_finite() || start < 0.0 || len < 0.0
+                    || len > MAX_SUBSTRING_LEN as f64
+                {
+                    return Err(SqlError::InvalidValue(
+                        "SUBSTRING start/length must be finite, non-negative, and bounded".into(),
+                    ));
+                }
                 return Ok(FieldOrBm25::Field(format!(
                     "__FUNC__SUBSTRING__{}__{}_{}",
                     arg1, start as usize, len as usize
@@ -2143,6 +2177,9 @@ impl Parser {
                     self.advance();
                     values.push(self.parse_value()?);
                 }
+                if values.len() > MAX_IN_LIST {
+                    return Err(SqlError::InvalidValue(format!("IN list too large (> {MAX_IN_LIST})")));
+                }
                 self.expect_rparen()?;
                 Ok(CondExpr::In { field, values })
             }
@@ -2154,6 +2191,9 @@ impl Parser {
                 while matches!(self.peek(), Tok::Comma) {
                     self.advance();
                     values.push(self.parse_value()?);
+                }
+                if values.len() > MAX_IN_LIST {
+                    return Err(SqlError::InvalidValue(format!("IN list too large (> {MAX_IN_LIST})")));
                 }
                 self.expect_rparen()?;
                 Ok(CondExpr::Not(Box::new(CondExpr::In { field, values })))
@@ -2487,6 +2527,9 @@ impl Parser {
         let query = self.parse_f32_array_or_param()?;
         self.expect_comma()?;
         let k = self.expect_usize()?;
+        if k > MAX_VECTOR_K {
+            return Err(SqlError::InvalidValue(format!("VECTOR_NEAR k too large (> {MAX_VECTOR_K})")));
+        }
         self.expect_rparen()?;
         Ok(CondExpr::VectorNear { field, query, k })
     }
@@ -2813,6 +2856,10 @@ impl Parser {
             }
             self.expect_rparen()?;
             rows.push(values);
+            if rows.len() > MAX_INSERT_ROWS {
+                return Err(SqlError::InvalidValue(format!(
+                    "INSERT has too many rows (> {MAX_INSERT_ROWS})")));
+            }
         }
         Ok(InsertStmt {
             collection,
@@ -4913,6 +4960,14 @@ impl Parser {
                     }
                 }
             }
+            if max_depth > MAX_HOP_DEPTH || min_depth > MAX_HOP_DEPTH {
+                return Err(SqlError::InvalidValue(format!(
+                    "graph hop depth exceeds the maximum ({MAX_HOP_DEPTH})")));
+            }
+            if min_depth > max_depth {
+                return Err(SqlError::InvalidValue(format!(
+                    "graph hop range invalid: min {min_depth} > max {max_depth}")));
+            }
             loop {
                 match self.peek() {
                     Tok::RBracket | Tok::Eof => break,
@@ -5321,6 +5376,13 @@ pub enum MatchOrAgg {
 
 fn parse_match_or_agg_inner(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
     let tokens = tokenize(sql)?;
+
+    // Bound parser recursion by rejecting pathologically-nested input up front.
+    if max_nesting(&tokens) > MAX_NEST_DEPTH {
+        return Err(SqlError::InvalidValue(format!(
+            "query nesting too deep (> {MAX_NEST_DEPTH} levels of parentheses/brackets)"
+        )));
+    }
 
     // Multi-FROM: SELECT … FROM source1, source2, … (comma between FROM sources)
     if is_multi_from(&tokens) {

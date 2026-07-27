@@ -310,6 +310,13 @@ impl Engine {
         Ok(total)
     }
 
+    /// Reclaim excess in-RAM capacity on demand (see [`CoreDB::trim_memory`]).
+    /// Cheap and safe — never drops data or indexes; query results are unchanged.
+    /// Briefly takes the exclusive write lock. For deeper reclaim use [`compact`](Self::compact).
+    pub fn trim_memory(&self) {
+        self.guard.write().trim_memory();
+    }
+
     /// Force WAL compaction regardless of policy.
     ///
     /// Rewrites the snapshot + payloads.bin and truncates the WAL log to zero.

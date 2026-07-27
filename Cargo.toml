@@ -2,7 +2,7 @@
 members = [".", "wrappers/python", "wrappers/flutter", "skcli"]
 
 [workspace.package]
-version = "0.12.1"
+version = "0.13.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/insanalamin/sekejap"
@@ -107,6 +107,11 @@ harness = false
 [[bench]]
 name = "dump_record"
 path = "benches/tools/dump_record.rs"
+harness = false
+
+[[bench]]
+name = "ram_residual"
+path = "benches/tools/ram_residual.rs"
 harness = false
 
 # Older criterion microbenchmarks in benches/*.rs are parked (autobenches = false).
