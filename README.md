@@ -1,125 +1,245 @@
 # sekejap
 
-Embedded, graph-first multimodel database. Graph traversal, spatial search, vector similarity, and full-text search — composable in a single query, zero external dependencies, runs in-process.
+Embedded, graph-first multi-model database. Graph traversal, spatial search, vector similarity, and full-text search — composable in a single query, zero external services, runs in-process or against S3.
+
+*`sekejap` means **"a brief moment"** in Indonesian.* The world flies into one island, you explore it across every dimension, and the days run out fast. This README is a Bali holiday — Chloe's, mostly.
 
 **Built for workloads that need more than one data model at a time:**
 
-- root-cause analysis — traverse a causal graph filtered by text relevance
-- hybrid RAG — find semantically similar nodes then walk their graph context
-- knowledge graph discovery — spatial + graph + vector in one query
+- travel & discovery — "near me, loved by people like me, described as *quiet sunset*, still open"
+- hybrid RAG — find semantically similar records then walk their graph context
+- local AI memory — a companion or robot that records where it went, when, and how it felt
 - spatiotemporal intelligence — who was where, connected to what, when
 
 Available as a Rust library, Rust CLI, and Python library.
 
+📖 **Documentation:** [`docs/`](docs/README.md) — a [user guide](docs/guide/README.md) (query language, including the [`SELECT … FROM MATCH`](docs/guide/graph-queries.md) reference) and [engine internals](docs/internals/README.md).
+
+### Who it's for
+
+| You are a… | You'll care about |
+|---|---|
+| **Data scientist** | pandas ↔ DataFrame, embeddings, similarity, aggregation over graphs |
+| **Full-stack developer** | one SQL surface for CRUD, search, transactions, hybrid ranking |
+| **Mobile developer** | embedded & offline, "near me" spatial, tiny footprint, no server |
+| **Embodied-AI developer** | a local memory graph — observations that fuse place, time, text, vector |
+
 ---
 
-## Hello World — One Piece
+## Getting started — the world lands in Bali
 
-The Grand Line is a graph. Islands are nodes. Sailing routes are edges. Characters have bounties, affiliations, fighting styles, and coordinates.
+Six travellers, five continents, one island: Giulia (Milan), Ethan (Toronto), Yasmine (Casablanca), Lucas (São Paulo), Aiym (Almaty), and **Chloe (Melbourne)**.
 
 ```python
 from sekejap import DB
 
-db = DB()
-
-# ── Schema ────────────────────────────────────────────────────────────────────
+db = DB("./bali")
 
 db.execute("""
-    CREATE TABLE characters (
+    CREATE TABLE tourists (
+        _key      TEXT PRIMARY KEY,
+        name      TEXT,
+        home_city TEXT,
+        arrival   TIMESTAMPTZ,
+        departure TIMESTAMPTZ,
+        taste     VECTOR
+    )
+""")
+db.execute("CREATE TABLE flights (_key TEXT PRIMARY KEY, airline TEXT, origin_city TEXT, duration_hours INTEGER)")
+db.execute("CREATE TABLE places  (_key TEXT PRIMARY KEY, name TEXT, category TEXT, area TEXT, geometry GEO, description TEXT, embedding VECTOR)")
+db.execute("CREATE TABLE restaurants (_key TEXT PRIMARY KEY, name TEXT, area TEXT, geometry GEO, open_now BOOLEAN)")
+db.execute("CREATE TABLE dishes  (_key TEXT PRIMARY KEY, name TEXT, price INTEGER, protein_g INTEGER, description TEXT, geometry GEO, open_now BOOLEAN, embedding VECTOR)")
+
+db.execute("CREATE INDEX ON places      USING spatial (geometry)")
+db.execute("CREATE INDEX ON dishes      USING spatial (geometry)")
+db.execute("CREATE INDEX ON dishes      USING bm25    (description)")
+db.execute("CREATE INDEX ON tourists    USING hnsw    (taste)")
+
+db.execute("INSERT INTO tourists (_key, name, home_city, arrival, departure) VALUES ('aiym',  'Aiym',  'Almaty',    '2024-06-02', '2024-06-10')")
+db.execute("INSERT INTO tourists (_key, name, home_city, arrival, departure) VALUES ('chloe', 'Chloe', 'Melbourne', '2024-06-01', '2024-06-08')")
+
+# tourist -[:flew_on]-> flight
+db.execute("INSERT ('tourists/aiym')-[:flew_on]->('flights/ky-alm')")
+db.execute("INSERT ('tourists/chloe')-[:flew_on]->('flights/qf-mel')")
+```
+
+### 1 — The basics: Aiym flies in from Almaty
+
+Follow one edge. `MATCH` names the graph pattern; everything around it is ordinary SQL.
+
+```python
+db.query("""
+    SELECT f.airline AS airline, f.duration_hours AS hours
+    FROM MATCH (t:tourists)-[:flew_on]->(f:flights)
+    WHERE t._key = 'aiym'
+""")
+# → { airline: "Air Astana", hours: 11 }
+```
+
+### 2 — One query, every model: what should Chloe order right now?
+
+Food for delivery: **near** her villa, **still open**, in a **price range**, with enough **protein**, matching a **craving** — ranked by text relevance *and* taste. Graph + spatial + text + scalar filters + hybrid score, in a single statement.
+
+```python
+db.query("""
+    SELECT r.name AS restaurant, d.name AS dish, d.price AS price, d.protein_g AS protein
+    FROM MATCH (r:restaurants)-[:serves]->(d:dishes)
+    WHERE d.open_now = true
+      AND d.price >= 40000 AND d.price <= 90000                    -- IDR range
+      AND d.protein_g >= 25                                        -- macro goal
+      AND ST_DWithin(d.geometry, POINT(115.168 -8.690), 5.0)       -- within 5 km of her villa
+      AND BM25(d.description, 'grilled chicken healthy') > 0.0      -- the craving
+    ORDER BY BM25_NORM(d.description, 'grilled healthy protein') * 0.6
+           + VECTOR_COSINE(d.embedding, chloe_taste)          * 0.4 DESC
+    LIMIT 10
+""")
+# → Ayam Bakar (La Favela, 65k, 38g) ranked above Tuna Poke Bowl; the far Ubud
+#   dish and the low-protein snack are filtered out.
+```
+
+### 3 — Multi-hop analysis: what did Chloe's fellow travellers fall for?
+
+Walk **backward** across the shared inbound flight to everyone who took it, then out to the dishes they loved — and count the distinct fans.
+
+```python
+db.query("""
+    SELECT d.name AS dish, COUNT(DISTINCT peer._key) AS fans
+    FROM MATCH (chloe:tourists)-[:flew_on]->(f:flights)<-[:flew_on]-(peer:tourists)-[:ate]->(d:dishes)
+    WHERE chloe._key = 'chloe'
+    GROUP BY d.name
+    ORDER BY fans DESC
+""")
+# → Ayam Bakar (2), Babi Guling (1)
+```
+
+That's the shape of everything below: **selection** (graph + filters) narrows the world, **ranking** scores what's left.
+
+---
+
+## Exploring Bali in five dimensions
+
+### Map — spatial
+
+```python
+# Temples & beaches within 5 km of Uluwatu
+db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.087 -8.829), 5.0)")
+```
+
+### Connections — graph (forward, backward, DISTINCT)
+
+```python
+# Forward: places Chloe reached within 2 hops of her itinerary
+db.query("""
+    SELECT DISTINCT p._key AS place
+    FROM MATCH (c:tourists)-[:visited]->(m:places)-[:near*1..2]->(p:places)
+    WHERE c._key = 'chloe'
+""")
+
+# Backward `<-`: who visited Uluwatu? (walk against the arrow)
+db.query("""
+    SELECT DISTINCT t.name AS visitor
+    FROM MATCH (p:places)<-[:visited]-(t:tourists)
+    WHERE p._key = 'uluwatu'
+""")
+
+# Edge properties: a bound edge exposes its strength + metadata (fixed single hops)
+db.query("""
+    SELECT t.name AS visitor, v.strength AS rating
+    FROM MATCH (p:places)<-[v:visited]-(t:tourists)
+    WHERE p._key = 'uluwatu'
+    ORDER BY v.strength DESC
+""")
+```
+
+> Multi-hop returns **one row per path** by default (a place reached two ways appears twice). Add `DISTINCT` for unique nodes, or `COUNT(DISTINCT field)` to count them.
+
+### Taste — vector
+
+```python
+# Tourists whose taste is closest to Chloe's
+db.query("""
+    SELECT * FROM tourists
+    WHERE VECTOR_NEAR(taste, chloe_taste, 5)
+""")
+```
+
+### Words — full-text (BM25 relevance, or positional SEARCH)
+
+```python
+db.query("""
+    SELECT * FROM places
+    WHERE BM25(description, 'clifftop sunset temple') > 0.2
+    ORDER BY BM25(description, 'clifftop sunset temple') DESC
+""")
+```
+
+### Time — the sekejap
+
+```python
+# Day-of-trip. A seven-day holiday is a brief moment.
+db.query("""
+    SELECT t.name AS name, AGE_DAYS(t.arrival) AS days_here, NOW() AS this_moment
+    FROM MATCH (t:tourists) WHERE t._key = 'chloe'
+""")
+# → { name: "Chloe", days_here: 5, this_moment: 1717... }   "the last light"
+```
+
+---
+
+## The Spatiotemporal Diary — Chloe
+
+Chloe keeps a diary. Each entry is a moment: **where** (a place, or a restaurant), **when** (`logged_at`), **what she wrote** (`reflection`), and **how it felt** (`mood` vector). The entries are part of the graph — `chloe -[:wrote]-> entry -[:at]-> place`, and a place may be a `restaurant -[:serves]-> dish` — so the diary can answer questions about the island it touched.
+
+```python
+db.execute("""
+    CREATE TABLE diary (
         _key       TEXT PRIMARY KEY,
-        name       TEXT,
-        crew       TEXT,
-        bounty     INTEGER,
-        location   GEO,
-        embedding  VECTOR
+        author     TEXT,
+        place      TEXT,
+        logged_at  TIMESTAMPTZ,
+        reflection TEXT,
+        mood       VECTOR
     )
 """)
-
-db.execute("""
-    CREATE TABLE islands (
-        _key     TEXT PRIMARY KEY,
-        name     TEXT,
-        sea      TEXT,
-        geometry GEO
-    )
-""")
-
-db.execute("CREATE INDEX ON characters USING hash    (crew)")
-db.execute("CREATE INDEX ON characters USING btree   (bounty)")
-db.execute("CREATE INDEX ON characters USING gin     (name)")
-db.execute("CREATE INDEX ON characters USING spatial (location)")
-db.execute("CREATE INDEX ON characters USING hnsw    (embedding)")
-db.execute("CREATE INDEX ON islands    USING spatial (geometry)")
-
-# ── Nodes ─────────────────────────────────────────────────────────────────────
-
-db.execute("INSERT INTO characters (_key, name, crew, bounty) VALUES ('luffy',  'Monkey D. Luffy',  'straw-hat',  3000000000)")
-db.execute("INSERT INTO characters (_key, name, crew, bounty) VALUES ('zoro',   'Roronoa Zoro',     'straw-hat',  1111000000)")
-db.execute("INSERT INTO characters (_key, name, crew, bounty) VALUES ('sanji',  'Vinsmoke Sanji',   'straw-hat',  1032000000)")
-db.execute("INSERT INTO characters (_key, name, crew, bounty) VALUES ('shanks', 'Red Hair Shanks',  'red-hair',   4048900000)")
-db.execute("INSERT INTO characters (_key, name, crew, bounty) VALUES ('mihawk', 'Dracule Mihawk',   'shichibukai', 0)")
-
-db.execute("INSERT INTO islands (_key, name, sea) VALUES ('marineford',     'Marineford',     'grand-line')")
-db.execute("INSERT INTO islands (_key, name, sea) VALUES ('dressrosa',      'Dressrosa',      'grand-line')")
-db.execute("INSERT INTO islands (_key, name, sea) VALUES ('wano',           'Wano Kuni',      'grand-line')")
-db.execute("INSERT INTO islands (_key, name, sea) VALUES ('fishman-island', 'Fishman Island', 'grand-line')")
-
-# ── Edges ─────────────────────────────────────────────────────────────────────
-
-db.execute("INSERT ('characters/luffy')-[:rival {strength: 10}]->('characters/mihawk')")
-db.execute("INSERT ('characters/zoro')-[:student_of {years: 3}]->('characters/mihawk')")
-db.execute("INSERT ('characters/shanks')-[:allied_with {trust: 10}]->('characters/luffy')")
-db.execute("INSERT ('islands/marineford')-[:route_to {days: 3}]->('islands/fishman-island')")
-db.execute("INSERT ('islands/fishman-island')-[:route_to {days: 7}]->('islands/dressrosa')")
-db.execute("INSERT ('islands/dressrosa')-[:route_to {days: 5}]->('islands/wano')")
+db.execute("CREATE INDEX ON diary USING search (reflection)")   # search her own words
+db.execute("CREATE INDEX ON diary USING hnsw   (mood)")         # moments that feel alike
 ```
 
 ```python
-# ── Graph: who trained under Mihawk, and who are their rivals? ────────────────
-
-hits = db.query("""
-    SELECT b._key AS name
-    FROM MATCH (a:characters)-[:student_of]->(:characters {_key: 'mihawk'})<-[:rival]-(b:characters)
+# Her whole week, retraced through space and time
+db.query("""
+    SELECT e.place AS place, e.logged_at AS moment, e.reflection AS words
+    FROM MATCH (o:tourists)-[:wrote]->(e:diary)
+    WHERE o._key = 'chloe'
+    ORDER BY e.logged_at ASC
 """)
 
-# ── Graph: reachable islands within 3 hops from Marineford ───────────────────
-
-hits = db.query("""
-    SELECT dest._key AS island
-    FROM MATCH (start:islands)-[:route_to*1..3]->(dest:islands)
-    WHERE start._key = 'marineford'
+# The moment she ate near a temple — traced through the graph (diary → warung → dish)
+db.query("""
+    SELECT e.logged_at AS moment, w.name AS warung, d.name AS dish
+    FROM MATCH (e:diary)-[:at]->(w:restaurants)-[:serves]->(d:dishes)
+    WHERE e.author = 'chloe'
+    ORDER BY e.logged_at
 """)
 
-# ── Aggregate: total route days from Marineford to each destination ───────────
-
-hits = db.query("""
-    SELECT dest._key AS island, SUM(r.days) AS total_days
-    FROM MATCH (start:islands)-[r:route_to*1..3]->(dest:islands)
-    WHERE start._key = 'marineford'
-    GROUP BY dest._key
-    ORDER BY total_days ASC
+# A moment tonight that rhymes with an earlier one (nearest mood)
+db.query(f"""
+    SELECT place, reflection FROM diary
+    WHERE author = 'chloe'
+    ORDER BY mood <=> {tonight} ASC
+    LIMIT 1
 """)
+# → this last Uluwatu sunset rhymes with the first quiet morning in Ubud.
 
-# ── Spatial: islands within 1000 km of Marineford (0°, 0°) ───────────────────
-
-hits = db.query("""
-    SELECT * FROM islands
-    WHERE ST_DWithin(geometry, POINT(0.0 0.0), 1000.0)
-""")
-
-# ── Vector: characters with similar fighting style to Zoro ───────────────────
-
-zoro_vec = [0.95, 0.02, 0.01, 0.02]   # hypothetical embedding
-hits = db.query(f"SELECT * FROM characters WHERE VECTOR_NEAR(embedding, {zoro_vec}, 5)")
-
-# ── BM25: search bounty posters by wanted description ────────────────────────
-
-hits = db.query("""
-    SELECT * FROM characters
-    WHERE BM25(description, 'swordsman pirate dangerous') > 0.3
-    ORDER BY BM25(description, 'swordsman pirate dangerous') DESC
+# "Where did I write about feeling small?" — search her reflections
+db.query("""
+    SELECT place, logged_at FROM diary
+    WHERE author = 'chloe' AND SEARCH('small still')
+    ORDER BY logged_at
 """)
 ```
+
+The island held still while the week ran out.
 
 ---
 
@@ -127,17 +247,16 @@ hits = db.query("""
 
 | Type | SQL keyword | Stored as | Use for |
 |---|---|---|---|
-| Text | `TEXT` | UTF-8 string | names, categories, IDs |
-| Integer | `INTEGER` | i64 | counts, years, bounties |
-| Float | `REAL` | f64 | scores, weights, ratios |
-| Timestamp | `TIMESTAMPTZ` | ISO-8601 | events, creation time |
-| Geometry | `GEO` | GeoJSON object | points, polygons, lines |
-| Vector | `VECTOR` | `[f32, ...]` array | embeddings |
+| Text | `TEXT` | UTF-8 string | names, categories, keys |
+| Integer | `INTEGER` | i64 | prices (IDR), durations, counts |
+| Float | `REAL` | f64 | scores, ratings, weights |
+| Timestamp | `TIMESTAMPTZ` | ISO-8601 | arrival, departure, `logged_at` |
+| Geometry | `GEO` | GeoJSON object | temple points, area polygons |
+| Vector | `VECTOR` | `[f32, ...]` array | taste, mood, review embeddings |
 | JSON | `JSON` | arbitrary JSON | nested / unstructured |
 
-**GEO** accepts any GeoJSON geometry — `Point`, `Polygon`, `LineString`, `MultiPolygon`, etc.
-
-**VECTOR** is inserted as a SQL array literal: `[0.12, -0.03, 0.87, ...]`
+**GEO** accepts any GeoJSON geometry — `Point`, `Polygon`, `LineString`, `MultiPolygon`.
+**VECTOR** is inserted as a SQL array literal: `[0.12, -0.03, 0.87, ...]`.
 
 ---
 
@@ -147,42 +266,29 @@ hits = db.query("""
 |---|---|---|
 | Hash | `hash` | `field = 'val'`, `IN (...)`, equality lookups |
 | B-tree | `btree` | `>`, `<`, `BETWEEN`, `ORDER BY field` |
-| GIN | `gin` | `ILIKE '%pattern%'` (exact trigram postings, no verification step) |
+| GIN | `gin` | `ILIKE '%pattern%'` (exact trigram postings) |
 | Spatial | `spatial` | `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects` |
-| HNSW | `hnsw` | `VECTOR_NEAR(field, [...], k)`, `ORDER BY field <=> [...]`, `VECTOR_COSINE(field, [...])` in score expressions |
-| BM25 | `bm25` | `BM25(field, 'query') > score`, `ORDER BY BM25(...) DESC`, `BM25(...)` in score expressions |
-
-All indexes are built via `CREATE INDEX`:
-
-```sql
-CREATE INDEX ON characters USING hash    (crew)
-CREATE INDEX ON characters USING btree   (bounty)
-CREATE INDEX ON characters USING gin     (name)
-CREATE INDEX ON characters USING spatial (location)
-CREATE INDEX ON characters USING hnsw    (embedding)
-CREATE INDEX ON characters USING bm25    (bio)
-```
-
-Or declared inline in `CREATE TABLE WITH (...)`:
+| HNSW | `hnsw` | `VECTOR_NEAR(field, [...], k)`, `<=>` ordering, `VECTOR_COSINE(...)` in scores |
+| BM25 | `bm25` | `BM25(field, 'query') > score`, `ORDER BY BM25(...)`, `BM25_NORM(...)` scores |
+| Search | `search` | `SEARCH('query')` filter, `SEARCH_SCORE('query')` ranking (positional inverted index) |
 
 ```sql
-CREATE TABLE characters (
-    _key      TEXT PRIMARY KEY,
-    name      TEXT,
-    bounty    INTEGER,
-    location  GEO,
-    embedding VECTOR,
-    bio       TEXT
-) WITH (hash: ['_key'], range: ['bounty'], fulltext: ['name'], spatial: ['location'], vector: ['embedding'], bm25: ['bio'])
+CREATE INDEX ON places  USING spatial (geometry)
+CREATE INDEX ON dishes  USING bm25    (description)
+CREATE INDEX ON diary   USING search  (reflection)
+CREATE INDEX ON tourists USING hnsw   (taste)
 ```
 
-**GIN** stores exact trigram→document postings (no lossy signatures), so `ILIKE` queries require no verification pass. GIN is maintained automatically on every insert — declaring the index before loading data is the standard workflow.
+Or inline in `CREATE TABLE ... WITH (...)`:
 
-**HNSW** is rebuilt automatically after each `put_vector` call when an index is declared. For large bulk loads, call `REINDEX` once after all data is in to rebuild the graph in one pass.
+```sql
+CREATE TABLE dishes (
+    _key TEXT PRIMARY KEY, name TEXT, price INTEGER, protein_g INTEGER,
+    description TEXT, geometry GEO, embedding VECTOR
+) WITH (range: ['price'], spatial: ['geometry'], bm25: ['description'], vector: ['embedding'])
+```
 
-**BM25** is batch-built at `CREATE INDEX` time. Run `REINDEX` after inserting new documents.
-
-All index types survive a cold restart. Hash, B-tree, GIN, and BM25 indexes are rebuilt from persisted schema hints on open. HNSW and Spatial indexes are stored directly in the snapshot.
+All index types survive a cold restart. Hash, B-tree, GIN, and BM25 rebuild from persisted schema hints on open; HNSW and Spatial are stored in the snapshot. Run `REINDEX` after large bulk loads.
 
 ---
 
@@ -192,583 +298,278 @@ sekejap has three interfaces. Use whichever fits the context.
 
 ### SQL
 
-Standard SQL for schema, mutations, and queries. Use this most of the time.
-
 ```sql
 -- Schema
-CREATE TABLE islands (_key TEXT PRIMARY KEY, name TEXT, sea TEXT, geometry GEO)
-CREATE INDEX ON islands USING spatial (geometry)
+CREATE TABLE places (_key TEXT PRIMARY KEY, name TEXT, category TEXT, geometry GEO)
+ALTER TABLE places ADD COLUMN rating REAL
+ALTER TABLE places RENAME COLUMN category TO kind
 
 -- Mutations
-INSERT INTO islands (_key, name, sea) VALUES ('wano', 'Wano Kuni', 'grand-line')
-UPDATE islands SET sea = 'new-world' WHERE _key = 'wano'
-DELETE FROM islands WHERE sea = 'east-blue'
+INSERT INTO places (_key, name, category) VALUES ('uluwatu', 'Uluwatu Temple', 'temple')
+UPDATE places SET rating = 4.8 WHERE _key = 'uluwatu'
+DELETE FROM places WHERE kind = 'closed'
 
--- Schema lifecycle
-DROP TABLE islands
-DROP TABLE IF EXISTS islands
+-- Edges (with metadata)
+INSERT ('tourists/chloe')-[:visited {rating: 4.8, hours: 2}]->('places/uluwatu')
+DELETE ('tourists/chloe')-[:visited]->('places/uluwatu')
 
--- DROP INDEX
-DROP INDEX ON islands USING spatial (geometry)
-DROP INDEX IF EXISTS ON islands USING btree (elevation)
+-- Graph traversal — forward `-[:e]->` and backward `<-[:e]-`
+SELECT dest._key AS place
+FROM MATCH (a:places)-[:near*1..3]->(dest:places)
+WHERE a._key = 'seminyak-beach'
 
--- REINDEX (force rebuild — useful after large bulk loads)
-REINDEX ON researchers USING hnsw    (embedding)
-REINDEX ON papers      USING bm25    (abstract)
-REINDEX ON characters  USING gin     (name)
+-- Backward: every place that routes into Ubud
+SELECT src._key AS place
+FROM MATCH (dest:places)<-[:near*1..3]-(src:places)
+WHERE dest._key = 'ubud'
 
--- ALTER TABLE (PostgreSQL-style)
-ALTER TABLE islands ADD COLUMN elevation INTEGER
-ALTER TABLE islands DROP COLUMN elevation
-ALTER TABLE islands DROP COLUMN IF EXISTS elevation
-ALTER TABLE islands RENAME COLUMN sea TO ocean
-ALTER TABLE islands RENAME TO atolls
-ALTER TABLE islands ALTER COLUMN elevation TYPE REAL
+-- DISTINCT — multi-hop returns one row per PATH; DISTINCT = unique nodes
+SELECT DISTINCT dest._key AS place
+FROM MATCH (a:places)-[:near*1..2]->(dest:places)
+WHERE a._key = 'seminyak-beach'
 
--- Edges
-INSERT ('islands/marineford')-[:route_to {days: 3}]->('islands/fishman-island')
-DELETE ('islands/marineford')-[:route_to]->('islands/fishman-island')
-
--- Graph traversal
-SELECT dest._key AS island
-FROM MATCH (a:islands)-[:route_to*1..5]->(dest:islands)
-WHERE a._key = 'marineford'
-
--- Graph aggregation
-SELECT b._key AS name, COUNT(a) AS allies, SUM(r.strength) AS total_strength
-FROM MATCH (a:characters)-[r:collaborated_with]->(b:characters)
-GROUP BY b._key
-ORDER BY total_strength DESC
+-- Aggregation: COUNT / SUM / AVG / MIN / MAX / COUNT(DISTINCT field).
+-- Without GROUP BY an aggregate returns exactly one row (even if nothing matches).
+SELECT p._key AS place,
+       COUNT(*)                        AS visits,
+       COUNT(DISTINCT t.home_city)     AS cities,
+       AVG(v.strength)                 AS avg_rating
+FROM MATCH (p:places)<-[v:visited]-(t:tourists)
+GROUP BY p._key
+ORDER BY visits DESC
 LIMIT 10
 
--- Multi-stage graph query with WITH chaining
-SELECT c.name AS island, COUNT(*) AS visitors
-FROM MATCH (a:characters)-[:allied_with]->(b:characters)
-WHERE a._key = 'luffy'
-WITH b
-MATCH (b)-[:visited]->(c:islands)
-GROUP BY c.name
-ORDER BY visitors DESC
+-- Edge properties — a bound edge (`-[v:type]->`) exposes `strength` + JSON
+-- metadata. Available on FIXED single hops (not variable-length `*a..b`).
+SELECT t.name AS visitor, v.strength AS rating, v.hours AS stayed
+FROM MATCH (p:places)<-[v:visited]-(t:tourists)
+WHERE p._key = 'uluwatu'
+ORDER BY v.strength DESC
 
--- MATCH...RETURN (Cypher-style, also via query())
-MATCH (a:characters)-[:rival]->(b:characters)
-RETURN a._key AS name, b.bounty AS rival_bounty
+-- Multi-hop: dishes eaten by travellers whose taste matches Chloe's
+SELECT d.name AS dish, COUNT(*) AS orders
+FROM MATCH (c:tourists)-[:similar_taste]->(peer:tourists)-[:ate]->(d:dishes)
+WHERE c._key = 'chloe'
+GROUP BY d.name
+ORDER BY orders DESC
 
--- Edge intrinsics: _depth, _path_keys, _path_strength, _avg_strength, _min/_max_strength
--- Available on any named edge binding (e.g. [r:route_to] or [r*])
-SELECT dest._key AS island, r2._depth AS hops, r2._path_keys AS route
-FROM MATCH (start:islands)-[r:route_to]->(stop:islands)-[r2:route_to]->(dest:islands)
-WHERE start._key = 'marineford'
-
--- PATH_* aggregates — operate on a JSON array in a path intrinsic field
--- PATH_AVG, PATH_SUM, PATH_MIN, PATH_MAX, PATH_PRODUCT, PATH_FIRST, PATH_LAST
-SELECT c._key AS dest,
-       PATH_PRODUCT(r2._path_strength) AS combined_reliability,
-       PATH_FIRST(r2._path_keys)       AS departure,
-       PATH_LAST(r2._path_keys)        AS arrival
-FROM MATCH (a:islands)-[r:route_to]->(b:islands)-[r2:route_to]->(c:islands)
-WHERE a._key = 'marineford'
-
--- CASE WHEN — conditional expression in SELECT list
-SELECT b._key AS name,
-       CASE WHEN r._depth = 1 THEN 'direct'
-            WHEN r._depth = 2 THEN 'indirect'
-            ELSE 'distant'
-       END AS rivalry_type
-FROM MATCH (a:characters)-[r:rival]->(b:characters)
-
--- Time expressions: NOW(), AGE_DAYS(var.field), AGE_HOURS(var.field)
--- NOW() returns current Unix timestamp (seconds as i64)
--- AGE_DAYS / AGE_HOURS accept a Unix int or "YYYY-MM-DD" string field
-SELECT b._key AS name,
-       AGE_DAYS(b.last_seen) AS days_since_seen,
-       NOW()                  AS queried_at
-FROM MATCH (a:characters)-[r:rival]->(b:characters)
-
--- JSON_ARRAY_LENGTH — length of a JSON array field
-SELECT b._key AS dest, JSON_ARRAY_LENGTH(r._path_keys) AS hops_plus_one
-FROM MATCH (a:islands)-[r:route_to*1..3]->(b:islands)
-WHERE a._key = 'marineford'
+-- Multi-stage with WITH — carry a binding into a follow-on MATCH
+SELECT d.name AS dish, COUNT(*) AS orders
+FROM MATCH (c:tourists)-[:similar_taste]->(peer:tourists)
+WHERE c._key = 'chloe'
+WITH peer
+MATCH (peer)-[:ate]->(d:dishes)
+GROUP BY d.name
+ORDER BY orders DESC
 
 -- Shortest path — 0 rows = unreachable, 1 row = found (path fields via r.*)
-SELECT a.name AS from_name, b.name AS to_name, r.length AS hops, r._path_keys AS route
+SELECT a.name AS from_n, b.name AS to_n, r.length AS hops, r._path_keys AS trail
 FROM MATCH SHORTEST (a)-[r*]->(b)
-WHERE a._key = 'islands/marineford' AND b._key = 'islands/wano'
--- Path predicates (ANY / ALL / NONE / SINGLE)
-AND ANY(n IN nodes(r) WHERE n.climate = 'tropical')
+WHERE a._key = 'tourists/chloe' AND b._key = 'dishes/babi-guling'
+-- Path predicates (ANY / ALL / NONE / SINGLE) filter intermediate nodes:
+AND ALL(n IN nodes(r) WHERE n.open_now = true)
 
--- Multi-FROM cross-join — two independent sources Cartesian-producted
-SELECT a._key AS island, b._key AS character
-FROM MATCH ('crews/straw-hats')-[:member]->(b), islands AS a
+-- CASE WHEN — conditional expression on a field
+SELECT d.name AS dish,
+       CASE WHEN d.protein_g >= 30 THEN 'high protein' ELSE 'light' END AS tier
+FROM MATCH (r:restaurants)-[:serves]->(d:dishes)
+WHERE r._key = 'la-favela'
+
+-- Time: NOW(), AGE_DAYS(var.field), AGE_HOURS(var.field)  (in SELECT FROM MATCH)
+SELECT t.name AS name, AGE_DAYS(t.arrival) AS days_here, NOW() AS this_moment
+FROM MATCH (t:tourists) WHERE t._key = 'chloe'
 
 -- Spatial
-SELECT * FROM islands WHERE ST_DWithin(geometry, POINT(0.0 0.0), 500.0)
-SELECT * FROM zones   WHERE ST_Contains(geometry, POINT(144.9671 -37.8183))
+SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)
+SELECT * FROM zones  WHERE ST_Contains(geometry, POINT(115.087 -8.829))
 
 -- Vector
-SELECT * FROM characters WHERE VECTOR_NEAR(embedding, [0.9, 0.1, 0.0], 5)
+SELECT * FROM tourists WHERE VECTOR_NEAR(taste, [0.9, 0.1, 0.0, 0.0], 5)
 
--- Full-text (GIN — fast exact ILIKE, no score)
-SELECT * FROM characters WHERE name ILIKE '%shanks%'
+-- Full-text: GIN (fast exact ILIKE) · BM25 (ranked) · SEARCH (positional, typo-tolerant)
+SELECT * FROM places WHERE name ILIKE '%uluwatu%'
+SELECT * FROM places WHERE BM25(description, 'sunset temple') > 0.3
+    ORDER BY BM25(description, 'sunset temple') DESC
+SELECT *, SEARCH_SCORE('quiet still') AS relevance FROM diary
+    WHERE SEARCH('quiet still') ORDER BY SEARCH_SCORE('quiet still') DESC
 
--- Full-text (BM25 — relevance-ranked)
-SELECT * FROM papers WHERE BM25(abstract, 'neural network') > 0.3
-ORDER BY BM25(abstract, 'neural network') DESC
+-- Hybrid ranking — combine any signals with +, -, *, /, ()
+ORDER BY BM25_NORM(description, 'quiet sunset') * 0.5
+       + VECTOR_COSINE(embedding, [0.7,0.3,0.0,0.0]) * 0.5 DESC
+ORDER BY -ST_DISTANCE_KM(geometry, POINT(115.168 -8.690)) DESC   -- nearest first
+-- vector distance operators: <=> cosine, <-> L2, <#> dot, <+> L1
 
--- Arithmetic ORDER BY (weighted multi-signal ranking)
--- Combine any signals with +, -, *, /, (), and unary negation
-ORDER BY BM25(title, 'pirate') * 0.7 + BM25(bio, 'pirate') * 0.3 DESC
-ORDER BY BM25(title, 'pirate') * 0.5 + bounty * 0.5 DESC
-ORDER BY VECTOR_COSINE(embedding, [0.9, 0.1, 0.0]) * 0.6 + BM25(bio, 'pirate') * 0.4 DESC
-ORDER BY (BM25(title, 'luffy') + BM25(bio, 'luffy')) * 0.8 + threat_level * 0.2 DESC
-
--- Spatial signal: ST_DISTANCE_KM(geometry_field, POINT(lon lat)) → km (f64)
--- Negate to rank nearest-first: -ST_DISTANCE_KM(...) DESC
-ORDER BY -ST_DISTANCE_KM(location, POINT(144.9671 -37.8183)) DESC
-
--- Vector distance operators (compile to same score node as the function forms)
--- a <=> b  ==  VECTOR_COSINE(a, b)    cosine distance (lower = more similar)
--- a <-> b  ==  VECTOR_L2(a, b)        Euclidean / L2
--- a <#> b  ==  VECTOR_DOT(a, b)       inner product (NOT negated, unlike pgvector)
--- a <+> b  ==  VECTOR_L1(a, b)        Manhattan / L1
-ORDER BY embedding <=> [0.9, 0.1, 0.0] ASC   -- nearest cosine first
-
--- VECTOR_COSINE(field, [vec]) returns cosine distance (lower = more similar)
--- Numeric payload fields are coerced to f64 (absent or non-numeric = 0.0)
--- Default direction for score expressions is DESC (highest score first)
-
--- Filters
-WHERE bounty BETWEEN 1000000000 AND 4000000000
-WHERE crew IN ('straw-hat', 'red-hair')
-WHERE name ILIKE '%luffy%'
-WHERE description IS NOT NULL
-AND / OR / NOT
+-- Transactions — book a whole trip atomically
+BEGIN
+INSERT ('tourists/chloe')-[:booked]->('flights/qf-mel')
+INSERT ('tourists/chloe')-[:stayed_at]->('villas/seminyak-01')
+INSERT ('tourists/chloe')-[:joined]->('activities/uluwatu-kecak')
+COMMIT   -- all three, or none
 
 -- Introspection
-SHOW TABLES                                  -- all collections with row counts
-SHOW EDGES                                   -- full graph schema with edge counts
-SHOW EDGES FROM characters                   -- edge types leaving a collection + counts
-SHOW EDGES FROM characters TO islands        -- edge types between two collections + counts
-SHOW characters                              -- field structure (declared schema or inferred)
+SHOW TABLES
+SHOW EDGES
+SHOW EDGES FROM tourists TO places
+SHOW places
 ```
-
-#### Graph path queries
-
-`SELECT … FROM MATCH SHORTEST` finds the shortest directed path between two nodes.
-Returns **1 row** when a path is found, **0 rows** when none exists.
-Path fields are exposed via the path-bind variable (e.g. `r`):
-`r.length`, `r._path_keys`, `r._path_strength`, `r.nodes`, `r.edges`.
-
-```python
-hits = db.query("""
-    SELECT a.name AS from_name, b.name AS to_name,
-           r.length AS hops, r._path_keys AS route
-    FROM MATCH SHORTEST (a)-[r*]->(b)
-    WHERE a._key = 'islands/marineford' AND b._key = 'islands/wano'
-""")
-
-if hits:
-    import json
-    row = json.loads(hits[0].payload)
-    print(f"Shortest route: {row['hops']} hops")
-    for slug in row['route']:
-        print(" ", slug)
-```
-
-Path predicates filter on intermediate nodes:
-
-```python
-# Only keep paths where every node has a tropical climate
-hits = db.query("""
-    SELECT r.length AS hops
-    FROM MATCH SHORTEST (a)-[r*]->(b)
-    WHERE a._key = 'islands/marineford' AND b._key = 'islands/wano'
-    AND ALL(n IN nodes(r) WHERE n.climate = 'tropical')
-""")
 
 ### Atomic (Rust fluent builder)
 
-Use when you need lower-level control — pre-resolved hashes, programmatic step composition, or performance-sensitive inner loops.
+For lower-level control, offline/mobile inner loops, or pre-resolved hashes.
 
 ```rust
 use sekejap::CoreDB;
 
-let mut db = CoreDB::open("./data")?;
+let mut db = CoreDB::open("./bali")?;
+
+// "Near me" — spatial radius, embedded and offline
+let nearby = db.collection("restaurants")
+    .st_dwithin(-8.690, 115.168, 3.0)   // lat, lon, km
+    .collect();
 
 // Fluent scan with filters
-let hits = db.collection("characters")
-    .where_eq("crew", "straw-hat")
-    .where_gte("bounty", 1_000_000_000)
-    .order_by("bounty", true)   // true = descending
+let picks = db.collection("dishes")
+    .where_gte("protein_g", 25)
+    .order_by("price", false)   // false = ascending
     .limit(10)
     .collect();
 
-// Vector similarity
-let hits = db.collection("characters")
-    .vector_near("embedding", query_vec, 10)
-    .collect();
-
-// Spatial radius
-let hits = db.collection("islands")
-    .st_dwithin(-37.8183, 144.9671, 5.0)   // lat, lon, km
-    .collect();
-
-// Raw node operations
-db.put("characters/luffy", r#"{"_collection":"characters","_key":"luffy","name":"Luffy"}"#)?;
-db.get("characters/luffy");
-db.remove("characters/luffy");
-
 // Edges
-db.link("characters/zoro", "characters/mihawk", "student_of", 1.0);
-db.link_meta("islands/marineford", "islands/fishman-island", "route_to", 1.0, r#"{"days":3}"#)?;
-db.unlink("characters/zoro", "characters/mihawk", "student_of");
-
-// Shortest path — 0 rows = unreachable, 1 row = found
-let hits = db.query(
-    "SELECT a.name AS from_n, b.name AS to_n, r.length AS hops, r._path_keys AS route \
-     FROM MATCH SHORTEST (a)-[r*]->(b) \
-     WHERE a._key = 'islands/marineford' AND b._key = 'islands/wano'"
-)?.collect();
-if let Some(hit) = hits.first() {
-    if let Some(p) = &hit.payload {
-        println!("{} hops", p["hops"]);
-        if let Some(arr) = p["route"].as_array() {
-            for slug in arr { println!("  {}", slug); }
-        }
-    }
-}
+db.link("tourists/chloe", "places/uluwatu", "visited", 4.8);
+db.link_meta("tourists/chloe", "places/uluwatu", "visited", 4.8, r#"{"hours":2}"#)?;
 ```
 
 ### Python DataFrame (`db.df`)
 
-Use for data science workflows — loading from CSV/parquet, returning query results as DataFrames.
+For data-science workflows — load from CSV/parquet, get results back as DataFrames.
 
 ```python
 import pandas as pd
-import json
 from sekejap import DB
 
-db = DB("./data")
+db = DB("./bali")
 
-# ── Load from DataFrame ───────────────────────────────────────────────────────
+# Load tourists + review embeddings
+df = pd.read_csv("tourists.csv")
+db.df.load_nodes(df, "tourists", id_col="tourist_id",
+                 mapping={"tourist_id": "_key", "full_name": "name"})
 
-df = pd.read_csv("characters.csv")
-# map DataFrame columns to schema field names
-db.df.load_nodes(df, "characters", id_col="character_id",
-                 mapping={"character_id": "_key", "full_name": "name"})
+db.df.load_edges(pd.read_csv("visits.csv"),
+                 source_col="tourist_id", target_col="place_id",
+                 edge_type="visited",
+                 source_collection="tourists", target_collection="places",
+                 weight_col="rating")
 
-df_routes = pd.read_csv("routes.csv")  # columns: from_island, to_island, days
-db.df.load_edges(
-    df_routes,
-    source_col="from_island",
-    target_col="to_island",
-    edge_type="route_to",
-    source_collection="islands",
-    target_collection="islands",
-    weight_col="days",
-)
-
-# ── Query → DataFrame ─────────────────────────────────────────────────────────
-
-df = db.df.query("SELECT * FROM characters WHERE bounty >= 1000000000")
-df = db.df.query("SELECT * FROM characters WHERE VECTOR_NEAR(embedding, [0.9, 0.1, 0.0], 20)")
-df = db.df.query("SELECT * FROM islands WHERE ST_DWithin(geometry, POINT(0.0 0.0), 500.0)")
-
-# ── Create collection from field spec ────────────────────────────────────────
-
-db.df.create_collection(
-    "characters",
-    fields={
-        "_key":      "TEXT PRIMARY KEY",
-        "name":      "TEXT",
-        "bounty":    "INTEGER",
-        "location":  "GEO",
-        "embedding": "VECTOR",
-    },
-    hash_index=["_key", "crew"],
-    range_index=["bounty"],
-    spatial_index=["location"],
-    vector_index=["embedding"],
-)
+# Query → DataFrame
+df = db.df.query("SELECT * FROM dishes WHERE protein_g >= 25 AND price <= 90000")
 ```
 
 ---
 
-## Full Data Science Example — Grand Line Intelligence
+## 📡 IoT — the island, sensed
 
-A pirate intelligence system combining all four data models.
+sekejap is embedded and continuously-writable, so an edge device can log sensor streams and query them locally — no server round-trip. Sensors monitor places; readings are just nodes and edges.
 
-### Schema and data loading
+```python
+db.execute("CREATE TABLE sensors (_key TEXT PRIMARY KEY, kind TEXT, geometry GEO, reading REAL, updated_at TIMESTAMPTZ)")
+# sensor -[:monitors]-> place
+db.execute("INSERT ('sensors/crowd-kuta')-[:monitors]->('places/kuta-beach')")
+
+# Quietest beaches near Seminyak right now (low crowd sensors, close by)
+db.query("""
+    SELECT b._key AS beach, s.reading AS crowd
+    FROM MATCH (s:sensors)-[:monitors]->(b:places)
+    WHERE s.kind = 'crowd'
+      AND s.reading < 0.4
+      AND ST_DWithin(b.geometry, POINT(115.168 -8.690), 8.0)
+    ORDER BY s.reading ASC
+""")
+```
+
+---
+
+## 🤖 Embodied AI — a humanoid travel assistant
+
+A companion robot walks Bali with Chloe and keeps a **local memory**: each observation fuses **place, time, a note, and a perception embedding**. Because sekejap holds graph + vector + spatial + text in one embedded engine, "recall" is a single query — the kind of local memory an on-device assistant needs.
+
+```python
+db.execute("""
+    CREATE TABLE observations (
+        _key       TEXT PRIMARY KEY,
+        seen_at    TIMESTAMPTZ,
+        geometry   GEO,          -- where the assistant was
+        note       TEXT,         -- what it noticed
+        embedding  VECTOR        -- what it perceived (image/scene vector)
+    )
+""")
+db.execute("CREATE INDEX ON observations USING spatial (geometry)")
+db.execute("CREATE INDEX ON observations USING hnsw    (embedding)")
+db.execute("CREATE INDEX ON observations USING search  (note)")
+
+# "What did we see near Ubud yesterday?"  (spatial + temporal)
+db.query("""
+    SELECT note, seen_at FROM observations
+    WHERE ST_DWithin(geometry, POINT(115.263 -8.507), 3.0)
+    ORDER BY seen_at DESC
+""")
+
+# "Find a past sunset that looked like this one"  (vector recall)
+db.query(f"""
+    SELECT note, seen_at FROM observations
+    ORDER BY embedding <=> {current_scene} ASC
+    LIMIT 3
+""")
+
+# "What did we say about temples?"  (text recall)
+db.query("SELECT note, seen_at FROM observations WHERE SEARCH('temple offering incense')")
+```
+
+Continuous ingest + local hybrid recall, in-process, on a small device — the same engine, no companion services.
+
+---
+
+## S3 Remote Storage
+
+Query datasets larger than local disk. Payloads stay on S3, fetched on demand via block-level caching.
 
 ```python
 from sekejap import DB
-import pandas as pd
-import numpy as np
-import json
 
-db = DB("./grandline_db")
+db = DB.open_s3("s3://my-bucket/bali",
+                access_key_id="AKID...", secret_access_key="secret...",
+                region="ap-southeast-1",
+                cache_budget_bytes=256 * 1024 * 1024,   # RAM cache
+                cache_dir="/tmp/sekejap-cache")          # optional disk cache
 
-db.execute("""
-    CREATE TABLE characters (
-        _key       TEXT PRIMARY KEY,
-        name       TEXT,
-        crew       TEXT,
-        role       TEXT,
-        bounty     INTEGER,
-        location   GEO,
-        embedding  VECTOR
-    )
-""")
-db.execute("""
-    CREATE TABLE bounty_posters (
-        _key        TEXT PRIMARY KEY,
-        subject     TEXT,
-        description TEXT,
-        bounty      INTEGER,
-        year        INTEGER
-    )
-""")
-
-db.execute("CREATE INDEX ON characters     USING hash    (crew)")
-db.execute("CREATE INDEX ON characters     USING btree   (bounty)")
-db.execute("CREATE INDEX ON characters     USING gin     (name)")
-db.execute("CREATE INDEX ON characters     USING spatial (location)")
-db.execute("CREATE INDEX ON characters     USING hnsw    (embedding)")
-db.execute("CREATE INDEX ON bounty_posters USING bm25    (description)")
-
-# Load from CSV + numpy embeddings
-df = pd.read_csv("characters.csv")
-embeddings = np.load("embeddings.npy")   # shape (n, 384)
-df["location"] = df.apply(
-    lambda r: json.dumps({"type": "Point", "coordinates": [r.lon, r.lat]}), axis=1
-)
-df["embedding"] = [e.tolist() for e in embeddings]
-
-db.df.load_nodes(df, "characters", id_col="character_id",
-                 mapping={"character_id": "_key"})
-
-db.df.load_edges(
-    pd.read_csv("rivalries.csv"),
-    source_col="from_id",
-    target_col="to_id",
-    edge_type="rival",
-    source_collection="characters",
-    target_collection="characters",
-    weight_col="intensity",
-)
+hits = db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 10.0)")
 ```
 
-### Spatial — powerful pirates in the New World
-
-```python
-df = db.df.query("""
-    SELECT * FROM characters
-    WHERE ST_DWithin(location, POINT(0.0 0.0), 500.0)
-      AND crew != 'marine'
-      AND bounty >= 1000000000
-    ORDER BY bounty DESC
-    LIMIT 20
-""")
-```
-
-### Vector — characters with similar fighting style
-
-```python
-from sentence_transformers import SentenceTransformer
-
-model = SentenceTransformer("all-MiniLM-L6-v2")
-vec = model.encode("swordsman close-range power haki").tolist()
-
-df = db.df.query(f"""
-    SELECT * FROM characters
-    WHERE VECTOR_NEAR(embedding, {vec}, 10)
-      AND bounty >= 500000000
-""")
-```
-
-### Graph — rival and alliance networks, path queries
-
-```python
-# Shortest path between two characters (0 rows = unreachable)
-hits = db.query("""
-    SELECT r.length AS hops, r._path_keys AS route
-    FROM MATCH SHORTEST (a)-[r*]->(b)
-    WHERE a._key = 'characters/luffy' AND b._key = 'characters/mihawk'
-""")
-if hits:
-    import json
-    row = json.loads(hits[0].payload)
-    print(f"Degrees of separation: {row['hops']}")
-    for slug in row['route']:
-        print(" ", slug)
-
-# 2-hop rival network from Luffy
-hits = db.query("""
-    SELECT b._key AS name
-    FROM MATCH (a:characters)-[:rival*1..2]->(b:characters)
-    WHERE a._key = 'luffy'
-""")
-
-# Most feared pirates by rival count
-hits = db.query("""
-    SELECT b._key AS pirate, COUNT(a) AS rivals, SUM(r.intensity) AS total_threat
-    FROM MATCH (a:characters)-[r:rival]->(b:characters)
-    GROUP BY b._key
-    ORDER BY total_threat DESC
-    LIMIT 10
-""")
-
-# Cross-crew rivalries
-hits = db.query("""
-    SELECT a.crew AS from_crew, b.crew AS to_crew, COUNT(r) AS clashes
-    FROM MATCH (a:characters)-[r:rival]->(b:characters)
-    GROUP BY a.crew, b.crew
-    ORDER BY clashes DESC
-""")
-```
-
-### PATH_* aggregates — aggregate over path arrays
-
-Edge bindings expose path intrinsics as JSON arrays: `_path_keys`, `_path_strength`, `_path_length`.
-`PATH_*` functions aggregate over those arrays in a single SELECT expression.
-
-```python
-# PATH_PRODUCT: multiply all strengths along a 2-hop route (reliability score)
-hits = db.query("""
-    SELECT dest._key AS island,
-           PATH_PRODUCT(r2._path_strength) AS route_reliability,
-           PATH_FIRST(r2._path_keys)       AS departure,
-           PATH_LAST(r2._path_keys)        AS arrival
-    FROM MATCH (start:islands)-[r:route_to]->(mid:islands)-[r2:route_to]->(dest:islands)
-    WHERE start._key = 'marineford'
-    ORDER BY route_reliability DESC
-""")
-
-# PATH_AVG / PATH_SUM / PATH_MIN / PATH_MAX / PATH_FIRST / PATH_LAST work the same way
-hits = db.query("""
-    SELECT c._key AS target,
-           PATH_MIN(r2._path_strength)  AS weakest_link,
-           PATH_AVG(r2._path_strength)  AS avg_intensity
-    FROM MATCH (a:characters)-[r:rival]->(b:characters)-[r2:rival]->(c:characters)
-    WHERE a._key = 'shanks'
-    ORDER BY avg_intensity DESC
-""")
-```
-
-### CASE WHEN, time functions, JSON_ARRAY_LENGTH
-
-```python
-# CASE WHEN — conditional expression in SELECT list
-hits = db.query("""
-    SELECT b._key AS name,
-           CASE WHEN r._depth = 1 THEN 'direct rival'
-                WHEN r._depth = 2 THEN 'indirect rival'
-                ELSE 'distant connection'
-           END AS rivalry_type
-    FROM MATCH (a:characters)-[r:rival]->(b:characters)
-""")
-
-# AGE_DAYS / AGE_HOURS — time since a field's epoch (Unix int or "YYYY-MM-DD")
-# NOW() — current Unix timestamp in seconds
-hits = db.query("""
-    SELECT b._key                AS name,
-           AGE_DAYS(b.last_seen) AS days_inactive,
-           NOW()                 AS queried_at
-    FROM MATCH (a:characters)-[r:rival]->(b:characters)
-    ORDER BY days_inactive DESC
-""")
-
-# JSON_ARRAY_LENGTH — length of a JSON array field (e.g. _path_keys)
-hits = db.query("""
-    SELECT dest._key                       AS island,
-           JSON_ARRAY_LENGTH(r._path_keys) AS stops
-    FROM MATCH (start:islands)-[r:route_to*1..3]->(dest:islands)
-    WHERE start._key = 'marineford'
-    ORDER BY stops ASC
-""")
-```
-
-### BM25 — search bounty posters
-
-```python
-df = db.df.query("""
-    SELECT * FROM bounty_posters
-    WHERE BM25(description, 'swordsman dangerous haki') > 0.2
-      AND bounty >= 100000000
-    ORDER BY BM25(description, 'swordsman dangerous haki') DESC
-""")
-```
-
-### Multi-modal — spatial + graph + vector in one workflow
-
-```python
-# "Pirates near Marineford who are in Shanks' rival network
-#  and have a similar fighting style to Whitebeard"
-
-whitebeard_vec = model.encode("massive power conqueror close-range").tolist()
-
-# Step 1: find pirates near Marineford (0°, 0°)
-nearby = db.df.query("SELECT * FROM characters WHERE ST_DWithin(location, POINT(0.0 0.0), 300.0)")
-
-# Step 2: walk Shanks' rival graph
-rivals = db.query("""
-    SELECT b._key AS name
-    FROM MATCH (a:characters)-[:rival*1..3]->(b:characters)
-    WHERE a._key = 'shanks'
-""")
-rival_keys = {json.loads(h.payload)["name"] for h in rivals if h.payload}
-
-# Step 3: filter nearby pirates who appear in the rival graph
-candidates = nearby[nearby["_key"].isin(rival_keys)]
-keys_clause = ", ".join(f"'{k}'" for k in candidates["_key"])
-
-# Step 4: rank by vector similarity to Whitebeard
-result = db.df.query(f"""
-    SELECT * FROM characters
-    WHERE _key IN ({keys_clause})
-      AND VECTOR_NEAR(embedding, {whitebeard_vec}, 5)
-""")
-```
+Works with AWS S3, MinIO, Cloudflare R2, and any S3-compatible store (`endpoint` / `allow_http` for custom endpoints).
 
 ---
 
 ## Installation
 
 ```bash
-# Rust library
-cargo add sekejap
-
-# Rust CLI
-cargo install sekejap-cli
-
-# Python
-pip install sekejap
+cargo add sekejap                 # Rust library
+cargo add sekejap --features s3   # with S3 support
+cargo install sekejap-cli         # Rust CLI
+pip install sekejap               # Python (includes S3)
 ```
 
 ## CLI
 
 ```bash
 sekejap                              # in-memory REPL
-sekejap ./data                       # persistent REPL
-sekejap ./data "SELECT * FROM r;"    # one-shot
-echo "SELECT...;" | sekejap ./data   # pipe script
+sekejap ./bali                       # persistent REPL
+sekejap ./bali "SELECT * FROM places;"   # one-shot
+echo "SELECT ...;" | sekejap ./bali  # pipe a script
 
-sekejap> CREATE TABLE islands (_key TEXT, name TEXT, geometry GEO);
-sekejap> INSERT INTO islands (_key, name, sea) VALUES ('wano', 'Wano Kuni', 'grand-line');
-sekejap> SELECT * FROM islands WHERE ST_DWithin(geometry, POINT(0.0 0.0), 500.0);
-
--- Introspection (SQL)
-sekejap> SHOW TABLES;
-sekejap> SHOW EDGES;
-sekejap> SHOW EDGES FROM characters;
-sekejap> SHOW characters;
-
--- Introspection (dot commands — same results, tabular output)
-sekejap> .tables
-sekejap> .edges
-sekejap> .edges characters
-sekejap> .schema islands
-sekejap> .stats
+sekejap> CREATE TABLE places (_key TEXT, name TEXT, geometry GEO);
+sekejap> SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0);
+sekejap> .tables        # introspection dot-commands
+sekejap> .edges tourists
+sekejap> .schema places
 sekejap> .help
 ```
 
