@@ -163,6 +163,51 @@ fn skbin_update_delete_roundtrip() {
 }
 
 #[test]
+fn trim_memory_is_safe_and_preserves_data() {
+    // trim_memory() reclaims excess map/index capacity on demand. It must NEVER
+    // drop data or indexes: every query result and stored value stays identical,
+    // and the DB stays fully writable afterwards.
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = CoreDB::open_with_config(dir.path(), skbin_cfg()).unwrap();
+    // Churn: insert 5000, delete 4000 — leaves the internal maps/Vecs heavily
+    // over-allocated (large capacity, small len), which is exactly what trim reclaims.
+    for i in 0..5000u32 {
+        db.put(
+            &format!("t/k{i:05}"),
+            &format!(r#"{{"_collection":"t","_key":"k{i:05}","v":{i}}}"#),
+        )
+        .unwrap();
+    }
+    for i in 0..4000u32 {
+        db.execute(&format!("DELETE FROM t WHERE _key = 'k{i:05}'")).unwrap();
+    }
+    let count = |db: &CoreDB| -> i64 {
+        let hits = db.query("SELECT COUNT(*) AS n FROM t").unwrap().collect();
+        hits[0].payload.as_ref().unwrap()["n"].as_i64().unwrap()
+    };
+    assert_eq!(count(&db), 1000, "1000 rows survive the churn");
+
+    db.trim_memory(); // must not panic, must not change anything
+
+    assert_eq!(count(&db), 1000, "trim_memory must not lose data");
+    // A specific surviving row still reads back its exact value.
+    let v: Value = serde_json::from_str(&db.get("t/k04500").unwrap()).unwrap();
+    assert_eq!(v["v"].as_i64(), Some(4500));
+    // A filtered query still returns the right rows post-trim.
+    assert_eq!(
+        db.query("SELECT _key FROM t WHERE v = 4500").unwrap().collect().len(),
+        1,
+        "field index still works after trim"
+    );
+    // Still fully writable after trimming.
+    db.put(r#"t/knew"#, r#"{"_collection":"t","_key":"knew","v":42}"#).unwrap();
+    assert_eq!(count(&db), 1001, "DB remains writable after trim");
+    // compact() now auto-trims at the end — must also stay correct.
+    db.compact().unwrap();
+    assert_eq!(count(&db), 1001, "compact (with auto-trim) preserves data");
+}
+
+#[test]
 fn skbin_alter_table_add_column() {
     // ALTER needs a declared schema, so build this collection via CREATE TABLE.
     let dir = tempfile::tempdir().unwrap();
