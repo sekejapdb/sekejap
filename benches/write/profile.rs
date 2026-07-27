@@ -1,7 +1,7 @@
 //! Breakdown of the atomic bulk-write cost (single-threaded, no lock noise) for
 //! an IoT-shaped numeric row. Tells us how much of put_value_bulk is JSON
 //! serialize vs storage/WAL/maps — i.e. whether the atom is serialize-bound.
-//!   cargo run --release --example write_profile
+//!   cargo bench --bench write_profile
 
 use sekejap::{Config, CoreDB};
 use serde_json::json;

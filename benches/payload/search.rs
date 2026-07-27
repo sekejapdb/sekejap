@@ -5,7 +5,7 @@
 //!   (B) QUERY time — ranking reads the index (neutral); projecting result fields
 //!       reads payloads (SKBIN), scaling with result-set size.
 //!
-//!   cargo run --release --example search_skbin_bench
+//!   cargo bench --bench payload_search
 
 use sekejap::{Config, CoreDB};
 use serde_json::json;

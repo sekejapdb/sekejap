@@ -6,7 +6,7 @@
 //!   WRITES — durable batched ingest (sekejap multi-row INSERT vs SQLite txn batch).
 //! Correctness asserted on both sides (right rows read; exact totals written).
 //!
-//!   cargo run --release --features engine --example concurrency_vs_sqlite
+//!   cargo bench --features engine --bench write_vs_sqlite
 
 use rusqlite::Connection;
 use sekejap::engine::Engine;

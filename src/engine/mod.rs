@@ -288,7 +288,7 @@ impl Engine {
 
         let mut db = self.guard.write();
         let mut total = 0usize;
-        // Prepared rows: pre-built (slug, Value) → put_value_many (group-commit, one
+        // Prepared rows: pre-built (slug, Value) → put_value_bulk (group-commit, one
         // shared timestamp, zero parsing). The fast IoT write path.
         if !rows.is_empty() {
             total += db.put_value_bulk(rows).map_err(|e| e.to_string())?;

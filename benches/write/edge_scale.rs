@@ -9,8 +9,8 @@
 //! paged), and query latency for pure traversal, fast-lane aggregation, and a
 //! JSON-bag read. Run with `/usr/bin/time -l` to also capture peak RSS.
 //!
-//!   cargo run --release --example edge_scale
-//!   NODES=1000000 /usr/bin/time -l cargo run --release --example edge_scale
+//!   cargo bench --bench edge_scale
+//!   NODES=1000000 /usr/bin/time -l cargo bench --bench edge_scale
 //!
 //! Tunables (env): NODES, RATED_PER_NODE, TAGGED_EVERY, BATCH.
 

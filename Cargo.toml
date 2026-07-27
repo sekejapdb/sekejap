@@ -49,26 +49,68 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile  = "3"
 rusqlite  = { version = "0.32", features = ["bundled"] }
 
-# Concurrency examples use the `engine` feature; gate them so the default
-# `cargo test` / `cargo build` (no features) doesn't try to compile them.
-[[example]]
-name = "concurrency_bench"
-required-features = ["engine"]
+# Benchmarks live under benches/ (subfoldered by area). Each is a plain `fn main`
+# harness (harness = false) run with `cargo bench --bench <name>`. Engine ones are
+# gated behind the `engine` feature so a plain build/test skips them.
 
-[[example]]
-name = "concurrency_vs_sqlite"
-required-features = ["engine"]
+# ── payload / query benchmarks ──────────────────────────────────────────────
+[[bench]]
+name = "payload_size_speed"
+path = "benches/payload/size_speed.rs"
+harness = false
 
-[[example]]
+[[bench]]
+name = "payload_mega_query"
+path = "benches/payload/mega_query.rs"
+harness = false
+
+[[bench]]
+name = "payload_hybrid"
+path = "benches/payload/hybrid.rs"
+harness = false
+
+[[bench]]
+name = "payload_search"
+path = "benches/payload/search.rs"
+harness = false
+
+# ── write-path / concurrency benchmarks (need the `engine` feature) ─────────
+[[bench]]
+name = "write_profile"
+path = "benches/write/profile.rs"
+harness = false
+
+[[bench]]
 name = "write_stress"
+path = "benches/write/stress.rs"
+harness = false
 required-features = ["engine"]
 
-[[example]]
+[[bench]]
 name = "write_scaling"
+path = "benches/write/scaling.rs"
+harness = false
 required-features = ["engine"]
 
-# Benches parked (autobenches = false above). Uncomment when reworked; ensure each
-# named file exists in benches/ before re-enabling, or the manifest won't parse.
+[[bench]]
+name = "write_vs_sqlite"
+path = "benches/write/vs_sqlite.rs"
+harness = false
+required-features = ["engine"]
+
+[[bench]]
+name = "edge_scale"
+path = "benches/write/edge_scale.rs"
+harness = false
+
+# ── inspection tools ─────────────────────────────────────────────────────────
+[[bench]]
+name = "dump_record"
+path = "benches/tools/dump_record.rs"
+harness = false
+
+# Older criterion microbenchmarks in benches/*.rs are parked (autobenches = false).
+# Uncomment when reworked; ensure each named file exists before re-enabling.
 # [[bench]]
 # name = "sql_vs_atomic"
 # harness = false

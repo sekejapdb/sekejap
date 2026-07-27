@@ -4,7 +4,7 @@
 //! of writes. Measures sustained durable throughput and — the point — verifies
 //! ZERO lost/duplicated rows under saturation, on sekejap vs SQLite.
 //!
-//!   cargo run --release --features engine --example write_stress
+//!   cargo bench --features engine --bench write_stress
 
 use rusqlite::Connection;
 use sekejap::engine::Engine;
