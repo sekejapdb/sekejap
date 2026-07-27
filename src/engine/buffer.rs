@@ -64,3 +64,27 @@ impl WriteBuffer {
         self.len() == 0
     }
 }
+
+/// Buffered accumulator for PREPARED row writes — pre-built `(slug, Value)` pairs
+/// that skip SQL parsing AND JSON re-parsing entirely. Drained via a group-commit
+/// batch put (one fsync, one shared timestamp, zero parses). Thread-safe.
+pub struct RowBuffer {
+    pending: Mutex<Vec<(String, serde_json::Value)>>,
+    threshold: usize,
+}
+
+impl RowBuffer {
+    pub fn new(threshold: usize) -> Self {
+        Self { pending: Mutex::new(Vec::with_capacity(threshold)), threshold }
+    }
+    /// Push a pre-built `(slug, payload Value)`; returns true at the flush threshold.
+    pub fn push(&self, slug: String, val: serde_json::Value) -> bool {
+        let mut b = self.pending.lock().expect("RowBuffer poisoned");
+        b.push((slug, val));
+        b.len() >= self.threshold
+    }
+    pub fn drain(&self) -> Vec<(String, serde_json::Value)> {
+        let mut b = self.pending.lock().expect("RowBuffer poisoned");
+        std::mem::take(&mut *b)
+    }
+}

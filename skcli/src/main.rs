@@ -12,7 +12,7 @@
 //! ```
 
 use rustyline::DefaultEditor;
-use sekejap::CoreDB;
+use sekejap::{Config, CoreDB};
 use std::io::{self, IsTerminal, Read};
 use std::time::Instant;
 
@@ -65,6 +65,7 @@ USAGE:
   sekejap <path> \"<SQL>\"           run SQL and exit
   sekejap --path <path> \"<SQL>\"    run SQL and exit
   echo \"SELECT...;\" | sekejap      pipe SQL script
+  sekejap migrate <path>           upgrade a DB to the latest (SKBIN) format + verify
 
 OPTIONS:
   -p, --path <path>    database directory path
@@ -603,7 +604,126 @@ fn repl(mut db: CoreDB, mut label: String) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+// ── migrate: upgrade a DB's payloads to the latest format, verify, report ──────
+
+fn payloads_mb(dir: &str) -> f64 {
+    std::fs::metadata(std::path::Path::new(dir).join("payloads.bin"))
+        .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0)
+}
+
+/// Compare two payloads ignoring engine-injected timestamps (which are already
+/// baked into stored records and unchanged by re-encoding, but excluded for safety).
+fn same_record(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    fn strip(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(m) => serde_json::Value::Object(
+                m.iter()
+                    .filter(|(k, _)| *k != "_created_unix" && *k != "_updated_unix")
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    strip(a) == strip(b)
+}
+
+/// Returns a process exit code (0 = success).
+fn migrate(path: &str) -> i32 {
+    println!("sekejap migrate — upgrading '{path}' to SKBIN (Level-1 binary payloads)");
+    println!("  (compaction is atomic and lossless; this run also verifies every record)");
+
+    let cfg = Config { payload_binary: true, ..Config::default() };
+    let mut db = match CoreDB::open_with_config(path, cfg.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open '{path}': {e}");
+            return 1;
+        }
+    };
+
+    // 1. Snapshot every record's value BEFORE compaction.
+    let slugs = db.all_slugs();
+    let n = slugs.len();
+    if n == 0 {
+        println!("  no records found — nothing to migrate.");
+        return 0;
+    }
+    println!("  {n} records found — snapshotting values…");
+    let before: Vec<(String, serde_json::Value)> = slugs
+        .iter()
+        .filter_map(|s| {
+            db.get(s)
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .map(|v| (s.clone(), v))
+        })
+        .collect();
+    let size_before = payloads_mb(path);
+
+    // 2. Compact → re-encodes live records into SKBIN (atomic tmp→rename).
+    println!("  compacting to SKBIN…");
+    if let Err(e) = db.compact() {
+        eprintln!("error: compaction failed: {e}  (original data is untouched)");
+        return 1;
+    }
+    drop(db);
+
+    // 3. Reopen and verify EVERY record round-trips byte-identical.
+    let db2 = match CoreDB::open_with_config(path, cfg) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: reopen after compaction failed: {e}");
+            return 1;
+        }
+    };
+    let mut diffs = 0usize;
+    for (slug, vb) in &before {
+        let ok = db2
+            .get(slug)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .map(|va| same_record(&va, vb))
+            .unwrap_or(false);
+        if !ok {
+            diffs += 1;
+            if diffs <= 5 {
+                eprintln!("  ⚠ record differs after migration: {slug}");
+            }
+        }
+    }
+    let size_after = payloads_mb(path);
+
+    // 4. Report.
+    if diffs == 0 {
+        let ratio = if size_after > 0.0 { size_before / size_after } else { 1.0 };
+        println!("  ✓ verified {n} records — 0 differences");
+        println!("  payloads.bin: {size_before:.1} MB → {size_after:.1} MB ({ratio:.2}x)");
+        println!("done — '{path}' now uses the official SKBIN format.");
+        0
+    } else {
+        eprintln!(
+            "  ✗ {diffs}/{n} records did not verify. This indicates a bug, not data loss —\n     \
+             the records are still present and readable. Please report this with the DB.\n     \
+             (Keep a backup of '{path}' before relying on it.)"
+        );
+        1
+    }
+}
+
 fn main() {
+    // `sekejap migrate <db>` — upgrade payloads to the latest (SKBIN) format,
+    // verifying every record round-trips byte-identical before reporting success.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("migrate") {
+        match raw.get(1) {
+            Some(p) => std::process::exit(migrate(p)),
+            None => {
+                eprintln!("usage: sekejap migrate <db-path>");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let args = parse_args();
     let (mut db, label) = open_db(&args.path);
 

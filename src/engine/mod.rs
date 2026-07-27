@@ -69,7 +69,7 @@ pub mod remote;
 pub use policy::WalPolicy;
 pub use scheduler::RebuildStrategy;
 
-use buffer::WriteBuffer;
+use buffer::{RowBuffer, WriteBuffer};
 use guard::ReadWriteGuard;
 use scheduler::IndexScheduler;
 
@@ -87,6 +87,8 @@ use serde_json::Value;
 pub struct Engine {
     guard: ReadWriteGuard,
     buffer: Option<WriteBuffer>,
+    /// Prepared-row buffer (pre-built (slug, json)); group-committed via put_many.
+    rows: Option<RowBuffer>,
     #[allow(dead_code)]
     scheduler: IndexScheduler,
     wal_policy: WalPolicy,
@@ -96,6 +98,16 @@ pub struct Engine {
     remote: Option<remote::RemoteSync>,
     #[cfg(feature = "s3")]
     generation: std::sync::atomic::AtomicU64,
+}
+
+/// A compiled INSERT template (collection + columns), prepared once and reused.
+/// Carries no SQL — `Engine::insert_prepared` binds values and writes directly,
+/// so per-row parsing/compilation is eliminated. Cheap to clone and share.
+#[derive(Clone, Debug)]
+pub struct PreparedInsert {
+    collection: String,
+    columns: Vec<String>,
+    key_idx: usize,
 }
 
 impl Engine {
@@ -128,6 +140,7 @@ impl Engine {
         Self {
             guard: ReadWriteGuard::new(CoreDB::new()),
             buffer: None,
+            rows: None,
             scheduler: IndexScheduler::new(RebuildStrategy::Immediate),
             wal_policy: WalPolicy::Manual,
             path: None,
@@ -210,6 +223,54 @@ impl Engine {
         db.execute_params(sql, params).map_err(|e| e.to_string())
     }
 
+    // ── Prepared inserts (no SQL parsing on the hot path) ──────────────────────
+
+    /// Prepare a typed INSERT template ONCE — no SQL, nothing parsed per row.
+    /// `columns` must include `"_key"` (used to derive the node slug). Reuse the
+    /// returned handle across many `insert_prepared` calls: the IoT write path.
+    pub fn prepare_insert(&self, collection: &str, columns: &[&str]) -> Result<PreparedInsert, String> {
+        let key_idx = columns.iter().position(|c| *c == "_key")
+            .ok_or_else(|| "prepare_insert requires a '_key' column".to_string())?;
+        Ok(PreparedInsert {
+            collection: collection.to_string(),
+            columns: columns.iter().map(|s| s.to_string()).collect(),
+            key_idx,
+        })
+    }
+
+    /// Execute a prepared insert with bound `params` (one per column). Skips ALL
+    /// SQL parsing — builds the payload directly. Buffered + group-committed when
+    /// a buffer is configured (call [`flush`](Self::flush) to drain), else applied
+    /// immediately. `params` length must equal the prepared column count.
+    pub fn insert_prepared(&self, p: &PreparedInsert, params: &[Value]) -> Result<(), String> {
+        if self.read_only {
+            return Err("database is read-only".to_string());
+        }
+        if params.len() != p.columns.len() {
+            return Err(format!("expected {} params, got {}", p.columns.len(), params.len()));
+        }
+        let key = match &params[p.key_idx] {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let slug = format!("{}/{}", p.collection, key);
+        let mut obj = serde_json::Map::with_capacity(p.columns.len() + 1);
+        obj.insert("_collection".to_string(), Value::String(p.collection.clone()));
+        for (c, v) in p.columns.iter().zip(params) {
+            obj.insert(c.clone(), v.clone());
+        }
+        let val = Value::Object(obj);
+        if let Some(ref rb) = self.rows {
+            if rb.push(slug, val) {
+                self.flush()?; // group-commit at threshold
+            }
+            Ok(())
+        } else {
+            let mut db = self.guard.write();
+            db.put_value(&slug, val).map(|_| ()).map_err(|e| e.to_string())
+        }
+    }
+
     // ── Flush & Maintenance ──────────────────────────────────────────────────
 
     /// Drain the write buffer, apply all pending statements, and optionally
@@ -218,28 +279,30 @@ impl Engine {
     /// Returns the total number of rows affected across all flushed statements.
     /// Returns `Ok(0)` if no buffer is configured or the buffer is empty.
     pub fn flush(&self) -> Result<usize, String> {
-        let statements = match self.buffer {
-            Some(ref buf) => buf.drain(),
-            None => return Ok(0),
-        };
-
-        if statements.is_empty() {
+        let statements = self.buffer.as_ref().map(|b| b.drain()).unwrap_or_default();
+        let rows = self.rows.as_ref().map(|r| r.drain()).unwrap_or_default();
+        if statements.is_empty() && rows.is_empty() {
             return Ok(0);
         }
+        let batch_len = statements.len() + rows.len();
 
         let mut db = self.guard.write();
-        let mut total = 0;
-        for sql in &statements {
-            total += db.execute(sql).map_err(|e| e.to_string())?;
+        let mut total = 0usize;
+        // Prepared rows: pre-built (slug, Value) → put_value_many (group-commit, one
+        // shared timestamp, zero parsing). The fast IoT write path.
+        if !rows.is_empty() {
+            total += db.put_value_bulk(rows).map_err(|e| e.to_string())?;
+        }
+        // Buffered SQL: apply the whole batch under one WAL fsync (group-commit).
+        if !statements.is_empty() {
+            total += db.execute_batch_grouped(&statements).map_err(|e| e.to_string())?;
         }
 
         // Check WAL compaction policy
         if let Some(ref path) = db.data_dir {
             let wal_path = path.join("wal.log");
-            let wal_bytes = std::fs::metadata(&wal_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if self.wal_policy.should_compact(wal_bytes, statements.len()) {
+            let wal_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+            if self.wal_policy.should_compact(wal_bytes, batch_len) {
                 let _ = db.compact();
             }
         }
@@ -528,6 +591,11 @@ impl EngineBuilder {
                 None
             } else {
                 self.buffer_size.map(WriteBuffer::new)
+            },
+            rows: if self.read_only {
+                None
+            } else {
+                self.buffer_size.map(RowBuffer::new)
             },
             scheduler: IndexScheduler::new(self.rebuild_strategy),
             wal_policy: self.wal_policy,

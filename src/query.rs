@@ -1624,8 +1624,9 @@ impl<'db> Set<'db> {
                     }
                     out
                 } else if let Some(bytes) = raw_map.get(&hash) {
-                    // Small payload from batch buffer — byte-search, no full JSON parse.
-                    let mut found = extract_fields_by_search(bytes, fields);
+                    // Small payload from batch buffer — SKBIN-aware extraction
+                    // (skip-scan for binary records, byte-search for raw JSON).
+                    let mut found = self.db.extract_stored_fields(bytes, fields);
                     let mut out = serde_json::Map::new();
                     for f in fields {
                         if let Some(v) = found.remove(f.as_str()) {
@@ -3306,7 +3307,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         let vals: Vec<Option<Value>> = if let Some(ref rm) = raw_map {
                             // Batch path: slice bytes from the pre-fetched map.
                             if let Some(bytes) = rm.get(&h) {
-                                let mut map = extract_fields_by_search(bytes, &sort_fields);
+                                let mut map = db.extract_stored_fields(bytes, &sort_fields);
                                 sort_fields.iter().map(|f| map.remove(f.as_str())).collect()
                             } else {
                                 sort_fields.iter().map(|_| None).collect()
@@ -6203,6 +6204,12 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
 
                     let mut fallbacks: Vec<u64> = Vec::new();
                     for &h in &sorted {
+                        // SKBIN records need field-table skip-scan (tail byte-search
+                        // can't read them); raw records keep the zero-copy tail path.
+                        if let Some(m) = db.try_skbin_node_fields(h, needed_fields) {
+                            cache.insert(h, Value::Object(m));
+                            continue;
+                        }
                         // Zero-copy: borrow directly from mmap, no Vec allocation.
                         if let Some(tail) = db.payload_tail_slice(h, 512) {
                             let extracted = extract_fields_by_search(tail, needed_fields);

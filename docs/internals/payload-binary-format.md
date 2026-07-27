@@ -1,7 +1,10 @@
 # Payload Binary Format (SKBIN) — Design
 
-Status: **proposal** (proven in `examples/schema_encode_bench.rs`; not yet in the engine)
-Chosen: 2026-07-26 — **Level 1 / metadata-only**. This is the design we ship first.
+Status: **SEALED / OFFICIAL** — implemented in `src/storage/skbin.rs` + `src/lib.rs`
++ `src/query.rs`; integrated across the full DML/DDL surface (resident + paged);
+decoder fuzzed (panic-free; every single-bit corruption detected). Enabled via
+`Config::payload_binary`. Format version **v1**, identified by first byte `0x02`.
+Chosen: 2026-07-26 — **Level 1 / metadata-only**. See §8 for the versioning rule.
 
 ## 1. Summary
 
@@ -48,15 +51,20 @@ tag 1  false
 tag 2  true
 tag 3  int     -> zigzag varint            (numbers stop being decimal text)
 tag 4  float   -> 8 bytes IEEE-754 LE
+tag 5  uint    -> plain varint (u64 > i64::MAX)
 tag 6  string  -> varint len + utf8 bytes  (ALWAYS literal — value lives here)
 tag 7  array   -> varint count + values
 tag 8  object  -> varint count + [varint field_id, value]*
+tag 11 zstr    -> RESERVED: per-field zstd string (self-contained, no shared dict).
+                  Off by default (`Config::payload_zstd`); never written unless enabled.
 ```
 
+Tag 10 is retired (was FSST — removed; it required a shared symbol table).
 Deliberately **no interned-string or templated-string tags** — those would put
 value data in shared state. Records **> 64 KB stay raw** (preserves the head/tail
-extraction fast path for huge GeoJSON). Each stored record is **CRC32-framed**;
-a CRC mismatch errors that one record only.
+extraction fast path for huge GeoJSON). Each stored record is **CRC32-framed**
+`[0x02][crc32 LE u32][body]`; a CRC mismatch errors that one record only, and —
+proven by fuzzing — the decoder never panics and never serves a corrupted value.
 
 ## 4. The shared table (field names only)
 
@@ -112,22 +120,50 @@ holding actual value data.
   roundtrip. Property-test this.
 - Non-object payloads (rare): encode as a single value, or keep raw.
 
-## 8. Phased build plan
+## 8. Versioning & format evolution (the sealed rule)
 
-1. SKBIN codec module + property-tested roundtrip (zero loss) + CRC framing.
-2. Field table: build / append / persist (redundant + CRC) / rebuild-from-scan /
-   rebuild-from-WAL, with tests.
-3. Read path: `decode_payload_record` handles `0x02`; `get_field` skip-scan;
-   mixed-file tests (raw + zstd + SKBIN coexisting).
-4. Write at compaction: image-then-records; reopen (resident + paged) equivalence.
-5. Crash tests: kill between table write and payload rename; assert recoverable.
-6. Query wiring: route single-field reads through `get_field`.
-7. Delete the zstd payload path once SKBIN is default (keep the `0x01` reader for
-   migration until a compaction rewrites the last zstd record).
+The **first byte is the format namespace** — this is how the format evolves safely
+without a flag day:
 
-Each phase ships green with tests before the next.
+```
+0x7B  '{'   raw JSON            (legacy / >64 KB / un-compacted writes)
+0x01        legacy whole-record zstd  (reader kept; default off)
+0x02        SKBIN v1            ← current official format
+0x03..0xFF  RESERVED for future record formats (SKBIN v2, …)
+```
 
-## 9. Future: leaner WITHOUT breaking the rule (not yet measured)
+Rules that make this safe:
+
+1. **A new record format takes a new first byte.** SKBIN v2 would be `0x03`, never
+   a silent change to the `0x02` body. Old and new records coexist in one file.
+2. **Readers dispatch on the first byte and reject the unknown cleanly.** A record
+   whose first byte a build doesn't recognise decodes to `None` (a *detected*
+   "can't read this", never a panic or a misread) — and surfaces the friendly
+   "run `sekejap migrate`" guidance (see the CLI toolkit).
+3. **Shared frames carry an explicit version byte.** The field table is
+   `["SKFT"][version][crc32][payload]`; the snapshot has `SNAPSHOT_FORMAT_VERSION`.
+   A newer on-disk version than the binary supports is refused with a clear
+   upgrade/migrate message rather than parsed optimistically.
+4. **Forward path is compaction.** There is no destructive migration: `compact()`
+   rewrites live records into the current format. `sekejap migrate <db>` wraps this
+   with a verify-before-finalize pass (read every record back, assert byte-identical
+   before swapping). Downgrade (SKBIN → raw) is `compact` with `payload_binary:false`.
+
+So "change the format later" is a defined operation: bump to a new first-byte tag,
+teach the reader to dispatch it, ship the migrate/verify path — never an in-place
+reinterpretation of existing bytes.
+
+## 9. Status: shipped & verified
+
+All build phases are complete and green: codec + roundtrip, redundant CRC'd field
+table (rebuildable from scan/WAL/`CREATE TABLE`), first-byte read dispatch, SKBIN
+at compaction, resident **and** paged equivalence, the full DML/DDL surface
+(projection/sort/GROUP BY/MATCH/filters/UPDATE/DELETE/ALTER/GIN/BM25), and a fuzzed
+decoder (200k random inputs + every single-bit corruption + every truncation →
+no panic, corruption always detected). The legacy `0x01` zstd reader is retained
+for migration; per-field zstd (tag 11) is reserved and default-off.
+
+## 10. Future: leaner WITHOUT breaking the rule (not yet measured)
 
 Level 1 is 1.6×. More is possible *only* via techniques that keep per-record
 isolation and put **no user data in shared state** — i.e. **universal codecs in
@@ -143,7 +179,7 @@ Expected ~2–2.2× (the irreducible unique content — keys, emails, free text 
 can't shrink without cross-record sharing). Prototype + measure before adopting;
 Level 1 is the floor we never drop below.
 
-## 10. Rejected alternatives
+## 11. Rejected alternatives
 
 `.workbench/payload-compression-verdict.md`: global trained dict (whole-DB loss),
 fixed/generic dict (worse than none), segment+dict (16k-record blast radius),
