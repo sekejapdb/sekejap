@@ -4,7 +4,7 @@
 //! SKBIN accelerates the last mile). Compares raw-resident vs SKBIN-resident.
 //! (Paged excluded: spatial metadata isn't served from the paged base.)
 //!
-//!   cargo run --release --example hybrid_skbin_bench
+//!   cargo bench --bench payload_hybrid
 
 use sekejap::{Config, CoreDB};
 use serde_json::json;

@@ -2668,28 +2668,6 @@ impl CoreDB {
         self.put_raw_inner(slug, raw.as_bytes(), payload)
     }
 
-    /// Bulk `put_value`: one shared timestamp, deferred index rebuild, and a single
-    /// WAL fsync for the whole batch — no per-row `from_str` parse and no per-row
-    /// `now()` syscall. This is the prepared-insert / IoT ingest throughput path.
-    pub fn put_value_many(&mut self, rows: Vec<(String, Value)>) -> Result<usize, serde_json::Error> {
-        self.defer_wal_sync = true;
-        self.defer_index_rebuild = true;
-        self.batch_now = Some(chrono::Utc::now().timestamp_millis());
-        let mut n = 0usize;
-        let mut err = None;
-        for (slug, val) in rows {
-            match self.put_value(&slug, val) {
-                Ok(_) => n += 1,
-                Err(e) => { err = Some(e); break; }
-            }
-        }
-        self.batch_now = None;
-        self.defer_wal_sync = false;
-        self.wal_flush();
-        self.flush_deferred_indexes();
-        self.autocompact_after_write();
-        match err { Some(e) => Err(e), None => Ok(n) }
-    }
 
     /// True bulk insert for prepared/programmatic writes — the IoT ingest fast path.
     /// One shared timestamp, one batched WAL write + single fsync, one batched

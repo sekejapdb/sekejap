@@ -5,10 +5,10 @@
 //! Usage (env-driven):
 //!   DATASET_MODE=geojsonl DATASET_PATH=/path/file.geojsonl.json COLLECTION=villages \
 //!   LIMIT=15000 [FILTER="PROVINSI = 'Jawa Barat'"] \
-//!     cargo run --release --example payload_bench
+//!     cargo bench --bench payload_size_speed
 //!
 //!   DATASET_MODE=jsonarray DATASET_PATH=/path/classroom_list.json COLLECTION=classes \
-//!   LIMIT=40000 cargo run --release --example payload_bench
+//!   LIMIT=40000 cargo bench --bench payload_size_speed
 
 use sekejap::{Config, CoreDB};
 use serde_json::Value;

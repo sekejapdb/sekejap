@@ -1,7 +1,7 @@
 //! Store ONE record in Level-1 SKBIN (no FSST, strings literal) and print its
 //! exact bytes on disk, annotated tag-by-tag.
 //!
-//!   cargo run --release --example dump_record
+//!   cargo bench --bench dump_record
 
 use sekejap::{Config, CoreDB};
 

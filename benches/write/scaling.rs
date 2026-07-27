@@ -1,7 +1,7 @@
 //! Write throughput vs thread count — is the concurrent write gap per-row cost or
 //! contention? Sweeps threads for sekejap (prepared, buffered group-commit) vs
 //! SQLite (WAL, synchronous=FULL), work-stealing over a fixed total.
-//!   cargo run --release --features engine --example write_scaling
+//!   cargo bench --features engine --bench write_scaling
 
 use rusqlite::Connection;
 use sekejap::engine::Engine;

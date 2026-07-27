@@ -8,7 +8,7 @@
 //! projection, graph traversal) — paged's documented spatial/edge-metadata
 //! limitations are unrelated to SKBIN, so those scenarios are excluded.
 //!
-//!   cargo run --release --example mega_skbin_bench
+//!   cargo bench --bench payload_mega_query
 
 use sekejap::{Config, CoreDB};
 use serde_json::json;
