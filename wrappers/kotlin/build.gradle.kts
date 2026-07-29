@@ -3,6 +3,8 @@
 // Dev: build libsekejap first (`cargo build --release -p sekejap-capi`), then `gradle test`.
 // Published jar bundles native libs under resources/natives/<os>-<arch>/ (see CI).
 
+import com.vanniktech.maven.publish.JavadocJar
+import com.vanniktech.maven.publish.KotlinJvm
 import com.vanniktech.maven.publish.SonatypeHost
 
 plugins {
@@ -51,6 +53,9 @@ tasks.named<JavaExec>("run") {
 //   ORG_GRADLE_PROJECT_mavenCentralUsername / ...Password  (Sonatype token)
 //   ORG_GRADLE_PROJECT_signingInMemoryKey / ...KeyPassword (GPG key + passphrase)
 mavenPublishing {
+    // Empty javadoc jar — Maven Central only requires *a* javadoc artifact, and the
+    // real `javadoc` tool chokes on the java.lang.foreign (FFM) code in Ffi.java.
+    configure(KotlinJvm(javadocJar = JavadocJar.Empty(), sourcesJar = true))
     publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
     signAllPublications()
     coordinates(group.toString(), "sekejap", version.toString())

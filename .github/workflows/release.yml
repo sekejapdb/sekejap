@@ -145,6 +145,7 @@ jobs:
       - name: Precompile (desktop + iOS on macOS host)
         if: matrix.os != 'ubuntu-latest'
         working-directory: wrappers/dart/cargokit/build_tool
+        shell: bash              # Windows default is PowerShell; force bash for \ continuations
         run: |
           dart pub get
           dart run build_tool precompile-binaries -v \
@@ -250,6 +251,7 @@ jobs:
   # ── Swift: build an xcframework (macOS + iOS) and attach it to the Release ──
   build-swift-xcframework:
     name: Swift xcframework
+    needs: release-native-libs   # let that job create the Release first (avoid a create race)
     runs-on: macos-14
     permissions:
       contents: write
@@ -334,7 +336,7 @@ jobs:
         with:
           pattern: node-*
           path: wrappers/node/artifacts
-          merge-multiple: true
+          # no merge-multiple: napi artifacts expects each target in its own subdir
       - name: Prepare platform packages + publish
         working-directory: wrappers/node
         run: |
