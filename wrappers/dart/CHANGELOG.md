@@ -1,3 +1,8 @@
+## 0.13.2
+
+* Maintenance release — coordinated version bump across all sekejap language
+  packages. No changes to the Dart/Flutter API since 0.13.1.
+
 ## 0.13.1
 
 * **Fix native build in a clean Flutter app.** The published `rust/Cargo.toml` no

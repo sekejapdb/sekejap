@@ -342,7 +342,9 @@ jobs:
         working-directory: wrappers/node
         run: |
           npm install
-          npx napi artifacts -d artifacts
+          npx napi create-npm-dirs                    # generate npm/<platform>/ (package.json per triple)
+          npx napi artifacts --dir artifacts           # copy the built .node files into those dirs
+          ls -R npm || true                            # debug: show what got populated
           npx napi prepublish -t npm --skip-gh-release
           npm publish --access public
         env:
