@@ -44,11 +44,37 @@ It's a good fit for:
 
 ## Install
 
+**Python** — [PyPI](https://pypi.org/project/sekejap/)
+
 ```bash
-pip install sekejap                 # Python (includes S3 support)
-cargo add sekejap                   # Rust library
-cargo add sekejap --features s3     # Rust library, with S3 support
+pip install sekejap                 # includes S3 support
+```
+
+**Rust** — [crates.io](https://crates.io/crates/sekejap)
+
+```bash
+cargo add sekejap                   # library
+cargo add sekejap --features s3     # library, with S3 support
 cargo install sekejap-cli           # command-line tool
+```
+
+**Node.js** — [npm](https://www.npmjs.com/package/sekejap)
+
+```bash
+npm install sekejap                 # prebuilt native binaries, no toolchain needed
+```
+
+**Dart / Flutter** — [pub.dev](https://pub.dev/packages/sekejap)
+
+```bash
+flutter pub add sekejap             # or: dart pub add sekejap
+```
+
+**Kotlin / Java** — [Maven Central](https://central.sonatype.com/artifact/com.zebflow/sekejap)
+
+```kotlin
+// build.gradle.kts
+implementation("com.zebflow:sekejap:0.13.3")
 ```
 
 ---
@@ -225,7 +251,7 @@ db.query("""
     SELECT name, AGE_DAYS(arrival) AS days_here, NOW() AS current_time
     FROM tourists WHERE _key = 'chloe'
 """)
-# → { name: "Chloe", days_here: 5, current_time: 1717... }
+# → { name: "Chloe", days_here: 5, current_time: "2024-06-06T09:00:00Z" }
 ```
 
 ---
@@ -299,6 +325,7 @@ db.query("""
 | Text | `TEXT` | UTF-8 string | names, categories, keys |
 | Integer | `INTEGER` | 64-bit integer | prices, durations, counts |
 | Float | `REAL` | 64-bit float | scores, ratings, weights |
+| Boolean | `BOOLEAN` | `true` / `false` | flags, toggles (e.g. `open_now`) |
 | Timestamp | `TIMESTAMPTZ` | ISO-8601 date/time | arrivals, log times |
 | Geometry | `GEO` | GeoJSON shape | points, areas, routes |
 | Vector | `VECTOR` | list of floats | embeddings (taste, mood, images) |
@@ -386,7 +413,7 @@ GROUP BY d.name
 -- Shortest path: 0 rows if unreachable, 1 row if a path exists
 SELECT a.name AS from_n, b.name AS to_n, r.length AS hops
 FROM MATCH SHORTEST (a:tourists)-[r*]->(b:dishes)
-WHERE a._key = 'tourists/chloe' AND b._key = 'dishes/babi-guling'
+WHERE a._key = 'chloe' AND b._key = 'betutu-chicken'
 
 -- Spatial, vector, and text
 SELECT * FROM places   WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)
@@ -420,7 +447,7 @@ let nearby = db.collection("restaurants")
 
 // Filter and sort.
 let picks = db.collection("dishes")
-    .where_gte("protein_g", 25)
+    .where_gte("protein_g", 25.0)
     .sort("price", true)   // true = ascending
     .take(10)
     .collect();
