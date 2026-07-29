@@ -6899,3 +6899,52 @@ fn match_group_by_with_function_filter() {
     assert_eq!(rust.get("shop"), Some(&1));
     assert_eq!(rust.get("bar"), None, "bar has no rust docs");
 }
+
+#[test]
+fn prepared_query_binds_varying_params() {
+    let mut db = CoreDB::new();
+    for i in 0..10 {
+        db.put(&format!("t/k{i}"),
+            &format!(r#"{{"_collection":"t","_key":"k{i}","v":{i}}}"#)).unwrap();
+    }
+
+    // Compile once, run many with DIFFERENT parameter values.
+    let stmt = db.prepare("SELECT _key FROM t WHERE v = $1").unwrap();
+    for i in 0..10 {
+        let hits = db.query_prepared(&stmt, &[serde_json::json!(i)]).unwrap().collect();
+        assert_eq!(hits.len(), 1, "v={i} should match exactly one row");
+        assert_eq!(hits[0].slug, format!("t/k{i}"));
+    }
+
+    // Prepared result must equal the equivalent one-shot query_params.
+    let prepared: Vec<_> = db.query_prepared(&stmt, &[serde_json::json!(7)]).unwrap()
+        .collect().into_iter().map(|h| h.slug).collect();
+    let oneshot: Vec<_> = db.query_params("SELECT _key FROM t WHERE v = $1", &[serde_json::json!(7)])
+        .unwrap().collect().into_iter().map(|h| h.slug).collect();
+    assert_eq!(prepared, oneshot);
+}
+
+#[test]
+fn bm25_filter_is_deterministic_and_complete() {
+    let mut db = CoreDB::new();
+    // 20 docs, identical content → identical BM25 scores (all tied). A top-k cap
+    // with HashMap-order tie-breaking used to return a NON-DETERMINISTIC subset.
+    for i in 0..20 {
+        db.put(&format!("d/k{i:02}"),
+            &format!(r#"{{"_collection":"d","_key":"k{i:02}","body":"the quick brown fox jumps over"}}"#)).unwrap();
+    }
+    db.execute("CREATE INDEX ON d USING bm25 (body)").unwrap();
+
+    let run = || {
+        let mut keys: Vec<String> = db
+            .query("SELECT _key FROM d WHERE BM25(body, 'quick fox') > 0.0")
+            .unwrap().collect().into_iter().map(|h| h.slug).collect();
+        keys.sort();
+        keys
+    };
+    let first = run();
+    assert_eq!(first.len(), 20, "a BM25 filter must return EVERY matching doc, not a capped subset");
+    for _ in 0..12 {
+        assert_eq!(run(), first, "BM25 filter must be deterministic across identical runs");
+    }
+}

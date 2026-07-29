@@ -45,17 +45,15 @@ fn main() {
     let tagged_every = env("TAGGED_EVERY", 8);
     let batch = env("BATCH", 50_000);
 
-    let compress = std::env::var("COMPRESS").ok().as_deref() == Some("1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
     println!("== edge-model scale test (disk-first) ==");
-    println!("nodes={n}  rated/node={rated_per}  tagged every {tagged_every}th  batch={batch}  payload_compression={compress}");
+    println!("nodes={n}  rated/node={rated_per}  tagged every {tagged_every}th  batch={batch}");
     println!("db dir: {}", path.display());
 
     let mut db = CoreDB::open_with_config(
         &path,
-        Config { payload_compression: compress, ..Config::default() },
+        Config::default(),
     )
     .unwrap();
 

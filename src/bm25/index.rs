@@ -259,6 +259,23 @@ impl Bm25Index {
     ///
     /// [`delete`]: Bm25Index::delete
     pub fn search(&self, query: &str, top_k: usize) -> Vec<Bm25Hit> {
+        let mut hits = self.score_all(query);
+        hits.truncate(top_k);
+        hits
+    }
+
+    /// Like [`search`](Self::search) but returns EVERY matching document (no
+    /// top-k cap). Use for filters (`BM25(f, q) > x`) and score maps, where
+    /// truncating both drops legitimate matches and — on tied scores — does so
+    /// non-deterministically (different rows each run).
+    pub fn search_all(&self, query: &str) -> Vec<Bm25Hit> {
+        self.score_all(query)
+    }
+
+    /// Score every document matching `query`, ordered by score DESC then doc_id
+    /// ASC — a deterministic total order (HashMap iteration order alone is not,
+    /// so ties would otherwise vary between runs).
+    fn score_all(&self, query: &str) -> Vec<Bm25Hit> {
         let query_terms = tokenize(query);
         if query_terms.is_empty() {
             return Vec::new();
@@ -323,8 +340,10 @@ impl Bm25Index {
             .into_iter()
             .map(|(doc_id, score)| Bm25Hit { doc_id, score })
             .collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-        hits.truncate(top_k);
+        // Deterministic total order: score DESC, ties broken by doc_id ASC.
+        hits.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score).unwrap().then(a.doc_id.cmp(&b.doc_id))
+        });
         hits
     }
 

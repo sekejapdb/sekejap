@@ -10,10 +10,9 @@
 //! class as the offset index raw storage already depends on). Losing it costs
 //! column *labels*, never *data*.
 //!
-//! Optional per-field zstd (opt-in): long string values can be zstd-compressed
-//! *in place* (tag [`T_ZSTR`]). This is SELF-CONTAINED — zstd is self-describing,
-//! so a compressed value needs no shared dictionary or symbol table. Corruption
-//! isolation stays 1-record, and there is still zero user data in shared state.
+//! Strings are stored literally. (A retired per-field zstd string tag, `T_ZSTR`,
+//! is still recognized on decode only, where it fails loudly — see below — so a
+//! record from the removed `payload_zstd` feature can never be mis-decoded.)
 //!
 //! Stored record layout: `[0x02][crc32 of body, LE u32][body]`. A CRC mismatch
 //! on read fails that one record — corruption is detected, never silently served.
@@ -22,8 +21,9 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-/// First byte of a SKBIN record. Raw JSON starts with `{` (0x7B) and legacy
-/// zstd records with 0x01, so all three coexist in one store with zero migration.
+/// First byte of a SKBIN record. Raw JSON starts with `{` (0x7B); a retired zstd
+/// record starts with 0x01 (recognized only to reject it), so all coexist with
+/// zero migration.
 ///
 /// The first byte IS the format version namespace: `0x02` = SKBIN v1 (this
 /// format). A future incompatible layout takes a NEW first byte (`0x03` = v2, …),
@@ -43,13 +43,7 @@ const T_UINT: u8 = 5;  // plain varint (u64 > i64::MAX)
 const T_STR: u8 = 6;   // varint len + utf8 bytes (literal)
 const T_ARR: u8 = 7;   // varint count + values
 const T_OBJ: u8 = 8;   // varint count + [varint field_id, value]*
-const T_ZSTR: u8 = 11; // per-field zstd string: varint ulen + varint zlen + zstd bytes (self-contained)
-
-/// Only strings at least this long are considered for per-field zstd. Short
-/// strings never shrink under zstd's framing overhead, so they stay literal.
-const ZSTD_MIN_LEN: usize = 64;
-/// zstd level for per-field string compression (fast, good ratio on text).
-const ZSTD_LEVEL: i32 = 3;
+const T_ZSTR: u8 = 11; // RETIRED per-field zstd string; recognized on decode only (fails loudly)
 
 /// Shared field-name table: `field_id <-> name`. IDs are append-only and never
 /// reused, so a record encoded at any time decodes against any later table.
@@ -194,12 +188,10 @@ fn unzig(v: u64) -> i64 {
 // ── encode ──────────────────────────────────────────────────────────────────
 
 /// Encode a JSON value to a framed SKBIN record: `[0x02][crc32][body]`.
-/// New field names are interned into `ft`. When `zstd` is true, string values
-/// at least [`ZSTD_MIN_LEN`] bytes are zstd-compressed in place (each
-/// independently — no shared dictionary, per-string random access).
-pub fn encode(v: &Value, ft: &mut FieldTable, zstd: bool) -> Vec<u8> {
+/// New field names are interned into `ft`. Strings are stored literally.
+pub fn encode(v: &Value, ft: &mut FieldTable) -> Vec<u8> {
     let mut body = Vec::new();
-    enc_value(v, ft, zstd, &mut body);
+    enc_value(v, ft, &mut body);
     let crc = crc32fast::hash(&body);
     let mut out = Vec::with_capacity(body.len() + 5);
     out.push(TAG_SKBIN);
@@ -208,7 +200,7 @@ pub fn encode(v: &Value, ft: &mut FieldTable, zstd: bool) -> Vec<u8> {
     out
 }
 
-fn enc_value(v: &Value, ft: &mut FieldTable, zstd: bool, o: &mut Vec<u8>) {
+fn enc_value(v: &Value, ft: &mut FieldTable, o: &mut Vec<u8>) {
     match v {
         Value::Null => o.push(T_NULL),
         Value::Bool(false) => o.push(T_FALSE),
@@ -225,12 +217,12 @@ fn enc_value(v: &Value, ft: &mut FieldTable, zstd: bool, o: &mut Vec<u8>) {
                 o.extend_from_slice(&n.as_f64().unwrap().to_le_bytes());
             }
         }
-        Value::String(s) => enc_string(s, zstd, o),
+        Value::String(s) => enc_string(s, o),
         Value::Array(a) => {
             o.push(T_ARR);
             put_uv(o, a.len() as u64);
             for e in a {
-                enc_value(e, ft, zstd, o);
+                enc_value(e, ft, o);
             }
         }
         Value::Object(m) => {
@@ -238,40 +230,17 @@ fn enc_value(v: &Value, ft: &mut FieldTable, zstd: bool, o: &mut Vec<u8>) {
             put_uv(o, m.len() as u64);
             for (k, val) in m {
                 put_uv(o, ft.intern(k) as u64);
-                enc_value(val, ft, zstd, o);
+                enc_value(val, ft, o);
             }
         }
     }
 }
 
-/// Emit a string, zstd-compressing it in place only when enabled, long enough,
-/// and the compressed form (plus its length prefixes) is actually smaller.
-fn enc_string(s: &str, zstd: bool, o: &mut Vec<u8>) {
-    if zstd && s.len() >= ZSTD_MIN_LEN {
-        if let Ok(z) = zstd::bulk::compress(s.as_bytes(), ZSTD_LEVEL) {
-            // budget the two varints; only take zstd if it still wins.
-            if z.len() + uv_len(s.len() as u64) + uv_len(z.len() as u64) + 1 < s.len() + 1 {
-                o.push(T_ZSTR);
-                put_uv(o, s.len() as u64); // uncompressed len (decompress capacity)
-                put_uv(o, z.len() as u64); // compressed len
-                o.extend_from_slice(&z);
-                return;
-            }
-        }
-    }
+/// Emit a string literally (`T_STR`).
+fn enc_string(s: &str, o: &mut Vec<u8>) {
     o.push(T_STR);
     put_uv(o, s.len() as u64);
     o.extend_from_slice(s.as_bytes());
-}
-
-/// Byte length of a varint-encoded value (for the size budget above).
-fn uv_len(mut v: u64) -> usize {
-    let mut n = 1;
-    while v >= 0x80 {
-        v >>= 7;
-        n += 1;
-    }
-    n
 }
 
 // ── decode ──────────────────────────────────────────────────────────────────
@@ -330,16 +299,11 @@ fn dec_value(b: &[u8], p: &mut usize, ft: &FieldTable) -> Option<Value> {
             *p += l;
             Value::String(s)
         }
-        T_ZSTR => {
-            let ulen = get_uv(b, p)? as usize;
-            let zlen = get_uv(b, p)? as usize;
-            if *p + zlen > b.len() {
-                return None;
-            }
-            let bytes = zstd::bulk::decompress(&b[*p..*p + zlen], ulen).ok()?;
-            *p += zlen;
-            Value::String(String::from_utf8(bytes).ok()?)
-        }
+        // Retired per-field zstd string. zstd was removed from the payload path;
+        // a record carrying this tag can only come from a DB that opted into the
+        // now-deleted `payload_zstd` feature. Fail the decode loudly (None →
+        // surfaced as a decode error) rather than silently returning wrong data.
+        T_ZSTR => return None,
         T_ARR => {
             let n = get_uv(b, p)? as usize;
             let mut a = Vec::with_capacity(n);
@@ -406,14 +370,9 @@ fn skip_value(b: &[u8], p: &mut usize) -> Option<()> {
             }
             *p += l;
         }
-        T_ZSTR => {
-            let _ulen = get_uv(b, p)?;
-            let zlen = get_uv(b, p)? as usize;
-            if *p + zlen > b.len() {
-                return None;
-            }
-            *p += zlen;
-        }
+        // Retired per-field zstd string (see decode). A record with this tag is
+        // from the removed `payload_zstd` feature — fail loudly, never skip-past.
+        T_ZSTR => return None,
         T_ARR => {
             let n = get_uv(b, p)? as usize;
             for _ in 0..n {
@@ -439,7 +398,7 @@ mod tests {
 
     fn roundtrip(v: Value) {
         let mut ft = FieldTable::new();
-        let rec = encode(&v, &mut ft, false);
+        let rec = encode(&v, &mut ft);
         assert_eq!(rec[0], TAG_SKBIN);
         let back = decode(&rec, &ft).expect("decode");
         assert_eq!(back, v, "roundtrip mismatch");
@@ -476,8 +435,8 @@ mod tests {
     #[test]
     fn field_table_persists_and_ids_stay_stable() {
         let mut ft = FieldTable::new();
-        let r1 = encode(&json!({"a":1,"b":2}), &mut ft, false);
-        let r2 = encode(&json!({"b":9,"c":"x"}), &mut ft, false); // c is new
+        let r1 = encode(&json!({"a":1,"b":2}), &mut ft);
+        let r2 = encode(&json!({"b":9,"c":"x"}), &mut ft); // c is new
         let bytes = ft.to_bytes();
         let ft2 = FieldTable::from_bytes(&bytes).unwrap();
         // records decode against the reloaded table identically
@@ -488,7 +447,7 @@ mod tests {
     #[test]
     fn skip_scan_field_access() {
         let mut ft = FieldTable::new();
-        let rec = encode(&json!({"a":1,"status":"paid","big":[1,2,3],"z":9.5}), &mut ft, false);
+        let rec = encode(&json!({"a":1,"status":"paid","big":[1,2,3],"z":9.5}), &mut ft);
         assert_eq!(get_field(&rec, "status", &ft), Some(json!("paid")));
         assert_eq!(get_field(&rec, "z", &ft), Some(json!(9.5)));
         assert_eq!(get_field(&rec, "a", &ft), Some(json!(1)));
@@ -496,29 +455,9 @@ mod tests {
     }
 
     #[test]
-    fn per_field_zstd_roundtrips_and_shrinks() {
-        // a long, compressible string field triggers T_ZSTR; short ones stay literal.
-        let body: String = std::iter::repeat("the quick brown fox jumps over the lazy dog. ")
-            .take(60)
-            .collect();
-        let v = json!({"_key":"p1","status":"ok","body": body});
-        let mut ft = FieldTable::new();
-        let literal = encode(&v, &mut ft, false);
-        let mut ft2 = FieldTable::new();
-        let compressed = encode(&v, &mut ft2, true);
-        assert!(compressed.len() < literal.len(), "zstd record must be smaller");
-        // both decode identically
-        assert_eq!(decode(&literal, &ft).unwrap(), v);
-        assert_eq!(decode(&compressed, &ft2).unwrap(), v);
-        // skip-scan still reads the short field and the compressed field
-        assert_eq!(get_field(&compressed, "status", &ft2), Some(json!("ok")));
-        assert_eq!(get_field(&compressed, "body", &ft2), Some(json!(body)));
-    }
-
-    #[test]
     fn corruption_is_detected_not_served() {
         let mut ft = FieldTable::new();
-        let mut rec = encode(&json!({"amount":100,"note":"ok"}), &mut ft, false);
+        let mut rec = encode(&json!({"amount":100,"note":"ok"}), &mut ft);
         // flip a byte in the body → CRC must catch it
         let last = rec.len() - 1;
         rec[last] ^= 0xff;
@@ -528,7 +467,7 @@ mod tests {
     #[test]
     fn truncation_is_rejected() {
         let mut ft = FieldTable::new();
-        let rec = encode(&json!({"a":"hello there"}), &mut ft, false);
+        let rec = encode(&json!({"a":"hello there"}), &mut ft);
         assert!(decode(&rec[..rec.len() - 3], &ft).is_none());
     }
 
@@ -605,7 +544,7 @@ mod tests {
         ];
         for v in records {
             let mut ft = FieldTable::new();
-            let rec = encode(&v, &mut ft, false);
+            let rec = encode(&v, &mut ft);
             for i in 0..rec.len() {
                 for bit in 0..8u8 {
                     let mut bad = rec.clone();
@@ -626,7 +565,7 @@ mod tests {
     fn truncation_at_every_length_returns_none() {
         let v = json!({"_collection":"c","_key":"k","qty":7,"status":"shipped","note":"padding padding padding"});
         let mut ft = FieldTable::new();
-        let rec = encode(&v, &mut ft, false);
+        let rec = encode(&v, &mut ft);
         // Every proper prefix must be rejected cleanly (no panic, no wrong value).
         for len in 0..rec.len() {
             assert!(decode(&rec[..len], &ft).is_none(), "truncated to {len} must not decode");
@@ -642,7 +581,7 @@ mod tests {
         // gracefully (unknown id → None), not panic or fabricate a field.
         let v = json!({"alpha":1,"beta":"two","gamma":[1,2,3]});
         let mut ft = FieldTable::new();
-        let rec = encode(&v, &mut ft, false);
+        let rec = encode(&v, &mut ft);
         let empty = FieldTable::new();
         assert!(decode(&rec, &empty).is_none(), "unknown field id must yield None");
         let mut s = 0x1234_5678u64;

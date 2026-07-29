@@ -40,7 +40,7 @@ pub mod vector;
 pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
 
 pub use query::{CmpOp, DestWhere, Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step, WhereValue, WithExpr, WithOutExpr, WithRow, WithStage};
-pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, FieldDef, FieldType, SqlError, TableSchema};
+pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, FieldDef, FieldType, PreparedQuery, SqlError, TableSchema};
 pub use storage::edgestore::EdgeMode;
 pub use storage::wal::WalFormat;
 
@@ -177,11 +177,6 @@ pub(crate) fn sk_hash(s: &str) -> u64 {
 /// bytes on disk and out of RAM. Only `NodeData` metadata (≈ 100 B per node)
 /// stays in the `HashMap`.
 pub(crate) struct PayloadStore {
-    /// Compress new records (zstd + first-byte tag). Read side always
-    /// auto-detects per record, so mixed files and legacy raw files need no
-    /// migration. Records > PAYLOAD_COMPRESS_MAX stay raw (preserves the
-    /// head/tail extraction fast paths for huge payloads).
-    compress: bool,
     /// When true, records are re-encoded as SKBIN (binary) at compaction.
     /// Incremental writes always stay raw JSON (hot/greppable); compaction is
     /// where we own the field table and can encode the cold bulk.
@@ -191,10 +186,6 @@ pub(crate) struct PayloadStore {
     /// superset table written before a payload swap never mis-decodes old
     /// records. Empty when no SKBIN records exist.
     field_table: storage::skbin::FieldTable,
-    /// zstd-compress long SKBIN string values in place at compaction (opt-in).
-    /// Self-contained per value (no shared dictionary), so 1-record isolation and
-    /// "no user data in shared state" both hold. Off keeps strings literal.
-    zstd_strings: bool,
     inner: PayloadInner,
 }
 
@@ -228,40 +219,28 @@ const FIELD_TABLE_COPIES: [&str; 3] =
 /// only taken for records above `FAST_PATH_THRESHOLD` (64 KB). Keeping the two
 /// thresholds equal preserves that invariant.
 const PAYLOAD_COMPRESS_MAX: usize = 64 * 1024;
-/// First-byte tag for a zstd-compressed record. Raw JSON records always start
-/// with `{` (0x7B), so legacy files auto-detect with zero migration.
+/// First-byte tag of a RETIRED whole-record zstd payload. zstd was removed from
+/// the payload path; this tag is now recognized only to reject such a record
+/// loudly (it cannot be decoded) rather than byte-searching its compressed bytes.
+/// Raw JSON starts with `{` (0x7B), SKBIN with `0x02`.
 const PAYLOAD_TAG_ZSTD: u8 = 0x01;
 
-/// Encode one record for storage under the given policy. Compressed output is
-/// used only when it actually shrinks the record.
-fn encode_payload_record(bytes: &[u8], compress: bool) -> std::borrow::Cow<'_, [u8]> {
-    if compress && bytes.len() <= PAYLOAD_COMPRESS_MAX && bytes.first() == Some(&b'{') {
-        if let Ok(mut z) = zstd::bulk::compress(bytes, 3) {
-            if z.len() + 1 < bytes.len() {
-                let mut out = Vec::with_capacity(z.len() + 1);
-                out.push(PAYLOAD_TAG_ZSTD);
-                out.append(&mut z);
-                return std::borrow::Cow::Owned(out);
-            }
-        }
-    }
-    std::borrow::Cow::Borrowed(bytes)
-}
-
-/// Decode a stored record: zstd-tagged records decompress; anything starting
-/// with `{` is raw JSON (legacy or above-threshold).
+/// Decode a stored record. Raw JSON starts with `{`; SKBIN with `0x02`; both
+/// pass through here unchanged (the SKBIN body is decoded downstream). A `0x01`
+/// tag is a RETIRED whole-record zstd payload — zstd was removed from the
+/// payload path, so such a record can only come from a DB that opted into the
+/// now-deleted `payload_compression` feature. Return `None` (a loud decode
+/// failure) rather than silently mis-serving it.
 fn decode_payload_record(stored: Vec<u8>) -> Option<Vec<u8>> {
     match stored.first() {
-        Some(&PAYLOAD_TAG_ZSTD) => {
-            zstd::bulk::decompress(&stored[1..], PAYLOAD_COMPRESS_MAX * 4).ok()
-        }
+        Some(&PAYLOAD_TAG_ZSTD) => None,
         _ => Some(stored),
     }
 }
 
 impl PayloadStore {
     fn new() -> Self {
-        Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), zstd_strings: false, inner: PayloadInner::Memory { data: Vec::new() } }
+        Self { binary: false, field_table: storage::skbin::FieldTable::new(), inner: PayloadInner::Memory { data: Vec::new() } }
     }
 
     /// Open (or create) a disk-backed store, truncating to zero.
@@ -272,7 +251,7 @@ impl PayloadStore {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), zstd_strings: false, inner: PayloadInner::Disk {
+        Ok(Self { binary: false, field_table: storage::skbin::FieldTable::new(), inner: PayloadInner::Disk {
             file,
             total_len: 0,
             #[cfg(unix)]
@@ -288,7 +267,7 @@ impl PayloadStore {
             .open(path)?;
         #[cfg(unix)]
         let mmap = MmapView::try_new(&file, total_len as usize);
-        Ok(Self { compress: false, binary: false, field_table: storage::skbin::FieldTable::new(), zstd_strings: false, inner: PayloadInner::Disk {
+        Ok(Self { binary: false, field_table: storage::skbin::FieldTable::new(), inner: PayloadInner::Disk {
             file,
             total_len,
             #[cfg(unix)]
@@ -312,9 +291,9 @@ impl PayloadStore {
             budget,
         )?;
         Ok(Self {
-            compress: false, // remote store is read-only; records self-describe
+            // remote store is read-only; records self-describe
             binary: false,
-            field_table: storage::skbin::FieldTable::new(), zstd_strings: false,
+            field_table: storage::skbin::FieldTable::new(),
             inner: PayloadInner::Remote {
                 cache: std::sync::Mutex::new(cache),
             },
@@ -328,8 +307,6 @@ impl PayloadStore {
     /// Append raw bytes; returns `(offset, len)`.
     /// Panics on disk write failure (disk-full etc.) — callers do not recover.
     fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
-        let stored = encode_payload_record(bytes, self.compress);
-        let bytes: &[u8] = &stored;
         match &mut self.inner {
             PayloadInner::Memory { data } => {
                 let offset = data.len() as u64;
@@ -364,12 +341,6 @@ impl PayloadStore {
 
     fn append_batch(&mut self, items: &[&[u8]]) -> Vec<(u64, u32)> {
         if items.is_empty() { return vec![]; }
-        let encoded: Vec<std::borrow::Cow<'_, [u8]>> = items
-            .iter()
-            .map(|b| encode_payload_record(b, self.compress))
-            .collect();
-        let items: Vec<&[u8]> = encoded.iter().map(|c| c.as_ref()).collect();
-        let items = items.as_slice();
         match &mut self.inner {
             PayloadInner::Memory { data } => {
                 items.iter().map(|bytes| {
@@ -413,7 +384,8 @@ impl PayloadStore {
 
     /// Decode the payload at the given position to a `Value` — the hot path for
     /// the query engine. SKBIN records decode DIRECTLY to `Value` (binary decode,
-    /// no JSON round-trip — faster than parsing text); raw/zstd records parse.
+    /// no JSON round-trip — faster than parsing text); raw JSON records parse; a
+    /// retired `0x01` zstd record yields `None`.
     fn get(&self, offset: u64, len: u32) -> Option<Value> {
         let stored = self.get_raw_at(offset, len as usize)?;
         if storage::skbin::is_skbin(&stored) {
@@ -423,9 +395,9 @@ impl PayloadStore {
     }
 
     /// Return raw JSON bytes at the given position (owned copy), transparently
-    /// decoding SKBIN and decompressing zstd-tagged records. Dispatch is by the
-    /// record's first byte (`0x02` SKBIN, `0x01` zstd, `{` raw) so mixed files
-    /// need no migration.
+    /// decoding SKBIN. Dispatch is by the record's first byte (`0x02` SKBIN,
+    /// `{` raw JSON, `0x01` = retired zstd → `None`) so mixed files need no
+    /// migration.
     pub(crate) fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
         let stored = self.get_raw_at(offset, len as usize)?;
         if storage::skbin::is_skbin(&stored) {
@@ -711,23 +683,11 @@ pub struct Config {
     /// Run a final `compact()` when the database is dropped (only if the WAL is
     /// non-trivial). Off by default — drops should not stall unexpectedly.
     pub compact_on_close: bool,
-    /// Compress payload records with zstd (first-byte tag; records > 64 KB stay
-    /// raw so large-payload fast paths keep working). Read side auto-detects per
-    /// record — mixed/legacy files need no migration; `compact()` transcodes the
-    /// whole store to the current setting. Default off pending the read-latency
-    /// gate (see benchmarks).
-    pub payload_compression: bool,
     /// Re-encode payloads as SKBIN (schema-aware binary) at compaction: field
     /// names → IDs, typed values, strings literal. ~1.6× smaller, faster field
     /// reads, 1-record corruption isolation (values never leave their record).
-    /// Incremental writes stay raw JSON until the next `compact()`. Default off.
+    /// Incremental writes stay raw JSON until the next `compact()`. Default on.
     pub payload_binary: bool,
-    /// On top of `payload_binary`, zstd-compress long SKBIN string values in
-    /// place at compaction. Self-contained per value (no shared dictionary or
-    /// symbol table), so corruption isolation stays 1-record and no user data
-    /// enters shared state. Big win on long text (article bodies, geometry);
-    /// short strings stay literal. Requires `payload_binary`. Default off.
-    pub payload_zstd: bool,
     /// **Experimental.** Serve topology (nodes + edges) from the mmap'd files
     /// written at `compact()` instead of loading it into RAM. The OS page cache
     /// keeps the hot working set resident and pages the rest — topology size is
@@ -751,14 +711,12 @@ impl Default for Config {
             auto_compact: AutoCompact::OnWrite,
             compact_thresholds: CompactThresholds::default(),
             compact_on_close: false,
-            payload_compression: false,
             // SKBIN Level-1 is the official default payload format: schema-aware
             // binary (~1.2–2x smaller on structured data, faster field reads,
             // 1-record corruption isolation, zero user data in shared state).
             // Fuzzed decoder, integrated across DML/DDL + resident/paged. Set
             // false for legacy raw-JSON payloads.
             payload_binary: true,
-            payload_zstd: false,
             paged_topology: false,
         }
     }
@@ -951,9 +909,8 @@ impl CoreDB {
 
         let mut db = Self::new();
         db.payload_store = PayloadStore {
-            compress: false,
             binary: false,
-            field_table: storage::skbin::FieldTable::new(), zstd_strings: false,
+            field_table: storage::skbin::FieldTable::new(),
             inner: PayloadInner::Remote {
                 cache: std::sync::Mutex::new(block_cache),
             },
@@ -1151,9 +1108,7 @@ impl CoreDB {
         } else {
             db.payload_store = PayloadStore::open_file(&pay_path)?;
         }
-        db.payload_store.compress = config.payload_compression;
         db.payload_store.binary = config.payload_binary;
-        db.payload_store.zstd_strings = config.payload_zstd;
         // Load the SKBIN field table if a prior compaction wrote one. Try each
         // redundant copy in turn; the first that passes its CRC wins (a corrupt
         // primary is recovered from a backup). Absent → no SKBIN records yet.
@@ -2947,10 +2902,6 @@ impl CoreDB {
             let mut node_new_offsets: Vec<(u64, u64, u32)> = Vec::new(); // (hash, off, len)
             let mut write_cursor = 0u64;
 
-            // Per-field zstd for this compaction: long string values are
-            // compressed in place (each independently — no shared dictionary, so
-            // 1-record isolation and "no user data in shared state" both hold).
-            let zstd_strings = self.payload_store.zstd_strings;
             {
                 #[cfg(unix)]
                 {
@@ -2973,14 +2924,11 @@ impl CoreDB {
                             {
                                 match serde_json::from_slice::<Value>(&bytes) {
                                     Ok(v) => storage::skbin::encode(
-                                        &v, &mut self.payload_store.field_table,
-                                        zstd_strings),
-                                    Err(_) => encode_payload_record(
-                                        &bytes, self.payload_store.compress).into_owned(),
+                                        &v, &mut self.payload_store.field_table),
+                                    Err(_) => bytes, // not valid JSON → store raw
                                 }
                             } else {
-                                encode_payload_record(
-                                    &bytes, self.payload_store.compress).into_owned()
+                                bytes // huge or non-binary → store raw JSON
                             };
                             tmp_file.write_all_at(&stored, write_cursor)?;
                             node_new_offsets.push((h, write_cursor, stored.len() as u32));
@@ -3011,14 +2959,10 @@ impl CoreDB {
             }
             // Atomically replace file, then reopen (preserving policy + table).
             std::fs::rename(&pay_tmp, &pay_path)?;
-            let keep_compress = self.payload_store.compress;
             let keep_binary = self.payload_store.binary;
-            let keep_zstd = self.payload_store.zstd_strings;
             let keep_ft = std::mem::take(&mut self.payload_store.field_table);
             self.payload_store = PayloadStore::open_existing(&pay_path, write_cursor)?;
-            self.payload_store.compress = keep_compress;
             self.payload_store.binary = keep_binary;
-            self.payload_store.zstd_strings = keep_zstd;
             self.payload_store.field_table = keep_ft;
         } else {
             // Memory DB: rebuild Vec<u8> without touching disk.
@@ -3680,8 +3624,8 @@ impl CoreDB {
         if storage::skbin::is_skbin(stored) {
             storage::skbin::get_field(stored, field, &self.payload_store.field_table)
         } else if stored.first() == Some(&PAYLOAD_TAG_ZSTD) {
-            // Whole-record zstd: decompress before byte-search (else the search
-            // scans compressed bytes and finds nothing).
+            // Retired whole-record zstd (0x01): decode_payload_record returns None,
+            // so this yields nothing rather than byte-searching compressed bytes.
             let raw = decode_payload_record(stored.to_vec())?;
             let fq = [field.to_string()];
             query::extract_fields_by_search(&raw, &fq).remove(field)
@@ -3712,7 +3656,8 @@ impl CoreDB {
             }
             m
         } else if stored.first() == Some(&PAYLOAD_TAG_ZSTD) {
-            // Whole-record zstd: decompress before byte-search.
+            // Retired whole-record zstd (0x01): can't decode → yield no fields
+            // (never byte-search the compressed bytes).
             match decode_payload_record(stored.to_vec()) {
                 Some(raw) => query::extract_fields_by_search(&raw, fields),
                 None => serde_json::Map::new(),
@@ -4182,27 +4127,53 @@ impl CoreDB {
     /// assert_eq!(hits[0].slug, "alice");
     /// ```
     pub fn query(&self, sql: &str) -> Result<Set<'_>, SqlError> {
-        match sql::parse_match_or_agg(sql)? {
-            sql::MatchOrAgg::Agg(stmt) => {
-                let hits = query::execute_match_agg(self, stmt);
-                Ok(Set::from_hits(self, hits))
-            }
+        Ok(self.run_plan(sql::parse_match_or_agg(sql)?))
+    }
+
+    /// Execute an already-parsed plan. Shared by `query`, `query_params`, and the
+    /// prepared-statement path so all three run identically.
+    fn run_plan(&self, plan: sql::MatchOrAgg) -> Set<'_> {
+        match plan {
+            sql::MatchOrAgg::Agg(stmt) => Set::from_hits(self, query::execute_match_agg(self, stmt)),
             sql::MatchOrAgg::AggUnion(stmts) => {
-                let hits = query::execute_match_agg_union(self, stmts);
-                Ok(Set::from_hits(self, hits))
+                Set::from_hits(self, query::execute_match_agg_union(self, stmts))
             }
             sql::MatchOrAgg::Shortest(stmt) => {
-                let hits = query::execute_shortest_select(self, stmt);
-                Ok(Set::from_hits(self, hits))
+                Set::from_hits(self, query::execute_shortest_select(self, stmt))
             }
             sql::MatchOrAgg::MultiFrom(stmt) => {
-                let hits = query::execute_multi_from(self, stmt);
-                Ok(Set::from_hits(self, hits))
+                Set::from_hits(self, query::execute_multi_from(self, stmt))
             }
-            sql::MatchOrAgg::Steps(steps) => {
-                Ok(Set::from_steps(self, steps))
-            }
+            sql::MatchOrAgg::Steps(steps) => Set::from_steps(self, steps),
         }
+    }
+
+    /// Compile a query once for repeated execution — a **prepared statement**.
+    /// The SQL is tokenized and validated now; each [`query_prepared`](Self::query_prepared)
+    /// call re-lowers the cached tokens with fresh `$N` parameters, skipping
+    /// re-tokenization. Best for the same query shape run many times (with
+    /// different parameter values). Also the injection-safe way to run user input.
+    ///
+    /// ```
+    /// # use sekejap::CoreDB;
+    /// # use serde_json::json;
+    /// let mut db = CoreDB::new();
+    /// db.put("u/a", r#"{"_collection":"u","_key":"a","age":30}"#).unwrap();
+    /// let stmt = db.prepare("SELECT _key FROM u WHERE age = $1").unwrap();
+    /// let hits = db.query_prepared(&stmt, &[json!(30)]).unwrap().collect();
+    /// assert_eq!(hits.len(), 1);
+    /// ```
+    pub fn prepare(&self, sql: &str) -> Result<sql::PreparedQuery, SqlError> {
+        sql::PreparedQuery::compile(sql)
+    }
+
+    /// Run a [`prepare`](Self::prepare)d query, binding `$1`, `$2`, … to `params`.
+    pub fn query_prepared(
+        &self,
+        prepared: &sql::PreparedQuery,
+        params: &[Value],
+    ) -> Result<Set<'_>, SqlError> {
+        Ok(self.run_plan(prepared.lower(params.to_vec())?))
     }
 
     /// Parameterized SELECT / MATCH query.
@@ -4223,27 +4194,7 @@ impl CoreDB {
     /// assert_eq!(hits[0].slug, "users/alice");
     /// ```
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Set<'_>, SqlError> {
-        match sql::parse_match_or_agg_params(sql, params.to_vec())? {
-            sql::MatchOrAgg::Agg(stmt) => {
-                let hits = query::execute_match_agg(self, stmt);
-                Ok(Set::from_hits(self, hits))
-            }
-            sql::MatchOrAgg::AggUnion(stmts) => {
-                let hits = query::execute_match_agg_union(self, stmts);
-                Ok(Set::from_hits(self, hits))
-            }
-            sql::MatchOrAgg::Shortest(stmt) => {
-                let hits = query::execute_shortest_select(self, stmt);
-                Ok(Set::from_hits(self, hits))
-            }
-            sql::MatchOrAgg::MultiFrom(stmt) => {
-                let hits = query::execute_multi_from(self, stmt);
-                Ok(Set::from_hits(self, hits))
-            }
-            sql::MatchOrAgg::Steps(steps) => {
-                Ok(Set::from_steps(self, steps))
-            }
-        }
+        Ok(self.run_plan(sql::parse_match_or_agg_params(sql, params.to_vec())?))
     }
 
     /// `EXPLAIN SELECT ...` — return the query plan as result rows.
@@ -7348,117 +7299,7 @@ mod hybrid_query_tests {
         assert_eq!(paged.query("SELECT * FROM place").unwrap().collect().len(), 2);
     }
 
-    #[test]
-    fn payload_compression_roundtrips_and_shrinks() {
-        let dir = tempfile::tempdir().unwrap();
-        // Pure whole-record zstd (SKBIN is now the default, so disable it here to
-        // exercise the payload_compression path in isolation).
-        let cfg = Config { payload_compression: true, payload_binary: false, ..Config::default() };
-        let body = "Uluwatu temple sunset ".repeat(30); // compressible text
-        {
-            let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
-            for i in 0..50 {
-                db.put(&format!("place/p{i}"),
-                    &format!(r#"{{"_collection":"place","_key":"p{i}","score":{i},"desc":"{body}"}}"#)).unwrap();
-            }
-            db.link("place/p0", "place/p1", "near");
-            db.compact().unwrap();
-        }
-        let compressed_size = std::fs::metadata(dir.path().join("payloads.bin")).unwrap().len();
-
-        // Reopen (compressed store) — reads decode transparently; queries intact.
-        {
-            let db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
-            let p: Value = serde_json::from_str(&db.get("place/p7").unwrap()).unwrap();
-            assert!(p["desc"].as_str().unwrap().starts_with("Uluwatu temple"));
-            assert_eq!(db.query("SELECT * FROM place WHERE score > 40").unwrap().collect().len(), 9);
-            let hits = db.query(
-                "SELECT b._key AS k FROM MATCH (a:place)-[:near]->(b:place) WHERE a._key='p0'"
-            ).unwrap().collect();
-            assert_eq!(hits[0].payload.as_ref().unwrap()["k"].as_str().unwrap(), "p1");
-        }
-
-        // Same data uncompressed → compare sizes; then reopening WITHOUT the flag
-        // still reads the compressed records (auto-detect) and compact() transcodes
-        // back to raw.
-        let dir2 = tempfile::tempdir().unwrap();
-        {
-            // Explicit RAW baseline (default is now SKBIN) for the size comparison.
-            let mut db = CoreDB::open_with_config(dir2.path(), Config { payload_binary: false, ..Config::default() }).unwrap();
-            for i in 0..50 {
-                db.put(&format!("place/p{i}"),
-                    &format!(r#"{{"_collection":"place","_key":"p{i}","score":{i},"desc":"{body}"}}"#)).unwrap();
-            }
-            db.link("place/p0", "place/p1", "near");
-            db.compact().unwrap();
-        }
-        let raw_size = std::fs::metadata(dir2.path().join("payloads.bin")).unwrap().len();
-        assert!(compressed_size * 2 < raw_size,
-            "compressed store must be at least 2x smaller ({compressed_size} vs {raw_size})");
-
-        let raw_cfg = Config { payload_binary: false, ..Config::default() };
-        {
-            // Reopen with RAW policy (no compression, no SKBIN): auto-detect still
-            // reads the compressed records, and compact() transcodes back to raw.
-            let mut db = CoreDB::open_with_config(dir.path(), raw_cfg.clone()).unwrap();
-            let p: Value = serde_json::from_str(&db.get("place/p3").unwrap()).unwrap();
-            assert_eq!(p["_key"].as_str().unwrap(), "p3", "auto-detect must read compressed records");
-            db.compact().unwrap(); // transcodes to raw under current (off) policy
-        }
-        let transcoded = std::fs::metadata(dir.path().join("payloads.bin")).unwrap().len();
-        assert!(transcoded > compressed_size * 2, "compact without flag must transcode back to raw");
-        let db = CoreDB::open_with_config(dir.path(), raw_cfg).unwrap();
-        assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 50);
-    }
-
-    #[test]
-    fn skbin_zstd_strings_roundtrip_shrink_and_recover() {
-        // Records with a long, compressible text body → per-field zstd (T_ZSTR).
-        let dir_bin = tempfile::tempdir().unwrap();
-        let dir_zst = tempfile::tempdir().unwrap();
-        let long = |i: usize| {
-            let body: String = std::iter::repeat(format!("document {i} processed at the facility. "))
-                .take(40).collect();
-            format!(r#"{{"_collection":"docs","_key":"d{i:05}","status":"shipped","body":"{body}"}}"#)
-        };
-        let build = |dir: &std::path::Path, zstd: bool| {
-            let cfg = Config { payload_binary: true, payload_zstd: zstd, ..Config::default() };
-            let mut before: Vec<Value> = Vec::new();
-            {
-                let mut db = CoreDB::open_with_config(dir, cfg.clone()).unwrap();
-                for i in 0..80 { db.put(&format!("docs/d{i:05}"), &long(i)).unwrap(); }
-                for i in 0..80 { before.push(serde_json::from_str(&db.get(&format!("docs/d{i:05}")).unwrap()).unwrap()); }
-                db.compact().unwrap();
-            }
-            // Reopen: every record decodes back byte-identical, filters work.
-            let db = CoreDB::open_with_config(dir, cfg).unwrap();
-            for i in 0..80 {
-                let got: Value = serde_json::from_str(&db.get(&format!("docs/d{i:05}")).unwrap()).unwrap();
-                assert_eq!(got, before[i], "record {i} must roundtrip (zstd={zstd})");
-            }
-            assert_eq!(db.query("SELECT _key FROM docs WHERE status = 'shipped'").unwrap().collect().len(), 80);
-            std::fs::metadata(dir.join("payloads.bin")).unwrap().len()
-        };
-        let plain = build(dir_bin.path(), false);
-        let zsize = build(dir_zst.path(), true);
-        assert!(zsize < plain, "per-field zstd must shrink payloads.bin ({zsize} < {plain})");
-
-        // No fsst symbol table is ever written — zstd values are self-contained.
-        assert!(!dir_zst.path().join("fsst_table.bin").exists(), "no shared symbol table for zstd");
-        // Corrupt the primary field table → reopen still recovers from a backup.
-        {
-            let p = dir_zst.path().join("field_table.bin");
-            let mut b = std::fs::read(&p).unwrap();
-            let last = b.len() - 1; b[last] ^= 0xff;
-            std::fs::write(&p, &b).unwrap();
-            let cfg = Config { payload_binary: true, payload_zstd: true, ..Config::default() };
-            let db = CoreDB::open_with_config(dir_zst.path(), cfg).unwrap();
-            let v: Value = serde_json::from_str(&db.get("docs/d00042").unwrap()).unwrap();
-            assert_eq!(v["_key"], "d00042", "must recover from a backup field-table copy");
-        }
-    }
-
-    #[test]
+#[test]
     fn skbin_field_table_recovers_from_corrupt_primary_copy() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config { payload_binary: true, ..Config::default() };

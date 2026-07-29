@@ -1,4 +1,4 @@
-//! Real-dataset payload benchmark: normal (raw JSON) vs SKBIN vs SKBIN+zstd.
+//! Real-dataset payload benchmark: normal (raw JSON) vs SKBIN.
 //! Loads records ONCE, ingests them into three identically-built DBs under
 //! different payload policies, then reports on-disk size + query latency.
 //!
@@ -55,20 +55,17 @@ fn load(mode: &str, path: &str, coll: &str, limit: usize) -> Vec<(String, String
     out
 }
 
-/// Policy triple: (skbin, per-field zstd on strings, whole-record zstd).
-type Policy = (bool, bool, bool);
-const NORMAL: Policy = (false, false, false);
-const SKBIN: Policy = (true, false, false);
-const SKBIN_ZSTD: Policy = (true, true, false);   // per-field zstd on long strings
-const RAW_ZSTD: Policy = (false, false, true);     // whole-record zstd (compresses numbers too)
+/// Whether payloads are stored as SKBIN (true) or raw JSON (false).
+type Policy = bool;
+const NORMAL: Policy = false;
+const SKBIN: Policy = true;
 
-fn cfg_of((binary, zstd, whole): Policy) -> Config {
-    Config { payload_binary: binary, payload_zstd: zstd, payload_compression: whole, ..Config::default() }
+fn cfg_of(binary: Policy) -> Config {
+    Config { payload_binary: binary, ..Config::default() }
 }
 
-fn cfg_paged((binary, zstd, whole): Policy) -> Config {
-    Config { payload_binary: binary, payload_zstd: zstd, payload_compression: whole,
-             paged_topology: true, ..Config::default() }
+fn cfg_paged(binary: Policy) -> Config {
+    Config { payload_binary: binary, paged_topology: true, ..Config::default() }
 }
 
 /// Time a query opened in PAGED mode (topology served from the mmap base — the
@@ -104,7 +101,7 @@ fn main() {
     let limit = env("LIMIT").and_then(|v| v.parse().ok()).unwrap_or(15_000);
     let filter = env("FILTER");
 
-    println!("== payload benchmark: normal vs SKBIN vs SKBIN+zstd ==");
+    println!("== payload benchmark: normal (raw JSON) vs SKBIN ==");
     println!("dataset={path}\n  mode={mode} collection={coll} limit={limit}");
 
     let recs = load(&mode, &path, &coll, limit);
@@ -114,21 +111,15 @@ fn main() {
 
     let d_raw = tempfile::tempdir().unwrap();
     let d_bin = tempfile::tempdir().unwrap();
-    let d_zst = tempfile::tempdir().unwrap();
-    let d_wz  = tempfile::tempdir().unwrap();
-    print!("  building normal…");           build(d_raw.path(), &recs, NORMAL);     println!(" done");
-    print!("  building SKBIN…");            build(d_bin.path(), &recs, SKBIN);      println!(" done");
-    print!("  building SKBIN+zstd…");       build(d_zst.path(), &recs, SKBIN_ZSTD); println!(" done");
-    print!("  building raw+zstd(whole)…");  build(d_wz.path(),  &recs, RAW_ZSTD);   println!(" done");
+    print!("  building normal…");  build(d_raw.path(), &recs, NORMAL); println!(" done");
+    print!("  building SKBIN…");   build(d_bin.path(), &recs, SKBIN);  println!(" done");
 
     let ps = |d: &std::path::Path| std::fs::metadata(d.join("payloads.bin")).unwrap().len();
-    let (praw, pbin, pzst, pwz) = (ps(d_raw.path()), ps(d_bin.path()), ps(d_zst.path()), ps(d_wz.path()));
+    let (praw, pbin) = (ps(d_raw.path()), ps(d_bin.path()));
 
     println!("\n[SIZE] payloads.bin");
     println!("  normal              {:>8.1} MB   1.00x", mb(praw));
     println!("  SKBIN               {:>8.1} MB   {:.2}x", mb(pbin), praw as f64 / pbin as f64);
-    println!("  SKBIN+zstd(strings) {:>8.1} MB   {:.2}x", mb(pzst), praw as f64 / pzst as f64);
-    println!("  raw+zstd(whole rec) {:>8.1} MB   {:.2}x", mb(pwz),  praw as f64 / pwz  as f64);
 
     let mut queries: Vec<(String, String, usize)> = vec![
         ("full scan (SELECT *)".into(),     format!("SELECT * FROM {coll}"), 3),
@@ -139,17 +130,12 @@ fn main() {
         queries.push((format!("filter (WHERE {f})"), format!("SELECT * FROM {coll} WHERE {f}"), 3));
     }
 
-    println!("\n[SPEED] query latency (ms avg) — normal | SKBIN | SKBIN+zstd | raw+zstd(whole)");
+    println!("\n[SPEED] query latency (ms avg) — normal | SKBIN");
     for (label, sql, reps) in &queries {
-        let (rn, rt) = time_query(d_raw.path(), NORMAL,     sql, *reps);
-        let (bn, bt) = time_query(d_bin.path(), SKBIN,      sql, *reps);
-        let (zn, zt) = time_query(d_zst.path(), SKBIN_ZSTD, sql, *reps);
-        let (wn, wt) = time_query(d_wz.path(),  RAW_ZSTD,   sql, *reps);
+        let (rn, rt) = time_query(d_raw.path(), NORMAL, sql, *reps);
+        let (bn, bt) = time_query(d_bin.path(), SKBIN,  sql, *reps);
         assert_eq!(rn, bn, "SKBIN row mismatch on {sql}");
-        assert_eq!(rn, zn, "zstd row mismatch on {sql}");
-        assert_eq!(rn, wn, "raw+zstd row mismatch on {sql}");
-        println!("  {label:<26} rows={rn:<7} {rt:>7.1} | {bt:>7.1} ({:.2}x) | {zt:>7.1} ({:.2}x) | {wt:>7.1} ({:.2}x)",
-            rt / bt, rt / zt, rt / wt);
+        println!("  {label:<26} rows={rn:<7} {rt:>7.1} | {bt:>7.1} ({:.2}x)", rt / bt);
     }
     // ── PAGED mode: the "big data on small RAM" path (nodes served from mmap) ──
     // Compare raw-paged vs SKBIN-paged — the question that matters for paged use.
