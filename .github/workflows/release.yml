@@ -182,9 +182,10 @@ jobs:
       name: release
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@v2       # provides flutter (FLUTTER_ROOT) for the sdk: flutter dep
         with:
           channel: stable
+      - uses: dart-lang/setup-dart@v1          # standalone Dart whose pub client does OIDC (must come AFTER flutter)
       - name: Publish
         working-directory: wrappers/dart
         run: |
