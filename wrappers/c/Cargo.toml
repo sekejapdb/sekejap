@@ -1,0 +1,32 @@
+[package]
+name = "sekejap-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "C ABI for sekejap — a stable extern \"C\" surface for binding from Swift, Kotlin, Dart, Go, and C/C++"
+
+[lib]
+# `libsekejap.{dylib,so,a}` — cdylib for FFI/dlopen, staticlib for embedding.
+name = "sekejap"
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+# Expose the concurrent, thread-safe `Engine` handle (SekejapEngine*) — the base
+# for building a multi-threaded sekejap server in any language. Off by default so
+# a plain build stays minimal (single-threaded CoreDB handle only).
+engine = ["sekejap/engine"]
+
+[dependencies]
+sekejap = { workspace = true }
+serde_json = "1"
+
+[build-dependencies]
+# Auto-generates include/sekejap.h from the extern "C" surface on every build,
+# so the header can never drift from the Rust functions. (Best-effort: a cbindgen
+# failure warns but does not fail the build — the committed header is the fallback.)
+cbindgen = "0.27"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,22 @@
+[package]
+# Dart/Flutter binding crate (flutter_rust_bridge). Package name == the Flutter
+# plugin/pod name's native lib; cargokit derives the artifact filename from it.
+name = "sekejap_ffi"
+# Explicit (NOT `.workspace`) so the manifest is self-contained when published to
+# pub.dev, where no workspace root exists in the package cache.
+version = "0.13.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# Registry dep so a from-source build in the pub.dev cache is self-contained.
+# Locally and in CI, the workspace root patches this to the in-repo core crate
+# (`[patch.crates-io]` in the root Cargo.toml), so dev builds use local source.
+sekejap             = "0.13"
+flutter_rust_bridge = "=2.12.0"
+serde_json          = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

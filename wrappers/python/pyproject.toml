@@ -10,7 +10,7 @@ readme = "../../README.md"
 
 [project.urls]
 homepage = "https://sekejap.workspace"
-repository = "https://github.com/user/sekejap"
+repository = "https://github.com/sekejapdb/sekejap"
 
 [project.scripts]
 sekejap = "sekejap.__main__:main"
