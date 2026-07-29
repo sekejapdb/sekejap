@@ -3850,6 +3850,7 @@ impl CoreDB {
                 sql::FieldType::Text        => "TEXT",
                 sql::FieldType::Integer     => "INTEGER",
                 sql::FieldType::Real        => "REAL",
+                sql::FieldType::Bool        => "BOOLEAN",
                 sql::FieldType::Timestamptz => "TIMESTAMPTZ",
                 sql::FieldType::Geo         => "GEO",
                 sql::FieldType::Vector      => "VECTOR",
@@ -4127,6 +4128,16 @@ impl CoreDB {
     /// assert_eq!(hits[0].slug, "alice");
     /// ```
     pub fn query(&self, sql: &str) -> Result<Set<'_>, SqlError> {
+        // `SHOW TABLES` / `SHOW EDGES …` / `SHOW <table>` return metadata rather than
+        // rows — route them to the show path so `query("SHOW TABLES")` just works.
+        if sql
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .map_or(false, |w| w.eq_ignore_ascii_case("show"))
+        {
+            return Ok(Set::from_hits(self, self.show(sql)?));
+        }
         Ok(self.run_plan(sql::parse_match_or_agg(sql)?))
     }
 
@@ -4551,6 +4562,7 @@ impl CoreDB {
                             sql::FieldType::Text        => "TEXT",
                             sql::FieldType::Integer     => "INTEGER",
                             sql::FieldType::Real        => "REAL",
+                            sql::FieldType::Bool        => "BOOLEAN",
                             sql::FieldType::Timestamptz => "TIMESTAMPTZ",
                             sql::FieldType::Geo         => "GEO",
                             sql::FieldType::Vector      => "VECTOR",
@@ -6343,6 +6355,7 @@ fn field_type_matches(ty: &sql::FieldType, v: &Value) -> bool {
         sql::FieldType::Integer     => v.is_number(),
         sql::FieldType::Real        => v.is_number(),
         sql::FieldType::Timestamptz => v.is_string() || v.is_number(),
+        sql::FieldType::Bool        => v.is_boolean(),
         sql::FieldType::Geo         => v.is_object() || v.is_array(),
         sql::FieldType::Vector      => v.is_array(),
         sql::FieldType::Json        => true,

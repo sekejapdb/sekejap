@@ -462,6 +462,24 @@ fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
             continue;
         }
 
+        // SQL line comment: `-- …` to end of line (a single `-` falls through below).
+        if c == '-' && i + 1 < len && chars[i + 1] == '-' {
+            i += 2;
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // SQL block comment: `/* … */`.
+        if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(len); // skip the closing `*/`
+            continue;
+        }
+
         match c {
             '*' => {
                 tokens.push(Tok::Star);
@@ -1014,6 +1032,7 @@ pub enum FieldType {
     Text,
     Integer,
     Real,
+    Bool,
     Timestamptz,
     Geo,
     Vector,
@@ -3447,12 +3466,13 @@ impl Parser {
             "TEXT" => Ok(FieldType::Text),
             "INTEGER" => Ok(FieldType::Integer),
             "REAL" => Ok(FieldType::Real),
+            "BOOL" | "BOOLEAN" => Ok(FieldType::Bool),
             "TIMESTAMPTZ" => Ok(FieldType::Timestamptz),
             "GEO" => Ok(FieldType::Geo),
             "VECTOR" => Ok(FieldType::Vector),
             "JSON" => Ok(FieldType::Json),
             _ => Err(SqlError::UnexpectedToken {
-                expected: "TEXT, INTEGER, REAL, TIMESTAMPTZ, GEO, VECTOR, or JSON",
+                expected: "TEXT, INTEGER, REAL, BOOLEAN, TIMESTAMPTZ, GEO, VECTOR, or JSON",
                 got: ident,
             }),
         }
@@ -3834,6 +3854,32 @@ impl Parser {
                 let cond_var = self.expect_ident()?;
                 self.expect_dot()?;
                 let cond_field = self.expect_ident()?;
+
+                // `field BETWEEN low AND high` → two conditions: `>= low` and `<= high`.
+                if matches!(self.peek(), Tok::Kw(Kw::Between)) {
+                    self.advance();
+                    let low = self.parse_value()?;
+                    self.expect_kw(Kw::And, "AND")?;
+                    let high = self.parse_value()?;
+                    dest_where.push(crate::query::DestWhere {
+                        var: cond_var.clone(),
+                        field: cond_field.clone(),
+                        op: crate::query::CmpOp::Gte,
+                        value: crate::query::WhereValue::Literal(low),
+                    });
+                    dest_where.push(crate::query::DestWhere {
+                        var: cond_var,
+                        field: cond_field,
+                        op: crate::query::CmpOp::Lte,
+                        value: crate::query::WhereValue::Literal(high),
+                    });
+                    if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+
                 let op = self.parse_cmp_op()?;
                 let cond_val = self.parse_value()?;
 
@@ -4750,6 +4796,32 @@ impl Parser {
             let cond_var = self.expect_ident()?;
             self.expect_dot()?;
             let cond_field = self.expect_ident()?;
+
+            // `field BETWEEN low AND high` → two conditions: `>= low` and `<= high`.
+            if matches!(self.peek(), Tok::Kw(Kw::Between)) {
+                self.advance();
+                let low = self.parse_value()?;
+                self.expect_kw(Kw::And, "AND")?;
+                let high = self.parse_value()?;
+                dest_where.push(crate::query::DestWhere {
+                    var: cond_var.clone(),
+                    field: cond_field.clone(),
+                    op: crate::query::CmpOp::Gte,
+                    value: crate::query::WhereValue::Literal(low),
+                });
+                dest_where.push(crate::query::DestWhere {
+                    var: cond_var,
+                    field: cond_field,
+                    op: crate::query::CmpOp::Lte,
+                    value: crate::query::WhereValue::Literal(high),
+                });
+                if matches!(self.peek(), Tok::Kw(Kw::And)) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+
             let op = self.parse_cmp_op()?;
             // RHS: literal value, param, or bare ident (RowRef)
             let (cond_val_opt, row_ref) = match self.peek().clone() {
@@ -6240,6 +6312,19 @@ mod tests {
         let tokens = tokenize("<-[:follows]-").unwrap();
         assert_eq!(tokens[0], Tok::BackArrow);
         assert_eq!(tokens[1], Tok::LBracket);
+    }
+
+    #[test]
+    fn tokenize_skips_comments() {
+        // `-- …` line comments and `/* … */` block comments are skipped like whitespace,
+        // while a lone `-` (negative number literal) still tokenizes correctly.
+        let toks = tokenize(
+            "SELECT a /* pick */ FROM t   -- trailing\n WHERE v = -5 /* end */",
+        )
+        .unwrap();
+        assert!(toks.iter().any(|t| matches!(t, Tok::Kw(Kw::Where))));
+        // No stray comment text leaked in as identifiers.
+        assert!(!toks.iter().any(|t| matches!(t, Tok::Ident(s) if s == "pick" || s == "trailing" || s == "end")));
     }
 
     #[test]

@@ -3141,10 +3141,15 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         if let Some(hnsw) = db.hnsw_index(field) {
                             // HNSW STARTER: approximate search over all vectors.
                             let ef = (*k * 3).max(50);
-                            candidates =
-                                hnsw.search::<CosineDistance, _>(query, field_vecs, *k, ef);
-                            // Skip to next step — HNSW result is already top-k.
-                            continue;
+                            let hits = hnsw.search::<CosineDistance, _>(query, field_vecs, *k, ef);
+                            // Only trust the index when it returns something. An empty
+                            // result means a stale/unbuilt index (e.g. rows inserted after
+                            // CREATE INDEX) — fall through to the exact scan below rather
+                            // than wrongly returning no matches.
+                            if !hits.is_empty() {
+                                candidates = hits;
+                                continue;
+                            }
                         }
                     }
                     // ── Flat-scan fallback ────────────────────────────────────
