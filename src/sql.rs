@@ -441,6 +441,13 @@ fn keyword(s: &str) -> Option<Kw> {
 
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
 
+/// Measurement helper: tokenize and return the token count (used by the
+/// `bench_parse` example to isolate tokenization cost). Hidden from docs.
+#[doc(hidden)]
+pub fn bench_tokenize(sql: &str) -> Result<usize, SqlError> {
+    tokenize(sql).map(|t| t.len())
+}
+
 fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
     let chars: Vec<char> = sql.chars().collect();
     let len = chars.len();
@@ -5376,14 +5383,44 @@ pub enum MatchOrAgg {
 
 fn parse_match_or_agg_inner(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
     let tokens = tokenize(sql)?;
-
     // Bound parser recursion by rejecting pathologically-nested input up front.
     if max_nesting(&tokens) > MAX_NEST_DEPTH {
         return Err(SqlError::InvalidValue(format!(
             "query nesting too deep (> {MAX_NEST_DEPTH} levels of parentheses/brackets)"
         )));
     }
+    lower_tokens(tokens, params)
+}
 
+/// A compiled query: the SQL is tokenized (and nesting-checked) ONCE; each run
+/// re-lowers the cached tokens with fresh `$N` parameters, skipping
+/// re-tokenization. Created by [`crate::CoreDB::prepare`]. Reusable and cheap to
+/// clone-and-run for the same query shape with different parameter values.
+pub struct PreparedQuery {
+    tokens: Vec<Tok>,
+}
+
+impl PreparedQuery {
+    pub(crate) fn compile(sql: &str) -> Result<Self, SqlError> {
+        let tokens = tokenize(sql)?;
+        if max_nesting(&tokens) > MAX_NEST_DEPTH {
+            return Err(SqlError::InvalidValue(format!(
+                "query nesting too deep (> {MAX_NEST_DEPTH} levels of parentheses/brackets)"
+            )));
+        }
+        Ok(Self { tokens })
+    }
+
+    /// Lower the cached tokens into a plan, binding the given parameters.
+    pub(crate) fn lower(&self, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
+        lower_tokens(self.tokens.clone(), params)
+    }
+}
+
+/// Turn a token stream + parameters into an executable plan. This is the second
+/// half of `parse_match_or_agg_inner` — reused by [`PreparedQuery`] so the
+/// (already-tokenized) SQL need not be re-tokenized on every execution.
+fn lower_tokens(tokens: Vec<Tok>, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
     // Multi-FROM: SELECT … FROM source1, source2, … (comma between FROM sources)
     if is_multi_from(&tokens) {
         let stmt = Parser::with_params(tokens, params).parse_select_multi_from()?;

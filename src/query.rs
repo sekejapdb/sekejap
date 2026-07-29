@@ -1215,7 +1215,7 @@ impl<'db> Set<'db> {
                 .into_iter()
                 .filter_map(|(field, query)| {
                     let index = self.db.bm25_indexes.get(&field)?;
-                    let results = index.search(&query, 10000);
+                    let results = index.search_all(&query);
                     let m: HashMap<u64, f64> =
                         results.iter().map(|h| (h.doc_id, h.score)).collect();
                     Some(((field, query), m))
@@ -3198,19 +3198,29 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::Bm25Filter(field, query, min_score) => {
-                // BM25(field, 'query') > min_score
+                // BM25(field, 'query') > min_score.
                 if candidates.is_empty() {
                     candidates = db.all_hashes();
                 }
                 let min_score = *min_score;
-                candidates.retain(|&h| {
-                    if let Some(hits) = db.bm25_indexes.get(field) {
-                        let results = hits.search(query, 100);
-                        results.iter().any(|r| r.doc_id == h && r.score > min_score)
-                    } else {
-                        false
+                match db.bm25_indexes.get(field) {
+                    Some(idx) => {
+                        // Compute the full matching set ONCE — not once per candidate.
+                        // A filter must return EVERY doc above the threshold, so use
+                        // the uncapped `search_all` (an earlier top-100 cap silently
+                        // dropped matches and, on tied scores, a NON-DETERMINISTIC
+                        // subset — different rows each run — and it was also
+                        // O(candidates × search)).
+                        let matched: std::collections::HashSet<u64> = idx
+                            .search_all(query)
+                            .into_iter()
+                            .filter(|r| r.score > min_score)
+                            .map(|r| r.doc_id)
+                            .collect();
+                        candidates.retain(|&h| matched.contains(&h));
                     }
-                });
+                    None => candidates.clear(),
+                }
             }
             Step::ScoreProject(_) => {
                 // Score projection annotation happens in collect(), not execute()
@@ -4773,7 +4783,7 @@ fn filter_raw_by_func_filters(
         if let MatchFuncFilter::Bm25 { field, query, .. } = f {
             bm25_maps.entry((field.clone(), query.clone())).or_insert_with(|| {
                 db.bm25_indexes.get(field)
-                    .map(|idx| idx.search(query, 10000).iter().map(|h| (h.doc_id, h.score)).collect())
+                    .map(|idx| idx.search_all(query).iter().map(|h| (h.doc_id, h.score)).collect())
                     .unwrap_or_default()
             });
         }
@@ -5540,7 +5550,7 @@ fn build_score_maps(
 
     let bm25_maps = bm25_keys.into_iter().filter_map(|(field, query)| {
         let index = db.bm25_indexes.get(&field)?;
-        let m: HashMap<u64, f64> = index.search(&query, 10000).iter()
+        let m: HashMap<u64, f64> = index.search_all(&query).iter()
             .map(|h| (h.doc_id, h.score)).collect();
         Some(((field, query), m))
     }).collect();
@@ -5670,7 +5680,7 @@ pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
             if let MatchFuncFilter::Bm25 { field, query, .. } = f {
                 bm25_maps.entry((field.clone(), query.clone())).or_insert_with(|| {
                     db.bm25_indexes.get(field)
-                        .map(|idx| idx.search(query, 10000).iter().map(|h| (h.doc_id, h.score)).collect())
+                        .map(|idx| idx.search_all(query).iter().map(|h| (h.doc_id, h.score)).collect())
                         .unwrap_or_default()
                 });
             }
