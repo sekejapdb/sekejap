@@ -1,39 +1,73 @@
 # sekejap
 
-Embedded, graph-first multi-model database. Graph traversal, spatial search, vector similarity, and full-text search — composable in a single query, zero external services, runs in-process or against S3.
+sekejap is a graph-first, embedded multimodel database that stores your data in several forms at once: plain records, graph relationships, geographic shapes, vectors, and full text. You can query and combine them in a single SQL statement.
 
-*`sekejap` means **"a brief moment"** in Indonesian.* The world flies into one island, you explore it across every dimension, and the days run out fast. This README is a Bali holiday — Chloe's, mostly.
+It runs inside your application, like SQLite, with no separate server to install or manage. Store your database on local disk for lightweight and offline use, or use S3-compatible object storage for datasets that grow beyond a single machine.
 
-**Built for workloads that need more than one data model at a time:**
+*(“sekejap” is Indonesian for “a brief moment”, reflecting how quickly you can set it up and start working with your multimodel data.)*
 
-- travel & discovery — "near me, loved by people like me, described as *quiet sunset*, still open"
-- hybrid RAG — find semantically similar records then walk their graph context
-- local AI memory — a companion or robot that records where it went, when, and how it felt
-- spatiotemporal intelligence — who was where, connected to what, when
+It's available as a Rust/Python/Dart/Kotlin/Swift/Java/Node.js/Go library, and a command-line tool.
 
-Available as a Rust library, Rust CLI, and Python library.
-
-📖 **Documentation:** [`docs/`](docs/README.md) — a [user guide](docs/guide/README.md) (query language, including the [`SELECT … FROM MATCH`](docs/guide/graph-queries.md) reference) and [engine internals](docs/internals/README.md).
-
-### Who it's for
-
-| You are a… | You'll care about |
-|---|---|
-| **Data scientist** | pandas ↔ DataFrame, embeddings, similarity, aggregation over graphs |
-| **Full-stack developer** | one SQL surface for CRUD, search, transactions, hybrid ranking |
-| **Mobile developer** | embedded & offline, "near me" spatial, tiny footprint, no server |
-| **Embodied-AI developer** | a local memory graph — observations that fuse place, time, text, vector |
+📖 **Documentation:** [`docs/`](docs/README.md) — a [user guide](docs/guide/README.md)
+(the query language, including the [`SELECT … FROM MATCH`](docs/guide/graph-queries.md)
+graph reference) and [engine internals](docs/internals/README.md).
 
 ---
 
-## Getting started — the world lands in Bali
+## Why you might want it
 
-Six travellers, five continents, one island: Giulia (Milan), Ethan (Toronto), Yasmine (Casablanca), Lucas (São Paulo), Aiym (Almaty), and **Chloe (Melbourne)**.
+Applications often need more than one kind of database at the same time:
+
+- a **relational** store for structured records,
+- a **graph** database for relationships ("who is connected to what"),
+- a **spatial** index for location queries ("what's near me"),
+- a **vector** store for similarity search over embeddings,
+- a **full-text** search engine for matching words in text.
+
+Running and keeping all of those in sync is a lot of moving parts. sekejap puts
+them in one embedded engine behind one query language, so a single query can use
+several of them together.
+
+It's a good fit for:
+
+- **Local and mobile apps** — runs in-process with no server and a small
+  footprint, so it works offline on phones and edge devices.
+- **Hybrid search and RAG** — rank results by combining vector similarity,
+  geographic location, and text relevance in a single query, then follow the
+  graph to pull in related records as context for a model.
+- **On-device memory for AI** — an agent or robot records what it observes
+  (place, time, a note, a perception vector) as it happens, and later recalls it
+  by any mix of location, similarity, and relationships — a private, queryable
+  memory with no network round-trip.
+
+---
+
+## Install
+
+```bash
+pip install sekejap                 # Python (includes S3 support)
+cargo add sekejap                   # Rust library
+cargo add sekejap --features s3     # Rust library, with S3 support
+cargo install sekejap-cli           # command-line tool
+```
+
+---
+
+## A first look
+
+The examples below all use the same small dataset: some tourists, the flights
+they arrived on, and places, restaurants, and dishes to visit and eat.
+
+### 1. Create some tables
+
+A table needs a `_key` column as its primary key. Other columns can be ordinary
+types (`TEXT`, `INTEGER`, `REAL`, `TIMESTAMPTZ`) or one of the special ones:
+`GEO` for geography, `VECTOR` for embeddings.
 
 ```python
 from sekejap import DB
 
-db = DB("./bali")
+db = DB("./bali")   # a directory on disk; created if it doesn't exist
 
 db.execute("""
     CREATE TABLE tourists (
@@ -41,262 +75,273 @@ db.execute("""
         name      TEXT,
         home_city TEXT,
         arrival   TIMESTAMPTZ,
-        departure TIMESTAMPTZ,
-        taste     VECTOR
+        taste     VECTOR          -- an embedding of what this person likes
     )
 """)
-db.execute("CREATE TABLE flights (_key TEXT PRIMARY KEY, airline TEXT, origin_city TEXT, duration_hours INTEGER)")
-db.execute("CREATE TABLE places  (_key TEXT PRIMARY KEY, name TEXT, category TEXT, area TEXT, geometry GEO, description TEXT, embedding VECTOR)")
-db.execute("CREATE TABLE restaurants (_key TEXT PRIMARY KEY, name TEXT, area TEXT, geometry GEO, open_now BOOLEAN)")
-db.execute("CREATE TABLE dishes  (_key TEXT PRIMARY KEY, name TEXT, price INTEGER, protein_g INTEGER, description TEXT, geometry GEO, open_now BOOLEAN, embedding VECTOR)")
+db.execute("CREATE TABLE flights     (_key TEXT PRIMARY KEY, airline TEXT, duration_hours INTEGER)")
+db.execute("CREATE TABLE restaurants (_key TEXT PRIMARY KEY, name TEXT, area TEXT, geometry GEO)")
+db.execute("""
+    CREATE TABLE dishes (
+        _key TEXT PRIMARY KEY, name TEXT, price INTEGER, protein_g INTEGER,
+        description TEXT, geometry GEO, open_now BOOLEAN, embedding VECTOR
+    )
+""")
+```
 
-db.execute("CREATE INDEX ON places      USING spatial (geometry)")
-db.execute("CREATE INDEX ON dishes      USING spatial (geometry)")
-db.execute("CREATE INDEX ON dishes      USING bm25    (description)")
-db.execute("CREATE INDEX ON tourists    USING hnsw    (taste)")
+### 2. Add indexes for the query types you'll use
 
-db.execute("INSERT INTO tourists (_key, name, home_city, arrival, departure) VALUES ('aiym',  'Aiym',  'Almaty',    '2024-06-02', '2024-06-10')")
-db.execute("INSERT INTO tourists (_key, name, home_city, arrival, departure) VALUES ('chloe', 'Chloe', 'Melbourne', '2024-06-01', '2024-06-08')")
+An index makes a certain kind of lookup fast. You only need the ones your
+queries actually use.
 
-# tourist -[:flew_on]-> flight
-db.execute("INSERT ('tourists/aiym')-[:flew_on]->('flights/ky-alm')")
+```python
+db.execute("CREATE INDEX ON dishes USING spatial (geometry)")     # location queries
+db.execute("CREATE INDEX ON dishes USING bm25    (description)")  # text relevance
+db.execute("CREATE INDEX ON tourists USING hnsw  (taste)")        # vector similarity
+```
+
+### 3. Insert data
+
+```python
+db.execute("INSERT INTO tourists (_key, name, home_city, arrival) VALUES ('chloe', 'Chloe', 'Melbourne', '2024-06-01')")
+db.execute("INSERT INTO tourists (_key, name, home_city, arrival) VALUES ('aiym',  'Aiym',  'Almaty',    '2024-06-02')")
+
+# A relationship (edge): tourist "chloe" flew on flight "qf-mel".
 db.execute("INSERT ('tourists/chloe')-[:flew_on]->('flights/qf-mel')")
 ```
 
-### 1 — The basics: Aiym flies in from Almaty
+### 4. Run a query
 
-Follow one edge. `MATCH` names the graph pattern; everything around it is ordinary SQL.
-
-```python
-db.query("""
-    SELECT f.airline AS airline, f.duration_hours AS hours
-    FROM MATCH (t:tourists)-[:flew_on]->(f:flights)
-    WHERE t._key = 'aiym'
-""")
-# → { airline: "Air Astana", hours: 11 }
-```
-
-### 2 — One query, every model: what should Chloe order right now?
-
-Food for delivery: **near** her villa, **still open**, in a **price range**, with enough **protein**, matching a **craving** — ranked by text relevance *and* taste. Graph + spatial + text + scalar filters + hybrid score, in a single statement.
+Ordinary SQL works as you'd expect:
 
 ```python
-db.query("""
-    SELECT r.name AS restaurant, d.name AS dish, d.price AS price, d.protein_g AS protein
-    FROM MATCH (r:restaurants)-[:serves]->(d:dishes)
-    WHERE d.open_now = true
-      AND d.price >= 40000 AND d.price <= 90000                    -- IDR range
-      AND d.protein_g >= 25                                        -- macro goal
-      AND ST_DWithin(d.geometry, POINT(115.168 -8.690), 5.0)       -- within 5 km of her villa
-      AND BM25(d.description, 'grilled chicken healthy') > 0.0      -- the craving
-    ORDER BY BM25_NORM(d.description, 'grilled healthy protein') * 0.6
-           + VECTOR_COSINE(d.embedding, chloe_taste)          * 0.4 DESC
-    LIMIT 10
-""")
-# → Ayam Bakar (La Favela, 65k, 38g) ranked above Tuna Poke Bowl; the far Ubud
-#   dish and the low-protein snack are filtered out.
+db.query("SELECT name, home_city FROM tourists WHERE home_city = 'Melbourne'")
+# → { name: "Chloe", home_city: "Melbourne" }
 ```
 
-### 3 — Multi-hop analysis: what did Chloe's fellow travellers fall for?
-
-Walk **backward** across the shared inbound flight to everyone who took it, then out to the dishes they loved — and count the distinct fans.
-
-```python
-db.query("""
-    SELECT d.name AS dish, COUNT(DISTINCT peer._key) AS fans
-    FROM MATCH (chloe:tourists)-[:flew_on]->(f:flights)<-[:flew_on]-(peer:tourists)-[:ate]->(d:dishes)
-    WHERE chloe._key = 'chloe'
-    GROUP BY d.name
-    ORDER BY fans DESC
-""")
-# → Ayam Bakar (2), Babi Guling (1)
-```
-
-That's the shape of everything below: **selection** (graph + filters) narrows the world, **ranking** scores what's left.
+That's the whole loop: create tables, add the indexes you need, insert rows and
+relationships, and query. The rest of this README shows what each data model can
+do, then how to combine them.
 
 ---
 
-## Exploring Bali in five dimensions
+## The five data models
 
-### Map — spatial
+Each section is a short, self-contained example. They build toward the last one,
+where several models are used in a single query.
+
+### Records and filters (SQL)
+
+Standard SQL — `SELECT`, `WHERE`, `ORDER BY`, `GROUP BY`, aggregates.
 
 ```python
-# Temples & beaches within 5 km of Uluwatu
-db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.087 -8.829), 5.0)")
+db.query("""
+    SELECT area, COUNT(*) AS n
+    FROM restaurants
+    GROUP BY area
+    ORDER BY n DESC
+""")
 ```
 
-### Connections — graph (forward, backward, DISTINCT)
+### Relationships (graph)
+
+A relationship between two rows is called an **edge**. You query edges with a
+`MATCH` pattern inside `FROM`. Everything around the `MATCH` is ordinary SQL.
 
 ```python
-# Forward: places Chloe reached within 2 hops of her itinerary
+# Follow one edge: which flight did Chloe arrive on?
+db.query("""
+    SELECT f.airline AS airline, f.duration_hours AS hours
+    FROM MATCH (t:tourists)-[:flew_on]->(f:flights)
+    WHERE t._key = 'chloe'
+""")
+```
+
+The pattern reads left to right: start at a `tourists` row (`t`), follow a
+`flew_on` edge, arrive at a `flights` row (`f`). The arrow direction matters —
+`-[:e]->` follows edges forward, `<-[:e]-` follows them backward.
+
+You can follow a chain of several hops, and `*1..3` means "between 1 and 3 hops":
+
+```python
+# Places reachable within 2 "near" hops of somewhere Chloe visited.
+# DISTINCT removes duplicates when a place can be reached more than one way.
 db.query("""
     SELECT DISTINCT p._key AS place
     FROM MATCH (c:tourists)-[:visited]->(m:places)-[:near*1..2]->(p:places)
     WHERE c._key = 'chloe'
 """)
+```
 
-# Backward `<-`: who visited Uluwatu? (walk against the arrow)
-db.query("""
-    SELECT DISTINCT t.name AS visitor
-    FROM MATCH (p:places)<-[:visited]-(t:tourists)
-    WHERE p._key = 'uluwatu'
-""")
+### Location (spatial)
 
-# Edge properties: a bound edge exposes its strength + metadata (fixed single hops)
+A `GEO` column holds a shape (a point, line, or polygon). With a spatial index
+you can ask distance and containment questions.
+
+```python
+# Restaurants within 5 km of a point (longitude, latitude).
 db.query("""
-    SELECT t.name AS visitor, v.strength AS rating
-    FROM MATCH (p:places)<-[v:visited]-(t:tourists)
-    WHERE p._key = 'uluwatu'
-    ORDER BY v.strength DESC
+    SELECT name FROM restaurants
+    WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)
 """)
 ```
 
-> Multi-hop returns **one row per path** by default (a place reached two ways appears twice). Add `DISTINCT` for unique nodes, or `COUNT(DISTINCT field)` to count them.
+### Similarity (vector)
 
-### Taste — vector
+A `VECTOR` column holds an embedding — a list of numbers that captures the
+"meaning" of something. With an HNSW index you can find the rows whose vectors
+are closest to a given one.
 
 ```python
-# Tourists whose taste is closest to Chloe's
+# The 5 tourists whose taste is most similar to a given taste vector.
 db.query("""
-    SELECT * FROM tourists
-    WHERE VECTOR_NEAR(taste, chloe_taste, 5)
+    SELECT name FROM tourists
+    WHERE VECTOR_NEAR(taste, [0.9, 0.1, 0.0, 0.0], 5)
 """)
 ```
 
-### Words — full-text (BM25 relevance, or positional SEARCH)
+### Text (full-text)
+
+For matching words in text, sekejap offers three tools:
+
+- `ILIKE '%word%'` — simple substring match (fast with a `gin` index).
+- `BM25(field, 'query')` — relevance scoring, like a classic search engine.
+- `SEARCH('query')` — a positional search index with typo tolerance.
 
 ```python
+# Dishes whose description is relevant to "grilled chicken", best first.
 db.query("""
-    SELECT * FROM places
-    WHERE BM25(description, 'clifftop sunset temple') > 0.2
-    ORDER BY BM25(description, 'clifftop sunset temple') DESC
+    SELECT name FROM dishes
+    WHERE BM25(description, 'grilled chicken') > 0.0
+    ORDER BY BM25(description, 'grilled chicken') DESC
 """)
 ```
 
-### Time — the sekejap
+### Time
+
+Timestamps are ordinary columns; a few helper functions work on them.
 
 ```python
-# Day-of-trip. A seven-day holiday is a brief moment.
 db.query("""
-    SELECT t.name AS name, AGE_DAYS(t.arrival) AS days_here, NOW() AS this_moment
-    FROM MATCH (t:tourists) WHERE t._key = 'chloe'
+    SELECT name, AGE_DAYS(arrival) AS days_here, NOW() AS current_time
+    FROM tourists WHERE _key = 'chloe'
 """)
-# → { name: "Chloe", days_here: 5, this_moment: 1717... }   "the last light"
+# → { name: "Chloe", days_here: 5, current_time: 1717... }
 ```
 
 ---
 
-## The Spatiotemporal Diary — Chloe
+## Combining models in one query
 
-Chloe keeps a diary. Each entry is a moment: **where** (a place, or a restaurant), **when** (`logged_at`), **what she wrote** (`reflection`), and **how it felt** (`mood` vector). The entries are part of the graph — `chloe -[:wrote]-> entry -[:at]-> place`, and a place may be a `restaurant -[:serves]-> dish` — so the diary can answer questions about the island it touched.
+This is the point of a multi-model database: asking one question that would
+otherwise need several systems.
+
+**"What should Chloe order for delivery right now?"** — a dish that is near her,
+still open, in her price range, has enough protein, matches a craving, and is
+ranked by how well it fits both the words she typed and her taste.
+
+```python
+db.query("""
+    SELECT r.name AS restaurant, d.name AS dish, d.price AS price
+    FROM MATCH (r:restaurants)-[:serves]->(d:dishes)
+    WHERE d.open_now = true
+      AND d.price BETWEEN 40000 AND 90000                        -- price range (IDR)
+      AND d.protein_g >= 25                                      -- enough protein
+      AND ST_DWithin(d.geometry, POINT(115.168 -8.690), 5.0)     -- within 5 km
+      AND BM25(d.description, 'grilled chicken healthy') > 0.0    -- matches the craving
+    ORDER BY BM25(d.description, 'grilled healthy') * 0.6         -- text relevance
+           + VECTOR_COSINE(d.embedding, [0.7,0.3,0.0,0.0]) * 0.4 -- taste similarity
+      DESC
+    LIMIT 10
+""")
+```
+
+The `WHERE` clause narrows the results using the graph, spatial, scalar, and
+text models. The `ORDER BY` combines a text score and a vector score into one
+ranking. The whole thing is one statement.
+
+A second example — **a personal journal** where each entry records a place, a
+time, some text, and a "mood" vector. Because the entries are just rows (and can
+be linked into the graph), you can search them by text, by similarity, or by
+time:
 
 ```python
 db.execute("""
     CREATE TABLE diary (
-        _key       TEXT PRIMARY KEY,
-        author     TEXT,
-        place      TEXT,
-        logged_at  TIMESTAMPTZ,
-        reflection TEXT,
-        mood       VECTOR
+        _key TEXT PRIMARY KEY, author TEXT, place TEXT,
+        logged_at TIMESTAMPTZ, reflection TEXT, mood VECTOR
     )
 """)
-db.execute("CREATE INDEX ON diary USING search (reflection)")   # search her own words
-db.execute("CREATE INDEX ON diary USING hnsw   (mood)")         # moments that feel alike
-```
+db.execute("CREATE INDEX ON diary USING search (reflection)")   # search the text
+db.execute("CREATE INDEX ON diary USING hnsw   (mood)")         # find similar moods
 
-```python
-# Her whole week, retraced through space and time
-db.query("""
-    SELECT e.place AS place, e.logged_at AS moment, e.reflection AS words
-    FROM MATCH (o:tourists)-[:wrote]->(e:diary)
-    WHERE o._key = 'chloe'
-    ORDER BY e.logged_at ASC
-""")
-
-# The moment she ate near a temple — traced through the graph (diary → warung → dish)
-db.query("""
-    SELECT e.logged_at AS moment, w.name AS warung, d.name AS dish
-    FROM MATCH (e:diary)-[:at]->(w:restaurants)-[:serves]->(d:dishes)
-    WHERE e.author = 'chloe'
-    ORDER BY e.logged_at
-""")
-
-# A moment tonight that rhymes with an earlier one (nearest mood)
-db.query(f"""
-    SELECT place, reflection FROM diary
-    WHERE author = 'chloe'
-    ORDER BY mood <=> {tonight} ASC
-    LIMIT 1
-""")
-# → this last Uluwatu sunset rhymes with the first quiet morning in Ubud.
-
-# "Where did I write about feeling small?" — search her reflections
+# "Where did I write about feeling small?" — text search over the entries.
 db.query("""
     SELECT place, logged_at FROM diary
     WHERE author = 'chloe' AND SEARCH('small still')
     ORDER BY logged_at
 """)
-```
 
-The island held still while the week ran out.
+# "Find an earlier moment that felt like tonight." — nearest mood vector.
+db.query("""
+    SELECT place, reflection FROM diary
+    WHERE author = 'chloe'
+    ORDER BY mood <=> [0.2, 0.7, 0.1, 0.0] ASC
+    LIMIT 1
+""")
+```
 
 ---
 
-## Data Types
+## Data types
 
 | Type | SQL keyword | Stored as | Use for |
 |---|---|---|---|
 | Text | `TEXT` | UTF-8 string | names, categories, keys |
-| Integer | `INTEGER` | i64 | prices (IDR), durations, counts |
-| Float | `REAL` | f64 | scores, ratings, weights |
-| Timestamp | `TIMESTAMPTZ` | ISO-8601 | arrival, departure, `logged_at` |
-| Geometry | `GEO` | GeoJSON object | temple points, area polygons |
-| Vector | `VECTOR` | `[f32, ...]` array | taste, mood, review embeddings |
-| JSON | `JSON` | arbitrary JSON | nested / unstructured |
+| Integer | `INTEGER` | 64-bit integer | prices, durations, counts |
+| Float | `REAL` | 64-bit float | scores, ratings, weights |
+| Timestamp | `TIMESTAMPTZ` | ISO-8601 date/time | arrivals, log times |
+| Geometry | `GEO` | GeoJSON shape | points, areas, routes |
+| Vector | `VECTOR` | list of floats | embeddings (taste, mood, images) |
+| JSON | `JSON` | arbitrary JSON | nested / unstructured data |
 
-**GEO** accepts any GeoJSON geometry — `Point`, `Polygon`, `LineString`, `MultiPolygon`.
-**VECTOR** is inserted as a SQL array literal: `[0.12, -0.03, 0.87, ...]`.
+- **GEO** accepts any GeoJSON geometry — `Point`, `Polygon`, `LineString`, `MultiPolygon`.
+- **VECTOR** is written as an array literal: `[0.12, -0.03, 0.87, ...]`.
 
 ---
 
 ## Indexes
 
-| Index | `USING` keyword | Enables |
+An index speeds up one kind of query. Create only the ones you need.
+
+| Index | `USING` keyword | Makes this fast |
 |---|---|---|
-| Hash | `hash` | `field = 'val'`, `IN (...)`, equality lookups |
-| B-tree | `btree` | `>`, `<`, `BETWEEN`, `ORDER BY field` |
-| GIN | `gin` | `ILIKE '%pattern%'` (exact trigram postings) |
-| Spatial | `spatial` | `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects` |
-| HNSW | `hnsw` | `VECTOR_NEAR(field, [...], k)`, `<=>` ordering, `VECTOR_COSINE(...)` in scores |
-| BM25 | `bm25` | `BM25(field, 'query') > score`, `ORDER BY BM25(...)`, `BM25_NORM(...)` scores |
-| Search | `search` | `SEARCH('query')` filter, `SEARCH_SCORE('query')` ranking (positional inverted index) |
+| Hash | `hash` | equality: `field = 'x'`, `IN (...)` |
+| B-tree | `btree` | ranges and ordering: `>`, `<`, `BETWEEN`, `ORDER BY` |
+| GIN | `gin` | substring text match: `ILIKE '%pattern%'` |
+| Spatial | `spatial` | location: `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects` |
+| HNSW | `hnsw` | vector similarity: `VECTOR_NEAR(...)`, `<=>` ordering |
+| BM25 | `bm25` | ranked text search: `BM25(field, 'query')` |
+| Search | `search` | positional, typo-tolerant search: `SEARCH('query')` |
 
 ```sql
-CREATE INDEX ON places  USING spatial (geometry)
-CREATE INDEX ON dishes  USING bm25    (description)
-CREATE INDEX ON diary   USING search  (reflection)
-CREATE INDEX ON tourists USING hnsw   (taste)
+CREATE INDEX ON dishes   USING spatial (geometry)
+CREATE INDEX ON dishes   USING bm25    (description)
+CREATE INDEX ON diary    USING search  (reflection)
+CREATE INDEX ON tourists USING hnsw    (taste)
 ```
 
-Or inline in `CREATE TABLE ... WITH (...)`:
-
-```sql
-CREATE TABLE dishes (
-    _key TEXT PRIMARY KEY, name TEXT, price INTEGER, protein_g INTEGER,
-    description TEXT, geometry GEO, embedding VECTOR
-) WITH (range: ['price'], spatial: ['geometry'], bm25: ['description'], vector: ['embedding'])
-```
-
-All index types survive a cold restart. Hash, B-tree, GIN, and BM25 rebuild from persisted schema hints on open; HNSW and Spatial are stored in the snapshot. Run `REINDEX` after large bulk loads.
+All index types survive a restart. After a large bulk load, run `REINDEX` (or
+`.compact` in the CLI) so later startups are fast.
 
 ---
 
 ## Interfaces
 
-sekejap has three interfaces. Use whichever fits the context.
+sekejap has three ways to use it. They query the same database.
 
 ### SQL
+
+The main interface. A quick tour of what the dialect supports:
 
 ```sql
 -- Schema
@@ -304,144 +349,92 @@ CREATE TABLE places (_key TEXT PRIMARY KEY, name TEXT, category TEXT, geometry G
 ALTER TABLE places ADD COLUMN rating REAL
 ALTER TABLE places RENAME COLUMN category TO kind
 
--- Mutations
+-- Rows
 INSERT INTO places (_key, name, category) VALUES ('uluwatu', 'Uluwatu Temple', 'temple')
 UPDATE places SET rating = 4.8 WHERE _key = 'uluwatu'
 DELETE FROM places WHERE kind = 'closed'
 
--- Edges (with metadata)
+-- Edges, optionally with properties
 INSERT ('tourists/chloe')-[:visited {rating: 4.8, hours: 2}]->('places/uluwatu')
 DELETE ('tourists/chloe')-[:visited]->('places/uluwatu')
 
--- Graph traversal — forward `-[:e]->` and backward `<-[:e]-`
+-- Graph traversal: forward -[:e]-> and backward <-[:e]-
 SELECT dest._key AS place
 FROM MATCH (a:places)-[:near*1..3]->(dest:places)
 WHERE a._key = 'seminyak-beach'
 
--- Backward: every place that routes into Ubud
-SELECT src._key AS place
-FROM MATCH (dest:places)<-[:near*1..3]-(src:places)
-WHERE dest._key = 'ubud'
-
--- DISTINCT — multi-hop returns one row per PATH; DISTINCT = unique nodes
-SELECT DISTINCT dest._key AS place
-FROM MATCH (a:places)-[:near*1..2]->(dest:places)
-WHERE a._key = 'seminyak-beach'
-
--- Aggregation: COUNT / SUM / AVG / MIN / MAX / COUNT(DISTINCT field).
--- Without GROUP BY an aggregate returns exactly one row (even if nothing matches).
-SELECT p._key AS place,
-       COUNT(*)                        AS visits,
-       COUNT(DISTINCT t.home_city)     AS cities,
-       AVG(v.strength)                 AS avg_rating
-FROM MATCH (p:places)<-[v:visited]-(t:tourists)
+-- Aggregation over a pattern: COUNT / SUM / AVG / MIN / MAX, and COUNT(DISTINCT ...)
+SELECT p._key AS place, COUNT(DISTINCT t.home_city) AS cities
+FROM MATCH (p:places)<-[:visited]-(t:tourists)
 GROUP BY p._key
-ORDER BY visits DESC
-LIMIT 10
+ORDER BY cities DESC
 
--- Edge properties — a bound edge (`-[v:type]->`) exposes `strength` + JSON
--- metadata. Available on FIXED single hops (not variable-length `*a..b`).
-SELECT t.name AS visitor, v.strength AS rating, v.hours AS stayed
+-- Edge properties: a named edge (-[v:type]->) exposes its rating + metadata
+SELECT t.name AS visitor, v.rating AS rating
 FROM MATCH (p:places)<-[v:visited]-(t:tourists)
 WHERE p._key = 'uluwatu'
-ORDER BY v.strength DESC
+ORDER BY v.rating DESC
 
--- Multi-hop: dishes eaten by travellers whose taste matches Chloe's
-SELECT d.name AS dish, COUNT(*) AS orders
-FROM MATCH (c:tourists)-[:similar_taste]->(peer:tourists)-[:ate]->(d:dishes)
-WHERE c._key = 'chloe'
-GROUP BY d.name
-ORDER BY orders DESC
-
--- Multi-stage with WITH — carry a binding into a follow-on MATCH
+-- Multi-stage traversal: carry a result into a follow-on MATCH with WITH
 SELECT d.name AS dish, COUNT(*) AS orders
 FROM MATCH (c:tourists)-[:similar_taste]->(peer:tourists)
 WHERE c._key = 'chloe'
 WITH peer
 MATCH (peer)-[:ate]->(d:dishes)
 GROUP BY d.name
-ORDER BY orders DESC
 
--- Shortest path — 0 rows = unreachable, 1 row = found (path fields via r.*)
-SELECT a.name AS from_n, b.name AS to_n, r.length AS hops, r._path_keys AS trail
-FROM MATCH SHORTEST (a)-[r*]->(b)
+-- Shortest path: 0 rows if unreachable, 1 row if a path exists
+SELECT a.name AS from_n, b.name AS to_n, r.length AS hops
+FROM MATCH SHORTEST (a:tourists)-[r*]->(b:dishes)
 WHERE a._key = 'tourists/chloe' AND b._key = 'dishes/babi-guling'
--- Path predicates (ANY / ALL / NONE / SINGLE) filter intermediate nodes:
-AND ALL(n IN nodes(r) WHERE n.open_now = true)
 
--- CASE WHEN — conditional expression on a field
-SELECT d.name AS dish,
-       CASE WHEN d.protein_g >= 30 THEN 'high protein' ELSE 'light' END AS tier
-FROM MATCH (r:restaurants)-[:serves]->(d:dishes)
-WHERE r._key = 'la-favela'
-
--- Time: NOW(), AGE_DAYS(var.field), AGE_HOURS(var.field)  (in SELECT FROM MATCH)
-SELECT t.name AS name, AGE_DAYS(t.arrival) AS days_here, NOW() AS this_moment
-FROM MATCH (t:tourists) WHERE t._key = 'chloe'
-
--- Spatial
-SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)
-SELECT * FROM zones  WHERE ST_Contains(geometry, POINT(115.087 -8.829))
-
--- Vector
+-- Spatial, vector, and text
+SELECT * FROM places   WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)
 SELECT * FROM tourists WHERE VECTOR_NEAR(taste, [0.9, 0.1, 0.0, 0.0], 5)
+SELECT * FROM places   WHERE name ILIKE '%uluwatu%'
 
--- Full-text: GIN (fast exact ILIKE) · BM25 (ranked) · SEARCH (positional, typo-tolerant)
-SELECT * FROM places WHERE name ILIKE '%uluwatu%'
-SELECT * FROM places WHERE BM25(description, 'sunset temple') > 0.3
-    ORDER BY BM25(description, 'sunset temple') DESC
-SELECT *, SEARCH_SCORE('quiet still') AS relevance FROM diary
-    WHERE SEARCH('quiet still') ORDER BY SEARCH_SCORE('quiet still') DESC
-
--- Hybrid ranking — combine any signals with +, -, *, /, ()
-ORDER BY BM25_NORM(description, 'quiet sunset') * 0.5
-       + VECTOR_COSINE(embedding, [0.7,0.3,0.0,0.0]) * 0.5 DESC
-ORDER BY -ST_DISTANCE_KM(geometry, POINT(115.168 -8.690)) DESC   -- nearest first
--- vector distance operators: <=> cosine, <-> L2, <#> dot, <+> L1
-
--- Transactions — book a whole trip atomically
+-- Transactions: all statements commit together, or none do
 BEGIN
 INSERT ('tourists/chloe')-[:booked]->('flights/qf-mel')
 INSERT ('tourists/chloe')-[:stayed_at]->('villas/seminyak-01')
-INSERT ('tourists/chloe')-[:joined]->('activities/uluwatu-kecak')
-COMMIT   -- all three, or none
+COMMIT
 
--- Introspection
+-- Inspect the database
 SHOW TABLES
-SHOW EDGES
 SHOW EDGES FROM tourists TO places
-SHOW places
 ```
 
-### Atomic (Rust fluent builder)
+### Rust
 
-For lower-level control, offline/mobile inner loops, or pre-resolved hashes.
+Besides raw SQL, the Rust library has a builder API for lower-level control:
 
 ```rust
 use sekejap::CoreDB;
 
 let mut db = CoreDB::open("./bali")?;
 
-// "Near me" — spatial radius, embedded and offline
+// Restaurants within 3 km of a point (latitude, longitude, km).
 let nearby = db.collection("restaurants")
-    .st_dwithin(-8.690, 115.168, 3.0)   // lat, lon, km
+    .st_dwithin(-8.690, 115.168, 3.0)
     .collect();
 
-// Fluent scan with filters
+// Filter and sort.
 let picks = db.collection("dishes")
     .where_gte("protein_g", 25)
-    .order_by("price", false)   // false = ascending
-    .limit(10)
+    .sort("price", true)   // true = ascending
+    .take(10)
     .collect();
 
-// Edges
-db.link("tourists/chloe", "places/uluwatu", "visited", 4.8);
-db.link_meta("tourists/chloe", "places/uluwatu", "visited", 4.8, r#"{"hours":2}"#)?;
+// Add a plain edge.
+db.link("tourists/chloe", "places/uluwatu", "visited");
+
+// Add an edge with attributes (any names; primitives are stored efficiently).
+db.link_meta("tourists/chloe", "places/uluwatu", "visited", r#"{"rating": 4.8, "hours": 2}"#)?;
 ```
 
-### Python DataFrame (`db.df`)
+### Python (with pandas)
 
-For data-science workflows — load from CSV/parquet, get results back as DataFrames.
+The Python library can load from and return pandas DataFrames:
 
 ```python
 import pandas as pd
@@ -449,88 +442,22 @@ from sekejap import DB
 
 db = DB("./bali")
 
-# Load tourists + review embeddings
+# Load a DataFrame as rows in a table.
 df = pd.read_csv("tourists.csv")
 db.df.load_nodes(df, "tourists", id_col="tourist_id",
                  mapping={"tourist_id": "_key", "full_name": "name"})
 
-db.df.load_edges(pd.read_csv("visits.csv"),
-                 source_col="tourist_id", target_col="place_id",
-                 edge_type="visited",
-                 source_collection="tourists", target_collection="places",
-                 weight_col="rating")
-
-# Query → DataFrame
-df = db.df.query("SELECT * FROM dishes WHERE protein_g >= 25 AND price <= 90000")
+# Get query results back as a DataFrame.
+result = db.df.query("SELECT * FROM dishes WHERE protein_g >= 25")
 ```
 
 ---
 
-## 📡 IoT — the island, sensed
+## Data larger than local disk (S3)
 
-sekejap is embedded and continuously-writable, so an edge device can log sensor streams and query them locally — no server round-trip. Sensors monitor places; readings are just nodes and edges.
-
-```python
-db.execute("CREATE TABLE sensors (_key TEXT PRIMARY KEY, kind TEXT, geometry GEO, reading REAL, updated_at TIMESTAMPTZ)")
-# sensor -[:monitors]-> place
-db.execute("INSERT ('sensors/crowd-kuta')-[:monitors]->('places/kuta-beach')")
-
-# Quietest beaches near Seminyak right now (low crowd sensors, close by)
-db.query("""
-    SELECT b._key AS beach, s.reading AS crowd
-    FROM MATCH (s:sensors)-[:monitors]->(b:places)
-    WHERE s.kind = 'crowd'
-      AND s.reading < 0.4
-      AND ST_DWithin(b.geometry, POINT(115.168 -8.690), 8.0)
-    ORDER BY s.reading ASC
-""")
-```
-
----
-
-## 🤖 Embodied AI — a humanoid travel assistant
-
-A companion robot walks Bali with Chloe and keeps a **local memory**: each observation fuses **place, time, a note, and a perception embedding**. Because sekejap holds graph + vector + spatial + text in one embedded engine, "recall" is a single query — the kind of local memory an on-device assistant needs.
-
-```python
-db.execute("""
-    CREATE TABLE observations (
-        _key       TEXT PRIMARY KEY,
-        seen_at    TIMESTAMPTZ,
-        geometry   GEO,          -- where the assistant was
-        note       TEXT,         -- what it noticed
-        embedding  VECTOR        -- what it perceived (image/scene vector)
-    )
-""")
-db.execute("CREATE INDEX ON observations USING spatial (geometry)")
-db.execute("CREATE INDEX ON observations USING hnsw    (embedding)")
-db.execute("CREATE INDEX ON observations USING search  (note)")
-
-# "What did we see near Ubud yesterday?"  (spatial + temporal)
-db.query("""
-    SELECT note, seen_at FROM observations
-    WHERE ST_DWithin(geometry, POINT(115.263 -8.507), 3.0)
-    ORDER BY seen_at DESC
-""")
-
-# "Find a past sunset that looked like this one"  (vector recall)
-db.query(f"""
-    SELECT note, seen_at FROM observations
-    ORDER BY embedding <=> {current_scene} ASC
-    LIMIT 3
-""")
-
-# "What did we say about temples?"  (text recall)
-db.query("SELECT note, seen_at FROM observations WHERE SEARCH('temple offering incense')")
-```
-
-Continuous ingest + local hybrid recall, in-process, on a small device — the same engine, no companion services.
-
----
-
-## S3 Remote Storage
-
-Query datasets larger than local disk. Payloads stay on S3, fetched on demand via block-level caching.
+sekejap can keep its data on S3-compatible storage and fetch pieces on demand,
+so you can query datasets bigger than the local disk. Works with AWS S3, MinIO,
+Cloudflare R2, and other S3-compatible stores.
 
 ```python
 from sekejap import DB
@@ -538,40 +465,34 @@ from sekejap import DB
 db = DB.open_s3("s3://my-bucket/bali",
                 access_key_id="AKID...", secret_access_key="secret...",
                 region="ap-southeast-1",
-                cache_budget_bytes=256 * 1024 * 1024,   # RAM cache
-                cache_dir="/tmp/sekejap-cache")          # optional disk cache
+                cache_budget_bytes=256 * 1024 * 1024)   # in-memory cache size
 
-hits = db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 10.0)")
+db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 10.0)")
 ```
-
-Works with AWS S3, MinIO, Cloudflare R2, and any S3-compatible store (`endpoint` / `allow_http` for custom endpoints).
 
 ---
 
-## Installation
+## Command-line tool
 
 ```bash
-cargo add sekejap                 # Rust library
-cargo add sekejap --features s3   # with S3 support
-cargo install sekejap-cli         # Rust CLI
-pip install sekejap               # Python (includes S3)
+sekejap                                   # in-memory session
+sekejap ./bali                            # open a database on disk
+sekejap ./bali "SELECT * FROM places;"    # run one statement and exit
+echo "SELECT ...;" | sekejap ./bali       # pipe in a script
 ```
 
-## CLI
+Inside the interactive session:
 
-```bash
-sekejap                              # in-memory REPL
-sekejap ./bali                       # persistent REPL
-sekejap ./bali "SELECT * FROM places;"   # one-shot
-echo "SELECT ...;" | sekejap ./bali  # pipe a script
-
+```
 sekejap> CREATE TABLE places (_key TEXT, name TEXT, geometry GEO);
 sekejap> SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0);
-sekejap> .tables        # introspection dot-commands
-sekejap> .edges tourists
-sekejap> .schema places
+sekejap> .tables          # list tables
+sekejap> .schema places   # show a table's columns
+sekejap> .compact         # compact the database after a big load
 sekejap> .help
 ```
+
+---
 
 ## License
 

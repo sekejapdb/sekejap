@@ -1,4 +1,18 @@
 {
-    "url": "https://context7.com/insanalamin/sekejap",
+    "$schema": "https://context7.com/schema/context7.json",
+    "projectTitle": "sekejap",
+    "description": "Embedded graph-first multi-model database (SQL + graph + vector + spatial) with a native Rust core and bindings for Python, Node, Go, Swift, Kotlin, and Dart/Flutter.",
+    "excludeFolders": ["target", "build", "node_modules", ".dart_tool", "Pods", "cargokit", "benches"],
+    "rules": [
+        "Use db.execute(sql) for DDL/DML (CREATE, INSERT, UPDATE, DELETE) and db.query(sql) for SELECT and graph queries; the SQL surface is PostgreSQL-like.",
+        "Prefer parameterized queries with $1, $2, ... (query_params / execute_params) over string interpolation to stay injection-safe.",
+        "For a query run many times with different parameters, call prepare(sql) once, then query_prepared(stmt, params) to reuse the compiled plan.",
+        "Query results are returned as JSON (an array of {slug, payload}); decode them on the host side.",
+        "Create graph edges with link(from, to, type) (attributes via link_meta) and traverse them with graph queries.",
+        "Call compact() after heavy writes to flush the WAL, rewrite payloads, and reclaim RAM.",
+        "In Dart/Flutter, call `await initSekejap()` once before any database call; the native library is precompiled and bundled, so no Rust toolchain is required.",
+        "The Maven coordinate is com.zebflow:sekejap; the pub.dev/npm/PyPI/crates.io package name is sekejap."
+    ],
+    "url": "https://context7.com/sekejapdb/sekejap",
     "public_key": "pk_SRQ5kPORDMRFyD0qf2be7"
 }

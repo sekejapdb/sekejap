@@ -160,7 +160,7 @@ At 1 B nodes / ~5 edges each: ~124 GB topology on disk (24 GB nodes + 8 GB offse
   evaluated and dropped for payloads — worse ratio on real data, no faster, and a
   shared symbol/dictionary violates the ≤1-record blast-radius rule. See
   [payload-binary-format.md](payload-binary-format.md). Edge attribute
-  (type/strength/meta) compression is an optional later pass.
+  (type / fast-lane columns / meta) compression is an optional later pass.
 - **Name resolution = sorted `hash→id` + a resident sparse index** (~1 fault/root).
 - **Recovery is compression-invisible:** WAL uncompressed + atomic tmp→fsync→rename.
 - **Resident load stays the default** until mmap ships; no perf regression is a hard gate.

@@ -88,16 +88,23 @@ Per-node **edge block**:
 [count            varint]                      // number of edges for this node
 [neighbor deltas  StreamVByte(count)]          // sorted absolute ids → deltas → SVB
 [edge_type_ids    u32 × count]                 // parallel array → dict.bin
-[strengths        f32 × count]                 // parallel array
+[attr columns     …      × count]              // parallel; one fast-lane column per primitive attribute
 [meta_refs        u32 × count]                 // parallel; u32::MAX = none → edgemeta.bin
 ```
+
+> **Note:** this spec originally reserved a single fixed `strength: f32` column.
+> The implemented runtime (`src/storage/edgestore.rs`) generalized that to
+> *fast-lane columns keyed by attribute name*, one per primitive attribute, routed
+> by value type — `strength` is no longer privileged, it's just one possible column.
+> The on-disk v2 layout should follow suit (a small column directory instead of a
+> single `strengths` array) when this format is built.
 Read node `k`'s edges: seek `offsets[k]`, read `count`, **StreamVByte-decode** the
 `count` neighbor deltas (4 ids/step, no branching) and prefix-sum to absolute dense
-ids, then read the parallel `type/strength/meta` arrays in the same order.
+ids, then read the parallel `type/attr/meta` arrays in the same order.
 
 Neighbor ids get the big compression (numerous + delta-friendly). The parallel
-attribute arrays stay fixed for now; dict/RLE/bitmap compression of `type/strength/
-meta` is an optional later pass.
+attribute arrays stay fixed for now; dict/RLE/bitmap compression of the
+`type` / attr / `meta` arrays is an optional later pass.
 
 > **Sidebar — why StreamVByte-delta is small *and* fast.**
 > A node's neighbors are sorted, so store the *gaps* not the absolute ids
@@ -246,7 +253,7 @@ compaction. No extra RAM beyond the id map (which can spill-sort for billion-sca
 5. ✅ **`idx.bin` = sorted array + binary search + a resident sparse index** (§3.3);
    on-disk hash table deferred.
 6. ✅ **Topology neighbor ids StreamVByte-delta; payloads SKBIN** (schema-aware binary;
-   block-zstd was evaluated and dropped for payloads). Attribute arrays (type/strength/meta)
+   block-zstd was evaluated and dropped for payloads). Attribute arrays (type/attr/meta)
    and any further CSR compression are optional later passes.
 7. ✅ **Access = `mmap`** (OS page cache), not a hand-rolled buffer pool; `BlockCache` for S3.
 
