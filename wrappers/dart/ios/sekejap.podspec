@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'sekejap'
-  s.version          = '0.0.1'
+  s.version          = '0.13.2'
   s.summary          = 'Embedded graph-first multi-model database (SQL + graph + vector + spatial).'
   s.description      = <<-DESC
 Embedded graph-first multi-model database (SQL + graph + vector + spatial).
