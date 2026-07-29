@@ -342,11 +342,10 @@ jobs:
         working-directory: wrappers/node
         run: |
           npm install
-          npx napi create-npm-dirs                    # generate npm/<platform>/ (package.json per triple)
+          npx napi create-npm-dir -t .                 # generate npm/<platform>/ (package.json per triple)
           npx napi artifacts --dir artifacts           # copy the built .node files into those dirs
-          ls -R npm || true                            # debug: show what got populated
-          npx napi prepublish -t npm --skip-gh-release
-          npm publish --access public
+          npx napi prepublish -t npm --skip-gh-release # publish the platform packages
+          npm publish --access public                  # publish the main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
