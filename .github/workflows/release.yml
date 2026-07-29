@@ -190,6 +190,8 @@ jobs:
         with:
           channel: stable
       - uses: dart-lang/setup-dart@v1          # standalone Dart whose pub client does OIDC (must come AFTER flutter)
+      - name: Sync version from Cargo.toml
+        run: ./scripts/sync-wrapper-versions.sh
       - name: Publish
         working-directory: wrappers/dart
         run: |
@@ -341,6 +343,8 @@ jobs:
         with:
           pattern: node-*
           path: wrappers/node/artifacts
+      - name: Sync version from Cargo.toml
+        run: ./scripts/sync-wrapper-versions.sh
       - name: Bundle all binaries into the single package + publish
         # Single-package model (like lmdb / better-sqlite3): the one `sekejap`
         # package ships all 5 platform .node files; index.js loads the right one
