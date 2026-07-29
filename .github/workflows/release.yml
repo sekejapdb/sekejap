@@ -132,6 +132,10 @@ jobs:
       name: release
     strategy:
       fail-fast: false
+      # Serialize the legs: the first creates the `precompiled_<hash>` GitHub release,
+      # the others just get it. Running in parallel races on release-create (GitHub
+      # returns "Published releases must have a valid tag" to the losers).
+      max-parallel: 1
       matrix:
         os: [ubuntu-latest, macos-14, windows-latest]
     steps:
