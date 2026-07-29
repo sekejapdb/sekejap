@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use ::sekejap::CoreDB;
 use ::sekejap::Hit;
+use ::sekejap::PreparedQuery;
 
 // ── PyHit ─────────────────────────────────────────────────────────────────────
 
@@ -23,6 +24,13 @@ pub struct PyHit {
     /// Raw JSON string — call json.loads() on the Python side.
     #[pyo3(get)]
     pub payload: Option<String>,
+}
+
+/// A prepared (compiled) query — from :meth:`DB.prepare`, run with
+/// :meth:`DB.query_prepared`. Opaque; reuse for the same shape with new params.
+#[pyclass(name = "PreparedQuery")]
+pub struct PyPreparedQuery {
+    inner: PreparedQuery,
 }
 
 #[pymethods]
@@ -345,6 +353,39 @@ impl PyDB {
         Ok(hits.into_iter().map(to_pyhit).collect())
     }
 
+    /// Compile a query once for repeated execution — a **prepared statement**.
+    /// Parse the SQL now; run it many times with different ``$1``, ``$2``, … values.
+    ///
+    /// Example::
+    ///
+    ///     stmt = db.prepare("SELECT * FROM users WHERE age > $1")
+    ///     young = db.query_prepared(stmt, [25])
+    ///     old   = db.query_prepared(stmt, [60])
+    fn prepare(&self, sql: &str) -> PyResult<PyPreparedQuery> {
+        let inner = self.db()?.prepare(sql).map_err(db_err)?;
+        Ok(PyPreparedQuery { inner })
+    }
+
+    /// Run a prepared statement (from :meth:`prepare`), binding ``$1``, ``$2``, ….
+    #[pyo3(signature = (stmt, params=None))]
+    fn query_prepared(
+        &self,
+        py: Python<'_>,
+        stmt: &PyPreparedQuery,
+        params: Option<Vec<PyObject>>,
+    ) -> PyResult<Vec<PyHit>> {
+        let vals = match params {
+            Some(p) => py_list_to_values(py, p)?,
+            None => Vec::new(),
+        };
+        let hits: Vec<Hit> = self
+            .db()?
+            .query_prepared(&stmt.inner, &vals)
+            .map_err(db_err)?
+            .collect();
+        Ok(hits.into_iter().map(to_pyhit).collect())
+    }
+
     /// Return the query plan for a ``SELECT`` / ``MATCH`` statement without running it.
     ///
     /// Each hit's ``payload`` is a JSON string describing one plan step. Use
@@ -464,5 +505,6 @@ fn sekejap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDB>()?;
     m.add_class::<PyHit>()?;
     m.add_class::<PyEdgeHit>()?;
+    m.add_class::<PyPreparedQuery>()?;
     Ok(())
 }

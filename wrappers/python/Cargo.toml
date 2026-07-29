@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-documentation = "https://github.com/insanalamin/sekejap#readme"
+documentation = "https://github.com/sekejapdb/sekejap#readme"
 keywords = ["database", "graph", "vector", "multi-model"]
 classifiers = [
     "Development Status :: 3 - Alpha",

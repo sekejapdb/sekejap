@@ -1,15 +1,25 @@
 [workspace]
-members = [".", "wrappers/python", "wrappers/flutter", "skcli"]
+members = [".", "wrappers/python", "wrappers/dart/rust", "wrappers/c", "skcli"]
+# napi-rs crate: excluded because (like pyo3) it links against the host runtime's
+# symbols and doesn't build under a plain `cargo build --workspace`. Built on its
+# own via the Node toolchain / cargo from within wrappers/node.
+exclude = ["wrappers/node"]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
-license = "MIT"
-repository = "https://github.com/insanalamin/sekejap"
-homepage = "https://db.sekejap.life"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sekejapdb/sekejap"
+homepage = "https://sekejap.zebflow.com"
 description = "A graph-first, embedded multi-model database engine"
 
 [workspace.dependencies]
+sekejap = { path = "." }
+
+# The Dart bridge crate (wrappers/dart/rust) depends on `sekejap` as a *registry*
+# dep so its published pub.dev package is self-contained. This patch redirects that
+# to the in-repo core for local/CI builds, so dev never needs the crate on crates.io.
+[patch.crates-io]
 sekejap = { path = "." }
 
 [package]
@@ -21,7 +31,7 @@ description.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://github.com/insanalamin/sekejap#readme"
+documentation = "https://github.com/sekejapdb/sekejap#readme"
 keywords = ["database", "graph", "vector", "spatial", "multi-model"]
 categories = ["database", "embedded", "data-structures"]
 
@@ -30,19 +40,24 @@ serde_json = "1"
 serde      = { version = "1", features = ["derive"] }
 seahash    = "4"
 crc32fast  = "1.4"
-zstd      = { version = "0.13", default-features = false }
 roaring    = "0.10"
 fst        = { version = "0.4", features = ["levenshtein"] }
 memchr     = "2"
 chrono     = "0.4"
 uuid       = { version = "1", features = ["v4", "v5"] }
 object_store = { version = "0.14", optional = true, features = ["aws"] }
-tokio        = { version = "1",    optional = true, features = ["rt"] }
+tokio        = { version = "1",    optional = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+# Benchmark-only: SurrealDB embedded (SurrealKV, pure-Rust disk engine) for the
+# vs-SurrealDB mega comparison. Optional + off by default — a huge dependency, so
+# normal builds/tests never pull it. Enabled via the `surreal-bench` feature.
+surrealdb    = { version = "2", optional = true, default-features = false, features = ["kv-surrealkv"] }
 
 [features]
 default = []
 engine = []
 s3 = ["engine", "dep:object_store", "dep:tokio"]
+# Build the mega_vs_surreal benchmark (pulls SurrealDB + a tokio runtime).
+surreal-bench = ["dep:surrealdb", "dep:tokio"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -52,6 +67,13 @@ rusqlite  = { version = "0.32", features = ["bundled"] }
 # Benchmarks live under benches/ (subfoldered by area). Each is a plain `fn main`
 # harness (harness = false) run with `cargo bench --bench <name>`. Engine ones are
 # gated behind the `engine` feature so a plain build/test skips them.
+
+# ── cross-engine comparison ─────────────────────────────────────────────────
+[[bench]]
+name = "mega_vs_surreal"
+path = "benches/mega_vs_surreal.rs"
+harness = false
+required-features = ["surreal-bench"]
 
 # ── payload / query benchmarks ──────────────────────────────────────────────
 [[bench]]

@@ -1,0 +1,5 @@
+module CSekejap {
+    header "sekejap.h"
+    link "sekejap"
+    export *
+}

@@ -1,0 +1,42 @@
+# cbindgen configuration for sekejap-capi. Drives build.rs (and manual
+# `cbindgen --output include/sekejap.h`). Keeps the C header in sync with the
+# Rust extern "C" surface.
+
+language = "C"
+include_guard = "SEKEJAP_H"
+tab_width = 4
+style = "type"
+cpp_compat = true          # wrap in extern "C" for C++ consumers
+documentation = true
+documentation_style = "c99"
+
+header = """
+/*
+ * sekejap.h — C ABI for sekejap (https://sekejap.zebflow.com)
+ *
+ * AUTO-GENERATED from sekejap-capi/src/lib.rs by cbindgen. Do not edit by hand.
+ *
+ * A stable extern "C" surface over the sekejap engine, for binding from
+ * Swift, Kotlin/JNI, Dart (dart:ffi), Go (cgo), and C/C++.
+ *
+ * Ownership: SekejapDb* is opaque (open* creates, close frees). Any char* the
+ * library RETURNS is yours — free it once with sekejap_string_free (except
+ * sekejap_version, which is static). Strings you PASS IN are borrowed UTF-8.
+ * Failure sentinels: NULL for pointers, -1 for integers; sekejap_last_error(db)
+ * has the message. No Rust panic crosses the boundary.
+ */
+"""
+
+[export]
+prefix = ""
+
+[parse]
+parse_deps = false         # SekejapDb wraps a foreign CoreDB → emitted opaque
+
+[defines]
+# The `engine` cargo feature → a C macro, so the concurrent Engine handle appears
+# in the header wrapped in `#if defined(SEKEJAP_ENGINE)` regardless of build flags.
+"feature = engine" = "SEKEJAP_ENGINE"
+
+[enum]
+prefix_with_name = true
