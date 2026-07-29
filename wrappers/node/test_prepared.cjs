@@ -1,6 +1,6 @@
 const assert = require('assert');
 const os = require('os'), fs = require('fs'), path = require('path');
-const { Db } = require('./sekejap.node');
+const { Db } = require('./index.js');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-node-prep-'));
 const db = Db.open(dir);
 db.execute("CREATE TABLE t (_key TEXT PRIMARY KEY, v INTEGER)");

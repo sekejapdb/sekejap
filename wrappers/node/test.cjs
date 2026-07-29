@@ -1,6 +1,6 @@
 const assert = require('assert');
 const os = require('os'), fs = require('fs'), path = require('path');
-const { Db, version } = require('./sekejap.node');
+const { Db, version } = require('./index.js');
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sekejap-node-'));
 const db = Db.open(dir);

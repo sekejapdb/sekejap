@@ -337,15 +337,16 @@ jobs:
         with:
           pattern: node-*
           path: wrappers/node/artifacts
-          # no merge-multiple: napi artifacts expects each target in its own subdir
-      - name: Prepare platform packages + publish
+      - name: Bundle all binaries into the single package + publish
+        # Single-package model (like lmdb / better-sqlite3): the one `sekejap`
+        # package ships all 5 platform .node files; index.js loads the right one
+        # at runtime. No platform sub-packages → no npm spam filter.
         working-directory: wrappers/node
         run: |
-          npm install
-          npx napi create-npm-dir -t .                 # generate npm/<platform>/ (package.json per triple)
-          npx napi artifacts --dir artifacts           # copy the built .node files into those dirs
-          npx napi prepublish -t npm --skip-gh-release # publish the platform packages
-          npm publish --access public                  # publish the main package
+          find artifacts -name '*.node' -exec cp {} . \;   # collect all 5 into the package root
+          rm -rf artifacts
+          ls -lh *.node
+          npm publish --access public                       # `files` allowlist ships index.js + index.d.ts + *.node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
