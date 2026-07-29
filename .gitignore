@@ -103,3 +103,19 @@ sekejap-benchmark/bench_sqlite.db
 # internal dev workbench + private domain notes (never committed)
 .workbench/
 .sekejap.cases.raw.md
+
+# compiled C examples (built by wrappers/c/examples/Makefile)
+/wrappers/c/examples/test
+/wrappers/c/examples/test_asan
+/wrappers/c/examples/server
+
+# node (napi-rs) build artifacts
+*.node
+node_modules/
+
+# swift build + kotlin/gradle build
+.build/
+wrappers/kotlin/.gradle/
+wrappers/kotlin/build/
+wrappers/kotlin/gradle/
+!wrappers/kotlin/gradle/wrapper/gradle-wrapper.properties

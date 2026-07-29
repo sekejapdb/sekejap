@@ -71,24 +71,24 @@ Filter on node fields, edge properties, spatial, and text:
 SELECT b.* FROM MATCH (a:users)-[r:visited]->(b:places)
 WHERE a._key = 'u1'                              -- node field
   AND b.rating >= 4                              -- destination field
-  AND r.strength > 0.5                           -- edge property (see below)
+  AND r.rating > 0.5                             -- edge attribute (see below)
   AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5.0)  -- PostGIS spatial
   AND BM25(b.description, 'coffee') > 0.0         -- text relevance
 ```
 
 ## Edge properties
 
-Bind the edge with a variable (`-[r:type]->`) to read its data. Each edge carries a typed `strength` plus arbitrary JSON metadata:
+Bind the edge with a variable (`-[r:type]->`) to read its attributes. An edge carries whatever attributes you gave it when you created it — there is no privileged field. Primitive attributes (numbers, booleans, strings) are stored in fast-lane columns and read back by name; other values ride a JSON bag. Any of them is available as `r.<name>`:
 
 ```sql
--- project and filter on edge fields
-SELECT b._key AS charger, s.kwh AS energy, s.strength AS weight
+-- project and filter on edge fields (any attribute name works)
+SELECT b._key AS charger, s.kwh AS energy, s.rate AS weight
 FROM MATCH (v:vehicles)-[s:charged_at]->(b:chargers)
 WHERE v._key = 'ev-7' AND s.kwh > 40
-ORDER BY s.strength DESC
+ORDER BY s.rate DESC
 ```
 
-Path intrinsics are also available on the edge variable: `r._depth`, `r._path_keys`, `r._path_strength`, `r._avg_strength`, `r._min_strength`, `r._max_strength`.
+Two path intrinsics are also available on the edge variable: `r._depth` (hop count) and `r._path_keys` (the keys along the path).
 
 ## Grouping and aggregation
 
@@ -175,7 +175,7 @@ GROUP BY d.name
 - **Bare `MATCH … RETURN`** — banned; always write `SELECT … FROM MATCH`.
 - **Undirected `-[:e]-`** (either direction) — use forward or backward explicitly.
 - A **second `WITH` stage that starts a *new* collection joined by a prior alias
-  field** (`WITH q.clo AS clo … MATCH (c:clos WHERE _key = clo)…`) — under-binds;
+  field** (`WITH q.owner AS owner … MATCH (o:owners WHERE _key = owner)…`) — under-binds;
   continue from a bound variable instead, or decompose into separate queries.
 - **`BETWEEN`** inside a MATCH `WHERE` — use `x >= a AND x <= b`.
 - **Functions in plain `SELECT` projection** (`AGE_DAYS`, `NOW`, `CASE`) — available in

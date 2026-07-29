@@ -55,8 +55,10 @@ tag 5  uint    -> plain varint (u64 > i64::MAX)
 tag 6  string  -> varint len + utf8 bytes  (ALWAYS literal — value lives here)
 tag 7  array   -> varint count + values
 tag 8  object  -> varint count + [varint field_id, value]*
-tag 11 zstr    -> RESERVED: per-field zstd string (self-contained, no shared dict).
-                  Off by default (`Config::payload_zstd`); never written unless enabled.
+tag 11 zstr    -> RETIRED per-field zstd string. zstd was removed from the payload
+                  path (and the `zstd` dependency dropped). Never written; on decode
+                  it is rejected loudly (record fails to decode) so a record from the
+                  removed feature can never be mis-read.
 ```
 
 Tag 10 is retired (was FSST — removed; it required a shared symbol table).
@@ -127,7 +129,7 @@ without a flag day:
 
 ```
 0x7B  '{'   raw JSON            (legacy / >64 KB / un-compacted writes)
-0x01        legacy whole-record zstd  (reader kept; default off)
+0x01        RETIRED whole-record zstd  (recognized only to reject loudly)
 0x02        SKBIN v1            ← current official format
 0x03..0xFF  RESERVED for future record formats (SKBIN v2, …)
 ```
@@ -160,8 +162,9 @@ table (rebuildable from scan/WAL/`CREATE TABLE`), first-byte read dispatch, SKBI
 at compaction, resident **and** paged equivalence, the full DML/DDL surface
 (projection/sort/GROUP BY/MATCH/filters/UPDATE/DELETE/ALTER/GIN/BM25), and a fuzzed
 decoder (200k random inputs + every single-bit corruption + every truncation →
-no panic, corruption always detected). The legacy `0x01` zstd reader is retained
-for migration; per-field zstd (tag 11) is reserved and default-off.
+no panic, corruption always detected). zstd has been removed entirely from the
+payload path (and the `zstd` dependency dropped); the `0x01` and tag-11 encodings
+are recognized only to reject them loudly on decode, never to decompress.
 
 ## 10. Future: leaner WITHOUT breaking the rule (not yet measured)
 

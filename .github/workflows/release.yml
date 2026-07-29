@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch: {}   # allow manual runs from the Actions UI (test publishes)
 
 jobs:
   publish-rust-library:
@@ -117,3 +118,274 @@ jobs:
         with:
           packages-dir: wrappers/python/dist
           skip-existing: true
+
+  # ── Dart/Flutter: precompile + sign the native library (cargokit) ──────────
+  # Builds libsekejap_ffi for every platform buildable from each host, signs it
+  # with DART_PRECOMPILED_PRIVATE_KEY, and uploads it to a `precompiled_<hash>`
+  # GitHub Release. Consumers download+verify it during `flutter build` (no Rust).
+  precompile-dart:
+    name: Precompile native libs (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write        # create/upload the precompiled_<hash> release
+    environment:
+      name: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - name: Install GTK (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Precompile (desktop + iOS on macOS host)
+        if: matrix.os != 'ubuntu-latest'
+        working-directory: wrappers/dart/cargokit/build_tool
+        run: |
+          dart pub get
+          dart run build_tool precompile-binaries -v \
+            --manifest-dir=../../rust \
+            --repository=sekejapdb/sekejap
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.DART_PRECOMPILED_PRIVATE_KEY }}
+      - name: Precompile (Linux desktop + Android)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: wrappers/dart/cargokit/build_tool
+        run: |
+          dart pub get
+          NDK_VERSION=$(ls "$ANDROID_SDK_ROOT/ndk" | sort -V | tail -1)
+          echo "Using Android NDK $NDK_VERSION"
+          dart run build_tool precompile-binaries -v \
+            --manifest-dir=../../rust \
+            --repository=sekejapdb/sekejap \
+            --android-sdk-location="$ANDROID_SDK_ROOT" \
+            --android-ndk-version="$NDK_VERSION" \
+            --android-min-sdk-version=23
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.DART_PRECOMPILED_PRIVATE_KEY }}
+
+  # ── Publish the Dart package to pub.dev (OIDC — no stored token) ───────────
+  publish-dart:
+    name: Publish to pub.dev
+    needs: precompile-dart
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # OIDC trusted publishing to pub.dev
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Publish
+        working-directory: wrappers/dart
+        run: |
+          flutter pub get
+          dart pub publish --force
+
+  # ── C ABI native libraries (serves C/C++, Go, Swift, any C-ABI consumer) ───
+  # Builds libsekejap for each desktop platform and attaches a tarball
+  # (lib + header) to the GitHub Release. This is the "download & link" path
+  # C/Go/Swift consumers use.
+  build-native-libs:
+    name: libsekejap (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,   runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  ext: so,    prefix: lib }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: so,    prefix: lib }
+          - { name: macos-arm64, runner: macos-14,         target: aarch64-apple-darwin,      ext: dylib, prefix: lib }
+          - { name: macos-x64,   runner: macos-14,         target: x86_64-apple-darwin,       ext: dylib, prefix: lib }
+          - { name: windows-x64, runner: windows-latest,   target: x86_64-pc-windows-msvc,    ext: dll,   prefix: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build C ABI (regenerates sekejap.h via cbindgen)
+        run: cargo build --release -p sekejap-capi --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          STAGE="libsekejap-${{ matrix.name }}"
+          mkdir -p "$STAGE/lib" "$STAGE/include"
+          cp "target/${{ matrix.target }}/release/${{ matrix.prefix }}sekejap.${{ matrix.ext }}" "$STAGE/lib/"
+          # static/import lib alongside the dynamic one, when present
+          cp "target/${{ matrix.target }}/release/libsekejap.a"  "$STAGE/lib/" 2>/dev/null || true
+          cp "target/${{ matrix.target }}/release/sekejap.lib"   "$STAGE/lib/" 2>/dev/null || true
+          cp wrappers/c/include/sekejap.h "$STAGE/include/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.name }}
+          path: libsekejap-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+  release-native-libs:
+    name: Attach native libs to Release
+    needs: build-native-libs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+
+  # ── Swift: build an xcframework (macOS + iOS) and attach it to the Release ──
+  build-swift-xcframework:
+    name: Swift xcframework
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Build static lib for all Apple targets
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+            cargo build --release -p sekejap-capi --target "$t"
+          done
+      - name: Assemble xcframework
+        run: |
+          HDR=wrappers/c/include
+          mkdir -p build
+          lipo -create target/aarch64-apple-darwin/release/libsekejap.a \
+                       target/x86_64-apple-darwin/release/libsekejap.a \
+               -output build/libsekejap-macos.a
+          lipo -create target/aarch64-apple-ios-sim/release/libsekejap.a \
+                       target/x86_64-apple-ios/release/libsekejap.a \
+               -output build/libsekejap-iossim.a
+          xcodebuild -create-xcframework \
+            -library build/libsekejap-macos.a  -headers "$HDR" \
+            -library target/aarch64-apple-ios/release/libsekejap.a -headers "$HDR" \
+            -library build/libsekejap-iossim.a -headers "$HDR" \
+            -output build/CSekejap.xcframework
+          (cd build && zip -r libsekejap.xcframework.zip CSekejap.xcframework)
+          swift package compute-checksum build/libsekejap.xcframework.zip | tee build/xcframework.checksum.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libsekejap.xcframework.zip
+            build/xcframework.checksum.txt
+
+  # ── Node.js: build the N-API addon per platform and publish to npm ─────────
+  build-node:
+    name: node addon (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runner: macos-14,         target: aarch64-apple-darwin }
+          - { runner: macos-14,         target: x86_64-apple-darwin }
+          - { runner: windows-latest,   target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build addon
+        working-directory: wrappers/node
+        run: |
+          npm install
+          npx napi build --platform --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.target }}
+          path: wrappers/node/*.node
+          if-no-files-found: error
+
+  publish-node:
+    name: Publish to npm
+    needs: build-node
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          path: wrappers/node/artifacts
+          merge-multiple: true
+      - name: Prepare platform packages + publish
+        working-directory: wrappers/node
+        run: |
+          npm install
+          npx napi artifacts -d artifacts
+          npx napi prepublish -t npm --skip-gh-release
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Kotlin/JVM → Maven Central. Bundles the per-platform native libs (from
+  # build-native-libs) into resources so the published jar is self-contained. ─
+  publish-kotlin:
+    name: Publish to Maven Central
+    needs: build-native-libs
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-artifacts
+          merge-multiple: true
+      - name: Stage native libs into resources
+        run: |
+          RES=wrappers/kotlin/src/main/resources/natives
+          declare -A MAP=( [linux-x64]=linux-x86_64 [linux-arm64]=linux-aarch64 \
+                           [macos-arm64]=macos-aarch64 [macos-x64]=macos-x86_64 \
+                           [windows-x64]=windows-x86_64 )
+          for tgz in native-artifacts/*.tar.gz; do
+            base=$(basename "$tgz" .tar.gz)          # libsekejap-linux-x64
+            name=${base#libsekejap-}                 # linux-x64
+            dest="$RES/${MAP[$name]}"
+            mkdir -p "$dest"
+            tar -xzf "$tgz" -C /tmp
+            cp /tmp/"$base"/lib/*.so /tmp/"$base"/lib/*.dylib /tmp/"$base"/lib/*.dll "$dest/" 2>/dev/null || true
+          done
+          find "$RES" -type f
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "22"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Publish
+        working-directory: wrappers/kotlin
+        run: gradle publishAndReleaseToMavenCentral --no-configuration-cache --stacktrace
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
