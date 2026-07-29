@@ -14,7 +14,11 @@ plugins {
 }
 
 group = "com.zebflow"           // reverse-DNS of the zebflow.com umbrella namespace
-version = "0.13.3"
+// Single source of truth: [workspace.package] version in the root Cargo.toml.
+// Read it directly so a Cargo.toml bump is the ONLY place a version lives.
+version = rootDir.resolve("../../Cargo.toml").readLines()
+    .first { it.trimStart().startsWith("version = ") }
+    .substringAfter('"').substringBefore('"')
 
 repositories { mavenCentral() }
 

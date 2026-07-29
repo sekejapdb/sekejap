@@ -74,7 +74,7 @@ flutter pub add sekejap             # or: dart pub add sekejap
 
 ```kotlin
 // build.gradle.kts
-implementation("com.zebflow:sekejap:0.13.3")
+implementation("com.zebflow:sekejap:0.13.5")
 ```
 
 ---
