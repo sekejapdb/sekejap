@@ -6,6 +6,6 @@ includedir=${prefix}/include
 Name: sekejap
 Description: Embedded graph-first multi-model database (C ABI)
 URL: https://sekejap.zebflow.com
-Version: 0.13.2
+Version: 0.13.3
 Libs: -L${libdir} -lsekejap
 Cflags: -I${includedir}

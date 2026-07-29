@@ -1,6 +1,6 @@
 {
   "name": "sekejap",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "description": "Embedded graph-first multi-model database — Node.js binding",
   "license": "MIT OR Apache-2.0",
   "repository": "github:sekejapdb/sekejap",
@@ -8,23 +8,15 @@
   "keywords": ["database", "graph", "vector", "spatial", "embedded", "multi-model"],
   "main": "index.js",
   "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node", "README.md"],
   "napi": {
-    "name": "sekejap",
-    "triples": {
-      "defaults": false,
-      "additional": [
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-pc-windows-msvc"
-      ]
-    }
+    "name": "sekejap"
   },
   "engines": { "node": ">= 16" },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform"
+    "build": "napi build --platform --release"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"

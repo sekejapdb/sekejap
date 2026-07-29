@@ -14,7 +14,7 @@ plugins {
 }
 
 group = "com.zebflow"           // reverse-DNS of the zebflow.com umbrella namespace
-version = "0.13.2"
+version = "0.13.3"
 
 repositories { mavenCentral() }
 

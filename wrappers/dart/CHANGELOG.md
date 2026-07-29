@@ -1,3 +1,8 @@
+## 0.13.3
+
+* Smaller native library — release builds now strip debug symbols and use LTO
+  (link-time optimization). No changes to the Dart/Flutter API.
+
 ## 0.13.2
 
 * Maintenance release — coordinated version bump across all sekejap language
