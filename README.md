@@ -411,7 +411,7 @@ MATCH (peer)-[:ate]->(d:dishes)
 GROUP BY d.name
 
 -- Shortest path: 0 rows if unreachable, 1 row if a path exists
-SELECT a.name AS from_n, b.name AS to_n, r.length AS hops
+SELECT a.name AS from_n, b.name AS to_n, length(r) AS hops, nodes(r) AS via
 FROM MATCH SHORTEST (a:tourists)-[r*]->(b:dishes)
 WHERE a._key = 'chloe' AND b._key = 'betutu-chicken'
 

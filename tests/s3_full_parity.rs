@@ -199,7 +199,7 @@ fn test_full_feature_parity() {
 
     // ── Test 11: MATCH SHORTEST ─────────────────────────────────────────
     let shortest = db.query(
-        "SELECT a.name AS src, b.name AS dst, r.length AS hops \
+        "SELECT a.name AS src, b.name AS dst, length(r) AS hops \
          FROM MATCH SHORTEST (a:cities)-[r*]->(b:countries) \
          WHERE a._key = 'jkt' AND b._key = 'id'"
     ).unwrap().collect();

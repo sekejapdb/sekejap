@@ -441,7 +441,7 @@ fn skbin_shortest_path() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
     let db = CoreDB::open_with_config(dir.path(), skbin_cfg()).unwrap();
-    let s = db.query("SELECT r.length AS hops FROM MATCH SHORTEST (a:orders)-[r*]->(b:orders) WHERE a._key = 'o0000' AND b._key = 'o0005'").unwrap().collect();
+    let s = db.query("SELECT length(r) AS hops FROM MATCH SHORTEST (a:orders)-[r*]->(b:orders) WHERE a._key = 'o0000' AND b._key = 'o0005'").unwrap().collect();
     assert_eq!(s.len(), 1);
     assert_eq!(s[0].payload.as_ref().unwrap()["hops"].as_i64(), Some(5));
 }
