@@ -418,6 +418,222 @@ fn match_backward_one_hop() {
 }
 
 #[test]
+fn select_graph_returns_nodes_and_edges() {
+    let db = setup_music_db();
+    // `SELECT GRAPH` → one Hit whose payload is `{nodes, edges}` for the traversal.
+    let hits = db.query(
+        "SELECT GRAPH FROM MATCH (a:artist)-[e:has_genre]->(g:genre) WHERE a._key = 'the-vines'"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 1, "graph mode returns a single graph object");
+    let g = hits[0].payload.as_ref().unwrap();
+    let nodes = g.get("nodes").unwrap().as_array().unwrap();
+    let edges = g.get("edges").unwrap().as_array().unwrap();
+    // artist + 2 genres = 3 nodes; 2 has_genre edges.
+    assert_eq!(nodes.len(), 3, "nodes: {nodes:?}");
+    assert_eq!(edges.len(), 2, "edges: {edges:?}");
+    // Node shape: slug/collection/key/payload.
+    assert!(nodes.iter().any(|n| n.get("slug").unwrap() == "artist/the-vines"
+        && n.get("collection").unwrap() == "artist"
+        && n.get("key").unwrap() == "the-vines"));
+    // Edge shape: from/to/type/attrs; `strength` (fast-lane attr) surfaces.
+    let e = edges.iter()
+        .find(|e| e.get("to").unwrap() == "genre/garage-rock")
+        .expect("edge to garage-rock");
+    assert_eq!(e.get("from").unwrap(), "artist/the-vines");
+    assert_eq!(e.get("type").unwrap(), "has_genre");
+    assert_eq!(e.get("attrs").unwrap().get("strength").unwrap(), 10);
+}
+
+#[test]
+fn select_graph_inbound_normalizes_edge_direction() {
+    let db = setup_music_db();
+    // Queried inbound (`<-`) but edges must still be emitted in STORED forward
+    // direction (artist → genre), so a viz layer draws arrows correctly.
+    let hits = db.query(
+        "SELECT GRAPH FROM MATCH (g:genre)<-[e:has_genre]-(a:artist) WHERE g._key = 'garage-rock'"
+    ).unwrap().collect();
+    let g = hits[0].payload.as_ref().unwrap();
+    let edges = g.get("edges").unwrap().as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].get("from").unwrap(), "artist/the-vines");
+    assert_eq!(edges[0].get("to").unwrap(), "genre/garage-rock");
+}
+
+// ── GQL grammar alignment ─────────────────────────────────────────────────────
+
+#[test]
+fn match_gql_edge_inline_props_filter() {
+    let db = setup_music_db();
+    // has_genre edges carry `strength`: garage-rock=10, alternative=5.
+    // GQL inline edge prop `{strength: 10}` must filter to only that edge.
+    let hits = db.query(
+        "SELECT g.* FROM MATCH (a:artist)-[e:has_genre {strength: 10}]->(g:genre) WHERE a._key = 'the-vines'"
+    ).unwrap().collect();
+    let names: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert_eq!(names, vec!["Garage Rock"], "inline edge prop must keep only strength=10; got {names:?}");
+}
+
+#[test]
+fn match_gql_edge_inline_props_anonymous() {
+    let db = setup_music_db();
+    // Anonymous edge (no bind) with an inline prop still filters.
+    let hits = db.query(
+        "SELECT g.* FROM MATCH (a:artist)-[:has_genre {strength: 5}]->(g:genre) WHERE a._key = 'the-vines'"
+    ).unwrap().collect();
+    let names: Vec<_> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
+        .collect();
+    assert_eq!(names, vec!["Alternative"], "anon edge inline prop strength=5; got {names:?}");
+}
+
+fn setup_chain_db() -> CoreDB {
+    let mut db = CoreDB::new();
+    for k in ["a", "b", "c", "d"] {
+        db.put(&format!("n/{k}"), &format!(r#"{{"_collection":"n","_key":"{k}"}}"#)).unwrap();
+    }
+    db.link("n/a", "n/b", "next");
+    db.link("n/b", "n/c", "next");
+    db.link("n/c", "n/d", "next");
+    db
+}
+
+#[test]
+fn match_gql_brace_quantifier_exact() {
+    let db = setup_chain_db();
+    // `{2}` → exactly 2 hops from a: path a→b→c (2 stored edges).
+    let hits = db.query(
+        "SELECT GRAPH FROM MATCH (x:n)-[e:next]->{2}(y) WHERE x._key = 'a'"
+    ).unwrap().collect();
+    let g = hits[0].payload.as_ref().unwrap();
+    let edges = g.get("edges").unwrap().as_array().unwrap();
+    assert_eq!(edges.len(), 2, "exact {{2}} traverses a->b->c: {edges:?}");
+}
+
+#[test]
+fn match_gql_anonymous_edge() {
+    let db = setup_chain_db(); // a→b→c→d via `next`
+    // `-->` — anonymous forward edge, any type.
+    let hits = db.query(
+        "SELECT GRAPH FROM MATCH (x:n)-->(y) WHERE x._key = 'a'"
+    ).unwrap().collect();
+    let edges = hits[0].payload.as_ref().unwrap().get("edges").unwrap().as_array().unwrap().clone();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].get("from").unwrap(), "n/a");
+    assert_eq!(edges[0].get("to").unwrap(), "n/b");
+
+    // `<--` — anonymous backward edge; emitted in stored forward direction.
+    let hits = db.query(
+        "SELECT GRAPH FROM MATCH (y:n)<--(x) WHERE y._key = 'b'"
+    ).unwrap().collect();
+    let edges = hits[0].payload.as_ref().unwrap().get("edges").unwrap().as_array().unwrap().clone();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].get("from").unwrap(), "n/a");
+    assert_eq!(edges[0].get("to").unwrap(), "n/b");
+
+    // `-->{1,2}` — anonymous edge with quantifier reaches a,b,c.
+    let hits = db.query(
+        "SELECT GRAPH FROM MATCH (x:n)-->{1,2}(y) WHERE x._key = 'a'"
+    ).unwrap().collect();
+    let nodes = hits[0].payload.as_ref().unwrap().get("nodes").unwrap().as_array().unwrap().len();
+    assert_eq!(nodes, 3, "a-->{{1,2}} reaches a,b,c");
+}
+
+#[test]
+fn match_gql_undirected_edge() {
+    let mut db = CoreDB::new();
+    for k in ["alice", "bob", "carol"] {
+        db.put(&format!("p/{k}"), &format!(r#"{{"_collection":"p","_key":"{k}"}}"#)).unwrap();
+    }
+    // Stored one-way: alice→bob, bob→carol.
+    db.link("p/alice", "p/bob", "friends");
+    db.link("p/bob", "p/carol", "friends");
+
+    // Directed from bob sees only carol.
+    let g = db.query("SELECT GRAPH FROM MATCH (a:p)-[:friends]->(x) WHERE a._key='bob'")
+        .unwrap().collect();
+    assert_eq!(g[0].payload.as_ref().unwrap()["edges"].as_array().unwrap().len(), 1);
+
+    // Undirected from bob sees BOTH neighbours (alice via reverse, carol via forward).
+    let g = db.query("SELECT GRAPH FROM MATCH (a:p)-[:friends]-(x) WHERE a._key='bob'")
+        .unwrap().collect();
+    let payload = g[0].payload.as_ref().unwrap();
+    let edges = payload["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 2, "undirected sees both neighbours: {edges:?}");
+    // Edges emitted in STORED direction regardless of traversal side.
+    assert!(edges.iter().any(|e| e["from"] == "p/alice" && e["to"] == "p/bob"));
+    assert!(edges.iter().any(|e| e["from"] == "p/bob" && e["to"] == "p/carol"));
+
+    // Undirected reachability *1..2 from alice reaches alice, bob, carol (no U-turn dupes).
+    let g = db.query("SELECT GRAPH FROM MATCH (a:p)-[:friends*1..2]-(x) WHERE a._key='alice'")
+        .unwrap().collect();
+    let nodes = g[0].payload.as_ref().unwrap()["nodes"].as_array().unwrap().len();
+    assert_eq!(nodes, 3, "alice reaches alice,bob,carol");
+}
+
+#[test]
+fn match_gql_path_functions() {
+    // a→b→c→d chain with weighted edges; a GQL path variable exposes the path.
+    let mut db = CoreDB::new();
+    for k in ["a", "b", "c", "d"] {
+        db.put(&format!("n/{k}"), &format!(r#"{{"_collection":"n","_key":"{k}"}}"#)).unwrap();
+    }
+    db.link_meta("n/a", "n/b", "next", r#"{"w":10}"#).unwrap();
+    db.link_meta("n/b", "n/c", "next", r#"{"w":20}"#).unwrap();
+    db.link_meta("n/c", "n/d", "next", r#"{"w":30}"#).unwrap();
+
+    let hits = db.query(
+        "SELECT length(p) AS hops, nodes(p) AS via, relationships(p) AS rels \
+         FROM MATCH p = (x:n)-[e:next]->{1,3}(y) WHERE x._key = 'a' ORDER BY hops"
+    ).unwrap().collect();
+    assert_eq!(hits.len(), 3, "1..3 hops → three paths");
+
+    // Deepest path: a→b→c→d.
+    let deep = hits.iter()
+        .find(|h| h.payload.as_ref().unwrap()["hops"].as_i64() == Some(3))
+        .expect("3-hop path");
+    let p = deep.payload.as_ref().unwrap();
+    let via: Vec<&str> = p["via"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(via, vec!["n/a", "n/b", "n/c", "n/d"]);
+    let rels = p["rels"].as_array().unwrap();
+    assert_eq!(rels.len(), 3);
+    assert_eq!(rels[0]["from"], "n/a");
+    assert_eq!(rels[0]["to"], "n/b");
+    assert_eq!(rels[0]["type"], "next");
+    assert_eq!(rels[0]["attrs"]["w"], 10);
+}
+
+#[test]
+fn gql_path_dotted_access_rejected() {
+    let db = setup_chain_db();
+    // Dotted field access on a path variable is a HARD error — the only way to
+    // read a path is length(p)/nodes(p)/relationships(p).
+    assert!(db.query(
+        "SELECT p.length FROM MATCH p = (x:n)-[:next]->(y) WHERE x._key = 'a'"
+    ).is_err(), "p.length must be rejected");
+    assert!(db.query(
+        "SELECT p.nodes AS via FROM MATCH p = (x:n)-[:next]->(y) WHERE x._key = 'a'"
+    ).is_err(), "p.nodes must be rejected");
+    // The official spelling works.
+    assert!(db.query(
+        "SELECT length(p) AS h FROM MATCH p = (x:n)-[:next]->(y) WHERE x._key = 'a'"
+    ).is_ok());
+}
+
+#[test]
+fn match_gql_brace_quantifier_range() {
+    let db = setup_chain_db();
+    // `{1,3}` → 1..3 hops from a reaches b, c, d (plus a itself) = 4 nodes.
+    let hits = db.query(
+        "SELECT GRAPH FROM MATCH (x:n)-[e:next]->{1,3}(y) WHERE x._key = 'a'"
+    ).unwrap().collect();
+    let g = hits[0].payload.as_ref().unwrap();
+    let nodes = g.get("nodes").unwrap().as_array().unwrap();
+    assert_eq!(nodes.len(), 4, "1..3 hops from a reaches a,b,c,d: {nodes:?}");
+}
+
+#[test]
 fn match_backward_multihop_descendants() {
     // child_of hierarchy: village -> district -> province.
     // Backward from the province walks DOWN to all descendants.
@@ -682,15 +898,17 @@ fn match_varlength_path_intrinsics_correct() {
     db.link("places/canggu",   "places/uluwatu", "route");
 
     let hits = db.query(
-        "SELECT dest._key AS dest, r._depth AS depth, \
-                JSON_ARRAY_LENGTH(r._path_keys) AS stops \
-         FROM MATCH (a:places)-[r:route*1..3]->(dest:places) WHERE a._key = 'seminyak'"
+        "SELECT dest._key AS dest, length(p) AS depth, nodes(p) AS via \
+         FROM MATCH p = (a:places)-[:route*1..3]->(dest:places) WHERE a._key = 'seminyak'"
     ).unwrap().collect();
     let ulu = hits.iter().find(|h|
         h.payload.as_ref().and_then(|p| p.get("dest")).and_then(|v| v.as_str()) == Some("uluwatu")
     ).expect("uluwatu row").payload.as_ref().unwrap();
     assert_eq!(ulu.get("depth").unwrap().as_i64(), Some(3));   // 3 physical hops
-    assert_eq!(ulu.get("stops").unwrap().as_i64(), Some(4));   // 4 nodes on the path
+    let via = ulu.get("via").unwrap().as_array().expect("nodes(p) array");
+    assert_eq!(via.len(), 4);                                  // 4 nodes on the path
+    assert_eq!(via[0].as_str(), Some("places/seminyak"));
+    assert_eq!(via[3].as_str(), Some("places/uluwatu"));
 }
 
 // ── Release audit fixes (Tier 1) ─────────────────────────────────────────────
@@ -4149,12 +4367,12 @@ fn gin_ilike_after_insert() {
     assert!(names.contains(&"The John Butler Trio"));
 }
 
-// ── Edge intrinsics: r._depth, r._path_keys ──────────────────────────────────
+// ── GQL path functions: length(p), nodes(p) ──────────────────────────────────
 
-/// `r._depth` counts hops from start.
+/// `length(p)` counts hops from start.
 /// Graph: Melbourne → Richmond → Hawthorn → Box Hill (each hop "adjacent")
 #[test]
-fn edge_intrinsic_depth() {
+fn gql_path_length_multi_hop() {
     let mut db = CoreDB::new();
     db.put("suburbs/melbourne", r#"{"_collection":"suburbs","_key":"melbourne"}"#).unwrap();
     db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
@@ -4164,21 +4382,21 @@ fn edge_intrinsic_depth() {
     db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent");
     db.link("suburbs/hawthorn",  "suburbs/box-hill", "adjacent");
 
-    // 2-hop path: melbourne -[r1]-> richmond -[r2]-> hawthorn
+    // 2-hop path: melbourne → richmond → hawthorn
     let hits = db.query(
-        "SELECT h2._key AS dest, r2._depth AS depth \
-         FROM MATCH (s:suburbs)-[r:adjacent]->(h1:suburbs)-[r2:adjacent]->(h2:suburbs) \
+        "SELECT h2._key AS dest, length(p) AS depth \
+         FROM MATCH p = (s:suburbs)-[:adjacent]->(h1:suburbs)-[:adjacent]->(h2:suburbs) \
          WHERE s._key = 'melbourne'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
     let payload = hits[0].payload.as_ref().unwrap();
-    assert_eq!(payload["depth"], 2, "r2._depth must be 2 after 2 hops");
+    assert_eq!(payload["depth"], 2, "length(p) must be 2 after 2 hops");
 }
 
-/// `r._path_keys` contains the full slug list from start to current node.
+/// `nodes(p)` contains the full slug list from start to current node.
 #[test]
-fn edge_intrinsic_path_keys() {
+fn gql_path_nodes_multi_hop() {
     let mut db = CoreDB::new();
     db.put("suburbs/fitzroy",   r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
     db.put("suburbs/collingwood", r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
@@ -4187,14 +4405,14 @@ fn edge_intrinsic_path_keys() {
     db.link("suburbs/collingwood","suburbs/richmond",    "borders");
 
     let hits = db.query(
-        "SELECT c._key AS dest, r2._path_keys AS path \
-         FROM MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
+        "SELECT c._key AS dest, nodes(p) AS path \
+         FROM MATCH p = (a:suburbs)-[:borders]->(b:suburbs)-[:borders]->(c:suburbs) \
          WHERE a._key = 'fitzroy'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
     let payload = hits[0].payload.as_ref().unwrap();
-    let path = payload["path"].as_array().expect("_path_keys must be array");
+    let path = payload["path"].as_array().expect("nodes(p) must be array");
     assert_eq!(path.len(), 3, "3 nodes in path: fitzroy, collingwood, richmond");
     assert_eq!(path[0].as_str().unwrap(), "suburbs/fitzroy");
     assert_eq!(path[2].as_str().unwrap(), "suburbs/richmond");
@@ -4241,7 +4459,7 @@ fn shortest_path_returns_correct_route() {
 
     // SELECT FROM MATCH SHORTEST — path row: a=start, b=end, r=path object
     let hits = db.query(
-        "SELECT a.name AS from_name, b.name AS to_name, r.length AS hops, r._path_keys AS path \
+        "SELECT a.name AS from_name, b.name AS to_name, length(r) AS hops, nodes(r) AS path \
          FROM MATCH SHORTEST (a)-[r*]->(b) \
          WHERE a._key = 'places/seminyak' AND b._key = 'places/uluwatu'"
     ).unwrap().collect();
@@ -4269,7 +4487,7 @@ fn shortest_path_collection_in_pattern() {
     // Same query but using (a:places) pattern + bare _key instead of full slug.
     let db = setup_path_db();
     let hits = db.query(
-        "SELECT a.name AS from_name, b.name AS to_name, r.length AS hops \
+        "SELECT a.name AS from_name, b.name AS to_name, length(r) AS hops \
          FROM MATCH SHORTEST (a:places)-[r*]->(b:places) \
          WHERE a._key = 'seminyak' AND b._key = 'uluwatu'"
     ).unwrap().collect();
@@ -4299,7 +4517,7 @@ fn shortest_path_same_node_returns_zero_hops() {
     let db = setup_path_db();
 
     let hits = db.query(
-        "SELECT r.length AS hops, r._path_keys AS path \
+        "SELECT length(r) AS hops, nodes(r) AS path \
          FROM MATCH SHORTEST (a)-[r*]->(b) \
          WHERE a._key = 'places/kuta' AND b._key = 'places/kuta'"
     ).unwrap().collect();
@@ -4339,10 +4557,10 @@ fn select_from_match() {
     db.link("suburbs/melbourne", "suburbs/richmond", "adjacent");
     db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent");
 
-    // Start variable (s) is not bound in path rows; use destination (n) and edge (r).
+    // Use destination (n) plus the GQL path variable p for hop count.
     let hits = db.query(
-        "SELECT n._key AS dest, r._depth AS depth \
-         FROM MATCH (s:suburbs)-[r:adjacent]->(n:suburbs) \
+        "SELECT n._key AS dest, length(p) AS depth \
+         FROM MATCH p = (s:suburbs)-[:adjacent]->(n:suburbs) \
          WHERE s._key = 'melbourne'"
     ).unwrap().collect();
 
@@ -4359,42 +4577,40 @@ fn select_from_match() {
 /// Uses r._path_keys which contains the full slug list from start to current node.
 #[test]
 fn path_first_last() {
+    // PATH_FIRST / PATH_LAST operate on a JSON array held in a node field.
     let mut db = CoreDB::new();
-    db.put("suburbs/fitzroy",    r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
-    db.put("suburbs/collingwood",r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
-    db.put("suburbs/richmond",   r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
-    db.link("suburbs/fitzroy",     "suburbs/collingwood", "borders");
-    db.link("suburbs/collingwood", "suburbs/richmond",    "borders");
+    db.put("hub/h", r#"{"_collection":"hub","_key":"h"}"#).unwrap();
+    db.put("line/l", r#"{"_collection":"line","_key":"l","stops":["fitzroy","collingwood","richmond"]}"#).unwrap();
+    db.link("hub/h", "line/l", "serves");
 
     let hits = db.query(
-        "SELECT PATH_FIRST(r2._path_keys) AS first_stop, PATH_LAST(r2._path_keys) AS last_stop \
-         FROM MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
-         WHERE a._key = 'fitzroy'"
+        "SELECT PATH_FIRST(b.stops) AS first_stop, PATH_LAST(b.stops) AS last_stop \
+         FROM MATCH (a:hub)-[:serves]->(b:line) WHERE a._key = 'h'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
     let p = hits[0].payload.as_ref().unwrap();
-    assert_eq!(p["first_stop"].as_str().unwrap(), "suburbs/fitzroy");
-    assert_eq!(p["last_stop"].as_str().unwrap(), "suburbs/richmond");
+    assert_eq!(p["first_stop"].as_str().unwrap(), "fitzroy");
+    assert_eq!(p["last_stop"].as_str().unwrap(), "richmond");
 }
 
 // ── Target 10: CASE WHEN, NOW(), JSON_ARRAY_LENGTH ───────────────────────────
 
-/// CASE WHEN routes on r._depth: depth 1 → "close", depth 2 → "far", else "unknown".
+/// CASE WHEN routes on a destination node field: ring 1 → "close", 2 → "far".
 #[test]
 fn case_when_depth() {
     let mut db = CoreDB::new();
-    db.put("suburbs/melbourne", r#"{"_collection":"suburbs","_key":"melbourne"}"#).unwrap();
-    db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
-    db.put("suburbs/hawthorn",  r#"{"_collection":"suburbs","_key":"hawthorn"}"#).unwrap();
+    db.put("suburbs/melbourne", r#"{"_collection":"suburbs","_key":"melbourne","ring":0}"#).unwrap();
+    db.put("suburbs/richmond",  r#"{"_collection":"suburbs","_key":"richmond","ring":1}"#).unwrap();
+    db.put("suburbs/hawthorn",  r#"{"_collection":"suburbs","_key":"hawthorn","ring":2}"#).unwrap();
     db.link("suburbs/melbourne", "suburbs/richmond", "adjacent");
     db.link("suburbs/richmond",  "suburbs/hawthorn", "adjacent");
 
-    // Two-hop path ends at hawthorn with r2._depth = 2
+    // Two-hop path ends at hawthorn (ring 2 → "far").
     let hits = db.query(
         "SELECT h2._key AS dest, \
-                CASE WHEN r2._depth = 1 THEN 'close' WHEN r2._depth = 2 THEN 'far' ELSE 'unknown' END AS proximity \
-         FROM MATCH (s:suburbs)-[r:adjacent]->(h1:suburbs)-[r2:adjacent]->(h2:suburbs) \
+                CASE WHEN h2.ring = 1 THEN 'close' WHEN h2.ring = 2 THEN 'far' ELSE 'unknown' END AS proximity \
+         FROM MATCH (s:suburbs)-[:adjacent]->(h1:suburbs)-[:adjacent]->(h2:suburbs) \
          WHERE s._key = 'melbourne'"
     ).unwrap().collect();
 
@@ -4424,25 +4640,22 @@ fn now_returns_integer() {
     assert!(ts > 1_000_000_000, "timestamp should be a plausible Unix epoch, got {ts}");
 }
 
-/// JSON_ARRAY_LENGTH on r._path_keys returns the number of nodes on the path.
+/// JSON_ARRAY_LENGTH returns the length of a JSON array held in a node field.
 #[test]
 fn json_array_length() {
     let mut db = CoreDB::new();
-    db.put("suburbs/fitzroy",    r#"{"_collection":"suburbs","_key":"fitzroy"}"#).unwrap();
-    db.put("suburbs/collingwood",r#"{"_collection":"suburbs","_key":"collingwood"}"#).unwrap();
-    db.put("suburbs/richmond",   r#"{"_collection":"suburbs","_key":"richmond"}"#).unwrap();
-    db.link("suburbs/fitzroy",     "suburbs/collingwood", "borders");
-    db.link("suburbs/collingwood", "suburbs/richmond",    "borders");
+    db.put("hub/h", r#"{"_collection":"hub","_key":"h"}"#).unwrap();
+    db.put("line/l", r#"{"_collection":"line","_key":"l","stops":["fitzroy","collingwood","richmond"]}"#).unwrap();
+    db.link("hub/h", "line/l", "serves");
 
     let hits = db.query(
-        "SELECT JSON_ARRAY_LENGTH(r2._path_keys) AS path_len \
-         FROM MATCH (a:suburbs)-[r:borders]->(b:suburbs)-[r2:borders]->(c:suburbs) \
-         WHERE a._key = 'fitzroy'"
+        "SELECT JSON_ARRAY_LENGTH(b.stops) AS path_len \
+         FROM MATCH (a:hub)-[:serves]->(b:line) WHERE a._key = 'h'"
     ).unwrap().collect();
 
     assert!(!hits.is_empty());
     let p = hits[0].payload.as_ref().unwrap();
-    // path: fitzroy, collingwood, richmond → length 3
+    // stops: fitzroy, collingwood, richmond → length 3
     assert_eq!(p["path_len"].as_i64().unwrap(), 3);
 }
 
@@ -4455,7 +4668,7 @@ fn shortest_with_any_predicate() {
     let db = setup_path_db();
 
     let hits = db.query(
-        "SELECT r.length AS hops \
+        "SELECT length(r) AS hops \
          FROM MATCH SHORTEST (a)-[r*]->(b) \
          WHERE a._key = 'places/seminyak' AND b._key = 'places/uluwatu' \
          AND ANY(n IN nodes(r) WHERE n.name = 'Kuta')"
@@ -4473,7 +4686,7 @@ fn shortest_with_all_predicate() {
     let db = setup_path_db();
 
     let hits = db.query(
-        "SELECT r.length AS hops \
+        "SELECT length(r) AS hops \
          FROM MATCH SHORTEST (a)-[r*]->(b) \
          WHERE a._key = 'places/seminyak' AND b._key = 'places/uluwatu' \
          AND ALL(n IN nodes(r) WHERE n.name = 'Seminyak')"
@@ -4539,7 +4752,7 @@ fn multi_from_match_and_shortest() {
     db.link("root_n/r", "towns/syd", "near");
 
     let hits = db.query(
-        "SELECT t._key AS town, p.length AS hops \
+        "SELECT t._key AS town, length(p) AS hops \
          FROM MATCH ('root_n/r')-[:near]->(t), \
               MATCH SHORTEST (x)-[p*]->(y) WHERE x._key = 'places/seminyak' AND y._key = 'places/uluwatu'"
     ).unwrap().collect();

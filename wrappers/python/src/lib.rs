@@ -326,7 +326,7 @@ impl PyDB {
     ///
     ///     # MATCH SHORTEST — returns a row with path fields
     ///     db.query("""
-    ///         SELECT a.name AS from_name, b.name AS to_name, r.length AS hops
+    ///         SELECT a.name AS from_name, b.name AS to_name, length(r) AS hops
     ///         FROM MATCH SHORTEST (a)-[r*]->(b)
     ///         WHERE a._key = 'places/seminyak' AND b._key = 'places/uluwatu'
     ///     """)

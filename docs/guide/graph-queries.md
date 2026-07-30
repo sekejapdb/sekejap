@@ -88,7 +88,15 @@ WHERE v._key = 'ev-7' AND s.kwh > 40
 ORDER BY s.rate DESC
 ```
 
-Two path intrinsics are also available on the edge variable: `r._depth` (hop count) and `r._path_keys` (the keys along the path).
+Path-level information comes from a **path variable** (GQL-style): bind the whole
+path with `p = (…)` and read it with `length(p)` (hop count), `nodes(p)` (the node
+slugs along the path), and `relationships(p)` (the edges, as `{from, to, type, attrs}`):
+
+```sql
+SELECT b._key AS dest, length(p) AS hops, nodes(p) AS via
+FROM MATCH p = (a:vehicles)-[:charged_at*1..3]->(b:chargers)
+WHERE a._key = 'ev-7'
+```
 
 ## Grouping and aggregation
 

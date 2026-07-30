@@ -5266,6 +5266,33 @@ impl CoreDB {
         None
     }
 
+    /// Locate the stored forward edge `from → to` (type_hash `0` = any) and return
+    /// its `(type_name, merged_attrs)` for graph-shaped output. `merged_attrs` is
+    /// the fast-lane columns + JSON bag as one object (empty object if none).
+    /// Used by [`crate::query::execute_match_graph`].
+    pub(crate) fn edge_between(
+        &self,
+        from: u64,
+        to: u64,
+        edge_type_hash: u64,
+    ) -> Option<(String, Value)> {
+        let edges = self.fwd_edges(from)?;
+        for e in edges.iter() {
+            if e.other == to && (edge_type_hash == 0 || e.edge_type == edge_type_hash) {
+                let ty = self
+                    .edges
+                    .type_name(e.edge_type)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let attrs = self
+                    .edge_all_attrs(e)
+                    .unwrap_or_else(|| Value::Object(Default::default()));
+                return Some((ty, attrs));
+            }
+        }
+        None
+    }
+
     /// Create an edge carrying attributes, auto-routed by value type: primitives
     /// (number/bool) → the columnar FAST LANE; everything else → the JSON bag.
     pub fn link_attr(

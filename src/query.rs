@@ -3751,6 +3751,25 @@ pub enum MatchAggReturn {
     Now,
     /// `JSON_ARRAY_LENGTH(var.field)` — length of a JSON array field
     JsonArrayLen { var: String, field: String },
+    /// GQL path function over a path variable (`MATCH p = …`): `length(p)`,
+    /// `nodes(p)`, `relationships(p)`. This is the ONLY way to read a path — dotted
+    /// field access on the path var (`p.length`) is rejected at parse time.
+    PathFn { var: String, kind: PathFnKind },
+}
+
+/// Which GQL path function: `length` / `nodes` / `relationships`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathFnKind { Length, Nodes, Relationships }
+
+impl PathFnKind {
+    /// Key in the injected path object this function reads.
+    fn key(&self) -> &'static str {
+        match self {
+            PathFnKind::Length => "length",
+            PathFnKind::Nodes => "nodes",
+            PathFnKind::Relationships => "relationships",
+        }
+    }
 }
 
 impl MatchAggReturn {
@@ -3770,6 +3789,7 @@ impl MatchAggReturn {
             | MatchAggReturn::AgeHours  { var: v, .. }
             | MatchAggReturn::JsonArrayLen { var: v, .. }
             | MatchAggReturn::CountDistinct { var: v, .. }
+            | MatchAggReturn::PathFn { var: v, .. }
             | MatchAggReturn::AllFields { var: v } => v == var,
             // MathExpr-based aggregates may reference the var inside their expression.
             MatchAggReturn::Sum(e) | MatchAggReturn::Avg(e)
@@ -3917,6 +3937,15 @@ impl MatchAggReturn {
                     .map(|a| serde_json::json!(a.len() as i64))
                     .unwrap_or(Value::Null)
             }
+            // GQL path function: read the corresponding key from the path object
+            // the traversal injected under the path variable.
+            MatchAggReturn::PathFn { var, kind } => {
+                rows.first()
+                    .and_then(|r| r.get(var.as_str()))
+                    .and_then(|v| v.get(kind.key()))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }
         }
     }
 }
@@ -4041,7 +4070,11 @@ pub struct HopSpec {
     pub node_label: Option<String>,
     /// Edge direction. `false` = forward `-[:e]->` (traverse `fwd_edges`);
     /// `true` = backward `<-[:e]-` (traverse `rev_edges`, i.e. against the arrow).
+    /// Ignored when `undirected` is set.
     pub backward: bool,
+    /// Undirected hop `-[:e]-`: match the edge from EITHER end (union `fwd_edges`
+    /// + `rev_edges`). Used for symmetric relationships (`friends_with`, `borders`).
+    pub undirected: bool,
 }
 
 // ── DestWhere / WhereValue ────────────────────────────────────────────────────
@@ -4202,6 +4235,15 @@ pub struct MatchAggStmt {
     /// Default (`false`) yields one row per matched path (graph-standard, and
     /// required for `SUM`/`COUNT` over traversals).
     pub distinct: bool,
+    /// `SELECT GRAPH FROM MATCH …` — return the traversed subgraph as a single
+    /// `{nodes, edges}` object instead of tabular rows. When set, `returns` is
+    /// empty and the query routes to [`execute_match_graph`].
+    pub graph_output: bool,
+    /// GQL path variable: `MATCH p = (a)-[…]->(b)`. When set, each result row
+    /// binds `p` to a path object `{ length, nodes, relationships }`, so the pure
+    /// GQL path functions `length(p)` / `nodes(p)` / `relationships(p)` (compiled
+    /// to field accesses on `p`) can read it.
+    pub path_var: Option<String>,
 }
 
 /// Topology-only path skeleton returned by [`collect_raw_paths`].
@@ -4277,35 +4319,44 @@ pub(crate) fn collect_raw_paths_opts(
     for hop in hops {
         let mut next_in_flight: Vec<Partial> = Vec::new();
 
+        // Directions this hop follows: forward, backward, or (undirected) both.
+        // A `&'static [bool]` of `use_rev` flags — zero allocation; a directed hop
+        // iterates a single element, keeping the hot path identical to before.
+        let dirs: &[bool] = if hop.undirected { &[false, true] }
+                            else if hop.backward { &[true] }
+                            else { &[false] };
+
         if hop.max_depth == 1 {
             'single: for partial in in_flight {
-                let adj = if hop.backward { db.rev_edges(partial.current_hash) }
-                          else { db.fwd_edges(partial.current_hash) };
-                if let Some(edges) = adj {
-                    for e in edges.iter() {
-                        if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
-                            continue;
-                        }
-                        if let Some(node) = db.node_data(e.other) {
-                            let mut d = partial.dest_so_far.clone();
-                            let mut s = partial.slugs_so_far.clone();
-                            let mut he = partial.hop_ends.clone();
-                            d.push(e.other);
-                            if with_slugs {
-                                s.push(node.slug.clone());
+                for &use_rev in dirs {
+                    let adj = if use_rev { db.rev_edges(partial.current_hash) }
+                              else { db.fwd_edges(partial.current_hash) };
+                    if let Some(edges) = adj {
+                        for e in edges.iter() {
+                            if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                                continue;
                             }
-                            let phys_len = partial.phys_len + 1;
-                            he.push(phys_len - 1);
-                            next_in_flight.push(Partial {
-                                start_hash:       partial.start_hash,
-                                current_hash:     e.other,
-                                dest_so_far:      d,
-                                slugs_so_far:     s,
-                                hop_ends:         he,
-                                phys_len,
-                            });
-                            if limit.map_or(false, |l| next_in_flight.len() >= l) {
-                                break 'single;
+                            if let Some(node) = db.node_data(e.other) {
+                                let mut d = partial.dest_so_far.clone();
+                                let mut s = partial.slugs_so_far.clone();
+                                let mut he = partial.hop_ends.clone();
+                                d.push(e.other);
+                                if with_slugs {
+                                    s.push(node.slug.clone());
+                                }
+                                let phys_len = partial.phys_len + 1;
+                                he.push(phys_len - 1);
+                                next_in_flight.push(Partial {
+                                    start_hash:       partial.start_hash,
+                                    current_hash:     e.other,
+                                    dest_so_far:      d,
+                                    slugs_so_far:     s,
+                                    hop_ends:         he,
+                                    phys_len,
+                                });
+                                if limit.map_or(false, |l| next_in_flight.len() >= l) {
+                                    break 'single;
+                                }
                             }
                         }
                     }
@@ -4314,26 +4365,33 @@ pub(crate) fn collect_raw_paths_opts(
         } else if track {
             // Multi-depth WITH full-path tracking: carry the sub-path nodes so
             // `_path_keys` / `_depth` are correct.
-            let mut pairs: Vec<(usize, u64, Vec<u64>)> = in_flight
+            // Tuple carries `came_from` (the node we arrived from) so an undirected
+            // hop doesn't immediately U-turn back over the same edge.
+            let mut pairs: Vec<(usize, u64, Vec<u64>, u64)> = in_flight
                 .iter()
                 .enumerate()
-                .map(|(idx, p)| (idx, p.current_hash, Vec::new()))
+                .map(|(idx, p)| (idx, p.current_hash, Vec::new(), p.current_hash))
                 .collect();
 
-            let mut result: Vec<(usize, u64, Vec<u64>)> = Vec::new();
+            let mut result: Vec<(usize, u64, Vec<u64>, u64)> = Vec::new();
 
             for depth in 1..=hop.max_depth {
-                let mut next_pairs: Vec<(usize, u64, Vec<u64>)> = Vec::new();
-                for (pidx, current_h, sub_n) in &pairs {
-                    let adj = if hop.backward { db.rev_edges(*current_h) } else { db.fwd_edges(*current_h) };
-                    if let Some(edges) = adj {
-                        for e in edges.iter() {
-                            if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
-                                continue;
-                            }
-                            if db.node_data(e.other).is_some() {
-                                let mut nn = sub_n.clone(); nn.push(e.other);
-                                next_pairs.push((*pidx, e.other, nn));
+                let mut next_pairs: Vec<(usize, u64, Vec<u64>, u64)> = Vec::new();
+                for (pidx, current_h, sub_n, came_from) in &pairs {
+                    for &use_rev in dirs {
+                        let adj = if use_rev { db.rev_edges(*current_h) } else { db.fwd_edges(*current_h) };
+                        if let Some(edges) = adj {
+                            for e in edges.iter() {
+                                if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                                    continue;
+                                }
+                                if hop.undirected && e.other == *came_from {
+                                    continue; // no immediate U-turn on an undirected hop
+                                }
+                                if db.node_data(e.other).is_some() {
+                                    let mut nn = sub_n.clone(); nn.push(e.other);
+                                    next_pairs.push((*pidx, e.other, nn, *current_h));
+                                }
                             }
                         }
                     }
@@ -4349,7 +4407,7 @@ pub(crate) fn collect_raw_paths_opts(
                 if pairs.is_empty() { break; }
             }
 
-            for (pidx, dest_h, sub_n) in result {
+            for (pidx, dest_h, sub_n, _came) in result {
                 let prior = &in_flight[pidx];
                 let mut d = prior.dest_so_far.clone();
                 d.push(dest_h);
@@ -4373,31 +4431,37 @@ pub(crate) fn collect_raw_paths_opts(
             }
         } else {
             // Multi-depth flat pair propagation (fast; path intrinsics not needed).
-            let mut pairs: Vec<(usize, u64)> = in_flight
+            // `came_from` guards undirected U-turns (see the tracked branch above).
+            let mut pairs: Vec<(usize, u64, u64)> = in_flight
                 .iter()
                 .enumerate()
-                .map(|(idx, p)| (idx, p.current_hash))
+                .map(|(idx, p)| (idx, p.current_hash, p.current_hash))
                 .collect();
 
             let mut result_pairs: Vec<(usize, u64)> = Vec::new();
 
             for depth in 1..=hop.max_depth {
-                let mut next_pairs: Vec<(usize, u64)> = Vec::new();
-                for &(pidx, current_h) in &pairs {
-                    let adj = if hop.backward { db.rev_edges(current_h) } else { db.fwd_edges(current_h) };
-                    if let Some(edges) = adj {
-                        for e in edges.iter() {
-                            if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
-                                continue;
-                            }
-                            if db.node_data(e.other).is_some() {
-                                next_pairs.push((pidx, e.other));
+                let mut next_pairs: Vec<(usize, u64, u64)> = Vec::new();
+                for &(pidx, current_h, came_from) in &pairs {
+                    for &use_rev in dirs {
+                        let adj = if use_rev { db.rev_edges(current_h) } else { db.fwd_edges(current_h) };
+                        if let Some(edges) = adj {
+                            for e in edges.iter() {
+                                if hop.edge_type_hash != 0 && e.edge_type != hop.edge_type_hash {
+                                    continue;
+                                }
+                                if hop.undirected && e.other == came_from {
+                                    continue; // no immediate U-turn on an undirected hop
+                                }
+                                if db.node_data(e.other).is_some() {
+                                    next_pairs.push((pidx, e.other, current_h));
+                                }
                             }
                         }
                     }
                 }
                 if depth >= hop.min_depth {
-                    result_pairs.extend_from_slice(&next_pairs);
+                    result_pairs.extend(next_pairs.iter().map(|&(pidx, dest, _)| (pidx, dest)));
                     if limit.map_or(false, |l| result_pairs.len() >= l) {
                         result_pairs.truncate(limit.unwrap());
                         break;
@@ -4625,6 +4689,29 @@ fn try_reverse_anchor(
 ///
 /// Separated from [`collect_raw_paths`] so callers can filter / truncate raw paths
 /// before paying the cost of payload reads.
+/// Resolve one physical edge between slugs `a` and `b` for a hop, returned in its
+/// STORED direction as `(from, to, type, attrs)`. Directed hops use the hop's own
+/// direction; an undirected hop probes both orientations and reports whichever way
+/// the edge is actually stored (so arrows always render correctly).
+fn oriented_edge(db: &CoreDB, a: &str, b: &str, hop: &HopSpec) -> (String, String, String, Value) {
+    let blank = |f: &str, t: &str| (f.to_string(), t.to_string(), String::new(), Value::Object(Default::default()));
+    if hop.undirected {
+        if let Some((ty, at)) = db.edge_between(sk_hash(a), sk_hash(b), hop.edge_type_hash) {
+            (a.to_string(), b.to_string(), ty, at)
+        } else if let Some((ty, at)) = db.edge_between(sk_hash(b), sk_hash(a), hop.edge_type_hash) {
+            (b.to_string(), a.to_string(), ty, at)
+        } else {
+            blank(a, b)
+        }
+    } else {
+        let (f, t) = if hop.backward { (b, a) } else { (a, b) };
+        match db.edge_between(sk_hash(f), sk_hash(t), hop.edge_type_hash) {
+            Some((ty, at)) => (f.to_string(), t.to_string(), ty, at),
+            None => blank(f, t),
+        }
+    }
+}
+
 pub(crate) fn build_path_rows_from_raw(
     db: &CoreDB,
     raw_paths: &[RawPath],
@@ -4636,6 +4723,9 @@ pub(crate) fn build_path_rows_from_raw(
     // payloads are skipped entirely — a large saving for deep multi-hop patterns.
     // `None` = materialise every var (conservative default for generic callers).
     needed_vars: Option<&HashSet<String>>,
+    // GQL path variable (`MATCH p = …`): when set, each row binds this name to a
+    // `{ length, nodes, relationships }` object read by length(p)/nodes(p)/… .
+    path_var: Option<&str>,
 ) -> Vec<PathRow> {
     if raw_paths.is_empty() { return vec![]; }
 
@@ -4698,17 +4788,9 @@ pub(crate) fn build_path_rows_from_raw(
                 let dest_h = rp.dest_per_hop[hop_idx];
 
                 if let Some(ref edge_bind) = hop.edge_bind {
-                    // `hop_end[hop_idx]` is the real index of this hop's dest in the
-                    // physical path (correct for variable-length hops, not just
-                    // `hop_idx + 1`).
-                    let end = rp.hop_end.get(hop_idx).copied().unwrap_or(hop_idx + 1);
-                    let path_slugs: Vec<&str> = rp.slugs_per_hop
-                        .iter()
-                        .take(end + 1)
-                        .map(|s| s.as_str())
-                        .collect();
-                    let depth = end; // physical hop count to this hop's dest
-
+                    // The edge binding carries only the edge's OWN attributes now.
+                    // Path-level info (depth, node list) is exposed via the GQL path
+                    // variable + length(p)/nodes(p)/relationships(p), not intrinsics.
                     let mut obj = serde_json::Map::new();
 
                     // Per-edge JSON metadata — only for a fixed single hop, and only
@@ -4746,10 +4828,6 @@ pub(crate) fn build_path_rows_from_raw(
                         }
                     }
 
-                    // Path intrinsics — always present; overwrite any colliding meta key.
-                    obj.insert("_depth".to_string(), serde_json::json!(depth));
-                    obj.insert("_path_keys".to_string(), serde_json::json!(path_slugs));
-
                     row.insert(edge_bind.clone(), Value::Object(obj));
                 }
 
@@ -4759,6 +4837,31 @@ pub(crate) fn build_path_rows_from_raw(
                     let dest_payload = payload_cache.get(&dest_h).unwrap_or(&null).clone();
                     row.insert(hop.node_bind.clone(), dest_payload);
                 }
+            }
+
+            // GQL path variable: bind `{ length, nodes, relationships }`.
+            if let Some(pv) = path_var {
+                let slugs = &rp.slugs_per_hop;
+                let length = slugs.len().saturating_sub(1);
+                let mut rels: Vec<Value> = Vec::new();
+                let mut seg_start = 0usize;
+                for (hi, hop) in hops.iter().enumerate() {
+                    let end = rp.hop_end.get(hi).copied()
+                        .unwrap_or(seg_start + 1)
+                        .min(slugs.len().saturating_sub(1));
+                    for j in seg_start..end {
+                        let (from, to, ty, attrs) = oriented_edge(db, &slugs[j], &slugs[j + 1], hop);
+                        rels.push(serde_json::json!({
+                            "from": from, "to": to, "type": ty, "attrs": attrs,
+                        }));
+                    }
+                    seg_start = end;
+                }
+                row.insert(pv.to_string(), serde_json::json!({
+                    "length": length,
+                    "nodes": slugs,
+                    "relationships": rels,
+                }));
             }
 
             row
@@ -5066,10 +5169,12 @@ pub fn collect_paths(
     start_var: Option<&str>,
     limit: Option<usize>,
     track: bool,
+    path_var: Option<&str>,
 ) -> Vec<PathRow> {
     if hops.is_empty() || starts.is_empty() { return vec![]; }
-    let raw = collect_raw_paths(db, starts, hops, limit, track);
-    build_path_rows_from_raw(db, &raw, hops, start_var, false, None)
+    // A path variable needs the per-hop slugs to assemble nodes/relationships.
+    let raw = collect_raw_paths(db, starts, hops, limit, track || path_var.is_some());
+    build_path_rows_from_raw(db, &raw, hops, start_var, false, None, path_var)
 }
 
 // ── Multi-stage executor (WITH chaining) ─────────────────────────────────────
@@ -5339,7 +5444,7 @@ fn execute_match_agg_with_stages(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             Some(row)
         }).collect()
     } else {
-        let paths = collect_paths(db, &starts, &stmt.hops, stmt.start_var.as_deref(), None, stmt_needs_var_path(&stmt));
+        let paths = collect_paths(db, &starts, &stmt.hops, stmt.start_var.as_deref(), None, stmt_needs_var_path(&stmt), stmt.path_var.as_deref());
         paths
     };
 
@@ -5601,7 +5706,128 @@ fn cmp_f64(op: &CmpOp, a: f64, b: f64) -> bool {
 /// materialization. The inner traversal runs exactly once; each post-processing
 /// stage is O(rows) and only engages when a filter / order / limit is present,
 /// so plain traversal is a zero-cost passthrough.
+/// Execute `SELECT GRAPH FROM MATCH …` → a single [`Hit`] whose payload is the
+/// traversed subgraph, `{ "nodes": [...], "edges": [...] }`, deduplicated across
+/// every matched path.
+///
+/// - **nodes**: `{ slug, collection, key, payload }`, one per unique node visited.
+/// - **edges**: `{ from, to, type, attrs }`, always emitted in the stored FORWARD
+///   direction (so a `<-[:e]-` query still renders arrows correctly), deduped by
+///   `(from, type, to)`. `attrs` merges an edge's fast-lane columns + JSON bag.
+///
+/// `WHERE` conditions on the start variable filter the start group, and `LIMIT`
+/// caps that start group (each anchor then expands fully — a truncated traversal
+/// would yield a broken graph). Conditions on non-start vars are not yet applied
+/// in graph mode.
+fn execute_match_graph(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
+    use std::collections::HashSet;
+
+    // ── 1. Start group: resolve, filter by start-var predicates, cap by LIMIT ──
+    let mut starts = resolve_match_start(db, &stmt.start);
+    if let Some(sv) = stmt.start_var.as_deref() {
+        let start_conds: Vec<&DestWhere> =
+            stmt.dest_where.iter().filter(|dw| dw.var == sv).collect();
+        if !start_conds.is_empty() {
+            starts.retain(|&h| match db.get_payload(h) {
+                Some(p) => start_conds.iter().all(|dw| {
+                    p.get(dw.field.as_str()).map_or(false, |v| match &dw.value {
+                        WhereValue::Literal(lit) => dw.op.apply(v, lit),
+                        WhereValue::RowRef(_) => true,
+                    })
+                }),
+                None => false,
+            });
+        }
+    }
+    if let Some(n) = stmt.limit {
+        starts.truncate(n);
+    }
+
+    // ── 2. Accumulators ───────────────────────────────────────────────────────
+    let mut seen_nodes: HashSet<String> = HashSet::new();
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+    let mut edges: Vec<Value> = Vec::new();
+
+    let mut push_node = |slug: &str| {
+        if !seen_nodes.insert(slug.to_string()) {
+            return;
+        }
+        let (collection, key) = match slug.split_once('/') {
+            Some((c, k)) => (c.to_string(), k.to_string()),
+            None => (String::new(), slug.to_string()),
+        };
+        let payload = db.get_payload(sk_hash(slug)).unwrap_or(Value::Null);
+        nodes.push(serde_json::json!({
+            "slug": slug,
+            "collection": collection,
+            "key": key,
+            "payload": payload,
+        }));
+    };
+
+    // Start-only pattern (no hops): just the anchor nodes.
+    if stmt.hops.is_empty() {
+        for &h in &starts {
+            if let Some(n) = db.node_data(h) {
+                push_node(&n.slug);
+            }
+        }
+        return vec![Hit {
+            slug: String::new(),
+            slug_hash: 0,
+            payload: Some(serde_json::json!({ "nodes": nodes, "edges": edges })),
+        }];
+    }
+
+    // ── 3. Traverse and collect physical paths (slugs tracked for reconstruction) ──
+    let raw = collect_raw_paths(db, &starts, &stmt.hops, None, true);
+
+    for rp in &raw {
+        for slug in &rp.slugs_per_hop {
+            push_node(slug);
+        }
+        // Each hop spans a slice of the physical path `(seg_start, hop_end[i]]`;
+        // every consecutive pair inside it is one stored edge (covers `*min..max`).
+        let mut seg_start = 0usize;
+        for (hop_idx, hop) in stmt.hops.iter().enumerate() {
+            let end = rp
+                .hop_end
+                .get(hop_idx)
+                .copied()
+                .unwrap_or(seg_start + 1)
+                .min(rp.slugs_per_hop.len().saturating_sub(1));
+            for j in seg_start..end {
+                // Emit in stored forward direction (undirected probes both ways).
+                let (from_slug, to_slug, etype, attrs) =
+                    oriented_edge(db, &rp.slugs_per_hop[j], &rp.slugs_per_hop[j + 1], hop);
+                let key = (from_slug.clone(), etype.clone(), to_slug.clone());
+                if seen_edges.insert(key) {
+                    edges.push(serde_json::json!({
+                        "from": from_slug,
+                        "to": to_slug,
+                        "type": etype,
+                        "attrs": attrs,
+                    }));
+                }
+            }
+            seg_start = end;
+        }
+    }
+
+    vec![Hit {
+        slug: String::new(),
+        slug_hash: 0,
+        payload: Some(serde_json::json!({ "nodes": nodes, "edges": edges })),
+    }]
+}
+
 pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
+    // `SELECT GRAPH FROM MATCH …` → assemble the traversed subgraph instead of rows.
+    if stmt.graph_output {
+        return execute_match_graph(db, stmt);
+    }
+
     // GROUP BY collapses rows, so its function filters must run pre-grouping
     // inside the inner (left in stmt). For row queries, post-filter here on the
     // individual destination nodes.
@@ -5771,13 +5997,11 @@ pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
     hits
 }
 
-/// Reserved edge-bound keys that are served WITHOUT reading edge metadata:
-/// the path intrinsics computed during traversal. Referencing only these never
-/// triggers a JSON meta parse. A weight is no longer an intrinsic — it's an
-/// ordinary user-named attribute, served from the fast lane / JSON bag.
-const EDGE_INTRINSICS: [&str; 2] = [
-    "_depth", "_path_keys",
-];
+/// Reserved edge-bound keys served WITHOUT reading edge metadata. Now empty:
+/// path info is exposed through the GQL path variable (`length(p)`/`nodes(p)`/
+/// `relationships(p)`), NOT through per-edge intrinsics. Every field on an edge
+/// binding is therefore an ordinary user attribute (fast lane / JSON bag).
+const EDGE_INTRINSICS: [&str; 0] = [];
 
 /// True if a math expression references an edge-bound variable's non-intrinsic
 /// field (e.g. `SUM(s.kwh)`), meaning per-edge metadata must be materialised.
@@ -6027,7 +6251,9 @@ pub fn execute_match_agg_union(db: &CoreDB, stmts: Vec<MatchAggStmt>) -> Vec<Hit
 
 fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     let needs_edge_meta = stmt_needs_edge_meta(&stmt);
-    let needs_var_path = stmt_needs_var_path(&stmt);
+    // A GQL path variable (`MATCH p = …`) needs the per-hop slugs to assemble
+    // nodes/relationships, so force full-path tracking whenever one is bound.
+    let needs_var_path = stmt_needs_var_path(&stmt) || stmt.path_var.is_some();
     // Multi-stage queries (WITH chaining) or no-hop queries use the stages executor.
     if stmt.with_stages.is_some() || stmt.hops.is_empty() {
         return execute_match_agg_with_stages(db, stmt);
@@ -7101,7 +7327,7 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
     };
     let all_paths = build_path_rows_from_raw(
         db, &raw, &stmt.hops, effective_start_var, needs_edge_meta,
-        needed_hop_vars.as_ref(),
+        needed_hop_vars.as_ref(), stmt.path_var.as_deref(),
     );
     if all_paths.is_empty() && !is_bare_agg { return vec![]; }
 
@@ -7265,10 +7491,9 @@ fn build_shortest_path_row(
         let node_slugs: Vec<Value> = pr.nodes.iter()
             .map(|n| Value::String(n.slug.clone()))
             .collect();
-        let edges_arr: Vec<Value> = pr.edges.iter()
+        let rels_arr: Vec<Value> = pr.edges.iter()
             .map(|e| {
-                // A path edge is naked — from/to/type only. Any attributes ride in
-                // `attrs` (the merged fast-lane + JSON bag), opt-in, never assumed.
+                // from/to/type, plus `attrs` (merged fast-lane + JSON bag) when present.
                 let mut o = serde_json::Map::new();
                 o.insert("from".into(), serde_json::json!(e.from_slug));
                 o.insert("to".into(), serde_json::json!(e.to_slug));
@@ -7279,11 +7504,11 @@ fn build_shortest_path_row(
                 Value::Object(o)
             })
             .collect();
+        // Canonical GQL path object — read via length(p) / nodes(p) / relationships(p).
         let path_obj = serde_json::json!({
-            "nodes":      &node_slugs,
-            "edges":      &edges_arr,
-            "length":     pr.length,
-            "_path_keys": &node_slugs,
+            "length":        pr.length,
+            "nodes":         &node_slugs,
+            "relationships": &rels_arr,
         });
         row.insert(pb.clone(), path_obj);
     }
@@ -7306,7 +7531,7 @@ fn eval_path_predicate(db: &CoreDB, pred: &PathPredicate, row: &PathRow) -> bool
     // Collect node slugs from the path object stored in `row` under `var`
     let slugs: Vec<String> = row
         .get(var.as_str())
-        .and_then(|v| v.get("_path_keys"))
+        .and_then(|v| v.get("nodes"))
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
@@ -7413,7 +7638,7 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
                 MatchAggStart::Collection(h) => db.collection_members(h).map(|m| m.into_owned()).unwrap_or_default(),
                 MatchAggStart::All           => db.all_hashes(),
             };
-            collect_paths(db, &starts, &agg.hops, agg.start_var.as_deref(), None, stmt_needs_var_path(&agg))
+            collect_paths(db, &starts, &agg.hops, agg.start_var.as_deref(), None, stmt_needs_var_path(&agg), agg.path_var.as_deref())
         }
         FromSource::Shortest(s) => {
             match build_shortest_path_row(db, &s) {

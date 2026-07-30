@@ -463,7 +463,11 @@ fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
         }
 
         // SQL line comment: `-- …` to end of line (a single `-` falls through below).
-        if c == '-' && i + 1 < len && chars[i + 1] == '-' {
+        // Exception: `-->` is the anonymous forward-edge token, NOT a comment — so
+        // only treat `--` as a comment when it is not immediately followed by `>`.
+        if c == '-' && i + 1 < len && chars[i + 1] == '-'
+            && !(i + 2 < len && chars[i + 2] == '>')
+        {
             i += 2;
             while i < len && chars[i] != '\n' {
                 i += 1;
@@ -3818,10 +3822,34 @@ impl Parser {
         } else {
             false
         };
-        let returns = self.parse_agg_return_list()?;
+        // `SELECT GRAPH FROM MATCH …` → graph-shaped output ({nodes, edges}) instead
+        // of rows. `graph` is a CONTEXTUAL keyword: only special in the projection
+        // slot immediately before FROM, so it stays usable as an ordinary identifier
+        // / collection name everywhere else.
+        let graph_output = matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("graph"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Tok::Kw(Kw::From)));
+        let returns = if graph_output {
+            self.advance(); // consume GRAPH
+            Vec::new()
+        } else {
+            self.parse_agg_return_list()?
+        };
 
         self.expect_kw(Kw::From, "FROM")?;
         self.expect_kw(Kw::Match, "MATCH")?;
+
+        // ── GQL path variable: `MATCH p = (a)-[…]->(b)` ───────────────────
+        // Binds the whole path so `length(p)` / `nodes(p)` / `relationships(p)`
+        // can read it. Detected by an identifier immediately followed by `=`.
+        let path_var: Option<String> = if matches!(self.peek(), Tok::Ident(_))
+            && matches!(self.tokens.get(self.pos + 1), Some(Tok::Eq))
+        {
+            let pv = self.expect_ident()?;
+            self.advance(); // consume '='
+            Some(pv)
+        } else {
+            None
+        };
 
         // ── Start node ────────────────────────────────────────────────────
         let start_node = self.parse_match_node()?;
@@ -3977,7 +4005,21 @@ impl Parser {
             None
         };
 
-        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, order_score, limit, dest_where, func_filters, with_stages, distinct })
+        // GQL: a path variable is read ONLY through length(p)/nodes(p)/relationships(p).
+        // Any dotted field access on it (p.length, p.nodes, …) is a hard error —
+        // there is exactly one spelling for path access.
+        if let Some(ref pv) = path_var {
+            let bad = returns.iter().any(|(r, _)|
+                    r.references_var(pv) && !matches!(r, crate::query::MatchAggReturn::PathFn { .. }))
+                || dest_where.iter().any(|dw| &dw.var == pv)
+                || group_by.as_ref().map_or(false, |g| g.iter().any(|(v, _)| v == pv));
+            if bad {
+                return Err(SqlError::InvalidValue(format!(
+                    "path variable '{pv}' is read only via length({pv}) / nodes({pv}) / relationships({pv}), not dotted field access")));
+            }
+        }
+
+        Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, order_score, limit, dest_where, func_filters, with_stages, distinct, graph_output, path_var })
     }
 
     /// Parse `SELECT return_list FROM MATCH SHORTEST (a[:col])-[r*]->(b[:col])
@@ -4151,6 +4193,17 @@ impl Parser {
             Some(self.expect_usize()?)
         } else { None };
 
+        // Same GQL rule for the SHORTEST path bind: length(r)/nodes(r)/relationships(r)
+        // only — never dotted field access on the path variable.
+        if let Some(ref pb) = path_bind {
+            let bad = returns.iter().any(|(r, _)|
+                r.references_var(pb) && !matches!(r, crate::query::MatchAggReturn::PathFn { .. }));
+            if bad {
+                return Err(SqlError::InvalidValue(format!(
+                    "path variable '{pb}' is read only via length({pb}) / nodes({pb}) / relationships({pb}), not dotted field access")));
+            }
+        }
+
         Ok(ShortestSelectStmt { from_slug, to_slug, start_bind, end_bind, path_bind, returns, predicates, order_by, limit })
     }
 
@@ -4293,7 +4346,7 @@ impl Parser {
                             }
                         }
                         FromSource::Match(MatchAggStmt {
-                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, order_score: None, limit: None, dest_where: hop_inline, func_filters: vec![], with_stages: None, distinct: false,
+                            start, start_var, hops, returns: vec![], group_by: None, order_by: None, order_score: None, limit: None, dest_where: hop_inline, func_filters: vec![], with_stages: None, distinct: false, graph_output: false, path_var: None,
                         })
                     }
                 }
@@ -4449,6 +4502,22 @@ impl Parser {
                     self.expect_lparen()?;
                     self.expect_rparen()?;
                     MatchAggReturn::Now
+                } else if matches!(upper.as_str(), "LENGTH" | "NODES" | "RELATIONSHIPS") {
+                    // Pure-GQL path functions over a path variable: `length(p)`,
+                    // `nodes(p)`, `relationships(p)`. This is the ONLY way to read a
+                    // path — dotted access (`p.length`) is rejected (see the
+                    // path-var validation in parse_select_from_match).
+                    use crate::query::PathFnKind;
+                    let kind = match upper.as_str() {
+                        "LENGTH" => PathFnKind::Length,
+                        "NODES" => PathFnKind::Nodes,
+                        _ => PathFnKind::Relationships,
+                    };
+                    self.advance(); // consume function name
+                    self.expect_lparen()?;
+                    let pvar = self.expect_ident()?;
+                    self.expect_rparen()?;
+                    MatchAggReturn::PathFn { var: pvar, kind }
                 } else {
                     let var = self.expect_ident()?;
                     if matches!(self.peek(), Tok::Dot) {
@@ -4527,6 +4596,11 @@ impl Parser {
             MatchAggReturn::AgeHours { .. } => "age_hours".to_string(),
             MatchAggReturn::Now => "now".to_string(),
             MatchAggReturn::JsonArrayLen { .. } => "json_array_length".to_string(),
+            MatchAggReturn::PathFn { kind, .. } => match kind {
+                crate::query::PathFnKind::Length => "length".to_string(),
+                crate::query::PathFnKind::Nodes => "nodes".to_string(),
+                crate::query::PathFnKind::Relationships => "relationships".to_string(),
+            },
         };
         let alias = if matches!(self.peek(), Tok::Kw(Kw::As)) {
             self.advance();
@@ -4997,10 +5071,72 @@ impl Parser {
             // `<-[...]-` is a backward hop; `-[...]->` is forward.
             let backward = matches!(self.peek(), Tok::BackArrow);
             self.advance(); // consume '-' or '<-'
+
+            // ── Anonymous short edge (#4): `-->` / `<--` — any edge type, no
+            // brackets. The leading `-`/`<-` is consumed; a token other than `[`
+            // means the short form. Forward closes with `->` (`-` + `->` = `-->`),
+            // backward closes with `-` (`<-` + `-` = `<--`). `--` (undirected) is
+            // intentionally NOT accepted here (needs the executor change, #2).
+            if !matches!(self.peek(), Tok::LBracket) {
+                let ok = if backward {
+                    matches!(self.peek(), Tok::Dash)
+                } else {
+                    matches!(self.peek(), Tok::Arrow)
+                };
+                if !ok {
+                    return Err(SqlError::UnexpectedToken {
+                        expected: if backward { "[ or `-` to close `<--`" } else { "[ or `->` to close `-->`" },
+                        got: format!("{:?}", self.peek()),
+                    });
+                }
+                self.advance(); // consume closing `->` (fwd) or `-` (bwd)
+
+                // Optional post-arrow quantifier `{n,m}` (same as bracketed form).
+                let (mut min_depth, mut max_depth) = (1u32, 1u32);
+                if matches!(self.peek(), Tok::LBrace) {
+                    let (mn, mx) = self.parse_brace_quantifier()?;
+                    min_depth = mn;
+                    max_depth = mx;
+                    if max_depth > MAX_HOP_DEPTH || min_depth > MAX_HOP_DEPTH {
+                        return Err(SqlError::InvalidValue(format!(
+                            "graph hop depth exceeds the maximum ({MAX_HOP_DEPTH})")));
+                    }
+                    if min_depth > max_depth {
+                        return Err(SqlError::InvalidValue(format!(
+                            "graph hop range invalid: min {min_depth} > max {max_depth}")));
+                    }
+                }
+
+                let node = self.parse_match_node()?;
+                let node_label = node.label.clone();
+                let node_bind = node.var.clone()
+                    .unwrap_or_else(|| format!("__anon_hop{}", hops.len()));
+                for (field, val) in node.props {
+                    inline_conds.push(DestWhere {
+                        var: node_bind.clone(),
+                        field,
+                        op: CmpOp::Eq,
+                        value: WhereValue::Literal(val),
+                    });
+                }
+                hops.push(HopSpec {
+                    edge_type_hash: 0,
+                    node_bind,
+                    edge_bind: None,
+                    min_depth,
+                    max_depth,
+                    node_label,
+                    backward,
+                    undirected: false, // `-->` / `<--` are directed
+                });
+                continue;
+            }
+
             self.expect_lbracket()?;
 
             let mut edge_bind: Option<String> = None;
             let mut edge_type_hash: u64 = 0;
+            let mut edge_props: Vec<(String, Value)> = Vec::new();
 
             match self.peek().clone() {
                 Tok::Ident(name) => {
@@ -5047,6 +5183,30 @@ impl Parser {
                 return Err(SqlError::InvalidValue(format!(
                     "graph hop range invalid: min {min_depth} > max {max_depth}")));
             }
+            // GQL inline edge props: `-[e {grade: 90}]->` → edge-field equality
+            // conditions (lowered below). Unambiguous inside the brackets — the `*`
+            // quantifier was already consumed, so a leading `{` can only be props.
+            if matches!(self.peek(), Tok::LBrace) {
+                self.advance();
+                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                    let key = self.expect_ident()?;
+                    match self.peek() {
+                        Tok::Colon => { self.advance(); }
+                        other => return Err(SqlError::UnexpectedToken {
+                            expected: ":",
+                            got: format!("{other:?}"),
+                        }),
+                    }
+                    let val = self.parse_value()?;
+                    edge_props.push((key, val));
+                    if matches!(self.peek(), Tok::Comma) { self.advance(); }
+                }
+                match self.peek() {
+                    Tok::RBrace => { self.advance(); }
+                    _ => return Err(SqlError::UnexpectedEnd { expected: "}" }),
+                }
+            }
+            // Safety net: swallow any other stray tokens before `]` (back-compat).
             loop {
                 match self.peek() {
                     Tok::RBracket | Tok::Eof => break,
@@ -5055,20 +5215,49 @@ impl Parser {
             }
             self.expect_rbracket()?;
 
-            // Closing arrow: forward hops end with `->`, backward hops end with `-`.
-            let (want, ok) = if backward {
-                ("-", matches!(self.peek(), Tok::Dash))
+            // Direction from leading + closing tokens:
+            //   -[...]->   forward     (lead `-`,  close `->`)
+            //   <-[...]-   backward    (lead `<-`, close `-`)
+            //   -[...]-    undirected  (lead `-`,  close `-`)  — match either end
+            let undirected;
+            if backward {
+                if !matches!(self.peek(), Tok::Dash) {
+                    return Err(SqlError::UnexpectedToken {
+                        expected: "-",
+                        got: format!("{:?} (expected `-` to close backward `<-[…]-` hop)", self.peek()),
+                    });
+                }
+                undirected = false;
             } else {
-                ("->", matches!(self.peek(), Tok::Arrow))
-            };
-            if !ok {
-                return Err(SqlError::UnexpectedToken {
-                    expected: if backward { "-" } else { "->" },
-                    got: format!("{:?} (expected `{want}` to close {} hop)",
-                        self.peek(), if backward { "backward" } else { "forward" }),
-                });
+                match self.peek() {
+                    Tok::Arrow => undirected = false,       // -[…]->
+                    Tok::Dash  => undirected = true,        // -[…]-  (undirected)
+                    other => return Err(SqlError::UnexpectedToken {
+                        expected: "-> or -",
+                        got: format!("{other:?} (expected `->` for a directed hop or `-` for an undirected `-[…]-` hop)"),
+                    }),
+                }
             }
             self.advance();
+
+            // GQL graph-pattern quantifier in post-arrow position: `-[:e]->{1,5}`.
+            // (openCypher's in-bracket `*1..5` is also accepted, parsed above.)
+            // After the arrow the next token is a node `(`, so a `{` here is
+            // unambiguously a quantifier.
+            if matches!(self.peek(), Tok::LBrace) {
+                let (mn, mx) = self.parse_brace_quantifier()?;
+                min_depth = mn;
+                max_depth = mx;
+                if max_depth > MAX_HOP_DEPTH || min_depth > MAX_HOP_DEPTH {
+                    return Err(SqlError::InvalidValue(format!(
+                        "graph hop depth exceeds the maximum ({MAX_HOP_DEPTH})")));
+                }
+                if min_depth > max_depth {
+                    return Err(SqlError::InvalidValue(format!(
+                        "graph hop range invalid: min {min_depth} > max {max_depth}")));
+                }
+            }
+
             // Destination node — reuse the full node parser so it accepts
             // anonymous `(:label)`, inline props `(:label {f: 'v'})`, and bare `(v)`.
             let node = self.parse_match_node()?;
@@ -5083,9 +5272,55 @@ impl Parser {
                     value: WhereValue::Literal(val),
                 });
             }
-            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label, backward });
+            // Lower inline edge props to edge-field equality conditions. If props
+            // were given without an explicit edge var, synthesize one so the filter
+            // has a binding to reference (this also flips on the edge-meta path).
+            if !edge_props.is_empty() && edge_bind.is_none() {
+                edge_bind = Some(format!("__anon_edge{}", hops.len()));
+            }
+            if let Some(ref eb) = edge_bind {
+                for (field, val) in std::mem::take(&mut edge_props) {
+                    inline_conds.push(DestWhere {
+                        var: eb.clone(),
+                        field,
+                        op: CmpOp::Eq,
+                        value: WhereValue::Literal(val),
+                    });
+                }
+            }
+            hops.push(HopSpec { edge_type_hash, node_bind, edge_bind, min_depth, max_depth, node_label, backward, undirected });
         }
         Ok((hops, inline_conds))
+    }
+
+    /// Parse a GQL graph-pattern quantifier: `{n}` (exact), `{n,m}` (range),
+    /// `{n,}` (n or more), `{,m}` (up to m). The caller has confirmed the current
+    /// token is `{`. Returns `(min_depth, max_depth)`.
+    fn parse_brace_quantifier(&mut self) -> Result<(u32, u32), SqlError> {
+        self.advance(); // consume `{`
+        let min = if let Tok::Num(_) = self.peek() {
+            self.expect_num()? as u32
+        } else {
+            1 // `{,m}` → lower bound defaults to a single hop
+        };
+        let max = if matches!(self.peek(), Tok::Comma) {
+            self.advance();
+            if let Tok::Num(_) = self.peek() {
+                self.expect_num()? as u32
+            } else {
+                MAX_HOP_DEPTH // `{n,}` → unbounded upper
+            }
+        } else {
+            min // `{n}` → exact
+        };
+        match self.peek() {
+            Tok::RBrace => { self.advance(); }
+            other => return Err(SqlError::UnexpectedToken {
+                expected: "}",
+                got: format!("{other:?}"),
+            }),
+        }
+        Ok((min, max))
     }
 
 }
@@ -5601,12 +5836,15 @@ fn is_multi_from(tokens: &[Tok]) -> bool {
         Some(p) => p,
         None => return false,
     };
-    // Scan after FROM for a top-level comma
+    // Scan after FROM for a top-level comma. Depth counts ALL bracket kinds:
+    // `()` node patterns, `[]` edge patterns, and `{}` inline props / `{n,m}`
+    // quantifiers — a comma inside any of those (e.g. `{1,3}` or `{a:1, b:2}`)
+    // is NOT a FROM-source separator.
     let mut depth: usize = 0;
     for tok in &tokens[from_pos + 1..] {
         match tok {
-            Tok::LParen => depth += 1,
-            Tok::RParen => { if depth > 0 { depth -= 1; } }
+            Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+            Tok::RParen | Tok::RBracket | Tok::RBrace => { if depth > 0 { depth -= 1; } }
             Tok::Comma if depth == 0 => return true,
             // Stop scanning at ORDER/LIMIT/WHERE/GROUP (these appear after all FROM sources)
             Tok::Kw(Kw::Where | Kw::Order | Kw::Limit | Kw::Group) if depth == 0 => break,

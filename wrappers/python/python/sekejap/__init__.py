@@ -48,14 +48,14 @@ class DB(_NativeDB):
 
         hits = db.query('''
             SELECT b._key AS venue,
-                   CASE WHEN r._depth = 1 THEN 'direct' ELSE 'multi-hop' END AS tier
-            FROM MATCH (a:bands)-[r:played_at]->(b:venues)
+                   CASE WHEN p.length = 1 THEN 'direct' ELSE 'multi-hop' END AS tier
+            FROM MATCH p = (a:bands)-[r:played_at]->(b:venues)
         ''')
 
     Shortest path (returns a row with path fields, 0 rows if unreachable)::
 
         hits = db.query('''
-            SELECT a.suburb AS from_name, b.suburb AS to_name, r.length AS hops
+            SELECT a.suburb AS from_name, b.suburb AS to_name, length(r) AS hops
             FROM MATCH SHORTEST (a)-[r*]->(b)
             WHERE a._key = 'venues/fitzroy_town_hall'
               AND b._key = 'venues/melbourne_cbd'
