@@ -55,6 +55,14 @@ surrealdb    = { version = "2", optional = true, default-features = false, featu
 [features]
 default = []
 engine = []
+# Sans-IO HTTP service dispatch (`sekejap::serve`). Pure protocol logic — no
+# sockets/async/framework, zero new deps. Consumers (the CLI, language wrappers)
+# own the transport and call `serve::handle`.
+serve = []
+# Sans-IO PostgreSQL wire protocol (`sekejap::pg::Connection`). Feed it socket
+# bytes, get reply bytes — no sockets/threads/deps. The CLI's `sekejap pg` and any
+# downstream app own the transport.
+pg = []
 s3 = ["engine", "dep:object_store", "dep:tokio"]
 # Build the mega_vs_surreal benchmark (pulls SurrealDB + a tokio runtime).
 surreal-bench = ["dep:surrealdb", "dep:tokio"]
@@ -129,6 +137,13 @@ required-features = ["engine"]
 [[bench]]
 name = "edge_scale"
 path = "benches/write/edge_scale.rs"
+harness = false
+
+# `pulse` — comprehensive-but-compact benchmark with live per-stage progress.
+# Run: cargo bench --bench pulse
+[[bench]]
+name = "pulse"
+path = "benches/pulse.rs"
 harness = false
 
 # ── inspection tools ─────────────────────────────────────────────────────────

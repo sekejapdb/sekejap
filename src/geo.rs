@@ -706,12 +706,122 @@ fn edges_from_ring(ring: &[[f64; 2]]) -> Vec<([f64; 2], [f64; 2])> {
     edges
 }
 
+// ── EWKB serialization (PostGIS `ST_AsEWKB`) ─────────────────────────────────
+
+/// Serialize a GeoJSON geometry to **EWKB hex** — the text form PostGIS emits over
+/// the wire (little-endian, SRID-tagged). Enables any PostGIS-aware client (DBeaver,
+/// QGIS) to render sekejap geometries on a map. Returns `None` if `geom` is not a
+/// recognized GeoJSON geometry (Point/LineString/Polygon and their Multi* forms,
+/// plus GeometryCollection).
+pub fn geojson_to_ewkb_hex(geom: &Value, srid: u32) -> Option<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    write_geometry(&mut buf, geom, Some(srid))?;
+    let mut out = String::with_capacity(buf.len() * 2);
+    for b in &buf {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    Some(out.to_ascii_uppercase())
+}
+
+/// Write one geometry in WKB. `srid` is `Some` only for the top-level geometry
+/// (EWKB tags SRID once); nested geometries in Multi*/collections pass `None`.
+fn write_geometry(buf: &mut Vec<u8>, geom: &Value, srid: Option<u32>) -> Option<()> {
+    let ty = geom.get("type")?.as_str()?;
+    let code: u32 = match ty {
+        "Point" => 1, "LineString" => 2, "Polygon" => 3,
+        "MultiPoint" => 4, "MultiLineString" => 5, "MultiPolygon" => 6,
+        "GeometryCollection" => 7,
+        _ => return None,
+    };
+    buf.push(1); // NDR (little-endian)
+    let flagged = if srid.is_some() { code | 0x2000_0000 } else { code };
+    buf.extend_from_slice(&flagged.to_le_bytes());
+    if let Some(s) = srid {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    match ty {
+        "Point" => write_position(buf, geom.get("coordinates")?)?,
+        "LineString" => write_position_seq(buf, geom.get("coordinates")?)?,
+        "Polygon" => write_rings(buf, geom.get("coordinates")?)?,
+        "MultiPoint" => {
+            let pts = geom.get("coordinates")?.as_array()?;
+            buf.extend_from_slice(&(pts.len() as u32).to_le_bytes());
+            for p in pts { buf.push(1); buf.extend_from_slice(&1u32.to_le_bytes()); write_position(buf, p)?; }
+        }
+        "MultiLineString" => {
+            let lines = geom.get("coordinates")?.as_array()?;
+            buf.extend_from_slice(&(lines.len() as u32).to_le_bytes());
+            for l in lines { buf.push(1); buf.extend_from_slice(&2u32.to_le_bytes()); write_position_seq(buf, l)?; }
+        }
+        "MultiPolygon" => {
+            let polys = geom.get("coordinates")?.as_array()?;
+            buf.extend_from_slice(&(polys.len() as u32).to_le_bytes());
+            for p in polys { buf.push(1); buf.extend_from_slice(&3u32.to_le_bytes()); write_rings(buf, p)?; }
+        }
+        "GeometryCollection" => {
+            let geoms = geom.get("geometries")?.as_array()?;
+            buf.extend_from_slice(&(geoms.len() as u32).to_le_bytes());
+            for g in geoms { write_geometry(buf, g, None)?; }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// A single position `[x, y]` (GeoJSON `[lon, lat]`) as two little-endian f64.
+fn write_position(buf: &mut Vec<u8>, pos: &Value) -> Option<()> {
+    let a = pos.as_array()?;
+    let x = a.first()?.as_f64()?;
+    let y = a.get(1)?.as_f64()?;
+    buf.extend_from_slice(&x.to_le_bytes());
+    buf.extend_from_slice(&y.to_le_bytes());
+    Some(())
+}
+
+/// A count-prefixed sequence of positions (a LineString or a Polygon ring).
+fn write_position_seq(buf: &mut Vec<u8>, seq: &Value) -> Option<()> {
+    let pts = seq.as_array()?;
+    buf.extend_from_slice(&(pts.len() as u32).to_le_bytes());
+    for p in pts { write_position(buf, p)?; }
+    Some(())
+}
+
+/// A count-prefixed sequence of rings (a Polygon).
+fn write_rings(buf: &mut Vec<u8>, rings: &Value) -> Option<()> {
+    let rs = rings.as_array()?;
+    buf.extend_from_slice(&(rs.len() as u32).to_le_bytes());
+    for r in rs { write_position_seq(buf, r)?; }
+    Some(())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ewkb_point_matches_postgis() {
+        // ST_AsEWKB(ST_SetSRID(ST_MakePoint(30,10),4326)) in PostGIS.
+        let g = json!({ "type": "Point", "coordinates": [30.0, 10.0] });
+        assert_eq!(
+            geojson_to_ewkb_hex(&g, 4326).unwrap(),
+            "0101000020E61000000000000000003E400000000000002440"
+        );
+    }
+
+    #[test]
+    fn ewkb_polygon_roundtrips_structurally() {
+        let g = json!({
+            "type": "Polygon",
+            "coordinates": [[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]]
+        });
+        let hex = geojson_to_ewkb_hex(&g, 4326).unwrap();
+        // 01 (LE) + 03000020 (polygon+srid) + E6100000 (4326) + 01000000 (1 ring) + 04000000 (4 pts)
+        assert!(hex.starts_with("0103000020E61000000100000004000000"));
+    }
 
     #[test]
     fn test_haversine_melbourne_to_geelong() {
