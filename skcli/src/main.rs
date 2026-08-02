@@ -11,6 +11,11 @@
 //! echo "SQL;" | sekejap <path>       pipe SQL script, exit when stdin closes
 //! ```
 
+#[cfg(feature = "serve")]
+mod serve;
+#[cfg(feature = "pg")]
+mod pg;
+
 use rustyline::DefaultEditor;
 use sekejap::{Config, CoreDB};
 use std::io::{self, IsTerminal, Read};
@@ -66,6 +71,8 @@ USAGE:
   sekejap --path <path> \"<SQL>\"    run SQL and exit
   echo \"SELECT...;\" | sekejap      pipe SQL script
   sekejap migrate <path>           upgrade a DB to the latest (SKBIN) format + verify
+  sekejap serve <path>             serve the DB over HTTP/JSON (default :5918; `serve --help`)
+  sekejap pg <path>                serve the DB over the PostgreSQL wire protocol (default :5432; `pg --help`)
 
 OPTIONS:
   -p, --path <path>    database directory path
@@ -714,6 +721,29 @@ fn main() {
     // `sekejap migrate <db>` — upgrade payloads to the latest (SKBIN) format,
     // verifying every record round-trips byte-identical before reporting success.
     let raw: Vec<String> = std::env::args().skip(1).collect();
+
+    // `sekejap serve <db> [flags]` — HTTP/JSON server (behind the `serve` feature).
+    if raw.first().map(String::as_str) == Some("serve") {
+        #[cfg(feature = "serve")]
+        { std::process::exit(serve::run(&raw[1..])); }
+        #[cfg(not(feature = "serve"))]
+        {
+            eprintln!("this build lacks the `serve` feature — rebuild: cargo install sekejap-cli --features serve");
+            std::process::exit(2);
+        }
+    }
+
+    // `sekejap pg <db> [flags]` — PostgreSQL wire-protocol listener (behind `pg`).
+    if raw.first().map(String::as_str) == Some("pg") {
+        #[cfg(feature = "pg")]
+        { std::process::exit(pg::run(&raw[1..])); }
+        #[cfg(not(feature = "pg"))]
+        {
+            eprintln!("this build lacks the `pg` feature — rebuild: cargo install sekejap-cli --features pg");
+            std::process::exit(2);
+        }
+    }
+
     if raw.first().map(String::as_str) == Some("migrate") {
         match raw.get(1) {
             Some(p) => std::process::exit(migrate(p)),
