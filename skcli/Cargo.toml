@@ -7,10 +7,23 @@ repository.workspace = true
 homepage.workspace = true
 description = "CLI for the Sekejap embedded graph-first multimodel database"
 
+[features]
+# `serve` ships the HTTP server (`sekejap serve`); `pg` ships the PostgreSQL
+# wire-protocol listener (`sekejap pg`). Both on by default so the published CLI
+# runs out of the box; build with `--no-default-features` for a lean REPL-only
+# binary. The embedded `sekejap` library is unaffected either way. `pg` pulls no
+# extra crates — it uses only std + serde_json.
+default = ["serve", "pg"]
+serve = ["dep:axum", "dep:tokio", "sekejap/serve"]
+pg = ["sekejap/pg"]
+
 [dependencies]
 sekejap.workspace = true
 rustyline = "13.0"
 serde_json = "1.0"
+axum  = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"], optional = true }
+
 [[bin]]
 name = "sekejap"
 path = "src/main.rs"
