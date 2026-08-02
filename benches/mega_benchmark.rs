@@ -133,7 +133,7 @@ fn setup_sekejap() -> (CoreDB, tempfile::TempDir) {
             db.link(
                 &format!("venues/v{i}"),
                 &format!("venues/v{}", (i + d) % VENUES),
-                "related_to", 1.0,
+                "related_to",
             );
         }
     }
@@ -150,7 +150,7 @@ fn setup_sekejap() -> (CoreDB, tempfile::TempDir) {
         db.link(
             &format!("services/svc{i}"),
             &format!("services/svc{}", (i - 1) / 2),
-            "depends_on", 1.0,
+            "depends_on",
         );
     }
 
