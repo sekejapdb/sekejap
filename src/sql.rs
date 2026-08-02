@@ -107,6 +107,9 @@ pub enum SqlError {
     ParamTypeMismatch { index: usize, expected: &'static str },
     /// Transaction protocol error (nested BEGIN, COMMIT/ROLLBACK without active transaction).
     TransactionError(String),
+    /// A schema qualifier other than `public` was used on a table name. sekejap
+    /// has a single implicit namespace exposed as `public` (Postgres' default).
+    UndefinedSchema(String),
 }
 
 impl fmt::Display for SqlError {
@@ -125,6 +128,7 @@ impl fmt::Display for SqlError {
                 "field count ({fields}) does not match value count ({values})"
             ),
             SqlError::InvalidValue(s) => write!(f, "invalid value: {s}"),
+            SqlError::UndefinedSchema(s) => write!(f, "schema \"{s}\" does not exist"),
             SqlError::IndexNotBuilt { collection, method, field } => write!(
                 f,
                 "{method} index on {collection}.{field} is declared but not built.\n  Hint: REINDEX ON {collection} USING {method} ({field})"
@@ -183,6 +187,7 @@ enum Tok {
     Dash,      // -
     Plus,      // +
     Slash,     // /
+    Concat,    // ||  (string concatenation)
     VecCosineOp, // <=>  cosine distance
     VecL2Op,     // <->  Euclidean (L2) distance
     VecDotOp,    // <#>  inner product
@@ -576,6 +581,10 @@ fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
                 tokens.push(Tok::Slash);
                 i += 1;
             }
+            '|' if i + 1 < len && chars[i + 1] == '|' => {
+                tokens.push(Tok::Concat); // ||  string concatenation
+                i += 2;
+            }
             '<' => {
                 // 3-char vector operators — must be checked before 2-char operators.
                 if i + 2 < len && chars[i + 1] == '=' && chars[i + 2] == '>' {
@@ -803,7 +812,7 @@ enum CondExpr {
     /// Each inner Vec is one AND-group.
     Or(Vec<Vec<CondExpr>>),
     /// `SEARCH('query text')` — positional search index filter.
-    Search { query: String },
+    Search { query: String, typo: Option<u32> },
 }
 
 enum OrderKey {
@@ -854,12 +863,15 @@ pub struct EdgeInsert {
     pub props_json: Option<String>,
 }
 
-/// A single edge parsed from DELETE ('a')-[:KIND]->('b').
+/// A single edge parsed from DELETE ('a')-[:KIND {k:v}]->('b').
 #[derive(Debug, Clone)]
 pub struct EdgeDelete {
     pub from: String,
     pub to: String,
     pub edge_type: String,
+    /// Optional inline attribute predicate — delete only edges matching these.
+    /// `None` (no `{…}`) deletes ALL edges of this type between the endpoints.
+    pub props: Option<Value>,
 }
 
 /// The result of compiling a mutation SQL statement.
@@ -891,6 +903,15 @@ pub enum CompiledMutation {
     InsertEdge(Vec<EdgeInsert>),
     /// Remove one or more directed edges via Cypher pattern.
     DeleteEdge(Vec<EdgeDelete>),
+    /// `UPDATE ('a')-[:T {pred}]->('b') SET k=v [WHERE …]` — set attributes on the
+    /// edges from→to of `edge_type` matching `predicate` (None = all of that type).
+    UpdateEdge {
+        from: String,
+        to: String,
+        edge_type: String,
+        predicate: Option<Value>,
+        sets: Vec<(String, Value)>,
+    },
     /// MATCH ... INSERT: select nodes via MATCH, then insert edges.
     MatchInsert {
         match_steps: Vec<Step>,
@@ -911,6 +932,18 @@ pub enum CompiledMutation {
         method: IndexMethod,
         fields: Vec<String>,
     },
+    /// `CREATE [MATERIALIZED|SEARCH] VIEW name AS <body>` — a materialized view: the
+    /// body query is stored and (re)run to populate a derived collection named `name`.
+    /// `auto_index` (SEARCH VIEW) auto-builds indexes on the view's search-type fields.
+    CreateView {
+        name: String,
+        /// The raw SQL of the projection body (after `AS`), re-run on refresh.
+        query_sql: String,
+        /// SEARCH VIEW → true: auto-index search-type fields (TEXT→bm25, …).
+        auto_index: bool,
+    },
+    /// `REFRESH MATERIALIZED VIEW name` — re-run the stored body and repopulate.
+    RefreshView { name: String },
     /// DROP TABLE [IF EXISTS]: delete schema + all nodes + cascade edges.
     DropTable {
         collection: String,
@@ -1056,6 +1089,62 @@ pub struct FieldDef {
     /// If set, auto-fill this field with UUIDV5(namespace, name) when absent from INSERT.
     #[serde(default)]
     pub default_uuid5: Option<(String, String)>,
+    /// `GENERATED ALWAYS AS (<expr>) STORED` — a computed column. When set, the field's
+    /// value is derived from this record's OTHER fields at INSERT/UPDATE (any value the
+    /// user supplies is ignored). See [`GenExpr`].
+    #[serde(default)]
+    pub generated: Option<GenExpr>,
+}
+
+/// A generated-column expression, evaluated against a record's own fields. Kept small
+/// on purpose: string building for search blobs / composite keys, not a full language.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GenExpr {
+    /// Reference to another field in the same record.
+    Field(String),
+    /// A string literal.
+    Lit(String),
+    /// `a || b || …` — concatenation (NULL/missing treated as empty string).
+    Concat(Vec<GenExpr>),
+    /// `concat_ws(sep, a, b, …)` — join non-null parts with a separator.
+    ConcatWs(String, Vec<GenExpr>),
+    /// `lower(x)` / `upper(x)`.
+    Lower(Box<GenExpr>),
+    Upper(Box<GenExpr>),
+    /// `coalesce(a, b, …)` — first non-null/non-empty part.
+    Coalesce(Vec<GenExpr>),
+}
+
+impl GenExpr {
+    /// Evaluate against a record's fields → the computed string value.
+    pub fn eval(&self, fields: &serde_json::Map<String, serde_json::Value>) -> String {
+        // Render a JSON value as text (strings unquoted, others via to_string; null → "").
+        fn text(v: &serde_json::Value) -> String {
+            match v {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            }
+        }
+        match self {
+            GenExpr::Field(name) => fields.get(name).map(text).unwrap_or_default(),
+            GenExpr::Lit(s) => s.clone(),
+            GenExpr::Concat(parts) => parts.iter().map(|p| p.eval(fields)).collect(),
+            GenExpr::ConcatWs(sep, parts) => parts
+                .iter()
+                .map(|p| p.eval(fields))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(sep),
+            GenExpr::Lower(e) => e.eval(fields).to_lowercase(),
+            GenExpr::Upper(e) => e.eval(fields).to_uppercase(),
+            GenExpr::Coalesce(parts) => parts
+                .iter()
+                .map(|p| p.eval(fields))
+                .find(|s| !s.is_empty())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1426,6 +1515,24 @@ impl Parser {
         }
     }
 
+    /// Parse a table reference with an optional schema qualifier: `[schema .] table`.
+    /// sekejap has one implicit namespace surfaced as `public` (Postgres' default),
+    /// so `public.artist` and `artist` both resolve to the `artist` collection.
+    /// Any other schema is rejected — matching Postgres, where only existing
+    /// schemas resolve. Lets standard clients (DBeaver, etc.) qualify table names.
+    fn parse_table_ref(&mut self) -> Result<String, SqlError> {
+        let first = self.expect_ident()?;
+        if matches!(self.peek(), Tok::Dot) {
+            self.advance(); // consume '.'
+            let table = self.expect_ident()?;
+            if !first.eq_ignore_ascii_case("public") {
+                return Err(SqlError::UndefinedSchema(first));
+            }
+            return Ok(table);
+        }
+        Ok(first)
+    }
+
     fn parse_value(&mut self) -> Result<Value, SqlError> {
         // NOW() in WHERE: returns current time as Unix milliseconds (i64),
         // suitable for comparison with _created_unix / _updated_unix fields.
@@ -1726,6 +1833,15 @@ impl Parser {
     }
 
     fn parse_field_list(&mut self) -> Result<(Vec<String>, Vec<(ScoreExpr, String)>), SqlError> {
+        // `a.*` → `*` — strip a table-alias qualifier on a star projection
+        // (DBeaver and other clients emit `SELECT a.* FROM t a`).
+        if matches!(self.tokens.get(self.pos), Some(Tok::Ident(_)))
+            && matches!(self.tokens.get(self.pos + 1), Some(Tok::Dot))
+            && matches!(self.tokens.get(self.pos + 2), Some(Tok::Star))
+        {
+            self.advance(); // alias
+            self.advance(); // dot
+        }
         if matches!(self.peek(), Tok::Star) {
             self.advance();
             // Check for trailing score projections: SELECT *, BM25(...) AS score
@@ -1776,6 +1892,16 @@ impl Parser {
         // would otherwise swallow the CASE keyword as a bare field name.
         if matches!(self.peek(), Tok::Kw(Kw::Case)) {
             return self.parse_plain_case_projection();
+        }
+        // Strip an optional table-alias qualifier: `a.col` → `col`. sekejap selects
+        // from a single collection, so the alias is cosmetic. Only when a real
+        // column identifier follows the dot (leaves functions/`a.*` untouched).
+        if matches!(self.tokens.get(self.pos), Some(Tok::Ident(_)))
+            && matches!(self.tokens.get(self.pos + 1), Some(Tok::Dot))
+            && matches!(self.tokens.get(self.pos + 2), Some(Tok::Ident(_)) | Some(Tok::Str(_)))
+        {
+            self.advance(); // alias
+            self.advance(); // dot
         }
         let ident = self.expect_ident()?;
         // Score functions → parse as full ScoreExpr, optional AS alias
@@ -2048,6 +2174,15 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 self.advance();
+                // Optional `schema.` qualifier — `public` is transparent.
+                if matches!(self.peek(), Tok::Dot) {
+                    self.advance();
+                    let table = self.expect_ident()?;
+                    if !name.eq_ignore_ascii_case("public") {
+                        return Err(SqlError::UndefinedSchema(name));
+                    }
+                    return Ok(Source::Collection(table));
+                }
                 Ok(Source::Collection(name))
             }
             Tok::Eof => Err(SqlError::UnexpectedEnd {
@@ -2400,12 +2535,29 @@ impl Parser {
             return self.parse_field_compare(func_field);
         }
 
-        // SEARCH('query text') — positional search index filter
+        // SEARCH('query text' [, typo => N]) — positional search index filter.
+        // `typo => N` overrides the auto edit-distance (0 = exact, 1–2 = tolerant).
         if upper == "SEARCH" {
             self.expect_lparen()?;
             let query = self.expect_str()?;
+            let mut typo = None;
+            if matches!(self.peek(), Tok::Comma) {
+                self.advance();
+                let arg = self.expect_ident()?; // "typo"
+                if !arg.eq_ignore_ascii_case("typo") {
+                    return Err(SqlError::UnexpectedToken { expected: "typo", got: arg });
+                }
+                // accept `typo => N` or `typo = N`  (`=>` tokenizes as `=` then `>`)
+                if !matches!(self.peek(), Tok::Eq) {
+                    return Err(SqlError::UnexpectedToken {
+                        expected: "=> or =", got: format!("{:?}", self.peek()) });
+                }
+                self.advance();                               // =
+                if matches!(self.peek(), Tok::Gt) { self.advance(); } // the > of =>
+                typo = Some(self.expect_num()? as u32);
+            }
             self.expect_rparen()?;
-            return Ok(CondExpr::Search { query });
+            return Ok(CondExpr::Search { query, typo });
         }
 
         // BM25 full-text search: BM25(field, 'query') > min_score
@@ -2857,7 +3009,7 @@ impl Parser {
     /// Supports multi-row INSERT: VALUES (a, b), (c, d), (e, f)
     fn parse_insert_node(&mut self) -> Result<InsertStmt, SqlError> {
         self.expect_kw(Kw::Into, "INTO")?;
-        let collection = self.expect_ident()?;
+        let collection = self.parse_table_ref()?;
         self.expect_lparen()?;
         let mut fields = vec![self.expect_ident()?];
         while matches!(self.peek(), Tok::Comma) {
@@ -3093,6 +3245,31 @@ impl Parser {
                 }
             }
             let edge_type = self.expect_ident()?;
+            // Optional {k:v, …} predicate — delete only edges matching these attrs.
+            let mut props: Option<Value> = None;
+            if matches!(self.peek(), Tok::LBrace) {
+                self.advance();
+                let mut map = serde_json::Map::new();
+                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                    let key = self.expect_ident()?;
+                    match self.peek() {
+                        Tok::Colon => { self.advance(); }
+                        other => return Err(SqlError::UnexpectedToken {
+                            expected: ":", got: format!("{other:?}"),
+                        }),
+                    }
+                    let val = self.parse_value()?;
+                    map.insert(key, val);
+                    if matches!(self.peek(), Tok::Comma) { self.advance(); }
+                }
+                match self.peek() {
+                    Tok::RBrace => { self.advance(); }
+                    other => return Err(SqlError::UnexpectedToken {
+                        expected: "}", got: format!("{other:?}"),
+                    }),
+                }
+                props = Some(Value::Object(map));
+            }
             // ]->
             match self.peek() {
                 Tok::RBracket => {
@@ -3127,6 +3304,7 @@ impl Parser {
                 from,
                 to,
                 edge_type,
+                props,
             });
 
             if matches!(self.peek(), Tok::Comma) {
@@ -3140,7 +3318,7 @@ impl Parser {
 
     fn parse_update(&mut self) -> Result<UpdateStmt, SqlError> {
         self.expect_kw(Kw::Update, "UPDATE")?;
-        let collection = self.expect_ident()?;
+        let collection = self.parse_table_ref()?;
         self.expect_kw(Kw::Set, "SET")?;
         // Parse one or more  field = value  pairs separated by commas
         let mut updates = Vec::new();
@@ -3177,6 +3355,88 @@ impl Parser {
         })
     }
 
+    /// Parse `UPDATE ('a')-[:TYPE {pred}]->('b') SET k=v[, …] [WHERE k=v [AND …]]`.
+    /// The relationship is the mutation subject: `SET` targets the edge; endpoints
+    /// and predicate only SELECT which edges to change.
+    fn parse_update_edge(&mut self) -> Result<CompiledMutation, SqlError> {
+        self.expect_kw(Kw::Update, "UPDATE")?;
+        // ('from')
+        self.expect_lparen()?;
+        let from = self.expect_str()?;
+        self.expect_rparen()?;
+        self.eat(Tok::Dash, "-")?;
+        self.eat(Tok::LBracket, "[")?;
+        self.eat(Tok::Colon, ":")?;
+        let edge_type = self.expect_ident()?;
+        // optional inline {k:v} predicate
+        let mut predicate = serde_json::Map::new();
+        if matches!(self.peek(), Tok::LBrace) {
+            self.advance();
+            while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                let key = self.expect_ident()?;
+                self.eat(Tok::Colon, ":")?;
+                predicate.insert(key, self.parse_value()?);
+                if matches!(self.peek(), Tok::Comma) { self.advance(); }
+            }
+            self.eat(Tok::RBrace, "}")?;
+        }
+        self.eat(Tok::RBracket, "]")?;
+        self.eat(Tok::Arrow, "->")?;
+        // ('to')
+        self.expect_lparen()?;
+        let to = self.expect_str()?;
+        self.expect_rparen()?;
+        // SET k=v[, …]  (SET is on the edge; an optional `r.` qualifier is stripped)
+        self.expect_kw(Kw::Set, "SET")?;
+        let mut sets = Vec::new();
+        loop {
+            let mut field = self.expect_ident()?;
+            if matches!(self.peek(), Tok::Dot) { self.advance(); field = self.expect_ident()?; }
+            if field == "_key" {
+                return Err(SqlError::InvalidValue(
+                    "cannot UPDATE _key (edge identity); delete and re-insert instead".into(),
+                ));
+            }
+            match self.peek() {
+                Tok::Eq => { self.advance(); }
+                other => return Err(SqlError::UnexpectedToken { expected: "=", got: format!("{other:?}") }),
+            }
+            sets.push((field, self.parse_value()?));
+            if matches!(self.peek(), Tok::Comma) { self.advance(); } else { break; }
+        }
+        // optional WHERE field=value [AND …]  — equality predicates on the edge
+        if matches!(self.peek(), Tok::Kw(Kw::Where)) {
+            self.advance();
+            loop {
+                let mut field = self.expect_ident()?;
+                if matches!(self.peek(), Tok::Dot) { self.advance(); field = self.expect_ident()?; }
+                match self.peek() {
+                    Tok::Eq => { self.advance(); }
+                    other => return Err(SqlError::UnexpectedToken { expected: "=", got: format!("{other:?}") }),
+                }
+                predicate.insert(field, self.parse_value()?);
+                if matches!(self.peek(), Tok::Kw(Kw::And)) { self.advance(); } else { break; }
+            }
+        }
+        Ok(CompiledMutation::UpdateEdge {
+            from,
+            to,
+            edge_type,
+            predicate: if predicate.is_empty() { None } else { Some(Value::Object(predicate)) },
+            sets,
+        })
+    }
+
+    /// Consume the next token if it matches `t` (by variant), else error `name`.
+    fn eat(&mut self, t: Tok, name: &'static str) -> Result<(), SqlError> {
+        if std::mem::discriminant(self.peek()) == std::mem::discriminant(&t) {
+            self.advance();
+            Ok(())
+        } else {
+            Err(SqlError::UnexpectedToken { expected: name, got: format!("{:?}", self.peek()) })
+        }
+    }
+
     /// Parse an optional `DEFAULT UUIDV4()` or `DEFAULT UUIDV5('ns', 'name')` clause.
     /// Returns `(default_uuid4, default_uuid5)`. Consumes tokens only when DEFAULT is present.
     fn parse_field_default(p: &mut Self) -> Result<(bool, Option<(String, String)>), SqlError> {
@@ -3205,9 +3465,89 @@ impl Parser {
         Ok((false, None))
     }
 
+    /// Parse an optional `GENERATED ALWAYS AS (<expr>) STORED` clause. `GENERATED`,
+    /// `ALWAYS`, and `STORED` are contextual identifiers (not reserved keywords).
+    fn parse_generated(&mut self) -> Result<Option<GenExpr>, SqlError> {
+        let is_generated = matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("generated"));
+        if !is_generated {
+            return Ok(None);
+        }
+        self.advance(); // GENERATED
+        // Optional `ALWAYS`
+        if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("always")) {
+            self.advance();
+        }
+        self.expect_kw(Kw::As, "AS")?;
+        self.expect_lparen()?;
+        let expr = self.parse_gen_expr()?;
+        self.expect_rparen()?;
+        // Optional `STORED` (the only mode we support; VIRTUAL is not).
+        if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("stored")) {
+            self.advance();
+        }
+        Ok(Some(expr))
+    }
+
+    /// Parse a generated-column expression: `a || b`, `concat_ws(sep, …)`,
+    /// `lower/upper(x)`, `coalesce(…)`, field refs, and string literals.
+    fn parse_gen_expr(&mut self) -> Result<GenExpr, SqlError> {
+        let mut parts = vec![self.parse_gen_primary()?];
+        while matches!(self.peek(), Tok::Concat) {
+            self.advance(); // ||
+            parts.push(self.parse_gen_primary()?);
+        }
+        Ok(if parts.len() == 1 { parts.pop().unwrap() } else { GenExpr::Concat(parts) })
+    }
+
+    fn parse_gen_primary(&mut self) -> Result<GenExpr, SqlError> {
+        match self.peek().clone() {
+            Tok::Str(s) => { self.advance(); Ok(GenExpr::Lit(s)) }
+            Tok::LParen => { self.advance(); let e = self.parse_gen_expr()?; self.expect_rparen()?; Ok(e) }
+            Tok::Ident(name) => {
+                self.advance();
+                let upper = name.to_ascii_uppercase();
+                if matches!(self.peek(), Tok::LParen)
+                    && matches!(upper.as_str(), "CONCAT" | "CONCAT_WS" | "LOWER" | "UPPER" | "COALESCE")
+                {
+                    self.expect_lparen()?;
+                    let expr = match upper.as_str() {
+                        "LOWER" => { let e = self.parse_gen_expr()?; GenExpr::Lower(Box::new(e)) }
+                        "UPPER" => { let e = self.parse_gen_expr()?; GenExpr::Upper(Box::new(e)) }
+                        "CONCAT_WS" => {
+                            let sep = self.expect_str()?;
+                            let mut args = Vec::new();
+                            while matches!(self.peek(), Tok::Comma) {
+                                self.advance();
+                                args.push(self.parse_gen_expr()?);
+                            }
+                            GenExpr::ConcatWs(sep, args)
+                        }
+                        "COALESCE" | "CONCAT" => {
+                            let mut args = vec![self.parse_gen_expr()?];
+                            while matches!(self.peek(), Tok::Comma) {
+                                self.advance();
+                                args.push(self.parse_gen_expr()?);
+                            }
+                            if upper == "COALESCE" { GenExpr::Coalesce(args) } else { GenExpr::Concat(args) }
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.expect_rparen()?;
+                    Ok(expr)
+                } else {
+                    Ok(GenExpr::Field(name))
+                }
+            }
+            other => Err(SqlError::UnexpectedToken {
+                expected: "generated expression (field, string, ||, concat_ws, lower, upper, coalesce)",
+                got: format!("{other:?}"),
+            }),
+        }
+    }
+
     fn parse_create_table(&mut self) -> Result<TableSchema, SqlError> {
         self.expect_kw(Kw::Table, "TABLE")?;
-        let collection = self.expect_ident()?;
+        let collection = self.parse_table_ref()?;
         self.expect_lparen()?;
 
         let mut fields = Vec::new();
@@ -3225,6 +3565,7 @@ impl Parser {
             let is_timestamptz = field_name.ends_with("_at") || field_name.ends_with("_time");
             let default_now = is_timestamptz;
             let (default_uuid4, default_uuid5) = Self::parse_field_default(self)?;
+            let generated = self.parse_generated()?;
             fields.push(FieldDef {
                 name: field_name,
                 ty,
@@ -3233,6 +3574,7 @@ impl Parser {
                 default_now,
                 default_uuid4,
                 default_uuid5,
+                generated,
             });
             if matches!(self.peek(), Tok::Comma) {
                 self.advance();
@@ -3255,6 +3597,7 @@ impl Parser {
                     default_now: false,
                     default_uuid4: true,
                     default_uuid5: None,
+                    generated: None,
                 },
             );
         }
@@ -3273,6 +3616,7 @@ impl Parser {
             default_now: true,
             default_uuid4: false,
             default_uuid5: None,
+            generated: None,
         });
         schema.fields.push(FieldDef {
             name: "_updated_unix".to_string(),
@@ -3282,6 +3626,7 @@ impl Parser {
             default_now: true,
             default_uuid4: false,
             default_uuid5: None,
+            generated: None,
         });
 
         Ok(schema)
@@ -3298,7 +3643,7 @@ impl Parser {
     /// - `ALTER [COLUMN] name TYPE new_type`
     fn parse_alter_table(&mut self) -> Result<CompiledMutation, SqlError> {
         self.expect_kw(Kw::Table, "TABLE")?;
-        let collection = self.expect_ident()?;
+        let collection = self.parse_table_ref()?;
 
         match self.peek().clone() {
             // ADD [COLUMN] name type [PRIMARY KEY] [NOT NULL]
@@ -3329,6 +3674,7 @@ impl Parser {
                 }
                 let is_timestamptz = col_name.ends_with("_at") || col_name.ends_with("_time");
                 let (default_uuid4, default_uuid5) = Self::parse_field_default(self)?;
+                let generated = self.parse_generated()?;
                 let def = FieldDef {
                     name: col_name,
                     ty,
@@ -3337,6 +3683,7 @@ impl Parser {
                     default_now: is_timestamptz,
                     default_uuid4,
                     default_uuid5,
+                    generated,
                 };
                 Ok(CompiledMutation::AlterTable {
                     collection,
@@ -3435,7 +3782,7 @@ impl Parser {
         };
 
         self.expect_kw(Kw::On, "ON")?;
-        let collection = self.expect_ident()?;
+        let collection = self.parse_table_ref()?;
         self.expect_kw(Kw::Using, "USING")?;
         let method_str = self.expect_ident()?;
         let method = match method_str.to_lowercase().as_str() {
@@ -4438,6 +4785,78 @@ impl Parser {
     }
 
     /// Parse a single aggregate return item: `var.field AS alias` or `SUM(math) AS alias`.
+    /// Parse one primary of a MATCH string expression: `'lit'`, `var.field`, or a
+    /// nested `concat/concat_ws/lower/coalesce(…)` call.
+    fn parse_match_str_primary(&mut self) -> Result<crate::query::MatchStr, SqlError> {
+        use crate::query::MatchStr;
+        match self.peek().clone() {
+            Tok::Str(s) => { self.advance(); Ok(MatchStr::Lit(s)) }
+            Tok::Ident(name) => {
+                let upper = name.to_ascii_uppercase();
+                self.advance();
+                if matches!(self.peek(), Tok::LParen)
+                    && matches!(upper.as_str(), "CONCAT" | "CONCAT_WS" | "LOWER" | "COALESCE")
+                {
+                    self.parse_match_str_fn_body(&upper)
+                } else if matches!(self.peek(), Tok::Dot) {
+                    self.advance();
+                    let field = self.expect_ident()?;
+                    Ok(MatchStr::Field(name, field))
+                } else {
+                    Err(SqlError::UnexpectedToken {
+                        expected: "var.field or a string function",
+                        got: name,
+                    })
+                }
+            }
+            other => Err(SqlError::UnexpectedToken {
+                expected: "string expression (var.field, 'literal', concat_ws, lower, coalesce)",
+                got: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// Parse a full MATCH string expression: primary (`||` primary)*.
+    fn parse_match_str(&mut self) -> Result<crate::query::MatchStr, SqlError> {
+        use crate::query::MatchStr;
+        let mut parts = vec![self.parse_match_str_primary()?];
+        while matches!(self.peek(), Tok::Concat) {
+            self.advance();
+            parts.push(self.parse_match_str_primary()?);
+        }
+        Ok(if parts.len() == 1 { parts.pop().unwrap() } else { MatchStr::Concat(parts) })
+    }
+
+    /// Parse the argument list of a string function (name already consumed): the
+    /// opening `(` is next.
+    fn parse_match_str_fn_body(&mut self, upper: &str) -> Result<crate::query::MatchStr, SqlError> {
+        use crate::query::MatchStr;
+        self.expect_lparen()?;
+        let e = match upper {
+            "LOWER" => MatchStr::Lower(Box::new(self.parse_match_str()?)),
+            "CONCAT_WS" => {
+                let sep = self.expect_str()?;
+                let mut parts = Vec::new();
+                while matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                    parts.push(self.parse_match_str()?);
+                }
+                MatchStr::ConcatWs(sep, parts)
+            }
+            "CONCAT" | "COALESCE" => {
+                let mut parts = vec![self.parse_match_str()?];
+                while matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                    parts.push(self.parse_match_str()?);
+                }
+                if upper == "CONCAT" { MatchStr::Concat(parts) } else { MatchStr::Coalesce(parts) }
+            }
+            _ => unreachable!(),
+        };
+        self.expect_rparen()?;
+        Ok(e)
+    }
+
     fn parse_agg_return_item(
         &mut self,
     ) -> Result<(crate::query::MatchAggReturn, String), SqlError> {
@@ -4518,6 +4937,10 @@ impl Parser {
                     let pvar = self.expect_ident()?;
                     self.expect_rparen()?;
                     MatchAggReturn::PathFn { var: pvar, kind }
+                } else if matches!(upper.as_str(), "CONCAT" | "CONCAT_WS" | "LOWER" | "COALESCE") {
+                    // String-building expression for materialized-view text columns.
+                    self.advance(); // consume function name
+                    MatchAggReturn::Str(self.parse_match_str_fn_body(&upper)?)
                 } else {
                     let var = self.expect_ident()?;
                     if matches!(self.peek(), Tok::Dot) {
@@ -4527,7 +4950,18 @@ impl Parser {
                             MatchAggReturn::AllFields { var }
                         } else {
                             let field = self.expect_ident()?;
-                            MatchAggReturn::Field { var, field }
+                            // `var.field || …` → a string concatenation expression.
+                            if matches!(self.peek(), Tok::Concat) {
+                                use crate::query::MatchStr;
+                                let mut parts = vec![MatchStr::Field(var, field)];
+                                while matches!(self.peek(), Tok::Concat) {
+                                    self.advance();
+                                    parts.push(self.parse_match_str_primary()?);
+                                }
+                                MatchAggReturn::Str(MatchStr::Concat(parts))
+                            } else {
+                                MatchAggReturn::Field { var, field }
+                            }
                         }
                     } else {
                         // Bare identifier — reference to a bound variable or WITH alias.
@@ -4601,6 +5035,7 @@ impl Parser {
                 crate::query::PathFnKind::Nodes => "nodes".to_string(),
                 crate::query::PathFnKind::Relationships => "relationships".to_string(),
             },
+            MatchAggReturn::Str(_) => "text".to_string(),
         };
         let alias = if matches!(self.peek(), Tok::Kw(Kw::As)) {
             self.advance();
@@ -5371,7 +5806,7 @@ fn compile_cond(cond: CondExpr) -> Step {
         CondExpr::Bm25Func { .. } => unreachable!("Bm25Func should not reach compile_cond"),
         CondExpr::VectorNear { field, query, k } => Step::VectorNear { field, query, k },
         CondExpr::IsNull { field, negated } => Step::WhereIsNull(field, negated),
-        CondExpr::Search { query } => Step::SearchFilter(query),
+        CondExpr::Search { query, typo } => Step::SearchFilter(query, typo),
         CondExpr::Not(inner) => Step::WhereNot(Box::new(compile_cond(*inner))),
         CondExpr::Or(groups) => Step::WhereOr(
             groups
@@ -5911,7 +6346,95 @@ pub fn parse_and_compile(sql: &str) -> Result<Vec<Step>, SqlError> {
     }
 }
 
+/// Find `kw` (lowercase) as a WHOLE word in `hay` (must be lowercase). Returns its
+/// byte offset. Used for the light textual parse of the VIEW DDL header.
+fn find_kw(hay: &str, kw: &str) -> Option<usize> {
+    let mut start = 0;
+    while let Some(p) = hay[start..].find(kw) {
+        let idx = start + p;
+        let before_ok = idx == 0 || !hay.as_bytes()[idx - 1].is_ascii_alphanumeric();
+        let after = idx + kw.len();
+        let after_ok = after >= hay.len() || !hay.as_bytes()[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return Some(idx);
+        }
+        start = idx + kw.len();
+    }
+    None
+}
+
+/// Textually recognize `CREATE [MATERIALIZED] [SEARCH] VIEW name AS <body>` and
+/// `REFRESH MATERIALIZED VIEW name`. Returns `None` for anything else (falls through
+/// to the token parser). Kept textual so the body SQL survives verbatim for refresh.
+fn parse_view_ddl(sql: &str) -> Option<CompiledMutation> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+
+    // REFRESH [MATERIALIZED] VIEW name
+    if words[0].eq_ignore_ascii_case("refresh") {
+        let mut i = 1;
+        if words.get(i).map_or(false, |w| w.eq_ignore_ascii_case("materialized")) { i += 1; }
+        if !words.get(i).map_or(false, |w| w.eq_ignore_ascii_case("view")) { return None; }
+        let name = words.get(i + 1)?.trim_end_matches(';');
+        return Some(CompiledMutation::RefreshView { name: name.to_string() });
+    }
+
+    // CREATE MATERIALIZED VIEW name [WITH (autoindex[ = true])] AS <body>
+    // (No `SEARCH VIEW`: automatic refresh isn't embedded-native, so a preset that
+    // implies it would mislead. `WITH (autoindex)` gives the auto-index convenience;
+    // freshness is explicit via `REFRESH MATERIALIZED VIEW`.)
+    if !(words[0].eq_ignore_ascii_case("create")
+        && words.get(1).map_or(false, |w| w.eq_ignore_ascii_case("materialized"))
+        && words.get(2).map_or(false, |w| w.eq_ignore_ascii_case("view")))
+    {
+        return None;
+    }
+    let name = words.get(3)?.to_string();
+
+    // Body = raw text after the header's `AS`; between the name and `AS` is the optional
+    // `WITH (…)` clause — `autoindex` there flips on auto-indexing.
+    let lower = trimmed.to_ascii_lowercase();
+    let vp = find_kw(&lower, "view")?;
+    let rel = find_kw(&lower[vp + 4..], "as")?;
+    let as_start = vp + 4 + rel;
+    let header_mid = &lower[vp + 4..as_start]; // " name [with (autoindex …)]"
+    let auto_index = header_mid.contains("autoindex");
+    let query_sql = trimmed[as_start + 2..].trim().to_string();
+    if query_sql.is_empty() {
+        return None;
+    }
+    Some(CompiledMutation::CreateView { name, query_sql, auto_index })
+}
+
+/// Extract the root collection label of a `… FROM MATCH (var:collection)…` projection
+/// (used to mirror the root's source vectors into a materialized view). Textual, on the
+/// standard form; returns `None` if no `MATCH (…)` node is found.
+pub fn extract_root_collection(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let mp = find_kw(&lower, "match")?;
+    let after = &sql[mp + 5..];
+    let lp = after.find('(')?;
+    let inner = &after[lp + 1..];
+    let end = inner.find(|c: char| c == ')' || c == '-' || c == '{' || c == ',' || c.is_whitespace())
+        .unwrap_or(inner.len());
+    let node = &inner[..end]; // e.g. "s:song", ":song", or "song"
+    let coll = match node.find(':') { Some(c) => &node[c + 1..], None => node };
+    let coll = coll.trim();
+    if coll.is_empty() { None } else { Some(coll.to_string()) }
+}
+
 fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutation, SqlError> {
+    // `CREATE [MATERIALIZED|SEARCH] VIEW …` and `REFRESH MATERIALIZED VIEW …` are
+    // handled textually so the body SQL (after `AS`) can be stored verbatim to re-run
+    // on refresh (the tokenizer drops source positions). The body is validated when
+    // the view is materialized.
+    if let Some(m) = parse_view_ddl(sql) {
+        return Ok(m);
+    }
+
     let tokens = tokenize(sql)?;
     let mut parser = Parser::with_params(tokens, params);
     match parser.peek().clone() {
@@ -5956,8 +6479,13 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
             }
         }
         Tok::Kw(Kw::Update) => {
-            let stmt = parser.parse_update()?;
-            Ok(compile_update(stmt))
+            // `UPDATE ('a')-[:T …]->('b') …` (edge) vs `UPDATE table …` (node).
+            if matches!(parser.tokens.get(parser.pos + 1), Some(Tok::LParen)) {
+                parser.parse_update_edge()
+            } else {
+                let stmt = parser.parse_update()?;
+                Ok(compile_update(stmt))
+            }
         }
         Tok::Kw(Kw::Match) => parser.parse_match_insert(),
         Tok::Kw(Kw::Create) => {
@@ -5989,7 +6517,7 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
                             }),
                         }
                     } else { false };
-                    let collection = parser.expect_ident()?;
+                    let collection = parser.parse_table_ref()?;
                     Ok(CompiledMutation::DropTable { collection, if_exists })
                 }
                 // DROP INDEX [IF EXISTS] ON collection USING method (field)
@@ -6006,7 +6534,7 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
                         }
                     } else { false };
                     parser.expect_kw(Kw::On, "ON")?;
-                    let collection = parser.expect_ident()?;
+                    let collection = parser.parse_table_ref()?;
                     parser.expect_kw(Kw::Using, "USING")?;
                     let method_str = parser.expect_ident()?;
                     let method = match method_str.to_ascii_uppercase().as_str() {
@@ -6041,7 +6569,7 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
         Tok::Kw(Kw::Reindex) => {
             parser.advance(); // consume REINDEX
             parser.expect_kw(Kw::On, "ON")?;
-            let collection = parser.expect_ident()?;
+            let collection = parser.parse_table_ref()?;
             parser.expect_kw(Kw::Using, "USING")?;
             let method_str = parser.expect_ident()?;
             let method = match method_str.to_lowercase().as_str() {

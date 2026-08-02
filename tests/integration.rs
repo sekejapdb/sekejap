@@ -7161,3 +7161,332 @@ fn bm25_filter_is_deterministic_and_complete() {
         assert_eq!(run(), first, "BM25 filter must be deterministic across identical runs");
     }
 }
+
+// ── Generated columns (GENERATED ALWAYS AS … STORED) ─────────────────────────
+
+#[test]
+fn generated_column_computes_and_overrides() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE people (_key TEXT PRIMARY KEY, first_name TEXT, last_name TEXT, \
+                fullname TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED, \
+                blob TEXT GENERATED ALWAYS AS (lower(concat_ws(' ', first_name, last_name))) STORED)").unwrap();
+    // fullname computed from the record's own fields
+    db.execute("INSERT INTO people (_key, first_name, last_name) VALUES ('p1','John','Smith')").unwrap();
+    // an explicit user value for a generated column is ignored (GENERATED ALWAYS)
+    db.execute("INSERT INTO people (_key, first_name, last_name, fullname) VALUES ('p2','Ada','Lovelace','WRONG')").unwrap();
+
+    let get = |db: &CoreDB, k: &str, f: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(&db.get(&format!("people/{k}")).unwrap()).unwrap();
+        v.get(f).unwrap().as_str().unwrap().to_string()
+    };
+    assert_eq!(get(&db, "p1", "fullname"), "John Smith");
+    assert_eq!(get(&db, "p1", "blob"), "john smith");
+    assert_eq!(get(&db, "p2", "fullname"), "Ada Lovelace", "GENERATED ALWAYS overrides user value");
+}
+
+#[test]
+fn generated_column_recomputes_on_update() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE people (_key TEXT PRIMARY KEY, first_name TEXT, last_name TEXT, \
+                fullname TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED)").unwrap();
+    db.execute("INSERT INTO people (_key, first_name, last_name) VALUES ('p1','John','Smith')").unwrap();
+
+    let fullname = |db: &CoreDB| -> String {
+        let v: serde_json::Value = serde_json::from_str(&db.get("people/p1").unwrap()).unwrap();
+        v.get("fullname").unwrap().as_str().unwrap().to_string()
+    };
+    assert_eq!(fullname(&db), "John Smith");
+    db.execute("UPDATE people SET last_name = 'Doe' WHERE _key = 'p1'").unwrap();
+    assert_eq!(fullname(&db), "John Doe", "generated column must recompute on UPDATE");
+}
+
+#[test]
+fn generated_column_is_searchable() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE people (_key TEXT PRIMARY KEY, first_name TEXT, last_name TEXT, \
+                fullname TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED)").unwrap();
+    db.execute("INSERT INTO people (_key, first_name, last_name) VALUES ('p1','John','Smith')").unwrap();
+    db.execute("INSERT INTO people (_key, first_name, last_name) VALUES ('p2','Jane','Doe')").unwrap();
+    db.execute("CREATE INDEX ON people USING bm25 (fullname)").unwrap();
+    // the combined value is indexed and matchable, though it's never stored by the user
+    let hits = db.query("SELECT _key FROM people WHERE BM25(fullname,'john smith') > 0").unwrap().collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].payload.as_ref().unwrap().get("_key").unwrap(), "p1");
+}
+
+// ── Materialized views (graph-sourced, cross-collection search) ──────────────
+
+fn setup_music_mv() -> CoreDB {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE song   (_key TEXT PRIMARY KEY, title TEXT)").unwrap();
+    db.execute("CREATE TABLE artist (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO artist (_key,name) VALUES ('beatles','The Beatles')").unwrap();
+    db.execute("INSERT INTO song (_key,title) VALUES ('yesterday','Yesterday')").unwrap();
+    db.execute("INSERT ('song/yesterday')-[:by]->('artist/beatles')").unwrap();
+    db
+}
+
+#[test]
+fn materialized_view_cross_collection_search() {
+    let mut db = setup_music_mv();
+    db.execute("CREATE MATERIALIZED VIEW song_search AS \
+                SELECT s._key AS id, s.title AS title, a.name AS artist, \
+                       concat_ws(' ', s.title, a.name) AS text \
+                FROM MATCH (s:song)-[:by]->(a:artist)").unwrap();
+
+    // The view is a real collection; text folds in the artist name across the edge.
+    let doc: serde_json::Value =
+        serde_json::from_str(&db.get("song_search/yesterday").unwrap()).unwrap();
+    assert_eq!(doc["text"], "Yesterday The Beatles");
+    assert_eq!(doc["artist"], "The Beatles");
+
+    // BM25 finds the song by the ARTIST word — which isn't in the song title at all.
+    db.execute("CREATE INDEX ON song_search USING bm25 (text)").unwrap();
+    let hits = db.query("SELECT id FROM song_search WHERE BM25(text,'beatles') > 0").unwrap().collect();
+    assert_eq!(hits.len(), 1, "'beatles' must find Yesterday via the materialized artist name");
+    assert_eq!(hits[0].payload.as_ref().unwrap()["id"], "yesterday");
+}
+
+#[test]
+fn materialized_view_refresh_picks_up_changes() {
+    let mut db = setup_music_mv();
+    db.execute("CREATE MATERIALIZED VIEW song_search AS \
+                SELECT s._key AS id, concat_ws(' ', s.title, a.name) AS text \
+                FROM MATCH (s:song)-[:by]->(a:artist)").unwrap();
+    let text = |db: &CoreDB| -> String {
+        let v: serde_json::Value = serde_json::from_str(&db.get("song_search/yesterday").unwrap()).unwrap();
+        v["text"].as_str().unwrap().to_string()
+    };
+    assert_eq!(text(&db), "Yesterday The Beatles");
+    db.execute("UPDATE artist SET name='Fab Four' WHERE _key='beatles'").unwrap();
+    // stale until refresh (Postgres-faithful base behavior)
+    assert_eq!(text(&db), "Yesterday The Beatles");
+    db.execute("REFRESH MATERIALIZED VIEW song_search").unwrap();
+    assert_eq!(text(&db), "Yesterday Fab Four");
+}
+
+#[test]
+fn materialized_view_with_autoindex() {
+    let mut db = setup_music_mv();
+    // WITH (autoindex): auto-indexes the search-type fields — no explicit CREATE INDEX.
+    db.execute("CREATE MATERIALIZED VIEW song_search WITH (autoindex = true) AS \
+                SELECT s._key AS id, concat_ws(' ', s.title, a.name) AS text \
+                FROM MATCH (s:song)-[:by]->(a:artist)").unwrap();
+    let hits = db.query("SELECT id FROM song_search WHERE BM25(text,'beatles') > 0").unwrap().collect();
+    assert_eq!(hits.len(), 1, "WITH (autoindex) must auto-index the text field");
+}
+
+
+#[test]
+fn search_view_multimodal_text_geo_vector() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE place (_key TEXT PRIMARY KEY, name TEXT, geometry GEO, embedding VECTOR)").unwrap();
+    db.execute("CREATE TABLE dish (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO place (_key,name,geometry,embedding) VALUES ('p1','Warung','{\"type\":\"Point\",\"coordinates\":[115.168,-8.690]}',[0.9,0.1,0.0,0.0])").unwrap();
+    db.execute("INSERT INTO place (_key,name,geometry,embedding) VALUES ('p2','Cafe','{\"type\":\"Point\",\"coordinates\":[116.0,-9.5]}',[0.1,0.9,0.0,0.0])").unwrap();
+    db.execute("INSERT INTO dish (_key,name) VALUES ('d1','grilled chicken')").unwrap();
+    db.execute("INSERT ('place/p1')-[:serves]->('dish/d1')").unwrap();
+    db.execute("INSERT ('place/p2')-[:serves]->('dish/d1')").unwrap();
+
+    // WITH (autoindex) auto-indexes text (bm25), geo (spatial), AND vector (hnsw).
+    db.execute("CREATE MATERIALIZED VIEW place_search WITH (autoindex = true) AS \
+        SELECT p._key AS id, concat_ws(' ', p.name, dish.name) AS text, p.geometry AS geometry, p.embedding AS embedding \
+        FROM MATCH (p:place)-[:serves]->(dish:dish)").unwrap();
+
+    let ids = |db: &CoreDB, q: &str| -> Vec<String> {
+        db.query(q).unwrap().collect().iter()
+            .filter_map(|h| h.payload.as_ref()?.get("id")?.as_str().map(String::from)).collect()
+    };
+    // text: both serve the dish
+    assert_eq!(ids(&db, "SELECT id FROM place_search WHERE BM25(text,'grilled chicken') > 0").len(), 2);
+    // geo: only p1 is near
+    assert_eq!(ids(&db, "SELECT id FROM place_search WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)"), vec!["p1"]);
+    // vector: nearest to p1's embedding is p1 (mirrored from source)
+    assert_eq!(ids(&db, "SELECT id FROM place_search WHERE VECTOR_NEAR(embedding, [0.9,0.1,0.0,0.0], 1)"), vec!["p1"]);
+}
+
+#[test]
+fn search_typo_tolerance() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE movie (_key TEXT PRIMARY KEY, title TEXT)").unwrap();
+    db.execute("INSERT INTO movie (_key,title) VALUES ('sw','Star Wars')").unwrap();
+    db.execute("INSERT INTO movie (_key,title) VALUES ('st','Star Trek')").unwrap();
+    db.execute("CREATE INDEX ON movie USING search (title)").unwrap();
+
+    let ids = |db: &CoreDB, q: &str| -> Vec<String> {
+        db.query(q).unwrap().collect().iter()
+            .filter_map(|h| h.payload.as_ref()?.get("_key")?.as_str().map(String::from)).collect()
+    };
+    // auto typo already handles 5+ char typos: "beatlez"-style. Here "warz" (4 chars) is
+    // below the auto threshold, so plain SEARCH misses it...
+    assert_eq!(ids(&db, "SELECT _key FROM movie WHERE SEARCH('star warz')").len(), 0);
+    // ...but `typo => 1` forces it — and matches ONLY Star Wars (precise, no Star Trek).
+    assert_eq!(ids(&db, "SELECT _key FROM movie WHERE SEARCH('star warz', typo => 1)"), vec!["sw"]);
+    // double typo, still just Star Wars
+    assert_eq!(ids(&db, "SELECT _key FROM movie WHERE SEARCH('stir warz', typo => 1)"), vec!["sw"]);
+    // typo => 0 forces exact (no tolerance)
+    assert_eq!(ids(&db, "SELECT _key FROM movie WHERE SEARCH('star warz', typo => 0)").len(), 0);
+}
+
+// ── Keyed edges + edge CRUD + per-edge attributes ──────────────────────────────
+//
+// Regression coverage for the keyed-edge feature (upsert INSERT, predicate DELETE,
+// edge UPDATE) and the two bugs fixed alongside it (per-edge attribute resolution
+// across parallel edges, and O(n²) node-insert into one collection).
+
+/// First column of the first row as i64 (`-1` if absent).
+fn kt_i64(db: &CoreDB, sql: &str) -> i64 {
+    db.query(sql).unwrap().collect().first()
+        .and_then(|h| h.payload.as_ref())
+        .and_then(|p| p.as_object())
+        .and_then(|o| o.values().next())
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1)
+}
+
+/// Sorted string values of `field` across all rows.
+fn kt_strs(db: &CoreDB, sql: &str, field: &str) -> Vec<String> {
+    let mut v: Vec<String> = db.query(sql).unwrap().collect().iter()
+        .filter_map(|h| h.payload.as_ref()
+            .and_then(|p| p.get(field))
+            .and_then(|x| x.as_str())
+            .map(String::from))
+        .collect();
+    v.sort();
+    v
+}
+
+fn kt_two_nodes() -> CoreDB {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO p (_key) VALUES ('a'),('b')").unwrap();
+    db
+}
+
+const KT_A_OUT: &str = "SELECT COUNT(*) AS c FROM MATCH (a:p)-[:rel]->(b:p) WHERE a._key='a'";
+
+#[test]
+fn keyed_edge_insert_is_upsert() {
+    let mut db = kt_two_nodes();
+    db.execute("INSERT ('p/a')-[:rel {_key:'k1', w:1}]->('p/b')").unwrap();
+    db.execute("INSERT ('p/a')-[:rel {_key:'k1', w:2}]->('p/b')").unwrap();
+    assert_eq!(kt_i64(&db, KT_A_OUT), 1, "same key must not stack");
+    assert_eq!(kt_i64(&db, "SELECT r.w AS w FROM MATCH (a:p)-[r:rel]->(b:p) WHERE r._key='k1'"), 2, "last-wins");
+    db.execute("INSERT ('p/a')-[:rel {_key:'k2'}]->('p/b')").unwrap();
+    assert_eq!(kt_i64(&db, KT_A_OUT), 2);
+}
+
+#[test]
+fn unkeyed_edge_stays_additive() {
+    let mut db = kt_two_nodes();
+    db.execute("INSERT ('p/a')-[:knows]->('p/b')").unwrap();
+    db.execute("INSERT ('p/a')-[:knows]->('p/b')").unwrap();
+    assert_eq!(
+        kt_i64(&db, "SELECT COUNT(*) AS c FROM MATCH (a:p)-[:knows]->(b:p) WHERE a._key='a'"),
+        2, "no _key => additive (parallel edges allowed)"
+    );
+}
+
+#[test]
+fn match_edge_attrs_are_per_parallel_edge() {
+    let mut db = kt_two_nodes();
+    db.execute("INSERT ('p/a')-[:rel {_key:'u1', by:'alice'}]->('p/b')").unwrap();
+    db.execute("INSERT ('p/a')-[:rel {_key:'u2', by:'bob'}]->('p/b')").unwrap();
+    db.execute("INSERT ('p/a')-[:rel {_key:'u3', by:'carol'}]->('p/b')").unwrap();
+    assert_eq!(
+        kt_strs(&db, "SELECT r._key AS v FROM MATCH (a:p)-[r:rel]->(b:p) WHERE a._key='a'", "v"),
+        vec!["u1", "u2", "u3"]
+    );
+    assert_eq!(
+        kt_strs(&db, "SELECT r.by AS v FROM MATCH (a:p)-[r:rel]->(b:p) WHERE a._key='a'", "v"),
+        vec!["alice", "bob", "carol"]
+    );
+    assert_eq!(kt_i64(&db, "SELECT COUNT(*) AS c FROM MATCH (a:p)-[r:rel]->(b:p) WHERE r.by='bob'"), 1);
+}
+
+#[test]
+fn unkeyed_parallel_edge_attrs_are_per_edge() {
+    let mut db = kt_two_nodes();
+    for t in ["x", "y", "z"] {
+        db.execute(&format!("INSERT ('p/a')-[:rel {{tag:'{t}'}}]->('p/b')")).unwrap();
+    }
+    assert_eq!(
+        kt_strs(&db, "SELECT r.tag AS v FROM MATCH (a:p)-[r:rel]->(b:p) WHERE a._key='a'", "v"),
+        vec!["x", "y", "z"]
+    );
+}
+
+#[test]
+fn edge_delete_by_predicate() {
+    let mut db = kt_two_nodes();
+    db.execute("INSERT ('p/a')-[:rel {_key:'u1', by:'x'}]->('p/b')").unwrap();
+    db.execute("INSERT ('p/a')-[:rel {_key:'u2', by:'y'}]->('p/b')").unwrap();
+    db.execute("INSERT ('p/a')-[:rel {_key:'u3', by:'y'}]->('p/b')").unwrap();
+    assert_eq!(kt_i64(&db, KT_A_OUT), 3);
+    db.execute("DELETE ('p/a')-[:rel {_key:'u1'}]->('p/b')").unwrap();
+    assert_eq!(kt_i64(&db, KT_A_OUT), 2);
+    db.execute("DELETE ('p/a')-[:rel {by:'y'}]->('p/b')").unwrap();
+    assert_eq!(kt_i64(&db, KT_A_OUT), 0);
+    // keyed index purged → key re-creates cleanly
+    db.execute("INSERT ('p/a')-[:rel {_key:'u1'}]->('p/b')").unwrap();
+    assert_eq!(kt_i64(&db, KT_A_OUT), 1);
+    db.execute("DELETE ('p/a')-[:rel]->('p/b')").unwrap(); // bare = all
+    assert_eq!(kt_i64(&db, KT_A_OUT), 0);
+}
+
+#[test]
+fn edge_update_by_predicate() {
+    let mut db = kt_two_nodes();
+    db.execute("INSERT ('p/a')-[:rel {_key:'u1', by:'alice'}]->('p/b')").unwrap();
+    db.execute("INSERT ('p/a')-[:rel {_key:'u2', by:'bob'}]->('p/b')").unwrap();
+    db.execute("UPDATE ('p/a')-[:rel {_key:'u1'}]->('p/b') SET by='ALICE'").unwrap();
+    db.execute("UPDATE ('p/a')-[:rel]->('p/b') SET by='BOB2' WHERE by='bob'").unwrap();
+    assert_eq!(
+        kt_strs(&db, "SELECT r.by AS v FROM MATCH (a:p)-[r:rel]->(b:p) WHERE a._key='a'", "v"),
+        vec!["ALICE", "BOB2"]
+    );
+    // SET merges (adds tag, keeps by)
+    db.execute("UPDATE ('p/a')-[:rel {_key:'u1'}]->('p/b') SET tag='t'").unwrap();
+    let row = db.query("SELECT r.tag AS tag, r.by AS by FROM MATCH (a:p)-[r:rel]->(b:p) WHERE r._key='u1'")
+        .unwrap().collect();
+    let p = row.first().and_then(|h| h.payload.clone()).unwrap();
+    assert_eq!(p.get("tag").and_then(|v| v.as_str()), Some("t"));
+    assert_eq!(p.get("by").and_then(|v| v.as_str()), Some("ALICE"));
+    // identity is immutable
+    assert!(db.execute("UPDATE ('p/a')-[:rel {_key:'u1'}]->('p/b') SET _key='zz'").is_err());
+}
+
+#[test]
+fn keyed_edge_crud_persists_across_reopen() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO p (_key) VALUES ('a'),('b')").unwrap();
+        db.execute("INSERT ('p/a')-[:rel {_key:'u1', by:'alice'}]->('p/b')").unwrap();
+        db.execute("INSERT ('p/a')-[:rel {_key:'u2', by:'bob'}]->('p/b')").unwrap();
+        db.execute("INSERT ('p/a')-[:rel {_key:'u1', by:'ALICE'}]->('p/b')").unwrap(); // upsert
+        db.execute("UPDATE ('p/a')-[:rel {_key:'u2'}]->('p/b') SET by='BOB2'").unwrap();
+        db.execute("INSERT ('p/a')-[:rel {_key:'u3'}]->('p/b')").unwrap();
+        db.execute("DELETE ('p/a')-[:rel {_key:'u3'}]->('p/b')").unwrap();
+    }
+    let db = CoreDB::open(dir.path()).unwrap();
+    assert_eq!(kt_i64(&db, KT_A_OUT), 2, "u1 (upserted) + u2 (updated); u3 deleted");
+    assert_eq!(
+        kt_strs(&db, "SELECT r.by AS v FROM MATCH (a:p)-[r:rel]->(b:p) WHERE a._key='a'", "v"),
+        vec!["ALICE", "BOB2"]
+    );
+}
+
+#[test]
+fn node_upsert_keeps_single_collection_membership() {
+    // O(n²)-fix guard: repeated upserts of one node never duplicate its membership.
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE t (_key TEXT PRIMARY KEY, v INTEGER)").unwrap();
+    for i in 0..20 {
+        db.put("t/x", &format!(r#"{{"_collection":"t","_key":"x","v":{i}}}"#)).unwrap();
+    }
+    assert_eq!(kt_i64(&db, "SELECT COUNT(*) AS c FROM t"), 1);
+    assert_eq!(kt_i64(&db, "SELECT v AS v FROM t WHERE _key='x'"), 19, "last write wins");
+}

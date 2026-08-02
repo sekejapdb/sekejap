@@ -110,6 +110,21 @@ pub enum WalEntry {
         to: String,
         edge_type: String,
     },
+    /// Delete only edges matching an attribute predicate (`props` = JSON object).
+    UnlinkWhere {
+        from: String,
+        to: String,
+        edge_type: String,
+        props: String,
+    },
+    /// Set attributes (`sets` = JSON object) on edges matching a predicate.
+    UpdateEdge {
+        from: String,
+        to: String,
+        edge_type: String,
+        props: String,
+        sets: String,
+    },
     CreateTable {
         collection: String,
         schema_json: String,
@@ -212,6 +227,8 @@ const TAG_ALTER_TABLE: u8 = 10;
 const TAG_TXN_BEGIN: u8 = 11;
 const TAG_TXN_END: u8 = 12;
 const TAG_UPDATE: u8 = 13;
+const TAG_UNLINK_WHERE: u8 = 14;
+const TAG_UPDATE_EDGE: u8 = 15;
 
 fn put_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -332,6 +349,21 @@ pub fn binary_encode(entry: &WalEntry) -> Vec<u8> {
             put_str(&mut buf, to);
             put_str(&mut buf, edge_type);
         }
+        WalEntry::UnlinkWhere { from, to, edge_type, props } => {
+            buf.push(TAG_UNLINK_WHERE);
+            put_str(&mut buf, from);
+            put_str(&mut buf, to);
+            put_str(&mut buf, edge_type);
+            put_str(&mut buf, props);
+        }
+        WalEntry::UpdateEdge { from, to, edge_type, props, sets } => {
+            buf.push(TAG_UPDATE_EDGE);
+            put_str(&mut buf, from);
+            put_str(&mut buf, to);
+            put_str(&mut buf, edge_type);
+            put_str(&mut buf, props);
+            put_str(&mut buf, sets);
+        }
         WalEntry::CreateTable { collection, schema_json } => {
             buf.push(TAG_CREATE_TABLE);
             put_str(&mut buf, collection);
@@ -403,6 +435,19 @@ pub fn binary_decode(data: &[u8]) -> Option<WalEntry> {
             from: r.read_str()?,
             to: r.read_str()?,
             edge_type: r.read_str()?,
+        }),
+        TAG_UNLINK_WHERE => Some(WalEntry::UnlinkWhere {
+            from: r.read_str()?,
+            to: r.read_str()?,
+            edge_type: r.read_str()?,
+            props: r.read_str()?,
+        }),
+        TAG_UPDATE_EDGE => Some(WalEntry::UpdateEdge {
+            from: r.read_str()?,
+            to: r.read_str()?,
+            edge_type: r.read_str()?,
+            props: r.read_str()?,
+            sets: r.read_str()?,
         }),
         TAG_CREATE_TABLE => Some(WalEntry::CreateTable {
             collection: r.read_str()?,

@@ -161,7 +161,7 @@ pub enum Step {
 
     // ── BM25 full-text filter ──────────────────────────────────────────────
     /// Positional search index filter: keep only docs matching all query terms.
-    SearchFilter(String),
+    SearchFilter(String, Option<u32>),
     /// BM25 score > min_score on field.
     Bm25Filter(String, String, f64),
     /// Add score projection columns to result (expr, alias).
@@ -248,7 +248,8 @@ pub fn describe_step(step: &Step, db: &CoreDB) -> serde_json::Map<String, Value>
         Step::StLength(f, km) => ("Spatial Filter", format!("ST_Length({f}) > {km}km")),
         Step::StArea(f, km2) => ("Spatial Filter", format!("ST_Area({f}) > {km2}km²")),
         Step::VectorNear { field, k, .. } => ("Vector Scan", format!("{field} top-{k} nearest")),
-        Step::SearchFilter(q) => ("Search Filter", format!("SEARCH('{q}')")),
+        Step::SearchFilter(q, typo) => ("Search Filter",
+            match typo { Some(n) => format!("SEARCH('{q}', typo => {n})"), None => format!("SEARCH('{q}')") }),
         Step::Bm25Filter(f, q, s) => ("BM25 Filter", format!("{f} match '{q}' score > {s}")),
         Step::ScoreProject(projs) => ("Score Project", format!("{} projection(s)", projs.len())),
         Step::WhereIsNull(f, neg) => {
@@ -1183,9 +1184,75 @@ impl<'db> Set<'db> {
         execute(self.db, &self.steps)
     }
 
+    /// Covering-index fast path for `SELECT <covered> FROM c ORDER BY <indexed> LIMIT k`
+    /// with no filter. Every projected column must be derivable WITHOUT the payload:
+    /// the sort field itself (its value IS the btree key) or an identity field
+    /// (`_key`/`_id`/`_collection`, from the slug). Builds the top-`k` rows straight
+    /// from the index — no `get_payload`, no JSON parse — matching an index-only scan.
+    /// Returns `None` (→ normal path) for anything outside this exact shape.
+    fn try_covered_sort_limit(&self) -> Option<Vec<Hit>> {
+        let steps = &self.steps;
+        let coll = match steps.first()? { Step::Collection(h) => *h, _ => return None };
+        let (field, asc) = match steps.get(1)? {
+            Step::Sort(cols) if cols.len() == 1 => (cols[0].0.clone(), cols[0].1),
+            _ => return None,
+        };
+        let mut limit: Option<usize> = None;
+        let mut select: Option<Vec<String>> = None;
+        for s in &steps[2..] {
+            match s {
+                Step::Take(n) => limit = Some((*n).min(limit.unwrap_or(usize::MAX))),
+                Step::Select(f) => select = Some(f.clone()),
+                Step::Distinct => {}
+                _ => return None, // filter/score/other → not a covered top-N
+            }
+        }
+        let limit = limit?;
+        let select = select?;
+        let identity = |n: &str| n == "_key" || n == "_id" || n == "_collection";
+        if !select.iter().all(|f| { let inner = field_inner_name(f); inner == field || identity(inner) }) {
+            return None; // some column needs the payload → not covered
+        }
+        if limit == 0 { return Some(Vec::new()); }
+        let idx = self.db.field_index(coll, &field)?;
+        let coll_name = self.db.collection_name(coll).map(|s| s.to_string()).unwrap_or_default();
+
+        let mut hits: Vec<Hit> = Vec::with_capacity(limit.min(4096));
+        let mut emit = |key_val: &Value, ids: &[u64]| -> bool {
+            for &h in ids {
+                let node = match self.db.node_data(h) { Some(n) => n, None => continue };
+                let slug = &node.slug;
+                let key_part = slug.split_once('/').map(|(_, k)| k).unwrap_or(slug);
+                let mut map = serde_json::Map::with_capacity(select.len());
+                for f in &select {
+                    let inner = field_inner_name(f);
+                    let v = if inner == field { key_val.clone() }
+                        else if inner == "_key" { Value::String(key_part.to_string()) }
+                        else if inner == "_id" { Value::String(slug.clone()) }
+                        else { Value::String(coll_name.clone()) }; // _collection
+                    map.insert(field_output_key(f), v);
+                }
+                hits.push(Hit { slug: slug.clone(), slug_hash: h, payload: Some(Value::Object(map)) });
+                if hits.len() >= limit { return true; }
+            }
+            false
+        };
+        if asc {
+            for (k, ids) in idx.iter() { if emit(&CoreDB::field_key_to_value(k), ids) { break; } }
+        } else {
+            for (k, ids) in idx.iter().rev() { if emit(&CoreDB::field_key_to_value(k), ids) { break; } }
+        }
+        Some(hits)
+    }
+
     pub fn collect(self) -> Vec<Hit> {
         // Short-circuit for pre-computed aggregate results.
         if let Some(hits) = self.precomputed {
+            return hits;
+        }
+
+        // Covering-index top-N: build rows straight from the index, no payload reads.
+        if let Some(hits) = self.try_covered_sort_limit() {
             return hits;
         }
 
@@ -2276,7 +2343,65 @@ fn eval_score(
 // ── Executor ──────────────────────────────────────────────────────────────────
 
 /// Execute the step pipeline and return candidate slug hashes in order.
+/// Super-fast `ORDER BY <indexed_field> LIMIT k` with NO pre-filter: read the top
+/// `k` straight from the field btree — O(k), no collection materialization, no
+/// candidate HashSet. This is what lets an unfiltered top-N match an index-backed
+/// DB (e.g. SQLite reading `k` entries off its btree) instead of sorting all rows.
+///
+/// Fires only for the exact shape `Collection(c), Sort([(f, dir)]), …` where the
+/// only steps after the sort are `Take(k)` / `Select` / `Distinct` (no filtering),
+/// and `f` has a btree field index. Returns the top-`k` hashes in sorted order, or
+/// `None` to fall back to the normal executor.
+fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>> {
+    let coll = match steps.first()? {
+        Step::Collection(h) => *h,
+        _ => return None,
+    };
+    let (field, asc) = match steps.get(1)? {
+        Step::Sort(cols) if cols.len() == 1 => (cols[0].0.clone(), cols[0].1),
+        _ => return None,
+    };
+    // Everything after the sort must be non-filtering, and a LIMIT must be present.
+    let mut limit: Option<usize> = None;
+    for s in &steps[2..] {
+        match s {
+            Step::Take(n) => limit = Some((*n).min(limit.unwrap_or(usize::MAX))),
+            Step::Select(_) | Step::Distinct | Step::ScoreProject(_) => {}
+            _ => return None, // a filter/other step after sort → not safe to fuse
+        }
+    }
+    let limit = limit?;
+    if limit == 0 {
+        return Some(Vec::new());
+    }
+    let idx = db.field_index(coll, &field)?;
+    // Walk the btree in the requested order, taking the first `limit` LIVE nodes.
+    // Each key holds nodes sharing that value (ties keep insertion order).
+    let mut out: Vec<u64> = Vec::with_capacity(limit.min(4096));
+    let push = |h: u64, out: &mut Vec<u64>| -> bool {
+        if db.node_data(h).is_some() {
+            out.push(h);
+        }
+        out.len() >= limit
+    };
+    if asc {
+        for ids in idx.values() {
+            for &h in ids { if push(h, &mut out) { return Some(out); } }
+        }
+    } else {
+        for ids in idx.values().rev() {
+            for &h in ids { if push(h, &mut out) { return Some(out); } }
+        }
+    }
+    Some(out)
+}
+
 fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
+    // O(k) index-order-limit fast path (unfiltered top-N off a btree index).
+    if let Some(fast) = try_index_order_limit(db, steps) {
+        return fast;
+    }
+
     let mut candidates: Vec<u64> = Vec::new();
     // Steps consumed by btree_seed (already applied as the seed filter)
     let mut skip_set: HashSet<usize> = HashSet::new();
@@ -3087,25 +3212,33 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::StDistance(field, lat, lon, max_km) => {
-                // ST_Distance(field, POINT(lon lat), max_km)
-                if candidates.is_empty() {
-                    candidates = db.all_hashes();
-                }
-                candidates.retain(|&h| {
+                // ST_Distance(field, POINT(lon lat), max_km).
+                // Spatial-grid pre-filter (O(nearby cells)) → EXACT distance on the
+                // narrowed set. Falls back to a full scan when no grid is built
+                // (build with `db.build_spatial_index()`). Result is identical either
+                // way — the grid only prunes which payloads we compute distance on.
+                let point = serde_json::json!({ "type": "Point", "coordinates": [lon, lat] });
+                let exact = |h: u64| -> bool {
                     db.get_payload(h)
-                        .and_then(|p| p.get(&*field).cloned())
-                        .and_then(|geom| {
-                            crate::geo::distance_km(
-                                &geom,
-                                &serde_json::json!({
-                                    "type": "Point",
-                                    "coordinates": [lon, lat]
-                                }),
-                            )
-                        })
+                        .and_then(|p| p.get(&**field).cloned())
+                        .and_then(|geom| crate::geo::distance_km(&geom, &point))
                         .map(|d| d < *max_km)
                         .unwrap_or(false)
-                });
+                };
+                if let Some(grid) = db.spatial_grid() {
+                    let near = grid.candidates_within_distance(*lat, *lon, *max_km);
+                    if candidates.is_empty() {
+                        candidates = near.into_iter().filter(|&h| exact(h)).collect();
+                    } else {
+                        let set: HashSet<u64> = near.into_iter().collect();
+                        candidates.retain(|&h| set.contains(&h) && exact(h));
+                    }
+                } else {
+                    if candidates.is_empty() {
+                        candidates = db.all_hashes();
+                    }
+                    candidates.retain(|&h| exact(h));
+                }
             }
             Step::StLength(field, min_km) => {
                 // ST_Length(field) > min_km
@@ -3179,7 +3312,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
 
-            Step::SearchFilter(query) => {
+            Step::SearchFilter(query, typo) => {
                 if candidates.is_empty() {
                     candidates = db.all_hashes();
                 }
@@ -3187,7 +3320,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     if let Some(coll_name) = db.collection_name(coll) {
                         let key = CoreDB::search_index_key(coll_name);
                         if let Some(idx) = db.search_indexes.get(&key) {
-                            let matching = idx.search(query);
+                            let matching = idx.search_typo(query, *typo);
                             let match_set: std::collections::HashSet<u64> = matching.iter()
                                 .filter_map(|slot| idx.slot_to_hash(slot))
                                 .collect();
@@ -3755,6 +3888,54 @@ pub enum MatchAggReturn {
     /// `nodes(p)`, `relationships(p)`. This is the ONLY way to read a path — dotted
     /// field access on the path var (`p.length`) is rejected at parse time.
     PathFn { var: String, kind: PathFnKind },
+    /// A string-building expression over bound `var.field`s: `a.x || ' ' || b.y`,
+    /// `concat_ws(sep, …)`, `lower(…)`, `coalesce(…)`. Used to assemble a combined
+    /// `text` column for materialized-view projections.
+    Str(MatchStr),
+}
+
+/// String expression over MATCH-bound `var.field`s (mirrors `sql::GenExpr`, but its
+/// leaves are `var.field` references resolved from the [`PathRow`]).
+#[derive(Clone, Debug)]
+pub enum MatchStr {
+    Field(String, String),
+    Lit(String),
+    Concat(Vec<MatchStr>),
+    ConcatWs(String, Vec<MatchStr>),
+    Lower(Box<MatchStr>),
+    Coalesce(Vec<MatchStr>),
+}
+
+impl MatchStr {
+    pub fn eval(&self, row: &PathRow) -> String {
+        fn text(v: &Value) -> String {
+            match v {
+                Value::Null => String::new(),
+                Value::String(s) => s.clone(),
+                o => o.to_string(),
+            }
+        }
+        match self {
+            MatchStr::Field(var, field) => row.get(var.as_str())
+                .and_then(|v| v.get(field.as_str())).map(text).unwrap_or_default(),
+            MatchStr::Lit(s) => s.clone(),
+            MatchStr::Concat(ps) => ps.iter().map(|p| p.eval(row)).collect(),
+            MatchStr::ConcatWs(sep, ps) => ps.iter().map(|p| p.eval(row))
+                .filter(|s| !s.is_empty()).collect::<Vec<_>>().join(sep),
+            MatchStr::Lower(e) => e.eval(row).to_lowercase(),
+            MatchStr::Coalesce(ps) => ps.iter().map(|p| p.eval(row))
+                .find(|s| !s.is_empty()).unwrap_or_default(),
+        }
+    }
+    pub fn references_var(&self, var: &str) -> bool {
+        match self {
+            MatchStr::Field(v, _) => v == var,
+            MatchStr::Lit(_) => false,
+            MatchStr::Concat(ps) | MatchStr::ConcatWs(_, ps) | MatchStr::Coalesce(ps) =>
+                ps.iter().any(|p| p.references_var(var)),
+            MatchStr::Lower(e) => e.references_var(var),
+        }
+    }
 }
 
 /// Which GQL path function: `length` / `nodes` / `relationships`.
@@ -3797,6 +3978,7 @@ impl MatchAggReturn {
             MatchAggReturn::Case { branches, .. } => {
                 branches.iter().any(|(cond, _)| cond.references_var(var))
             }
+            MatchAggReturn::Str(e) => e.references_var(var),
             MatchAggReturn::Count | MatchAggReturn::Now => false,
         }
     }
@@ -3945,6 +4127,10 @@ impl MatchAggReturn {
                     .and_then(|v| v.get(kind.key()))
                     .cloned()
                     .unwrap_or(Value::Null)
+            }
+            // String expression (concat/concat_ws/…) over the first row's bound vars.
+            MatchAggReturn::Str(e) => {
+                rows.first().map(|r| Value::String(e.eval(r))).unwrap_or(Value::Null)
             }
         }
     }
@@ -4258,6 +4444,10 @@ pub(crate) struct RawPath {
     /// `hop_end[i]` = index in `slugs_per_hop` of HopSpec `i`'s destination node,
     /// so a hop's `_path_keys`/`_depth` slice by real position.
     pub hop_end:           Vec<usize>,
+    /// Attribute slot of the specific edge walked at each hop (`u32::MAX` =
+    /// unknown → fall back to first-match `edge_locate`). This is what lets edge
+    /// binds (`r._key`) read the RIGHT parallel edge, not just the first one.
+    pub edges_per_hop:     Vec<u32>,
 }
 
 /// Phase 1 of [`collect_paths`]: traverse the graph and return topology skeletons only.
@@ -4287,6 +4477,9 @@ pub(crate) fn collect_raw_paths_opts(
     track: bool,
     with_slugs: bool,
 ) -> Vec<RawPath> {
+    // Only record per-edge identity when a single-hop edge bind might read it.
+    // Otherwise (COUNT, node-only projection) skip it entirely — no per-path Vec.
+    let track_edges = hops.iter().any(|h| h.edge_bind.is_some() && h.max_depth == 1);
     if hops.is_empty() || starts.is_empty() {
         return vec![];
     }
@@ -4299,6 +4492,9 @@ pub(crate) fn collect_raw_paths_opts(
         hop_ends:         Vec<usize>,
         /// Physical node count incl. start (drives hop_end when slugs are off).
         phys_len:         usize,
+        /// Attribute slot of the specific edge walked at each hop (`u32::MAX` =
+        /// unknown / fall back to first-match). Distinguishes parallel edges.
+        edges_so_far:     Vec<u32>,
     }
 
     let mut in_flight: Vec<Partial> = starts
@@ -4312,6 +4508,7 @@ pub(crate) fn collect_raw_paths_opts(
                 slugs_so_far:     if with_slugs { vec![node.slug.clone()] } else { Vec::new() },
                 hop_ends:         Vec::new(),
                 phys_len:         1,
+                edges_so_far:     Vec::new(),
             })
         })
         .collect();
@@ -4346,6 +4543,10 @@ pub(crate) fn collect_raw_paths_opts(
                                 }
                                 let phys_len = partial.phys_len + 1;
                                 he.push(phys_len - 1);
+                                let mut es = partial.edges_so_far.clone();
+                                if track_edges {
+                                    es.push(e.attr_slot().unwrap_or(u32::MAX)); // THIS edge
+                                }
                                 next_in_flight.push(Partial {
                                     start_hash:       partial.start_hash,
                                     current_hash:     e.other,
@@ -4353,6 +4554,7 @@ pub(crate) fn collect_raw_paths_opts(
                                     slugs_so_far:     s,
                                     hop_ends:         he,
                                     phys_len,
+                                    edges_so_far:     es,
                                 });
                                 if limit.map_or(false, |l| next_in_flight.len() >= l) {
                                     break 'single;
@@ -4420,6 +4622,10 @@ pub(crate) fn collect_raw_paths_opts(
                 let mut he = prior.hop_ends.clone();
                 let phys_len = prior.phys_len + sub_n.len();
                 he.push(phys_len - 1);
+                let mut es = prior.edges_so_far.clone();
+                if track_edges {
+                    es.push(u32::MAX); // var-length hop: edge bind falls back to first-match
+                }
                 next_in_flight.push(Partial {
                     start_hash:       prior.start_hash,
                     current_hash:     dest_h,
@@ -4427,6 +4633,7 @@ pub(crate) fn collect_raw_paths_opts(
                     slugs_so_far:     s,
                     hop_ends:         he,
                     phys_len,
+                    edges_so_far:     es,
                 });
             }
         } else {
@@ -4487,6 +4694,10 @@ pub(crate) fn collect_raw_paths_opts(
                 let mut he = prior.hop_ends.clone();
                 let phys_len = prior.phys_len + 1;
                 he.push(phys_len - 1);
+                let mut es = prior.edges_so_far.clone();
+                if track_edges {
+                    es.push(u32::MAX); // var-length hop: edge bind falls back to first-match
+                }
                 next_in_flight.push(Partial {
                     start_hash:       prior.start_hash,
                     current_hash:     dest_h,
@@ -4494,6 +4705,7 @@ pub(crate) fn collect_raw_paths_opts(
                     slugs_so_far:     s,
                     hop_ends:         he,
                     phys_len,
+                    edges_so_far:     es,
                 });
             }
         }
@@ -4509,6 +4721,7 @@ pub(crate) fn collect_raw_paths_opts(
             dest_per_hop:      p.dest_so_far,
             slugs_per_hop:     p.slugs_so_far,
             hop_end:           p.hop_ends,
+            edges_per_hop:     p.edges_so_far,
         })
         .collect()
 }
@@ -4673,6 +4886,7 @@ fn try_reverse_anchor(
                 dest_per_hop: vec![dest_hash],
                 slugs_per_hop: vec![source_node.slug.clone(), dest_slug.clone()],
                 hop_end: vec![1], // single hop: dest is at slug index 1
+                edges_per_hop: vec![e.attr_slot().unwrap_or(u32::MAX)], // THIS edge
             });
         }
     }
@@ -4797,32 +5011,37 @@ pub(crate) fn build_path_rows_from_raw(
                     // when the query references a non-intrinsic edge field (lazy: one
                     // adjacency scan + one metadata read per surviving edge).
                     if needs_edge_meta && hop.max_depth == 1 {
-                        let prev_h = if hop_idx == 0 {
-                            rp.start_hash
+                        // Prefer the EXACT edge recorded during traversal — this is
+                        // what makes parallel edges resolve to their own attributes
+                        // instead of the first match. `u32::MAX` = not recorded
+                        // (var-length / older path) → fall back to first-match locate.
+                        let recorded = rp.edges_per_hop.get(hop_idx).copied().unwrap_or(u32::MAX);
+                        let (slot, json): (Option<u32>, Option<Value>) = if recorded != u32::MAX {
+                            (Some(recorded), db.edge_json_at(recorded))
                         } else {
-                            rp.dest_per_hop[hop_idx - 1]
-                        };
-                        // The stored edge always runs from→to along its own arrow.
-                        // Forward hop: prev→dest.  Backward hop: dest→prev.
-                        let (edge_from, edge_to) = if hop.backward {
-                            (dest_h, prev_h)
-                        } else {
-                            (prev_h, dest_h)
-                        };
-                        // Locate the edge ONCE → its JSON meta + fast-lane slot.
-                        if let Some((slot, json)) =
+                            let prev_h = if hop_idx == 0 {
+                                rp.start_hash
+                            } else {
+                                rp.dest_per_hop[hop_idx - 1]
+                            };
+                            // Forward hop: prev→dest.  Backward hop: dest→prev.
+                            let (edge_from, edge_to) = if hop.backward {
+                                (dest_h, prev_h)
+                            } else {
+                                (prev_h, dest_h)
+                            };
                             db.edge_locate(edge_from, edge_to, hop.edge_type_hash)
-                        {
-                            if let Some(Value::Object(m)) = json {
-                                for (k, v) in m { obj.insert(k, v); }
-                            }
-                            // Fast-lane columns — direct array index by slot, no
-                            // parse, no scan; override any JSON key of the same name.
-                            if let Some(slot) = slot {
-                                for (name, col) in &hop_cols[hop_idx] {
-                                    if let Some(v) = col.at(slot) {
-                                        obj.insert((*name).to_string(), v);
-                                    }
+                                .unwrap_or((None, None))
+                        };
+                        if let Some(Value::Object(m)) = json {
+                            for (k, v) in m { obj.insert(k, v); }
+                        }
+                        // Fast-lane columns — direct array index by slot, no parse,
+                        // no scan; override any JSON key of the same name.
+                        if let Some(slot) = slot {
+                            for (name, col) in &hop_cols[hop_idx] {
+                                if let Some(v) = col.at(slot) {
+                                    obj.insert((*name).to_string(), v);
                                 }
                             }
                         }

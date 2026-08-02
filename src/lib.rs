@@ -29,9 +29,13 @@ pub mod bm25;
 #[cfg(feature = "engine")]
 pub mod engine;
 pub mod geo;
+#[cfg(feature = "pg")]
+pub mod pg;
 mod query;
 pub mod scalar;
 pub mod search;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod sql;
 mod storage;
 pub mod text_index;
@@ -570,6 +574,12 @@ pub struct CoreDB {
     /// Table schemas (collection name -> schema).
     /// Persisted in WAL/snapshot.
     schemas: HashMap<String, sql::TableSchema>,
+    /// Materialized views: view name → (body SQL, auto_index flag, root collection).
+    /// The materialized docs are ordinary nodes in a collection named after the view.
+    /// `root_collection` is the projection's root (for mirroring its source vectors).
+    /// Refreshed explicitly via `REFRESH MATERIALIZED VIEW` (Postgres-faithful; embedded
+    /// -native — no background auto-refresh, which wouldn't fit the single-threaded core).
+    materialized_views: HashMap<String, (String, bool, String)>,
     /// Vector store: field_name → per-field store.
     ///
     /// Memory mode wraps `HashMap<u64, Vec<f32>>`; disk mode (Phase 4) will
@@ -775,6 +785,7 @@ impl CoreDB {
             bm25_indexes: HashMap::new(),
             search_indexes: HashMap::new(),
             schemas: HashMap::new(),
+            materialized_views: HashMap::new(),
             vectors: HashMap::new(),
             hnsw_indexes: HashMap::new(),
             field_indexes: HashMap::new(),
@@ -1452,7 +1463,11 @@ impl CoreDB {
         if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
             let coll_hash = sk_hash(coll);
             let members = self.collections.entry(coll_hash).or_default();
-            if !members.contains(&hash) {
+            // A fresh insert's hash is brand new, so it can't already be a member —
+            // skip the O(n) `contains` scan that made bulk-load into one collection
+            // O(n²). On update the old-collection cleanup above already removed this
+            // hash, so the guard is only a safety net for that rarer path.
+            if old_info.is_none() || !members.contains(&hash) {
                 members.push(hash);
             }
             self.collection_names_map.entry(coll_hash).or_insert_with(|| coll.to_string());
@@ -1462,7 +1477,9 @@ impl CoreDB {
                         payload.get(idx_field.as_str()).unwrap_or(&Value::Null)
                     ) {
                         let ids = btree.entry(key).or_default();
-                        if !ids.contains(&hash) { ids.push(hash); }
+                        // Same O(n²) guard as collection membership: a fresh insert's
+                        // hash can't already be in the posting list.
+                        if old_info.is_none() || !ids.contains(&hash) { ids.push(hash); }
                     }
                 }
             }
@@ -2124,10 +2141,22 @@ impl CoreDB {
         // edge rebuilds identically on reopen (persistence for free).
         match meta {
             Value::Object(m) => {
+                // A `_key` attribute makes the edge keyed: identity = (from, type,
+                // sk_hash(_key)). Keyed edges dedup on re-insert (idempotent);
+                // unkeyed edges stay additive (parallel allowed), as before.
+                let key_hash = m.get("_key").and_then(|v| v.as_str()).map(sk_hash);
                 let (cols, json) =
                     Self::route_edge_attrs(m.into_iter().collect());
-                self.edges
-                    .link_with_attrs(from_h, to_h, type_h, edge_type, &cols, json);
+                match key_hash {
+                    Some(kh) => {
+                        self.edges
+                            .link_keyed(from_h, to_h, type_h, edge_type, kh, &cols, json);
+                    }
+                    None => {
+                        self.edges
+                            .link_with_attrs(from_h, to_h, type_h, edge_type, &cols, json);
+                    }
+                }
             }
             // Non-object meta (rare): keep whole in the JSON bag as before.
             other => {
@@ -2143,6 +2172,22 @@ impl CoreDB {
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
         self.edges.unlink(from_h, to_h, type_h);
+    }
+
+    /// Delete only edges from→to of `edge_type` whose attributes match the JSON
+    /// `props` object (equality). Empty object = delete all. Returns count removed.
+    fn unlink_where_raw(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str) -> usize {
+        let from_h = sk_hash(from);
+        let to_h = sk_hash(to);
+        let type_h = sk_hash(edge_type);
+        let props: Vec<(String, Value)> = serde_json::from_str::<Value>(props_json)
+            .ok()
+            .and_then(|v| match v {
+                Value::Object(m) => Some(m.into_iter().collect()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        self.edges.unlink_matching(from_h, to_h, type_h, &props)
     }
 
     // ── WAL helpers ───────────────────────────────────────────────────────────
@@ -2471,6 +2516,23 @@ impl CoreDB {
             } => {
                 self.unlink_raw(&from, &to, &edge_type);
             }
+            WalEntry::UnlinkWhere {
+                from,
+                to,
+                edge_type,
+                props,
+            } => {
+                self.unlink_where_raw(&from, &to, &edge_type, &props);
+            }
+            WalEntry::UpdateEdge {
+                from,
+                to,
+                edge_type,
+                props,
+                sets,
+            } => {
+                self.update_edge_raw(&from, &to, &edge_type, &props, &sets);
+            }
             WalEntry::CreateTable {
                 collection: _,
                 schema_json,
@@ -2603,10 +2665,18 @@ impl CoreDB {
     ) -> Result<Vec<u64>, serde_json::Error> {
         self.defer_wal_sync = true;
         self.defer_index_rebuild = true;
+        // One timestamp for the whole batch — skip a per-row time syscall.
+        let had_batch_now = self.batch_now.is_some();
+        if !had_batch_now {
+            self.batch_now = Some(chrono::Utc::now().timestamp_millis());
+        }
         let result: Result<Vec<u64>, _> = items
             .into_iter()
             .map(|(slug, json)| self.put(slug, json))
             .collect();
+        if !had_batch_now {
+            self.batch_now = None;
+        }
         self.defer_wal_sync = false;
         self.wal_flush();
         self.flush_deferred_indexes();
@@ -2815,6 +2885,42 @@ impl CoreDB {
         self.autocompact_after_write();
     }
 
+    /// Bulk edge insert with optional per-edge metadata — the attributed
+    /// counterpart of [`link_many`](Self::link_many). Each item is
+    /// `(from, to, edge_type, meta_json)`; `None` metadata takes the naked-edge
+    /// fast lane ([`link`]), `Some(json)` rides [`link_meta`]. WAL fsync is
+    /// deferred and flushed once for the whole batch — the primitive a graph
+    /// import needs so attributed edges don't fsync one at a time.
+    ///
+    /// Nesting-safe: the previous defer state is saved and restored, so calling
+    /// this inside a larger batch never prematurely flushes the outer group.
+    /// Stops and returns the first metadata parse error encountered.
+    pub fn link_meta_many<'a>(
+        &mut self,
+        edges: impl IntoIterator<Item = (&'a str, &'a str, &'a str, Option<&'a str>)>,
+    ) -> Result<(), serde_json::Error> {
+        let prev = self.defer_wal_sync;
+        self.defer_wal_sync = true;
+        let mut result = Ok(());
+        for (from, to, edge_type, meta) in edges {
+            match meta {
+                Some(m) => {
+                    if let Err(e) = self.link_meta(from, to, edge_type, m) {
+                        result = Err(e);
+                        break;
+                    }
+                }
+                None => self.link(from, to, edge_type),
+            }
+        }
+        self.defer_wal_sync = prev;
+        if !prev {
+            self.wal_flush();
+        }
+        self.autocompact_after_write();
+        result
+    }
+
     /// Remove a node by slug. Also removes its collection membership and edges.
     pub fn remove(&mut self, slug: &str) {
         self.wal_write(WalEntry::Remove {
@@ -2867,6 +2973,55 @@ impl CoreDB {
         });
         self.unlink_raw(from, to, edge_type);
         self.autocompact_after_write();
+    }
+
+    /// Set attributes (`sets_json` object) on edges from→to of `edge_type` matching
+    /// the `props_json` predicate. Returns count updated.
+    fn update_edge_raw(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str, sets_json: &str) -> usize {
+        let from_h = sk_hash(from);
+        let to_h = sk_hash(to);
+        let type_h = sk_hash(edge_type);
+        let obj_to_vec = |s: &str| -> Vec<(String, Value)> {
+            serde_json::from_str::<Value>(s).ok()
+                .and_then(|v| match v { Value::Object(m) => Some(m.into_iter().collect()), _ => None })
+                .unwrap_or_default()
+        };
+        let pred = obj_to_vec(props_json);
+        let (set_cols, set_json_opt) = Self::route_edge_attrs(obj_to_vec(sets_json));
+        let set_json = match set_json_opt {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        self.edges.update_matching(from_h, to_h, type_h, &pred, &set_cols, &set_json)
+    }
+
+    /// Set attributes on edges from→to of `edge_type` matching `props_json`.
+    /// Returns count updated. `sets_json` is a JSON object of field→value.
+    pub fn update_edge(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str, sets_json: &str) -> usize {
+        self.wal_write(WalEntry::UpdateEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            edge_type: edge_type.to_string(),
+            props: props_json.to_string(),
+            sets: sets_json.to_string(),
+        });
+        let n = self.update_edge_raw(from, to, edge_type, props_json, sets_json);
+        self.autocompact_after_write();
+        n
+    }
+
+    /// Delete only edges from→to of `edge_type` matching the JSON `props` predicate
+    /// (e.g. `{"_key":"u1"}`). Empty `props` deletes all. Returns count removed.
+    pub fn unlink_where(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str) -> usize {
+        self.wal_write(WalEntry::UnlinkWhere {
+            from: from.to_string(),
+            to: to.to_string(),
+            edge_type: edge_type.to_string(),
+            props: props_json.to_string(),
+        });
+        let n = self.unlink_where_raw(from, to, edge_type, props_json);
+        self.autocompact_after_write();
+        n
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────
@@ -4653,13 +4808,94 @@ impl CoreDB {
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<usize, SqlError> {
         // Re-parse with params, then delegate to the same execution arms.
         // We cannot just call self.execute() because it would re-parse without params.
-        match sql::parse_mutation_params(sql, params.to_vec())? {
-            m => {
-                // Build a temporary SQL string? No — reuse the mutation directly.
-                // We need to inline the same execute() body. Instead, factor via a helper.
-                self.execute_mutation(m)
+        let m = sql::parse_mutation_params(sql, params.to_vec())?;
+        self.execute_mutation(m)
+    }
+
+    /// Run a materialized view's body query and (re)populate its derived collection.
+    /// Each projected row becomes a node keyed by its `id` (or `_key`) column.
+    fn materialize_view(&mut self, name: &str, query_sql: &str, root: &str) -> Result<usize, SqlError> {
+        let hits = self.query(query_sql)?.collect();
+        // Vector fields of the root collection are mirrored from the source vector
+        // store into the view (they don't ride in the projection payload). GEO fields
+        // ride in the payload, so they materialize for free.
+        let root_vec_fields: Vec<String> = self.schemas.get(root)
+            .map(|s| s.fields.iter()
+                .filter(|f| matches!(f.ty, sql::FieldType::Vector))
+                .map(|f| f.name.clone()).collect())
+            .unwrap_or_default();
+        let mut count = 0;
+        for h in hits {
+            let mut doc = match h.payload {
+                Some(Value::Object(m)) => m,
+                _ => continue,
+            };
+            let key = doc.get("id").or_else(|| doc.get("_key"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| SqlError::InvalidValue(format!(
+                    "materialized view '{name}' projection must include an 'id' (or '_key') column")))?
+                .to_string();
+            // Keep the projected `id` column (so `SELECT id FROM view` works) and also
+            // set `_key`/`_collection` so the view is an ordinary, queryable collection.
+            doc.insert("_key".to_string(), Value::String(key.clone()));
+            doc.insert("_collection".to_string(), Value::String(name.to_string()));
+            let json = serde_json::to_string(&Value::Object(doc))
+                .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+            self.put(&format!("{name}/{key}"), &json)
+                .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
+            // Mirror each root vector (same field name) into the view doc.
+            for vf in &root_vec_fields {
+                if let Some(vec) = self.get_vector(&format!("{root}/{key}"), vf).map(|s| s.to_vec()) {
+                    let _ = self.put_vector(&format!("{name}/{key}"), vf, &vec);
+                }
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Remove every node of a view's derived collection (before a refresh repopulates).
+    fn clear_view_collection(&mut self, name: &str) {
+        let members: Vec<u64> = self.collection_members(sk_hash(name))
+            .map(|m| m.into_owned())
+            .unwrap_or_default();
+        let slugs: Vec<String> = members.iter()
+            .filter_map(|&h| self.node_data(h).map(|n| n.slug.clone()))
+            .collect();
+        for s in slugs {
+            self.remove(&s);
+        }
+    }
+
+    /// SEARCH VIEW: auto-build a BM25 index on each string field of the view.
+    /// (v1 — vector/geo auto-indexing is a follow-up.)
+    fn auto_index_view(&mut self, name: &str, root: &str) {
+        let sample = self.collection_members(sk_hash(name))
+            .and_then(|m| m.first().copied())
+            .and_then(|h| self.get_payload(h));
+        let mut text_fields = Vec::new();
+        let mut geo_fields = Vec::new();
+        if let Some(Value::Object(map)) = sample {
+            for (k, v) in &map {
+                if k.starts_with('_') || k == "id" { continue; }
+                match v {
+                    Value::String(_) => text_fields.push(k.clone()),
+                    // GeoJSON object → spatial.
+                    Value::Object(o) if o.contains_key("type") && o.contains_key("coordinates")
+                        => geo_fields.push(k.clone()),
+                    _ => {}
+                }
             }
         }
+        // Vector fields mirror the root collection's vector fields (same names).
+        let vec_fields: Vec<String> = self.schemas.get(root)
+            .map(|s| s.fields.iter()
+                .filter(|f| matches!(f.ty, sql::FieldType::Vector))
+                .map(|f| f.name.clone()).collect())
+            .unwrap_or_default();
+        for f in text_fields { let _ = self.apply_index(name, &sql::IndexMethod::Bm25, &[f]); }
+        for f in geo_fields  { let _ = self.apply_index(name, &sql::IndexMethod::Spatial, &[f]); }
+        for f in vec_fields  { let _ = self.apply_index(name, &sql::IndexMethod::Hnsw, &[f]); }
     }
 
     /// Internal: execute an already-parsed mutation.
@@ -4769,6 +5005,15 @@ impl CoreDB {
                                     field.name.clone(),
                                     Value::String(crate::scalar::uuid_v5(ns, nm)),
                                 );
+                            }
+                        }
+                        // Generated columns: computed from the record's other fields,
+                        // OVERRIDING any user-supplied value. Runs after defaults so it
+                        // can read default-filled fields too.
+                        for field in &schema.fields {
+                            if let Some(expr) = &field.generated {
+                                let val = expr.eval(&map);
+                                map.insert(field.name.clone(), Value::String(val));
                             }
                         }
                         if slug.is_empty() {
@@ -4932,11 +5177,28 @@ impl CoreDB {
                 let count = edges.len();
                 self.defer_wal_sync = true;
                 for edge in edges {
-                    self.unlink(&edge.from, &edge.to, &edge.edge_type);
+                    match &edge.props {
+                        Some(Value::Object(m)) if !m.is_empty() => {
+                            let props_json = serde_json::to_string(&Value::Object(m.clone()))
+                                .unwrap_or_else(|_| "{}".to_string());
+                            self.unlink_where(&edge.from, &edge.to, &edge.edge_type, &props_json);
+                        }
+                        _ => self.unlink(&edge.from, &edge.to, &edge.edge_type),
+                    }
                 }
                 self.defer_wal_sync = false;
                 self.wal_flush();
                 Ok(count)
+            }
+            sql::CompiledMutation::UpdateEdge { from, to, edge_type, predicate, sets } => {
+                let props_json = predicate
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+                let sets_map: serde_json::Map<String, Value> = sets.into_iter().collect();
+                let sets_json = serde_json::to_string(&Value::Object(sets_map))
+                    .unwrap_or_else(|_| "{}".to_string());
+                let n = self.update_edge(&from, &to, &edge_type, &props_json, &sets_json);
+                Ok(n)
             }
             sql::CompiledMutation::MatchInsert {
                 match_steps,
@@ -4974,8 +5236,13 @@ impl CoreDB {
                         schema.fields.iter().any(|f| &f.name == field && matches!(f.ty, sql::FieldType::Geo))
                     })
                 });
+                // Generated columns must be recomputed from the updated record, which
+                // the splice fast path can't do — route through the slow (full-parse)
+                // path whenever the target may carry a generated column.
+                let has_generated = self.schemas.values()
+                    .any(|s| s.fields.iter().any(|f| f.generated.is_some()));
 
-                if !has_vec && !has_geo {
+                if !has_vec && !has_geo && !has_generated {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     self.update_fast_path(steps, &updates, now_ms)
                 } else {
@@ -5018,6 +5285,21 @@ impl CoreDB {
                             }
                             if let Value::Object(ref mut map) = payload {
                                 map.insert(field.clone(), value.clone());
+                            }
+                        }
+                        // Recompute generated columns from the now-updated record.
+                        if let Value::Object(ref mut map) = payload {
+                            let coll = map.get("_collection").and_then(|v| v.as_str()).map(str::to_string);
+                            if let Some(coll) = coll {
+                                let gens: Vec<(String, sql::GenExpr)> = self.schemas.get(&coll)
+                                    .map(|s| s.fields.iter()
+                                        .filter_map(|f| f.generated.clone().map(|g| (f.name.clone(), g)))
+                                        .collect())
+                                    .unwrap_or_default();
+                                for (name, expr) in gens {
+                                    let val = expr.eval(map);
+                                    map.insert(name, Value::String(val));
+                                }
                             }
                         }
                         let json = serde_json::to_string(&payload)
@@ -5069,6 +5351,23 @@ impl CoreDB {
             sql::CompiledMutation::Reindex { collection, method, fields } => {
                 self.apply_index(&collection, &method, &fields)?;
                 Ok(1)
+            }
+            sql::CompiledMutation::CreateView { name, query_sql, auto_index } => {
+                let root = sql::extract_root_collection(&query_sql).unwrap_or_default();
+                self.materialized_views.insert(name.clone(), (query_sql.clone(), auto_index, root.clone()));
+                let n = self.materialize_view(&name, &query_sql, &root)?;
+                if auto_index {
+                    self.auto_index_view(&name, &root);
+                }
+                Ok(n)
+            }
+            sql::CompiledMutation::RefreshView { name } => {
+                let (query_sql, root) = self.materialized_views.get(&name)
+                    .map(|(q, _, r)| (q.clone(), r.clone()))
+                    .ok_or_else(|| SqlError::InvalidValue(format!("no materialized view named '{name}'")))?;
+                self.clear_view_collection(&name);
+                let n = self.materialize_view(&name, &query_sql, &root)?;
+                Ok(n)
             }
             sql::CompiledMutation::DropTable { collection, if_exists } => {
                 let has_schema = self.schemas.contains_key(&collection);
@@ -5264,6 +5563,13 @@ impl CoreDB {
             }
         }
         None
+    }
+
+    /// Read an edge's JSON meta by its exact attribute slot (recorded during
+    /// traversal). Unlike `edge_locate`, this reads the SPECIFIC edge, so parallel
+    /// edges resolve to their own attributes instead of the first match.
+    pub(crate) fn edge_json_at(&self, slot: u32) -> Option<Value> {
+        self.edges.json_at(slot)
     }
 
     /// Locate the stored forward edge `from → to` (type_hash `0` = any) and return
