@@ -102,6 +102,14 @@ pub(crate) struct EdgeStore {
     /// no parse — a direct-indexed weight lane, opt-in, for any
     /// user-named primitive column. `NaN` = unset for that edge.
     columns: HashMap<(u64, String), EdgeColumn>,
+    /// Identity set for KEYED edges: `(from_hash, edge_type, key_hash)` where
+    /// `key_hash = sk_hash(_key)`. An edge that carries a `_key` attribute is
+    /// deduped on this triple — re-asserting the same keyed edge is idempotent
+    /// (no parallel-edge stacking). Rebuilt from the edges on reopen (WAL replay
+    /// funnels through the same insert path), so it needs no separate persistence.
+    /// Maps the identity to the edge's attribute slot (`meta_id`) so re-insert can
+    /// UPSERT — overwrite that edge's attributes in place (last-wins).
+    keyed: HashMap<(u64, u64, u64), u32>,
 }
 
 /// One fast-lane column. `vals` is dense over the attribute-slot space; `is_bool`
@@ -149,6 +157,15 @@ pub(crate) enum ColVal {
     Bool(bool),
 }
 
+/// Value equality with numeric coercion (JSON int `2` == literal `2.0`), so an
+/// edge attribute stored via the columnar lane matches a parsed SQL literal.
+fn val_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+        _ => a == b,
+    }
+}
+
 enum MetaStore {
     /// Metadata in RAM — `meta_id` indexes into `metas`.
     Ram {
@@ -177,6 +194,7 @@ impl EdgeStore {
             type_names: HashMap::new(),
             meta: MetaStore::Ram { metas: Vec::new() },
             columns: HashMap::new(),
+            keyed: HashMap::new(),
         }
     }
 
@@ -201,6 +219,7 @@ impl EdgeStore {
                 mmap: None,
             },
             columns: HashMap::new(),
+            keyed: HashMap::new(),
         })
     }
 
@@ -226,6 +245,7 @@ impl EdgeStore {
                     mmap,
                 },
                 columns: HashMap::new(),
+                keyed: HashMap::new(),
             })
         } else {
             Self::new_compact(dir)
@@ -314,6 +334,87 @@ impl EdgeStore {
         self.rev.entry(to_hash).or_default().push(rev);
     }
 
+    /// Insert or UPSERT a KEYED edge, identity `(from, type, key)`. If no such edge
+    /// exists it is created; if one exists its attributes are overwritten in place
+    /// (last-wins) — so re-asserting the same keyed edge updates it rather than
+    /// stacking a duplicate. Returns `true` if a new edge was created, `false` if an
+    /// existing one was updated. `key_hash = sk_hash(_key)`.
+    pub fn link_keyed(
+        &mut self,
+        from_hash: u64,
+        to_hash: u64,
+        edge_type: u64,
+        edge_type_name: &str,
+        key_hash: u64,
+        cols: &[(String, ColVal)],
+        json: Option<Value>,
+    ) -> bool {
+        self.type_names.insert(edge_type, edge_type_name.to_string());
+        let id = (from_hash, edge_type, key_hash);
+        if let Some(&slot) = self.keyed.get(&id) {
+            // UPSERT: overwrite this edge's attributes at its existing slot.
+            // Clear the type's columns at the slot first so attributes dropped from
+            // the new value don't linger, then set the new ones.
+            for ((etype, _name), col) in self.columns.iter_mut() {
+                if *etype == edge_type {
+                    col.set(slot, f64::NAN);
+                }
+            }
+            self.set_cols(edge_type, slot, cols);
+            self.set_meta(slot, json.unwrap_or(Value::Null));
+            return false;
+        }
+        // NEW keyed edge: allocate a slot, store attrs, record the identity → slot.
+        let slot = self.store_meta(json.unwrap_or(Value::Null));
+        self.set_cols(edge_type, slot, cols);
+        let fwd = Edge { other: to_hash, edge_type, meta_id: slot };
+        let rev = Edge { other: from_hash, edge_type, meta_id: slot };
+        self.fwd.entry(from_hash).or_default().push(fwd);
+        self.rev.entry(to_hash).or_default().push(rev);
+        self.keyed.insert(id, slot);
+        true
+    }
+
+    /// Write fast-lane columns for one edge at `slot`.
+    fn set_cols(&mut self, edge_type: u64, slot: u32, cols: &[(String, ColVal)]) {
+        for (name, val) in cols {
+            let (v, is_bool) = match val {
+                ColVal::Num(n) => (*n, false),
+                ColVal::Bool(b) => (if *b { 1.0 } else { 0.0 }, true),
+            };
+            self.columns
+                .entry((edge_type, name.clone()))
+                .or_insert_with(|| EdgeColumn::new(is_bool))
+                .set(slot, v);
+        }
+    }
+
+    /// Overwrite the JSON meta at an existing `slot` (upsert). RAM overwrites in
+    /// place; Disk appends the new bytes and repoints the offset (reads fall back to
+    /// `pread`, so the stale mmap is fine until the next remap/compaction).
+    fn set_meta(&mut self, slot: u32, meta: Value) {
+        match &mut self.meta {
+            MetaStore::Ram { metas } => {
+                if let Some(m) = metas.get_mut(slot as usize) {
+                    *m = meta;
+                }
+            }
+            #[cfg(unix)]
+            MetaStore::Disk { offsets, file, total_len, .. } => {
+                let json_bytes = serde_json::to_vec(&meta).unwrap_or_default();
+                let offset = *total_len as u32;
+                let len = json_bytes.len() as u16;
+                use std::os::unix::fs::FileExt;
+                file.write_all_at(&json_bytes, *total_len)
+                    .expect("sekejap: edge meta disk write failed");
+                *total_len += json_bytes.len() as u64;
+                if let Some(e) = offsets.get_mut(slot as usize) {
+                    *e = (offset, len);
+                }
+            }
+        }
+    }
+
     /// Resolve a fast-lane column ONCE for `(edge_type, attr)`. The hot path calls
     /// this once per query, then reads `col.at(edge.attr_slot())` per edge — a
     /// direct array index, no lookup, no parse. `None` = no such column.
@@ -399,7 +500,118 @@ impl EdgeStore {
         if let Some(edges) = self.rev.get_mut(&to_hash) {
             edges.retain(|e| !(e.other == from_hash && e.edge_type == edge_type));
         }
+        self.keyed.retain(|&(f, t, _k), _| !(f == from_hash && t == edge_type));
         // Dead meta entries are reclaimed by compact().
+    }
+
+    /// One attribute value for an edge — fast-lane column first, then the JSON bag.
+    fn edge_attr(&self, e: &Edge, name: &str) -> Option<Value> {
+        if let Some(slot) = e.attr_slot() {
+            if let Some(col) = self.columns.get(&(e.edge_type, name.to_string())) {
+                if let Some(v) = col.at(slot) {
+                    return Some(v);
+                }
+            }
+        }
+        self.edge_meta(e).and_then(|m| m.get(name).cloned())
+    }
+
+    /// Delete only the edges `from → to` of `edge_type` whose attributes match ALL
+    /// of `props` (equality). Empty `props` deletes them all (same as `unlink`).
+    /// Returns the number of edges removed. Purges keyed identities for removed
+    /// edges so a later re-insert of the same key creates cleanly.
+    pub fn unlink_matching(
+        &mut self,
+        from_hash: u64,
+        to_hash: u64,
+        edge_type: u64,
+        props: &[(String, Value)],
+    ) -> usize {
+        if props.is_empty() {
+            let n = self.fwd.get(&from_hash).map_or(0, |es| {
+                es.iter().filter(|e| e.other == to_hash && e.edge_type == edge_type).count()
+            });
+            if n > 0 {
+                self.unlink(from_hash, to_hash, edge_type);
+            }
+            return n;
+        }
+        // Immutable pass: collect the attribute slots of matching edges.
+        let mut rm: HashMap<u32, ()> = HashMap::new();
+        if let Some(edges) = self.fwd.get(&from_hash) {
+            for e in edges {
+                if e.other == to_hash && e.edge_type == edge_type {
+                    let all = props.iter().all(|(k, want)| {
+                        self.edge_attr(e, k).map_or(false, |got| val_eq(&got, want))
+                    });
+                    if all {
+                        if let Some(s) = e.attr_slot() {
+                            rm.insert(s, ());
+                        }
+                    }
+                }
+            }
+        }
+        if rm.is_empty() {
+            return 0;
+        }
+        let n = rm.len();
+        if let Some(edges) = self.fwd.get_mut(&from_hash) {
+            edges.retain(|e| !(e.other == to_hash && e.edge_type == edge_type
+                && e.attr_slot().map_or(false, |s| rm.contains_key(&s))));
+        }
+        if let Some(edges) = self.rev.get_mut(&to_hash) {
+            edges.retain(|e| !(e.other == from_hash && e.edge_type == edge_type
+                && e.attr_slot().map_or(false, |s| rm.contains_key(&s))));
+        }
+        self.keyed.retain(|&(f, t, _k), slot| !(f == from_hash && t == edge_type && rm.contains_key(slot)));
+        n
+    }
+
+    /// Set attributes on edges `from → to` of `edge_type` matching ALL of `pred`.
+    /// `set_cols` are primitive fast-lane values; `set_json` are the remaining attrs
+    /// merged into each matched edge's JSON bag (keys not in `set_json` are kept).
+    /// Only edges that already have an attribute slot can be updated. Returns count.
+    pub fn update_matching(
+        &mut self,
+        from_hash: u64,
+        to_hash: u64,
+        edge_type: u64,
+        pred: &[(String, Value)],
+        set_cols: &[(String, ColVal)],
+        set_json: &serde_json::Map<String, Value>,
+    ) -> usize {
+        // Immutable pass: find the slots of matching edges.
+        let mut slots: Vec<u32> = Vec::new();
+        if let Some(edges) = self.fwd.get(&from_hash) {
+            for e in edges {
+                if e.other == to_hash && e.edge_type == edge_type {
+                    let all = pred.iter().all(|(k, want)| {
+                        self.edge_attr(e, k).map_or(false, |got| val_eq(&got, want))
+                    });
+                    if all {
+                        if let Some(s) = e.attr_slot() {
+                            slots.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        // Mutable pass: overwrite the columns and merge the JSON bag at each slot.
+        for &slot in &slots {
+            self.set_cols(edge_type, slot, set_cols);
+            if !set_json.is_empty() {
+                let mut cur = match self.json_at(slot) {
+                    Some(Value::Object(m)) => m,
+                    _ => serde_json::Map::new(),
+                };
+                for (k, v) in set_json {
+                    cur.insert(k.clone(), v.clone());
+                }
+                self.set_meta(slot, Value::Object(cur));
+            }
+        }
+        slots.len()
     }
 
     /// Remove all edges involving `hash` (both directions).
@@ -478,6 +690,17 @@ impl EdgeStore {
                 serde_json::from_slice(&buf).ok()
             }
         }
+    }
+
+    /// Read the JSON meta bag at an attribute slot directly. Used when the caller
+    /// already knows the EXACT edge's slot (from traversal), so there's no
+    /// first-match ambiguity across parallel edges.
+    pub(crate) fn json_at(&self, slot: u32) -> Option<Value> {
+        if slot == NO_META {
+            return None;
+        }
+        let synth = Edge { other: 0, edge_type: 0, meta_id: slot };
+        self.edge_meta(&synth)
     }
 
     /// Resolve edge type hash to human-readable name.

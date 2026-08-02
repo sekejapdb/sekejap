@@ -183,6 +183,14 @@ impl SearchIndex {
 
     /// AND intersection with typo tolerance: returns bitmap of slots matching ALL query terms.
     pub fn search(&self, query: &str) -> RoaringBitmap {
+        self.search_typo(query, None)
+    }
+
+    /// Same as [`search`], but `typo` overrides the per-word auto edit-distance
+    /// (`SEARCH('q', typo => N)`). `None` = the auto policy (Meili-style: 0 for words
+    /// < 5 chars, 1 for 5–8, 2 for 9+). Exact matches are preferred; a term that isn't
+    /// found exactly is fuzzy-expanded to within its edit distance.
+    pub fn search_typo(&self, query: &str, typo: Option<u32>) -> RoaringBitmap {
         let unique_terms = deduplicate_tokens(query);
         if unique_terms.is_empty() {
             return RoaringBitmap::new();
@@ -190,9 +198,10 @@ impl SearchIndex {
 
         let mut result: Option<RoaringBitmap> = None;
         for term in &unique_terms {
+            let dist = typo.unwrap_or_else(|| auto_distance(term));
             let bm = match self.get_bitmap(term) {
                 Some(bm) if !bm.is_empty() => bm,
-                _ => self.search_fuzzy(term, auto_distance(term)),
+                _ => self.search_fuzzy(term, dist),
             };
 
             if bm.is_empty() {
