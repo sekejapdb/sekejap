@@ -67,12 +67,9 @@ CREATE INDEX ON place_search USING hnsw (embedding);
 CREATE INDEX ON place_search USING spatial (geometry);
 ```
 
-Preset form — batteries-included one-liner:
-```sql
-CREATE SEARCH VIEW place_search AS <projection>;   -- auto-indexes search-type fields + auto-refresh
-```
-Unlike Postgres, both are **auto-maintained** (eventual) — no manual `REFRESH`. That's
-the one extended behavior; the syntax stays SQL-family.
+(An earlier draft proposed a `CREATE SEARCH VIEW` preset with automatic refresh;
+both were dropped — see the decision above. The shipped form is
+`CREATE MATERIALIZED VIEW … WITH (autoindex = true)` with explicit `REFRESH`.)
 Query (normalized weighted blend — all primitives already exist):
 ```sql
 SELECT id, name,
@@ -118,9 +115,8 @@ Background pass rebuilds dirty docs. Near-real-time, like ES/Meili. No synchrono
    `concat_ws`/`||`/`lower`/`coalesce` over `var.field` in the MATCH SELECT (new
    `MatchAggReturn::Str(MatchStr)`). Cross-collection search proven (BM25 finds a song by
    its artist's name). `CompiledMutation::CreateView`/`RefreshView`; `CoreDB.materialized_views`.
-   AUTO-REFRESH: DONE (eventual, v1) — data writes mark dependent views stale via
-   `mark_all_views_dirty` (O(1), never rebuilds on the write path); `refresh_stale_views()`
-   reconciles (drains the dirty set, rebuilds). Benchmarked: materialized search 48.8x
+   AUTO-REFRESH: built, then **removed** (decision above: not embedded-native; it added
+   write-path cost for no payoff). Freshness is explicit `REFRESH MATERIALIZED VIEW`. Benchmarked: materialized search 48.8x
    faster than the live cross-collection query (73ms → 1.5ms), identical results (20k songs).
    MULTI-MODAL: DONE — GEO rides in the payload (materializes free; `USING spatial` works);
    VECTOR mirrored from the root collection's vector store into the view (`get_vector`→
@@ -132,8 +128,8 @@ Background pass rebuilds dirty docs. Near-real-time, like ES/Meili. No synchrono
    per-view — needs parsing the projection's edges for reverse-dependency resolution +
    scoped re-derivation; full-reconcile is correct meanwhile); view-def persistence across
    reopen; background refresh loop (serve calls refresh_stale_views on a timer).
-2b. **`CREATE SEARCH VIEW`** — DONE: preset that auto-indexes the view's string fields
-   (BM25) via `auto_index_view`. (vector/geo auto-index is the follow-up.)
+2b. **`CREATE SEARCH VIEW`** — built, then **removed** (decision above). Its auto-index
+   behavior survives as `WITH (autoindex = true)`: text→bm25, geo→spatial, vector→hnsw.
 3. **`CREATE VIEW`** (virtual) — completes the family; easy, useful as saved queries.
 4. **Additive**: automatic ranking tier, typo tolerance (FST), multi-hop, field-level
    incremental rebuild.

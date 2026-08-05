@@ -22,7 +22,7 @@ full-record read: 1846 ns  (10% FASTER than JSON parse)
 single-field read:  351 ns  (6x FASTER than parse-then-get)
 ```
 
-A strict win over raw: smaller, faster, and **identical 1-record corruption
+Compared with raw JSON: smaller, faster, and **identical 1-record corruption
 isolation**. zstd is removed from the payload path (worse ratio, no faster; its
 only higher-ratio variants require cross-record sharing = corruption spread).
 
@@ -104,7 +104,7 @@ holding actual value data.
 
 - **Read:** dispatch on first byte. Full record → `dec_record`. Single field →
   `get_field` **skip-scan** (jump over other fields by length; 6× faster than
-  parse-then-get) — a net query-engine win beyond size.
+  parse-then-get) — a query-engine gain beyond size.
 - **Write (`put`):** parse once, append any new field names (append-only ID +
   journal), encode, CRC-frame, append.
 - **Compaction:** `compact()` already streams a full rewrite; it writes the

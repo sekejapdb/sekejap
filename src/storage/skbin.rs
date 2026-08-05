@@ -29,7 +29,7 @@ use serde_json::Value;
 /// format). A future incompatible layout takes a NEW first byte (`0x03` = v2, …),
 /// never a silent change to the `0x02` body — so old readers reject the unknown
 /// tag cleanly (decode → `None`) instead of misreading it. See
-/// `docs/internals/payload-binary-format.md` §8.
+/// `docs/developer/notes/skbin-format.md` §8.
 pub const TAG_SKBIN: u8 = 0x02;
 
 // Value tags (Level 1 — no interned-string / templated-string tags: those would

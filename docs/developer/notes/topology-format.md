@@ -1,9 +1,10 @@
 # Phase 0 Spec — Dense-ID, Offset-Addressable Topology Format (v2)
 
-Status: design / pre-launch format lock. No behavior change in the version that
-ships it — topology is still loaded fully into RAM. The point is to **freeze the
-on-disk shape** so that mmap paging (Phase 1) and S3 paging (Phase 2) are
-read-path flips, not data migrations.
+Status: **shipped**. `compact()` writes these files and `open()` reads them
+(recovery when the snapshot is missing, and the paged-topology mode). The format
+was locked before wiring so that mmap paging (Phase 1) and S3 paging (Phase 2)
+stay read-path flips, not data migrations; forward/reverse CSR adjacency is now
+also servable as memory-mapped slices.
 
 Goal it unblocks: **1 billion nodes on 1 GB RAM** for bounded queries, by making
 topology an offset-addressable file the OS/page-cache can page — the way
@@ -202,7 +203,7 @@ compaction. No extra RAM beyond the id map (which can spill-sort for billion-sca
   (`raw` `{` vs `0x02` SKBIN) lets `compact()` transcode incrementally and old raw records
   coexist. Whole-payload block-zstd was evaluated and dropped (worse ratio on real data,
   no faster, shared dictionary breaks the ≤1-record blast radius). See
-  [payload-binary-format.md](payload-binary-format.md).
+  [payload-binary-format.md](skbin-format.md).
 - **Compression is invisible to crash recovery.** The **WAL is uncompressed**; all
   checkpoint files (topology + payloads) are written **atomically** (tmp → `fsync` →
   rename) and are **rebuildable from WAL + payloads**. A blackout mid-write leaves the
@@ -213,10 +214,12 @@ compaction. No extra RAM beyond the id map (which can spill-sort for billion-sca
 
 ## 6. What this version ships vs. defers
 
-**Ships (Phase 0):**
-- Writes v3 topology files at `compact()`; reads them at `open()`.
-- Still **loads them into the existing in-RAM `EdgeStore`/`nodes` map** → today's
-  speed, zero user-visible change. (Load = mmap the files, copy into RAM for now.)
+**Ships (Phase 0 — now live):**
+- Writes v3 topology files at `compact()`; reads them at `open()` (recovery and
+  paged mode).
+- Resident mode still loads them into the in-RAM `EdgeStore`/`nodes` map → same
+  speed, zero user-visible change; edge spill additionally serves CSR adjacency
+  straight from mmap.
 - Dense-id + `idx.bin` name resolution replaces raw-hash identity internally.
 - Collision handling folded into `idx.bin` resolution (loud on hash+slug mismatch).
 

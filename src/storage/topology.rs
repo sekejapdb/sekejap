@@ -4,7 +4,7 @@
 //! into a set of pointer-free byte buffers, and reads them back. It is NOT yet wired
 //! into `CoreDB` — the engine still loads topology into RAM. The point of Phase 0 is
 //! to lock the on-disk shape so that Phase 1 (mmap) and Phase 2 (S3) are read-path
-//! flips, not migrations. See `docs/internals/topology-format-v2.md`.
+//! flips, not migrations. See `docs/developer/notes/topology-format.md`.
 //!
 //! ## Files (each starts with a 16-byte `[magic 8][version u32][flags u32]` header)
 //! - `nodes.bin` — `count u64` + fixed 24-byte node records, addressed by dense id

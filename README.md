@@ -8,9 +8,17 @@ It runs inside your application, like SQLite, with no separate server to install
 
 It's available as a Rust/Python/Dart/Kotlin/Swift/Java/Node.js/Go library, and a command-line tool.
 
-📖 **Documentation:** [`docs/`](docs/README.md) — a [user guide](docs/guide/README.md)
-(the query language, including the [`SELECT … FROM MATCH`](docs/guide/graph-queries.md)
-graph reference) and [engine internals](docs/internals/README.md).
+📖 **Documentation:** [`docs/`](docs/README.md) — a [usage guide](docs/usage/README.md)
+(the query language, including the [`SELECT … FROM MATCH`](docs/usage/graph-queries.md)
+graph reference) and a [developer guide](docs/developer/README.md)
+(architecture diagrams, storage, indexes, invariants).
+
+📄 **Paper:** the sekejap architecture and its six-category benchmark
+(relational · graph · spatial · vector · full-text · hybrid, vs SQLite, DuckDB,
+PostgreSQL/PostGIS/pgvector, Neo4j, ArangoDB, Qdrant, Redis, Elasticsearch,
+Solr, Meilisearch) are described in a paper submitted to CIDR 2027.
+Reproduction harnesses, datasets, and the measured results live in
+[`eval/`](eval/README.md).
 
 ---
 
@@ -76,6 +84,23 @@ flutter pub add sekejap             # or: dart pub add sekejap
 // build.gradle.kts
 implementation("com.zebflow:sekejap:0.13.5")
 ```
+
+**Swift** — Swift Package Manager (see [`wrappers/swift/`](wrappers/swift/))
+
+```swift
+// Package.swift
+.package(url: "https://github.com/sekejapdb/sekejap-swift.git", from: "0.13.0")
+```
+
+**Go** — Go modules (see [`wrappers/go/`](wrappers/go/))
+
+```bash
+go get github.com/sekejapdb/sekejap/wrappers/go
+```
+
+**C / C++ and other native callers** — the stable C ABI in
+[`wrappers/c/`](wrappers/c/) (build from source; ships a single header +
+static/shared library).
 
 ---
 
@@ -357,8 +382,9 @@ CREATE INDEX ON diary    USING search  (reflection)
 CREATE INDEX ON tourists USING hnsw    (taste)
 ```
 
-All index types survive a restart. After a large bulk load, run `REINDEX` (or
-`.compact` in the CLI) so later startups are fast.
+All index types survive a restart. After a large bulk load, run `compact()`
+(`.compact` in the CLI) so later startups are fast. A single index can be
+rebuilt in place with `REINDEX ON <table> USING <index> (<field>)`.
 
 ---
 
@@ -493,6 +519,11 @@ db = DB.open_s3("s3://my-bucket/bali",
                 access_key_id="AKID...", secret_access_key="secret...",
                 region="ap-southeast-1",
                 cache_budget_bytes=256 * 1024 * 1024)   # in-memory cache size
+
+# MinIO / R2 / other S3-compatible stores: point at their endpoint
+db = DB.open_s3("s3://my-bucket/bali", "AKID...", "secret...", "auto",
+                cache_budget_bytes=256 * 1024 * 1024,
+                endpoint="https://<account>.r2.cloudflarestorage.com")
 
 db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 10000.0)")
 ```

@@ -2,6 +2,12 @@
 
 > Default port **5918**.
 
+**Shipped today** (`src/serve.rs`, sans-IO — the CLI provides the socket):
+`POST /query` (SQL with `$1` params), `POST /graph` / `DELETE /graph`
+(node+edge upsert/remove), `GET /health`, `GET /version`. The Postgres wire
+adapter also shipped separately (`src/pg.rs`). Everything below beyond those
+endpoints is design for later phases.
+
 ## Goals
 - One command turns the embedded DB into a networked service (the Ollama model).
 - Universal access over plain HTTP — no driver, any language.
@@ -54,7 +60,7 @@ POST /collections/{c}/search
   "vector": [0.7,0.3,0.0,0.0],
   "hybrid": { "text": 0.6, "vector": 0.4 },
   "filter": "protein_g >= 25 AND open_now = true",
-  "near":   { "lat": -8.69, "lon": 115.168, "km": 5 },
+  "near":   { "lat": -8.69, "lon": 115.168, "m": 5000 },
   "limit": 10, "offset": 0
 }
 → { "hits": [ { "score": 0.87, "document": {…} } ], "estimated_total": 42, "took_ms": 6 }
@@ -81,7 +87,7 @@ POST /keys · GET /keys · DELETE /keys/{id}
 ### Ops / migration
 ```
 GET  /health   → { "ok": true }
-GET  /version  → { "version": "0.14.0" }
+GET  /version  → { "version": "<crate version>" }
 POST /admin/compact
 GET  /admin/dump     → NDJSON stream (backup / move between servers)
 POST /admin/restore  ← NDJSON stream
@@ -99,7 +105,7 @@ POST /admin/restore  ← NDJSON stream
 - HTTP stack: `axum` + `tokio` (recommended) vs `tiny_http` (minimal deps) — DECISION.
 
 ## Positioning (honest)
-Win on the **combination**: search + vector + spatial + **graph** + SQL, one binary,
+The value is the **combination**: search + vector + spatial + **graph** + SQL, one binary,
 run like Ollama. Do not claim Meilisearch's typo/analyzer depth or Elasticsearch's
 cluster scale. Nobody else has graph + search together.
 

@@ -458,9 +458,9 @@ JSON_ARRAY_LENGTH(var.field)
 
 Shortest path (0 rows = unreachable, 1 row = found)
 ────────────────────────────────────────────────────
-SELECT a.field AS from_f, b.field AS to_f, r.length AS hops, r._path_keys AS route
-FROM MATCH SHORTEST (a)-[r*]->(b)
-WHERE a._key = 'start/slug' AND b._key = 'end/slug'
+SELECT a.field AS from_f, b.field AS to_f, length(r) AS hops, nodes(r) AS route
+FROM MATCH SHORTEST (a:col)-[r*]->(b:col)
+WHERE a._key = 'start' AND b._key = 'end'
 AND ANY(n IN nodes(r) WHERE n.field = 'val')
 
 Introspection
