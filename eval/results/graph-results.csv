@@ -1,0 +1,29 @@
+engine,dataset,load_ms,index_ms,rss_mb,query,p50_ms,p99_ms,result
+sekejap,ldbc,1933.2,0.0,53.1,q1_1hop,11.1433,13.8526,814
+sekejap,ldbc,1933.2,0.0,53.1,q2_2hop,90.9828,97.4274,5628
+sekejap,ldbc,1933.2,0.0,53.1,q3_3hop,118.1778,130.0970,7185
+sekejap,ldbc,1933.2,0.0,53.1,q4_spath,7.2361,7.8023,5
+sekejap,amazon,15474.1,0.0,461.3,q1_1hop,2.0410,2.0708,168
+sekejap,amazon,15474.1,0.0,461.3,q2_2hop,5.2244,5.7568,376
+sekejap,amazon,15474.1,0.0,461.3,q3_3hop,11.7537,11.9146,713
+sekejap,amazon,15474.1,0.0,461.3,q4_spath,0.4177,0.4780,9
+neo4j,ldbc,6218.9,0.0,-1.0,q1_1hop,23.1854,24.0627,814
+neo4j,ldbc,6218.9,0.0,-1.0,q2_2hop,35.5554,45.1425,5628
+neo4j,ldbc,6218.9,0.0,-1.0,q3_3hop,56.1948,57.6365,7185
+neo4j,ldbc,6218.9,0.0,-1.0,q4_spath,20.3275,21.5559,5
+neo4j,amazon,44853.8,0.0,-1.0,q1_1hop,19.3593,33.1736,168
+neo4j,amazon,44853.8,0.0,-1.0,q2_2hop,25.7327,25.8331,376
+neo4j,amazon,44853.8,0.0,-1.0,q3_3hop,23.4886,66.4746,713
+neo4j,amazon,44853.8,0.0,-1.0,q4_spath,21.3390,25.5642,9
+arango,ldbc,10692.5,0.0,-1.0,q1_1hop,5.4679,7.4688,814
+arango,ldbc,10692.5,0.0,-1.0,q2_2hop,21.4924,23.5306,5628
+arango,ldbc,10692.5,0.0,-1.0,q3_3hop,147.7054,160.4869,7185
+arango,ldbc,10692.5,0.0,-1.0,q4_spath,7.7992,8.0484,5
+arango,amazon,58420.6,0.0,-1.0,q1_1hop,7.5684,14.1748,168
+arango,amazon,58420.6,0.0,-1.0,q2_2hop,13.4799,13.6975,376
+arango,amazon,58420.6,0.0,-1.0,q3_3hop,14.8167,23.2189,713
+arango,amazon,58420.6,0.0,-1.0,q4_spath,7.9289,8.2055,9
+# sekejap = disk-first adjacency (mmap'd CSR). Heap adjacency RAM (before->after spill):
+#   ldbc 12.7MB -> 0.7MB (18x); amazon 96.3MB -> 21.0MB (4.6x). Traversal BFS-verified identical.
+# rss_mb = process VmHWM (includes harness graph struct + build peak), not engine-only.
+# neo4j/arango rss_mb = -1 (separate JVM/server process; not captured in-process).

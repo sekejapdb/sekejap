@@ -1,0 +1,21 @@
+[package]
+name = "relbench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Relational (ClickBench-projection) benchmark: sekejap (atomic + SQL) vs SQLite,
+# all embedded in this one Rust process, with btree indexes on the queried columns.
+[dependencies]
+sekejap = { path = "../../.." }
+rusqlite = { version = "0.32", features = ["bundled"] }   # bundled = compiles SQLite in
+duckdb = { version = "1", features = ["bundled"] }        # bundled = compiles DuckDB in (columnar reference)
+postgres = "0.19"                                          # sync client for the Postgres reference (server pod)
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+# no LTO here — keep harness compiles fast; sekejap itself is already optimized.
+
+# standalone crate — opt out of the repo root workspace
+[workspace]

@@ -1,0 +1,18 @@
+[package]
+name = "hybridbench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# HYBRID benchmark: dense (vector) + sparse (BM25) fusion in ONE sekejap engine.
+# Dataset: BEIR FiQA-2018 (57.6k docs, 648 queries, qrels) + bge-small-en-v1.5 384-d
+# embeddings. Modes: BM25-only vs dense-only vs hybrid (RRF) → nDCG@10 + recall.
+[dependencies]
+sekejap    = { path = "../../.." }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+
+# standalone crate — opt out of the repo root workspace
+[workspace]

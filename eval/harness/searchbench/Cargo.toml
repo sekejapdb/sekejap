@@ -1,0 +1,21 @@
+[package]
+name = "searchbench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SEARCH benchmark: sekejap BM25 vs Elasticsearch vs Solr vs Meilisearch vs
+# Postgres FTS vs DuckDB FTS. Dataset: BEIR FiQA-2018 (57.6k docs, 648 test
+# queries, qrels) → nDCG@10 + recall@{10,100} vs latency, build time, RAM.
+[dependencies]
+sekejap  = { path = "../../.." }
+duckdb   = { version = "1", features = ["bundled"] }
+postgres = "0.19"
+ureq     = { version = "2", features = ["json"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+
+# standalone crate — opt out of the repo root workspace
+[workspace]
