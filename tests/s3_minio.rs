@@ -37,6 +37,42 @@ fn test_writer_reader_via_minio() {
         }
     };
 
+    // Clean any objects a previous run left under this prefix, so the
+    // generation assertion below sees a fresh remote.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use object_store::{ObjectStore, ObjectStoreExt};
+            for name in &[
+                "manifest.json",
+                "snapshot.json",
+                "payloads.bin",
+                "field_table.bin",
+                "field_table.bin.1",
+                "field_table.bin.2",
+                "nodes.bin",
+                "idx.bin",
+                "adj_fwd.bin",
+                "adj_rev.bin",
+                "slugs.bin",
+                "dict.bin",
+                "collections.bin",
+                "edgemeta.bin",
+                "spatial.bin",
+                "gin.bin",
+                "search.bin",
+                "edges.bin",
+                "edge_meta.bin",
+            ] {
+                let p = object_store::path::Path::from(format!("integration-test/{name}"));
+                let _ = store.delete(&p).await;
+            }
+        });
+    }
+
     // ── Writer: create DB, insert data, compact, upload ─────────────────
     let w_dir = tempfile::tempdir().unwrap();
     let writer_remote = sekejap::engine::remote::RemoteSync::from_store(
@@ -121,6 +157,18 @@ fn test_writer_reader_via_minio() {
             "manifest.json",
             "snapshot.json",
             "payloads.bin",
+            "field_table.bin",
+            "field_table.bin.1",
+            "field_table.bin.2",
+            "nodes.bin",
+            "idx.bin",
+            "adj_fwd.bin",
+            "adj_rev.bin",
+            "slugs.bin",
+            "dict.bin",
+            "collections.bin",
+            "edgemeta.bin",
+            "spatial.bin",
             "gin.bin",
             "search.bin",
             "edges.bin",

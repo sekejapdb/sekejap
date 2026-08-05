@@ -409,6 +409,20 @@ fn list_segment_files(db_dir: &Path) -> io::Result<Vec<PathBuf>> {
     for name in &[
         "snapshot.json",
         "payloads.bin",
+        "field_table.bin",
+        "field_table.bin.1",
+        "field_table.bin.2",
+        // topology sidecars (written by compact(); required by open_s3's v3 path)
+        "nodes.bin",
+        "idx.bin",
+        "adj_fwd.bin",
+        "adj_rev.bin",
+        "slugs.bin",
+        "dict.bin",
+        "collections.bin",
+        "edgemeta.bin",
+        "spatial.bin",
+        // rebuildable index sidecars
         "gin.bin",
         "search.bin",
         "edges.bin",
