@@ -79,19 +79,19 @@ SELECT id, name,
        BM25_NORM(name,'grilled chicken')*0.4
      + BM25_NORM(dishes,'grilled chicken')*0.3
      + VECTOR_COSINE(embedding,[q])*0.2
-     - ST_DISTANCE_KM(geometry, POINT(115.168 -8.690))*0.1  AS score
+     - ST_DISTANCE(geometry, POINT(115.168 -8.690))*0.0001  AS score
 FROM place_search
-WHERE SEARCH('grilled chicken') AND ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)
+WHERE SEARCH('grilled chicken') AND ST_DWithin(geometry, POINT(115.168 -8.690), 5000.0)
 ORDER BY score DESC LIMIT 20;
 -- or Meili-kind automatic:  SELECT * FROM place_search WHERE SEARCH('grilled chicken');
 ```
 
 ## Ranking: two modes over one index
 - **Automatic tier** (Meili-kind): `SEARCH('q')` — default, normalized, sensible weights.
-- **Custom formula** (Solr/Sphinx-kind): `BM25_NORM * w + VECTOR_COSINE * w - ST_DISTANCE_KM * w`.
+- **Custom formula** (Solr/Sphinx-kind): `BM25_NORM * w + VECTOR_COSINE * w - ST_DISTANCE * w`.
 Both run on the same optimized index (no operational-data scan, no traversal).
 Normalization is solved: `BM25_NORM` ∈ [0,1] (`s/(s+k)`), `VECTOR_COSINE` scoring form
-is [0,1] similarity; distance signals (`ST_DISTANCE_KM`) are flipped (subtract/normalize).
+is [0,1] similarity; distance signals (`ST_DISTANCE`, metres) are flipped (subtract/normalize).
 
 ## Maintenance (eventual)
 On any write to node N: N is a root → mark its doc dirty; N is related → walk
@@ -140,5 +140,5 @@ Background pass rebuilds dirty docs. Near-real-time, like ES/Meili. No synchrono
 
 ## Already built (query side is real)
 `BM25`, `BM25_NORM`, `SEARCH`, `SEARCH_SCORE`, `VECTOR_COSINE`/`_L2`/`_DOT`/`_L1`,
-`ST_DWithin`, `ST_DISTANCE_KM`, per-field bm25/search/hnsw/spatial indexes, graph
+`ST_DWithin`, `ST_DISTANCE`, per-field bm25/search/hnsw/spatial indexes, graph
 traversal + `rev_edges`. The new work is the projection input + cross-collection refresh.

@@ -207,7 +207,7 @@ you can ask distance and containment questions.
 # Restaurants within 5 km of a point (longitude, latitude).
 db.query("""
     SELECT name FROM restaurants
-    WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)
+    WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5000.0)
 """)
 ```
 
@@ -272,7 +272,7 @@ db.query("""
     WHERE d.open_now = true
       AND d.price BETWEEN 40000 AND 90000                        -- price range (IDR)
       AND d.protein_g >= 25                                      -- enough protein
-      AND ST_DWithin(d.geometry, POINT(115.168 -8.690), 5.0)     -- within 5 km
+      AND ST_DWithin(d.geometry, POINT(115.168 -8.690), 5000.0)  -- within 5 km (metres)
       AND BM25(d.description, 'grilled chicken healthy') > 0.0    -- matches the craving
     ORDER BY BM25(d.description, 'grilled healthy') * 0.6         -- text relevance
            + VECTOR_COSINE(d.embedding, [0.7,0.3,0.0,0.0]) * 0.4 -- taste similarity
@@ -416,7 +416,7 @@ FROM MATCH SHORTEST (a:tourists)-[r*]->(b:dishes)
 WHERE a._key = 'chloe' AND b._key = 'betutu-chicken'
 
 -- Spatial, vector, and text
-SELECT * FROM places   WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)
+SELECT * FROM places   WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5000.0)
 SELECT * FROM tourists WHERE VECTOR_NEAR(taste, [0.9, 0.1, 0.0, 0.0], 5)
 SELECT * FROM places   WHERE name ILIKE '%uluwatu%'
 
@@ -440,9 +440,9 @@ use sekejap::CoreDB;
 
 let mut db = CoreDB::open("./bali")?;
 
-// Restaurants within 3 km of a point (latitude, longitude, km).
+// Restaurants within 3 km of a point (latitude, longitude, metres).
 let nearby = db.collection("restaurants")
-    .st_dwithin(-8.690, 115.168, 3.0)
+    .st_dwithin(-8.690, 115.168, 3000.0)
     .collect();
 
 // Filter and sort.
@@ -494,7 +494,7 @@ db = DB.open_s3("s3://my-bucket/bali",
                 region="ap-southeast-1",
                 cache_budget_bytes=256 * 1024 * 1024)   # in-memory cache size
 
-db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 10.0)")
+db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 10000.0)")
 ```
 
 ---
@@ -512,7 +512,7 @@ Inside the interactive session:
 
 ```
 sekejap> CREATE TABLE places (_key TEXT, name TEXT, geometry GEO);
-sekejap> SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0);
+sekejap> SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5000.0);
 sekejap> .tables          # list tables
 sekejap> .schema places   # show a table's columns
 sekejap> .compact         # compact the database after a big load
