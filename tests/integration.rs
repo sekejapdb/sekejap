@@ -939,7 +939,7 @@ fn spatial_distance_length_area_parse() {
     let mut db = CoreDB::new();
     db.put("p/1", r#"{"_collection":"p","_key":"1","geometry":{"type":"Point","coordinates":[115.087,-8.829]}}"#).unwrap();
     // These three all used to fail to parse.
-    assert!(db.query("SELECT * FROM p WHERE ST_Distance(geometry, POINT(115.087 -8.829), 5.0)").is_ok());
+    assert!(db.query("SELECT * FROM p WHERE ST_Distance(geometry, POINT(115.087 -8.829), 5000.0)").is_ok());
     db.put("ln/1", r#"{"_collection":"ln","_key":"1","geometry":{"type":"LineString","coordinates":[[115.0,-8.8],[115.1,-8.9]]}}"#).unwrap();
     assert!(db.query("SELECT * FROM ln WHERE ST_Length(geometry, 1.0)").is_ok());
     db.put("pg/1", r#"{"_collection":"pg","_key":"1","geometry":{"type":"Polygon","coordinates":[[[0,0],[0,1],[1,1],[1,0],[0,0]]]}}"#).unwrap();
@@ -1314,7 +1314,7 @@ fn spatial_st_dwithin() {
     let db = setup_spatial_db();
     // Find places within 2km of Melbourne Central
     let hits = db.query(
-        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 2.0)"
+        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 2000.0)"
     ).unwrap().collect();
     let names: Vec<&str> = hits.iter()
         .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
@@ -1372,7 +1372,7 @@ fn spatial_atomic_api() {
     let db = setup_spatial_db();
     // Test atomic API: st_dwithin
     let hits = db.collection("places")
-        .st_dwithin(-37.8102, 144.9631, 2.0)
+        .st_dwithin(-37.8102, 144.9631, 2000.0)
         .collect();
     let names: Vec<&str> = hits.iter()
         .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
@@ -1383,7 +1383,7 @@ fn spatial_atomic_api() {
 
     // Test atomic API: near (alias)
     let near_count = db.collection("places")
-        .near(-37.8102, 144.9631, 2.0)
+        .near(-37.8102, 144.9631, 2000.0)
         .count();
     assert_eq!(near_count, hits.len());
 }
@@ -1393,7 +1393,7 @@ fn spatial_sql_combined() {
     let db = setup_spatial_db();
     // Combine spatial with regular filter
     let hits = db.query(
-        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 2.0) AND category = 'landmark'"
+        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8102), 2000.0) AND category = 'landmark'"
     ).unwrap().collect();
     let names: Vec<&str> = hits.iter()
         .filter_map(|h| h.payload.as_ref()?.get("name")?.as_str())
@@ -1423,7 +1423,7 @@ fn spatial_execute_insert_then_query() {
         "INSERT INTO places (_key, name, geometry) VALUES ('melb-central', 'Melbourne Central', '{\"type\":\"Point\",\"coordinates\":[144.9631,-37.8102]}')"
     ).unwrap();
     let hits = db.query(
-        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8136), 1.0)"
+        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9631 -37.8136), 1000.0)"
     ).unwrap().collect();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].slug, "places/melb-central");
@@ -1450,8 +1450,8 @@ fn spatial_grid_same_results_as_brute_force() {
     db_grid.build_spatial_index();
 
     // ST_DWithin
-    let brute = db_brute.collection("places").st_dwithin(-37.81, 144.96, 2.0).count();
-    let grid  = db_grid.collection("places").st_dwithin(-37.81, 144.96, 2.0).count();
+    let brute = db_brute.collection("places").st_dwithin(-37.81, 144.96, 2000.0).count();
+    let grid  = db_grid.collection("places").st_dwithin(-37.81, 144.96, 2000.0).count();
     assert_eq!(brute, grid, "ST_DWithin mismatch");
 
     // ST_ContainsPoint (need polygon nodes)
@@ -1476,15 +1476,15 @@ fn spatial_grid_incremental_update() {
     db.build_spatial_index();
 
     // Verify initial state
-    assert_eq!(db.collection("places").st_dwithin(-37.81, 144.96, 1.0).count(), 1);
+    assert_eq!(db.collection("places").st_dwithin(-37.81, 144.96, 1000.0).count(), 1);
 
     // Insert after grid build — should be found via incremental update
     db.put("p2", r#"{"_collection":"places","geometry":{"type":"Point","coordinates":[144.97,-37.82]}}"#).unwrap();
-    assert_eq!(db.collection("places").st_dwithin(-37.81, 144.96, 2.0).count(), 2);
+    assert_eq!(db.collection("places").st_dwithin(-37.81, 144.96, 2000.0).count(), 2);
 
     // Remove — should no longer be found
     db.remove("p1");
-    let hits = db.collection("places").st_dwithin(-37.81, 144.96, 2.0).collect();
+    let hits = db.collection("places").st_dwithin(-37.81, 144.96, 2000.0).collect();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].slug, "p2");
 }
@@ -1507,7 +1507,7 @@ fn insert_geometry_json_auto_parsed() {
 
     // Should be queryable via spatial SQL
     let hits = db.query(
-        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9694 -37.8180), 1.0)"
+        "SELECT * FROM places WHERE ST_DWithin(geometry, POINT(144.9694 -37.8180), 1000.0)"
     ).unwrap().collect();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].slug, "places/fed-square");
@@ -3283,10 +3283,10 @@ fn order_by_expr_st_distance_descending_proximity() {
     db.execute("INSERT INTO venues (_key, name, geometry) VALUES ('mc', 'Melbourne Central', '{\"type\":\"Point\",\"coordinates\":[144.9631,-37.8102]}')").unwrap();
     db.execute("INSERT INTO venues (_key, name, geometry) VALUES ('gs', 'Geelong Station', '{\"type\":\"Point\",\"coordinates\":[144.3617,-38.1499]}')").unwrap();
 
-    // Sort by negative ST_DISTANCE_KM from Flinders Street Station — ascending distance = descending score.
+    // Sort by negative ST_DISTANCE from Flinders Street Station — ascending distance = descending score.
     // fss itself has distance 0 (most negative negate = highest), geelong is furthest.
     let hits = db
-        .query("SELECT * FROM venues ORDER BY -ST_DISTANCE_KM(geometry, POINT(144.9671 -37.8183)) DESC")
+        .query("SELECT * FROM venues ORDER BY -ST_DISTANCE(geometry, POINT(144.9671 -37.8183)) DESC")
         .unwrap()
         .collect();
 
@@ -6921,7 +6921,7 @@ fn spatial_works_on_non_geometry_field_name() {
     db.execute(r#"INSERT INTO places (_key,geo) VALUES ('far','{"type":"Point","coordinates":[150.0,-40.0]}')"#).unwrap();
     db.execute("CREATE INDEX ON places USING spatial (geo)").unwrap();
 
-    let dwithin: Vec<_> = db.query("SELECT _key FROM places WHERE ST_DWithin(geo, POINT(144.96 -37.81), 5.0)").unwrap().collect();
+    let dwithin: Vec<_> = db.query("SELECT _key FROM places WHERE ST_DWithin(geo, POINT(144.96 -37.81), 5000.0)").unwrap().collect();
     assert_eq!(dwithin.len(), 1, "ST_DWithin must find the near point on a 'geo' field");
     assert_eq!(dwithin[0].payload.as_ref().unwrap()["_key"], "near");
 
@@ -6930,7 +6930,7 @@ fn spatial_works_on_non_geometry_field_name() {
     assert_eq!(within.len(), 1, "ST_Within must work on a 'geo' field");
 
     // Distance scoring already respected the field arg — confirm order
-    let order: Vec<String> = db.query("SELECT _key FROM places ORDER BY ST_DISTANCE_KM(geo, POINT(144.96 -37.81)) ASC")
+    let order: Vec<String> = db.query("SELECT _key FROM places ORDER BY ST_DISTANCE(geo, POINT(144.96 -37.81)) ASC")
         .unwrap().collect().into_iter().map(|h| h.payload.unwrap()["_key"].as_str().unwrap().to_string()).collect();
     assert_eq!(order, vec!["near", "far"]);
 }
@@ -7051,7 +7051,7 @@ fn match_where_function_filters_and_full_hybrid() {
     };
 
     // Spatial filter: excludes the distant node.
-    let s = keys(&db, "SELECT b._key AS k FROM MATCH (u:users)-[:visited]->(b:places) WHERE u._key='u1' AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5.0)");
+    let s = keys(&db, "SELECT b._key AS k FROM MATCH (u:users)-[:visited]->(b:places) WHERE u._key='u1' AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5000.0)");
     assert!(!s.contains(&"far".to_string()), "ST_DWithin must exclude the far node, got {s:?}");
     assert!(s.contains(&"p1".to_string()));
 
@@ -7061,11 +7061,11 @@ fn match_where_function_filters_and_full_hybrid() {
     assert_eq!(ts, vec!["p1","p2","p5"], "BM25 filter must keep only rust docs, got {t:?}");
 
     // Full hybrid: graph + spatial filter + text filter + hybrid rank.
-    let h = keys(&db, "SELECT b._key AS k FROM MATCH (u:users)-[:visited]->(b:places) WHERE u._key='u1' AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5.0) AND BM25(b.body,'rust') > 0.0 ORDER BY BM25_NORM(b.body,'rust')*0.5 + VECTOR_COSINE(b.emb,[0.9,0.1])*0.5 DESC");
+    let h = keys(&db, "SELECT b._key AS k FROM MATCH (u:users)-[:visited]->(b:places) WHERE u._key='u1' AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5000.0) AND BM25(b.body,'rust') > 0.0 ORDER BY BM25_NORM(b.body,'rust')*0.5 + VECTOR_COSINE(b.emb,[0.9,0.1])*0.5 DESC");
     assert_eq!(h.len(), 3, "3 near rust docs, got {h:?}");
     assert_eq!(h[0], "p1", "hybrid winner is p1, got {h:?}");
     // hidden columns stripped
-    let hit = db.query("SELECT b._key AS k FROM MATCH (u:users)-[:visited]->(b:places) WHERE u._key='u1' AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5.0) ORDER BY BM25_NORM(b.body,'rust') DESC").unwrap().collect();
+    let hit = db.query("SELECT b._key AS k FROM MATCH (u:users)-[:visited]->(b:places) WHERE u._key='u1' AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5000.0) ORDER BY BM25_NORM(b.body,'rust') DESC").unwrap().collect();
     let cols: Vec<String> = hit[0].payload.as_ref().unwrap().as_object().unwrap().keys().cloned().collect();
     assert_eq!(cols, vec!["k"], "hidden columns must be stripped, got {cols:?}");
 }
@@ -7101,7 +7101,7 @@ fn match_group_by_with_function_filter() {
     assert_eq!(all["cafe"], 4);
 
     // Spatial filter must exclude the distant cafe BEFORE grouping → cafe=3.
-    let near = counts(&db, "SELECT b.category AS category, COUNT(*) AS n FROM MATCH (r:regions)-[:contains]->(b:places) WHERE r._key='r1' AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5.0) GROUP BY b.category");
+    let near = counts(&db, "SELECT b.category AS category, COUNT(*) AS n FROM MATCH (r:regions)-[:contains]->(b:places) WHERE r._key='r1' AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5000.0) GROUP BY b.category");
     assert_eq!(near["cafe"], 3, "far cafe must be excluded pre-grouping");
     assert_eq!(near["bar"], 2);
     assert_eq!(near["shop"], 2);
@@ -7300,7 +7300,7 @@ fn search_view_multimodal_text_geo_vector() {
     // text: both serve the dish
     assert_eq!(ids(&db, "SELECT id FROM place_search WHERE BM25(text,'grilled chicken') > 0").len(), 2);
     // geo: only p1 is near
-    assert_eq!(ids(&db, "SELECT id FROM place_search WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5.0)"), vec!["p1"]);
+    assert_eq!(ids(&db, "SELECT id FROM place_search WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 5000.0)"), vec!["p1"]);
     // vector: nearest to p1's embedding is p1 (mirrored from source)
     assert_eq!(ids(&db, "SELECT id FROM place_search WHERE VECTOR_NEAR(embedding, [0.9,0.1,0.0,0.0], 1)"), vec!["p1"]);
 }
@@ -7489,4 +7489,26 @@ fn node_upsert_keeps_single_collection_membership() {
     }
     assert_eq!(kt_i64(&db, "SELECT COUNT(*) AS c FROM t"), 1);
     assert_eq!(kt_i64(&db, "SELECT v AS v FROM t WHERE _key='x'"), 19, "last write wins");
+}
+
+/// HNSW honours the distance metric it was built with: L2 vs cosine pick DIFFERENT
+/// nearest neighbours on the same data (regression for the L2/dot/L1 HNSW wiring).
+#[test]
+fn hnsw_metric_l2_vs_cosine() {
+    use sekejap::VecMetric;
+    let mut db = CoreDB::new();
+    db.put("v/a", r#"{"_collection":"v","_key":"a"}"#).unwrap();
+    db.put("v/b", r#"{"_collection":"v","_key":"b"}"#).unwrap();
+    // Query q=[1,0]. A=[3,0] same direction (cosine-nearest, but L2 dist 4).
+    // B=[1,0.2] slightly off-axis (L2-nearest, dist 0.04; cosine a bit worse).
+    db.put_vector("v/a", "emb", &[3.0, 0.0]).unwrap();
+    db.put_vector("v/b", "emb", &[1.0, 0.2]).unwrap();
+
+    db.build_hnsw_index_metric("emb", 16, 200, VecMetric::L2).unwrap();
+    let l2 = db.collection("v").vector_near("emb", vec![1.0, 0.0], 1).collect();
+    assert_eq!(l2[0].slug, "v/b", "L2-nearest is B");
+
+    db.build_hnsw_index_metric("emb", 16, 200, VecMetric::Cosine).unwrap();
+    let cos = db.collection("v").vector_near("emb", vec![1.0, 0.0], 1).collect();
+    assert_eq!(cos[0].slug, "v/a", "cosine-nearest is A (same direction)");
 }

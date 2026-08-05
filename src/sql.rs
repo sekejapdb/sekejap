@@ -753,7 +753,7 @@ enum CondExpr {
     StDWithin {
         lat: f64,
         lon: f64,
-        distance_km: f64,
+        distance_m: f64,
     },
     StContainsPoint {
         lat: f64,
@@ -772,15 +772,19 @@ enum CondExpr {
         field: String,
         lat: f64,
         lon: f64,
-        max_km: f64,
+        max_m: f64,
     },
     StLength {
         field: String,
-        min_km: f64,
+        min_m: f64,
+    },
+    StPerimeter {
+        field: String,
+        min_m: f64,
     },
     StArea {
         field: String,
-        min_km2: f64,
+        min_m2: f64,
     },
     Bm25Func {
         field: String,
@@ -1417,7 +1421,7 @@ impl Parser {
     }
 
     /// Parse a MATCH `WHERE` filter function on a hop variable:
-    /// `ST_DWithin(var.geo, POINT(lon lat), km)` or `BM25(var.field,'q') op n`.
+    /// `ST_DWithin(var.geo, POINT(lon lat), metres)` or `BM25(var.field,'q') op n`.
     fn parse_match_func_filter(&mut self) -> Result<crate::query::MatchFuncFilter, SqlError> {
         use crate::query::MatchFuncFilter;
         let name = self.expect_ident()?.to_ascii_uppercase();
@@ -1428,9 +1432,9 @@ impl Parser {
                 self.expect_comma()?;
                 let (lon, lat) = self.parse_point_literal()?;
                 self.expect_comma()?;
-                let km = self.expect_num()?;
+                let m = self.expect_num()?;
                 self.expect_rparen()?;
-                Ok(MatchFuncFilter::StDWithin { lat, lon, km })
+                Ok(MatchFuncFilter::StDWithin { lat, lon, m })
             }
             "BM25" => {
                 self.expect_lparen()?;
@@ -1450,7 +1454,7 @@ impl Parser {
     fn peek_is_score_fn(&self) -> bool {
         matches!(self.peek(), Tok::Ident(name) if matches!(name.to_ascii_uppercase().as_str(),
             "BM25" | "BM25_NORM" | "VECTOR_COSINE" | "VECTOR_L2" | "VECTOR_DOT"
-            | "VECTOR_L1" | "ST_DISTANCE_KM" | "SEARCH_SCORE"))
+            | "VECTOR_L1" | "ST_DISTANCE" | "SEARCH_SCORE"))
     }
 
     /// Consume an optional `ASC`/`DESC`; returns `true` for ascending (default).
@@ -1909,7 +1913,7 @@ impl Parser {
             let upper = ident.to_uppercase();
             if matches!(upper.as_str(),
                 "BM25" | "BM25_NORM" | "VECTOR_COSINE" | "VECTOR_L2"
-                | "VECTOR_DOT" | "VECTOR_L1" | "ST_DISTANCE_KM" | "SEARCH_SCORE"
+                | "VECTOR_DOT" | "VECTOR_L1" | "ST_DISTANCE" | "SEARCH_SCORE"
             ) {
                 // Back up so parse_score_expr can consume the ident
                 self.pos -= 1;
@@ -2503,6 +2507,7 @@ impl Parser {
                 | "ST_INTERSECTS"
                 | "ST_DISTANCE"
                 | "ST_LENGTH"
+                | "ST_PERIMETER"
                 | "ST_AREA"
         ) {
             return self.parse_spatial_function(&upper);
@@ -2613,7 +2618,7 @@ impl Parser {
 
         match func {
             "ST_DWITHIN" => {
-                // ST_DWithin(geometry, POINT(lon lat), distance)
+                // ST_DWithin(geometry, POINT(lon lat), distance_metres)
                 let (lon, lat) = self.parse_point_literal()?;
                 self.expect_comma()?;
                 let distance = self.expect_num()?;
@@ -2621,7 +2626,7 @@ impl Parser {
                 Ok(CondExpr::StDWithin {
                     lat,
                     lon,
-                    distance_km: distance,
+                    distance_m: distance,
                 })
             }
             "ST_CONTAINS" => {
@@ -2658,30 +2663,36 @@ impl Parser {
                 Ok(CondExpr::StIntersects { ring })
             }
             "ST_DISTANCE" => {
-                // ST_Distance(geometry, POINT(lon lat), max_km)
+                // ST_Distance(geometry, POINT(lon lat), max_metres)
                 // The field was already consumed by the shared prefix.
                 let (lon, lat) = self.parse_point_literal()?;
                 self.expect_comma()?;
-                let max_km = self.expect_num()?;
+                let max_m = self.expect_num()?;
                 self.expect_rparen()?;
                 Ok(CondExpr::StDistance {
                     field: geom_field,
                     lat,
                     lon,
-                    max_km,
+                    max_m,
                 })
             }
             "ST_LENGTH" => {
-                // ST_Length(geometry, min_km)
-                let min_km = self.expect_num()?;
+                // ST_Length(geometry, min_metres)
+                let min_m = self.expect_num()?;
                 self.expect_rparen()?;
-                Ok(CondExpr::StLength { field: geom_field, min_km })
+                Ok(CondExpr::StLength { field: geom_field, min_m })
+            }
+            "ST_PERIMETER" => {
+                // ST_Perimeter(geometry, min_metres)
+                let min_m = self.expect_num()?;
+                self.expect_rparen()?;
+                Ok(CondExpr::StPerimeter { field: geom_field, min_m })
             }
             "ST_AREA" => {
-                // ST_Area(geometry, min_km2)
-                let min_km2 = self.expect_num()?;
+                // ST_Area(geometry, min_square_metres)
+                let min_m2 = self.expect_num()?;
                 self.expect_rparen()?;
-                Ok(CondExpr::StArea { field: geom_field, min_km2 })
+                Ok(CondExpr::StArea { field: geom_field, min_m2 })
             }
             _ => Err(SqlError::UnexpectedToken {
                 expected: "spatial function",
@@ -2791,7 +2802,7 @@ impl Parser {
     ///             | VECTOR_L2 '(' ident ',' f32_array ')'
     ///             | VECTOR_DOT '(' ident ',' f32_array ')'
     ///             | VECTOR_L1 '(' ident ',' f32_array ')'
-    ///             | ST_DISTANCE_KM '(' ident ',' POINT '(' lon lat ')' ')'
+    ///             | ST_DISTANCE '(' ident ',' POINT '(' lon lat ')' ')'
     ///             | ident [ json_path_tail ]
     ///             | number
     /// ```
@@ -2933,8 +2944,8 @@ impl Parser {
                         self.expect_rparen()?;
                         Ok(ScoreExpr::VectorL1 { field, query })
                     }
-                    "ST_DISTANCE_KM" => {
-                        // ST_DISTANCE_KM(field, POINT(lon lat))
+                    "ST_DISTANCE" => {
+                        // ST_Distance(field, POINT(lon lat)) — metres, geodesic.
                         self.expect_lparen()?;
                         let field = self.expect_score_field()?;
                         self.expect_comma()?;
@@ -2950,7 +2961,7 @@ impl Parser {
                 }
             }
             other => Err(SqlError::UnexpectedToken {
-                expected: "score expression (number, field, BM25, SEARCH_SCORE, VECTOR_COSINE, VECTOR_L2, VECTOR_DOT, VECTOR_L1, ST_DISTANCE_KM, or parentheses)",
+                expected: "score expression (number, field, BM25, SEARCH_SCORE, VECTOR_COSINE, VECTOR_L2, VECTOR_DOT, VECTOR_L1, ST_DISTANCE, or parentheses)",
                 got: format!("{other:?}"),
             }),
         }
@@ -5784,8 +5795,8 @@ fn compile_cond(cond: CondExpr) -> Step {
         CondExpr::StDWithin {
             lat,
             lon,
-            distance_km,
-        } => Step::StDWithin(lat, lon, distance_km),
+            distance_m,
+        } => Step::StDWithin(lat, lon, distance_m),
         CondExpr::StContainsPoint { lat, lon } => Step::StContainsPoint(lat, lon),
         CondExpr::StWithin { ring } => Step::StWithin(ring),
         CondExpr::StContains { ring } => Step::StContains(ring),
@@ -5794,10 +5805,11 @@ fn compile_cond(cond: CondExpr) -> Step {
             field,
             lat,
             lon,
-            max_km,
-        } => Step::StDistance(field, lat, lon, max_km),
-        CondExpr::StLength { field, min_km } => Step::StLength(field, min_km),
-        CondExpr::StArea { field, min_km2 } => Step::StArea(field, min_km2),
+            max_m,
+        } => Step::StDistance(field, lat, lon, max_m),
+        CondExpr::StLength { field, min_m } => Step::StLength(field, min_m),
+        CondExpr::StPerimeter { field, min_m } => Step::StPerimeter(field, min_m),
+        CondExpr::StArea { field, min_m2 } => Step::StArea(field, min_m2),
         CondExpr::Bm25 {
             field,
             query,
@@ -5853,18 +5865,21 @@ fn append_tail(
     }
 }
 
-/// Returns true for any spatial CondExpr variant.
-fn is_spatial_cond(c: &CondExpr) -> bool {
+/// Spatial predicates that benefit from a grid *starter* (point-anchored radius/
+/// distance over a large point collection): the grid narrows millions of points to
+/// tens before any payload read.
+///
+/// Containment predicates (point-in-polygon and polygon–polygon) are deliberately
+/// EXCLUDED. Polygon collections are small (hundreds–tens of thousands), the grid's
+/// global cell size is dominated by the widest collection's extent (worldwide points
+/// → ~degrees-wide cells) so its candidate lookup degenerates to a near-linear scan,
+/// and the executor's FILTER path already does exact point-in-polygon via cached
+/// polygon rings (no payload read). So route containment through the default
+/// Collection-first plan → cheap exact filter over the collection's members.
+fn is_grid_starter_cond(c: &CondExpr) -> bool {
     matches!(
         c,
-        CondExpr::StDWithin { .. }
-            | CondExpr::StContainsPoint { .. }
-            | CondExpr::StWithin { .. }
-            | CondExpr::StContains { .. }
-            | CondExpr::StIntersects { .. }
-            | CondExpr::StDistance { .. }
-            | CondExpr::StLength { .. }
-            | CondExpr::StArea { .. }
+        CondExpr::StDWithin { .. } | CondExpr::StDistance { .. }
     )
 }
 
@@ -5939,11 +5954,13 @@ fn compile(stmt: SelectStmt) -> Vec<Step> {
     // (~thousands) and then filtering.  Emit spatial steps first with an empty
     // candidates list so they act as starters, then gate on _collection membership.
     if let Source::Collection(ref name) = source {
-        if conditions.iter().any(is_spatial_cond) {
+        if conditions.iter().any(is_grid_starter_cond) {
             let coll_name = name.clone();
-            // Partition once: spatial goes first (as starters), rest follows
+            // Partition once: grid-startable spatial conds go first (as starters),
+            // everything else (containment predicates + non-spatial filters) follows
+            // after the collection gate, running as cheap exact filters.
             let (spatial_conds, other_conds): (Vec<CondExpr>, Vec<CondExpr>) =
-                conditions.into_iter().partition(|c| is_spatial_cond(c));
+                conditions.into_iter().partition(|c| is_grid_starter_cond(c));
             for cond in spatial_conds {
                 steps.push(compile_cond(cond));
             }
@@ -5952,6 +5969,30 @@ fn compile(stmt: SelectStmt) -> Vec<Step> {
                 "_collection".to_string(),
                 Value::String(coll_name),
             ));
+            for cond in other_conds {
+                steps.push(compile_cond(cond));
+            }
+            push_group_having_distinct(&mut steps, group_by, having, distinct);
+            append_tail(&mut steps, order_by, offset, limit, fields, score_projections);
+            return steps;
+        }
+    }
+
+    // ── Fast-path 3: Collection + VECTOR_NEAR → HNSW starter ──────────────────────
+    //
+    // Fire the HNSW ANN index (a VectorNear starter with an empty candidate list) to
+    // get the approximate top-k, THEN gate on _collection membership — instead of
+    // loading the entire collection and exact-scanning it. Without this, a filtered
+    // top-k query silently bypasses the built HNSW and does an O(N) exact scan.
+    if let Source::Collection(ref name) = source {
+        if conditions.iter().any(|c| matches!(c, CondExpr::VectorNear { .. })) {
+            let coll_name = name.clone();
+            let (vec_conds, other_conds): (Vec<CondExpr>, Vec<CondExpr>) =
+                conditions.into_iter().partition(|c| matches!(c, CondExpr::VectorNear { .. }));
+            for cond in vec_conds {
+                steps.push(compile_cond(cond)); // VectorNear starter → HNSW
+            }
+            steps.push(Step::WhereEq("_collection".to_string(), Value::String(coll_name)));
             for cond in other_conds {
                 steps.push(compile_cond(cond));
             }
@@ -6742,6 +6783,7 @@ mod tests {
                 Step::StIntersects(..) => "StIntersects",
                 Step::StDistance(..) => "StDistance",
                 Step::StLength(..) => "StLength",
+                Step::StPerimeter(..) => "StPerimeter",
                 Step::StArea(..) => "StArea",
                 Step::VectorNear { .. } => "VectorNear",
                 Step::SearchFilter(..) => "SearchFilter",
@@ -7127,13 +7169,17 @@ mod tests {
         assert_eq!(step_names(&steps), ["StDWithin", "WhereEq"]);
     }
 
+    // Containment predicates (point-in-polygon, polygon–polygon) do NOT use the grid
+    // starter: they compile Collection-first and run as an exact filter over cached
+    // polygon rings. On a small polygon collection that beats a coarse-global-grid
+    // candidate scan (see is_grid_starter_cond). So the plan is [Collection, St*].
     #[test]
     fn parse_st_contains_point() {
         let steps = parse_and_compile(
             "SELECT * FROM zones WHERE ST_Contains(geometry, POINT(144.9631 -37.8136))",
         )
         .unwrap();
-        assert_eq!(step_names(&steps), ["StContainsPoint", "WhereEq"]);
+        assert_eq!(step_names(&steps), ["Collection", "StContainsPoint"]);
     }
 
     #[test]
@@ -7141,7 +7187,7 @@ mod tests {
         let steps = parse_and_compile(
             "SELECT * FROM places WHERE ST_Within(geometry, POLYGON((144.95 -37.80, 144.98 -37.80, 144.98 -37.83, 144.95 -37.83, 144.95 -37.80)))"
         ).unwrap();
-        assert_eq!(step_names(&steps), ["StWithin", "WhereEq"]);
+        assert_eq!(step_names(&steps), ["Collection", "StWithin"]);
     }
 
     #[test]
@@ -7149,7 +7195,7 @@ mod tests {
         let steps = parse_and_compile(
             "SELECT * FROM routes WHERE ST_Intersects(geometry, POLYGON((144.95 -37.80, 144.98 -37.80, 144.98 -37.83, 144.95 -37.83, 144.95 -37.80)))"
         ).unwrap();
-        assert_eq!(step_names(&steps), ["StIntersects", "WhereEq"]);
+        assert_eq!(step_names(&steps), ["Collection", "StIntersects"]);
     }
 
     #[test]
@@ -7157,7 +7203,7 @@ mod tests {
         let steps = parse_and_compile(
             "SELECT * FROM zones WHERE ST_Contains(geometry, POLYGON((144.96 -37.81, 144.97 -37.81, 144.97 -37.82, 144.96 -37.82, 144.96 -37.81)))"
         ).unwrap();
-        assert_eq!(step_names(&steps), ["StContains", "WhereEq"]);
+        assert_eq!(step_names(&steps), ["Collection", "StContains"]);
     }
 
     #[test]

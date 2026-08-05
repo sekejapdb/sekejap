@@ -484,7 +484,7 @@ fn skbin_spatial_projects_real_fields() {
     let dir = tempfile::tempdir().unwrap();
     seed_geo(dir.path());
     let db = CoreDB::open_with_config(dir.path(), skbin_cfg()).unwrap();
-    let hits = db.query("SELECT _key, name FROM places WHERE ST_DWithin(geometry, POINT(144.96 -37.81), 1.0)").unwrap().collect();
+    let hits = db.query("SELECT _key, name FROM places WHERE ST_DWithin(geometry, POINT(144.96 -37.81), 1000.0)").unwrap().collect();
     assert!(!hits.is_empty(), "spatial filter must match over SKBIN geometry");
     assert!(hits[0].payload.as_ref().unwrap()["name"].is_string(), "spatial result projects real name");
 }
