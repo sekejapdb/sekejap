@@ -42,6 +42,45 @@ use std::collections::HashMap;
 
 use super::dict::TermDict;
 use super::postings::{decode_postings_from_bytes, encode_postings_to_file, Posting};
+
+/// The compressed postings blob — the index's one large structure. Held either
+/// in RAM (ephemeral DBs) or **on disk** (disk-first): term ranges are read via
+/// `pread` at query time, so the blob never occupies process RAM. The term
+/// dictionary + doc arrays stay resident either way (small, needed for scoring).
+enum PostingsBlob {
+    Memory(Vec<u8>),
+    #[cfg(unix)]
+    Disk { file: std::fs::File, len: u64 },
+}
+
+impl PostingsBlob {
+    /// Read `[offset, offset+len)` of the blob. RAM: slice; disk: `pread` into an
+    /// owned buffer (kernel page cache, not process RSS).
+    fn read(&self, offset: u64, len: u32) -> Vec<u8> {
+        let (start, end) = (offset as usize, offset as usize + len as usize);
+        match self {
+            PostingsBlob::Memory(b) => {
+                if end > b.len() { return Vec::new(); }
+                b[start..end].to_vec()
+            }
+            #[cfg(unix)]
+            PostingsBlob::Disk { file, len: total } => {
+                if offset + len as u64 > *total { return Vec::new(); }
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; len as usize];
+                if file.read_exact_at(&mut buf, offset).is_err() { return Vec::new(); }
+                buf
+            }
+        }
+    }
+    fn mem_bytes(&self) -> usize {
+        match self {
+            PostingsBlob::Memory(b) => b.capacity(),
+            #[cfg(unix)]
+            PostingsBlob::Disk { .. } => 0, // on disk — not resident
+        }
+    }
+}
 use super::tokenizer::tokenize;
 
 /// BM25 term-frequency saturation factor.
@@ -126,7 +165,7 @@ pub struct Bm25Index {
     /// Concatenated, delta-encoded, varint-compressed postings for
     /// every indexed term.  Never rewritten during incremental
     /// operations; dead entries are reclaimed only on a full rebuild.
-    postings_bytes: Vec<u8>,
+    postings: PostingsBlob,
     /// Token count for each document, addressed by the slot index
     /// stored in `doc_id_to_idx`.  Slots belonging to deleted
     /// documents become unreachable orphans; each wastes exactly
@@ -150,6 +189,31 @@ pub struct Bm25Index {
 }
 
 impl Bm25Index {
+    /// Approximate resident RAM held by this index, in bytes: the compressed
+    /// postings blob + term dictionary + per-doc length array + id→slot map.
+    pub fn mem_bytes(&self) -> usize {
+        self.postings.mem_bytes()
+            + self.dict.mem_bytes()
+            + self.doc_lengths.capacity() * 4
+            + self.doc_id_to_idx.capacity() * (8 + 8 + 8)
+    }
+
+    /// Spill the postings blob to `path` and switch to disk-backed reads,
+    /// freeing the in-RAM blob. Makes the index **disk-first**: only the term
+    /// dictionary + doc arrays stay resident; postings are `pread` at query time.
+    #[cfg(unix)]
+    pub fn spill_to_disk(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        if let PostingsBlob::Memory(blob) = &self.postings {
+            let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
+            f.write_all(blob)?;
+            f.sync_all()?;
+            let len = blob.len() as u64;
+            self.postings = PostingsBlob::Disk { file: f, len };
+        }
+        Ok(())
+    }
+
     /// Build a BM25 index from a document iterator.
     ///
     /// `docs` yields `(doc_id, text)` pairs where `doc_id` is
@@ -243,7 +307,7 @@ impl Bm25Index {
         Self {
             meta,
             dict,
-            postings_bytes: all_postings,
+            postings: PostingsBlob::Memory(all_postings),
             doc_lengths,
             doc_id_to_idx,
             sum_doc_len,
@@ -479,12 +543,9 @@ impl Bm25Index {
 
     /// Decode the postings list for a term dictionary entry.
     fn get_postings(&self, entry: &super::dict::TermEntry) -> Vec<Posting> {
-        let start = entry.postings_offset as usize;
-        let end = start + entry.postings_len as usize;
-        if start >= self.postings_bytes.len() || end > self.postings_bytes.len() {
-            return Vec::new();
-        }
-        decode_postings_from_bytes(&self.postings_bytes[start..end])
+        let bytes = self.postings.read(entry.postings_offset, entry.postings_len);
+        if bytes.is_empty() { return Vec::new(); }
+        decode_postings_from_bytes(&bytes)
     }
 
     /// Look up the `doc_lengths` slot index for a given node hash.
