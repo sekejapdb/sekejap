@@ -1,0 +1,20 @@
+[package]
+name = "spatialbench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Spatial benchmark: sekejap vs PostGIS vs DuckDB(spatial). One engine per process.
+# An embedded DuckDB reads the parquet, reprojects NYC (UTM-18N → WGS84), serves geometry
+# to the other engines, AND computes the correctness oracle (expected answers).
+[dependencies]
+sekejap = { path = "../../.." }
+duckdb  = { version = "1", features = ["bundled"] }
+postgres = "0.19"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+
+# standalone crate — opt out of the repo root workspace
+[workspace]

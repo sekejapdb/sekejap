@@ -1,0 +1,10 @@
+engine,n,dim,m,efc,ef,k,build_ms,recall,qps,p50_ms,p99_ms,engine_ram_mb,vmrss_mb,vmhwm_mb
+sekejap-disk-int8,1000000,128,16,200,100,10,718209.4,0.9540,301.5,2.9980,7.9356,466.9,1266.8,3123.6
+sekejap-disk-int8,1000000,128,16,200,400,10,718209.4,0.9851,204.6,4.7556,9.7992,466.9,1266.8,3123.6
+sekejap-disk-int8,1000000,128,16,200,800,10,718209.4,0.9915,138.4,7.1343,12.9140,466.9,1266.8,3123.6
+# TRUE process RSS (standalone, no DuckDB, input freed) = 655.3 MB @ 1M.
+# engine_ram_mb (466.9) = the index data structures only (byte-exact CoreDB::memory_report):
+#   compact_index 262.7 (CSR graph + int8) + NodeData 140 + id-index 42 + misc 22. The ~188 MB
+#   remainder to 655 is Rust runtime + glibc allocator slack. vmrss_mb column below (1266.8) is the
+#   *vecbench* process (with DuckDB + SIFT base in RAM) — NOT representative; use 655 MB standalone.
+# vmhwm_mb = transient build peak.

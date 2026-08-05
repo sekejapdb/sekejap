@@ -1,0 +1,22 @@
+[package]
+name = "vecbench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# VECTOR benchmark: sekejap vs pgvector vs DuckDB-VSS vs Qdrant vs Weaviate vs
+# Elasticsearch. One engine per process. Dataset: SIFT1M (1M×128, L2) with exact
+# ground-truth 100-NN → recall@10 vs QPS at a common recall, + build time + RAM.
+[dependencies]
+sekejap  = { path = "../../.." }
+duckdb   = { version = "1", features = ["bundled"] }
+postgres = "0.19"
+ureq     = { version = "2", features = ["json"] }  # blocking HTTP for Qdrant/Weaviate/Elasticsearch
+redis    = "0.27"          # RESP client for Redis Stack / RediSearch (HNSW vector index)
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+
+# standalone crate — opt out of the repo root workspace
+[workspace]

@@ -1,0 +1,18 @@
+[package]
+name = "graphbench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Graph benchmark: sekejap (atomic + MATCH) vs Neo4j (Cypher/HTTP) vs ArangoDB (AQL/HTTP).
+# Neo4j + Arango are servers driven over their HTTP APIs via blocking `ureq` (no tokio).
+[dependencies]
+sekejap = { path = "../../.." }
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+
+# standalone crate — opt out of the repo root workspace
+[workspace]

@@ -1,0 +1,19 @@
+[package]
+name = "hybridmulti"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# HYBRID benchmark, MULTI-MODEL competitors: DuckDB (fts + vss) and
+# Postgres+pgvector (tsvector FTS + pgvector), each doing BM25 + dense + RRF fusion
+# in ONE system over the SAME FiQA corpus + SAME precomputed embeddings as sekejap.
+# No sekejap dep (sekejap's numbers come from `hybridbench`) → fast build.
+[dependencies]
+duckdb   = { version = "1", features = ["bundled"] }
+postgres = "0.19"
+
+[profile.release]
+opt-level = 3
+
+# standalone crate — opt out of the repo root workspace
+[workspace]
