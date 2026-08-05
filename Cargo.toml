@@ -45,6 +45,7 @@ fst        = { version = "0.4", features = ["levenshtein"] }
 memchr     = "2"
 chrono     = "0.4"
 uuid       = { version = "1", features = ["v4", "v5"] }
+rayon      = "1"
 object_store = { version = "0.14", optional = true, features = ["aws"] }
 tokio        = { version = "1",    optional = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 # Benchmark-only: SurrealDB embedded (SurrealKV, pure-Rust disk engine) for the
@@ -187,9 +188,10 @@ harness = false
 # name = "hybrid_query"
 # harness = false
 #
-# [[bench]]
-# name = "mega_benchmark"
-# harness = false
+[[bench]]
+name = "mega_benchmark"
+path = "benches/mega_benchmark.rs"
+harness = false
 #
 # [[bench]]
 # name = "vector_10k_4096"
