@@ -22,89 +22,214 @@ pub fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS_KM * c
 }
 
-/// Euclidean distance in degrees (fast, for small distances).
-fn euclidean_degrees(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    ((lat2 - lat1).powi(2) + (lon2 - lon1).powi(2)).sqrt()
+// ── Geodesic core (WGS84 ellipsoid — matches PostGIS `geography`) ─────────────
+//
+// PostGIS `geography` measures on the WGS84 ellipsoid in METRES / SQUARE METRES.
+// sekejap mirrors that exactly: distances via Vincenty's inverse formula (sub-mm
+// for all non-antipodal pairs) and polygon area via the authalic-sphere spherical
+// excess. All SQL-facing spatial measures (ST_Distance, ST_DWithin, ST_Perimeter,
+// ST_Area) are in these units so results equal PostGIS to float precision.
+
+/// WGS84 defining parameters.
+const WGS84_A: f64 = 6_378_137.0;                 // semi-major axis (m)
+const WGS84_F: f64 = 1.0 / 298.257_223_563;       // flattening
+/// WGS84 first eccentricity squared, e² = f(2−f).
+const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
+/// WGS84 authalic (equal-area) sphere radius (m) — the sphere with the same
+/// surface area as the ellipsoid; used for geodesic polygon area.
+const WGS84_AUTHALIC_R: f64 = 6_371_007.180_918_47;
+
+/// Authalic latitude (radians) for a geodetic latitude — the equal-area mapping
+/// onto the authalic sphere. Computing the spherical excess in authalic latitude
+/// (not geodetic) is what makes the sphere-based area equal the ellipsoid's, so it
+/// matches PostGIS `ST_Area(::geography)` rather than running ~0.12% low.
+fn authalic_lat(phi: f64) -> f64 {
+    let e2 = WGS84_E2;
+    let e = e2.sqrt();
+    let s = phi.sin();
+    // q(φ) = (1−e²)[ sinφ/(1−e²sin²φ) − 1/(2e)·ln((1−e·sinφ)/(1+e·sinφ)) ]
+    let q = |s: f64| {
+        (1.0 - e2) * (s / (1.0 - e2 * s * s) - (1.0 / (2.0 * e)) * ((1.0 - e * s) / (1.0 + e * s)).ln())
+    };
+    let qp = q(1.0); // q at the pole (sinφ = 1)
+    (q(s) / qp).clamp(-1.0, 1.0).asin()
+}
+
+/// Geodesic distance between two points in METRES on the WGS84 ellipsoid
+/// (Vincenty inverse). Matches PostGIS `ST_Distance(a::geography, b::geography)`.
+pub fn geodesic_distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let a = WGS84_A;
+    let f = WGS84_F;
+    let b = a * (1.0 - f);
+
+    let l = (lon2 - lon1).to_radians();
+    let u1 = ((1.0 - f) * lat1.to_radians().tan()).atan();
+    let u2 = ((1.0 - f) * lat2.to_radians().tan()).atan();
+    let (sin_u1, cos_u1) = (u1.sin(), u1.cos());
+    let (sin_u2, cos_u2) = (u2.sin(), u2.cos());
+
+    let mut lambda = l;
+    let mut sin_sigma = 0.0;
+    let mut cos_sigma = 0.0;
+    let mut sigma = 0.0;
+    let mut cos_sq_alpha = 0.0;
+    let mut cos2_sigma_m = 0.0;
+
+    for _ in 0..200 {
+        let (sin_lambda, cos_lambda) = (lambda.sin(), lambda.cos());
+        sin_sigma = ((cos_u2 * sin_lambda).powi(2)
+            + (cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_lambda).powi(2))
+        .sqrt();
+        if sin_sigma == 0.0 {
+            return 0.0; // coincident points
+        }
+        cos_sigma = sin_u1 * sin_u2 + cos_u1 * cos_u2 * cos_lambda;
+        sigma = sin_sigma.atan2(cos_sigma);
+        let sin_alpha = cos_u1 * cos_u2 * sin_lambda / sin_sigma;
+        cos_sq_alpha = 1.0 - sin_alpha * sin_alpha;
+        cos2_sigma_m = if cos_sq_alpha != 0.0 {
+            cos_sigma - 2.0 * sin_u1 * sin_u2 / cos_sq_alpha
+        } else {
+            0.0 // equatorial line
+        };
+        let c = f / 16.0 * cos_sq_alpha * (4.0 + f * (4.0 - 3.0 * cos_sq_alpha));
+        let lambda_prev = lambda;
+        lambda = l
+            + (1.0 - c)
+                * f
+                * sin_alpha
+                * (sigma
+                    + c * sin_sigma
+                        * (cos2_sigma_m + c * cos_sigma * (-1.0 + 2.0 * cos2_sigma_m * cos2_sigma_m)));
+        if (lambda - lambda_prev).abs() < 1e-12 {
+            break;
+        }
+    }
+
+    let u_sq = cos_sq_alpha * (a * a - b * b) / (b * b);
+    let cap_a = 1.0 + u_sq / 16384.0 * (4096.0 + u_sq * (-768.0 + u_sq * (320.0 - 175.0 * u_sq)));
+    let cap_b = u_sq / 1024.0 * (256.0 + u_sq * (-128.0 + u_sq * (74.0 - 47.0 * u_sq)));
+    let delta_sigma = cap_b
+        * sin_sigma
+        * (cos2_sigma_m
+            + cap_b / 4.0
+                * (cos_sigma * (-1.0 + 2.0 * cos2_sigma_m * cos2_sigma_m)
+                    - cap_b / 6.0
+                        * cos2_sigma_m
+                        * (-3.0 + 4.0 * sin_sigma * sin_sigma)
+                        * (-3.0 + 4.0 * cos2_sigma_m * cos2_sigma_m)));
+    b * cap_a * (sigma - delta_sigma)
+}
+
+/// Geodesic length of a `[lat, lon]` vertex path in METRES (sum of Vincenty edges).
+/// For a closed ring this is the perimeter. Matches PostGIS `ST_Perimeter`/`ST_Length`.
+pub fn geodesic_path_length_m(coords: &[[f64; 2]]) -> f64 {
+    coords
+        .windows(2)
+        .map(|w| geodesic_distance_m(w[0][0], w[0][1], w[1][0], w[1][1]))
+        .sum()
+}
+
+/// Geodesic area of a polygon ring (`[lat, lon]`) in SQUARE METRES, via the
+/// spherical excess on the WGS84 authalic sphere. Matches PostGIS
+/// `ST_Area(::geography)` to ~1e-5 relative for city-scale polygons. Sign is
+/// dropped (absolute area); the ring need not be explicitly closed.
+pub fn geodesic_ring_area_m2(ring: &[[f64; 2]]) -> f64 {
+    let n = ring.len();
+    if n < 3 {
+        return 0.0;
+    }
+    // L'Huilier / line-integral form of the spherical excess:
+    //   E = Σ 2·atan2( tan(Δλ/2)·(tan(φ1/2)+tan(φ2/2)), 1 + tan(φ1/2)·tan(φ2/2) )
+    let mut excess = 0.0;
+    for i in 0..n {
+        // Longitude stays geodetic; latitude → authalic so the excess yields the
+        // ellipsoid's area (matches PostGIS geography) not the sphere's.
+        let (lat1, lon1) = (authalic_lat(ring[i][0].to_radians()), ring[i][1].to_radians());
+        let j = (i + 1) % n;
+        let (lat2, lon2) = (authalic_lat(ring[j][0].to_radians()), ring[j][1].to_radians());
+        let d_lon = lon2 - lon1;
+        let t1 = (lat1 / 2.0).tan();
+        let t2 = (lat2 / 2.0).tan();
+        excess += 2.0 * ((d_lon / 2.0).tan() * (t1 + t2)).atan2(1.0 + t1 * t2);
+    }
+    (excess.abs()) * WGS84_AUTHALIC_R * WGS84_AUTHALIC_R
 }
 
 // ── Spatial measurements ─────────────────────────────────────────────────────
 
-/// Compute ST_Distance between two geometries in km (uses Haversine for points).
+/// `ST_Distance(a::geography, b::geography)` — geodesic distance in METRES on the
+/// WGS84 ellipsoid. Point-to-point is exact (Vincenty); for geometries with
+/// vertices it returns the minimum geodesic distance between any vertex pair.
 /// Returns None if either geometry is invalid.
-pub fn distance_km(geom1: &Value, geom2: &Value) -> Option<f64> {
+pub fn distance_m(geom1: &Value, geom2: &Value) -> Option<f64> {
     let coords1 = extract_geojson_coords(geom1);
     let coords2 = extract_geojson_coords(geom2);
     if coords1.is_empty() || coords2.is_empty() {
         return None;
     }
-
-    // For point-to-point, use Haversine
     if coords1.len() == 1 && coords2.len() == 1 {
-        return Some(haversine_km(
-            coords1[0][0],
-            coords1[0][1],
-            coords2[0][0],
-            coords2[0][1],
+        return Some(geodesic_distance_m(
+            coords1[0][0], coords1[0][1], coords2[0][0], coords2[0][1],
         ));
     }
-
-    // For general case, find minimum distance between any two points
     let mut min_dist = f64::MAX;
     for c1 in &coords1 {
         for c2 in &coords2 {
-            let d = euclidean_degrees(c1[0], c1[1], c2[0], c2[1]);
+            let d = geodesic_distance_m(c1[0], c1[1], c2[0], c2[1]);
             if d < min_dist {
                 min_dist = d;
             }
         }
     }
-    // Convert degrees to km (approximate at mid-latitudes)
-    Some(min_dist * 111.0)
+    Some(min_dist)
 }
 
-/// Compute ST_Length of a LineString in km.
-/// Returns None if geometry is not a LineString.
-pub fn length_km(geom: &Value) -> Option<f64> {
-    let coords = extract_geojson_coords(geom);
-    if coords.len() < 2 {
+/// `ST_Length(::geography)` — geodesic length of a LINESTRING in METRES.
+/// Per PostGIS, a Polygon has **zero** length (its boundary is `ST_Perimeter`);
+/// returns None for non-line geometries so a callers' `> x` filter excludes them.
+pub fn length_m(geom: &Value) -> Option<f64> {
+    match geom.get("type").and_then(|t| t.as_str()) {
+        Some("LineString") | Some("MultiLineString") => {
+            let coords = extract_geojson_coords(geom);
+            if coords.len() < 2 {
+                return Some(0.0);
+            }
+            Some(geodesic_path_length_m(&coords))
+        }
+        // Points, Polygons, MultiPolygons: length is 0 in PostGIS.
+        _ => Some(0.0),
+    }
+}
+
+/// `ST_Perimeter(::geography)` — geodesic perimeter of a Polygon/MultiPolygon in
+/// METRES (sum of each outer ring's closed geodesic boundary). None if not areal.
+pub fn perimeter_m(geom: &Value) -> Option<f64> {
+    let rings = extract_polygon_rings(geom);
+    if rings.is_empty() {
         return None;
     }
-
     let mut total = 0.0;
-    for i in 0..coords.len() - 1 {
-        total += haversine_km(
-            coords[i][0],
-            coords[i][1],
-            coords[i + 1][0],
-            coords[i + 1][1],
-        );
+    for ring in &rings {
+        total += geodesic_path_length_m(ring);
+        // Close the ring if the last vertex doesn't repeat the first.
+        if let (Some(first), Some(last)) = (ring.first(), ring.last()) {
+            if first != last {
+                total += geodesic_distance_m(last[0], last[1], first[0], first[1]);
+            }
+        }
     }
     Some(total)
 }
 
-/// Compute ST_Area of a Polygon in square km using Shoelace formula.
-/// Returns None if geometry is not a Polygon.
-pub fn area_km2(geom: &Value) -> Option<f64> {
-    let coords = extract_geojson_coords(geom);
-    if coords.len() < 3 {
+/// `ST_Area(::geography)` — geodesic area of a Polygon/MultiPolygon in SQUARE
+/// METRES on the WGS84 ellipsoid (sum of each part's outer ring). None if not areal.
+pub fn area_m2(geom: &Value) -> Option<f64> {
+    let rings = extract_polygon_rings(geom);
+    if rings.is_empty() {
         return None;
     }
-
-    // Shoelace formula works on [lon, lat] - returns area in degree-squared
-    let mut area_deg2 = 0.0;
-    let n = coords.len();
-    for i in 0..n {
-        let j = (i + 1) % n;
-        area_deg2 += coords[i][1] * coords[j][0]; // lon * next_lat
-        area_deg2 -= coords[j][1] * coords[i][0]; // next_lat * lon
-    }
-    area_deg2 = area_deg2.abs() / 2.0;
-
-    // Convert degree² to km² (at mid-latitude, 1 degree lat ≈ 111km, 1 degree lon ≈ 111km * cos(lat))
-    let avg_lat = coords.iter().map(|c| c[0]).sum::<f64>() / coords.len() as f64;
-    let lat_factor = 111.0;
-    let lon_factor = 111.0 * avg_lat.to_radians().cos();
-    Some(area_deg2 * lat_factor * lon_factor)
+    Some(rings.iter().map(|r| geodesic_ring_area_m2(r)).sum())
 }
 
 // ── Geometry field discovery ─────────────────────────────────────────────────
@@ -200,6 +325,9 @@ pub(crate) struct SpatialGrid {
     cell_size: f64,
     cells: HashMap<(i32, i32), Vec<u64>>,
     meta: HashMap<u64, SpatialMeta>,
+    /// Parsed polygon rings (`[[lat,lon],…]`) cached per node so point-in-polygon
+    /// tests never re-read + re-parse the GeoJSON payload from disk (the PIP hot path).
+    poly_rings: HashMap<u64, Vec<Vec<[f64; 2]>>>,
 }
 
 impl SpatialGrid {
@@ -211,6 +339,7 @@ impl SpatialGrid {
                 cell_size: 0.01,
                 cells: HashMap::new(),
                 meta: HashMap::new(),
+                poly_rings: HashMap::new(),
             };
         }
 
@@ -227,12 +356,22 @@ impl SpatialGrid {
         }
         let lat_range = max_lat - min_lat;
         let lon_range = max_lon - min_lon;
-        let cell_size = (lat_range.max(lon_range) / 100.0).max(0.001);
+        // Occupancy-based cell size. The old `extent / 100` tied cell size to the
+        // widest collection's extent, so a worldwide point set (~360° span) produced
+        // ~3.6°-wide cells (~400 km) — one cell swallowed an entire metropolitan
+        // cluster, and every grid lookup degenerated to a near-linear scan (a huge
+        // initial kNN ring, a giant radius box). Instead size cells to the DATA
+        // VOLUME: aim for a handful of nodes per cell (~n/4 non-empty cells) so a
+        // neighborhood scan touches tens of nodes regardless of global spread.
+        let n = collected.len().max(1);
+        let divisor = ((n as f64) / 4.0).sqrt().max(1.0);
+        let cell_size = (lat_range.max(lon_range) / divisor).clamp(0.0005, 1.0);
 
         let mut grid = Self {
             cell_size,
             cells: HashMap::new(),
             meta: HashMap::new(),
+            poly_rings: HashMap::new(),
         };
 
         for (hash, m) in collected {
@@ -266,6 +405,24 @@ impl SpatialGrid {
         self.meta.get(&hash)
     }
 
+    /// Number of nodes in the grid.
+    pub fn len(&self) -> usize {
+        self.meta.len()
+    }
+
+    /// Cache a node's parsed polygon rings (`[[lat,lon],…]`) for fast PIP.
+    pub fn cache_rings(&mut self, hash: u64, rings: Vec<Vec<[f64; 2]>>) {
+        if !rings.is_empty() {
+            self.poly_rings.insert(hash, rings);
+        }
+    }
+
+    /// `Some(true/false)` if this node has cached polygon rings — exact point-in-polygon
+    /// with zero payload reads. `None` if not cached (caller falls back to the payload).
+    pub fn contains_point(&self, hash: u64, lat: f64, lon: f64) -> Option<bool> {
+        self.poly_rings.get(&hash).map(|rings| rings.iter().any(|r| point_in_polygon(lat, lon, r)))
+    }
+
     /// Return candidate node hashes within `km` of `(lat, lon)`.
     pub fn candidates_within_distance(&self, lat: f64, lon: f64, km: f64) -> Vec<u64> {
         // Convert km to approximate degree range (conservative)
@@ -279,6 +436,107 @@ impl SpatialGrid {
             lat + lat_expand,
             lon + lon_expand,
         )
+    }
+
+    /// k nearest node hashes to `(lat, lon)`, ascending by haversine distance.
+    ///
+    /// Best-first ring expansion (the grid analog of an R-tree's Hjaltason–Samet
+    /// best-first search). We visit grid cells in growing square rings around the
+    /// query cell, keeping only the k closest seen so far in a bounded max-heap.
+    /// After each ring we compute a LOWER BOUND on the distance to any node in an
+    /// unsearched cell — the gap from the query point to the nearest edge of the
+    /// searched box. Once the heap holds k nodes and the k-th is closer than that
+    /// bound, no unsearched node can beat it, so we stop. Each node is scored at
+    /// most once (no re-scanning), and typical queries touch a handful of cells.
+    pub fn k_nearest(&self, lat: f64, lon: f64, k: usize) -> Vec<u64> {
+        if k == 0 || self.meta.is_empty() {
+            return Vec::new();
+        }
+        let cs = self.cell_size;
+        let cy0 = (lat / cs).floor() as i32;
+        let cx0 = (lon / cs).floor() as i32;
+        let coslat = lat.to_radians().cos().abs().max(0.01);
+
+        // Bounded max-heap: the root is the current farthest of the k best, so a new
+        // closer node evicts it. `Dist` orders by distance (NaN sinks to "largest").
+        #[derive(PartialEq)]
+        struct Dist(f64);
+        impl Eq for Dist {}
+        impl PartialOrd for Dist { fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) } }
+        impl Ord for Dist { fn cmp(&self, o: &Self) -> std::cmp::Ordering { self.0.total_cmp(&o.0) } }
+        let mut heap: std::collections::BinaryHeap<(Dist, u64)> = std::collections::BinaryHeap::new();
+
+        let mut seen = 0usize;
+        let total = self.meta.len();
+        let mut r = 0i32;
+        loop {
+            // Bound for cell-level pruning: once we hold k candidates, a cell whose
+            // nearest possible point is farther than the current k-th best cannot
+            // contain a closer node — skip scoring its nodes entirely. Computed once
+            // per ring (conservative: the true k-th only shrinks as we scan).
+            let bound = if heap.len() >= k { heap.peek().map(|(d, _)| d.0).unwrap_or(f64::INFINITY) } else { f64::INFINITY };
+            // Scan every cell at Chebyshev distance exactly `r` (the new ring).
+            let visit = |cy: i32, cx: i32, heap: &mut std::collections::BinaryHeap<(Dist, u64)>, seen: &mut usize| {
+                if let Some(hashes) = self.cells.get(&(cy, cx)) {
+                    // Nearest possible distance from the query to this cell's box.
+                    if bound.is_finite() {
+                        let dlat = if lat < cy as f64 * cs { cy as f64 * cs - lat }
+                                   else if lat > (cy + 1) as f64 * cs { lat - (cy + 1) as f64 * cs } else { 0.0 };
+                        let dlon = if lon < cx as f64 * cs { cx as f64 * cs - lon }
+                                   else if lon > (cx + 1) as f64 * cs { lon - (cx + 1) as f64 * cs } else { 0.0 };
+                        // Conservative metres-per-degree (110_000 < the true WGS84
+                        // minimum ≈110_574) → cell_min UNDER-estimates the geodesic
+                        // distance, so a cell is only ever pruned when it truly cannot
+                        // hold a closer node. Heap distances are geodesic metres.
+                        let cell_min = ((dlat * 110_000.0).powi(2) + (dlon * 110_000.0 * coslat).powi(2)).sqrt();
+                        if cell_min > bound { *seen += hashes.len(); return; }
+                    }
+                    for &h in hashes {
+                        if let Some(m) = self.meta.get(&h) {
+                            *seen += 1;
+                            let d = geodesic_distance_m(lat, lon, m.centroid_lat, m.centroid_lon);
+                            heap.push((Dist(d), h));
+                            if heap.len() > k { heap.pop(); }
+                        }
+                    }
+                }
+            };
+            if r == 0 {
+                visit(cy0, cx0, &mut heap, &mut seen);
+            } else {
+                for cx in (cx0 - r)..=(cx0 + r) {
+                    visit(cy0 - r, cx, &mut heap, &mut seen);
+                    visit(cy0 + r, cx, &mut heap, &mut seen);
+                }
+                for cy in (cy0 - r + 1)..=(cy0 + r - 1) {
+                    visit(cy, cx0 - r, &mut heap, &mut seen);
+                    visit(cy, cx0 + r, &mut heap, &mut seen);
+                }
+            }
+
+            // Lower bound on any unsearched node: distance from the query point to the
+            // nearest edge of the box of cells within Chebyshev distance `r`.
+            let box_min_lat = (cy0 - r) as f64 * cs;
+            let box_max_lat = (cy0 + r + 1) as f64 * cs;
+            let box_min_lon = (cx0 - r) as f64 * cs;
+            let box_max_lon = (cx0 + r + 1) as f64 * cs;
+            // Lower bound in geodesic metres (110_000 m/deg under-estimates the true
+            // minimum, so we never stop before the true k-nearest are settled).
+            let lb_m = ((lat - box_min_lat) * 110_000.0)
+                .min((box_max_lat - lat) * 110_000.0)
+                .min((lon - box_min_lon) * 110_000.0 * coslat)
+                .min((box_max_lon - lon) * 110_000.0 * coslat);
+
+            let kth = heap.peek().map(|(d, _)| d.0).unwrap_or(f64::INFINITY);
+            if (heap.len() >= k && kth <= lb_m) || seen >= total || r > 2000 {
+                break;
+            }
+            r += 1;
+        }
+
+        let mut v: Vec<(f64, u64)> = heap.into_iter().map(|(d, h)| (d.0, h)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v.into_iter().map(|(_, h)| h).collect()
     }
 
     /// Return candidate node hashes whose bbox overlaps the query bbox.
@@ -588,6 +846,12 @@ fn extract_polygon_rings(geom: &Value) -> Vec<Vec<[f64; 2]>> {
     }
 }
 
+/// Parse a payload's geometry into polygon rings (`[[lat,lon],…]`), for caching in the
+/// spatial grid. Empty if the geometry is not a Polygon/MultiPolygon.
+pub fn rings_from_payload(payload: &Value) -> Vec<Vec<[f64; 2]>> {
+    find_geometry(payload).map(extract_polygon_rings).unwrap_or_default()
+}
+
 // ── High-level predicates ────────────────────────────────────────────────────
 
 /// Node geometry contains query point (reverse geocoding).
@@ -801,6 +1065,36 @@ fn write_rings(buf: &mut Vec<u8>, rings: &Value) -> Option<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn geodesic_distance_vincenty_reference() {
+        // Unambiguous WGS84 references (exact by construction, no DMS rounding):
+        //   1° of longitude at the equator = a·π/180 = 111319.4908 m.
+        let deg_lon = geodesic_distance_m(0.0, 0.0, 0.0, 1.0);
+        assert!((deg_lon - 111319.4908).abs() < 0.01, "got {deg_lon}");
+        //   1° of latitude at the equator (meridian arc) = 110574.389 m.
+        let deg_lat = geodesic_distance_m(0.0, 0.0, 1.0, 0.0);
+        assert!((deg_lat - 110574.389).abs() < 0.05, "got {deg_lat}");
+        // Coincident points → 0.
+        assert_eq!(geodesic_distance_m(40.0, -73.0, 40.0, -73.0), 0.0);
+        // Sanity: Flinders Peak → Buninyong ≈ 54972 m (Vincenty's own test pair).
+        let d = geodesic_distance_m(-37.95103, 144.42487, -37.65282, 143.92650);
+        assert!((d - 54972.0).abs() < 2.0, "got {d}");
+    }
+
+    #[test]
+    fn geodesic_matches_postgis_geography() {
+        // Reference values captured from LIVE PostGIS `ST_*(::geography)` (WGS84).
+        // A 0.01°×0.01° cell at NYC (lat 40.70) and one point-to-point distance.
+        let poly = json!({"type":"Polygon","coordinates":[[
+            [-74.00,40.70],[-73.99,40.70],[-73.99,40.71],[-74.00,40.71],[-74.00,40.70]]]});
+        let a = area_m2(&poly).unwrap();
+        assert!((a - 938459.4059114456).abs() / 938459.406 < 1e-6, "area {a}");
+        let p = perimeter_m(&poly).unwrap();
+        assert!((p - 3911.147957345263).abs() / 3911.148 < 1e-6, "perim {p}");
+        let d = geodesic_distance_m(40.70, -74.00, 40.75, -73.95);
+        assert!((d - 6976.62506433).abs() < 0.001, "dist {d}");
+    }
 
     #[test]
     fn ewkb_point_matches_postgis() {
