@@ -87,11 +87,49 @@ pub enum EdgeMode {
     Compact,
 }
 
+/// Disk-first CSR adjacency for one direction: the edge records live in an
+/// mmap'd file (`adj_*_csr.bin`), and only a compact `node → (edge_offset, count)`
+/// index stays in RAM. `edges()` returns a zero-copy `&[Edge]` slice into the mmap
+/// (page cache, reclaimable), so 10M edges cost ~an offset map instead of ~550 MB.
+#[cfg(unix)]
+pub(crate) struct DiskAdj {
+    index: HashMap<u64, (u64, u32)>, // node → (edge index, count)
+    mmap: super::mmap::MmapView,
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl DiskAdj {
+    #[inline]
+    fn edges(&self, node: u64) -> Option<&[Edge]> {
+        let &(off, cnt) = self.index.get(&node)?;
+        if cnt == 0 { return Some(&[]); }
+        let byte_off = off as usize * std::mem::size_of::<Edge>();
+        let bytes = self.mmap.slice(byte_off, cnt as usize * std::mem::size_of::<Edge>())?;
+        // Safety: bytes come from mmap of edges written as [Edge] (same binary/layout);
+        // Edge is 24 B (8-aligned fields), records start at 24·i, mmap base is page-aligned.
+        Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const Edge, cnt as usize) })
+    }
+    /// Resident **heap** RAM: the node→offset index only. The edge blob is mmap'd
+    /// (reclaimable page cache, not heap), so it is deliberately excluded — this is
+    /// the bounded footprint the disk-first design guarantees.
+    fn mem_bytes(&self) -> usize {
+        self.index.capacity() * (8 + 8 + 8)
+    }
+}
+
 pub(crate) struct EdgeStore {
     /// Forward adjacency: from_hash → outgoing edges.
     fwd: HashMap<u64, Vec<Edge>>,
     /// Reverse adjacency: to_hash → incoming edges.
     rev: HashMap<u64, Vec<Edge>>,
+    /// Disk-first overlays. When `Some`, `fwd_edges`/`rev_edges` serve `&[Edge]`
+    /// slices from the mmap'd CSR file instead of the in-RAM HashMaps (which are
+    /// cleared after spill). Only the offset index stays resident.
+    #[cfg(unix)]
+    fwd_disk: Option<DiskAdj>,
+    #[cfg(unix)]
+    rev_disk: Option<DiskAdj>,
     /// edge_type_hash → human-readable name.
     type_names: HashMap<u64, String>,
     /// Metadata backend (the JSON bag — the slow lane).
@@ -195,6 +233,10 @@ impl EdgeStore {
             meta: MetaStore::Ram { metas: Vec::new() },
             columns: HashMap::new(),
             keyed: HashMap::new(),
+            #[cfg(unix)]
+            fwd_disk: None,
+            #[cfg(unix)]
+            rev_disk: None,
         }
     }
 
@@ -220,6 +262,10 @@ impl EdgeStore {
             },
             columns: HashMap::new(),
             keyed: HashMap::new(),
+            #[cfg(unix)]
+            fwd_disk: None,
+            #[cfg(unix)]
+            rev_disk: None,
         })
     }
 
@@ -246,6 +292,8 @@ impl EdgeStore {
                 },
                 columns: HashMap::new(),
                 keyed: HashMap::new(),
+                fwd_disk: None,
+                rev_disk: None,
             })
         } else {
             Self::new_compact(dir)
@@ -645,13 +693,71 @@ impl EdgeStore {
     /// Outgoing edges from `hash`.
     #[inline]
     pub fn fwd_edges(&self, hash: u64) -> Option<&[Edge]> {
+        #[cfg(unix)]
+        if let Some(d) = &self.fwd_disk { return d.edges(hash); }
         self.fwd.get(&hash).map(|v| v.as_slice())
     }
 
     /// Incoming edges to `hash`.
     #[inline]
     pub fn rev_edges(&self, hash: u64) -> Option<&[Edge]> {
+        #[cfg(unix)]
+        if let Some(d) = &self.rev_disk { return d.edges(hash); }
         self.rev.get(&hash).map(|v| v.as_slice())
+    }
+
+    /// Approximate resident RAM held by the adjacency (for profiling).
+    pub fn adjacency_mem_bytes(&self) -> usize {
+        #[cfg(unix)]
+        {
+            if self.fwd_disk.is_some() || self.rev_disk.is_some() {
+                return self.fwd_disk.as_ref().map_or(0, |d| d.mem_bytes())
+                    + self.rev_disk.as_ref().map_or(0, |d| d.mem_bytes());
+            }
+        }
+        let e = std::mem::size_of::<Edge>();
+        let ram = |m: &HashMap<u64, Vec<Edge>>| -> usize {
+            m.capacity() * (8 + 24) + m.values().map(|v| v.capacity() * e).sum::<usize>()
+        };
+        ram(&self.fwd) + ram(&self.rev)
+    }
+
+    /// **Disk-first spill**: write both adjacency directions to mmap'd CSR files
+    /// (`adj_fwd_csr.bin` / `adj_rev_csr.bin`) and serve `&[Edge]` slices from them,
+    /// freeing the in-RAM adjacency HashMaps. Only the node→offset index stays resident.
+    #[cfg(unix)]
+    pub fn spill_to_disk(&mut self, dir: &Path) -> io::Result<()> {
+        let fd = Self::build_csr(&self.fwd, &dir.join("adj_fwd_csr.bin"))?;
+        let rd = Self::build_csr(&self.rev, &dir.join("adj_rev_csr.bin"))?;
+        self.fwd = HashMap::new();
+        self.rev = HashMap::new();
+        self.fwd_disk = Some(fd);
+        self.rev_disk = Some(rd);
+        Ok(())
+    }
+
+    /// Serialise one adjacency map to `path` (concatenated `[Edge]` records,
+    /// per-node contiguous), mmap it, and return the disk-backed view.
+    #[cfg(unix)]
+    fn build_csr(map: &HashMap<u64, Vec<Edge>>, path: &Path) -> io::Result<DiskAdj> {
+        use std::io::Write;
+        let esz = std::mem::size_of::<Edge>();
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
+        let mut index: HashMap<u64, (u64, u32)> = HashMap::with_capacity(map.len());
+        let mut edge_i: u64 = 0;
+        let mut buf: Vec<u8> = Vec::with_capacity(map.values().map(|v| v.len()).sum::<usize>() * esz);
+        for (&node, edges) in map.iter() {
+            index.insert(node, (edge_i, edges.len() as u32));
+            // SAFETY: Edge is POD (u64/u64/u32) — serialise its raw bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(edges.as_ptr() as *const u8, edges.len() * esz) };
+            buf.extend_from_slice(bytes);
+            edge_i += edges.len() as u64;
+        }
+        (&file).write_all(&buf)?;
+        file.sync_all()?;
+        let mmap = super::mmap::MmapView::try_new(&file, buf.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "adjacency mmap failed"))?;
+        Ok(DiskAdj { index, mmap, _file: file })
     }
 
     /// Resolve metadata for an edge.  Returns `None` if the edge has no meta
