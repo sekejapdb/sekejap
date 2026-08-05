@@ -20,9 +20,10 @@ pub struct Hit {
 // ── VecMetric ─────────────────────────────────────────────────────────────────
 
 /// Which vector distance metric to use.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VecMetric {
     /// Cosine distance (`<=>`, `VECTOR_COSINE`). Lower = more similar.
+    #[default]
     Cosine,
     /// Squared Euclidean distance (`<->`, `VECTOR_L2`). Lower = closer.
     L2,
@@ -144,11 +145,13 @@ pub enum Step {
     StContains(Vec<[f64; 2]>),
     /// Node geometry intersects query polygon.
     StIntersects(Vec<[f64; 2]>),
-    /// Geometry distance to point < max_km.
+    /// Geometry distance to point < max_m (metres, geodesic).
     StDistance(String, f64, f64, f64),
-    /// Geometry length (LineString) > min_km.
+    /// Geometry length (LineString) > min_m (metres, geodesic; 0 for polygons).
     StLength(String, f64),
-    /// Geometry area (Polygon) > min_km2.
+    /// Geometry perimeter (Polygon boundary) > min_m (metres, geodesic).
+    StPerimeter(String, f64),
+    /// Geometry area (Polygon) > min_m2 (square metres, geodesic).
     StArea(String, f64),
 
     // ── Vector similarity ──────────────────────────────────────────────────
@@ -239,14 +242,15 @@ pub fn describe_step(step: &Step, db: &CoreDB) -> serde_json::Map<String, Value>
             let op = if *ci { "ILIKE" } else { "LIKE" };
             ("Filter", format!("{f} {op} '{p}'"))
         }
-        Step::StDWithin(lat, lon, km) => ("Spatial Filter", format!("ST_DWithin({lat},{lon},{km}km)")),
+        Step::StDWithin(lat, lon, m) => ("Spatial Filter", format!("ST_DWithin({lat},{lon},{m}m)")),
         Step::StContainsPoint(lat, lon) => ("Spatial Filter", format!("ST_Contains(POINT({lat},{lon}))")),
         Step::StWithin(_) => ("Spatial Filter", "ST_Within(polygon)".into()),
         Step::StContains(_) => ("Spatial Filter", "ST_Contains(polygon)".into()),
         Step::StIntersects(_) => ("Spatial Filter", "ST_Intersects(polygon)".into()),
-        Step::StDistance(f, lat, lon, km) => ("Spatial Filter", format!("ST_Distance({f},{lat},{lon}) < {km}km")),
-        Step::StLength(f, km) => ("Spatial Filter", format!("ST_Length({f}) > {km}km")),
-        Step::StArea(f, km2) => ("Spatial Filter", format!("ST_Area({f}) > {km2}km²")),
+        Step::StDistance(f, lat, lon, m) => ("Spatial Filter", format!("ST_Distance({f},{lat},{lon}) < {m}m")),
+        Step::StLength(f, m) => ("Spatial Filter", format!("ST_Length({f}) > {m}m")),
+        Step::StPerimeter(f, m) => ("Spatial Filter", format!("ST_Perimeter({f}) > {m}m")),
+        Step::StArea(f, m2) => ("Spatial Filter", format!("ST_Area({f}) > {m2}m²")),
         Step::VectorNear { field, k, .. } => ("Vector Scan", format!("{field} top-{k} nearest")),
         Step::SearchFilter(q, typo) => ("Search Filter",
             match typo { Some(n) => format!("SEARCH('{q}', typo => {n})"), None => format!("SEARCH('{q}')") }),
@@ -2326,7 +2330,7 @@ fn eval_score(
             let point = serde_json::json!({ "type": "Point", "coordinates": [lon, lat] });
             payload
                 .get(field)
-                .and_then(|geom| crate::geo::distance_km(geom, &point))
+                .and_then(|geom| crate::geo::distance_m(geom, &point))
                 .unwrap_or(f64::MAX)
         }
         ScoreExpr::Add(a, b) => rec!(a) + rec!(b),
@@ -2431,8 +2435,18 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::Collection(hash) => {
                 current_coll_hash = Some(*hash);
+                // Priority 0: spatial kNN — ORDER BY ST_DISTANCE_KM(field, POINT) LIMIT k.
+                // Grid best-first search; skips the O(N) distance scan + sort + take.
+                if let Some((knn, skips)) = db.spatial_knn_seed(*hash, remaining) {
+                    candidates = knn;
+                    for sj in skips { skip_set.insert(i + 1 + sj); }
+                // Priority 0.5: multi-field range intersection (axis-aligned box) —
+                // intersect btree range scans over ≥2 fields, zero payload reads.
+                } else if let Some((seeded, skips)) = db.btree_multi_range_seed(*hash, remaining) {
+                    candidates = seeded;
+                    for sj in skips { skip_set.insert(i + 1 + sj); }
                 // Priority 1: btree equality/range filter seed (most selective)
-                if let Some((seeded, skip_j, opt_skip_j2)) = db.btree_seed(*hash, remaining) {
+                } else if let Some((seeded, skip_j, opt_skip_j2)) = db.btree_seed(*hash, remaining) {
                     candidates = seeded;
                     // skip the step(s) consumed by the btree index
                     skip_set.insert(i + 1 + skip_j);
@@ -2950,45 +2964,36 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             // The no-grid fallback for a STARTER expands to all_hashes() and brute-
             // forces, which is slow but correct.  Production use should always call
             // `db.build_spatial_index()` before running spatial queries.
-            Step::StDWithin(lat, lon, distance_km) => {
+            Step::StDWithin(lat, lon, distance_m) => {
+                // ST_DWithin(field, POINT(lon lat), R metres) — geodesic (WGS84).
+                let dist_m = *distance_m;
+                // Grid prune is spherical/degree-based; inflate the metres→km radius 1%
+                // so it never excludes a point inside the true ellipsoidal radius.
+                let prune_km = dist_m / 1000.0 * 1.01;
                 if let Some(grid) = db.spatial_grid() {
-                    if candidates.is_empty() {
-                        // STARTER: grid → exact Haversine (no large collection scan)
-                        candidates = grid
-                            .candidates_within_distance(*lat, *lon, *distance_km)
-                            .into_iter()
-                            .filter(|&h| {
-                                grid.get_meta(h)
-                                    .map(|m| {
-                                        crate::geo::haversine_km(
-                                            m.centroid_lat,
-                                            m.centroid_lon,
-                                            *lat,
-                                            *lon,
-                                        ) <= *distance_km
-                                    })
-                                    .unwrap_or(false)
+                    let exact = |h: u64| -> bool {
+                        grid.get_meta(h)
+                            .map(|m| {
+                                crate::geo::geodesic_distance_m(
+                                    m.centroid_lat, m.centroid_lon, *lat, *lon,
+                                ) <= dist_m
                             })
+                            .unwrap_or(false)
+                    };
+                    if candidates.is_empty() {
+                        // STARTER: grid → exact geodesic (no large collection scan)
+                        candidates = grid
+                            .candidates_within_distance(*lat, *lon, prune_km)
+                            .into_iter()
+                            .filter(|&h| exact(h))
                             .collect();
                     } else {
                         // FILTER: intersect current candidates with grid result
                         let grid_set: HashSet<u64> = grid
-                            .candidates_within_distance(*lat, *lon, *distance_km)
+                            .candidates_within_distance(*lat, *lon, prune_km)
                             .into_iter()
                             .collect();
-                        candidates.retain(|h| grid_set.contains(h));
-                        candidates.retain(|&h| {
-                            grid.get_meta(h)
-                                .map(|m| {
-                                    crate::geo::haversine_km(
-                                        m.centroid_lat,
-                                        m.centroid_lon,
-                                        *lat,
-                                        *lon,
-                                    ) <= *distance_km
-                                })
-                                .unwrap_or(false)
-                        });
+                        candidates.retain(|&h| grid_set.contains(&h) && exact(h));
                     }
                 } else {
                     if candidates.is_empty() {
@@ -2998,7 +3003,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         db.get_payload(h)
                             .and_then(|p| crate::geo::extract_centroid(&p))
                             .map(|(clat, clon)| {
-                                crate::geo::haversine_km(clat, clon, *lat, *lon) <= *distance_km
+                                crate::geo::geodesic_distance_m(clat, clon, *lat, *lon) <= dist_m
                             })
                             .unwrap_or(false)
                     });
@@ -3006,29 +3011,30 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::StContainsPoint(lat, lon) => {
                 if let Some(grid) = db.spatial_grid() {
+                    // Exact point-in-polygon from the grid's cached rings (no payload
+                    // read); fall back to parsing the payload only for nodes without
+                    // cached rings.
+                    let exact = |h: u64| -> bool {
+                        match grid.contains_point(h, *lat, *lon) {
+                            Some(b) => b,
+                            None => db.get_payload(h)
+                                .map(|p| crate::geo::geom_contains_point(&p, *lat, *lon))
+                                .unwrap_or(false),
+                        }
+                    };
                     if candidates.is_empty() {
-                        // STARTER: grid → exact polygon check
+                        // STARTER (whole dataset): grid bbox candidates → exact check.
                         candidates = grid
                             .candidates_containing_point(*lat, *lon)
                             .into_iter()
-                            .filter(|&h| {
-                                db.get_payload(h)
-                                    .map(|p| crate::geo::geom_contains_point(&p, *lat, *lon))
-                                    .unwrap_or(false)
-                            })
+                            .filter(|&h| exact(h))
                             .collect();
                     } else {
-                        // FILTER
-                        let grid_set: HashSet<u64> = grid
-                            .candidates_containing_point(*lat, *lon)
-                            .into_iter()
-                            .collect();
-                        candidates.retain(|h| grid_set.contains(h));
-                        candidates.retain(|&h| {
-                            db.get_payload(h)
-                                .map(|p| crate::geo::geom_contains_point(&p, *lat, *lon))
-                                .unwrap_or(false)
-                        });
+                        // FILTER on an existing (usually small, e.g. one collection)
+                        // candidate set: exact PIP directly via cached rings. The grid
+                        // candidate scan is pure overhead here (coarse global cells scan
+                        // the whole cluster) and can also false-negative, so skip it.
+                        candidates.retain(|&h| exact(h));
                     }
                 } else {
                     if candidates.is_empty() {
@@ -3212,21 +3218,24 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::StDistance(field, lat, lon, max_km) => {
-                // ST_Distance(field, POINT(lon lat), max_km).
-                // Spatial-grid pre-filter (O(nearby cells)) → EXACT distance on the
-                // narrowed set. Falls back to a full scan when no grid is built
+                // ST_Distance(field, POINT(lon lat)) < max_m  (metres, geodesic).
+                // Spatial-grid pre-filter (O(nearby cells)) → EXACT geodesic distance on
+                // the narrowed set. Falls back to a full scan when no grid is built
                 // (build with `db.build_spatial_index()`). Result is identical either
                 // way — the grid only prunes which payloads we compute distance on.
+                let max_m = *max_km;
                 let point = serde_json::json!({ "type": "Point", "coordinates": [lon, lat] });
                 let exact = |h: u64| -> bool {
                     db.get_payload(h)
                         .and_then(|p| p.get(&**field).cloned())
-                        .and_then(|geom| crate::geo::distance_km(&geom, &point))
-                        .map(|d| d < *max_km)
+                        .and_then(|geom| crate::geo::distance_m(&geom, &point))
+                        .map(|d| d < max_m)
                         .unwrap_or(false)
                 };
                 if let Some(grid) = db.spatial_grid() {
-                    let near = grid.candidates_within_distance(*lat, *lon, *max_km);
+                    // Grid prune is spherical/degree-based; inflate the metres→km radius
+                    // 1% so it never excludes a point inside the true ellipsoidal radius.
+                    let near = grid.candidates_within_distance(*lat, *lon, max_m / 1000.0 * 1.01);
                     if candidates.is_empty() {
                         candidates = near.into_iter().filter(|&h| exact(h)).collect();
                     } else {
@@ -3240,41 +3249,98 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     candidates.retain(|&h| exact(h));
                 }
             }
-            Step::StLength(field, min_km) => {
-                // ST_Length(field) > min_km
+            Step::StLength(field, min_m) => {
+                // ST_Length(field) > min_m  (metres, geodesic; 0 for polygons)
                 if candidates.is_empty() {
                     candidates = db.all_hashes();
                 }
                 candidates.retain(|&h| {
                     db.get_payload(h)
                         .and_then(|p| p.get(&*field).cloned())
-                        .and_then(|geom| crate::geo::length_km(&geom))
-                        .map(|l| l > *min_km)
+                        .and_then(|geom| crate::geo::length_m(&geom))
+                        .map(|l| l > *min_m)
                         .unwrap_or(false)
                 });
             }
-            Step::StArea(field, min_km2) => {
-                // ST_Area(field) > min_km2
+            Step::StPerimeter(field, min_m) => {
+                // ST_Perimeter(field) > min_m  (metres, geodesic polygon boundary)
                 if candidates.is_empty() {
                     candidates = db.all_hashes();
                 }
                 candidates.retain(|&h| {
                     db.get_payload(h)
                         .and_then(|p| p.get(&*field).cloned())
-                        .and_then(|geom| crate::geo::area_km2(&geom))
-                        .map(|a| a > *min_km2)
+                        .and_then(|geom| crate::geo::perimeter_m(&geom))
+                        .map(|l| l > *min_m)
+                        .unwrap_or(false)
+                });
+            }
+            Step::StArea(field, min_m2) => {
+                // ST_Area(field) > min_m2  (square metres, geodesic)
+                if candidates.is_empty() {
+                    candidates = db.all_hashes();
+                }
+                candidates.retain(|&h| {
+                    db.get_payload(h)
+                        .and_then(|p| p.get(&*field).cloned())
+                        .and_then(|geom| crate::geo::area_m2(&geom))
+                        .map(|a| a > *min_m2)
                         .unwrap_or(false)
                 });
             }
             Step::VectorNear { field, query, k } => {
-                use crate::vector::{CosineDistance, Distance};
+                use crate::vector::{CosineDistance, DotProduct, L1Distance, L2Distance, Distance};
+                // Search with the SAME metric the HNSW index was built under.
+                let metric = db.hnsw_metric(field);
+                // Distance eval for the flat-scan fallback (lower = closer for
+                // L2/Cosine/L1; Dot is similarity so negate to keep ascending order).
+                let dist = |v: &[f32]| -> f32 { match metric {
+                    VecMetric::Cosine => CosineDistance::eval(query, v),
+                    VecMetric::L2     => L2Distance::eval(query, v),
+                    VecMetric::Dot    => -DotProduct::eval(query, v),
+                    VecMetric::L1     => L1Distance::eval(query, v),
+                }};
                 if let Some(field_vecs) = db.vector_field(field) {
+                    // ── Disk-first int8 two-stage (low-RAM) ───────────────────
+                    // Traverse the HNSW on int8 codes resident in RAM, then re-rank
+                    // the top k×oversample candidates against full-precision f32
+                    // read from disk. Only active for fields built disk-first.
+                    if candidates.is_empty() {
+                        if let (Some(qf), Some(hnsw)) = (db.quant_field(field), db.hnsw_index(field)) {
+                            use crate::vector::VectorAccess;
+                            let ef = db.hnsw_ef_search().unwrap_or((*k * 3).max(50)).max(*k);
+                            // int8 distances are noisier than f32, so traverse a WIDER
+                            // beam and re-rank more candidates from disk to recover recall.
+                            let oversample = 8; // read 8× candidates from disk for exact re-rank
+                            let trav_ef = ef.max(*k * oversample);
+                            let q_code = qf.quantize_query(query);
+                            let approx = hnsw.search_quant(&q_code, qf, *k * oversample, trav_ef);
+                            if !approx.is_empty() {
+                                let mut rescored: Vec<(u64, f32)> = approx
+                                    .iter()
+                                    .filter_map(|&id| field_vecs.get(id).map(|v| (id, dist(v))))
+                                    .collect();
+                                rescored.sort_by(|a, b| {
+                                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                rescored.truncate(*k);
+                                candidates = rescored.into_iter().map(|(id, _)| id).collect();
+                                continue;
+                            }
+                        }
+                    }
                     // ── HNSW fast path ────────────────────────────────────────
                     if candidates.is_empty() {
                         if let Some(hnsw) = db.hnsw_index(field) {
                             // HNSW STARTER: approximate search over all vectors.
-                            let ef = (*k * 3).max(50);
-                            let hits = hnsw.search::<CosineDistance, _>(query, field_vecs, *k, ef);
+                            // ef_search controls breadth (speed↔recall); overridable per session.
+                            let ef = db.hnsw_ef_search().unwrap_or((*k * 3).max(50)).max(*k);
+                            let hits = match metric {
+                                VecMetric::Cosine => hnsw.search::<CosineDistance, _>(query, field_vecs, *k, ef),
+                                VecMetric::L2     => hnsw.search::<L2Distance, _>(query, field_vecs, *k, ef),
+                                VecMetric::Dot    => hnsw.search::<DotProduct, _>(query, field_vecs, *k, ef),
+                                VecMetric::L1     => hnsw.search::<L1Distance, _>(query, field_vecs, *k, ef),
+                            };
                             // Only trust the index when it returns something. An empty
                             // result means a stale/unbuilt index (e.g. rows inserted after
                             // CREATE INDEX) — fall through to the exact scan below rather
@@ -3290,7 +3356,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         // STARTER: scan all vectors in this field
                         field_vecs
                             .iter()
-                            .map(|(h, v)| (h, CosineDistance::eval(query, v)))
+                            .map(|(h, v)| (h, dist(v)))
                             .collect()
                     } else {
                         // FILTER: re-rank only the existing candidates
@@ -3298,7 +3364,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         field_vecs
                             .iter()
                             .filter(|(h, _)| set.contains(h))
-                            .map(|(h, v)| (h, CosineDistance::eval(query, v)))
+                            .map(|(h, v)| (h, dist(v)))
                             .collect()
                     };
                     scored.sort_unstable_by(|a, b| {
@@ -4289,7 +4355,7 @@ pub enum WhereValue {
 #[derive(Clone, Debug)]
 pub enum MatchFuncFilter {
     /// Destination centroid within `km` of `(lat, lon)`.
-    StDWithin { lat: f64, lon: f64, km: f64 },
+    StDWithin { lat: f64, lon: f64, m: f64 },
     /// BM25 relevance of the destination on `field` for `query`, compared to `threshold`.
     Bm25 { field: String, query: String, op: CmpOp, threshold: f64 },
 }
@@ -5118,10 +5184,10 @@ fn filter_raw_by_func_filters(
     raw.into_iter().filter(|rp| {
         let dest = *rp.dest_per_hop.last().unwrap_or(&0);
         filters.iter().all(|f| match f {
-            MatchFuncFilter::StDWithin { lat, lon, km } => {
+            MatchFuncFilter::StDWithin { lat, lon, m: dist_m } => {
                 db.node_data(dest).map_or(false, |n| n.spatial_meta.as_ref()
-                    .map_or(false, |m| crate::geo::haversine_km(
-                        m.centroid_lat, m.centroid_lon, *lat, *lon) <= *km))
+                    .map_or(false, |sm| crate::geo::geodesic_distance_m(
+                        sm.centroid_lat, sm.centroid_lon, *lat, *lon) <= *dist_m))
             }
             MatchFuncFilter::Bm25 { field, query, op, threshold } => {
                 let s = bm25_maps.get(&(field.clone(), query.clone()))
@@ -6138,10 +6204,10 @@ pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
         hits.retain(|h| {
             let hash = hash_of(h);
             post_filters.iter().all(|f| match f {
-                MatchFuncFilter::StDWithin { lat, lon, km } => {
+                MatchFuncFilter::StDWithin { lat, lon, m: dist_m } => {
                     db.node_data(hash).map_or(false, |n| n.spatial_meta.as_ref()
-                        .map_or(false, |m| crate::geo::haversine_km(
-                            m.centroid_lat, m.centroid_lon, *lat, *lon) <= *km))
+                        .map_or(false, |sm| crate::geo::geodesic_distance_m(
+                            sm.centroid_lat, sm.centroid_lon, *lat, *lon) <= *dist_m))
                 }
                 MatchFuncFilter::Bm25 { field, query, op, threshold } => {
                     let s = bm25_maps.get(&(field.clone(), query.clone()))

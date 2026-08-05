@@ -10,9 +10,13 @@
 //! - [`HnswGraph`] — in-memory HNSW for approximate k-NN search
 
 pub mod access;
+pub mod compact;
 pub mod hnsw;
-pub use access::VectorAccess;
-pub use hnsw::HnswGraph;
+pub mod quant;
+pub use access::{QuantAccess, VectorAccess};
+pub use compact::CompactDiskIndex;
+pub use hnsw::{DenseVectors, HnswGraph};
+pub use quant::{l2_u8, QuantizedField, ScalarQuantizer};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;

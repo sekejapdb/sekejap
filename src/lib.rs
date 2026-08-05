@@ -43,7 +43,7 @@ pub mod vector;
 
 pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
 
-pub use query::{CmpOp, DestWhere, Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step, WhereValue, WithExpr, WithOutExpr, WithRow, WithStage};
+pub use query::{CmpOp, DestWhere, Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step, VecMetric, WhereValue, WithExpr, WithOutExpr, WithRow, WithStage};
 pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, FieldDef, FieldType, PreparedQuery, SqlError, TableSchema};
 pub use storage::edgestore::EdgeMode;
 pub use storage::wal::WalFormat;
@@ -591,6 +591,11 @@ pub struct CoreDB {
     /// Built explicitly via [`CoreDB::build_hnsw_index`].
     /// Secondary index — never affects the main store on error.
     hnsw_indexes: HashMap<String, vector::HnswGraph>,
+    /// **Disk-first int8 stores**: field_name → quantized codes (resident in RAM).
+    /// Present only for fields built via [`CoreDB::build_hnsw_index_disk`]; when set,
+    /// `VECTOR_NEAR` traverses on int8 in RAM and re-ranks from f32 on disk, so RAM
+    /// is ~4× smaller than holding f32. Absent = classic in-RAM-f32 path (unchanged).
+    quant_fields: HashMap<String, vector::QuantizedField>,
     /// Btree field indexes: (collection_hash, field_name) → ordered value → [node hashes].
     /// Built via `CREATE INDEX ON collection(field) USING btree`.
     /// Maintained incrementally on every put()/remove().
@@ -598,6 +603,14 @@ pub struct CoreDB {
     /// Build params for each HNSW index: field → (m, ef_construction).
     /// Populated by build_hnsw_index(); used to auto-rebuild on version mismatch.
     hnsw_params: HashMap<String, (usize, usize)>,
+    /// Distance metric each HNSW index was built with: field → VecMetric. The graph
+    /// encodes neighbours under one metric, so search MUST use the same one. Absent
+    /// ⇒ Cosine (back-compat with pre-metric indexes).
+    hnsw_metric: HashMap<String, crate::query::VecMetric>,
+    /// Optional override for HNSW search breadth (`ef_search`). `None` ⇒ the per-query
+    /// default `(k*3).max(50)`. Set higher to trade speed for recall (analogous to
+    /// pgvector's `SET hnsw.ef_search` / qdrant's `hnsw_ef`). Not persisted (session knob).
+    hnsw_ef_search: Option<usize>,
     /// Append-only byte slab for raw JSON payloads.
     /// All `NodeData` entries index into this store via `(payload_offset, payload_len)`.
     payload_store: PayloadStore,
@@ -788,8 +801,11 @@ impl CoreDB {
             materialized_views: HashMap::new(),
             vectors: HashMap::new(),
             hnsw_indexes: HashMap::new(),
+            quant_fields: HashMap::new(),
             field_indexes: HashMap::new(),
             hnsw_params: HashMap::new(),
+            hnsw_metric: HashMap::new(),
+            hnsw_ef_search: None,
             payload_store: PayloadStore::new(),
             replaying: false,
             pending_txn: None,
@@ -2108,8 +2124,14 @@ impl CoreDB {
             if filtered.is_empty() {
                 self.hnsw_indexes.remove(field);
             } else {
-                use vector::CosineDistance;
-                let graph = vector::HnswGraph::build::<CosineDistance, _>(&filtered, 16, 200);
+                use crate::query::VecMetric;
+                use vector::{CosineDistance, DotProduct, L1Distance, L2Distance};
+                let graph = match self.hnsw_metric(field) {
+                    VecMetric::Cosine => vector::HnswGraph::build::<CosineDistance, _>(&filtered, 16, 200),
+                    VecMetric::L2     => vector::HnswGraph::build::<L2Distance, _>(&filtered, 16, 200),
+                    VecMetric::Dot    => vector::HnswGraph::build::<DotProduct, _>(&filtered, 16, 200),
+                    VecMetric::L1     => vector::HnswGraph::build::<L1Distance, _>(&filtered, 16, 200),
+                };
                 self.hnsw_indexes.insert(field.to_string(), graph);
             }
         } else {
@@ -3574,6 +3596,7 @@ impl CoreDB {
                     version: HNSW_INDEX_VERSION,
                     m,
                     ef_construction: ef,
+                    metric: self.hnsw_metric(field),
                     graph: graph.clone(),
                 }
             })
@@ -3672,10 +3695,11 @@ impl CoreDB {
             for sh in hnsw_list {
                 if sh.version == HNSW_INDEX_VERSION {
                     self.hnsw_params.insert(sh.field.clone(), (sh.m, sh.ef_construction));
+                    self.hnsw_metric.insert(sh.field.clone(), sh.metric);
                     self.hnsw_indexes.insert(sh.field, sh.graph);
                 } else {
-                    // Version mismatch — rebuild from stored vectors.
-                    let _ = self.build_hnsw_index(&sh.field, sh.m, sh.ef_construction);
+                    // Version mismatch — rebuild from stored vectors with same metric.
+                    let _ = self.build_hnsw_index_metric(&sh.field, sh.m, sh.ef_construction, sh.metric);
                 }
             }
         }
@@ -5727,7 +5751,22 @@ impl CoreDB {
                 }
             }
         }
-        self.spatial_grid = Some(geo::SpatialGrid::build(items.into_iter()));
+        // Cache each polygon's parsed rings so point-in-polygon tests never re-read +
+        // re-parse the GeoJSON payload from disk (the PIP hot path). Only nodes with a
+        // non-degenerate bbox (i.e. real area, not points) can be polygons.
+        let polys: Vec<(u64, Vec<Vec<[f64; 2]>>)> = items
+            .iter()
+            .filter(|(_, m)| m.bbox_min_lat != m.bbox_max_lat || m.bbox_min_lon != m.bbox_max_lon)
+            .filter_map(|(h, _)| {
+                let rings = geo::rings_from_payload(&self.get_payload(*h)?);
+                (!rings.is_empty()).then_some((*h, rings))
+            })
+            .collect();
+        let mut grid = geo::SpatialGrid::build(items.into_iter());
+        for (h, rings) in polys {
+            grid.cache_rings(h, rings);
+        }
+        self.spatial_grid = Some(grid);
     }
 
     // ── Text index ─────────────────────────────────────────────────────────────
@@ -6041,12 +6080,20 @@ impl CoreDB {
         let hnsw_declared = self.schemas.values()
             .any(|s| s.indexes.vector.contains(&field.to_string()));
         if hnsw_declared {
+            use crate::query::VecMetric;
+            use vector::{CosineDistance, DotProduct, L1Distance, L2Distance};
             let (m, ef) = self.hnsw_params.get(field).copied().unwrap_or((16, 200));
+            let metric = self.hnsw_metric(field); // copy out before the &mut borrow
             let field_vecs = self.vectors.get(field).unwrap();
             let graph = self.hnsw_indexes
                 .entry(field.to_string())
                 .or_insert_with(|| vector::HnswGraph::empty(m));
-            graph.insert::<CosineDistance, _>(hash, field_vecs, ef);
+            match metric {
+                VecMetric::Cosine => graph.insert::<CosineDistance, _>(hash, field_vecs, ef),
+                VecMetric::L2     => graph.insert::<L2Distance, _>(hash, field_vecs, ef),
+                VecMetric::Dot    => graph.insert::<DotProduct, _>(hash, field_vecs, ef),
+                VecMetric::L1     => graph.insert::<L1Distance, _>(hash, field_vecs, ef),
+            }
         }
         Ok(hash)
     }
@@ -6128,6 +6175,133 @@ impl CoreDB {
                     .insert(format!("{}:{}", method, field), version);
             }
         }
+    }
+
+    /// Seed a `Collection` step for a k-nearest-neighbour query:
+    /// `ORDER BY ST_DISTANCE_KM(field, POINT(lon lat)) LIMIT k`. Grid-accelerated
+    /// best-first search returns the k nearest members directly, skipping the O(N)
+    /// distance scan + full sort + take. Returns `None` (normal path) for anything
+    /// that isn't a pure kNN — any filter/traversal step disqualifies it.
+    pub(crate) fn spatial_knn_seed(&self, coll_hash: u64, remaining: &[Step]) -> Option<(Vec<u64>, Vec<usize>)> {
+        let (mut sort_i, mut take_i, mut k) = (None, None, 0usize);
+        let (mut lat, mut lon) = (0.0f64, 0.0f64);
+        for (j, s) in remaining.iter().enumerate() {
+            match s {
+                // Match either sort direction — kNN is nearest-first by construction.
+                Step::SortByExpr { expr: crate::query::ScoreExpr::StDistance { lat: la, lon: lo, .. }, .. } => {
+                    sort_i = Some(j); lat = *la; lon = *lo;
+                }
+                Step::Take(n) => { take_i = Some(j); k = *n; }
+                Step::Select(_) | Step::ScoreProject(_) | Step::Skip(_) | Step::Distinct => {}
+                _ => return None, // any filter/traversal → not a pure kNN
+            }
+        }
+        let (si, ti) = (sort_i?, take_i?);
+        if k == 0 { return None; }
+        let grid = self.spatial_grid()?;
+        let total = grid.len();
+        let mut fetch = k;
+        loop {
+            let cand = grid.k_nearest(lat, lon, fetch);
+            let filtered: Vec<u64> = cand.into_iter()
+                .filter(|&h| self.node_data(h).map(|n| sk_hash(&n.collection)) == Some(coll_hash))
+                .collect();
+            if filtered.len() >= k || fetch >= total {
+                return Some((filtered.into_iter().take(k).collect(), vec![si, ti]));
+            }
+            fetch = (fetch * 4).min(total.max(k));
+        }
+    }
+
+    /// Seed a `Collection` step by INTERSECTING btree range scans over two or more
+    /// distinct indexed fields — the fast path for an axis-aligned box query such as
+    /// `WHERE lon BETWEEN … AND lat BETWEEN …`.
+    ///
+    /// Single-field `btree_seed` only indexes one axis, then reads a payload per
+    /// candidate to filter the other axis — O(strip) payload reads. Here every axis
+    /// with a btree becomes a range scan; we intersect the posting sets (smallest
+    /// first) entirely in the index, doing ZERO payload reads. Returns the intersected
+    /// candidates plus every consumed step index, or `None` when fewer than two
+    /// indexed fields carry a range (nothing to intersect → let the single-field seed
+    /// handle it). Scanning stops at the first non-filter step so it never intersects
+    /// range predicates that apply to a DIFFERENT node-set (e.g. across a traversal).
+    pub(crate) fn btree_multi_range_seed(
+        &self,
+        coll_hash: u64,
+        remaining: &[Step],
+    ) -> Option<(Vec<u64>, Vec<usize>)> {
+        use std::ops::Bound;
+        struct R {
+            field: String,
+            lo: Bound<FieldKey>,
+            hi: Bound<FieldKey>,
+            steps: Vec<usize>,
+        }
+        let mut ranges: Vec<R> = Vec::new();
+        let mut touch = |field: &str, lo: Option<Bound<FieldKey>>, hi: Option<Bound<FieldKey>>, j: usize| {
+            let slot = match ranges.iter_mut().find(|r| r.field == field) {
+                Some(r) => r,
+                None => {
+                    ranges.push(R { field: field.to_string(), lo: Bound::Unbounded, hi: Bound::Unbounded, steps: Vec::new() });
+                    ranges.last_mut().unwrap()
+                }
+            };
+            if let Some(b) = lo { slot.lo = b; }
+            if let Some(b) = hi { slot.hi = b; }
+            slot.steps.push(j);
+        };
+        for (j, step) in remaining.iter().enumerate() {
+            match step {
+                Step::WhereGte(f, v) => touch(f, Some(Bound::Included(FieldKey::from_f64(*v))), None, j),
+                Step::WhereGt(f, v)  => touch(f, Some(Bound::Excluded(FieldKey::from_f64(*v))), None, j),
+                Step::WhereLte(f, v) => touch(f, None, Some(Bound::Included(FieldKey::from_f64(*v))), j),
+                Step::WhereLt(f, v)  => touch(f, None, Some(Bound::Excluded(FieldKey::from_f64(*v))), j),
+                Step::WhereBetween(f, lo, hi) =>
+                    touch(f, Some(Bound::Included(FieldKey::from_f64(*lo))), Some(Bound::Included(FieldKey::from_f64(*hi))), j),
+                // Other row-preserving filters on the SAME collection are fine to scan
+                // past (we just don't consume them) — the ranges we collect still all
+                // apply to this collection's nodes with AND semantics.
+                Step::WhereEq(..) | Step::WhereNeq(..) | Step::WhereIn(..) | Step::Like(..)
+                | Step::WhereIsNull(..) | Step::ArrayContains(..) | Step::WhereNot(..)
+                | Step::WhereOr(..) => {}
+                // Anything else (graph traversal, GROUP BY, SORT, SELECT, set algebra,
+                // spatial/vector/search steps…) changes or reshapes the node-set. Ranges
+                // after such a boundary may apply to DIFFERENT nodes (e.g. the atomic API
+                // `.where_gte(a).forward(e).where_lte(b)`), so stop here — never intersect
+                // across it. This keeps the seed correct for every query shape.
+                _ => break,
+            }
+        }
+        ranges.retain(|r| self.field_index(coll_hash, &r.field).is_some());
+        if ranges.len() < 2 {
+            return None;
+        }
+        // Concatenated postings for each field's range (each node has one value per
+        // field → one key → no dupes within a field). Then intersect.
+        let mut postings: Vec<Vec<u64>> = ranges
+            .iter()
+            .filter_map(|r| {
+                let idx = self.field_index(coll_hash, &r.field)?;
+                Some(idx.range((r.lo.as_ref(), r.hi.as_ref()))
+                    .flat_map(|(_, ids)| ids.iter().copied())
+                    .collect::<Vec<u64>>())
+            })
+            .collect();
+        if postings.len() != ranges.len() {
+            return None;
+        }
+        postings.sort_by_key(|p| p.len());
+        // Build ONE hash set from the smallest range, then probe it while streaming
+        // each larger range — avoids materializing a hash set for the big sides.
+        let mut acc: std::collections::HashSet<u64> = postings[0].iter().copied().collect();
+        for p in &postings[1..] {
+            acc = p.iter().copied().filter(|h| acc.contains(h)).collect();
+            if acc.is_empty() {
+                break;
+            }
+        }
+        let skips: Vec<usize> = ranges.iter().flat_map(|r| r.steps.iter().copied()).collect();
+        Some((acc.into_iter().collect(), skips))
     }
 
     /// Try to seed the candidate list for a `Collection` step from a btree index.
@@ -6382,12 +6556,29 @@ impl CoreDB {
     /// - `ef_construction`: beam width during build (100–400; 200 is a good default)
     ///
     /// Returns `Err` if `field` has no stored vectors.
+    ///
+    /// Uses **cosine** distance. For L2/dot/L1 ANN use [`build_hnsw_index_metric`].
     pub fn build_hnsw_index(
         &mut self,
         field: &str,
         m: usize,
         ef_construction: usize,
     ) -> Result<(), String> {
+        self.build_hnsw_index_metric(field, m, ef_construction, crate::query::VecMetric::Cosine)
+    }
+
+    /// Build (or rebuild) an HNSW ANN index with an explicit distance `metric`
+    /// (cosine / L2 / dot / L1). The graph encodes neighbours under this metric, so
+    /// all searches on the field use the same one (stored in `hnsw_metric`).
+    pub fn build_hnsw_index_metric(
+        &mut self,
+        field: &str,
+        m: usize,
+        ef_construction: usize,
+        metric: crate::query::VecMetric,
+    ) -> Result<(), String> {
+        use crate::query::VecMetric;
+        use vector::{CosineDistance, DotProduct, L1Distance, L2Distance};
         // Ensure mmap covers any recently-appended vectors.
         #[cfg(unix)]
         if let Some(store) = self.vectors.get_mut(field) {
@@ -6398,15 +6589,114 @@ impl CoreDB {
             .get(field)
             .ok_or_else(|| format!("no vectors stored for field '{field}'"))?;
 
+        // Copy the field's vectors into ONE contiguous buffer first, then build over
+        // DENSE ids (0..n): distance evals + neighbour lookups become pure array
+        // indexing — no HashMap probes, no scattered pointer-chases. This removes the
+        // super-linear (cache-bound) build cost.
+        let dense = vector::DenseVectors::snapshot(field_vecs);
+        let (flat, dim, ids) = dense.parts();
+
         // Build entirely into a local — zero writes to self until this line.
-        let graph =
-            vector::HnswGraph::build::<CosineDistance, _>(field_vecs, m, ef_construction);
+        // Dispatch on the metric; each uses its already-SIMD-optimised kernel.
+        let graph = match metric {
+            VecMetric::Cosine => vector::HnswGraph::build_dense_parallel::<CosineDistance>(flat, dim, ids, m, ef_construction),
+            VecMetric::L2     => vector::HnswGraph::build_dense_parallel::<L2Distance>(flat, dim, ids, m, ef_construction),
+            VecMetric::Dot    => vector::HnswGraph::build_dense_parallel::<DotProduct>(flat, dim, ids, m, ef_construction),
+            VecMetric::L1     => vector::HnswGraph::build_dense_parallel::<L1Distance>(flat, dim, ids, m, ef_construction),
+        };
 
         // Atomic replace: old index (if any) is dropped here.
         self.hnsw_indexes.insert(field.to_string(), graph);
         self.hnsw_params.insert(field.to_string(), (m, ef_construction));
+        self.hnsw_metric.insert(field.to_string(), metric);
         Ok(())
     }
+
+    /// **Disk-first int8 HNSW build** — the low-RAM index (DiskANN/pgvector/Qdrant
+    /// pattern). The graph is built on **full-precision f32** for quality, then:
+    ///
+    /// 1. a global scalar quantizer is calibrated (0.5 %/99.5 % quantiles),
+    /// 2. every vector is quantized to **u8 codes kept resident in RAM** (4× smaller),
+    /// 3. the **f32 stays on disk** (the field's [`VectorStore`]) for re-ranking.
+    ///
+    /// Steady-state RAM ≈ `codes + graph` (e.g. ~190 MB for 1M×128) instead of the
+    /// ~2.4 GB the all-f32 path holds. `VECTOR_NEAR` then does int8 traversal + f32
+    /// re-rank automatically (see the query executor).
+    ///
+    /// L2 only (SIFT/Euclidean); other metrics fall back to the in-RAM path.
+    /// Requires a disk-backed store (an on-disk data directory) so f32 lives on disk.
+    pub fn build_hnsw_index_disk(
+        &mut self,
+        field: &str,
+        m: usize,
+        ef_construction: usize,
+        metric: crate::query::VecMetric,
+    ) -> Result<(), String> {
+        use crate::query::VecMetric;
+        use vector::L2Distance;
+        if !matches!(metric, VecMetric::L2) {
+            return Err("disk-first int8 index currently supports L2 only".into());
+        }
+        #[cfg(unix)]
+        if let Some(store) = self.vectors.get_mut(field) {
+            store.remap();
+        }
+        let field_vecs = self
+            .vectors
+            .get(field)
+            .ok_or_else(|| format!("no vectors stored for field '{field}'"))?;
+        if !field_vecs.is_disk() {
+            return Err("disk-first index needs a disk-backed store (open a data directory)".into());
+        }
+
+        // Build the graph on full precision (transient flat snapshot, freed after).
+        let dense = vector::DenseVectors::snapshot(field_vecs);
+        let (flat, dim, ids) = dense.parts();
+        let graph = vector::HnswGraph::build_dense_parallel::<L2Distance>(flat, dim, ids, m, ef_construction);
+
+        // Calibrate the quantizer from a sample of components (cheap, robust).
+        let mut sample: Vec<f32> = Vec::with_capacity(200_000);
+        let stride = (flat.len() / 200_000).max(1);
+        let mut i = 0;
+        while i < flat.len() {
+            sample.push(flat[i]);
+            i += stride;
+        }
+        let quantizer = vector::ScalarQuantizer::calibrate(&mut sample);
+
+        // Quantize every vector into the resident int8 store.
+        let mut qf = vector::QuantizedField::with_capacity(quantizer, dim, ids.len());
+        for (chunk_idx, &id) in ids.iter().enumerate() {
+            let off = chunk_idx * dim;
+            qf.insert(id, &flat[off..off + dim]);
+        }
+
+        // Atomic replace. f32 stays on disk in `self.vectors[field]`.
+        self.hnsw_indexes.insert(field.to_string(), graph);
+        self.hnsw_params.insert(field.to_string(), (m, ef_construction));
+        self.hnsw_metric.insert(field.to_string(), metric);
+        self.quant_fields.insert(field.to_string(), qf);
+        Ok(())
+    }
+
+    /// The int8 store for a disk-first field, if it was built that way.
+    pub(crate) fn quant_field(&self, field: &str) -> Option<&vector::QuantizedField> {
+        self.quant_fields.get(field)
+    }
+
+    /// The distance metric an HNSW index was built with (Cosine if unset).
+    pub(crate) fn hnsw_metric(&self, field: &str) -> crate::query::VecMetric {
+        self.hnsw_metric.get(field).copied().unwrap_or(crate::query::VecMetric::Cosine)
+    }
+
+    /// Override HNSW search breadth (`ef_search`) for all subsequent `VECTOR_NEAR`
+    /// queries. `Some(ef)` trades speed for recall; `None` restores the default
+    /// `(k*3).max(50)`. Session-only (not persisted). Analogous to pgvector's
+    /// `SET hnsw.ef_search` and qdrant's per-query `hnsw_ef`.
+    pub fn set_hnsw_ef_search(&mut self, ef: Option<usize>) { self.hnsw_ef_search = ef; }
+
+    /// Current `ef_search` override, if any.
+    pub(crate) fn hnsw_ef_search(&self) -> Option<usize> { self.hnsw_ef_search }
 
     // ── CREATE INDEX executor ──────────────────────────────────────────────────
 
@@ -7070,6 +7360,8 @@ struct SnapHnsw {
     m: usize,
     #[serde(default = "default_hnsw_ef")]
     ef_construction: usize,
+    #[serde(default)] // Cosine for pre-metric snapshots
+    metric: crate::query::VecMetric,
     graph: vector::HnswGraph,
 }
 fn default_hnsw_m()  -> usize { 16 }
@@ -7575,9 +7867,9 @@ mod hybrid_query_tests {
         }
 
         // Resident results first (sequential opens — single-writer lock).
-        let q_grid = "SELECT _key FROM place WHERE ST_DWithin(geometry, POINT(115.08 -8.83), 5.0) ORDER BY _key ASC";
+        let q_grid = "SELECT _key FROM place WHERE ST_DWithin(geometry, POINT(115.08 -8.83), 5000.0) ORDER BY _key ASC";
         let q_match = "SELECT b._key AS k FROM MATCH (a:tourist)-[:visited]->(b:place) \
-                       WHERE a._key='chloe' AND ST_DWithin(b.geometry, POINT(115.08 -8.83), 5.0)";
+                       WHERE a._key='chloe' AND ST_DWithin(b.geometry, POINT(115.08 -8.83), 5000.0)";
         let (r_grid, r_match) = {
             let resident = CoreDB::open(dir.path()).unwrap();
             let g: Vec<_> = resident.query(q_grid).unwrap().collect()

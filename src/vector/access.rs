@@ -38,3 +38,21 @@ impl VectorAccess for HashMap<u64, Vec<f32>> {
         HashMap::len(self)
     }
 }
+
+/// Zero-copy read access to **int8-quantized** codes for a single field.
+///
+/// The disk-first counterpart to [`VectorAccess`]: HNSW traversal reads compact
+/// u8 codes (resident in RAM) through this trait and ranks with the integer L2
+/// kernel, while full-precision f32 stays on disk for the final re-rank.
+pub trait QuantAccess {
+    /// Return the u8 code vector for `id`, or `None` if absent.
+    fn code(&self, id: u64) -> Option<&[u8]>;
+
+    /// Number of code vectors stored.
+    fn len(&self) -> usize;
+
+    /// Returns `true` if no codes are stored.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}

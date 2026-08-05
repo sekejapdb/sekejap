@@ -21,7 +21,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::vector::access::VectorAccess;
+use crate::vector::access::{QuantAccess, VectorAccess};
+use crate::vector::quant::l2_u8;
 use crate::vector::Distance;
 
 // ── Candidate types ───────────────────────────────────────────────────────────
@@ -182,6 +183,225 @@ impl HnswGraph {
         graph
     }
 
+    /// Fully-dense build: contiguous vector data + a `Vec`-indexed graph using
+    /// dense internal ids (0..n), so distance evals and neighbour lookups are pure
+    /// array indexing — NO `HashMap` probes and NO scattered pointer-chases (which
+    /// made the old `HashMap`-keyed build scale super-linearly once data exceeds
+    /// cache). `flat` is `n*dim` row-major; `ids[dense] = node hash`. The result is
+    /// converted back to the public `HashMap`-keyed graph. Same algorithm/params →
+    /// same recall as [`build`], just cache-friendly.
+    pub fn build_dense<D: Distance>(
+        flat: &[f32],
+        dim: usize,
+        ids: &[u64],
+        m: usize,
+        ef_construction: usize,
+    ) -> Self {
+        let n = ids.len();
+        let mut g = Self::new(m);
+        if n == 0 {
+            return g;
+        }
+        let m_max0 = 2 * m;
+        let level_mult = 1.0 / (m as f64).ln();
+        let vget = |a: u32| -> &[f32] { &flat[a as usize * dim..(a as usize + 1) * dim] };
+
+        // dense adjacency: node → layers → neighbour dense ids
+        let mut nodes: Vec<Vec<Vec<u32>>> = Vec::with_capacity(n);
+        let mut entry: (u32, usize) = (0, 0);
+
+        for i in 0..n as u32 {
+            let qv = vget(i);
+            let seed = ids[i as usize].wrapping_add((i as u64).wrapping_mul(6364136223846793005));
+            let level = (-random_unit(seed).ln() * level_mult) as usize;
+            nodes.push(vec![Vec::new(); level + 1]);
+            if i == 0 {
+                entry = (0, level);
+                continue;
+            }
+            let (mut cur, top) = entry;
+            let mut cur_d = D::eval(qv, vget(cur));
+            // Phase 1: greedy descent to level+1 (ef=1).
+            for l in ((level + 1)..=top).rev() {
+                loop {
+                    let mut improved = false;
+                    if let Some(nbs) = nodes[cur as usize].get(l) {
+                        for &nb in nbs {
+                            let d = D::eval(qv, vget(nb));
+                            if d < cur_d {
+                                cur_d = d;
+                                cur = nb;
+                                improved = true;
+                            }
+                        }
+                    }
+                    if !improved {
+                        break;
+                    }
+                }
+            }
+            // Phase 2: connect at each shared level.
+            for l in (0..=level.min(top)).rev() {
+                let cands = search_layer_dense::<D>(&nodes, flat, dim, qv, cur, ef_construction, l);
+                let m_l = if l == 0 { m_max0 } else { m };
+                let chosen = select_neighbors_dense::<D>(&cands, m_l, flat, dim);
+                nodes[i as usize][l] = chosen.clone();
+                // Back-links (+ prune the neighbour's list if over capacity).
+                for &nb in &chosen {
+                    let mm = if l == 0 { m_max0 } else { m };
+                    let layers = &mut nodes[nb as usize];
+                    if l < layers.len() {
+                        layers[l].push(i);
+                        if layers[l].len() > mm {
+                            let nbv = &flat[nb as usize * dim..(nb as usize + 1) * dim];
+                            let mut scored: Vec<(f32, u32)> = layers[l]
+                                .iter()
+                                .map(|&x| (D::eval(nbv, &flat[x as usize * dim..(x as usize + 1) * dim]), x))
+                                .collect();
+                            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+                            scored.truncate(mm);
+                            layers[l] = scored.into_iter().map(|(_, x)| x).collect();
+                        }
+                    }
+                }
+                if let Some(c) = cands.first() {
+                    cur = c.1;
+                }
+            }
+            if level > top {
+                entry = (i, level);
+            }
+        }
+
+        // Convert dense → public HashMap-keyed graph.
+        g.entry_point = Some((ids[entry.0 as usize], entry.1));
+        for i in 0..n {
+            let mapped: Vec<Vec<u64>> = nodes[i]
+                .iter()
+                .map(|layer| layer.iter().map(|&d| ids[d as usize]).collect())
+                .collect();
+            g.nodes.insert(ids[i], mapped);
+        }
+        g
+    }
+
+    /// Parallel dense build (rayon) — the same dense algorithm as [`build_dense`],
+    /// but inserts run concurrently across cores. Each node's adjacency is behind an
+    /// `RwLock`; a node picked as a neighbour before its own insert completes just
+    /// receives a back-link (merged, deduped — never overwritten), which HNSW tolerates.
+    /// Falls back to the sequential dense build below the rayon-overhead threshold.
+    pub fn build_dense_parallel<D: Distance>(
+        flat: &[f32],
+        dim: usize,
+        ids: &[u64],
+        m: usize,
+        ef_construction: usize,
+    ) -> Self {
+        use rayon::prelude::*;
+        use std::sync::RwLock;
+        let n = ids.len();
+        if n < 4000 {
+            return Self::build_dense::<D>(flat, dim, ids, m, ef_construction);
+        }
+        let m_max0 = 2 * m;
+        let level_mult = 1.0 / (m as f64).ln();
+        let vget = |a: u32| -> &[f32] { &flat[a as usize * dim..(a as usize + 1) * dim] };
+        // Precompute levels (deterministic per node hash → order-independent shape).
+        let levels: Vec<usize> = (0..n)
+            .map(|i| {
+                let seed = ids[i].wrapping_add((i as u64).wrapping_mul(6364136223846793005));
+                (-random_unit(seed).ln() * level_mult) as usize
+            })
+            .collect();
+        // Pre-allocate every node's (empty) layers behind a per-node lock.
+        let nodes: Vec<RwLock<Vec<Vec<u32>>>> =
+            (0..n).map(|i| RwLock::new(vec![Vec::new(); levels[i] + 1])).collect();
+        let entry = RwLock::new((0u32, levels[0]));
+
+        (1..n as u32).into_par_iter().for_each(|i| {
+            let qv = vget(i);
+            let level = levels[i as usize];
+            let (mut cur, top) = *entry.read().unwrap();
+            let mut cur_d = D::eval(qv, vget(cur));
+            // Phase 1: greedy descent (ef=1), reading neighbour lists under short locks.
+            for l in ((level + 1)..=top).rev() {
+                loop {
+                    let nbs = nodes[cur as usize].read().unwrap().get(l).cloned().unwrap_or_default();
+                    let mut improved = false;
+                    for nb in nbs {
+                        let d = D::eval(qv, vget(nb));
+                        if d < cur_d {
+                            cur_d = d;
+                            cur = nb;
+                            improved = true;
+                        }
+                    }
+                    if !improved {
+                        break;
+                    }
+                }
+            }
+            // Phase 2: connect at each shared level.
+            for l in (0..=level.min(top)).rev() {
+                let cands = search_layer_dense_locked::<D>(&nodes, flat, dim, qv, cur, ef_construction, l);
+                let m_l = if l == 0 { m_max0 } else { m };
+                let chosen = select_neighbors_dense::<D>(&cands, m_l, flat, dim);
+                // Merge my links (don't overwrite — a back-link may already be here).
+                {
+                    let mut me = nodes[i as usize].write().unwrap();
+                    for &c in &chosen {
+                        if !me[l].contains(&c) {
+                            me[l].push(c);
+                        }
+                    }
+                }
+                // Back-links (+ prune the neighbour's list if over capacity).
+                for &nb in &chosen {
+                    let mm = if l == 0 { m_max0 } else { m };
+                    let mut gnb = nodes[nb as usize].write().unwrap();
+                    if l < gnb.len() {
+                        if !gnb[l].contains(&i) {
+                            gnb[l].push(i);
+                        }
+                        if gnb[l].len() > mm {
+                            let nbv = &flat[nb as usize * dim..(nb as usize + 1) * dim];
+                            let mut scored: Vec<(f32, u32)> = gnb[l]
+                                .iter()
+                                .map(|&x| (D::eval(nbv, &flat[x as usize * dim..(x as usize + 1) * dim]), x))
+                                .collect();
+                            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+                            scored.truncate(mm);
+                            gnb[l] = scored.into_iter().map(|(_, x)| x).collect();
+                        }
+                    }
+                }
+                if let Some(c) = cands.first() {
+                    cur = c.1;
+                }
+            }
+            if level > top {
+                let mut e = entry.write().unwrap();
+                if level > e.1 {
+                    *e = (i, level);
+                }
+            }
+        });
+
+        // Convert dense → public HashMap-keyed graph.
+        let mut g = Self::new(m);
+        let (ep, eplvl) = *entry.read().unwrap();
+        g.entry_point = Some((ids[ep as usize], eplvl));
+        for i in 0..n {
+            let layers = nodes[i].read().unwrap();
+            let mapped: Vec<Vec<u64>> = layers
+                .iter()
+                .map(|layer| layer.iter().map(|&d| ids[d as usize]).collect())
+                .collect();
+            g.nodes.insert(ids[i], mapped);
+        }
+        g
+    }
+
     /// Search for the `k` approximate nearest neighbours to `query`.
     ///
     /// - `ef`: exploration factor (must be ≥ k; try `ef = k * 3` for good recall)
@@ -218,6 +438,43 @@ impl HnswGraph {
         results.into_iter().map(|c| c.id).collect()
     }
 
+    /// **Disk-first int8 traversal.** Same greedy-descent + beam search as
+    /// [`search`](Self::search), but distances are the integer L2 over u8 codes
+    /// held in RAM ([`QuantAccess`]) — no f32, no disk reads on the hot path.
+    ///
+    /// Returns the top `k` candidate ids ranked by *approximate* (quantized)
+    /// distance. Callers re-rank these against full-precision f32 from disk.
+    /// `q_code` is the query quantized with the field's calibration.
+    pub fn search_quant<Q: QuantAccess>(
+        &self,
+        q_code: &[u8],
+        codes: &Q,
+        k: usize,
+        ef: usize,
+    ) -> Vec<u64> {
+        let (mut ep_id, ep_level) = match self.entry_point {
+            Some(ep) => ep,
+            None => return vec![],
+        };
+
+        // Greedy descent through upper layers (ef=1).
+        for level in (1..=ep_level).rev() {
+            let cands = search_layer_quant(&self.nodes, q_code, ep_id, 1, level, codes);
+            if let Some(best) = cands.into_iter().min_by(|a, b| {
+                a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal)
+            }) {
+                ep_id = best.id;
+            }
+        }
+
+        // Beam search at layer 0.
+        let ef_actual = ef.max(k);
+        let mut results = search_layer_quant(&self.nodes, q_code, ep_id, ef_actual, 0, codes);
+        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+        results.truncate(k);
+        results.into_iter().map(|c| c.id).collect()
+    }
+
     /// Number of nodes in the graph.
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -231,6 +488,32 @@ impl HnswGraph {
     /// Returns the node ID of the current entry point, if any.
     pub fn entry_point_id(&self) -> Option<u64> {
         self.entry_point.map(|(id, _)| id)
+    }
+
+    /// Raw node adjacency (id → per-level neighbour ids) — for building a
+    /// compact CSR representation. Not for hot-path use.
+    pub(crate) fn raw_nodes(&self) -> &HashMap<u64, Vec<Vec<u64>>> {
+        &self.nodes
+    }
+
+    /// Raw entry point (id, level) — for compaction.
+    pub(crate) fn raw_entry(&self) -> Option<(u64, usize)> {
+        self.entry_point
+    }
+
+    /// Approximate RAM held by the graph, in bytes — for memory profiling.
+    /// Counts the node HashMap (keys + bucket overhead) and every per-node
+    /// `Vec<Vec<u64>>` (outer + inner Vec headers + neighbour-id capacity).
+    pub fn mem_bytes(&self) -> usize {
+        // HashMap: ~1.1× load factor; entry = 8-byte key + Vec<Vec<u64>> header (24).
+        let mut total = self.nodes.capacity() * (8 + 24 + 8 /*control byte + slack*/);
+        for layers in self.nodes.values() {
+            total += layers.capacity() * 24; // inner Vec<u64> headers
+            for lvl in layers {
+                total += lvl.capacity() * 8; // neighbour ids
+            }
+        }
+        total
     }
 
     /// Insert a single node into an existing HNSW graph in O(log n) time.
@@ -431,6 +714,56 @@ impl IterableVectors for HashMap<u64, Vec<f32>> {
     }
 }
 
+/// Contiguous, cache-friendly snapshot of a field's vectors for fast index BUILD.
+///
+/// The persistent store is a `HashMap<u64, Vec<f32>>` — one scattered heap
+/// allocation per vector. Building an HNSW does *billions* of random distance
+/// evaluations, so each read is a pointer-chase to a random heap Vec → a cache
+/// miss (this is why sekejap's build scaled super-linearly). We first copy every
+/// vector into ONE flat buffer and index it densely, turning every distance read
+/// into a contiguous slice. Same idea as hnswlib's dense `Vec<NodeId>` store and
+/// Qdrant's global-to-local id table.
+pub struct DenseVectors {
+    data: Vec<f32>,          // n * dim, contiguous
+    dim: usize,
+    ids: Vec<u64>,           // dense index → node hash
+    idx: HashMap<u64, u32>,  // node hash → dense index
+}
+
+impl DenseVectors {
+    /// Copy every vector from `src` into one contiguous buffer.
+    pub fn snapshot<V: IterableVectors>(src: &V) -> Self {
+        let mut data = Vec::new();
+        let mut ids = Vec::new();
+        let mut idx = HashMap::new();
+        let mut dim = 0usize;
+        for (id, v) in src.iter_vectors() {
+            if dim == 0 { dim = v.len(); }
+            idx.insert(id, ids.len() as u32);
+            ids.push(id);
+            data.extend_from_slice(v);
+        }
+        Self { data, dim, ids, idx }
+    }
+    /// Flat buffer + dense→hash id map (for the parallel builder).
+    pub fn parts(&self) -> (&[f32], usize, &[u64]) { (&self.data, self.dim, &self.ids) }
+}
+
+impl VectorAccess for DenseVectors {
+    fn get(&self, id: u64) -> Option<&[f32]> {
+        let i = *self.idx.get(&id)? as usize;
+        Some(&self.data[i * self.dim..(i + 1) * self.dim])
+    }
+    fn len(&self) -> usize { self.ids.len() }
+}
+
+impl IterableVectors for DenseVectors {
+    fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, &[f32])> + '_> {
+        let dim = self.dim;
+        Box::new(self.ids.iter().enumerate().map(move |(i, &id)| (id, &self.data[i * dim..(i + 1) * dim])))
+    }
+}
+
 // ── Module-level search helpers ───────────────────────────────────────────────
 
 /// Beam search restricted to one layer of the graph.
@@ -503,6 +836,71 @@ fn search_layer<D: Distance, V: VectorAccess>(
     out
 }
 
+/// Integer-distance twin of [`search_layer`] for the disk-first int8 path.
+///
+/// Identical beam search, but distance = [`l2_u8`] over u8 codes read from RAM.
+/// The integer sum (≤ dim·255² ≈ 8.3M for 128-d) is < 2²⁴, so casting to `f32`
+/// for the heap ordering is exact and lets us reuse `MinCand`/`MaxCand`.
+fn search_layer_quant<Q: QuantAccess>(
+    nodes: &HashMap<u64, Vec<Vec<u64>>>,
+    q_code: &[u8],
+    entry_point: u64,
+    ef: usize,
+    layer: usize,
+    codes: &Q,
+) -> Vec<MinCand> {
+    let d0 = match codes.code(entry_point) {
+        Some(c) => l2_u8(q_code, c) as f32,
+        None => return vec![],
+    };
+
+    let mut visited: HashSet<u64> = HashSet::new();
+    visited.insert(entry_point);
+
+    let mut to_visit: BinaryHeap<MinCand> = BinaryHeap::new();
+    to_visit.push(MinCand { id: entry_point, dist: d0 });
+    let mut results: BinaryHeap<MaxCand> = BinaryHeap::new();
+    results.push(MaxCand { id: entry_point, dist: d0 });
+
+    while let Some(MinCand { id, dist: c_dist }) = to_visit.pop() {
+        let worst = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+        if c_dist > worst && results.len() >= ef {
+            break;
+        }
+
+        let neighbours = nodes
+            .get(&id)
+            .and_then(|ls| ls.get(layer))
+            .map(|ns| ns.as_slice())
+            .unwrap_or(&[]);
+
+        for &nb in neighbours {
+            if !visited.insert(nb) {
+                continue;
+            }
+            let d = match codes.code(nb) {
+                Some(c) => l2_u8(q_code, c) as f32,
+                None => continue,
+            };
+            let worst = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+            if d < worst || results.len() < ef {
+                to_visit.push(MinCand { id: nb, dist: d });
+                results.push(MaxCand { id: nb, dist: d });
+                if results.len() > ef {
+                    results.pop();
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<MinCand> = results
+        .into_iter()
+        .map(|mc| MinCand { id: mc.id, dist: mc.dist })
+        .collect();
+    out.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+    out
+}
+
 /// Select up to `m` diverse neighbours using the paper's simple heuristic.
 ///
 /// Accepts a candidate whose closest already-selected neighbour is farther from
@@ -550,6 +948,134 @@ fn select_neighbors_heuristic<D: Distance, V: VectorAccess>(
     }
 
     result
+}
+
+// ── Dense build helpers (contiguous data + dense ids, no HashMap) ──────────────
+
+/// Beam search over one layer of the DENSE graph. `nodes[id][layer]` holds
+/// neighbour dense ids; vectors are read as `flat[id*dim..]`. Returns candidates
+/// sorted ascending by distance as `(dist, dense_id)`.
+fn search_layer_dense<D: Distance>(
+    nodes: &[Vec<Vec<u32>>],
+    flat: &[f32],
+    dim: usize,
+    query: &[f32],
+    ep: u32,
+    ef: usize,
+    layer: usize,
+) -> Vec<(f32, u32)> {
+    let vget = |a: u32| -> &[f32] { &flat[a as usize * dim..(a as usize + 1) * dim] };
+    let d0 = D::eval(query, vget(ep));
+    let mut visited: HashSet<u32> = HashSet::new();
+    visited.insert(ep);
+    let mut to_visit: BinaryHeap<MinCand> = BinaryHeap::new();
+    to_visit.push(MinCand { id: ep as u64, dist: d0 });
+    let mut results: BinaryHeap<MaxCand> = BinaryHeap::new();
+    results.push(MaxCand { id: ep as u64, dist: d0 });
+
+    while let Some(MinCand { id, dist: c_dist }) = to_visit.pop() {
+        let worst = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+        if c_dist > worst && results.len() >= ef {
+            break;
+        }
+        if let Some(nbs) = nodes[id as usize].get(layer) {
+            for &nb in nbs {
+                if !visited.insert(nb) {
+                    continue;
+                }
+                let d = D::eval(query, vget(nb));
+                let worst = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+                if d < worst || results.len() < ef {
+                    to_visit.push(MinCand { id: nb as u64, dist: d });
+                    results.push(MaxCand { id: nb as u64, dist: d });
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<(f32, u32)> = results.into_iter().map(|mc| (mc.dist, mc.id as u32)).collect();
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    out
+}
+
+/// Neighbour-selection heuristic (dense): keep a candidate only if no already-chosen
+/// neighbour is closer to it than the query is. `cands` sorted ascending by dist.
+fn select_neighbors_dense<D: Distance>(cands: &[(f32, u32)], m: usize, flat: &[f32], dim: usize) -> Vec<u32> {
+    let vget = |a: u32| -> &[f32] { &flat[a as usize * dim..(a as usize + 1) * dim] };
+    if cands.len() <= m {
+        return cands.iter().map(|c| c.1).collect();
+    }
+    let mut result: Vec<u32> = Vec::with_capacity(m);
+    let mut discarded: Vec<u32> = Vec::new();
+    'outer: for &(cd, cid) in cands {
+        if result.len() >= m {
+            break;
+        }
+        let cv = vget(cid);
+        for &sid in &result {
+            if D::eval(cv, vget(sid)) < cd {
+                discarded.push(cid);
+                continue 'outer;
+            }
+        }
+        result.push(cid);
+    }
+    for cid in discarded {
+        if result.len() >= m {
+            break;
+        }
+        result.push(cid);
+    }
+    result
+}
+
+/// Locked variant of [`search_layer_dense`] for the parallel builder: neighbour
+/// lists are read under a short per-node `RwLock` (cloned out so distance evals
+/// never hold the lock).
+fn search_layer_dense_locked<D: Distance>(
+    nodes: &[std::sync::RwLock<Vec<Vec<u32>>>],
+    flat: &[f32],
+    dim: usize,
+    query: &[f32],
+    ep: u32,
+    ef: usize,
+    layer: usize,
+) -> Vec<(f32, u32)> {
+    let vget = |a: u32| -> &[f32] { &flat[a as usize * dim..(a as usize + 1) * dim] };
+    let d0 = D::eval(query, vget(ep));
+    let mut visited: HashSet<u32> = HashSet::new();
+    visited.insert(ep);
+    let mut to_visit: BinaryHeap<MinCand> = BinaryHeap::new();
+    to_visit.push(MinCand { id: ep as u64, dist: d0 });
+    let mut results: BinaryHeap<MaxCand> = BinaryHeap::new();
+    results.push(MaxCand { id: ep as u64, dist: d0 });
+
+    while let Some(MinCand { id, dist: c_dist }) = to_visit.pop() {
+        let worst = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+        if c_dist > worst && results.len() >= ef {
+            break;
+        }
+        let nbs = nodes[id as usize].read().unwrap().get(layer).cloned().unwrap_or_default();
+        for nb in nbs {
+            if !visited.insert(nb) {
+                continue;
+            }
+            let d = D::eval(query, vget(nb));
+            let worst = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+            if d < worst || results.len() < ef {
+                to_visit.push(MinCand { id: nb as u64, dist: d });
+                results.push(MaxCand { id: nb as u64, dist: d });
+                if results.len() > ef {
+                    results.pop();
+                }
+            }
+        }
+    }
+    let mut out: Vec<(f32, u32)> = results.into_iter().map(|mc| (mc.dist, mc.id as u32)).collect();
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    out
 }
 
 /// Re-select neighbours for an existing node after its list grew too large.

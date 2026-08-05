@@ -334,6 +334,57 @@ impl VectorStore {
         }
     }
 
+    /// Read one vector by id via **pread** (owned copy, no mmap).
+    ///
+    /// For the disk-first re-rank path: disk pages served here go through the
+    /// kernel's reclaimable page cache, which is **not** counted in the process
+    /// RSS — unlike mmap-resident pages. This is what keeps f32 out of RAM.
+    pub fn get_owned(&self, id: u64) -> Option<Vec<f32>> {
+        match &self.inner {
+            VectorStoreInner::Memory { vecs } => vecs.get(&id).cloned(),
+            #[cfg(unix)]
+            VectorStoreInner::Disk { file, dim, index, .. } => {
+                use std::os::unix::fs::FileExt;
+                let &offset = index.get(&id)?;
+                let d = *dim as usize;
+                let data_offset = offset + RECORD_HEADER as u64;
+                let mut buf = vec![0u8; d * 4];
+                file.read_exact_at(&mut buf, data_offset).ok()?;
+                let mut out = vec![0f32; d];
+                for i in 0..d {
+                    out[i] = f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+                }
+                Some(out)
+            }
+        }
+    }
+
+    /// Release the mmap view (munmap), dropping its resident pages from RSS.
+    ///
+    /// Call after a disk-first build once traversal reads f32 no more: the graph
+    /// runs on int8 in RAM and re-rank uses [`get_owned`](Self::get_owned) (pread),
+    /// so the f32 mmap is pure dead RSS weight afterwards. No-op for memory mode.
+    #[cfg(unix)]
+    pub fn drop_mmap(&mut self) {
+        if let VectorStoreInner::Disk { mmap, .. } = &mut self.inner {
+            *mmap = None;
+        }
+    }
+
+    /// Approximate RAM held by this store (for memory profiling). In disk mode
+    /// this is the id→offset index + any resident mmap; the f32 lives on disk.
+    pub fn mem_bytes(&self) -> usize {
+        match &self.inner {
+            VectorStoreInner::Memory { vecs } => {
+                vecs.capacity() * (8 + 24) + vecs.values().map(|v| v.capacity() * 4).sum::<usize>()
+            }
+            #[cfg(unix)]
+            VectorStoreInner::Disk { index, mmap, .. } => {
+                index.capacity() * (8 + 8 + 8) + mmap.as_ref().map(|m| m.len()).unwrap_or(0)
+            }
+        }
+    }
+
     /// Whether this store is disk-backed.
     pub fn is_disk(&self) -> bool {
         match &self.inner {
