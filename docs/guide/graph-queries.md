@@ -6,7 +6,7 @@ Sekejap's query language is a **PostgreSQL-style dialect** (PostGIS spatial + pg
 SELECT DISTINCT b._key AS k        -- PostgreSQL: projection, DISTINCT
 FROM MATCH (a:users)-[r:visited]->(b:places)   -- Cypher: the graph pattern
 WHERE a._key = 'u1' AND b.rating > 4           -- PostgreSQL: filters
-  AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5.0)  -- PostGIS
+  AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5000.0)  -- PostGIS (metres)
 ORDER BY b.rating DESC LIMIT 10                 -- PostgreSQL
 ```
 
@@ -72,7 +72,7 @@ SELECT b.* FROM MATCH (a:users)-[r:visited]->(b:places)
 WHERE a._key = 'u1'                              -- node field
   AND b.rating >= 4                              -- destination field
   AND r.rating > 0.5                             -- edge attribute (see below)
-  AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5.0)  -- PostGIS spatial
+  AND ST_DWithin(b.geometry, POINT(144.96 -37.81), 5000.0)  -- PostGIS spatial (metres)
   AND BM25(b.description, 'coffee') > 0.0         -- text relevance
 ```
 
@@ -143,7 +143,7 @@ ORDER BY BM25_NORM(b.description, 'coffee') * 0.5
 LIMIT 10
 ```
 
-Scoring operators mirror pgvector: `VECTOR_COSINE` (`<=>`), `VECTOR_L2` (`<->`), `VECTOR_DOT` (`<#>`), `VECTOR_L1` (`<+>`); `BM25` / `BM25_NORM` for text; `ST_DISTANCE_KM` for spatial.
+Scoring operators mirror pgvector: `VECTOR_COSINE` (`<=>`), `VECTOR_L2` (`<->`), `VECTOR_DOT` (`<#>`), `VECTOR_L1` (`<+>`); `BM25` / `BM25_NORM` for text; `ST_DISTANCE` (metres) for spatial.
 
 ## `UNION`
 

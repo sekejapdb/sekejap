@@ -481,9 +481,9 @@ AND  OR  NOT
 
 Spatial
 ───────
-ST_DWithin(geometry, POINT(lon lat), km)
+ST_DWithin(geometry, POINT(lon lat), metres)
 ST_Contains / ST_Within / ST_Intersects
-ORDER BY -ST_DISTANCE_KM(geometry, POINT(lon lat)) DESC
+ORDER BY -ST_DISTANCE(geometry, POINT(lon lat)) DESC   -- metres
 
 Vector
 ──────
