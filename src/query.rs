@@ -4,7 +4,7 @@ use crate::{sk_hash, CoreDB, FieldKey};
 use crate::vector::VectorAccess;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
@@ -65,9 +65,10 @@ pub enum ScoreExpr {
     VectorDot { field: String, query: Vec<f32> },
     /// Manhattan distance: `VECTOR_L1(field, [vec])`. Lower = closer.
     VectorL1 { field: String, query: Vec<f32> },
-    /// Great-circle distance in km: `ST_DISTANCE_KM(field, POINT(lon lat))`.
+    /// Geodesic distance in **metres**: `ST_DISTANCE(field, POINT(lon lat))`.
     ///
-    /// Returns the Haversine distance from the node's geometry to the given point.
+    /// WGS84 ellipsoidal (Vincenty) distance from the node's geometry to the
+    /// given point — PostGIS `geography` semantics.
     /// Absent or non-GeoJSON fields → `f64::MAX` (very far away).
     StDistance { field: String, lat: f64, lon: f64 },
     /// `a + b`.
@@ -135,7 +136,7 @@ pub enum Step {
     Like(String, String, bool),
 
     // ── Spatial filters ───────────────────────────────────────────────────
-    /// Centroid within `distance_km` of `(lat, lon)`. Uses Haversine.
+    /// Centroid within `distance_m` (metres) of `(lat, lon)` — PostGIS geography semantics.
     StDWithin(f64, f64, f64),
     /// Node geometry contains query point (reverse geocoding).
     StContainsPoint(f64, f64),
@@ -298,13 +299,13 @@ pub fn explain_steps(db: &CoreDB, steps: &[Step]) -> Vec<Hit> {
                 let coll = steps.iter().find_map(|s| {
                     if let Step::Collection(h) = s { Some(*h) } else { None }
                 });
-                coll.and_then(|c| db.field_index(c, f)).is_some()
+                coll.map(|c| db.has_field_index(c, f)).unwrap_or(false)
             }
             Step::WhereBetween(f, _, _) => {
                 let coll = steps.iter().find_map(|s| {
                     if let Step::Collection(h) = s { Some(*h) } else { None }
                 });
-                coll.and_then(|c| db.field_index(c, f)).is_some()
+                coll.map(|c| db.has_field_index(c, f)).unwrap_or(false)
             }
             _ => false,
         };
@@ -450,15 +451,16 @@ impl<'db> Set<'db> {
 
     // ── Spatial filters ───────────────────────────────────────────────────
 
-    /// Keep nodes whose centroid is within `distance_km` of `(lat, lon)`.
-    pub fn st_dwithin(mut self, lat: f64, lon: f64, distance_km: f64) -> Self {
-        self.steps.push(Step::StDWithin(lat, lon, distance_km));
+    /// Keep nodes whose centroid is within `distance_m` **metres** of `(lat, lon)`
+    /// (PostGIS `geography` semantics — was kilometres before the geodesic re-basing).
+    pub fn st_dwithin(mut self, lat: f64, lon: f64, distance_m: f64) -> Self {
+        self.steps.push(Step::StDWithin(lat, lon, distance_m));
         self
     }
 
     /// Alias for [`st_dwithin`](Self::st_dwithin).
-    pub fn near(self, lat: f64, lon: f64, radius_km: f64) -> Self {
-        self.st_dwithin(lat, lon, radius_km)
+    pub fn near(self, lat: f64, lon: f64, radius_m: f64) -> Self {
+        self.st_dwithin(lat, lon, radius_m)
     }
 
     /// Keep nodes whose geometry contains the query point.
@@ -1005,20 +1007,20 @@ impl<'db> Set<'db> {
         };
 
         // Look up the btree for this (collection, field) pair.
-        let btree = self.db.field_index(collection_hash, gf)?;
+        let btree = self.db.field_index_ref(collection_hash, gf)?;
 
         // For aggregate args that aren't "*", verify btree indexes exist and
         // build hash→f64 reverse maps from those indexes.
         let mut arg_val_maps: HashMap<String, HashMap<u64, f64>> = HashMap::new();
         for af in &agg_fields {
             if af.arg == "*" { continue; }
-            let arg_idx = self.db.field_index(collection_hash, &af.arg)?;
+            let arg_idx = self.db.field_index_ref(collection_hash, &af.arg)?;
             if !arg_val_maps.contains_key(&af.arg) {
                 let mut m: HashMap<u64, f64> = HashMap::new();
-                for (key, node_hashes) in arg_idx.iter() {
-                    let val = CoreDB::field_key_to_value(key);
+                for (key, node_hashes) in arg_idx.iter_kv(false) {
+                    let val = CoreDB::field_key_to_value(&key);
                     if let Some(f) = val.as_f64() {
-                        for &h in node_hashes {
+                        for &h in &node_hashes {
                             m.insert(h, f);
                         }
                     }
@@ -1038,9 +1040,10 @@ impl<'db> Set<'db> {
             if agg_inner(f).is_none() { Some(field_output_key(f)) } else { None }
         });
         let mut rows: Vec<serde_json::Map<String, Value>> = btree
-            .iter()
+            .iter_kv(false)
+            .into_iter()
             .map(|(key, group_hashes)| {
-                let group_val = CoreDB::field_key_to_value(key);
+                let group_val = CoreDB::field_key_to_value(&key);
                 let mut map = serde_json::Map::new();
                 if let Some(ref alias) = group_alias {
                     map.insert(alias.clone(), group_val);
@@ -1059,7 +1062,7 @@ impl<'db> Set<'db> {
                     } else if let Some(vm) = arg_val_maps.get(&af.arg) {
                         let mut acc = AggAccum::new(&af.func, &af.arg);
                         acc.all_count = group_hashes.len();
-                        for &h in group_hashes {
+                        for &h in &group_hashes {
                             if let Some(&f) = vm.get(&h) {
                                 acc.count_notnull += 1;
                                 acc.sum += f;
@@ -1218,7 +1221,7 @@ impl<'db> Set<'db> {
             return None; // some column needs the payload → not covered
         }
         if limit == 0 { return Some(Vec::new()); }
-        let idx = self.db.field_index(coll, &field)?;
+        let idx = self.db.field_index_ref(coll, &field)?;
         let coll_name = self.db.collection_name(coll).map(|s| s.to_string()).unwrap_or_default();
 
         let mut hits: Vec<Hit> = Vec::with_capacity(limit.min(4096));
@@ -1241,10 +1244,8 @@ impl<'db> Set<'db> {
             }
             false
         };
-        if asc {
-            for (k, ids) in idx.iter() { if emit(&CoreDB::field_key_to_value(k), ids) { break; } }
-        } else {
-            for (k, ids) in idx.iter().rev() { if emit(&CoreDB::field_key_to_value(k), ids) { break; } }
+        for (k, ids) in idx.iter_kv(!asc) {
+            if emit(&CoreDB::field_key_to_value(&k), &ids) { break; }
         }
         Some(hits)
     }
@@ -1553,7 +1554,7 @@ impl<'db> Set<'db> {
                         // COUNT(DISTINCT) needs distinct-value tracking — the
                         // index accumulator can't do it, so scan payloads.
                         if func == "COUNTD" { break 'index_agg; }
-                        if arg != "*" && self.db.field_index(coll_hash, &arg).is_none() {
+                        if arg != "*" && !self.db.has_field_index(coll_hash, &arg) {
                             break 'index_agg; // no index for this arg
                         }
                         agg_infos.push(AggInfo { func, arg, out_key: field_output_key(f) });
@@ -1573,17 +1574,17 @@ impl<'db> Set<'db> {
                             Value::Number(serde_json::Number::from(total as i64)));
                         continue;
                     }
-                    let idx = match self.db.field_index(coll_hash, &info.arg) {
+                    let idx = match self.db.field_index_ref(coll_hash, &info.arg) {
                         Some(i) => i,
                         None => break 'index_agg,
                     };
                     let mut acc = AggAccum::new(&info.func, &info.arg);
                     acc.all_count = total;
                     // Iterate btree entries and accumulate for matching hashes.
-                    for (key, node_hashes) in idx.iter() {
-                        let val = CoreDB::field_key_to_value(key);
+                    for (key, node_hashes) in idx.iter_kv(false) {
+                        let val = CoreDB::field_key_to_value(&key);
                         if let Some(f) = val.as_f64() {
-                            for &h in node_hashes {
+                            for &h in &node_hashes {
                                 if hash_set.contains(&h) {
                                     acc.count_notnull += 1;
                                     acc.sum += f;
@@ -2378,7 +2379,7 @@ fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>> {
     if limit == 0 {
         return Some(Vec::new());
     }
-    let idx = db.field_index(coll, &field)?;
+    let idx = db.field_index_ref(coll, &field)?;
     // Walk the btree in the requested order, taking the first `limit` LIVE nodes.
     // Each key holds nodes sharing that value (ties keep insertion order).
     let mut out: Vec<u64> = Vec::with_capacity(limit.min(4096));
@@ -2388,14 +2389,8 @@ fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>> {
         }
         out.len() >= limit
     };
-    if asc {
-        for ids in idx.values() {
-            for &h in ids { if push(h, &mut out) { return Some(out); } }
-        }
-    } else {
-        for ids in idx.values().rev() {
-            for &h in ids { if push(h, &mut out) { return Some(out); } }
-        }
+    for (_, ids) in idx.iter_kv(!asc) {
+        for &h in &ids { if push(h, &mut out) { return Some(out); } }
     }
     Some(out)
 }
@@ -2435,8 +2430,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::Collection(hash) => {
                 current_coll_hash = Some(*hash);
-                // Priority 0: spatial kNN — ORDER BY ST_DISTANCE_KM(field, POINT) LIMIT k.
-                // Grid best-first search; skips the O(N) distance scan + sort + take.
+                // Priority 0: spatial kNN — ORDER BY ST_Distance(field, POINT) ASC LIMIT k.
+                // Grid-accelerated k-nearest; skips the O(N) distance scan + sort + take.
                 if let Some((knn, skips)) = db.spatial_knn_seed(*hash, remaining) {
                     candidates = knn;
                     for sj in skips { skip_set.insert(i + 1 + sj); }
@@ -2585,12 +2580,11 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     current_coll_hash,
                     FieldKey::from_json(value),
                 ) {
-                    if let Some(idx) = db.field_index(coll, field) {
+                    if let Some(idx) = db.field_index_ref(coll, field) {
                         let btree_set: HashSet<u64> = idx
-                            .get(&fk)
-                            .into_iter()
-                            .flat_map(|ids| ids.iter().copied())
-                            .collect();
+                            .get_eq(&fk)
+                            .map(|ids| ids.iter().copied().collect())
+                            .unwrap_or_default();
                         candidates.retain(|h| btree_set.contains(h));
                         // Skip payload reads entirely — done.
                     } else {
@@ -2659,11 +2653,11 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereGt(field, threshold) => {
                 if let Some(coll) = current_coll_hash {
-                    if let Some(idx) = db.field_index(coll, field) {
+                    if let Some(idx) = db.field_index_ref(coll, field) {
                         let lo = FieldKey::from_f64(*threshold);
                         let btree_set: HashSet<u64> = idx
-                            .range((std::ops::Bound::Excluded(lo), std::ops::Bound::Unbounded))
-                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .range_postings(std::ops::Bound::Excluded(&lo), std::ops::Bound::Unbounded)
+                            .into_iter()
                             .collect();
                         candidates.retain(|h| btree_set.contains(h));
                     } else {
@@ -2687,11 +2681,11 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereLt(field, threshold) => {
                 if let Some(coll) = current_coll_hash {
-                    if let Some(idx) = db.field_index(coll, field) {
+                    if let Some(idx) = db.field_index_ref(coll, field) {
                         let hi = FieldKey::from_f64(*threshold);
                         let btree_set: HashSet<u64> = idx
-                            .range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(hi)))
-                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .range_postings(std::ops::Bound::Unbounded, std::ops::Bound::Excluded(&hi))
+                            .into_iter()
                             .collect();
                         candidates.retain(|h| btree_set.contains(h));
                     } else {
@@ -2715,11 +2709,11 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereGte(field, threshold) => {
                 if let Some(coll) = current_coll_hash {
-                    if let Some(idx) = db.field_index(coll, field) {
+                    if let Some(idx) = db.field_index_ref(coll, field) {
                         let lo = FieldKey::from_f64(*threshold);
                         let btree_set: HashSet<u64> = idx
-                            .range(lo..)
-                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .range_postings(std::ops::Bound::Included(&lo), std::ops::Bound::Unbounded)
+                            .into_iter()
                             .collect();
                         candidates.retain(|h| btree_set.contains(h));
                     } else {
@@ -2743,11 +2737,11 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereLte(field, threshold) => {
                 if let Some(coll) = current_coll_hash {
-                    if let Some(idx) = db.field_index(coll, field) {
+                    if let Some(idx) = db.field_index_ref(coll, field) {
                         let hi = FieldKey::from_f64(*threshold);
                         let btree_set: HashSet<u64> = idx
-                            .range(..=hi)
-                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .range_postings(std::ops::Bound::Unbounded, std::ops::Bound::Included(&hi))
+                            .into_iter()
                             .collect();
                         candidates.retain(|h| btree_set.contains(h));
                     } else {
@@ -2771,12 +2765,12 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereBetween(field, lo, hi) => {
                 if let Some(coll) = current_coll_hash {
-                    if let Some(idx) = db.field_index(coll, field) {
+                    if let Some(idx) = db.field_index_ref(coll, field) {
                         let lo_key = FieldKey::from_f64(*lo);
                         let hi_key = FieldKey::from_f64(*hi);
                         let btree_set: HashSet<u64> = idx
-                            .range(lo_key..=hi_key)
-                            .flat_map(|(_, ids)| ids.iter().copied())
+                            .range_postings(std::ops::Bound::Included(&lo_key), std::ops::Bound::Included(&hi_key))
+                            .into_iter()
                             .collect();
                         candidates.retain(|h| btree_set.contains(h));
                     } else {
@@ -2800,10 +2794,10 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereIn(field, values) => {
                 if let Some(coll) = current_coll_hash {
-                    if let Some(idx) = db.field_index(coll, field) {
+                    if let Some(idx) = db.field_index_ref(coll, field) {
                         let btree_set: HashSet<u64> = values.iter()
                             .filter_map(|v| FieldKey::from_json(v))
-                            .flat_map(|fk| idx.get(&fk).into_iter().flat_map(|ids| ids.iter().copied()))
+                            .flat_map(|fk| idx.get_eq(&fk).map(|c| c.into_owned()).unwrap_or_default())
                             .collect();
                         candidates.retain(|h| btree_set.contains(h));
                     } else {
@@ -2981,14 +2975,12 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             .unwrap_or(false)
                     };
                     if candidates.is_empty() {
-                        // STARTER: grid → exact geodesic (no large collection scan)
                         candidates = grid
                             .candidates_within_distance(*lat, *lon, prune_km)
                             .into_iter()
                             .filter(|&h| exact(h))
                             .collect();
                     } else {
-                        // FILTER: intersect current candidates with grid result
                         let grid_set: HashSet<u64> = grid
                             .candidates_within_distance(*lat, *lon, prune_km)
                             .into_iter()
@@ -3010,31 +3002,34 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::StContainsPoint(lat, lon) => {
+                let _dbg = std::env::var("SK_DEBUG").is_ok();
+                let _t0 = std::time::Instant::now();
+                let _n_in = candidates.len();
+                let mut _n_cand = 0usize;
+                let mut _n_rings = 0usize;
                 if let Some(grid) = db.spatial_grid() {
-                    // Exact point-in-polygon from the grid's cached rings (no payload
-                    // read); fall back to parsing the payload only for nodes without
-                    // cached rings.
+                    // Exact PIP from the grid's cached rings (no payload read); fall back to
+                    // parsing the payload only for nodes without cached rings.
                     let exact = |h: u64| -> bool {
                         match grid.contains_point(h, *lat, *lon) {
                             Some(b) => b,
-                            None => db.get_payload(h)
-                                .map(|p| crate::geo::geom_contains_point(&p, *lat, *lon))
-                                .unwrap_or(false),
+                            None => db.get_payload(h).map(|p| crate::geo::geom_contains_point(&p, *lat, *lon)).unwrap_or(false),
                         }
                     };
                     if candidates.is_empty() {
                         // STARTER (whole dataset): grid bbox candidates → exact check.
-                        candidates = grid
-                            .candidates_containing_point(*lat, *lon)
-                            .into_iter()
-                            .filter(|&h| exact(h))
-                            .collect();
+                        let cands = grid.candidates_containing_point(*lat, *lon);
+                        _n_cand = cands.len();
+                        candidates = cands.into_iter().filter(|&h| exact(h)).collect();
+                        if _dbg { eprintln!("[SK_DEBUG] StContains STARTER n_in=0 grid_cands={} out={} {:?}", _n_cand, candidates.len(), _t0.elapsed()); }
                     } else {
-                        // FILTER on an existing (usually small, e.g. one collection)
-                        // candidate set: exact PIP directly via cached rings. The grid
-                        // candidate scan is pure overhead here (coarse global cells scan
-                        // the whole cluster) and can also false-negative, so skip it.
+                        // FILTER on an existing (usually small, e.g. one collection) candidate
+                        // set: exact PIP directly via cached rings. The grid candidate scan is
+                        // pure overhead here (coarse global cells scan the whole cluster) and
+                        // can also false-negative, so skip it.
+                        if _dbg { _n_rings = candidates.iter().filter(|&&h| grid.contains_point(h, *lat, *lon).is_some()).count(); }
                         candidates.retain(|&h| exact(h));
+                        if _dbg { eprintln!("[SK_DEBUG] StContains FILTER n_in={} cached_rings={}/{} out={} {:?}", _n_in, _n_rings, _n_in, candidates.len(), _t0.elapsed()); }
                     }
                 } else {
                     if candidates.is_empty() {
@@ -3217,13 +3212,13 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     });
                 }
             }
-            Step::StDistance(field, lat, lon, max_km) => {
+            Step::StDistance(field, lat, lon, max_m_arg) => {
                 // ST_Distance(field, POINT(lon lat)) < max_m  (metres, geodesic).
                 // Spatial-grid pre-filter (O(nearby cells)) → EXACT geodesic distance on
                 // the narrowed set. Falls back to a full scan when no grid is built
                 // (build with `db.build_spatial_index()`). Result is identical either
                 // way — the grid only prunes which payloads we compute distance on.
-                let max_m = *max_km;
+                let max_m = *max_m_arg;
                 let point = serde_json::json!({ "type": "Point", "coordinates": [lon, lat] });
                 let exact = |h: u64| -> bool {
                     db.get_payload(h)
@@ -3290,10 +3285,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::VectorNear { field, query, k } => {
                 use crate::vector::{CosineDistance, DotProduct, L1Distance, L2Distance, Distance};
-                // Search with the SAME metric the HNSW index was built under.
                 let metric = db.hnsw_metric(field);
-                // Distance eval for the flat-scan fallback (lower = closer for
-                // L2/Cosine/L1; Dot is similarity so negate to keep ascending order).
                 let dist = |v: &[f32]| -> f32 { match metric {
                     VecMetric::Cosine => CosineDistance::eval(query, v),
                     VecMetric::L2     => L2Distance::eval(query, v),
@@ -3301,28 +3293,19 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     VecMetric::L1     => L1Distance::eval(query, v),
                 }};
                 if let Some(field_vecs) = db.vector_field(field) {
-                    // ── Disk-first int8 two-stage (low-RAM) ───────────────────
-                    // Traverse the HNSW on int8 codes resident in RAM, then re-rank
-                    // the top k×oversample candidates against full-precision f32
-                    // read from disk. Only active for fields built disk-first.
+                    // Disk-first int8 two-stage: int8 traversal in RAM + f32 re-rank from disk.
                     if candidates.is_empty() {
-                        if let (Some(qf), Some(hnsw)) = (db.quant_field(field), db.hnsw_index(field)) {
-                            use crate::vector::VectorAccess;
+                        if let Some(ci) = db.compact_index(field) {
                             let ef = db.hnsw_ef_search().unwrap_or((*k * 3).max(50)).max(*k);
-                            // int8 distances are noisier than f32, so traverse a WIDER
-                            // beam and re-rank more candidates from disk to recover recall.
-                            let oversample = 8; // read 8× candidates from disk for exact re-rank
+                            let oversample = 8;
                             let trav_ef = ef.max(*k * oversample);
-                            let q_code = qf.quantize_query(query);
-                            let approx = hnsw.search_quant(&q_code, qf, *k * oversample, trav_ef);
+                            let q_code = ci.quantize_query(query);
+                            let approx = ci.search(&q_code, *k * oversample, trav_ef);
                             if !approx.is_empty() {
-                                let mut rescored: Vec<(u64, f32)> = approx
-                                    .iter()
-                                    .filter_map(|&id| field_vecs.get(id).map(|v| (id, dist(v))))
+                                let mut rescored: Vec<(u64, f32)> = approx.iter()
+                                    .filter_map(|&id| field_vecs.get_owned(id).map(|v| (id, dist(&v))))
                                     .collect();
-                                rescored.sort_by(|a, b| {
-                                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                                });
+                                rescored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                                 rescored.truncate(*k);
                                 candidates = rescored.into_iter().map(|(id, _)| id).collect();
                                 continue;
@@ -3333,7 +3316,6 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     if candidates.is_empty() {
                         if let Some(hnsw) = db.hnsw_index(field) {
                             // HNSW STARTER: approximate search over all vectors.
-                            // ef_search controls breadth (speed↔recall); overridable per session.
                             let ef = db.hnsw_ef_search().unwrap_or((*k * 3).max(50)).max(*k);
                             let hits = match metric {
                                 VecMetric::Cosine => hnsw.search::<CosineDistance, _>(query, field_vecs, *k, ef),
@@ -3459,31 +3441,18 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 if columns.len() == 1 {
                     let (sort_field, asc) = &columns[0];
                     if let Some(coll) = current_coll_hash {
-                        if let Some(idx) = db.field_index(coll, sort_field) {
+                        if let Some(idx) = db.field_index_ref(coll, sort_field) {
                             let candidate_set: HashSet<u64> =
                                 candidates.iter().copied().collect();
                             let limit = find_take_limit(remaining).unwrap_or(usize::MAX);
                             let mut sorted_result: Vec<u64> =
                                 Vec::with_capacity(limit.min(candidate_set.len()));
-                            if *asc {
-                                'asc: for ids in idx.values() {
-                                    for &h in ids {
-                                        if candidate_set.contains(&h) {
-                                            sorted_result.push(h);
-                                            if sorted_result.len() >= limit {
-                                                break 'asc;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                'desc: for ids in idx.values().rev() {
-                                    for &h in ids {
-                                        if candidate_set.contains(&h) {
-                                            sorted_result.push(h);
-                                            if sorted_result.len() >= limit {
-                                                break 'desc;
-                                            }
+                            'scan: for (_, ids) in idx.iter_kv(!*asc) {
+                                for &h in &ids {
+                                    if candidate_set.contains(&h) {
+                                        sorted_result.push(h);
+                                        if sorted_result.len() >= limit {
+                                            break 'scan;
                                         }
                                     }
                                 }
@@ -4350,7 +4319,7 @@ pub enum WhereValue {
 }
 
 /// A function-based WHERE filter on the destination node of a MATCH pattern
-/// (`WHERE ST_DWithin(b.geo, POINT(...), km)` / `WHERE BM25(b.body,'q') > n`).
+/// (`WHERE ST_DWithin(b.geo, POINT(...), metres)` / `WHERE BM25(b.body,'q') > n`).
 /// Applied post-traversal against each result node.
 #[derive(Clone, Debug)]
 pub enum MatchFuncFilter {
@@ -4470,7 +4439,7 @@ pub struct MatchAggStmt {
     /// `ORDER BY`: `(alias, ascending)` — sort by a projected column / dest field.
     pub order_by: Option<(String, bool)>,
     /// `ORDER BY <score expr>`: rank by a scoring expression (BM25_NORM,
-    /// VECTOR_COSINE, ST_DISTANCE_KM, blends) evaluated against the destination
+    /// VECTOR_COSINE, ST_DISTANCE, blends) evaluated against the destination
     /// node. Takes precedence over `order_by` when set.
     pub order_score: Option<(ScoreExpr, bool)>,
     /// `LIMIT n`.
@@ -5257,11 +5226,11 @@ fn filter_raw_by_dest_where(
             continue;
         }
 
-        if let Some(btree) = db.field_index(coll_hash, &dw.field) {
+        if let Some(btree) = db.field_index_ref(coll_hash, &dw.field) {
             match dw.op {
                 CmpOp::Eq => {
                     if let Some(fk) = FieldKey::from_json(literal_val) {
-                        let matches: HashSet<u64> = btree.get(&fk)
+                        let matches: HashSet<u64> = btree.get_eq(&fk)
                             .map(|v| v.iter().copied().collect())
                             .unwrap_or_default();
                         index_match_sets.push(Some(matches));
@@ -5270,11 +5239,12 @@ fn filter_raw_by_dest_where(
                 }
                 CmpOp::Neq => {
                     if let Some(fk) = FieldKey::from_json(literal_val) {
-                        let excluded: HashSet<u64> = btree.get(&fk)
+                        let excluded: HashSet<u64> = btree.get_eq(&fk)
                             .map(|v| v.iter().copied().collect())
                             .unwrap_or_default();
-                        let all: HashSet<u64> = btree.values()
-                            .flat_map(|v| v.iter().copied())
+                        let all: HashSet<u64> = btree
+                            .range_postings(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+                            .into_iter()
                             .collect();
                         let matches: HashSet<u64> = all.difference(&excluded).copied().collect();
                         index_match_sets.push(Some(matches));
@@ -5283,8 +5253,9 @@ fn filter_raw_by_dest_where(
                 }
                 CmpOp::Gt => {
                     if let Some(fk) = FieldKey::from_json(literal_val) {
-                        let matches: HashSet<u64> = btree.range((std::ops::Bound::Excluded(fk), std::ops::Bound::Unbounded))
-                            .flat_map(|(_, v)| v.iter().copied())
+                        let matches: HashSet<u64> = btree
+                            .range_postings(std::ops::Bound::Excluded(&fk), std::ops::Bound::Unbounded)
+                            .into_iter()
                             .collect();
                         index_match_sets.push(Some(matches));
                         continue;
@@ -5292,8 +5263,9 @@ fn filter_raw_by_dest_where(
                 }
                 CmpOp::Gte => {
                     if let Some(fk) = FieldKey::from_json(literal_val) {
-                        let matches: HashSet<u64> = btree.range(fk..)
-                            .flat_map(|(_, v)| v.iter().copied())
+                        let matches: HashSet<u64> = btree
+                            .range_postings(std::ops::Bound::Included(&fk), std::ops::Bound::Unbounded)
+                            .into_iter()
                             .collect();
                         index_match_sets.push(Some(matches));
                         continue;
@@ -5301,8 +5273,9 @@ fn filter_raw_by_dest_where(
                 }
                 CmpOp::Lt => {
                     if let Some(fk) = FieldKey::from_json(literal_val) {
-                        let matches: HashSet<u64> = btree.range(..fk)
-                            .flat_map(|(_, v)| v.iter().copied())
+                        let matches: HashSet<u64> = btree
+                            .range_postings(std::ops::Bound::Unbounded, std::ops::Bound::Excluded(&fk))
+                            .into_iter()
                             .collect();
                         index_match_sets.push(Some(matches));
                         continue;
@@ -5310,8 +5283,9 @@ fn filter_raw_by_dest_where(
                 }
                 CmpOp::Lte => {
                     if let Some(fk) = FieldKey::from_json(literal_val) {
-                        let matches: HashSet<u64> = btree.range(..=fk)
-                            .flat_map(|(_, v)| v.iter().copied())
+                        let matches: HashSet<u64> = btree
+                            .range_postings(std::ops::Bound::Unbounded, std::ops::Bound::Included(&fk))
+                            .into_iter()
                             .collect();
                         index_match_sets.push(Some(matches));
                         continue;
@@ -5324,8 +5298,8 @@ fn filter_raw_by_dest_where(
                     use crate::text_index::query::ilike_matches;
                     if let Some(pattern) = literal_val.as_str() {
                         let mut matches: HashSet<u64> = HashSet::new();
-                        for (key, node_hashes) in btree {
-                            if let FieldKey::Str(s) = key {
+                        for (key, node_hashes) in btree.iter_kv(false) {
+                            if let FieldKey::Str(s) = &key {
                                 if ilike_matches(s, pattern) {
                                     matches.extend(node_hashes.iter().copied());
                                 }
@@ -6663,8 +6637,8 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             ) -> bool {
                 if needed_fields.is_empty() || coll_hash == 0 { return false; }
                 // Check all needed fields have btree indexes
-                let indexes: Vec<&BTreeMap<FieldKey, Vec<u64>>> = needed_fields.iter()
-                    .filter_map(|f| db.field_index(coll_hash, f))
+                let indexes: Vec<crate::FieldIndexRef> = needed_fields.iter()
+                    .filter_map(|f| db.field_index_ref(coll_hash, f))
                     .collect();
                 if indexes.len() != needed_fields.len() { return false; }
 
@@ -6673,9 +6647,9 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 let mut field_maps: Vec<HashMap<u64, Value>> = Vec::with_capacity(indexes.len());
                 for idx in &indexes {
                     let mut map: HashMap<u64, Value> = HashMap::with_capacity(hash_set.len());
-                    for (key, node_hashes) in *idx {
-                        let val = CoreDB::field_key_to_value(key);
-                        for &h in node_hashes {
+                    for (key, node_hashes) in idx.iter_kv(false) {
+                        let val = CoreDB::field_key_to_value(&key);
+                        for &h in &node_hashes {
                             if hash_set.contains(&h) {
                                 map.insert(h, val.clone());
                             }
@@ -7149,17 +7123,17 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                 // Try btree index resolution for start node fields.
                 let resolved = 'resolve: {
                     if needed_start_fields.is_empty() || start_coll_hash == 0 { break 'resolve false; }
-                    let indexes: Vec<&BTreeMap<FieldKey, Vec<u64>>> = needed_start_fields.iter()
-                        .filter_map(|f| db.field_index(start_coll_hash, f))
+                    let indexes: Vec<crate::FieldIndexRef> = needed_start_fields.iter()
+                        .filter_map(|f| db.field_index_ref(start_coll_hash, f))
                         .collect();
                     if indexes.len() != needed_start_fields.len() { break 'resolve false; }
                     let hash_set: HashSet<u64> = unique_starts.iter().copied().collect();
                     let mut field_maps: Vec<HashMap<u64, Value>> = Vec::with_capacity(indexes.len());
                     for idx in &indexes {
                         let mut map: HashMap<u64, Value> = HashMap::with_capacity(hash_set.len());
-                        for (key, node_hashes) in *idx {
-                            let val = CoreDB::field_key_to_value(key);
-                            for &h in node_hashes {
+                        for (key, node_hashes) in idx.iter_kv(false) {
+                            let val = CoreDB::field_key_to_value(&key);
+                            for &h in &node_hashes {
                                 if hash_set.contains(&h) {
                                     map.insert(h, val.clone());
                                 }

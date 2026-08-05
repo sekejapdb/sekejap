@@ -164,13 +164,123 @@ impl FieldKey {
     pub(crate) fn from_f64(f: f64) -> Self {
         FieldKey::Number(OrdF64(f))
     }
+
+    /// Encode for the on-disk field index (`storage::fieldstore`): 1 tag byte +
+    /// payload. Order is recovered by decode-and-compare (Ord), so the byte
+    /// layout need not be order-preserving.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            FieldKey::Null => out.push(0),
+            FieldKey::Bool(b) => { out.push(1); out.push(*b as u8); }
+            FieldKey::Number(OrdF64(f)) => { out.push(2); out.extend_from_slice(&f.to_le_bytes()); }
+            FieldKey::Str(s) => { out.push(3); out.extend_from_slice(s.as_bytes()); }
+        }
+    }
+
+    /// Decode a key written by [`FieldKey::encode`]. Returns `Null` on malformed
+    /// input (defensive — a corrupt key sorts first, never panics a query).
+    pub(crate) fn decode(bytes: &[u8]) -> FieldKey {
+        match bytes.first() {
+            Some(0) => FieldKey::Null,
+            Some(1) => FieldKey::Bool(bytes.get(1).copied().unwrap_or(0) != 0),
+            Some(2) if bytes.len() >= 9 => {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&bytes[1..9]);
+                FieldKey::Number(OrdF64(f64::from_le_bytes(a)))
+            }
+            Some(3) => FieldKey::Str(String::from_utf8_lossy(&bytes[1..]).into_owned()),
+            _ => FieldKey::Null,
+        }
+    }
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
+/// A btree field-index handle over either the heap overlay or the mmap'd base.
+/// Unifies `get`/`range`/`iter` so the query executor shares one code path for
+/// paged and in-memory indexes. Mapped lookups decode postings into transient
+/// owned `Vec`s; the retained bytes stay in reclaimable mmap page cache.
+pub(crate) enum FieldIndexRef<'a> {
+    Heap(&'a std::collections::BTreeMap<FieldKey, Vec<u64>>),
+    Mapped(&'a storage::fieldstore::MappedFieldStore),
+}
+
+impl<'a> FieldIndexRef<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match *self {
+            FieldIndexRef::Heap(m) => m.len(),
+            FieldIndexRef::Mapped(s) => s.len(),
+        }
+    }
+
+    /// Postings for an exact key. `Cow` avoids cloning the heap posting list.
+    pub(crate) fn get_eq(&self, k: &FieldKey) -> Option<std::borrow::Cow<'a, [u64]>> {
+        match *self {
+            FieldIndexRef::Heap(m) => m.get(k).map(|v| std::borrow::Cow::Borrowed(v.as_slice())),
+            FieldIndexRef::Mapped(s) => s.get_eq(k).map(std::borrow::Cow::Owned),
+        }
+    }
+
+    /// Concatenated postings for all keys in the `(lo, hi)` window.
+    pub(crate) fn range_postings(
+        &self,
+        lo: std::ops::Bound<&FieldKey>,
+        hi: std::ops::Bound<&FieldKey>,
+    ) -> Vec<u64> {
+        match *self {
+            FieldIndexRef::Heap(m) => m
+                .range((lo, hi))
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .collect(),
+            FieldIndexRef::Mapped(s) => s.range_postings(lo, hi),
+        }
+    }
+
+    /// All `(key, postings)` pairs in key order (`rev` = descending).
+    pub(crate) fn iter_kv(&self, rev: bool) -> Vec<(FieldKey, Vec<u64>)> {
+        match *self {
+            FieldIndexRef::Heap(m) => {
+                if rev {
+                    m.iter().rev().map(|(k, v)| (k.clone(), v.clone())).collect()
+                } else {
+                    m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                }
+            }
+            FieldIndexRef::Mapped(s) => s.iter_kv(rev),
+        }
+    }
+}
+
 /// Hash a string with SeaHash (fast, non-cryptographic, deterministic).
 pub(crate) fn sk_hash(s: &str) -> u64 {
     seahash::hash(s.as_bytes())
+}
+
+/// Lower-hex encode bytes (for embedding a field name in a fieldstore filename).
+fn hex_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.as_bytes() {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    out
+}
+
+/// Inverse of [`hex_encode`]. Returns `None` on malformed input.
+fn hex_decode(s: &str) -> Option<String> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)? as u8;
+        let lo = (bytes[i + 1] as char).to_digit(16)? as u8;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Payload storage backend — either an in-memory `Vec<u8>` (ephemeral DB) or
@@ -486,7 +596,7 @@ pub struct NodeData {
     pub collection: String,
     /// Cached spatial bounding-box, computed once in `put_raw()`.
     /// `rebuild_spatial_grid()` reads from here to avoid disk reads.
-    pub spatial_meta: Option<geo::SpatialMeta>,
+    pub spatial_meta: Option<Box<geo::SpatialMeta>>,
     /// Byte offset of this node's raw JSON payload in `CoreDB.payload_store`.
     pub payload_offset: u64,
     /// Byte length of this node's raw JSON payload.
@@ -591,25 +701,22 @@ pub struct CoreDB {
     /// Built explicitly via [`CoreDB::build_hnsw_index`].
     /// Secondary index — never affects the main store on error.
     hnsw_indexes: HashMap<String, vector::HnswGraph>,
-    /// **Disk-first int8 stores**: field_name → quantized codes (resident in RAM).
-    /// Present only for fields built via [`CoreDB::build_hnsw_index_disk`]; when set,
-    /// `VECTOR_NEAR` traverses on int8 in RAM and re-ranks from f32 on disk, so RAM
-    /// is ~4× smaller than holding f32. Absent = classic in-RAM-f32 path (unchanged).
+    /// Disk-first int8 stores: field -> quantized codes resident in RAM.
     quant_fields: HashMap<String, vector::QuantizedField>,
+    compact_indexes: HashMap<String, vector::CompactDiskIndex>,
     /// Btree field indexes: (collection_hash, field_name) → ordered value → [node hashes].
     /// Built via `CREATE INDEX ON collection(field) USING btree`.
     /// Maintained incrementally on every put()/remove().
     field_indexes: HashMap<(u64, String), BTreeMap<FieldKey, Vec<u64>>>,
+    /// Paged mode: mmap'd on-disk btree indexes (posting lists live in reclaimable
+    /// page cache, not the heap). Consulted by `field_index_ref` when a
+    /// `(collection, field)` is absent from the heap `field_indexes` overlay.
+    field_base: HashMap<(u64, String), storage::fieldstore::MappedFieldStore>,
     /// Build params for each HNSW index: field → (m, ef_construction).
     /// Populated by build_hnsw_index(); used to auto-rebuild on version mismatch.
     hnsw_params: HashMap<String, (usize, usize)>,
-    /// Distance metric each HNSW index was built with: field → VecMetric. The graph
-    /// encodes neighbours under one metric, so search MUST use the same one. Absent
-    /// ⇒ Cosine (back-compat with pre-metric indexes).
+    /// Distance metric each HNSW index was built with (Cosine if unset).
     hnsw_metric: HashMap<String, crate::query::VecMetric>,
-    /// Optional override for HNSW search breadth (`ef_search`). `None` ⇒ the per-query
-    /// default `(k*3).max(50)`. Set higher to trade speed for recall (analogous to
-    /// pgvector's `SET hnsw.ef_search` / qdrant's `hnsw_ef`). Not persisted (session knob).
     hnsw_ef_search: Option<usize>,
     /// Append-only byte slab for raw JSON payloads.
     /// All `NodeData` entries index into this store via `(payload_offset, payload_len)`.
@@ -802,7 +909,9 @@ impl CoreDB {
             vectors: HashMap::new(),
             hnsw_indexes: HashMap::new(),
             quant_fields: HashMap::new(),
+            compact_indexes: HashMap::new(),
             field_indexes: HashMap::new(),
+            field_base: HashMap::new(),
             hnsw_params: HashMap::new(),
             hnsw_metric: HashMap::new(),
             hnsw_ef_search: None,
@@ -1159,6 +1268,13 @@ impl CoreDB {
                 // write overlay. WAL replay below adds post-compact writes to it.
                 db.topo_base = Some(storage::topology::MappedTopology::open(dir)?);
                 db.load_snapshot_parts(snap, /*load_topology=*/ false);
+                // Serve btree indexes from the mmap'd sidecars, not the heap: mmap
+                // them into field_base and drop any heap copies the snapshot loaded
+                // (posting lists become reclaimable page cache instead of RAM).
+                db.load_field_base(dir)?;
+                if !db.field_base.is_empty() {
+                    db.field_indexes.clear();
+                }
             } else if snap.topology_in_files {
                 // v3 manifest: nodes + edges live in the topology files.
                 db.load_snapshot_parts(snap, /*load_topology=*/ false);
@@ -1525,7 +1641,7 @@ impl CoreDB {
         self.nodes.insert(hash, NodeData {
             slug: slug.to_string(),
             collection: collection_str,
-            spatial_meta: spatial_meta.clone(),
+            spatial_meta: spatial_meta.clone().map(Box::new),
             payload_offset: offset,
             payload_len: len,
         });
@@ -2821,7 +2937,7 @@ impl CoreDB {
             self.nodes.insert(hash, NodeData {
                 slug,
                 collection: coll,
-                spatial_meta: spatial_meta.clone(),
+                spatial_meta: spatial_meta.clone().map(Box::new),
                 payload_offset: offset,
                 payload_len: len,
             });
@@ -2887,6 +3003,13 @@ impl CoreDB {
             self.wal_flush(); // single fsync for the whole group
         }
         result.map(|_| total)
+    }
+
+    pub fn begin_bulk(&mut self) { self.defer_wal_sync = true; }
+    pub fn end_bulk(&mut self) {
+        self.defer_wal_sync = false;
+        self.wal_flush();
+        self.autocompact_after_write();
     }
 
     /// Bulk edge insert — the edge counterpart of [`put_many`](Self::put_many).
@@ -3176,6 +3299,15 @@ impl CoreDB {
         // points at the previous, still-valid files; WAL not yet truncated).
         self.write_topology_files(&dir)?;
 
+        // Persist btree field indexes as mmap'able sidecars so a reopened paged DB
+        // serves indexed queries from page cache (not heap). One file per
+        // (collection, field); the field name is hex-encoded so any identifier
+        // round-trips through the filename.
+        for ((coll_hash, field), btree) in &self.field_indexes {
+            let fname = format!("fieldidx_{}_{}.bin", coll_hash, hex_encode(field));
+            storage::fieldstore::write(&dir.join(fname), btree)?;
+        }
+
         let snap_json = serde_json::to_vec(&self.build_snapshot())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let snap_tmp = dir.join("snapshot.json.tmp");
@@ -3380,7 +3512,7 @@ impl CoreDB {
             self.nodes.insert(hash, NodeData {
                 slug: slug.to_string(),
                 collection: coll.clone(),
-                spatial_meta,
+                spatial_meta: spatial_meta.map(Box::new),
                 payload_offset: rec.payload_offset,
                 payload_len: rec.payload_len,
             });
@@ -3651,7 +3783,7 @@ impl CoreDB {
                     self.nodes.insert(hash, NodeData {
                         slug:           n.slug.clone(),
                         collection:     coll.clone(),
-                        spatial_meta:   n.spatial_meta,
+                        spatial_meta:   n.spatial_meta.map(Box::new),
                         payload_offset: offset,
                         payload_len:    len,
                     });
@@ -3769,6 +3901,10 @@ impl CoreDB {
     // ── Reads ─────────────────────────────────────────────────────────────────
 
     /// Get raw JSON payload for a slug. Returns `None` if not found.
+    pub fn slug_of(&self, hash: u64) -> Option<&str> {
+        self.nodes.get(&hash).map(|n| n.slug.as_str())
+    }
+
     pub fn get(&self, slug: &str) -> Option<String> {
         let (off, len) = self.payload_loc(sk_hash(slug))?;
         self.payload_store
@@ -4869,7 +5005,7 @@ impl CoreDB {
                 .map_err(|e| SqlError::InvalidValue(e.to_string()))?;
             // Mirror each root vector (same field name) into the view doc.
             for vf in &root_vec_fields {
-                if let Some(vec) = self.get_vector(&format!("{root}/{key}"), vf).map(|s| s.to_vec()) {
+                if let Some(vec) = self.get_vector(&format!("{root}/{key}"), vf) {
                     let _ = self.put_vector(&format!("{name}/{key}"), vf, &vec);
                 }
             }
@@ -5471,11 +5607,11 @@ impl CoreDB {
                 .collection_name(rec.collection_id)
                 .unwrap_or("")
                 .to_string(),
-            spatial_meta: base.spatial(id).map(|v| geo::SpatialMeta {
+            spatial_meta: base.spatial(id).map(|v| Box::new(geo::SpatialMeta {
                 centroid_lat: v[0], centroid_lon: v[1],
                 bbox_min_lat: v[2], bbox_min_lon: v[3],
                 bbox_max_lat: v[4], bbox_max_lon: v[5],
-            }),
+            })),
             payload_offset: rec.payload_offset,
             payload_len: rec.payload_len,
         }))
@@ -5701,6 +5837,62 @@ impl CoreDB {
         self.field_indexes.get(&(coll_hash, field.to_string()))
     }
 
+    /// Base-aware btree index handle: the heap overlay first, then the mmap'd base
+    /// (paged mode). All query paths should use this, not `field_index`, so a
+    /// reopened paged DB serves indexed queries from the mmap.
+    pub(crate) fn field_index_ref(&self, coll_hash: u64, field: &str) -> Option<FieldIndexRef<'_>> {
+        if let Some(m) = self.field_indexes.get(&(coll_hash, field.to_string())) {
+            return Some(FieldIndexRef::Heap(m));
+        }
+        self.field_base
+            .get(&(coll_hash, field.to_string()))
+            .map(FieldIndexRef::Mapped)
+    }
+
+    /// Whether a btree index exists for `(collection, field)` — heap or mmap base.
+    pub(crate) fn has_field_index(&self, coll_hash: u64, field: &str) -> bool {
+        let k = (coll_hash, field.to_string());
+        self.field_indexes.contains_key(&k) || self.field_base.contains_key(&k)
+    }
+
+    /// Populate `field_base` by mmap'ing every `fieldidx_<coll>_<field>.bin` sidecar
+    /// in `dir` (written by `compact`). Filenames carry the hex-encoded field name
+    /// so the `(collection, field)` key round-trips. Used on paged open.
+    fn load_field_base(&mut self, dir: &Path) -> io::Result<()> {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name = match name.to_str() {
+                Some(n) => n,
+                None => continue,
+            };
+            let stem = match name.strip_prefix("fieldidx_").and_then(|s| s.strip_suffix(".bin")) {
+                Some(s) => s,
+                None => continue,
+            };
+            // stem = "<coll_hash>_<hexfield>"
+            let (coll_str, hex_field) = match stem.split_once('_') {
+                Some(p) => p,
+                None => continue,
+            };
+            let coll_hash: u64 = match coll_str.parse() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let field = match hex_decode(hex_field) {
+                Some(f) => f,
+                None => continue,
+            };
+            if let Some(store) = storage::fieldstore::MappedFieldStore::open_disk(&entry.path())? {
+                self.field_base.insert((coll_hash, field), store);
+            }
+        }
+        Ok(())
+    }
+
     /// Convert a `FieldKey` to a `serde_json::Value` for result projection.
     pub(crate) fn field_key_to_value(key: &FieldKey) -> Value {
         match key {
@@ -5732,7 +5924,7 @@ impl CoreDB {
 
     fn rebuild_spatial_grid(&mut self) {
         let mut items: Vec<(u64, geo::SpatialMeta)> = self.nodes.iter()
-            .filter_map(|(&hash, node)| node.spatial_meta.clone().map(|m| (hash, m)))
+            .filter_map(|(&hash, node)| node.spatial_meta.clone().map(|m| (hash, *m)))
             .collect();
         // Paged mode: base nodes live in the mmap, not in self.nodes — pull their
         // spatial records from the side-table (48 B each; only geometry nodes).
@@ -5751,11 +5943,9 @@ impl CoreDB {
                 }
             }
         }
-        // Cache each polygon's parsed rings so point-in-polygon tests never re-read +
-        // re-parse the GeoJSON payload from disk (the PIP hot path). Only nodes with a
-        // non-degenerate bbox (i.e. real area, not points) can be polygons.
-        let polys: Vec<(u64, Vec<Vec<[f64; 2]>>)> = items
-            .iter()
+        // Parse polygon rings ONCE here (non-degenerate bbox = has extent) and cache them
+        // in the grid, so point-in-polygon queries never re-read + re-parse GeoJSON.
+        let polys: Vec<(u64, Vec<Vec<[f64; 2]>>)> = items.iter()
             .filter(|(_, m)| m.bbox_min_lat != m.bbox_max_lat || m.bbox_min_lon != m.bbox_max_lon)
             .filter_map(|(h, _)| {
                 let rings = geo::rings_from_payload(&self.get_payload(*h)?);
@@ -5763,9 +5953,7 @@ impl CoreDB {
             })
             .collect();
         let mut grid = geo::SpatialGrid::build(items.into_iter());
-        for (h, rings) in polys {
-            grid.cache_rings(h, rings);
-        }
+        for (h, rings) in polys { grid.cache_rings(h, rings); }
         self.spatial_grid = Some(grid);
     }
 
@@ -6003,7 +6191,11 @@ impl CoreDB {
             })
             .collect();
         let refs: Vec<(u64, &str)> = owned.iter().map(|(h, s)| (*h, s.as_str())).collect();
-        let index = bm25::Bm25Index::build(field, refs.into_iter());
+        let mut index = bm25::Bm25Index::build(field, refs.into_iter());
+        #[cfg(unix)]
+        if let Some(ref dir) = self.data_dir {
+            let _ = index.spill_to_disk(&dir.join(format!("bm25_{field}.postings")));
+        }
         self.bm25_indexes.insert(field.to_string(), index);
         self.record_index_version("bm25", field, BM25_INDEX_VERSION);
     }
@@ -6075,15 +6267,15 @@ impl CoreDB {
         let hash = sk_hash(slug);
         self.ensure_vector_store(field);
         self.vectors.get_mut(field).unwrap().put(hash, data.to_vec());
-        #[cfg(unix)]
-        self.vectors.get_mut(field).unwrap().remap();
         let hnsw_declared = self.schemas.values()
             .any(|s| s.indexes.vector.contains(&field.to_string()));
         if hnsw_declared {
+            #[cfg(unix)]
+            self.vectors.get_mut(field).unwrap().remap();
             use crate::query::VecMetric;
             use vector::{CosineDistance, DotProduct, L1Distance, L2Distance};
             let (m, ef) = self.hnsw_params.get(field).copied().unwrap_or((16, 200));
-            let metric = self.hnsw_metric(field); // copy out before the &mut borrow
+            let metric = self.hnsw_metric(field);
             let field_vecs = self.vectors.get(field).unwrap();
             let graph = self.hnsw_indexes
                 .entry(field.to_string())
@@ -6101,10 +6293,19 @@ impl CoreDB {
     /// Retrieve the stored vector for a node under a named field.
     ///
     /// Returns `None` if the node has no vector for that field.
-    pub fn get_vector(&self, slug: &str, field: &str) -> Option<&[f32]> {
+    ///
+    /// Zero-copy when the vector is inside the store's mmap window; falls back
+    /// to a positional read for data appended after the last remap (a disk
+    /// store only refreshes its mmap on open/compact/index-build, so a
+    /// write-then-read must not depend on it).
+    pub fn get_vector(&self, slug: &str, field: &str) -> Option<Vec<f32>> {
         let hash = sk_hash(slug);
         use crate::vector::VectorAccess;
-        self.vectors.get(field)?.get(hash)
+        let store = self.vectors.get(field)?;
+        if let Some(v) = store.get(hash) {
+            return Some(v.to_vec());
+        }
+        store.get_owned(hash)
     }
 
     /// Access all vectors for a given field (used by the query executor).
@@ -6144,12 +6345,16 @@ impl CoreDB {
     /// Incrementally maintained by every subsequent `put()` / `remove()`.
     pub fn build_field_index(&mut self, collection: &str, field: &str) {
         let coll_hash = sk_hash(collection);
-        let members: Vec<u64> = self.collections.get(&coll_hash).cloned().unwrap_or_default();
+        // Base-aware: merge heap overlay + mmap topology base. Reading only
+        // self.collections/self.nodes misses every base node on a reopened paged
+        // DB, which silently builds an EMPTY index (all indexed queries return 0).
+        let members: Vec<u64> = self
+            .collection_members(coll_hash)
+            .map(|m| m.into_owned())
+            .unwrap_or_default();
         let mut btree: BTreeMap<FieldKey, Vec<u64>> = BTreeMap::new();
         for hash in members {
-            if let Some(node) = self.nodes.get(&hash) {
-                let payload = self.payload_store.get(node.payload_offset, node.payload_len)
-                    .unwrap_or(Value::Null);
+            if let Some(payload) = self.get_payload(hash) {
                 if let Some(fk) = FieldKey::from_json(payload.get(field).unwrap_or(&Value::Null)) {
                     btree.entry(fk).or_default().push(hash);
                 }
@@ -6177,60 +6382,24 @@ impl CoreDB {
         }
     }
 
-    /// Seed a `Collection` step for a k-nearest-neighbour query:
-    /// `ORDER BY ST_DISTANCE_KM(field, POINT(lon lat)) LIMIT k`. Grid-accelerated
-    /// best-first search returns the k nearest members directly, skipping the O(N)
-    /// distance scan + full sort + take. Returns `None` (normal path) for anything
-    /// that isn't a pure kNN — any filter/traversal step disqualifies it.
-    pub(crate) fn spatial_knn_seed(&self, coll_hash: u64, remaining: &[Step]) -> Option<(Vec<u64>, Vec<usize>)> {
-        let (mut sort_i, mut take_i, mut k) = (None, None, 0usize);
-        let (mut lat, mut lon) = (0.0f64, 0.0f64);
-        for (j, s) in remaining.iter().enumerate() {
-            match s {
-                // Match either sort direction — kNN is nearest-first by construction.
-                Step::SortByExpr { expr: crate::query::ScoreExpr::StDistance { lat: la, lon: lo, .. }, .. } => {
-                    sort_i = Some(j); lat = *la; lon = *lo;
-                }
-                Step::Take(n) => { take_i = Some(j); k = *n; }
-                Step::Select(_) | Step::ScoreProject(_) | Step::Skip(_) | Step::Distinct => {}
-                _ => return None, // any filter/traversal → not a pure kNN
-            }
-        }
-        let (si, ti) = (sort_i?, take_i?);
-        if k == 0 { return None; }
-        let grid = self.spatial_grid()?;
-        let total = grid.len();
-        let mut fetch = k;
-        loop {
-            let cand = grid.k_nearest(lat, lon, fetch);
-            let filtered: Vec<u64> = cand.into_iter()
-                .filter(|&h| self.node_data(h).map(|n| sk_hash(&n.collection)) == Some(coll_hash))
-                .collect();
-            if filtered.len() >= k || fetch >= total {
-                return Some((filtered.into_iter().take(k).collect(), vec![si, ti]));
-            }
-            fetch = (fetch * 4).min(total.max(k));
-        }
-    }
-
     /// Seed a `Collection` step by INTERSECTING btree range scans over two or more
     /// distinct indexed fields — the fast path for an axis-aligned box query such as
     /// `WHERE lon BETWEEN … AND lat BETWEEN …`.
     ///
     /// Single-field `btree_seed` only indexes one axis, then reads a payload per
     /// candidate to filter the other axis — O(strip) payload reads. Here every axis
-    /// with a btree becomes a range scan; we intersect the posting sets (smallest
-    /// first) entirely in the index, doing ZERO payload reads. Returns the intersected
-    /// candidates plus every consumed step index, or `None` when fewer than two
-    /// indexed fields carry a range (nothing to intersect → let the single-field seed
-    /// handle it). Scanning stops at the first non-filter step so it never intersects
-    /// range predicates that apply to a DIFFERENT node-set (e.g. across a traversal).
+    /// with a btree becomes a `range_postings` scan; we intersect the posting sets
+    /// (smallest first) entirely in the index, doing ZERO payload reads. Returns the
+    /// intersected candidates plus every consumed step index, or `None` when fewer
+    /// than two indexed fields carry a range (nothing to intersect → let the normal
+    /// single-field seed handle it).
     pub(crate) fn btree_multi_range_seed(
         &self,
         coll_hash: u64,
         remaining: &[Step],
     ) -> Option<(Vec<u64>, Vec<usize>)> {
         use std::ops::Bound;
+        // Per-field accumulated (lower, upper) bound and the step indices that set them.
         struct R {
             field: String,
             lo: Bound<FieldKey>,
@@ -6272,23 +6441,21 @@ impl CoreDB {
                 _ => break,
             }
         }
-        ranges.retain(|r| self.field_index(coll_hash, &r.field).is_some());
+        // Keep only fields that actually have a btree index on this collection.
+        ranges.retain(|r| self.has_field_index(coll_hash, &r.field));
         if ranges.len() < 2 {
             return None;
         }
-        // Concatenated postings for each field's range (each node has one value per
-        // field → one key → no dupes within a field). Then intersect.
+        // Scan each field's range; intersect smallest posting set first.
         let mut postings: Vec<Vec<u64>> = ranges
             .iter()
             .filter_map(|r| {
-                let idx = self.field_index(coll_hash, &r.field)?;
-                Some(idx.range((r.lo.as_ref(), r.hi.as_ref()))
-                    .flat_map(|(_, ids)| ids.iter().copied())
-                    .collect::<Vec<u64>>())
+                let idx = self.field_index_ref(coll_hash, &r.field)?;
+                Some(idx.range_postings(r.lo.as_ref(), r.hi.as_ref()))
             })
             .collect();
         if postings.len() != ranges.len() {
-            return None;
+            return None; // an index vanished under us — bail to a safe path
         }
         postings.sort_by_key(|p| p.len());
         // Build ONE hash set from the smallest range, then probe it while streaming
@@ -6322,23 +6489,24 @@ impl CoreDB {
         for (j, step) in remaining.iter().enumerate() {
             match step {
                 Step::WhereEq(field, value) => {
-                    if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
+                    if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         if let Some(fk) = FieldKey::from_json(value) {
-                            return Some((idx.get(&fk).cloned().unwrap_or_default(), j, None));
+                            let ids = idx.get_eq(&fk).map(|c| c.into_owned()).unwrap_or_default();
+                            return Some((ids, j, None));
                         }
                     }
                 }
                 Step::WhereNeq(field, value) => {
-                    if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
+                    if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         if let Some(fk) = FieldKey::from_json(value) {
                             // Set-difference: all collection members minus those matching value.
                             let excluded: std::collections::HashSet<u64> = idx
-                                .get(&fk)
+                                .get_eq(&fk)
                                 .map(|ids| ids.iter().copied().collect())
                                 .unwrap_or_default();
-                            let all = self.collections
-                                .get(&coll_hash)
-                                .cloned()
+                            let all = self
+                                .collection_members(coll_hash)
+                                .map(|c| c.into_owned())
                                 .unwrap_or_default();
                             return Some((
                                 all.into_iter().filter(|h| !excluded.contains(h)).collect(),
@@ -6349,7 +6517,7 @@ impl CoreDB {
                     }
                 }
                 Step::WhereGt(field, lo) => {
-                    if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
+                    if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         let fk_lo = FieldKey::from_f64(*lo);
                         // Look ahead: combine with WhereLte/WhereLt on same field into
                         // a single btree range scan, consuming both steps.
@@ -6362,27 +6530,16 @@ impl CoreDB {
                                 _ => None,
                             }
                         });
+                        let lo_b = Bound::Excluded(fk_lo);
                         return if let Some((pair_j, upper_bound)) = upper {
-                            Some((
-                                idx.range((Bound::Excluded(fk_lo), upper_bound))
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                                j,
-                                Some(pair_j),
-                            ))
+                            Some((idx.range_postings(lo_b.as_ref(), upper_bound.as_ref()), j, Some(pair_j)))
                         } else {
-                            Some((
-                                idx.range((Bound::Excluded(fk_lo), Bound::Unbounded))
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                                j,
-                                None,
-                            ))
+                            Some((idx.range_postings(lo_b.as_ref(), Bound::Unbounded), j, None))
                         };
                     }
                 }
                 Step::WhereLt(field, hi) => {
-                    if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
+                    if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         let fk_hi = FieldKey::from_f64(*hi);
                         // Look ahead for lower bound on same field.
                         let lower = remaining[j + 1..].iter().enumerate().find_map(|(k, s)| {
@@ -6394,27 +6551,16 @@ impl CoreDB {
                                 _ => None,
                             }
                         });
+                        let hi_b = Bound::Excluded(fk_hi);
                         return if let Some((pair_j, lower_bound)) = lower {
-                            Some((
-                                idx.range((lower_bound, Bound::Excluded(fk_hi)))
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                                j,
-                                Some(pair_j),
-                            ))
+                            Some((idx.range_postings(lower_bound.as_ref(), hi_b.as_ref()), j, Some(pair_j)))
                         } else {
-                            Some((
-                                idx.range(..fk_hi)
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                                j,
-                                None,
-                            ))
+                            Some((idx.range_postings(Bound::Unbounded, hi_b.as_ref()), j, None))
                         };
                     }
                 }
                 Step::WhereGte(field, lo) => {
-                    if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
+                    if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         let fk_lo = FieldKey::from_f64(*lo);
                         let upper = remaining[j + 1..].iter().enumerate().find_map(|(k, s)| {
                             match s {
@@ -6425,27 +6571,16 @@ impl CoreDB {
                                 _ => None,
                             }
                         });
+                        let lo_b = Bound::Included(fk_lo);
                         return if let Some((pair_j, upper_bound)) = upper {
-                            Some((
-                                idx.range((Bound::Included(fk_lo), upper_bound))
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                                j,
-                                Some(pair_j),
-                            ))
+                            Some((idx.range_postings(lo_b.as_ref(), upper_bound.as_ref()), j, Some(pair_j)))
                         } else {
-                            Some((
-                                idx.range(fk_lo..)
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                                j,
-                                None,
-                            ))
+                            Some((idx.range_postings(lo_b.as_ref(), Bound::Unbounded), j, None))
                         };
                     }
                 }
                 Step::WhereLte(field, hi) => {
-                    if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
+                    if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         let fk_hi = FieldKey::from_f64(*hi);
                         let lower = remaining[j + 1..].iter().enumerate().find_map(|(k, s)| {
                             match s {
@@ -6456,33 +6591,20 @@ impl CoreDB {
                                 _ => None,
                             }
                         });
+                        let hi_b = Bound::Included(fk_hi);
                         return if let Some((pair_j, lower_bound)) = lower {
-                            Some((
-                                idx.range((lower_bound, Bound::Included(fk_hi)))
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                                j,
-                                Some(pair_j),
-                            ))
+                            Some((idx.range_postings(lower_bound.as_ref(), hi_b.as_ref()), j, Some(pair_j)))
                         } else {
-                            Some((
-                                idx.range(..=fk_hi)
-                                    .flat_map(|(_, ids)| ids.iter().copied())
-                                    .collect(),
-                                j,
-                                None,
-                            ))
+                            Some((idx.range_postings(Bound::Unbounded, hi_b.as_ref()), j, None))
                         };
                     }
                 }
                 Step::WhereBetween(field, lo, hi) => {
-                    if let Some(idx) = self.field_indexes.get(&(coll_hash, field.clone())) {
+                    if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         let fk_lo = FieldKey::from_f64(*lo);
                         let fk_hi = FieldKey::from_f64(*hi);
                         return Some((
-                            idx.range(fk_lo..=fk_hi)
-                                .flat_map(|(_, ids)| ids.iter().copied())
-                                .collect(),
+                            idx.range_postings(Bound::Included(&fk_lo), Bound::Included(&fk_hi)),
                             j,
                             None,
                         ));
@@ -6524,24 +6646,59 @@ impl CoreDB {
         }
         let (field, asc) = &cols[0];
 
-        let idx = self.field_indexes.get(&(coll_hash, field.clone()))?;
+        let idx = self.field_index_ref(coll_hash, field)?;
 
         // Look ahead for a Take limit — enables O(k) extraction instead of O(N)
         let take_n = remaining[sort_pos + 1..]
             .iter()
             .find_map(|s| if let Step::Take(n) = s { Some(*n) } else { None });
 
-        let result: Vec<u64> = if *asc {
-            idx.values().flat_map(|ids| ids.iter().copied()).collect()
-        } else {
-            idx.values().rev().flat_map(|ids| ids.iter().copied()).collect()
-        };
+        let result: Vec<u64> = idx
+            .iter_kv(!*asc)
+            .into_iter()
+            .flat_map(|(_, ids)| ids)
+            .collect();
 
         let candidates = match take_n {
             Some(n) => result.into_iter().take(n).collect(),
             None => result,
         };
         Some((candidates, sort_pos))
+    }
+
+    /// Fast-path for `Collection … ORDER BY ST_Distance(field, POINT) ASC LIMIT k`:
+    /// return the k nearest nodes of this collection via the spatial grid (avoiding the
+    /// O(N) per-row distance scan + sort), plus the step indices to skip (Sort + Take).
+    /// Applies only when there are no filters/traversals — a pure kNN.
+    pub(crate) fn spatial_knn_seed(&self, coll_hash: u64, remaining: &[Step]) -> Option<(Vec<u64>, Vec<usize>)> {
+        let (mut sort_i, mut take_i, mut k) = (None, None, 0usize);
+        let (mut lat, mut lon) = (0.0f64, 0.0f64);
+        for (j, s) in remaining.iter().enumerate() {
+            match s {
+                // Match either ascending value — kNN is nearest-first by construction.
+                Step::SortByExpr { expr: crate::query::ScoreExpr::StDistance { lat: la, lon: lo, .. }, .. } => {
+                    sort_i = Some(j); lat = *la; lon = *lo;
+                }
+                Step::Take(n) => { take_i = Some(j); k = *n; }
+                Step::Select(_) | Step::ScoreProject(_) | Step::Skip(_) | Step::Distinct => {}
+                _ => return None, // any filter/traversal → not a pure kNN
+            }
+        }
+        let (si, ti) = (sort_i?, take_i?);
+        if k == 0 { return None; }
+        let grid = self.spatial_grid()?;
+        let total = grid.len();
+        let mut fetch = k;
+        loop {
+            let cand = grid.k_nearest(lat, lon, fetch);
+            let filtered: Vec<u64> = cand.into_iter()
+                .filter(|&h| self.node_data(h).map(|n| sk_hash(&n.collection)) == Some(coll_hash))
+                .collect();
+            if filtered.len() >= k || fetch >= total {
+                return Some((filtered.into_iter().take(k).collect(), vec![si, ti]));
+            }
+            fetch = (fetch * 4).min(total.max(k));
+        }
     }
 
     /// Build (or rebuild) an HNSW approximate-NN index for a vector field.
@@ -6556,8 +6713,6 @@ impl CoreDB {
     /// - `ef_construction`: beam width during build (100–400; 200 is a good default)
     ///
     /// Returns `Err` if `field` has no stored vectors.
-    ///
-    /// Uses **cosine** distance. For L2/dot/L1 ANN use [`build_hnsw_index_metric`].
     pub fn build_hnsw_index(
         &mut self,
         field: &str,
@@ -6567,9 +6722,7 @@ impl CoreDB {
         self.build_hnsw_index_metric(field, m, ef_construction, crate::query::VecMetric::Cosine)
     }
 
-    /// Build (or rebuild) an HNSW ANN index with an explicit distance `metric`
-    /// (cosine / L2 / dot / L1). The graph encodes neighbours under this metric, so
-    /// all searches on the field use the same one (stored in `hnsw_metric`).
+    /// Build (or rebuild) an HNSW ANN index with an explicit distance `metric`.
     pub fn build_hnsw_index_metric(
         &mut self,
         field: &str,
@@ -6589,15 +6742,11 @@ impl CoreDB {
             .get(field)
             .ok_or_else(|| format!("no vectors stored for field '{field}'"))?;
 
-        // Copy the field's vectors into ONE contiguous buffer first, then build over
-        // DENSE ids (0..n): distance evals + neighbour lookups become pure array
-        // indexing — no HashMap probes, no scattered pointer-chases. This removes the
-        // super-linear (cache-bound) build cost.
+        // Contiguous snapshot + DENSE-id build → no HashMap probes / pointer-chases.
         let dense = vector::DenseVectors::snapshot(field_vecs);
         let (flat, dim, ids) = dense.parts();
 
         // Build entirely into a local — zero writes to self until this line.
-        // Dispatch on the metric; each uses its already-SIMD-optimised kernel.
         let graph = match metric {
             VecMetric::Cosine => vector::HnswGraph::build_dense_parallel::<CosineDistance>(flat, dim, ids, m, ef_construction),
             VecMetric::L2     => vector::HnswGraph::build_dense_parallel::<L2Distance>(flat, dim, ids, m, ef_construction),
@@ -6612,19 +6761,6 @@ impl CoreDB {
         Ok(())
     }
 
-    /// **Disk-first int8 HNSW build** — the low-RAM index (DiskANN/pgvector/Qdrant
-    /// pattern). The graph is built on **full-precision f32** for quality, then:
-    ///
-    /// 1. a global scalar quantizer is calibrated (0.5 %/99.5 % quantiles),
-    /// 2. every vector is quantized to **u8 codes kept resident in RAM** (4× smaller),
-    /// 3. the **f32 stays on disk** (the field's [`VectorStore`]) for re-ranking.
-    ///
-    /// Steady-state RAM ≈ `codes + graph` (e.g. ~190 MB for 1M×128) instead of the
-    /// ~2.4 GB the all-f32 path holds. `VECTOR_NEAR` then does int8 traversal + f32
-    /// re-rank automatically (see the query executor).
-    ///
-    /// L2 only (SIFT/Euclidean); other metrics fall back to the in-RAM path.
-    /// Requires a disk-backed store (an on-disk data directory) so f32 lives on disk.
     pub fn build_hnsw_index_disk(
         &mut self,
         field: &str,
@@ -6638,50 +6774,73 @@ impl CoreDB {
             return Err("disk-first int8 index currently supports L2 only".into());
         }
         #[cfg(unix)]
-        if let Some(store) = self.vectors.get_mut(field) {
-            store.remap();
-        }
-        let field_vecs = self
-            .vectors
-            .get(field)
-            .ok_or_else(|| format!("no vectors stored for field '{field}'"))?;
-        if !field_vecs.is_disk() {
-            return Err("disk-first index needs a disk-backed store (open a data directory)".into());
-        }
-
-        // Build the graph on full precision (transient flat snapshot, freed after).
-        let dense = vector::DenseVectors::snapshot(field_vecs);
-        let (flat, dim, ids) = dense.parts();
-        let graph = vector::HnswGraph::build_dense_parallel::<L2Distance>(flat, dim, ids, m, ef_construction);
-
-        // Calibrate the quantizer from a sample of components (cheap, robust).
-        let mut sample: Vec<f32> = Vec::with_capacity(200_000);
-        let stride = (flat.len() / 200_000).max(1);
-        let mut i = 0;
-        while i < flat.len() {
-            sample.push(flat[i]);
-            i += stride;
-        }
-        let quantizer = vector::ScalarQuantizer::calibrate(&mut sample);
-
-        // Quantize every vector into the resident int8 store.
-        let mut qf = vector::QuantizedField::with_capacity(quantizer, dim, ids.len());
-        for (chunk_idx, &id) in ids.iter().enumerate() {
-            let off = chunk_idx * dim;
-            qf.insert(id, &flat[off..off + dim]);
-        }
-
-        // Atomic replace. f32 stays on disk in `self.vectors[field]`.
-        self.hnsw_indexes.insert(field.to_string(), graph);
+        if let Some(store) = self.vectors.get_mut(field) { store.remap(); }
+        let compact = {
+            let field_vecs = self.vectors.get(field)
+                .ok_or_else(|| format!("no vectors stored for field '{field}'"))?;
+            if !field_vecs.is_disk() {
+                return Err("disk-first index needs a disk-backed store (open a data directory)".into());
+            }
+            let dense = vector::DenseVectors::snapshot(field_vecs);
+            let (flat, dim, ids) = dense.parts();
+            let graph = vector::HnswGraph::build_dense_parallel::<L2Distance>(flat, dim, ids, m, ef_construction);
+            let mut sample: Vec<f32> = Vec::with_capacity(200_000);
+            let stride = (flat.len() / 200_000).max(1);
+            let mut i = 0;
+            while i < flat.len() { sample.push(flat[i]); i += stride; }
+            let quantizer = vector::ScalarQuantizer::calibrate(&mut sample);
+            let mut qf = vector::QuantizedField::with_capacity(quantizer, dim, ids.len());
+            for (chunk_idx, &id) in ids.iter().enumerate() {
+                let off = chunk_idx * dim;
+                qf.insert(id, &flat[off..off + dim]);
+            }
+            vector::CompactDiskIndex::from_hnsw(&graph, &qf, dim)
+        };
+        self.compact_indexes.insert(field.to_string(), compact);
         self.hnsw_params.insert(field.to_string(), (m, ef_construction));
         self.hnsw_metric.insert(field.to_string(), metric);
-        self.quant_fields.insert(field.to_string(), qf);
+        #[cfg(unix)]
+        if let Some(store) = self.vectors.get_mut(field) { store.drop_mmap(); }
+        #[cfg(target_os = "linux")]
+        { extern "C" { fn malloc_trim(pad: usize) -> std::os::raw::c_int; } unsafe { malloc_trim(0); } }
         Ok(())
     }
 
-    /// The int8 store for a disk-first field, if it was built that way.
     pub(crate) fn quant_field(&self, field: &str) -> Option<&vector::QuantizedField> {
         self.quant_fields.get(field)
+    }
+
+    #[cfg(unix)]
+    pub fn spill_edges_to_disk(&mut self) -> std::io::Result<()> {
+        if let Some(dir) = self.data_dir.clone() { self.edges.spill_to_disk(&dir)?; }
+        Ok(())
+    }
+
+    pub(crate) fn compact_index(&self, field: &str) -> Option<&vector::CompactDiskIndex> {
+        self.compact_indexes.get(field)
+    }
+
+    pub fn memory_report(&self) -> Vec<(&'static str, usize)> {
+        use std::mem::size_of;
+        let node_map = self.nodes.capacity() * (8 + size_of::<NodeData>());
+        let node_str: usize = self.nodes.values().map(|n| n.slug.capacity() + n.collection.capacity()).sum();
+        let colls = self.collections.capacity() * (8 + 24) + self.collections.values().map(|v| v.capacity() * 8).sum::<usize>();
+        let vec_store: usize = self.vectors.values().map(|v| v.mem_bytes()).sum();
+        let graph: usize = self.hnsw_indexes.values().map(|g| g.mem_bytes()).sum();
+        let int8: usize = self.quant_fields.values().map(|q| q.mem_bytes()).sum();
+        let compact: usize = self.compact_indexes.values().map(|c| c.mem_bytes()).sum();
+        vec![
+            ("nodes.map (NodeData inline)", node_map),
+            ("nodes.strings (slug+collection heap)", node_str),
+            ("collections", colls),
+            ("vector_store (id index + mmap)", vec_store),
+            ("hnsw_graph (fat)", graph),
+            ("int8_codes (fat)", int8),
+            ("compact_index (disk-first CSR)", compact),
+            ("bm25_index (in-RAM postings)", self.bm25_indexes.values().map(|b| b.mem_bytes()).sum()),
+            ("edge_adjacency", self.edges.adjacency_mem_bytes()),
+            ("_sizeof NodeData", size_of::<NodeData>()),
+        ]
     }
 
     /// The distance metric an HNSW index was built with (Cosine if unset).
@@ -6689,13 +6848,7 @@ impl CoreDB {
         self.hnsw_metric.get(field).copied().unwrap_or(crate::query::VecMetric::Cosine)
     }
 
-    /// Override HNSW search breadth (`ef_search`) for all subsequent `VECTOR_NEAR`
-    /// queries. `Some(ef)` trades speed for recall; `None` restores the default
-    /// `(k*3).max(50)`. Session-only (not persisted). Analogous to pgvector's
-    /// `SET hnsw.ef_search` and qdrant's per-query `hnsw_ef`.
     pub fn set_hnsw_ef_search(&mut self, ef: Option<usize>) { self.hnsw_ef_search = ef; }
-
-    /// Current `ef_search` override, if any.
     pub(crate) fn hnsw_ef_search(&self) -> Option<usize> { self.hnsw_ef_search }
 
     // ── CREATE INDEX executor ──────────────────────────────────────────────────
