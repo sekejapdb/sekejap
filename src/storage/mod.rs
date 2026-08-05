@@ -1,4 +1,5 @@
 pub(crate) mod edgestore;
+pub(crate) mod fieldstore;
 pub(crate) mod mmap;
 pub(crate) mod skbin;
 pub(crate) mod topology;
