@@ -1,9 +1,18 @@
 # Examples — the core engine API (Rust)
 
 Runnable, self-contained demos of sekejap's core concepts, using the `sekejap`
-crate directly. These are general (language-agnostic in spirit) — for
-language-specific usage see each wrapper's own examples under
-[`wrappers/`](../wrappers/) (e.g. [`wrappers/c/examples/`](../wrappers/c/examples/)).
+crate directly. The same five-stop tour also exists per language:
+
+| language | tour |
+|---|---|
+| Python | [`wrappers/python/examples/tour.py`](../wrappers/python/examples/tour.py) |
+| Node.js | [`wrappers/node/examples/tour.js`](../wrappers/node/examples/tour.js) |
+| Go | [`wrappers/go/examples/tour/`](../wrappers/go/examples/tour/) |
+| C | [`wrappers/c/examples/tour.c`](../wrappers/c/examples/tour.c) (`make tour`) |
+| Dart / Flutter | [`wrappers/dart/example/`](../wrappers/dart/example/) (full app) |
+
+Kotlin and Swift quickstarts live in the
+[bindings pages](../docs/usage/bindings/README.md).
 
 Run any of them with `cargo run --example <name>`:
 
