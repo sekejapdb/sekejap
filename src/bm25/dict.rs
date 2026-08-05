@@ -23,6 +23,13 @@ impl TermDict {
         self.entries.insert(term, TermEntry { postings_offset, postings_len });
     }
 
+    /// Approximate resident RAM: term-string bytes + entry structs + map overhead.
+    pub fn mem_bytes(&self) -> usize {
+        let e = std::mem::size_of::<TermEntry>();
+        self.entries.capacity() * (std::mem::size_of::<String>() + e + 8)
+            + self.entries.keys().map(|k| k.capacity()).sum::<usize>()
+    }
+
     pub fn get(&self, term: &str) -> Option<&TermEntry> {
         self.entries.get(term)
     }
