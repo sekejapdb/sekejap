@@ -1052,6 +1052,20 @@ impl CoreDB {
             },
         };
 
+        // Compacted payloads are SKBIN records whose field NAMES live in the
+        // field-table sidecar — without it every field lookup on a SKBIN record
+        // misses (filters silently match nothing). Mirror open(): try each
+        // redundant copy, first that passes its CRC wins. Absent → the store
+        // holds raw-JSON records only, and the empty table is correct.
+        for name in FIELD_TABLE_COPIES {
+            if let Ok(bytes) = remote.fetch_file(name) {
+                if let Some(ft) = storage::skbin::FieldTable::from_frame(&bytes) {
+                    db.payload_store.field_table = ft;
+                    break;
+                }
+            }
+        }
+
         if snap.topology_in_files {
             // v3 manifest: fetch the topology files (small vs payloads) and
             // rebuild the resident graph from them. Payloads stay remote.
@@ -3386,7 +3400,8 @@ impl CoreDB {
     /// Phase 0: write the offset-addressable topology files from the live graph.
     /// Builds `TopoNode`/`TopoEdge` from `self.nodes` + `self.edges` (dense ids
     /// assigned in hash order for deterministic output), then writes the five files
-    /// atomically. Not yet read by `open()` — see `docs/internals/topology-format-v2.md`.
+    /// atomically. Read back by `open()` for snapshot-missing recovery and by the
+    /// paged-topology mode — see `docs/developer/notes/topology-format.md`.
     fn write_topology_files(&self, dir: &Path) -> io::Result<()> {
         use storage::topology::{self, TopoEdge, TopoNode};
 
