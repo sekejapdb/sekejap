@@ -520,8 +520,8 @@ fn bench_11_shortest_path(c: &mut Criterion) {
     // sekejap: native BFS shortest path via MATCH SHORTEST SQL
     g.bench_function("sekejap_sql", |b| b.iter(|| black_box(
         sk.query(
-            "SELECT a._key AS start, b._key AS end, r.length AS hops \
-             FROM MATCH SHORTEST (a)-[r*]->(b) \
+            "SELECT a._key AS start, b._key AS end, length(r) AS hops \
+             FROM MATCH SHORTEST (a:services)-[r*]->(b:services) \
              WHERE a._key = 'svc200' AND b._key = 'svc0'"
         ).unwrap().count()
     )));
@@ -555,11 +555,11 @@ fn bench_12_st_dwithin(c: &mut Criterion) {
     g.bench_function("sekejap_sql", |b| b.iter(|| black_box(
         sk.query(&format!(
             "SELECT _key FROM venues \
-             WHERE ST_DWithin(geometry, POINT({CENTRE_LON} {CENTRE_LAT}), 5.0)"
+             WHERE ST_DWithin(geometry, POINT({CENTRE_LON} {CENTRE_LAT}), 5000.0)"
         )).unwrap().count()
     )));
     g.bench_function("sekejap_atomic", |b| b.iter(|| black_box(
-        sk.collection("venues").st_dwithin(CENTRE_LAT, CENTRE_LON, 5.0).count()
+        sk.collection("venues").st_dwithin(CENTRE_LAT, CENTRE_LON, 5000.0).count()
     )));
     // SQLite: R*Tree bbox + Haversine in Rust
     g.bench_function("sqlite", |b| b.iter(|| {
@@ -614,13 +614,13 @@ fn bench_14_spatial_category(c: &mut Criterion) {
     g.bench_function("sekejap_sql", |b| b.iter(|| black_box(
         sk.query(&format!(
             "SELECT _key FROM venues \
-             WHERE ST_DWithin(geometry, POINT({CENTRE_LON} {CENTRE_LAT}), 3.0) \
+             WHERE ST_DWithin(geometry, POINT({CENTRE_LON} {CENTRE_LAT}), 3000.0) \
              AND category = 'hospital'"
         )).unwrap().count()
     )));
     g.bench_function("sekejap_atomic", |b| b.iter(|| black_box(
         sk.collection("venues")
-          .st_dwithin(CENTRE_LAT, CENTRE_LON, 3.0)
+          .st_dwithin(CENTRE_LAT, CENTRE_LON, 3000.0)
           .where_eq("category", "hospital")
           .count()
     )));
@@ -690,7 +690,7 @@ fn bench_16_hybrid_spatial_vector(c: &mut Criterion) {
     // sekejap: fused spatial index → HNSW re-rank
     g.bench_function("sekejap_atomic", |b| b.iter(|| black_box(
         sk.collection("venues")
-          .st_dwithin(CENTRE_LAT, CENTRE_LON, 5.0)
+          .st_dwithin(CENTRE_LAT, CENTRE_LON, 5000.0)
           .vector_near("emb", query.clone(), 10)
           .count()
     )));
@@ -724,7 +724,7 @@ fn bench_17_hybrid_spatial_graph(c: &mut Criterion) {
     // sekejap: spatial index → graph hop in one pipeline
     g.bench_function("sekejap_atomic", |b| b.iter(|| black_box(
         sk.collection("venues")
-          .st_dwithin(CENTRE_LAT, CENTRE_LON, 5.0)
+          .st_dwithin(CENTRE_LAT, CENTRE_LON, 5000.0)
           .forward("related_to")
           .count()
     )));
@@ -835,7 +835,7 @@ fn bench_20_holy_trinity(c: &mut Criterion) {
     // sekejap: ONE fused atomic pipeline — spatial index → graph hop → HNSW top-5
     g.bench_function("sekejap_atomic", |b| b.iter(|| black_box(
         sk.collection("venues")
-          .st_dwithin(CENTRE_LAT, CENTRE_LON, 3.0)
+          .st_dwithin(CENTRE_LAT, CENTRE_LON, 3000.0)
           .forward("related_to")
           .vector_near("emb", query.clone(), 5)
           .count()
