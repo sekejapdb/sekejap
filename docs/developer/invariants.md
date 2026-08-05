@@ -12,7 +12,7 @@ A change that satisfies one invariant while breaking another is not acceptable.
 |--------|----------|
 | **Fast startup** | `open()` completes in < 1s regardless of dataset size |
 | **Disk-first memory** | RAM usage ∝ metadata + indexes, never ∝ payload size |
-| **Lightspeed queries** | Result cost ∝ result size, not dataset size |
+| **Fast queries** | Result cost ∝ result size, not dataset size |
 
 These are not independent goals. They share one root design:
 **payloads live on disk; everything else lives in RAM.**
@@ -118,7 +118,7 @@ During replay, the full HNSW rebuild at the end of `open()` handles it.
 
 ---
 
-## Pillar 3 — Lightspeed Queries
+## Pillar 3 — Fast Queries
 
 ### The four query paths
 

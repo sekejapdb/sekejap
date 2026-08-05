@@ -269,6 +269,7 @@ Rules the six domains agree on:
 The sweet spot the domains keep pointing at is the one nobody occupies: **a
 lightweight edge that still carries a few *declared, typed, path-aware,
 time-aware* qualifiers on the fast path, plus a provenance bag off it.** That is the
-generalization of today's single `strength` column — and it's the same shape whether
+generalization of the single `strength` column this document started from
+(since generalized: `strength` is an ordinary edge attribute today) — and it's the same shape whether
 the edge is a criminal accusation, a causal link, a dietary fit, a diary moment, a
 similarity, or a graded answer.

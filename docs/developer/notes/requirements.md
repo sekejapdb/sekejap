@@ -46,7 +46,7 @@ An embedded DB runs in someone else's process. These come before features.
      Same model as Postgres/SQLite. **Verify:** auto-commit multi-structure inserts
      (node + its edges) are wrapped in one txn unit, not just explicit `BEGIN/COMMIT`.
      Topology files (Phase 0+) keep this: atomic-rename written, re-derivable from
-     `payloads.bin` + WAL. See [durability.md](durability.md).
+     `payloads.bin` + WAL. See [durability.md](durability-benchmarks.md).
 4. **Predictable latency.** Bounded/local queries stay µs. Hot working set never
    faults. (Cold/full-scan latency is disk-bound — accepted, universal.)
 5. **Format-stable & evolvable.** Every on-disk file has a `[magic][version][flags]`
@@ -78,7 +78,7 @@ fast *and* compact *and* power-loss-safe *and* unbounded.
 - **Neighbor ids = StreamVByte-delta** — sorted, gap-encoded, SIMD-decoded (~1–2 B
   each). Compact *and* ceiling-free (logically `u64`, no `u32` limit) *and* fast
   (branch-free 4-at-a-time decode ≈ a raw array read). Payloads use **SKBIN**
-  (schema-aware binary — see [payload-binary-format.md](payload-binary-format.md)).
+  (schema-aware binary — see [payload-binary-format.md](skbin-format.md)).
 - **Compression is invisible to crash recovery.** The WAL is uncompressed; checkpoints
   (topology/payload files) are written atomically (tmp→fsync→rename) and are
   rebuildable from WAL + payloads. Blackout-safe regardless of compression.
@@ -114,7 +114,7 @@ At 1 B nodes / ~5 edges each: ~124 GB topology on disk (24 GB nodes + 8 GB offse
 - **Phase 0 — lock the format** (pre-launch, irreversible part). Dense internal ids +
   offset-addressable, versioned topology files (`nodes.bin`, `adj_fwd/rev.bin`,
   `idx.bin`, `dict.bin`). Still loads into RAM this version → no behavior change.
-  Spec: [topology-format-v2.md](topology-format-v2.md).
+  Spec: [topology-format-v2.md](topology-format.md).
 - **Phase 1 — mmap flip.** Read topology directly from the mmap; OS pages it →
   50 GB / billions on 1 GB for bounded queries.
 - **Phase 2 — S3 flip.** Topology block source = existing `BlockCache` → unbounded.
@@ -125,7 +125,7 @@ At 1 B nodes / ~5 edges each: ~124 GB topology on disk (24 GB nodes + 8 GB offse
   collisions impossible (no birthday limit), index-free traversal, half-size edges.
   API keeps `hash(slug)` linking (no caller-visible change). **128-bit not needed.**
 
-### Analytics engine (make live aggregation beat Postgres)
+### Analytics engine (fast live aggregation)
 - ✅ **Selective materialization** — MATCH aggregate skips payloads for traversal-only
   hop vars (~1.7× on LMS-shaped rollups). Shipped.
 - **btree for aggregated numeric fields** — `AVG/SUM(x)` reads values from the btree
@@ -139,7 +139,7 @@ At 1 B nodes / ~5 edges each: ~124 GB topology on disk (24 GB nodes + 8 GB offse
 - Collision check (above). I/O + executor panic → error pass. Verify auto-commit
   multi-structure atomicity.
 
-### Features (deferred — see [../../TODO.md](../../TODO.md))
+### Features (deferred — tracked in the repo `TODO.md`)
 - Constraints: `NOT NULL`, `CHECK`, `UNIQUE` (write-path, pay-per-declaration).
 - `VAGUE` fuzzy-match operator; UUID auto-key / dual-MATCH-INSERT phases.
 - Multi-language bindings: Node (napi-rs), then a `sekejap-capi` C ABI for Go/Java.
@@ -159,7 +159,7 @@ At 1 B nodes / ~5 edges each: ~124 GB topology on disk (24 GB nodes + 8 GB offse
 - **Payloads = SKBIN (schema-aware binary; size + recoverability).** Block-zstd was
   evaluated and dropped for payloads — worse ratio on real data, no faster, and a
   shared symbol/dictionary violates the ≤1-record blast-radius rule. See
-  [payload-binary-format.md](payload-binary-format.md). Edge attribute
+  [payload-binary-format.md](skbin-format.md). Edge attribute
   (type / fast-lane columns / meta) compression is an optional later pass.
 - **Name resolution = sorted `hash→id` + a resident sparse index** (~1 fault/root).
 - **Recovery is compression-invisible:** WAL uncompressed + atomic tmp→fsync→rename.
@@ -171,4 +171,4 @@ At 1 B nodes / ~5 edges each: ~124 GB topology on disk (24 GB nodes + 8 GB offse
 `CASE`/`COUNT(DISTINCT)`, Python `EXPLAIN`, versioned snapshot header, selective
 materialization, **SKBIN default payload format**, concurrent bulk write path,
 on-demand RAM reclaim (`trim_memory`), and SQL resource guardrails. See
-[architecture.md](architecture.md). Detail on payloads: [payload-binary-format.md](payload-binary-format.md).
+[invariants.md](../invariants.md). Detail on payloads: [payload-binary-format.md](skbin-format.md).

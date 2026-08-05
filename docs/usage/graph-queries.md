@@ -186,8 +186,6 @@ GROUP BY d.name
   field** (`WITH q.owner AS owner … MATCH (o:owners WHERE _key = owner)…`) — under-binds;
   continue from a bound variable instead, or decompose into separate queries.
 - **`BETWEEN`** inside a MATCH `WHERE` — use `x >= a AND x <= b`.
-- **Functions in plain `SELECT` projection** (`AGE_DAYS`, `NOW`, `CASE`) — available in
-  `SELECT … FROM MATCH`, not bare `SELECT col, f(col) FROM table`.
 - **Variable-length edge metadata** — `r.field` reads on fixed single hops, not `*a..b`.
 
 ## Semantics cheat-sheet

@@ -1,16 +1,23 @@
-# Sekejap Documentation
+# sekejap documentation
 
-Sekejap is an embedded, disk-first, graph-first multi-model database with a
-PostgreSQL-style query dialect (PostGIS spatial + pgvector vector operators) and
-a Cypher `MATCH` pattern for graph traversal.
+sekejap is an embedded, disk-first, graph-first multi-model database. One
+engine, one file on disk, five retrieval models — records, graph, spatial,
+vector, and text — queryable together in a single SQL statement.
 
-Documentation is split by audience:
+Two doors:
 
-- **[guide/](guide/README.md)** — using sekejap: the query language and public API.
-- **[internals/](internals/README.md)** — how the engine works: architecture,
-  durability, foundations, benchmarks (for contributors and deep integrators).
+- **[usage/](usage/README.md)** — you are *using* sekejap: the query language,
+  network access, and language bindings.
+- **[developer/](developer/README.md)** — you are *changing* sekejap: the
+  architecture, storage formats, index designs, and the invariants that keep
+  it fast.
 
 ## Start here
 
-- New to the query language? → [guide/graph-queries.md](guide/graph-queries.md)
-- Changing engine internals? → [internals/architecture.md](internals/architecture.md)
+1. Hands-on tour of the five models → the [main README](../README.md)
+2. The query language, properly → [usage/queries.md](usage/queries.md) and
+   [usage/graph-queries.md](usage/graph-queries.md)
+3. How the engine works → [developer/README.md](developer/README.md)
+4. Measurements → [../eval/](../eval/README.md): the comparative benchmarks
+   (relational, graph, spatial, vector, text, hybrid) with per-category
+   results and the harnesses to reproduce them
