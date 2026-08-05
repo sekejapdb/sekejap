@@ -24,10 +24,10 @@ fn main() {
     }
     db.build_spatial_index();
 
-    // Everything within 20 km of Uluwatu (lon lat).
+    // Everything within 20 km of Uluwatu (lon lat; radius in metres).
     println!("within 20km of Uluwatu:");
     for hit in db
-        .query("SELECT name FROM places WHERE ST_DWithin(geometry, POINT(115.087 -8.829), 20.0)")
+        .query("SELECT name FROM places WHERE ST_DWithin(geometry, POINT(115.087 -8.829), 20000.0)")
         .unwrap()
         .collect()
     {

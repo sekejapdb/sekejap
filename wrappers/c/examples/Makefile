@@ -43,6 +43,11 @@ test: lib
 	$(CC) $(CFLAGS) test.c -I $(INCLUDE) -L $(TARGET_DIR) -lsekejap -o test
 	$(LOADER)=$(TARGET_DIR) ./test
 
+# ── compile + run the five-stop tour (SQL, graph, spatial, vector, hybrid) ──
+tour: lib
+	$(CC) $(CFLAGS) tour.c -I $(INCLUDE) -L $(TARGET_DIR) -lsekejap -o tour
+	$(LOADER)=$(TARGET_DIR) ./tour
+
 # ── same, under AddressSanitizer (instruments the C side) ───────────────────
 asan: lib
 	$(CC) $(CFLAGS) -fsanitize=address -g test.c -I $(INCLUDE) -L $(TARGET_DIR) -lsekejap -o test_asan
