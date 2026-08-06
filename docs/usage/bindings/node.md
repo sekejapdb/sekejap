@@ -34,6 +34,40 @@ const one = JSON.parse(
 const stmt = db.prepare('SELECT * FROM places WHERE name = $1');
 ```
 
-Direct record and edge operations (`put`, `get`, `link`) work the same as in
-the other bindings. Full API: [`wrappers/node/`](../../../wrappers/node/); runnable tour:
+## Beyond SQL
+
+The Node API mirrors the Rust core (camelCase; list arguments are JSON
+strings, list results are JSON strings to `JSON.parse`):
+
+```js
+// Records and edges
+db.put('t/k1', JSON.stringify({_collection: 't', _key: 'k1'}));
+db.get('t/k1');                        // JSON string or null
+db.linkMeta('t/k1', 't/k2', 'rated', '{"stars": 5}');
+JSON.parse(db.edgesFrom('t/k1'));      // [{from, to, type, meta}, ...]
+
+// Bulk loading: one disk sync for the whole batch
+db.beginBulk();
+db.putMany(JSON.stringify([['t/k1', '{...}'], ['t/k2', '{...}']]));
+db.linkMany(JSON.stringify([['t/k1', 't/k2', 'likes']]));
+db.endBulk();
+
+// Vectors
+db.putVector('t/k1', 'emb', [0.1, 0.9, 0.0]);
+db.getVector('t/k1', 'emb');
+db.setHnswEfSearch(200);               // recall/speed knob; null = default
+
+// Ranked text search, introspection, maintenance
+JSON.parse(db.bm25Search('body', 'grilled healthy', 10));
+db.collectionNames(); db.schemaDdl('t');
+JSON.parse(db.memoryReport()); db.trimMemory();
+
+// Open modes + lifecycle
+const ro = Db.openReadOnly('./mydb');
+const paged = Db.openPaged('./big');   // mmap topology: fast open, small memory
+db.close();                            // releases the writer lock
+```
+
+Full API: [`wrappers/node/`](../../../wrappers/node/) (typed —
+`index.d.ts` is generated from the binding); runnable tour:
 [`wrappers/node/examples/tour.js`](../../../wrappers/node/examples/tour.js).

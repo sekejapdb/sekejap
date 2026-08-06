@@ -37,7 +37,13 @@ class DataFrameAccessor:
 
     # ── Query → DataFrame ─────────────────────────────────────────────────────
 
-    def query(self, sql: str, *, index_col: str | None = None) -> "pd.DataFrame":
+    def query(
+        self,
+        sql: str,
+        params: list | None = None,
+        *,
+        index_col: str | None = None,
+    ) -> "pd.DataFrame":
         """
         Run a SQL query and return a ``pandas.DataFrame``.
 
@@ -46,6 +52,7 @@ class DataFrameAccessor:
 
         Args:
             sql:        Any SELECT or SELECT … FROM MATCH query.
+            params:     Values for ``$1``, ``$2``, … placeholders.
             index_col:  If provided, set this column as the DataFrame index.
 
         Supported query forms::
@@ -74,7 +81,7 @@ class DataFrameAccessor:
             )
         """
         pd = _require_pandas()
-        hits = self._db.query(sql)
+        hits = self._db.query(sql, params) if params else self._db.query(sql)
         rows = []
         for hit in hits:
             if hit.payload:
@@ -97,6 +104,7 @@ class DataFrameAccessor:
         *,
         id_col: str = "_key",
         mapping: dict[str, str] | None = None,
+        vector_cols: list[str] | None = None,
         batch_size: int = 1000,
     ) -> int:
         """
@@ -111,8 +119,12 @@ class DataFrameAccessor:
             collection:  Target collection name (e.g. ``"researchers"``).
             id_col:      Column used as ``_key``.  Defaults to ``"_key"``.
             mapping:     ``{df_column: schema_field}`` rename map.
-            batch_size:  Rows per ``put_many`` call (unused — kept for API
-                         compatibility; rows are inserted individually for now).
+            vector_cols: Columns holding embeddings (list / numpy array per
+                         row).  These are stored through the vector store
+                         (``put_vector``) instead of the JSON payload, so the
+                         HNSW index picks them up directly.
+            batch_size:  Kept for API compatibility.  The whole load runs in
+                         one bulk scope (a single disk sync).
 
         Returns:
             Number of nodes inserted.
@@ -128,29 +140,41 @@ class DataFrameAccessor:
             )
         """
         mapping = mapping or {}
+        vector_fields = {mapping.get(c, c) for c in (vector_cols or [])}
         count = 0
-        for _, row in df.iterrows():
-            record: dict[str, Any] = {}
-            for col, val in row.items():
-                field = mapping.get(str(col), str(col))
-                record[field] = _coerce(val)
+        self._db.begin_bulk()
+        try:
+            for _, row in df.iterrows():
+                record: dict[str, Any] = {}
+                vectors: dict[str, list[float]] = {}
+                for col, val in row.items():
+                    field = mapping.get(str(col), str(col))
+                    coerced = _coerce(val)
+                    if field in vector_fields and coerced is not None:
+                        vectors[field] = [float(x) for x in coerced]
+                    else:
+                        record[field] = coerced
 
-            key_field = mapping.get(id_col, id_col)
-            raw_key = record.get(key_field)
-            if raw_key is None:
-                raw_key = record.get(id_col)
-            # Only skip when the key is genuinely absent; a falsy but valid key
-            # (0, "", False) is a real identifier and must not be dropped.
-            if raw_key is None:
-                continue
-            key = str(raw_key)
+                key_field = mapping.get(id_col, id_col)
+                raw_key = record.get(key_field)
+                if raw_key is None:
+                    raw_key = record.get(id_col)
+                # Only skip when the key is genuinely absent; a falsy but valid
+                # key (0, "", False) is a real identifier and must not drop.
+                if raw_key is None:
+                    continue
+                key = str(raw_key)
 
-            record["_collection"] = collection
-            record["_key"] = key
-            slug = f"{collection}/{key}"
+                record["_collection"] = collection
+                record["_key"] = key
+                slug = f"{collection}/{key}"
 
-            self._db.put(slug, json.dumps(record))
-            count += 1
+                self._db.put(slug, json.dumps(record))
+                for field, vec in vectors.items():
+                    self._db.put_vector(slug, field, vec)
+                count += 1
+        finally:
+            self._db.end_bulk()
         return count
 
     # ── Load edges from DataFrame ─────────────────────────────────────────────
@@ -216,6 +240,7 @@ class DataFrameAccessor:
             raise ValueError("provide either edge_type or edge_type_col")
 
         count = 0
+        self._db.begin_bulk()
         for _, row in df.iterrows():
             src = str(row[source_col])
             tgt = str(row[target_col])
@@ -244,6 +269,7 @@ class DataFrameAccessor:
                 self._db.link(src, tgt, etype)
 
             count += 1
+        self._db.end_bulk()
         return count
 
     # ── Create collection from field spec ─────────────────────────────────────
@@ -281,8 +307,8 @@ class DataFrameAccessor:
                     "_key": "TEXT PRIMARY KEY",
                     "name": "TEXT",
                     "campus": "TEXT",
-                    "embedding": "VECTOR(128)",
-                    "geometry": "GEOMETRY",
+                    "embedding": "VECTOR",
+                    "geometry": "GEO",
                 },
                 hash_index=["_key", "campus"],
                 vector_index=["embedding"],

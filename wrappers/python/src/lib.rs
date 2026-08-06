@@ -83,6 +83,15 @@ impl PyEdgeHit {
     }
 }
 
+fn to_pyedge(e: ::sekejap::EdgeHit) -> PyEdgeHit {
+    PyEdgeHit {
+        from_slug: e.from_slug,
+        to_slug: e.to_slug,
+        edge_type: e.edge_type,
+        meta_json: e.meta.map(|m| m.to_string()),
+    }
+}
+
 fn db_err(e: impl std::fmt::Display) -> PyErr {
     PyIOError::new_err(e.to_string())
 }
@@ -234,6 +243,20 @@ impl PyDB {
         ))
     }
 
+    /// Open an existing database in paged mode: identity and topology are
+    /// served from memory-mapped files, so open time and resident memory stay
+    /// small regardless of database size. Read-heavy workloads only.
+    #[staticmethod]
+    fn open_paged(path: &str) -> PyResult<Self> {
+        Ok(Self { inner: Some(CoreDB::open_paged(std::path::Path::new(path)).map_err(db_err)?) })
+    }
+
+    /// Open an existing database read-only (no lock contention with a writer).
+    #[staticmethod]
+    fn open_read_only(path: &str) -> PyResult<Self> {
+        Ok(Self { inner: Some(CoreDB::open_read_only(std::path::Path::new(path)).map_err(db_err)?) })
+    }
+
     // ── Nodes ─────────────────────────────────────────────────────────────────
 
     /// Store a node. ``json`` must contain ``_collection`` and ``_key``.
@@ -256,6 +279,36 @@ impl PyDB {
         Ok(self.db()?.contains(key))
     }
 
+    /// Store many nodes in one batch: a list of ``(key, json)`` pairs.
+    /// One disk sync for the whole batch — the fast path for bulk loads.
+    fn put_many(&mut self, pairs: Vec<(String, String)>) -> PyResult<usize> {
+        let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, j)| (k.as_str(), j.as_str())).collect();
+        self.db_mut()?.put_many(refs).map(|v| v.len()).map_err(db_err)
+    }
+
+    /// Begin a bulk-load scope: defers the per-write disk sync until
+    /// :meth:`end_bulk`. Wrap large streams of ``put`` / ``put_vector`` /
+    /// ``link`` calls in a bulk scope to avoid one sync per write.
+    fn begin_bulk(&mut self) -> PyResult<()> {
+        self.db_mut()?.begin_bulk(); Ok(())
+    }
+
+    /// End a bulk-load scope: one disk sync for everything since
+    /// :meth:`begin_bulk`.
+    fn end_bulk(&mut self) -> PyResult<()> {
+        self.db_mut()?.end_bulk(); Ok(())
+    }
+
+    /// Store a vector under a named field of a node.
+    fn put_vector(&mut self, key: &str, field: &str, data: Vec<f32>) -> PyResult<()> {
+        self.db_mut()?.put_vector(key, field, &data).map(|_| ()).map_err(db_err)
+    }
+
+    /// Retrieve the stored vector for a node's field, or ``None``.
+    fn get_vector(&self, key: &str, field: &str) -> PyResult<Option<Vec<f32>>> {
+        Ok(self.db()?.get_vector(key, field))
+    }
+
     // ── Edges ─────────────────────────────────────────────────────────────────
 
     /// Create a directed edge: ``from -[edge_type]-> to``.
@@ -274,6 +327,42 @@ impl PyDB {
     /// Remove a directed edge.
     fn unlink(&mut self, from: &str, to: &str, edge_type: &str) {
         if let Some(db) = self.inner.as_mut() { db.unlink(from, to, edge_type); }
+    }
+
+    /// Create many edges in one batch: a list of ``(from, to, edge_type)``.
+    /// One disk sync for the whole batch.
+    fn link_many(&mut self, edges: Vec<(String, String, String)>) -> PyResult<()> {
+        let refs: Vec<(&str, &str, &str)> =
+            edges.iter().map(|(f, t, e)| (f.as_str(), t.as_str(), e.as_str())).collect();
+        self.db_mut()?.link_many(refs); Ok(())
+    }
+
+    /// Remove edges matching attribute values (``props_json`` is a JSON object
+    /// of attribute equality conditions). Returns how many were removed.
+    fn unlink_where(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str) -> PyResult<usize> {
+        Ok(self.db_mut()?.unlink_where(from, to, edge_type, props_json))
+    }
+
+    /// Update attributes on matching edges: ``props_json`` selects (equality
+    /// conditions), ``sets_json`` assigns. Returns how many were updated.
+    fn update_edge(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str, sets_json: &str) -> PyResult<usize> {
+        Ok(self.db_mut()?.update_edge(from, to, edge_type, props_json, sets_json))
+    }
+
+    /// All edges leaving a node. Each :class:`EdgeHit` has ``from_slug``,
+    /// ``to_slug``, ``edge_type``, and ``meta_json`` (attributes as JSON, or ``None``).
+    fn edges_from(&self, key: &str) -> PyResult<Vec<PyEdgeHit>> {
+        Ok(self.db()?.edges_from(key).into_iter().map(to_pyedge).collect())
+    }
+
+    /// All edges arriving at a node.
+    fn edges_to(&self, key: &str) -> PyResult<Vec<PyEdgeHit>> {
+        Ok(self.db()?.edges_to(key).into_iter().map(to_pyedge).collect())
+    }
+
+    /// All edges from one collection to another.
+    fn edges_between(&self, from_collection: &str, to_collection: &str) -> PyResult<Vec<PyEdgeHit>> {
+        Ok(self.db()?.edges_between(from_collection, to_collection).into_iter().map(to_pyedge).collect())
     }
 
     // ── SQL ───────────────────────────────────────────────────────────────────
@@ -467,11 +556,44 @@ impl PyDB {
     /// Total number of edges.
     fn edge_count(&self) -> PyResult<usize> { Ok(self.db()?.edge_count()) }
 
+    /// Every node key in the database.
+    fn all_slugs(&self) -> PyResult<Vec<String>> {
+        Ok(self.db()?.all_slugs())
+    }
+
+    /// Ranked text search over a BM25-indexed field. Returns
+    /// ``(key, score)`` pairs, best first.
+    fn bm25_search(&self, field: &str, query: &str, top_k: usize) -> PyResult<Vec<(String, f64)>> {
+        let db = self.db()?;
+        Ok(db.bm25_search(field, query, top_k)
+            .into_iter()
+            .filter_map(|(h, s)| db.slug_of(h).map(|slug| (slug.to_string(), s)))
+            .collect())
+    }
+
     // ── Persistence ───────────────────────────────────────────────────────────
 
     /// Flush WAL snapshot and truncate the log.
     fn compact(&mut self) -> PyResult<()> {
         self.db_mut()?.compact().map_err(db_err)
+    }
+
+    /// Shrink resident memory to the live working set (also runs inside
+    /// :meth:`compact`). Never drops indexes.
+    fn trim_memory(&mut self) -> PyResult<()> {
+        self.db_mut()?.trim_memory(); Ok(())
+    }
+
+    /// Per-structure resident-memory estimate: ``{name: bytes}``.
+    fn memory_report(&self) -> PyResult<std::collections::HashMap<String, usize>> {
+        Ok(self.db()?.memory_report().into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    /// Override HNSW search breadth (``ef_search``). Higher = better recall,
+    /// slower queries. ``None`` restores the per-query default.
+    #[pyo3(signature = (ef=None))]
+    fn set_hnsw_ef_search(&mut self, ef: Option<usize>) -> PyResult<()> {
+        self.db_mut()?.set_hnsw_ef_search(ef); Ok(())
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
