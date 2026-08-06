@@ -6123,25 +6123,51 @@ fn compile_insert(stmt: InsertStmt) -> Result<CompiledMutation, SqlError> {
     }
 }
 
-fn compile_delete(stmt: DeleteStmt) -> Vec<Step> {
-    let mut steps: Vec<Step> = Vec::new();
-    match stmt.source {
-        Source::Collection(name) => steps.push(Step::Collection(sk_hash(&name))),
-        Source::All => steps.push(Step::All),
-    }
-    for cond in stmt.conditions {
-        steps.push(compile_cond(cond));
+/// Compile a scan-or-lookup starter for a keyed mutation. If `conditions`
+/// contains `_key = '<literal>'`, the primary key IS the slug, so we start from
+/// the direct `One(hash("collection/key"))` lookup (O(1)) and apply the
+/// remaining conditions as filters — instead of scanning the whole collection
+/// (O(N)). Consumes `conditions` to avoid cloning.
+fn compile_keyed_steps(collection: &str, conditions: Vec<CondExpr>) -> Vec<Step> {
+    let key_pos = conditions.iter().position(|c| match c {
+        CondExpr::Compare { field, op: CompareOp::Eq, value } =>
+            field == "_key" && value.is_string(),
+        _ => false,
+    });
+    let mut steps = Vec::with_capacity(conditions.len() + 1);
+    match key_pos {
+        Some(i) => {
+            let key = match &conditions[i] {
+                CondExpr::Compare { value, .. } => value.as_str().unwrap_or_default().to_string(),
+                _ => unreachable!(),
+            };
+            steps.push(Step::One(sk_hash(&format!("{collection}/{key}"))));
+            for (j, cond) in conditions.into_iter().enumerate() {
+                if j != i { steps.push(compile_cond(cond)); }
+            }
+        }
+        None => {
+            steps.push(Step::Collection(sk_hash(collection)));
+            for cond in conditions { steps.push(compile_cond(cond)); }
+        }
     }
     steps
 }
 
-fn compile_update(stmt: UpdateStmt) -> CompiledMutation {
-    let mut steps: Vec<Step> = vec![Step::Collection(sk_hash(&stmt.collection))];
-    for cond in stmt.conditions {
-        steps.push(compile_cond(cond));
+fn compile_delete(stmt: DeleteStmt) -> Vec<Step> {
+    match stmt.source {
+        Source::Collection(name) => compile_keyed_steps(&name, stmt.conditions),
+        Source::All => {
+            let mut steps = vec![Step::All];
+            for cond in stmt.conditions { steps.push(compile_cond(cond)); }
+            steps
+        }
     }
+}
+
+fn compile_update(stmt: UpdateStmt) -> CompiledMutation {
     CompiledMutation::Update {
-        steps,
+        steps: compile_keyed_steps(&stmt.collection, stmt.conditions),
         updates: stmt.updates,
     }
 }
