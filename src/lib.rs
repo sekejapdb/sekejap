@@ -649,6 +649,16 @@ pub struct CoreDB {
     auto_compact: AutoCompact,
     compact_thresholds: CompactThresholds,
     wal_sync: SyncMode,
+    /// Changes accumulated since the last emission; flushed as one [`ChangeEvent`]
+    /// at each committed-mutation boundary (see [`CoreDB::subscribe_changes`]).
+    pending_change: ChangeEvent,
+    /// Registered change listeners: `(id, callback)`.
+    change_listeners: Vec<(u64, Box<dyn FnMut(&ChangeEvent) + Send + Sync>)>,
+    /// Next subscription id.
+    next_change_id: u64,
+    /// >0 while replaying a COMMIT: batch arms accumulate but do not emit, so
+    /// the whole transaction publishes exactly one change event at COMMIT.
+    commit_depth: u32,
     compact_on_close: bool,
     /// Amortises the WAL-size stat: thresholds are checked every N writes.
     writes_since_compact_check: u32,
@@ -771,6 +781,38 @@ pub enum AutoCompact {
     Manual,
     /// SQLite-style: the write that crosses a threshold compacts inline.
     OnWrite,
+}
+
+/// What changed in one committed mutation (or transaction). Delivered to
+/// listeners registered with [`CoreDB::subscribe_changes`] — the foundation for
+/// reactive/`watch`-style queries in the language wrappers. Granularity is
+/// chosen so a watcher can decide precisely whether to refresh: a collection
+/// query cares about `collections`, a single-record watcher about `keys`, a
+/// graph traversal about `edge_types`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangeEvent {
+    /// Collections whose members were inserted, updated, or removed.
+    pub collections: Vec<String>,
+    /// Node slugs (`collection/key`) that were put, updated, or removed.
+    pub keys: Vec<String>,
+    /// Edge type labels that were linked or unlinked.
+    pub edge_types: Vec<String>,
+}
+
+impl ChangeEvent {
+    fn is_empty(&self) -> bool {
+        self.collections.is_empty() && self.keys.is_empty() && self.edge_types.is_empty()
+    }
+    fn clear(&mut self) {
+        self.collections.clear();
+        self.keys.clear();
+        self.edge_types.clear();
+    }
+    fn push_unique(v: &mut Vec<String>, s: &str) {
+        if !v.iter().any(|x| x == s) {
+            v.push(s.to_string());
+        }
+    }
 }
 
 /// WAL durability level. See [`Config::wal_sync`].
@@ -914,6 +956,10 @@ impl CoreDB {
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
             compact_thresholds: CompactThresholds::default(),
             wal_sync: SyncMode::Full,
+            pending_change: ChangeEvent::default(),
+            change_listeners: Vec::new(),
+            next_change_id: 0,
+            commit_depth: 0,
             compact_on_close: false,
             writes_since_compact_check: 0,
             autocompacting: false,
@@ -1540,6 +1586,7 @@ impl CoreDB {
     }
 
     fn put_raw_inner(&mut self, slug: &str, raw: &[u8], payload: Value) -> Result<u64, serde_json::Error> {
+        self.note_key_change(slug);
         let hash = sk_hash(slug);
         // In a batch, all rows share one timestamp — skip a per-row time syscall.
         let now = self.batch_now.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
@@ -1727,6 +1774,7 @@ impl CoreDB {
     }
 
     fn remove_raw(&mut self, slug: &str) {
+        self.note_key_change(slug);
         let hash = sk_hash(slug);
         if let Some(node) = self.nodes.remove(&hash) {
             self.slug_map.remove(slug);
@@ -2306,6 +2354,7 @@ impl CoreDB {
     }
 
     fn link_raw(&mut self, from: &str, to: &str, edge_type: &str) {
+        self.note_edge_change(edge_type);
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
@@ -2319,6 +2368,7 @@ impl CoreDB {
         edge_type: &str,
         meta_json: &str,
     ) -> Result<(), serde_json::Error> {
+        self.note_edge_change(edge_type);
         let meta: Value = serde_json::from_str(meta_json)?;
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
@@ -2356,6 +2406,7 @@ impl CoreDB {
     }
 
     fn unlink_raw(&mut self, from: &str, to: &str, edge_type: &str) {
+        self.note_edge_change(edge_type);
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
@@ -2461,6 +2512,70 @@ impl CoreDB {
         }
     }
 
+    // ── Change notification ────────────────────────────────────────────────────
+
+    /// Record that a node slug changed (put/update/remove). Derives the
+    /// collection from the slug (`collection/key`). Accumulates into the pending
+    /// event; flushed once at the mutation boundary by [`emit_changes`].
+    fn note_key_change(&mut self, slug: &str) {
+        if self.change_listeners.is_empty() { return; }
+        ChangeEvent::push_unique(&mut self.pending_change.keys, slug);
+        if let Some((coll, _)) = slug.split_once('/') {
+            ChangeEvent::push_unique(&mut self.pending_change.collections, coll);
+        }
+    }
+
+    /// Record that edges of a type changed (link/unlink).
+    fn note_edge_change(&mut self, edge_type: &str) {
+        if self.change_listeners.is_empty() { return; }
+        ChangeEvent::push_unique(&mut self.pending_change.edge_types, edge_type);
+    }
+
+    /// Flush accumulated changes to listeners as one [`ChangeEvent`]. No-op
+    /// inside a transaction (`defer_wal_sync` set, or `commit_depth` > 0 during
+    /// COMMIT replay) — changes accumulate and emit once at COMMIT — or when
+    /// nothing changed / no one is listening.
+    fn emit_changes(&mut self) {
+        if self.defer_wal_sync
+            || self.commit_depth > 0
+            || self.change_listeners.is_empty()
+            || self.pending_change.is_empty()
+        {
+            return;
+        }
+        let event = std::mem::take(&mut self.pending_change);
+        for (_, cb) in self.change_listeners.iter_mut() {
+            cb(&event);
+        }
+    }
+
+    /// Post-mutation boundary: emit the change event, then run auto-compaction.
+    /// Called at the end of every public mutation.
+    fn after_mutation(&mut self) {
+        self.emit_changes();
+        self.autocompact_after_write();
+    }
+
+    /// Subscribe to change events. The callback fires once per committed
+    /// mutation (a transaction fires once, at COMMIT) with the set of
+    /// collections, keys, and edge types that changed — the basis for reactive
+    /// `watch`-style queries. Returns an id for [`unsubscribe_changes`]. The
+    /// callback must not call back into this database.
+    pub fn subscribe_changes(
+        &mut self,
+        f: impl FnMut(&ChangeEvent) + Send + Sync + 'static,
+    ) -> u64 {
+        let id = self.next_change_id;
+        self.next_change_id += 1;
+        self.change_listeners.push((id, Box::new(f)));
+        id
+    }
+
+    /// Remove a change subscription registered with [`subscribe_changes`].
+    pub fn unsubscribe_changes(&mut self, id: u64) {
+        self.change_listeners.retain(|(i, _)| *i != id);
+    }
+
     fn flush_deferred_indexes(&mut self) {
         let bm25_fields: Vec<String> = self.dirty_bm25.drain().collect();
         for field in bm25_fields {
@@ -2547,6 +2662,10 @@ impl CoreDB {
             .collect();
         let count = hits.len();
         if count == 0 { return Ok(0); }
+        if !self.change_listeners.is_empty() {
+            let slugs: Vec<String> = hits.iter().map(|(s, _, _)| s.clone()).collect();
+            for slug in &slugs { self.note_key_change(slug); }
+        }
 
         // Schema validation (once for the batch)
         let coll_name = self.nodes.get(&hits[0].1)
@@ -2678,6 +2797,7 @@ impl CoreDB {
             self.touch_search_index(&coll_name);
         }
 
+        self.emit_changes();
         Ok(count)
     }
 
@@ -2843,7 +2963,7 @@ impl CoreDB {
             }
         }
 
-        self.autocompact_after_write();
+        self.after_mutation();
         Ok(hash)
     }
 
@@ -2873,7 +2993,7 @@ impl CoreDB {
         self.defer_wal_sync = false;
         self.wal_flush();
         self.flush_deferred_indexes();
-        self.autocompact_after_write();
+        self.after_mutation();
         result
     }
 
@@ -3027,7 +3147,7 @@ impl CoreDB {
         // Only autocompact when standalone — a nesting caller (e.g. InsertBatch,
         // a transaction) that set defer_wal_sync finalizes/compacts itself.
         if !self.defer_wal_sync {
-            self.autocompact_after_write();
+            self.after_mutation();
         }
         Ok(wal_entries.len())
     }
@@ -3064,7 +3184,7 @@ impl CoreDB {
     pub fn end_bulk(&mut self) {
         self.defer_wal_sync = false;
         self.wal_flush();
-        self.autocompact_after_write();
+        self.after_mutation();
     }
 
     /// Bulk edge insert — the edge counterpart of [`put_many`](Self::put_many).
@@ -3082,7 +3202,7 @@ impl CoreDB {
         }
         self.defer_wal_sync = false;
         self.wal_flush();
-        self.autocompact_after_write();
+        self.after_mutation();
     }
 
     /// Bulk edge insert with optional per-edge metadata — the attributed
@@ -3117,7 +3237,7 @@ impl CoreDB {
         if !prev {
             self.wal_flush();
         }
-        self.autocompact_after_write();
+        self.after_mutation();
         result
     }
 
@@ -3127,7 +3247,7 @@ impl CoreDB {
             slug: slug.to_string(),
         });
         self.remove_raw(slug);
-        self.autocompact_after_write();
+        self.after_mutation();
     }
 
     /// Create a directed edge: `from` → `to` with a type label. The edge is a
@@ -3140,7 +3260,7 @@ impl CoreDB {
             edge_type: edge_type.to_string(),
         });
         self.link_raw(from, to, edge_type);
-        self.autocompact_after_write();
+        self.after_mutation();
     }
 
     /// Like `link` but attaches a JSON metadata object to the edge. Primitive
@@ -3160,7 +3280,7 @@ impl CoreDB {
             meta: meta_json.to_string(),
         });
         self.link_meta_raw(from, to, edge_type, meta_json)?;
-        self.autocompact_after_write();
+        self.after_mutation();
         Ok(())
     }
 
@@ -3172,12 +3292,13 @@ impl CoreDB {
             edge_type: edge_type.to_string(),
         });
         self.unlink_raw(from, to, edge_type);
-        self.autocompact_after_write();
+        self.after_mutation();
     }
 
     /// Set attributes (`sets_json` object) on edges from→to of `edge_type` matching
     /// the `props_json` predicate. Returns count updated.
     fn update_edge_raw(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str, sets_json: &str) -> usize {
+        self.note_edge_change(edge_type);
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
@@ -3206,7 +3327,7 @@ impl CoreDB {
             sets: sets_json.to_string(),
         });
         let n = self.update_edge_raw(from, to, edge_type, props_json, sets_json);
-        self.autocompact_after_write();
+        self.after_mutation();
         n
     }
 
@@ -3220,7 +3341,7 @@ impl CoreDB {
             props: props_json.to_string(),
         });
         let n = self.unlink_where_raw(from, to, edge_type, props_json);
-        self.autocompact_after_write();
+        self.after_mutation();
         n
     }
 
@@ -5135,16 +5256,33 @@ impl CoreDB {
                 self.defer_index_rebuild = true;
                 self.wal_write(WalEntry::TxnBegin);
                 let mut total = 0usize;
+                self.commit_depth += 1;
+                let mut txn_err = None;
                 for op in buf {
-                    total += self.execute_mutation(op)?;
+                    match self.execute_mutation(op) {
+                        Ok(n) => total += n,
+                        Err(e) => { txn_err = Some(e); break; }
+                    }
+                }
+                self.commit_depth -= 1;
+                if let Some(e) = txn_err {
+                    self.wal_write(WalEntry::TxnEnd);
+                    self.defer_wal_sync = false;
+                    self.wal_flush();
+                    self.flush_deferred_indexes();
+                    self.pending_change.clear();
+                    return Err(e);
                 }
                 self.wal_write(WalEntry::TxnEnd);
                 self.defer_wal_sync = false;
                 self.wal_flush();
                 self.flush_deferred_indexes();
+                self.emit_changes();
                 return Ok(total);
             }
             sql::CompiledMutation::Rollback => {
+                // Discard any changes accumulated in the aborted transaction.
+                self.pending_change.clear();
                 if self.pending_txn.take().is_none() {
                     return Err(SqlError::TransactionError(
                         "ROLLBACK without an active transaction".into(),
@@ -5352,6 +5490,7 @@ impl CoreDB {
                         let _ = self.build_hnsw_index(field, m, ef);
                     }
                 }
+                self.emit_changes();
                 Ok(count)
             }
             sql::CompiledMutation::Delete(steps) => {
@@ -5369,6 +5508,7 @@ impl CoreDB {
                 self.defer_wal_sync = false;
                 self.wal_flush();
                 self.flush_deferred_indexes();
+                self.emit_changes();
                 Ok(count)
             }
             sql::CompiledMutation::InsertEdge(edges) => {
@@ -5387,6 +5527,7 @@ impl CoreDB {
                 }
                 self.defer_wal_sync = false;
                 self.wal_flush();
+                self.emit_changes();
                 Ok(count)
             }
             sql::CompiledMutation::DeleteEdge(edges) => {
@@ -5404,6 +5545,7 @@ impl CoreDB {
                 }
                 self.defer_wal_sync = false;
                 self.wal_flush();
+                self.emit_changes();
                 Ok(count)
             }
             sql::CompiledMutation::UpdateEdge { from, to, edge_type, predicate, sets } => {
@@ -5442,6 +5584,7 @@ impl CoreDB {
                 }
                 self.defer_wal_sync = false;
                 self.wal_flush();
+                self.emit_changes();
                 Ok(count)
             }
             sql::CompiledMutation::Update { steps, updates } => {
@@ -5545,6 +5688,7 @@ impl CoreDB {
                     self.defer_wal_sync = false;
                     self.wal_flush();
                     self.flush_deferred_indexes();
+                    self.emit_changes();
                     Ok(count)
                 }
             }
