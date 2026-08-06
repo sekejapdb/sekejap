@@ -1,11 +1,17 @@
 # Swift
 
-Install with Swift Package Manager (iOS + macOS):
+Build from source for now (a dedicated SwiftPM package repository is
+planned):
 
-```swift
-// Package.swift
-.package(url: "https://github.com/sekejapdb/sekejap-swift.git", from: "0.13.0")
+```sh
+git clone https://github.com/sekejapdb/sekejap
+cd sekejap
+cargo build --release -p sekejap-capi     # the native engine
+cd wrappers/swift && swift test           # the Swift package, ready to use
 ```
+
+Depend on it as a local package (`.package(path: "…/sekejap/wrappers/swift")`)
+until the standalone package repository is published.
 
 ## First query
 

@@ -43,10 +43,9 @@ wrappers/swift/
 ## Distribution
 
 - **No central registry.** Swift Package Manager consumes packages from **Git URLs**.
-- **Install (SwiftPM):**
-  ```swift
-  .package(url: "https://github.com/sekejapdb/sekejap-swift.git", from: "0.13.0")
-  ```
+- **Install (SwiftPM):** planned via a dedicated package repository
+  (`sekejapdb/sekejap-swift` — not yet created); until then, depend on this
+  directory as a local package: `.package(path: "…/sekejap/wrappers/swift")`.
 - **Publish:** git-tag a release; the [Swift Package Index](https://swiftpackageindex.com)
   indexes it automatically. Ship the native code as a `libsekejap.xcframework` attached
   to the GitHub Release and referenced by a `binaryTarget`.

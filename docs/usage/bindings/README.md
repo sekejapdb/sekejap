@@ -10,7 +10,7 @@ behavior and the SQL surface are identical everywhere. Pick your language:
 | Node.js | [node.md](node.md) | npm |
 | Dart / Flutter | [dart.md](dart.md) | pub.dev |
 | Kotlin / Java | [kotlin.md](kotlin.md) | Maven Central |
-| Swift | [swift.md](swift.md) | Swift Package Manager |
+| Swift | [swift.md](swift.md) | build from source (SwiftPM repo planned) |
 | Go | [go.md](go.md) | Go modules |
 | C / C++ | [c.md](c.md) | build from source |
 

@@ -1,4 +1,4 @@
-# sekejap for Kotlin/Java (JVM + Android)
+# sekejap for Kotlin/Java (desktop/server JVM)
 
 **Status: working** (tested). Kotlin/JVM binding via **Panama / Foreign Function &
 Memory API** (FFM, JDK 22+) over the C ABI (`../c`, `libsekejap`) — pure JVM, no
@@ -49,7 +49,7 @@ temp → `-Dsekejap.lib`), or rely on a system-installed library.
 ## Distribution
 
 - **Registry:** [Maven Central](https://central.sonatype.com) → Gradle
-  `implementation("com.app:sekejap:0.13.0")`
+  `implementation("com.app:sekejap:0.16.1")`
 - **groupId:** **`com.app`** — reverse-DNS of the `app.com` umbrella domain.
   Verifying the apex with Sonatype once grants `com.app.*` for every product
   (sekejap, geonative, josie, …).
