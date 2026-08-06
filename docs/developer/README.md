@@ -268,6 +268,7 @@ cargo bench --bench mega_benchmark   # 20-scenario local benchmark vs SQLite
 - [queries.md](queries.md) — how a query executes
 - [invariants.md](invariants.md) — **read before changing anything**: the
   checklists that keep startup, memory, and query speed intact
+- [roadmap.md](roadmap.md) — where the engine and wrappers are going next
 - [notes/](notes/) — design history and rationale (archive)
 - [../../eval/](../../eval/README.md) — the comparative benchmark suite:
   harnesses, datasets, and measured results per category

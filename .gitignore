@@ -121,3 +121,4 @@ wrappers/kotlin/build/
 wrappers/kotlin/gradle/
 !wrappers/kotlin/gradle/wrapper/gradle-wrapper.properties
 .docs.backup/
+.brainstorm/
