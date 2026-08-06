@@ -52,6 +52,38 @@ pub fn db_put(db: &SekejapDb, slug: String, json: String) -> Result<u64, String>
         .map_err(|e| e.to_string())
 }
 
+/// Store many nodes in one FFI crossing: `pairs` is a list of `(slug, json)`.
+/// One batch, one durability barrier — the bulk-load fast path on mobile.
+pub fn db_put_many(db: &SekejapDb, pairs: Vec<(String, String)>) -> Result<usize, String> {
+    let refs: Vec<(&str, &str)> = pairs.iter().map(|(s, j)| (s.as_str(), j.as_str())).collect();
+    db.0.lock().unwrap()
+        .put_many(refs)
+        .map(|v| v.len())
+        .map_err(|e| e.to_string())
+}
+
+/// Set the WAL durability level: 0 = Full (fsync every write), 1 = Normal
+/// (fsync at checkpoint only — the mobile default), 2 = Off.
+pub fn db_set_wal_sync(db: &SekejapDb, mode: u8) {
+    let m = match mode {
+        1 => sekejap::SyncMode::Normal,
+        2 => sekejap::SyncMode::Off,
+        _ => sekejap::SyncMode::Full,
+    };
+    db.0.lock().unwrap().set_wal_sync(m);
+}
+
+/// Apply the recommended mobile profile in one call: WAL sync = Normal (fsync
+/// at checkpoint, not per write) and auto-compaction = Manual (a burst of
+/// writes never triggers an inline full compaction). Call `db_compact` at an
+/// idle moment or on close to reclaim the WAL. This is the durability/latency
+/// trade-off every mobile database makes by default.
+pub fn db_mobile_profile(db: &SekejapDb) {
+    let mut g = db.0.lock().unwrap();
+    g.set_wal_sync(sekejap::SyncMode::Normal);
+    g.set_auto_compact(sekejap::AutoCompact::Manual);
+}
+
 /// Remove a node (and its associated edges).
 pub fn db_remove(db: &SekejapDb, slug: String) {
     db.0.lock().unwrap().remove(&slug);

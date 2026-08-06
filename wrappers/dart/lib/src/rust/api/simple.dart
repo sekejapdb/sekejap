@@ -20,41 +20,50 @@ Future<BigInt> dbExecute({required SekejapDb db, required String sql}) =>
 
 /// Store a node. `json` must be a valid JSON object containing `_collection`.
 /// Returns the internal storage id of the written node.
-Future<BigInt> dbPut({
-  required SekejapDb db,
-  required String slug,
-  required String json,
-}) => RustLib.instance.api.crateApiSimpleDbPut(db: db, slug: slug, json: json);
+Future<BigInt> dbPut(
+        {required SekejapDb db, required String slug, required String json}) =>
+    RustLib.instance.api.crateApiSimpleDbPut(db: db, slug: slug, json: json);
+
+/// Store many nodes in one FFI crossing: `pairs` is a list of `(slug, json)`.
+/// One batch, one durability barrier — the bulk-load fast path on mobile.
+Future<BigInt> dbPutMany(
+        {required SekejapDb db, required List<(String, String)> pairs}) =>
+    RustLib.instance.api.crateApiSimpleDbPutMany(db: db, pairs: pairs);
+
+/// Set the WAL durability level: 0 = Full (fsync every write), 1 = Normal
+/// (fsync at checkpoint only — the mobile default), 2 = Off.
+Future<void> dbSetWalSync({required SekejapDb db, required int mode}) =>
+    RustLib.instance.api.crateApiSimpleDbSetWalSync(db: db, mode: mode);
+
+/// Apply the recommended mobile profile in one call: WAL sync = Normal (fsync
+/// at checkpoint, not per write) and auto-compaction = Manual (a burst of
+/// writes never triggers an inline full compaction). Call `db_compact` at an
+/// idle moment or on close to reclaim the WAL. This is the durability/latency
+/// trade-off every mobile database makes by default.
+Future<void> dbMobileProfile({required SekejapDb db}) =>
+    RustLib.instance.api.crateApiSimpleDbMobileProfile(db: db);
 
 /// Remove a node (and its associated edges).
 Future<void> dbRemove({required SekejapDb db, required String slug}) =>
     RustLib.instance.api.crateApiSimpleDbRemove(db: db, slug: slug);
 
 /// Create a directed edge: `from -[edge_type]-> to`.
-Future<void> dbLink({
-  required SekejapDb db,
-  required String from,
-  required String to,
-  required String edgeType,
-}) => RustLib.instance.api.crateApiSimpleDbLink(
-  db: db,
-  from: from,
-  to: to,
-  edgeType: edgeType,
-);
+Future<void> dbLink(
+        {required SekejapDb db,
+        required String from,
+        required String to,
+        required String edgeType}) =>
+    RustLib.instance.api
+        .crateApiSimpleDbLink(db: db, from: from, to: to, edgeType: edgeType);
 
 /// Remove a directed edge between two nodes.
-Future<void> dbUnlink({
-  required SekejapDb db,
-  required String from,
-  required String to,
-  required String edgeType,
-}) => RustLib.instance.api.crateApiSimpleDbUnlink(
-  db: db,
-  from: from,
-  to: to,
-  edgeType: edgeType,
-);
+Future<void> dbUnlink(
+        {required SekejapDb db,
+        required String from,
+        required String to,
+        required String edgeType}) =>
+    RustLib.instance.api
+        .crateApiSimpleDbUnlink(db: db, from: from, to: to, edgeType: edgeType);
 
 /// Run a SELECT or MATCH query.
 /// Returns a JSON array: `[{"slug":"...","payload":{...}}, ...]`
@@ -64,47 +73,37 @@ Future<String> dbQuery({required SekejapDb db, required String sql}) =>
 /// Run a SELECT or MATCH query with parameter bindings ($1, $2, …).
 /// `params_json` is a JSON array of values, e.g. `'["Alice", 25]'`.
 /// Returns a JSON array: `[{"slug":"...","payload":{...}}, ...]`
-Future<String> dbQueryParams({
-  required SekejapDb db,
-  required String sql,
-  required String paramsJson,
-}) => RustLib.instance.api.crateApiSimpleDbQueryParams(
-  db: db,
-  sql: sql,
-  paramsJson: paramsJson,
-);
+Future<String> dbQueryParams(
+        {required SekejapDb db,
+        required String sql,
+        required String paramsJson}) =>
+    RustLib.instance.api
+        .crateApiSimpleDbQueryParams(db: db, sql: sql, paramsJson: paramsJson);
 
 /// Compile a query once for repeated execution (a prepared statement). Use
 /// `$1`, `$2`, … placeholders and bind them per run via [`db_query_prepared`].
-Future<SekejapPreparedQuery> dbPrepare({
-  required SekejapDb db,
-  required String sql,
-}) => RustLib.instance.api.crateApiSimpleDbPrepare(db: db, sql: sql);
+Future<SekejapPreparedQuery> dbPrepare(
+        {required SekejapDb db, required String sql}) =>
+    RustLib.instance.api.crateApiSimpleDbPrepare(db: db, sql: sql);
 
 /// Run a prepared statement, binding $1, $2, … from `params_json` (a JSON array).
 /// Returns a JSON array: `[{"slug":"...","payload":{...}}, ...]`
-Future<String> dbQueryPrepared({
-  required SekejapDb db,
-  required SekejapPreparedQuery stmt,
-  required String paramsJson,
-}) => RustLib.instance.api.crateApiSimpleDbQueryPrepared(
-  db: db,
-  stmt: stmt,
-  paramsJson: paramsJson,
-);
+Future<String> dbQueryPrepared(
+        {required SekejapDb db,
+        required SekejapPreparedQuery stmt,
+        required String paramsJson}) =>
+    RustLib.instance.api.crateApiSimpleDbQueryPrepared(
+        db: db, stmt: stmt, paramsJson: paramsJson);
 
 /// Run a DDL/DML statement with parameter bindings ($1, $2, …).
 /// `params_json` is a JSON array of values.
 /// Returns the number of rows affected.
-Future<BigInt> dbExecuteParams({
-  required SekejapDb db,
-  required String sql,
-  required String paramsJson,
-}) => RustLib.instance.api.crateApiSimpleDbExecuteParams(
-  db: db,
-  sql: sql,
-  paramsJson: paramsJson,
-);
+Future<BigInt> dbExecuteParams(
+        {required SekejapDb db,
+        required String sql,
+        required String paramsJson}) =>
+    RustLib.instance.api.crateApiSimpleDbExecuteParams(
+        db: db, sql: sql, paramsJson: paramsJson);
 
 /// Get a single node by slug. Returns its JSON payload string, or null.
 Future<String?> dbGet({required SekejapDb db, required String slug}) =>
