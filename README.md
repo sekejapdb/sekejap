@@ -82,15 +82,11 @@ flutter pub add sekejap             # or: dart pub add sekejap
 
 ```kotlin
 // build.gradle.kts
-implementation("com.zebflow:sekejap:0.13.5")
+implementation("com.zebflow:sekejap:0.16.1")
 ```
 
-**Swift** — Swift Package Manager (see [`wrappers/swift/`](wrappers/swift/))
-
-```swift
-// Package.swift
-.package(url: "https://github.com/sekejapdb/sekejap-swift.git", from: "0.13.0")
-```
+**Swift** — build from source for now (see [`wrappers/swift/`](wrappers/swift/));
+a dedicated SwiftPM package repository is planned.
 
 **Go** — Go modules (see [`wrappers/go/`](wrappers/go/))
 

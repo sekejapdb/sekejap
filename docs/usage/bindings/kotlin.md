@@ -7,11 +7,13 @@ install:
 
 ```kotlin
 // build.gradle.kts
-implementation("com.zebflow:sekejap:0.13.5")
+implementation("com.zebflow:sekejap:0.16.1")
 ```
 
 Requires **JDK 22+** at runtime (the binding uses the Java FFM API, finalized
-in JDK 22; pure JVM, no JNI glue, no JNA dependency).
+in JDK 22; pure JVM, no JNI glue, no JNA dependency). This serves **desktop and
+server JVMs**; Android's runtime does not provide the FFM API — on Android, use
+the [Flutter binding](dart.md) instead.
 
 ## First query
 
