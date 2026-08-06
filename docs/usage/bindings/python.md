@@ -69,5 +69,7 @@ db.df.load_edges(edges_df, source_col="s", target_col="t", edge_type="knows")
 `create_collection` builds a typed table from a dict. Loads run inside a bulk
 scope (one disk sync). pandas is only required if you use `db.df`.
 
-A runnable five-stop tour (SQL, graph, spatial, vector, hybrid):
-[`wrappers/python/examples/tour.py`](../../../wrappers/python/examples/tour.py).
+Runnable examples: the five-stop tour
+([`tour.py`](../../../wrappers/python/examples/tour.py)) and a FastAPI app
+([`fastapi_app.py`](../../../wrappers/python/examples/fastapi_app.py)) with
+spatial, vector, and ranked-text endpoints.

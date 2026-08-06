@@ -7,8 +7,8 @@ systems, one constrained node.
 - `harness/` — one Rust harness per category (plus `hybridmulti` for the
   DuckDB / Postgres+pgvector hybrid competitors). Each is a standalone crate
   that depends on the sekejap crate at the repo root, so building here
-  benchmarks exactly the checked-out engine (tag `cidr2027-submission` is the
-  exact paper snapshot).
+  benchmarks exactly the checked-out engine (tag `v0.16.0` is the
+  exact snapshot the paper measured).
 - `results/` — the measured numbers cited in the paper: one
   `benchmark-0N-<category>.md` per category plus the raw CSVs.
 - `scripts/` — dataset download + preprocessing helpers.
