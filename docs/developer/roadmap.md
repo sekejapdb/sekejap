@@ -33,22 +33,45 @@ db.dishes
 
 The builder compiles to the same SGQL plan the engine already runs — it is a
 typed front-end, not a second engine. What differs per language is only the
-surface:
+surface.
 
-| ecosystem | model form | generation | reactive type |
+## One umbrella, native idioms
+
+Every language surface is a thin front-end over the same three things: the C
+ABI, the SGQL plan it lowers to, and the change feed it subscribes to. The
+engine never changes to add a language — a binding just (1) calls the C ABI,
+(2) compiles its idiomatic query form to the SGQL plan, and (3) maps the change
+feed to the language's reactive primitive. That contract is what lets each
+ecosystem feel native without forking the core.
+
+So each binding is shaped for the community that actually uses that language,
+in the idiom they already reach for — the goal is to feel *native*, not ported.
+
+| language | shaped for | interface form | reactive |
 |---|---|---|---|
-| Dart / Flutter | annotated class | build_runner | `Stream` |
-| Kotlin / Android | annotated data class | KSP | `Flow` |
-| Swift / iOS | `@Model`-style macro | Swift macros | `AsyncSequence` |
-| TypeScript / Node | schema or decorators | generated `.d.ts` | async iterator |
-| Python | Pydantic model | runtime type hints | async iterator |
-| Go | struct tags | `go generate` | channels |
+| **Dart / Flutter** | Flutter app & game (Flame) developers | annotated `@Entity` classes, build_runner codegen, widget-ready results | `Stream` |
+| **Kotlin** | Android app developers | annotated data classes, KSP codegen, coroutine-first | `Flow` (Compose) |
+| **Swift** | iOS / macOS app developers | `@Model`-style macro, SwiftUI `@Query`-style property wrapper | `AsyncSequence` |
+| **TypeScript** | full-stack web **and** React Native | typed client from a schema (Prisma/Drizzle feel), same code on device and server | async iterator / hooks |
+| **Python** | FastAPI developers **and** data scientists | two doors: Pydantic models + async queries; DataFrame in/out | async iterator |
+| **Go** | backend & cloud engineers | struct tags, `go generate`, context-aware | channels |
+| **C / C++** | game engines, robotics, systems | the stable C ABI itself; C++ gets RAII typed wrappers | callbacks |
+| **C# / .NET** | **Unity game developers** (also .NET backends) | a **LINQ** provider so queries feel built into the language; MonoBehaviour-friendly lifecycle | `IAsyncEnumerable` / Rx |
+| **Lua** | **game scripting** (Roblox, LÖVE, engines) & embedded (Neovim, Redis) | a **tiny table-based API**, no build step, coroutine-friendly | coroutines |
+| **Elixir** | realtime & distributed backends, IoT (Nerves) | an **Ecto-style** macro query DSL, GenServer-owned handle | `Phoenix.PubSub` / LiveView |
+| **Clojure** | data engineers, functional backends | **Datalog** — query as data, a natural fit for the graph model | `core.async` / atoms |
+| **Julia** | scientific computing & ML | **DataFrame + broadcasting**, vector-native for embeddings | observers |
+| **Haskell** | type-safety-first, research & finance | a **typed EDSL** (Esqueleto-style), compile-time-checked queries | `STM` |
+| **Zig** | systems & game-engine developers | a **comptime** zero-cost typed API, explicit allocators | explicit callbacks |
 
-A single embedded engine means the TypeScript surface is the same on a device
-(React Native) and on a server (Express, Next.js) — the query you write in a
-route handler is the query you write in a screen. Python meets its two
-audiences at once: Pydantic models with async queries for API developers, and
-DataFrames (pandas today, Arrow-based analytics later) for data work.
+A single embedded engine also means the TypeScript surface is the same on a
+device (React Native) and on a server (Express, Next.js) — the query you write
+in a route handler is the query you write in a screen.
+
+The first six are in progress; the rest are community-driven targets, not
+scheduled deliverables — each is a self-contained binding an interested
+contributor can own end to end, because the umbrella contract keeps the engine
+out of the picture.
 
 ## What the engine needs to support it
 
