@@ -648,6 +648,7 @@ pub struct CoreDB {
     /// Auto-compaction mode + thresholds (copied from `Config` at open).
     auto_compact: AutoCompact,
     compact_thresholds: CompactThresholds,
+    wal_sync: SyncMode,
     compact_on_close: bool,
     /// Amortises the WAL-size stat: thresholds are checked every N writes.
     writes_since_compact_check: u32,
@@ -772,6 +773,19 @@ pub enum AutoCompact {
     OnWrite,
 }
 
+/// WAL durability level. See [`Config::wal_sync`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    /// fsync every write. Safe against power loss; slow on mobile flash.
+    Full,
+    /// Append without per-write fsync; sync at checkpoint/compact. The standard
+    /// mobile trade-off (SQLite `synchronous=NORMAL`): durable to the last
+    /// checkpoint, never corrupting.
+    Normal,
+    /// Never fsync. Fastest, least durable.
+    Off,
+}
+
 /// Thresholds that make compaction eligible.
 #[derive(Clone, Copy, Debug)]
 pub struct CompactThresholds {
@@ -813,6 +827,15 @@ pub struct Config {
     /// Run a final `compact()` when the database is dropped (only if the WAL is
     /// non-trivial). Off by default — drops should not stall unexpectedly.
     pub compact_on_close: bool,
+    /// Durability of individual writes. [`SyncMode::Full`] (default) fsyncs the
+    /// WAL on every write — safe against power loss, but each fsync costs tens
+    /// of milliseconds on mobile flash (Android FUSE/eMMC). [`SyncMode::Normal`]
+    /// appends to the WAL without a per-write fsync and syncs only at
+    /// checkpoint/compact — the standard mobile trade-off (SQLite
+    /// `synchronous=NORMAL`): a crash can lose writes since the last checkpoint
+    /// but never corrupts the database (WAL replay resumes from the last synced
+    /// point). [`SyncMode::Off`] never syncs.
+    pub wal_sync: SyncMode,
     /// Re-encode payloads as SKBIN (schema-aware binary) at compaction: field
     /// names → IDs, typed values, strings literal. ~1.6× smaller, faster field
     /// reads, 1-record corruption isolation (values never leave their record).
@@ -841,6 +864,7 @@ impl Default for Config {
             auto_compact: AutoCompact::OnWrite,
             compact_thresholds: CompactThresholds::default(),
             compact_on_close: false,
+            wal_sync: SyncMode::Full,
             // SKBIN Level-1 is the official default payload format: schema-aware
             // binary (~1.2–2x smaller on structured data, faster field reads,
             // 1-record corruption isolation, zero user data in shared state).
@@ -889,6 +913,7 @@ impl CoreDB {
             slug_map: HashMap::new(),
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
             compact_thresholds: CompactThresholds::default(),
+            wal_sync: SyncMode::Full,
             compact_on_close: false,
             writes_since_compact_check: 0,
             autocompacting: false,
@@ -1160,12 +1185,22 @@ impl CoreDB {
                 .create(true)
                 .write(true)
                 .open(dir.join("db.lock"))?;
-            f.try_lock().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "database is locked by another process",
-                )
-            })?;
+            // Only a genuine `WouldBlock` means another process holds the lock.
+            // On some filesystems (Android FUSE/sdcardfs, some network mounts)
+            // `flock` is unsupported and returns an error instead — there we
+            // proceed without advisory locking, the way SQLite degrades.
+            match f.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "database is locked by another process",
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(_)) => {
+                    // Locking not supported on this filesystem — continue unlocked.
+                }
+            }
             Some(f)
         };
 
@@ -1271,6 +1306,7 @@ impl CoreDB {
             }
         }
         db.auto_compact = config.auto_compact;
+        db.wal_sync = config.wal_sync;
         db.compact_thresholds = config.compact_thresholds;
         db.compact_on_close = config.compact_on_close;
 
@@ -2348,7 +2384,11 @@ impl CoreDB {
         if let Some(wal) = &mut self.wal {
             wal.append(&entry)
                 .expect("sekejap: WAL write failed — disk error");
-            if !self.defer_wal_sync {
+            // fsync only under Full durability and outside a batch. Normal/Off
+            // append durably to the WAL file but defer the fsync to
+            // checkpoint/compact — the standard mobile trade-off, where a
+            // per-write fsync on flash storage costs tens of milliseconds.
+            if !self.defer_wal_sync && self.wal_sync == SyncMode::Full {
                 wal.sync()
                     .expect("sekejap: WAL fsync failed — disk error");
             }
@@ -2414,6 +2454,7 @@ impl CoreDB {
     }
 
     fn wal_flush(&mut self) {
+        if self.wal_sync != SyncMode::Full { return; }
         if let Some(wal) = &mut self.wal {
             wal.sync()
                 .expect("sekejap: WAL fsync failed — disk error");
@@ -2616,7 +2657,7 @@ impl CoreDB {
                 if let Some(wal) = &mut self.wal {
                     wal.append_batch(&wal_entries)
                         .expect("sekejap: WAL batch write failed");
-                    if !self.defer_wal_sync {
+                    if !self.defer_wal_sync && self.wal_sync == SyncMode::Full {
                         wal.sync().expect("sekejap: WAL fsync failed");
                     }
                 }
@@ -2916,7 +2957,7 @@ impl CoreDB {
         // on open, so this ordering is crash-safe). One batch each, one fsync.
         if let Some(wal) = &mut self.wal {
             wal.append_batch(&wal_entries).expect("sekejap: WAL batch append failed");
-            if !self.defer_wal_sync {
+            if !self.defer_wal_sync && self.wal_sync == SyncMode::Full {
                 wal.sync().expect("sekejap: WAL fsync failed");
             }
         }
@@ -6864,6 +6905,28 @@ impl CoreDB {
     }
 
     pub fn set_hnsw_ef_search(&mut self, ef: Option<usize>) { self.hnsw_ef_search = ef; }
+
+    /// Change the WAL durability level at runtime (see [`SyncMode`]). Under
+    /// `Normal`/`Off`, individual writes skip the per-write fsync — the standard
+    /// mobile trade-off. Durability is re-established at the next
+    /// `compact()`/checkpoint. Switching back to `Full` fsyncs the pending WAL
+    /// immediately so no already-acknowledged writes are left unsynced.
+    pub fn set_wal_sync(&mut self, mode: SyncMode) {
+        if mode == SyncMode::Full {
+            if let Some(wal) = &mut self.wal {
+                let _ = wal.sync();
+            }
+        }
+        self.wal_sync = mode;
+    }
+
+    /// Change the auto-compaction policy at runtime (see [`AutoCompact`]).
+    /// Mobile apps set `Manual` so a mutation burst never triggers an inline
+    /// full compaction, then call [`compact`](Self::compact) at an idle moment
+    /// (or rely on `compact_on_close`).
+    pub fn set_auto_compact(&mut self, policy: AutoCompact) {
+        self.auto_compact = policy;
+    }
     pub(crate) fn hnsw_ef_search(&self) -> Option<usize> { self.hnsw_ef_search }
 
     // ── CREATE INDEX executor ──────────────────────────────────────────────────
