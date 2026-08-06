@@ -1,0 +1,3 @@
+{ "name": "sk-next", "private": true,
+  "scripts": { "build": "next build", "start": "next start -p 3457" },
+  "dependencies": { "next": "15", "react": "19", "react-dom": "19", "sekejap": "0.16.1" } }

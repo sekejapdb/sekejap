@@ -68,6 +68,48 @@ const paged = Db.openPaged('./big');   // mmap topology: fast open, small memory
 db.close();                            // releases the writer lock
 ```
 
+## Using sekejap with Express and Next.js
+
+**Express** (and Fastify, Koa, plain Node servers): works as-is — open the
+database once at startup and use it in your handlers. The engine runs
+in-process, so there is no database service to deploy next to your server.
+
+```js
+const express = require('express');
+const { Db } = require('sekejap');
+
+const db = Db.open('./data');
+const app = express();
+
+app.get('/near', (req, res) => {
+  res.json(JSON.parse(db.queryParams(
+    'SELECT name FROM places WHERE ST_DWithin(geometry, POINT(115.09 -8.83), $1)',
+    JSON.stringify([Number(req.query.m ?? 5000)])
+  )));
+});
+
+app.listen(3000);
+```
+
+**Next.js**: works in the Node runtime — API routes, route handlers, server
+components, and server actions. One config line is needed. Next.js bundles
+server code at build time, but sekejap's engine is a native addon (a compiled
+`.node` file) that Node must load from disk — it cannot be bundled. Tell
+Next.js to leave it external:
+
+```js
+// next.config.js  (Next 15+)
+module.exports = { serverExternalPackages: ['sekejap'] };
+// Next 14: experimental: { serverComponentsExternalPackages: ['sekejap'] }
+```
+
+The same line is needed by every native package (better-sqlite3, sharp, …).
+Two boundaries to know: the Edge runtime (middleware, edge functions) cannot
+load native addons, and client components run in the browser — keep sekejap
+calls in server-side code.
+
 Full API: [`wrappers/node/`](../../../wrappers/node/) (typed —
-`index.d.ts` is generated from the binding); runnable tour:
-[`wrappers/node/examples/tour.js`](../../../wrappers/node/examples/tour.js).
+`index.d.ts` is generated from the binding). Runnable examples:
+[`tour.js`](../../../wrappers/node/examples/tour.js) (the five-stop tour),
+[`express-server.js`](../../../wrappers/node/examples/express-server.js), and a
+minimal [Next.js project](../../../wrappers/node/examples/nextjs/).
