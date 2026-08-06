@@ -35,8 +35,12 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 
   /// Initialize flutter_rust_bridge in mock mode.
   /// No libraries for FFI are loaded.
-  static void initMock({required RustLibApi api}) {
-    instance.initMockImpl(api: api);
+  static void initMock({
+    required RustLibApi api,
+  }) {
+    instance.initMockImpl(
+      api: api,
+    );
   }
 
   /// Dispose flutter_rust_bridge
@@ -66,117 +70,99 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -558830298;
+  int get rustContentHash => 114010943;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
-        stem: 'sekejap_ffi',
-        ioDirectory: 'rust/target/release/',
-        webPrefix: 'pkg/',
-        wasmBindgenName: 'wasm_bindgen',
-      );
+    stem: 'sekejap_ffi',
+    ioDirectory: 'rust/target/release/',
+    webPrefix: 'pkg/',
+    wasmBindgenName: 'wasm_bindgen',
+  );
 }
 
 abstract class RustLibApi extends BaseApi {
   Future<void> crateApiSimpleDbCompact({required SekejapDb db});
 
-  Future<bool> crateApiSimpleDbContains({
-    required SekejapDb db,
-    required String slug,
-  });
+  Future<bool> crateApiSimpleDbContains(
+      {required SekejapDb db, required String slug});
 
-  Future<BigInt> crateApiSimpleDbExecute({
-    required SekejapDb db,
-    required String sql,
-  });
+  Future<BigInt> crateApiSimpleDbExecute(
+      {required SekejapDb db, required String sql});
 
-  Future<BigInt> crateApiSimpleDbExecuteParams({
-    required SekejapDb db,
-    required String sql,
-    required String paramsJson,
-  });
+  Future<BigInt> crateApiSimpleDbExecuteParams(
+      {required SekejapDb db, required String sql, required String paramsJson});
 
-  Future<String?> crateApiSimpleDbGet({
-    required SekejapDb db,
-    required String slug,
-  });
+  Future<String?> crateApiSimpleDbGet(
+      {required SekejapDb db, required String slug});
 
-  Future<void> crateApiSimpleDbLink({
-    required SekejapDb db,
-    required String from,
-    required String to,
-    required String edgeType,
-  });
+  Future<void> crateApiSimpleDbLink(
+      {required SekejapDb db,
+      required String from,
+      required String to,
+      required String edgeType});
+
+  Future<void> crateApiSimpleDbMobileProfile({required SekejapDb db});
 
   Future<SekejapDb> crateApiSimpleDbNew();
 
   Future<SekejapDb> crateApiSimpleDbOpen({required String path});
 
-  Future<SekejapPreparedQuery> crateApiSimpleDbPrepare({
-    required SekejapDb db,
-    required String sql,
-  });
+  Future<SekejapPreparedQuery> crateApiSimpleDbPrepare(
+      {required SekejapDb db, required String sql});
 
-  Future<BigInt> crateApiSimpleDbPut({
-    required SekejapDb db,
-    required String slug,
-    required String json,
-  });
+  Future<BigInt> crateApiSimpleDbPut(
+      {required SekejapDb db, required String slug, required String json});
 
-  Future<String> crateApiSimpleDbQuery({
-    required SekejapDb db,
-    required String sql,
-  });
+  Future<BigInt> crateApiSimpleDbPutMany(
+      {required SekejapDb db, required List<(String, String)> pairs});
 
-  Future<String> crateApiSimpleDbQueryParams({
-    required SekejapDb db,
-    required String sql,
-    required String paramsJson,
-  });
+  Future<String> crateApiSimpleDbQuery(
+      {required SekejapDb db, required String sql});
 
-  Future<String> crateApiSimpleDbQueryPrepared({
-    required SekejapDb db,
-    required SekejapPreparedQuery stmt,
-    required String paramsJson,
-  });
+  Future<String> crateApiSimpleDbQueryParams(
+      {required SekejapDb db, required String sql, required String paramsJson});
 
-  Future<void> crateApiSimpleDbRemove({
-    required SekejapDb db,
-    required String slug,
-  });
+  Future<String> crateApiSimpleDbQueryPrepared(
+      {required SekejapDb db,
+      required SekejapPreparedQuery stmt,
+      required String paramsJson});
 
-  Future<String> crateApiSimpleDbShow({
-    required SekejapDb db,
-    required String sql,
-  });
+  Future<void> crateApiSimpleDbRemove(
+      {required SekejapDb db, required String slug});
+
+  Future<void> crateApiSimpleDbSetWalSync(
+      {required SekejapDb db, required int mode});
+
+  Future<String> crateApiSimpleDbShow(
+      {required SekejapDb db, required String sql});
 
   Future<void> crateApiSimpleDbSync({required SekejapDb db});
 
-  Future<void> crateApiSimpleDbUnlink({
-    required SekejapDb db,
-    required String from,
-    required String to,
-    required String edgeType,
-  });
+  Future<void> crateApiSimpleDbUnlink(
+      {required SekejapDb db,
+      required String from,
+      required String to,
+      required String edgeType});
 
   Future<void> crateApiSimpleInitApp();
 
   RustArcIncrementStrongCountFnType
-  get rust_arc_increment_strong_count_SekejapDb;
+      get rust_arc_increment_strong_count_SekejapDb;
 
   RustArcDecrementStrongCountFnType
-  get rust_arc_decrement_strong_count_SekejapDb;
+      get rust_arc_decrement_strong_count_SekejapDb;
 
   CrossPlatformFinalizerArg get rust_arc_decrement_strong_count_SekejapDbPtr;
 
   RustArcIncrementStrongCountFnType
-  get rust_arc_increment_strong_count_SekejapPreparedQuery;
+      get rust_arc_increment_strong_count_SekejapPreparedQuery;
 
   RustArcDecrementStrongCountFnType
-  get rust_arc_decrement_strong_count_SekejapPreparedQuery;
+      get rust_arc_decrement_strong_count_SekejapPreparedQuery;
 
   CrossPlatformFinalizerArg
-  get rust_arc_decrement_strong_count_SekejapPreparedQueryPtr;
+      get rust_arc_decrement_strong_count_SekejapPreparedQueryPtr;
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -189,137 +175,106 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @override
   Future<void> crateApiSimpleDbCompact({required SekejapDb db}) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 1,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbCompactConstMeta,
-        argValues: [db],
-        apiImpl: this,
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 1, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_unit,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbCompactConstMeta,
+      argValues: [db],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbCompactConstMeta =>
-      const TaskConstMeta(debugName: "db_compact", argNames: ["db"]);
+  TaskConstMeta get kCrateApiSimpleDbCompactConstMeta => const TaskConstMeta(
+        debugName: "db_compact",
+        argNames: ["db"],
+      );
 
   @override
-  Future<bool> crateApiSimpleDbContains({
-    required SekejapDb db,
-    required String slug,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(slug, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 2,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_bool,
-          decodeErrorData: null,
-        ),
-        constMeta: kCrateApiSimpleDbContainsConstMeta,
-        argValues: [db, slug],
-        apiImpl: this,
+  Future<bool> crateApiSimpleDbContains(
+      {required SekejapDb db, required String slug}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(slug, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 2, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_bool,
+        decodeErrorData: null,
       ),
-    );
+      constMeta: kCrateApiSimpleDbContainsConstMeta,
+      argValues: [db, slug],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbContainsConstMeta =>
-      const TaskConstMeta(debugName: "db_contains", argNames: ["db", "slug"]);
+  TaskConstMeta get kCrateApiSimpleDbContainsConstMeta => const TaskConstMeta(
+        debugName: "db_contains",
+        argNames: ["db", "slug"],
+      );
 
   @override
-  Future<BigInt> crateApiSimpleDbExecute({
-    required SekejapDb db,
-    required String sql,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(sql, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 3,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_usize,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbExecuteConstMeta,
-        argValues: [db, sql],
-        apiImpl: this,
+  Future<BigInt> crateApiSimpleDbExecute(
+      {required SekejapDb db, required String sql}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(sql, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 3, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_usize,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbExecuteConstMeta,
+      argValues: [db, sql],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbExecuteConstMeta =>
-      const TaskConstMeta(debugName: "db_execute", argNames: ["db", "sql"]);
+  TaskConstMeta get kCrateApiSimpleDbExecuteConstMeta => const TaskConstMeta(
+        debugName: "db_execute",
+        argNames: ["db", "sql"],
+      );
 
   @override
-  Future<BigInt> crateApiSimpleDbExecuteParams({
-    required SekejapDb db,
-    required String sql,
-    required String paramsJson,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(sql, serializer);
-          sse_encode_String(paramsJson, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 4,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_usize,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbExecuteParamsConstMeta,
-        argValues: [db, sql, paramsJson],
-        apiImpl: this,
+  Future<BigInt> crateApiSimpleDbExecuteParams(
+      {required SekejapDb db,
+      required String sql,
+      required String paramsJson}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(sql, serializer);
+        sse_encode_String(paramsJson, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 4, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_usize,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbExecuteParamsConstMeta,
+      argValues: [db, sql, paramsJson],
+      apiImpl: this,
+    ));
   }
 
   TaskConstMeta get kCrateApiSimpleDbExecuteParamsConstMeta =>
@@ -329,280 +284,272 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<String?> crateApiSimpleDbGet({
-    required SekejapDb db,
-    required String slug,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(slug, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 5,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_opt_String,
-          decodeErrorData: null,
-        ),
-        constMeta: kCrateApiSimpleDbGetConstMeta,
-        argValues: [db, slug],
-        apiImpl: this,
+  Future<String?> crateApiSimpleDbGet(
+      {required SekejapDb db, required String slug}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(slug, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 5, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_opt_String,
+        decodeErrorData: null,
       ),
-    );
+      constMeta: kCrateApiSimpleDbGetConstMeta,
+      argValues: [db, slug],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbGetConstMeta =>
-      const TaskConstMeta(debugName: "db_get", argNames: ["db", "slug"]);
+  TaskConstMeta get kCrateApiSimpleDbGetConstMeta => const TaskConstMeta(
+        debugName: "db_get",
+        argNames: ["db", "slug"],
+      );
 
   @override
-  Future<void> crateApiSimpleDbLink({
-    required SekejapDb db,
-    required String from,
-    required String to,
-    required String edgeType,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(from, serializer);
-          sse_encode_String(to, serializer);
-          sse_encode_String(edgeType, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 6,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
-          decodeErrorData: null,
-        ),
-        constMeta: kCrateApiSimpleDbLinkConstMeta,
-        argValues: [db, from, to, edgeType],
-        apiImpl: this,
+  Future<void> crateApiSimpleDbLink(
+      {required SekejapDb db,
+      required String from,
+      required String to,
+      required String edgeType}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(from, serializer);
+        sse_encode_String(to, serializer);
+        sse_encode_String(edgeType, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 6, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_unit,
+        decodeErrorData: null,
       ),
-    );
+      constMeta: kCrateApiSimpleDbLinkConstMeta,
+      argValues: [db, from, to, edgeType],
+      apiImpl: this,
+    ));
   }
 
   TaskConstMeta get kCrateApiSimpleDbLinkConstMeta => const TaskConstMeta(
-    debugName: "db_link",
-    argNames: ["db", "from", "to", "edgeType"],
-  );
+        debugName: "db_link",
+        argNames: ["db", "from", "to", "edgeType"],
+      );
+
+  @override
+  Future<void> crateApiSimpleDbMobileProfile({required SekejapDb db}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 7, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_unit,
+        decodeErrorData: null,
+      ),
+      constMeta: kCrateApiSimpleDbMobileProfileConstMeta,
+      argValues: [db],
+      apiImpl: this,
+    ));
+  }
+
+  TaskConstMeta get kCrateApiSimpleDbMobileProfileConstMeta =>
+      const TaskConstMeta(
+        debugName: "db_mobile_profile",
+        argNames: ["db"],
+      );
 
   @override
   Future<SekejapDb> crateApiSimpleDbNew() {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 7,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData:
-              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb,
-          decodeErrorData: null,
-        ),
-        constMeta: kCrateApiSimpleDbNewConstMeta,
-        argValues: [],
-        apiImpl: this,
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 8, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData:
+            sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb,
+        decodeErrorData: null,
       ),
-    );
+      constMeta: kCrateApiSimpleDbNewConstMeta,
+      argValues: [],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbNewConstMeta =>
-      const TaskConstMeta(debugName: "db_new", argNames: []);
+  TaskConstMeta get kCrateApiSimpleDbNewConstMeta => const TaskConstMeta(
+        debugName: "db_new",
+        argNames: [],
+      );
 
   @override
   Future<SekejapDb> crateApiSimpleDbOpen({required String path}) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_String(path, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 8,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData:
-              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbOpenConstMeta,
-        argValues: [path],
-        apiImpl: this,
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_String(path, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 9, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData:
+            sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbOpenConstMeta,
+      argValues: [path],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbOpenConstMeta =>
-      const TaskConstMeta(debugName: "db_open", argNames: ["path"]);
+  TaskConstMeta get kCrateApiSimpleDbOpenConstMeta => const TaskConstMeta(
+        debugName: "db_open",
+        argNames: ["path"],
+      );
 
   @override
-  Future<SekejapPreparedQuery> crateApiSimpleDbPrepare({
-    required SekejapDb db,
-    required String sql,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(sql, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 9,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData:
-              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbPrepareConstMeta,
-        argValues: [db, sql],
-        apiImpl: this,
+  Future<SekejapPreparedQuery> crateApiSimpleDbPrepare(
+      {required SekejapDb db, required String sql}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(sql, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 10, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData:
+            sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbPrepareConstMeta,
+      argValues: [db, sql],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbPrepareConstMeta =>
-      const TaskConstMeta(debugName: "db_prepare", argNames: ["db", "sql"]);
+  TaskConstMeta get kCrateApiSimpleDbPrepareConstMeta => const TaskConstMeta(
+        debugName: "db_prepare",
+        argNames: ["db", "sql"],
+      );
 
   @override
-  Future<BigInt> crateApiSimpleDbPut({
-    required SekejapDb db,
-    required String slug,
-    required String json,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(slug, serializer);
-          sse_encode_String(json, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 10,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_u_64,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbPutConstMeta,
-        argValues: [db, slug, json],
-        apiImpl: this,
+  Future<BigInt> crateApiSimpleDbPut(
+      {required SekejapDb db, required String slug, required String json}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(slug, serializer);
+        sse_encode_String(json, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 11, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_u_64,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbPutConstMeta,
+      argValues: [db, slug, json],
+      apiImpl: this,
+    ));
   }
 
   TaskConstMeta get kCrateApiSimpleDbPutConstMeta => const TaskConstMeta(
-    debugName: "db_put",
-    argNames: ["db", "slug", "json"],
-  );
+        debugName: "db_put",
+        argNames: ["db", "slug", "json"],
+      );
 
   @override
-  Future<String> crateApiSimpleDbQuery({
-    required SekejapDb db,
-    required String sql,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(sql, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 11,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbQueryConstMeta,
-        argValues: [db, sql],
-        apiImpl: this,
+  Future<BigInt> crateApiSimpleDbPutMany(
+      {required SekejapDb db, required List<(String, String)> pairs}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_list_record_string_string(pairs, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 12, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_usize,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbPutManyConstMeta,
+      argValues: [db, pairs],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbQueryConstMeta =>
-      const TaskConstMeta(debugName: "db_query", argNames: ["db", "sql"]);
+  TaskConstMeta get kCrateApiSimpleDbPutManyConstMeta => const TaskConstMeta(
+        debugName: "db_put_many",
+        argNames: ["db", "pairs"],
+      );
 
   @override
-  Future<String> crateApiSimpleDbQueryParams({
-    required SekejapDb db,
-    required String sql,
-    required String paramsJson,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(sql, serializer);
-          sse_encode_String(paramsJson, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 12,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbQueryParamsConstMeta,
-        argValues: [db, sql, paramsJson],
-        apiImpl: this,
+  Future<String> crateApiSimpleDbQuery(
+      {required SekejapDb db, required String sql}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(sql, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 13, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_String,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbQueryConstMeta,
+      argValues: [db, sql],
+      apiImpl: this,
+    ));
+  }
+
+  TaskConstMeta get kCrateApiSimpleDbQueryConstMeta => const TaskConstMeta(
+        debugName: "db_query",
+        argNames: ["db", "sql"],
+      );
+
+  @override
+  Future<String> crateApiSimpleDbQueryParams(
+      {required SekejapDb db,
+      required String sql,
+      required String paramsJson}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(sql, serializer);
+        sse_encode_String(paramsJson, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 14, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_String,
+        decodeErrorData: sse_decode_String,
+      ),
+      constMeta: kCrateApiSimpleDbQueryParamsConstMeta,
+      argValues: [db, sql, paramsJson],
+      apiImpl: this,
+    ));
   }
 
   TaskConstMeta get kCrateApiSimpleDbQueryParamsConstMeta =>
@@ -612,40 +559,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<String> crateApiSimpleDbQueryPrepared({
-    required SekejapDb db,
-    required SekejapPreparedQuery stmt,
-    required String paramsJson,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-            stmt,
-            serializer,
-          );
-          sse_encode_String(paramsJson, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 13,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbQueryPreparedConstMeta,
-        argValues: [db, stmt, paramsJson],
-        apiImpl: this,
+  Future<String> crateApiSimpleDbQueryPrepared(
+      {required SekejapDb db,
+      required SekejapPreparedQuery stmt,
+      required String paramsJson}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+            stmt, serializer);
+        sse_encode_String(paramsJson, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 15, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_String,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbQueryPreparedConstMeta,
+      argValues: [db, stmt, paramsJson],
+      apiImpl: this,
+    ));
   }
 
   TaskConstMeta get kCrateApiSimpleDbQueryPreparedConstMeta =>
@@ -655,240 +591,226 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<void> crateApiSimpleDbRemove({
-    required SekejapDb db,
-    required String slug,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(slug, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 14,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
-          decodeErrorData: null,
-        ),
-        constMeta: kCrateApiSimpleDbRemoveConstMeta,
-        argValues: [db, slug],
-        apiImpl: this,
+  Future<void> crateApiSimpleDbRemove(
+      {required SekejapDb db, required String slug}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(slug, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 16, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_unit,
+        decodeErrorData: null,
       ),
-    );
+      constMeta: kCrateApiSimpleDbRemoveConstMeta,
+      argValues: [db, slug],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbRemoveConstMeta =>
-      const TaskConstMeta(debugName: "db_remove", argNames: ["db", "slug"]);
+  TaskConstMeta get kCrateApiSimpleDbRemoveConstMeta => const TaskConstMeta(
+        debugName: "db_remove",
+        argNames: ["db", "slug"],
+      );
 
   @override
-  Future<String> crateApiSimpleDbShow({
-    required SekejapDb db,
-    required String sql,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(sql, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 15,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbShowConstMeta,
-        argValues: [db, sql],
-        apiImpl: this,
+  Future<void> crateApiSimpleDbSetWalSync(
+      {required SekejapDb db, required int mode}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_u_8(mode, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 17, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_unit,
+        decodeErrorData: null,
       ),
-    );
+      constMeta: kCrateApiSimpleDbSetWalSyncConstMeta,
+      argValues: [db, mode],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbShowConstMeta =>
-      const TaskConstMeta(debugName: "db_show", argNames: ["db", "sql"]);
+  TaskConstMeta get kCrateApiSimpleDbSetWalSyncConstMeta => const TaskConstMeta(
+        debugName: "db_set_wal_sync",
+        argNames: ["db", "mode"],
+      );
+
+  @override
+  Future<String> crateApiSimpleDbShow(
+      {required SekejapDb db, required String sql}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(sql, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 18, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_String,
+        decodeErrorData: sse_decode_String,
+      ),
+      constMeta: kCrateApiSimpleDbShowConstMeta,
+      argValues: [db, sql],
+      apiImpl: this,
+    ));
+  }
+
+  TaskConstMeta get kCrateApiSimpleDbShowConstMeta => const TaskConstMeta(
+        debugName: "db_show",
+        argNames: ["db", "sql"],
+      );
 
   @override
   Future<void> crateApiSimpleDbSync({required SekejapDb db}) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 16,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSimpleDbSyncConstMeta,
-        argValues: [db],
-        apiImpl: this,
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 19, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_unit,
+        decodeErrorData: sse_decode_String,
       ),
-    );
+      constMeta: kCrateApiSimpleDbSyncConstMeta,
+      argValues: [db],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleDbSyncConstMeta =>
-      const TaskConstMeta(debugName: "db_sync", argNames: ["db"]);
+  TaskConstMeta get kCrateApiSimpleDbSyncConstMeta => const TaskConstMeta(
+        debugName: "db_sync",
+        argNames: ["db"],
+      );
 
   @override
-  Future<void> crateApiSimpleDbUnlink({
-    required SekejapDb db,
-    required String from,
-    required String to,
-    required String edgeType,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-            db,
-            serializer,
-          );
-          sse_encode_String(from, serializer);
-          sse_encode_String(to, serializer);
-          sse_encode_String(edgeType, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 17,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
-          decodeErrorData: null,
-        ),
-        constMeta: kCrateApiSimpleDbUnlinkConstMeta,
-        argValues: [db, from, to, edgeType],
-        apiImpl: this,
+  Future<void> crateApiSimpleDbUnlink(
+      {required SekejapDb db,
+      required String from,
+      required String to,
+      required String edgeType}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+            db, serializer);
+        sse_encode_String(from, serializer);
+        sse_encode_String(to, serializer);
+        sse_encode_String(edgeType, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 20, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_unit,
+        decodeErrorData: null,
       ),
-    );
+      constMeta: kCrateApiSimpleDbUnlinkConstMeta,
+      argValues: [db, from, to, edgeType],
+      apiImpl: this,
+    ));
   }
 
   TaskConstMeta get kCrateApiSimpleDbUnlinkConstMeta => const TaskConstMeta(
-    debugName: "db_unlink",
-    argNames: ["db", "from", "to", "edgeType"],
-  );
+        debugName: "db_unlink",
+        argNames: ["db", "from", "to", "edgeType"],
+      );
 
   @override
   Future<void> crateApiSimpleInitApp() {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 18,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
-          decodeErrorData: null,
-        ),
-        constMeta: kCrateApiSimpleInitAppConstMeta,
-        argValues: [],
-        apiImpl: this,
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 21, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_unit,
+        decodeErrorData: null,
       ),
-    );
+      constMeta: kCrateApiSimpleInitAppConstMeta,
+      argValues: [],
+      apiImpl: this,
+    ));
   }
 
-  TaskConstMeta get kCrateApiSimpleInitAppConstMeta =>
-      const TaskConstMeta(debugName: "init_app", argNames: []);
+  TaskConstMeta get kCrateApiSimpleInitAppConstMeta => const TaskConstMeta(
+        debugName: "init_app",
+        argNames: [],
+      );
 
   RustArcIncrementStrongCountFnType
-  get rust_arc_increment_strong_count_SekejapDb => wire
-      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb;
+      get rust_arc_increment_strong_count_SekejapDb => wire
+          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb;
 
   RustArcDecrementStrongCountFnType
-  get rust_arc_decrement_strong_count_SekejapDb => wire
-      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb;
+      get rust_arc_decrement_strong_count_SekejapDb => wire
+          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb;
 
   RustArcIncrementStrongCountFnType
-  get rust_arc_increment_strong_count_SekejapPreparedQuery => wire
-      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery;
+      get rust_arc_increment_strong_count_SekejapPreparedQuery => wire
+          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery;
 
   RustArcDecrementStrongCountFnType
-  get rust_arc_decrement_strong_count_SekejapPreparedQuery => wire
-      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery;
+      get rust_arc_decrement_strong_count_SekejapPreparedQuery => wire
+          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery;
 
   @protected
   SekejapDb
-  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    dynamic raw,
-  ) {
+      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return SekejapDbImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   SekejapPreparedQuery
-  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    dynamic raw,
-  ) {
+      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return SekejapPreparedQueryImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   SekejapDb
-  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    dynamic raw,
-  ) {
+      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return SekejapDbImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   SekejapPreparedQuery
-  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    dynamic raw,
-  ) {
+      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return SekejapPreparedQueryImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   SekejapDb
-  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    dynamic raw,
-  ) {
+      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return SekejapDbImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   SekejapPreparedQuery
-  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    dynamic raw,
-  ) {
+      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return SekejapPreparedQueryImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
@@ -912,9 +834,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<(String, String)> dco_decode_list_record_string_string(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_record_string_string).toList();
+  }
+
+  @protected
   String? dco_decode_opt_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_String(raw);
+  }
+
+  @protected
+  (String, String) dco_decode_record_string_string(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2) {
+      throw Exception('Expected 2 elements, got ${arr.length}');
+    }
+    return (
+      dco_decode_String(arr[0]),
+      dco_decode_String(arr[1]),
+    );
   }
 
   @protected
@@ -943,74 +884,56 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   SekejapDb
-  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    SseDeserializer deserializer,
-  ) {
+      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return SekejapDbImpl.frbInternalSseDecode(
-      sse_decode_usize(deserializer),
-      sse_decode_i_32(deserializer),
-    );
+        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
   }
 
   @protected
   SekejapPreparedQuery
-  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    SseDeserializer deserializer,
-  ) {
+      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return SekejapPreparedQueryImpl.frbInternalSseDecode(
-      sse_decode_usize(deserializer),
-      sse_decode_i_32(deserializer),
-    );
+        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
   }
 
   @protected
   SekejapDb
-  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    SseDeserializer deserializer,
-  ) {
+      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return SekejapDbImpl.frbInternalSseDecode(
-      sse_decode_usize(deserializer),
-      sse_decode_i_32(deserializer),
-    );
+        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
   }
 
   @protected
   SekejapPreparedQuery
-  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    SseDeserializer deserializer,
-  ) {
+      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return SekejapPreparedQueryImpl.frbInternalSseDecode(
-      sse_decode_usize(deserializer),
-      sse_decode_i_32(deserializer),
-    );
+        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
   }
 
   @protected
   SekejapDb
-  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    SseDeserializer deserializer,
-  ) {
+      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return SekejapDbImpl.frbInternalSseDecode(
-      sse_decode_usize(deserializer),
-      sse_decode_i_32(deserializer),
-    );
+        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
   }
 
   @protected
   SekejapPreparedQuery
-  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    SseDeserializer deserializer,
-  ) {
+      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return SekejapPreparedQueryImpl.frbInternalSseDecode(
-      sse_decode_usize(deserializer),
-      sse_decode_i_32(deserializer),
-    );
+        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
   }
 
   @protected
@@ -1034,6 +957,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<(String, String)> sse_decode_list_record_string_string(
+      SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <(String, String)>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_record_string_string(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -1042,6 +978,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     } else {
       return null;
     }
+  }
+
+  @protected
+  (String, String) sse_decode_record_string_string(
+      SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_field0 = sse_decode_String(deserializer);
+    var var_field1 = sse_decode_String(deserializer);
+    return (var_field0, var_field1);
   }
 
   @protected
@@ -1075,80 +1020,59 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void
-  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    SekejapDb self,
-    SseSerializer serializer,
-  ) {
+      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          SekejapDb self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-      (self as SekejapDbImpl).frbInternalSseEncode(move: true),
-      serializer,
-    );
+        (self as SekejapDbImpl).frbInternalSseEncode(move: true), serializer);
   }
 
   @protected
   void
-  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    SekejapPreparedQuery self,
-    SseSerializer serializer,
-  ) {
+      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          SekejapPreparedQuery self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-      (self as SekejapPreparedQueryImpl).frbInternalSseEncode(move: true),
-      serializer,
-    );
+        (self as SekejapPreparedQueryImpl).frbInternalSseEncode(move: true),
+        serializer);
   }
 
   @protected
   void
-  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    SekejapDb self,
-    SseSerializer serializer,
-  ) {
+      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          SekejapDb self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-      (self as SekejapDbImpl).frbInternalSseEncode(move: false),
-      serializer,
-    );
+        (self as SekejapDbImpl).frbInternalSseEncode(move: false), serializer);
   }
 
   @protected
   void
-  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    SekejapPreparedQuery self,
-    SseSerializer serializer,
-  ) {
+      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          SekejapPreparedQuery self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-      (self as SekejapPreparedQueryImpl).frbInternalSseEncode(move: false),
-      serializer,
-    );
+        (self as SekejapPreparedQueryImpl).frbInternalSseEncode(move: false),
+        serializer);
   }
 
   @protected
   void
-  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
-    SekejapDb self,
-    SseSerializer serializer,
-  ) {
+      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapDb(
+          SekejapDb self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-      (self as SekejapDbImpl).frbInternalSseEncode(move: null),
-      serializer,
-    );
+        (self as SekejapDbImpl).frbInternalSseEncode(move: null), serializer);
   }
 
   @protected
   void
-  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
-    SekejapPreparedQuery self,
-    SseSerializer serializer,
-  ) {
+      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSekejapPreparedQuery(
+          SekejapPreparedQuery self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-      (self as SekejapPreparedQueryImpl).frbInternalSseEncode(move: null),
-      serializer,
-    );
+        (self as SekejapPreparedQueryImpl).frbInternalSseEncode(move: null),
+        serializer);
   }
 
   @protected
@@ -1165,12 +1089,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_prim_u_8_strict(
-    Uint8List self,
-    SseSerializer serializer,
-  ) {
+      Uint8List self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
+  }
+
+  @protected
+  void sse_encode_list_record_string_string(
+      List<(String, String)> self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_record_string_string(item, serializer);
+    }
   }
 
   @protected
@@ -1181,6 +1113,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     if (self != null) {
       sse_encode_String(self, serializer);
     }
+  }
+
+  @protected
+  void sse_encode_record_string_string(
+      (String, String) self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.$1, serializer);
+    sse_encode_String(self.$2, serializer);
   }
 
   @protected
@@ -1217,11 +1157,11 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 class SekejapDbImpl extends RustOpaque implements SekejapDb {
   // Not to be used by end users
   SekejapDbImpl.frbInternalDcoDecode(List<dynamic> wire)
-    : super.frbInternalDcoDecode(wire, _kStaticData);
+      : super.frbInternalDcoDecode(wire, _kStaticData);
 
   // Not to be used by end users
   SekejapDbImpl.frbInternalSseDecode(BigInt ptr, int externalSizeOnNative)
-    : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+      : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
 
   static final _kStaticData = RustArcStaticData(
     rustArcIncrementStrongCount:
@@ -1238,26 +1178,19 @@ class SekejapPreparedQueryImpl extends RustOpaque
     implements SekejapPreparedQuery {
   // Not to be used by end users
   SekejapPreparedQueryImpl.frbInternalDcoDecode(List<dynamic> wire)
-    : super.frbInternalDcoDecode(wire, _kStaticData);
+      : super.frbInternalDcoDecode(wire, _kStaticData);
 
   // Not to be used by end users
   SekejapPreparedQueryImpl.frbInternalSseDecode(
-    BigInt ptr,
-    int externalSizeOnNative,
-  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+      BigInt ptr, int externalSizeOnNative)
+      : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
 
   static final _kStaticData = RustArcStaticData(
     rustArcIncrementStrongCount: RustLib
-        .instance
-        .api
-        .rust_arc_increment_strong_count_SekejapPreparedQuery,
+        .instance.api.rust_arc_increment_strong_count_SekejapPreparedQuery,
     rustArcDecrementStrongCount: RustLib
-        .instance
-        .api
-        .rust_arc_decrement_strong_count_SekejapPreparedQuery,
+        .instance.api.rust_arc_decrement_strong_count_SekejapPreparedQuery,
     rustArcDecrementStrongCountPtr: RustLib
-        .instance
-        .api
-        .rust_arc_decrement_strong_count_SekejapPreparedQueryPtr,
+        .instance.api.rust_arc_decrement_strong_count_SekejapPreparedQueryPtr,
   );
 }
