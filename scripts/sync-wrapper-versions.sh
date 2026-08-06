@@ -29,10 +29,15 @@ echo "Syncing wrapper manifests to sekejap $VERSION"
 perl -0pi -e "s/(\"version\"\s*:\s*)\"[^\"]*\"/\${1}\"$VERSION\"/" \
   "$ROOT/wrappers/node/package.json"
 
+# node crate — version() in the addon is env!("CARGO_PKG_VERSION") of this
+# crate, so stamp it too or the addon reports a stale number.
+perl -pi -e "s/^version = .*/version = \"$VERSION\"/ if \$. <= 10" \
+  "$ROOT/wrappers/node/Cargo.toml"
+
 # dart — the top-level `version:` key.
 perl -pi -e "s/^version:.*/version: $VERSION/" \
   "$ROOT/wrappers/dart/pubspec.yaml"
 
-echo "  node : $(grep -m1 '"version"' "$ROOT/wrappers/node/package.json" | tr -d ' ,')"
+echo "  node : $(grep -m1 '"version"' "$ROOT/wrappers/node/package.json" | tr -d ' ,') / crate $(grep -m1 '^version = ' "$ROOT/wrappers/node/Cargo.toml")"
 echo "  dart : $(grep -m1 '^version:' "$ROOT/wrappers/dart/pubspec.yaml")"
 echo "  kotlin reads Cargo.toml directly (no stamp needed)"

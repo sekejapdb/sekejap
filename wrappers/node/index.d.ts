@@ -35,6 +35,89 @@ export declare class Db {
   edgeCount(): number
   /** Compact: truncate WAL, rewrite payloads/topology, reclaim RAM. */
   compact(): void
+  /**
+   * Open an existing database in paged mode: identity/topology served from
+   * memory-mapped files — small open time and resident memory at any size.
+   */
+  static openPaged(path: string): Db
+  /** Open an existing database read-only. */
+  static openReadOnly(path: string): Db
+  /** A node's raw JSON payload, or null. */
+  get(slug: string): string | null
+  /** True if the node exists. */
+  contains(slug: string): boolean
+  /** Delete a node (and its edges). */
+  remove(slug: string): void
+  /**
+   * Store many nodes in one batch (single disk sync).
+   * `pairsJson` is a JSON array of `[slug, payloadJson]` pairs.
+   */
+  putMany(pairsJson: string): number
+  /** Begin a bulk-load scope (defer the per-write disk sync). Pair with `endBulk`. */
+  beginBulk(): void
+  /** End a bulk-load scope: one disk sync for the whole batch. */
+  endBulk(): void
+  /** Store an embedding under a named field of a node. */
+  putVector(slug: string, field: string, data: Array<number>): void
+  /** The stored embedding for a node's field, or null. */
+  getVector(slug: string, field: string): Array<number> | null
+  /** Create an edge with JSON attributes (primitives ride fast columns). */
+  linkMeta(from: string, to: string, edgeType: string, metaJson: string): void
+  /**
+   * Create many edges in one batch (single disk sync).
+   * `edgesJson` is a JSON array of `[from, to, edgeType]` triples.
+   */
+  linkMany(edgesJson: string): void
+  /** Remove a directed edge. */
+  unlink(from: string, to: string, edgeType: string): void
+  /**
+   * Remove edges matching attribute equality conditions (`propsJson` is a
+   * JSON object). Returns how many were removed.
+   */
+  unlinkWhere(from: string, to: string, edgeType: string, propsJson: string): number
+  /**
+   * Update attributes on matching edges: `propsJson` selects, `setsJson`
+   * assigns. Returns how many were updated.
+   */
+  updateEdge(from: string, to: string, edgeType: string, propsJson: string, setsJson: string): number
+  /**
+   * Edges leaving a node, as a JSON-array string of
+   * `{from, to, type, meta}` objects.
+   */
+  edgesFrom(slug: string): string
+  /** Edges arriving at a node, same shape as `edgesFrom`. */
+  edgesTo(slug: string): string
+  /** Edges from one collection to another, same shape as `edgesFrom`. */
+  edgesBetween(fromCollection: string, toCollection: string): string
+  /** All collection names. */
+  collectionNames(): Array<string>
+  /** Every node slug. */
+  allSlugs(): Array<string>
+  /** DDL string for a collection schema, or null. */
+  schemaDdl(collection: string): string | null
+  /**
+   * Ranked text search over a BM25-indexed field: JSON-array string of
+   * `[slug, score]` pairs, best first.
+   */
+  bm25Search(field: string, query: string, topK: number): string
+  /**
+   * The query plan for a statement, as a JSON-array string (one step per
+   * element). `analyze = true` also executes it and adds per-step timings.
+   */
+  explain(sql: string, analyze?: boolean | undefined | null): string
+  /** Run a SHOW statement (`SHOW TABLES`, `SHOW EDGES`, …); JSON-array string. */
+  show(sql: string): string
+  /** Shrink resident memory to the live working set (never drops indexes). */
+  trimMemory(): void
+  /** Per-structure resident-memory estimate, as a JSON object string. */
+  memoryReport(): string
+  /** Override HNSW search breadth (`efSearch`); null restores the default. */
+  setHnswEfSearch(ef?: number | undefined | null): void
+  /**
+   * Close the database and release its lock. Further calls error (or no-op
+   * for count/list getters). Safe to call twice.
+   */
+  close(): void
 }
 /** A prepared (compiled) query — from `Db.prepare`, run with `Db.queryPrepared`. */
 export declare class PreparedStatement { }
