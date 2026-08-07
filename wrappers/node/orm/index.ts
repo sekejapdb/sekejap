@@ -1,6 +1,10 @@
 // sekejap — typed, reactive TypeScript API (schema-as-code, no build step).
 // Works on Node (backend) and React Native (device) over the same native core.
-import { Native, RawDb } from './native';
+import type { RawDb, RawDbCtor } from './raw';
+
+// Re-export the backend contract so a platform (e.g. React Native / JSI) can
+// implement it and pass it to `Sekejap.open({ native })`.
+export type { RawDb, RawDbCtor } from './raw';
 
 // ── schema-as-code ────────────────────────────────────────────────────────────
 
@@ -395,8 +399,18 @@ function ddl(ent: Entity<any>): { create: string; indexes: string[] } {
 }
 
 export const Sekejap = {
-  open<S extends Schema>(path: string, opts: { schema: S }): Db<S> {
-    const raw = Native.open(path);
+  /**
+   * Open a database. `opts.native` is the backend (napi on Node, JSI on React
+   * Native); it defaults to the Node napi addon so backend code needs only
+   * `{ schema }`. React Native passes its JSI backend explicitly.
+   */
+  open<S extends Schema>(
+    path: string,
+    opts: { schema: S; native?: RawDbCtor },
+  ): Db<S> {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const ctor: RawDbCtor = opts.native ?? (require('./native').Native as RawDbCtor);
+    const raw = ctor.open(path);
     for (const ent of Object.values(opts.schema)) {
       const { create, indexes } = ddl(ent);
       try {
