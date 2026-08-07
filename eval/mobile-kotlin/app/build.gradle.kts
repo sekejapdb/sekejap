@@ -60,8 +60,10 @@ dependencies {
     // SQLDelight
     implementation("app.cash.sqldelight:android-driver:2.0.2")
 
-    // sekejap ergonomic typed layer (composite build) + its KSP processor
-    implementation("life.sekejap:sekejap-orm")
+    // sekejap ergonomic typed layer (composite build) + its KSP processor.
+    // Composite substitution matches the Gradle project name (":processor");
+    // real consumers use the published coordinate life.sekejap:sekejap-processor.
+    implementation("life.sekejap:sekejap")
     ksp("life.sekejap:processor")
 }
 

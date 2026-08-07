@@ -14,7 +14,10 @@ plugins {
 }
 
 group = "life.sekejap"
-version = "0.1.0"
+// Single source of truth: the workspace version in the root Cargo.toml.
+version = rootDir.resolve("../../../Cargo.toml").readLines()
+    .first { it.trimStart().startsWith("version = ") }
+    .substringAfter('"').substringBefore('"')
 
 android {
     namespace = "life.sekejap.android"
@@ -26,7 +29,7 @@ android {
 }
 
 dependencies {
-    api("life.sekejap:sekejap-orm:0.1.0") // the typed runtime + API
+    api("life.sekejap:sekejap:$version") // the typed runtime + API
 }
 
 mavenPublishing {

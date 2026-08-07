@@ -110,6 +110,24 @@ Two primitives underpin the ergonomic layer:
   the change feed already uses). Each typed language surface would expose this
   as a non-null, existence-checked reference (`ref(...)` / `Ref<T>`).
 
+- **On-disk format stability** — a whole-database format version, checked on
+  open, with a documented compatibility policy so a format change is a detectable,
+  migratable step rather than a surprise. The durable log is already versioned;
+  this extends that guarantee across the whole store.
+
+- **Disk-first spatial at scale** — serving spatial queries (not just counts)
+  from the on-disk spatial index with bounded memory, for large map/geo datasets
+  that exceed RAM.
+
+- **Security** — for shared/served deployments: authentication and per-role
+  access control on the serve/Postgres surfaces, optional encryption at rest,
+  and hardened input validation. The embedded, in-process path stays
+  dependency-light and unchanged.
+
+- **Diagnostics & repair tooling** — the command-line tool as an operational
+  companion: inspect schema and counts, monitor size/memory/WAL, verify
+  integrity, and rebuild indexes or compact to fix.
+
 - **Mobile operating profile** — a relaxed-durability, deferred-compaction mode
   suited to phone flash storage, alongside the default power-loss-safe mode.
 - **Incremental index maintenance** — segment-based text and vector index

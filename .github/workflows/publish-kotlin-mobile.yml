@@ -1,20 +1,19 @@
 # Publishes the ergonomic Kotlin/Android layer to Maven Central under life.sekejap:
-#   life.sekejap:sekejap-orm            (typed runtime, JVM jar)
-#   life.sekejap:sekejap-orm-processor  (KSP processor, JVM jar)
-#   life.sekejap:sekejap-android        (AAR bundling the JNI .so for 3 ABIs)
+#   life.sekejap:sekejap            (typed runtime, JVM jar)
+#   life.sekejap:sekejap-processor  (KSP processor, JVM jar)
+#   life.sekejap:sekejap-android    (AAR bundling the JNI .so for 3 ABIs)
 #
-# Trigger: push a tag like `kotlin-orm-v0.1.0`, or run it manually
-# (Actions → this workflow → Run workflow). Bump the version in
-# wrappers/kotlin/orm/{build.gradle.kts,processor/build.gradle.kts} and
-# wrappers/kotlin/sekejap-android/build.gradle.kts before publishing a new one
-# (Central versions are immutable).
+# Version is the single source of truth in the root Cargo.toml — no manual bump.
+# Trigger: a release tag `v*` (same tag that releases the rest of the ecosystem),
+# or run it manually (Actions → this workflow → Run workflow). Central versions
+# are immutable, so a re-tag of an already-published version will fail.
 name: Publish Kotlin (mobile ergonomic)
 
 on:
   workflow_dispatch: {}
   push:
     tags:
-      - "kotlin-orm-v*"
+      - "v*"
 
 jobs:
   publish:
@@ -24,6 +23,25 @@ jobs:
       name: release
     steps:
       - uses: actions/checkout@v4
+
+      # The AAR/orm/processor versions are read from Cargo.toml (single source of
+      # truth). On a release tag, refuse to publish if the tag disagrees, so the
+      # mobile artifacts can never diverge from the tag they were cut from.
+      - name: Verify tag matches Cargo.toml
+        shell: bash
+        run: |
+          CARGO_VERSION=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Cargo.toml [workspace.package] version: $CARGO_VERSION"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} != Cargo.toml version ${CARGO_VERSION}. Bump [workspace.package].version to match the tag (or retag), then push again."
+              exit 1
+            fi
+            echo "tag and Cargo.toml agree on ${CARGO_VERSION}"
+          else
+            echo "Manual run (not a tag) — skipping the tag/Cargo equality check."
+          fi
 
       - uses: actions/setup-java@v4
         with:

@@ -13,7 +13,7 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.30.0"
 }
 
-group = "com.zebflow"           // reverse-DNS of the zebflow.com umbrella namespace
+group = "life.sekejap"
 // Single source of truth: [workspace.package] version in the root Cargo.toml.
 // Read it directly so a Cargo.toml bump is the ONLY place a version lives.
 version = rootDir.resolve("../../Cargo.toml").readLines()
@@ -62,9 +62,9 @@ mavenPublishing {
     configure(KotlinJvm(javadocJar = JavadocJar.Empty(), sourcesJar = true))
     publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
     signAllPublications()
-    coordinates(group.toString(), "sekejap", version.toString())
+    coordinates("life.sekejap", "sekejap-ffm", version.toString())
     pom {
-        name.set("sekejap")
+        name.set("sekejap-ffm")
         description.set("Embedded graph-first multi-model database — Kotlin/JVM binding (Panama/FFM).")
         url.set("https://github.com/sekejapdb/sekejap")
         licenses {
@@ -80,7 +80,7 @@ mavenPublishing {
         developers {
             developer {
                 id.set("sekejapdb")
-                name.set("sekejap")
+                name.set("sekejap-ffm")
                 url.set("https://github.com/sekejapdb")
             }
         }

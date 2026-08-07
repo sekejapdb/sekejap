@@ -23,6 +23,21 @@ Annotate a model, run `build_runner`, and get a typed collection, a fluent
 query builder, and reactive queries — no SQL strings. It lowers to the same
 engine; it's a typed front-end, not a second engine.
 
+> Ships in the upcoming release. `pub.dev` `sekejap` 0.16.1 currently exposes the
+> lower-level SQL/JSON API below; the typed layer and its `sekejap_generator`
+> land together in the next version.
+
+Add the codegen tooling (dev-only):
+
+```yaml
+# pubspec.yaml
+dependencies:
+  sekejap: ^0.16.2
+dev_dependencies:
+  build_runner: ^2.4.0
+  sekejap_generator: ^0.1.0
+```
+
 ```dart
 import 'package:sekejap/sekejap.dart';
 part 'dish.g.dart';

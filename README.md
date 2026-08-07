@@ -81,11 +81,18 @@ npm install sekejap                 # prebuilt native binaries, no toolchain nee
 flutter pub add sekejap             # or: dart pub add sekejap
 ```
 
-**Kotlin / Java** — [Maven Central](https://central.sonatype.com/artifact/com.zebflow/sekejap) · [typed API tutorial](wrappers/kotlin/orm/README.md)
+**Kotlin / Android** — [Maven Central](https://central.sonatype.com/namespace/life.sekejap) · [typed API tutorial](wrappers/kotlin/orm/README.md)
 
 ```kotlin
-// build.gradle.kts
-implementation("com.zebflow:sekejap:0.16.1")
+// build.gradle.kts — Android app (typed, reactive; the AAR bundles the native library)
+plugins {
+  id("com.google.devtools.ksp")
+}
+dependencies {
+  implementation("life.sekejap:sekejap-android:0.16.2")   // typed API + native library
+  ksp("life.sekejap:sekejap-processor:0.16.2")            // @SekejapEntity codegen
+}
+// Desktop / server JVM: life.sekejap:sekejap  (+ sekejap-ffm for the Panama binding)
 ```
 
 **Swift** — build from source for now (see [`wrappers/swift/`](wrappers/swift/) · [tutorial](docs/usage/bindings/swift.md));

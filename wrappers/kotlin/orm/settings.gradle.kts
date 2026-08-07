@@ -19,7 +19,7 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "sekejap-orm"
+rootProject.name = "sekejap"
 include(":processor")
 // NOTE: the Android AAR (:android) lives as a SEPARATE Gradle build — mixing a
 // kotlin("jvm") root with a com.android.library submodule breaks the Kotlin

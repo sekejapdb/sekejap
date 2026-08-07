@@ -7,8 +7,39 @@ on:
   workflow_dispatch: {}   # allow manual runs from the Actions UI (test publishes)
 
 jobs:
+  # ── Single source of truth: the pushed tag must equal Cargo.toml's version ──
+  # [workspace.package].version drives every wrapper (Rust/Python inherit it,
+  # Kotlin reads it, sync-wrapper-versions.sh stamps npm+dart from it). This job
+  # refuses the release if the tag and Cargo.toml disagree, so a shipped version
+  # can never diverge from its tag. Registries are immutable — fail before, not after.
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        shell: bash
+        run: |
+          CARGO_VERSION=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Cargo.toml [workspace.package] version: $CARGO_VERSION"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            echo "Release tag: ${GITHUB_REF_NAME} (version $TAG_VERSION)"
+            if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} != Cargo.toml version ${CARGO_VERSION}. Bump [workspace.package].version in Cargo.toml to match the tag (or retag), then push again."
+              exit 1
+            fi
+            echo "tag and Cargo.toml agree on ${CARGO_VERSION}"
+          else
+            echo "Manual run (not a tag) — skipping the tag/Cargo equality check."
+          fi
+          echo "version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+
   publish-rust-library:
     name: Publish Rust Library
+    needs: verify-version
     runs-on: ubuntu-latest
     environment:
       name: release
@@ -95,6 +126,7 @@ jobs:
     name: Publish Python Distributions
     runs-on: ubuntu-latest
     needs:
+      - verify-version
       - build-python-wheels
       - build-python-sdist
     permissions:
@@ -178,7 +210,7 @@ jobs:
   # ── Publish the Dart package to pub.dev (OIDC — no stored token) ───────────
   publish-dart:
     name: Publish to pub.dev
-    needs: precompile-dart
+    needs: [verify-version, precompile-dart]
     runs-on: ubuntu-latest
     permissions:
       id-token: write        # OIDC trusted publishing to pub.dev
@@ -329,7 +361,7 @@ jobs:
 
   publish-node:
     name: Publish to npm
-    needs: build-node
+    needs: [verify-version, build-node]
     runs-on: ubuntu-latest
     environment:
       name: release
@@ -363,7 +395,7 @@ jobs:
   # build-native-libs) into resources so the published jar is self-contained. ─
   publish-kotlin:
     name: Publish to Maven Central
-    needs: build-native-libs
+    needs: [verify-version, build-native-libs]
     runs-on: ubuntu-latest
     environment:
       name: release
