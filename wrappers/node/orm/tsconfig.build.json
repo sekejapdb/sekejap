@@ -11,5 +11,5 @@
     "types": ["node"],
     "skipLibCheck": true
   },
-  "include": ["index.ts", "native.ts", "react.ts"]
+  "include": ["core.ts", "index.ts", "native.ts", "react.ts", "raw.ts"]
 }
