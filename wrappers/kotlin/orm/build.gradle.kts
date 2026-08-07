@@ -10,7 +10,10 @@ plugins {
 
 // Reverse-DNS of the brand domain sekejap.life (matches the Kotlin package).
 group = "life.sekejap"
-version = "0.1.0"
+// Single source of truth: the workspace version in the root Cargo.toml.
+version = rootDir.resolve("../../../Cargo.toml").readLines()
+    .first { it.trimStart().startsWith("version = ") }
+    .substringAfter('"').substringBefore('"')
 
 repositories { mavenCentral() }
 
@@ -41,9 +44,9 @@ mavenPublishing {
     configure(KotlinJvm(javadocJar = JavadocJar.Empty(), sourcesJar = true))
     publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
     if (project.findProperty("signingInMemoryKey") != null) signAllPublications()
-    coordinates("life.sekejap", "sekejap-orm", version.toString())
+    coordinates("life.sekejap", "sekejap", version.toString())
     pom {
-        name.set("sekejap-orm")
+        name.set("sekejap")
         description.set("Typed, reactive Kotlin API for sekejap — @SekejapEntity + KSP + Flow, over the JNI core.")
         url.set("https://sekejap.life")
         licenses {

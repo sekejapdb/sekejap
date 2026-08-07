@@ -8,7 +8,10 @@ plugins {
 }
 
 group = "life.sekejap"
-version = "0.1.0"
+// Single source of truth: the workspace version in the root Cargo.toml.
+version = rootDir.resolve("../../../Cargo.toml").readLines()
+    .first { it.trimStart().startsWith("version = ") }
+    .substringAfter('"').substringBefore('"')
 
 repositories { mavenCentral() }
 
@@ -22,9 +25,9 @@ mavenPublishing {
     configure(KotlinJvm(javadocJar = JavadocJar.Empty(), sourcesJar = true))
     publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
     if (project.findProperty("signingInMemoryKey") != null) signAllPublications()
-    coordinates("life.sekejap", "sekejap-orm-processor", version.toString())
+    coordinates("life.sekejap", "sekejap-processor", version.toString())
     pom {
-        name.set("sekejap-orm-processor")
+        name.set("sekejap-processor")
         description.set("KSP processor generating the typed sekejap collection API from @SekejapEntity.")
         url.set("https://sekejap.life")
         licenses {

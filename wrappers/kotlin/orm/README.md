@@ -12,6 +12,29 @@ Three layers, pick your level:
 | **Raw** (`SekejapNative`) | `external fun` + string SGQL + JSON | hot paths, tooling |
 | **Core** (`../rust`, `../c`) | the Rust engine / C ABI | other bindings |
 
+## Install
+
+**Android app** — two dependencies, that's all (the AAR bundles the native `.so`):
+
+```kotlin
+// build.gradle.kts
+plugins {
+  id("com.google.devtools.ksp")
+}
+dependencies {
+  implementation("life.sekejap:sekejap-android:0.16.2")   // typed API + native library
+  ksp("life.sekejap:sekejap-processor:0.16.2")            // @SekejapEntity codegen
+}
+```
+
+**Desktop / server JVM** — `implementation("life.sekejap:sekejap:0.16.2")` (typed API)
++ the same `ksp(...)` line; provide the host native library via
+`-Dsekejap.jni.path=…` or the Panama binding `life.sekejap:sekejap-ffm`.
+
+> Only `sekejap-android` + `sekejap-processor` are needed for an app. The runtime
+> `life.sekejap:sekejap` is pulled in transitively. (The older `sekejap-orm` /
+> `sekejap-orm-processor` coordinates are deprecated — use the names above.)
+
 ## Typed, reactive usage
 
 ```kotlin
@@ -54,11 +77,13 @@ ANDROID_NDK_HOME=$ANDROID_HOME/ndk/<version> ./build-native.sh android
 
 ## Consuming it
 
-- **Android app**: depend on this library, and place `libsekejap_jni.so` per ABI
-  under `app/src/main/jniLibs/<abi>/` (run `build-native.sh android` with
-  `JNILIBS=app/src/main/jniLibs`). `SekejapNative` loads it via
-  `System.loadLibrary("sekejap_jni")`. KSP: add `ksp("life.sekejap:processor")`.
-- **JVM backend / tests**: pass `-Dsekejap.jni.path=/abs/libsekejap_jni.{so,dylib,dll}`.
+- **Android app**: just the two dependencies in [Install](#install) — the
+  `sekejap-android` AAR already bundles `libsekejap_jni.so` for every ABI, loaded
+  via `System.loadLibrary("sekejap_jni")`. No manual `jniLibs`, no Rust toolchain.
+- **JVM backend / tests**: add `life.sekejap:sekejap`, and provide the host native
+  library with `-Dsekejap.jni.path=/abs/libsekejap_jni.{so,dylib,dll}`.
+- Building the `.so` yourself (extra ABIs, source builds) is only needed for
+  contributors — see [Building the native library](#building-the-native-library).
 
 ## Test
 
