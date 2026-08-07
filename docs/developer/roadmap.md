@@ -46,6 +46,11 @@ ecosystem feel native without forking the core.
 
 So each binding is shaped for the community that actually uses that language,
 in the idiom they already reach for — the goal is to feel *native*, not ported.
+Each surface is designed for that language's **primary audience first**, rather
+than trying to suit every possible user. Focusing on the people most likely to
+reach for the language keeps the surface small, coherent, and stable; a binding
+that tries to serve everyone tends to grow more interfaces than any one user
+needs. The `shaped for` column names that primary audience.
 
 **Wrapper philosophy.** Each wrapper is written the way a fan of that language
 would write it, showcasing that language's strongest trait — while all wrappers
@@ -62,7 +67,7 @@ working. See [the vocabulary guide](../usage/vocabulary.md).
 | **Kotlin** | Android app developers | annotated data classes, KSP codegen, coroutine-first | `Flow` (Compose) |
 | **Swift** | iOS / macOS app developers | `@Model`-style macro, SwiftUI `@Query`-style property wrapper | `AsyncSequence` |
 | **TypeScript** | full-stack web **and** React Native | typed client from a schema (Prisma/Drizzle feel), same code on device and server | async iterator / hooks |
-| **Python** | FastAPI developers **and** data scientists | two doors: Pydantic models + async queries; DataFrame in/out | async iterator |
+| **Python** | data engineers, analysts & scientists, and data-driven backends | SQL as the query surface, DataFrame in/out (`query → DataFrame`, `DataFrame → nodes/edges`), notebook & REPL flow | async iterator |
 | **Go** | backend & cloud engineers | struct tags, `go generate`, context-aware | channels |
 | **C / C++** | game engines, robotics, systems | the stable C ABI itself; C++ gets RAII typed wrappers | callbacks |
 | **C# / .NET** | **Unity game developers** (also .NET backends) | a **LINQ** provider so queries feel built into the language; MonoBehaviour-friendly lifecycle | `IAsyncEnumerable` / Rx |
@@ -91,6 +96,25 @@ Two primitives underpin the ergonomic layer:
 2. **Change notification.** Reactive queries need to know when to re-emit. Each
    committed transaction publishes which collections, keys, and edge types
    changed, so a watcher can refresh precisely instead of polling.
+
+## Depth before breadth in each binding
+
+Once a binding ships, strengthening and stabilizing its existing surface takes
+priority over adding new ways to do the same thing. Each language keeps a small,
+coherent set of entry points shaped for its primary audience, and effort goes
+into making those more reliable, more predictable, and more pleasant — not into
+multiplying alternatives. A stable, well-worn core is easier to learn, document,
+and depend on than a wide one.
+
+Near-term core polish includes:
+
+- **Python** — return query results as parsed, mapping-like rows rather than
+  JSON strings, so the common path needs no manual decode step. SQL and the
+  DataFrame accessor stay the two complementary modes; no additional query
+  interface is added.
+- **General** — consistent result shapes, error types, and parameter handling
+  across bindings, and steady, additive-only evolution of each surface so code
+  written today keeps working.
 
 ## Other directions on the horizon
 
