@@ -17,6 +17,45 @@ flutter pub add sekejap      # Flutter app
 dart pub add sekejap         # standalone Dart
 ```
 
+## Typed, reactive API (recommended)
+
+Annotate a model, run `build_runner`, and get a typed collection, a fluent
+query builder, and reactive queries — no SQL strings. It lowers to the same
+engine; it's a typed front-end, not a second engine.
+
+```dart
+import 'package:sekejap/sekejap.dart';
+part 'dish.g.dart';
+
+@SekejapEntity()
+class Dish {
+  @Key() final String id;
+  @Index(IndexKind.hash) final String category;
+  @Index() final int price;                // btree
+  const Dish({required this.id, required this.category, required this.price});
+}
+// dart run build_runner build   → generates the typed layer
+```
+
+```dart
+final db = await Sekejap.open('app.db', schema: [dishSchema]);
+await db.dishes.put(const Dish(id: 'd1', category: 'main', price: 45000));
+
+final cheapMains = await db.dishes
+    .where((d) => d.category.eq('main') & d.price.lt(90000))
+    .sortBy((d) => d.price)
+    .find();                                // List<Dish>
+
+// Reactive — a StreamBuilder rebuilds when matching data changes:
+db.dishes.where((d) => d.category.eq('main')).watch();   // Stream<List<Dish>>
+```
+
+`d.price.lt('cheap')` is a compile error. Multi-model composes in one query:
+`.near((d) => d.location, here, metres: 5000).matchText((d) => d.about, 'grilled')
+.rankByVector((d) => d.taste, myTaste)`.
+
+The rest of this page covers the lower-level SQL/JSON API the typed layer builds on.
+
 ## Quick start
 
 ```dart

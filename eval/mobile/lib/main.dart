@@ -8,7 +8,6 @@ import 'bench.dart';
 import 'workload.dart';
 import 'adapters/sekejap_a.dart';
 import 'adapters/sqflite_a.dart';
-import 'adapters/isar_a.dart';
 import 'adapters/objectbox_a.dart';
 import 'adapters/hive_a.dart';
 import 'adapters/realm_a.dart';
@@ -49,7 +48,6 @@ class _BenchPageState extends State<BenchPage> {
       final engines = <EngineBench>[
         SekejapBench(),
         SqfliteBench(),
-        IsarBench(),
         ObjectBoxBench(),
         HiveBench(),
         RealmBench(),

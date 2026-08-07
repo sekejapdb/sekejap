@@ -20,7 +20,9 @@ subprojects {
 }
 
 // Legacy plugins published before AGP 8 (isar_flutter_libs) lack the now
-// mandatory `namespace`; derive it from their manifest package attribute.
+// mandatory `namespace`; derive it from their manifest package attribute. They
+// also compile against an old SDK missing `android:attr/lStar` (API 31+), so
+// pin their compileSdk forward too.
 subprojects {
     plugins.withId("com.android.library") {
         extensions.configure<com.android.build.gradle.LibraryExtension> {

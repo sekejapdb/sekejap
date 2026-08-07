@@ -52,13 +52,16 @@ It's a good fit for:
 
 ## Install
 
-**Python** — [PyPI](https://pypi.org/project/sekejap/)
+Each language has its own tutorial — install, first query, and (where
+available) the typed, reactive API. Index: [docs/usage/bindings/](docs/usage/bindings/README.md).
+
+**Python** — [PyPI](https://pypi.org/project/sekejap/) · [tutorial](docs/usage/bindings/python.md)
 
 ```bash
 pip install sekejap                 # includes S3 support
 ```
 
-**Rust** — [crates.io](https://crates.io/crates/sekejap)
+**Rust** — [crates.io](https://crates.io/crates/sekejap) · [tutorial](docs/usage/bindings/rust.md)
 
 ```bash
 cargo add sekejap                   # library
@@ -66,37 +69,37 @@ cargo add sekejap --features s3     # library, with S3 support
 cargo install sekejap-cli           # command-line tool
 ```
 
-**Node.js** — [npm](https://www.npmjs.com/package/sekejap)
+**Node.js / TypeScript** — [npm](https://www.npmjs.com/package/sekejap) · [typed API tutorial](wrappers/node/orm/README.md)
 
 ```bash
 npm install sekejap                 # prebuilt native binaries, no toolchain needed
 ```
 
-**Dart / Flutter** — [pub.dev](https://pub.dev/packages/sekejap)
+**Dart / Flutter** — [pub.dev](https://pub.dev/packages/sekejap) · [typed API tutorial](wrappers/dart/README.md)
 
 ```bash
 flutter pub add sekejap             # or: dart pub add sekejap
 ```
 
-**Kotlin / Java** — [Maven Central](https://central.sonatype.com/artifact/com.zebflow/sekejap)
+**Kotlin / Java** — [Maven Central](https://central.sonatype.com/artifact/com.zebflow/sekejap) · [typed API tutorial](wrappers/kotlin/orm/README.md)
 
 ```kotlin
 // build.gradle.kts
 implementation("com.zebflow:sekejap:0.16.1")
 ```
 
-**Swift** — build from source for now (see [`wrappers/swift/`](wrappers/swift/));
+**Swift** — build from source for now (see [`wrappers/swift/`](wrappers/swift/) · [tutorial](docs/usage/bindings/swift.md));
 a dedicated SwiftPM package repository is planned.
 
-**Go** — Go modules (see [`wrappers/go/`](wrappers/go/))
+**Go** — Go modules ([tutorial](docs/usage/bindings/go.md))
 
 ```bash
 go get github.com/sekejapdb/sekejap/wrappers/go
 ```
 
 **C / C++ and other native callers** — the stable C ABI in
-[`wrappers/c/`](wrappers/c/) (build from source; ships a single header +
-static/shared library).
+[`wrappers/c/`](wrappers/c/) ([tutorial](docs/usage/bindings/c.md); build from
+source; ships a single header + static/shared library).
 
 ---
 

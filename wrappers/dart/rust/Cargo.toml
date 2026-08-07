@@ -14,7 +14,10 @@ crate-type = ["cdylib", "staticlib"]
 # Registry dep so a from-source build in the pub.dev cache is self-contained.
 # Locally and in CI, the workspace root patches this to the in-repo core crate
 # (`[patch.crates-io]` in the root Cargo.toml), so dev builds use local source.
-sekejap             = "0.13"
+# NOTE: the requirement must be satisfiable by the in-repo core version for the
+# patch to apply — keep it in step with the workspace version. Publishing the
+# pub.dev package therefore requires the matching sekejap release on crates.io.
+sekejap             = "0.16"
 flutter_rust_bridge = "=2.12.0"
 serde_json          = "1"
 

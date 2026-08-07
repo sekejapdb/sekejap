@@ -2,7 +2,7 @@ name: sekejap
 description: >-
   Embedded graph-first multi-model database (SQL + graph + vector + spatial),
   bundled as a native library. Dart & Flutter bindings over the Rust core.
-version: 0.16.1
+version: 0.16.2
 homepage: https://sekejap.zebflow.com
 repository: https://github.com/sekejapdb/sekejap
 
@@ -24,6 +24,10 @@ dev_dependencies:
   flutter_lints: ^6.0.0
   integration_test:
     sdk: flutter
+  # Typed-model codegen (@SekejapEntity → dart run build_runner build).
+  build_runner: ">=2.4.0 <3.0.0"
+  sekejap_generator:
+    path: sekejap_generator
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

@@ -24,6 +24,14 @@ import 'src/rust/frb_generated.dart';
 
 export 'src/rust/api/simple.dart';
 export 'src/rust/frb_generated.dart' show RustLib;
+export 'src/watch.dart' show watchChanges;
+
+// Typed model layer.
+export 'src/annotations.dart';
+export 'src/orm/filter.dart' show Filter, Col;
+export 'src/orm/query.dart' show Query, GeoPoint, VectorMetric;
+export 'src/orm/collection.dart' show Collection;
+export 'src/orm/database.dart' show Sekejap, EntitySchema;
 
 /// Initialise the native library. Safe to call more than once (later calls are
 /// no-ops).

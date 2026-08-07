@@ -80,6 +80,56 @@ impl Db {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
+    /// Parameterized mutating statement ($1, $2, …); `paramsJson` is a JSON array
+    /// string. Returns affected rows. The typed layer's update/delete lower here.
+    #[napi]
+    pub fn execute_params(&self, sql: String, params_json: String) -> Result<i64> {
+        let params: Vec<serde_json::Value> = serde_json::from_str(&params_json)
+            .map_err(|e| Error::from_reason(format!("params_json: {e}")))?;
+        let mut guard = self.inner.lock().unwrap();
+        let db = guard.as_mut().ok_or_else(closed)?;
+        db.execute_params(&sql, &params)
+            .map(|n| n as i64)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    // ── Change feed (reactive .watch()) ───────────────────────────────────────
+
+    /// Subscribe to the change feed. `callback` is invoked once per committed
+    /// mutation (a transaction fires once, at COMMIT) with a JSON string
+    /// `{"collections":[…],"keys":[…],"edge_types":[…]}`. Returns a subscription
+    /// id; pass it to [`unwatch`] to stop. The napi ThreadsafeFunction marshals
+    /// the call onto the JS event loop, so no manual threading is needed.
+    #[napi]
+    pub fn watch(
+        &self,
+        callback: napi::threadsafe_function::ThreadsafeFunction<
+            String,
+            napi::threadsafe_function::ErrorStrategy::Fatal,
+        >,
+    ) -> Result<i64> {
+        let mut guard = self.inner.lock().unwrap();
+        let db = guard.as_mut().ok_or_else(closed)?;
+        let id = db.subscribe_changes(move |ev| {
+            let json = serde_json::json!({
+                "collections": ev.collections,
+                "keys": ev.keys,
+                "edge_types": ev.edge_types,
+            })
+            .to_string();
+            callback.call(json, napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
+        });
+        Ok(id as i64)
+    }
+
+    /// Stop a change-feed subscription created by [`watch`].
+    #[napi]
+    pub fn unwatch(&self, id: i64) {
+        if let Some(db) = self.inner.lock().unwrap().as_mut() {
+            db.unsubscribe_changes(id as u64);
+        }
+    }
+
     /// Compile a query once for repeated execution — a prepared statement.
     #[napi]
     pub fn prepare(&self, sql: String) -> Result<PreparedStatement> {

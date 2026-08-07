@@ -6,6 +6,8 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `WatchMsg`
+
 /// Open a persistent database at `path` (a directory on the filesystem).
 Future<SekejapDb> dbOpen({required String path}) =>
     RustLib.instance.api.crateApiSimpleDbOpen(path: path);
@@ -64,6 +66,24 @@ Future<void> dbUnlink(
         required String edgeType}) =>
     RustLib.instance.api
         .crateApiSimpleDbUnlink(db: db, from: from, to: to, edgeType: edgeType);
+
+/// Begin watching the change feed. Registers an engine listener that forwards
+/// every committed change (a transaction reports once, at COMMIT) to the
+/// returned handle. Pair with [`db_watch_stream`] to receive and
+/// [`db_watch_close`] to stop.
+Future<SekejapWatch> dbWatchOpen({required SekejapDb db}) =>
+    RustLib.instance.api.crateApiSimpleDbWatchOpen(db: db);
+
+/// Stream committed changes from a [`SekejapWatch`] to Dart. Parks on the
+/// channel between commits (no busy-wait); returns when [`db_watch_close`] is
+/// called or the Dart subscription is cancelled. Call once per handle.
+Stream<ChangeEvent> dbWatchStream({required SekejapWatch watch}) =>
+    RustLib.instance.api.crateApiSimpleDbWatchStream(watch: watch);
+
+/// Stop a watch: wake its stream loop and remove the engine listener. Idempotent.
+Future<void> dbWatchClose(
+        {required SekejapDb db, required SekejapWatch watch}) =>
+    RustLib.instance.api.crateApiSimpleDbWatchClose(db: db, watch: watch);
 
 /// Run a SELECT or MATCH query.
 /// Returns a JSON array: `[{"slug":"...","payload":{...}}, ...]`
@@ -130,3 +150,38 @@ abstract class SekejapDb implements RustOpaqueInterface {}
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SekejapPreparedQuery>>
 abstract class SekejapPreparedQuery implements RustOpaqueInterface {}
+
+// Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SekejapWatch>>
+abstract class SekejapWatch implements RustOpaqueInterface {}
+
+/// What changed in one committed mutation. A transaction reports once, at
+/// COMMIT, carrying every collection, node key, and edge type it touched — so a
+/// watcher can decide precisely whether to re-run its query.
+class ChangeEvent {
+  /// Collections whose members changed.
+  final List<String> collections;
+
+  /// Node slugs (`collection/key`) put, updated, or removed.
+  final List<String> keys;
+
+  /// Edge types linked or unlinked.
+  final List<String> edgeTypes;
+
+  const ChangeEvent({
+    required this.collections,
+    required this.keys,
+    required this.edgeTypes,
+  });
+
+  @override
+  int get hashCode => collections.hashCode ^ keys.hashCode ^ edgeTypes.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ChangeEvent &&
+          runtimeType == other.runtimeType &&
+          collections == other.collections &&
+          keys == other.keys &&
+          edgeTypes == other.edgeTypes;
+}

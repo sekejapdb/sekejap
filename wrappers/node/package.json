@@ -1,24 +1,75 @@
 {
   "name": "sekejap",
-  "version": "0.16.1",
-  "description": "Embedded graph-first multi-model database — Node.js binding",
+  "version": "0.16.2",
+  "description": "Embedded graph-first multi-model database — Node.js & React Native binding",
   "license": "MIT OR Apache-2.0",
   "repository": "github:sekejapdb/sekejap",
-  "homepage": "https://sekejap.zebflow.com",
-  "keywords": ["database", "graph", "vector", "spatial", "embedded", "multi-model"],
+  "homepage": "https://sekejap.life",
+  "keywords": [
+    "database",
+    "graph",
+    "vector",
+    "spatial",
+    "embedded",
+    "multi-model",
+    "typescript",
+    "react-native"
+  ],
   "main": "index.js",
   "types": "index.d.ts",
-  "files": ["index.js", "index.d.ts", "*.node", "README.md"],
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./orm": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./orm/react": {
+      "types": "./dist/react.d.ts",
+      "default": "./dist/react.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node",
+    "dist/",
+    "README.md"
+  ],
   "napi": {
     "name": "sekejap"
   },
-  "engines": { "node": ">= 16" },
-  "os": ["darwin", "linux", "win32"],
-  "cpu": ["x64", "arm64"],
+  "engines": {
+    "node": ">= 16"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
   "scripts": {
-    "build": "napi build --platform --release"
+    "build": "napi build --platform --release",
+    "build:orm": "tsc -p orm/tsconfig.build.json",
+    "test:orm": "tsx orm/orm.test.ts"
+  },
+  "peerDependencies": {
+    "react": ">=17"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.0"
+    "@napi-rs/cli": "^2.18.0",
+    "@types/node": "^20.19.43",
+    "@types/react": "^18.3.31",
+    "typescript": "^5.6.3"
   }
 }
