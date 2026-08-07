@@ -1,0 +1,23 @@
+# Android JNI binding for sekejap. Cross-compiled with cargo-ndk to a
+# libsekejap_jni.so loaded by the Kotlin app via System.loadLibrary("sekejap_jni").
+# Detached from the workspace: it resolves the in-repo core directly by path, so
+# `cargo build --workspace` never tries to build it for the host.
+[workspace]
+
+[package]
+name = "sekejap_jni"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sekejap = { path = "../../.." }
+jni = "0.21"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

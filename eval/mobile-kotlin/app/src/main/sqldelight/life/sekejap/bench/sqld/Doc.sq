@@ -1,0 +1,28 @@
+CREATE TABLE doc (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL,
+  value REAL NOT NULL,
+  ts INTEGER NOT NULL
+);
+
+CREATE INDEX doc_category ON doc(category);
+CREATE INDEX doc_value ON doc(value);
+
+insert:
+INSERT OR REPLACE INTO doc(id, name, category, value, ts) VALUES (?, ?, ?, ?, ?);
+
+getName:
+SELECT name FROM doc WHERE id = ?;
+
+countCategory:
+SELECT COUNT(*) FROM doc WHERE category = ?;
+
+countRange:
+SELECT COUNT(*) FROM doc WHERE value >= ? AND value <= ?;
+
+updateValue:
+UPDATE doc SET value = ? WHERE id = ?;
+
+deleteById:
+DELETE FROM doc WHERE id = ?;

@@ -122,3 +122,11 @@ wrappers/kotlin/gradle/
 !wrappers/kotlin/gradle/wrapper/gradle-wrapper.properties
 .docs.backup/
 .brainstorm/
+
+# Gradle / Kotlin daemon caches (any depth) — never commit these
+.gradle/
+.kotlin/
+# Node typed-layer build output (built in CI / prepublish)
+wrappers/node/dist/
+# scratch notes
+TODO.md

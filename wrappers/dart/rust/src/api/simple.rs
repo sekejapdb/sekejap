@@ -1,6 +1,7 @@
 //! Public API surface bridged to Dart by flutter_rust_bridge.
 
 use flutter_rust_bridge::frb;
+use crate::frb_generated::StreamSink;
 use sekejap::CoreDB;
 use serde_json::Value;
 use std::sync::Mutex;
@@ -97,6 +98,88 @@ pub fn db_link(db: &SekejapDb, from: String, to: String, edge_type: String) {
 /// Remove a directed edge between two nodes.
 pub fn db_unlink(db: &SekejapDb, from: String, to: String, edge_type: String) {
     db.0.lock().unwrap().unlink(&from, &to, &edge_type);
+}
+
+// ── Reactive (change feed) ───────────────────────────────────────────────────────
+
+/// What changed in one committed mutation. A transaction reports once, at
+/// COMMIT, carrying every collection, node key, and edge type it touched — so a
+/// watcher can decide precisely whether to re-run its query.
+pub struct ChangeEvent {
+    /// Collections whose members changed.
+    pub collections: Vec<String>,
+    /// Node slugs (`collection/key`) put, updated, or removed.
+    pub keys: Vec<String>,
+    /// Edge types linked or unlinked.
+    pub edge_types: Vec<String>,
+}
+
+/// One item on a watch channel: a committed change, or a stop signal that wakes
+/// the parked forwarding loop so cancellation is immediate (no polling).
+enum WatchMsg {
+    Event(sekejap::ChangeEvent),
+    Stop,
+}
+
+/// An active subscription to the change feed. Created by [`db_watch_open`],
+/// streamed by [`db_watch_stream`], and released by [`db_watch_close`]. The Dart
+/// wrapper composes these into a single `Stream<ChangeEvent>` whose `onCancel`
+/// calls [`db_watch_close`]. Freed automatically when garbage-collected.
+#[frb(opaque)]
+pub struct SekejapWatch {
+    id: u64,
+    /// Cloned so [`db_watch_close`] can post `Stop` and wake the stream loop.
+    tx: std::sync::mpsc::Sender<WatchMsg>,
+    /// Taken once by [`db_watch_stream`].
+    rx: Mutex<Option<std::sync::mpsc::Receiver<WatchMsg>>>,
+}
+
+/// Begin watching the change feed. Registers an engine listener that forwards
+/// every committed change (a transaction reports once, at COMMIT) to the
+/// returned handle. Pair with [`db_watch_stream`] to receive and
+/// [`db_watch_close`] to stop.
+pub fn db_watch_open(db: &SekejapDb) -> SekejapWatch {
+    let (tx, rx) = std::sync::mpsc::channel::<WatchMsg>();
+    // Wrap the sender in a Mutex so the listener is `Send + Sync` (CoreDB
+    // requires it). Uncontended — the listener only runs on the commit thread.
+    let listener_tx = Mutex::new(tx.clone());
+    let id = db.0.lock().unwrap().subscribe_changes(move |ev| {
+        if let Ok(tx) = listener_tx.lock() {
+            let _ = tx.send(WatchMsg::Event(ev.clone()));
+        }
+    });
+    SekejapWatch { id, tx, rx: Mutex::new(Some(rx)) }
+}
+
+/// Stream committed changes from a [`SekejapWatch`] to Dart. Parks on the
+/// channel between commits (no busy-wait); returns when [`db_watch_close`] is
+/// called or the Dart subscription is cancelled. Call once per handle.
+pub fn db_watch_stream(watch: &SekejapWatch, sink: StreamSink<ChangeEvent>) {
+    let rx = match watch.rx.lock().unwrap().take() {
+        Some(rx) => rx,
+        None => return, // already streamed once
+    };
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            WatchMsg::Stop => break,
+            WatchMsg::Event(ev) => {
+                let out = ChangeEvent {
+                    collections: ev.collections,
+                    keys: ev.keys,
+                    edge_types: ev.edge_types,
+                };
+                if sink.add(out).is_err() {
+                    break; // Dart cancelled between commits
+                }
+            }
+        }
+    }
+}
+
+/// Stop a watch: wake its stream loop and remove the engine listener. Idempotent.
+pub fn db_watch_close(db: &SekejapDb, watch: &SekejapWatch) {
+    let _ = watch.tx.send(WatchMsg::Stop);
+    db.0.lock().unwrap().unsubscribe_changes(watch.id);
 }
 
 // ── Queries ────────────────────────────────────────────────────────────────────

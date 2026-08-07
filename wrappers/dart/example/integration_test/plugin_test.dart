@@ -47,4 +47,40 @@ void main() {
       expect(rows, contains('k$i'), reason: 'param $i: $rows');
     }
   });
+
+  test('watch emits a ChangeEvent per committed mutation', () async {
+    final dir = Directory.systemTemp.createTempSync('sekejap_flutter_watch');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    final db = await dbOpen(path: dir.path);
+    await dbExecute(
+        db: db, sql: 'CREATE TABLE items (_key TEXT PRIMARY KEY, v INTEGER)');
+
+    // Collect events off the change feed.
+    final events = <ChangeEvent>[];
+    final sub = watchChanges(db).listen(events.add);
+    // Let the stream registration reach the Rust side before mutating.
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    // Single insert → one event naming the collection and key.
+    await dbExecute(db: db, sql: "INSERT INTO items (_key, v) VALUES ('a', 1)");
+    // Transaction of two inserts → exactly one event at COMMIT.
+    await dbExecute(db: db, sql: 'BEGIN');
+    await dbExecute(db: db, sql: "INSERT INTO items (_key, v) VALUES ('b', 2)");
+    await dbExecute(db: db, sql: "INSERT INTO items (_key, v) VALUES ('c', 3)");
+    await dbExecute(db: db, sql: 'COMMIT');
+    // An edge → one event naming the edge type.
+    await dbLink(db: db, from: 'items/a', to: 'items/b', edgeType: 'rel');
+
+    // Give the async stream a moment to drain.
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    await sub.cancel().timeout(const Duration(seconds: 3));
+
+    expect(events.length, 3, reason: 'insert + txn(once) + link = 3 events');
+    expect(events[0].collections, contains('items'));
+    expect(events[0].keys.any((k) => k.contains('a')), isTrue);
+    expect(events[1].keys.length, greaterThanOrEqualTo(2),
+        reason: 'both txn keys in the single commit event');
+    expect(events[2].edgeTypes, contains('rel'));
+  });
 }

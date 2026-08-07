@@ -47,6 +47,15 @@ ecosystem feel native without forking the core.
 So each binding is shaped for the community that actually uses that language,
 in the idiom they already reach for — the goal is to feel *native*, not ported.
 
+**Wrapper philosophy.** Each wrapper is written the way a fan of that language
+would write it, showcasing that language's strongest trait — while all wrappers
+follow the *same conceptual flow* (model → typed collection → fluent multi-model
+query → run / watch → write). The surface is idiomatic and deliberately differs
+between languages (`limitTo` in Dart, `limit` in TypeScript; `Stream` vs `Flow`
+vs async iteration for `watch`); only the flow is shared. And once a language's
+surface ships, it is meant to last — additive-only, so code written today keeps
+working. See [the vocabulary guide](../usage/vocabulary.md).
+
 | language | shaped for | interface form | reactive |
 |---|---|---|---|
 | **Dart / Flutter** | Flutter app & game (Flame) developers | annotated `@Entity` classes, build_runner codegen, widget-ready results | `Stream` |
@@ -84,6 +93,22 @@ Two primitives underpin the ergonomic layer:
    changed, so a watcher can refresh precisely instead of polling.
 
 ## Other directions on the horizon
+
+- **Relational integrity** — optional constraints declared in the schema and
+  enforced by the engine, so a typed relation like *a tourist must originate
+  from an existing country* holds everywhere:
+  - **NOT NULL** on scalar columns (a value must be present).
+  - **Required edges** — a mandatory relationship: an entity of a collection
+    must have a given edge (the graph analogue of a NOT NULL foreign key).
+  - **Referential integrity** — `REFERENCES EXISTING`: an edge can only be
+    created when its destination node exists.
+  - **`ON DELETE` policies** — `RESTRICT` (block), `CASCADE` (remove dependents),
+    `SET NULL`/`DETACH` (drop the edge), or `NONE` (no action).
+
+  Required and referential checks would be **deferred to COMMIT**, so a
+  transaction can stage a node and its edges together (the same commit boundary
+  the change feed already uses). Each typed language surface would expose this
+  as a non-null, existence-checked reference (`ref(...)` / `Ref<T>`).
 
 - **Mobile operating profile** — a relaxed-durability, deferred-compaction mode
   suited to phone flash storage, alongside the default power-loss-safe mode.
