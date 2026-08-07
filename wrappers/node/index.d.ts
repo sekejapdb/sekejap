@@ -18,6 +18,21 @@ export declare class Db {
   query(sql: string): string
   /** Parameterized SELECT ($1, $2, …); `paramsJson` is a JSON array string. */
   queryParams(sql: string, paramsJson: string): string
+  /**
+   * Parameterized mutating statement ($1, $2, …); `paramsJson` is a JSON array
+   * string. Returns affected rows. The typed layer's update/delete lower here.
+   */
+  executeParams(sql: string, paramsJson: string): number
+  /**
+   * Subscribe to the change feed. `callback` is invoked once per committed
+   * mutation (a transaction fires once, at COMMIT) with a JSON string
+   * `{"collections":[…],"keys":[…],"edge_types":[…]}`. Returns a subscription
+   * id; pass it to [`unwatch`] to stop. The napi ThreadsafeFunction marshals
+   * the call onto the JS event loop, so no manual threading is needed.
+   */
+  watch(callback: (arg: string) => any): number
+  /** Stop a change-feed subscription created by [`watch`]. */
+  unwatch(id: number): void
   /** Compile a query once for repeated execution — a prepared statement. */
   prepare(sql: string): PreparedStatement
   /**

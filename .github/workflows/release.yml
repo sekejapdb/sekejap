@@ -348,6 +348,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      # Stamp the version from Cargo.toml BEFORE building — the addon bakes
+      # CARGO_PKG_VERSION into version() at compile time, so this must run first
+      # or the published binary reports a stale version.
+      - name: Sync version from Cargo.toml
+        run: ./scripts/sync-wrapper-versions.sh
       - name: Build addon
         working-directory: wrappers/node
         run: |
