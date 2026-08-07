@@ -1,7 +1,7 @@
 // React / React Native binding — a hook over the reactive query.
 // Import from 'sekejap/orm/react'. `react` is an optional peer dependency.
 import { useEffect, useState } from 'react';
-import type { Columns, Query } from './index';
+import type { Columns, Query } from './core';
 
 /**
  * Subscribe a component to a query. Returns the current rows (undefined until the
