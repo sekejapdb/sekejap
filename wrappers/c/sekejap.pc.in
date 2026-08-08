@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: sekejap
+Description: sekejap embedded multi-model database (SQL + graph + spatial + vector + text) — C ABI
+URL: https://sekejap.life
+Version: @VERSION@
+Libs: -L${libdir} -lsekejap -Wl,-rpath,${libdir}
+Cflags: -I${includedir}
