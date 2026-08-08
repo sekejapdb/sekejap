@@ -42,11 +42,30 @@ wrappers/swift/
 
 ## Distribution
 
-- **No central registry.** Swift Package Manager consumes packages from **Git URLs**.
-- **Install (SwiftPM):** planned via a dedicated package repository
-  (`sekejapdb/sekejap-swift` — not yet created); until then, depend on this
-  directory as a local package: `.package(path: "…/sekejap/wrappers/swift")`.
-- **Publish:** git-tag a release; the [Swift Package Index](https://swiftpackageindex.com)
-  indexes it automatically. Ship the native code as a `libsekejap.xcframework` attached
-  to the GitHub Release and referenced by a `binaryTarget`.
+SwiftPM consumes packages from a **Git URL whose root has a `Package.swift`** —
+so, unlike Go's subdirectory module, sekejap's Swift package needs its own
+distribution repo. The plan (and remaining steps):
+
+**Status today:** the binding builds and `swift test` passes against a locally
+built `libsekejap` (the dev manifest in this folder computes the path to
+`target/release`). Use it now as a local dependency:
+`.package(path: "…/sekejap/wrappers/swift")`.
+
+**To publish via SwiftPM** (`.package(url: …, from: "0.16.2")`), three steps —
+best done together in an Xcode session on real hardware:
+
+1. **Create `sekejapdb/sekejap-swift`** (a small repo whose root is a
+   `Package.swift`). This is the URL SwiftPM and the
+   [Swift Package Index](https://swiftpackageindex.com) resolve.
+2. **Ship the native code as a prebuilt `libsekejap.xcframework`** (iOS device +
+   simulator + macOS). The Release workflow already builds and attaches
+   `libsekejap.xcframework.zip` + its checksum to each GitHub release; the
+   distribution `Package.swift` references it as a `binaryTarget` (url + checksum).
+   *Validate that `import CSekejap` resolves from the xcframework on a real Xcode
+   build before tagging.*
+3. **Wire the checksum:** the xcframework checksum only exists after the release
+   builds it, so the `sekejap-swift` repo's `Package.swift` (url + checksum) is
+   updated per release — either by hand from the release asset, or by a CI job
+   that pushes the updated manifest + a matching tag after the build.
+
 - **Optional CocoaPods:** `pod 'Sekejap'`, published with `pod trunk push`.
