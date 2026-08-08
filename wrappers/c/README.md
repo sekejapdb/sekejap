@@ -151,6 +151,40 @@ int main(void) {
 }
 ```
 
+## C++ (header-only)
+
+For C++ there's an idiomatic RAII wrapper, [`include/sekejap.hpp`](include/sekejap.hpp)
+— include it instead of `sekejap.h`. It links the same `libsekejap`, and adds:
+handles that close/free themselves (move-only `Db`, `Stmt`), `std::string` in/out,
+`std::optional<std::string>` for a missing node, and exceptions (`sekejap::Error`,
+carrying `sekejap_last_error()`) instead of sentinel checks. Requires C++17.
+
+```cpp
+#include "sekejap.hpp"
+
+int main() {
+    sekejap::Db db = sekejap::Db::open("./data");                 // throws on failure
+    db.execute("CREATE TABLE t (_key TEXT PRIMARY KEY, v INTEGER)");
+    db.executeParams("INSERT INTO t (_key, v) VALUES ($1, $2)", R"(["a",42])");
+
+    std::string rows = db.query("SELECT v FROM t WHERE _key = 'a'");  // [{"v":42,...}]
+    if (auto node = db.get("t/a")) { /* found */ }                    // std::optional
+
+    auto stmt = db.prepare("SELECT _key FROM t WHERE v > $1");
+    std::string big = db.queryPrepared(stmt, R"([10])");
+    // db + stmt close/free themselves at scope end
+}
+```
+
+Build (from the repo root):
+
+```bash
+clang++ -std=c++17 -Iwrappers/c/include wrappers/c/examples/cpp_tour.cpp \
+  -Ltarget/release -lsekejap -Wl,-rpath,target/release -o cpp_tour && ./cpp_tour
+```
+
+The runnable tour with assertions is [`examples/cpp_tour.cpp`](examples/cpp_tour.cpp).
+
 ## Scope
 
 The surface favors **UTF-8 in, JSON out**: query/show results come back as one
