@@ -230,6 +230,28 @@ jobs:
           flutter pub get
           dart pub publish --force
 
+  # ── Publish the Dart codegen generator to pub.dev (dev-only package) ────────
+  # Pure Dart (no Flutter). Requires OIDC trusted publishing to be enabled for
+  # `sekejap_generator` on pub.dev (one-time, per-package, same as `sekejap`).
+  publish-dart-generator:
+    name: Publish sekejap_generator to pub.dev
+    needs: [verify-version, publish-dart]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # OIDC trusted publishing to pub.dev
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - name: Sync version from Cargo.toml
+        run: ./scripts/sync-wrapper-versions.sh
+      - name: Publish
+        working-directory: wrappers/dart/sekejap_generator
+        run: |
+          dart pub get
+          dart pub publish --force
+
   # ── C ABI native libraries (serves C/C++, Go, Swift, any C-ABI consumer) ───
   # Builds libsekejap for each desktop platform and attaches a tarball
   # (lib + header) to the GitHub Release. This is the "download & link" path

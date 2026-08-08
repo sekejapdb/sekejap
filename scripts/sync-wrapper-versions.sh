@@ -34,10 +34,12 @@ perl -0pi -e "s/(\"version\"\s*:\s*)\"[^\"]*\"/\${1}\"$VERSION\"/" \
 perl -pi -e "s/^version = .*/version = \"$VERSION\"/ if \$. <= 10" \
   "$ROOT/wrappers/node/Cargo.toml"
 
-# dart — the top-level `version:` key.
+# dart — the top-level `version:` key (runtime package + the codegen generator).
 perl -pi -e "s/^version:.*/version: $VERSION/" \
   "$ROOT/wrappers/dart/pubspec.yaml"
+perl -pi -e "s/^version:.*/version: $VERSION/" \
+  "$ROOT/wrappers/dart/sekejap_generator/pubspec.yaml"
 
 echo "  node : $(grep -m1 '"version"' "$ROOT/wrappers/node/package.json" | tr -d ' ,') / crate $(grep -m1 '^version = ' "$ROOT/wrappers/node/Cargo.toml")"
-echo "  dart : $(grep -m1 '^version:' "$ROOT/wrappers/dart/pubspec.yaml")"
+echo "  dart : $(grep -m1 '^version:' "$ROOT/wrappers/dart/pubspec.yaml") / generator $(grep -m1 '^version:' "$ROOT/wrappers/dart/sekejap_generator/pubspec.yaml")"
 echo "  kotlin reads Cargo.toml directly (no stamp needed)"
