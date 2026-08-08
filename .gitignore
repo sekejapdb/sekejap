@@ -138,3 +138,6 @@ wrappers/lua/*.so
 wrappers/csharp/**/bin/
 wrappers/csharp/**/obj/
 wrappers/csharp/native/
+
+# Dart generator is a library — don't lock
+wrappers/dart/sekejap_generator/pubspec.lock
