@@ -423,6 +423,12 @@ impl SpatialGrid {
         self.poly_rings.get(&hash).map(|rings| rings.iter().any(|r| point_in_polygon(lat, lon, r)))
     }
 
+    /// Cached polygon rings for a node, if present (eager-cached in resident mode,
+    /// or previously loaded). `None` → not cached; the caller loads from the payload.
+    pub fn rings_for(&self, hash: u64) -> Option<&Vec<Vec<[f64; 2]>>> {
+        self.poly_rings.get(&hash)
+    }
+
     /// Return candidate node hashes within `km` of `(lat, lon)`.
     pub fn candidates_within_distance(&self, lat: f64, lon: f64, km: f64) -> Vec<u64> {
         // Convert km to approximate degree range (conservative)
@@ -671,6 +677,62 @@ pub fn point_in_polygon(lat: f64, lon: f64, ring: &[[f64; 2]]) -> bool {
         j = i;
     }
     inside
+}
+
+/// Bearing (radians) from `(lat1,lon1)` to `(lat2,lon2)` along the great circle.
+fn bearing_rad(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dl = (lon2 - lon1).to_radians();
+    let y = dl.sin() * p2.cos();
+    let x = p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos();
+    y.atan2(x)
+}
+
+/// Minimum geodesic distance (metres) from point P to the great-circle segment
+/// A→B. Spherical (consistent with [`haversine_km`]); all coords are `(lat, lon)`.
+/// Cross-track distance, clamped to the segment endpoints.
+pub fn point_to_segment_m(
+    plat: f64, plon: f64, alat: f64, alon: f64, blat: f64, blon: f64,
+) -> f64 {
+    const R: f64 = 6_371_008.8; // mean Earth radius (m)
+    let da = haversine_km(alat, alon, plat, plon) * 1000.0;
+    let dab = haversine_km(alat, alon, blat, blon) * 1000.0;
+    if dab < 1e-6 {
+        return da; // degenerate segment (A == B)
+    }
+    let db = haversine_km(blat, blon, plat, plon) * 1000.0;
+    let d13 = da / R; // angular distance A→P
+    let dxt = (d13.sin()
+        * (bearing_rad(alat, alon, plat, plon) - bearing_rad(alat, alon, blat, blon)).sin())
+    .asin(); // cross-track angular distance
+    let dat = (d13.cos() / dxt.cos()).acos(); // along-track angular distance
+    if !dat.is_finite() || dat < 0.0 {
+        da // foot of perpendicular is before A → nearest is A
+    } else if dat > dab / R {
+        db // foot is beyond B → nearest is B
+    } else {
+        dxt.abs() * R // perpendicular distance to the great circle
+    }
+}
+
+/// Minimum geodesic distance (metres) from point P to a polygon given as rings:
+/// `0.0` if P is inside any ring, else the nearest edge distance. This matches
+/// PostGIS `ST_DWithin(geography)` semantics (nearest boundary, not centroid).
+/// Coords are `(lat, lon)`.
+pub fn min_ring_distance_m(plat: f64, plon: f64, rings: &[Vec<[f64; 2]>]) -> f64 {
+    if rings.iter().any(|r| point_in_polygon(plat, plon, r)) {
+        return 0.0;
+    }
+    let mut best = f64::MAX;
+    for r in rings {
+        for w in r.windows(2) {
+            let d = point_to_segment_m(plat, plon, w[0][0], w[0][1], w[1][0], w[1][1]);
+            if d < best {
+                best = d;
+            }
+        }
+    }
+    best
 }
 
 // ── Segment intersection ─────────────────────────────────────────────────────
@@ -1152,6 +1214,22 @@ mod tests {
         ];
         // Geelong is outside
         assert!(!point_in_polygon(-38.15, 144.36, &ring));
+    }
+
+    #[test]
+    fn nearest_boundary_beats_centroid() {
+        // Square [lat,lon]: lat 0..0.1, lon 0..0.1; centroid ≈ (0.05, 0.05).
+        let rings = vec![vec![[0.0, 0.0], [0.0, 0.1], [0.1, 0.1], [0.1, 0.0], [0.0, 0.0]]];
+        // Point just west of the lon=0 edge at lat 0.05: nearest boundary ~110 m,
+        // but the centroid is ~0.05° (~5.5 km) away. This is the ST_DWithin bug the
+        // PostGIS comparison caught — centroid distance would wrongly exclude it.
+        let (plat, plon) = (0.05, -0.001);
+        let d = min_ring_distance_m(plat, plon, &rings);
+        let centroid_d = geodesic_distance_m(0.05, 0.05, plat, plon);
+        assert!(d < centroid_d, "boundary {d} must be < centroid {centroid_d}");
+        assert!(d < 200.0, "point ~110 m from the edge, got {d} m");
+        // A point inside the polygon has distance 0 (PostGIS semantics).
+        assert_eq!(min_ring_distance_m(0.05, 0.05, &rings), 0.0);
     }
 
     #[test]
