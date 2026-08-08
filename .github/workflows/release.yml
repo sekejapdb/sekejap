@@ -246,9 +246,17 @@ jobs:
       - uses: dart-lang/setup-dart@v1
       - name: Sync version from Cargo.toml
         run: ./scripts/sync-wrapper-versions.sh
-      - name: Publish
+      - name: Publish (skip if this version is already on pub.dev)
         working-directory: wrappers/dart/sekejap_generator
         run: |
+          VERSION=$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version:[[:space:]]*//')
+          # pub.dev versions are immutable; skip-existing keeps a re-tag (or the
+          # manual bootstrap release) from failing this job. Mirrors PyPI's skip-existing.
+          EXISTS=$(curl -s "https://pub.dev/api/packages/sekejap_generator" | grep -c "\"version\":\"$VERSION\"" || true)
+          if [ "$EXISTS" != "0" ]; then
+            echo "sekejap_generator $VERSION already on pub.dev — skipping."
+            exit 0
+          fi
           dart pub get
           dart pub publish --force
 
