@@ -6143,15 +6143,25 @@ impl CoreDB {
                 }
             }
         }
-        // Parse polygon rings ONCE here (non-degenerate bbox = has extent) and cache them
-        // in the grid, so point-in-polygon queries never re-read + re-parse GeoJSON.
-        let polys: Vec<(u64, Vec<Vec<[f64; 2]>>)> = items.iter()
-            .filter(|(_, m)| m.bbox_min_lat != m.bbox_max_lat || m.bbox_min_lon != m.bbox_max_lon)
-            .filter_map(|(h, _)| {
-                let rings = geo::rings_from_payload(&self.get_payload(*h)?);
-                (!rings.is_empty()).then_some((*h, rings))
-            })
-            .collect();
+        // Polygon-ring caching is mode-dependent:
+        //  - Resident (heap) opens eagerly cache every polygon's rings, trading
+        //    RAM for fast PIP / ST_DWithin refinement (RAM-rich servers).
+        //  - Paged (edge/bounded) opens SKIP this — parsing all geometry costs
+        //    O(total geometry) resident RAM (~360 MB for 7k complex polygons) and
+        //    defeats bounded serving. Rings load on demand in the query path; open
+        //    stays O(1) RAM regardless of geometry size.
+        let eager = self.topo_base.is_none();
+        let polys: Vec<(u64, Vec<Vec<[f64; 2]>>)> = if eager {
+            items.iter()
+                .filter(|(_, m)| m.bbox_min_lat != m.bbox_max_lat || m.bbox_min_lon != m.bbox_max_lon)
+                .filter_map(|(h, _)| {
+                    let rings = geo::rings_from_payload(&self.get_payload(*h)?);
+                    (!rings.is_empty()).then_some((*h, rings))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut grid = geo::SpatialGrid::build(items.into_iter());
         for (h, rings) in polys { grid.cache_rings(h, rings); }
         self.spatial_grid = Some(grid);
