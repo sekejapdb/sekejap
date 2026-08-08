@@ -2,8 +2,14 @@ name: sekejap_generator
 description: >-
   build_runner code generator for sekejap @SekejapEntity models — emits typed
   collections, column references, and (de)serializers.
-version: 0.1.0
-publish_to: none
+version: 0.16.2
+homepage: https://sekejap.life
+repository: https://github.com/sekejapdb/sekejap
+topics:
+  - codegen
+  - build-runner
+  - database
+  - orm
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
