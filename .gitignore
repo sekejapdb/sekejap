@@ -130,3 +130,6 @@ wrappers/kotlin/gradle/
 wrappers/node/dist/
 # scratch notes
 TODO.md
+
+# Lua C module build artifact
+wrappers/lua/*.so
