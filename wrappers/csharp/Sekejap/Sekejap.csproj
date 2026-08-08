@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- netstandard2.1: clean UTF-8 marshaling (LPUTF8Str / PtrToStringUTF8) and
+       consumable by modern .NET *and* Unity 2021+. Version is set here; keep it
+       in step with the workspace Cargo.toml (single source of truth). -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Sekejap</AssemblyName>
+    <RootNamespace>Sekejap</RootNamespace>
+
+    <PackageId>Sekejap</PackageId>
+    <Version>0.16.2</Version>
+    <Authors>sekejap</Authors>
+    <Description>Embedded graph-first multi-model database (SQL + graph + spatial + vector + full-text) for .NET and Unity, over the sekejap C ABI.</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://sekejap.life</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/sekejapdb/sekejap</RepositoryUrl>
+    <PackageTags>database;graph;vector;spatial;multi-model;unity;embedded</PackageTags>
+  </PropertyGroup>
+
+  <!-- Native libsekejap per-RID, packed into the NuGet under runtimes/<rid>/native.
+       Build these with `cargo build --release -p sekejap-capi` per target and drop
+       them in ../native/<rid>/ before `dotnet pack`. -->
+  <ItemGroup Condition="Exists('..\native')">
+    <Content Include="..\native\**\*.*" Pack="true" PackagePath="runtimes" />
+  </ItemGroup>
+
+</Project>
