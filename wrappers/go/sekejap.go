@@ -10,8 +10,10 @@
 // so binaries find the shared library at run time without LD_LIBRARY_PATH.
 package sekejap
 
-// #cgo CFLAGS: -I${SRCDIR}/../c/include
-// #cgo LDFLAGS: -L${SRCDIR}/../../target/release -lsekejap -Wl,-rpath,${SRCDIR}/../../target/release
+// The link flags live in build-tagged files: cgo_pkgconfig.go (default, resolves
+// libsekejap via pkg-config for installed consumers) and cgo_dev.go (the
+// `sekejap_dev` tag, links against the monorepo build output for in-repo work).
+
 // #include <stdlib.h>
 // #include "sekejap.h"
 import "C"
