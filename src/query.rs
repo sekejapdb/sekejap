@@ -2965,14 +2965,43 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 // so it never excludes a point inside the true ellipsoidal radius.
                 let prune_km = dist_m / 1000.0 * 1.01;
                 if let Some(grid) = db.spatial_grid() {
+                    // Nearest-boundary distance (PostGIS geography ST_DWithin semantics),
+                    // not centroid: a polygon whose edge is within R matches even if its
+                    // centroid is farther. Points (degenerate bbox) use the point itself.
                     let exact = |h: u64| -> bool {
-                        grid.get_meta(h)
-                            .map(|m| {
-                                crate::geo::geodesic_distance_m(
-                                    m.centroid_lat, m.centroid_lon, *lat, *lon,
-                                ) <= dist_m
-                            })
-                            .unwrap_or(false)
+                        let m = match grid.get_meta(h) { Some(m) => m, None => return false };
+                        // Point (degenerate bbox): the centroid IS the point.
+                        if m.bbox_min_lat == m.bbox_max_lat && m.bbox_min_lon == m.bbox_max_lon {
+                            return crate::geo::geodesic_distance_m(
+                                m.centroid_lat, m.centroid_lon, *lat, *lon) <= dist_m;
+                        }
+                        // Cheap exact bounds — skip ring parsing for the clear cases:
+                        //  - centroid within R  ⟹ nearest boundary within R  → hit
+                        //  - nearest bbox point beyond R ⟹ boundary beyond R → miss
+                        // Only boundary-ambiguous polygons (centroid out, bbox in) parse rings.
+                        if crate::geo::geodesic_distance_m(m.centroid_lat, m.centroid_lon, *lat, *lon) <= dist_m {
+                            return true;
+                        }
+                        let clat = (*lat).clamp(m.bbox_min_lat, m.bbox_max_lat);
+                        let clon = (*lon).clamp(m.bbox_min_lon, m.bbox_max_lon);
+                        if crate::geo::geodesic_distance_m(clat, clon, *lat, *lon) > dist_m {
+                            return false;
+                        }
+                        if let Some(rings) = grid.rings_for(h) {
+                            return crate::geo::min_ring_distance_m(*lat, *lon, rings) <= dist_m;
+                        }
+                        match db.get_payload(h) {
+                            Some(p) => {
+                                let rings = crate::geo::rings_from_payload(&p);
+                                if rings.is_empty() {
+                                    crate::geo::geodesic_distance_m(
+                                        m.centroid_lat, m.centroid_lon, *lat, *lon) <= dist_m
+                                } else {
+                                    crate::geo::min_ring_distance_m(*lat, *lon, &rings) <= dist_m
+                                }
+                            }
+                            None => false,
+                        }
                     };
                     if candidates.is_empty() {
                         candidates = grid
@@ -2992,12 +3021,19 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         candidates = db.all_hashes();
                     }
                     candidates.retain(|&h| {
-                        db.get_payload(h)
-                            .and_then(|p| crate::geo::extract_centroid(&p))
-                            .map(|(clat, clon)| {
-                                crate::geo::geodesic_distance_m(clat, clon, *lat, *lon) <= dist_m
-                            })
-                            .unwrap_or(false)
+                        match db.get_payload(h) {
+                            Some(p) => {
+                                let rings = crate::geo::rings_from_payload(&p);
+                                if rings.is_empty() {
+                                    crate::geo::extract_centroid(&p)
+                                        .map(|(clat, clon)| crate::geo::geodesic_distance_m(clat, clon, *lat, *lon) <= dist_m)
+                                        .unwrap_or(false)
+                                } else {
+                                    crate::geo::min_ring_distance_m(*lat, *lon, &rings) <= dist_m
+                                }
+                            }
+                            None => false,
+                        }
                     });
                 }
             }
