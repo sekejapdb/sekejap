@@ -133,3 +133,8 @@ TODO.md
 
 # Lua C module build artifact
 wrappers/lua/*.so
+
+# .NET build outputs
+wrappers/csharp/**/bin/
+wrappers/csharp/**/obj/
+wrappers/csharp/native/
