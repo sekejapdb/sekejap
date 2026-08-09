@@ -6342,6 +6342,33 @@ fn search_index_create_and_query() {
 }
 
 #[test]
+fn search_composes_with_spatial() {
+    // Regression: `SEARCH(...) AND ST_DWithin(...)` returned 0 rows. The spatial
+    // filter's starter left current_coll_hash unset, so SearchFilter took its
+    // else-branch and cleared every candidate. It must fall back to the candidates'
+    // own collection and intersect normally (cf. the composed cross-model query).
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = CoreDB::open(dir.path()).unwrap();
+    db.execute("CREATE TABLE cafes (name TEXT, geometry GEO)").unwrap();
+    db.put("cafes/a", r#"{"_collection":"cafes","_key":"a","name":"great coffee","geometry":{"type":"Point","coordinates":[106.50,-6.40]}}"#).unwrap();
+    db.put("cafes/b", r#"{"_collection":"cafes","_key":"b","name":"best coffee","geometry":{"type":"Point","coordinates":[106.51,-6.41]}}"#).unwrap();
+    db.put("cafes/c", r#"{"_collection":"cafes","_key":"c","name":"coffee house","geometry":{"type":"Point","coordinates":[120.0,-8.0]}}"#).unwrap(); // far
+    db.put("cafes/d", r#"{"_collection":"cafes","_key":"d","name":"tea room","geometry":{"type":"Point","coordinates":[106.50,-6.40]}}"#).unwrap(); // near, no 'coffee'
+    db.build_spatial_index();
+    db.execute("CREATE INDEX ON cafes USING search (name)").unwrap();
+
+    // 'coffee' near the origin → a, b only (c is far; d has no 'coffee').
+    let both_orders = [
+        "SELECT _key FROM cafes WHERE SEARCH('coffee') AND ST_DWithin(geometry, POINT(106.5 -6.4), 5000) ORDER BY _key ASC",
+        "SELECT _key FROM cafes WHERE ST_DWithin(geometry, POINT(106.5 -6.4), 5000) AND SEARCH('coffee') ORDER BY _key ASC",
+    ];
+    for q in both_orders {
+        let rows: Vec<String> = db.query(q).unwrap().collect().iter().map(|h| h.slug.clone()).collect();
+        assert_eq!(rows, vec!["cafes/a".to_string(), "cafes/b".to_string()], "SEARCH∩spatial for: {q}");
+    }
+}
+
+#[test]
 fn search_index_multi_term_and() {
     let mut db = CoreDB::new();
     db.execute("CREATE TABLE articles (title TEXT, body TEXT)").unwrap();

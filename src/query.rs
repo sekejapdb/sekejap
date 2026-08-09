@@ -3400,24 +3400,34 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 if candidates.is_empty() {
                     candidates = db.all_hashes();
                 }
-                if let Some(coll) = current_coll_hash {
-                    if let Some(coll_name) = db.collection_name(coll) {
-                        let key = CoreDB::search_index_key(coll_name);
-                        if let Some(idx) = db.search_indexes.get(&key) {
-                            let matching = idx.search_typo(query, *typo);
-                            let match_set: std::collections::HashSet<u64> = matching.iter()
+                // Resolve the per-collection search index. Prefer the FROM collection,
+                // but a spatial (or other) starter can leave current_coll_hash unset —
+                // in that case fall back to each candidate's own collection so SEARCH
+                // still composes with ST_DWithin/vector/etc. The matching slot→hash set
+                // is computed once per collection and cached.
+                let tracked = current_coll_hash
+                    .and_then(|c| db.collection_name(c).map(|s| s.to_string()));
+                let mut cache: std::collections::HashMap<String, std::collections::HashSet<u64>> =
+                    std::collections::HashMap::new();
+                candidates.retain(|&h| {
+                    let coll = match &tracked {
+                        Some(c) => c.clone(),
+                        None => match db.node_data(h) {
+                            Some(n) => n.collection.clone(),
+                            None => return false,
+                        },
+                    };
+                    let set = cache.entry(coll).or_insert_with_key(|coll| {
+                        let key = CoreDB::search_index_key(coll);
+                        match db.search_indexes.get(&key) {
+                            Some(idx) => idx.search_typo(query, *typo).iter()
                                 .filter_map(|slot| idx.slot_to_hash(slot))
-                                .collect();
-                            candidates.retain(|h| match_set.contains(h));
-                        } else {
-                            candidates.clear();
+                                .collect(),
+                            None => std::collections::HashSet::new(),
                         }
-                    } else {
-                        candidates.clear();
-                    }
-                } else {
-                    candidates.clear();
-                }
+                    });
+                    set.contains(&h)
+                });
             }
             Step::Bm25Filter(field, query, min_score) => {
                 // BM25(field, 'query') > min_score.
