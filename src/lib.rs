@@ -1536,6 +1536,12 @@ impl CoreDB {
             db.rebuild_declared_search_indexes();
             let _ = db.save_gin_binary(&gin_bin_path);
             let _ = db.save_search_binary(&search_bin_path);
+            // Paged mode: drop the just-built resident search blobs and re-serve
+            // them from the mmap'd search.bin (disk-first) — same as the load path.
+            if db.topo_base.is_some() {
+                db.search_indexes.clear();
+                let _ = db.load_search_binary(&search_bin_path);
+            }
         } else {
             // No payload changes — try loading GIN from gin.bin. If missing or
             // stale, rebuild once (covers first open after CREATE INDEX, etc.).
@@ -7292,7 +7298,49 @@ impl CoreDB {
         Ok(())
     }
 
+    /// Disk-first (paged mode): mmap the `search.bin` container and serve each
+    /// per-collection index's FST + postings from the map (`open_mapped`), leaving
+    /// only scalars/norms/bitmaps resident. Mirrors `load_field_base`. Returns
+    /// false on any problem so the caller falls back to a resident rebuild.
+    fn load_search_base(&mut self, path: &std::path::Path) -> bool {
+        use std::sync::Arc;
+        let file = match std::fs::File::open(path) { Ok(f) => f, Err(_) => return false };
+        let len = match file.metadata() { Ok(m) => m.len() as usize, Err(_) => return false };
+        if len < 12 { return false; }
+        let view = match storage::mmap::MmapView::try_new(&file, len) {
+            Some(v) => Arc::new(v),
+            None => return false,
+        };
+        let hdr = match view.slice(0, 12) { Some(h) => h, None => return false };
+        if &hdr[..8] != b"SKSRCH01" { return false; }
+        let count = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        let mut pos = 12usize;
+        let mut loaded = Vec::with_capacity(count);
+        for _ in 0..count {
+            let kl = match view.slice(pos, 2) { Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize, None => return false };
+            pos += 2;
+            let key = match view.slice(pos, kl).and_then(|b| std::str::from_utf8(b).ok()) {
+                Some(k) => k.to_string(),
+                None => return false,
+            };
+            pos += kl;
+            match search::SearchIndex::open_mapped(&view, pos) {
+                Ok((idx, consumed)) => { pos += consumed; loaded.push((key, idx)); }
+                Err(_) => return false,
+            }
+        }
+        for (key, idx) in loaded {
+            self.search_indexes.insert(key, idx);
+        }
+        true
+    }
+
     fn load_search_binary(&mut self, path: &std::path::Path) -> bool {
+        // In paged (disk-first) mode, mmap the container instead of reading it
+        // into RAM. Fall through to the resident path if mmap serving fails.
+        if self.topo_base.is_some() && self.load_search_base(path) {
+            return true;
+        }
         use std::io::Read;
         let data = match std::fs::read(path) {
             Ok(d) => d,
@@ -8274,6 +8322,50 @@ mod hybrid_query_tests {
             .iter().map(|h| h.payload.clone()).collect();
         assert_eq!(r_grid, p_grid, "grid-path spatial must match resident");
         assert_eq!(r_match, p_match, "MATCH-filter spatial must match resident");
+    }
+
+    #[test]
+    fn paged_mode_serves_search_from_mmap() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.execute("CREATE TABLE articles (title TEXT, body TEXT)").unwrap();
+            db.execute("INSERT INTO articles (_key, title, body) VALUES ('a1', 'Rust Programming', 'Rust is fast and safe')").unwrap();
+            db.execute("INSERT INTO articles (_key, title, body) VALUES ('a2', 'Python Guide', 'Python is easy to learn')").unwrap();
+            db.execute("INSERT INTO articles (_key, title, body) VALUES ('a3', 'Rust and Python', 'Both languages are great')").unwrap();
+            db.execute("CREATE INDEX ON articles USING search (title, body)").unwrap();
+            db.compact().unwrap();
+        }
+
+        // Exercise exact-term, multi-term AND, and fuzzy — all go through the FST
+        // + postings, which are the mmap-served blobs in paged mode.
+        let queries = [
+            "SELECT _key FROM articles WHERE SEARCH('rust') ORDER BY _key ASC",
+            "SELECT _key FROM articles WHERE SEARCH('rust fast') ORDER BY _key ASC",
+            "SELECT _key FROM articles WHERE SEARCH('programing') ORDER BY _key ASC", // fuzzy
+        ];
+
+        let resident: Vec<Vec<Option<serde_json::Value>>> = {
+            let db = CoreDB::open(dir.path()).unwrap();
+            queries.iter().map(|q| db.query(q).unwrap().collect()
+                .iter().map(|h| h.payload.clone()).collect()).collect()
+        };
+        assert!(!resident[0].is_empty(), "resident SEARCH must find 'rust'");
+
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert!(paged.nodes.is_empty(), "paged: node map stays empty (disk-first)");
+        // Proof the index blobs are served from the mmap, not the heap.
+        let idx = paged.search_indexes.values().next().expect("search index present in paged mode");
+        assert!(matches!(idx.fst_data, search::index::Bytes::Mapped { .. }),
+                "FST must be mmap-backed in paged mode");
+        assert!(matches!(idx.postings_data, search::index::Bytes::Mapped { .. }),
+                "postings must be mmap-backed in paged mode");
+
+        for (i, q) in queries.iter().enumerate() {
+            let p: Vec<_> = paged.query(q).unwrap().collect()
+                .iter().map(|h| h.payload.clone()).collect();
+            assert_eq!(resident[i], p, "paged SEARCH must match resident for: {q}");
+        }
     }
 
     #[test]

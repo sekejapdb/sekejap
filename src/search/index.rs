@@ -1,10 +1,39 @@
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::sync::Arc;
 use fst::IntoStreamer;
 
 use crate::bm25::tokenizer::tokenize_with_positions;
+use crate::storage::mmap::MmapView;
 
 const POSITION_BUCKET_SIZE: usize = 8;
+
+/// Backing for the two bulk blobs (FST term dict + postings). Either owned on the
+/// heap (resident mode, `CoreDB::new` / non-paged open) or a range of an mmap'd
+/// `search.bin` (paged/disk-first mode) — the disk-first substrate: the blobs stay
+/// on disk (OS page cache holds hot pages) instead of being read into RAM. Several
+/// blobs of the same file share one `Arc<MmapView>`.
+pub(crate) enum Bytes {
+    Owned(Vec<u8>),
+    Mapped { view: Arc<MmapView>, off: usize, len: usize },
+}
+
+impl Bytes {
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Bytes::Owned(v) => v,
+            Bytes::Mapped { view, off, len } => view.slice(*off, *len).unwrap_or(&[]),
+        }
+    }
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Bytes::Owned(v) => v.len(),
+            Bytes::Mapped { len, .. } => *len,
+        }
+    }
+}
 
 pub struct SearchIndex {
     pub(crate) fields: Vec<String>,
@@ -13,9 +42,9 @@ pub struct SearchIndex {
     pub(crate) doc_count: u32,
     pub(crate) doc_field_lengths: Vec<Vec<u16>>,
     /// FST mapping term → byte offset into `postings_data`.
-    pub(crate) fst_data: Vec<u8>,
+    pub(crate) fst_data: Bytes,
     /// Contiguous serialized RoaringBitmaps: at each offset, [len: u32 LE][bitmap bytes].
-    pub(crate) postings_data: Vec<u8>,
+    pub(crate) postings_data: Bytes,
     pub(crate) term_field_bitmaps: HashMap<(String, u8), RoaringBitmap>,
     pub(crate) term_position_bitmaps: HashMap<(String, u16), RoaringBitmap>,
 }
@@ -113,8 +142,8 @@ impl SearchIndex {
             id_to_slot,
             doc_count,
             doc_field_lengths,
-            fst_data,
-            postings_data,
+            fst_data: Bytes::Owned(fst_data),
+            postings_data: Bytes::Owned(postings_data),
             term_field_bitmaps,
             term_position_bitmaps,
         }
@@ -122,21 +151,22 @@ impl SearchIndex {
 
     /// Read a bitmap from the postings blob at the given byte offset.
     fn read_bitmap_at(&self, offset: usize) -> Option<RoaringBitmap> {
-        if offset + 4 > self.postings_data.len() {
+        let data = self.postings_data.as_slice();
+        if offset + 4 > data.len() {
             return None;
         }
         let len = u32::from_le_bytes(
-            self.postings_data[offset..offset + 4].try_into().ok()?
+            data[offset..offset + 4].try_into().ok()?
         ) as usize;
-        if offset + 4 + len > self.postings_data.len() {
+        if offset + 4 + len > data.len() {
             return None;
         }
-        RoaringBitmap::deserialize_from(&self.postings_data[offset + 4..offset + 4 + len]).ok()
+        RoaringBitmap::deserialize_from(&data[offset + 4..offset + 4 + len]).ok()
     }
 
     /// Exact term lookup via FST.
     fn get_bitmap(&self, term: &str) -> Option<RoaringBitmap> {
-        let map = fst::Map::new(&self.fst_data).ok()?;
+        let map = fst::Map::new(self.fst_data.as_slice()).ok()?;
         let offset = map.get(term)? as usize;
         self.read_bitmap_at(offset)
     }
@@ -155,7 +185,7 @@ impl SearchIndex {
                 None => (RoaringBitmap::new(), vec![]),
             };
         }
-        let map = match fst::Map::new(&self.fst_data) {
+        let map = match fst::Map::new(self.fst_data.as_slice()) {
             Ok(m) => m,
             Err(_) => return (RoaringBitmap::new(), vec![]),
         };
