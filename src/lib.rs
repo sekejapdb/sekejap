@@ -8343,6 +8343,9 @@ mod hybrid_query_tests {
             "SELECT _key FROM articles WHERE SEARCH('rust') ORDER BY _key ASC",
             "SELECT _key FROM articles WHERE SEARCH('rust fast') ORDER BY _key ASC",
             "SELECT _key FROM articles WHERE SEARCH('programing') ORDER BY _key ASC", // fuzzy
+            // Ranking exercises field_post + position_post (proximity/field-order),
+            // which are also mmap-served in paged mode.
+            "SELECT _key FROM articles WHERE SEARCH('rust') ORDER BY SEARCH_SCORE('rust fast') DESC",
         ];
 
         let resident: Vec<Vec<Option<serde_json::Value>>> = {

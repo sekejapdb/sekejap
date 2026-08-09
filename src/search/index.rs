@@ -35,6 +35,105 @@ impl Bytes {
     }
 }
 
+/// Read one length-prefixed RoaringBitmap (`[len:u32 LE][bytes]`) from a blob.
+pub(crate) fn read_bitmap_slice(data: &[u8], offset: usize) -> Option<RoaringBitmap> {
+    let lb = data.get(offset..offset + 4)?;
+    let len = u32::from_le_bytes(lb.try_into().ok()?) as usize;
+    let bytes = data.get(offset + 4..offset + 4 + len)?;
+    RoaringBitmap::deserialize_from(bytes).ok()
+}
+
+/// The shared disk-first posting-store primitive: an FST (`key → u64 offset`) plus
+/// a blob of length-prefixed RoaringBitmaps, both `Bytes`-backed (heap resident, or
+/// a slice of an mmap'd `search.bin`). Used for the field-scoped and position
+/// (proximity) bitmaps so they need not be read into RAM in paged mode. The base
+/// term postings (`fst_data`/`postings_data`) follow the same shape.
+pub(crate) struct MappedPostings {
+    pub(crate) fst: Bytes,
+    pub(crate) blob: Bytes,
+}
+
+impl MappedPostings {
+    /// Build from keyed bitmaps. `key_bytes` maps each entry key to its FST byte
+    /// key; keys must be unique. Produces heap-`Owned` blobs (paged open rebinds
+    /// them to `Bytes::Mapped`).
+    fn build<K>(entries: &HashMap<K, RoaringBitmap>, key_bytes: impl Fn(&K) -> Vec<u8>) -> Self {
+        let mut keyed: Vec<(Vec<u8>, &RoaringBitmap)> =
+            entries.iter().map(|(k, v)| (key_bytes(k), v)).collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut blob = Vec::new();
+        let mut builder = fst::MapBuilder::memory();
+        for (k, bm) in &keyed {
+            builder.insert(k, blob.len() as u64).unwrap();
+            let mut bytes = Vec::new();
+            bm.serialize_into(&mut bytes).unwrap();
+            blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            blob.extend_from_slice(&bytes);
+        }
+        MappedPostings {
+            fst: Bytes::Owned(builder.into_inner().unwrap()),
+            blob: Bytes::Owned(blob),
+        }
+    }
+
+    /// Exact point lookup.
+    fn get(&self, key: &[u8]) -> Option<RoaringBitmap> {
+        let map = fst::Map::new(self.fst.as_slice()).ok()?;
+        let off = map.get(key)? as usize;
+        read_bitmap_slice(self.blob.as_slice(), off)
+    }
+
+    /// All `(key, bitmap)` whose FST key starts with `prefix`, in key order.
+    fn range_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, RoaringBitmap)> {
+        use fst::{IntoStreamer, Streamer};
+        let map = match fst::Map::new(self.fst.as_slice()) { Ok(m) => m, Err(_) => return Vec::new() };
+        let blob = self.blob.as_slice();
+        let mut out = Vec::new();
+        let mut stream = map.range().ge(prefix).into_stream();
+        while let Some((k, off)) = stream.next() {
+            if !k.starts_with(prefix) { break; }
+            if let Some(bm) = read_bitmap_slice(blob, off as usize) {
+                out.push((k.to_vec(), bm));
+            }
+        }
+        out
+    }
+}
+
+/// FST key for a field-scoped bitmap: `term \0 [field:u8]`.
+fn field_key(term: &str, field: u8) -> Vec<u8> {
+    let mut k = Vec::with_capacity(term.len() + 2);
+    k.extend_from_slice(term.as_bytes());
+    k.push(0);
+    k.push(field);
+    k
+}
+
+/// FST key for a position bitmap: `term \0 [bucket:u16 BE]` (BE so buckets sort
+/// numerically within a term for prefix range scans).
+fn position_key(term: &str, bucket: u16) -> Vec<u8> {
+    let mut k = Vec::with_capacity(term.len() + 3);
+    k.extend_from_slice(term.as_bytes());
+    k.push(0);
+    k.extend_from_slice(&bucket.to_be_bytes());
+    k
+}
+
+/// Prefix selecting every position key for a term: `term \0`.
+fn position_prefix(term: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(term.len() + 1);
+    k.extend_from_slice(term.as_bytes());
+    k.push(0);
+    k
+}
+
+/// Decode the bucket (trailing BE u16) from a position key `term \0 [bucket]`.
+fn bucket_from_key(k: &[u8]) -> u16 {
+    let n = k.len();
+    if n >= 2 { u16::from_be_bytes([k[n - 2], k[n - 1]]) } else { 0 }
+}
+
 pub struct SearchIndex {
     pub(crate) fields: Vec<String>,
     pub(crate) id_map: Vec<u64>,
@@ -45,8 +144,10 @@ pub struct SearchIndex {
     pub(crate) fst_data: Bytes,
     /// Contiguous serialized RoaringBitmaps: at each offset, [len: u32 LE][bitmap bytes].
     pub(crate) postings_data: Bytes,
-    pub(crate) term_field_bitmaps: HashMap<(String, u8), RoaringBitmap>,
-    pub(crate) term_position_bitmaps: HashMap<(String, u16), RoaringBitmap>,
+    /// Field-scoped bitmaps keyed by `term \0 field` (for field-order ranking).
+    pub(crate) field_post: MappedPostings,
+    /// Position/proximity bitmaps keyed by `term \0 bucket` (for proximity ranking).
+    pub(crate) position_post: MappedPostings,
 }
 
 pub struct DocFields {
@@ -136,6 +237,9 @@ impl SearchIndex {
         let fst_data = fst_builder.into_inner().unwrap();
         let doc_count = id_map.len() as u32;
 
+        let field_post = MappedPostings::build(&term_field_bitmaps, |(t, f)| field_key(t, *f));
+        let position_post = MappedPostings::build(&term_position_bitmaps, |(t, b)| position_key(t, *b));
+
         SearchIndex {
             fields,
             id_map,
@@ -144,8 +248,8 @@ impl SearchIndex {
             doc_field_lengths,
             fst_data: Bytes::Owned(fst_data),
             postings_data: Bytes::Owned(postings_data),
-            term_field_bitmaps,
-            term_position_bitmaps,
+            field_post,
+            position_post,
         }
     }
 
@@ -270,7 +374,7 @@ impl SearchIndex {
                     matched_count += 1;
                     matched_fst_terms.push(vec![term.clone()]);
                     for fi in 0..self.fields.len() {
-                        if self.term_field_bitmaps.get(&(term.clone(), fi as u8))
+                        if self.field_post.get(&field_key(term, fi as u8))
                             .map_or(false, |b| b.contains(slot)) {
                             best_field_idx = best_field_idx.min(fi);
                             break;
@@ -289,7 +393,7 @@ impl SearchIndex {
                     for ft in &fst_terms {
                         if best_field_idx == 0 { break; }
                         for fi in 0..self.fields.len() {
-                            if self.term_field_bitmaps.get(&(ft.clone(), fi as u8))
+                            if self.field_post.get(&field_key(ft, fi as u8))
                                 .map_or(false, |b| b.contains(slot)) {
                                 best_field_idx = best_field_idx.min(fi);
                                 break;
@@ -310,7 +414,7 @@ impl SearchIndex {
                     for ft in &fst_terms {
                         if best_field_idx == 0 { break; }
                         for fi in 0..self.fields.len() {
-                            if self.term_field_bitmaps.get(&(ft.clone(), fi as u8))
+                            if self.field_post.get(&field_key(ft, fi as u8))
                                 .map_or(false, |b| b.contains(slot)) {
                                 best_field_idx = best_field_idx.min(fi);
                                 break;
@@ -352,15 +456,15 @@ impl SearchIndex {
             if ta.is_empty() || tb.is_empty() { continue; }
 
             let buckets_a: Vec<u16> = ta.iter().flat_map(|t| {
-                self.term_position_bitmaps.iter()
-                    .filter(move |((tt, _), bm)| tt == t && bm.contains(slot))
-                    .map(|((_, b), _)| *b)
+                self.position_post.range_prefix(&position_prefix(t)).into_iter()
+                    .filter(|(_, bm)| bm.contains(slot))
+                    .map(|(k, _)| bucket_from_key(&k))
             }).collect();
 
             let buckets_b: Vec<u16> = tb.iter().flat_map(|t| {
-                self.term_position_bitmaps.iter()
-                    .filter(move |((tt, _), bm)| tt == t && bm.contains(slot))
-                    .map(|((_, b), _)| *b)
+                self.position_post.range_prefix(&position_prefix(t)).into_iter()
+                    .filter(|(_, bm)| bm.contains(slot))
+                    .map(|(k, _)| bucket_from_key(&k))
             }).collect();
 
             if buckets_a.is_empty() || buckets_b.is_empty() { continue; }
@@ -402,16 +506,11 @@ impl SearchIndex {
     }
 
     pub fn delete(&mut self, hash: u64) {
-        if let Some(_slot) = self.id_to_slot.remove(&hash) {
-            // FST + postings blob are immutable — deletion is tracked via id_to_slot.
-            // Deleted docs are excluded at search time by filtering through id_to_slot.
-            for bm in self.term_field_bitmaps.values_mut() {
-                bm.remove(_slot);
-            }
-            for bm in self.term_position_bitmaps.values_mut() {
-                bm.remove(_slot);
-            }
-        }
+        // All term data (FST, postings, field/position bitmaps) is immutable and may
+        // be mmap-backed — deletion is tracked by removing the hash from id_to_slot.
+        // Deleted docs are excluded at search time via id_to_slot; score() only runs
+        // on live slots, so a stale slot lingering in a bitmap is harmless.
+        self.id_to_slot.remove(&hash);
     }
 }
 
@@ -558,10 +657,10 @@ mod tests {
             vec!["title".into(), "body".into()],
             make_docs().into_iter(),
         );
-        let bm = idx.term_field_bitmaps.get(&("rust".into(), 0)).unwrap();
+        let bm = idx.field_post.get(&field_key("rust", 0)).unwrap();
         assert!(bm.contains(0));
         assert!(bm.contains(2));
-        let bm = idx.term_field_bitmaps.get(&("fast".into(), 1)).unwrap();
+        let bm = idx.field_post.get(&field_key("fast", 1)).unwrap();
         assert!(bm.contains(0));
     }
 

@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
-use roaring::RoaringBitmap;
-use super::index::{Bytes, SearchIndex};
+use super::index::{Bytes, MappedPostings, SearchIndex};
 use crate::storage::mmap::MmapView;
 
 const MAGIC: &[u8; 8] = b"SKSRCH02";
-pub const SEARCH_INDEX_VERSION: u32 = 2;
+// v3: field/position bitmaps stored as FST+blob (MappedPostings), not HashMap dumps,
+// so they can be mmap-served in paged mode. Older (v2) files fail the version check
+// and are transparently rebuilt.
+pub const SEARCH_INDEX_VERSION: u32 = 3;
 
 impl SearchIndex {
     pub fn write_binary<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -42,25 +44,13 @@ impl SearchIndex {
         w.write_all(&(self.postings_data.len() as u64).to_le_bytes())?;
         w.write_all(self.postings_data.as_slice())?;
 
-        // Term-field bitmaps
-        w.write_all(&(self.term_field_bitmaps.len() as u32).to_le_bytes())?;
-        for ((term, field_idx), bm) in &self.term_field_bitmaps {
-            let bytes = term.as_bytes();
-            w.write_all(&(bytes.len() as u16).to_le_bytes())?;
-            w.write_all(bytes)?;
-            w.write_all(&[*field_idx])?;
-            write_bitmap(w, bm)?;
-        }
+        // Field-scoped postings (FST + bitmap blob)
+        write_blob(w, self.field_post.fst.as_slice())?;
+        write_blob(w, self.field_post.blob.as_slice())?;
 
-        // Term-position bitmaps
-        w.write_all(&(self.term_position_bitmaps.len() as u32).to_le_bytes())?;
-        for ((term, bucket), bm) in &self.term_position_bitmaps {
-            let bytes = term.as_bytes();
-            w.write_all(&(bytes.len() as u16).to_le_bytes())?;
-            w.write_all(bytes)?;
-            w.write_all(&bucket.to_le_bytes())?;
-            write_bitmap(w, bm)?;
-        }
+        // Position/proximity postings (FST + bitmap blob)
+        write_blob(w, self.position_post.fst.as_slice())?;
+        write_blob(w, self.position_post.blob.as_slice())?;
 
         Ok(())
     }
@@ -106,38 +96,20 @@ impl SearchIndex {
             doc_field_lengths.push(lengths);
         }
 
-        // FST data blob
-        let fst_len = read_u64(r)? as usize;
-        let mut fst_buf = vec![0u8; fst_len];
-        r.read_exact(&mut fst_buf)?;
-        let fst_data = super::index::Bytes::Owned(fst_buf);
+        // FST data blob + postings blob
+        let fst_data = Bytes::Owned(read_blob(r)?);
+        let postings_data = Bytes::Owned(read_blob(r)?);
 
-        // Postings data blob
-        let postings_len = read_u64(r)? as usize;
-        let mut postings_buf = vec![0u8; postings_len];
-        r.read_exact(&mut postings_buf)?;
-        let postings_data = super::index::Bytes::Owned(postings_buf);
-
-        // Term-field bitmaps
-        let tf_count = read_u32(r)? as usize;
-        let mut term_field_bitmaps = HashMap::with_capacity(tf_count);
-        for _ in 0..tf_count {
-            let term = read_string(r)?;
-            let mut fi = [0u8; 1];
-            r.read_exact(&mut fi)?;
-            let bm = read_bitmap(r)?;
-            term_field_bitmaps.insert((term, fi[0]), bm);
-        }
-
-        // Term-position bitmaps
-        let tp_count = read_u32(r)? as usize;
-        let mut term_position_bitmaps = HashMap::with_capacity(tp_count);
-        for _ in 0..tp_count {
-            let term = read_string(r)?;
-            let bucket = read_u16(r)?;
-            let bm = read_bitmap(r)?;
-            term_position_bitmaps.insert((term, bucket), bm);
-        }
+        // Field-scoped postings (FST + blob)
+        let field_post = MappedPostings {
+            fst: Bytes::Owned(read_blob(r)?),
+            blob: Bytes::Owned(read_blob(r)?),
+        };
+        // Position/proximity postings (FST + blob)
+        let position_post = MappedPostings {
+            fst: Bytes::Owned(read_blob(r)?),
+            blob: Bytes::Owned(read_blob(r)?),
+        };
 
         Ok(SearchIndex {
             fields,
@@ -147,8 +119,8 @@ impl SearchIndex {
             doc_field_lengths,
             fst_data,
             postings_data,
-            term_field_bitmaps,
-            term_position_bitmaps,
+            field_post,
+            position_post,
         })
     }
 
@@ -201,38 +173,17 @@ impl SearchIndex {
             doc_field_lengths.push(lengths);
         }
 
-        // FST data blob → mmap slice (skip the bytes, don't copy)
-        let fst_len = read_u64(&mut r)? as usize;
-        let fst_off = base + r.position() as usize;
-        r.seek(io::SeekFrom::Current(fst_len as i64))?;
-        let fst_data = Bytes::Mapped { view: view.clone(), off: fst_off, len: fst_len };
-
-        // Postings data blob → mmap slice (skip the bytes, don't copy)
-        let postings_len = read_u64(&mut r)? as usize;
-        let post_off = base + r.position() as usize;
-        r.seek(io::SeekFrom::Current(postings_len as i64))?;
-        let postings_data = Bytes::Mapped { view: view.clone(), off: post_off, len: postings_len };
-
-        // Term-field bitmaps (resident — the small RAM part)
-        let tf_count = read_u32(&mut r)? as usize;
-        let mut term_field_bitmaps = HashMap::with_capacity(tf_count);
-        for _ in 0..tf_count {
-            let term = read_string(&mut r)?;
-            let mut fi = [0u8; 1];
-            r.read_exact(&mut fi)?;
-            let bm = read_bitmap(&mut r)?;
-            term_field_bitmaps.insert((term, fi[0]), bm);
-        }
-
-        // Term-position bitmaps (resident)
-        let tp_count = read_u32(&mut r)? as usize;
-        let mut term_position_bitmaps = HashMap::with_capacity(tp_count);
-        for _ in 0..tp_count {
-            let term = read_string(&mut r)?;
-            let bucket = read_u16(&mut r)?;
-            let bm = read_bitmap(&mut r)?;
-            term_position_bitmaps.insert((term, bucket), bm);
-        }
+        // Each remaining blob → an mmap slice (skip its bytes, don't copy).
+        let map_blob = |r: &mut io::Cursor<&[u8]>| -> io::Result<Bytes> {
+            let len = read_u64(r)? as usize;
+            let off = base + r.position() as usize;
+            r.seek(io::SeekFrom::Current(len as i64))?;
+            Ok(Bytes::Mapped { view: view.clone(), off, len })
+        };
+        let fst_data = map_blob(&mut r)?;
+        let postings_data = map_blob(&mut r)?;
+        let field_post = MappedPostings { fst: map_blob(&mut r)?, blob: map_blob(&mut r)? };
+        let position_post = MappedPostings { fst: map_blob(&mut r)?, blob: map_blob(&mut r)? };
 
         let consumed = r.position() as usize;
         Ok((SearchIndex {
@@ -243,25 +194,24 @@ impl SearchIndex {
             doc_field_lengths,
             fst_data,
             postings_data,
-            term_field_bitmaps,
-            term_position_bitmaps,
+            field_post,
+            position_post,
         }, consumed))
     }
 }
 
-fn write_bitmap<W: Write>(w: &mut W, bm: &RoaringBitmap) -> io::Result<()> {
-    let mut buf = Vec::new();
-    bm.serialize_into(&mut buf)?;
-    w.write_all(&(buf.len() as u32).to_le_bytes())?;
-    w.write_all(&buf)
+/// Write a length-prefixed byte blob (`[len:u64 LE][bytes]`).
+fn write_blob<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
+    w.write_all(&(data.len() as u64).to_le_bytes())?;
+    w.write_all(data)
 }
 
-fn read_bitmap<R: Read>(r: &mut R) -> io::Result<RoaringBitmap> {
-    let len = read_u32(r)? as usize;
+/// Read a length-prefixed byte blob written by [`write_blob`].
+fn read_blob<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+    let len = read_u64(r)? as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
-    RoaringBitmap::deserialize_from(&buf[..])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    Ok(buf)
 }
 
 fn read_u16<R: Read>(r: &mut R) -> io::Result<u16> {
