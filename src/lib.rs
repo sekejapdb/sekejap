@@ -1558,7 +1558,12 @@ impl CoreDB {
                 let _ = db.save_search_binary(&search_bin_path);
             }
             // HNSW: rebuild only when vectors changed (PutVector is part of wal_had_payload,
-            // so here vectors are unchanged — no rebuild needed).
+            // so here vectors are unchanged — no rebuild needed). In paged mode, mmap the
+            // compact vector indexes from vecidx.bin (disk-first) so vector queries use the
+            // int8+CSR fast path without a resident graph rebuild.
+            if db.topo_base.is_some() {
+                let _ = db.load_vector_base(&dir.join("vecidx.bin"));
+            }
         }
         let _ = wal_had_graph; // used only to determine topology was replayed (no index rebuild needed)
 
@@ -3644,6 +3649,9 @@ impl CoreDB {
             grid.write_binary(&mut buf)?;
             Self::write_atomic(dir, "spatialgrid.bin", &buf)?;
         }
+        // Compact vector indexes (int8 + CSR) sidecar — lets a paged reopen mmap them
+        // instead of rebuilding the HNSW graph resident.
+        self.save_vector_binary(&dir.join("vecidx.bin"))?;
         Ok(())
     }
 
@@ -3765,6 +3773,66 @@ impl CoreDB {
     /// The file format uses RoaringBitmap's native binary serialization, which
     /// is ~10-50× smaller and faster to load than JSON integer arrays.
     /// Called automatically after GIN is rebuilt so future opens skip the rebuild.
+    /// Persist the compact (int8 + CSR) vector indexes to a `SKVEC001` container so
+    /// a paged reopen can mmap them instead of rebuilding the HNSW graph resident.
+    /// Skipped when indexes are already mmap-backed (the file is authoritative).
+    fn save_vector_binary(&self, path: &Path) -> io::Result<()> {
+        use std::io::Write;
+        if self.compact_indexes.is_empty() { return Ok(()); }
+        if self.compact_indexes.values().any(|c| c.is_disk_backed()) { return Ok(()); }
+        let tmp = path.with_extension("bin.tmp");
+        let mut f = std::io::BufWriter::new(
+            std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?
+        );
+        f.write_all(b"SKVEC001")?;
+        f.write_all(&(self.compact_indexes.len() as u32).to_le_bytes())?;
+        for (field, ci) in &self.compact_indexes {
+            let fb = field.as_bytes();
+            f.write_all(&(fb.len() as u16).to_le_bytes())?;
+            f.write_all(fb)?;
+            ci.write_binary(&mut f)?;
+        }
+        f.flush()?;
+        f.get_ref().sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Disk-first (paged): mmap the vecidx.bin container and serve each field's
+    /// compact vector index (int8 codes + CSR graph) from the map. f32 re-rank
+    /// still reads the mmap'd f32 store. Returns false on any problem.
+    fn load_vector_base(&mut self, path: &Path) -> bool {
+        use std::sync::Arc;
+        let file = match std::fs::File::open(path) { Ok(f) => f, Err(_) => return false };
+        let len = match file.metadata() { Ok(m) => m.len() as usize, Err(_) => return false };
+        if len < 12 { return false; }
+        let view = match storage::mmap::MmapView::try_new(&file, len) {
+            Some(v) => Arc::new(v),
+            None => return false,
+        };
+        let hdr = match view.slice(0, 12) { Some(h) => h, None => return false };
+        if &hdr[..8] != b"SKVEC001" { return false; }
+        let count = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        let mut pos = 12usize;
+        let mut loaded = Vec::with_capacity(count);
+        for _ in 0..count {
+            let kl = match view.slice(pos, 2) { Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize, None => return false };
+            pos += 2;
+            let field = match view.slice(pos, kl).and_then(|b| std::str::from_utf8(b).ok()) {
+                Some(s) => s.to_string(),
+                None => return false,
+            };
+            pos += kl;
+            match vector::CompactDiskIndex::open_mapped(&view, pos) {
+                Ok((ci, consumed)) => { pos += consumed; loaded.push((field, ci)); }
+                Err(_) => return false,
+            }
+        }
+        for (field, ci) in loaded { self.compact_indexes.insert(field, ci); }
+        true
+    }
+
     fn save_gin_binary(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
         // If any index is served from the mmap (paged, disk-first), the on-disk
@@ -7104,6 +7172,12 @@ impl CoreDB {
         self.compact_indexes.insert(field.to_string(), compact);
         self.hnsw_params.insert(field.to_string(), (m, ef_construction));
         self.hnsw_metric.insert(field.to_string(), metric);
+        // Persist the compact index so a paged reopen can mmap it (disk-first)
+        // rather than rebuilding the graph resident. Written here (not only at
+        // compact) because building an index doesn't itself trigger a compaction.
+        if let Some(dir) = self.data_dir.clone() {
+            let _ = self.save_vector_binary(&dir.join("vecidx.bin"));
+        }
         #[cfg(unix)]
         if let Some(store) = self.vectors.get_mut(field) { store.drop_mmap(); }
         #[cfg(target_os = "linux")]
@@ -8415,6 +8489,39 @@ mod hybrid_query_tests {
             .iter().map(|h| h.payload.clone()).collect();
         assert_eq!(r_grid, p_grid, "grid-path spatial must match resident");
         assert_eq!(r_match, p_match, "MATCH-filter spatial must match resident");
+    }
+
+    #[test]
+    fn paged_mode_serves_vector_from_mmap() {
+        // The compact vector index (int8 codes + CSR graph) served from mmap'd
+        // vecidx.bin must return identical top-k to resident (same bytes, same
+        // deterministic search) and be asserted disk-backed.
+        let dir = tempfile::tempdir().unwrap();
+        let dim = 16usize;
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            for i in 0..2000u32 {
+                db.put(&format!("v/n{i}"), &format!(r#"{{"_collection":"v","_key":"n{i}"}}"#)).unwrap();
+                let vec: Vec<f32> = (0..dim).map(|d| ((i as usize * 31 + d * 7) % 97) as f32 * 0.01).collect();
+                db.put_vector(&format!("v/n{i}"), "emb", &vec).unwrap();
+            }
+            db.compact().unwrap();               // migrate vectors to the disk store
+            db.build_hnsw_index_disk("emb", 16, 200, crate::query::VecMetric::L2).unwrap();
+        }
+        let qvec = "[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.05,0.15,0.25,0.35,0.45,0.55,0.65,0.75]";
+        let q = format!("SELECT _key FROM v ORDER BY VECTOR_L2(emb, {qvec}) ASC LIMIT 10");
+
+        let resident: Vec<String> = {
+            let db = CoreDB::open(dir.path()).unwrap();
+            db.query(&q).unwrap().collect().iter().map(|h| h.slug.clone()).collect()
+        };
+        assert_eq!(resident.len(), 10, "resident vector search returns 10");
+
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert!(paged.compact_index("emb").map_or(false, |c| c.is_disk_backed()),
+            "paged vector index must be mmap-backed");
+        let p: Vec<String> = paged.query(&q).unwrap().collect().iter().map(|h| h.slug.clone()).collect();
+        assert_eq!(resident, p, "paged vector top-k must match resident exactly");
     }
 
     #[test]
