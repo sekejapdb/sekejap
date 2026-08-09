@@ -42,16 +42,19 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Build a text corpus with a SEARCH index, then compact so search.bin exists.
-    let words = ["rust", "python", "graph", "vector", "spatial", "embedded", "query",
-                 "index", "memory", "disk", "fast", "safe", "bounded", "engine", "edge"];
+    // Realistic vocabulary: a few common words + a large space of per-doc terms, so
+    // the FST + postings + field/position bitmaps (all mmap-served in paged mode)
+    // dominate the index — this is where disk-first pays off.
+    let common = ["rust", "python", "graph", "vector", "spatial", "embedded"];
+    let vocab = 20_000usize; // unique "content" terms across the corpus
     {
         let mut db = CoreDB::open(&dir).unwrap();
         db.execute("CREATE TABLE docs (title TEXT, body TEXT)").unwrap();
         for i in 0..n {
-            let title = format!("{} {}", words[i % words.len()], words[(i / 3) % words.len()]);
-            let body = format!("{} {} {} {}",
-                words[(i / 2) % words.len()], words[(i / 5) % words.len()],
-                words[(i / 7) % words.len()], words[(i / 11) % words.len()]);
+            let title = format!("{} t{} t{}", common[i % common.len()], i % vocab, (i * 7) % vocab);
+            let body = format!("t{} t{} t{} t{} {}",
+                (i * 3) % vocab, (i * 11) % vocab, (i * 13) % vocab, (i * 17) % vocab,
+                common[(i / 4) % common.len()]);
             db.execute(&format!(
                 "INSERT INTO docs (_key, title, body) VALUES ('d{i}', '{title}', '{body}')"
             )).unwrap();
