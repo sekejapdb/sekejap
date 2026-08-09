@@ -120,7 +120,7 @@ fn snapshot_probe(head: &[u8]) -> (u32, usize) {
 
 /// Bump each constant when the corresponding index algorithm changes in a way
 /// that makes indexes built by the previous version produce wrong results.
-const GIN_INDEX_VERSION:     u32 = 2; // slot-map fix 2026-04-13
+const GIN_INDEX_VERSION:     u32 = 3; // sorted trigram dir + blob (mmap-served) 2026-08
 const BM25_INDEX_VERSION:    u32 = 1;
 const BTREE_INDEX_VERSION:   u32 = 1;
 const HNSW_INDEX_VERSION:    u32 = 1;
@@ -3767,6 +3767,12 @@ impl CoreDB {
     /// Called automatically after GIN is rebuilt so future opens skip the rebuild.
     fn save_gin_binary(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
+        // If any index is served from the mmap (paged, disk-first), the on-disk
+        // gin.bin is already authoritative and self-contained — don't overwrite it
+        // with the empty resident maps. Rewritten only when indexes are resident.
+        if self.gin_indexes.values().any(|g| g.is_disk_backed()) {
+            return Ok(());
+        }
         let tmp = path.with_extension("bin.tmp");
         let mut f = std::io::BufWriter::new(
             std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?
@@ -3790,7 +3796,41 @@ impl CoreDB {
     /// Returns `true` if the file was successfully loaded (all indexes had
     /// matching versions), `false` if missing, corrupt, or version-mismatched
     /// (caller should then call `rebuild_declared_gin_indexes` + `save_gin_binary`).
+    /// Disk-first (paged): mmap the gin.bin container and serve each field's GIN
+    /// postings + id map from the map (`MappedGin`), leaving nothing resident.
+    /// Mirrors `load_search_base`. Returns false on any problem → caller rebuilds.
+    fn load_gin_base(&mut self, path: &Path) -> bool {
+        use std::sync::Arc;
+        let file = match std::fs::File::open(path) { Ok(f) => f, Err(_) => return false };
+        let len = match file.metadata() { Ok(m) => m.len() as usize, Err(_) => return false };
+        if len < 12 { return false; }
+        let view = match storage::mmap::MmapView::try_new(&file, len) {
+            Some(v) => Arc::new(v),
+            None => return false,
+        };
+        let hdr = match view.slice(0, 12) { Some(h) => h, None => return false };
+        if &hdr[..8] != b"SKGIN001" { return false; }
+        let count = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        let mut pos = 12usize;
+        let mut loaded = Vec::with_capacity(count);
+        for _ in 0..count {
+            match storage::ginstore::MappedGin::open_mapped(&view, pos, GIN_INDEX_VERSION) {
+                Ok((mg, consumed)) => { pos += consumed; loaded.push(mg); }
+                Err(_) => return false,
+            }
+        }
+        for mg in loaded {
+            let field = mg.field().to_string();
+            self.gin_indexes.insert(field, GINIndex::from_mapped(mg));
+        }
+        true
+    }
+
     fn load_gin_binary(&mut self, path: &Path) -> bool {
+        // Paged (disk-first): mmap the container instead of reading it into heap.
+        if self.topo_base.is_some() && self.load_gin_base(path) {
+            return true;
+        }
         use std::io::Read;
         let data = match std::fs::read(path) {
             Ok(d) => d,
@@ -4315,7 +4355,11 @@ impl CoreDB {
 
     /// Check if a node exists.
     pub fn contains(&self, slug: &str) -> bool {
-        let h = sk_hash(slug);
+        self.node_exists(sk_hash(slug))
+    }
+
+    /// Base-aware node existence by hash (resident overlay or mmap base).
+    pub(crate) fn node_exists(&self, h: u64) -> bool {
         self.nodes.contains_key(&h)
             || self.topo_base.as_ref().map_or(false, |b| b.resolve(h).is_some())
     }
@@ -6408,7 +6452,9 @@ impl CoreDB {
             .map(|idx| idx.ilike(pattern, limit))
             .unwrap_or_default()
             .into_iter()
-            .filter(|h| self.nodes.contains_key(h))
+            // Exclude nodes deleted since the index was built. Base-aware: in paged
+            // mode the live nodes are in the mmap base, not self.nodes.
+            .filter(|h| self.node_exists(*h))
             .collect()
     }
 
@@ -6499,10 +6545,10 @@ impl CoreDB {
             .map(|idx| {
                 idx.search(query, top_k)
                     .into_iter()
-                    // Belt-and-suspenders: exclude any doc not present in
-                    // the live node map, covering the narrow window between
-                    // node deletion and BM25 index update.
-                    .filter(|hit| self.nodes.contains_key(&hit.doc_id))
+                    // Belt-and-suspenders: exclude any doc not present in the live
+                    // node set, covering the window between deletion and index update.
+                    // Base-aware: in paged mode the live nodes are in the mmap base.
+                    .filter(|hit| self.node_exists(hit.doc_id))
                     .map(|hit| (hit.doc_id, hit.score))
                     .collect()
             })
@@ -8369,6 +8415,44 @@ mod hybrid_query_tests {
             .iter().map(|h| h.payload.clone()).collect();
         assert_eq!(r_grid, p_grid, "grid-path spatial must match resident");
         assert_eq!(r_match, p_match, "MATCH-filter spatial must match resident");
+    }
+
+    #[test]
+    fn paged_mode_serves_gin_from_mmap() {
+        // GIN (LIKE/ILIKE trigram index) served from the mmap'd gin.bin in paged
+        // mode must match resident results, and be asserted disk-backed.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.execute("CREATE TABLE docs (name TEXT)").unwrap();
+            let names = ["Alpha Bakery", "Beta Cafe", "Gamma Coffee House", "Delta Bakehouse",
+                         "Epsilon Bistro", "Zeta Bakery Corner", "coffee roasters", "the coffee lab"];
+            for (i, n) in names.iter().enumerate() {
+                db.execute(&format!("INSERT INTO docs (_key, name) VALUES ('d{i}', '{n}')")).unwrap();
+            }
+            db.execute("CREATE INDEX ON docs USING gin (name)").unwrap();
+            db.compact().unwrap();
+        }
+        let queries = [
+            "SELECT _key FROM docs WHERE name ILIKE '%bak%' ORDER BY _key ASC",
+            "SELECT _key FROM docs WHERE name ILIKE '%coffee%' ORDER BY _key ASC",
+            "SELECT _key FROM docs WHERE name LIKE '%Cafe%' ORDER BY _key ASC",
+            "SELECT _key FROM docs WHERE name ILIKE '%zzzznope%' ORDER BY _key ASC",
+        ];
+        let resident: Vec<Vec<String>> = {
+            let db = CoreDB::open(dir.path()).unwrap();
+            queries.iter().map(|q| db.query(q).unwrap().collect()
+                .iter().map(|h| h.slug.clone()).collect()).collect()
+        };
+        assert!(!resident[0].is_empty(), "resident ILIKE must find bakeries");
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert!(paged.gin_indexes.get("name").unwrap().is_disk_backed(),
+            "paged GIN must be mmap-backed");
+        for (i, q) in queries.iter().enumerate() {
+            let p: Vec<String> = paged.query(q).unwrap().collect()
+                .iter().map(|h| h.slug.clone()).collect();
+            assert_eq!(resident[i], p, "paged GIN must match resident: {q}");
+        }
     }
 
     #[test]
