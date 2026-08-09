@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
+use std::sync::Arc;
 use roaring::RoaringBitmap;
-use super::index::SearchIndex;
+use super::index::{Bytes, SearchIndex};
+use crate::storage::mmap::MmapView;
 
 const MAGIC: &[u8; 8] = b"SKSRCH02";
 pub const SEARCH_INDEX_VERSION: u32 = 2;
@@ -34,11 +36,11 @@ impl SearchIndex {
 
         // FST data blob
         w.write_all(&(self.fst_data.len() as u64).to_le_bytes())?;
-        w.write_all(&self.fst_data)?;
+        w.write_all(self.fst_data.as_slice())?;
 
         // Postings data blob
         w.write_all(&(self.postings_data.len() as u64).to_le_bytes())?;
-        w.write_all(&self.postings_data)?;
+        w.write_all(self.postings_data.as_slice())?;
 
         // Term-field bitmaps
         w.write_all(&(self.term_field_bitmaps.len() as u32).to_le_bytes())?;
@@ -106,13 +108,15 @@ impl SearchIndex {
 
         // FST data blob
         let fst_len = read_u64(r)? as usize;
-        let mut fst_data = vec![0u8; fst_len];
-        r.read_exact(&mut fst_data)?;
+        let mut fst_buf = vec![0u8; fst_len];
+        r.read_exact(&mut fst_buf)?;
+        let fst_data = super::index::Bytes::Owned(fst_buf);
 
         // Postings data blob
         let postings_len = read_u64(r)? as usize;
-        let mut postings_data = vec![0u8; postings_len];
-        r.read_exact(&mut postings_data)?;
+        let mut postings_buf = vec![0u8; postings_len];
+        r.read_exact(&mut postings_buf)?;
+        let postings_data = super::index::Bytes::Owned(postings_buf);
 
         // Term-field bitmaps
         let tf_count = read_u32(r)? as usize;
@@ -146,6 +150,102 @@ impl SearchIndex {
             term_field_bitmaps,
             term_position_bitmaps,
         })
+    }
+
+    /// Disk-first open of one `SKSRCH02` blob starting at byte `base` in an mmap'd
+    /// `search.bin`. The two bulk blobs (FST term dict + postings) are served from
+    /// the memory map (`Bytes::Mapped`) — never read into RAM; only the scalars,
+    /// id map, norms, and the field/position bitmaps stay resident. Returns the
+    /// index plus the number of bytes the blob consumed, so a container loop can
+    /// advance to the next entry. Several blobs share one `Arc<MmapView>`.
+    pub(crate) fn open_mapped(view: &Arc<MmapView>, base: usize) -> io::Result<(SearchIndex, usize)> {
+        let total = view.len();
+        let bytes = view.slice(base, total.saturating_sub(base))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "search blob out of range"))?;
+        let mut r = io::Cursor::new(bytes);
+
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad search index magic"));
+        }
+        let version = read_u32(&mut r)?;
+        if version != SEARCH_INDEX_VERSION {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "search index version mismatch"));
+        }
+
+        // Fields (resident)
+        let num_fields = read_u16(&mut r)? as usize;
+        let mut fields = Vec::with_capacity(num_fields);
+        for _ in 0..num_fields {
+            fields.push(read_string(&mut r)?);
+        }
+
+        // ID map (resident)
+        let doc_count = read_u32(&mut r)?;
+        let mut id_map = Vec::with_capacity(doc_count as usize);
+        let mut id_to_slot = HashMap::with_capacity(doc_count as usize);
+        for slot in 0..doc_count {
+            let hash = read_u64(&mut r)?;
+            id_to_slot.insert(hash, slot);
+            id_map.push(hash);
+        }
+
+        // Doc field lengths / norms (resident)
+        let mut doc_field_lengths = Vec::with_capacity(doc_count as usize);
+        for _ in 0..doc_count {
+            let mut lengths = Vec::with_capacity(num_fields);
+            for _ in 0..num_fields {
+                lengths.push(read_u16(&mut r)?);
+            }
+            doc_field_lengths.push(lengths);
+        }
+
+        // FST data blob → mmap slice (skip the bytes, don't copy)
+        let fst_len = read_u64(&mut r)? as usize;
+        let fst_off = base + r.position() as usize;
+        r.seek(io::SeekFrom::Current(fst_len as i64))?;
+        let fst_data = Bytes::Mapped { view: view.clone(), off: fst_off, len: fst_len };
+
+        // Postings data blob → mmap slice (skip the bytes, don't copy)
+        let postings_len = read_u64(&mut r)? as usize;
+        let post_off = base + r.position() as usize;
+        r.seek(io::SeekFrom::Current(postings_len as i64))?;
+        let postings_data = Bytes::Mapped { view: view.clone(), off: post_off, len: postings_len };
+
+        // Term-field bitmaps (resident — the small RAM part)
+        let tf_count = read_u32(&mut r)? as usize;
+        let mut term_field_bitmaps = HashMap::with_capacity(tf_count);
+        for _ in 0..tf_count {
+            let term = read_string(&mut r)?;
+            let mut fi = [0u8; 1];
+            r.read_exact(&mut fi)?;
+            let bm = read_bitmap(&mut r)?;
+            term_field_bitmaps.insert((term, fi[0]), bm);
+        }
+
+        // Term-position bitmaps (resident)
+        let tp_count = read_u32(&mut r)? as usize;
+        let mut term_position_bitmaps = HashMap::with_capacity(tp_count);
+        for _ in 0..tp_count {
+            let term = read_string(&mut r)?;
+            let bucket = read_u16(&mut r)?;
+            let bm = read_bitmap(&mut r)?;
+            term_position_bitmaps.insert((term, bucket), bm);
+        }
+
+        let consumed = r.position() as usize;
+        Ok((SearchIndex {
+            fields,
+            id_map,
+            id_to_slot,
+            doc_count,
+            doc_field_lengths,
+            fst_data,
+            postings_data,
+            term_field_bitmaps,
+            term_position_bitmaps,
+        }, consumed))
     }
 }
 
@@ -215,8 +315,8 @@ mod tests {
         assert_eq!(loaded.id_map, idx.id_map);
         assert_eq!(loaded.doc_count, idx.doc_count);
         assert_eq!(loaded.doc_field_lengths, idx.doc_field_lengths);
-        assert_eq!(loaded.fst_data, idx.fst_data);
-        assert_eq!(loaded.postings_data, idx.postings_data);
+        assert_eq!(loaded.fst_data.as_slice(), idx.fst_data.as_slice());
+        assert_eq!(loaded.postings_data.as_slice(), idx.postings_data.as_slice());
 
         // Verify search still works after roundtrip
         let results = loaded.search("rust");
