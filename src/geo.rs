@@ -328,6 +328,10 @@ pub(crate) struct SpatialGrid {
     /// Parsed polygon rings (`[[lat,lon],…]`) cached per node so point-in-polygon
     /// tests never re-read + re-parse the GeoJSON payload from disk (the PIP hot path).
     poly_rings: HashMap<u64, Vec<Vec<[f64; 2]>>>,
+    /// Disk-first (paged) base: cell index + per-node meta served from an mmap'd
+    /// `spatialgrid.bin`. When present, `cells`/`meta` act as the resident write
+    /// overlay and reads union the overlay with the base. `None` in heap mode.
+    mapped: Option<crate::storage::spatialstore::MappedSpatialGrid>,
 }
 
 impl SpatialGrid {
@@ -340,6 +344,7 @@ impl SpatialGrid {
                 cells: HashMap::new(),
                 meta: HashMap::new(),
                 poly_rings: HashMap::new(),
+                mapped: None,
             };
         }
 
@@ -372,6 +377,7 @@ impl SpatialGrid {
             cells: HashMap::new(),
             meta: HashMap::new(),
             poly_rings: HashMap::new(),
+            mapped: None,
         };
 
         for (hash, m) in collected {
@@ -380,6 +386,86 @@ impl SpatialGrid {
         }
 
         grid
+    }
+
+    /// Disk-first grid for paged mode: cells + meta served from the mmap'd base;
+    /// the resident `cells`/`meta` start empty and act as the write overlay.
+    pub fn from_mapped(base: crate::storage::spatialstore::MappedSpatialGrid) -> Self {
+        Self {
+            cell_size: base.cell_size(),
+            cells: HashMap::new(),
+            meta: HashMap::new(),
+            poly_rings: HashMap::new(),
+            mapped: Some(base),
+        }
+    }
+
+    /// Serialize the grid (cell index + per-node meta + cell size) to the
+    /// `SKGRID01` sidecar format read by `MappedSpatialGrid`.
+    pub fn write_binary<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b"SKGRID01")?;
+        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&self.cell_size.to_le_bytes())?;
+
+        // Meta records, sorted by hash (binary-searchable).
+        let mut metas: Vec<(&u64, &SpatialMeta)> = self.meta.iter().collect();
+        metas.sort_unstable_by_key(|(h, _)| **h);
+        w.write_all(&(metas.len() as u32).to_le_bytes())?;
+        for (h, m) in &metas {
+            w.write_all(&h.to_le_bytes())?;
+            for v in [m.centroid_lat, m.centroid_lon, m.bbox_min_lat, m.bbox_min_lon, m.bbox_max_lat, m.bbox_max_lon] {
+                w.write_all(&v.to_le_bytes())?;
+            }
+        }
+
+        // Cell directory (sorted by (cy,cx)) + concatenated posting blob.
+        let mut cells: Vec<(&(i32, i32), &Vec<u64>)> = self.cells.iter().collect();
+        cells.sort_unstable_by_key(|(k, _)| **k);
+        w.write_all(&(cells.len() as u32).to_le_bytes())?;
+        let mut blob: Vec<u8> = Vec::new();
+        let mut dir: Vec<u8> = Vec::with_capacity(cells.len() * 20);
+        for ((cy, cx), hashes) in &cells {
+            let off = blob.len() as u64;
+            dir.extend_from_slice(&cy.to_le_bytes());
+            dir.extend_from_slice(&cx.to_le_bytes());
+            dir.extend_from_slice(&off.to_le_bytes());
+            dir.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
+            for &h in hashes.iter() { blob.extend_from_slice(&h.to_le_bytes()); }
+        }
+        w.write_all(&dir)?;
+        w.write_all(&(blob.len() as u64).to_le_bytes())?;
+        w.write_all(&blob)?;
+        Ok(())
+    }
+
+    /// Node hashes in cell `(cy,cx)` — resident overlay unioned with the mmap base.
+    fn cell_members_at(&self, key: (i32, i32)) -> Option<Vec<u64>> {
+        let overlay = self.cells.get(&key);
+        let base = self.mapped.as_ref().and_then(|m| m.cell_members(key.0, key.1));
+        match (overlay, base) {
+            (None, None) => None,
+            (Some(v), None) => Some(v.clone()),
+            (None, Some(v)) => Some(v),
+            (Some(o), Some(mut b)) => { b.extend_from_slice(o); Some(b) }
+        }
+    }
+
+    /// Spatial metadata for a node — resident overlay first, then the mmap base.
+    fn meta_at(&self, hash: u64) -> Option<SpatialMeta> {
+        if let Some(m) = self.meta.get(&hash) { return Some(m.clone()); }
+        self.mapped.as_ref().and_then(|m| m.node_meta(hash))
+    }
+
+    /// Whether the mmap base holds this node (used to avoid double-inserting a
+    /// base node into the resident overlay on paged open).
+    pub fn base_contains(&self, hash: u64) -> bool {
+        self.mapped.as_ref().map_or(false, |m| m.node_meta(hash).is_some())
+    }
+
+    /// True when the cell index + meta are served from the mmap base (paged mode)
+    /// rather than a resident HashMap. For tests / introspection.
+    pub fn is_disk_backed(&self) -> bool {
+        self.mapped.is_some()
     }
 
     /// Insert a node into the grid.
@@ -400,14 +486,14 @@ impl SpatialGrid {
         }
     }
 
-    /// Get cached spatial metadata for a node.
-    pub fn get_meta(&self, hash: u64) -> Option<&SpatialMeta> {
-        self.meta.get(&hash)
+    /// Get cached spatial metadata for a node (resident overlay or mmap base).
+    pub fn get_meta(&self, hash: u64) -> Option<SpatialMeta> {
+        self.meta_at(hash)
     }
 
-    /// Number of nodes in the grid.
+    /// Number of nodes in the grid (resident overlay + mmap base).
     pub fn len(&self) -> usize {
-        self.meta.len()
+        self.meta.len() + self.mapped.as_ref().map_or(0, |m| m.len())
     }
 
     /// Cache a node's parsed polygon rings (`[[lat,lon],…]`) for fast PIP.
@@ -455,7 +541,7 @@ impl SpatialGrid {
     /// bound, no unsearched node can beat it, so we stop. Each node is scored at
     /// most once (no re-scanning), and typical queries touch a handful of cells.
     pub fn k_nearest(&self, lat: f64, lon: f64, k: usize) -> Vec<u64> {
-        if k == 0 || self.meta.is_empty() {
+        if k == 0 || self.len() == 0 {
             return Vec::new();
         }
         let cs = self.cell_size;
@@ -473,7 +559,7 @@ impl SpatialGrid {
         let mut heap: std::collections::BinaryHeap<(Dist, u64)> = std::collections::BinaryHeap::new();
 
         let mut seen = 0usize;
-        let total = self.meta.len();
+        let total = self.len();
         let mut r = 0i32;
         loop {
             // Bound for cell-level pruning: once we hold k candidates, a cell whose
@@ -483,7 +569,7 @@ impl SpatialGrid {
             let bound = if heap.len() >= k { heap.peek().map(|(d, _)| d.0).unwrap_or(f64::INFINITY) } else { f64::INFINITY };
             // Scan every cell at Chebyshev distance exactly `r` (the new ring).
             let visit = |cy: i32, cx: i32, heap: &mut std::collections::BinaryHeap<(Dist, u64)>, seen: &mut usize| {
-                if let Some(hashes) = self.cells.get(&(cy, cx)) {
+                if let Some(hashes) = self.cell_members_at((cy, cx)) {
                     // Nearest possible distance from the query to this cell's box.
                     if bound.is_finite() {
                         let dlat = if lat < cy as f64 * cs { cy as f64 * cs - lat }
@@ -497,8 +583,8 @@ impl SpatialGrid {
                         let cell_min = ((dlat * 110_000.0).powi(2) + (dlon * 110_000.0 * coslat).powi(2)).sqrt();
                         if cell_min > bound { *seen += hashes.len(); return; }
                     }
-                    for &h in hashes {
-                        if let Some(m) = self.meta.get(&h) {
+                    for &h in &hashes {
+                        if let Some(m) = self.meta_at(h) {
                             *seen += 1;
                             let d = geodesic_distance_m(lat, lon, m.centroid_lat, m.centroid_lon);
                             heap.push((Dist(d), h));
@@ -563,11 +649,11 @@ impl SpatialGrid {
 
         for cy in min_cell_lat..=max_cell_lat {
             for cx in min_cell_lon..=max_cell_lon {
-                if let Some(hashes) = self.cells.get(&(cy, cx)) {
-                    for &h in hashes {
+                if let Some(hashes) = self.cell_members_at((cy, cx)) {
+                    for h in hashes {
                         if seen.insert(h) {
                             // Bbox overlap check against the node's actual bbox
-                            if let Some(m) = self.meta.get(&h) {
+                            if let Some(m) = self.meta_at(h) {
                                 if m.bbox_max_lat >= min_lat
                                     && m.bbox_min_lat <= max_lat
                                     && m.bbox_max_lon >= min_lon
@@ -596,10 +682,10 @@ impl SpatialGrid {
 
         for dy in -1..=1i32 {
             for dx in -1..=1i32 {
-                if let Some(hashes) = self.cells.get(&(cy + dy, cx + dx)) {
-                    for &h in hashes {
+                if let Some(hashes) = self.cell_members_at((cy + dy, cx + dx)) {
+                    for h in hashes {
                         if seen.insert(h) {
-                            if let Some(m) = self.meta.get(&h) {
+                            if let Some(m) = self.meta_at(h) {
                                 if lat >= m.bbox_min_lat
                                     && lat <= m.bbox_max_lat
                                     && lon >= m.bbox_min_lon

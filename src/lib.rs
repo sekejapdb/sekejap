@@ -1517,8 +1517,12 @@ impl CoreDB {
             db.wal = Some(wal);
         }
 
-        // 4. Build spatial index from loaded data
-        db.rebuild_spatial_grid();
+        // 4. Spatial index: in paged mode, serve the cell index + meta from the
+        //    mmap'd spatialgrid.bin (disk-first) if present; otherwise rebuild it
+        //    resident. WAL-added geometry (wal_had_payload) needs a fresh grid.
+        if !(paged && !wal_had_payload && db.attach_spatial_base(dir)) {
+            db.rebuild_spatial_grid();
+        }
 
         // 5. Rebuild GIN and HNSW when WAL added new data, or load GIN from the
         //    binary sidecar gin.bin (compact, fast — no JSON parsing overhead).
@@ -3630,6 +3634,16 @@ impl CoreDB {
         Self::write_atomic(dir, "spatial.bin", &blob.spat)?;
         Self::write_atomic(dir, "edgemeta.bin", &blob.emeta)?;
         Self::write_atomic(dir, "collections.bin", &blob.colls)?;
+        // Spatial grid (cell index + per-node meta) sidecar — lets a paged reopen
+        // serve the grid straight from the mmap instead of rebuilding it resident.
+        // Built fresh from all node metas (overlay + base) so it is complete even
+        // when compacting in paged mode; ring caches are not persisted.
+        if self.spatial_grid.is_some() {
+            let grid = geo::SpatialGrid::build(self.all_spatial_items().into_iter());
+            let mut buf = Vec::new();
+            grid.write_binary(&mut buf)?;
+            Self::write_atomic(dir, "spatialgrid.bin", &buf)?;
+        }
         Ok(())
     }
 
@@ -6128,7 +6142,9 @@ impl CoreDB {
         self.rebuild_spatial_grid();
     }
 
-    fn rebuild_spatial_grid(&mut self) {
+    /// All `(hash, SpatialMeta)` across the resident overlay and the mmap base
+    /// (paged). Shared by grid rebuild and the compact-time grid serialization.
+    fn all_spatial_items(&self) -> Vec<(u64, geo::SpatialMeta)> {
         let mut items: Vec<(u64, geo::SpatialMeta)> = self.nodes.iter()
             .filter_map(|(&hash, node)| node.spatial_meta.clone().map(|m| (hash, *m)))
             .collect();
@@ -6149,6 +6165,11 @@ impl CoreDB {
                 }
             }
         }
+        items
+    }
+
+    fn rebuild_spatial_grid(&mut self) {
+        let items = self.all_spatial_items();
         // Polygon-ring caching is mode-dependent:
         //  - Resident (heap) opens eagerly cache every polygon's rings, trading
         //    RAM for fast PIP / ST_DWithin refinement (RAM-rich servers).
@@ -6171,6 +6192,28 @@ impl CoreDB {
         let mut grid = geo::SpatialGrid::build(items.into_iter());
         for (h, rings) in polys { grid.cache_rings(h, rings); }
         self.spatial_grid = Some(grid);
+    }
+
+    /// Paged (disk-first) open: serve the spatial grid from the mmap'd
+    /// `spatialgrid.bin` instead of rebuilding it resident. Post-compact overlay
+    /// writes (WAL-replayed geometry nodes not in the base) are folded into the
+    /// resident overlay so queries still see them. Returns false if unavailable.
+    fn attach_spatial_base(&mut self, dir: &Path) -> bool {
+        let path = dir.join("spatialgrid.bin");
+        let base = match storage::spatialstore::MappedSpatialGrid::open_disk(&path) {
+            Ok(Some(b)) => b,
+            _ => return false,
+        };
+        let mut grid = geo::SpatialGrid::from_mapped(base);
+        for (&h, node) in &self.nodes {
+            if let Some(m) = &node.spatial_meta {
+                if !grid.base_contains(h) {
+                    grid.insert(h, (**m).clone());
+                }
+            }
+        }
+        self.spatial_grid = Some(grid);
+        true
     }
 
     // ── Text index ─────────────────────────────────────────────────────────────
@@ -8316,12 +8359,61 @@ mod hybrid_query_tests {
         // Paged: same results, spatial served from spatial.bin (nodes map empty).
         let paged = CoreDB::open_paged(dir.path()).unwrap();
         assert!(paged.nodes.is_empty());
+        // The grid's cell index + meta are served from the mmap'd spatialgrid.bin,
+        // not a resident HashMap (disk-first).
+        assert!(paged.spatial_grid.as_ref().unwrap().is_disk_backed(),
+            "paged spatial grid must be mmap-backed");
         let p_grid: Vec<_> = paged.query(q_grid).unwrap().collect()
             .iter().map(|h| h.payload.clone()).collect();
         let p_match: Vec<_> = paged.query(q_match).unwrap().collect()
             .iter().map(|h| h.payload.clone()).collect();
         assert_eq!(r_grid, p_grid, "grid-path spatial must match resident");
         assert_eq!(r_match, p_match, "MATCH-filter spatial must match resident");
+    }
+
+    #[test]
+    fn paged_spatial_grid_bbox_radius_knn_match_resident() {
+        // Grid served from mmap must match resident for bbox, radius, and kNN over a
+        // denser point set (exercises binary search on cells + meta at scale).
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            for i in 0..2000u32 {
+                // Jitter off the regular grid so distances are unique (no kNN ties).
+                let lat = -8.0 + (i % 50) as f64 * 0.02 + i as f64 * 1e-7;
+                let lon = 115.0 + (i / 50) as f64 * 0.02 + i as f64 * 3e-7;
+                db.put(&format!("p/n{i}"), &format!(
+                    r#"{{"_collection":"p","_key":"n{i}","geometry":{{"type":"Point","coordinates":[{lon},{lat}]}}}}"#
+                )).unwrap();
+            }
+            db.build_spatial_index();
+            db.compact().unwrap();
+        }
+        let queries = [
+            "SELECT _key FROM p WHERE ST_DWithin(geometry, POINT(115.3 -7.5), 8000) ORDER BY _key ASC",
+            "SELECT _key FROM p WHERE ST_DWithin(geometry, POINT(115.05 -7.95), 3000) ORDER BY _key ASC",
+            "SELECT _key FROM p ORDER BY ST_Distance(geometry, POINT(115.25 -7.55)) ASC LIMIT 15",
+        ];
+        // Compare order-independently (sorted) — kNN order among near-ties is not
+        // guaranteed stable across resident vs mmap iteration; the SET must match.
+        let run = |db: &CoreDB, q: &str| -> Vec<String> {
+            let mut v: Vec<String> = db.query(q).unwrap().collect()
+                .iter().map(|h| h.slug.clone()).collect();
+            v.sort();
+            v
+        };
+        let resident: Vec<Vec<String>> = {
+            let db = CoreDB::open(dir.path()).unwrap();
+            queries.iter().map(|q| run(&db, q)).collect()
+        };
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert!(paged.spatial_grid.as_ref().unwrap().is_disk_backed(),
+            "grid must be mmap-backed in paged mode");
+        for (i, q) in queries.iter().enumerate() {
+            let p = run(&paged, q);
+            assert_eq!(resident[i], p, "paged spatial must match resident: {q}");
+            assert!(!p.is_empty(), "query should return rows: {q}");
+        }
     }
 
     #[test]
