@@ -63,6 +63,10 @@ pub struct GINIndex {
     doc_count: usize,
     /// Field name being indexed
     field: String,
+    /// Disk-first (paged) base: postings + id map served from an mmap'd `gin.bin`.
+    /// When present the resident `postings`/`id_map` are empty (attached only on a
+    /// clean paged reopen, no post-compact writes). `None` in heap mode.
+    mapped: Option<crate::storage::ginstore::MappedGin>,
 }
 
 impl GINIndex {
@@ -104,7 +108,37 @@ impl GINIndex {
             id_map,
             doc_count,
             field: field.to_string(),
+            mapped: None,
         }
+    }
+
+    /// True when postings + id map are served from the mmap base (paged, disk-first).
+    pub fn is_disk_backed(&self) -> bool {
+        self.mapped.is_some()
+    }
+
+    /// Disk-first GIN for paged mode: postings + id map served from the mmap base;
+    /// resident maps stay empty. Attached only on a clean reopen (no overlay).
+    pub(crate) fn from_mapped(base: crate::storage::ginstore::MappedGin) -> Self {
+        Self {
+            postings: HashMap::new(),
+            id_map: Vec::new(),
+            doc_count: base.doc_count(),
+            field: base.field().to_string(),
+            mapped: Some(base),
+        }
+    }
+
+    /// Posting bitmap for a trigram hash — resident overlay or the mmap base.
+    fn trigram_postings(&self, hash: u32) -> Option<roaring::RoaringBitmap> {
+        if let Some(bm) = self.postings.get(&hash) { return Some(bm.clone()); }
+        self.mapped.as_ref().and_then(|m| m.trigram_bitmap(hash))
+    }
+
+    /// Node hash for a slot — resident overlay or the mmap base.
+    fn slot_hash(&self, slot: u32) -> Option<u64> {
+        if let Some(h) = self.id_map.get(slot as usize) { return Some(*h); }
+        self.mapped.as_ref().and_then(|m| m.slot_hash(slot))
     }
 
     /// Query the index for documents matching an ILIKE pattern.
@@ -121,18 +155,11 @@ impl GINIndex {
         // Extract trigrams from pattern
         let pattern_trigrams = extract_pattern_trigrams(pattern);
         if pattern_trigrams.is_empty() {
-            // Degenerate pattern (all wildcards) — return all docs from first posting
-            return self
-                .postings
-                .values()
-                .next()
-                .map(|bm| {
-                    bm.iter()
-                        .filter_map(|slot| self.id_map.get(slot as usize).copied())
-                        .take(limit.unwrap_or(usize::MAX))
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Degenerate pattern (all wildcards) — matches every indexed doc.
+            return (0..self.doc_count as u32)
+                .filter_map(|slot| self.slot_hash(slot))
+                .take(limit.unwrap_or(usize::MAX))
+                .collect();
         }
 
         // Deduplicate trigrams
@@ -140,18 +167,16 @@ impl GINIndex {
 
         // Start with first trigram's bitmap, intersect with rest
         let first_h = hash_trigram(&trigrams[0]);
-        let mut result = match self.postings.get(&first_h) {
-            Some(bm) => bm.clone(),
+        let mut result = match self.trigram_postings(first_h) {
+            Some(bm) => bm,
             None => return vec![], // No documents have first trigram
         };
 
         for trigram in &trigrams[1..] {
             let h = hash_trigram(trigram);
-            if let Some(bm) = self.postings.get(&h) {
-                result &= bm.clone();
-            } else {
-                // This trigram doesn't exist in any document
-                return vec![];
+            match self.trigram_postings(h) {
+                Some(bm) => result &= bm,
+                None => return vec![], // This trigram doesn't exist in any document
             }
             if result.is_empty() {
                 return vec![]; // Early exit if intersection empty
@@ -161,7 +186,7 @@ impl GINIndex {
         // Apply limit — map slot indices back to original u64 node hashes
         result
             .iter()
-            .filter_map(|slot| self.id_map.get(slot as usize).copied())
+            .filter_map(|slot| self.slot_hash(slot))
             .take(limit.unwrap_or(usize::MAX))
             .collect()
     }
@@ -208,6 +233,7 @@ impl GINIndex {
             id_map,
             doc_count,
             field: field.to_string(),
+            mapped: None,
         }
     }
 
@@ -241,14 +267,28 @@ impl GINIndex {
         for &h in &self.id_map {
             w.write_all(&h.to_le_bytes())?;
         }
-        w.write_all(&(self.postings.len() as u32).to_le_bytes())?;
-        for (&trigram_hash, bm) in &self.postings {
-            let mut bm_bytes = Vec::new();
-            bm.serialize_into(&mut bm_bytes)?;
-            w.write_all(&trigram_hash.to_le_bytes())?;
-            w.write_all(&(bm_bytes.len() as u32).to_le_bytes())?;
-            w.write_all(&bm_bytes)?;
+        // Sorted trigram directory + concatenated bitmap blob (binary-searchable
+        // directly on the mmap by MappedGin). dir record = [u32 hash][u64 off][u32 len].
+        let mut entries: Vec<(u32, Vec<u8>)> = Vec::with_capacity(self.postings.len());
+        for (&h, bm) in &self.postings {
+            let mut bytes = Vec::new();
+            bm.serialize_into(&mut bytes)?;
+            entries.push((h, bytes));
         }
+        entries.sort_unstable_by_key(|(h, _)| *h);
+        w.write_all(&(entries.len() as u32).to_le_bytes())?;
+        let mut blob: Vec<u8> = Vec::new();
+        let mut dir: Vec<u8> = Vec::with_capacity(entries.len() * 16);
+        for (h, bytes) in &entries {
+            let off = blob.len() as u64;
+            dir.extend_from_slice(&h.to_le_bytes());
+            dir.extend_from_slice(&off.to_le_bytes());
+            dir.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            blob.extend_from_slice(bytes);
+        }
+        w.write_all(&dir)?;
+        w.write_all(&(blob.len() as u64).to_le_bytes())?;
+        w.write_all(&blob)?;
         Ok(())
     }
 
@@ -281,23 +321,36 @@ impl GINIndex {
             id_map.push(u64::from_le_bytes(u64buf));
         }
 
+        // Sorted trigram directory + bitmap blob (see write_binary). Read the dir,
+        // then slice each bitmap out of the blob.
         r.read_exact(&mut u32buf)?;
-        let postings_count = u32::from_le_bytes(u32buf) as usize;
-        let mut postings = HashMap::new();
-        for _ in 0..postings_count {
+        let trigram_count = u32::from_le_bytes(u32buf) as usize;
+        let mut dir: Vec<(u32, u64, u32)> = Vec::with_capacity(trigram_count);
+        for _ in 0..trigram_count {
             r.read_exact(&mut u32buf)?;
-            let trigram_hash = u32::from_le_bytes(u32buf);
+            let hash = u32::from_le_bytes(u32buf);
+            r.read_exact(&mut u64buf)?;
+            let off = u64::from_le_bytes(u64buf);
             r.read_exact(&mut u32buf)?;
-            let bm_len = u32::from_le_bytes(u32buf) as usize;
-            let mut bm_bytes = vec![0u8; bm_len];
-            r.read_exact(&mut bm_bytes)?;
-            let bm = roaring::RoaringBitmap::deserialize_from(&bm_bytes[..])
+            let len = u32::from_le_bytes(u32buf);
+            dir.push((hash, off, len));
+        }
+        r.read_exact(&mut u64buf)?;
+        let blob_len = u64::from_le_bytes(u64buf) as usize;
+        let mut blob = vec![0u8; blob_len];
+        r.read_exact(&mut blob)?;
+        let mut postings = HashMap::with_capacity(trigram_count);
+        for (hash, off, len) in dir {
+            let (o, l) = (off as usize, len as usize);
+            let bytes = blob.get(o..o + l)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "gin blob offset out of range"))?;
+            let bm = roaring::RoaringBitmap::deserialize_from(bytes)
                 .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-            postings.insert(trigram_hash, bm);
+            postings.insert(hash, bm);
         }
 
         let doc_count = id_map.len();
-        Ok((field.clone(), Self { postings, id_map, doc_count, field }))
+        Ok((field.clone(), Self { postings, id_map, doc_count, field, mapped: None }))
     }
 
     /// Get the number of unique trigrams indexed.
