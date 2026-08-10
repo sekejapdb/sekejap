@@ -4916,8 +4916,9 @@ impl CoreDB {
         // Sentinel: parent for the start node points to itself with a zero
         // edge_type hash so we can detect "we are at the root" during
         // reconstruction without a separate visited set.
-        // (from_hash, edge_type_hash, meta)
-        let mut parent: HashMap<u64, (u64, u64, Option<Value>)> = HashMap::new();
+        // (from_hash, edge_type_hash) — edge metadata is fetched lazily during
+        // reconstruction for the ~path-length edges only, not every visited edge.
+        let mut parent: HashMap<u64, (u64, u64)> = HashMap::new();
 
         // Same-node degenerate case
         if start == end {
@@ -4938,7 +4939,7 @@ impl CoreDB {
             return None;
         }
 
-        parent.insert(start, (start, 0, None)); // sentinel
+        parent.insert(start, (start, 0)); // sentinel
         let mut queue: VecDeque<u64> = VecDeque::new();
         queue.push_back(start);
 
@@ -4948,14 +4949,14 @@ impl CoreDB {
                     if parent.contains_key(&e.other) {
                         continue; // already visited
                     }
-                    parent.insert(e.other, (current, e.edge_type, self.edges.edge_meta(e)));
+                    parent.insert(e.other, (current, e.edge_type));
                     if e.other == end {
                         // Reconstruct path: walk parent map from end → start, then reverse.
                         let mut node_hashes: Vec<u64> = Vec::new();
                         let mut cur = end;
                         loop {
                             node_hashes.push(cur);
-                            let (prev, _, _) = parent[&cur];
+                            let (prev, _) = parent[&cur];
                             if prev == cur {
                                 break; // reached the sentinel (start node)
                             }
@@ -4963,23 +4964,32 @@ impl CoreDB {
                         }
                         node_hashes.reverse();
 
-                        // Build Hit list from the ordered hashes
+                        // Build Hit list from the ordered hashes. No payload read:
+                        // callers use only the slug (path node_slugs); a.*/b.* payloads
+                        // are bound separately, and predicates reload per node.
                         let nodes: Vec<query::Hit> = node_hashes
                             .iter()
                             .filter_map(|&h| {
                                 self.nodes.get(&h).map(|n| query::Hit {
                                     slug: n.slug.clone(),
                                     slug_hash: h,
-                                    payload: self.payload_store.get(n.payload_offset, n.payload_len),
+                                    payload: None,
                                 })
                             })
                             .collect();
 
-                        // Build EdgeHit list: edges[i] connects nodes[i] → nodes[i+1]
+                        // Build EdgeHit list for the path edges only. Edge metadata is
+                        // fetched here (path-length lookups) instead of for every edge
+                        // visited during the search.
                         let edges: Vec<EdgeHit> = node_hashes
                             .windows(2)
                             .map(|w| {
-                                let (_, edge_type_hash, meta) = parent[&w[1]].clone();
+                                let (_, edge_type_hash) = parent[&w[1]];
+                                let meta = self.edges.fwd_edges(w[0]).and_then(|es| {
+                                    es.iter()
+                                        .find(|e| e.other == w[1] && e.edge_type == edge_type_hash)
+                                        .and_then(|e| self.edges.edge_meta(e))
+                                });
                                 EdgeHit {
                                     from_slug: self.nodes.get(&w[0]).map(|n| n.slug.clone()),
                                     to_slug: self.nodes.get(&w[1]).map(|n| n.slug.clone()),
