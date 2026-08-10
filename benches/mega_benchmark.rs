@@ -517,13 +517,18 @@ fn bench_11_shortest_path(c: &mut Criterion) {
     let (sk, _dir) = setup_sekejap();
     let sq = setup_sqlite();
     let mut g = c.benchmark_group("11_shortest_path");
-    // sekejap: native BFS shortest path via MATCH SHORTEST SQL
+    let sql = "SELECT a._key AS start, b._key AS end, length(r) AS hops \
+               FROM MATCH SHORTEST (a:services)-[r*]->(b:services) \
+               WHERE a._key = 'svc200' AND b._key = 'svc0'";
+    // sekejap: native BFS shortest path via MATCH SHORTEST SQL (re-parsed each call).
     g.bench_function("sekejap_sql", |b| b.iter(|| black_box(
-        sk.query(
-            "SELECT a._key AS start, b._key AS end, length(r) AS hops \
-             FROM MATCH SHORTEST (a:services)-[r*]->(b:services) \
-             WHERE a._key = 'svc200' AND b._key = 'svc0'"
-        ).unwrap().count()
+        sk.query(sql).unwrap().count()
+    )));
+    // sekejap prepared — the fair comparison vs SQLite's prepare_cached below (both
+    // amortize parse/plan; measures pure BFS + row projection).
+    let prep = sk.prepare(sql).unwrap();
+    g.bench_function("sekejap_prepared", |b| b.iter(|| black_box(
+        sk.query_prepared(&prep, &[]).unwrap().count()
     )));
     // SQLite: recursive CTE shortest path (tree = no cycles, so UNION ALL + depth cap is safe)
     g.bench_function("sqlite", |b| b.iter(|| {
