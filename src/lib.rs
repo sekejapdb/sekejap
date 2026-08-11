@@ -1567,6 +1567,12 @@ impl CoreDB {
                 // the map, dict resident, postings pread. Also covers the clean-reopen
                 // case where BM25 was previously not restored at all.
                 let _ = db.load_bm25_base(&dir.join("bm25.bin"), dir);
+            } else {
+                // Resident mode: BM25 has no resident sidecar loader (bm25.bin serves
+                // the paged mmap path, and a mmap-backed index would silently drop live
+                // inserts). Rebuild into owned/mutable form. Without this, a clean
+                // reopen with no writes since compact serves EMPTY BM25.
+                db.rebuild_declared_bm25_indexes();
             }
         }
         let _ = wal_had_graph; // used only to determine topology was replayed (no index rebuild needed)
