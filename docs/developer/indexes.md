@@ -10,7 +10,7 @@ structure and where its bytes live.
 | scalar btree/hash | `WHERE x = / < / BETWEEN`, `ORDER BY` | heap btree (resident mode) or just the mmap window (paged) | mapped field-index sidecar |
 | graph adjacency | `FROM MATCH`, hops, shortest path | node → (offset, count) | forward/reverse CSR files (mmap) |
 | vector HNSW | `VECTOR_NEAR`, `<->` `<=>` `<#>` `<+>` | graph + int8 codes | full-precision f32 vectors |
-| text BM25 | `BM25(field, 'q')` | dictionary (term → offset) | postings blob (positional reads) |
+| text BM25 | `BM25(field, 'q')` | dictionary (term → offset), sub-linear | postings blob + doc arrays (mmap, no rebuild on open) |
 | positional search | `SEARCH('q')`, `SEARCH_SCORE()` | loaded structures | rebuildable sidecar |
 | trigram GIN | `ILIKE '%…%'` | postings | rebuildable sidecar |
 | spatial grid | `ST_DWithin`, `ST_Contains`, … | occupancy grid + cached polygon rings | geometry in payloads |
@@ -43,10 +43,15 @@ expansion, and the aggregation fast paths (frontier-merged counts — see
 
 ## Text: dictionary in RAM, postings on disk
 
-The BM25 index keeps the term dictionary resident and the postings blob on
-disk, read positionally per query term. A 57k-document corpus serves ranked
-search from 8.7 MB resident. The positional `search` index and the trigram GIN
-follow the same sidecar pattern and are always rebuildable.
+The BM25 index keeps the term dictionary resident — sub-linear in corpus size by
+Heaps' law, the chosen accelerator — while the postings blob is read positionally
+per query term from disk. The two O(N) pieces (per-doc lengths and the
+doc-id→slot map) are persisted to `bm25.bin` and, in paged mode, mmap'd rather
+than rebuilt: a flat u32 length array and a sorted `(doc_id, slot)` array
+binary-searched in place. So open is flat in corpus size (mmap, no rebuild) and
+resident heap stays tiny — a 50k corpus serves ranked search from ~14 KB paged.
+The positional `search` index and the trigram GIN follow the same sidecar
+pattern and are always rebuildable.
 
 ## Spatial: grid + cached rings
 

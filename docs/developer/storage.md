@@ -4,6 +4,26 @@ The disk-first contract: bulk bytes live on disk; RAM holds identity, offsets,
 and hot index structures. Every file below is either the source of truth
 (payloads, WAL) or rebuildable from it (everything else).
 
+## Design philosophy: fast open, RAM as accelerator
+
+> sekejap opens at lightspeed and treats RAM as a clever accelerator, not a
+> requirement.
+
+In paged mode every index *maps* its bytes from disk rather than *rebuilding*
+them, so **open time is flat in dataset size** — 10 K rows and 40 M rows open in
+the same milliseconds (measured: BM25 6.9 ms mmap vs 103.7 ms rebuild at 50 K).
+Data lives on disk and the OS page cache holds the hot working set. RAM is a
+small, bounded, deliberate boost — the target is a sub-linear resident footprint
+(≈10 B/doc; 40 M records → a few hundred MB), never an O(N) blow-up and never a
+rebuild-on-open tax. Three rules follow for every index:
+
+1. **Never rebuild on open** — persist it, mmap it, skip the rebuild.
+2. **No O(N) resident structure** — anything that grows with row count goes on
+   the mmap (sorted array + binary search, or a flat typed array). Only
+   sub-linear things (O(vocab), O(N/M)) may stay resident, as a chosen accelerator.
+3. **Resident mode unchanged** — the in-RAM path keeps its direct `Vec`/`HashMap`
+   structures; the mmap is paged-mode only, so there is no regression.
+
 ## File inventory
 
 | group | files | role |
