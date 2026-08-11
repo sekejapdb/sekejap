@@ -5011,6 +5011,43 @@ impl CoreDB {
         None // no path found
     }
 
+    /// Length-only shortest path: BFS returning just the hop count, with zero path
+    /// materialization — no `Hit`s, slugs, payloads, or edge metadata, and level-set
+    /// BFS instead of a per-node parent map. Powers the fast-path for simple
+    /// `MATCH SHORTEST` queries that only need `length(path)` + endpoint keys.
+    /// Same reachability semantics as `bfs_shortest_path`.
+    pub(crate) fn bfs_shortest_len(&self, start: u64, end: u64) -> Option<usize> {
+        use std::collections::HashSet;
+        if start == end {
+            return if self.nodes.contains_key(&start) { Some(0) } else { None };
+        }
+        if !self.nodes.contains_key(&start) {
+            return None;
+        }
+        let mut visited: HashSet<u64> = HashSet::new();
+        visited.insert(start);
+        let mut frontier: Vec<u64> = vec![start];
+        let mut depth = 0usize;
+        while !frontier.is_empty() {
+            depth += 1;
+            let mut next: Vec<u64> = Vec::new();
+            for &node in &frontier {
+                if let Some(edges) = self.edges.fwd_edges(node) {
+                    for e in edges {
+                        if e.other == end {
+                            return Some(depth);
+                        }
+                        if visited.insert(e.other) {
+                            next.push(e.other);
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        None
+    }
+
     /// Execute a `SHOW` introspection statement.
     ///
     /// Syntax:

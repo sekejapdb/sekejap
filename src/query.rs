@@ -7892,7 +7892,75 @@ fn finalize_rows(
 /// Execute a `SELECT … FROM MATCH SHORTEST` statement.
 ///
 /// Returns 0 rows when no path exists, 1 row when found (after predicate filtering).
+/// Fast-path for simple `MATCH SHORTEST` queries whose returns are only
+/// `length(path)` and endpoint `_key`/`_id`. Returns `Some(hits)` when it handled the
+/// query (including 0 rows for no-path), or `None` to signal "not simple — use the
+/// general path". Avoids BfsPath materialization, get_payload, PathRow, and eval_group.
+fn try_fast_shortest(db: &CoreDB, stmt: &ShortestSelectStmt) -> Option<Vec<Hit>> {
+    use crate::sk_hash;
+    enum FastRet { Len, StartKey, EndKey, StartId, EndId }
+
+    let mut plan: Vec<(String, FastRet)> = Vec::with_capacity(stmt.returns.len());
+    for (ret, alias) in &stmt.returns {
+        let fr = match ret {
+            MatchAggReturn::PathFn { var, kind: PathFnKind::Length }
+                if stmt.path_bind.as_deref() == Some(var.as_str()) => FastRet::Len,
+            MatchAggReturn::Field { var, field }
+                if var == &stmt.start_bind && field == "_key" => FastRet::StartKey,
+            MatchAggReturn::Field { var, field }
+                if var == &stmt.end_bind && field == "_key" => FastRet::EndKey,
+            MatchAggReturn::Field { var, field }
+                if var == &stmt.start_bind && field == "_id" => FastRet::StartId,
+            MatchAggReturn::Field { var, field }
+                if var == &stmt.end_bind && field == "_id" => FastRet::EndId,
+            _ => return None, // any other return shape → general path
+        };
+        plan.push((alias.clone(), fr));
+    }
+
+    let start = sk_hash(&stmt.from_slug);
+    let end = sk_hash(&stmt.to_slug);
+    let len = match db.bfs_shortest_len(start, end) {
+        Some(l) => l,
+        None => {
+            // Diagnose a genuinely-missing endpoint (cold path only).
+            if db.node_data(start).is_none() {
+                eprintln!("MATCH SHORTEST: start node '{}' not found — did you specify the collection? e.g. ({}:collection)",
+                    stmt.from_slug, stmt.start_bind);
+            } else if db.node_data(end).is_none() {
+                eprintln!("MATCH SHORTEST: end node '{}' not found — did you specify the collection? e.g. ({}:collection)",
+                    stmt.to_slug, stmt.end_bind);
+            }
+            return Some(vec![]); // handled: no path → no rows
+        }
+    };
+
+    let skey = stmt.from_slug.rsplit('/').next().unwrap_or(&stmt.from_slug);
+    let ekey = stmt.to_slug.rsplit('/').next().unwrap_or(&stmt.to_slug);
+    let mut map = serde_json::Map::with_capacity(plan.len());
+    for (alias, fr) in plan {
+        let v = match fr {
+            FastRet::Len      => Value::from(len as u64),
+            FastRet::StartKey => Value::from(skey),
+            FastRet::EndKey   => Value::from(ekey),
+            FastRet::StartId  => Value::from(stmt.from_slug.as_str()),
+            FastRet::EndId    => Value::from(stmt.to_slug.as_str()),
+        };
+        map.insert(alias, v);
+    }
+    Some(finalize_rows(vec![Value::Object(map)], stmt.order_by.as_ref(), stmt.limit))
+}
+
 pub fn execute_shortest_select(db: &CoreDB, stmt: ShortestSelectStmt) -> Vec<Hit> {
+    // Fast-path for simple shortest queries — returns limited to length(path) and
+    // endpoint _key/_id, no path predicates. Skips the full path materialization
+    // (Hits/slugs/payloads/edge-meta) + PathRow + eval_group + finalize projection.
+    if stmt.predicates.is_empty() {
+        if let Some(hits) = try_fast_shortest(db, &stmt) {
+            return hits;
+        }
+    }
+
     let row = match build_shortest_path_row(db, &stmt) {
         Some(r) => r,
         None    => return vec![],
