@@ -170,12 +170,58 @@ impl SlotIndex {
     }
 }
 
+/// slot → node hash. Resident `Vec<u64>` (heap mode, direct index — no regression) or
+/// a u64 array served from the mmap'd `search.bin` (paged, O(N)/8 B-per-doc off heap).
+pub(crate) enum IdMap {
+    Owned(Vec<u64>),
+    Mapped { view: std::sync::Arc<MmapView>, off: usize, count: usize },
+}
+impl IdMap {
+    #[inline]
+    pub(crate) fn get(&self, slot: usize) -> Option<u64> {
+        match self {
+            IdMap::Owned(v) => v.get(slot).copied(),
+            IdMap::Mapped { view, off, count } => {
+                if slot >= *count { return None; }
+                let s = view.slice(off + slot * 8, 8)?;
+                Some(u64::from_le_bytes(s.try_into().ok()?))
+            }
+        }
+    }
+    #[inline]
+    pub(crate) fn count(&self) -> usize {
+        match self { IdMap::Owned(v) => v.len(), IdMap::Mapped { count, .. } => *count }
+    }
+}
+
+/// Per-doc field lengths (norms), doc-major `num_fields` u16 each. Resident jagged
+/// `Vec<Vec<u16>>` (borrowed slice, no regression) or a flat u16 array on the mmap
+/// (paged; O(N·fields)/2 B off heap). Only read by SEARCH_SCORE ranking.
+pub(crate) enum Norms {
+    Owned(Vec<Vec<u16>>),
+    Mapped { view: std::sync::Arc<MmapView>, off: usize, doc_count: usize, num_fields: usize },
+}
+impl Norms {
+    #[inline]
+    pub(crate) fn doc_lengths(&self, slot: usize) -> Option<std::borrow::Cow<'_, [u16]>> {
+        match self {
+            Norms::Owned(v) => v.get(slot).map(|l| std::borrow::Cow::Borrowed(l.as_slice())),
+            Norms::Mapped { view, off, doc_count, num_fields } => {
+                if slot >= *doc_count { return None; }
+                let bytes = view.slice(off + slot * num_fields * 2, num_fields * 2)?;
+                Some(std::borrow::Cow::Owned(
+                    bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()))
+            }
+        }
+    }
+}
+
 pub struct SearchIndex {
     pub(crate) fields: Vec<String>,
-    pub(crate) id_map: Vec<u64>,
+    pub(crate) id_map: IdMap,
     pub(crate) id_to_slot: SlotIndex,
     pub(crate) doc_count: u32,
-    pub(crate) doc_field_lengths: Vec<Vec<u16>>,
+    pub(crate) doc_field_lengths: Norms,
     /// FST mapping term → byte offset into `postings_data`.
     pub(crate) fst_data: Bytes,
     /// Contiguous serialized RoaringBitmaps: at each offset, [len: u32 LE][bitmap bytes].
@@ -278,10 +324,10 @@ impl SearchIndex {
 
         SearchIndex {
             fields,
-            id_map,
+            id_map: IdMap::Owned(id_map),
             id_to_slot: SlotIndex::Resident(id_to_slot),
             doc_count,
-            doc_field_lengths,
+            doc_field_lengths: Norms::Owned(doc_field_lengths),
             fst_data: Bytes::Owned(fst_data),
             postings_data: Bytes::Owned(postings_data),
             field_post,
@@ -520,8 +566,8 @@ impl SearchIndex {
 
     fn cascade_exactness(&self, query_terms: &[String], slot: u32) -> f64 {
         let qlen = query_terms.len() as u16;
-        if let Some(lengths) = self.doc_field_lengths.get(slot as usize) {
-            for &flen in lengths {
+        if let Some(lengths) = self.doc_field_lengths.doc_lengths(slot as usize) {
+            for &flen in lengths.iter() {
                 if flen == qlen { return 1.0; }
             }
             if let Some(&min_len) = lengths.iter().filter(|&&l| l > 0).min() {
@@ -534,7 +580,7 @@ impl SearchIndex {
     }
 
     pub fn slot_to_hash(&self, slot: u32) -> Option<u64> {
-        self.id_map.get(slot as usize).copied()
+        self.id_map.get(slot as usize)
     }
 
     pub fn hash_to_slot(&self, hash: u64) -> Option<u32> {
