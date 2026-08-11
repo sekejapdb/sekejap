@@ -37,6 +37,11 @@ impl TermDict {
     pub fn num_terms(&self) -> usize {
         self.entries.len()
     }
+
+    /// Iterate `(term, entry)` pairs — for serialization.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &TermEntry)> {
+        self.entries.iter().map(|(k, v)| (k.as_str(), v))
+    }
 }
 
 impl Default for TermDict {
