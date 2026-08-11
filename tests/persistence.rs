@@ -571,3 +571,47 @@ fn hnsw_version_mismatch_triggers_rebuild() {
         assert_eq!(results[0].slug, "docs/d1");
     }
 }
+
+/// Regression: a clean RESIDENT reopen (CoreDB::open, no writes since compact)
+/// must serve BM25 results. BM25 has no resident sidecar loader, so open() must
+/// rebuild it; without that, a clean reopen silently returns empty BM25. This is
+/// the production (embedded/server) open path — see invariants.md Pillar 4.
+#[test]
+fn bm25_resident_reopen_serves_results() {
+    let dir = tmpdir();
+
+    // Step 1: build a BM25 index, compact (writes bm25.bin + records version),
+    // and confirm the query works before reopen.
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE docs (body TEXT)").unwrap();
+        db.execute("CREATE INDEX ON docs USING bm25 (body)").ok();
+        for i in 0..60 {
+            let body = if i % 3 == 0 { "coffee melbourne" } else { "tea sydney" };
+            db.put(&format!("docs/d{i}"), &format!(r#"{{"_collection":"docs","body":"{body}"}}"#))
+                .unwrap();
+        }
+        db.build_bm25_index("body");
+        db.compact().unwrap();
+        let hits = db
+            .query("SELECT _key FROM docs WHERE BM25(body, 'coffee') > 0.0")
+            .unwrap()
+            .collect()
+            .len();
+        assert_eq!(hits, 20, "BM25 must return results before reopen");
+    }
+
+    // Step 2: clean resident reopen — no explicit rebuild. BM25 must still serve.
+    {
+        let db = CoreDB::open(dir.path()).unwrap();
+        let hits = db
+            .query("SELECT _key FROM docs WHERE BM25(body, 'coffee') > 0.0")
+            .unwrap()
+            .collect()
+            .len();
+        assert_eq!(
+            hits, 20,
+            "resident reopen must serve BM25 (rebuilt on open), not empty"
+        );
+    }
+}
