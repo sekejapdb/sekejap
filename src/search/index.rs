@@ -134,10 +134,46 @@ fn bucket_from_key(k: &[u8]) -> u16 {
     if n >= 2 { u16::from_be_bytes([k[n - 2], k[n - 1]]) } else { 0 }
 }
 
+/// Reverse index hash → slot. Resident mode keeps the `HashMap` (fast, no
+/// regression). Paged mode serves it from a sorted `(hash:u64, slot:u32)` array in
+/// the mmap'd `search.bin` (12 B/rec, binary search) — so the ~O(N) HashMap (the
+/// largest resident piece of a mapped SEARCH index) never enters the heap.
+pub(crate) enum SlotIndex {
+    Resident(HashMap<u64, u32>),
+    Mapped(Bytes),
+}
+impl SlotIndex {
+    #[inline]
+    pub(crate) fn get(&self, hash: u64) -> Option<u32> {
+        match self {
+            SlotIndex::Resident(m) => m.get(&hash).copied(),
+            SlotIndex::Mapped(b) => {
+                let data = b.as_slice();
+                let n = data.len() / 12;
+                let (mut lo, mut hi) = (0isize, n as isize - 1);
+                while lo <= hi {
+                    let mid = ((lo + hi) / 2) as usize;
+                    let o = mid * 12;
+                    let h = u64::from_le_bytes(data[o..o + 8].try_into().ok()?);
+                    if h == hash {
+                        return u32::from_le_bytes(data[o + 8..o + 12].try_into().ok()?).into();
+                    } else if h < hash { lo = mid as isize + 1; } else { hi = mid as isize - 1; }
+                }
+                None
+            }
+        }
+    }
+    pub(crate) fn remove(&mut self, hash: u64) {
+        // Deletions only mutate the resident overlay; the mmap base is immutable
+        // (deleted docs are excluded via node existence at query time, like GIN/BM25).
+        if let SlotIndex::Resident(m) = self { m.remove(&hash); }
+    }
+}
+
 pub struct SearchIndex {
     pub(crate) fields: Vec<String>,
     pub(crate) id_map: Vec<u64>,
-    pub(crate) id_to_slot: HashMap<u64, u32>,
+    pub(crate) id_to_slot: SlotIndex,
     pub(crate) doc_count: u32,
     pub(crate) doc_field_lengths: Vec<Vec<u16>>,
     /// FST mapping term → byte offset into `postings_data`.
@@ -243,7 +279,7 @@ impl SearchIndex {
         SearchIndex {
             fields,
             id_map,
-            id_to_slot,
+            id_to_slot: SlotIndex::Resident(id_to_slot),
             doc_count,
             doc_field_lengths,
             fst_data: Bytes::Owned(fst_data),
@@ -502,7 +538,7 @@ impl SearchIndex {
     }
 
     pub fn hash_to_slot(&self, hash: u64) -> Option<u32> {
-        self.id_to_slot.get(&hash).copied()
+        self.id_to_slot.get(hash)
     }
 
     pub fn delete(&mut self, hash: u64) {
@@ -510,7 +546,7 @@ impl SearchIndex {
         // be mmap-backed — deletion is tracked by removing the hash from id_to_slot.
         // Deleted docs are excluded at search time via id_to_slot; score() only runs
         // on live slots, so a stale slot lingering in a bitmap is harmless.
-        self.id_to_slot.remove(&hash);
+        self.id_to_slot.remove(hash);
     }
 }
 

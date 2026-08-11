@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
-use super::index::{Bytes, MappedPostings, SearchIndex};
+use super::index::{Bytes, MappedPostings, SearchIndex, SlotIndex};
 use crate::storage::mmap::MmapView;
 
 const MAGIC: &[u8; 8] = b"SKSRCH02";
-// v3: field/position bitmaps stored as FST+blob (MappedPostings), not HashMap dumps,
-// so they can be mmap-served in paged mode. Older (v2) files fail the version check
-// and are transparently rebuilt.
-pub const SEARCH_INDEX_VERSION: u32 = 3;
+// v4: append a sorted (hash,slot) reverse index so paged mode serves hash→slot from
+// the mmap (no resident id_to_slot HashMap). Older files fail the check and rebuild.
+pub const SEARCH_INDEX_VERSION: u32 = 4;
 
 impl SearchIndex {
     pub fn write_binary<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -51,6 +50,17 @@ impl SearchIndex {
         // Position/proximity postings (FST + bitmap blob)
         write_blob(w, self.position_post.fst.as_slice())?;
         write_blob(w, self.position_post.blob.as_slice())?;
+
+        // Sorted (hash:u64, slot:u32) reverse index — lets paged mode binary-search
+        // hash→slot off the mmap instead of holding the id_to_slot HashMap resident.
+        let mut pairs: Vec<(u64, u32)> = self.id_map.iter().enumerate()
+            .map(|(slot, &hash)| (hash, slot as u32)).collect();
+        pairs.sort_unstable_by_key(|(h, _)| *h);
+        w.write_all(&(pairs.len() as u32).to_le_bytes())?;
+        for (hash, slot) in &pairs {
+            w.write_all(&hash.to_le_bytes())?;
+            w.write_all(&slot.to_le_bytes())?;
+        }
 
         Ok(())
     }
@@ -111,10 +121,16 @@ impl SearchIndex {
             blob: Bytes::Owned(read_blob(r)?),
         };
 
+        // Sorted (hash,slot) reverse index — resident mode keeps the HashMap built
+        // above from id_map, so just consume this section to advance the stream.
+        let sorted_count = read_u32(r)? as usize;
+        let mut skip = vec![0u8; sorted_count * 12];
+        r.read_exact(&mut skip)?;
+
         Ok(SearchIndex {
             fields,
             id_map,
-            id_to_slot,
+            id_to_slot: SlotIndex::Resident(id_to_slot),
             doc_count,
             doc_field_lengths,
             fst_data,
@@ -153,14 +169,12 @@ impl SearchIndex {
             fields.push(read_string(&mut r)?);
         }
 
-        // ID map (resident)
+        // ID map (resident; small — 8 B/doc). The reverse hash→slot index is served
+        // from the mmap'd sorted section below, not a resident HashMap.
         let doc_count = read_u32(&mut r)?;
         let mut id_map = Vec::with_capacity(doc_count as usize);
-        let mut id_to_slot = HashMap::with_capacity(doc_count as usize);
-        for slot in 0..doc_count {
-            let hash = read_u64(&mut r)?;
-            id_to_slot.insert(hash, slot);
-            id_map.push(hash);
+        for _ in 0..doc_count {
+            id_map.push(read_u64(&mut r)?);
         }
 
         // Doc field lengths / norms (resident)
@@ -184,6 +198,13 @@ impl SearchIndex {
         let postings_data = map_blob(&mut r)?;
         let field_post = MappedPostings { fst: map_blob(&mut r)?, blob: map_blob(&mut r)? };
         let position_post = MappedPostings { fst: map_blob(&mut r)?, blob: map_blob(&mut r)? };
+
+        // Sorted (hash,slot) reverse index → mmap slice (12 B/rec), binary-searched.
+        let sorted_count = read_u32(&mut r)? as usize;
+        let sorted_off = base + r.position() as usize;
+        let sorted_len = sorted_count * 12;
+        r.seek(io::SeekFrom::Current(sorted_len as i64))?;
+        let id_to_slot = SlotIndex::Mapped(Bytes::Mapped { view: view.clone(), off: sorted_off, len: sorted_len });
 
         let consumed = r.position() as usize;
         Ok((SearchIndex {
