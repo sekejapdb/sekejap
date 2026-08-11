@@ -79,5 +79,30 @@ storage. The core stays single-writer; the wrapper only orchestrates.
 
 ## Invariants
 
-Before touching `open()`, the write path, or compaction, read the startup and
-memory checklists in [invariants.md](invariants.md).
+Three pillars hold across every change (the enforcement checklists, decision
+trees, and thresholds live in [invariants.md](invariants.md)):
+
+- **Fast startup** — `open()` is flat in dataset size: it *maps* indexes from
+  disk, it does not *rebuild* them from payloads.
+- **Disk-first memory** — RAM ∝ metadata + hot indexes, never ∝ payload size.
+- **Fast queries** — cost ∝ result size, not dataset size.
+
+They share one root: *payloads live on disk; everything else is a rebuildable
+accelerator.* That root also defines what stays **stable across versions** —
+three rings, outermost the most stable:
+
+1. **SGQL (the language)** — the portable contract. A logical dump/restore in
+   SGQL round-trips a database between *any* two versions, independent of the
+   binary layout (the `sqlite .dump` / `pg_dump` guarantee). Never break SGQL.
+2. **Source-of-truth files** — `payloads.bin`, raw `vectors_*.bin`, topology,
+   WAL. The physical fast path: stable with an explicit migration reader, never
+   a silent reformat.
+3. **Derived accelerators** — `gin.bin`, `search.bin`, `bm25.bin`, the spatial
+   grid, HNSW. Free to change every release; a version bump just rebuilds them
+   on open.
+
+Because most improvements touch only ring 3, a database survives sekejap
+upgrades untouched; ring 2 covers the rare physical change; ring 1 is the escape
+hatch that makes even a physical break recoverable. Before touching `open()`,
+the write path, or compaction, read the checklists in
+[invariants.md](invariants.md).

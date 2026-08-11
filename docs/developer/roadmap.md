@@ -134,10 +134,19 @@ Near-term core polish includes:
   the change feed already uses). Each typed language surface would expose this
   as a non-null, existence-checked reference (`ref(...)` / `Ref<T>`).
 
-- **On-disk format stability** — a whole-database format version, checked on
-  open, with a documented compatibility policy so a format change is a detectable,
-  migratable step rather than a surprise. The durable log is already versioned;
-  this extends that guarantee across the whole store.
+- **Format & language stability** — the compatibility contract is defined in
+  [invariants.md](invariants.md#pillar-4--format--language-stability) (three
+  rings: SGQL language, source-of-truth files, derived accelerators). Two pieces
+  remain to build:
+  - **Whole-database format version** — a single store-level version stamped in
+    the manifest and checked on open, so a Ring-2 physical change is a detectable,
+    migratable step. Per-file `[magic][version]` headers already exist; this
+    unifies them into one checked contract with migration readers.
+  - **SGQL logical dump/restore** — `dump` emits a database as portable SGQL
+    text (`CREATE TABLE` + `INSERT` + edge `link`); `load` replays it. Version-
+    independent by construction (the `sqlite .dump` / `pg_dump` escape hatch), so
+    a database can always move between any two sekejap versions regardless of the
+    binary layout. This is the strongest safety net and does not exist yet.
 
 - **Disk-first spatial at scale** — serving spatial queries (not just counts)
   from the on-disk spatial index with bounded memory, for large map/geo datasets
