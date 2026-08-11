@@ -359,3 +359,62 @@ It clears the WAL and ensures:
 **In Rust:** `db.compact().unwrap()`
 
 After compact, `open()` should always be < 1 second for any dataset.
+
+---
+
+## Pillar 4 — Format & language stability
+
+A database must survive a sekejap upgrade. The guarantee is layered as three
+rings (see [core.md](core.md#invariants) for the principle); this section is the
+enforcement detail — which files are a compatibility surface, and the policy for
+changing each.
+
+### Ring 1 — SGQL (the language): the portable contract
+
+The strongest guarantee, because it is independent of the binary layout. A
+logical dump emits a database as SGQL text (`CREATE TABLE …`, `INSERT …`, edge
+`link` statements); a load replays it. As long as SGQL parses the same, a dump
+from **any** version loads into **any** other version — the `sqlite .dump` /
+`pg_dump` escape hatch. This makes SGQL-stability the top invariant: even if a
+Ring-2 physical format ever *must* break, logical dump/restore bridges it, so
+data is never trapped in an old version.
+
+- **Never remove or repurpose SGQL surface** that a stored database could depend
+  on for round-trip (statement forms, type names, edge syntax). Additive is fine.
+- The dump/restore tool itself is roadmap (`roadmap.md`), not yet built; this
+  invariant governs it once it exists.
+
+### Ring 2 — source-of-truth files: stable *with migration*
+
+These cannot be regenerated from anything else, so their on-disk format **is** a
+compatibility surface:
+
+| file | holds |
+|---|---|
+| `payloads.bin` + `field_table.bin` | record bytes + shared field-name table |
+| `vectors_{field}.bin` | raw f32 vectors |
+| topology snapshot — `nodes.bin`, `idx.bin`, `adj_fwd/rev.bin`, `slugs.bin`, `dict.bin`, `collections.bin`, `edgemeta.bin` | ids, adjacency, names |
+| `wal.log`, snapshot manifest | durable log + versioned manifest |
+
+Policy:
+- Every file carries a `[magic][version]` header. An unknown version **fails
+  loudly**, never corrupts (the safety floor — already in place).
+- A format change ships an explicit **migration reader** (old → new). Never a
+  silent reformat, because there is no source to rebuild these from.
+- Ring 1 (SGQL dump/restore) is always the fallback if migration is infeasible.
+
+### Ring 3 — derived accelerators: free to change
+
+`gin.bin`, `search.bin`, `bm25.bin`, the spatial grid, HNSW — pure caches of
+Ring 2. A format change needs **no migration**: bump the version, and open
+rebuilds the sidecar from source (the GIN/HNSW decision trees above already do
+this). Their format is explicitly **not** part of the compatibility contract, so
+most improvements land here with zero data risk. (The BM25 disk-first change is
+the worked example: `bm25.bin` got a new format; existing stores just rebuild it.)
+
+### Change checklist
+
+- [ ] Does the change alter a Ring-2 file format? → migration reader required;
+      do not merge without it.
+- [ ] Does it alter a Ring-3 sidecar? → bump its version; confirm open rebuilds.
+- [ ] Does it change any SGQL surface? → must stay additive / round-trippable.
