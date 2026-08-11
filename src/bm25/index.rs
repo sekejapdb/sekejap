@@ -40,8 +40,71 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use std::sync::Arc;
+use crate::storage::mmap::MmapView;
 use super::dict::TermDict;
 use super::postings::{decode_postings_from_bytes, encode_postings_to_file, Posting};
+
+/// Per-doc token counts. Resident `Vec<u32>` (heap mode — no regression) or a mmap'd
+/// u32 array (paged, O(N)·4 B off heap).
+pub enum DocLens {
+    Owned(Vec<u32>),
+    Mapped { view: Arc<MmapView>, off: usize, count: usize },
+}
+impl DocLens {
+    #[inline]
+    pub fn get(&self, idx: usize) -> u32 {
+        match self {
+            DocLens::Owned(v) => v.get(idx).copied().unwrap_or(0),
+            DocLens::Mapped { view, off, count } => {
+                if idx >= *count { return 0; }
+                view.slice(off + idx * 4, 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])).unwrap_or(0)
+            }
+        }
+    }
+    #[inline]
+    pub fn len(&self) -> usize { match self { DocLens::Owned(v) => v.len(), DocLens::Mapped { count, .. } => *count } }
+}
+
+/// doc_id (node hash) → slot index. Resident `HashMap` (heap mode) or a mmap'd sorted
+/// `(doc_id:u64, idx:u32)` array (paged, binary-searched) — the largest O(N) BM25 piece.
+pub enum DocIdx {
+    Owned(HashMap<u64, usize>),
+    Mapped { view: Arc<MmapView>, off: usize, count: usize },
+}
+impl DocIdx {
+    #[inline]
+    pub fn get(&self, doc_id: u64) -> Option<usize> {
+        match self {
+            DocIdx::Owned(m) => m.get(&doc_id).copied(),
+            DocIdx::Mapped { view, off, count } => {
+                let data = view.slice(*off, count * 12)?;
+                let (mut lo, mut hi) = (0isize, *count as isize - 1);
+                while lo <= hi {
+                    let mid = ((lo + hi) / 2) as usize;
+                    let o = mid * 12;
+                    let id = u64::from_le_bytes(data[o..o + 8].try_into().ok()?);
+                    if id == doc_id {
+                        return Some(u32::from_le_bytes(data[o + 8..o + 12].try_into().ok()?) as usize);
+                    } else if id < doc_id { lo = mid as isize + 1; } else { hi = mid as isize - 1; }
+                }
+                None
+            }
+        }
+    }
+    pub fn remove(&mut self, doc_id: u64) { if let DocIdx::Owned(m) = self { m.remove(&doc_id); } }
+    pub fn len(&self) -> usize { match self { DocIdx::Owned(m) => m.len(), DocIdx::Mapped { count, .. } => *count } }
+    pub fn sorted(&self) -> Vec<(u64, u32)> {
+        match self {
+            DocIdx::Owned(m) => {
+                let mut v: Vec<(u64, u32)> = m.iter().map(|(&k, &i)| (k, i as u32)).collect();
+                v.sort_unstable_by_key(|(k, _)| *k);
+                v
+            }
+            DocIdx::Mapped { .. } => Vec::new(),
+        }
+    }
+}
 
 /// The compressed postings blob — the index's one large structure. Held either
 /// in RAM (ephemeral DBs) or **on disk** (disk-first): term ranges are read via
@@ -170,14 +233,14 @@ pub struct Bm25Index {
     /// stored in `doc_id_to_idx`.  Slots belonging to deleted
     /// documents become unreachable orphans; each wastes exactly
     /// 4 bytes until the next rebuild.
-    doc_lengths: Vec<u32>,
+    doc_lengths: DocLens,
     /// Maps a node hash (`sk_hash(slug)`) to its slot index in
     /// `doc_lengths`.
     ///
     /// This is the single source of truth for document liveness:
     /// removing an entry here is sufficient to exclude the document
     /// from all future search results.
-    doc_id_to_idx: HashMap<u64, usize>,
+    doc_id_to_idx: DocIdx,
     /// Running total of token counts across **live** documents only.
     ///
     /// Decremented by [`delete`] so that [`avg_doc_len`] stays
@@ -194,8 +257,8 @@ impl Bm25Index {
     pub fn mem_bytes(&self) -> usize {
         self.postings.mem_bytes()
             + self.dict.mem_bytes()
-            + self.doc_lengths.capacity() * 4
-            + self.doc_id_to_idx.capacity() * (8 + 8 + 8)
+            + match &self.doc_lengths { DocLens::Owned(v) => v.capacity() * 4, DocLens::Mapped { .. } => 0 }
+            + match &self.doc_id_to_idx { DocIdx::Owned(m) => m.capacity() * 24, DocIdx::Mapped { .. } => 0 }
     }
 
     /// Spill the postings blob to `path` and switch to disk-backed reads,
@@ -212,6 +275,112 @@ impl Bm25Index {
             self.postings = PostingsBlob::Disk { file: f, len };
         }
         Ok(())
+    }
+
+    /// Serialize the resident metadata (dict + doc_lengths + doc_id_to_idx + counters)
+    /// to the bm25.bin container. Postings stay in the separate `bm25_<field>.postings`
+    /// file (already spilled). Format is documented in `open_mapped`.
+    pub(crate) fn write_binary<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        let fb = self.meta.field.as_bytes();
+        w.write_all(&(fb.len() as u16).to_le_bytes())?;
+        w.write_all(fb)?;
+        w.write_all(&self.meta.num_docs.to_le_bytes())?;
+        w.write_all(&self.sum_doc_len.to_le_bytes())?;
+        // doc_lengths (u32 array)
+        let dc = self.doc_lengths.len();
+        w.write_all(&(dc as u32).to_le_bytes())?;
+        for i in 0..dc { w.write_all(&self.doc_lengths.get(i).to_le_bytes())?; }
+        // doc_id_to_idx (sorted (u64,u32) array)
+        let idmap = self.doc_id_to_idx.sorted();
+        w.write_all(&(idmap.len() as u32).to_le_bytes())?;
+        for (id, idx) in &idmap {
+            w.write_all(&id.to_le_bytes())?;
+            w.write_all(&idx.to_le_bytes())?;
+        }
+        // dict (term → postings location), loaded resident on open
+        let terms: Vec<(&str, &super::dict::TermEntry)> = self.dict.iter().collect();
+        w.write_all(&(terms.len() as u32).to_le_bytes())?;
+        for (term, e) in &terms {
+            let tb = term.as_bytes();
+            w.write_all(&(tb.len() as u16).to_le_bytes())?;
+            w.write_all(tb)?;
+            w.write_all(&e.postings_offset.to_le_bytes())?;
+            w.write_all(&e.postings_len.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Disk-first open of one field's BM25 index from an mmap'd bm25.bin at `base`.
+    /// The two O(N) doc arrays are served from the map; the dict is loaded resident
+    /// (the deliberate accelerator — sub-linear in N); postings are `pread` from the
+    /// spilled `bm25_<field>.postings` file. Returns the index + bytes consumed.
+    /// Layout: [u16 field_len][field][u64 num_docs][u64 sum_doc_len]
+    ///   [u32 doc_count][doc_count × u32 lengths]
+    ///   [u32 idmap_count][idmap_count × (u64 id, u32 idx)]
+    ///   [u32 term_count][term_count × (u16 tlen, term, u64 off, u32 len)]
+    pub(crate) fn open_mapped(view: &Arc<MmapView>, base: usize, dir: &std::path::Path) -> std::io::Result<(Self, usize)> {
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+        let total = view.len();
+        let b = view.slice(base, total.saturating_sub(base)).ok_or_else(|| bad("bm25 blob range"))?;
+        let ru16 = |b: &[u8], p: usize| u16::from_le_bytes([b[p], b[p + 1]]);
+        let ru32 = |b: &[u8], p: usize| u32::from_le_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]]);
+        let ru64 = |b: &[u8], p: usize| u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
+
+        let mut p = 0usize;
+        let flen = ru16(b, p) as usize; p += 2;
+        let field = std::str::from_utf8(b.get(p..p + flen).ok_or_else(|| bad("bm25 field"))?)
+            .map_err(|_| bad("bm25 field utf8"))?.to_string();
+        p += flen;
+        let num_docs = ru64(b, p); p += 8;
+        let sum_doc_len = ru64(b, p); p += 8;
+
+        let doc_count = ru32(b, p) as usize; p += 4;
+        let dl_off = base + p; p += doc_count * 4;
+
+        let idmap_count = ru32(b, p) as usize; p += 4;
+        let idmap_off = base + p; p += idmap_count * 12;
+
+        let term_count = ru32(b, p) as usize; p += 4;
+        let mut dict = TermDict::new();
+        for _ in 0..term_count {
+            let tlen = ru16(b, p) as usize; p += 2;
+            let term = std::str::from_utf8(b.get(p..p + tlen).ok_or_else(|| bad("bm25 term"))?)
+                .map_err(|_| bad("bm25 term utf8"))?;
+            p += tlen;
+            let off = ru64(b, p); p += 8;
+            let len = ru32(b, p); p += 4;
+            dict.insert(term.to_string(), off, len);
+        }
+
+        // Postings: pread from the spilled per-field file.
+        let ppath = dir.join(format!("bm25_{field}.postings"));
+        let pfile = std::fs::File::open(&ppath)?;
+        let plen = pfile.metadata()?.len();
+        #[cfg(unix)]
+        let postings = PostingsBlob::Disk { file: pfile, len: plen };
+        #[cfg(not(unix))]
+        let postings = { let _ = (pfile, plen); PostingsBlob::Memory(std::fs::read(&ppath)?) };
+
+        let avg = if num_docs == 0 { 1.0 } else { sum_doc_len as f64 / num_docs as f64 };
+        let index = Bm25Index {
+            meta: Bm25Meta { num_docs, avg_doc_len: avg, field },
+            dict,
+            postings,
+            doc_lengths: DocLens::Mapped { view: view.clone(), off: dl_off, count: doc_count },
+            doc_id_to_idx: DocIdx::Mapped { view: view.clone(), off: idmap_off, count: idmap_count },
+            sum_doc_len,
+        };
+        Ok((index, p))
+    }
+
+    /// True when the doc arrays are served from the mmap (paged, disk-first).
+    pub(crate) fn is_disk_backed(&self) -> bool {
+        matches!(self.doc_lengths, DocLens::Mapped { .. })
+    }
+
+    /// The indexed field name.
+    pub(crate) fn field_name(&self) -> &str {
+        &self.meta.field
     }
 
     /// Build a BM25 index from a document iterator.
@@ -308,8 +477,8 @@ impl Bm25Index {
             meta,
             dict,
             postings: PostingsBlob::Memory(all_postings),
-            doc_lengths,
-            doc_id_to_idx,
+            doc_lengths: DocLens::Owned(doc_lengths),
+            doc_id_to_idx: DocIdx::Owned(doc_id_to_idx),
             sum_doc_len,
         }
     }
@@ -385,7 +554,7 @@ impl Bm25Index {
                     None => continue,
                 };
 
-                let doc_len = self.doc_lengths[doc_idx] as f64;
+                let doc_len = self.doc_lengths.get(doc_idx) as f64;
                 let tf = posting.freq as f64;
 
                 // Standard BM25 formula:
@@ -450,11 +619,11 @@ impl Bm25Index {
     /// [`orphan_count`]: Bm25Index::orphan_count
     /// [`needs_rebuild`]: Bm25Index::needs_rebuild
     pub fn delete(&mut self, doc_id: u64) -> bool {
-        if let Some(&idx) = self.doc_id_to_idx.get(&doc_id) {
-            let doc_len = self.doc_lengths[idx] as u64;
+        if let Some(idx) = self.doc_id_to_idx.get(doc_id) {
+            let doc_len = self.doc_lengths.get(idx) as u64;
             self.sum_doc_len = self.sum_doc_len.saturating_sub(doc_len);
             self.meta.num_docs = self.meta.num_docs.saturating_sub(1);
-            self.doc_id_to_idx.remove(&doc_id);
+            self.doc_id_to_idx.remove(doc_id);
             // doc_lengths[idx] becomes an unreachable orphan slot.
             true
         } else {
@@ -552,7 +721,7 @@ impl Bm25Index {
     /// Returns `None` if the document has been deleted or was never
     /// indexed.
     fn doc_id_to_index(&self, doc_id: u64) -> Option<usize> {
-        self.doc_id_to_idx.get(&doc_id).copied()
+        self.doc_id_to_idx.get(doc_id)
     }
 }
 

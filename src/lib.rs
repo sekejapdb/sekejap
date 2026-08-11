@@ -1563,6 +1563,10 @@ impl CoreDB {
             // int8+CSR fast path without a resident graph rebuild.
             if db.topo_base.is_some() {
                 let _ = db.load_vector_base(&dir.join("vecidx.bin"));
+                // BM25: mmap dict/doc-arrays from bm25.bin (disk-first) — doc arrays off
+                // the map, dict resident, postings pread. Also covers the clean-reopen
+                // case where BM25 was previously not restored at all.
+                let _ = db.load_bm25_base(&dir.join("bm25.bin"), dir);
             }
         }
         let _ = wal_had_graph; // used only to determine topology was replayed (no index rebuild needed)
@@ -3652,6 +3656,8 @@ impl CoreDB {
         // Compact vector indexes (int8 + CSR) sidecar — lets a paged reopen mmap them
         // instead of rebuilding the HNSW graph resident.
         self.save_vector_binary(&dir.join("vecidx.bin"))?;
+        // BM25 metadata sidecar (dict + doc arrays) for disk-first paged reopen.
+        self.save_bm25_binary(&dir.join("bm25.bin"))?;
         Ok(())
     }
 
@@ -3830,6 +3836,58 @@ impl CoreDB {
             }
         }
         for (field, ci) in loaded { self.compact_indexes.insert(field, ci); }
+        true
+    }
+
+    /// Persist BM25 metadata (dict + doc arrays) to bm25.bin so a paged reopen can
+    /// mmap it instead of rebuilding. Postings stay in the `bm25_<field>.postings`
+    /// files. Skipped when any index is already mmap-backed (the file is authoritative).
+    fn save_bm25_binary(&self, path: &Path) -> io::Result<()> {
+        use std::io::Write;
+        if self.bm25_indexes.is_empty() { return Ok(()); }
+        if self.bm25_indexes.values().any(|ix| ix.is_disk_backed()) { return Ok(()); }
+        let tmp = path.with_extension("bin.tmp");
+        let mut f = std::io::BufWriter::new(
+            std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?
+        );
+        f.write_all(b"SKBM2501")?;
+        f.write_all(&(self.bm25_indexes.len() as u32).to_le_bytes())?;
+        for ix in self.bm25_indexes.values() {
+            ix.write_binary(&mut f)?;
+        }
+        f.flush()?;
+        f.get_ref().sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Disk-first (paged): mmap bm25.bin and serve each field's BM25 index — doc
+    /// arrays off the map, dict loaded resident (the accelerator), postings `pread`
+    /// from their spilled files. Returns false on any problem → caller rebuilds.
+    fn load_bm25_base(&mut self, path: &Path, dir: &Path) -> bool {
+        use std::sync::Arc;
+        let file = match std::fs::File::open(path) { Ok(f) => f, Err(_) => return false };
+        let len = match file.metadata() { Ok(m) => m.len() as usize, Err(_) => return false };
+        if len < 12 { return false; }
+        let view = match storage::mmap::MmapView::try_new(&file, len) {
+            Some(v) => Arc::new(v),
+            None => return false,
+        };
+        let hdr = match view.slice(0, 12) { Some(h) => h, None => return false };
+        if &hdr[..8] != b"SKBM2501" { return false; }
+        let count = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        let mut pos = 12usize;
+        let mut loaded = Vec::with_capacity(count);
+        for _ in 0..count {
+            match bm25::Bm25Index::open_mapped(&view, pos, dir) {
+                Ok((ix, consumed)) => { pos += consumed; loaded.push(ix); }
+                Err(_) => return false,
+            }
+        }
+        for ix in loaded {
+            self.bm25_indexes.insert(ix.field_name().to_string(), ix);
+        }
         true
     }
 
@@ -6618,6 +6676,11 @@ impl CoreDB {
         }
         self.bm25_indexes.insert(field.to_string(), index);
         self.record_index_version("bm25", field, BM25_INDEX_VERSION);
+        // Persist metadata (dict + doc arrays) so a paged reopen can mmap it instead
+        // of rebuilding. Postings are already spilled above.
+        if let Some(dir) = self.data_dir.clone() {
+            let _ = self.save_bm25_binary(&dir.join("bm25.bin"));
+        }
     }
 
     /// Search the BM25 index for `field` and return the top-`top_k`
@@ -8569,6 +8632,47 @@ mod hybrid_query_tests {
             "paged vector index must be mmap-backed");
         let p: Vec<String> = paged.query(&q).unwrap().collect().iter().map(|h| h.slug.clone()).collect();
         assert_eq!(resident, p, "paged vector top-k must match resident exactly");
+    }
+
+    #[test]
+    fn paged_mode_serves_bm25_from_mmap() {
+        // BM25 served from mmap'd bm25.bin (doc arrays off the map, dict resident,
+        // postings pread) must match resident and be asserted disk-backed.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.execute("CREATE TABLE docs (body TEXT)").unwrap();
+            let bodies = ["rust systems programming", "python is easy", "rust async runtime fast",
+                          "coffee and rust", "great coffee place", "melbourne coffee roasters",
+                          "learning rust today", "fast systems language"];
+            for (i, b) in bodies.iter().enumerate() {
+                db.execute(&format!("INSERT INTO docs (_key, body) VALUES ('d{i}', '{b}')")).unwrap();
+            }
+            db.compact().unwrap();               // migrate payloads to disk
+            db.build_bm25_index("body");         // build + spill + save bm25.bin
+        }
+        let queries = [
+            "SELECT _key FROM docs WHERE BM25(body, 'rust') > 0.0 ORDER BY _key ASC",
+            "SELECT _key FROM docs WHERE BM25(body, 'coffee') > 0.0 ORDER BY _key ASC",
+            "SELECT _key FROM docs WHERE BM25(body, 'zzznope') > 0.0 ORDER BY _key ASC",
+            "SELECT _key FROM docs ORDER BY BM25(body, 'rust fast') DESC, _key ASC LIMIT 3",
+        ];
+        let resident: Vec<Vec<String>> = {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.build_bm25_index("body"); // heap reopen rebuilds; ensure present for the baseline
+            queries.iter().map(|q| db.query(q).unwrap().collect()
+                .iter().map(|h| h.slug.clone()).collect()).collect()
+        };
+        assert!(!resident[0].is_empty(), "resident BM25 must find 'rust'");
+
+        let paged = CoreDB::open_paged(dir.path()).unwrap();
+        assert!(paged.bm25_indexes.get("body").map_or(false, |ix| ix.is_disk_backed()),
+            "paged BM25 must be mmap-backed");
+        for (i, q) in queries.iter().enumerate() {
+            let p: Vec<String> = paged.query(q).unwrap().collect()
+                .iter().map(|h| h.slug.clone()).collect();
+            assert_eq!(resident[i], p, "paged BM25 must match resident: {q}");
+        }
     }
 
     #[test]
