@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
-use super::index::{Bytes, MappedPostings, SearchIndex, SlotIndex};
+use super::index::{Bytes, IdMap, MappedPostings, Norms, SearchIndex, SlotIndex};
 use crate::storage::mmap::MmapView;
 
 const MAGIC: &[u8; 8] = b"SKSRCH02";
@@ -24,14 +24,16 @@ impl SearchIndex {
 
         // ID map
         w.write_all(&self.doc_count.to_le_bytes())?;
-        for &hash in &self.id_map {
-            w.write_all(&hash.to_le_bytes())?;
+        for slot in 0..self.id_map.count() {
+            w.write_all(&self.id_map.get(slot).unwrap_or(0).to_le_bytes())?;
         }
 
-        // Doc field lengths
-        for lengths in &self.doc_field_lengths {
-            for &l in lengths {
-                w.write_all(&l.to_le_bytes())?;
+        // Doc field lengths (doc-major, num_fields u16 each)
+        for slot in 0..self.doc_count as usize {
+            if let Some(lengths) = self.doc_field_lengths.doc_lengths(slot) {
+                for &l in lengths.iter() {
+                    w.write_all(&l.to_le_bytes())?;
+                }
             }
         }
 
@@ -53,8 +55,8 @@ impl SearchIndex {
 
         // Sorted (hash:u64, slot:u32) reverse index — lets paged mode binary-search
         // hash→slot off the mmap instead of holding the id_to_slot HashMap resident.
-        let mut pairs: Vec<(u64, u32)> = self.id_map.iter().enumerate()
-            .map(|(slot, &hash)| (hash, slot as u32)).collect();
+        let mut pairs: Vec<(u64, u32)> = (0..self.id_map.count())
+            .map(|slot| (self.id_map.get(slot).unwrap_or(0), slot as u32)).collect();
         pairs.sort_unstable_by_key(|(h, _)| *h);
         w.write_all(&(pairs.len() as u32).to_le_bytes())?;
         for (hash, slot) in &pairs {
@@ -129,10 +131,10 @@ impl SearchIndex {
 
         Ok(SearchIndex {
             fields,
-            id_map,
+            id_map: IdMap::Owned(id_map),
             id_to_slot: SlotIndex::Resident(id_to_slot),
             doc_count,
-            doc_field_lengths,
+            doc_field_lengths: Norms::Owned(doc_field_lengths),
             fst_data,
             postings_data,
             field_post,
@@ -169,23 +171,20 @@ impl SearchIndex {
             fields.push(read_string(&mut r)?);
         }
 
-        // ID map (resident; small — 8 B/doc). The reverse hash→slot index is served
-        // from the mmap'd sorted section below, not a resident HashMap.
+        // ID map → mmap slice (slot→hash, 8 B/doc), served off the map. The reverse
+        // hash→slot index is the sorted section below.
         let doc_count = read_u32(&mut r)?;
-        let mut id_map = Vec::with_capacity(doc_count as usize);
-        for _ in 0..doc_count {
-            id_map.push(read_u64(&mut r)?);
-        }
+        let id_map_off = base + r.position() as usize;
+        r.seek(io::SeekFrom::Current(doc_count as i64 * 8))?;
+        let id_map = IdMap::Mapped { view: view.clone(), off: id_map_off, count: doc_count as usize };
 
         // Doc field lengths / norms (resident)
-        let mut doc_field_lengths = Vec::with_capacity(doc_count as usize);
-        for _ in 0..doc_count {
-            let mut lengths = Vec::with_capacity(num_fields);
-            for _ in 0..num_fields {
-                lengths.push(read_u16(&mut r)?);
-            }
-            doc_field_lengths.push(lengths);
-        }
+        // Norms → mmap slice (doc_count × num_fields u16), served off the map.
+        let norms_off = base + r.position() as usize;
+        r.seek(io::SeekFrom::Current(doc_count as i64 * num_fields as i64 * 2))?;
+        let doc_field_lengths = Norms::Mapped {
+            view: view.clone(), off: norms_off, doc_count: doc_count as usize, num_fields,
+        };
 
         // Each remaining blob → an mmap slice (skip its bytes, don't copy).
         let map_blob = |r: &mut io::Cursor<&[u8]>| -> io::Result<Bytes> {
@@ -283,9 +282,14 @@ mod tests {
         let loaded = SearchIndex::read_binary(&mut cursor).unwrap();
 
         assert_eq!(loaded.fields, idx.fields);
-        assert_eq!(loaded.id_map, idx.id_map);
+        assert_eq!(loaded.id_map.count(), idx.id_map.count());
+        for s in 0..idx.id_map.count() {
+            assert_eq!(loaded.id_map.get(s), idx.id_map.get(s));
+        }
         assert_eq!(loaded.doc_count, idx.doc_count);
-        assert_eq!(loaded.doc_field_lengths, idx.doc_field_lengths);
+        for s in 0..idx.doc_count as usize {
+            assert_eq!(loaded.doc_field_lengths.doc_lengths(s), idx.doc_field_lengths.doc_lengths(s));
+        }
         assert_eq!(loaded.fst_data.as_slice(), idx.fst_data.as_slice());
         assert_eq!(loaded.postings_data.as_slice(), idx.postings_data.as_slice());
 
