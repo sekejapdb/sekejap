@@ -3588,11 +3588,22 @@ impl CoreDB {
         self.wal_format
     }
 
-    /// After compaction the WAL is empty and `snapshot.json` contains the
-    /// complete current state. All previous WAL entries are discarded.
+    /// Fold the write-ahead log into a fresh snapshot — the key to fast startup.
     ///
-    /// In-memory (`CoreDB::new()`) databases silently ignore this call.
+    /// Every write appends to the WAL, so the log only grows; without compaction,
+    /// `open()` would replay an ever-longer history. Compaction rewrites the
+    /// current state into two clean artifacts — a defragmented `payloads.bin`
+    /// (only *live* nodes, dropped ones' space reclaimed) and a `snapshot.json`
+    /// manifest — and then truncates the WAL to empty. The next `open()` just
+    /// loads the snapshot and replays nothing, so startup stays fast no matter
+    /// how many writes happened.
+    ///
+    /// Crash-safety throughout: new files are written to a `.tmp` path and then
+    /// atomically `rename`d over the real one, so a crash mid-compaction leaves
+    /// the old, still-valid files in place. Memory-only databases have no files,
+    /// so this is a no-op for them.
     pub fn compact(&mut self) -> io::Result<()> {
+        // No data directory ⇒ ephemeral in-memory DB ⇒ nothing on disk to compact.
         let dir = match self.data_dir.clone() {
             Some(d) => d,
             None => return Ok(()),
@@ -3667,7 +3678,10 @@ impl CoreDB {
                     Self::write_atomic(&dir, name, &frame)?;
                 }
             }
-            // Atomically replace file, then reopen (preserving policy + table).
+            // The crux of crash-safety: `rename` on the same filesystem is
+            // ATOMIC — the OS switches the name over in one indivisible step. So
+            // `payloads.bin` is either entirely the old file or entirely the new
+            // one, never a half-written mix, no matter when a crash happens.
             std::fs::rename(&pay_tmp, &pay_path)?;
             let keep_binary = self.payload_store.binary;
             let keep_ft = std::mem::take(&mut self.payload_store.field_table);
