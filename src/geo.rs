@@ -1,7 +1,18 @@
-//! Pure geometry functions for spatial queries.
+//! # Spatial math — distances, containment, and the location index
 //!
-//! All coordinates: `[lon, lat]` in GeoJSON, `(lat, lon)` in function params (PostGIS convention).
-//! No external crate dependencies — everything is hand-rolled.
+//! This file is the geometry engine behind sekejap's spatial queries
+//! (`ST_DWithin`, `ST_Contains`, `ST_Distance`, …). It does two jobs: the pure
+//! math on points and polygons (how far apart are two lat/long points on the
+//! curved Earth? is this point inside that boundary?), and the **spatial grid**
+//! that indexes locations so a query only checks nearby items instead of all of
+//! them.
+//!
+//! Two things a newcomer should know. First, the Earth is a sphere(-ish), so
+//! "distance" isn't flat-plane Pythagoras — the code uses geodesic formulas
+//! (great-circle / Vincenty) to match real-world metres, calibrated against
+//! PostGIS. Second, coordinate order is a classic trap: GeoJSON stores points as
+//! `[lon, lat]`, but the function parameters here take `(lat, lon)` (the PostGIS
+//! convention). Everything is hand-rolled — no external geometry crate.
 
 use serde_json::Value;
 use std::collections::HashMap;
