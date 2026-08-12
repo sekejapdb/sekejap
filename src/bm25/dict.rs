@@ -1,6 +1,12 @@
-//! Term dictionary for BM25.
+//! # Term dictionary — the index's table of contents
 //!
-//! Maps each term to the location of its postings list in the postings file.
+//! The postings for every term are packed together in one big blob (see
+//! `postings.rs`). The term dictionary is the lookup that makes it usable: it maps
+//! each term (e.g. `"coffee"`) to *where* its postings list starts and how long it
+//! is. A search tokenizes the query, looks up each term here to find its postings,
+//! and scores from there. It's small (one entry per distinct word — sub-linear in
+//! the corpus by Heaps' law), so it's the one BM25 piece kept resident in RAM
+//! while the bulk postings stay on disk.
 
 use std::collections::HashMap;
 

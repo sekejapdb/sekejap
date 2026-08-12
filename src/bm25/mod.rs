@@ -1,4 +1,16 @@
-//! Lightweight BM25 full-text search index.
+//! # BM25 — ranking documents by how relevant they are to a query
+//!
+//! When you search text, you don't just want documents that contain the words —
+//! you want the *most relevant* ones first. BM25 is the standard formula for that
+//! (the same idea behind classic search engines). It scores a document higher
+//! when: the query words appear in it more often (term frequency), those words
+//! are *rare* across the whole collection (a rare word is more telling than "the"),
+//! and the document is short (a match in a tweet counts more than one buried in a
+//! book). This module builds the index that makes that scoring fast — an inverted
+//! index (term → which docs, how often) plus the per-document lengths BM25 needs.
+//!
+//! Submodules: `index` (the index + scoring), `postings` (the compressed per-term
+//! doc lists), `dict` (term → postings location), `tokenizer` (text → terms).
 //!
 //! # Design goals
 //!

@@ -1,6 +1,11 @@
-//! Compressed postings list for BM25.
+//! # Postings lists — the compressed "which docs have this term" data
 //!
-//! Uses delta encoding + variable-length integers (varints) for compression.
+//! A *postings list* is the core of an inverted index: for one term, the list of
+//! documents that contain it (and how many times). To keep it small, this uses
+//! two classic tricks. **Delta encoding**: the doc ids are sorted, so we store the
+//! *gaps* between them (e.g. 5, 9, 40 → 5, +4, +31) — smaller numbers. **Varints**
+//! (variable-length integers): a small number is written in 1 byte, a big one in
+//! more, instead of a fixed 8 bytes each. Together they shrink the postings a lot.
 //!
 //! Format per posting: [doc_id_delta (varint)] [term_freq (varint)]
 //!
