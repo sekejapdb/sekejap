@@ -717,6 +717,47 @@ fn migrate(path: &str) -> i32 {
     }
 }
 
+/// `sekejap dump <db>` — write the whole database as portable SGQL to stdout.
+fn dump_cmd(path: &str) -> i32 {
+    let db = match CoreDB::open(path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open '{path}': {e}");
+            return 1;
+        }
+    };
+    print!("{}", db.dump_sql());
+    0
+}
+
+/// `sekejap load <db> <file.sql>` — replay an SGQL dump into a database.
+fn load_cmd(path: &str, file: &str) -> i32 {
+    let sql = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read '{file}': {e}");
+            return 1;
+        }
+    };
+    let mut db = match CoreDB::open(path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open '{path}': {e}");
+            return 1;
+        }
+    };
+    match db.load_sql(&sql) {
+        Ok(n) => {
+            eprintln!("loaded {n} statements into '{path}'");
+            0
+        }
+        Err(e) => {
+            eprintln!("load failed: {e}");
+            1
+        }
+    }
+}
+
 fn main() {
     // `sekejap migrate <db>` — upgrade payloads to the latest (SKBIN) format,
     // verifying every record round-trips byte-identical before reporting success.
@@ -749,6 +790,28 @@ fn main() {
             Some(p) => std::process::exit(migrate(p)),
             None => {
                 eprintln!("usage: sekejap migrate <db-path>");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // `sekejap dump <db>` — write the whole database as portable SGQL to stdout.
+    // `sekejap load <db> <file.sql>` — replay an SGQL dump into a database.
+    // The version-independent migration path (see docs/developer/invariants.md).
+    if raw.first().map(String::as_str) == Some("dump") {
+        match raw.get(1) {
+            Some(p) => std::process::exit(dump_cmd(p)),
+            None => {
+                eprintln!("usage: sekejap dump <db-path>   (writes SGQL to stdout)");
+                std::process::exit(2);
+            }
+        }
+    }
+    if raw.first().map(String::as_str) == Some("load") {
+        match (raw.get(1), raw.get(2)) {
+            (Some(p), Some(f)) => std::process::exit(load_cmd(p, f)),
+            _ => {
+                eprintln!("usage: sekejap load <db-path> <dump.sql>");
                 std::process::exit(2);
             }
         }

@@ -1079,7 +1079,7 @@ impl std::fmt::Display for IndexMethod {
 
 // ── CREATE TABLE AST ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
     Text,
     Integer,

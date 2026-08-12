@@ -4555,6 +4555,146 @@ impl CoreDB {
         Some(ddl)
     }
 
+    /// Serialize the entire database as portable SGQL text (a `.sql` dump).
+    ///
+    /// The dump is the version-independent migration path (Ring 1 of the
+    /// stability contract — see `docs/developer/invariants.md`): it loads into
+    /// *any* sekejap version via [`load_sql`], independent of the on-disk binary
+    /// format. It is plain SGQL — `CREATE TABLE`, `CREATE INDEX`, `INSERT`
+    /// rows, and edge `INSERT`s — so `sqlite`/`pg_dump`-style tooling and any
+    /// editor treat it as SQL. One statement per line (so `load_sql` splits on
+    /// newlines without a SQL parser). Auto columns (`_id`, `_collection`,
+    /// timestamps) are regenerated on load and are not emitted.
+    pub fn dump_sql(&self) -> String {
+        let mut out = String::from("-- sekejap dump; format 1; SGQL\n");
+        let mut colls = self.collection_names();
+        colls.sort();
+
+        // 1. Schema — CREATE TABLE + CREATE INDEX for each declared collection.
+        for coll in &colls {
+            if let Some(s) = self.schemas.get(coll) {
+                // Emit only user columns; the engine re-adds _key + timestamps on
+                // CREATE TABLE, so listing them would double them each reload.
+                let parts: Vec<String> = s.fields.iter()
+                    .filter(|f| !is_internal_field(&f.name))
+                    .map(|f| format!("{} {}", f.name, field_type_sql(f.ty)))
+                    .collect();
+                out.push_str(&format!("CREATE TABLE {coll} ({});\n", parts.join(", ")));
+
+                let ix = &s.indexes;
+                let groups: [(&str, &Vec<String>); 5] = [
+                    ("btree", &ix.range),
+                    ("gin", &ix.fulltext),
+                    ("bm25", &ix.bm25),
+                    ("spatial", &ix.spatial),
+                    ("hnsw", &ix.vector),
+                ];
+                for (method, fields) in groups {
+                    for f in fields {
+                        out.push_str(&format!("CREATE INDEX ON {coll} USING {method} ({f});\n"));
+                    }
+                }
+                // Search indexes cover a list of fields each.
+                for fields in &ix.search {
+                    out.push_str(&format!(
+                        "CREATE INDEX ON {coll} USING search ({});\n", fields.join(", ")
+                    ));
+                }
+            }
+        }
+
+        // 2. Rows — one INSERT per node, field-type aware.
+        for coll in &colls {
+            for hit in self.collection(coll).collect() {
+                if let Some(line) = self.dump_row_insert(coll, &hit) {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
+        }
+
+        // 3. Edges — INSERT ('from')-[:TYPE {attrs}]->('to').
+        for coll in &colls {
+            for e in self.edges_from_collection(coll) {
+                let (Some(from), Some(to)) = (&e.from_slug, &e.to_slug) else { continue };
+                let etype = e.edge_type.clone().unwrap_or_default();
+                let attrs = dump_edge_attrs(e.meta.as_ref());
+                out.push_str(&format!(
+                    "INSERT ('{}')-[:{}{}]->('{}');\n",
+                    sql_str_escape(from), etype, attrs, sql_str_escape(to)
+                ));
+            }
+        }
+        out
+    }
+
+    /// Build one `INSERT INTO coll (...) VALUES (...)` for a node. Returns `None`
+    /// if the node has no payload. Vector fields are read from the separate
+    /// vector store; GEO fields are emitted via `ST_GeomFromGeoJSON`.
+    fn dump_row_insert(&self, coll: &str, hit: &query::Hit) -> Option<String> {
+        let payload = hit.payload.as_ref()?.as_object()?;
+        let key = payload.get("_key").and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| hit.slug.split_once('/').map(|(_, k)| k.to_string()))?;
+
+        let mut cols = vec!["_key".to_string()];
+        let mut vals = vec![format!("'{}'", sql_str_escape(&key))];
+
+        // Field type lookup (schema'd collections get exact types; schemaless
+        // collections infer from the JSON value).
+        let field_types: std::collections::HashMap<&str, sql::FieldType> = self
+            .schemas.get(coll)
+            .map(|s| s.fields.iter().map(|f| (f.name.as_str(), f.ty)).collect())
+            .unwrap_or_default();
+
+        // Vector fields (from schema) are pulled from the vector store, not the
+        // payload — emit them even though they are absent from the JSON.
+        if let Some(s) = self.schemas.get(coll) {
+            for f in &s.fields {
+                if f.ty == sql::FieldType::Vector {
+                    if let Some(v) = self.get_vector(&hit.slug, &f.name) {
+                        cols.push(f.name.clone());
+                        let nums: Vec<String> = v.iter().map(|x| fmt_f32(*x)).collect();
+                        vals.push(format!("[{}]", nums.join(", ")));
+                    }
+                }
+            }
+        }
+
+        // Payload fields (skip auto/internal columns, and vector fields — those
+        // are emitted from the vector store above, and also linger in the payload).
+        for (name, val) in payload {
+            if is_internal_field(name) { continue; }
+            let ty = field_types.get(name.as_str()).copied();
+            if ty == Some(sql::FieldType::Vector) { continue; }
+            cols.push(name.clone());
+            vals.push(sql_value_literal(val, ty));
+        }
+
+        Some(format!(
+            "INSERT INTO {coll} ({}) VALUES ({});",
+            cols.join(", "),
+            vals.join(", ")
+        ))
+    }
+
+    /// Load a `.sql` dump produced by [`dump_sql`] into this database. Each
+    /// non-comment line is one SGQL statement, run through the same execution
+    /// path as a normal query. Returns the number of statements applied.
+    pub fn load_sql(&mut self, dump: &str) -> Result<usize, SqlError> {
+        let mut applied = 0usize;
+        for raw in dump.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with("--") { continue; }
+            let stmt = line.strip_suffix(';').unwrap_or(line);
+            // CREATE/INSERT/UPDATE/DELETE go through execute(); the dump emits
+            // only mutations + DDL, never SELECT.
+            self.execute(stmt)?;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
     /// Return the structured schema for a collection, if one was declared via
     /// `CREATE TABLE`.  Returns `None` for schemaless collections.
     pub fn table_schema(&self, collection: &str) -> Option<&TableSchema> {
@@ -9579,5 +9719,86 @@ mod hybrid_query_tests {
             .collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].slug, "articles/a1");
+    }
+}
+
+// ── SGQL dump helpers (used by CoreDB::dump_sql) ───────────────────────────────
+
+/// Auto/internal payload columns that a dump must not emit (regenerated on load).
+fn is_internal_field(name: &str) -> bool {
+    matches!(
+        name,
+        "_id" | "_collection" | "_key" | "_created_unix" | "_updated_unix"
+    )
+}
+
+/// Escape a string for a single-quoted SGQL literal (SQL-standard `''`).
+fn sql_str_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// SGQL type keyword for a schema field type (mirrors `schema_ddl`).
+fn field_type_sql(ty: sql::FieldType) -> &'static str {
+    use sql::FieldType::*;
+    match ty {
+        Text => "TEXT",
+        Integer => "INTEGER",
+        Real => "REAL",
+        Bool => "BOOLEAN",
+        Timestamptz => "TIMESTAMPTZ",
+        Geo => "GEO",
+        Vector => "VECTOR",
+        Json => "JSON",
+    }
+}
+
+/// Shortest round-trippable float literal for a vector element (always has a `.`
+/// or exponent so it lexes as a float, never a bare integer).
+fn fmt_f32(x: f32) -> String {
+    let s = format!("{x}");
+    if s.contains('.') || s.contains('e') || s.contains('E') || s.contains("inf") || s.contains("NaN") {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+/// Render a JSON value as an SGQL literal, honoring the column's declared type.
+/// GEO → `ST_GeomFromGeoJSON('…')`; VECTOR arrays → `[…]`; objects/JSON arrays →
+/// a quoted JSON string; scalars → their literal form.
+fn sql_value_literal(v: &Value, ty: Option<sql::FieldType>) -> String {
+    use sql::FieldType;
+    if ty == Some(FieldType::Geo) {
+        let json = serde_json::to_string(v).unwrap_or_else(|_| "null".into());
+        return format!("ST_GeomFromGeoJSON('{}')", sql_str_escape(&json));
+    }
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("'{}'", sql_str_escape(s)),
+        Value::Array(a) if ty == Some(FieldType::Vector) && a.iter().all(|x| x.is_number()) => {
+            let nums: Vec<String> = a.iter().map(|x| x.to_string()).collect();
+            format!("[{}]", nums.join(", "))
+        }
+        Value::Array(_) | Value::Object(_) => {
+            format!("'{}'", sql_str_escape(&serde_json::to_string(v).unwrap_or_default()))
+        }
+    }
+}
+
+/// Format an edge's merged attributes as ` {k: v, …}` for an edge INSERT, or an
+/// empty string if the edge is naked.
+fn dump_edge_attrs(meta: Option<&Value>) -> String {
+    let Some(Value::Object(map)) = meta else { return String::new() };
+    let parts: Vec<String> = map
+        .iter()
+        .filter(|(k, _)| !is_internal_field(k))
+        .map(|(k, v)| format!("{}: {}", k, sql_value_literal(v, None)))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {{{}}}", parts.join(", "))
     }
 }
