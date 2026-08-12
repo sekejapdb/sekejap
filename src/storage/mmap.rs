@@ -40,12 +40,24 @@
 /// Created via [`MmapView::try_new`]; dropped automatically via `munmap`.
 /// Zero-copy reads via [`slice()`](Self::slice) — no syscall, just pointer
 /// arithmetic into the kernel page cache.
+///
+/// Rust note for newcomers: `*const u8` is a **raw pointer** — a bare memory
+/// address, like a pointer in C. Unlike Rust's normal `&` references, a raw
+/// pointer has no borrow-checker protection and no lifetime, so *we* are
+/// responsible for only reading valid, in-bounds bytes. That is exactly why the
+/// read method below is careful, and why creating/using it needs `unsafe`.
 #[cfg(unix)]
 pub(crate) struct MmapView {
-    ptr: *const u8,
-    len: usize,
+    ptr: *const u8, // start address the kernel gave us for the mapping
+    len: usize,     // how many bytes are mapped (the bound we check against)
 }
 
+// `Send` = "safe to move to another thread"; `Sync` = "safe to share by
+// reference across threads". Rust won't auto-derive them for a struct holding a
+// raw pointer (it can't know the pointer is safe to share), so we assert it with
+// `unsafe impl`. It IS safe here because the mapping is READ-ONLY: many threads
+// reading the same immutable bytes can never race. If this view were writable,
+// these impls would be unsound.
 #[cfg(unix)]
 unsafe impl Send for MmapView {}
 #[cfg(unix)]
@@ -63,9 +75,12 @@ impl MmapView {
     /// [`slice`]: Self::slice
     pub fn try_new(file: &std::fs::File, len: usize) -> Option<Self> {
         if len == 0 { return None; } // an empty mapping is meaningless — bail early
-        use std::os::unix::io::AsRawFd;
-        // Declare the two libc calls we need directly, so this crate needs no
-        // `libc` dependency. `mmap` creates the mapping; `madvise` hints access.
+        use std::os::unix::io::AsRawFd; // brings the `.as_raw_fd()` method into scope
+        // `extern "C" { ... }` is Rust's FFI (Foreign Function Interface): it
+        // declares functions that live in the operating system's C library so we
+        // can call them directly — no `libc` crate dependency needed. `mmap`
+        // creates the mapping; `madvise` gives the kernel a hint about how we'll
+        // read it.
         extern "C" {
             fn mmap(
                 addr: *mut std::ffi::c_void, length: usize,
@@ -75,7 +90,9 @@ impl MmapView {
         }
         const PROT_READ: i32 = 1;    // pages are readable, never writable
         const MAP_PRIVATE: i32 = 2;  // our own view; the file on disk is never modified
-        // addr = null (kernel picks the address), offset = 0 (map from the start).
+        // Calling a C function is `unsafe`: the compiler can't verify the OS keeps
+        // its promises, so we take responsibility. addr = null (let the kernel
+        // choose the address), offset = 0 (map from the start of the file).
         let ptr = unsafe {
             mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
         };
