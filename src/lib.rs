@@ -1759,18 +1759,34 @@ impl CoreDB {
     }
 
     // ── Raw internals (no WAL write — used during replay and open) ────────────
+    //
+    // The public `put` writes the WAL and then calls into here. On `open()`, WAL
+    // replay ALSO calls in here directly — the change is already in the log, so
+    // re-logging it would be wrong. That's the whole reason the "apply" logic
+    // lives in a separate no-WAL function.
 
+    /// Parse `payload_json` and apply the write. The no-WAL entry point used by
+    /// the public `put` (which already logged) and by WAL replay.
     fn put_raw(&mut self, slug: &str, payload_json: &str) -> Result<u64, serde_json::Error> {
         let payload: Value = serde_json::from_str(payload_json)?;
         self.put_raw_inner(slug, payload_json.as_bytes(), payload)
     }
 
+    /// Apply one node insert/update to the in-memory maps, the payload store, and
+    /// the indexes. Takes the raw bytes AND the parsed `Value` so callers that
+    /// already have both don't pay to re-parse or re-serialize.
+    ///
+    /// The steps: stamp timestamps, guard against hash collisions, append the
+    /// bytes to the payload store, update the node metadata + collection
+    /// membership, and refresh any affected indexes. Returns the node's id hash.
     fn put_raw_inner(&mut self, slug: &str, raw: &[u8], payload: Value) -> Result<u64, serde_json::Error> {
-        self.note_key_change(slug);
-        let hash = sk_hash(slug);
-        // In a batch, all rows share one timestamp — skip a per-row time syscall.
+        self.note_key_change(slug); // remember this key changed (for the change feed)
+        let hash = sk_hash(slug);   // the node's u64 identity
+        // In a bulk batch every row shares one timestamp, so we take the clock
+        // once (`batch_now`) instead of a `now()` syscall per row.
         let now = self.batch_now.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
+        // A node is always a JSON object (it has named fields); reject anything else.
         if !payload.is_object() {
             return Err(serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1800,27 +1816,38 @@ impl CoreDB {
             }
         }
 
+        // If this slug already exists, remember its old collection + payload
+        // location so we can retract stale index entries and reclaim its space.
         let old_info: Option<(String, u64, u32)> = self
             .node_data(hash)
             .map(|n| (n.collection.clone(), n.payload_offset, n.payload_len));
 
-        // Splice timestamps into raw bytes (avoids re-serialize).
+        // Add `_updated_unix` by editing the JSON *bytes* directly rather than
+        // re-serializing the whole parsed `Value` — much cheaper for a large
+        // record. `splice_json_field` returns the edited buffer, or (on failure)
+        // we keep the original via `unwrap_or(buf)`.
         let now_str = now.to_string();
-        let mut buf = raw.to_vec();
+        let mut buf = raw.to_vec(); // owned copy we can edit
         buf = query::splice_json_field(&buf, "_updated_unix", now_str.as_bytes())
             .unwrap_or(buf);
 
+        // `_created_unix` must be set once and then never change. If the caller
+        // didn't supply it, try to preserve the ORIGINAL creation time by reading
+        // it out of the previous version's bytes; only fall back to `now` for a
+        // genuinely new node. The `.and_then(...)?...` chain is Option plumbing:
+        // each step yields the next value or short-circuits to `None`, and
+        // `unwrap_or_else(now)` supplies the default when there's no old value.
         if payload.get("_created_unix").is_none() {
             let created_str = old_info.as_ref()
                 .and_then(|(_, off, len)| {
-                    let old_raw = self.payload_store.get_raw(*off, *len)?;
+                    let old_raw = self.payload_store.get_raw(*off, *len)?; // read old bytes
                     let map = query::extract_fields_by_search(
                         &old_raw, &["_created_unix".to_string()],
                     );
                     map.get("_created_unix").and_then(|v| v.as_i64())
                 })
                 .map(|v| v.to_string())
-                .unwrap_or_else(|| now_str.clone());
+                .unwrap_or_else(|| now_str.clone()); // new node → created == now
             buf = query::splice_json_field(&buf, "_created_unix", created_str.as_bytes())
                 .unwrap_or(buf);
         }
@@ -2611,14 +2638,30 @@ impl CoreDB {
 
     // ── WAL helpers ───────────────────────────────────────────────────────────
 
+    /// Record one change in the write-ahead log (WAL) — the durability step.
+    ///
+    /// A WAL is the classic crash-safety trick: before we change any in-memory
+    /// state, we append a description of the change to the end of a log file. If
+    /// the process crashes mid-write, the next `open()` replays the log and ends
+    /// up exactly where it left off. This is why every public write calls
+    /// `wal_write` *before* touching the maps.
+    ///
+    /// Two subtleties:
+    /// - `if let Some(wal)` — an in-memory (ephemeral) database has no WAL
+    ///   (`wal` is `None`), so this is a no-op there; nothing is persisted.
+    /// - **fsync policy.** `append` writes to the file, but the OS may still hold
+    ///   those bytes in its own buffer. `sync()` (fsync) forces them to the
+    ///   physical disk. We only fsync per-write under `Full` durability; `Normal`/
+    ///   `Off` defer the fsync to the next checkpoint/compact. That's the standard
+    ///   mobile trade-off — a per-write fsync on phone flash costs tens of ms.
     fn wal_write(&mut self, entry: WalEntry) {
         if let Some(wal) = &mut self.wal {
+            // `.expect(...)` panics on failure: a disk write error here is not
+            // something the caller can recover from without risking corruption.
             wal.append(&entry)
                 .expect("sekejap: WAL write failed — disk error");
-            // fsync only under Full durability and outside a batch. Normal/Off
-            // append durably to the WAL file but defer the fsync to
-            // checkpoint/compact — the standard mobile trade-off, where a
-            // per-write fsync on flash storage costs tens of milliseconds.
+            // Force-flush to physical disk only when durability is Full and we're
+            // not inside a batch (`defer_wal_sync`), which fsyncs once at the end.
             if !self.defer_wal_sync && self.wal_sync == SyncMode::Full {
                 wal.sync()
                     .expect("sekejap: WAL fsync failed — disk error");
