@@ -1,3 +1,13 @@
+//! # GiST trigram index — a smaller, lossier alternative to GIN
+//!
+//! GiST ("Generalized Search Tree") trades exactness for size. Instead of exact
+//! per-trigram document lists, each document gets ONE fixed-size bitmap
+//! "signature": each of its trigrams flips a bit (chosen by hashing). A query
+//! keeps documents whose signature has all the query's trigram bits set — very
+//! compact and cheap, but because different trigrams can hash to the same bit, it
+//! yields more false positives, which the verification step filters out (against
+//! a cached lowercased copy of the text, for a fast in-RAM re-check).
+//!
 //! ## GiST Trigram Index (Bitmap Signature)
 //!
 //! GiST (Generalized Search Tree) index for trigrams using bitmap signatures.

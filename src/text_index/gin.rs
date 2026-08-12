@@ -1,3 +1,13 @@
+//! # GIN trigram index — the in-memory builder
+//!
+//! This is the in-RAM form of the trigram index whose on-disk twin is
+//! `storage/ginstore.rs` (read that file's docs for what trigrams and postings
+//! are). GIN ("Generalized Inverted Index") stores, for each trigram, the *exact*
+//! set of documents that contain it, as a compressed bitmap. "Exact postings"
+//! distinguishes it from GiST below (which uses lossy signatures) — but either
+//! way a query still does a final substring re-check, because a document can hold
+//! all of a word's trigrams without holding the contiguous word.
+//!
 //! ## GIN Trigram Index (Exact Postings)
 //!
 //! GIN (Generalized Inverted Index) for trigrams using exact postings.

@@ -1,3 +1,12 @@
+//! # Running an `ILIKE` query against the trigram index
+//!
+//! This is the glue that answers `name ILIKE '%pattern%'` using the trigram
+//! indexes: extract the pattern's trigrams, intersect their postings to get a
+//! small candidate set, then verify each candidate actually contains the
+//! substring (trigrams over-match, so the re-check is mandatory for correctness).
+//! It falls back to a plain scan only when the pattern has no usable trigram (a
+//! fixed part shorter than 3 characters).
+//!
 //! ## ILIKE Query Execution
 //!
 //! Handles ILIKE pattern matching with trigram index acceleration.
