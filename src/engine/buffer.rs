@@ -1,3 +1,15 @@
+//! # Batching writes to amortize the lock — the write buffer
+//!
+//! Part of the optional `engine` wrapper. Taking the exclusive write lock (see
+//! `guard.rs`) has a fixed cost, and paying it once per statement is wasteful
+//! when many writes arrive together. [`WriteBuffer`] collects incoming SQL
+//! statements in a thread-safe list and signals when a threshold is reached; the
+//! engine then takes the write lock ONCE and applies the whole batch, spreading
+//! that lock cost over many statements.
+//!
+//! The pending list is guarded by a `Mutex` (mutual exclusion — one holder at a
+//! time) because several threads may push into it at once.
+
 use std::sync::Mutex;
 
 /// Buffered write accumulator for batching SQL mutations.
