@@ -40,6 +40,15 @@ perl -pi -e "s/^version:.*/version: $VERSION/" \
 perl -pi -e "s/^version:.*/version: $VERSION/" \
   "$ROOT/wrappers/dart/sekejap_generator/pubspec.yaml"
 
+# README install snippets — the Gradle coordinate `life.sekejap:sekejap-android:X.Y.Z`
+# is static prose, so stamp it here too so the published docs never show a stale
+# version. (The Kotlin *build* reads Cargo.toml directly; only these copy-paste
+# snippets need updating.)
+for readme in "$ROOT/README.md" "$ROOT/wrappers/kotlin/orm/README.md"; do
+  perl -pi -e "s/(life\.sekejap:sekejap-android:)[0-9]+\.[0-9]+\.[0-9]+/\${1}$VERSION/g" "$readme"
+done
+
 echo "  node : $(grep -m1 '"version"' "$ROOT/wrappers/node/package.json" | tr -d ' ,') / crate $(grep -m1 '^version = ' "$ROOT/wrappers/node/Cargo.toml")"
 echo "  dart : $(grep -m1 '^version:' "$ROOT/wrappers/dart/pubspec.yaml") / generator $(grep -m1 '^version:' "$ROOT/wrappers/dart/sekejap_generator/pubspec.yaml")"
-echo "  kotlin reads Cargo.toml directly (no stamp needed)"
+echo "  readme: $(grep -m1 -oE 'sekejap-android:[0-9.]+' "$ROOT/README.md")"
+echo "  kotlin build reads Cargo.toml directly (no stamp needed)"
