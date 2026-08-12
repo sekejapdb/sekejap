@@ -1,0 +1,39 @@
+name: CI
+
+# The push/PR gate that release.yml is not. Its whole reason to exist is to
+# compile the code — including for Windows — on every change, so a Unix-only
+# assumption (e.g. the raw-mmap paged path) can never again ride undetected all
+# the way to a release tag. See docs/developer/invariants.md.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --lib
+      - run: cargo test --release --test integration
+      - run: cargo test --release --test persistence
+
+  windows-compile:
+    name: Windows compile check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Native Windows build of the crates that must ship on Windows. The core
+      # crate and the C ABI cover every downstream Windows artifact (node addon,
+      # Python wheels, C/C++/C# bindings) — they all fail here first if a
+      # Unix-only symbol leaks into an unconditional path.
+      - run: cargo check -p sekejap -p sekejap-capi
