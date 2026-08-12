@@ -1147,6 +1147,14 @@ impl CoreDB {
     /// Uses [`EdgeMode::Compact`] by default (disk-first edge metadata).
     /// For the original all-in-RAM behaviour, use
     /// [`open_with_config`](Self::open_with_config) with [`EdgeMode::Fat`].
+    /// Open (or create) a persistent, WAL-backed database in directory `dir`.
+    ///
+    /// This is the normal way to get a durable `CoreDB`. If the directory is
+    /// empty it starts a fresh database there; otherwise it recovers the previous
+    /// state by loading the snapshot and replaying the WAL (see
+    /// `open_with_config`, which does the real work). `impl AsRef<Path>` just
+    /// means "anything that can be viewed as a filesystem path" — a `&str`, a
+    /// `String`, a `PathBuf`, etc. — so callers can pass whichever they have.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         Self::open_with_config(dir, Config::default())
     }
@@ -1346,25 +1354,40 @@ impl CoreDB {
         Ok(db)
     }
 
-    /// Open (or create) a persistent database with explicit configuration.
+    /// Open (or create) a persistent database with explicit configuration — the
+    /// full startup / crash-recovery routine.
     ///
-    /// On startup:
-    /// 1. Loads the latest snapshot (if any).
-    /// 2. Replays WAL entries written after the snapshot.
-    /// 3. Opens the WAL for subsequent writes.
+    /// The startup story, in order:
+    /// 1. **Lock** the directory (`db.lock`) so two processes can't corrupt it
+    ///    by writing at once.
+    /// 2. **Load the snapshot** — the manifest from the last `compact()`, which is
+    ///    the bulk of the state. Its version is checked first: a store newer than
+    ///    this build is refused, an older one is migrated (see the Ring-2
+    ///    migration framework near the version constants).
+    /// 3. **Replay the WAL** — re-apply every change logged *after* that snapshot,
+    ///    catching up on writes that hadn't been folded in yet. This is what makes
+    ///    a crash recoverable: whatever was logged is re-applied.
+    /// 4. **Restore the indexes** — for each family, either load its on-disk
+    ///    sidecar (fast) or rebuild it from the data (correct), depending on
+    ///    whether the WAL carried new data and whether the sidecar's version
+    ///    matches. This is the "never rebuild what you can map" rule in action.
     ///
-    /// If the WAL contains a corrupted frame, recovery stops at that frame —
-    /// all entries before it are intact. A warning is printed to stderr.
+    /// If the WAL contains a corrupted frame, recovery stops at that frame — all
+    /// entries before it are intact — and a warning is printed to stderr, so a
+    /// partially-written last record can never make the whole database unopenable.
     ///
     /// # Errors
-    /// Returns an error if the directory cannot be created, the snapshot
-    /// cannot be parsed, or the WAL file cannot be opened.
+    /// Returns an error if the directory cannot be created, the snapshot cannot be
+    /// parsed, or the WAL file cannot be opened.
     pub fn open_with_config(dir: impl AsRef<Path>, config: Config) -> io::Result<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
 
-        // Acquire exclusive file lock to prevent concurrent access.
-        // Skipped in read-only mode (read replicas don't need exclusion).
+        // Take an exclusive lock on a `db.lock` file so a second process can't
+        // open the same database for writing and corrupt it. This is an *advisory*
+        // OS lock (like SQLite's): it only blocks other processes that also try to
+        // lock — it doesn't physically prevent reads. Skipped in read-only mode,
+        // where many replicas may share the directory safely.
         let lock_file = if config.read_only {
             None
         } else {
