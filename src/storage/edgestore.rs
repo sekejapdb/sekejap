@@ -1,4 +1,11 @@
-//! Edge storage backend.
+//! # Edge storage — the graph's connections
+//!
+//! [`EdgeStore`] holds the edges. For each node it keeps two *adjacency lists* —
+//! the edges going OUT of it (forward) and coming IN to it (reverse) — plus each
+//! edge's optional attributes. Keeping both directions is what lets a query walk
+//! the graph either way (`.forward("follows")` or `.backward("follows")`) without
+//! scanning everything. "Adjacency list" just means: per node, the list of who
+//! it's connected to.
 //!
 //! `EdgeStore` manages graph adjacency lists (forward + reverse) and edge
 //! metadata.  Two modes:
