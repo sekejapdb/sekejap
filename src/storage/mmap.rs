@@ -1,8 +1,39 @@
-//! Shared memory-mapped file view.
+//! # Memory-mapped file view — reading a file as if it were a byte array
 //!
-//! Thin wrapper around the OS `mmap()` syscall, used by both
-//! [`PayloadStore`](crate::PayloadStore) and
-//! [`VectorStore`](super::vecstore::VectorStore) for zero-copy reads.
+//! Normally, to read part of a file you ask the operating system to copy those
+//! bytes into a buffer you own (a `read()` syscall). Memory mapping is a
+//! different deal with the OS: it hands your program a pointer, and pretends the
+//! whole file is already sitting in memory at that address. When you actually
+//! touch a byte, the OS quietly loads that page from disk in the background and
+//! caches it. You never call `read()`; you just index into memory.
+//!
+//! That is the whole trick behind sekejap being "disk-first": an index can live
+//! on disk as one big file, and this type lets the rest of the code treat it as
+//! a `&[u8]` slice with **zero copying** — the bytes are read straight out of the
+//! kernel's page cache. RAM only fills with the pages you actually touch, and the
+//! OS reclaims cold ones on its own. So a 40 GB index costs almost no RAM until
+//! it's used.
+//!
+//! ## How it works
+//!
+//! 1. [`MmapView::try_new`] calls the raw `mmap` syscall to map a file
+//!    read-only and privately, and stores the returned pointer + length.
+//! 2. [`MmapView::slice`] does bounds-checked pointer arithmetic to hand back a
+//!    `&[u8]` into the mapping — no syscall, no copy, just an offset.
+//! 3. `Drop` calls `munmap` to release the mapping when the view goes away.
+//!
+//! ## Core components
+//!
+//! - [`MmapView`] — the whole file: a raw `ptr` + `len`. It is `unsafe impl
+//!   Send + Sync` because a read-only mapping is safe to share across threads
+//!   (nothing mutates it).
+//! - **Unix only.** `mmap`/`munmap` are Unix syscalls, so the real type is
+//!   `#[cfg(unix)]`. On other platforms (Windows) a stub with the same shape
+//!   exists so the disk-first modules still compile — `try_new` just returns
+//!   `None`, and every index falls back to its in-RAM path.
+//!
+//! Used by [`PayloadStore`](crate::PayloadStore),
+//! [`VectorStore`](super::vecstore::VectorStore), and every mmap-served index.
 
 /// Read-only view into a memory-mapped file region.
 ///
@@ -22,12 +53,19 @@ unsafe impl Sync for MmapView {}
 
 #[cfg(unix)]
 impl MmapView {
-    /// Map the first `len` bytes of `file` into memory (read-only, private).
+    /// Map the first `len` bytes of `file` into memory, read-only.
     ///
-    /// Returns `None` if `len == 0` or the kernel rejects the mapping.
+    /// Asks the kernel for a mapping and keeps the pointer it returns. Nothing is
+    /// read from disk yet — pages load lazily on first touch (see [`slice`]).
+    /// Returns `None` if `len == 0` or the kernel refuses the mapping (e.g. out
+    /// of address space); callers treat `None` as "fall back to reading in RAM".
+    ///
+    /// [`slice`]: Self::slice
     pub fn try_new(file: &std::fs::File, len: usize) -> Option<Self> {
-        if len == 0 { return None; }
+        if len == 0 { return None; } // an empty mapping is meaningless — bail early
         use std::os::unix::io::AsRawFd;
+        // Declare the two libc calls we need directly, so this crate needs no
+        // `libc` dependency. `mmap` creates the mapping; `madvise` hints access.
         extern "C" {
             fn mmap(
                 addr: *mut std::ffi::c_void, length: usize,
@@ -35,26 +73,34 @@ impl MmapView {
             ) -> *mut std::ffi::c_void;
             fn madvise(addr: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
         }
-        const PROT_READ: i32 = 1;
-        const MAP_PRIVATE: i32 = 2;
+        const PROT_READ: i32 = 1;    // pages are readable, never writable
+        const MAP_PRIVATE: i32 = 2;  // our own view; the file on disk is never modified
+        // addr = null (kernel picks the address), offset = 0 (map from the start).
         let ptr = unsafe {
             mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
         };
-        if ptr == !0usize as *mut std::ffi::c_void { // MAP_FAILED
+        // mmap signals failure with the sentinel MAP_FAILED (all-ones), not null.
+        if ptr == !0usize as *mut std::ffi::c_void {
             return None;
         }
-        // MADV_NORMAL (0) — let OS use default readahead policy.
+        // MADV_NORMAL (0): use the OS's default read-ahead. We touch these files
+        // both sequentially and randomly, so no special advice wins across the board.
         unsafe { madvise(ptr, len, 0); }
         Some(Self { ptr: ptr as *const u8, len })
     }
 
-    /// Zero-copy slice into the mapped region.
+    /// Borrow `read_len` bytes starting at `offset` as a plain `&[u8]`.
     ///
-    /// Returns `None` if the requested range exceeds the mapped length.
+    /// This is the hot path — a bounds check plus pointer arithmetic, no syscall
+    /// and no copy. Returns `None` if the range runs past the end of the mapping
+    /// (or the offset + length overflows), so a corrupt on-disk offset can never
+    /// read out of bounds.
     #[inline]
     pub fn slice(&self, offset: usize, read_len: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(read_len)?;
-        if end > self.len { return None; }
+        let end = offset.checked_add(read_len)?;      // reject overflow, not just OOB
+        if end > self.len { return None; }            // stay inside the mapping
+        // Safe: the range is verified in-bounds above, and the mapping outlives
+        // the returned slice (tied to `&self`).
         unsafe { Some(std::slice::from_raw_parts(self.ptr.add(offset), read_len)) }
     }
 
