@@ -487,15 +487,30 @@ pub fn bench_tokenize(sql: &str) -> Result<usize, SqlError> {
     tokenize(sql).map(|t| t.len())
 }
 
+/// Turn raw SQL text into a flat list of tokens — step 1 of parsing.
+///
+/// "Tokenizing" (or lexing) means splitting a string like `SELECT age FROM users`
+/// into meaningful chunks: a keyword `SELECT`, an identifier `age`, a keyword
+/// `FROM`, an identifier `users`. It's easier for the parser to work over these
+/// typed `Tok`s than over raw characters. This is a classic character scanner: a
+/// cursor `i` walks the input, and at each position it decides what kind of token
+/// starts there (whitespace to skip, a comment, a quoted string, a number, an
+/// operator, or a word) and advances past it.
+///
+/// Errors are returned for malformed input (e.g. an unterminated string), so a
+/// bad query fails cleanly here rather than confusing the parser later.
 fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
+    // Collect into `Vec<char>` so indexing counts CHARACTERS, not bytes — a `&str`
+    // is UTF-8 and one character can span several bytes, which would break `chars[i]`.
     let chars: Vec<char> = sql.chars().collect();
     let len = chars.len();
-    let mut i = 0;
-    let mut tokens = Vec::new();
+    let mut i = 0;                 // cursor: index of the character we're looking at
+    let mut tokens = Vec::new();   // the token stream we're building
 
     while i < len {
         let c = chars[i];
 
+        // Whitespace between tokens is meaningless — skip it.
         if c.is_ascii_whitespace() {
             i += 1;
             continue;
