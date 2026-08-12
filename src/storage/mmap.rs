@@ -74,3 +74,35 @@ impl Drop for MmapView {
         unsafe { munmap(self.ptr as *mut std::ffi::c_void, self.len); }
     }
 }
+
+// ── Non-Unix stub ────────────────────────────────────────────────────────────
+//
+// sekejap's memory-mapped paged mode is Unix-only (raw `mmap`/`munmap`). On
+// non-Unix targets (Windows) `MmapView` still exists so the disk-first index
+// modules compile and share one code path, but it never maps anything:
+// `try_new` returns `None`, so paged-mode loads fall through and every index
+// uses its resident path. A real Windows mapping (e.g. via `memmap2`) could
+// enable paged mode there later — see roadmap "Format & language stability".
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub(crate) struct MmapView {
+    _never: std::convert::Infallible,
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+impl MmapView {
+    pub fn try_new(_file: &std::fs::File, _len: usize) -> Option<Self> {
+        None
+    }
+
+    #[inline]
+    pub fn slice(&self, _offset: usize, _read_len: usize) -> Option<&[u8]> {
+        match self._never {}
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self._never {}
+    }
+}
