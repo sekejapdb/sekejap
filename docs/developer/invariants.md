@@ -381,8 +381,10 @@ data is never trapped in an old version.
 
 - **Never remove or repurpose SGQL surface** that a stored database could depend
   on for round-trip (statement forms, type names, edge syntax). Additive is fine.
-- The dump/restore tool itself is roadmap (`roadmap.md`), not yet built; this
-  invariant governs it once it exists.
+- Shipped: `CoreDB::dump_sql()` / `load_sql()` and the `sekejap dump` /
+  `sekejap load` CLI emit and replay a `.sql` (`tests/dump_restore.rs` proves
+  dump→load→dump equivalence over every field type, adversarial strings, edges,
+  and index kinds). This invariant governs what those must keep round-tripping.
 
 ### Ring 2 — source-of-truth files: stable *with migration*
 
