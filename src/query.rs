@@ -2851,23 +2851,44 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 if gin_has_index && gin_results.is_empty() {
                     candidates.clear();
                 } else if !gin_results.is_empty() {
-                    let verify = |h: u64| -> bool {
-                        db.get_payload(h)
-                            .and_then(|p| json_path_get(field, &p))
-                            .and_then(|v| v.as_str().map(|s| s.to_string()))
-                            .map(|s| if *case_insensitive { ilike_matches(&s, pattern) }
-                                     else { like_matches(&s, pattern) })
-                            .unwrap_or(false)
-                    };
-                    if candidates.is_empty() {
-                        // STARTER: verify GIN candidates
-                        candidates = gin_results.into_iter().filter(|&h| verify(h)).collect();
+                    // Recheck (trigram is lossy). Read ONLY the indexed field from
+                    // each candidate's stored bytes — batched sequentially, no
+                    // whole-record JSON parse (skips large sibling fields, e.g. a
+                    // GeoJSON geometry). Mirrors the GiST path's cheap recheck.
+                    // Falls back to a full read+parse only when the field can't be
+                    // pulled from the raw bytes (e.g. a dotted JSON path).
+                    let to_verify: Vec<u64> = if candidates.is_empty() {
+                        gin_results // STARTER
                     } else {
-                        // FILTER: intersect + verify
+                        // FILTER: keep candidate order, intersect with GIN set.
                         let gin_set: std::collections::HashSet<u64> =
                             gin_results.into_iter().collect();
-                        candidates.retain(|h| gin_set.contains(h) && verify(*h));
-                    }
+                        candidates.iter().copied().filter(|h| gin_set.contains(h)).collect()
+                    };
+                    let raw = db.read_raw_payloads_batched(&to_verify);
+                    let field_arr = [field.clone()];
+                    candidates = to_verify
+                        .into_iter()
+                        .filter(|&h| {
+                            let text = raw
+                                .get(&h)
+                                .and_then(|bytes| {
+                                    db.extract_stored_fields(bytes, &field_arr)
+                                        .get(field.as_str())
+                                        .and_then(|v| v.as_str().map(str::to_string))
+                                })
+                                .or_else(|| {
+                                    db.get_payload(h)
+                                        .and_then(|p| json_path_get(field, &p))
+                                        .and_then(|v| v.as_str().map(str::to_string))
+                                });
+                            text.map(|s| {
+                                if *case_insensitive { ilike_matches(&s, pattern) }
+                                else { like_matches(&s, pattern) }
+                            })
+                            .unwrap_or(false)
+                        })
+                        .collect();
                 } else if let Some(candidates_from_index) =
                     db.text_index_candidates_with_limit(field, pattern, take_limit)
                 {

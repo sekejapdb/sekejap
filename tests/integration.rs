@@ -4390,6 +4390,34 @@ fn gin_ilike_after_insert() {
     assert!(names.contains(&"The John Butler Trio"));
 }
 
+/// GIN ILIKE recheck reads ONLY the indexed field from the stored bytes (not a
+/// full-record parse). Guards that optimization: exact matches must be returned
+/// even when records carry a large non-indexed sibling field, and a trigram
+/// false-positive (all trigrams present, substring absent) must be excluded.
+#[test]
+fn gin_ilike_verify_exact_with_large_sibling_field() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE docs (content TEXT, blob TEXT)").unwrap();
+    let big = "x".repeat(20_000); // large non-indexed sibling field
+    // Two true matches for '%abcabc%':
+    db.put("docs/t1", &format!(r#"{{"_collection":"docs","content":"see abcabc here","blob":"{big}"}}"#)).unwrap();
+    db.put("docs/t2", &format!(r#"{{"_collection":"docs","content":"abcabc","blob":"{big}"}}"#)).unwrap();
+    // Trigram false positive: contains trigrams abc/bca/cab (from "cab abc") but
+    // NOT the contiguous "abcabc" — the recheck must exclude it.
+    db.put("docs/fp", &format!(r#"{{"_collection":"docs","content":"a cab and abc","blob":"{big}"}}"#)).unwrap();
+    // Unrelated:
+    db.put("docs/n1", &format!(r#"{{"_collection":"docs","content":"nothing here","blob":"{big}"}}"#)).unwrap();
+    db.execute("CREATE INDEX ON docs USING gin (content)").unwrap();
+
+    let hits = db.query("SELECT _key FROM docs WHERE content ILIKE '%abcabc%'").unwrap().collect();
+    let keys: std::collections::HashSet<String> = hits.iter()
+        .filter_map(|h| h.payload.as_ref()?.get("_key")?.as_str().map(String::from))
+        .collect();
+    assert_eq!(keys.len(), 2, "exactly the two true matches");
+    assert!(keys.contains("t1") && keys.contains("t2"));
+    assert!(!keys.contains("fp"), "trigram false positive must be rechecked out");
+}
+
 // ── GQL path functions: length(p), nodes(p) ──────────────────────────────────
 
 /// `length(p)` counts hops from start.
