@@ -1,4 +1,10 @@
-//! Scalar functions for SQL expressions.
+//! # Scalar functions — the per-value helpers SQL expressions call
+//!
+//! "Scalar" means "operates on one value at a time" (as opposed to an aggregate
+//! like `COUNT` that folds many rows into one). This file implements the built-in
+//! functions a query can use on a field — string ops, math, type coercions, and
+//! the like — that the SQL executor calls while evaluating a `SELECT` expression
+//! or a `WHERE` condition for each row.
 
 use chrono::{Datelike, Timelike};
 use serde_json::{Number, Value};
