@@ -142,11 +142,13 @@ Near-term core polish includes:
     the manifest and checked on open, so a Ring-2 physical change is a detectable,
     migratable step. Per-file `[magic][version]` headers already exist; this
     unifies them into one checked contract with migration readers.
-  - **SGQL logical dump/restore** — `dump` emits a database as portable SGQL
-    text (`CREATE TABLE` + `INSERT` + edge creation); `load` replays it. Version-
-    independent by construction (the `sqlite .dump` / `pg_dump` escape hatch), so
-    a database can always move between any two sekejap versions regardless of the
-    binary layout. This is the strongest safety net and does not exist yet.
+  - **SGQL logical dump/restore** — ✅ shipped. `CoreDB::dump_sql()` /
+    `load_sql()` and the `sekejap dump` / `sekejap load` CLI emit a database as
+    portable SGQL text (`CREATE TABLE` + `INSERT` + edge creation) and replay it.
+    Version-independent by construction (the `sqlite .dump` / `pg_dump` escape
+    hatch), so a database can move between any two sekejap versions regardless of
+    the binary layout — the strongest safety net. (Prerequisite fixed en route:
+    the lexer now supports SQL-standard `''` quote escaping.)
     - **File is `.sql`**, not a custom extension — the dump is overwhelmingly
       standard SQL (`CREATE TABLE` + `INSERT`), matching the `pg_dump` / `sqlite
       .dump` precedent, so every editor and tool syntax-highlights it for free.
