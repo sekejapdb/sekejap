@@ -3498,19 +3498,30 @@ impl CoreDB {
         result
     }
 
-    /// Remove a node by slug. Also removes its collection membership and edges.
+    /// Delete a node by slug, along with its collection membership and every
+    /// edge that touches it.
+    ///
+    /// Note the shape shared by every public mutation: log the intent to the WAL
+    /// first (durability), then apply it via the no-WAL `_raw` helper, then run
+    /// `after_mutation` (fire the change feed, maybe auto-compact). `put`, `link`,
+    /// and `remove` are all this same three-step dance.
     pub fn remove(&mut self, slug: &str) {
-        self.wal_write(WalEntry::Remove {
-            slug: slug.to_string(),
-        });
-        self.remove_raw(slug);
-        self.after_mutation();
+        self.wal_write(WalEntry::Remove { slug: slug.to_string() }); // 1. log
+        self.remove_raw(slug);   // 2. apply to maps/indexes (no WAL)
+        self.after_mutation();   // 3. notify + maybe compact
     }
 
-    /// Create a directed edge: `from` → `to` with a type label. The edge is a
-    /// naked connector — no weight. Nodes do not need to exist before linking.
-    /// For a weighted or attributed edge use [`link_attr`] or [`link_meta`].
+    /// Create a directed graph edge: `from` → `to`, labelled `edge_type`.
+    ///
+    /// An edge is what makes this a *graph* database: a first-class connection
+    /// between two nodes that queries can traverse (`.forward("follows")`, the
+    /// `MATCH` patterns, shortest-path). This variant is a **naked** edge — just
+    /// a typed arrow, no attributes; use [`link_attr`] / [`link_meta`] for a
+    /// weighted or attributed edge. The endpoints don't have to exist yet: an
+    /// edge is stored by the id hashes of its slugs, so you can wire up the graph
+    /// before (or without) inserting the nodes themselves.
     pub fn link(&mut self, from: &str, to: &str, edge_type: &str) {
+        // Same WAL-first pattern as `put`/`remove` (see `remove` above).
         self.wal_write(WalEntry::Link {
             from: from.to_string(),
             to: to.to_string(),
