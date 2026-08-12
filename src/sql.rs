@@ -1,7 +1,41 @@
-//! Hand-rolled SQL parser and compiler for sekejap.
+//! # SGQL — turning query text into a runnable plan
 //!
-//! Parses a subset of SELECT SQL and compiles it to a `Vec<Step>` pipeline
-//! that the existing executor can run without any extra overhead.
+//! This file is sekejap's query language front-end. It reads a query written as
+//! text (`SELECT … WHERE …`, `INSERT …`, and graph patterns inside `MATCH`) and
+//! turns it into the plan the engine runs. The language is called **SGQL**:
+//! familiar SQL for the relational parts, plus standard graph patterns for the
+//! `MATCH` parts — one statement can mix both.
+//!
+//! Crucially, the parser does **not** invent a second execution engine. A
+//! `SELECT` compiles down to the very same `Vec<Step>` the chainable API builds
+//! (see `query.rs`), so text queries and code queries run through one executor
+//! with no extra overhead. Writes (`INSERT`/`UPDATE`/`DELETE`) compile to a
+//! small mutation type instead.
+//!
+//! ## How a query becomes a plan
+//!
+//! 1. **Tokenize** — split the raw text into tokens (keywords, identifiers,
+//!    strings, numbers, operators). This is where, for example, a doubled quote
+//!    inside a string (`'O''Brien'`) collapses to one literal quote.
+//! 2. **Parse** — a hand-written recursive-descent [`Parser`] walks the tokens
+//!    into a typed statement (a `SELECT`, an aggregate `MATCH`, a shortest-path
+//!    query, a mutation, DDL like `CREATE TABLE`, …).
+//! 3. **Lower / compile** — the statement is translated into `Vec<Step>` (for
+//!    reads) or a mutation value (for writes), ready for the executor.
+//!
+//! The parser is hand-rolled (no parser-generator dependency) and guards against
+//! pathological input with explicit caps (nesting depth, `IN`-list size, etc.),
+//! while typed `$N` parameters keep user values out of the SQL text entirely — so
+//! there is no string interpolation to inject through.
+//!
+//! ## Core components in this file
+//!
+//! - `Tok` / the tokenizer — the raw text split into tokens.
+//! - [`Parser`] — the recursive-descent parser; one method per grammar rule.
+//! - [`FieldType`] and the schema types — what `CREATE TABLE` declares.
+//! - The lowering functions — statement → `Vec<Step>` / mutation.
+//!
+//! The full accepted grammar is below.
 //!
 //! # Grammar
 //! ```text

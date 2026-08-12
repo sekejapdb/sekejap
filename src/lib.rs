@@ -1,9 +1,54 @@
-//! sekejap — lite graph database engine
+//! # sekejap core — the database engine (`CoreDB`)
 //!
-//! HashMap-backed, minimal deps.
-//! Same chainable query API as sekejap full, without spatial/vector/fulltext.
+//! This is the heart of sekejap. Everything else (the SQL parser, the wrappers,
+//! the server) is a thin layer over the one type defined here: [`CoreDB`]. It is
+//! an **embedded** database — it runs inside your program like SQLite, not as a
+//! separate server you connect to. And it is **multi-model**: the same store
+//! holds records (like a document DB), edges between them (like a graph DB), and
+//! specialized indexes for text, geo, and vector search — all queried together.
 //!
-//! # In-memory (ephemeral)
+//! ## The one idea to hold on to: disk-first
+//!
+//! A record's bytes (its "payload") live **on disk**, not in RAM. What stays in
+//! memory is small: for each node, its identity, where its payload sits on disk
+//! (`payload_offset` + `payload_len`), and the compact index structures needed to
+//! *find* things fast. So memory usage tracks the number of records and their
+//! indexes — never the total size of the data. A database far bigger than RAM
+//! still opens instantly and answers queries with a bounded memory footprint.
+//!
+//! ## How a request flows through
+//!
+//! **Writing** (`put` / `link`): the change is first appended to the
+//! write-ahead log (WAL) on disk so a crash can't lose it, then applied to the
+//! in-memory maps and the on-disk payload store. `compact()` later folds the WAL
+//! into a clean snapshot so the next open is fast.
+//!
+//! **Reading** (`query` / the chainable builder): a query becomes a list of
+//! [`Step`]s — `Collection`, `WhereEq`, `Forward` (an edge hop), `Sort`, `Take`,
+//! and so on. The executor ([`Set`] in `query.rs`) runs those steps, using an
+//! index to *seed* a small candidate set whenever it can, and only reads payloads
+//! from disk for the rows that survive. The SQL surface (`sql.rs`) is just a
+//! front-end that compiles text into the very same `Vec<Step>`.
+//!
+//! ## Core components in this file
+//!
+//! - [`CoreDB`] — owns everything: the node map, the edge store, the payload
+//!   store, and every index. All reads and writes go through it.
+//! - `NodeData` — the small in-RAM record for one node: its slug (`collection/key`),
+//!   its cached collection name, spatial metadata, and the offset/length of its
+//!   payload on disk. Deliberately does **not** hold the payload itself.
+//! - `PayloadStore` — the on-disk record bytes (`payloads.bin`), read on demand
+//!   by offset. Ephemeral in-memory databases keep the bytes in RAM instead.
+//! - The index families (scalar/btree, graph adjacency, spatial grid, text,
+//!   vector) — each answers a query with a set of node ids, the shared currency
+//!   that lets one query combine several of them.
+//!
+//! See `docs/developer/` for the architecture in depth, and
+//! `docs/developer/invariants.md` for the rules this engine must never break.
+//!
+//! ## Quick start
+//!
+//! In-memory (ephemeral — nothing is written to disk):
 //! ```
 //! use sekejap::CoreDB;
 //!
@@ -12,17 +57,18 @@
 //! db.put("bob",   r#"{"name":"Bob",  "age":25,"_collection":"users"}"#).unwrap();
 //! db.link("alice", "bob", "follows"); // a naked, weightless edge
 //!
+//! // Start at alice, hop along "follows" edges, collect where we land.
 //! let hits = db.one("alice").forward("follows").collect();
 //! assert_eq!(hits[0].slug, "bob");
 //! ```
 //!
-//! # Persistent (WAL-backed)
+//! Persistent (WAL-backed — survives restarts):
 //! ```no_run
 //! use sekejap::CoreDB;
 //!
 //! let mut db = CoreDB::open("mydb").unwrap();
 //! db.put("alice", r#"{"name":"Alice","_collection":"users"}"#).unwrap();
-//! db.compact().unwrap();  // flush snapshot + truncate WAL
+//! db.compact().unwrap();  // fold the WAL into a snapshot so the next open is fast
 //! ```
 
 pub mod bm25;

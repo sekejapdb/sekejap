@@ -1,4 +1,54 @@
-//! Chainable query builder and executor.
+//! # The query engine — building and running queries
+//!
+//! This file is where a query is described and then executed. A query in sekejap
+//! is not a string that gets interpreted ad-hoc; it is a small **list of steps**,
+//! and this module both builds that list (the chainable API) and runs it (the
+//! executor). The SQL surface in `sql.rs` produces the exact same list of steps,
+//! so text queries and code queries share one engine.
+//!
+//! ## The plan is data: `Step`
+//!
+//! Every operation is a [`Step`] value — a starter like `Collection` ("all rows
+//! in this table") or `One` ("this one node"), a graph move like `Forward` (hop
+//! along an edge), a filter like `WhereEq`/`Like`, or a shaper like `Sort`,
+//! `Take`, `Select`. A whole query is just a `Vec<Step>`. Because the plan is
+//! plain data, the same executor runs a query no matter whether it came from the
+//! chainable API or from SQL.
+//!
+//! ## Building the plan: the `Set` builder
+//!
+//! [`Set`] is the fluent builder you get from `db.collection("x")` or
+//! `db.one("k")`. Each method (`.where_eq(...)`, `.forward(...)`, `.sort(...)`,
+//! `.take(n)`) just pushes another `Step`. Nothing runs until you call
+//! `.collect()` (materialize rows) or `.count()` (just the number).
+//!
+//! ## Running the plan: `execute`
+//!
+//! The interpreter walks the steps and carries a working set of **node ids**
+//! (u64 hashes) — never payloads — for as long as it can. The two ideas that make
+//! this fast:
+//!
+//! - **Seed from an index.** When a filter can be answered by an index (a btree
+//!   for `=`/`<`, the GIN trigram index for `ILIKE`, the spatial grid, …), the
+//!   executor starts from that index's small candidate set instead of scanning
+//!   every row.
+//! - **Read payloads last.** The heavy step — reading a record's bytes from disk
+//!   and parsing them — happens only for the handful of rows that survive all the
+//!   filters, and only for the columns the query actually asked for. Identity
+//!   columns (`_key`, `_id`) and sort keys can often be answered without any
+//!   payload read at all.
+//!
+//! ## Core components in this file
+//!
+//! - [`Step`] — one operation in a query plan (the enum every query is made of).
+//! - [`Set`] — the chainable builder that assembles a `Vec<Step>`.
+//! - [`Hit`] — one result row: its slug, its id hash, and an optional projected
+//!   payload (`None` until materialized).
+//! - `execute(db, steps)` — the interpreter that turns a plan into node ids.
+//!
+//! Graph traversal, aggregation (`GROUP BY`), `MATCH`/shortest-path, and the
+//! per-shape fast paths all live here too, each layered on this same
+//! steps-over-ids foundation.
 
 use crate::{sk_hash, CoreDB, FieldKey};
 use crate::vector::VectorAccess;
