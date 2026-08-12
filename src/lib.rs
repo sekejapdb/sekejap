@@ -402,6 +402,7 @@ pub(crate) struct PayloadStore {
     /// superset table written before a payload swap never mis-decodes old
     /// records. Empty when no SKBIN records exist.
     field_table: storage::skbin::FieldTable,
+    /// Where the bytes actually live (RAM vs. disk vs. remote) — see [`PayloadInner`].
     inner: PayloadInner,
 }
 
@@ -409,14 +410,21 @@ pub(crate) struct PayloadStore {
 #[cfg(unix)]
 use storage::mmap::MmapView;
 
+/// The three places a payload store can keep its bytes. `PayloadStore` presents
+/// one `get(offset, len)` API over whichever of these it is.
 enum PayloadInner {
+    /// Ephemeral database: all record bytes held in one growing `Vec<u8>`.
     Memory { data: Vec<u8> },
+    /// Persistent database: bytes in the `payloads.bin` file. Reads go through
+    /// the `mmap` view when present (zero-copy), else fall back to `pread`.
     Disk {
         file: std::fs::File,
         total_len: u64,
         #[cfg(unix)]
         mmap: Option<MmapView>,
     },
+    /// Object-storage backend (feature `s3`): bytes fetched from remote blocks
+    /// and held in a bounded in-memory `BlockCache`.
     #[cfg(feature = "s3")]
     Remote {
         cache: std::sync::Mutex<engine::cache::BlockCache>,
@@ -690,8 +698,18 @@ impl PayloadStore {
     }
 }
 
+/// The small in-RAM record for one node — everything the engine keeps resident
+/// per node, which is deliberately **not** the payload.
+///
+/// This is the crux of disk-first: for every node we hold its identity and a
+/// pointer to where its bytes live on disk (`payload_offset` + `payload_len`),
+/// plus two cached values (`collection`, `spatial_meta`) that would otherwise
+/// force a disk read + JSON parse for common lookups. The payload bytes stay on
+/// disk and are fetched only when a query actually needs them. So per-node RAM is
+/// a few dozen bytes regardless of how big the record is.
 #[derive(Clone)]
 pub struct NodeData {
+    /// The node's human-readable slug, `"collection/key"` (e.g. `"users/alice"`).
     pub slug: String,
     /// Cached `_collection` field value (empty string if no collection).
     /// Avoids parsing JSON for collection-only lookups.
@@ -736,20 +754,39 @@ pub(crate) struct BfsPath {
 
 // ── CoreDB ────────────────────────────────────────────────────────────────────
 
-/// The database. Not thread-safe by itself — wrap in `Mutex<CoreDB>` if needed.
+/// The database — owns every node, edge, index, and the on-disk stores.
 ///
-/// Writes take `&mut self`. Reads and query starters take `&self`.
+/// Not thread-safe by itself: writes take `&mut self`, reads and query starters
+/// take `&self`. Wrap in `Mutex<CoreDB>` (or use the optional `engine` wrapper)
+/// for concurrent access. Create one with [`CoreDB::new`] (in-memory, ephemeral)
+/// or [`CoreDB::open`] (WAL-backed, persistent).
 ///
-/// Use [`CoreDB::new`] for an in-memory DB, or [`CoreDB::open`] for a
-/// WAL-backed persistent DB.
+/// The many fields group into a few roles:
+///
+/// - **Identity & topology** — `nodes` (id → the small in-RAM [`NodeData`]),
+///   `slug_map` (`"collection/key"` → id), `edges`, `collections`, and
+///   `topo_base` (the mmap'd base in paged mode; the maps above become a write
+///   *overlay* on top of it).
+/// - **Record storage** — `payload_store` lives inside the nodes' offsets; the
+///   actual bytes are on disk (or in RAM for an ephemeral DB).
+/// - **Indexes** — one map per family: `spatial_grid`, `text_indexes` (GiST),
+///   `gin_indexes`, `bm25_indexes`, `search_indexes`, `vectors` + HNSW. Each
+///   turns a query into a set of node ids.
+/// - **Schema** — `schemas` (from `CREATE TABLE`) and `materialized_views`.
+/// - **Durability & config** — `wal` (+ `wal_format`, `wal_sync`), `data_dir`,
+///   the auto-compaction thresholds, and the change-feed bookkeeping.
 pub struct CoreDB {
+    /// The primary map: node id (a `u64` hash of the slug) → its in-RAM record.
     nodes: HashMap<u64, NodeData>,
+    /// Reverse lookup: human slug `"collection/key"` → node id.
     slug_map: HashMap<String, u64>,
     /// Graph edges (forward + reverse adjacency, edge type names, metadata).
     edges: storage::edgestore::EdgeStore,
     /// Auto-compaction mode + thresholds (copied from `Config` at open).
     auto_compact: AutoCompact,
+    /// When auto-compaction fires — the write-count / WAL-size limits it checks.
     compact_thresholds: CompactThresholds,
+    /// How hard each WAL write is flushed to disk (durability vs. speed trade-off).
     wal_sync: SyncMode,
     /// Changes accumulated since the last emission; flushed as one [`ChangeEvent`]
     /// at each committed-mutation boundary (see [`CoreDB::subscribe_changes`]).
@@ -761,6 +798,8 @@ pub struct CoreDB {
     /// >0 while replaying a COMMIT: batch arms accumulate but do not emit, so
     /// the whole transaction publishes exactly one change event at COMMIT.
     commit_depth: u32,
+    /// If set, run a final `compact()` when the database is dropped, so the next
+    /// open starts from a clean snapshot instead of replaying a long WAL.
     compact_on_close: bool,
     /// Amortises the WAL-size stat: thresholds are checked every N writes.
     writes_since_compact_check: u32,
