@@ -58,12 +58,22 @@ use std::collections::{HashMap, HashSet};
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
-/// A resolved node returned from `.collect()`.
+/// One result row returned from `.collect()`.
+///
+/// It always carries the node's identity — its `slug` (`"collection/key"`) and
+/// `slug_hash` (the `u64` id). The `payload` is an `Option` on purpose: it stays
+/// `None` while the query is still working over ids, and is only filled in at the
+/// end for the rows that survive — and even then only the columns the query asked
+/// for (`SELECT`). That's the "read payloads last" idea made concrete: identity
+/// is cheap and always present; the expensive record bytes are attached lazily.
 #[derive(Debug, Clone)]
 pub struct Hit {
+    /// Human-readable id, `"collection/key"` (e.g. `"users/alice"`).
     pub slug: String,
+    /// The node's `u64` identity hash (what the engine actually works with).
     pub slug_hash: u64,
-    /// Full payload, or projected subset if `.select()` was used.
+    /// The record's fields — `None` until materialized; a projected subset when
+    /// `.select()` / `SELECT col, …` limited which columns to read.
     pub payload: Option<Value>,
 }
 
@@ -135,12 +145,22 @@ pub enum ScoreExpr {
 
 // ── Step ──────────────────────────────────────────────────────────────────────
 
-/// A single pipeline step.
+/// One operation in a query — the atom that whole query plans are made of.
 ///
-/// Steps are accumulated in `Set` and executed lazily on `.collect()` / `.count()`.
+/// This is the "plan is data" idea: instead of interpreting query text directly,
+/// sekejap represents a query as a `Vec<Step>` and has one executor walk it. A
+/// plan reads left to right — a **starter** ([`One`](Step::One)/`Collection`/…)
+/// seeds the working set of node ids, then **graph moves**, **filters**, and
+/// **shapers** (sort/take/select) transform it. The chainable API and the SQL
+/// front-end both just produce this same list, so they share one executor.
 ///
-/// Serializable so logical WAL entries (`WalEntry::Update`) can store the
-/// compiled filter pipeline and re-execute it deterministically on replay.
+/// Steps are collected in a [`Set`] and run lazily — nothing executes until
+/// `.collect()` / `.count()`. The enum derives `Serialize`/`Deserialize` so a
+/// compiled filter pipeline can be stored in a logical WAL entry
+/// (`WalEntry::Update`) and re-run deterministically on replay.
+///
+/// The variants below are grouped: starters, graph traversal, filters, and
+/// sort/page/set-algebra shapers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Step {
     // ── Starters (always the first step) ──────────────────────────────────────
