@@ -2465,23 +2465,41 @@ fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>> {
     Some(out)
 }
 
+/// The interpreter: run a query plan and return the surviving node ids.
+///
+/// This is the engine's read core. It keeps a `candidates` list of node id
+/// hashes (never payloads) and folds each [`Step`] over it: a starter fills it,
+/// a filter shrinks it, a graph move replaces it with neighbours, and so on. The
+/// caller (`Set::collect`) reads payloads only for whatever ids come back.
+///
+/// Two performance ideas live here:
+/// - **Fast paths first** — before the general loop, it checks for a couple of
+///   recognizable query *shapes* (like "top-N off a sorted index, no filter")
+///   that can be answered directly. Short-circuiting a hot shape beats optimizing
+///   the general path.
+/// - **Seed from an index, don't scan** — `btree_seed` can answer an equality/
+///   range filter straight from an index. Steps it "used up" are recorded in
+///   `skip_set` so the main loop doesn't redo them as a scan.
 fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
-    // O(k) index-order-limit fast path (unfiltered top-N off a btree index).
+    // Fast path: `... ORDER BY indexed_col LIMIT k` with no filter reads straight
+    // from the btree in sorted order — O(k) instead of sort-everything.
     if let Some(fast) = try_index_order_limit(db, steps) {
         return fast;
     }
 
-    let mut candidates: Vec<u64> = Vec::new();
-    // Steps consumed by btree_seed (already applied as the seed filter)
+    let mut candidates: Vec<u64> = Vec::new(); // the working set of node ids
+    // Step indices already applied by `btree_seed` — the main loop skips these so
+    // an index-seeded filter isn't also run as a full scan.
     let mut skip_set: HashSet<usize> = HashSet::new();
-    // Track the active collection hash so post-seed filters can use btree indexes.
+    // Which collection we're scoped to, so later filters can find its btree indexes.
     let mut current_coll_hash: Option<u64> = None;
 
+    // Walk the plan step by step, transforming `candidates` in place.
     for (i, step) in steps.iter().enumerate() {
         if skip_set.contains(&i) {
-            continue;
+            continue; // already handled as an index seed
         }
-        let remaining = &steps[i + 1..];
+        let remaining = &steps[i + 1..]; // lookahead: some steps peek at what follows (e.g. a LIMIT)
         match step {
             // ── Starters ────────────────────────────────────────────────────
             Step::One(hash) => {
