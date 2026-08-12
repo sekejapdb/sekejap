@@ -1,3 +1,10 @@
+//! # Spatial index — finding things by location, on disk
+//!
+//! To answer "which venues are within 5 km of this point" without checking every
+//! row, sekejap lays a **grid** over the map and records which items fall in each
+//! cell. A spatial query then only inspects the handful of cells the query area
+//! covers. This file is the disk-first form of that grid.
+//!
 //! Disk-first (mmap-served) spatial grid: the cell index and per-node spatial
 //! metadata served straight from a memory-mapped `spatialgrid.bin`, so paged mode
 //! need not rebuild the resident `SpatialGrid` (cells + meta HashMaps) on open.

@@ -1,4 +1,13 @@
-//! On-disk, mmap'd btree field index — the btree analogue of [`super::vecstore`].
+//! # Scalar (btree) field index — fast `WHERE x = / < / BETWEEN` and `ORDER BY`
+//!
+//! When you filter or sort on a column, scanning every row is slow. A btree index
+//! keeps that column's values in *sorted* order mapping value → the ids of rows
+//! that have it, so an equality or range lookup is a quick search and `ORDER BY`
+//! is just reading the tree in order. This file is the on-disk, memory-mapped form
+//! of that index: one file per `(collection, field)`, with the bulk posting lists
+//! (linear in the row count) living in the mmap — reclaimable OS page cache —
+//! instead of a heap `BTreeMap`. So a reopened paged database answers indexed
+//! queries with bounded RAM no matter how big the table is.
 //!
 //! One file per `(collection, field)`: `fieldidx_<coll_hash>_<field>.bin`. The
 //! posting lists (the linear-in-N bulk) live in the mmap — reclaimable page

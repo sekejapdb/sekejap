@@ -1,4 +1,12 @@
-//! Vector storage backend.
+//! # Vector storage — the raw embeddings behind vector search
+//!
+//! A "vector" here is an embedding: a fixed-length array of `f32`s that represents
+//! a record's meaning (from an ML model), so that "similar" records have nearby
+//! vectors. This file stores those raw vectors for one field. The HNSW index and
+//! the query executor never touch the storage directly — they go through the
+//! [`VectorAccess`] trait, so they don't care whether the vectors live in RAM
+//! (ephemeral DB) or in a memory-mapped file on disk (persistent DB). That trait
+//! boundary is what lets vector search be disk-first without changing its logic.
 //!
 //! `VectorStore` wraps an inner storage engine and presents it through the
 //! [`VectorAccess`] trait so that HNSW and query execution are agnostic to
