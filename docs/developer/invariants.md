@@ -398,12 +398,25 @@ compatibility surface:
 | topology snapshot — `nodes.bin`, `idx.bin`, `adj_fwd/rev.bin`, `slugs.bin`, `dict.bin`, `collections.bin`, `edgemeta.bin` | ids, adjacency, names |
 | `wal.log`, snapshot manifest | durable log + versioned manifest |
 
-Policy:
-- Every file carries a `[magic][version]` header. An unknown version **fails
-  loudly**, never corrupts (the safety floor — already in place).
-- A format change ships an explicit **migration reader** (old → new). Never a
-  silent reformat, because there is no source to rebuild these from.
-- Ring 1 (SGQL dump/restore) is always the fallback if migration is infeasible.
+Authoritative store version: `SNAPSHOT_FORMAT_VERSION` (the snapshot manifest is
+read first on open and gates the whole store, so a store-format bump is a
+snapshot-version bump).
+
+Policy — three outcomes on open (in `lib.rs`):
+- **store == code** → read normally.
+- **store > code** → **fail loud** (`newer_format_msg`), never corrupt — the
+  safety floor. (`snapshot_version_too_new_rejected`.)
+- **store < code** → apply registered migrations in sequence via the migration
+  framework (`StoreMigration` / `STORE_MIGRATIONS` / `apply_store_migrations`),
+  else fall back to backward-compatible reading (older snapshots parse via serde
+  defaults; derived accelerators rebuild). Tests:
+  `store_migration_*` (sequencing, gap-skip, empty registry, same-version).
+
+A format change registers its `StoreMigration` (old → new) — never a silent
+reformat, because there is no source to rebuild these from. `STORE_MIGRATIONS` is
+**empty today** (format at v3, no change pending); the framework means the next
+change is a one-line registration, not a stuck-data crisis. Ring 1 (SGQL
+dump/restore) is always the fallback if a physical migration is infeasible.
 
 ### Ring 3 — derived accelerators: free to change
 

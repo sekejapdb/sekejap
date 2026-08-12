@@ -118,6 +118,62 @@ fn snapshot_probe(head: &[u8]) -> (u32, usize) {
     }
 }
 
+// ── Ring-2 store-format migration framework ────────────────────────────────────
+//
+// `SNAPSHOT_FORMAT_VERSION` is the authoritative *whole-store* format version:
+// the snapshot manifest is the first file read on open and gates the store, so a
+// store-format bump is a snapshot-version bump. Ring 2 (source-of-truth files —
+// payloads, topology, raw vectors, WAL) is a real compatibility surface (see
+// docs/developer/invariants.md, Pillar 4). Three outcomes on open:
+//   • store == code → read normally.
+//   • store  > code → fail loud (`newer_format_msg`) — never corrupt.
+//   • store  < code → apply registered migrations in sequence, else fall back to
+//                     backward-compatible reading (older snapshots parse via serde
+//                     defaults; derived accelerators rebuild).
+
+/// One source-of-truth (Ring 2) format migration: upgrades a store directory in
+/// place from format `from` to `from + 1`. Registered (ascending, contiguous) in
+/// `STORE_MIGRATIONS` and applied in sequence on open.
+struct StoreMigration {
+    /// The store version this migration upgrades *from* (it produces `from + 1`).
+    from: u32,
+    /// One-line description of the on-disk change (for logs / tooling).
+    #[allow(dead_code)]
+    describe: &'static str,
+    /// Transform the store directory in place from `from` to `from + 1`.
+    run: fn(dir: &std::path::Path) -> io::Result<()>,
+}
+
+/// Registered store-format migrations. **Empty today** — the format is at v3 and
+/// older snapshots still parse via backward-compatible defaults, so no explicit
+/// upgrade is due. The *next* Ring-2 format change registers its reader here so an
+/// old store is upgraded on open rather than stuck at the fail-loud safety floor.
+const STORE_MIGRATIONS: &[StoreMigration] = &[];
+
+/// Upgrade a store directory from format `from` toward `to` by applying every
+/// registered migration covering `[from, to)` in ascending order. Returns the
+/// version actually reached: `to` if the chain was complete, or the first version
+/// with no registered migration (the caller then reads with backward-compatible
+/// parsing). Errors only if a registered migration itself fails.
+fn apply_store_migrations(
+    dir: &std::path::Path,
+    from: u32,
+    to: u32,
+    migrations: &[StoreMigration],
+) -> io::Result<u32> {
+    let mut v = from;
+    while v < to {
+        match migrations.iter().find(|m| m.from == v) {
+            Some(m) => {
+                (m.run)(dir)?;
+                v += 1;
+            }
+            None => break, // no explicit migration for this step → backward-compat read
+        }
+    }
+    Ok(v)
+}
+
 /// Bump each constant when the corresponding index algorithm changes in a way
 /// that makes indexes built by the previous version produce wrong results.
 const GIN_INDEX_VERSION:     u32 = 3; // sorted trigram dir + blob (mmap-served) 2026-08
@@ -1294,7 +1350,21 @@ impl CoreDB {
                     newer_format_msg("snapshot", fmt_version, SNAPSHOT_FORMAT_VERSION),
                 ));
             }
-            file.seek(SeekFrom::Start(body_offset as u64))?;
+            // Ring 2: an older store is upgraded in place by registered migrations
+            // before it is read. Dormant while STORE_MIGRATIONS is empty (older
+            // snapshots then fall through to backward-compatible parsing below); a
+            // future format change activates this path. A rewriting migration
+            // reopens the header, so re-probe when the chain completed.
+            if fmt_version < SNAPSHOT_FORMAT_VERSION && !STORE_MIGRATIONS.is_empty() {
+                drop(file);
+                apply_store_migrations(dir, fmt_version, SNAPSHOT_FORMAT_VERSION, STORE_MIGRATIONS)?;
+                file = std::fs::File::open(&snap_path)?;
+                let n2 = file.read(&mut head).unwrap_or(0);
+                let (_v2, body2) = snapshot_probe(&head[..n2]);
+                file.seek(SeekFrom::Start(body2 as u64))?;
+            } else {
+                file.seek(SeekFrom::Start(body_offset as u64))?;
+            }
             // Stream-parse rather than loading the whole file into RAM.
             // This handles legacy snapshots that embedded gin_indexes (multi-GB).
             // serde_json::from_reader reads incrementally; IgnoredAny skips gin_indexes
@@ -9719,6 +9789,53 @@ mod hybrid_query_tests {
             .collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].slug, "articles/a1");
+    }
+
+    // ── Ring-2 store-format migration framework ──
+    fn mig_1to2(dir: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(dir.join("m12"), b"")
+    }
+    fn mig_2to3(dir: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(dir.join("m23"), b"")
+    }
+
+    #[test]
+    fn store_migration_empty_registry_is_noop() {
+        let d = tempfile::tempdir().unwrap();
+        let reached = super::apply_store_migrations(d.path(), 1, 3, &[]).unwrap();
+        assert_eq!(reached, 1, "no registered migration → stays at source version");
+    }
+
+    #[test]
+    fn store_migration_full_chain_applies_in_order() {
+        let d = tempfile::tempdir().unwrap();
+        let migs = [
+            super::StoreMigration { from: 1, describe: "1->2", run: mig_1to2 },
+            super::StoreMigration { from: 2, describe: "2->3", run: mig_2to3 },
+        ];
+        let reached = super::apply_store_migrations(d.path(), 1, 3, &migs).unwrap();
+        assert_eq!(reached, 3);
+        assert!(d.path().join("m12").exists() && d.path().join("m23").exists());
+    }
+
+    #[test]
+    fn store_migration_stops_at_gap() {
+        let d = tempfile::tempdir().unwrap();
+        // 1->2 registered, 2->3 missing: chain reaches 2, then backward-compat read.
+        let migs = [super::StoreMigration { from: 1, describe: "1->2", run: mig_1to2 }];
+        let reached = super::apply_store_migrations(d.path(), 1, 3, &migs).unwrap();
+        assert_eq!(reached, 2);
+        assert!(d.path().join("m12").exists());
+        assert!(!d.path().join("m23").exists());
+    }
+
+    #[test]
+    fn store_migration_same_version_runs_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let migs = [super::StoreMigration { from: 1, describe: "x", run: mig_1to2 }];
+        let reached = super::apply_store_migrations(d.path(), 3, 3, &migs).unwrap();
+        assert_eq!(reached, 3);
+        assert!(!d.path().join("m12").exists());
     }
 }
 
