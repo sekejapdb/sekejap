@@ -143,10 +143,20 @@ Near-term core polish includes:
     migratable step. Per-file `[magic][version]` headers already exist; this
     unifies them into one checked contract with migration readers.
   - **SGQL logical dump/restore** — `dump` emits a database as portable SGQL
-    text (`CREATE TABLE` + `INSERT` + edge `link`); `load` replays it. Version-
+    text (`CREATE TABLE` + `INSERT` + edge creation); `load` replays it. Version-
     independent by construction (the `sqlite .dump` / `pg_dump` escape hatch), so
     a database can always move between any two sekejap versions regardless of the
     binary layout. This is the strongest safety net and does not exist yet.
+    - **File is `.sql`**, not a custom extension — the dump is overwhelmingly
+      standard SQL (`CREATE TABLE` + `INSERT`), matching the `pg_dump` / `sqlite
+      .dump` precedent, so every editor and tool syntax-highlights it for free.
+    - **Self-identify with a header comment** (pg_dump style), e.g.
+      `-- sekejap dump; format 1; SGQL` — identity travels in the file, not the
+      extension. Strict SQL linters may squiggle the graph statements; that is
+      cosmetic and does not affect loading.
+    - **Edges emit as round-trippable SGQL statements** that `db.query()` accepts,
+      so the whole `.sql` file reloads through the single query surface (no
+      separate parser, no reliance on the atomic `link()` API).
 
 - **Disk-first spatial at scale** — serving spatial queries (not just counts)
   from the on-disk spatial index with bounded memory, for large map/geo datasets
