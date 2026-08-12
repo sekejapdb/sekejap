@@ -1,3 +1,12 @@
+//! # The BM25 index — building it and scoring queries
+//!
+//! This ties the BM25 pieces together (see the `bm25` module doc for what BM25
+//! *is*): it tokenizes documents, builds the term dictionary + postings, tracks
+//! per-document lengths, and computes the relevance score at query time. The
+//! `DocLens`/`DocIdx` types are the disk-first split — the O(N) per-doc arrays can
+//! be memory-mapped so a reopened index costs little RAM, while the small term
+//! dictionary stays resident as the deliberate accelerator.
+//!
 //! BM25 full-text search index.
 //!
 //! Lightweight and Pi-friendly: the only allocations are the postings
