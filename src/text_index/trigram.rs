@@ -1,97 +1,96 @@
-//! ## Trigram Extraction
+//! # Trigram extraction — chopping text into 3-character shingles
 //!
-//! A trigram is a 3-character substring extracted via sliding window.
-//! Follows PostgreSQL's pg_trgm convention: space padding before and after.
+//! This is the small, pure-math counterpart to `ginstore.rs`: given a piece of
+//! text, produce its **trigrams** — every 3-character window. The index in
+//! `ginstore.rs` stores, per trigram, which documents contain it; this file is
+//! what turns a string into that list of trigrams in the first place, for both
+//! the documents being indexed and the `%…%` pattern of an `ILIKE` query.
 //!
-//! ### Why Space Padding?
+//! ## The sliding window (the core algorithm)
 //!
-//! pg_trgm adds spaces before and after the string to improve edge trigram matching:
-//! - "cat" → " al", " alp", "alp", "lph", "pha", "ha "
-//! - This helps ILIKE '%cat' match strings starting with "cat"
+//! Slide a width-3 window across the string one character at a time and record
+//! each window. `"alpha"` → `alp`, `lph`, `pha`. That's it — a string of length
+//! `n` yields `n - 2` trigrams. Strings shorter than 3 characters yield none.
 //!
-//! ### Examples
+//! ## Why the spaces? (the clever detail, from PostgreSQL's pg_trgm)
 //!
-//! ```rust
-//! use sekejap::text_index::trigram::extract_trigrams;
+//! We first pad the text with a leading and trailing space: `"alpha"` becomes
+//! `" alpha "`, giving the extra trigrams `" al"` and `"ha "`. Those *boundary*
+//! trigrams encode "this is the start/end of the value", which lets an
+//! **anchored** query like `name ILIKE 'alpha%'` (starts-with) use the index
+//! precisely. An *unanchored* `%alpha%` doesn't want the boundary trigrams
+//! (`alpha` could sit anywhere inside a longer value), so the pattern extractor
+//! only pads the edges that are actually anchored — that asymmetry is the whole
+//! subtlety of [`extract_pattern_trigrams`].
 //!
-//! // Basic extraction with space padding (like pg_trgm)
-//! let trigrams = sekejap::text_index::trigram::extract_trigrams("Alpha");
-//! assert!(trigrams.contains(&" al".to_string())); // leading space padded
-//! assert!(trigrams.contains(&" al".to_string())); // leading space padded
-//! assert!(trigrams.contains(&"alp".to_string()));   // no padding overlap
-//! assert!(trigrams.contains(&"lph".to_string()));
+//! ## Core components
 //!
-//! // Short strings (< 3 chars) return empty
-//! let trigrams = extract_trigrams("AB");
-//! assert!(trigrams.is_empty());
-//! ```
-//!
-//! ### Hashing
-//!
-//! FNV-1a hash for trigrams — fast and good distribution for 3-byte strings.
+//! - [`extract_trigrams`] — trigrams of a document value (always padded).
+//! - [`extract_pattern_trigrams`] — trigrams a `%…%` pattern requires, padding
+//!   only anchored edges; these are the trigrams that MUST appear in any match.
+//! - [`hash_trigram`] — a fast FNV-1a hash so a trigram becomes a `u32` key.
+//! - [`dedup_trigrams`] — drops repeats while keeping order (fewer index lookups).
 
 use std::collections::HashSet;
 
-/// Extract trigrams from a string with space padding (pg_trgm convention).
+/// All trigrams of a document value, space-padded on both ends.
 ///
-/// Adds ' ' (space) before and after the string, then extracts all
-/// 3-character substrings via sliding window. Lowercase for case-insensitive matching.
-///
-/// # Arguments
-/// * `text` - The input string to extract trigrams from
-///
-/// # Returns
-/// * `Vec<String>` - All trigrams found (lowercased, with leading/trailing spaces)
-///
-/// # Example (run with `cargo test --doc` to see actual output)
-///
-/// ```rust,ignore
-/// let trigrams = sekejap::text_index::trigram::extract_trigrams("Alpha");
-/// // Returns: [" al", "alp", "lph", "pha", "ha "]
-/// ```
+/// Lowercases first (so matching is case-insensitive), space-pads to capture the
+/// start/end boundary trigrams, then slides a width-3 window. `"Alpha"` →
+/// `" al", "alp", "lph", "pha", "ha "`. A value shorter than 3 characters has no
+/// trigrams and returns an empty `Vec`.
 pub fn extract_trigrams(text: &str) -> Vec<String> {
+    // Lowercase up front — the index is case-insensitive, so "Cat" and "cat"
+    // must produce the same trigrams.
     let lower = text.to_lowercase();
+    // Collect into a `Vec<char>`: a Rust `&str` is UTF-8 *bytes*, but a "3-char
+    // window" means 3 *characters*, and one character can be several bytes. So we
+    // work over `char`s to slide correctly on non-ASCII text.
     let chars: Vec<char> = lower.chars().collect();
     let len = chars.len();
 
     if len < 3 {
-        return vec![];
+        return vec![]; // nothing to slide a width-3 window over
     }
 
-    // Create padded string: " text" with leading space
+    // Build the padded character sequence " …text… ". `with_capacity` pre-sizes
+    // the Vec (len + the two spaces) to avoid re-allocations while pushing.
     let mut result = Vec::with_capacity(len + 2);
-    result.push(' ');
-
+    result.push(' '); // leading boundary marker
     for c in &chars {
         result.push(*c);
     }
-    result.push(' ');
+    result.push(' '); // trailing boundary marker
 
-    // Extract trigrams via sliding window
+    // `.windows(3)` is a standard slice method: it yields every overlapping
+    // 3-element sub-slice ([0,1,2], then [1,2,3], …) — exactly a sliding window.
     let mut trigrams = Vec::with_capacity(len);
     for window in result.windows(3) {
+        // `iter().collect::<String>()` turns the 3 chars back into a `String`.
         trigrams.push(window.iter().collect::<String>());
     }
 
     trigrams
 }
 
-/// Extract trigrams from a pattern string (for ILIKE query).
+/// Trigrams a `%…%` pattern requires — the ones that MUST appear in any match.
 ///
-/// Unlike document extraction, patterns may contain '%' wildcards.
-/// We extract only the fixed (non-wildcard) parts as trigrams.
+/// An `ILIKE` pattern has `%` wildcards ("any run of characters"), so we keep
+/// only the fixed literal segments between the wildcards and take *their*
+/// trigrams. The subtle part is padding (see the module docs): a `%` next to a
+/// segment means that side is unanchored, so we do NOT add the boundary space
+/// there. `'Alpha%'` (starts-with) pads only the left → includes `" al"`;
+/// `'%Alpha%'` (contains) pads neither → just the interior `alp`, `lph`, `pha`.
 ///
-/// # Arguments
-/// * `pattern` - ILIKE pattern like "%Alpha%" or "foo%bar%"
+/// Segments shorter than 3 characters carry no trigram signal and are skipped —
+/// which is why a query like `%ab%` can't use the index and falls back to a scan.
 ///
-/// # Returns
-/// * `Vec<String>` - Trigrams that MUST appear in matching documents
-///
-/// # Example
 /// ```
 /// use sekejap::text_index::trigram::extract_pattern_trigrams;
+/// // "%Alpha%" is unanchored on both sides → interior trigrams only, no spaces.
 /// let trigrams = extract_pattern_trigrams("%Alpha%");
-/// // Returns trigrams for "Alpha": [" al", "alp", "lph", "pha", "ha "]
+/// assert!(trigrams.contains(&"alp".to_string()));
+/// assert!(!trigrams.contains(&" al".to_string())); // no leading-space boundary
 /// ```
 pub fn extract_pattern_trigrams(pattern: &str) -> Vec<String> {
     // Split pattern on wildcards and collect fixed literal segments.
@@ -136,44 +135,39 @@ pub fn extract_pattern_trigrams(pattern: &str) -> Vec<String> {
     all_trigrams
 }
 
-/// Hash a trigram string to a u32 value using FNV-1a.
+/// Turn a trigram into a compact `u32` key with the FNV-1a hash.
 ///
-/// FNV-1a is chosen because:
-/// - Fast computation
-/// - Good distribution for short strings
-/// - No cryptographic requirements
-///
-/// # Arguments
-/// * `trigram` - A 3-character string (may include spaces)
-///
-/// # Returns
-/// * `u32` - Hash value
+/// The index stores trigrams by a `u32` hash rather than the string itself
+/// (smaller, faster to compare). FNV-1a is a tiny non-cryptographic hash: start
+/// from a fixed seed and, for each byte, XOR it in then multiply by a fixed
+/// prime. It's fast and spreads short 3-byte strings evenly across the `u32`
+/// range, which is all an index bucket key needs.
 pub fn hash_trigram(trigram: &str) -> u32 {
-    let bytes = trigram.as_bytes();
-    let mut hash: u32 = 2166136261; // FNV offset basis
+    let bytes = trigram.as_bytes(); // hash over raw UTF-8 bytes
+    let mut hash: u32 = 2166136261; // FNV offset basis (the standard seed)
     for &b in bytes {
-        hash ^= b as u32;
+        hash ^= b as u32; // mix the byte in with XOR
+        // `wrapping_mul` multiplies and lets the result overflow-wrap around the
+        // u32 instead of panicking — overflow is intended and part of the hash.
         hash = hash.wrapping_mul(16777619); // FNV prime
     }
     hash
 }
 
-/// Deduplicate trigrams while preserving order.
+/// Remove duplicate trigrams while keeping their original order.
 ///
-/// For ILIKE queries, we want to use as many trigrams as possible
-/// but avoid redundant AND operations on the same trigram.
-///
-/// # Arguments
-/// * `trigrams` - List of trigrams (possibly with duplicates)
-///
-/// # Returns
-/// * `Vec<String>` - Trigrams in order, without duplicates
+/// A word like `"banana"` repeats the trigram `"ana"`; intersecting the same
+/// postings list twice during a query is wasted work, so we drop repeats first.
+/// Order is preserved (a plain `HashSet` would lose it) so the query can still
+/// intersect the rarest trigram first.
 pub fn dedup_trigrams(trigrams: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::new(); // trigrams we've already emitted
     let mut result = Vec::new();
     for t in trigrams {
+        // `HashSet::insert` returns `true` only if the value was NOT already
+        // present — so this both records `t` and tells us if it's the first sighting.
         if seen.insert(t) {
-            result.push(t.clone());
+            result.push(t.clone()); // first time we've seen it → keep it
         }
     }
     result
