@@ -1,3 +1,31 @@
+//! # The positional search index — words, positions, and ranking
+//!
+//! This builds and serves the index behind `SEARCH('query')`. It is an *inverted
+//! index*: instead of scanning documents, it stores, for each term, the list of
+//! documents that contain it — plus **where** in each document (word positions),
+//! which is what lets it reward phrase proximity and exact matches.
+//!
+//! ## How it's laid out (and the clever parts)
+//!
+//! - **Term dictionary as an FST.** All the distinct terms are stored in a
+//!   *Finite State Transducer* (the `fst` crate) — a compressed, sorted map from
+//!   term → id. It shares the common prefixes/suffixes of words, so a huge
+//!   vocabulary stays tiny, and it supports fast prefix and fuzzy lookups.
+//! - **Postings.** For each term id, a compact list of (document, positions).
+//!   Document sets use [`RoaringBitmap`] (a compressed integer set) for fast
+//!   intersection; positions drive the proximity ranking.
+//! - **Disk-first split.** The two bulk blobs (FST + postings) are held behind a
+//!   [`Bytes`] type that is EITHER owned on the heap (resident mode) OR a slice of
+//!   an mmap'd file (paged mode) — same code path, the memory just lives on disk.
+//!   The persistence itself is in the sibling `disk.rs`.
+//!
+//! ## Core components
+//!
+//! - [`SearchIndex`] — the whole index for one field group.
+//! - [`Bytes`] / [`IdMap`] / [`Norms`] / [`SlotIndex`] — the resident-vs-mmap
+//!   backing types that make the index disk-first.
+//! - `score()` — applies the cascade ranking (see `ranking.rs`).
+
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;

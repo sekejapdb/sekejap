@@ -1,3 +1,16 @@
+//! # Persisting the search index — write it once, mmap it back
+//!
+//! The sibling `index.rs` builds the positional search index in memory; this file
+//! makes it durable. It serializes the index (FST term dictionary, postings,
+//! per-doc norms, the slot↔hash maps) into a single `search.bin` file, and on a
+//! paged reopen it *memory-maps* that file and serves the index straight from it
+//! — no rebuild, near-zero heap. A leading `[magic][version]` header lets an
+//! incompatible or older file be detected and rebuilt instead of mis-read.
+//!
+//! This is the search index's half of the disk-first bargain: the bulk term data
+//! lives on disk (`Bytes::Mapped` slices of the mmap), and only small structures
+//! stay resident.
+
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
