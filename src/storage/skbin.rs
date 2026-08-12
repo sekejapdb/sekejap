@@ -1,4 +1,21 @@
-//! SKBIN — self-describing per-record binary payload encoding (Level 1).
+//! # SKBIN — a compact binary format for record payloads
+//!
+//! By default a record's payload is stored as its raw JSON text. That's simple
+//! and greppable, but bulky. During `compact()`, sekejap re-encodes payloads into
+//! **SKBIN**, a tighter binary form: field *names* are replaced by small integer
+//! ids (from a shared [`FieldTable`]), and values are typed (variable-length
+//! integers, `f64`, packed bool/null). It's ~1.6× smaller and much faster to pull
+//! a single field out of.
+//!
+//! The one safety rule that shapes the whole design: **each record is encoded
+//! independently, and no user value is shared between records.** Field *names* are
+//! shared (they're structural metadata, and the `FieldTable` is stored
+//! redundantly with checksums), but every value byte lives in exactly one record.
+//! So a single corrupt byte can destroy at most one record — never cascade. The
+//! worst case of losing the name table is losing column *labels*, never *data*.
+//!
+//! (Detail preserved below: a retired per-field zstd tag `T_ZSTR` is still
+//! recognized on decode so old data fails loudly rather than mis-decoding.)
 //!
 //! Replaces raw-JSON payload storage. Each record is encoded INDEPENDENTLY:
 //! field *names* become integer IDs from a shared [`FieldTable`]; values are

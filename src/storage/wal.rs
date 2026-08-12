@@ -1,4 +1,18 @@
-//! Append-only WAL with pluggable encoding (JSON or Binary).
+//! # The write-ahead log (WAL) — how a crash can't lose your data
+//!
+//! A WAL is the classic durability trick. Before the database changes anything in
+//! memory, it *appends* a description of the change to the end of this log file
+//! and flushes it to disk. If the process crashes, the next `open()` replays the
+//! log and re-applies every change, arriving exactly where it left off. Because
+//! writes only ever append (never seek and overwrite), they're fast and simple to
+//! reason about, and a crash can at worst leave a half-written *last* record —
+//! which the CRC check below catches and discards, never corrupting earlier ones.
+//!
+//! Each change is one **frame**: a CRC32 checksum (to detect a torn write), a
+//! length, then the encoded payload. Two encodings are supported, told apart by
+//! the file's 4-byte magic: `SKWJ` (JSON — human-readable, greppable) and `SKWB`
+//! (binary — compact). `compact()` folds this log into a snapshot and truncates
+//! it back to empty (see `CoreDB::compact`).
 //!
 //! # File layout
 //! ```text
