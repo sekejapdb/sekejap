@@ -1,3 +1,16 @@
+//! # When to rebuild secondary indexes — the index scheduler
+//!
+//! Part of the optional `engine` wrapper. Some indexes update themselves on every
+//! write (HNSW inserts in ~O(log n)); others (GIN, BM25) are cheaper to rebuild
+//! in bulk than to patch row by row. This file decides WHEN those bulk rebuilds
+//! run.
+//!
+//! [`RebuildStrategy`] is the policy — `Immediate` (rebuild after every write:
+//! freshest reads, slowest writes), `Every(n)` (rebuild every `n` writes: a
+//! balance), or `Lazy` (never auto-rebuild; the caller triggers it). The
+//! [`IndexScheduler`] remembers which index fields were "dirtied" since the last
+//! rebuild (in a `HashSet`, so duplicates collapse) and applies that strategy.
+
 use std::collections::HashSet;
 
 /// Controls when secondary indexes (HNSW, GIN, BM25) are rebuilt after writes.

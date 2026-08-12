@@ -1,3 +1,16 @@
+//! # Sharing one database across threads — the read/write guard
+//!
+//! Part of the optional `engine` wrapper. A bare [`CoreDB`] is not thread-safe,
+//! so to use it from many threads at once we wrap it in a lock. This file is
+//! [`ReadWriteGuard`], a thin wrapper around Rust's [`RwLock`].
+//!
+//! An `RwLock` (reader-writer lock) is the whole idea: it permits EITHER any
+//! number of readers simultaneously, OR one writer alone — never both. That fits
+//! a database exactly — queries ([`read`](ReadWriteGuard::read)) run concurrently
+//! and don't block each other; only a mutation ([`write`](ReadWriteGuard::write))
+//! needs exclusive access. A plain `Mutex` would allow just one holder at a time
+//! (even two readers would queue), so `RwLock` removes that read-vs-read waiting.
+
 use std::sync::RwLock;
 
 use crate::CoreDB;

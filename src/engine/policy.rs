@@ -1,3 +1,15 @@
+//! # When to auto-compact — the WAL compaction policy
+//!
+//! Part of the optional `engine` wrapper. This file is one small config enum,
+//! [`WalPolicy`], answering a single question: after a batch of writes, should
+//! the engine automatically compact (fold the WAL into a fresh snapshot — see
+//! `CoreDB::compact`)? The engine consults it after every flush.
+//!
+//! Compaction keeps startup fast but costs I/O, so the policy lets the caller
+//! trade freshness for throughput: `Manual` (never — you call `compact()`
+//! yourself) or `Auto { max_bytes, max_entries }` (compact once the WAL grows
+//! past either limit, whichever comes first).
+
 /// WAL compaction policy — decides when the engine should auto-compact.
 ///
 /// Compaction rewrites snapshot + payloads.bin and truncates the WAL log
