@@ -89,7 +89,7 @@ plugins {
   id("com.google.devtools.ksp")
 }
 dependencies {
-  implementation("life.sekejap:sekejap-android:0.16.2")   // typed API + native library
+  implementation("life.sekejap:sekejap-android:0.16.4")   // typed API + native library
   ksp("life.sekejap:sekejap-processor:0.16.2")            // @SekejapEntity codegen
 }
 // Desktop / server JVM: life.sekejap:sekejap  (+ sekejap-ffm for the Panama binding)
