@@ -631,11 +631,22 @@ fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
             '\'' | '"' => {
                 let quote = c;
                 i += 1;
-                let start = i;
-                while i < len && chars[i] != quote {
+                // Build char-by-char so a doubled quote inside the string
+                // (SQL-standard escape: 'O''Brien' → O'Brien) collapses to one
+                // literal quote instead of terminating the string.
+                let mut s = String::new();
+                while i < len {
+                    if chars[i] == quote {
+                        if i + 1 < len && chars[i + 1] == quote {
+                            s.push(quote);
+                            i += 2;
+                            continue;
+                        }
+                        break; // closing quote
+                    }
+                    s.push(chars[i]);
                     i += 1;
                 }
-                let s: String = chars[start..i].iter().collect();
                 if i < len {
                     i += 1;
                 } // consume closing quote

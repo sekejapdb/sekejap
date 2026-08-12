@@ -2947,6 +2947,29 @@ fn not_in_combined_with_and() {
     assert_eq!(hits.len(), 2); // u1 (Jakarta,true) and u3 (Bandung,true)
 }
 
+// ── string literal escaping ────────────────────────────────────────────────────
+
+/// SQL-standard `''` escape: a doubled quote inside a string literal is one
+/// literal quote, so values with apostrophes (`O'Brien`) round-trip through the
+/// SQL surface. Prerequisite for a faithful SGQL dump/restore.
+#[test]
+fn sql_string_literal_doubled_quote_escape() {
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE t (name TEXT)").unwrap();
+    db.execute("INSERT INTO t (_key, name) VALUES ('a', 'O''Brien')").unwrap();
+    db.execute("INSERT INTO t (_key, name) VALUES ('b', 'Rod Laver''s Arena')").unwrap();
+    db.execute("INSERT INTO t (_key, name) VALUES ('c', '')").unwrap(); // empty string still valid
+
+    assert!(db.get("t/a").unwrap().contains(r#""name":"O'Brien""#));
+    assert!(db.get("t/b").unwrap().contains(r#""name":"Rod Laver's Arena""#));
+    // WHERE with an escaped literal matches the stored value.
+    let hits = db
+        .query("SELECT name FROM t WHERE name = 'O''Brien'")
+        .unwrap()
+        .collect();
+    assert_eq!(hits.len(), 1);
+}
+
 // ── put_vector via SQL ────────────────────────────────────────────────────────
 
 /// INSERT with a `[f32, ...]` array literal stores the vector and makes it
