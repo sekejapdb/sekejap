@@ -3095,19 +3095,30 @@ impl CoreDB {
 
     // ── Writes ────────────────────────────────────────────────────────────────
 
-    /// Insert or update a node. The `_collection` field in the payload
-    /// registers the node in a named collection for `db.collection()` queries.
+    /// Insert or update one node from a JSON string.
     ///
-    /// Returns the slug hash on success.
+    /// `slug` is the node's `"collection/key"` id; the `_collection` field inside
+    /// the payload is what registers it in a named collection for
+    /// `db.collection()` queries. Called again with the same slug, it overwrites.
+    ///
+    /// The order matters for crash-safety: the change is written to the WAL
+    /// **first** (so a crash mid-write can be replayed on the next open), and only
+    /// then applied to the in-memory maps, the on-disk payload store, and any
+    /// affected indexes. Returns the node's id hash on success, or a parse error
+    /// if `payload_json` isn't valid JSON.
     pub fn put(&mut self, slug: &str, payload_json: &str) -> Result<u64, serde_json::Error> {
+        // Validate the JSON up front — a bad payload must fail before we touch the WAL.
         let payload: Value = serde_json::from_str(payload_json)?;
 
+        // Durability first: append the intent to the WAL before mutating state.
         self.wal_write(WalEntry::Put {
             slug: slug.to_string(),
             payload: payload_json.to_string(),
         });
 
         let node_hash = sk_hash(slug);
+        // Whether this is a fresh insert or an overwrite decides index bookkeeping
+        // (an update must first retract the node's old index entries).
         let is_update = self.nodes.contains_key(&node_hash);
 
         // Pre-collect GIN info from the parsed Value before put_raw_inner consumes it.
@@ -4429,10 +4440,17 @@ impl CoreDB {
         self.nodes.get(&hash).map(|n| n.slug.as_str())
     }
 
+    /// Fetch one node's raw JSON payload by slug, or `None` if it doesn't exist.
+    ///
+    /// This is the disk-read counterpart to [`put`](Self::put): the in-RAM
+    /// `NodeData` only holds *where* the bytes are, so this looks up the
+    /// offset/length ([`payload_loc`](Self::payload_loc)) and then reads those
+    /// bytes from the payload store (a zero-copy mmap slice on disk, or the RAM
+    /// buffer for an ephemeral DB).
     pub fn get(&self, slug: &str) -> Option<String> {
-        let (off, len) = self.payload_loc(sk_hash(slug))?;
+        let (off, len) = self.payload_loc(sk_hash(slug))?; // metadata → disk location
         self.payload_store
-            .get_raw(off, len)
+            .get_raw(off, len) // the only disk touch
             .map(|b| String::from_utf8_lossy(&b).into_owned())
     }
 
@@ -5032,23 +5050,27 @@ impl CoreDB {
     }
 
     // ── Query starters ────────────────────────────────────────────────────────
+    //
+    // Each starter returns a [`Set`] builder seeded with one starting [`Step`].
+    // Nothing runs yet — you chain filters/hops/shapers onto it and then call
+    // `.collect()` or `.count()` to execute (see `query.rs`).
 
-    /// Start a query from a single node.
+    /// Start a query from a single node (`SELECT … WHERE _key = …`).
     pub fn one(&self, slug: &str) -> Set<'_> {
         Set::new(self, Step::One(sk_hash(slug)))
     }
 
-    /// Start a query from a set of nodes.
+    /// Start a query from a specific set of nodes given by slug.
     pub fn many<'a>(&self, slugs: impl IntoIterator<Item = &'a str>) -> Set<'_> {
         Set::new(self, Step::Many(slugs.into_iter().map(sk_hash).collect()))
     }
 
-    /// Start a query over all nodes.
+    /// Start a query over every node in the database (a full scan).
     pub fn all(&self) -> Set<'_> {
         Set::new(self, Step::All)
     }
 
-    /// Start a query over all nodes in a named collection.
+    /// Start a query over all nodes in one named collection (`SELECT … FROM name`).
     pub fn collection(&self, name: &str) -> Set<'_> {
         Set::new(self, Step::Collection(sk_hash(name)))
     }
