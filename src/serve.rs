@@ -1,4 +1,12 @@
-//! HTTP service dispatch — **sans-IO**.
+//! # The HTTP/JSON surface — routing requests, sans-IO
+//!
+//! This is the HTTP counterpart to `pg.rs`: it lets a web client query sekejap
+//! over plain HTTP + JSON. Like `pg.rs` it is *sans-IO* ("without I/O") — it
+//! contains only the decision logic: given a parsed request `(method, path,
+//! body)` it returns a response `(status, json)`, and touches no sockets or async
+//! runtime. The caller (the CLI's server in `skcli/src/serve.rs`) owns the actual
+//! networking and just wires it into [`handle`]. Keeping I/O out makes the routing
+//! trivial to test and reusable under any web server.
 //!
 //! Given a parsed request `(method, path, body)`, produce a response
 //! `(status, json)`. No sockets, no async runtime, no web framework: the caller

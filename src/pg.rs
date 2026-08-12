@@ -1,4 +1,16 @@
-//! PostgreSQL wire-protocol (v3) — **sans-IO**.
+//! # Speaking PostgreSQL's language — the wire protocol, sans-IO
+//!
+//! A *wire protocol* is the exact byte-level format two programs use to talk over
+//! a connection. Postgres has one, and every Postgres client (`psql`, DBeaver,
+//! pgjdbc, …) speaks it. Implement that same format and those clients can connect
+//! to sekejap thinking it's a real Postgres server.
+//!
+//! *Sans-IO* ("without I/O") is the design style: this module contains the whole
+//! protocol brain but touches **no** sockets. You feed it the bytes that arrived
+//! and it hands back the bytes to send; the caller owns the actual socket,
+//! threads, and networking. That keeps the tricky protocol logic pure and easy to
+//! test, and lets it run over any transport (see `skcli/src/pg.rs` for the thin
+//! adapter that adds the real TCP socket).
 //!
 //! Lets any Postgres client (`psql`, DBeaver, pgjdbc, …) talk to an embedded
 //! sekejap DB. This module is the whole protocol *engine* with **no I/O**: you
