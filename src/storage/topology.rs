@@ -1,10 +1,22 @@
-//! Phase 0 — dense-id, offset-addressable, StreamVByte-delta topology format.
+//! # Topology — the graph (nodes + edges) as memory-mappable files
 //!
-//! This module is **self-contained**: it turns an in-memory graph (nodes + edges)
-//! into a set of pointer-free byte buffers, and reads them back. It is NOT yet wired
-//! into `CoreDB` — the engine still loads topology into RAM. The point of Phase 0 is
-//! to lock the on-disk shape so that Phase 1 (mmap) and Phase 2 (S3) are read-path
-//! flips, not migrations. See `docs/developer/notes/topology-format.md`.
+//! "Topology" is the shape of the graph: which nodes exist and which edges connect
+//! them. This module turns that in-memory graph into a set of flat, pointer-free
+//! byte buffers on disk, and reads them back — so in paged mode the graph can be
+//! served straight from an mmap (`MappedTopology`, held by `CoreDB.topo_base`)
+//! with the write-since-open overlay merged on top.
+//!
+//! Two ideas make it mappable with no parsing:
+//! - **Dense ids.** Nodes are numbered 0, 1, 2, … so node `k`'s fixed-size record
+//!   is at `data_start + k * record_size` — pure arithmetic, no lookup table.
+//! - **CSR adjacency** (Compressed Sparse Row). Instead of a list-per-node
+//!   (pointers everywhere), all edge blocks are packed back-to-back, and an
+//!   `offsets[]` array says where each node's block starts. That's the standard
+//!   compact way to store a graph's neighbours in one contiguous buffer.
+//!
+//! Edge blocks use StreamVByte delta encoding (small, SIMD-friendly integers).
+//! Each file starts with a `[magic 8][version u32][flags u32]` header. See
+//! `docs/developer/notes/topology-format.md` for the byte-level details.
 //!
 //! ## Files (each starts with a 16-byte `[magic 8][version u32][flags u32]` header)
 //! - `nodes.bin` — `count u64` + fixed 24-byte node records, addressed by dense id
