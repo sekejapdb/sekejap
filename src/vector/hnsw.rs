@@ -1,3 +1,18 @@
+//! # HNSW — finding near neighbours without checking every vector
+//!
+//! Comparing a query against all N stored vectors is O(N) — too slow for big
+//! datasets. HNSW ("Hierarchical Navigable Small World") is an *approximate*
+//! nearest-neighbour index: it accepts occasionally missing the exact closest
+//! match in exchange for being dramatically faster.
+//!
+//! The idea: build a graph where each vector is a node linked to its near
+//! neighbours, stacked in **layers** — a sparse top layer for big jumps across
+//! the space, denser layers below for fine local steps (like a skip list, but for
+//! geometry). A search enters at the top, greedily hops toward the query, and
+//! descends layer by layer, so it only ever touches a tiny fraction of the
+//! vectors. `m` controls how many neighbours each node keeps; `ef` controls how
+//! wide the search beam is (bigger = more accurate, slower).
+//!
 //! In-memory HNSW (Hierarchical Navigable Small World) graph.
 //!
 //! Adapted from HyperHNSW (sekejap-full) for single-threaded use with

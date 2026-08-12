@@ -1,3 +1,13 @@
+//! # The compact vector index — arrays instead of hash maps
+//!
+//! The straightforward HNSW-on-disk layout uses hash maps keyed by node id (a
+//! `HashMap<u64, ...>` for the graph, another for id→slot), which are pointer-
+//! heavy and RAM-hungry. This file replaces them with dense, contiguous ARRAYS
+//! indexed by a small **slot** number (0, 1, 2, …): the int8 codes become one
+//! flat `Vec<u8>`, the graph becomes flat neighbour arrays. Contiguous arrays are
+//! tiny, cache-friendly, and — crucially — trivially memory-mappable, which is
+//! what lets the vector index be served from disk with little resident RAM.
+//!
 //! Compact, slot-indexed disk-first vector index — the low-RAM representation.
 //!
 //! Replaces the two fat RAM structures of the naive disk-first path — the

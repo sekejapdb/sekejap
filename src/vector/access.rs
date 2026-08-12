@@ -1,4 +1,12 @@
-//! Trait for zero-copy read access to vectors.
+//! # `VectorAccess` — one read interface, RAM or disk behind it
+//!
+//! A Rust *trait* is a shared interface: code written against the trait works
+//! with any type that implements it. [`VectorAccess`] is that interface for
+//! reading vectors, so the HNSW graph and query executor never learn whether the
+//! vectors sit in a RAM `HashMap` (ephemeral DB) or in a memory-mapped file
+//! (persistent DB) — swapping the backend doesn't touch the search code. "Zero-
+//! copy" means a read hands back a borrowed slice into the existing bytes rather
+//! than copying them out.
 //!
 //! Decouples HNSW and query execution from any specific storage backend.
 //! Implemented by both in-memory `HashMap<u64, Vec<f32>>` (ephemeral DB)

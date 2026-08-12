@@ -1,3 +1,17 @@
+//! # Vector search — finding the nearest embeddings
+//!
+//! Vector search answers "which records are most *similar* to this one". Each
+//! record has an embedding — a fixed-length array of `f32`s from an ML model —
+//! and similarity is measured as a *distance* between vectors (close = similar).
+//! This module provides the two ingredients: the **distance kernels** that
+//! compute that distance quickly (using SIMD — one CPU instruction over many
+//! numbers at once), and the **HNSW index** ([`hnsw`]) that finds near neighbours
+//! without comparing against every single vector.
+//!
+//! Submodules: [`hnsw`] (the search graph), [`quant`] (int8 compression for
+//! low-RAM search), [`compact`] (the disk-first slot-indexed layout), [`access`]
+//! (the storage-agnostic read trait).
+//!
 //! High-performance distance kernels with SIMD acceleration, and the HNSW
 //! approximate nearest-neighbour graph.
 //!
