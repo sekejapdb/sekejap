@@ -1,3 +1,12 @@
+//! # Quantization — shrinking vectors from `f32` to `int8` to save RAM
+//!
+//! "Quantization" means storing each vector number in fewer bits, trading a
+//! little precision for a lot of memory. Here each `f32` (4 bytes) becomes an
+//! `int8` (1 byte) — 4× smaller — by mapping its value range onto -128..127.
+//! The small int8 codes stay resident and drive the fast graph traversal; the
+//! exact `f32` vectors live on disk and are only read to re-rank the final
+//! candidates. This is the same split DiskANN / pgvector / Qdrant use.
+//!
 //! Scalar int8 quantization for **disk-first, low-RAM** vector search.
 //!
 //! The foundational design (same split as DiskANN / pgvector / Qdrant):
