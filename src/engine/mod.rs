@@ -248,6 +248,29 @@ impl Engine {
         self.published.as_ref().map(|p| p.current())
     }
 
+    /// Scan a whole collection: every member node's JSON payload. Like [`get`](Self::get),
+    /// this is **lock-free** when snapshot reads are enabled (never queues behind a
+    /// writer), else it falls back to a shared read lock. Unindexed — it reads every
+    /// member's payload, so it's for list endpoints on bounded collections, not a
+    /// substitute for an indexed `query("SELECT ... WHERE ...")`.
+    pub fn scan(&self, collection: &str) -> Vec<String> {
+        #[cfg(unix)]
+        if let Some(p) = &self.published {
+            return p.current().scan(collection);
+        }
+        self.guard.read().collection_payloads(collection)
+    }
+
+    /// Count the members of `collection` — lock-free when snapshot reads are on,
+    /// else via a shared read lock. The `COUNT(*)` companion to [`scan`](Self::scan).
+    pub fn count(&self, collection: &str) -> usize {
+        #[cfg(unix)]
+        if let Some(p) = &self.published {
+            return p.current().count(collection);
+        }
+        self.guard.read().collection_count(collection)
+    }
+
     /// Force an immediate re-mint of the published snapshot (bypasses the debounce),
     /// so subsequent [`get`](Self::get) calls see everything committed up to now.
     /// No-op if snapshot reads are not enabled. Use for read-your-own-write.
@@ -831,6 +854,46 @@ mod snapshot_read_tests {
         engine.insert_prepared(&ins, &[json!("v2"), json!(2)]).unwrap();
         engine.refresh_snapshot();
         assert!(engine.get("venues/v2").is_some(), "get sees committed write after refresh");
+    }
+
+    /// Engine scan/count over a collection: lock-free via the published snapshot,
+    /// and a forced refresh reflects a committed write.
+    #[test]
+    fn engine_scan_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("venues/v1", &json!({"_collection":"venues","_key":"v1","n":1}).to_string()).unwrap();
+            db.compact().unwrap();
+        }
+        let engine = Engine::builder(dir.path().to_str().unwrap())
+            .snapshot_reads(true)
+            .build()
+            .unwrap();
+
+        assert_eq!(engine.count("venues"), 1);
+        assert_eq!(engine.scan("venues").len(), 1);
+
+        let ins = engine.prepare_insert("venues", &["_key", "n"]).unwrap();
+        engine.insert_prepared(&ins, &[json!("v2"), json!(2)]).unwrap();
+        engine.refresh_snapshot();
+        assert_eq!(engine.count("venues"), 2, "scan/count reflect the write after refresh");
+        assert_eq!(engine.scan("venues").len(), 2);
+    }
+
+    /// Scan/count also work with snapshot reads off (via the read lock).
+    #[test]
+    fn engine_scan_falls_back_without_snapshot_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("t/a", &json!({"_collection":"t","_key":"a"}).to_string()).unwrap();
+            db.put("t/b", &json!({"_collection":"t","_key":"b"}).to_string()).unwrap();
+        }
+        let engine = Engine::builder(dir.path().to_str().unwrap()).build().unwrap();
+        assert!(engine.snapshot().is_none());
+        assert_eq!(engine.count("t"), 2, "count via read-lock fallback");
+        assert_eq!(engine.scan("t").len(), 2, "scan via read-lock fallback");
     }
 
     /// Without `snapshot_reads`, there's no published snapshot and `get` falls back
