@@ -62,6 +62,7 @@ const DIR_REC: usize = 4 + 8 + 4;
 /// holds no heap. The three regions it points at are the *id map* (slot → node
 /// hash), the *directory* (sorted trigram entries), and the *blob* (the packed
 /// bitmaps).
+#[derive(Clone)]
 pub(crate) struct MappedGin {
     view: Arc<MmapView>,     // shared handle to the whole mmap'd gin.bin
     field: String,           // which column this index is for (e.g. "name")

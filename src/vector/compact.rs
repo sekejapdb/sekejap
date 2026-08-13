@@ -34,6 +34,8 @@ use crate::vector::hnsw::HnswGraph;
 use crate::vector::quant::{l2_u8, QuantizedField, ScalarQuantizer};
 
 /// Byte array backing: heap-resident `Vec<u8>` or a range of an mmap'd sidecar.
+/// `Clone` shares the mmap (an `Arc` bump), never re-maps.
+#[derive(Clone)]
 enum Bytes8 {
     Owned(Vec<u8>),
     Mapped { view: Arc<MmapView>, off: usize, len: usize },
@@ -54,6 +56,7 @@ impl Bytes8 {
 /// `u32` array backing. Resident returns a borrowed slice (zero cost); mapped
 /// decodes on demand (per-element `get`, or a small owned `Cow` for a range —
 /// the neighbour lists are ~degree-sized, so the per-node decode is cheap).
+#[derive(Clone)]
 enum ArrU32 {
     Owned(Vec<u32>),
     Mapped { view: Arc<MmapView>, off: usize, count: usize },
@@ -85,6 +88,7 @@ impl ArrU32 {
 }
 
 /// `u64` array backing (slot → id).
+#[derive(Clone)]
 enum ArrU64 {
     Owned(Vec<u64>),
     Mapped { view: Arc<MmapView>, off: usize, count: usize },
@@ -107,6 +111,7 @@ impl ArrU64 {
 
 /// A frozen, slot-indexed disk-first index: int8 codes + CSR graph in RAM,
 /// full-precision f32 on disk (re-rank reads it by id).
+#[derive(Clone)]
 pub struct CompactDiskIndex {
     dim: usize,
     quantizer: ScalarQuantizer,
