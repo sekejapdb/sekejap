@@ -63,6 +63,7 @@ use std::collections::HashMap;
 ///
 /// Each trigram maps to a RoaringBitmap of document IDs that contain it.
 /// Querying intersects the bitmaps to find documents with ALL required trigrams.
+#[derive(Clone)]
 pub struct GINIndex {
     /// Inverted index: trigram_hash -> RoaringBitmap of slot indices
     postings: HashMap<u32, roaring::RoaringBitmap>,

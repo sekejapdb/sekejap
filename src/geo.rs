@@ -332,6 +332,7 @@ pub fn extract_spatial_meta(payload: &Value) -> Option<SpatialMeta> {
 
 /// Grid-based spatial index using spatial hashing.
 /// Maps `(cell_lat, cell_lon)` → `Vec<node_hash>` for fast candidate lookup.
+#[derive(Clone)]
 pub(crate) struct SpatialGrid {
     cell_size: f64,
     cells: HashMap<(i32, i32), Vec<u64>>,

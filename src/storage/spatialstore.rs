@@ -28,6 +28,7 @@ const VERSION: u32 = 1;
 const META_REC: usize = 8 + 6 * 8; // 56
 const DIR_REC: usize = 4 + 4 + 8 + 4; // 20
 
+#[derive(Clone)]
 pub(crate) struct MappedSpatialGrid {
     view: MmapView,
     cell_size: f64,

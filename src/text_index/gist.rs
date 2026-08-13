@@ -71,6 +71,7 @@ pub const GIST_SIG_BITS: usize = 96;
 ///
 /// Each document gets a fixed-size signature bitmap. Querying checks
 /// which documents have the required trigram bits set.
+#[derive(Clone)]
 pub struct GiSTIndex {
     /// Document signatures: doc_id -> signature bitmap (as u128 array)
     /// 96 bits / 64 bits per u64 = 2 u64s

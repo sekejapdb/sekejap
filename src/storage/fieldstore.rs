@@ -50,10 +50,15 @@ fn rd_u32(b: &[u8], o: usize) -> u32 {
 }
 
 /// mmap-or-owned backing (mirrors the private `Backing` in `topology.rs`).
+///
+/// `Clone`-able so a read snapshot can share this field index: the mmap is shared
+/// (an `Arc` bump via [`MmapView`]) and the retained fd is shared via `Arc<File>`
+/// (kept only to hold the file open; the mapping itself outlives it on unix).
+#[derive(Clone)]
 enum Backing {
     #[cfg(unix)]
     Map {
-        _file: std::fs::File,
+        _file: std::sync::Arc<std::fs::File>,
         map: super::mmap::MmapView,
     },
     Owned(Vec<u8>),
@@ -66,7 +71,7 @@ impl Backing {
             let file = std::fs::File::open(path)?;
             let len = file.metadata()?.len() as usize;
             if let Some(map) = super::mmap::MmapView::try_new(&file, len) {
-                return Ok(Backing::Map { _file: file, map });
+                return Ok(Backing::Map { _file: std::sync::Arc::new(file), map });
             }
         }
         Ok(Backing::Owned(std::fs::read(path)?))
@@ -145,6 +150,7 @@ pub(crate) fn write(
 
 /// A memory-mapped btree field index. Lookups decode postings into owned `Vec`s
 /// (transient — dropped after use); the retained bytes are the reclaimable mmap.
+#[derive(Clone)]
 pub(crate) struct MappedFieldStore {
     backing: Backing,
     nkeys: usize,
