@@ -94,6 +94,11 @@ pub struct Engine {
     wal_policy: WalPolicy,
     path: Option<String>,
     read_only: bool,
+    /// Safety-valve caps for [`Engine::scan`] — max rows and max payload bytes a
+    /// single scan will collect (`None` = unbounded). Guard against a runaway
+    /// full-collection read on the shared engine.
+    scan_max_rows: Option<usize>,
+    scan_max_bytes: Option<usize>,
     /// Opt-in lock-free read path (snapshot reads). `Some` only when the engine was
     /// built with `.snapshot_reads(true)` on a writable paged-mode database (unix).
     /// See [`Engine::get`] and `docs/developer/notes/snapshot-reads-design.md`.
@@ -156,6 +161,8 @@ impl Engine {
             read_only: false,
             snapshot_reads: false,
             publish_interval: std::time::Duration::from_millis(5),
+            scan_max_rows: None,
+            scan_max_bytes: None,
             #[cfg(feature = "s3")]
             remote_url: None,
             #[cfg(feature = "s3")]
@@ -179,6 +186,8 @@ impl Engine {
             wal_policy: WalPolicy::Manual,
             path: None,
             read_only: false,
+            scan_max_rows: None,
+            scan_max_bytes: None,
             #[cfg(unix)]
             published: None,
             #[cfg(feature = "s3")]
@@ -254,11 +263,12 @@ impl Engine {
     /// member's payload, so it's for list endpoints on bounded collections, not a
     /// substitute for an indexed `query("SELECT ... WHERE ...")`.
     pub fn scan(&self, collection: &str) -> Vec<String> {
+        let (rows, bytes) = (self.scan_max_rows, self.scan_max_bytes);
         #[cfg(unix)]
         if let Some(p) = &self.published {
-            return p.current().scan(collection);
+            return p.current().scan_bounded(collection, rows, bytes);
         }
-        self.guard.read().collection_payloads(collection)
+        self.guard.read().collection_payloads_bounded(collection, rows, bytes)
     }
 
     /// Count the members of `collection` — lock-free when snapshot reads are on,
@@ -589,6 +599,9 @@ pub struct EngineBuilder {
     snapshot_reads: bool,
     /// Staleness bound / debounce for the published snapshot (default 5 ms).
     publish_interval: std::time::Duration,
+    /// Safety-valve caps for `Engine::scan` (`None` = unbounded).
+    scan_max_rows: Option<usize>,
+    scan_max_bytes: Option<usize>,
     #[cfg(feature = "s3")]
     remote_url: Option<String>,
     #[cfg(feature = "s3")]
@@ -654,6 +667,23 @@ impl EngineBuilder {
     /// immediately regardless of this.
     pub fn publish_interval(mut self, interval: std::time::Duration) -> Self {
         self.publish_interval = interval;
+        self
+    }
+
+    /// Cap the number of rows a single [`Engine::scan`] collects (`0` / unset =
+    /// unbounded). A safety valve so one `scan` of an unexpectedly huge collection
+    /// can't allocate without bound on the shared engine. `scan` returns *up to*
+    /// this many rows (like an implicit `LIMIT`).
+    pub fn max_scan_rows(mut self, rows: usize) -> Self {
+        self.scan_max_rows = if rows > 0 { Some(rows) } else { None };
+        self
+    }
+
+    /// Cap the total payload bytes a single [`Engine::scan`] collects (`0` / unset =
+    /// unbounded). Stops once the next payload would exceed the cap, but always
+    /// returns at least one row so a single oversized payload isn't silently dropped.
+    pub fn max_scan_bytes(mut self, bytes: usize) -> Self {
+        self.scan_max_bytes = if bytes > 0 { Some(bytes) } else { None };
         self
     }
 
@@ -808,6 +838,8 @@ impl EngineBuilder {
             wal_policy: self.wal_policy,
             path: Some(self.path),
             read_only: self.read_only,
+            scan_max_rows: self.scan_max_rows,
+            scan_max_bytes: self.scan_max_bytes,
             #[cfg(unix)]
             published,
             #[cfg(feature = "s3")]
@@ -879,6 +911,43 @@ mod snapshot_read_tests {
         engine.refresh_snapshot();
         assert_eq!(engine.count("venues"), 2, "scan/count reflect the write after refresh");
         assert_eq!(engine.scan("venues").len(), 2);
+    }
+
+    /// `max_scan_rows` caps a scan (safety valve) — via the snapshot and via the
+    /// read-lock fallback alike.
+    #[test]
+    fn engine_scan_respects_row_cap() {
+        fn seed(dir: &std::path::Path) {
+            let mut db = CoreDB::open(dir).unwrap();
+            for i in 0..10 {
+                db.put(
+                    &format!("t/v{i}"),
+                    &json!({"_collection":"t","_key":format!("v{i}")}).to_string(),
+                )
+                .unwrap();
+            }
+            db.compact().unwrap();
+        }
+
+        // Snapshot path (its own dir — one writer per dir holds the file lock).
+        let d1 = tempfile::tempdir().unwrap();
+        seed(d1.path());
+        let e1 = Engine::builder(d1.path().to_str().unwrap())
+            .snapshot_reads(true)
+            .max_scan_rows(3)
+            .build()
+            .unwrap();
+        assert_eq!(e1.scan("t").len(), 3, "snapshot scan capped at 3");
+        assert_eq!(e1.count("t"), 10, "count is not capped");
+
+        // Read-lock fallback path (no snapshot reads), separate dir.
+        let d2 = tempfile::tempdir().unwrap();
+        seed(d2.path());
+        let e2 = Engine::builder(d2.path().to_str().unwrap())
+            .max_scan_rows(4)
+            .build()
+            .unwrap();
+        assert_eq!(e2.scan("t").len(), 4, "fallback scan capped at 4");
     }
 
     /// Scan/count also work with snapshot reads off (via the read lock).
@@ -1026,6 +1095,8 @@ mod tests {
             wal_policy: WalPolicy::Manual,
             path: Some(r_path),
             read_only: true,
+            scan_max_rows: None,
+            scan_max_bytes: None,
             #[cfg(unix)]
             published: None,
             remote: Some(reader_remote),

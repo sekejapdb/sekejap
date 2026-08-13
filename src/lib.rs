@@ -864,11 +864,34 @@ impl ReadSnapshot {
     /// payload, no `WHERE`/index acceleration — use for list endpoints on
     /// bounded collections). Nodes whose payloads can't be read are skipped.
     pub fn scan(&self, collection: &str) -> Vec<String> {
+        self.scan_bounded(collection, None, None)
+    }
+
+    /// Like [`scan`](Self::scan), but stops once `max_rows` rows **or** `max_bytes`
+    /// of payload have been collected (whichever first) — the safety valve against a
+    /// runaway full-collection read on a shared engine. `None` for either = unbounded.
+    /// At least one row is always returned if any member exists (a single oversized
+    /// payload is never silently dropped by `max_bytes`).
+    pub fn scan_bounded(
+        &self,
+        collection: &str,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
+    ) -> Vec<String> {
         let members = self.members(sk_hash(collection));
-        let mut out = Vec::with_capacity(members.len());
+        let cap = max_rows.map_or(members.len(), |m| m.min(members.len()));
+        let mut out = Vec::with_capacity(cap);
+        let mut bytes = 0usize;
         for h in members {
+            if max_rows.is_some_and(|m| out.len() >= m) {
+                break;
+            }
             if let Some((off, len)) = self.payload_loc(h) {
+                if max_bytes.is_some_and(|m| !out.is_empty() && bytes + len as usize > m) {
+                    break;
+                }
                 if let Some(b) = self.payloads.get_raw(off, len) {
+                    bytes += b.len();
                     out.push(String::from_utf8_lossy(&b).into_owned());
                 }
             }
@@ -6907,14 +6930,35 @@ impl CoreDB {
     /// snapshot reads are off. Unindexed: reads every member's payload.
     #[allow(dead_code)] // used by the `engine` feature (Engine::scan fallback)
     pub(crate) fn collection_payloads(&self, collection: &str) -> Vec<String> {
+        self.collection_payloads_bounded(collection, None, None)
+    }
+
+    /// Bounded variant of [`CoreDB::collection_payloads`] — the live-lock analogue of
+    /// [`ReadSnapshot::scan_bounded`] (stops at `max_rows`/`max_bytes`).
+    #[allow(dead_code)] // used by the `engine` feature (Engine::scan fallback)
+    pub(crate) fn collection_payloads_bounded(
+        &self,
+        collection: &str,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
+    ) -> Vec<String> {
         let members = match self.collection_members(sk_hash(collection)) {
             Some(m) => m,
             None => return Vec::new(),
         };
-        let mut out = Vec::with_capacity(members.len());
+        let cap = max_rows.map_or(members.len(), |m| m.min(members.len()));
+        let mut out = Vec::with_capacity(cap);
+        let mut bytes = 0usize;
         for &h in members.iter() {
+            if max_rows.is_some_and(|m| out.len() >= m) {
+                break;
+            }
             if let Some((off, len)) = self.payload_loc(h) {
+                if max_bytes.is_some_and(|m| !out.is_empty() && bytes + len as usize > m) {
+                    break;
+                }
                 if let Some(b) = self.payload_store.get_raw(off, len) {
+                    bytes += b.len();
                     out.push(String::from_utf8_lossy(&b).into_owned());
                 }
             }
