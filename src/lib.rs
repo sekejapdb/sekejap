@@ -808,7 +808,12 @@ pub struct CoreDB {
     /// Paged-topology base (mmap'd files written at compact). `None` = resident
     /// mode (default). When `Some`, the resident maps above act as the **write
     /// overlay** since open, and the topology accessors merge overlay-over-base.
-    topo_base: Option<storage::topology::MappedTopology>,
+    ///
+    /// Wrapped in `Arc` so a read-only [`Snapshot`](CoreDB::snapshot) can share
+    /// this immutable base for free (a refcount bump, no bytes copied) — the base
+    /// never changes, only the overlay does. See
+    /// `docs/developer/notes/snapshot-reads-design.md`.
+    topo_base: Option<std::sync::Arc<storage::topology::MappedTopology>>,
     /// collection_hash → member slug hashes
     collections: HashMap<u64, Vec<u64>>,
     /// collection_hash → collection name (for O(1) SHOW TABLES without node scan)
@@ -1540,7 +1545,7 @@ impl CoreDB {
                 // (schemas, vectors, HNSW, btree indexes). Nodes + edges are NOT
                 // loaded into RAM — the resident maps stay empty and act as the
                 // write overlay. WAL replay below adds post-compact writes to it.
-                db.topo_base = Some(storage::topology::MappedTopology::open(dir)?);
+                db.topo_base = Some(std::sync::Arc::new(storage::topology::MappedTopology::open(dir)?));
                 db.load_snapshot_parts(snap, /*load_topology=*/ false);
                 // Serve btree indexes from the mmap'd sidecars, not the heap: mmap
                 // them into field_base and drop any heap copies the snapshot loaded
