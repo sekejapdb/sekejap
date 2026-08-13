@@ -163,7 +163,7 @@ Because the base is immutable and self-contained, a snapshot is basically a
 
 That is horizontal **read scale-out from an embedded database** — the pattern a
 high-traffic, read-heavy site actually needs (write-once, read-many). Pair it with
-**deferred index maintenance** (engine `IndexScheduler`) so the write side holds
+**deferred index maintenance** (core's dirty-index tracking) so the write side holds
 its exclusive lock only briefly, and the "frozen app" problem is gone from both
 the read and the write side.
 

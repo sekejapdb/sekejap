@@ -3420,6 +3420,22 @@ impl CoreDB {
         self.defer_wal_sync = prev;
         if !prev {
             self.wal_flush(); // single fsync for the whole group
+            // Auto-compaction was suppressed for every statement in the group:
+            // `autocompact_after_write` returns at the `defer_wal_sync` guard
+            // *before* bumping its 64-write amortisation counter, so that counter
+            // never advances during a batch and calling it here would not reach
+            // the threshold check. Test the thresholds directly instead, once the
+            // batch is durable. Changes were already emitted per statement, so
+            // only compaction is re-checked here — not the full `after_mutation`.
+            if self.auto_compact == AutoCompact::OnWrite
+                && !self.autocompacting
+                && self.compact_eligible()
+            {
+                self.autocompacting = true;
+                let _ = self.compact();
+                self.autocompacting = false;
+                self.writes_since_compact_check = 0;
+            }
         }
         result.map(|_| total)
     }
@@ -9509,6 +9525,40 @@ mod hybrid_query_tests {
             "auto-compact must have truncated the WAL (len = {wal_len})");
         assert!(dir.path().join("nodes.bin").exists(), "compaction wrote topology files");
         // All data intact after the inline compaction(s).
+        assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 150);
+        drop(db);
+        let db = CoreDB::open(dir.path()).unwrap();
+        assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 150);
+    }
+
+    #[test]
+    #[cfg(feature = "engine")]
+    fn auto_compact_fires_after_a_grouped_batch() {
+        // Regression: every statement inside `execute_batch_grouped` runs with
+        // `defer_wal_sync = true`, which short-circuits `autocompact_after_write`.
+        // Without a check once the group is durable, buffered SQL (the path
+        // `Engine::flush` uses) would never auto-compact.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            auto_compact: AutoCompact::OnWrite,
+            compact_thresholds: CompactThresholds { wal_bytes: 2048, overlay_entries: usize::MAX },
+            ..Config::default()
+        };
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE t (_key TEXT PRIMARY KEY, pad TEXT)").unwrap();
+
+        let stmts: Vec<String> = (0..150)
+            .map(|i| format!(
+                "INSERT INTO t (_key, pad) VALUES ('n{i}', 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"
+            ))
+            .collect();
+        db.execute_batch_grouped(&stmts).unwrap();
+
+        let wal_len = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        assert!(
+            wal_len < 2048 + 4096,
+            "grouped batch must auto-compact once durable (wal len = {wal_len})"
+        );
         assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 150);
         drop(db);
         let db = CoreDB::open(dir.path()).unwrap();
