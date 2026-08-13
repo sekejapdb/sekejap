@@ -1,8 +1,16 @@
 # Snapshot reads — readers that never block writers (design plan)
 
-Status: design / phase 1a done (base Arc-wrapped). This is the plan for the
+Status: **Phase 1 done** (core `ReadSnapshot` primitive shipped — point reads,
+correctness-tested, benchmark-proven). Phase 2 (engine `SharedDB` façade) and
+Phase 3 (scale-out + richer snapshot queries) remain. This is the plan for the
 "killer feature" for high-traffic *server* use (Zebflow): letting many reads run
 at full speed while a write is in progress.
+
+> **Phase 1 result (commit `cfd0145`/`8d6b70c`, benchmark `b24e5ba`).** Under a long
+> write, classic locked reads collapse to **28 reads/sec (0%, 13.6 s max latency)**;
+> snapshot (published) reads hold **97% of the reads-only ceiling (p99 4.2µs)**. The
+> resident/embedded path is untouched (mega bench: no regression). See
+> `eval/results/concurrency-benchmark.md` and `tests/snapshot_reads.rs`.
 
 ## Hard constraint: zero-cost for embedded (IoT / mobile)
 
