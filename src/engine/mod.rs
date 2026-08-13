@@ -94,10 +94,42 @@ pub struct Engine {
     wal_policy: WalPolicy,
     path: Option<String>,
     read_only: bool,
+    /// Opt-in lock-free read path (snapshot reads). `Some` only when the engine was
+    /// built with `.snapshot_reads(true)` on a writable paged-mode database (unix).
+    /// See [`Engine::get`] and `docs/developer/notes/snapshot-reads-design.md`.
+    #[cfg(unix)]
+    published: Option<Published>,
     #[cfg(feature = "s3")]
     remote: Option<remote::RemoteSync>,
     #[cfg(feature = "s3")]
     generation: std::sync::atomic::AtomicU64,
+}
+
+/// The engine's published snapshot: a shared, periodically-refreshed "photograph"
+/// of the store that readers read **lock-free** (see [`crate::ReadSnapshot`]).
+///
+/// The writer re-mints it after a committed write, but **at most once per
+/// `interval`** (write-debounced): minting copies the write overlay, so this keeps
+/// that cost off the per-write path and off the reader entirely. Readers only ever
+/// bump an `Arc` out of `slot` and read from their own copy — the writer swapping in
+/// a fresh photo never blocks them. Staleness is bounded by `interval`.
+#[cfg(unix)]
+struct Published {
+    /// The latest published photo. A reader takes it with a tiny slot-lock + `Arc`
+    /// bump (nothing to do with the DB lock); the writer swaps a fresh one in.
+    slot: std::sync::RwLock<std::sync::Arc<crate::ReadSnapshot>>,
+    /// When the slot was last re-minted — the debounce clock.
+    last: std::sync::Mutex<std::time::Instant>,
+    /// Minimum time between re-mints (staleness bound).
+    interval: std::time::Duration,
+}
+
+#[cfg(unix)]
+impl Published {
+    /// The current published photo (lock-free read path for callers).
+    fn current(&self) -> std::sync::Arc<crate::ReadSnapshot> {
+        self.slot.read().expect("snapshot slot poisoned").clone()
+    }
 }
 
 /// A compiled INSERT template (collection + columns), prepared once and reused.
@@ -122,6 +154,8 @@ impl Engine {
             rebuild_strategy: RebuildStrategy::default(),
             wal_policy: WalPolicy::default(),
             read_only: false,
+            snapshot_reads: false,
+            publish_interval: std::time::Duration::from_millis(5),
             #[cfg(feature = "s3")]
             remote_url: None,
             #[cfg(feature = "s3")]
@@ -145,6 +179,8 @@ impl Engine {
             wal_policy: WalPolicy::Manual,
             path: None,
             read_only: false,
+            #[cfg(unix)]
+            published: None,
             #[cfg(feature = "s3")]
             remote: None,
             #[cfg(feature = "s3")]
@@ -182,6 +218,78 @@ impl Engine {
             .map_err(|e| e.to_string())
     }
 
+    // ── Snapshot reads (lock-free point reads) ────────────────────────────────
+
+    /// Point read: the JSON payload for `slug`, or `None` if absent.
+    ///
+    /// When the engine was built with [`snapshot_reads`](EngineBuilder::snapshot_reads),
+    /// this reads a shared point-in-time snapshot **lock-free** — it never queues
+    /// behind a writer, even a long one (bulk import, index rebuild). Otherwise it
+    /// falls back to a normal shared read lock (still concurrent with other readers,
+    /// but blocked while a writer holds the exclusive lock).
+    ///
+    /// The snapshot is "as of" the last publish (bounded by the configured interval),
+    /// so a `get` right after your own `execute` may not yet reflect it — call
+    /// [`refresh_snapshot`](Self::refresh_snapshot) first, or use [`query`](Self::query)
+    /// (locked) for read-your-own-write.
+    pub fn get(&self, slug: &str) -> Option<String> {
+        #[cfg(unix)]
+        if let Some(p) = &self.published {
+            return p.current().get(slug);
+        }
+        self.guard.read().get(slug)
+    }
+
+    /// Hand out the engine's current published snapshot for several consistent
+    /// lock-free reads (all against the same instant). `None` if snapshot reads are
+    /// not enabled. Keep it short-lived — a live snapshot pins the memory it references.
+    #[cfg(unix)]
+    pub fn snapshot(&self) -> Option<std::sync::Arc<crate::ReadSnapshot>> {
+        self.published.as_ref().map(|p| p.current())
+    }
+
+    /// Force an immediate re-mint of the published snapshot (bypasses the debounce),
+    /// so subsequent [`get`](Self::get) calls see everything committed up to now.
+    /// No-op if snapshot reads are not enabled. Use for read-your-own-write.
+    #[cfg(unix)]
+    pub fn refresh_snapshot(&self) {
+        self.republish_now();
+    }
+
+    /// Re-mint the published snapshot unconditionally (if enabled). Takes a brief
+    /// shared read lock to freeze the current view; readers keep using the old photo
+    /// until the new one is swapped in.
+    #[cfg(unix)]
+    fn republish_now(&self) {
+        if let Some(p) = &self.published {
+            if let Some(snap) = self.guard.read().snapshot() {
+                *p.slot.write().expect("snapshot slot poisoned") = std::sync::Arc::new(snap);
+                *p.last.lock().expect("snapshot clock poisoned") = std::time::Instant::now();
+            }
+        }
+    }
+
+    /// Re-mint the published snapshot only if `interval` has elapsed since the last
+    /// mint (write-debounced). Called after each committed write, so republish cost
+    /// is bounded to once per interval regardless of write rate.
+    #[cfg(unix)]
+    fn maybe_republish(&self) {
+        if let Some(p) = &self.published {
+            let due = {
+                let last = p.last.lock().expect("snapshot clock poisoned");
+                last.elapsed() >= p.interval
+            };
+            if due {
+                self.republish_now();
+            }
+        }
+    }
+
+    /// No-op stand-in on non-unix (snapshot reads are unix-only).
+    #[cfg(not(unix))]
+    #[inline]
+    fn maybe_republish(&self) {}
+
     // ── Writes ───────────────────────────────────────────────────────────────
 
     /// Execute a write SQL statement.
@@ -203,9 +311,14 @@ impl Engine {
             }
             return Ok(0);
         }
-        // No buffer — apply immediately
-        let mut db = self.guard.write();
-        db.execute(sql).map_err(|e| e.to_string())
+        // No buffer — apply immediately, then refresh the published snapshot
+        // (debounced) so lock-free readers pick up the change.
+        let n = {
+            let mut db = self.guard.write();
+            db.execute(sql).map_err(|e| e.to_string())?
+        };
+        self.maybe_republish();
+        Ok(n)
     }
 
     /// Execute a write SQL statement with parameter bindings.
@@ -219,8 +332,12 @@ impl Engine {
         if self.read_only {
             return Err("database is read-only".to_string());
         }
-        let mut db = self.guard.write();
-        db.execute_params(sql, params).map_err(|e| e.to_string())
+        let n = {
+            let mut db = self.guard.write();
+            db.execute_params(sql, params).map_err(|e| e.to_string())?
+        };
+        self.maybe_republish();
+        Ok(n)
     }
 
     // ── Prepared inserts (no SQL parsing on the hot path) ──────────────────────
@@ -266,8 +383,12 @@ impl Engine {
             }
             Ok(())
         } else {
-            let mut db = self.guard.write();
-            db.put_value(&slug, val).map(|_| ()).map_err(|e| e.to_string())
+            {
+                let mut db = self.guard.write();
+                db.put_value(&slug, val).map_err(|e| e.to_string())?;
+            }
+            self.maybe_republish();
+            Ok(())
         }
     }
 
@@ -306,6 +427,8 @@ impl Engine {
                 let _ = db.compact();
             }
         }
+        drop(db); // release the write lock before re-minting the read snapshot
+        self.maybe_republish();
 
         Ok(total)
     }
@@ -334,6 +457,10 @@ impl Engine {
             let mut db = self.guard.write();
             db.compact().map_err(|e| e.to_string())?;
         }
+        // Compaction swaps in a fresh (empty-overlay) base — re-mint now, bypassing
+        // the debounce, so lock-free readers move onto the compacted base promptly.
+        #[cfg(unix)]
+        self.republish_now();
 
         #[cfg(feature = "s3")]
         if let (Some(ref remote), Some(ref path)) = (&self.remote, &self.path) {
@@ -435,6 +562,10 @@ pub struct EngineBuilder {
     rebuild_strategy: RebuildStrategy,
     wal_policy: WalPolicy,
     read_only: bool,
+    /// Opt-in lock-free snapshot reads (implies paged-mode open). unix-only.
+    snapshot_reads: bool,
+    /// Staleness bound / debounce for the published snapshot (default 5 ms).
+    publish_interval: std::time::Duration,
     #[cfg(feature = "s3")]
     remote_url: Option<String>,
     #[cfg(feature = "s3")]
@@ -475,6 +606,31 @@ impl EngineBuilder {
     /// newer data published by a writer.
     pub fn read_only(mut self, ro: bool) -> Self {
         self.read_only = ro;
+        self
+    }
+
+    /// Enable lock-free **snapshot reads** for [`Engine::get`] (unix-only).
+    ///
+    /// This opens the database in **paged mode** (the immutable-base layout that
+    /// makes a store snapshottable) and maintains a shared point-in-time snapshot
+    /// that the writer re-mints after commits. Point reads (`get`) then never queue
+    /// behind a writer — the payoff for read-heavy, concurrent (server) workloads.
+    ///
+    /// Trade-offs: reads are "as of" the last publish (see
+    /// [`publish_interval`](Self::publish_interval)); it needs paged mode; and it is
+    /// a no-op in read-only mode and on non-unix. Ignored for single-threaded /
+    /// embedded use, which should leave it off (the default) and pay nothing.
+    pub fn snapshot_reads(mut self, enabled: bool) -> Self {
+        self.snapshot_reads = enabled;
+        self
+    }
+
+    /// Staleness bound for [`snapshot_reads`](Self::snapshot_reads): the minimum time
+    /// between snapshot re-mints (default 5 ms). Smaller = fresher reads but more
+    /// overlay copies; larger = cheaper but staler. Compaction always re-mints
+    /// immediately regardless of this.
+    pub fn publish_interval(mut self, interval: std::time::Duration) -> Self {
+        self.publish_interval = interval;
         self
     }
 
@@ -552,6 +708,10 @@ impl EngineBuilder {
         #[cfg(not(feature = "s3"))]
         let use_remote_only = false;
 
+        // Snapshot reads need paged mode (the immutable base) and a writable engine;
+        // unix-only. When on, open paged so the store is snapshottable.
+        let want_paged = cfg!(unix) && self.snapshot_reads && !self.read_only && !use_remote_only;
+
         let db;
 
         #[cfg(feature = "s3")]
@@ -578,6 +738,8 @@ impl EngineBuilder {
 
             db = if self.read_only {
                 CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
+            } else if want_paged {
+                CoreDB::open_paged(&self.path).map_err(|e| e.to_string())?
             } else {
                 CoreDB::open(&self.path).map_err(|e| e.to_string())?
             };
@@ -587,10 +749,25 @@ impl EngineBuilder {
         {
             db = if self.read_only {
                 CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
+            } else if want_paged {
+                CoreDB::open_paged(&self.path).map_err(|e| e.to_string())?
             } else {
                 CoreDB::open(&self.path).map_err(|e| e.to_string())?
             };
         }
+
+        // Seed the initial published snapshot (unix + paged). If the store isn't
+        // actually snapshottable, this stays None and `get` uses the read lock.
+        #[cfg(unix)]
+        let published = if want_paged {
+            db.snapshot().map(|snap| Published {
+                slot: std::sync::RwLock::new(std::sync::Arc::new(snap)),
+                last: std::sync::Mutex::new(std::time::Instant::now()),
+                interval: self.publish_interval,
+            })
+        } else {
+            None
+        };
 
         Ok(Engine {
             guard: ReadWriteGuard::new(db),
@@ -608,11 +785,88 @@ impl EngineBuilder {
             wal_policy: self.wal_policy,
             path: Some(self.path),
             read_only: self.read_only,
+            #[cfg(unix)]
+            published,
             #[cfg(feature = "s3")]
             remote: remote_sync,
             #[cfg(feature = "s3")]
             generation: std::sync::atomic::AtomicU64::new(initial_gen),
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod snapshot_read_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A paged engine with `snapshot_reads` serves `get` from a lock-free published
+    /// snapshot, and a forced refresh makes a just-committed write visible.
+    #[test]
+    fn engine_snapshot_reads_served_and_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-create + compact so the paged open has an immutable base.
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put(
+                "venues/v1",
+                &json!({"_collection":"venues","_key":"v1","n":1}).to_string(),
+            )
+            .unwrap();
+            db.compact().unwrap();
+        }
+
+        let engine = Engine::builder(dir.path().to_str().unwrap())
+            .snapshot_reads(true)
+            .build()
+            .unwrap();
+
+        // Enabled → there is a published snapshot, and get() reads the base through it.
+        assert!(engine.snapshot().is_some(), "paged engine should have snapshot reads on");
+        assert!(engine.get("venues/v1").unwrap().contains("\"n\":1"));
+        assert!(engine.get("venues/nope").is_none());
+
+        // Write, then force a refresh → the lock-free get sees it.
+        let ins = engine.prepare_insert("venues", &["_key", "n"]).unwrap();
+        engine.insert_prepared(&ins, &[json!("v2"), json!(2)]).unwrap();
+        engine.refresh_snapshot();
+        assert!(engine.get("venues/v2").is_some(), "get sees committed write after refresh");
+    }
+
+    /// Without `snapshot_reads`, there's no published snapshot and `get` falls back
+    /// to the shared read lock (still correct, just not lock-free).
+    #[test]
+    fn engine_without_snapshot_reads_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put(
+                "t/a",
+                &json!({"_collection":"t","_key":"a","n":1}).to_string(),
+            )
+            .unwrap();
+        }
+        let engine = Engine::builder(dir.path().to_str().unwrap()).build().unwrap();
+        assert!(engine.snapshot().is_none(), "not enabled → no published snapshot");
+        assert!(engine.get("t/a").is_some(), "get falls back to the read lock");
+    }
+
+    /// Snapshot reads only apply to a writable engine — read-only keeps it off.
+    #[test]
+    fn read_only_has_no_snapshot_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("t/a", &json!({"_collection":"t","_key":"a"}).to_string()).unwrap();
+            db.compact().unwrap();
+        }
+        let engine = Engine::builder(dir.path().to_str().unwrap())
+            .read_only(true)
+            .snapshot_reads(true) // requested, but read-only wins
+            .build()
+            .unwrap();
+        assert!(engine.snapshot().is_none(), "read-only engine is not snapshottable");
+        assert!(engine.get("t/a").is_some(), "read-only get still works via the lock");
     }
 }
 
@@ -709,6 +963,8 @@ mod tests {
             wal_policy: WalPolicy::Manual,
             path: Some(r_path),
             read_only: true,
+            #[cfg(unix)]
+            published: None,
             remote: Some(reader_remote),
             generation: std::sync::atomic::AtomicU64::new(1),
         };
