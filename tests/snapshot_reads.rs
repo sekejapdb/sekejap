@@ -117,6 +117,36 @@ fn snapshot_survives_live_compact() {
     assert!(db.get("venues/late").is_some());
 }
 
+/// A snapshot can scan a whole collection and count it — base members plus overlay
+/// members — and both are point-in-time (a later insert isn't seen by an old snapshot).
+#[test]
+fn snapshot_scan_and_count() {
+    let (mut db, _dir) = paged_db(6); // venues/v0..v5, all folded into the base
+
+    let before = db.snapshot().unwrap();
+    assert_eq!(before.count("venues"), 6);
+    let payloads = before.scan("venues");
+    assert_eq!(payloads.len(), 6);
+    assert!(payloads.iter().any(|p| p.contains("\"n\":3")), "scan returns real payloads");
+
+    // Overlay insert: a fresh snapshot merges base + overlay (7); the old one is
+    // frozen at 6.
+    db.put(
+        "venues/v6",
+        &json!({"_collection":"venues","_key":"v6","n":6}).to_string(),
+    )
+    .unwrap();
+    let after = db.snapshot().unwrap();
+    assert_eq!(after.count("venues"), 7, "new snapshot sees base + overlay");
+    assert_eq!(before.count("venues"), 6, "old snapshot is point-in-time");
+    assert!(after.scan("venues").iter().any(|p| p.contains("\"n\":6")));
+    assert!(!before.scan("venues").iter().any(|p| p.contains("\"n\":6")));
+
+    // Unknown collection → empty, not a panic.
+    assert_eq!(before.count("ghosts"), 0);
+    assert!(before.scan("ghosts").is_empty());
+}
+
 /// Gating / embedded safety: resident mode (`open`) has no immutable base, so it is
 /// NOT snapshottable — `snapshot()` returns `None`. This is what keeps the feature
 /// opt-in and zero-cost for single-threaded/embedded users.

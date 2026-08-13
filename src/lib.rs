@@ -797,6 +797,10 @@ pub struct ReadSnapshot {
     /// Frozen copy of the write overlay at snapshot time — an independent map, so
     /// the live writer mutating its own overlay can't change what this reader sees.
     nodes: std::sync::Arc<HashMap<u64, NodeData>>,
+    /// Frozen copy of the overlay's per-collection member lists (`collection hash →
+    /// member node hashes`). Merged with the base's posting lists for scans, exactly
+    /// like [`CoreDB::collection_members`].
+    collections: std::sync::Arc<HashMap<u64, Vec<u64>>>,
     /// Lock-free reader over the payload bytes (own fd + shared base mmap).
     payloads: SnapshotPayloads,
 }
@@ -821,6 +825,55 @@ impl ReadSnapshot {
         }
         let rec = self.base.node_record(self.base.resolve(hash)?)?;
         Some((rec.payload_offset, rec.payload_len))
+    }
+
+    /// The member node hashes of `collection` in this snapshot — the frozen overlay
+    /// list merged with the immutable base's posting list, deduped so an updated
+    /// base node appears once. Mirrors [`CoreDB::collection_members`].
+    ///
+    /// Note the same paged-mode caveat as the live engine: a base node `remove`d but
+    /// not yet compacted still appears here (deletes of base data land at `compact`).
+    fn members(&self, coll_hash: u64) -> Vec<u64> {
+        let base = self.base.members_by_coll_hash(coll_hash);
+        let overlay = self.collections.get(&coll_hash);
+        match (overlay, base) {
+            (Some(o), None) => o.clone(),
+            (overlay, Some(mut b)) => {
+                if let Some(o) = overlay {
+                    let seen: std::collections::HashSet<u64> = b.iter().copied().collect();
+                    for &h in o {
+                        if !seen.contains(&h) {
+                            b.push(h);
+                        }
+                    }
+                }
+                b
+            }
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// Number of nodes in `collection` as of this snapshot — a lock-free `COUNT(*)`.
+    pub fn count(&self, collection: &str) -> usize {
+        self.members(sk_hash(collection)).len()
+    }
+
+    /// Scan a whole collection: the JSON payload of every member node, as of this
+    /// snapshot. Lock-free — never queues behind a writer. This is the snapshot
+    /// analogue of `SELECT * FROM collection` (unindexed: it reads every member's
+    /// payload, no `WHERE`/index acceleration — use for list endpoints on
+    /// bounded collections). Nodes whose payloads can't be read are skipped.
+    pub fn scan(&self, collection: &str) -> Vec<String> {
+        let members = self.members(sk_hash(collection));
+        let mut out = Vec::with_capacity(members.len());
+        for h in members {
+            if let Some((off, len)) = self.payload_loc(h) {
+                if let Some(b) = self.payloads.get_raw(off, len) {
+                    out.push(String::from_utf8_lossy(&b).into_owned());
+                }
+            }
+        }
+        out
     }
 }
 
@@ -4724,7 +4777,8 @@ impl CoreDB {
         let base = self.topo_base.clone()?; // Arc bump — shares the immutable base
         let payloads = self.payload_store.snapshot_reader()?; // own fd + shared mmap
         let nodes = std::sync::Arc::new(self.nodes.clone()); // freeze the overlay
-        Some(ReadSnapshot { base, nodes, payloads })
+        let collections = std::sync::Arc::new(self.collections.clone()); // freeze coll membership
+        Some(ReadSnapshot { base, nodes, collections, payloads })
     }
 
     /// Parse and return the JSON payload for a node hash. Returns `None` if
@@ -6846,6 +6900,33 @@ impl CoreDB {
             }
             (None, None) => None,
         }
+    }
+
+    /// Every member payload of `collection` (base + overlay), as JSON strings — the
+    /// live-lock analogue of [`ReadSnapshot::scan`]. Used by `Engine::scan` when
+    /// snapshot reads are off. Unindexed: reads every member's payload.
+    #[allow(dead_code)] // used by the `engine` feature (Engine::scan fallback)
+    pub(crate) fn collection_payloads(&self, collection: &str) -> Vec<String> {
+        let members = match self.collection_members(sk_hash(collection)) {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(members.len());
+        for &h in members.iter() {
+            if let Some((off, len)) = self.payload_loc(h) {
+                if let Some(b) = self.payload_store.get_raw(off, len) {
+                    out.push(String::from_utf8_lossy(&b).into_owned());
+                }
+            }
+        }
+        out
+    }
+
+    /// Number of members of `collection` (base + overlay). Live-lock analogue of
+    /// [`ReadSnapshot::count`].
+    #[allow(dead_code)] // used by the `engine` feature (Engine::count fallback)
+    pub(crate) fn collection_count(&self, collection: &str) -> usize {
+        self.collection_members(sk_hash(collection)).map_or(0, |m| m.len())
     }
 
     /// Return the btree index for `(collection_hash, field)` if one exists.
