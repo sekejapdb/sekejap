@@ -37,7 +37,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion, black_box};
 use rusqlite::{Connection, params};
-use sekejap::{CosineDistance, CoreDB, Distance};
+use sekejap::{Config, CoreDB, CosineDistance, Distance, SyncMode};
 use serde_json::json;
 
 // ── Dataset constants ─────────────────────────────────────────────────────────
@@ -109,7 +109,16 @@ fn cosine_top_k(scores: &mut Vec<f32>, k: usize) -> usize {
 
 fn setup_sekejap() -> (CoreDB, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
-    let mut db = CoreDB::open(dir.path()).unwrap();
+    // Load with SyncMode::Normal (fsync at checkpoint, not per write). The default
+    // Full mode fsyncs every one of the ~20k setup puts — on macOS F_FULLFSYNC
+    // that alone can take 20+ minutes and dominates the whole run. Setup is NOT
+    // measured (only the queries below are), and SQLite's setup likewise batches
+    // in one BEGIN/COMMIT, so this keeps the comparison fair and the run reliable.
+    let mut db = CoreDB::open_with_config(
+        dir.path(),
+        Config { wal_sync: SyncMode::Normal, ..Default::default() },
+    )
+    .unwrap();
 
     for i in 0..VENUES {
         let slug = format!("venues/v{i}");
