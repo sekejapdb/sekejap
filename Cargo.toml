@@ -10,7 +10,7 @@ version = "0.16.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sekejapdb/sekejap"
-homepage = "https://sekejap.zebflow.com"
+homepage = "https://sekejap.life"
 description = "A graph-first, embedded multi-model database engine"
 
 [workspace.dependencies]

@@ -12,7 +12,7 @@ documentation_style = "c99"
 
 header = """
 /*
- * sekejap.h — C ABI for sekejap (https://sekejap.zebflow.com)
+ * sekejap.h — C ABI for sekejap (https://sekejap.life)
  *
  * AUTO-GENERATED from sekejap-capi/src/lib.rs by cbindgen. Do not edit by hand.
  *

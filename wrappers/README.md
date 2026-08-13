@@ -27,9 +27,9 @@ The name to claim everywhere is **`sekejap`**. Reserve it early on each registry
 | Wrapper | Registry | Install | How you publish |
 |---|---|---|---|
 | **Python** | [PyPI](https://pypi.org) | `pip install sekejap` | `maturin publish` (or the `maturin-action` GitHub workflow → wheels per platform) |
-| **Dart/Flutter** | [pub.dev](https://pub.dev) | `dart pub add sekejap` · `flutter pub add sekejap` | `dart pub publish`. Published under the *verified publisher* **`zebflow.com`** (the umbrella domain, shared by all products) |
+| **Dart/Flutter** | [pub.dev](https://pub.dev) | `dart pub add sekejap` · `flutter pub add sekejap` | `dart pub publish`, under the configured verified publisher |
 | **Node.js** | [npm](https://npmjs.com) | `npm install sekejap` | `npm publish`. napi-rs builds prebuilt binaries per platform in CI; ship them as `optionalDependencies` platform packages |
-| **Kotlin/Java** | [Maven Central](https://central.sonatype.com) | Gradle `implementation("com.zebflow:sekejap:0.13.0")` | Publish via the Sonatype **Central Portal**. groupId **`com.zebflow`** (reverse-DNS of the `zebflow.com` umbrella; verifying the apex grants `com.zebflow.*` for every product). Verify the domain once |
+| **Kotlin/Java** | [Maven Central](https://central.sonatype.com) | Gradle `implementation("life.sekejap:sekejap:0.16.5")` | Publish via the Sonatype **Central Portal**. groupId **`life.sekejap`** (matches `group` in the Gradle build files) |
 | **Go** | *no registry* — Go modules via Git | `go get github.com/sekejapdb/sekejap/wrappers/go` | Just **git-tag** a release (`v0.13.0`); [pkg.go.dev](https://pkg.go.dev) indexes it automatically. Module path must match the repo URL |
 | **C/C++** | *no single registry* | see below | Options: **vcpkg**, **Conan**, a **Homebrew tap** (`brew install <you>/tap/sekejap`), or prebuilt `.so`/`.a` + header + `sekejap.pc` on **GitHub Releases** |
 | **Swift** | *no central registry* — SwiftPM via Git | `.package(url: "…/sekejap-swift.git", from: "0.13.0")` | **git-tag** a release; the [Swift Package Index](https://swiftpackageindex.com) indexes it. Optionally also **CocoaPods** (`pod 'Sekejap'`, `pod trunk push`). Ship the native lib as an `.xcframework` (binaryTarget) on Releases |

@@ -1,13 +1,13 @@
 # Kotlin / Java
 
 Install from
-[Maven Central](https://central.sonatype.com/artifact/com.zebflow/sekejap) —
+[Maven Central](https://central.sonatype.com/artifact/life.sekejap/sekejap) —
 the jar bundles the native library per platform, so there is nothing else to
 install:
 
 ```kotlin
 // build.gradle.kts
-implementation("com.zebflow:sekejap:0.16.1")
+implementation("life.sekejap:sekejap:0.16.5")
 ```
 
 Requires **JDK 22+** at runtime (the binding uses the Java FFM API, finalized

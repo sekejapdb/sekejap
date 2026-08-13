@@ -49,9 +49,7 @@ temp → `-Dsekejap.lib`), or rely on a system-installed library.
 ## Distribution
 
 - **Registry:** [Maven Central](https://central.sonatype.com) → Gradle
-  `implementation("com.zebflow:sekejap:0.16.1")`
-- **groupId:** **`com.zebflow`** — reverse-DNS of the `zebflow.com` umbrella domain.
-  Verifying the apex with Sonatype once grants `com.zebflow.*` for every product
-  (sekejap, geonative, josie, …).
+  `implementation("life.sekejap:sekejap:0.16.5")`
+- **groupId:** **`life.sekejap`** (matches `group` in the Gradle build files).
 - **Publish:** via the Sonatype **Central Portal**, using the vanniktech
   `com.vanniktech.maven.publish` Gradle plugin (handles signing + Central Portal upload).
