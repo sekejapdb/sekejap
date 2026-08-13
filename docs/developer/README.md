@@ -225,6 +225,10 @@ flowchart LR
 
 ## Repo map
 
+For a **per-file** index — every one of the 44 `src/` files with a one-line purpose
+and how they connect — see [repo-map.md](repo-map.md). The tree below is the
+directory-level summary.
+
 ```
 sekejap/
 ├── src/
@@ -262,6 +266,8 @@ cargo bench --bench mega_benchmark   # 20-scenario local benchmark vs SQLite
 
 ## Where to read next
 
+- [repo-map.md](repo-map.md) — the per-file index: what each of the 44 `src/` files
+  does and how a query flows through them (start here to get oriented)
 - [core.md](core.md) — the write path, durability, recovery, compaction
 - [storage.md](storage.md) — what's on disk and why it looks that way
 - [indexes.md](indexes.md) — the six index families and their disk-first designs
