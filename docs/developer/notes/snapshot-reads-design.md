@@ -1,9 +1,11 @@
 # Snapshot reads — readers that never block writers (design plan)
 
-Status: **Phase 1 + 2 done** (core `ReadSnapshot` primitive + `Engine` integration —
-lock-free `Engine::get`, correctness-tested, benchmark-proven; **point reads only**).
-Phase 3 remains: richer snapshot queries (scans/graph/spatial/vector on a snapshot),
-scale-out docs, query limits. This is the plan for the
+Status: **Phase 1 + 2 done, Phase 3 in progress.** Core `ReadSnapshot` primitive +
+`Engine` integration (lock-free `get`) + snapshot **`scan`/`count`** + operational
+usage docs — all correctness-tested and benchmark-proven. Remaining Phase 3:
+**full indexed SQL over a snapshot** (the big lift — needs index structures frozen,
+the Clone-cascade) and **query limits** (`max_rows`/`max_scan_bytes`, orthogonal
+safety valve). This is the plan for the
 "killer feature" for high-traffic *server* use (Zebflow): letting many reads run
 at full speed while a write is in progress.
 
@@ -203,11 +205,24 @@ layer, so a second façade would only duplicate it. What shipped (commit `076a3b
 - Scope: **point reads only** (that's `ReadSnapshot`'s current surface). Full
   snapshot SQL (scans/graph/spatial/vector) is Phase 3.
 
-**Phase 3 — scale-out + companions:**
-1. Document/tighten the `open_paged` + `open_read_only` + `open_s3` read-replica
-   pattern on top of snapshots.
-2. Add query limits (`max_rows` / `max_scan_bytes`) as the safety valve so one bad
-   scan can't hurt the shared engine (this is orthogonal but pairs well).
+**Phase 3 — richer reads + scale-out + companions (in progress):**
+1. **Snapshot `scan` + `count` (DONE, commit `cee17b3`).** `ReadSnapshot::scan`/
+   `count` and `Engine::scan`/`count` — whole-collection reads, lock-free, base +
+   overlay merged like `collection_members`. Unindexed (reads every member's
+   payload); for list/aggregate endpoints on bounded collections.
+2. **Scale-out + operational docs (DONE, commit `5ec207a`).**
+   `docs/usage/concurrency-and-snapshots.md` — the reader/writer model, snapshot
+   reads, the `open_paged`+`open_read_only`+`open_s3` read-replica pattern, and
+   operational limits (S3 publish-only, paged base deletes at compact, GEO WGS84/
+   subtype-less).
+3. **Full indexed SQL over a snapshot (TODO — the big lift).** Route the query
+   executor (scans/filters/graph/spatial/vector) over a snapshot's base+overlay
+   view instead of live `self`. Blocked on freezing the index structures too
+   (`Bm25Index`/`SearchIndex`/`EdgeStore`/`SpatialGrid`/`VectorStore`/GIN/GiST don't
+   derive `Clone`) — either make them `Arc`-shareable (like the base/payload mmap
+   already are) or serve them from the mmap'd base + overlay deltas.
+4. **Query limits (TODO).** `max_rows` / `max_scan_bytes` as a safety valve so one
+   bad scan can't hurt the shared engine (orthogonal; pairs with `scan`).
 
 ## 8. Risks & open questions
 
