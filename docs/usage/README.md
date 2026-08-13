@@ -11,6 +11,9 @@ hands-on tour; these pages are the reference.
   aggregation, multi-stage `WITH`.
 - [connectivity.md](connectivity.md) — beyond embedded: the HTTP server, the
   Postgres wire adapter, and object-storage read-only mode.
+- [concurrency-and-snapshots.md](concurrency-and-snapshots.md) — sharing one
+  database across threads: the reader/writer model, lock-free **snapshot reads**
+  for high-traffic servers, read scale-out, and operational limits.
 - [bindings/](bindings/README.md) — install + first query per language:
   Python, Rust, Node.js, Dart/Flutter, Kotlin/Java, Swift, Go, and C.
 - [best-practices.md](best-practices.md) — evidence-backed guidance on
