@@ -46,8 +46,24 @@
 /// pointer has no borrow-checker protection and no lifetime, so *we* are
 /// responsible for only reading valid, in-bounds bytes. That is exactly why the
 /// read method below is careful, and why creating/using it needs `unsafe`.
+// The mapping is held behind an `Arc` so a view is cheap to **clone**: cloning
+// bumps a reference count instead of re-mapping the file, and the kernel mapping
+// is released (`munmap`) only when the LAST clone drops. That is what lets an
+// immutable base be *shared* — e.g. handed to a read snapshot, or cloned into a
+// read-only view of the engine — without copying any bytes. Because the mapping
+// is read-only and immutable, sharing it across threads/clones can never race.
 #[cfg(unix)]
+#[derive(Clone)]
 pub(crate) struct MmapView {
+    region: std::sync::Arc<MmapRegion>,
+}
+
+/// The owned mapping itself — the raw address + length that `munmap`s on drop.
+/// Private and reference-counted (via the `Arc` in [`MmapView`]); never handed out
+/// directly, so the only way to observe its bytes is the bounds-checked
+/// [`MmapView::slice`].
+#[cfg(unix)]
+struct MmapRegion {
     ptr: *const u8, // start address the kernel gave us for the mapping
     len: usize,     // how many bytes are mapped (the bound we check against)
 }
@@ -56,12 +72,13 @@ pub(crate) struct MmapView {
 // reference across threads". Rust won't auto-derive them for a struct holding a
 // raw pointer (it can't know the pointer is safe to share), so we assert it with
 // `unsafe impl`. It IS safe here because the mapping is READ-ONLY: many threads
-// reading the same immutable bytes can never race. If this view were writable,
-// these impls would be unsound.
+// reading the same immutable bytes can never race. If this region were writable,
+// these impls would be unsound. `MmapView` then inherits `Send + Sync`
+// automatically because it only holds an `Arc<MmapRegion>`.
 #[cfg(unix)]
-unsafe impl Send for MmapView {}
+unsafe impl Send for MmapRegion {}
 #[cfg(unix)]
-unsafe impl Sync for MmapView {}
+unsafe impl Sync for MmapRegion {}
 
 #[cfg(unix)]
 impl MmapView {
@@ -103,7 +120,7 @@ impl MmapView {
         // MADV_NORMAL (0): use the OS's default read-ahead. We touch these files
         // both sequentially and randomly, so no special advice wins across the board.
         unsafe { madvise(ptr, len, 0); }
-        Some(Self { ptr: ptr as *const u8, len })
+        Some(Self { region: std::sync::Arc::new(MmapRegion { ptr: ptr as *const u8, len }) })
     }
 
     /// Borrow `read_len` bytes starting at `offset` as a plain `&[u8]`.
@@ -115,22 +132,24 @@ impl MmapView {
     #[inline]
     pub fn slice(&self, offset: usize, read_len: usize) -> Option<&[u8]> {
         let end = offset.checked_add(read_len)?;      // reject overflow, not just OOB
-        if end > self.len { return None; }            // stay inside the mapping
-        // Safe: the range is verified in-bounds above, and the mapping outlives
-        // the returned slice (tied to `&self`).
-        unsafe { Some(std::slice::from_raw_parts(self.ptr.add(offset), read_len)) }
+        if end > self.region.len { return None; }     // stay inside the mapping
+        // Safe: the range is verified in-bounds above, and the mapping (owned by the
+        // `Arc`) outlives the returned slice (both are tied to `&self`).
+        unsafe { Some(std::slice::from_raw_parts(self.region.ptr.add(offset), read_len)) }
     }
 
     /// Total number of mapped bytes.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.region.len
     }
 }
 
 #[cfg(unix)]
-impl Drop for MmapView {
+impl Drop for MmapRegion {
     fn drop(&mut self) {
+        // Runs only when the last `MmapView` sharing this region drops (the `Arc`
+        // refcount hits zero), so a shared/cloned view never unmaps too early.
         extern "C" {
             fn munmap(addr: *mut std::ffi::c_void, length: usize) -> i32;
         }
@@ -148,6 +167,7 @@ impl Drop for MmapView {
 // enable paged mode there later — see roadmap "Format & language stability".
 #[cfg(not(unix))]
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct MmapView {
     _never: std::convert::Infallible,
 }
