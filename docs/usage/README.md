@@ -9,8 +9,8 @@ hands-on tour; these pages are the reference.
 - [graph-queries.md](graph-queries.md) — the graph lane:
   `SELECT … FROM MATCH`, traversal, variable-length paths, shortest path,
   aggregation, multi-stage `WITH`.
-- [connectivity.md](connectivity.md) — beyond embedded: the HTTP server, the
-  Postgres wire adapter, and object-storage read-only mode.
+- [connectivity.md](connectivity.md) — beyond embedded: the HTTP server and
+  the Postgres wire adapter.
 - [concurrency-and-snapshots.md](concurrency-and-snapshots.md) — sharing one
   database across threads: the reader/writer model, lock-free **snapshot reads**
   for high-traffic servers, read scale-out, and operational limits.

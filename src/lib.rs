@@ -423,12 +423,6 @@ enum PayloadInner {
         #[cfg(unix)]
         mmap: Option<std::sync::Arc<MmapView>>,
     },
-    /// Object-storage backend (feature `s3`): bytes fetched from remote blocks
-    /// and held in a bounded in-memory `BlockCache`.
-    #[cfg(feature = "s3")]
-    Remote {
-        cache: std::sync::Mutex<engine::cache::BlockCache>,
-    },
 }
 
 /// The SKBIN field table — the only shared decode state — is written to these
@@ -501,31 +495,6 @@ impl PayloadStore {
         } })
     }
 
-    /// Create a remote-backed store that fetches blocks from S3 on demand.
-    #[cfg(feature = "s3")]
-    fn new_remote(
-        store: std::sync::Arc<dyn object_store::ObjectStore>,
-        prefix: &str,
-        total_remote_len: u64,
-        budget: engine::cache::CacheBudget,
-    ) -> Result<Self, String> {
-        let cache = engine::cache::BlockCache::new(
-            store,
-            prefix,
-            "payloads.bin",
-            total_remote_len,
-            budget,
-        )?;
-        Ok(Self {
-            // remote store is read-only; records self-describe
-            binary: false,
-            field_table: storage::skbin::FieldTable::new(),
-            inner: PayloadInner::Remote {
-                cache: std::sync::Mutex::new(cache),
-            },
-        })
-    }
-
     fn is_disk(&self) -> bool {
         matches!(self.inner, PayloadInner::Disk { .. })
     }
@@ -557,10 +526,6 @@ impl PayloadStore {
                 let offset = *total_len;
                 *total_len += bytes.len() as u64;
                 (offset, bytes.len() as u32)
-            }
-            #[cfg(feature = "s3")]
-            PayloadInner::Remote { .. } => {
-                panic!("sekejap: cannot write to remote payload store (read-only)");
             }
         }
     }
@@ -601,10 +566,6 @@ impl PayloadStore {
                 *total_len = base + buf.len() as u64;
                 results
             }
-            #[cfg(feature = "s3")]
-            PayloadInner::Remote { .. } => {
-                panic!("sekejap: cannot write to remote payload store (read-only)");
-            }
         }
     }
 
@@ -636,7 +597,6 @@ impl PayloadStore {
 
     /// Read `read_len` bytes starting at an arbitrary absolute byte offset.
     /// Uses mmap when available (zero syscalls), falls back to pread.
-    /// Remote variant fetches via block cache from S3.
     pub(crate) fn get_raw_at(&self, abs_offset: u64, read_len: usize) -> Option<Vec<u8>> {
         if read_len == 0 {
             return Some(vec![]);
@@ -666,10 +626,6 @@ impl PayloadStore {
                 let _ = (file, abs_offset, read_len);
                 None
             }
-            #[cfg(feature = "s3")]
-            PayloadInner::Remote { cache } => {
-                cache.lock().ok()?.get_raw_at(abs_offset, read_len)
-            }
         }
     }
 
@@ -687,8 +643,6 @@ impl PayloadStore {
             PayloadInner::Disk { mmap, .. } => {
                 mmap.as_ref()?.slice(abs_offset as usize, read_len)
             }
-            #[cfg(feature = "s3")]
-            PayloadInner::Remote { .. } => None,
         }
     }
 
@@ -711,7 +665,7 @@ impl PayloadStore {
     ///   names any already-written record could reference are present).
     ///
     /// Only disk-backed stores (paged mode) are snapshottable — the ephemeral
-    /// in-memory store and the remote/S3 store return `None`.
+    /// in-memory store returns `None`.
     #[cfg(unix)]
     fn snapshot_reader(&self) -> Option<SnapshotPayloads> {
         match &self.inner {
@@ -1377,7 +1331,7 @@ impl CoreDB {
 
     /// Open a database in read-only mode (no lock, no WAL writer).
     ///
-    /// Suitable for read replicas that sync their local directory from S3.
+    /// Suitable for read replicas alongside a writer process.
     /// Write operations will silently skip WAL persistence.
     pub fn open_read_only(dir: impl AsRef<Path>) -> io::Result<Self> {
         Self::open_with_config(
@@ -1386,180 +1340,6 @@ impl CoreDB {
         )
     }
 
-    /// Open a read-only database backed by S3 remote storage.
-    ///
-    /// Downloads only the snapshot (node index, ~100 B/node) and loads it
-    /// into RAM. Payloads stay on S3 — each `get_payload()` call fetches
-    /// the relevant 64 KB block via `GET_RANGE` and caches it in a bounded
-    /// LRU. No local `payloads.bin` file is needed.
-    ///
-    /// This allows querying a 1 TB dataset from a machine with 50 GB of disk:
-    /// the node index stays in RAM (~hundreds of MB), the block cache keeps
-    /// hot payload blocks on local storage, and cold blocks are fetched on
-    /// demand from S3.
-    /// Open a read-only database backed by S3.
-    ///
-    /// Payloads are fetched on demand via S3 `GET_RANGE` and cached in an
-    /// LRU cache bounded by `cache_budget`.
-    ///
-    /// - Without `cache_dir`: budget controls RAM cache size. Evicted blocks
-    ///   are discarded.
-    /// - With `cache_dir`: budget controls disk cache size (RAM tier is 256 MB).
-    ///   Evicted blocks are spilled to disk and survive restarts.
-    #[cfg(feature = "s3")]
-    pub fn open_s3(
-        remote: &engine::remote::RemoteSync,
-        cache_budget: engine::cache::CacheBudget,
-        cache_dir: Option<&std::path::Path>,
-    ) -> Result<Self, String> {
-        Self::open_s3_inner(remote, cache_budget, cache_dir)
-    }
-
-    #[cfg(feature = "s3")]
-    fn open_s3_inner(
-        remote: &engine::remote::RemoteSync,
-        cache_budget: engine::cache::CacheBudget,
-        cache_dir: Option<&std::path::Path>,
-    ) -> Result<Self, String> {
-        let manifest = remote
-            .get_manifest()?
-            .ok_or("no manifest found on remote")?;
-
-        // Find payloads.bin size from manifest.
-        let payload_size = manifest
-            .segments
-            .iter()
-            .find(|s| s.name == "payloads.bin")
-            .map(|s| s.size)
-            .unwrap_or(0);
-
-        // Fetch snapshot.json via RemoteSync (reuses its existing Runtime/connection).
-        let snap_bytes = remote.fetch_file("snapshot.json")?;
-
-        // Strip the versioned header (v2+) if present; legacy files start at 0.
-        let (fmt_version, body_offset) = snapshot_probe(&snap_bytes);
-        if fmt_version > SNAPSHOT_FORMAT_VERSION {
-            return Err(newer_format_msg("snapshot", fmt_version, SNAPSHOT_FORMAT_VERSION));
-        }
-        let snap: Snapshot = serde_json::from_slice(&snap_bytes[body_offset..])
-            .map_err(|e| format!("parsing snapshot: {e}"))?;
-
-        let mut block_cache = if cache_dir.is_some() {
-            // Disk-cached mode: budget controls disk tier, RAM is default 256MB.
-            engine::cache::BlockCache::new(
-                remote.store(),
-                remote.prefix(),
-                "payloads.bin",
-                payload_size,
-                cache_budget,
-            )?
-        } else {
-            // RAM-only mode: budget controls RAM tier, no disk.
-            engine::cache::BlockCache::new(
-                remote.store(),
-                remote.prefix(),
-                "payloads.bin",
-                payload_size,
-                engine::cache::CacheBudget::new(0),
-            )?
-            .with_ram_cap(cache_budget.max_bytes() as usize)
-        };
-
-        if let Some(dir) = cache_dir {
-            let payload_cache_dir = dir.join("payloads");
-            block_cache = block_cache.with_cache_dir(payload_cache_dir)?;
-        }
-
-        let mut db = Self::new();
-        db.payload_store = PayloadStore {
-            binary: false,
-            field_table: storage::skbin::FieldTable::new(),
-            inner: PayloadInner::Remote {
-                cache: std::sync::Mutex::new(block_cache),
-            },
-        };
-
-        // Compacted payloads are SKBIN records whose field NAMES live in the
-        // field-table sidecar — without it every field lookup on a SKBIN record
-        // misses (filters silently match nothing). Mirror open(): try each
-        // redundant copy, first that passes its CRC wins. Absent → the store
-        // holds raw-JSON records only, and the empty table is correct.
-        for name in FIELD_TABLE_COPIES {
-            if let Ok(bytes) = remote.fetch_file(name) {
-                if let Some(ft) = storage::skbin::FieldTable::from_frame(&bytes) {
-                    db.payload_store.field_table = ft;
-                    break;
-                }
-            }
-        }
-
-        if snap.topology_in_files {
-            // v3 manifest: fetch the topology files (small vs payloads) and
-            // rebuild the resident graph from them. Payloads stay remote.
-            let fetch = |name: &str| -> Result<Vec<u8>, String> {
-                remote.fetch_file(name).map_err(|e| format!("fetching {name}: {e}"))
-            };
-            let blob = storage::topology::TopologyBlob {
-                nodes: fetch("nodes.bin")?,
-                fwd: fetch("adj_fwd.bin")?,
-                rev: fetch("adj_rev.bin")?,
-                idx: fetch("idx.bin")?,
-                slugs: fetch("slugs.bin")?,
-                dict: fetch("dict.bin")?,
-                spat: fetch("spatial.bin").unwrap_or_default(),
-                emeta: fetch("edgemeta.bin").unwrap_or_default(),
-                colls: fetch("collections.bin").unwrap_or_default(),
-            };
-            db.load_snapshot_parts(snap, /*load_topology=*/ false);
-            db.load_topology_blob(&blob)
-                .map_err(|e| format!("loading topology files: {e}"))?;
-        } else {
-            db.load_snapshot(snap);
-        }
-
-        // Download small index files (GIN, search) if they exist on remote,
-        // then load them to restore full-text search capability.
-        let has_gin = manifest.segments.iter().any(|s| s.name == "gin.bin" && s.size > 12);
-        let has_search = manifest.segments.iter().any(|s| s.name == "search.bin" && s.size > 12);
-
-        if has_gin {
-            if let Ok(gin_bytes) = remote.fetch_file("gin.bin") {
-                let tmp = std::env::temp_dir().join(format!("sekejap_gin_{}.bin", std::process::id()));
-                if std::fs::write(&tmp, &gin_bytes).is_ok() {
-                    db.load_gin_binary(&tmp);
-                    let _ = std::fs::remove_file(&tmp);
-                }
-            }
-        }
-
-        if has_search {
-            if let Ok(search_bytes) = remote.fetch_file("search.bin") {
-                let tmp = std::env::temp_dir().join(format!("sekejap_search_{}.bin", std::process::id()));
-                if std::fs::write(&tmp, &search_bytes).is_ok() {
-                    db.load_search_binary(&tmp);
-                    let _ = std::fs::remove_file(&tmp);
-                }
-            }
-        }
-
-        // Rebuild indexes that aren't covered by sidecar files.
-        // BM25 is always rebuilt from data (no sidecar).
-        db.rebuild_declared_bm25_indexes();
-        if !has_gin {
-            db.rebuild_declared_gin_indexes();
-        }
-        if !has_search {
-            db.rebuild_declared_search_indexes();
-        }
-
-        // Rebuild spatial grid for geo queries.
-        db.rebuild_spatial_grid();
-
-        // Rebuild HNSW from vectors loaded via snapshot.
-        db.rebuild_declared_hnsw_indexes();
-
-        Ok(db)
-    }
 
     /// Open (or create) a persistent database with explicit configuration — the
     /// full startup / crash-recovery routine.
@@ -4156,7 +3936,7 @@ impl CoreDB {
     }
 
     /// Rebuild the resident graph from an in-memory set of topology file bytes.
-    /// Used by local open (manifest snapshots + recovery) and the S3 open path.
+    /// Used by local open (snapshot + recovery).
     fn load_topology_blob(&mut self, blob: &storage::topology::TopologyBlob) -> io::Result<()> {
         use storage::topology::TopologyView;
         let view = TopologyView::new(blob)

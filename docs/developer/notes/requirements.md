@@ -1,5 +1,7 @@
 # sekejap — Requirements & Roadmap
 
+> **Superseded (0.17.0):** object-storage support was removed; the S3 phases
+> described below are no longer planned. The local mmap design still stands.
 Single source of truth for what sekejap must be, its non-negotiables, and the
 phased plan. Cross-links the detailed docs rather than duplicating them.
 

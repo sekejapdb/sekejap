@@ -63,8 +63,8 @@ Full wire format: [notes/skbin-format.md](notes/skbin-format.md).
   traversals from mmap'd slices with only the (offset, count) index resident
   (96 MB of heap adjacency became 21 MB on a 925k-edge graph, with equal or
   better traversal latency);
-- the same layout works over local files today and object-storage range reads
-  later — paging is a read-path flip, not a format migration.
+- paging is a read-path flip, not a format migration — the same layout serves
+  both fully-resident and mmap'd reads.
 
 Full format: [notes/topology-format.md](notes/topology-format.md).
 

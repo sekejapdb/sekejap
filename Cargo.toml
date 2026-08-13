@@ -46,7 +46,6 @@ memchr     = "2"
 chrono     = "0.4"
 uuid       = { version = "1", features = ["v4", "v5"] }
 rayon      = "1"
-object_store = { version = "0.14", optional = true, features = ["aws"] }
 tokio        = { version = "1",    optional = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 # Benchmark-only: SurrealDB embedded (SurrealKV, pure-Rust disk engine) for the
 # vs-SurrealDB mega comparison. Optional + off by default — a huge dependency, so
@@ -64,7 +63,6 @@ serve = []
 # bytes, get reply bytes — no sockets/threads/deps. The CLI's `sekejap pg` and any
 # downstream app own the transport.
 pg = []
-s3 = ["engine", "dep:object_store", "dep:tokio"]
 # Build the mega_vs_surreal benchmark (pulls SurrealDB + a tokio runtime).
 surreal-bench = ["dep:surrealdb", "dep:tokio"]
 

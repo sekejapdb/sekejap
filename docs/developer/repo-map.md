@@ -40,7 +40,7 @@ A query passes through four layers.
 ```
 sekejap/
 │
-├── src/                          THE ENGINE — 44 files
+├── src/                          THE ENGINE — 41 files
 │   │
 │   ├── lib.rs                    ★ CoreDB: the heart. Holds the data + every index;
 │   │                               put/get/compact, WAL, paged base+overlay
@@ -102,14 +102,11 @@ sekejap/
 │       ├── guard.rs              The read/write lock (many readers OR one writer)
 │       ├── buffer.rs             Batching writes so the lock is taken once
 │       ├── scheduler.rs          When to rebuild secondary indexes
-│       ├── policy.rs             When to auto-compact the WAL
-│       ├── cache.rs              LRU block cache for payloads fetched from S3
-│       ├── manifest.rs           Tracks which segments exist on remote storage
-│       └── remote.rs             S3 sync — upload/download the database files
+│       └── policy.rs             When to auto-compact the WAL
 │
 ├── tests/                        Integration tests, one file per area
 │                                   (snapshot_reads, crash_recovery, persistence,
-│                                    dump_restore, graph_disk, s3_*, stress, fuzz)
+│                                    dump_restore, graph_disk, stress, fuzz)
 ├── benches/                      Benchmarks — mega_benchmark (vs SQLite),
 │                                   concurrency (reads under write), vs SurrealDB
 ├── eval/                         Committed benchmark result history

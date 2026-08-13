@@ -2,7 +2,7 @@
 
 sekejap is a graph-first, embedded multimodel database that stores your data in several forms at once: plain records, graph relationships, geographic shapes, vectors, and full text. You can query and combine them in a single SQL statement.
 
-It runs inside your application, like SQLite, with no separate server to install or manage. Store your database on local disk for lightweight and offline use, or use S3-compatible object storage for datasets that grow beyond a single machine.
+It runs inside your application, like SQLite, with no separate server to install or manage. Your database is a directory on local disk.
 
 *(“sekejap” is Indonesian for “a brief moment”, reflecting how quickly you can set it up and start working with your multimodel data.)*
 
@@ -13,12 +13,11 @@ It's available as a Rust/Python/Dart/Kotlin/Swift/Java/Node.js/Go library, and a
 graph reference) and a [developer guide](docs/developer/README.md)
 (architecture diagrams, storage, indexes, invariants).
 
-📄 **Paper:** the sekejap architecture and its six-category benchmark
-(relational · graph · spatial · vector · full-text · hybrid, vs SQLite, DuckDB,
+📊 **Benchmarks:** a six-category benchmark
+(relational · graph · spatial · vector · full-text · hybrid, against SQLite, DuckDB,
 PostgreSQL/PostGIS/pgvector, Neo4j, ArangoDB, Qdrant, Redis, Elasticsearch,
-Solr, Meilisearch) are described in a paper submitted to CIDR 2027.
-Reproduction harnesses, datasets, and the measured results live in
-[`eval/`](eval/README.md).
+Solr, Meilisearch). Reproduction harnesses, datasets, and the measured results live
+in [`eval/`](eval/README.md).
 
 ---
 
@@ -48,6 +47,36 @@ It's a good fit for:
   by any mix of location, similarity, and relationships — a private, queryable
   memory with no network round-trip.
 
+## How you'll run it
+
+One thing decides what you turn on: **is the database part of your app, or is it
+running as a service?**
+
+```toml
+# Cargo.toml — pick the line that matches your case
+sekejap = "0.16"                                          # inside your app
+sekejap = { version = "0.16", features = ["engine"] }     # run it as a service
+```
+
+| | what it is | example |
+|---|---|---|
+| **inside your app** | it starts and stops with the app | a mobile app, a game, an analysis script |
+| **as a service** | it keeps running and looks after its data | a small server, a robot, an IoT gateway — even for one person |
+
+`engine` gives your app the things a database server normally does for you: many
+readers can read while one writer writes, writes are batched, the log is compacted
+as it grows, and indexes are rebuilt on a schedule you choose.
+
+There is still **no separate server** to install, start or manage. These are
+functions your app calls, in your app's own process — which is why it is still an
+embedded database. Use the parts you need and ignore the rest.
+
+To reach a database from another machine, use the command-line tool: `sekejap serve`
+for HTTP, or `sekejap pg` so PostgreSQL clients can connect. See
+[connectivity](docs/usage/connectivity.md), and
+[concurrency and snapshots](docs/usage/concurrency-and-snapshots.md) for what
+happens to reads while a write runs.
+
 ---
 
 ## Install
@@ -58,14 +87,13 @@ available) the typed, reactive API. Index: [docs/usage/bindings/](docs/usage/bin
 **Python** — [PyPI](https://pypi.org/project/sekejap/) · [tutorial](docs/usage/bindings/python.md)
 
 ```bash
-pip install sekejap                 # includes S3 support
+pip install sekejap
 ```
 
 **Rust** — [crates.io](https://crates.io/crates/sekejap) · [tutorial](docs/usage/bindings/rust.md)
 
 ```bash
 cargo add sekejap                   # library
-cargo add sekejap --features s3     # library, with S3 support
 cargo install sekejap-cli           # command-line tool
 ```
 
@@ -508,30 +536,6 @@ db.df.load_nodes(df, "tourists", id_col="tourist_id",
 
 # Get query results back as a DataFrame.
 result = db.df.query("SELECT * FROM dishes WHERE protein_g >= 25")
-```
-
----
-
-## Data larger than local disk (S3)
-
-sekejap can keep its data on S3-compatible storage and fetch pieces on demand,
-so you can query datasets bigger than the local disk. Works with AWS S3, MinIO,
-Cloudflare R2, and other S3-compatible stores.
-
-```python
-from sekejap import DB
-
-db = DB.open_s3("s3://my-bucket/bali",
-                access_key_id="AKID...", secret_access_key="secret...",
-                region="ap-southeast-1",
-                cache_budget_bytes=256 * 1024 * 1024)   # in-memory cache size
-
-# MinIO / R2 / other S3-compatible stores: point at their endpoint
-db = DB.open_s3("s3://my-bucket/bali", "AKID...", "secret...", "auto",
-                cache_budget_bytes=256 * 1024 * 1024,
-                endpoint="https://<account>.r2.cloudflarestorage.com")
-
-db.query("SELECT * FROM places WHERE ST_DWithin(geometry, POINT(115.168 -8.690), 10000.0)")
 ```
 
 ---
