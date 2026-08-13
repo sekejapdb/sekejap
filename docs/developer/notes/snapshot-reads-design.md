@@ -1,11 +1,10 @@
 # Snapshot reads — readers that never block writers (design plan)
 
-Status: **Phase 1 + 2 done, Phase 3 in progress.** Core `ReadSnapshot` primitive +
-`Engine` integration (lock-free `get`) + snapshot **`scan`/`count`** + operational
-usage docs — all correctness-tested and benchmark-proven. Remaining Phase 3:
-**full indexed SQL over a snapshot** (the big lift — needs index structures frozen,
-the Clone-cascade) and **query limits** (`max_rows`/`max_scan_bytes`, orthogonal
-safety valve). This is the plan for the
+Status: **Phase 1 + 2 done, Phase 3 nearly done.** Core `ReadSnapshot` primitive +
+`Engine` integration (lock-free `get`) + snapshot **`scan`/`count`** + **scan query
+limits** + operational usage docs — all correctness-tested and benchmark-proven.
+The one remaining item is **full indexed SQL over a snapshot** (§7 Phase 3.4 — the
+big lift, its own project). This is the plan for the
 "killer feature" for high-traffic *server* use (Zebflow): letting many reads run
 at full speed while a write is in progress.
 
@@ -215,14 +214,37 @@ layer, so a second façade would only duplicate it. What shipped (commit `076a3b
    reads, the `open_paged`+`open_read_only`+`open_s3` read-replica pattern, and
    operational limits (S3 publish-only, paged base deletes at compact, GEO WGS84/
    subtype-less).
-3. **Full indexed SQL over a snapshot (TODO — the big lift).** Route the query
-   executor (scans/filters/graph/spatial/vector) over a snapshot's base+overlay
-   view instead of live `self`. Blocked on freezing the index structures too
-   (`Bm25Index`/`SearchIndex`/`EdgeStore`/`SpatialGrid`/`VectorStore`/GIN/GiST don't
-   derive `Clone`) — either make them `Arc`-shareable (like the base/payload mmap
-   already are) or serve them from the mmap'd base + overlay deltas.
-4. **Query limits (TODO).** `max_rows` / `max_scan_bytes` as a safety valve so one
-   bad scan can't hurt the shared engine (orthogonal; pairs with `scan`).
+3. **Query limits (DONE, commit `184d3ec`).** `EngineBuilder::max_scan_rows` /
+   `max_scan_bytes`; `Engine::scan` stops at the cap on both the snapshot and
+   read-lock-fallback paths (`ReadSnapshot::scan_bounded` /
+   `CoreDB::collection_payloads_bounded`), always returning ≥1 row. Guards the
+   shared engine against a runaway full-collection read.
+4. **Full indexed SQL over a snapshot (TODO — the big lift, its own project).** Let
+   a snapshot run the whole `query()` surface (indexed filters, graph, spatial,
+   vector), not just `get`/`scan`/`count`.
+
+   **Chosen approach — "clone-the-engine":** `snapshot()` produces a read-only
+   `CoreDB` that (a) shares the Arc'd immutable base (topology, payload mmap, field/
+   text/vector base mmaps) and (b) clones the *small* RAM overlay (the maps of writes
+   since `compact`). Then the **existing executor runs unchanged** (`Set<'a>` borrows
+   that `CoreDB`) — no executor/trait refactor. Cheap because the overlay is small
+   (bounded by compaction frequency) and the base is shared, not copied.
+
+   **What it requires (the work):**
+   - `Clone` on the overlay index types that don't have it: `GINIndex`, `GiSTIndex`,
+     `CompactDiskIndex`, `SpatialGrid`, `VectorStore`, `EdgeStore`, `MappedFieldStore`
+     (`HnswGraph` already derives it; `field_indexes` is a `BTreeMap`, already `Clone`).
+   - For the **mmap/disk-backed** ones (`MappedFieldStore`, `CompactDiskIndex`,
+     `VectorStore` int8-on-disk, text/GiST mmap), `Clone` must **share** the mmap via
+     `Arc` (as `topo_base` and the payload mmap already do), NOT deep-copy — else it's
+     slow and wrong.
+   - A guard so the cloned `CoreDB` is safely read-only (no WAL writer, no file lock,
+     writes rejected), and it drops cleanly (shares fds/mmaps; frees only its overlay).
+   - Wire `Engine::query`/`query_params` to run on the published snapshot's cloned
+     `CoreDB` when snapshot reads are on (lock-free), else the current read-lock path.
+
+   Multi-day, multi-module — start it as a dedicated effort with its own tests, not
+   folded into a smaller change.
 
 ## 8. Risks & open questions
 
