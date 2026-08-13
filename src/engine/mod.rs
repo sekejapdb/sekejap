@@ -7,10 +7,6 @@
 //!   mutation (microseconds with incremental HNSW).
 //! - **Write buffering** — accumulate SQL statements and apply them in one
 //!   short lock acquisition via [`Engine::flush()`].
-//! - **WAL compaction policy** — auto-compact when the write-ahead log
-//!   exceeds a byte or entry threshold.
-//! - **Index rebuild scheduling** — track dirty fields and rebuild HNSW /
-//!   GIN / BM25 indexes on a configurable cadence.
 //!
 //! The engine exposes the **full** Sekejap SQL surface — graph traversals,
 //! spatial queries, vector search, full-text search, and standard CRUD — all
@@ -21,13 +17,11 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use sekejap::engine::{Engine, RebuildStrategy, WalPolicy};
+//! use sekejap::engine::Engine;
 //!
 //! // Open (or create) a persistent database
 //! let engine = Engine::builder("/tmp/mydb")
 //!     .buffer_size(100)
-//!     .rebuild_strategy(RebuildStrategy::Lazy)
-//!     .wal_policy(WalPolicy::default())
 //!     .build()
 //!     .unwrap();
 //!
@@ -52,15 +46,9 @@
 
 pub mod buffer;
 pub mod guard;
-pub mod policy;
-pub mod scheduler;
-
-pub use policy::WalPolicy;
-pub use scheduler::RebuildStrategy;
 
 use buffer::{RowBuffer, WriteBuffer};
 use guard::ReadWriteGuard;
-use scheduler::IndexScheduler;
 
 use crate::query::Hit;
 use crate::CoreDB;
@@ -78,9 +66,6 @@ pub struct Engine {
     buffer: Option<WriteBuffer>,
     /// Prepared-row buffer (pre-built (slug, json)); group-committed via put_many.
     rows: Option<RowBuffer>,
-    #[allow(dead_code)]
-    scheduler: IndexScheduler,
-    wal_policy: WalPolicy,
     read_only: bool,
     /// Safety-valve caps for [`Engine::scan`] — max rows and max payload bytes a
     /// single scan will collect (`None` = unbounded). Guard against a runaway
@@ -140,8 +125,6 @@ impl Engine {
         EngineBuilder {
             path: path.to_string(),
             buffer_size: None,
-            rebuild_strategy: RebuildStrategy::default(),
-            wal_policy: WalPolicy::default(),
             read_only: false,
             snapshot_reads: false,
             publish_interval: std::time::Duration::from_millis(5),
@@ -156,8 +139,6 @@ impl Engine {
             guard: ReadWriteGuard::new(CoreDB::new()),
             buffer: None,
             rows: None,
-            scheduler: IndexScheduler::new(RebuildStrategy::Immediate),
-            wal_policy: WalPolicy::Manual,
             read_only: false,
             scan_max_rows: None,
             scan_max_bytes: None,
@@ -407,7 +388,6 @@ impl Engine {
         if statements.is_empty() && rows.is_empty() {
             return Ok(0);
         }
-        let batch_len = statements.len() + rows.len();
 
         let mut db = self.guard.write();
         let mut total = 0usize;
@@ -421,14 +401,8 @@ impl Engine {
             total += db.execute_batch_grouped(&statements).map_err(|e| e.to_string())?;
         }
 
-        // Check WAL compaction policy
-        if let Some(ref path) = db.data_dir {
-            let wal_path = path.join("wal.log");
-            let wal_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-            if self.wal_policy.should_compact(wal_bytes, batch_len) {
-                let _ = db.compact();
-            }
-        }
+        // Auto-compaction is core's job (`CoreDB::set_auto_compact` +
+        // `CompactThresholds`), applied inside the bulk write paths above.
         drop(db); // release the write lock before re-minting the read snapshot
         self.maybe_republish();
 
@@ -501,23 +475,16 @@ impl Engine {
 /// # Example
 ///
 /// ```rust,no_run
-/// use sekejap::engine::{Engine, RebuildStrategy, WalPolicy};
+/// use sekejap::engine::Engine;
 ///
 /// let engine = Engine::builder("/tmp/mydb")
 ///     .buffer_size(100)                       // buffer 100 writes before flush
-///     .rebuild_strategy(RebuildStrategy::Lazy) // no auto-rebuild
-///     .wal_policy(WalPolicy::Auto {           // compact at 32 MB
-///         max_bytes: 32 * 1024 * 1024,
-///         max_entries: 10_000,
-///     })
 ///     .build()
 ///     .unwrap();
 /// ```
 pub struct EngineBuilder {
     path: String,
     buffer_size: Option<usize>,
-    rebuild_strategy: RebuildStrategy,
-    wal_policy: WalPolicy,
     read_only: bool,
     /// Opt-in lock-free snapshot reads (implies paged-mode open). unix-only.
     snapshot_reads: bool,
@@ -533,18 +500,6 @@ impl EngineBuilder {
     /// Pass `0` or omit to disable buffering.
     pub fn buffer_size(mut self, size: usize) -> Self {
         self.buffer_size = if size > 0 { Some(size) } else { None };
-        self
-    }
-
-    /// Set the index rebuild strategy.
-    pub fn rebuild_strategy(mut self, strategy: RebuildStrategy) -> Self {
-        self.rebuild_strategy = strategy;
-        self
-    }
-
-    /// Set the WAL compaction policy.
-    pub fn wal_policy(mut self, policy: WalPolicy) -> Self {
-        self.wal_policy = policy;
         self
     }
 
@@ -675,8 +630,6 @@ impl EngineBuilder {
             } else {
                 self.buffer_size.map(RowBuffer::new)
             },
-            scheduler: IndexScheduler::new(self.rebuild_strategy),
-            wal_policy: self.wal_policy,
             read_only: self.read_only,
             scan_max_rows: self.scan_max_rows,
             scan_max_bytes: self.scan_max_bytes,

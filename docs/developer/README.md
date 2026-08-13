@@ -47,7 +47,6 @@ flowchart TB
     direction LR
     LOCK["RwLock: parallel readers,<br/>brief exclusive writes"]
     BUF["Write buffering<br/><i>engine/buffer.rs</i>"]
-    SCHED["Index-build scheduler<br/><i>engine/scheduler.rs</i>"]
   end
 
   CORE["<b>CoreDB</b> — single-writer core<br/>put / get / link · build_*_index · get_payload<br/><i>lib.rs</i>"]
@@ -170,8 +169,8 @@ flowchart LR
     GE["geo.rs — geodesic spatial (PostGIS-compatible)"]
 
     subgraph M_ENG["engine/ (feature=engine)"]
-      E1["mod, buffer, scheduler"]
-      E2["guard, policy"]
+      E1["mod, buffer"]
+      E2["guard"]
     end
     subgraph M_VEC["vector/"]
       V1["hnsw, quant (int8 SQ)"]

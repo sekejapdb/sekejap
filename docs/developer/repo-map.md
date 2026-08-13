@@ -40,7 +40,7 @@ A query passes through four layers.
 ```
 sekejap/
 │
-├── src/                          THE ENGINE — 41 files
+├── src/                          THE ENGINE — 39 files
 │   │
 │   ├── lib.rs                    ★ CoreDB: the heart. Holds the data + every index;
 │   │                               put/get/compact, WAL, paged base+overlay
@@ -100,9 +100,7 @@ sekejap/
 │       ├── mod.rs                Engine — the front door: shares one CoreDB
 │       │                           across threads; query/execute; snapshot reads
 │       ├── guard.rs              The read/write lock (many readers OR one writer)
-│       ├── buffer.rs             Batching writes so the lock is taken once
-│       ├── scheduler.rs          When to rebuild secondary indexes
-│       └── policy.rs             When to auto-compact the WAL
+│       └── buffer.rs             Batching writes so the lock is taken once
 │
 ├── tests/                        Integration tests, one file per area
 │                                   (snapshot_reads, crash_recovery, persistence,
