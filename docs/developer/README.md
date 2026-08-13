@@ -268,6 +268,9 @@ cargo bench --bench mega_benchmark   # 20-scenario local benchmark vs SQLite
 
 - [repo-map.md](repo-map.md) — the per-file index: what each of the 44 `src/` files
   does and how a query flows through them (start here to get oriented)
+- [repo-outline.md](repo-outline.md) — **generated**: every type and function with
+  its line number, so you can jump straight to `file:line`. Regenerate with
+  `scripts/repo-outline.sh` (the pre-commit hook keeps it fresh)
 - [core.md](core.md) — the write path, durability, recovery, compaction
 - [storage.md](storage.md) — what's on disk and why it looks that way
 - [indexes.md](indexes.md) — the six index families and their disk-first designs

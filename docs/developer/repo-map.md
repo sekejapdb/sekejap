@@ -4,6 +4,10 @@ A newcomer's map of the codebase: every folder and file with a one-line
 description. Each source file also carries its own `//!` tutorial header — this map
 is the index, those headers are the depth.
 
+Looking for a specific type or function? [repo-outline.md](repo-outline.md) is the
+generated companion: every struct/enum/trait/fn with its line number, so you can
+jump straight to `file:line`. Regenerate it with `scripts/repo-outline.sh`.
+
 ## How a request flows
 
 sekejap is an embedded database: your program calls it in-process, like SQLite.
