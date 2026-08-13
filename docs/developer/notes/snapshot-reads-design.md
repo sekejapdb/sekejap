@@ -1,8 +1,9 @@
 # Snapshot reads — readers that never block writers (design plan)
 
-Status: **Phase 1 done** (core `ReadSnapshot` primitive shipped — point reads,
-correctness-tested, benchmark-proven). Phase 2 (engine `SharedDB` façade) and
-Phase 3 (scale-out + richer snapshot queries) remain. This is the plan for the
+Status: **Phase 1 + 2 done** (core `ReadSnapshot` primitive + `Engine` integration —
+lock-free `Engine::get`, correctness-tested, benchmark-proven; **point reads only**).
+Phase 3 remains: richer snapshot queries (scans/graph/spatial/vector on a snapshot),
+scale-out docs, query limits. This is the plan for the
 "killer feature" for high-traffic *server* use (Zebflow): letting many reads run
 at full speed while a write is in progress.
 
@@ -186,12 +187,21 @@ tested (immutable base + overlay). This is the substrate.
 4. Tests: a snapshot taken before a write does NOT see the write; two snapshots
    are independent; dropping a snapshot frees its overlay.
 
-**Phase 2 — engine `SharedDB` façade:**
-1. `SharedDB` owning a `CoreDB` + the single-writer coordination.
-2. `read(|snap| …)` (lock-free over a fresh snapshot) and `write(|core| …)`
-   (brief exclusive). Reuses the existing `ReadWriteGuard`/scheduler pieces.
-3. Publish it as the recommended way to embed sekejap concurrently (so apps stop
-   hand-rolling `Arc<RwLock<CoreDB>>`).
+**Phase 2 — engine integration (DONE, point reads).** Implemented *inside the
+existing `Engine`* rather than a parallel `SharedDB` type — `Engine` already owns
+the `ReadWriteGuard` and is the "one shared engine, no hand-rolled `Arc<RwLock>`"
+layer, so a second façade would only duplicate it. What shipped (commit `076a3bd`):
+- `EngineBuilder::snapshot_reads(true)` → opens paged mode, seeds a shared
+  **published snapshot** (unix + writable only; a no-op otherwise, so nothing
+  changes for embedded/read-only users).
+- `Engine::get(slug)` reads that snapshot **lock-free**; `Engine::snapshot()` hands
+  out the current photo; `Engine::refresh_snapshot()` forces a re-mint (RYOW).
+- Republish is **write-debounced** (`publish_interval`, default 5 ms) so the
+  overlay-copy cost stays off the per-write path and off readers; `compact()`
+  re-mints immediately. **Thread-free** — no background publisher; republish
+  piggybacks on the write path.
+- Scope: **point reads only** (that's `ReadSnapshot`'s current surface). Full
+  snapshot SQL (scans/graph/spatial/vector) is Phase 3.
 
 **Phase 3 — scale-out + companions:**
 1. Document/tighten the `open_paged` + `open_read_only` + `open_s3` read-replica
