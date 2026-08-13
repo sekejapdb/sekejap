@@ -21,6 +21,36 @@ not apples-to-apples — noted where it matters). `vs sqlite` > 1 = sekejap fast
 
 <!-- entries -->
 
+## 2026-08-13 — `2009a51` (bench(tooling): record mega-benchmark wall-clock runtime) · runtime 11m 32s
+
+mode: resident (`CoreDB::open`) · vs in-memory SQLite · 20k venues + graph/spatial/vector
+
+| scenario | sekejap | sqlite | vs sqlite |
+|---|---|---|---|
+| 01_eq_filter | 564ns | 434.1µs | 769.4x |
+| 02_neq_filter | 265.9µs | 1.24ms | 4.7x |
+| 03_range_filter | 10.3µs | 2.29ms | 222.0x |
+| 04_sort_limit | 9.6µs | 10.8µs | 1.1x |
+| 05_point_lookup | 68ns | 777ns | 11.4x |
+| 06_compound_filter | 54.6µs | 470.3µs | 8.6x |
+| 07_compound_sort_limit | 50.7µs | 500.7µs | 9.9x |
+| 08_graph_1hop | 291ns | 912ns | 3.1x |
+| 09_graph_5hop_bfs | 5.1µs | 217.3µs | 42.3x |
+| 10_root_cause_bfs_leaves | 996ns | 8.8µs | 8.9x |
+| 11_shortest_path | 5.3µs | 5.8µs | 1.1x |
+| 12_st_dwithin_5km | 657.2µs | 1.21ms | 1.8x |
+| 13_st_within_polygon | 14.0µs | — | sekejap-only |
+| 14_spatial_category_filter | 59.1µs | 501.4µs | 8.5x |
+| 15_vector_hnsw_top20 | 102.7µs | — | sekejap-only |
+| 16_hybrid_spatial_vector | 1.07ms | 1.72ms | 1.6x |
+| 17_hybrid_spatial_graph | 855.3µs | 1.99ms | 2.3x |
+| 18_hybrid_graph_vector | 317.4µs | 2.44ms | 7.7x |
+| 19_hybrid_ilike_vector_rag | 7.39ms | 5.08ms | 1.5x SLOWER |
+| 20_holy_trinity_spatial_graph_vector | 387.0µs | 1.06ms | 2.7x |
+
+**head-to-head: 17 wins / 1 loss** (+ sekejap-only cases)
+
+
 ## 2026-08-13 — `6e1948c` (bench: reliable mega-bench (SyncMode::Normal setup) + commit)
 
 mode: resident (`CoreDB::open`) · vs in-memory SQLite · 20k venues + graph/spatial/vector
@@ -49,5 +79,3 @@ mode: resident (`CoreDB::open`) · vs in-memory SQLite · 20k venues + graph/spa
 | 20_holy_trinity_spatial_graph_vector | 402.4µs | 1.12ms | 2.8x |
 
 **head-to-head: 17 wins / 1 loss** (+ sekejap-only cases)
-
-
