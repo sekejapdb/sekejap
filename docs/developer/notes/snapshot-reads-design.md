@@ -236,14 +236,22 @@ layer, so a second façade would only duplicate it. What shipped (commit `076a3b
      is the primitive every mmap-backed index wraps, so cloning any of them can now
      share the mapping by an `Arc` bump instead of re-mapping — the hard part of the
      next bullet.
-   - **[DONE — commits `ef58552`, `6d5586c`]** `Clone` on every overlay index type:
-     `GINIndex`, `GiSTIndex`, `CompactDiskIndex` (+ `Bytes8`/`ArrU32`/`ArrU64`),
-     `MappedGin`, `SpatialGrid` (+ `MappedSpatialGrid`), `MappedFieldStore` (+ `Backing`),
-     `VectorStore`, `EdgeStore` (+ `DiskAdj`/`MetaStore`/`EdgeColumn`). mmap-backed ones
-     share via the now-`Clone` `MmapView` (Arc bump); retained fds became `Arc<File>`
-     (shared, reads are absolute-offset pread so no cursor race). `HnswGraph`/`Edge`
-     already derived it; `field_indexes` is a `BTreeMap`. Additive, behavior-preserving
-     (703 tests green). This is the whole Clone-cascade — the hard prerequisite — done.
+   - **[DONE — commits `ef58552`, `6d5586c`]** `Clone` on the scalar/graph/spatial/
+     vector overlay index types: `GINIndex`, `GiSTIndex`, `CompactDiskIndex`
+     (+ `Bytes8`/`ArrU32`/`ArrU64`), `MappedGin`, `SpatialGrid` (+ `MappedSpatialGrid`),
+     `MappedFieldStore` (+ `Backing`), `VectorStore`, `EdgeStore` (+ `DiskAdj`/
+     `MetaStore`/`EdgeColumn`). mmap-backed ones share via the now-`Clone` `MmapView`
+     (Arc bump); retained fds became `Arc<File>`. `HnswGraph`/`Edge` already derived it;
+     `field_indexes` is a `BTreeMap`. Additive, behavior-preserving (703 tests green).
+   - **[TODO — the Clone-cascade is NOT finished]** The **text-search** index types
+     still lack `Clone` — found by a two-model cross-check (codex + qwen), then
+     verified: `Bm25Index`, `search::SearchIndex`, and `QuantizedField` (all `CoreDB`
+     fields) don't derive `Clone`, and they sit on a *nested* cascade of sub-types that
+     also need it: `TermDict` (RAM), `PostingsBlob` (holds a `File` → `Arc<File>`),
+     `DocLens`→`DocIdx` (mmap), `Bytes`/`IdMap`/`Norms` (hold `Arc<MmapView>` → derive),
+     `SlotIndex`/`MappedPostings` (RAM). Do this the careful field-by-field way (a
+     scripted mass-derive broke on the nesting) before the wire-up — a `SELECT` that
+     touches BM25/SEARCH would hit these. `QuantizedField` itself is a trivial derive.
    - **[TODO — next]** A guard so the cloned `CoreDB` is safely read-only (no WAL
      writer, no file lock, writes rejected), and it drops cleanly (shares fds/mmaps;
      frees only its overlay). Likely a `CoreDB::snapshot_db()` that builds a read-only
@@ -252,8 +260,13 @@ layer, so a second façade would only duplicate it. What shipped (commit `076a3b
      snapshot's cloned `CoreDB` when snapshot reads are on (lock-free), else the
      current read-lock path.
 
-   Remaining is the wire-up (construct the read-only `CoreDB` + route `query`) — the
-   invasive prerequisite (Clone-cascade) is now behind us.
+   A **field-by-field construction plan** for `snapshot_db()` (which of `CoreDB`'s ~47
+   fields to SHARE / CLONE / EMPTY-DISABLE) was produced by two independent models
+   (codex + qwen) and agreed closely — see the `snapshot-reads` memory. Key subtleties
+   both flagged: `payload_store` must be rebuilt read-only via `SnapshotPayloads`
+   (never carry its append `File`); `wal` and `_lock_file` must be `None`; `field_base`
+   shares via the `Clone` `MappedFieldStore`; disk-backed clones must be *shallow*
+   (share mmap) not deep-copy.
 
 ## 8. Risks & open questions
 
