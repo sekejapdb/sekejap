@@ -421,7 +421,7 @@ enum PayloadInner {
         file: std::fs::File,
         total_len: u64,
         #[cfg(unix)]
-        mmap: Option<MmapView>,
+        mmap: Option<std::sync::Arc<MmapView>>,
     },
     /// Object-storage backend (feature `s3`): bytes fetched from remote blocks
     /// and held in a bounded in-memory `BlockCache`.
@@ -489,8 +489,10 @@ impl PayloadStore {
             .read(true)
             .write(true)
             .open(path)?;
+        // Wrap in Arc so a read-only Snapshot can share this mmap (base payloads)
+        // for lock-free reads — see docs/developer/notes/snapshot-reads-design.md.
         #[cfg(unix)]
-        let mmap = MmapView::try_new(&file, total_len as usize);
+        let mmap = MmapView::try_new(&file, total_len as usize).map(std::sync::Arc::new);
         Ok(Self { binary: false, field_table: storage::skbin::FieldTable::new(), inner: PayloadInner::Disk {
             file,
             total_len,
@@ -696,6 +698,130 @@ impl PayloadStore {
             *data = new_data;
         }
     }
+
+    /// Build a shareable, read-only view of this store for a [`ReadSnapshot`].
+    ///
+    /// The returned [`SnapshotPayloads`] can read payload bytes with **no lock**
+    /// on the live store, because it owns everything it needs:
+    /// - its **own file descriptor** (`try_clone` — a second fd onto the same
+    ///   `payloads.bin` inode; on unix that inode stays alive even if the live
+    ///   store later `compact()`s and renames the file over it), and
+    /// - a **shared** `Arc<MmapView>` of the base bytes (zero-copy fast path), and
+    /// - a **copy** of the SKBIN field table frozen at this instant (all field
+    ///   names any already-written record could reference are present).
+    ///
+    /// Only disk-backed stores (paged mode) are snapshottable — the ephemeral
+    /// in-memory store and the remote/S3 store return `None`.
+    #[cfg(unix)]
+    fn snapshot_reader(&self) -> Option<SnapshotPayloads> {
+        match &self.inner {
+            PayloadInner::Disk { file, mmap, .. } => Some(SnapshotPayloads {
+                file: file.try_clone().ok()?,
+                mmap: mmap.clone(),
+                field_table: self.field_table.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A shareable, read-only view of a disk-backed payload store, held by a
+/// [`ReadSnapshot`]. It reads payload bytes without touching (or locking) the live
+/// `PayloadStore`, so a snapshot reader never contends with the writer.
+///
+/// It mirrors the Disk arm of [`PayloadStore::get_raw_at`]/[`PayloadStore::get_raw`]
+/// against its own fd + shared mmap + frozen field table.
+#[cfg(unix)]
+pub(crate) struct SnapshotPayloads {
+    /// An independent file descriptor onto `payloads.bin` (from `try_clone`), used
+    /// for `pread` of bytes past the end of the shared mmap (writes since open).
+    file: std::fs::File,
+    /// The shared base mmap — zero-copy reads for bytes present at open time.
+    mmap: Option<std::sync::Arc<MmapView>>,
+    /// SKBIN field-name table, cloned at snapshot time (decode is self-contained).
+    field_table: storage::skbin::FieldTable,
+}
+
+#[cfg(unix)]
+impl SnapshotPayloads {
+    /// Raw bytes at `(abs_offset, read_len)` — mmap fast path, else `pread`.
+    /// Mirrors [`PayloadStore::get_raw_at`]'s Disk arm.
+    fn read_bytes(&self, abs_offset: u64, read_len: usize) -> Option<Vec<u8>> {
+        if read_len == 0 {
+            return Some(vec![]);
+        }
+        if let Some(ref m) = self.mmap {
+            if let Some(slice) = m.slice(abs_offset as usize, read_len) {
+                return Some(slice.to_vec());
+            }
+        }
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; read_len];
+        self.file.read_exact_at(&mut buf, abs_offset).ok()?;
+        Some(buf)
+    }
+
+    /// Raw JSON bytes at `(offset, len)`, transparently decoding SKBIN.
+    /// Mirrors [`PayloadStore::get_raw`].
+    fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
+        let stored = self.read_bytes(offset, len as usize)?;
+        if storage::skbin::is_skbin(&stored) {
+            let v = storage::skbin::decode(&stored, &self.field_table)?;
+            return serde_json::to_vec(&v).ok();
+        }
+        decode_payload_record(stored)
+    }
+}
+
+/// An immutable, point-in-time read view of a [`CoreDB`] — a cheap "photograph"
+/// of the store that reads never have to lock. Minted by [`CoreDB::snapshot`].
+///
+/// A `Snapshot` is `Send + Sync` and self-contained: it owns a shared reference
+/// to the immutable base, a frozen copy of the write overlay, and its own handle
+/// on the payload bytes. Hand it to any thread and read from it while the parent
+/// `CoreDB` keeps taking writes — the snapshot's view never changes, so its reads
+/// never block (and are never blocked by) the writer.
+///
+/// The trade-off is *freshness*: a snapshot is "as of" the instant it was taken.
+/// For the latest data, take a new one. Keep them short-lived (one request), since
+/// a live snapshot pins the base pages and frozen overlay it references in memory.
+///
+/// This first cut serves **point reads** ([`Snapshot::get`]); richer snapshot
+/// queries (scans, graph, etc.) build on the same base+overlay view.
+#[cfg(unix)]
+pub struct ReadSnapshot {
+    /// Shared immutable base (the mmap'd files from the last `compact`). Held by
+    /// `Arc`, so the base stays alive for this snapshot even if the live `CoreDB`
+    /// compacts and swaps in a new base.
+    base: std::sync::Arc<storage::topology::MappedTopology>,
+    /// Frozen copy of the write overlay at snapshot time — an independent map, so
+    /// the live writer mutating its own overlay can't change what this reader sees.
+    nodes: std::sync::Arc<HashMap<u64, NodeData>>,
+    /// Lock-free reader over the payload bytes (own fd + shared base mmap).
+    payloads: SnapshotPayloads,
+}
+
+#[cfg(unix)]
+impl ReadSnapshot {
+    /// Point read: the JSON payload for `slug`, or `None` if absent — the
+    /// snapshot's lock-free analogue of [`CoreDB::get`].
+    pub fn get(&self, slug: &str) -> Option<String> {
+        let (off, len) = self.payload_loc(sk_hash(slug))?;
+        self.payloads
+            .get_raw(off, len)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// Where a node's payload lives — frozen overlay first, then the immutable
+    /// base. Same lookup order as [`CoreDB::payload_loc`], against the snapshot's
+    /// own frozen state.
+    fn payload_loc(&self, hash: u64) -> Option<(u64, u32)> {
+        if let Some(n) = self.nodes.get(&hash) {
+            return Some((n.payload_offset, n.payload_len));
+        }
+        let rec = self.base.node_record(self.base.resolve(hash)?)?;
+        Some((rec.payload_offset, rec.payload_len))
+    }
 }
 
 /// The small in-RAM record for one node — everything the engine keeps resident
@@ -809,7 +935,7 @@ pub struct CoreDB {
     /// mode (default). When `Some`, the resident maps above act as the **write
     /// overlay** since open, and the topology accessors merge overlay-over-base.
     ///
-    /// Wrapped in `Arc` so a read-only [`Snapshot`](CoreDB::snapshot) can share
+    /// Wrapped in `Arc` so a read-only [`ReadSnapshot`](CoreDB::snapshot) can share
     /// this immutable base for free (a refcount bump, no bytes copied) — the base
     /// never changes, only the overlay does. See
     /// `docs/developer/notes/snapshot-reads-design.md`.
@@ -4560,6 +4686,45 @@ impl CoreDB {
         let base = self.topo_base.as_ref()?;
         let rec = base.node_record(base.resolve(hash)?)?;
         Some((rec.payload_offset, rec.payload_len))
+    }
+
+    /// Take a cheap, point-in-time **snapshot** for lock-free reads — the
+    /// "photograph" primitive behind reads-that-never-block-writes (see
+    /// `docs/developer/notes/snapshot-reads-design.md`).
+    ///
+    /// # What you get
+    ///
+    /// A [`ReadSnapshot`] is an immutable read view of the store *as of this instant*.
+    /// You can `get()` from it with **no lock**, on any thread, while the owning
+    /// `CoreDB` keeps taking writes. The snapshot never sees those later writes —
+    /// it is a consistent moment in time, like MVCC snapshot isolation.
+    ///
+    /// # Why it's cheap (and how it stays isolated)
+    ///
+    /// In paged mode the store is `immutable base (mmap) + small RAM overlay`. A
+    /// snapshot:
+    /// - **shares** the immutable base by `Arc` (free — the base is never mutated), and
+    /// - **freezes** the overlay by *copying* the current node map into an `Arc`
+    ///   (`self.nodes.clone()`). The writer keeps mutating its own `self.nodes`;
+    ///   the snapshot holds an independent copy, so the two never interfere.
+    ///
+    /// The copy costs `O(overlay size)`. Right after a `compact()` the overlay is
+    /// empty, so a snapshot is almost free; between compactions it grows. Compaction
+    /// frequency is the tuning knob. Crucially, **the write path is untouched** —
+    /// taking a snapshot changes nothing about how writes work, so an embedded /
+    /// single-threaded user who never calls `snapshot()` pays exactly nothing.
+    ///
+    /// # When it returns `None`
+    ///
+    /// Snapshots require the immutable base, so this is a **paged-mode** feature
+    /// (`open_paged`). In resident mode (`open`) or the ephemeral in-memory store
+    /// there is no base to share, so this returns `None`. (unix only for now.)
+    #[cfg(unix)]
+    pub fn snapshot(&self) -> Option<ReadSnapshot> {
+        let base = self.topo_base.clone()?; // Arc bump — shares the immutable base
+        let payloads = self.payload_store.snapshot_reader()?; // own fd + shared mmap
+        let nodes = std::sync::Arc::new(self.nodes.clone()); // freeze the overlay
+        Some(ReadSnapshot { base, nodes, payloads })
     }
 
     /// Parse and return the JSON payload for a node hash. Returns `None` if
@@ -8794,6 +8959,52 @@ mod hybrid_query_tests {
         // (a real collision can't be forged against the base without breaking the
         // idx invariant, so we just assert same-slug base update passes)
         db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu","u":1}"#).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_is_isolated_from_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe","v":1}"#).unwrap();
+            db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
+            db.compact().unwrap();
+        }
+
+        let mut db = CoreDB::open_paged(dir.path()).unwrap();
+
+        // Photograph BEFORE any write — overlay is empty, so this view is the base.
+        let before = db.snapshot().expect("paged mode is snapshottable");
+
+        // Now write: a brand-new node + an update to a base node (lands in overlay).
+        db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
+        db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe","v":2}"#).unwrap();
+
+        // The pre-write snapshot must NOT see either change (isolation).
+        assert!(before.get("place/ubud").is_none(),
+            "snapshot must not see a node created after it was taken");
+        let chloe_before: Value =
+            serde_json::from_str(&before.get("tourist/chloe").unwrap()).unwrap();
+        assert_eq!(chloe_before["v"].as_f64().unwrap(), 1.0,
+            "snapshot must see the base value, not the later overlay update");
+        assert!(before.get("place/uluwatu").is_some(), "base nodes are visible in the snapshot");
+
+        // The live DB sees the new state.
+        let chloe_live: Value = serde_json::from_str(&db.get("tourist/chloe").unwrap()).unwrap();
+        assert_eq!(chloe_live["v"].as_f64().unwrap(), 2.0);
+
+        // A snapshot taken AFTER the writes sees them (freshness by re-photographing).
+        let after = db.snapshot().unwrap();
+        assert!(after.get("place/ubud").is_some(), "fresh snapshot sees the new node");
+        let chloe_after: Value =
+            serde_json::from_str(&after.get("tourist/chloe").unwrap()).unwrap();
+        assert_eq!(chloe_after["v"].as_f64().unwrap(), 2.0, "fresh snapshot sees the update");
+
+        // Resident/ephemeral mode has no immutable base → snapshots are unsupported.
+        let resident_dir = tempfile::tempdir().unwrap();
+        let resident = CoreDB::open(resident_dir.path()).unwrap();
+        assert!(resident.snapshot().is_none(), "resident mode must not offer snapshots");
     }
 
     #[test]
