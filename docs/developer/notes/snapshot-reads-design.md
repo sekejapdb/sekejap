@@ -231,13 +231,16 @@ layer, so a second façade would only duplicate it. What shipped (commit `076a3b
    (bounded by compaction frequency) and the base is shared, not copied.
 
    **What it requires (the work):**
+   - **[DONE — foundation, commit `914d8ed`]** `MmapView` is now `Clone` via an
+     internal `Arc<MmapRegion>` (munmap at last-drop, `slice`/`len` unchanged). This
+     is the primitive every mmap-backed index wraps, so cloning any of them can now
+     share the mapping by an `Arc` bump instead of re-mapping — the hard part of the
+     next bullet.
    - `Clone` on the overlay index types that don't have it: `GINIndex`, `GiSTIndex`,
      `CompactDiskIndex`, `SpatialGrid`, `VectorStore`, `EdgeStore`, `MappedFieldStore`
      (`HnswGraph` already derives it; `field_indexes` is a `BTreeMap`, already `Clone`).
-   - For the **mmap/disk-backed** ones (`MappedFieldStore`, `CompactDiskIndex`,
-     `VectorStore` int8-on-disk, text/GiST mmap), `Clone` must **share** the mmap via
-     `Arc` (as `topo_base` and the payload mmap already do), NOT deep-copy — else it's
-     slow and wrong.
+     With `MmapView: Clone` in place, the mmap-backed ones should mostly `#[derive(Clone)]`
+     cleanly (verify each shares, not copies, its mapping); the rest are RAM structures.
    - A guard so the cloned `CoreDB` is safely read-only (no WAL writer, no file lock,
      writes rejected), and it drops cleanly (shares fds/mmaps; frees only its overlay).
    - Wire `Engine::query`/`query_params` to run on the published snapshot's cloned
