@@ -236,18 +236,24 @@ layer, so a second façade would only duplicate it. What shipped (commit `076a3b
      is the primitive every mmap-backed index wraps, so cloning any of them can now
      share the mapping by an `Arc` bump instead of re-mapping — the hard part of the
      next bullet.
-   - `Clone` on the overlay index types that don't have it: `GINIndex`, `GiSTIndex`,
-     `CompactDiskIndex`, `SpatialGrid`, `VectorStore`, `EdgeStore`, `MappedFieldStore`
-     (`HnswGraph` already derives it; `field_indexes` is a `BTreeMap`, already `Clone`).
-     With `MmapView: Clone` in place, the mmap-backed ones should mostly `#[derive(Clone)]`
-     cleanly (verify each shares, not copies, its mapping); the rest are RAM structures.
-   - A guard so the cloned `CoreDB` is safely read-only (no WAL writer, no file lock,
-     writes rejected), and it drops cleanly (shares fds/mmaps; frees only its overlay).
-   - Wire `Engine::query`/`query_params` to run on the published snapshot's cloned
-     `CoreDB` when snapshot reads are on (lock-free), else the current read-lock path.
+   - **[DONE — commits `ef58552`, `6d5586c`]** `Clone` on every overlay index type:
+     `GINIndex`, `GiSTIndex`, `CompactDiskIndex` (+ `Bytes8`/`ArrU32`/`ArrU64`),
+     `MappedGin`, `SpatialGrid` (+ `MappedSpatialGrid`), `MappedFieldStore` (+ `Backing`),
+     `VectorStore`, `EdgeStore` (+ `DiskAdj`/`MetaStore`/`EdgeColumn`). mmap-backed ones
+     share via the now-`Clone` `MmapView` (Arc bump); retained fds became `Arc<File>`
+     (shared, reads are absolute-offset pread so no cursor race). `HnswGraph`/`Edge`
+     already derived it; `field_indexes` is a `BTreeMap`. Additive, behavior-preserving
+     (703 tests green). This is the whole Clone-cascade — the hard prerequisite — done.
+   - **[TODO — next]** A guard so the cloned `CoreDB` is safely read-only (no WAL
+     writer, no file lock, writes rejected), and it drops cleanly (shares fds/mmaps;
+     frees only its overlay). Likely a `CoreDB::snapshot_db()` that builds a read-only
+     `CoreDB` from the Arc'd base + cloned index overlays + `SnapshotPayloads`.
+   - **[TODO — next]** Wire `Engine::query`/`query_params` to run on the published
+     snapshot's cloned `CoreDB` when snapshot reads are on (lock-free), else the
+     current read-lock path.
 
-   Multi-day, multi-module — start it as a dedicated effort with its own tests, not
-   folded into a smaller change.
+   Remaining is the wire-up (construct the read-only `CoreDB` + route `query`) — the
+   invasive prerequisite (Clone-cascade) is now behind us.
 
 ## 8. Risks & open questions
 
