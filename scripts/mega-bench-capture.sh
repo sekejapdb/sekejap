@@ -21,9 +21,12 @@ DATE=$(date +%Y-%m-%d)
 COMMIT=$(git rev-parse --short HEAD)
 SUBJECT=$(git log -1 --format=%s | cut -c1-60)
 
-ENTRY=$(python3 - "$DATE" "$COMMIT" "$SUBJECT" <<'PY'
+# Optional wall-clock runtime (seconds) — set by mega-bench-run.sh, recorded in
+# the entry so we can see how long the run took (and whether a change slows it).
+ENTRY=$(python3 - "$DATE" "$COMMIT" "$SUBJECT" "${MEGA_BENCH_RUNTIME:-}" <<'PY'
 import json, os, sys
 date, commit, subject = sys.argv[1], sys.argv[2], sys.argv[3]
+runtime = sys.argv[4] if len(sys.argv) > 4 else ""
 base = "target/criterion"
 def med(p):
     try: return json.load(open(p))["median"]["point_estimate"]
@@ -49,7 +52,10 @@ for case in sorted(os.listdir(base)):
     else:
         verdict = f"{1/sp:.1f}x SLOWER"; losses += 1
     rows.append((case, fmt(best), fmt(s["sqlite"]), verdict))
-print(f"## {date} — `{commit}` ({subject})")
+rt = ""
+if runtime.isdigit():
+    s = int(runtime); rt = f" · runtime {s//60}m {s%60}s"
+print(f"## {date} — `{commit}` ({subject}){rt}")
 print()
 print("mode: resident (`CoreDB::open`) · vs in-memory SQLite · 20k venues + graph/spatial/vector")
 print()
