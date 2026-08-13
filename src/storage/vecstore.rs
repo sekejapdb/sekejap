@@ -53,18 +53,22 @@ const RECORD_HEADER: usize = 12;
 ///
 /// Data is always serialised to `snapshot.json` for recoverability — the
 /// binary file is a performance optimisation that can be regenerated.
+#[derive(Clone)]
 pub(crate) struct VectorStore {
     inner: VectorStoreInner,
 }
 
+#[derive(Clone)]
 enum VectorStoreInner {
     Memory {
         vecs: HashMap<u64, Vec<f32>>,
     },
     #[cfg(unix)]
     Disk {
-        /// The binary file for this field.
-        file: std::fs::File,
+        /// The binary file for this field. `Arc` so a cloned (read-only snapshot)
+        /// store shares the fd — reads use absolute-offset `pread`/mmap, so there is
+        /// no cursor race with the live writer's appends.
+        file: std::sync::Arc<std::fs::File>,
         /// Path to the binary file (for compaction / re-open).
         path: PathBuf,
         /// Total bytes written to the file (append cursor).
@@ -138,7 +142,7 @@ impl VectorStore {
 
         Ok(Self {
             inner: VectorStoreInner::Disk {
-                file,
+                file: std::sync::Arc::new(file),
                 path,
                 total_len: file_len,
                 dim,
@@ -306,7 +310,7 @@ impl VectorStore {
                     .open(&*path)?;
                 let new_mmap = super::mmap::MmapView::try_new(&new_file, write_pos as usize);
 
-                *file = new_file;
+                *file = std::sync::Arc::new(new_file);
                 *total_len = write_pos;
                 *index = new_index;
                 *mmap = new_mmap;
@@ -338,7 +342,7 @@ impl VectorStore {
                     return; // already covers all data
                 }
             }
-            *mmap = super::mmap::MmapView::try_new(file, len);
+            *mmap = super::mmap::MmapView::try_new(&**file, len);
         }
     }
 

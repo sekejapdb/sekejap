@@ -99,10 +99,11 @@ pub enum EdgeMode {
 /// index stays in RAM. `edges()` returns a zero-copy `&[Edge]` slice into the mmap
 /// (page cache, reclaimable), so 10M edges cost ~an offset map instead of ~550 MB.
 #[cfg(unix)]
+#[derive(Clone)]
 pub(crate) struct DiskAdj {
     index: HashMap<u64, (u64, u32)>, // node → (edge index, count)
     mmap: super::mmap::MmapView,
-    _file: std::fs::File,
+    _file: std::sync::Arc<std::fs::File>,
 }
 
 #[cfg(unix)]
@@ -125,6 +126,7 @@ impl DiskAdj {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct EdgeStore {
     /// Forward adjacency: from_hash → outgoing edges.
     fwd: HashMap<u64, Vec<Edge>>,
@@ -159,6 +161,7 @@ pub(crate) struct EdgeStore {
 
 /// One fast-lane column. `vals` is dense over the attribute-slot space; `is_bool`
 /// records whether values were booleans (so reads return `true/false`, not `1.0`).
+#[derive(Clone)]
 pub(crate) struct EdgeColumn {
     vals: Vec<f64>,
     is_bool: bool,
@@ -211,6 +214,7 @@ fn val_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+#[derive(Clone)]
 enum MetaStore {
     /// Metadata in RAM — `meta_id` indexes into `metas`.
     Ram {
@@ -222,7 +226,7 @@ enum MetaStore {
     Disk {
         /// (byte_offset, byte_len) per meta entry.
         offsets: Vec<(u32, u16)>,
-        file: std::fs::File,
+        file: std::sync::Arc<std::fs::File>,
         total_len: u64,
         mmap: Option<super::mmap::MmapView>,
     },
@@ -263,7 +267,7 @@ impl EdgeStore {
             type_names: HashMap::new(),
             meta: MetaStore::Disk {
                 offsets: Vec::new(),
-                file,
+                file: std::sync::Arc::new(file),
                 total_len: 0,
                 mmap: None,
             },
@@ -293,7 +297,7 @@ impl EdgeStore {
                 type_names: HashMap::new(),
                 meta: MetaStore::Disk {
                     offsets: Vec::new(),
-                    file,
+                    file: std::sync::Arc::new(file),
                     total_len: file_len,
                     mmap,
                 },
@@ -764,7 +768,7 @@ impl EdgeStore {
         file.sync_all()?;
         let mmap = super::mmap::MmapView::try_new(&file, buf.len())
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "adjacency mmap failed"))?;
-        Ok(DiskAdj { index, mmap, _file: file })
+        Ok(DiskAdj { index, mmap, _file: std::sync::Arc::new(file) })
     }
 
     /// Resolve metadata for an edge.  Returns `None` if the edge has no meta
@@ -856,7 +860,7 @@ impl EdgeStore {
                     return;
                 }
             }
-            *mmap = super::mmap::MmapView::try_new(file, len);
+            *mmap = super::mmap::MmapView::try_new(&**file, len);
         }
     }
 
