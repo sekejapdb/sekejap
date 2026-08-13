@@ -1,31 +1,19 @@
 # Known limits & future concerns
 
 Deliberate simplifications where sekejap does less than a full server DB. Captured
-for later — none are urgent, but each is a place a downstream app (Zebflow) could
+for later — none are urgent, but each is a place a downstream app could
 hit an edge, and a place we may invest later.
 
 ---
 
-## 1. S3 backend is publish/checkpoint-write, not live-write
+## 1. ~~S3 backend~~ — REMOVED in 0.17.0
 
-**Today:** `CoreDB::open_s3()` is **read-only**. Object storage can't do the random
-appends/`pwrite`s a live WAL + `payloads.bin` need, so per-request writes directly
-to S3 are not possible.
-
-**How writes reach S3 now:** the write path runs on a normal writable *local* disk
-(`CoreDB::open`), and `engine/remote.rs` `RemoteSync::upload()` publishes the
-segment files (snapshot, payloads, …) to S3 as objects + a manifest, at
-**checkpoint granularity** (on compact / interval). Read replicas `open_s3` and
-serve read-only from those published segments.
-
-Model: **one local writer → publish snapshots to S3 → many read-only replicas.**
-
-**Future concern:** a write-capable S3 mode would need a *local WAL/payload buffer*
-that flushes up to S3 on an interval — durable locally, eventually-durable on S3.
-That's a design, not something that exists. It pairs naturally with the
-snapshot-reads read-scale-out story (see `snapshot-reads-design.md`).
-
----
+Object storage support (`open_s3`, `RemoteSync`, `BlockCache`, `Manifest`) was
+removed. It could only ever *read* data in place; making it writable needs the
+WAL-segment-upload + manifest-swap + conditional-PUT pattern, which was judged too
+costly for sekejap. Dropping it took the dependency tree from 187 crates back to 36.
+Read scale-out survives without it: several processes can open the same local
+directory read-only (see `docs/usage/connectivity.md`).
 
 ## 2. Spatial type system — subtype-less `GEO`, fixed WGS84/4326
 

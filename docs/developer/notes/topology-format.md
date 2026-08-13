@@ -1,5 +1,7 @@
 # Phase 0 Spec — Dense-ID, Offset-Addressable Topology Format (v2)
 
+> **Superseded (0.17.0):** object-storage support was removed; the S3 phases
+> described below are no longer planned. The local mmap design still stands.
 Status: **shipped**. `compact()` writes these files and `open()` reads them
 (recovery when the snapshot is missing, and the paged-topology mode). The format
 was locked before wiring so that mmap paging (Phase 1) and S3 paging (Phase 2)

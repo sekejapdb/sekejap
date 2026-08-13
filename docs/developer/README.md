@@ -47,9 +47,7 @@ flowchart TB
     direction LR
     LOCK["RwLock: parallel readers,<br/>brief exclusive writes"]
     BUF["Write buffering<br/><i>engine/buffer.rs</i>"]
-    CACHE["Query/result cache<br/><i>engine/cache.rs</i>"]
     SCHED["Index-build scheduler<br/><i>engine/scheduler.rs</i>"]
-    MANI["Manifest / snapshot<br/><i>engine/manifest.rs, remote.rs</i>"]
   end
 
   CORE["<b>CoreDB</b> — single-writer core<br/>put / get / link · build_*_index · get_payload<br/><i>lib.rs</i>"]
@@ -138,7 +136,6 @@ flowchart TB
     R4["BM25 dictionary (terms → postings offset)"]
     R5["Spatial occupancy grid"]
     R6["Adjacency index — node → (offset,count)"]
-    R7["Caches (engine/cache.rs)"]
   end
 
   subgraph DISKBOX["Disk — bulk, read on demand"]
@@ -173,8 +170,8 @@ flowchart LR
     GE["geo.rs — geodesic spatial (PostGIS-compatible)"]
 
     subgraph M_ENG["engine/ (feature=engine)"]
-      E1["mod, buffer, cache, scheduler"]
-      E2["guard, policy, manifest, remote"]
+      E1["mod, buffer, scheduler"]
+      E2["guard, policy"]
     end
     subgraph M_VEC["vector/"]
       V1["hnsw, quant (int8 SQ)"]
@@ -218,7 +215,7 @@ flowchart LR
 - **The RAM/disk split (diagram 3) is the core promise.** The dashed arrows
   (positional reads, mmap slices) are how bulk data stays on disk until the
   moment it is needed.
-- Feature-gated modules — `engine`, `serve`, `pg`, `s3` — are opt-in: the
+- Feature-gated modules — `engine`, `serve`, `pg` — are opt-in: the
   minimal build is just the embedded core.
 
 ---
@@ -259,7 +256,7 @@ sekejap/
 
 ```sh
 cargo build                    # core library
-cargo build --all-features     # + engine, serve, pg, s3
+cargo build --all-features     # + engine, serve, pg
 cargo test                     # full suite (unit + integration)
 cargo bench --bench mega_benchmark   # 20-scenario local benchmark vs SQLite
 ```

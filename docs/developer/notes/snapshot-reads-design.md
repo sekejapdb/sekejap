@@ -5,7 +5,7 @@ Status: **Phase 1 + 2 done, Phase 3 nearly done.** Core `ReadSnapshot` primitive
 limits** + operational usage docs — all correctness-tested and benchmark-proven.
 The one remaining item is **full indexed SQL over a snapshot** (§7 Phase 3.4 — the
 big lift, its own project). This is the plan for the
-"killer feature" for high-traffic *server* use (Zebflow): letting many reads run
+"killer feature" for high-traffic *server* use: letting many reads run
 at full speed while a write is in progress.
 
 > **Phase 1 result (commit `cfd0145`/`8d6b70c`, benchmark `b24e5ba`).** Under a long
@@ -68,7 +68,7 @@ Today sekejap is a **single-writer** engine, and an app wraps it in a lock
 
 That's correct, but on a high-traffic site the pain is **long writes / index
 rebuilds holding the exclusive lock** and stalling the read flood behind them.
-That's the "app feels frozen" the Zebflow note describes. Snapshot reads remove
+That's the "app feels frozen" report from production. Snapshot reads remove
 the reads from that queue entirely: they read their photo, lock-free.
 
 ## 3. Why sekejap can do this *cheaply* (and most embedded DBs can't)
@@ -118,9 +118,9 @@ Costs / things to know:
 - **Cheap in paged mode; expensive in resident mode.** The whole "free base"
   property needs paged mode (`open_paged`). In today's default **resident** mode
   there is no immutable base — everything is one big mutable RAM structure, so a
-  snapshot would mean copying it. **Zebflow currently uses resident mode**, so
-  adopting this feature pairs naturally with moving Zebflow to paged mode (already
-  on the table for RAM reasons). See `docs/developer/storage.md`.
+  snapshot would mean copying it. A service still on resident mode therefore needs
+  to move to paged mode to benefit (worth doing for RAM reasons anyway). See
+  `docs/developer/storage.md`.
 
 ## 5. Where it lives: core vs engine (answering "is this extra in engine or core?")
 
@@ -211,9 +211,8 @@ layer, so a second façade would only duplicate it. What shipped (commit `076a3b
    payload); for list/aggregate endpoints on bounded collections.
 2. **Scale-out + operational docs (DONE, commit `5ec207a`).**
    `docs/usage/concurrency-and-snapshots.md` — the reader/writer model, snapshot
-   reads, the `open_paged`+`open_read_only`+`open_s3` read-replica pattern, and
-   operational limits (S3 publish-only, paged base deletes at compact, GEO WGS84/
-   subtype-less).
+   reads, the `open_paged`+`open_read_only` read-replica pattern, and operational
+   limits (paged base deletes at compact, GEO WGS84/subtype-less).
 3. **Query limits (DONE, commit `184d3ec`).** `EngineBuilder::max_scan_rows` /
    `max_scan_bytes`; `Engine::scan` stops at the cap on both the snapshot and
    read-lock-fallback paths (`ReadSnapshot::scan_bounded` /

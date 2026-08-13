@@ -46,15 +46,6 @@ BI tools — can connect and issue the full SGQL surface, including
 `SELECT … FROM MATCH`. Current implementation is a localhost-trust listener:
 convenient for tools and dashboards, not an exposed production server.
 
-## Object storage (read-only scale-out)
-
-With the `s3` feature, a writer can publish compacted database state to
-S3-compatible object storage, and many lightweight readers can open it
-read-only, fetching payload blocks on demand with range reads and a bounded
-cache. This is deliberately **not** a distributed database — no consensus, no
-cross-node transactions — just a low-complexity way to serve many readers from
-one published snapshot.
-
 ## Choosing a path
 
 | you want | use |
@@ -62,7 +53,7 @@ one published snapshot.
 | lowest latency, no ops | embedded (default) |
 | browser/dashboard/another language over HTTP | `sekejap serve` |
 | existing SQL tooling (psql, DBeaver, BI) | `sekejap pg` |
-| many readers, one writer, cloud storage | S3 read-only mode |
+| many readers, one writer | several read-only opens of the same directory |
 
-The adapters are feature-gated (`serve`, `pg`, `s3`) and live outside the
+The adapters are feature-gated (`serve`, `pg`) and live outside the
 core: the minimal embedded build carries none of them.

@@ -5,7 +5,6 @@ Install from [crates.io](https://crates.io/crates/sekejap):
 
 ```bash
 cargo add sekejap
-cargo add sekejap --features s3     # with object-storage read support
 ```
 
 ## First query

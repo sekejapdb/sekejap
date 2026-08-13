@@ -94,20 +94,14 @@ Combined with primitives sekejap already has:
 
 - `open_paged` + `open_read_only` → **many read-only workers**, each memory-mapping
   the same base locally, while one writer advances it and republishes.
-- `open_s3` (feature `s3`) → those workers can serve the base **from object
-  storage**, so a dataset larger than local disk is queryable from small machines.
 
 This is write-once/read-many scale-out from an embedded database — see
-[connectivity.md](connectivity.md) for the read-only and object-storage modes.
+[connectivity.md](connectivity.md) for the read-only mode.
 
 ## Operational limits to know
 
 Honest caveats for production planning:
 
-- **S3 writes are publish-only, at compaction granularity.** With the `s3` feature,
-  a writer *uploads* compacted segments after `compact()` — it is not per-write
-  durability to S3. Readers pull new generations on `refresh()`. Think "publish a
-  new version," not "every insert is immediately in S3."
 - **Paged base deletes land at `compact()`.** In paged mode, `remove`/`unlink` of a
   node that lives in the base takes effect when the next `compact()` rewrites the
   base. Overlay (recent) deletes are immediate. `scan`/`count` follow the same rule.
