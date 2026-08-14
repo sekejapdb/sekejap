@@ -3853,6 +3853,21 @@ impl CoreDB {
     fn write_topology_files(&self, dir: &Path) -> io::Result<()> {
         use storage::topology::{self, TopoEdge, TopoNode};
 
+        // INVARIANT GUARD (data safety). This rewrites the whole topology from the
+        // resident map. In paged mode that map is only the *overlay*, so running
+        // this with a base still mapped writes a store containing just the recent
+        // writes and destroys every base-resident node — the exact bug fixed in
+        // fc86a44. Callers must hydrate the base first (compact() does).
+        if self.topo_base.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "sekejap: refusing to rewrite topology while a paged base is still \
+                 mapped — the base must be hydrated into the overlay first, or every \
+                 base-resident node would be lost. This is an internal invariant \
+                 violation; please report it.",
+            ));
+        }
+
         // Nodes — sorted by hash so dense-id assignment is deterministic.
         let mut topo_nodes: Vec<TopoNode> = self
             .nodes
@@ -4271,6 +4286,15 @@ impl CoreDB {
     // ── Snapshot helpers ──────────────────────────────────────────────────────
 
     fn build_snapshot(&self) -> Snapshot {
+        // INVARIANT GUARD — see write_topology_files. snapshot.json records the node
+        // set; building it from the overlay while a base is mapped would persist a
+        // truncated store.
+        debug_assert!(
+            self.topo_base.is_none(),
+            "build_snapshot() called with a paged base still mapped — would persist \
+             only the overlay and lose base nodes"
+        );
+
         let is_disk = self.payload_store.is_disk();
         let nodes: Vec<SnapNode> = if is_disk {
             // Disk-backed → MANIFEST snapshot (v3): nodes + edges live in the

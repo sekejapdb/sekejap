@@ -177,3 +177,102 @@ fn buffered_flushed_survives_unflushed_lost_db_stays_consistent() {
     assert_eq!(engine.query("SELECT COUNT(*) AS n FROM s").unwrap()[0]
         .payload.as_ref().unwrap()["n"].as_i64().unwrap(), 101);
 }
+
+
+/// **P0.S6 — crash injection around compaction.**
+///
+/// The compaction guard rail (S4) catches a rewrite that *loses* nodes, but not one
+/// interrupted half-way. Compaction is designed to be crash-safe by writing every
+/// new file to a `.tmp` path and renaming it into place, so a crash at any point
+/// leaves either the old store or the new one — never a blend.
+///
+/// These simulate a crash by leaving the intermediate files a killed process would
+/// have left behind, then reopening.
+#[test]
+fn compaction_survives_a_crash_at_every_stage() {
+    use sekejap::CoreDB;
+    use serde_json::json;
+
+    // Stale intermediates a process killed mid-compaction could leave behind.
+    let leftovers = [
+        "payloads.bin.tmp",
+        "snapshot.json.tmp",
+        "nodes.bin.tmp",
+        "collections.bin.tmp",
+    ];
+
+    for (i, leftover) in leftovers.iter().enumerate() {
+        for paged in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            {
+                let mut db = CoreDB::open(dir.path()).unwrap();
+                for n in 0..20 {
+                    db.put(&format!("v/n{n}"),
+                        &json!({"_collection":"v","_key":format!("n{n}"),"i":n}).to_string()).unwrap();
+                }
+                db.compact().unwrap();
+            }
+
+            // Simulate the crash: a partial file of garbage left at the temp path.
+            std::fs::write(dir.path().join(leftover), b"PARTIAL GARBAGE \x00\x01\x02").unwrap();
+
+            // Reopening must ignore it and serve the committed data intact.
+            let db = if paged {
+                CoreDB::open_paged(dir.path()).unwrap()
+            } else {
+                CoreDB::open(dir.path()).unwrap()
+            };
+            let rows = db.query("SELECT _key FROM v").unwrap().collect().len();
+            assert_eq!(rows, 20,
+                "case {i} ({leftover}, paged={paged}): stale temp file must not affect recovery");
+            assert!(db.get("v/n7").is_some(), "case {i}: payloads still readable");
+            assert_eq!(db.node_count(), 20, "case {i}: node_count intact");
+            drop(db);
+
+            // And a real compaction afterwards must still be lossless.
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.compact().unwrap();
+            assert_eq!(db.node_count(), 20, "case {i}: compaction after a crash is lossless");
+        }
+    }
+}
+
+/// A crash *between* writes — the WAL has entries the last compaction did not
+/// include — must replay them, in both storage modes.
+#[test]
+fn uncompacted_writes_survive_a_crash_in_both_modes() {
+    use sekejap::CoreDB;
+    use serde_json::json;
+
+    for paged in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            for n in 0..10 {
+                db.put(&format!("v/n{n}"), &json!({"_collection":"v","_key":format!("n{n}")}).to_string()).unwrap();
+            }
+            db.compact().unwrap();
+        }
+        {
+            // Writes after the compaction, then "crash" (drop without compacting).
+            let mut db = if paged {
+                CoreDB::open_paged(dir.path()).unwrap()
+            } else {
+                CoreDB::open(dir.path()).unwrap()
+            };
+            for n in 10..15 {
+                db.put(&format!("v/n{n}"), &json!({"_collection":"v","_key":format!("n{n}")}).to_string()).unwrap();
+            }
+            db.remove("v/n0"); // includes a delete against the base
+            // Drop without compacting — the WAL is already durable per write, so this
+            // is what a killed process leaves behind (mem::forget would leak the file
+            // lock inside this same process and block the reopen).
+            drop(db);
+        }
+        let db = CoreDB::open(dir.path()).unwrap();
+        assert_eq!(db.query("SELECT _key FROM v").unwrap().collect().len(), 14,
+            "paged={paged}: 10 + 5 new - 1 removed must be recovered from the WAL");
+        assert!(db.get("v/n0").is_none(), "paged={paged}: the delete replayed too");
+        assert!(db.get("v/n14").is_some(), "paged={paged}: the last write replayed");
+    }
+}
