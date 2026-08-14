@@ -346,12 +346,31 @@ fn run_dot(db: &mut CoreDB, label: &mut String, line: &str) -> bool {
         },
 
         ".stats" => {
-            let nodes = db.node_count();
-            let edges = db.edge_count();
-            let colls = db.collection_names().len();
-            println!("nodes       : {nodes}");
-            println!("edges       : {edges}");
-            println!("collections : {colls}");
+            let s = db.stats();
+            println!("nodes          : {}", s.nodes);
+            println!("edges          : {}", s.edges);
+            println!("collections    : {}", s.collections);
+            println!("mode           : {}", if s.paged { "paged (mmap base + overlay)" } else { "resident" });
+            if s.paged {
+                println!("write overlay  : {} nodes", s.overlay_nodes);
+            }
+            println!("payloads.bin   : {}", human_bytes(s.payload_bytes));
+            println!("wal.log        : {}", human_bytes(s.wal_bytes));
+            println!(
+                "indexes        : {} field, {} vector, {} bm25, {} search, {} trigram, spatial {}",
+                s.field_indexes, s.hnsw_indexes, s.bm25_indexes, s.search_indexes,
+                s.trigram_indexes, if s.spatial_index { "yes" } else { "no" }
+            );
+            println!("since open     : {} queries, {} writes, {} compactions, {} snapshots",
+                s.queries, s.writes, s.compactions, s.snapshots);
+            if s.compactions > 0 {
+                println!("compaction     : last {} ms, slowest {} ms",
+                    s.last_compact_us / 1000, s.max_compact_us / 1000);
+            }
+            if s.snapshots > 0 {
+                println!("snapshot mint  : last {} µs, slowest {} µs",
+                    s.last_snapshot_us, s.max_snapshot_us);
+            }
         }
 
         ".edges" => {
@@ -835,4 +854,14 @@ fn main() {
     }
 
     repl(db, label);
+}
+
+/// Human-readable byte size for `.stats`.
+fn human_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let n = n as f64;
+    if n < K { format!("{n:.0} B") }
+    else if n < K * K { format!("{:.1} KB", n / K) }
+    else if n < K * K * K { format!("{:.1} MB", n / (K * K)) }
+    else { format!("{:.2} GB", n / (K * K * K)) }
 }
