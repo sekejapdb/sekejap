@@ -475,3 +475,76 @@ fn deleting_a_base_node_takes_effect() {
     assert!(db.get("v/n2").is_none());
     assert_eq!(count(&db), 4, "the other four survive compaction");
 }
+
+/// **Guard rail.** Compaction rewrites the whole store, so a bug there destroys
+/// data silently — which is exactly what happened. `compact()` now counts what must
+/// survive and returns an error rather than reporting success on a lossy rewrite.
+/// This test pins the counting contract in both storage modes.
+#[test]
+fn compaction_never_reports_success_after_losing_data() {
+    for paged in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            for i in 0..25 {
+                let c = if i % 2 == 0 { "a" } else { "b" };
+                db.put(&format!("{c}/n{i}"),
+                    &json!({"_collection":c,"_key":format!("n{i}")}).to_string()).unwrap();
+            }
+            db.compact().unwrap();
+        }
+        let mut db = if paged {
+            CoreDB::open_paged(dir.path()).unwrap()
+        } else {
+            CoreDB::open(dir.path()).unwrap()
+        };
+        db.put("a/late", &json!({"_collection":"a","_key":"late"}).to_string()).unwrap();
+
+        let before = db.node_count();
+        assert_eq!(before, 26, "paged={paged}: node_count must see base + overlay");
+
+        // Repeated compaction must be idempotent and lossless, and must not error.
+        for round in 0..3 {
+            db.compact().unwrap_or_else(|e| panic!("paged={paged} round={round}: {e}"));
+            assert_eq!(db.node_count(), before, "paged={paged} round={round}: nodes lost");
+        }
+
+        // ...and it must still be true after a reopen, which is where the original
+        // bug actually showed up.
+        drop(db);
+        let db = CoreDB::open(dir.path()).unwrap();
+        assert_eq!(db.node_count(), before, "paged={paged}: data lost across reopen");
+        assert_eq!(db.collection_names(), vec!["a".to_string(), "b".to_string()]);
+    }
+}
+
+/// The overlay maps are not the store in paged mode. Any accessor that enumerates
+/// them directly under-reports — three public ones did (`node_count`,
+/// `collection_names`, and `SHOW`'s schema inference), each returning empty for a
+/// store whose data all lived in the base. Pin the parity between modes.
+#[test]
+fn accessors_report_the_same_in_both_storage_modes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        for i in 0..12 {
+            let c = if i < 7 { "alpha" } else { "beta" };
+            db.put(&format!("{c}/n{i}"), &json!({"_collection":c,"_key":format!("n{i}")}).to_string()).unwrap();
+        }
+        db.compact().unwrap();
+    }
+    // One writer at a time — the exclusive lock is real, so measure them in turn.
+    let (r_nodes, r_colls, r_stats, r_alpha) = {
+        let db = CoreDB::open(dir.path()).unwrap();
+        (db.node_count(), db.collection_names(), db.stats().nodes,
+         db.query("SELECT _key FROM alpha").unwrap().collect().len())
+    };
+    let paged = CoreDB::open_paged(dir.path()).unwrap();
+
+    assert_eq!(paged.node_count(), r_nodes, "node_count differs by mode");
+    assert_eq!(paged.node_count(), 12);
+    assert_eq!(paged.collection_names(), r_colls, "collection_names differs by mode");
+    assert_eq!(paged.collection_names(), vec!["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(paged.stats().nodes, r_stats, "stats differ by mode");
+    assert_eq!(paged.query("SELECT _key FROM alpha").unwrap().collect().len(), r_alpha);
+}

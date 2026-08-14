@@ -3600,7 +3600,27 @@ impl CoreDB {
     /// so this is a no-op for them.
     pub fn compact(&mut self) -> io::Result<()> {
         let t0 = std::time::Instant::now();
+        // GUARD RAIL — data safety. Compaction rewrites the entire store; a bug here
+        // silently destroys data (paged compaction did exactly that: it rebuilt from
+        // the overlay alone and dropped every base-resident node). Count what must
+        // survive first, and refuse to report success if it did not.
+        let expected = self.node_count().saturating_sub(self.tombstones.len());
         let r = self.compact_inner();
+        if r.is_ok() {
+            let actual = self.node_count();
+            if actual < expected {
+                // Do NOT return Ok: the caller must never believe a lossy compaction
+                // succeeded. The WAL and the previous files are still on disk.
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "sekejap: compaction would lose data ({expected} nodes before, \
+                         {actual} after) — aborted before it could be trusted. This is \
+                         a bug; please report it with the database layout."
+                    ),
+                ));
+            }
+        }
         let us = t0.elapsed().as_micros() as u64;
         self.counters.compactions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.counters.compact_us_last.store(us, std::sync::atomic::Ordering::Relaxed);
@@ -4913,7 +4933,18 @@ impl CoreDB {
     }
 
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        let Some(base) = &self.topo_base else {
+            return self.nodes.len(); // resident: the map IS the store
+        };
+        // Paged: base + overlay-only nodes - tombstones. An overlay entry that also
+        // exists in the base is an update, not an addition, so it must not be
+        // double-counted.
+        let overlay_new = self
+            .nodes
+            .keys()
+            .filter(|h| base.resolve(**h).is_none())
+            .count();
+        (base.node_count() + overlay_new).saturating_sub(self.tombstones.len())
     }
 
     /// Every node's slug (resident overlay ∪ mmap base). Order is unspecified.
@@ -4938,6 +4969,15 @@ impl CoreDB {
         for node in self.nodes.values() {
             if !node.collection.is_empty() {
                 names.insert(node.collection.clone());
+            }
+        }
+        // Paged: collections whose members all live in the mmap'd base are absent
+        // from the overlay entirely, so they must be read from the base too.
+        if let Some(base) = &self.topo_base {
+            for name in base.collection_names() {
+                if !name.is_empty() {
+                    names.insert(name.clone());
+                }
             }
         }
         names.into_iter().collect()
@@ -5879,8 +5919,12 @@ impl CoreDB {
                 let mut field_types: std::collections::BTreeMap<String, &'static str> =
                     std::collections::BTreeMap::new();
 
-                for node in self.nodes.values() {
-                    if !node.collection.is_empty() && sk_hash(&node.collection) == col_h {
+                let members: Vec<u64> = self
+                    .collection_members(col_h)
+                    .map(|m| m.into_owned())
+                    .unwrap_or_default();
+                for h in members {
+                    if let Some(node) = self.node_data(h) {
                         if let Some(payload) = self.payload_store.get(node.payload_offset, node.payload_len) {
                             if let serde_json::Value::Object(map) = payload {
                                 for (k, v) in &map {
