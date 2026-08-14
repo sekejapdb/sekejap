@@ -43,7 +43,7 @@
 //!
 //! Run: `cargo bench --bench concurrency`
 
-use sekejap::{Config, CoreDB, ReadSnapshot, SyncMode};
+use sekejap::{Config, CoreDB, SyncMode};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -65,7 +65,7 @@ const BURST: u64 = 4_000;
 /// guarding one `Arc` pointer — nothing to do with the DB lock) and `Arc`-clone the
 /// snapshot out; the publisher `.write()`s a fresh one in. Models Phase 2's
 /// `SharedDB`, where the writer republishes after each commit.
-type SnapSlot = Arc<RwLock<Arc<ReadSnapshot>>>;
+type SnapSlot = Arc<RwLock<Arc<CoreDB>>>;
 
 /// Build a disk-backed store with `N_NODES` venues, compact it into an immutable
 /// base, then **reopen in paged mode** and wrap it in the `Arc<RwLock<CoreDB>>`
@@ -140,8 +140,8 @@ fn run(db: &Arc<RwLock<CoreDB>>, disturb: Disturb, mode: Read) -> Stats {
     let slot: Option<SnapSlot> = if mode == Read::Locked {
         None
     } else {
-        let snap = db.read().unwrap().snapshot().expect("paged mode is snapshottable");
-        Some(Arc::new(RwLock::new(Arc::new(snap))))
+        let snap = db.read().unwrap().snapshot_db().expect("paged mode is snapshottable");
+        Some(Arc::new(RwLock::new(snap)))
     };
 
     // Publisher: re-mint the shared snapshot every PUBLISH_MS (Published mode only).
@@ -151,8 +151,8 @@ fn run(db: &Arc<RwLock<CoreDB>>, disturb: Disturb, mode: Read) -> Stats {
         let slot = slot.clone().unwrap();
         Some(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                if let Some(fresh) = db.read().unwrap().snapshot() {
-                    *slot.write().unwrap() = Arc::new(fresh);
+                if let Some(fresh) = db.read().unwrap().snapshot_db() {
+                    *slot.write().unwrap() = fresh;
                 }
                 thread::sleep(Duration::from_millis(PUBLISH_MS));
             }
