@@ -16,6 +16,7 @@ pub struct TermEntry {
     pub postings_len: u32,
 }
 
+#[derive(Clone)]
 pub struct TermDict {
     entries: HashMap<String, TermEntry>,
 }

@@ -50,57 +50,57 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
 
 ## `src/bm25/`
 
-### `dict.rs` · 75L — Term dictionary — the index's table of contents
+### `dict.rs` · 76L — Term dictionary — the index's table of contents
 
 ```
     14  pub struct TermEntry
-    19  pub struct TermDict
-    23  impl TermDict
-    24    pub fn new() -> Self
-    28    pub fn insert(&mut self, term: String, postings_offset: u64, postings_len: u32)
-    33    pub fn mem_bytes(&self) -> usize
-    39    pub fn get(&self, term: &str) -> Option<&TermEntry>
-    43    pub fn num_terms(&self) -> usize
-    48    pub fn iter(&self) -> impl Iterator<Item = (&str, &TermEntry)>
-    53  impl Default for TermDict
-    60  mod tests
+    20  pub struct TermDict
+    24  impl TermDict
+    25    pub fn new() -> Self
+    29    pub fn insert(&mut self, term: String, postings_offset: u64, postings_len: u32)
+    34    pub fn mem_bytes(&self) -> usize
+    40    pub fn get(&self, term: &str) -> Option<&TermEntry>
+    44    pub fn num_terms(&self) -> usize
+    49    pub fn iter(&self) -> impl Iterator<Item = (&str, &TermEntry)>
+    54  impl Default for TermDict
+    61  mod tests
 ```
 
-### `index.rs` · 843L — The BM25 index — building it and scoring queries
+### `index.rs` · 847L — The BM25 index — building it and scoring queries
 
 ```
-    59  pub enum DocLens
-    63  impl DocLens
-    65    pub fn get(&self, idx: usize) -> u32
-    75    pub fn len(&self) -> usize { match self { DocLens::Owned(v) => v.len(), DocLens::Mapped { count…
-    80  pub enum DocIdx
-    84  impl DocIdx
-    86    pub fn get(&self, doc_id: u64) -> Option<usize>
-   104    pub fn remove(&mut self, doc_id: u64) { if let DocIdx::Owned(m) = self { m.remove(&doc_id); } }
-   105    pub fn len(&self) -> usize { match self { DocIdx::Owned(m) => m.len(), DocIdx::Mapped { count, …
-   106    pub fn sorted(&self) -> Vec<(u64, u32)>
-   122  enum PostingsBlob
-   128  impl PostingsBlob
-   188  pub struct Bm25Meta
-   202  pub struct Bm25Hit
-   231  pub struct Bm25Index
-   263  impl Bm25Index
-   266    pub fn mem_bytes(&self) -> usize
-   277    pub fn spill_to_disk(&mut self, path: &std::path::Path) -> std::io::Result<()>
-   292    pub(crate) fn write_binary<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>
-   330    pub(crate) fn open_mapped(view: &Arc<MmapView>, base: usize, dir: &std::path::Path) -> std::io:…
-   386    pub(crate) fn is_disk_backed(&self) -> bool
-   391    pub(crate) fn field_name(&self) -> &str
-   408    pub fn build<'a>(field: &str, docs: impl Iterator<Item = (u64, &'a str)>) -> Self
-   503    pub fn search(&self, query: &str, top_k: usize) -> Vec<Bm25Hit>
-   513    pub fn search_all(&self, query: &str) -> Vec<Bm25Hit>
-   630    pub fn delete(&mut self, doc_id: u64) -> bool
-   654    pub fn avg_doc_len(&self) -> f64
-   676    pub fn orphan_count(&self) -> usize
-   702    pub fn needs_rebuild(&self, threshold: f64) -> bool
-   711    pub fn num_docs(&self) -> u64
-   716    pub fn num_terms(&self) -> usize
-   738  mod tests
+    60  pub enum DocLens
+    64  impl DocLens
+    66    pub fn get(&self, idx: usize) -> u32
+    76    pub fn len(&self) -> usize { match self { DocLens::Owned(v) => v.len(), DocLens::Mapped { count…
+    82  pub enum DocIdx
+    86  impl DocIdx
+    88    pub fn get(&self, doc_id: u64) -> Option<usize>
+   106    pub fn remove(&mut self, doc_id: u64) { if let DocIdx::Owned(m) = self { m.remove(&doc_id); } }
+   107    pub fn len(&self) -> usize { match self { DocIdx::Owned(m) => m.len(), DocIdx::Mapped { count, …
+   108    pub fn sorted(&self) -> Vec<(u64, u32)>
+   125  enum PostingsBlob
+   131  impl PostingsBlob
+   191  pub struct Bm25Meta
+   205  pub struct Bm25Hit
+   235  pub struct Bm25Index
+   267  impl Bm25Index
+   270    pub fn mem_bytes(&self) -> usize
+   281    pub fn spill_to_disk(&mut self, path: &std::path::Path) -> std::io::Result<()>
+   296    pub(crate) fn write_binary<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>
+   334    pub(crate) fn open_mapped(view: &Arc<MmapView>, base: usize, dir: &std::path::Path) -> std::io:…
+   390    pub(crate) fn is_disk_backed(&self) -> bool
+   395    pub(crate) fn field_name(&self) -> &str
+   412    pub fn build<'a>(field: &str, docs: impl Iterator<Item = (u64, &'a str)>) -> Self
+   507    pub fn search(&self, query: &str, top_k: usize) -> Vec<Bm25Hit>
+   517    pub fn search_all(&self, query: &str) -> Vec<Bm25Hit>
+   634    pub fn delete(&mut self, doc_id: u64) -> bool
+   658    pub fn avg_doc_len(&self) -> f64
+   680    pub fn orphan_count(&self) -> usize
+   706    pub fn needs_rebuild(&self, threshold: f64) -> bool
+   715    pub fn num_docs(&self) -> u64
+   720    pub fn num_terms(&self) -> usize
+   742  mod tests
 ```
 
 ### `mod.rs` · 57L — BM25 — ranking documents by how relevant they are to a query
@@ -267,7 +267,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   1225  mod tests
 ```
 
-### `lib.rs` · 10326L — sekejap core — the database engine (`CoreDB`)
+### `lib.rs` · 10347L — sekejap core — the database engine (`CoreDB`)
 
 ```
    109  pub fn open(path: impl AsRef<Path>) -> io::Result<CoreDB>
@@ -480,12 +480,12 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   8645  struct SnapVector
   8653  struct SnapBtree
   8661  mod hybrid_query_tests
- 10250  fn is_internal_field(name: &str) -> bool
- 10258  fn sql_str_escape(s: &str) -> String
- 10263  fn field_type_sql(ty: sql::FieldType) -> &'static str
- 10279  fn fmt_f32(x: f32) -> String
- 10291  fn sql_value_literal(v: &Value, ty: Option<sql::FieldType>) -> String
- 10314  fn dump_edge_attrs(meta: Option<&Value>) -> String
+ 10271  fn is_internal_field(name: &str) -> bool
+ 10279  fn sql_str_escape(s: &str) -> String
+ 10284  fn field_type_sql(ty: sql::FieldType) -> &'static str
+ 10300  fn fmt_f32(x: f32) -> String
+ 10312  fn sql_value_literal(v: &Value, ty: Option<sql::FieldType>) -> String
+ 10335  fn dump_edge_attrs(meta: Option<&Value>) -> String
 ```
 
 ### `pg.rs` · 1227L — Speaking PostgreSQL's language — the wire protocol, sans-IO
@@ -780,44 +780,44 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    277  mod tests
 ```
 
-### `index.rs` · 827L — The positional search index — words, positions, and ranking
+### `index.rs` · 833L — The positional search index — words, positions, and ranking
 
 ```
-    44  pub(crate) enum Bytes
-    49  impl Bytes
-    51    pub(crate) fn as_slice(&self) -> &[u8]
-    58    pub(crate) fn len(&self) -> usize
-    67  pub(crate) fn read_bitmap_slice(data: &[u8], offset: usize) -> Option<RoaringBitmap>
-    79  pub(crate) struct MappedPostings
-    84  impl MappedPostings
-   133  fn field_key(term: &str, field: u8) -> Vec<u8>
-   143  fn position_key(term: &str, bucket: u16) -> Vec<u8>
-   152  fn position_prefix(term: &str) -> Vec<u8>
-   160  fn bucket_from_key(k: &[u8]) -> u16
-   169  pub(crate) enum SlotIndex
-   173  impl SlotIndex
-   175    pub(crate) fn get(&self, hash: u64) -> Option<u32>
-   194    pub(crate) fn remove(&mut self, hash: u64)
-   203  pub(crate) enum IdMap
-   207  impl IdMap
-   209    pub(crate) fn get(&self, slot: usize) -> Option<u64>
-   220    pub(crate) fn count(&self) -> usize
-   228  pub(crate) enum Norms
-   232  impl Norms
-   234    pub(crate) fn doc_lengths(&self, slot: usize) -> Option<std::borrow::Cow<'_, [u16]>>
-   247  pub struct SearchIndex
-   263  pub struct DocFields
-   269  fn auto_distance(term: &str) -> u32
-   277  fn deduplicate_tokens(query: &str) -> Vec<String>
-   285  impl SearchIndex
-   286    pub fn build(fields: Vec<String>, docs: impl Iterator<Item = DocFields>) -> Self
-   429    pub fn search(&self, query: &str) -> RoaringBitmap
-   437    pub fn search_typo(&self, query: &str, typo: Option<u32>) -> RoaringBitmap
-   468    pub fn score(&self, query: &str, slot: u32) -> f64
-   610    pub fn slot_to_hash(&self, slot: u32) -> Option<u64>
-   614    pub fn hash_to_slot(&self, hash: u64) -> Option<u32>
-   618    pub fn delete(&mut self, hash: u64)
-   628  mod tests
+    45  pub(crate) enum Bytes
+    50  impl Bytes
+    52    pub(crate) fn as_slice(&self) -> &[u8]
+    59    pub(crate) fn len(&self) -> usize
+    68  pub(crate) fn read_bitmap_slice(data: &[u8], offset: usize) -> Option<RoaringBitmap>
+    81  pub(crate) struct MappedPostings
+    86  impl MappedPostings
+   135  fn field_key(term: &str, field: u8) -> Vec<u8>
+   145  fn position_key(term: &str, bucket: u16) -> Vec<u8>
+   154  fn position_prefix(term: &str) -> Vec<u8>
+   162  fn bucket_from_key(k: &[u8]) -> u16
+   172  pub(crate) enum SlotIndex
+   176  impl SlotIndex
+   178    pub(crate) fn get(&self, hash: u64) -> Option<u32>
+   197    pub(crate) fn remove(&mut self, hash: u64)
+   207  pub(crate) enum IdMap
+   211  impl IdMap
+   213    pub(crate) fn get(&self, slot: usize) -> Option<u64>
+   224    pub(crate) fn count(&self) -> usize
+   233  pub(crate) enum Norms
+   237  impl Norms
+   239    pub(crate) fn doc_lengths(&self, slot: usize) -> Option<std::borrow::Cow<'_, [u16]>>
+   253  pub struct SearchIndex
+   269  pub struct DocFields
+   275  fn auto_distance(term: &str) -> u32
+   283  fn deduplicate_tokens(query: &str) -> Vec<String>
+   291  impl SearchIndex
+   292    pub fn build(fields: Vec<String>, docs: impl Iterator<Item = DocFields>) -> Self
+   435    pub fn search(&self, query: &str) -> RoaringBitmap
+   443    pub fn search_typo(&self, query: &str, typo: Option<u32>) -> RoaringBitmap
+   474    pub fn score(&self, query: &str, slot: u32) -> f64
+   616    pub fn slot_to_hash(&self, slot: u32) -> Option<u64>
+   620    pub fn hash_to_slot(&self, hash: u64) -> Option<u32>
+   624    pub fn delete(&mut self, hash: u64)
+   634  mod tests
 ```
 
 ### `mod.rs` · 18L — Positional full-text search — the `SEARCH()` index
@@ -1361,7 +1361,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    333  mod tests
 ```
 
-### `quant.rs` · 295L — Quantization — shrinking vectors from `f32` to `int8` to save RAM
+### `quant.rs` · 296L — Quantization — shrinking vectors from `f32` to `int8` to save RAM
 
 ```
     47  pub struct ScalarQuantizer
@@ -1370,15 +1370,15 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     73    pub fn quantize(&self, v: &[f32]) -> Vec<u8>
     89  pub fn l2_u8(a: &[u8], b: &[u8]) -> u32
    106  fn l2_u8_scalar(a: &[u8], b: &[u8]) -> u32
-   177  pub struct QuantizedField
-   184  impl QuantizedField
-   185    pub fn new(quantizer: ScalarQuantizer, dim: usize) -> Self
-   190    pub fn with_capacity(quantizer: ScalarQuantizer, dim: usize, n: usize) -> Self
-   200    pub fn insert(&mut self, id: u64, v: &[f32])
-   218    pub fn quantize_query(&self, q: &[f32]) -> Vec<u8>
-   223    pub fn mem_bytes(&self) -> usize
-   228  impl QuantAccess for QuantizedField
-   243  mod tests
+   178  pub struct QuantizedField
+   185  impl QuantizedField
+   186    pub fn new(quantizer: ScalarQuantizer, dim: usize) -> Self
+   191    pub fn with_capacity(quantizer: ScalarQuantizer, dim: usize, n: usize) -> Self
+   201    pub fn insert(&mut self, id: u64, v: &[f32])
+   219    pub fn quantize_query(&self, q: &[f32]) -> Vec<u8>
+   224    pub fn mem_bytes(&self) -> usize
+   229  impl QuantAccess for QuantizedField
+   244  mod tests
 ```
 
 <!-- 42 files, 1144 items -->

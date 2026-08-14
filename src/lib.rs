@@ -9568,6 +9568,27 @@ mod hybrid_query_tests {
         assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 150);
     }
 
+    /// Compile-time proof that every index family a snapshot must freeze is
+    /// `Clone`-able. This is the prerequisite for running indexed SQL against a
+    /// snapshot (`snapshot_db()`): the immutable base is shared by `Arc`, and each
+    /// index overlay is cloned. If someone adds a non-`Clone` member to any of
+    /// these, this test stops compiling instead of failing much later.
+    #[test]
+    fn every_index_family_is_clone() {
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<crate::bm25::Bm25Index>();          // relevance ranking
+        assert_clone::<crate::search::SearchIndex>();      // positional / phrase
+        assert_clone::<crate::vector::QuantizedField>();   // int8 vector codes
+        assert_clone::<crate::vector::HnswGraph>();        // vector graph
+        assert_clone::<crate::geo::SpatialGrid>();         // spatial
+        assert_clone::<crate::storage::edgestore::EdgeStore>();          // graph edges
+        assert_clone::<crate::storage::fieldstore::MappedFieldStore>();  // btree field index
+        assert_clone::<crate::storage::vecstore::VectorStore>();         // raw vectors
+        assert_clone::<crate::text_index::gin::GINIndex>();   // trigram ILIKE
+        assert_clone::<crate::text_index::gist::GiSTIndex>(); // trigram (lossy)
+        assert_clone::<crate::storage::mmap::MmapView>();  // the shared primitive
+    }
+
     #[test]
     fn auto_compact_fires_after_a_grouped_batch() {
         // Regression: every statement inside `execute_batch_grouped` runs with

@@ -56,6 +56,7 @@ use super::postings::{decode_postings_from_bytes, encode_postings_to_file, Posti
 
 /// Per-doc token counts. Resident `Vec<u32>` (heap mode — no regression) or a mmap'd
 /// u32 array (paged, O(N)·4 B off heap).
+#[derive(Clone)]
 pub enum DocLens {
     Owned(Vec<u32>),
     Mapped { view: Arc<MmapView>, off: usize, count: usize },
@@ -77,6 +78,7 @@ impl DocLens {
 
 /// doc_id (node hash) → slot index. Resident `HashMap` (heap mode) or a mmap'd sorted
 /// `(doc_id:u64, idx:u32)` array (paged, binary-searched) — the largest O(N) BM25 piece.
+#[derive(Clone)]
 pub enum DocIdx {
     Owned(HashMap<u64, usize>),
     Mapped { view: Arc<MmapView>, off: usize, count: usize },
@@ -119,10 +121,11 @@ impl DocIdx {
 /// in RAM (ephemeral DBs) or **on disk** (disk-first): term ranges are read via
 /// `pread` at query time, so the blob never occupies process RAM. The term
 /// dictionary + doc arrays stay resident either way (small, needed for scoring).
+#[derive(Clone)]
 enum PostingsBlob {
     Memory(Vec<u8>),
     #[cfg(unix)]
-    Disk { file: std::fs::File, len: u64 },
+    Disk { file: std::sync::Arc<std::fs::File>, len: u64 },
 }
 
 impl PostingsBlob {
@@ -228,6 +231,7 @@ pub struct Bm25Hit {
 /// returns `true` drop the index and call `build_bm25_index` again.
 ///
 /// [`needs_rebuild`]: Bm25Index::needs_rebuild
+#[derive(Clone)]
 pub struct Bm25Index {
     /// Collection-level metadata (document count, field name).
     meta: Bm25Meta,
@@ -281,7 +285,7 @@ impl Bm25Index {
             f.write_all(blob)?;
             f.sync_all()?;
             let len = blob.len() as u64;
-            self.postings = PostingsBlob::Disk { file: f, len };
+            self.postings = PostingsBlob::Disk { file: std::sync::Arc::new(f), len };
         }
         Ok(())
     }
@@ -366,7 +370,7 @@ impl Bm25Index {
         let pfile = std::fs::File::open(&ppath)?;
         let plen = pfile.metadata()?.len();
         #[cfg(unix)]
-        let postings = PostingsBlob::Disk { file: pfile, len: plen };
+        let postings = PostingsBlob::Disk { file: std::sync::Arc::new(pfile), len: plen };
         #[cfg(not(unix))]
         let postings = { let _ = (pfile, plen); PostingsBlob::Memory(std::fs::read(&ppath)?) };
 
