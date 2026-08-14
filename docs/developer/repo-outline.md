@@ -164,7 +164,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     78    pub fn into_inner(self) -> CoreDB
 ```
 
-### `mod.rs` · 912L — Quick start
+### `mod.rs` · 968L — Quick start
 
 ```
     62  pub struct Engine
