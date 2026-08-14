@@ -721,6 +721,62 @@ mod snapshot_read_tests {
         assert!(engine.get("venues/v2").is_some(), "get sees committed write after refresh");
     }
 
+    /// Minting must be safe while writes are in flight: the publisher takes the
+    /// shared read lock, so a snapshot can only be built between mutations, never
+    /// mid-write. Readers must keep seeing consistent, non-empty results throughout.
+    #[test]
+    fn snapshots_stay_consistent_under_concurrent_writes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.execute("CREATE TABLE v (_key TEXT PRIMARY KEY, cat TEXT, n INTEGER)").unwrap();
+            for i in 0..200 {
+                db.execute(&format!("INSERT INTO v (_key,cat,n) VALUES ('b{i}','cafe',{i})")).unwrap();
+            }
+            db.execute("CREATE INDEX ON v USING btree (cat)").unwrap();
+            db.compact().unwrap();
+        }
+        let engine = Arc::new(Engine::open_as_service(dir.path().to_str().unwrap()).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let bad = Arc::new(AtomicUsize::new(0));
+
+        // Readers: query continuously while the writer runs. Row counts may grow as
+        // snapshots are republished, but must never drop below the committed base
+        // and must never error.
+        let readers: Vec<_> = (0..4).map(|_| {
+            let e = Arc::clone(&engine);
+            let stop = Arc::clone(&stop);
+            let bad = Arc::clone(&bad);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match e.query("SELECT _key FROM v WHERE cat = 'cafe'") {
+                        Ok(rows) if rows.len() >= 200 => {}
+                        Ok(rows) => { bad.fetch_add(1, Ordering::Relaxed);
+                                      eprintln!("short read: {} rows", rows.len()); }
+                        Err(err) => { bad.fetch_add(1, Ordering::Relaxed);
+                                      eprintln!("query error: {err}"); }
+                    }
+                }
+            })
+        }).collect();
+
+        // Writer: mutate steadily, forcing republishes along the way.
+        for i in 0..300 {
+            engine.execute(&format!("INSERT INTO v (_key,cat,n) VALUES ('w{i}','cafe',{i})")).unwrap();
+            if i % 50 == 0 { engine.refresh_snapshot(); }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers { r.join().unwrap(); }
+
+        assert_eq!(bad.load(Ordering::Relaxed), 0, "no reader saw a short or failed read");
+        engine.refresh_snapshot();
+        assert_eq!(engine.query("SELECT _key FROM v").unwrap().len(), 500,
+            "every committed write is visible after a final refresh");
+    }
+
     /// The point of the whole exercise: on a service engine, `query()` — indexed
     /// SQL, not just point reads — runs against the published snapshot rather than
     /// taking the shared read lock.
