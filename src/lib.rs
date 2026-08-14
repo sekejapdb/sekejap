@@ -704,6 +704,30 @@ impl PayloadStore {
     ///
     /// Only disk-backed stores (paged mode) are snapshottable — the ephemeral
     /// in-memory store returns `None`.
+    /// A **read-only** copy of this store for a snapshot `CoreDB`.
+    ///
+    /// Nothing is duplicated that matters: the disk arm takes its own file
+    /// descriptor (`try_clone` — a second fd onto the same `payloads.bin` inode, so
+    /// the bytes stay readable even after the live store compacts and renames over
+    /// it) and shares the same `Arc<MmapView>`. Only the tiny SKBIN field table is
+    /// copied.
+    ///
+    /// The result must never be appended to — it points at the live file. Safety
+    /// comes from the caller: [`CoreDB::snapshot_db`] hands out `Arc<CoreDB>`, and
+    /// every mutating method takes `&mut self`, so a shared `Arc` cannot reach one.
+    #[cfg(unix)]
+    fn read_only_clone(&self) -> Option<PayloadStore> {
+        let inner = match &self.inner {
+            PayloadInner::Memory { data } => PayloadInner::Memory { data: data.clone() },
+            PayloadInner::Disk { file, total_len, mmap } => PayloadInner::Disk {
+                file: file.try_clone().ok()?,
+                total_len: *total_len,
+                mmap: mmap.clone(),
+            },
+        };
+        Some(PayloadStore { binary: self.binary, field_table: self.field_table.clone(), inner })
+    }
+
     #[cfg(unix)]
     fn snapshot_reader(&self) -> Option<SnapshotPayloads> {
         match &self.inner {
@@ -4635,6 +4659,101 @@ impl CoreDB {
         let nodes = std::sync::Arc::new(self.nodes.clone()); // freeze the overlay
         let collections = std::sync::Arc::new(self.collections.clone()); // freeze coll membership
         Some(ReadSnapshot { base, nodes, collections, payloads })
+    }
+
+    /// A **read-only `CoreDB`** frozen at this instant — the snapshot that indexed
+    /// SQL runs against.
+    ///
+    /// [`snapshot`](Self::snapshot) gives a `ReadSnapshot`, which can only do reads
+    /// that need no index (`get`, `scan`, `count`). This gives back a whole `CoreDB`,
+    /// so the *existing* query executor runs against it unchanged — `WHERE`, `MATCH`,
+    /// `VECTOR_NEAR`, `BM25`, `ST_*` all work, and none of them touch the live
+    /// database or its write lock.
+    ///
+    /// # What it costs
+    ///
+    /// - The immutable base is **shared** (`Arc` bump): the mmap'd topology, and the
+    ///   mmap-backed field indexes. No bytes are copied.
+    /// - The write overlay and the resident index structures are **cloned**. That is
+    ///   the real cost, and it grows with how much has been written since the last
+    ///   `compact()` — so compaction frequency is the tuning knob, exactly as for
+    ///   `ReadSnapshot`.
+    ///
+    /// # Why it is safe to hand around
+    ///
+    /// It returns `Arc<CoreDB>`. Every mutating method on `CoreDB` takes `&mut self`,
+    /// and a shared `Arc` never yields `&mut`, so the borrow checker — not a runtime
+    /// flag — guarantees a snapshot can only be read. On top of that the copy is
+    /// defused: no WAL writer, no file lock, no `data_dir`, auto-compaction off and
+    /// `compact_on_close` false (its `Drop` must never compact the real database).
+    ///
+    /// Returns `None` unless this is a paged-mode store (unix only), same as
+    /// [`snapshot`](Self::snapshot).
+    #[cfg(unix)]
+    pub fn snapshot_db(&self) -> Option<std::sync::Arc<CoreDB>> {
+        let topo_base = Some(self.topo_base.clone()?); // shared immutable base
+        let payload_store = self.payload_store.read_only_clone()?; // own fd, shared mmap
+
+        Some(std::sync::Arc::new(CoreDB {
+            // ── frozen write overlay ────────────────────────────────────────
+            nodes: self.nodes.clone(),
+            slug_map: self.slug_map.clone(),
+            collections: self.collections.clone(),
+            collection_names_map: self.collection_names_map.clone(),
+            edges: self.edges.clone(),
+
+            // ── shared immutable base (no bytes copied) ─────────────────────
+            topo_base,
+            field_base: self.field_base.clone(), // MappedFieldStore shares its mmap
+            payload_store,
+
+            // ── index overlays the executor needs ───────────────────────────
+            spatial_grid: self.spatial_grid.clone(),
+            text_indexes: self.text_indexes.clone(),
+            gin_indexes: self.gin_indexes.clone(),
+            bm25_indexes: self.bm25_indexes.clone(),
+            search_indexes: self.search_indexes.clone(),
+            vectors: self.vectors.clone(),
+            hnsw_indexes: self.hnsw_indexes.clone(),
+            quant_fields: self.quant_fields.clone(),
+            compact_indexes: self.compact_indexes.clone(),
+            field_indexes: self.field_indexes.clone(),
+            hnsw_params: self.hnsw_params.clone(),
+            hnsw_metric: self.hnsw_metric.clone(),
+            hnsw_ef_search: self.hnsw_ef_search,
+
+            // ── query-visible metadata ──────────────────────────────────────
+            schemas: self.schemas.clone(),
+            materialized_views: self.materialized_views.clone(),
+
+            // ── every write path: disarmed ──────────────────────────────────
+            wal: None,                       // no WAL writer: cannot log a mutation
+            _lock_file: None,                // never touches the parent's lock
+            data_dir: None,                  // no path: nothing on disk can be written
+            compact_on_close: false,         // Drop must NOT compact the real database
+            auto_compact: AutoCompact::Off,  // and must not compact while alive
+            pending_change: ChangeEvent::default(),
+            change_listeners: Vec::new(),    // never re-emit the parent's events
+            next_change_id: 0,
+            commit_depth: 0,
+            pending_txn: None,
+            replaying: false,
+            autocompacting: false,
+            writes_since_compact_check: 0,
+            defer_wal_sync: false,
+            batch_now: None,
+            defer_index_rebuild: false,
+            dirty_bm25: HashSet::new(),
+            dirty_gin: HashSet::new(),
+            dirty_search: HashSet::new(),
+
+            // ── inert configuration (kept so reads behave identically) ──────
+            compact_thresholds: self.compact_thresholds.clone(),
+            wal_sync: self.wal_sync,
+            wal_format: self.wal_format,
+            logical_wal: self.logical_wal,
+            wal_sync_level: self.wal_sync_level,
+        }))
     }
 
     /// Parse and return the JSON payload for a node hash. Returns `None` if

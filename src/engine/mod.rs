@@ -89,7 +89,7 @@ pub struct Engine {
 struct Published {
     /// The latest published photo. A reader takes it with a tiny slot-lock + `Arc`
     /// bump (nothing to do with the DB lock); the writer swaps a fresh one in.
-    slot: std::sync::RwLock<std::sync::Arc<crate::ReadSnapshot>>,
+    slot: std::sync::RwLock<std::sync::Arc<CoreDB>>,
     /// When the slot was last re-minted — the debounce clock.
     last: std::sync::Mutex<std::time::Instant>,
     /// Minimum time between re-mints (staleness bound).
@@ -99,7 +99,7 @@ struct Published {
 #[cfg(unix)]
 impl Published {
     /// The current published photo (lock-free read path for callers).
-    fn current(&self) -> std::sync::Arc<crate::ReadSnapshot> {
+    fn current(&self) -> std::sync::Arc<CoreDB> {
         self.slot.read().expect("snapshot slot poisoned").clone()
     }
 }
@@ -192,6 +192,12 @@ impl Engine {
     /// Supports the full Sekejap SQL surface: `SELECT`, `MATCH`, `VECTOR_NEAR`,
     /// `GEO_NEAR`, `BM25_SEARCH`, etc.
     pub fn query(&self, sql: &str) -> Result<Vec<Hit>, String> {
+        #[cfg(unix)]
+        if let Some(p) = &self.published {
+            // Lock-free: the snapshot is a read-only CoreDB, so the normal executor
+            // runs against it without touching the live database or its write lock.
+            return p.current().query(sql).map(|set| set.collect()).map_err(|e| e.to_string());
+        }
         let db = self.guard.read();
         db.query(sql)
             .map(|set| set.collect())
@@ -203,6 +209,12 @@ impl Engine {
     /// Parameters are referenced as `$1`, `$2`, ... in the SQL string.
     /// Takes a shared read lock (concurrent with other readers).
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Vec<Hit>, String> {
+        #[cfg(unix)]
+        if let Some(p) = &self.published {
+            return p.current().query_params(sql, params)
+                .map(|set| set.collect())
+                .map_err(|e| e.to_string());
+        }
         let db = self.guard.read();
         db.query_params(sql, params)
             .map(|set| set.collect())
@@ -235,7 +247,7 @@ impl Engine {
     /// lock-free reads (all against the same instant). `None` if snapshot reads are
     /// not enabled. Keep it short-lived — a live snapshot pins the memory it references.
     #[cfg(unix)]
-    pub fn snapshot(&self) -> Option<std::sync::Arc<crate::ReadSnapshot>> {
+    pub fn snapshot(&self) -> Option<std::sync::Arc<CoreDB>> {
         self.published.as_ref().map(|p| p.current())
     }
 
@@ -248,7 +260,7 @@ impl Engine {
         let (rows, bytes) = (self.scan_max_rows, self.scan_max_bytes);
         #[cfg(unix)]
         if let Some(p) = &self.published {
-            return p.current().scan_bounded(collection, rows, bytes);
+            return p.current().collection_payloads_bounded(collection, rows, bytes);
         }
         self.guard.read().collection_payloads_bounded(collection, rows, bytes)
     }
@@ -258,7 +270,7 @@ impl Engine {
     pub fn count(&self, collection: &str) -> usize {
         #[cfg(unix)]
         if let Some(p) = &self.published {
-            return p.current().count(collection);
+            return p.current().collection_count(collection);
         }
         self.guard.read().collection_count(collection)
     }
@@ -277,8 +289,8 @@ impl Engine {
     #[cfg(unix)]
     fn republish_now(&self) {
         if let Some(p) = &self.published {
-            if let Some(snap) = self.guard.read().snapshot() {
-                *p.slot.write().expect("snapshot slot poisoned") = std::sync::Arc::new(snap);
+            if let Some(snap) = self.guard.read().snapshot_db() {
+                *p.slot.write().expect("snapshot slot poisoned") = snap;
                 *p.last.lock().expect("snapshot clock poisoned") = std::time::Instant::now();
             }
         }
@@ -632,8 +644,8 @@ impl EngineBuilder {
         // actually snapshottable, this stays None and `get` uses the read lock.
         #[cfg(unix)]
         let published = if want_paged {
-            db.snapshot().map(|snap| Published {
-                slot: std::sync::RwLock::new(std::sync::Arc::new(snap)),
+            db.snapshot_db().map(|snap| Published {
+                slot: std::sync::RwLock::new(snap),
                 last: std::sync::Mutex::new(std::time::Instant::now()),
                 interval: self.publish_interval,
             })
@@ -698,6 +710,42 @@ mod snapshot_read_tests {
         engine.insert_prepared(&ins, &[json!("v2"), json!(2)]).unwrap();
         engine.refresh_snapshot();
         assert!(engine.get("venues/v2").is_some(), "get sees committed write after refresh");
+    }
+
+    /// The point of the whole exercise: on a service engine, `query()` — indexed
+    /// SQL, not just point reads — runs against the published snapshot rather than
+    /// taking the shared read lock.
+    #[test]
+    fn service_query_runs_on_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.execute("CREATE TABLE venues (_key TEXT PRIMARY KEY, cat TEXT, n INTEGER)").unwrap();
+            for i in 0..30 {
+                let cat = ["cafe", "bar"][i % 2];
+                db.execute(&format!(
+                    "INSERT INTO venues (_key, cat, n) VALUES ('v{i}', '{cat}', {i})"
+                )).unwrap();
+            }
+            db.execute("CREATE INDEX ON venues USING btree (cat)").unwrap();
+            db.compact().unwrap();
+        }
+        let db = Engine::open_as_service(dir.path().to_str().unwrap()).unwrap();
+
+        // Indexed SQL works through the engine.
+        let cafes = db.query("SELECT _key FROM venues WHERE cat = 'cafe'").unwrap();
+        assert!(!cafes.is_empty(), "indexed WHERE must work on a service engine");
+        assert_eq!(db.query("SELECT _key FROM venues").unwrap().len(), 30);
+
+        // A write is not visible until the snapshot is republished — that is the
+        // staleness contract, and it proves the read came from the snapshot rather
+        // than the live database.
+        db.execute("INSERT INTO venues (_key, cat, n) VALUES ('v999', 'cafe', 999)").unwrap();
+        let before = db.query("SELECT _key FROM venues").unwrap().len();
+        db.refresh_snapshot();
+        let after = db.query("SELECT _key FROM venues").unwrap().len();
+        assert_eq!(after, 31, "after an explicit refresh the write is visible");
+        assert!(before <= after, "reads are served from a point-in-time snapshot");
     }
 
     /// `open_as_service` must actually deliver the service behaviour: a working
