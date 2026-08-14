@@ -1,4 +1,4 @@
-//! Correctness tests for snapshot reads (`CoreDB::snapshot` → `ReadSnapshot`).
+//! Correctness tests for snapshot reads (`CoreDB::snapshot_db`).
 //!
 //! The concurrency benchmark shows snapshots are *fast* (reads don't queue behind
 //! writes). These tests show they are *correct*: a snapshot is a consistent
@@ -31,7 +31,7 @@ fn paged_db(n: usize) -> (CoreDB, tempfile::TempDir) {
 #[test]
 fn snapshot_reads_base() {
     let (db, _dir) = paged_db(10);
-    let snap = db.snapshot().expect("paged mode is snapshottable");
+    let snap = db.snapshot_db().expect("paged mode is snapshottable");
     let v = snap.get("venues/v3").expect("v3 is in the base");
     assert!(v.contains("\"n\":3"), "unexpected payload: {v}");
     assert!(snap.get("venues/does-not-exist").is_none());
@@ -44,7 +44,7 @@ fn snapshot_is_point_in_time() {
     let (mut db, _dir) = paged_db(10);
 
     // Photo #1 — before the new write.
-    let before = db.snapshot().unwrap();
+    let before = db.snapshot_db().unwrap();
 
     // A write lands in the overlay (not yet compacted into the base).
     db.put(
@@ -54,7 +54,7 @@ fn snapshot_is_point_in_time() {
     .unwrap();
 
     // Photo #2 — after the write.
-    let after = db.snapshot().unwrap();
+    let after = db.snapshot_db().unwrap();
 
     // The live DB sees it; so does the later snapshot; the earlier one does not.
     assert!(db.get("venues/v999").is_some(), "live db must see its own write");
@@ -74,13 +74,13 @@ fn snapshot_is_point_in_time() {
 fn snapshots_are_independent() {
     let (mut db, _dir) = paged_db(5);
 
-    let a = db.snapshot().unwrap();
+    let a = db.snapshot_db().unwrap();
     db.put(
         "venues/x1",
         &json!({"_collection":"venues","_key":"x1","n":1}).to_string(),
     )
     .unwrap();
-    let b = db.snapshot().unwrap();
+    let b = db.snapshot_db().unwrap();
     db.put(
         "venues/x2",
         &json!({"_collection":"venues","_key":"x2","n":2}).to_string(),
@@ -98,7 +98,7 @@ fn snapshots_are_independent() {
 #[test]
 fn snapshot_survives_live_compact() {
     let (mut db, _dir) = paged_db(10);
-    let snap = db.snapshot().unwrap();
+    let snap = db.snapshot_db().unwrap();
 
     // Grow the overlay, then compact the live DB (folds overlay into a NEW base and
     // rewrites payloads.bin). The snapshot must keep reading its own frozen view.
@@ -117,17 +117,18 @@ fn snapshot_survives_live_compact() {
     assert!(db.get("venues/late").is_some());
 }
 
-/// A snapshot can scan a whole collection and count it — base members plus overlay
-/// members — and both are point-in-time (a later insert isn't seen by an old snapshot).
+/// A snapshot sees base + overlay members, and stays point-in-time: a later insert
+/// is invisible to a snapshot minted before it.
 #[test]
 fn snapshot_scan_and_count() {
     let (mut db, _dir) = paged_db(6); // venues/v0..v5, all folded into the base
+    let count = |snap: &std::sync::Arc<CoreDB>| {
+        snap.query("SELECT _key FROM venues").unwrap().collect().len()
+    };
 
-    let before = db.snapshot().unwrap();
-    assert_eq!(before.count("venues"), 6);
-    let payloads = before.scan("venues");
-    assert_eq!(payloads.len(), 6);
-    assert!(payloads.iter().any(|p| p.contains("\"n\":3")), "scan returns real payloads");
+    let before = db.snapshot_db().unwrap();
+    assert_eq!(count(&before), 6);
+    assert!(before.get("venues/v3").unwrap().contains("\"n\":3"), "payloads are readable");
 
     // Overlay insert: a fresh snapshot merges base + overlay (7); the old one is
     // frozen at 6.
@@ -136,15 +137,14 @@ fn snapshot_scan_and_count() {
         &json!({"_collection":"venues","_key":"v6","n":6}).to_string(),
     )
     .unwrap();
-    let after = db.snapshot().unwrap();
-    assert_eq!(after.count("venues"), 7, "new snapshot sees base + overlay");
-    assert_eq!(before.count("venues"), 6, "old snapshot is point-in-time");
-    assert!(after.scan("venues").iter().any(|p| p.contains("\"n\":6")));
-    assert!(!before.scan("venues").iter().any(|p| p.contains("\"n\":6")));
+    let after = db.snapshot_db().unwrap();
+    assert_eq!(count(&after), 7, "new snapshot sees base + overlay");
+    assert_eq!(count(&before), 6, "old snapshot is point-in-time");
+    assert!(after.get("venues/v6").is_some());
+    assert!(before.get("venues/v6").is_none());
 
     // Unknown collection → empty, not a panic.
-    assert_eq!(before.count("ghosts"), 0);
-    assert!(before.scan("ghosts").is_empty());
+    assert!(before.query("SELECT _key FROM ghosts").map(|s| s.collect().len()).unwrap_or(0) == 0);
 }
 
 /// Gating / embedded safety: resident mode (`open`) has no immutable base, so it is
@@ -159,7 +159,7 @@ fn resident_mode_is_not_snapshottable() {
         &json!({"_collection":"venues","_key":"v0","n":0}).to_string(),
     )
     .unwrap();
-    assert!(db.snapshot().is_none(), "resident mode must not be snapshottable");
+    assert!(db.snapshot_db().is_none(), "resident mode must not be snapshottable");
 }
 
 /// The payoff: a snapshot `CoreDB` runs the **full indexed query surface** — not
@@ -288,11 +288,9 @@ fn snapshot_never_sees_an_uncommitted_transaction() {
 
     // Mid-transaction snapshots — neither kind may show the buffered rows.
     let mid_db = db.snapshot_db().expect("snapshottable");
-    let mid_ro = db.snapshot().expect("snapshottable");
+    
     let rows = mid_db.query("SELECT _key FROM v").unwrap().collect();
     assert_eq!(rows.len(), 1, "snapshot_db must not see an open transaction (saw {rows:?})");
-    assert!(mid_ro.get("v/t1").is_none(), "ReadSnapshot must not see an open transaction");
-    assert_eq!(mid_ro.count("v"), 1);
 
     db.execute("COMMIT").unwrap();
 

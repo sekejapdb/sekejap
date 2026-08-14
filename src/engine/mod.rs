@@ -78,7 +78,7 @@ pub struct Engine {
 }
 
 /// The engine's published snapshot: a shared, periodically-refreshed "photograph"
-/// of the store that readers read **lock-free** (see [`crate::ReadSnapshot`]).
+/// of the store that readers read **lock-free** (a read-only [`CoreDB`]).
 ///
 /// The writer re-mints it after a committed write, but **at most once per
 /// `interval`** (write-debounced): minting copies the write overlay, so this keeps
@@ -792,7 +792,7 @@ mod snapshot_read_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = crate::open(dir.path()).unwrap();
         db.put("t/a", &json!({"_collection":"t","_key":"a"}).to_string()).unwrap();
-        assert!(db.snapshot().is_none(), "resident mode is not snapshottable");
+        assert!(db.snapshot_db().is_none(), "resident mode is not snapshottable");
         assert!(db.get("t/a").is_some());
     }
 

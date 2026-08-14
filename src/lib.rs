@@ -691,19 +691,6 @@ impl PayloadStore {
         }
     }
 
-    /// Build a shareable, read-only view of this store for a [`ReadSnapshot`].
-    ///
-    /// The returned [`SnapshotPayloads`] can read payload bytes with **no lock**
-    /// on the live store, because it owns everything it needs:
-    /// - its **own file descriptor** (`try_clone` — a second fd onto the same
-    ///   `payloads.bin` inode; on unix that inode stays alive even if the live
-    ///   store later `compact()`s and renames the file over it), and
-    /// - a **shared** `Arc<MmapView>` of the base bytes (zero-copy fast path), and
-    /// - a **copy** of the SKBIN field table frozen at this instant (all field
-    ///   names any already-written record could reference are present).
-    ///
-    /// Only disk-backed stores (paged mode) are snapshottable — the ephemeral
-    /// in-memory store returns `None`.
     /// A **read-only** copy of this store for a snapshot `CoreDB`.
     ///
     /// Nothing is duplicated that matters: the disk arm takes its own file
@@ -726,193 +713,6 @@ impl PayloadStore {
             },
         };
         Some(PayloadStore { binary: self.binary, field_table: self.field_table.clone(), inner })
-    }
-
-    #[cfg(unix)]
-    fn snapshot_reader(&self) -> Option<SnapshotPayloads> {
-        match &self.inner {
-            PayloadInner::Disk { file, mmap, .. } => Some(SnapshotPayloads {
-                file: file.try_clone().ok()?,
-                mmap: mmap.clone(),
-                field_table: self.field_table.clone(),
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// A shareable, read-only view of a disk-backed payload store, held by a
-/// [`ReadSnapshot`]. It reads payload bytes without touching (or locking) the live
-/// `PayloadStore`, so a snapshot reader never contends with the writer.
-///
-/// It mirrors the Disk arm of [`PayloadStore::get_raw_at`]/[`PayloadStore::get_raw`]
-/// against its own fd + shared mmap + frozen field table.
-#[cfg(unix)]
-pub(crate) struct SnapshotPayloads {
-    /// An independent file descriptor onto `payloads.bin` (from `try_clone`), used
-    /// for `pread` of bytes past the end of the shared mmap (writes since open).
-    file: std::fs::File,
-    /// The shared base mmap — zero-copy reads for bytes present at open time.
-    mmap: Option<std::sync::Arc<MmapView>>,
-    /// SKBIN field-name table, cloned at snapshot time (decode is self-contained).
-    field_table: storage::skbin::FieldTable,
-}
-
-#[cfg(unix)]
-impl SnapshotPayloads {
-    /// Raw bytes at `(abs_offset, read_len)` — mmap fast path, else `pread`.
-    /// Mirrors [`PayloadStore::get_raw_at`]'s Disk arm.
-    fn read_bytes(&self, abs_offset: u64, read_len: usize) -> Option<Vec<u8>> {
-        if read_len == 0 {
-            return Some(vec![]);
-        }
-        if let Some(ref m) = self.mmap {
-            if let Some(slice) = m.slice(abs_offset as usize, read_len) {
-                return Some(slice.to_vec());
-            }
-        }
-        use std::os::unix::fs::FileExt;
-        let mut buf = vec![0u8; read_len];
-        self.file.read_exact_at(&mut buf, abs_offset).ok()?;
-        Some(buf)
-    }
-
-    /// Raw JSON bytes at `(offset, len)`, transparently decoding SKBIN.
-    /// Mirrors [`PayloadStore::get_raw`].
-    fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
-        let stored = self.read_bytes(offset, len as usize)?;
-        if storage::skbin::is_skbin(&stored) {
-            let v = storage::skbin::decode(&stored, &self.field_table)?;
-            return serde_json::to_vec(&v).ok();
-        }
-        decode_payload_record(stored)
-    }
-}
-
-/// An immutable, point-in-time read view of a [`CoreDB`] — a cheap "photograph"
-/// of the store that reads never have to lock. Minted by [`CoreDB::snapshot`].
-///
-/// A `Snapshot` is `Send + Sync` and self-contained: it owns a shared reference
-/// to the immutable base, a frozen copy of the write overlay, and its own handle
-/// on the payload bytes. Hand it to any thread and read from it while the parent
-/// `CoreDB` keeps taking writes — the snapshot's view never changes, so its reads
-/// never block (and are never blocked by) the writer.
-///
-/// The trade-off is *freshness*: a snapshot is "as of" the instant it was taken.
-/// For the latest data, take a new one. Keep them short-lived (one request), since
-/// a live snapshot pins the base pages and frozen overlay it references in memory.
-///
-/// This first cut serves **point reads** ([`Snapshot::get`]); richer snapshot
-/// queries (scans, graph, etc.) build on the same base+overlay view.
-#[cfg(unix)]
-pub struct ReadSnapshot {
-    /// Shared immutable base (the mmap'd files from the last `compact`). Held by
-    /// `Arc`, so the base stays alive for this snapshot even if the live `CoreDB`
-    /// compacts and swaps in a new base.
-    base: std::sync::Arc<storage::topology::MappedTopology>,
-    /// Frozen copy of the write overlay at snapshot time — an independent map, so
-    /// the live writer mutating its own overlay can't change what this reader sees.
-    nodes: std::sync::Arc<HashMap<u64, NodeData>>,
-    /// Frozen copy of the overlay's per-collection member lists (`collection hash →
-    /// member node hashes`). Merged with the base's posting lists for scans, exactly
-    /// like [`CoreDB::collection_members`].
-    collections: std::sync::Arc<HashMap<u64, Vec<u64>>>,
-    /// Lock-free reader over the payload bytes (own fd + shared base mmap).
-    payloads: SnapshotPayloads,
-}
-
-#[cfg(unix)]
-impl ReadSnapshot {
-    /// Point read: the JSON payload for `slug`, or `None` if absent — the
-    /// snapshot's lock-free analogue of [`CoreDB::get`].
-    pub fn get(&self, slug: &str) -> Option<String> {
-        let (off, len) = self.payload_loc(sk_hash(slug))?;
-        self.payloads
-            .get_raw(off, len)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-    }
-
-    /// Where a node's payload lives — frozen overlay first, then the immutable
-    /// base. Same lookup order as [`CoreDB::payload_loc`], against the snapshot's
-    /// own frozen state.
-    fn payload_loc(&self, hash: u64) -> Option<(u64, u32)> {
-        if let Some(n) = self.nodes.get(&hash) {
-            return Some((n.payload_offset, n.payload_len));
-        }
-        let rec = self.base.node_record(self.base.resolve(hash)?)?;
-        Some((rec.payload_offset, rec.payload_len))
-    }
-
-    /// The member node hashes of `collection` in this snapshot — the frozen overlay
-    /// list merged with the immutable base's posting list, deduped so an updated
-    /// base node appears once. Mirrors [`CoreDB::collection_members`].
-    ///
-    /// Note the same paged-mode caveat as the live engine: a base node `remove`d but
-    /// not yet compacted still appears here (deletes of base data land at `compact`).
-    fn members(&self, coll_hash: u64) -> Vec<u64> {
-        let base = self.base.members_by_coll_hash(coll_hash);
-        let overlay = self.collections.get(&coll_hash);
-        match (overlay, base) {
-            (Some(o), None) => o.clone(),
-            (overlay, Some(mut b)) => {
-                if let Some(o) = overlay {
-                    let seen: std::collections::HashSet<u64> = b.iter().copied().collect();
-                    for &h in o {
-                        if !seen.contains(&h) {
-                            b.push(h);
-                        }
-                    }
-                }
-                b
-            }
-            (None, None) => Vec::new(),
-        }
-    }
-
-    /// Number of nodes in `collection` as of this snapshot — a lock-free `COUNT(*)`.
-    pub fn count(&self, collection: &str) -> usize {
-        self.members(sk_hash(collection)).len()
-    }
-
-    /// Scan a whole collection: the JSON payload of every member node, as of this
-    /// snapshot. Lock-free — never queues behind a writer. This is the snapshot
-    /// analogue of `SELECT * FROM collection` (unindexed: it reads every member's
-    /// payload, no `WHERE`/index acceleration — use for list endpoints on
-    /// bounded collections). Nodes whose payloads can't be read are skipped.
-    pub fn scan(&self, collection: &str) -> Vec<String> {
-        self.scan_bounded(collection, None, None)
-    }
-
-    /// Like [`scan`](Self::scan), but stops once `max_rows` rows **or** `max_bytes`
-    /// of payload have been collected (whichever first) — the safety valve against a
-    /// runaway full-collection read on a shared engine. `None` for either = unbounded.
-    /// At least one row is always returned if any member exists (a single oversized
-    /// payload is never silently dropped by `max_bytes`).
-    pub fn scan_bounded(
-        &self,
-        collection: &str,
-        max_rows: Option<usize>,
-        max_bytes: Option<usize>,
-    ) -> Vec<String> {
-        let members = self.members(sk_hash(collection));
-        let cap = max_rows.map_or(members.len(), |m| m.min(members.len()));
-        let mut out = Vec::with_capacity(cap);
-        let mut bytes = 0usize;
-        for h in members {
-            if max_rows.is_some_and(|m| out.len() >= m) {
-                break;
-            }
-            if let Some((off, len)) = self.payload_loc(h) {
-                if max_bytes.is_some_and(|m| !out.is_empty() && bytes + len as usize > m) {
-                    break;
-                }
-                if let Some(b) = self.payloads.get_raw(off, len) {
-                    bytes += b.len();
-                    out.push(String::from_utf8_lossy(&b).into_owned());
-                }
-            }
-        }
-        out
     }
 }
 
@@ -1105,7 +905,7 @@ pub struct CoreDB {
     /// mode (default). When `Some`, the resident maps above act as the **write
     /// overlay** since open, and the topology accessors merge overlay-over-base.
     ///
-    /// Wrapped in `Arc` so a read-only [`ReadSnapshot`](CoreDB::snapshot) can share
+    /// Wrapped in `Arc` so a read-only snapshot can share
     /// this immutable base for free (a refcount bump, no bytes copied) — the base
     /// never changes, only the overlay does. See
     /// `docs/developer/notes/snapshot-reads-design.md`.
@@ -4717,45 +4517,11 @@ impl CoreDB {
     ///
     /// # What you get
     ///
-    /// A [`ReadSnapshot`] is an immutable read view of the store *as of this instant*.
-    /// You can `get()` from it with **no lock**, on any thread, while the owning
-    /// `CoreDB` keeps taking writes. The snapshot never sees those later writes —
-    /// it is a consistent moment in time, like MVCC snapshot isolation.
-    ///
-    /// # Why it's cheap (and how it stays isolated)
-    ///
-    /// In paged mode the store is `immutable base (mmap) + small RAM overlay`. A
-    /// snapshot:
-    /// - **shares** the immutable base by `Arc` (free — the base is never mutated), and
-    /// - **freezes** the overlay by *copying* the current node map into an `Arc`
-    ///   (`self.nodes.clone()`). The writer keeps mutating its own `self.nodes`;
-    ///   the snapshot holds an independent copy, so the two never interfere.
-    ///
-    /// The copy costs `O(overlay size)`. Right after a `compact()` the overlay is
-    /// empty, so a snapshot is almost free; between compactions it grows. Compaction
-    /// frequency is the tuning knob. Crucially, **the write path is untouched** —
-    /// taking a snapshot changes nothing about how writes work, so an embedded /
-    /// single-threaded user who never calls `snapshot()` pays exactly nothing.
-    ///
-    /// # When it returns `None`
-    ///
-    /// Snapshots require the immutable base, so this is a **paged-mode** feature
-    /// (`open_paged`). In resident mode (`open`) or the ephemeral in-memory store
-    /// there is no base to share, so this returns `None`. (unix only for now.)
-    #[cfg(unix)]
-    pub fn snapshot(&self) -> Option<ReadSnapshot> {
-        let base = self.topo_base.clone()?; // Arc bump — shares the immutable base
-        let payloads = self.payload_store.snapshot_reader()?; // own fd + shared mmap
-        let nodes = std::sync::Arc::new(self.nodes.clone()); // freeze the overlay
-        let collections = std::sync::Arc::new(self.collections.clone()); // freeze coll membership
-        Some(ReadSnapshot { base, nodes, collections, payloads })
-    }
-
     /// A **read-only `CoreDB`** frozen at this instant — the snapshot that indexed
     /// SQL runs against.
     ///
-    /// [`snapshot`](Self::snapshot) gives a `ReadSnapshot`, which can only do reads
-    /// that need no index (`get`, `scan`, `count`). This gives back a whole `CoreDB`,
+    /// Reads that need no index would only require the base plus the frozen
+    /// overlay; this gives back a whole `CoreDB` instead,
     /// so the *existing* query executor runs against it unchanged — `WHERE`, `MATCH`,
     /// `VECTOR_NEAR`, `BM25`, `ST_*` all work, and none of them touch the live
     /// database or its write lock.
@@ -4767,7 +4533,7 @@ impl CoreDB {
     /// - The write overlay and the resident index structures are **cloned**. That is
     ///   the real cost, and it grows with how much has been written since the last
     ///   `compact()` — so compaction frequency is the tuning knob, exactly as for
-    ///   `ReadSnapshot`.
+    ///   the overlay.
     ///
     /// # Why it is safe to hand around
     ///
@@ -7028,7 +6794,7 @@ impl CoreDB {
     }
 
     /// Every member payload of `collection` (base + overlay), as JSON strings — the
-    /// live-lock analogue of [`ReadSnapshot::scan`]. Used by `Engine::scan` when
+    /// live-lock analogue of [`CoreDB::snapshot_db`]. Used by `Engine::scan` when
     /// snapshot reads are off. Unindexed: reads every member's payload.
     #[allow(dead_code)] // used by the `engine` feature (Engine::scan fallback)
     pub(crate) fn collection_payloads(&self, collection: &str) -> Vec<String> {
@@ -7036,7 +6802,7 @@ impl CoreDB {
     }
 
     /// Bounded variant of [`CoreDB::collection_payloads`] — the live-lock analogue of
-    /// [`ReadSnapshot::scan_bounded`] (stops at `max_rows`/`max_bytes`).
+    /// [`CoreDB::snapshot_db`] (stops at `max_rows`/`max_bytes`).
     #[allow(dead_code)] // used by the `engine` feature (Engine::scan fallback)
     pub(crate) fn collection_payloads_bounded(
         &self,
@@ -7069,7 +6835,7 @@ impl CoreDB {
     }
 
     /// Number of members of `collection` (base + overlay). Live-lock analogue of
-    /// [`ReadSnapshot::count`].
+    /// [`CoreDB::snapshot_db`].
     #[allow(dead_code)] // used by the `engine` feature (Engine::count fallback)
     pub(crate) fn collection_count(&self, collection: &str) -> usize {
         self.collection_members(sk_hash(collection)).map_or(0, |m| m.len())
@@ -9202,7 +8968,7 @@ mod hybrid_query_tests {
         let mut db = CoreDB::open_paged(dir.path()).unwrap();
 
         // Photograph BEFORE any write — overlay is empty, so this view is the base.
-        let before = db.snapshot().expect("paged mode is snapshottable");
+        let before = db.snapshot_db().expect("paged mode is snapshottable");
 
         // Now write: a brand-new node + an update to a base node (lands in overlay).
         db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
@@ -9222,7 +8988,7 @@ mod hybrid_query_tests {
         assert_eq!(chloe_live["v"].as_f64().unwrap(), 2.0);
 
         // A snapshot taken AFTER the writes sees them (freshness by re-photographing).
-        let after = db.snapshot().unwrap();
+        let after = db.snapshot_db().unwrap();
         assert!(after.get("place/ubud").is_some(), "fresh snapshot sees the new node");
         let chloe_after: Value =
             serde_json::from_str(&after.get("tourist/chloe").unwrap()).unwrap();
@@ -9231,7 +8997,7 @@ mod hybrid_query_tests {
         // Resident/ephemeral mode has no immutable base → snapshots are unsupported.
         let resident_dir = tempfile::tempdir().unwrap();
         let resident = CoreDB::open(resident_dir.path()).unwrap();
-        assert!(resident.snapshot().is_none(), "resident mode must not offer snapshots");
+        assert!(resident.snapshot_db().is_none(), "resident mode must not offer snapshots");
     }
 
     #[test]
