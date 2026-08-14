@@ -266,3 +266,62 @@ fn stats_report_reality() {
     assert_eq!(s.snapshots, 1, "snapshot mints are counted");
     assert!(s.overlay_nodes >= 1, "the write overlay is reported (got {})", s.overlay_nodes);
 }
+
+/// **G1 — the transaction boundary.** A snapshot must capture a *committed* state,
+/// never a half-applied multi-statement transaction. Writes buffer in `pending_txn`
+/// until COMMIT, so a snapshot taken mid-transaction must show none of them, and one
+/// taken after COMMIT must show all of them.
+#[test]
+fn snapshot_never_sees_an_uncommitted_transaction() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE v (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO v (_key, n) VALUES ('base', 0)").unwrap();
+        db.compact().unwrap();
+    }
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO v (_key, n) VALUES ('t1', 1)").unwrap();
+    db.execute("INSERT INTO v (_key, n) VALUES ('t2', 2)").unwrap();
+
+    // Mid-transaction snapshots — neither kind may show the buffered rows.
+    let mid_db = db.snapshot_db().expect("snapshottable");
+    let mid_ro = db.snapshot().expect("snapshottable");
+    let rows = mid_db.query("SELECT _key FROM v").unwrap().collect();
+    assert_eq!(rows.len(), 1, "snapshot_db must not see an open transaction (saw {rows:?})");
+    assert!(mid_ro.get("v/t1").is_none(), "ReadSnapshot must not see an open transaction");
+    assert_eq!(mid_ro.count("v"), 1);
+
+    db.execute("COMMIT").unwrap();
+
+    // After COMMIT a fresh snapshot sees everything; the old ones stay frozen.
+    let after = db.snapshot_db().unwrap();
+    assert_eq!(after.query("SELECT _key FROM v").unwrap().collect().len(), 3);
+    assert_eq!(mid_db.query("SELECT _key FROM v").unwrap().collect().len(), 1,
+        "a snapshot taken earlier stays frozen after the commit");
+    assert_eq!(db.query("SELECT _key FROM v").unwrap().collect().len(), 3);
+}
+
+/// A rolled-back transaction must never appear in any snapshot either.
+#[test]
+fn snapshot_never_sees_a_rolled_back_transaction() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE v (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO v (_key, n) VALUES ('base', 0)").unwrap();
+        db.compact().unwrap();
+    }
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO v (_key, n) VALUES ('gone', 1)").unwrap();
+    db.execute("ROLLBACK").unwrap();
+
+    let snap = db.snapshot_db().unwrap();
+    assert_eq!(snap.query("SELECT _key FROM v").unwrap().collect().len(), 1,
+        "a rolled-back row must never appear in a snapshot");
+    assert_eq!(db.query("SELECT _key FROM v").unwrap().collect().len(), 1);
+}
