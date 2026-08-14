@@ -96,7 +96,7 @@ sekejap/
 │   │   ├── compact.rs            Compact index — flat arrays, not hash maps
 │   │   └── access.rs             One read interface, RAM or disk behind it
 │   │
-│   └── engine/                   CONCURRENCY & OPS (optional, feature=engine)
+│   └── engine/                   SERVICE MODE — concurrency & ops (open_as_service)
 │       ├── mod.rs                Engine — the front door: shares one CoreDB
 │       │                           across threads; query/execute; snapshot reads
 │       ├── guard.rs              The read/write lock (many readers OR one writer)

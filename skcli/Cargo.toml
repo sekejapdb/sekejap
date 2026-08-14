@@ -12,10 +12,11 @@ description = "CLI for the Sekejap embedded graph-first multimodel database"
 # wire-protocol listener (`sekejap pg`). Both on by default so the published CLI
 # runs out of the box; build with `--no-default-features` for a lean REPL-only
 # binary. The embedded `sekejap` library is unaffected either way. `pg` pulls no
-# extra crates — it uses only std + serde_json.
+# extra crates — it uses only std + serde_json. The library always ships the
+# sans-IO protocol logic; these flags only gate the CLI's own listeners.
 default = ["serve", "pg"]
-serve = ["dep:axum", "dep:tokio", "sekejap/serve"]
-pg = ["sekejap/pg"]
+serve = ["dep:axum", "dep:tokio"]
+pg = []
 
 [dependencies]
 sekejap.workspace = true

@@ -150,7 +150,7 @@ so it is never mistaken for accidental slowness.
 rustc -O /tmp/fsync_bench.rs -o /tmp/fsync_bench && /tmp/fsync_bench
 
 # durability-matched write benchmarks (engine feature)
-cargo bench --features engine --bench write_vs_sqlite
+cargo bench --bench write_vs_sqlite
 ```
 
 Measured 2026-07 on macOS (Darwin 25), Apple SSD. Numbers will differ on
