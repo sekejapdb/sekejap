@@ -872,6 +872,13 @@ pub struct Stats {
 pub struct CoreDB {
     /// Event counters + timings for [`CoreDB::stats`].
     pub(crate) counters: Counters,
+    /// Nodes deleted from the **mmap'd base** since the last `compact()`.
+    ///
+    /// The base is immutable, so a delete cannot be applied there. Instead the
+    /// hash is recorded here and every base-aware lookup treats it as absent;
+    /// `compact()` then drops those nodes for real and clears the set. Empty in
+    /// resident mode, where deletes just remove from the maps.
+    tombstones: HashSet<u64>,
     /// The primary map: node id (a `u64` hash of the slug) → its in-RAM record.
     nodes: HashMap<u64, NodeData>,
     /// Reverse lookup: human slug `"collection/key"` → node id.
@@ -1194,6 +1201,7 @@ impl CoreDB {
     pub fn new() -> Self {
         Self {
             counters: Counters::default(),
+            tombstones: HashSet::new(),
             nodes: HashMap::new(),
             slug_map: HashMap::new(),
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
@@ -1934,6 +1942,16 @@ impl CoreDB {
     fn remove_raw(&mut self, slug: &str) {
         self.note_key_change(slug);
         let hash = sk_hash(slug);
+        // Paged mode: a node that lives in the immutable base cannot be removed
+        // in place, so record a tombstone that every base-aware lookup honours
+        // until the next compact() folds it away for real.
+        if !self.nodes.contains_key(&hash)
+            && self.topo_base.as_ref().is_some_and(|b| b.resolve(hash).is_some())
+        {
+            self.tombstones.insert(hash);
+            self.slug_map.remove(slug);
+            return;
+        }
         if let Some(node) = self.nodes.remove(&hash) {
             self.slug_map.remove(slug);
             if !node.collection.is_empty() {
@@ -3597,6 +3615,18 @@ impl CoreDB {
             None => return Ok(()),
         };
 
+        // Paged mode: the store is `immutable base + RAM overlay`, but everything
+        // below rebuilds payloads.bin and the topology from `self.nodes` alone. Pull
+        // the base into the overlay first, or compaction would write a store
+        // containing only what had been written since the last compact — silently
+        // destroying every base-resident node.
+        //
+        // Tombstoned nodes are deliberately skipped: this is where a delete against
+        // the immutable base finally takes effect.
+        if self.topo_base.is_some() {
+            self.hydrate_base_into_overlay();
+        }
+
         // 1. Compact payload store: rebuild from live nodes only.
         // Must happen BEFORE build_snapshot() so the snapshot records the
         // new (post-compaction) offsets, not the pre-compaction ones.
@@ -4503,6 +4533,9 @@ impl CoreDB {
     /// the mapped base. Lean (no string materialization): this sits on the
     /// payload-read hot path.
     pub(crate) fn payload_loc(&self, hash: u64) -> Option<(u64, u32)> {
+        if self.tombstones.contains(&hash) {
+            return None;
+        }
         if let Some(n) = self.nodes.get(&hash) {
             return Some((n.payload_offset, n.payload_len));
         }
@@ -4554,6 +4587,7 @@ impl CoreDB {
         let snap = std::sync::Arc::new(CoreDB {
             // ── frozen write overlay ────────────────────────────────────────
             counters: Counters::default(), // a snapshot starts its own tally
+            tombstones: self.tombstones.clone(),
             nodes: self.nodes.clone(),
             slug_map: self.slug_map.clone(),
             collections: self.collections.clone(),
@@ -4818,6 +4852,9 @@ impl CoreDB {
 
     /// Base-aware node existence by hash (resident overlay or mmap base).
     pub(crate) fn node_exists(&self, h: u64) -> bool {
+        if self.tombstones.contains(&h) {
+            return false;
+        }
         self.nodes.contains_key(&h)
             || self.topo_base.as_ref().map_or(false, |b| b.resolve(h).is_some())
     }
@@ -6559,6 +6596,9 @@ impl CoreDB {
     // `self.nodes` / `self.edges` access outside lib.rs.
 
     pub(crate) fn node_data(&self, hash: u64) -> Option<std::borrow::Cow<'_, NodeData>> {
+        if self.tombstones.contains(&hash) {
+            return None;
+        }
         // Overlay first: anything written since open (or everything, in resident
         // mode) lives in the resident map and wins over the mapped base.
         if let Some(n) = self.nodes.get(&hash) {
@@ -6590,6 +6630,39 @@ impl CoreDB {
         self.topo_base.as_ref()?.collection_name_by_hash(coll_hash)
     }
 
+    /// Materialise every base-resident node into the RAM overlay, skipping
+    /// tombstones, and drop the base. Used by `compact()` in paged mode so the
+    /// rewrite covers the whole store rather than just recent writes.
+    ///
+    /// This is deliberately the one place that trades bounded RAM for correctness:
+    /// compaction rewrites everything anyway, and only node *metadata* is pulled in
+    /// — payload bytes stay on disk and are streamed through the temp file.
+    fn hydrate_base_into_overlay(&mut self) {
+        let Some(base) = self.topo_base.clone() else { return };
+        for h in base.all_hashes() {
+            if self.tombstones.contains(&h) || self.nodes.contains_key(&h) {
+                continue; // deleted, or the overlay already has a newer version
+            }
+            if let Some(nd) = self.node_data(h) {
+                let nd = nd.into_owned();
+                self.slug_map.insert(nd.slug.clone(), h);
+                if !nd.collection.is_empty() {
+                    let ch = sk_hash(&nd.collection);
+                    let members = self.collections.entry(ch).or_default();
+                    if !members.contains(&h) {
+                        members.push(h);
+                    }
+                    self.collection_names_map.entry(ch).or_insert_with(|| nd.collection.clone());
+                }
+                self.nodes.insert(h, nd);
+            }
+        }
+        // Everything now lives in the overlay; the old base is finished with and the
+        // tombstones it needed are satisfied.
+        self.topo_base = None;
+        self.tombstones.clear();
+    }
+
     pub(crate) fn all_hashes(&self) -> Vec<u64> {
         match &self.topo_base {
             None => self.nodes.keys().copied().collect(),
@@ -6598,6 +6671,10 @@ impl CoreDB {
                 // dedup keeps each hash once).
                 let mut set: HashSet<u64> = base.all_hashes().into_iter().collect();
                 set.extend(self.nodes.keys().copied());
+                // Deleted base nodes must not reappear in a full enumeration.
+                for t in &self.tombstones {
+                    set.remove(t);
+                }
                 set.into_iter().collect()
             }
         }
@@ -6769,6 +6846,23 @@ impl CoreDB {
     }
 
     pub(crate) fn collection_members(&self, hash: u64) -> Option<std::borrow::Cow<'_, [u64]>> {
+        // Deleted base nodes are still listed in the base posting list, so a
+        // tombstoned member has to be filtered out of every scan.
+        if !self.tombstones.is_empty() {
+            let mut merged: Vec<u64> = Vec::new();
+            if let Some(b) = self.topo_base.as_ref().and_then(|b| b.members_by_coll_hash(hash)) {
+                merged.extend(b);
+            }
+            if let Some(o) = self.collections.get(&hash) {
+                let seen: HashSet<u64> = merged.iter().copied().collect();
+                merged.extend(o.iter().copied().filter(|h| !seen.contains(h)));
+            }
+            if merged.is_empty() {
+                return None;
+            }
+            merged.retain(|h| !self.tombstones.contains(h));
+            return Some(std::borrow::Cow::Owned(merged));
+        }
         let overlay = self.collections.get(&hash);
         let base = self
             .topo_base
