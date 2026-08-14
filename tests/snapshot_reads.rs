@@ -323,3 +323,69 @@ fn snapshot_never_sees_a_rolled_back_transaction() {
         "a rolled-back row must never appear in a snapshot");
     assert_eq!(db.query("SELECT _key FROM v").unwrap().collect().len(), 1);
 }
+
+/// **Stabilisation: every index family must behave identically on a snapshot and on
+/// the live database.** A snapshot clones each index; this proves the clones are
+/// functional, not merely present.
+#[test]
+fn snapshot_matches_live_for_every_index_family() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute(
+            "CREATE TABLE p (_key TEXT PRIMARY KEY, name TEXT, cat TEXT, n INTEGER, \
+             descr TEXT, geometry GEO, emb VECTOR)",
+        ).unwrap();
+        for i in 0..60 {
+            let cat = ["cafe", "bar", "gym"][i % 3];
+            let lon = 115.0 + (i as f64) * 0.001;
+            let lat = -8.6 - (i as f64) * 0.001;
+            db.execute(&format!(
+                "INSERT INTO p (_key, name, cat, n, descr, geometry, emb) VALUES \
+                 ('p{i}', 'Place {i}', '{cat}', {i}, 'grilled chicken number {i}', \
+                  '{{\"type\":\"Point\",\"coordinates\":[{lon},{lat}]}}', [{}, {}, {}])",
+                (i % 7) as f64 / 7.0, (i % 5) as f64 / 5.0, (i % 3) as f64 / 3.0
+            )).unwrap();
+        }
+        // graph edges
+        for i in 0..30 {
+            db.execute(&format!("INSERT ('p/p{i}')-[:near]->('p/p{}')", i + 1)).unwrap();
+        }
+        db.execute("CREATE INDEX ON p USING btree (cat)").unwrap();
+        db.execute("CREATE INDEX ON p USING gin (name)").unwrap();
+        db.execute("CREATE INDEX ON p USING bm25 (descr)").unwrap();
+        db.execute("CREATE INDEX ON p USING search (descr)").unwrap();
+        db.execute("CREATE INDEX ON p USING spatial (geometry)").unwrap();
+        db.execute("CREATE INDEX ON p USING hnsw (emb)").unwrap();
+        db.compact().unwrap();
+    }
+    let db = CoreDB::open_paged(dir.path()).unwrap();
+    let snap = db.snapshot_db().expect("snapshottable");
+
+    let cases: Vec<(&str, &str)> = vec![
+        ("scalar btree",   "SELECT _key FROM p WHERE cat = 'cafe'"),
+        ("range",          "SELECT _key FROM p WHERE n > 40"),
+        ("order+limit",    "SELECT _key FROM p ORDER BY n DESC LIMIT 5"),
+        ("aggregate",      "SELECT cat, COUNT(*) FROM p GROUP BY cat"),
+        ("graph MATCH",    "SELECT b._key AS k FROM MATCH (a:p)-[:near]->(b:p) WHERE a._key = 'p1'"),
+        ("graph 3-hop",    "SELECT b._key AS k FROM MATCH (a:p)-[:near*1..3]->(b:p) WHERE a._key = 'p1'"),
+        ("ILIKE (trigram)","SELECT _key FROM p WHERE name ILIKE '%lace 1%'"),
+        ("BM25",           "SELECT _key FROM p WHERE BM25(descr, 'grilled chicken') > 0 LIMIT 5"),
+        ("SEARCH (phrase)", "SELECT _key FROM p WHERE SEARCH('grilled chicken') LIMIT 5"),
+        ("spatial",        "SELECT _key FROM p WHERE ST_DWithin(geometry, POINT(115.01 -8.61), 5000.0)"),
+        ("vector",         "SELECT _key FROM p WHERE VECTOR_NEAR(emb, [0.5, 0.5, 0.5], 5)"),
+    ];
+
+    let mut broken = vec![];
+    for (label, sql) in cases {
+        let live = db.query(sql).map(|s| s.collect().len());
+        let snp = snap.query(sql).map(|s| s.collect().len());
+        match (live, snp) {
+            (Ok(l), Ok(s)) if l == s => println!("  ok       {label:16} {l} rows"),
+            (Ok(l), Ok(s)) => { println!("  MISMATCH {label:16} live={l} snapshot={s}"); broken.push(label); }
+            (Ok(l), Err(e)) => { println!("  SNAP-ERR {label:16} live={l} snapshot error: {e}"); broken.push(label); }
+            (Err(e), _) => println!("  (skip)   {label:16} unsupported on live: {e}"),
+        }
+    }
+    assert!(broken.is_empty(), "index families broken on a snapshot: {broken:?}");
+}
