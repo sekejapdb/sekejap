@@ -991,6 +991,12 @@ impl MappedTopology {
     }
 
     /// `sk_hash(collection name) → name` (for collection_name lookups in paged mode).
+    /// Every collection name recorded in the base. Needed so callers that enumerate
+    /// collections do not miss ones that exist only in the mmap'd base.
+    pub fn collection_names(&self) -> &[String] {
+        &self.collections
+    }
+
     pub fn collection_name_by_hash(&self, coll_hash: u64) -> Option<&str> {
         self.coll_hash_to_id
             .get(&coll_hash)
