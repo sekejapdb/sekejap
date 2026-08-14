@@ -161,3 +161,66 @@ fn resident_mode_is_not_snapshottable() {
     .unwrap();
     assert!(db.snapshot().is_none(), "resident mode must not be snapshottable");
 }
+
+/// The payoff: a snapshot `CoreDB` runs the **full indexed query surface** — not
+/// just `get`/`scan`/`count` — and stays frozen while the live database moves on.
+#[test]
+fn snapshot_db_runs_indexed_sql() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE venues (_key TEXT PRIMARY KEY, name TEXT, cat TEXT, n INTEGER)")
+            .unwrap();
+        for i in 0..50 {
+            let cat = ["cafe", "bar", "gym"][i % 3];
+            db.execute(&format!(
+                "INSERT INTO venues (_key, name, cat, n) VALUES ('v{i}', 'Venue {i}', '{cat}', {i})"
+            ))
+            .unwrap();
+        }
+        db.execute("CREATE INDEX ON venues USING btree (cat)").unwrap();
+        db.execute("CREATE INDEX ON venues USING btree (n)").unwrap();
+        db.execute("CREATE INDEX ON venues USING bm25 (name)").unwrap();
+        db.compact().unwrap();
+    }
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+
+    let snap = db.snapshot_db().expect("paged mode is snapshottable");
+
+    // Indexed filter, ordering and aggregation all run on the snapshot.
+    let cafes = snap.query("SELECT _key FROM venues WHERE cat = 'cafe'").unwrap().collect();
+    assert!(!cafes.is_empty(), "indexed WHERE must return rows on a snapshot");
+    let all = snap.query("SELECT _key FROM venues").unwrap().collect();
+    assert_eq!(all.len(), 50);
+    let sorted = snap.query("SELECT _key FROM venues ORDER BY n DESC LIMIT 3").unwrap().collect();
+    assert_eq!(sorted.len(), 3);
+
+    // Now the live database moves on...
+    db.execute("INSERT INTO venues (_key, name, cat, n) VALUES ('v999', 'Late', 'cafe', 999)")
+        .unwrap();
+
+    // ...and the snapshot does not see it (point-in-time), while the live one does.
+    let after_snap = snap.query("SELECT _key FROM venues").unwrap().collect();
+    assert_eq!(after_snap.len(), 50, "snapshot must stay frozen at 50 rows");
+    let after_live = db.query("SELECT _key FROM venues").unwrap().collect();
+    assert_eq!(after_live.len(), 51, "live db sees its own write");
+}
+
+/// A snapshot must never mutate or compact the real database — its `Drop` in
+/// particular (CoreDB::drop compacts when `compact_on_close` + `data_dir` are set).
+#[test]
+fn snapshot_db_is_inert_on_drop() {
+    let (mut db, dir) = paged_db(10);
+    db.put("venues/extra", &json!({"_collection":"venues","_key":"extra"}).to_string()).unwrap();
+
+    let wal_before = std::fs::metadata(dir.path().join("wal.log")).map(|m| m.len()).unwrap_or(0);
+    {
+        let snap = db.snapshot_db().unwrap();
+        assert_eq!(snap.query("SELECT _key FROM venues").unwrap().collect().len(), 11);
+    } // snapshot dropped here — must not compact or write anything
+
+    let wal_after = std::fs::metadata(dir.path().join("wal.log")).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(wal_before, wal_after, "dropping a snapshot must not touch the WAL");
+    // The live database is untouched and still usable.
+    assert_eq!(db.query("SELECT _key FROM venues").unwrap().collect().len(), 11);
+}
