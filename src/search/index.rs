@@ -41,6 +41,7 @@ const POSITION_BUCKET_SIZE: usize = 8;
 /// `search.bin` (paged/disk-first mode) — the disk-first substrate: the blobs stay
 /// on disk (OS page cache holds hot pages) instead of being read into RAM. Several
 /// blobs of the same file share one `Arc<MmapView>`.
+#[derive(Clone)]
 pub(crate) enum Bytes {
     Owned(Vec<u8>),
     Mapped { view: Arc<MmapView>, off: usize, len: usize },
@@ -76,6 +77,7 @@ pub(crate) fn read_bitmap_slice(data: &[u8], offset: usize) -> Option<RoaringBit
 /// a slice of an mmap'd `search.bin`). Used for the field-scoped and position
 /// (proximity) bitmaps so they need not be read into RAM in paged mode. The base
 /// term postings (`fst_data`/`postings_data`) follow the same shape.
+#[derive(Clone)]
 pub(crate) struct MappedPostings {
     pub(crate) fst: Bytes,
     pub(crate) blob: Bytes,
@@ -166,6 +168,7 @@ fn bucket_from_key(k: &[u8]) -> u16 {
 /// regression). Paged mode serves it from a sorted `(hash:u64, slot:u32)` array in
 /// the mmap'd `search.bin` (12 B/rec, binary search) — so the ~O(N) HashMap (the
 /// largest resident piece of a mapped SEARCH index) never enters the heap.
+#[derive(Clone)]
 pub(crate) enum SlotIndex {
     Resident(HashMap<u64, u32>),
     Mapped(Bytes),
@@ -200,6 +203,7 @@ impl SlotIndex {
 
 /// slot → node hash. Resident `Vec<u64>` (heap mode, direct index — no regression) or
 /// a u64 array served from the mmap'd `search.bin` (paged, O(N)/8 B-per-doc off heap).
+#[derive(Clone)]
 pub(crate) enum IdMap {
     Owned(Vec<u64>),
     Mapped { view: std::sync::Arc<MmapView>, off: usize, count: usize },
@@ -225,6 +229,7 @@ impl IdMap {
 /// Per-doc field lengths (norms), doc-major `num_fields` u16 each. Resident jagged
 /// `Vec<Vec<u16>>` (borrowed slice, no regression) or a flat u16 array on the mmap
 /// (paged; O(N·fields)/2 B off heap). Only read by SEARCH_SCORE ranking.
+#[derive(Clone)]
 pub(crate) enum Norms {
     Owned(Vec<Vec<u16>>),
     Mapped { view: std::sync::Arc<MmapView>, off: usize, doc_count: usize, num_fields: usize },
@@ -244,6 +249,7 @@ impl Norms {
     }
 }
 
+#[derive(Clone)]
 pub struct SearchIndex {
     pub(crate) fields: Vec<String>,
     pub(crate) id_map: IdMap,

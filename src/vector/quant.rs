@@ -174,6 +174,7 @@ unsafe fn l2_u8_neon(a: &[u8], b: &[u8]) -> u32 {
 ///
 /// RAM = `n · dim` bytes (e.g. 1M × 128 = 128 MB) + the id map — 4× smaller than
 /// holding f32, and the *only* per-vector RAM cost of the disk-first index.
+#[derive(Clone)]
 pub struct QuantizedField {
     pub quantizer: ScalarQuantizer,
     pub dim: usize,
