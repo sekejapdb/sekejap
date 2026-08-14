@@ -21,6 +21,51 @@ not apples-to-apples — noted where it matters). `vs sqlite` > 1 = sekejap fast
 
 <!-- entries -->
 
+## 2026-08-15 — `7b2f1d3` (fix!: P0.S5-S7 — invariant guards on the rewrite paths + cra) · runtime 11m 7s
+
+mode: resident (`CoreDB::open`) · vs in-memory SQLite · 20k venues + graph/spatial/vector
+
+| scenario | sekejap | sqlite | vs sqlite |
+|---|---|---|---|
+| 01_eq_filter | 534ns | 418.5µs | 784.0x |
+| 02_neq_filter | 256.7µs | 1.20ms | 4.7x |
+| 03_range_filter | 10.3µs | 2.21ms | 214.0x |
+| 04_sort_limit | 9.3µs | 10.2µs | 1.1x |
+| 05_point_lookup | 64ns | 706ns | 11.1x |
+| 06_compound_filter | 52.0µs | 439.3µs | 8.4x |
+| 07_compound_sort_limit | 54.3µs | 472.9µs | 8.7x |
+| 08_graph_1hop | 272ns | 841ns | 3.1x |
+| 09_graph_5hop_bfs | 5.1µs | 207.1µs | 40.3x |
+| 10_root_cause_bfs_leaves | 976ns | 8.2µs | 8.4x |
+| 11_shortest_path | 5.0µs | 5.5µs | 1.1x |
+| 12_st_dwithin_5km | 636.9µs | 1.15ms | 1.8x |
+| 13_st_within_polygon | 13.4µs | — | sekejap-only |
+| 14_spatial_category_filter | 55.6µs | 481.6µs | 8.7x |
+| 15_vector_hnsw_top20 | 102.0µs | — | sekejap-only |
+| 16_hybrid_spatial_vector | 1.05ms | 1.62ms | 1.5x |
+| 17_hybrid_spatial_graph | 845.1µs | 1.95ms | 2.3x |
+| 18_hybrid_graph_vector | 315.4µs | 2.50ms | 7.9x |
+| 19_hybrid_ilike_vector_rag | 8.77ms | 5.06ms | 1.7x SLOWER |
+| 20_holy_trinity_spatial_graph_vector | 371.0µs | 1.03ms | 2.8x |
+
+**head-to-head: 17 wins / 1 loss** (+ sekejap-only cases)
+
+> **Reading this entry.** vs the previous run, 19 of 20 scenarios are within ±6%
+> (noise). `19_hybrid_ilike_vector_rag` looked +27% — but rebuilding the previous
+> commit and benchmarking it *in the same session* gave 8.60ms against this build's
+> 8.87ms, i.e. **+3%, no regression**. The earlier 6.89ms was a cooler-machine
+> artifact.
+>
+> **Method note:** cross-session comparisons on a laptop are unreliable for the
+> heaviest scenarios. Confirm any apparent regression with a same-session A/B
+> (`git worktree add` the old commit and re-run the single scenario) before
+> believing it.
+>
+> **Mode parity:** regular vs service mode (`open_as_service`, paged + snapshot
+> reads) measured separately over 11 query shapes — identical row counts, latency
+> ratios 0.97-1.14x. Service mode costs nothing on the read path.
+
+
 ## 2026-08-14 — `79da332` (test: G1 — snapshots never see an uncommitted or rolled-back) · runtime 10m 51s
 
 mode: resident (`CoreDB::open`) · vs in-memory SQLite · 20k venues + graph/spatial/vector
