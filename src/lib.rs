@@ -4577,7 +4577,9 @@ impl CoreDB {
     /// the mapped base. Lean (no string materialization): this sits on the
     /// payload-read hot path.
     pub(crate) fn payload_loc(&self, hash: u64) -> Option<(u64, u32)> {
-        if self.tombstones.contains(&hash) {
+        // `is_empty` first: with no pending base deletes this is a length check,
+        // not a hash lookup, so the hot read path pays essentially nothing.
+        if !self.tombstones.is_empty() && self.tombstones.contains(&hash) {
             return None;
         }
         if let Some(n) = self.nodes.get(&hash) {
@@ -4896,7 +4898,7 @@ impl CoreDB {
 
     /// Base-aware node existence by hash (resident overlay or mmap base).
     pub(crate) fn node_exists(&self, h: u64) -> bool {
-        if self.tombstones.contains(&h) {
+        if !self.tombstones.is_empty() && self.tombstones.contains(&h) {
             return false;
         }
         self.nodes.contains_key(&h)
@@ -6664,7 +6666,7 @@ impl CoreDB {
     // `self.nodes` / `self.edges` access outside lib.rs.
 
     pub(crate) fn node_data(&self, hash: u64) -> Option<std::borrow::Cow<'_, NodeData>> {
-        if self.tombstones.contains(&hash) {
+        if !self.tombstones.is_empty() && self.tombstones.contains(&hash) {
             return None;
         }
         // Overlay first: anything written since open (or everything, in resident
