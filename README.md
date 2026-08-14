@@ -49,27 +49,30 @@ It's a good fit for:
 
 ## How you'll run it
 
-One thing decides what you turn on: **is the database part of your app, or is it
+One thing decides how you open it: **is the database part of your app, or is it
 running as a service?**
 
-```toml
-# Cargo.toml — pick the line that matches your case
-sekejap = "0.16"                                          # inside your app
-sekejap = { version = "0.16", features = ["engine"] }     # run it as a service
+```rust
+// part of your app — starts and stops with it
+let mut db = sekejap::open("./mydb")?;
+
+// runs as a service — long-lived, looks after its own data
+let db = sekejap::open_as_service("/var/lib/app/db")?;
 ```
 
 | | what it is | example |
 |---|---|---|
-| **inside your app** | it starts and stops with the app | a mobile app, a game, an analysis script |
-| **as a service** | it keeps running and looks after its data | a small server, a robot, an IoT gateway — even for one person |
+| **`open`** | the database starts and stops with your app | a mobile app, a game, an analysis script |
+| **`open_as_service`** | it keeps running and looks after its data | a small server, a robot, an IoT gateway — even for one person |
 
-`engine` gives your app the things a database server normally does for you: many
-readers can read while one writer writes, writes are batched, the log is compacted
-as it grows, and indexes are rebuilt on a schedule you choose.
+`open_as_service` gives your app the things a database server normally does for
+you: reads don't wait behind writes, memory stays bounded over long runs, and the
+log is compacted as it grows. Many threads can share it — reads run in parallel,
+writes take turns.
 
-There is still **no separate server** to install, start or manage. These are
-functions your app calls, in your app's own process — which is why it is still an
-embedded database. Use the parts you need and ignore the rest.
+There is still **no separate server** to install, start or manage, and nothing
+extra to enable at build time. These are functions your app calls, in your app's
+own process — which is why it is still an embedded database.
 
 To reach a database from another machine, use the command-line tool: `sekejap serve`
 for HTTP, or `sekejap pg` so PostgreSQL clients can connect. See

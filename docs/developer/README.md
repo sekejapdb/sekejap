@@ -43,7 +43,7 @@ flowchart TB
   end
 
   %% ---------- CONCURRENCY WRAPPER ----------
-  subgraph ENG["Engine — concurrency wrapper (feature=engine)"]
+  subgraph ENG["Engine — service mode (open_as_service)"]
     direction LR
     LOCK["RwLock: parallel readers,<br/>brief exclusive writes"]
     BUF["Write buffering<br/><i>engine/buffer.rs</i>"]
@@ -168,7 +168,7 @@ flowchart LR
     SC["scalar.rs — SQL scalar functions"]
     GE["geo.rs — geodesic spatial (PostGIS-compatible)"]
 
-    subgraph M_ENG["engine/ (feature=engine)"]
+    subgraph M_ENG["engine/ (service mode)"]
       E1["mod, buffer"]
       E2["guard"]
     end
@@ -214,8 +214,9 @@ flowchart LR
 - **The RAM/disk split (diagram 3) is the core promise.** The dashed arrows
   (positional reads, mmap slices) are how bulk data stays on disk until the
   moment it is needed.
-- Feature-gated modules — `engine`, `serve`, `pg` — are opt-in: the
-  minimal build is just the embedded core.
+- There are no build-time feature flags for the service, HTTP or Postgres-wire
+  surfaces — they are always compiled (they carry no dependencies). Which one you
+  get is a runtime choice: `open` vs `open_as_service`.
 
 ---
 
@@ -240,7 +241,7 @@ sekejap/
 │   ├── text_index/       trigram GIN for ILIKE
 │   ├── storage/          WAL, SKBIN payloads, topology (CSR), vector
 │   │                     stores, mmap field indexes
-│   ├── engine/           optional concurrency wrapper (feature=engine)
+│   ├── engine/           service mode: concurrency + ops (open_as_service)
 │   ├── serve.rs          HTTP adapter, sans-IO (feature=serve)
 │   └── pg.rs             Postgres-wire adapter, sans-IO (feature=pg)
 ├── skcli/                the command-line tool (query runner, serve, pg)
@@ -255,7 +256,7 @@ sekejap/
 
 ```sh
 cargo build                    # core library
-cargo build --all-features     # + engine, serve, pg
+cargo build --all-features     # + benchmark-only extras
 cargo test                     # full suite (unit + integration)
 cargo bench --bench mega_benchmark   # 20-scenario local benchmark vs SQLite
 ```

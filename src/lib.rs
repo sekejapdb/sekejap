@@ -72,15 +72,12 @@
 //! ```
 
 pub mod bm25;
-#[cfg(feature = "engine")]
 pub mod engine;
 pub mod geo;
-#[cfg(feature = "pg")]
 pub mod pg;
 mod query;
 pub mod scalar;
 pub mod search;
-#[cfg(feature = "serve")]
 pub mod serve;
 pub mod sql;
 mod storage;
@@ -88,6 +85,47 @@ pub mod text_index;
 pub mod vector;
 
 pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
+
+// ── The two ways to open a database ──────────────────────────────────────────
+//
+// Which one you want depends on a single question: is the database part of your
+// app, or is it running as a service?
+
+/// Open a database that lives **inside your app** — it starts and stops with the
+/// program. A mobile app, a game, an analysis script.
+///
+/// One process, one writer, nothing extra running. This is what the defaults are
+/// tuned for: fast startup, small memory, quick single-threaded queries.
+///
+/// Creates the directory if it doesn't exist.
+///
+/// ```rust,no_run
+/// let mut db = sekejap::open("./mydb")?;
+/// db.put("users/alice", r#"{"_collection":"users","_key":"alice"}"#)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// Use [`open_as_service`] instead if the database keeps running and serves others.
+pub fn open(path: impl AsRef<Path>) -> io::Result<CoreDB> {
+    CoreDB::open(path)
+}
+
+/// Open a database that **runs as a service** — long-lived, looking after its own
+/// data: a small server, a robot, an IoT gateway. Even when it serves one person.
+///
+/// Compared with [`open`], reads don't wait behind writes, memory stays bounded
+/// over long runs, and it compacts itself. See [`engine::Engine::open_as_service`]
+/// for the details and the trade-offs.
+///
+/// ```rust,no_run
+/// let db = sekejap::open_as_service("/var/lib/app/db")?;
+/// let row = db.get("venues/v1");   // lock-free, even while a write is running
+/// # Ok::<(), String>(())
+/// ```
+pub fn open_as_service(path: impl AsRef<Path>) -> Result<engine::Engine, String> {
+    let p = path.as_ref().to_str().ok_or("database path is not valid UTF-8")?;
+    engine::Engine::open_as_service(p)
+}
 
 pub use query::{CmpOp, DestWhere, Hit, MathExpr, MatchAggReturn, MatchAggStart, MatchAggStmt, Set, Step, VecMetric, WhereValue, WithExpr, WithOutExpr, WithRow, WithStage};
 pub use sql::{CompiledMutation, EdgeDelete, EdgeInsert, FieldDef, FieldType, PreparedQuery, SqlError, TableSchema};
@@ -3405,7 +3443,6 @@ impl CoreDB {
     /// un-synced batch — the same all-or-nothing guarantee, per-record CRC intact).
     /// Nesting-safe: the previous defer state is saved and restored, so an inner
     /// batch (e.g. a multi-row INSERT) never prematurely flushes an outer group.
-    #[cfg(feature = "engine")]
     pub(crate) fn execute_batch_grouped(&mut self, stmts: &[String]) -> Result<usize, SqlError> {
         let prev = self.defer_wal_sync;
         self.defer_wal_sync = true;
@@ -9532,7 +9569,6 @@ mod hybrid_query_tests {
     }
 
     #[test]
-    #[cfg(feature = "engine")]
     fn auto_compact_fires_after_a_grouped_batch() {
         // Regression: every statement inside `execute_batch_grouped` runs with
         // `defer_wal_sync = true`, which short-circuits `autocompact_after_write`.

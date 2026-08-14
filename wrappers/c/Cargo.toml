@@ -12,12 +12,6 @@ description = "C ABI for sekejap — a stable extern \"C\" surface for binding f
 name = "sekejap"
 crate-type = ["cdylib", "staticlib"]
 
-[features]
-# Expose the concurrent, thread-safe `Engine` handle (SekejapEngine*) — the base
-# for building a multi-threaded sekejap server in any language. Off by default so
-# a plain build stays minimal (single-threaded CoreDB handle only).
-engine = ["sekejap/engine"]
-
 [dependencies]
 sekejap = { workspace = true }
 serde_json = "1"

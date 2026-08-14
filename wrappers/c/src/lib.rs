@@ -759,7 +759,6 @@ pub extern "C" fn sekejap_version() -> *const c_char {
 // building a sekejap server in any language. Errors are thread-local (like
 // `errno`): each thread reads its own last error via `sekejap_engine_last_error`.
 
-#[cfg(feature = "engine")]
 mod engine_abi {
     use super::{cstr, into_c_string, parse_params};
     use sekejap::engine::Engine;
@@ -995,7 +994,6 @@ mod engine_abi {
     }
 }
 
-#[cfg(feature = "engine")]
 pub use engine_abi::*;
 
 #[cfg(test)]
@@ -1151,8 +1149,7 @@ mod tests {
     // concurrently by many reader threads AND a writer thread at the same time —
     // exactly what a server does. No data race (the handle is Send+Sync), reads
     // stay correct, writes land, and a final flush is durable.
-    #[cfg(feature = "engine")]
-    #[test]
+        #[test]
     fn engine_handle_is_concurrent_and_safe() {
         use std::sync::Arc;
         use std::thread;

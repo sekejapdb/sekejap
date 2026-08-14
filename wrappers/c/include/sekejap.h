@@ -1,5 +1,5 @@
 /*
- * sekejap.h — C ABI for sekejap (https://sekejap.zebflow.com)
+ * sekejap.h — C ABI for sekejap (https://sekejap.life)
  *
  * AUTO-GENERATED from sekejap-capi/src/lib.rs by cbindgen. Do not edit by hand.
  *
@@ -26,12 +26,10 @@
 // destroyed by [`sekejap_close`]. Treat as a black box from C.
 typedef struct SekejapDb SekejapDb;
 
-#if defined(SEKEJAP_ENGINE)
 // Opaque thread-safe engine handle. `Engine` is `Send + Sync`, so the same
 // `*mut SekejapEngine` may be used concurrently from many threads (do not,
 // however, call `sekejap_engine_close` while other threads are still using it).
 typedef struct SekejapEngine SekejapEngine;
-#endif
 
 // A prepared (compiled) query. Parse the SQL once with [`sekejap_prepare`], run
 // it many times with different parameters via [`sekejap_query_prepared`], and
@@ -260,29 +258,22 @@ void sekejap_string_free(char *s);
 // The sekejap-capi version, as a static null-terminated string. Do NOT free.
 const char *sekejap_version(void);
 
-#if defined(SEKEJAP_ENGINE)
 // Open (or create) a thread-safe engine at `path`. Returns null on failure.
 //
 // # Safety
 // `path` must be a valid null-terminated UTF-8 C string.
 SekejapEngine *sekejap_engine_open(const char *path);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Open an in-memory (ephemeral) thread-safe engine. Never fails → non-null.
 SekejapEngine *sekejap_engine_open_memory(void);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Close an engine handle and free its resources. Safe with null. Do NOT call
 // while other threads are still using this handle.
 //
 // # Safety
 // `e` must be null or a handle from `sekejap_engine_open*`, not yet closed.
 void sekejap_engine_close(SekejapEngine *e);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Run a `SELECT` — CONCURRENT-SAFE (takes a read lock; many run in parallel).
 // Returns a heap JSON-array string, or null on error. Free with
 // `sekejap_string_free`.
@@ -290,26 +281,20 @@ void sekejap_engine_close(SekejapEngine *e);
 // # Safety
 // `e` a live handle; `sql` valid null-terminated UTF-8.
 char *sekejap_engine_query(const SekejapEngine *e, const char *sql);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Parameterized `SELECT` (positional `$1` from a JSON array). Concurrent-safe.
 //
 // # Safety
 // `e` a live handle; `sql`/`params_json` valid UTF-8 (params_json may be null).
 char *sekejap_engine_query_params(const SekejapEngine *e, const char *sql, const char *params_json);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Run a mutating statement — writes are SERIALIZED (one writer at a time)
 // while reads continue in parallel. Returns affected rows, or -1.
 //
 // # Safety
 // `e` a live handle; `sql` valid null-terminated UTF-8.
 long sekejap_engine_execute(const SekejapEngine *e, const char *sql);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Parameterized mutating statement (injection-safe). Returns affected rows, or -1.
 //
 // # Safety
@@ -317,39 +302,30 @@ long sekejap_engine_execute(const SekejapEngine *e, const char *sql);
 long sekejap_engine_execute_params(const SekejapEngine *e,
                                    const char *sql,
                                    const char *params_json);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Flush the write buffer to disk under one fsync (group commit). Returns the
 // number of buffered rows committed, or -1.
 //
 // # Safety
 // `e` must be a live handle.
 long sekejap_engine_flush(const SekejapEngine *e);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Compact the engine's store. `0` on success, `-1` on error.
 //
 // # Safety
 // `e` must be a live handle.
 int32_t sekejap_engine_compact(const SekejapEngine *e);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // Reclaim excess in-RAM capacity (cheap; never drops data/indexes).
 //
 // # Safety
 // `e` must be a live handle.
 void sekejap_engine_trim_memory(const SekejapEngine *e);
-#endif
 
-#if defined(SEKEJAP_ENGINE)
 // The calling thread's last engine error as a heap C string, or null if the
 // last engine call on THIS thread succeeded. Free with `sekejap_string_free`.
 // (Thread-local — like `errno` — so concurrent callers don't clobber each other.)
 char *sekejap_engine_last_error(void);
-#endif
 
 #ifdef __cplusplus
 }  // extern "C"

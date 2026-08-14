@@ -12,8 +12,6 @@
 //! spatial queries, vector search, full-text search, and standard CRUD — all
 //! through [`Engine::query()`] and [`Engine::execute()`].
 //!
-//! Gated behind `#[cfg(feature = "engine")]`. Zero cost when disabled.
-//!
 //! # Quick start
 //!
 //! ```rust,no_run
@@ -131,6 +129,40 @@ impl Engine {
             scan_max_rows: None,
             scan_max_bytes: None,
         }
+    }
+
+    /// Open a database that runs **as a service** — something long-lived that keeps
+    /// running and looks after its own data: a small server, a robot, an IoT
+    /// gateway. Even when it serves only one person.
+    ///
+    /// Use [`CoreDB::open`] instead when the database is simply part of your app and
+    /// starts and stops with it (a mobile app, a game, an analysis script).
+    ///
+    /// What you get here that a plain open doesn't give you:
+    ///
+    /// - **Reads don't wait for writes.** Readers work from a shared point-in-time
+    ///   snapshot the writer refreshes after commits, so a long write never freezes
+    ///   them. (Today this covers [`get`](Engine::get), [`scan`](Engine::scan) and
+    ///   [`count`](Engine::count); indexed `query()` still takes a shared lock.)
+    /// - **Memory stays bounded** over weeks of running, because the store is opened
+    ///   in paged mode: the bulk lives in memory-mapped files, not the heap.
+    /// - **It compacts itself** as the write-ahead log grows.
+    /// - **Many threads can share it** — reads run in parallel, writes take turns.
+    ///
+    /// There is still no separate server process: these are functions your app calls,
+    /// in your app's own process.
+    ///
+    /// ```rust,no_run
+    /// let db = sekejap::open_as_service("/var/lib/app/db")?;
+    /// let row = db.get("venues/v1");          // lock-free, even while writing
+    /// db.execute("INSERT INTO venues (_key) VALUES ('v2')")?;
+    /// # Ok::<(), String>(())
+    /// ```
+    ///
+    /// For finer control (read-only, buffer size, staleness bound, scan caps) use
+    /// [`Engine::builder`].
+    pub fn open_as_service(path: &str) -> Result<Engine, String> {
+        Engine::builder(path).snapshot_reads(true).build()
     }
 
     /// Create an in-memory Engine (no persistence).
@@ -584,26 +616,17 @@ impl EngineBuilder {
 
     /// Build the Engine, opening (or creating) the database at the configured path.
     pub fn build(self) -> Result<Engine, String> {
-
-
-        let use_remote_only = false;
-
         // Snapshot reads need paged mode (the immutable base) and a writable engine;
         // unix-only. When on, open paged so the store is snapshottable.
-        let want_paged = cfg!(unix) && self.snapshot_reads && !self.read_only && !use_remote_only;
+        let want_paged = cfg!(unix) && self.snapshot_reads && !self.read_only;
 
-        let db;
-
-
-        {
-            db = if self.read_only {
-                CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
-            } else if want_paged {
-                CoreDB::open_paged(&self.path).map_err(|e| e.to_string())?
-            } else {
-                CoreDB::open(&self.path).map_err(|e| e.to_string())?
-            };
-        }
+        let db = if self.read_only {
+            CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
+        } else if want_paged {
+            CoreDB::open_paged(&self.path).map_err(|e| e.to_string())?
+        } else {
+            CoreDB::open(&self.path).map_err(|e| e.to_string())?
+        };
 
         // Seed the initial published snapshot (unix + paged). If the store isn't
         // actually snapshottable, this stays None and `get` uses the read lock.
@@ -675,6 +698,45 @@ mod snapshot_read_tests {
         engine.insert_prepared(&ins, &[json!("v2"), json!(2)]).unwrap();
         engine.refresh_snapshot();
         assert!(engine.get("venues/v2").is_some(), "get sees committed write after refresh");
+    }
+
+    /// `open_as_service` must actually deliver the service behaviour: a working
+    /// database whose reads are served lock-free from a published snapshot.
+    #[test]
+    fn open_as_service_gives_lock_free_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-create + compact so the paged open has an immutable base.
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.put("venues/v1", &json!({"_collection":"venues","_key":"v1","n":1}).to_string())
+                .unwrap();
+            db.compact().unwrap();
+        }
+
+        let db = Engine::open_as_service(dir.path().to_str().unwrap()).unwrap();
+
+        // The promise: reads come from a snapshot, not the write lock.
+        assert!(db.snapshot().is_some(), "service mode must publish a snapshot");
+        assert!(db.get("venues/v1").unwrap().contains("\"n\":1"));
+        assert_eq!(db.count("venues"), 1);
+
+        // And it is still a normal, writable database.
+        let ins = db.prepare_insert("venues", &["_key", "n"]).unwrap();
+        db.insert_prepared(&ins, &[json!("v2"), json!(2)]).unwrap();
+        db.refresh_snapshot();
+        assert_eq!(db.count("venues"), 2);
+        assert!(!db.is_read_only());
+    }
+
+    /// The plain `open` path stays embedded: no snapshot machinery is created, so a
+    /// single-threaded user pays nothing for the service features.
+    #[test]
+    fn plain_open_stays_embedded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = crate::open(dir.path()).unwrap();
+        db.put("t/a", &json!({"_collection":"t","_key":"a"}).to_string()).unwrap();
+        assert!(db.snapshot().is_none(), "resident mode is not snapshottable");
+        assert!(db.get("t/a").is_some());
     }
 
     /// Engine scan/count over a collection: lock-free via the published snapshot,

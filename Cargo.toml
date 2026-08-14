@@ -54,15 +54,10 @@ surrealdb    = { version = "2", optional = true, default-features = false, featu
 
 [features]
 default = []
-engine = []
-# Sans-IO HTTP service dispatch (`sekejap::serve`). Pure protocol logic — no
-# sockets/async/framework, zero new deps. Consumers (the CLI, language wrappers)
-# own the transport and call `serve::handle`.
-serve = []
-# Sans-IO PostgreSQL wire protocol (`sekejap::pg::Connection`). Feed it socket
-# bytes, get reply bytes — no sockets/threads/deps. The CLI's `sekejap pg` and any
-# downstream app own the transport.
-pg = []
+# NOTE: `engine`, `serve` and `pg` used to be features. They gated zero-dependency
+# code, so the flag bought nothing but build-matrix complexity — and it made the
+# service API unreachable from the language wrappers, none of which enabled it.
+# They are now always compiled; `open_as_service()` is the runtime switch instead.
 # Build the mega_vs_surreal benchmark (pulls SurrealDB + a tokio runtime).
 surreal-bench = ["dep:surrealdb", "dep:tokio"]
 
@@ -119,19 +114,16 @@ harness = false
 name = "write_stress"
 path = "benches/write/stress.rs"
 harness = false
-required-features = ["engine"]
 
 [[bench]]
 name = "write_scaling"
 path = "benches/write/scaling.rs"
 harness = false
-required-features = ["engine"]
 
 [[bench]]
 name = "write_vs_sqlite"
 path = "benches/write/vs_sqlite.rs"
 harness = false
-required-features = ["engine"]
 
 [[bench]]
 name = "edge_scale"
