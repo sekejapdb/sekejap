@@ -224,3 +224,45 @@ fn snapshot_db_is_inert_on_drop() {
     // The live database is untouched and still usable.
     assert_eq!(db.query("SELECT _key FROM venues").unwrap().collect().len(), 11);
 }
+
+/// Stats must report real numbers, not placeholders: sizes reflect the data,
+/// counters move when work happens, and snapshot timing is recorded.
+#[test]
+fn stats_report_reality() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut db = CoreDB::open(dir.path()).unwrap();
+    db.execute("CREATE TABLE v (_key TEXT PRIMARY KEY, cat TEXT)").unwrap();
+    for i in 0..20 {
+        db.execute(&format!("INSERT INTO v (_key, cat) VALUES ('v{i}', 'cafe')")).unwrap();
+    }
+    db.execute("CREATE INDEX ON v USING btree (cat)").unwrap();
+
+    let s = db.stats();
+    assert_eq!(s.nodes, 20, "node count reflects the data");
+    assert_eq!(s.collections, 1);
+    assert!(s.writes >= 20, "durable writes are counted (got {})", s.writes);
+    assert!(s.field_indexes >= 1, "the btree index is reported");
+    assert!(s.wal_bytes > 0, "wal size is measured");
+    assert!(!s.paged, "a plain open is resident");
+    assert_eq!(s.compactions, 0);
+
+    let before = db.stats().queries;
+    let _ = db.query("SELECT _key FROM v").unwrap().collect();
+    assert_eq!(db.stats().queries, before + 1, "queries are counted");
+
+    db.compact().unwrap();
+    let s = db.stats();
+    assert_eq!(s.compactions, 1, "compaction is counted");
+    assert!(s.last_compact_us > 0, "compaction duration is recorded");
+    assert!(s.payload_bytes > 0, "payload size is measured after compact");
+
+    // Paged reopen: snapshot minting is timed, and the overlay is visible.
+    drop(db);
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    db.put("v/extra", &json!({"_collection":"v","_key":"extra"}).to_string()).unwrap();
+    let _snap = db.snapshot_db().unwrap();
+    let s = db.stats();
+    assert!(s.paged, "reopened paged");
+    assert_eq!(s.snapshots, 1, "snapshot mints are counted");
+    assert!(s.overlay_nodes >= 1, "the write overlay is reported (got {})", s.overlay_nodes);
+}

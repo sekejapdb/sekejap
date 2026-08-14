@@ -993,7 +993,85 @@ pub(crate) struct BfsPath {
 /// - **Schema** — `schemas` (from `CREATE TABLE`) and `materialized_views`.
 /// - **Durability & config** — `wal` (+ `wal_format`, `wal_sync`), `data_dir`,
 ///   the auto-compaction thresholds, and the change-feed bookkeeping.
+/// Cheap event counters kept by a live database. All relaxed atomics: a read path
+/// only ever does one increment (~a nanosecond against a query measured in
+/// microseconds), so an embedded user pays nothing meaningful for them.
+#[derive(Default)]
+pub(crate) struct Counters {
+    queries: std::sync::atomic::AtomicU64,
+    writes: std::sync::atomic::AtomicU64,
+    compactions: std::sync::atomic::AtomicU64,
+    snapshots: std::sync::atomic::AtomicU64,
+    compact_us_last: std::sync::atomic::AtomicU64,
+    compact_us_max: std::sync::atomic::AtomicU64,
+    snapshot_us_last: std::sync::atomic::AtomicU64,
+    snapshot_us_max: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time picture of what the database is holding and what it has done —
+/// the answer to "how big is this, and why was that slow".
+///
+/// Gathered by [`CoreDB::stats`]. Sizes are measured when you ask; counters and
+/// timings accumulate from the moment the database was opened.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Stats {
+    // ── how big is it ───────────────────────────────────────────────────────
+    /// Nodes visible now (mmap'd base + in-RAM overlay).
+    pub nodes: usize,
+    /// Edges visible now.
+    pub edges: usize,
+    /// Distinct collections.
+    pub collections: usize,
+    /// Nodes sitting in the RAM write-overlay — i.e. written since the last
+    /// `compact()`. This is what a snapshot has to copy, so it is the number to
+    /// watch if snapshot minting feels expensive.
+    pub overlay_nodes: usize,
+    /// Size of `payloads.bin` on disk, bytes.
+    pub payload_bytes: u64,
+    /// Size of `wal.log` on disk, bytes. Auto-compaction triggers off this.
+    pub wal_bytes: u64,
+    /// Whether this store is paged (mmap'd base) rather than fully resident.
+    pub paged: bool,
+
+    // ── indexes ─────────────────────────────────────────────────────────────
+    /// Scalar btree/hash field indexes (heap overlay + mmap'd base).
+    pub field_indexes: usize,
+    /// Vector (HNSW) indexes.
+    pub hnsw_indexes: usize,
+    /// BM25 relevance indexes.
+    pub bm25_indexes: usize,
+    /// Positional search indexes.
+    pub search_indexes: usize,
+    /// Trigram (GIN + GiST) indexes for `ILIKE`.
+    pub trigram_indexes: usize,
+    /// Whether a spatial index is built.
+    pub spatial_index: bool,
+
+    // ── what has happened since open ────────────────────────────────────────
+    /// Queries executed.
+    pub queries: u64,
+    /// Durable mutations written to the WAL.
+    pub writes: u64,
+    /// Compactions run.
+    pub compactions: u64,
+    /// Snapshots minted (`snapshot` + `snapshot_db`).
+    pub snapshots: u64,
+
+    // ── how long the slow things took ───────────────────────────────────────
+    /// Most recent compaction, microseconds. Compaction holds the write lock, so
+    /// this is how long writers were stalled.
+    pub last_compact_us: u64,
+    /// Slowest compaction seen, microseconds.
+    pub max_compact_us: u64,
+    /// Most recent snapshot mint, microseconds.
+    pub last_snapshot_us: u64,
+    /// Slowest snapshot mint seen, microseconds.
+    pub max_snapshot_us: u64,
+}
+
 pub struct CoreDB {
+    /// Event counters + timings for [`CoreDB::stats`].
+    pub(crate) counters: Counters,
     /// The primary map: node id (a `u64` hash of the slug) → its in-RAM record.
     nodes: HashMap<u64, NodeData>,
     /// Reverse lookup: human slug `"collection/key"` → node id.
@@ -1315,6 +1393,7 @@ impl CoreDB {
     /// Create a new in-memory database (no persistence).
     pub fn new() -> Self {
         Self {
+            counters: Counters::default(),
             nodes: HashMap::new(),
             slug_map: HashMap::new(),
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
@@ -2727,6 +2806,7 @@ impl CoreDB {
     ///   `Off` defer the fsync to the next checkpoint/compact. That's the standard
     ///   mobile trade-off — a per-write fsync on phone flash costs tens of ms.
     fn wal_write(&mut self, entry: WalEntry) {
+        self.counters.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(wal) = &mut self.wal {
             // `.expect(...)` panics on failure: a disk write error here is not
             // something the caller can recover from without risking corruption.
@@ -3701,6 +3781,16 @@ impl CoreDB {
     /// the old, still-valid files in place. Memory-only databases have no files,
     /// so this is a no-op for them.
     pub fn compact(&mut self) -> io::Result<()> {
+        let t0 = std::time::Instant::now();
+        let r = self.compact_inner();
+        let us = t0.elapsed().as_micros() as u64;
+        self.counters.compactions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.counters.compact_us_last.store(us, std::sync::atomic::Ordering::Relaxed);
+        self.counters.compact_us_max.fetch_max(us, std::sync::atomic::Ordering::Relaxed);
+        r
+    }
+
+    fn compact_inner(&mut self) -> io::Result<()> {
         // No data directory ⇒ ephemeral in-memory DB ⇒ nothing on disk to compact.
         let dir = match self.data_dir.clone() {
             Some(d) => d,
@@ -4691,11 +4781,13 @@ impl CoreDB {
     /// [`snapshot`](Self::snapshot).
     #[cfg(unix)]
     pub fn snapshot_db(&self) -> Option<std::sync::Arc<CoreDB>> {
+        let t0 = std::time::Instant::now();
         let topo_base = Some(self.topo_base.clone()?); // shared immutable base
         let payload_store = self.payload_store.read_only_clone()?; // own fd, shared mmap
 
-        Some(std::sync::Arc::new(CoreDB {
+        let snap = std::sync::Arc::new(CoreDB {
             // ── frozen write overlay ────────────────────────────────────────
+            counters: Counters::default(), // a snapshot starts its own tally
             nodes: self.nodes.clone(),
             slug_map: self.slug_map.clone(),
             collections: self.collections.clone(),
@@ -4753,7 +4845,12 @@ impl CoreDB {
             wal_format: self.wal_format,
             logical_wal: self.logical_wal,
             wal_sync_level: self.wal_sync_level,
-        }))
+        });
+        let us = t0.elapsed().as_micros() as u64;
+        self.counters.snapshots.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.counters.snapshot_us_last.store(us, std::sync::atomic::Ordering::Relaxed);
+        self.counters.snapshot_us_max.fetch_max(us, std::sync::atomic::Ordering::Relaxed);
+        Some(snap)
     }
 
     /// Parse and return the JSON payload for a node hash. Returns `None` if
@@ -4960,6 +5057,58 @@ impl CoreDB {
     }
 
     /// Total number of nodes.
+    /// What this database is holding, and what it has done since it was opened.
+    ///
+    /// Sizes are measured now; counters and timings accumulate from open. Cheap —
+    /// no index is walked, only lengths and two file sizes are read.
+    ///
+    /// ```rust,no_run
+    /// let db = sekejap::open("./mydb")?;
+    /// let s = db.stats();
+    /// println!("{} nodes, {} in the write overlay", s.nodes, s.overlay_nodes);
+    /// println!("last compaction took {} µs", s.last_compact_us);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn stats(&self) -> Stats {
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        let file_len = |name: &str| {
+            self.data_dir
+                .as_ref()
+                .and_then(|d| std::fs::metadata(d.join(name)).ok())
+                .map(|m| m.len())
+                .unwrap_or(0)
+        };
+        Stats {
+            nodes: self.node_count(),
+            edges: self.edge_count(),
+            collections: self.collection_names().len(),
+            // In paged mode the resident map IS the overlay; resident mode holds
+            // everything, so "overlay" is only meaningful when paged.
+            overlay_nodes: if self.topo_base.is_some() { self.nodes.len() } else { 0 },
+            payload_bytes: file_len("payloads.bin"),
+            wal_bytes: file_len("wal.log"),
+            paged: self.topo_base.is_some(),
+
+            field_indexes: self.field_indexes.len() + self.field_base.len(),
+            hnsw_indexes: self.hnsw_indexes.len(),
+            bm25_indexes: self.bm25_indexes.len(),
+            search_indexes: self.search_indexes.len(),
+            trigram_indexes: self.gin_indexes.len() + self.text_indexes.len(),
+            // `Some` alone is not meaningful — an empty grid gets built eagerly.
+            spatial_index: self.spatial_grid.as_ref().is_some_and(|g| g.len() > 0),
+
+            queries: load(&self.counters.queries),
+            writes: load(&self.counters.writes),
+            compactions: load(&self.counters.compactions),
+            snapshots: load(&self.counters.snapshots),
+
+            last_compact_us: load(&self.counters.compact_us_last),
+            max_compact_us: load(&self.counters.compact_us_max),
+            last_snapshot_us: load(&self.counters.snapshot_us_last),
+            max_snapshot_us: load(&self.counters.snapshot_us_max),
+        }
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -5423,6 +5572,7 @@ impl CoreDB {
     /// assert_eq!(hits[0].slug, "alice");
     /// ```
     pub fn query(&self, sql: &str) -> Result<Set<'_>, SqlError> {
+        self.counters.queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // `SHOW TABLES` / `SHOW EDGES …` / `SHOW <table>` return metadata rather than
         // rows — route them to the show path so `query("SHOW TABLES")` just works.
         if sql

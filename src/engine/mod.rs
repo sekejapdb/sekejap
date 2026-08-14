@@ -453,6 +453,15 @@ impl Engine {
         Ok(total)
     }
 
+    /// What the database is holding and what it has done — see [`CoreDB::stats`].
+    ///
+    /// Always read from the **live** database, not the published snapshot, so the
+    /// numbers describe the real store (overlay size, WAL size, compaction timings)
+    /// rather than a frozen copy of it.
+    pub fn stats(&self) -> crate::Stats {
+        self.guard.read().stats()
+    }
+
     /// Reclaim excess in-RAM capacity on demand (see [`CoreDB::trim_memory`]).
     /// Cheap and safe — never drops data or indexes; query results are unchanged.
     /// Briefly takes the exclusive write lock. For deeper reclaim use [`compact`](Self::compact).
