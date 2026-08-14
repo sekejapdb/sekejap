@@ -389,3 +389,89 @@ fn snapshot_matches_live_for_every_index_family() {
     }
     assert!(broken.is_empty(), "index families broken on a snapshot: {broken:?}");
 }
+
+/// **Regression: paged compaction must not destroy the base.**
+///
+/// `compact()` rebuilds payloads.bin and the topology from the RAM overlay. In
+/// paged mode the overlay is only what has been written since the last compact, so
+/// without hydrating the base first, compacting wrote a store containing just the
+/// recent writes — every base-resident node was silently lost on the next open.
+/// `open_as_service` uses paged mode with auto-compaction on, so this destroyed a
+/// service's data at the first auto-compact.
+#[test]
+fn paged_compaction_preserves_base_nodes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        for i in 0..5 {
+            db.put(&format!("v/n{i}"), &json!({"_collection":"v","_key":format!("n{i}")}).to_string()).unwrap();
+        }
+        db.compact().unwrap(); // all five now live in the immutable base
+    }
+
+    // (a) compacting with an EMPTY overlay must keep all five.
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM v").unwrap().collect().len(), 5);
+    db.compact().unwrap();
+    drop(db);
+    let db = CoreDB::open_paged(dir.path()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM v").unwrap().collect().len(), 5,
+        "compacting a paged store must not drop base nodes");
+    assert!(db.get("v/n3").is_some(), "payloads must still be readable after compaction");
+    drop(db);
+
+    // (b) base + overlay writes must both survive.
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    db.put("v/extra", &json!({"_collection":"v","_key":"extra"}).to_string()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM v").unwrap().collect().len(), 6);
+    db.compact().unwrap();
+    drop(db);
+    let db = CoreDB::open_paged(dir.path()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM v").unwrap().collect().len(), 6,
+        "base and overlay must both survive compaction");
+    assert!(db.get("v/extra").is_some() && db.get("v/n0").is_some());
+}
+
+/// **G4: deleting a node that lives in the immutable base actually deletes it.**
+///
+/// The base cannot be edited in place, so a delete records a tombstone that every
+/// base-aware lookup honours until the next compaction folds it away. Previously the
+/// delete was silently ignored, and after compaction it degraded into a phantom row
+/// — gone from `get`, still returned by queries.
+#[test]
+fn deleting_a_base_node_takes_effect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        for i in 0..5 {
+            db.put(&format!("v/n{i}"), &json!({"_collection":"v","_key":format!("n{i}")}).to_string()).unwrap();
+        }
+        db.compact().unwrap();
+    }
+    let count = |db: &CoreDB| db.query("SELECT _key FROM v").unwrap().collect().len();
+
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    db.remove("v/n2");
+
+    // Immediately: invisible to get, contains, scans — and to a snapshot.
+    assert!(db.get("v/n2").is_none(), "a removed base node must not be readable");
+    assert!(!db.contains("v/n2"));
+    assert_eq!(count(&db), 4);
+    let snap = db.snapshot_db().unwrap();
+    assert_eq!(count(&snap), 4, "a snapshot inherits the tombstone");
+    assert!(snap.get("v/n2").is_none());
+    drop(snap);
+
+    // Durable: the tombstone survives a reopen via WAL replay.
+    drop(db);
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    assert!(db.get("v/n2").is_none(), "the delete must survive a reopen");
+    assert_eq!(count(&db), 4);
+
+    // And it is folded away for real by compaction.
+    db.compact().unwrap();
+    drop(db);
+    let db = CoreDB::open_paged(dir.path()).unwrap();
+    assert!(db.get("v/n2").is_none());
+    assert_eq!(count(&db), 4, "the other four survive compaction");
+}
