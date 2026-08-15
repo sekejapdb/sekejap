@@ -281,9 +281,24 @@ impl Bm25Index {
     pub fn spill_to_disk(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
         if let PostingsBlob::Memory(blob) = &self.postings {
-            let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
-            f.write_all(blob)?;
-            f.sync_all()?;
+            // Write a NEW file and rename it into place rather than truncating the
+            // existing one. A snapshot holds its own descriptor onto this file
+            // (PostingsBlob::Disk shares it by Arc), and on unix that descriptor keeps
+            // reading the old inode across a rename — so an existing snapshot stays
+            // valid. Truncating in place would rewrite the bytes underneath every live
+            // snapshot and make their BM25 queries return nothing.
+            let tmp = path.with_extension("postings.tmp");
+            {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                f.write_all(blob)?;
+                f.sync_all()?;
+            }
+            std::fs::rename(&tmp, path)?;
+            let f = std::fs::OpenOptions::new().read(true).open(path)?;
             let len = blob.len() as u64;
             self.postings = PostingsBlob::Disk { file: std::sync::Arc::new(f), len };
         }
