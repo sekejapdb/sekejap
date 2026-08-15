@@ -506,6 +506,8 @@ pub(crate) struct WalWriter {
     inner: BufWriter<File>,
     format: WalFormat,
     sync_level: SyncLevel,
+    /// Records appended since open. See [`seq`](WalWriter::seq).
+    seq: u64,
 }
 
 impl WalWriter {
@@ -535,6 +537,7 @@ impl WalWriter {
                 inner: BufWriter::new(file),
                 format: detected,
                 sync_level: SyncLevel::Full,
+                seq: 0,
             });
         }
 
@@ -547,7 +550,7 @@ impl WalWriter {
         writer.write_all(&magic)?;
         writer.write_all(&WAL_VERSION.to_le_bytes())?;
         writer.flush()?;
-        Ok(Self { inner: writer, format, sync_level: SyncLevel::Full })
+        Ok(Self { inner: writer, format, sync_level: SyncLevel::Full, seq: 0 })
     }
 
     /// The encoding format this writer uses.
@@ -572,6 +575,7 @@ impl WalWriter {
         self.inner.write_all(&checksum)?;
         self.inner.write_all(&len_bytes)?;
         self.inner.write_all(&encoded)?;
+        self.seq += 1;
         self.inner.flush()
     }
 
@@ -588,6 +592,7 @@ impl WalWriter {
             self.inner.write_all(&checksum)?;
             self.inner.write_all(&len_bytes)?;
             self.inner.write_all(&encoded)?;
+            self.seq += 1;
         }
         self.inner.flush()
     }
@@ -596,8 +601,37 @@ impl WalWriter {
     /// guaranteed on-disk durability. Strength depends on `sync_level`.
     pub fn sync(&mut self) -> io::Result<()> {
         self.inner.flush()?;
-        let file = self.inner.get_ref();
-        match self.sync_level {
+        sync_file(self.inner.get_ref(), self.sync_level)
+    }
+
+    /// Records appended so far, counted since this writer was opened.
+    ///
+    /// The log is append-only and written in order, so one `fsync` makes every
+    /// record up to the current count durable. That is what lets several writers
+    /// share a single `fsync`: each remembers the count it reached, and waits
+    /// until a sync covering at least that count has completed.
+    pub fn seq(&self) -> u64 { self.seq }
+
+    /// The strength this writer syncs at, so a shared descriptor matches it.
+    pub fn sync_level(&self) -> SyncLevel { self.sync_level }
+
+    /// A second descriptor onto the same log file.
+    ///
+    /// `fsync` on it flushes the same file, which is what allows the sync to
+    /// happen *outside* the write lock while another thread is already appending
+    /// the next record.
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.inner.get_ref().try_clone()
+    }
+}
+
+/// `fsync` a descriptor at the requested strength.
+///
+/// Split out of `WalWriter::sync` so the group-commit coordinator can sync a
+/// cloned descriptor without holding the writer.
+pub(crate) fn sync_file(file: &File, level: SyncLevel) -> io::Result<()> {
+    {
+        match level {
             SyncLevel::Full => file.sync_data(),
             #[cfg(target_os = "macos")]
             SyncLevel::Barrier => {

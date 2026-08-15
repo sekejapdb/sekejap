@@ -75,6 +75,133 @@ pub struct Engine {
     /// See [`Engine::get`] and `docs/developer/notes/snapshot-reads-design.md`.
     #[cfg(unix)]
     published: Option<Published>,
+    /// Shares one `fsync` between writers that commit at the same time.
+    /// `None` when the engine fsyncs inline, which is the embedded behaviour.
+    commit: Option<GroupCommit>,
+}
+
+/// Coalesces the log's `fsync` across concurrent writers.
+///
+/// # The problem
+///
+/// With durability set to `Full` every write fsyncs and waits for the disk —
+/// measured at 2.9 ms, which after index maintenance was made incremental is
+/// **99.6 % of a write**. Ten threads writing at once perform ten fsyncs, one
+/// after another, even though the log is a single append-only file where one
+/// fsync would have made all ten records durable.
+///
+/// # What this does
+///
+/// Each writer appends its record under the write lock, notes how far the log has
+/// reached, releases the lock, and then asks to be told when a sync covering that
+/// point has completed. The first to ask performs the fsync; everyone who arrives
+/// while it runs simply waits and is woken by it. Under load the fsync count
+/// falls towards one per batch instead of one per write.
+///
+/// # What this does not do
+///
+/// It does not weaken durability, and it is not a write buffer. Nothing is
+/// deferred, batched or dropped: the record is written and flushed to the OS
+/// before the writer waits, and the writer does not return until its own data is
+/// on the disk. A crash at any point loses exactly what it would have lost
+/// before.
+///
+/// It also does nothing for a single writer, who still waits for a whole fsync of
+/// their own. The gain is proportional to how many writers commit concurrently,
+/// which is why this is service-mode only.
+struct GroupCommit {
+    level: crate::storage::wal::SyncLevel,
+    /// The log generation this coordinator is currently tracking, readable without
+    /// taking the mutex so a writer can cheaply tell whether the log was replaced
+    /// underneath it.
+    seen: std::sync::atomic::AtomicU64,
+    state: std::sync::Mutex<CommitState>,
+    woken: std::sync::Condvar,
+}
+
+struct CommitState {
+    /// Which generation of the log file `file` refers to.
+    generation: u64,
+    /// Descriptor onto the log — fsync'd outside the write lock, so another thread
+    /// can already be appending the next record. Shared rather than duplicated so
+    /// a syncer can keep using it after someone else swaps in a newer generation.
+    file: std::sync::Arc<std::fs::File>,
+    /// Highest record count handed to the OS by any writer.
+    flushed: u64,
+    /// Highest record count known to be on the disk.
+    durable: u64,
+    /// Someone is inside an fsync right now; new arrivals wait instead of starting
+    /// a second one.
+    syncing: bool,
+}
+
+impl GroupCommit {
+    /// Return once record `seq` of log generation `gen` is durable, performing the
+    /// fsync if nobody else is already doing it.
+    ///
+    /// `fresh` supplies a descriptor for a generation this coordinator has not seen
+    /// yet; the caller obtains it while still holding the write lock.
+    fn commit_upto(
+        &self,
+        gen: u64,
+        seq: u64,
+        fresh: Option<std::fs::File>,
+    ) -> Result<(), String> {
+        let mut st = self.state.lock().map_err(|_| "commit state poisoned")?;
+
+        if gen < st.generation {
+            // The log holding this record has since been compacted away. Compaction
+            // fsyncs the snapshot it folds records into *before* removing the old
+            // log, so the record is already on disk by a different route.
+            return Ok(());
+        }
+        if gen > st.generation {
+            let Some(f) = fresh else {
+                return Err("log was replaced and no descriptor was supplied".into());
+            };
+            st.generation = gen;
+            st.file = std::sync::Arc::new(f);
+            st.flushed = 0;
+            st.durable = 0;
+            self.seen.store(gen, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        st.flushed = st.flushed.max(seq);
+        while st.durable < seq {
+            if st.syncing {
+                // Another writer's fsync is in flight. It may or may not cover this
+                // record, so re-check the condition once it finishes.
+                st = self.woken.wait(st).map_err(|_| "commit state poisoned")?;
+                if st.generation != gen {
+                    // Compacted away while waiting — durable by the route above.
+                    return Ok(());
+                }
+                continue;
+            }
+            st.syncing = true;
+            // Read the watermark *before* syncing: records flushed after this point
+            // may not be covered, and claiming them would be a lie. Capture the
+            // generation too, so a log replaced mid-sync cannot inherit the result.
+            let target = st.flushed;
+            let synced_gen = st.generation;
+            let file = std::sync::Arc::clone(&st.file);
+            drop(st);
+
+            let result = crate::storage::wal::sync_file(&file, self.level);
+
+            st = self.state.lock().map_err(|_| "commit state poisoned")?;
+            st.syncing = false;
+            if result.is_ok() && st.generation == synced_gen {
+                st.durable = st.durable.max(target);
+            }
+            self.woken.notify_all();
+            result.map_err(|e| format!("WAL fsync failed: {e}"))?;
+            if st.generation != gen {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The engine's published snapshot: a shared, periodically-refreshed "photograph"
@@ -176,6 +303,7 @@ impl Engine {
             scan_max_bytes: None,
             #[cfg(unix)]
             published: None,
+            commit: None,
         }
     }
 
@@ -319,6 +447,44 @@ impl Engine {
 
     // ── Writes ───────────────────────────────────────────────────────────────
 
+    /// Apply a write under the exclusive lock, then return once it is on disk.
+    ///
+    /// Every write path goes through here. The fsync deliberately happens *after*
+    /// the lock is released: another writer can be appending its own record while
+    /// this one is being synced, and the two then share the single fsync rather
+    /// than performing one each. Nothing is deferred — the record is already
+    /// written and flushed to the OS before the wait begins, and this does not
+    /// return until it is durable.
+    ///
+    /// With no coordinator (embedded, in-memory, or durability below `Full`) the
+    /// database fsyncs inline as it always did and this is a plain locked call.
+    fn write_durable<T>(
+        &self,
+        f: impl FnOnce(&mut CoreDB) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let (result, mark) = {
+            let mut db = self.guard.write();
+            let result = f(&mut db);
+            // Read the log position whether or not the statement succeeded: a
+            // failure can still leave records appended, and they must be made
+            // durable rather than left in limbo.
+            let mark = self.commit.as_ref().map(|gc| {
+                let (gen, seq) = db.wal_mark();
+                let fresh = if gc.seen.load(std::sync::atomic::Ordering::Relaxed) == gen {
+                    None
+                } else {
+                    db.wal_clone_file()
+                };
+                (gen, seq, fresh)
+            });
+            (result, mark)
+        };
+        if let (Some(gc), Some((gen, seq, fresh))) = (self.commit.as_ref(), mark) {
+            gc.commit_upto(gen, seq, fresh)?;
+        }
+        result
+    }
+
     /// Execute a write SQL statement.
     ///
     /// If a write buffer is configured, the statement is buffered and only
@@ -340,10 +506,7 @@ impl Engine {
         }
         // No buffer — apply immediately, then refresh the published snapshot
         // (debounced) so lock-free readers pick up the change.
-        let n = {
-            let mut db = self.guard.write();
-            db.execute(sql).map_err(|e| e.to_string())?
-        };
+        let n = self.write_durable(|db| db.execute(sql).map_err(|e| e.to_string()))?;
         self.maybe_republish();
         Ok(n)
     }
@@ -359,10 +522,9 @@ impl Engine {
         if self.read_only {
             return Err("database is read-only".to_string());
         }
-        let n = {
-            let mut db = self.guard.write();
-            db.execute_params(sql, params).map_err(|e| e.to_string())?
-        };
+        let n = self.write_durable(|db| {
+            db.execute_params(sql, params).map_err(|e| e.to_string())
+        })?;
         self.maybe_republish();
         Ok(n)
     }
@@ -410,10 +572,7 @@ impl Engine {
             }
             Ok(())
         } else {
-            {
-                let mut db = self.guard.write();
-                db.put_value(&slug, val).map_err(|e| e.to_string())?;
-            }
+            self.write_durable(|db| db.put_value(&slug, val).map_err(|e| e.to_string()))?;
             self.maybe_republish();
             Ok(())
         }
@@ -433,21 +592,21 @@ impl Engine {
             return Ok(0);
         }
 
-        let mut db = self.guard.write();
-        let mut total = 0usize;
-        // Prepared rows: pre-built (slug, Value) → put_value_bulk (group-commit, one
-        // shared timestamp, zero parsing). The fast IoT write path.
-        if !rows.is_empty() {
-            total += db.put_value_bulk(rows).map_err(|e| e.to_string())?;
-        }
-        // Buffered SQL: apply the whole batch under one WAL fsync (group-commit).
-        if !statements.is_empty() {
-            total += db.execute_batch_grouped(&statements).map_err(|e| e.to_string())?;
-        }
-
-        // Auto-compaction is core's job (`CoreDB::set_auto_compact` +
-        // `CompactThresholds`), applied inside the bulk write paths above.
-        drop(db); // release the write lock before re-minting the read snapshot
+        let total = self.write_durable(|db| {
+            let mut total = 0usize;
+            // Prepared rows: pre-built (slug, Value) → put_value_bulk (one shared
+            // timestamp, zero parsing). The fast IoT write path.
+            if !rows.is_empty() {
+                total += db.put_value_bulk(rows).map_err(|e| e.to_string())?;
+            }
+            // Buffered SQL: the whole batch applied under one lock.
+            if !statements.is_empty() {
+                total += db.execute_batch_grouped(&statements).map_err(|e| e.to_string())?;
+            }
+            // Auto-compaction is core's job (`CoreDB::set_auto_compact` +
+            // `CompactThresholds`), applied inside the bulk write paths above.
+            Ok(total)
+        })?;
         self.maybe_republish();
 
         Ok(total)
@@ -482,10 +641,10 @@ impl Engine {
         if self.read_only {
             return Err("database is read-only".to_string());
         }
-        {
-            let mut db = self.guard.write();
-            db.compact().map_err(|e| e.to_string())?;
-        }
+        // Compaction fsyncs the snapshot it writes before removing the old log, and
+        // replaces the log with a fresh one. Routing it through write_durable is
+        // what teaches the coordinator about the new generation.
+        self.write_durable(|db| db.compact().map_err(|e| e.to_string()))?;
         // Compaction swaps in a fresh (empty-overlay) base — re-mint now, bypassing
         // the debounce, so lock-free readers move onto the compacted base promptly.
         #[cfg(unix)]
@@ -641,7 +800,7 @@ impl EngineBuilder {
         // unix-only. When on, open paged so the store is snapshottable.
         let want_paged = cfg!(unix) && self.snapshot_reads && !self.read_only;
 
-        let db = if self.read_only {
+        let mut db = if self.read_only {
             CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
         } else if want_paged {
             CoreDB::open_paged(&self.path).map_err(|e| e.to_string())?
@@ -662,7 +821,32 @@ impl EngineBuilder {
             None
         };
 
+        // Take over the log's fsync so writers that commit at the same time can
+        // share one. Returns None when there is nothing to coordinate — no log, or
+        // durability is not Full — and the database keeps fsyncing inline.
+        let commit = if self.read_only {
+            None
+        } else {
+            let mark = db.wal_mark();
+            db.take_over_wal_sync().map(|(file, level)| {
+                let gen = mark.0;
+                GroupCommit {
+                    level,
+                    seen: std::sync::atomic::AtomicU64::new(gen),
+                    state: std::sync::Mutex::new(CommitState {
+                        generation: gen,
+                        file: std::sync::Arc::new(file),
+                        flushed: 0,
+                        durable: 0,
+                        syncing: false,
+                    }),
+                    woken: std::sync::Condvar::new(),
+                }
+            })
+        };
+
         Ok(Engine {
+            commit,
             guard: ReadWriteGuard::new(db),
             buffer: if self.read_only {
                 None
