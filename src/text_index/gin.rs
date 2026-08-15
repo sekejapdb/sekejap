@@ -78,6 +78,22 @@ pub struct GINIndex {
     /// When present the resident `postings`/`id_map` are empty (attached only on a
     /// clean paged reopen, no post-compact writes). `None` in heap mode.
     mapped: Option<crate::storage::ginstore::MappedGin>,
+    /// Slots whose document has been deleted, or superseded by an update.
+    ///
+    /// Trigram bitmaps are append-only and may be mmap-backed, so a document
+    /// cannot be erased from them. Removal is recorded here and applied in
+    /// [`slot_hash`], the same liveness gate the search index uses — which is what
+    /// lets a delete or an update cost `O(text)` instead of a full rebuild.
+    ///
+    /// [`slot_hash`]: GINIndex::slot_hash
+    dead_slots: roaring::RoaringBitmap,
+    /// `doc_id` -> its one live slot.
+    ///
+    /// Built on demand, because the mmap'd base stores slot → hash and offers no
+    /// reverse lookup; walking it per mutation would put every insert and delete
+    /// back to `O(documents)`, which is the cost this whole change exists to
+    /// remove. Built once on the first mutation, maintained from then on.
+    slot_of: Option<HashMap<u64, u32>>,
 }
 
 impl GINIndex {
@@ -120,12 +136,23 @@ impl GINIndex {
             doc_count,
             field: field.to_string(),
             mapped: None,
+            dead_slots: roaring::RoaringBitmap::new(),
+            slot_of: None,
         }
     }
 
     /// True when postings + id map are served from the mmap base (paged, disk-first).
     pub fn is_disk_backed(&self) -> bool {
         self.mapped.is_some()
+    }
+
+    /// True when writes have accumulated on top of the mmap base.
+    ///
+    /// `gin.bin` stores one flat segment, so the resident overlay has nowhere to be
+    /// written and would be lost on reopen. The database rebuilds these before
+    /// persisting; this is how it knows which ones need it.
+    pub fn has_pending_overlay(&self) -> bool {
+        self.mapped.is_some() && (!self.id_map.is_empty() || !self.dead_slots.is_empty())
     }
 
     /// Disk-first GIN for paged mode: postings + id map served from the mmap base;
@@ -135,21 +162,89 @@ impl GINIndex {
             postings: HashMap::new(),
             id_map: Vec::new(),
             doc_count: base.doc_count(),
+            dead_slots: roaring::RoaringBitmap::new(),
+            slot_of: None,
             field: base.field().to_string(),
             mapped: Some(base),
         }
     }
 
     /// Posting bitmap for a trigram hash — resident overlay or the mmap base.
-    fn trigram_postings(&self, hash: u32) -> Option<roaring::RoaringBitmap> {
-        if let Some(bm) = self.postings.get(&hash) { return Some(bm.clone()); }
-        self.mapped.as_ref().and_then(|m| m.trigram_bitmap(hash))
+    /// Slots `0 .. base_slots()` belong to the mmap'd base; resident writes are
+    /// numbered from there. Sharing one flat slot space is what keeps the two
+    /// halves addressable by a single bitmap.
+    #[inline]
+    fn base_slots(&self) -> u32 {
+        self.mapped.as_ref().map_or(0, |m| m.doc_count() as u32)
     }
 
-    /// Node hash for a slot — resident overlay or the mmap base.
+    fn trigram_postings(&self, hash: u32) -> Option<roaring::RoaringBitmap> {
+        // Union, not fallback. Returning the resident bitmap alone would hide every
+        // base document carrying the same trigram — one write after a paged reopen
+        // would silently erase them from ILIKE results.
+        let resident = self.postings.get(&hash);
+        let base = self.mapped.as_ref().and_then(|m| m.trigram_bitmap(hash));
+        match (resident, base) {
+            (Some(r), Some(b)) => Some(r | b),
+            (Some(r), None) => Some(r.clone()),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Node hash for a slot — the mmap base below `base_slots()`, the resident
+    /// overlay above it. `None` for a slot whose document has been retired.
     fn slot_hash(&self, slot: u32) -> Option<u64> {
-        if let Some(h) = self.id_map.get(slot as usize) { return Some(*h); }
-        self.mapped.as_ref().and_then(|m| m.slot_hash(slot))
+        if self.dead_slots.contains(slot) {
+            return None;
+        }
+        let base = self.base_slots();
+        if slot < base {
+            return self.mapped.as_ref().and_then(|m| m.slot_hash(slot));
+        }
+        self.id_map.get((slot - base) as usize).copied()
+    }
+
+    /// Retire every slot holding `doc_id`, so it stops matching.
+    ///
+    /// Scans the slot table, which costs a pass over an array of `u64` — orders of
+    /// magnitude below the full rebuild this replaces, and only on a delete.
+    pub fn delete(&mut self, doc_id: u64) -> bool {
+        self.ensure_slot_map();
+        let slot = match self.slot_of.as_mut().and_then(|m| m.remove(&doc_id)) {
+            Some(s) => s,
+            None => return false,
+        };
+        self.dead_slots.insert(slot);
+        self.doc_count = self.doc_count.saturating_sub(1);
+        true
+    }
+
+    /// Populate the reverse slot map, once, by walking both halves of the slot
+    /// space. Later slots win, so a document written twice resolves to its newest.
+    fn ensure_slot_map(&mut self) {
+        if self.slot_of.is_some() {
+            return;
+        }
+        let base = self.base_slots();
+        let mut map: HashMap<u64, u32> = HashMap::with_capacity(
+            base as usize + self.id_map.len(),
+        );
+        for slot in 0..base {
+            if self.dead_slots.contains(slot) {
+                continue;
+            }
+            if let Some(h) = self.mapped.as_ref().and_then(|m| m.slot_hash(slot)) {
+                map.insert(h, slot);
+            }
+        }
+        for (i, &h) in self.id_map.iter().enumerate() {
+            let slot = base + i as u32;
+            if !self.dead_slots.contains(slot) {
+                map.insert(h, slot);
+            }
+        }
+        self.slot_of = Some(map);
     }
 
     /// Query the index for documents matching an ILIKE pattern.
@@ -167,7 +262,7 @@ impl GINIndex {
         let pattern_trigrams = extract_pattern_trigrams(pattern);
         if pattern_trigrams.is_empty() {
             // Degenerate pattern (all wildcards) — matches every indexed doc.
-            return (0..self.doc_count as u32)
+            return (0..self.base_slots() + self.id_map.len() as u32)
                 .filter_map(|slot| self.slot_hash(slot))
                 .take(limit.unwrap_or(usize::MAX))
                 .collect();
@@ -208,10 +303,18 @@ impl GINIndex {
     /// For updates (doc already indexed), remove the old entry first by
     /// calling `build_gin_index()` for a full rebuild.
     pub fn insert_doc(&mut self, doc_id: u64, text: &str) {
+        // Retire any earlier copy first, so re-indexing a document replaces it
+        // rather than leaving the old text matching alongside the new.
+        self.delete(doc_id);
         let trigrams = extract_trigrams(text);
         if !trigrams.is_empty() {
-            let slot = self.id_map.len() as u32;
+            // Numbered above the mmap base — using id_map.len() alone would collide
+            // with a base slot and make one existing document unreachable.
+            let slot = self.base_slots() + self.id_map.len() as u32;
             self.id_map.push(doc_id);
+            if let Some(map) = self.slot_of.as_mut() {
+                map.insert(doc_id, slot);
+            }
             for trigram in &trigrams {
                 let h = hash_trigram(trigram);
                 self.postings
@@ -245,6 +348,8 @@ impl GINIndex {
             doc_count,
             field: field.to_string(),
             mapped: None,
+            dead_slots: roaring::RoaringBitmap::new(),
+            slot_of: None,
         }
     }
 
@@ -361,7 +466,7 @@ impl GINIndex {
         }
 
         let doc_count = id_map.len();
-        Ok((field.clone(), Self { postings, id_map, doc_count, field, mapped: None }))
+        Ok((field.clone(), Self { postings, id_map, doc_count, field, mapped: None, dead_slots: roaring::RoaringBitmap::new(), slot_of: None }))
     }
 
     /// Get the number of unique trigrams indexed.

@@ -660,3 +660,42 @@ fn rebuilding_an_index_in_paged_mode_keeps_the_base() {
         "positional search build kept the base documents",
     );
 }
+
+/// Updating a row that lives in the compacted base must take effect.
+///
+/// The planner matched such rows correctly, but the update path then looked them up
+/// in `self.nodes` — the write overlay — and dropped every one of them. The
+/// statement reported 0 rows matched and the write was lost, with no error. This is
+/// the same base/overlay fallacy as the accessor and index-builder bugs, in the one
+/// place where it destroys data the caller believed was written.
+#[test]
+fn updating_a_base_node_takes_effect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, body TEXT, n INTEGER)").unwrap();
+        for i in 0..5 {
+            db.execute(&format!(
+                "INSERT INTO d (_key, body, n) VALUES ('d{i}', 'alpha {i}', {i})"
+            )).unwrap();
+        }
+        db.compact().unwrap();
+    }
+
+    // Every row now lives in the immutable base; the overlay is empty.
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    let matched = db.execute("UPDATE d SET body = 'quebec' WHERE _key = 'd0'").unwrap();
+    assert_eq!(matched, 1, "UPDATE matched no rows in paged mode");
+    assert!(db.get("d/d0").unwrap().contains("quebec"), "the row still reads as it was");
+
+    // A multi-row update over base rows, and one that must survive a restart.
+    let matched = db.execute("UPDATE d SET body = 'sierra' WHERE n >= 3").unwrap();
+    assert_eq!(matched, 2, "range UPDATE matched the wrong number of base rows");
+    db.compact().unwrap();
+    drop(db);
+
+    let db = CoreDB::open(dir.path()).unwrap();
+    assert!(db.get("d/d0").unwrap().contains("quebec"), "update lost across a reopen");
+    assert!(db.get("d/d4").unwrap().contains("sierra"), "range update lost across a reopen");
+    assert!(db.get("d/d1").unwrap().contains("alpha 1"), "an untouched row changed");
+}

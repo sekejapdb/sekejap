@@ -264,3 +264,56 @@ fn merging_the_search_delta_changes_no_answer() {
     assert!(fox.contains(&"d897".to_string()), "post-merge write is searchable");
     assert!(fox.contains(&"d0".to_string()), "pre-merge document survived");
 }
+
+// ── GIN (trigram ILIKE) in paged mode ────────────────────────────────────────
+//
+// GIN's postings are append-only bitmaps over a flat slot space, half of which can
+// be mmap-backed. Writing into that after a paged reopen went wrong three ways:
+// resident postings replaced the base's instead of joining them, new slots were
+// numbered from zero and collided with base slots, and nothing could be retired.
+
+fn ilike(db: &CoreDB, pat: &str) -> usize {
+    db.query(&format!("SELECT _key FROM d WHERE body ILIKE '{pat}'"))
+        .unwrap().collect().len()
+}
+
+#[test]
+fn gin_stays_correct_when_written_after_a_paged_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
+        for i in 0..30 {
+            db.execute(&format!(
+                "INSERT INTO d (_key, body) VALUES ('d{i}', 'alpha bravo charlie {i}')"
+            )).unwrap();
+        }
+        db.execute("CREATE INDEX ON d USING gin (body)").unwrap();
+        db.compact().unwrap();
+    }
+
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    assert_eq!(ilike(&db, "%alpha%"), 30, "baseline");
+
+    // An unrelated insert must not make an existing row unreachable.
+    db.execute("INSERT INTO d (_key, body) VALUES ('new1', 'zulu yankee xray')").unwrap();
+    assert_eq!(ilike(&db, "%alpha%"), 30, "an insert hid a base row");
+    assert_eq!(ilike(&db, "%zulu%"), 1, "the new row is not searchable");
+
+    // An update must retire the old text and index the new.
+    db.execute("UPDATE d SET body = 'quebec papa' WHERE _key = 'd0'").unwrap();
+    assert_eq!(ilike(&db, "%alpha%"), 29, "the old text still matches after an update");
+    assert_eq!(ilike(&db, "%quebec%"), 1, "the new text is not searchable after an update");
+
+    // A delete must take effect without a rebuild.
+    db.execute("DELETE FROM d WHERE _key = 'd1'").unwrap();
+    assert_eq!(ilike(&db, "%alpha%"), 28, "a deleted row still matches");
+
+    // And all of it must survive a restart.
+    db.compact().unwrap();
+    drop(db);
+    let db = CoreDB::open_paged(dir.path()).unwrap();
+    assert_eq!(ilike(&db, "%alpha%"), 28, "counts drifted across a reopen");
+    assert_eq!(ilike(&db, "%quebec%"), 1, "updated text lost across a reopen");
+    assert_eq!(ilike(&db, "%zulu%"), 1, "inserted row lost across a reopen");
+}

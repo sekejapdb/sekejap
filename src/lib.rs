@@ -267,6 +267,10 @@ const GIN_INDEX_VERSION:     u32 = 3; // sorted trigram dir + blob (mmap-served)
 /// it replaces.
 const SEARCH_DELTA_MERGE_DOCS: usize = 256;
 
+/// Above this many rows in one UPDATE, rebuilding a text index beats re-indexing
+/// the rows one by one.
+const UPDATE_INCREMENTAL_ROWS: usize = 256;
+
 const BM25_INDEX_VERSION:    u32 = 1;
 const BTREE_INDEX_VERSION:   u32 = 1;
 const HNSW_INDEX_VERSION:    u32 = 1;
@@ -2044,12 +2048,12 @@ impl CoreDB {
                     None => self.touch_search_index(&coll),
                 }
 
+                // Retiring a document is O(1) and order-independent, so it runs
+                // even inside a batch — deferring it would only mean a full rebuild
+                // at flush, which is what this replaces.
                 if !self.gin_indexes.is_empty() {
-                    let gin_fields: Vec<String> = self.gin_indexes.keys().cloned().collect();
-                    if self.defer_index_rebuild {
-                        for f in gin_fields { self.dirty_gin.insert(f); }
-                    } else {
-                        for f in gin_fields { self.build_gin_index(&f); }
+                    for ix in self.gin_indexes.values_mut() {
+                        ix.delete(hash);
                     }
                 }
             }
@@ -2798,7 +2802,29 @@ impl CoreDB {
     /// Anything that persists indexes calls this first.
     fn merge_index_deltas(&mut self) {
         self.merge_search_deltas();
+        self.merge_gin_overlays();
         self.merge_bm25_deltas_inner();
+    }
+
+    /// Fold resident GIN writes back into a single segment before anything is
+    /// persisted.
+    ///
+    /// `gin.bin` holds one flat segment and is left untouched while any index is
+    /// served from it, so writes sitting on top of the mmap base have nowhere to go
+    /// and would vanish on reopen. Rebuilding every disk-backed index — not only the
+    /// ones with an overlay — is deliberate: the file is written as a whole, so a
+    /// partial rebuild would persist the rebuilt indexes and drop the rest.
+    fn merge_gin_overlays(&mut self) {
+        if !self.gin_indexes.values().any(|g| g.has_pending_overlay()) {
+            return;
+        }
+        let fields: Vec<String> = self.gin_indexes.iter()
+            .filter(|(_, g)| g.is_disk_backed())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for field in fields {
+            self.build_gin_index(&field);
+        }
     }
 
     /// Fold every search delta into its base by rebuilding the collection's index.
@@ -2943,7 +2969,11 @@ impl CoreDB {
             .collect_hashes()
             .into_iter()
             .filter_map(|hash| {
-                let n = self.nodes.get(&hash)?;
+                // Base-aware. `self.nodes` is only the write overlay in paged mode,
+                // so looking there alone dropped every row that still lived in the
+                // compacted base — the planner matched them, this discarded them,
+                // and the UPDATE reported 0 rows and silently lost the write.
+                let n = self.node_data(hash)?;
                 let raw = self.payload_store.get_raw(n.payload_offset, n.payload_len)?;
                 Some((n.slug.clone(), hash, raw))
             })
@@ -2956,7 +2986,7 @@ impl CoreDB {
         }
 
         // Schema validation (once for the batch)
-        let coll_name = self.nodes.get(&hits[0].1)
+        let coll_name = self.node_data(hits[0].1)
             .map(|n| n.collection.clone()).unwrap_or_default();
         if let Some(schema) = self.schemas.get(&coll_name) {
             if let Some(err) = validate_updates_against_schema(schema, updates) {
@@ -3032,6 +3062,10 @@ impl CoreDB {
             batch.push((slug, hash, buf));
         }
 
+        // Which rows actually changed — needed for index maintenance below, and
+        // captured here because the WAL phase consumes `batch`.
+        let touched: Vec<u64> = batch.iter().map(|(_, h, _)| *h).collect();
+
         // ── Phase 2: batch payload write (one syscall) ───────────
         let offsets = {
             let refs: Vec<&[u8]> = batch.iter()
@@ -3044,6 +3078,16 @@ impl CoreDB {
             if let Some(node) = self.nodes.get_mut(hash) {
                 node.payload_offset = offsets[i].0;
                 node.payload_len = offsets[i].1;
+                continue;
+            }
+            // Paged mode: the row still lives in the immutable base, which cannot be
+            // edited in place. Promote it into the write overlay pointing at the new
+            // payload — the overlay wins over the base for every base-aware lookup,
+            // and compact() folds it down later.
+            if let Some(mut nd) = self.node_data(*hash).map(|n| n.into_owned()) {
+                nd.payload_offset = offsets[i].0;
+                nd.payload_len = offsets[i].1;
+                self.nodes.insert(*hash, nd);
             }
         }
 
@@ -3071,18 +3115,43 @@ impl CoreDB {
             }
         }
 
-        // Rebuild GIN/BM25 once for the whole batch (not per row).
+        // Index maintenance. Re-indexing only the rows that changed costs
+        // O(rows touched); rebuilding costs O(table). Past a point the rebuild wins,
+        // so wide updates still take it.
+        let incremental = touched.len() <= UPDATE_INCREMENTAL_ROWS;
         for (field, _) in updates {
-            if self.gin_indexes.contains_key(field.as_str()) {
-                self.build_gin_index(field);
+            let has_gin = self.gin_indexes.contains_key(field.as_str());
+            let has_bm25 = self.bm25_indexes.contains_key(field.as_str());
+            if !has_gin && !has_bm25 {
+                continue;
             }
-            if self.bm25_indexes.contains_key(field.as_str()) {
-                self.build_bm25_index(field);
+            if !incremental {
+                if has_gin { self.build_gin_index(field); }
+                if has_bm25 { self.build_bm25_index(field); }
+                continue;
+            }
+            for &h in &touched {
+                let text = self.get_payload(h)
+                    .and_then(|p| p.get(field).and_then(|v| v.as_str()).map(|s| s.to_string()));
+                let Some(text) = text else { continue };
+                if has_gin {
+                    if let Some(ix) = self.gin_indexes.get_mut(field.as_str()) {
+                        ix.insert_doc(h, &text);
+                    }
+                }
+                if has_bm25 {
+                    if let Some(ix) = self.bm25_indexes.get_mut(field.as_str()) {
+                        ix.insert_doc(h, &text);
+                    }
+                }
             }
         }
-        // Search index spans the whole collection — rebuild once if present.
         if !coll_name.is_empty() {
-            self.touch_search_index(&coll_name);
+            if incremental {
+                for &h in &touched { self.touch_search_index_row(&coll_name, h); }
+            } else {
+                self.touch_search_index(&coll_name);
+            }
         }
 
         self.emit_changes();
