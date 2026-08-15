@@ -72,6 +72,31 @@ Writing to an indexed table now costs the same as writing to an unindexed one,
 and stops growing with the table. Results are unchanged: scores and match sets
 are identical to a freshly built index, which the tests check directly.
 
+### Faster — many writers at once
+
+At the strongest durability setting a write is almost entirely the `fsync`: 2.94 ms
+of a 2.95 ms write. Each writer used to pay for its own, even though the log is one
+append-only file where a single `fsync` makes every record up to that point durable.
+
+`open_as_service` now shares one `fsync` between writers that commit at the same
+time. Throughput, all writes fully durable:
+
+| writers | writes/sec | |
+|---|---|---|
+| 1 | 340 | unchanged |
+| 4 | 714 | 2.1× |
+| 8 | 1 412 | 4.2× |
+| 16 | 2 569 | 7.6× |
+
+Nothing is deferred and no write is acknowledged early: the record is written and
+flushed before the wait begins, and the call does not return until the data is on
+the disk. A crash loses exactly what it would have lost before. A single writer is
+unaffected — this only helps when writes overlap.
+
+This is separate from the existing write buffer (`EngineBuilder::buffer_size`),
+which is still opt-in and still trades durability for speed: buffered statements
+are not applied or logged until `flush()`.
+
 ### Changed — how you open a database
 
 Which behaviour you get is now chosen at runtime instead of at build time:
