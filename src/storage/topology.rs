@@ -1052,6 +1052,16 @@ impl MappedTopology {
     pub fn fwd_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>> {
         self.edges_by_hash(hash, /*fwd=*/ true)
     }
+    /// Every edge type this base knows, as `(hash, name)`.
+    ///
+    /// The names are persisted here but the live edge store only learns them by
+    /// observing a `link()`. On a paged reopen no links are made, so without this
+    /// every edge served from the base would come back with no type name at all —
+    /// which is what made graph introspection look empty.
+    pub fn edge_type_table(&self) -> Vec<(u64, String)> {
+        self.type_hashes.iter().copied().zip(self.edge_types.iter().cloned()).collect()
+    }
+
     pub fn rev_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>> {
         self.edges_by_hash(hash, /*fwd=*/ false)
     }

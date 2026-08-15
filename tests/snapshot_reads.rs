@@ -699,3 +699,55 @@ fn updating_a_base_node_takes_effect() {
     assert!(db.get("d/d4").unwrap().contains("sierra"), "range update lost across a reopen");
     assert!(db.get("d/d1").unwrap().contains("alpha 1"), "an untouched row changed");
 }
+
+/// The graph surface must answer the same in both storage modes.
+///
+/// Paged mode keeps compacted rows in an immutable mmap and only recent writes in
+/// RAM. Read paths that consult the RAM map alone see a fraction of the database
+/// and report it as the whole truth — `SHORTEST` found no path, edge introspection
+/// came back empty, and none of it raised an error. This runs the same graph
+/// queries against both modes and requires identical answers.
+#[test]
+fn the_graph_surface_agrees_in_both_storage_modes() {
+    use serde_json::json;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        for i in 0..6 {
+            db.put(&format!("p/n{i}"), &json!({
+                "_collection": "p", "_key": format!("n{i}"), "name": format!("node {i}")
+            }).to_string()).unwrap();
+        }
+        for i in 0..5 {
+            db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next");
+        }
+        db.compact().unwrap();   // everything now lives in the base
+    }
+
+    let measure = |db: &CoreDB| -> (usize, usize, usize, usize, usize, usize) {
+        let one_hop = db.one("p/n0").forward("next").collect().len();
+        let five_hop = db.one("p/n0").forward("next").forward("next").forward("next")
+            .forward("next").forward("next").collect().len();
+        let shortest = db
+            .query("SELECT _key FROM MATCH SHORTEST (a)-[r*]->(b) \
+                    WHERE a._key = 'p/n0' AND b._key = 'p/n5'")
+            .map(|s| s.collect().len()).unwrap_or(0);
+        (one_hop, five_hop, shortest,
+         db.edge_schema().len(),
+         db.edge_types_from("p/n0").len(),
+         db.edges_from_collection("p").len())
+    };
+
+    let resident = measure(&CoreDB::open(dir.path()).unwrap());
+    let paged = measure(&CoreDB::open_paged(dir.path()).unwrap());
+
+    assert_eq!(resident, paged, "paged mode answers differently from resident");
+    assert_eq!(resident, (1, 1, 1, 1, 1, 5), "the baseline itself is wrong: {resident:?}");
+
+    // SHOW must agree too — it walks the same structures.
+    let r = CoreDB::open(dir.path()).unwrap().show("SHOW EDGES").unwrap().len();
+    let p = CoreDB::open_paged(dir.path()).unwrap().show("SHOW EDGES").unwrap().len();
+    assert_eq!(r, p, "SHOW EDGES differs between modes");
+    assert!(r > 0, "SHOW EDGES found nothing even in resident mode");
+}

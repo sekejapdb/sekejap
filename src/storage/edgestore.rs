@@ -822,6 +822,13 @@ impl EdgeStore {
 
     /// Resolve edge type hash to human-readable name.
     #[inline]
+    /// Teach the store an edge type name it did not observe being created.
+    /// Used when attaching a memory-mapped base, whose types were interned in an
+    /// earlier process.
+    pub fn register_type_name(&mut self, type_hash: u64, name: String) {
+        self.type_names.entry(type_hash).or_insert(name);
+    }
+
     pub fn type_name(&self, type_hash: u64) -> Option<&str> {
         self.type_names.get(&type_hash).map(|s| s.as_str())
     }
