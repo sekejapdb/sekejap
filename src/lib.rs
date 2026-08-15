@@ -1503,7 +1503,13 @@ impl CoreDB {
                 // (schemas, vectors, HNSW, btree indexes). Nodes + edges are NOT
                 // loaded into RAM — the resident maps stay empty and act as the
                 // write overlay. WAL replay below adds post-compact writes to it.
-                db.topo_base = Some(std::sync::Arc::new(storage::topology::MappedTopology::open(dir)?));
+                let base = std::sync::Arc::new(storage::topology::MappedTopology::open(dir)?);
+                // The base carries its own edge type names; the live store only
+                // learns them from link(), which never runs on a reopen.
+                for (h, name) in base.edge_type_table() {
+                    db.edges.register_type_name(h, name);
+                }
+                db.topo_base = Some(base);
                 db.load_snapshot_parts(snap, /*load_topology=*/ false);
                 // Serve btree indexes from the mmap'd sidecars, not the heap: mmap
                 // them into field_base and drop any heap copies the snapshot loaded
@@ -5447,13 +5453,21 @@ impl CoreDB {
     pub fn edges_from_collection(&self, from_collection: &str) -> Vec<EdgeHit> {
         let col_h = sk_hash(from_collection);
         let mut result = Vec::new();
-        for (&node_h, node) in &self.nodes {
+        // Base-aware: collection_members merges the mmap base with the overlay, so
+        // this no longer reports an empty graph for a database whose rows have been
+        // compacted.
+        let members: Vec<u64> = match self.collection_members(col_h) {
+            Some(m) => m.into_owned(),
+            None => return result,
+        };
+        for node_h in members {
+            let Some(node) = self.node_data(node_h) else { continue };
             if node.collection.is_empty() || sk_hash(&node.collection) != col_h { continue; }
-            if let Some(edges) = self.edges.fwd_edges(node_h) {
-                for e in edges {
+            if let Some(edges) = self.fwd_edges(node_h) {
+                for e in edges.iter() {
                     result.push(EdgeHit {
                         from_slug: Some(node.slug.clone()),
-                        to_slug: self.nodes.get(&e.other).map(|n| n.slug.clone()),
+                        to_slug: self.node_data(e.other).map(|n| n.slug.clone()),
                         edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
                         meta: self.edge_all_attrs(e),
@@ -5494,8 +5508,8 @@ impl CoreDB {
         let hash = sk_hash(slug);
         let mut seen = std::collections::HashSet::new();
         let mut types = Vec::new();
-        if let Some(edges) = self.edges.fwd_edges(hash) {
-            for e in edges {
+        if let Some(edges) = self.fwd_edges(hash) {
+            for e in edges.iter() {
                 if let Some(label) = self.edges.type_name(e.edge_type) {
                     if seen.insert(e.edge_type) {
                         types.push(label.to_string());
@@ -5522,10 +5536,16 @@ impl CoreDB {
         let col_h = sk_hash(collection);
         let mut seen = std::collections::HashSet::new();
         let mut types = Vec::new();
-        for (&node_h, node) in &self.nodes {
+        // Base-aware — see edges_from_collection.
+        let members: Vec<u64> = match self.collection_members(col_h) {
+            Some(m) => m.into_owned(),
+            None => return types,
+        };
+        for node_h in members {
+            let Some(node) = self.node_data(node_h) else { continue };
             if node.collection.is_empty() || sk_hash(&node.collection) != col_h { continue; }
-            if let Some(edges) = self.edges.fwd_edges(node_h) {
-                for e in edges {
+            if let Some(edges) = self.fwd_edges(node_h) {
+                for e in edges.iter() {
                     if let Some(label) = self.edges.type_name(e.edge_type) {
                         if seen.insert(e.edge_type) {
                             types.push(label.to_string());
@@ -5554,16 +5574,18 @@ impl CoreDB {
     pub fn edge_schema(&self) -> Vec<(String, String, String)> {
         let mut seen = std::collections::HashSet::new();
         let mut triples = Vec::new();
-        for (&from_h, node) in &self.nodes {
+        // Base-aware — see edges_from_collection.
+        for from_h in self.all_hashes() {
+            let Some(node) = self.node_data(from_h) else { continue };
             if node.collection.is_empty() { continue; }
             let from_col = node.collection.clone();
-            if let Some(edges) = self.edges.fwd_edges(from_h) {
-                for e in edges {
+            if let Some(edges) = self.fwd_edges(from_h) {
+                for e in edges.iter() {
                     let edge_label = match self.edges.type_name(e.edge_type) {
                         Some(l) => l.to_string(),
                         None => continue,
                     };
-                    let to_col = match self.nodes.get(&e.other) {
+                    let to_col = match self.node_data(e.other) {
                         Some(n) if !n.collection.is_empty() => n.collection.clone(),
                         _ => continue,
                     };
@@ -5833,7 +5855,10 @@ impl CoreDB {
 
         // Same-node degenerate case
         if start == end {
-            if let Some(node) = self.nodes.get(&start) {
+            // Base-aware: `self.nodes` is only the write overlay in paged mode, so
+            // checking it alone reported every base-resident node as missing and
+            // made SHORTEST return nothing at all.
+            if let Some(node) = self.node_data(start) {
                 let hit = query::Hit {
                     slug: node.slug.clone(),
                     slug_hash: start,
@@ -5846,7 +5871,7 @@ impl CoreDB {
         }
 
         // The start node must exist
-        if !self.nodes.contains_key(&start) {
+        if !self.node_exists(start) {
             return None;
         }
 
@@ -5855,8 +5880,8 @@ impl CoreDB {
         queue.push_back(start);
 
         while let Some(current) = queue.pop_front() {
-            if let Some(edges) = self.edges.fwd_edges(current) {
-                for e in edges {
+            if let Some(edges) = self.fwd_edges(current) {
+                for e in edges.iter() {
                     if parent.contains_key(&e.other) {
                         continue; // already visited
                     }
@@ -5881,7 +5906,9 @@ impl CoreDB {
                         let nodes: Vec<query::Hit> = node_hashes
                             .iter()
                             .filter_map(|&h| {
-                                self.nodes.get(&h).map(|n| query::Hit {
+                                // Base-aware — an intermediate node living in the
+                                // base would otherwise drop out of the path.
+                                self.node_data(h).map(|n| query::Hit {
                                     slug: n.slug.clone(),
                                     slug_hash: h,
                                     payload: None,
@@ -5896,14 +5923,14 @@ impl CoreDB {
                             .windows(2)
                             .map(|w| {
                                 let (_, edge_type_hash) = parent[&w[1]];
-                                let meta = self.edges.fwd_edges(w[0]).and_then(|es| {
+                                let meta = self.fwd_edges(w[0]).and_then(|es| {
                                     es.iter()
                                         .find(|e| e.other == w[1] && e.edge_type == edge_type_hash)
                                         .and_then(|e| self.edges.edge_meta(e))
                                 });
                                 EdgeHit {
-                                    from_slug: self.nodes.get(&w[0]).map(|n| n.slug.clone()),
-                                    to_slug: self.nodes.get(&w[1]).map(|n| n.slug.clone()),
+                                    from_slug: self.node_data(w[0]).map(|n| n.slug.clone()),
+                                    to_slug: self.node_data(w[1]).map(|n| n.slug.clone()),
                                     edge_type: self.edges.type_name(edge_type_hash).map(|s| s.to_string()),
                                     edge_type_hash,
                                     meta,
@@ -5930,9 +5957,9 @@ impl CoreDB {
     pub(crate) fn bfs_shortest_len(&self, start: u64, end: u64) -> Option<usize> {
         use std::collections::HashSet;
         if start == end {
-            return if self.nodes.contains_key(&start) { Some(0) } else { None };
+            return if self.node_exists(start) { Some(0) } else { None };
         }
-        if !self.nodes.contains_key(&start) {
+        if !self.node_exists(start) {
             return None;
         }
         let mut visited: HashSet<u64> = HashSet::new();
@@ -5943,8 +5970,8 @@ impl CoreDB {
             depth += 1;
             let mut next: Vec<u64> = Vec::new();
             for &node in &frontier {
-                if let Some(edges) = self.edges.fwd_edges(node) {
-                    for e in edges {
+                if let Some(edges) = self.fwd_edges(node) {
+                    for e in edges.iter() {
                         if e.other == end {
                             return Some(depth);
                         }
@@ -6028,22 +6055,23 @@ impl CoreDB {
                         // Full schema — count all edges per (from, type, to) triple
                         let mut counts: std::collections::HashMap<(String, String, String), usize> =
                             std::collections::HashMap::new();
-                        for (&from_h, node) in &self.nodes {
+                        for from_h in self.all_hashes() {
+                            let Some(node) = self.node_data(from_h) else { continue };
                             let from_col = if node.collection.is_empty() {
                                 continue;
                             } else {
                                 node.collection.clone()
                             };
-                            if let Some(edges) = self.edges.fwd_edges(from_h) {
-                                for edge in edges {
+                            if let Some(edges) = self.fwd_edges(from_h) {
+                                for edge in edges.iter() {
                                     let label = match self.edges.type_name(edge.edge_type) {
                                         Some(l) => l.to_string(),
                                         None => continue,
                                     };
-                                    let to_col = match self.nodes.get(&edge.other)
-                                        .map(|n| &n.collection)
+                                    let to_col = match self.node_data(edge.other)
+                                        .map(|n| n.collection.clone())
                                     {
-                                        Some(c) if !c.is_empty() => c.clone(),
+                                        Some(c) if !c.is_empty() => c,
                                         _ => continue,
                                     };
                                     *counts.entry((from_col.clone(), label, to_col)).or_insert(0) += 1;
@@ -6067,10 +6095,13 @@ impl CoreDB {
                         let col_h = sk_hash(&from_col);
                         let mut counts: std::collections::HashMap<String, usize> =
                             std::collections::HashMap::new();
-                        for (&node_h, node) in &self.nodes {
+                        for node_h in self.collection_members(col_h)
+                            .map(|m| m.into_owned()).unwrap_or_default()
+                        {
+                            let Some(node) = self.node_data(node_h) else { continue };
                             if !node.collection.is_empty() && sk_hash(&node.collection) == col_h {
-                                if let Some(edges) = self.edges.fwd_edges(node_h) {
-                                    for edge in edges {
+                                if let Some(edges) = self.fwd_edges(node_h) {
+                                    for edge in edges.iter() {
                                         if let Some(label) = self.edges.type_name(edge.edge_type) {
                                             *counts.entry(label.to_string()).or_insert(0) += 1;
                                         }
@@ -6096,11 +6127,14 @@ impl CoreDB {
                         let to_col_h = sk_hash(&to_col);
                         let mut counts: std::collections::HashMap<String, usize> =
                             std::collections::HashMap::new();
-                        for (&node_h, node) in &self.nodes {
+                        for node_h in self.collection_members(from_h)
+                            .map(|m| m.into_owned()).unwrap_or_default()
+                        {
+                            let Some(node) = self.node_data(node_h) else { continue };
                             if !node.collection.is_empty() && sk_hash(&node.collection) == from_h {
-                                if let Some(edges) = self.edges.fwd_edges(node_h) {
-                                    for edge in edges {
-                                        let in_to = self.nodes.get(&edge.other)
+                                if let Some(edges) = self.fwd_edges(node_h) {
+                                    for edge in edges.iter() {
+                                        let in_to = self.node_data(edge.other)
                                             .map(|n| !n.collection.is_empty() && sk_hash(&n.collection) == to_col_h)
                                             .unwrap_or(false);
                                         if in_to {
@@ -7333,6 +7367,11 @@ impl CoreDB {
             for id in 0..base.node_count() as u64 {
                 if let Some(v) = base.spatial(id) {
                     if let Some(h) = base.hash_of(id) {
+                        // Skip deleted base nodes, or the grid would keep matching
+                        // geometry for rows that are gone.
+                        if self.tombstones.contains(&h) {
+                            continue;
+                        }
                         if !self.nodes.contains_key(&h) {
                             items.push((h, geo::SpatialMeta {
                                 centroid_lat: v[0], centroid_lon: v[1],
