@@ -33,10 +33,44 @@ These are the reason to upgrade.
   awkwardly-connected graphs.
 - **Buffered SQL never triggered automatic compaction**, so a write-buffered
   workload grew its log without bound.
+- **`UPDATE` silently discarded writes.** In paged mode, updating a row that
+  lived in the compacted base matched 0 rows and threw the write away — no error,
+  nothing changed, nothing logged. Reachable from `open_as_service`, which uses
+  paged mode.
+- **Rebuilding a text index dropped most of the database.** BM25, GIN, trigram
+  and positional-search rebuilds all enumerated only the in-memory write overlay,
+  so in paged mode a rebuild produced an index covering just the recent writes.
+  Symptom: 60 rows present, text search returning 30.
+- **`ILIKE` lost rows after a write.** Writing to a paged database made the new
+  trigram postings replace the memory-mapped ones for that trigram instead of
+  joining them, so one unrelated insert could erase every existing match. New
+  rows also reused slot numbers already owned by existing rows, and updates left
+  the old text matching alongside the new.
+- **A held snapshot's BM25 results could drop to nothing.** Rebuilding the index
+  rewrote the postings file in place, underneath any snapshot still reading it.
 
 `compact()` now verifies it did not lose records and returns an error instead of
 reporting success if it did; the write-ahead log and previous files are left intact
 when that happens.
+
+### Faster — writing to a table that has a text index
+
+Writing a row used to rebuild the whole index. The cost therefore grew with the
+table: at 20 000 rows a single statement took a tenth of a second, and at 100 000
+it would have taken most of a second. Indexes are now maintained per row.
+
+Milliseconds per statement at 20 000 rows:
+
+| index | insert | update | delete |
+|---|---|---|---|
+| trigram (`ILIKE`) | 3.0 → 3.0 | 93 → 4.1 | 93 → 4.7 |
+| `BM25` | 134 → 3.3 | 108 → 2.8 | 2.8 → 2.7 |
+| `SEARCH` | 144 → 3.0 | 124 → 3.8 | 1.9 → 2.6 |
+| no index (for reference) | 3.0 | 3.0 | 3.0 |
+
+Writing to an indexed table now costs the same as writing to an unindexed one,
+and stops growing with the table. Results are unchanged: scores and match sets
+are identical to a freshly built index, which the tests check directly.
 
 ### Changed — how you open a database
 
