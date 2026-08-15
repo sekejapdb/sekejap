@@ -8,6 +8,8 @@ It runs inside your application, like SQLite, with no separate server to install
 
 It's available as a Rust/Python/Dart/Kotlin/Swift/Java/Node.js/Go library, and a command-line tool.
 
+📝 **Changelog:** [CHANGELOG.md](CHANGELOG.md) — 0.17.0 is a breaking release (data-loss fixes + `open`/`open_as_service`).
+
 📖 **Documentation:** [`docs/`](docs/README.md) — a [usage guide](docs/usage/README.md)
 (the query language, including the [`SELECT … FROM MATCH`](docs/usage/graph-queries.md)
 graph reference) and a [developer guide](docs/developer/README.md)
