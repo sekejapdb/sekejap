@@ -1,6 +1,6 @@
 {
   "name": "sekejap",
-  "version": "0.16.5",
+  "version": "0.17.0",
   "description": "Embedded graph-first multi-model database — Node.js & React Native binding",
   "license": "MIT OR Apache-2.0",
   "repository": "github:sekejapdb/sekejap",

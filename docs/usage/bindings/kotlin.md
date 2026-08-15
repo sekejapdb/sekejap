@@ -7,7 +7,7 @@ install:
 
 ```kotlin
 // build.gradle.kts
-implementation("life.sekejap:sekejap:0.16.5")
+implementation("life.sekejap:sekejap:0.17.0")
 ```
 
 Requires **JDK 22+** at runtime (the binding uses the Java FFM API, finalized

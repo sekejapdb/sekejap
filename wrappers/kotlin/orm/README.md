@@ -22,12 +22,12 @@ plugins {
   id("com.google.devtools.ksp")
 }
 dependencies {
-  implementation("life.sekejap:sekejap-android:0.16.5")   // typed API + native library
-  ksp("life.sekejap:sekejap-processor:0.16.2")            // @SekejapEntity codegen
+  implementation("life.sekejap:sekejap-android:0.17.0")   // typed API + native library
+  ksp("life.sekejap:sekejap-processor:0.17.0")            // @SekejapEntity codegen
 }
 ```
 
-**Desktop / server JVM** — `implementation("life.sekejap:sekejap:0.16.2")` (typed API)
+**Desktop / server JVM** — `implementation("life.sekejap:sekejap:0.17.0")` (typed API)
 + the same `ksp(...)` line; provide the host native library via
 `-Dsekejap.jni.path=…` or the Panama binding `life.sekejap:sekejap-ffm`.
 

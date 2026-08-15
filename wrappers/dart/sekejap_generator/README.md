@@ -13,7 +13,7 @@ classes), the same way `json_serializable` pairs with `json_annotation`.
 
 ```yaml
 dependencies:
-  sekejap: ^0.16.2            # runtime: annotations + typed base classes
+  sekejap: ^0.17.0            # runtime: annotations + typed base classes
 dev_dependencies:
   build_runner: ^2.4.0
   sekejap_generator: ^0.16.2  # this package — emits the .g.dart

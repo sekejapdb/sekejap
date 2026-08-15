@@ -32,7 +32,7 @@ Add the codegen tooling (dev-only):
 ```yaml
 # pubspec.yaml
 dependencies:
-  sekejap: ^0.16.2
+  sekejap: ^0.17.0
 dev_dependencies:
   build_runner: ^2.4.0
   sekejap_generator: ^0.1.0
