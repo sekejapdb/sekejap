@@ -6049,10 +6049,34 @@ fn compile(stmt: SelectStmt) -> Vec<Step> {
             let coll_name = name.clone();
             let (vec_conds, other_conds): (Vec<CondExpr>, Vec<CondExpr>) =
                 conditions.into_iter().partition(|c| matches!(c, CondExpr::VectorNear { .. }));
+            // CORRECTNESS: the starter searches the vector index, which is keyed by
+            // FIELD NAME — so it spans every collection using that field (a
+            // materialised view mirroring its source's vectors is the common case).
+            // Asking it for exactly `k` and *then* gating on `_collection` can throw
+            // away every hit and answer empty for a query that has matches. Ask for a
+            // wider band, gate, then cut back to the requested `k` so the result is
+            // the k nearest *within the collection*.
+            const VEC_SCOPE_OVERSAMPLE: usize = 16;
+            let mut requested_k = 0usize;
             for cond in vec_conds {
-                steps.push(compile_cond(cond)); // VectorNear starter → HNSW
+                let widened = match cond {
+                    CondExpr::VectorNear { field, query, k } => {
+                        requested_k = k;
+                        CondExpr::VectorNear {
+                            field,
+                            query,
+                            k: k.saturating_mul(VEC_SCOPE_OVERSAMPLE).max(k),
+                        }
+                    }
+                    other => other,
+                };
+                steps.push(compile_cond(widened)); // VectorNear starter → HNSW
             }
             steps.push(Step::WhereEq("_collection".to_string(), Value::String(coll_name)));
+            if requested_k > 0 {
+                // Trim the widened band back to the k nearest that are in-collection.
+                steps.push(Step::Take(requested_k));
+            }
             for cond in other_conds {
                 steps.push(compile_cond(cond));
             }
