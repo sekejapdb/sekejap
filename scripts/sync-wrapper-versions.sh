@@ -48,6 +48,26 @@ for readme in "$ROOT/README.md" "$ROOT/wrappers/kotlin/orm/README.md"; do
   perl -pi -e "s/(life\.sekejap:sekejap-android:)[0-9]+\.[0-9]+\.[0-9]+/\${1}$VERSION/g" "$readme"
 done
 
+# Every other copy-paste coordinate that is static prose. These drifted once
+# already (0.16.1 / 0.16.2 / 0.16.5 all lived in the docs at the same time), so
+# stamp them from the single source rather than by hand.
+for doc in "$ROOT/README.md" \
+           "$ROOT/wrappers/kotlin/README.md" \
+           "$ROOT/wrappers/kotlin/orm/README.md" \
+           "$ROOT/docs/usage/bindings/kotlin.md" \
+           "$ROOT/wrappers/README.md"; do
+  [ -f "$doc" ] || continue
+  # Gradle: life.sekejap:<artifact>:X.Y.Z  (sekejap, sekejap-processor, …)
+  perl -pi -e "s/(life\.sekejap:[a-z-]+:)[0-9]+\.[0-9]+\.[0-9]+/\${1}$VERSION/g" "$doc"
+done
+
+# Dart pub coordinate in prose:  sekejap: ^X.Y.Z
+for doc in "$ROOT/wrappers/dart/README.md" "$ROOT/docs/usage/bindings/dart.md" \
+           "$ROOT/wrappers/dart/sekejap_generator/README.md"; do
+  [ -f "$doc" ] || continue
+  perl -pi -e "s/(sekejap: \^)[0-9]+\.[0-9]+\.[0-9]+/\${1}$VERSION/g" "$doc"
+done
+
 echo "  node : $(grep -m1 '"version"' "$ROOT/wrappers/node/package.json" | tr -d ' ,') / crate $(grep -m1 '^version = ' "$ROOT/wrappers/node/Cargo.toml")"
 echo "  dart : $(grep -m1 '^version:' "$ROOT/wrappers/dart/pubspec.yaml") / generator $(grep -m1 '^version:' "$ROOT/wrappers/dart/sekejap_generator/pubspec.yaml")"
 echo "  readme: $(grep -m1 -oE 'sekejap-android:[0-9.]+' "$ROOT/README.md")"

@@ -49,7 +49,7 @@ temp → `-Dsekejap.lib`), or rely on a system-installed library.
 ## Distribution
 
 - **Registry:** [Maven Central](https://central.sonatype.com) → Gradle
-  `implementation("life.sekejap:sekejap:0.16.5")`
+  `implementation("life.sekejap:sekejap:0.17.0")`
 - **groupId:** **`life.sekejap`** (matches `group` in the Gradle build files).
 - **Publish:** via the Sonatype **Central Portal**, using the vanniktech
   `com.vanniktech.maven.publish` Gradle plugin (handles signing + Central Portal upload).
