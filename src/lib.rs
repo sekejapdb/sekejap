@@ -1529,6 +1529,7 @@ impl CoreDB {
         // Use 500 MB as the threshold — safely above any real snapshot, far below bloated ones.
         if snap_file_size > 500 * 1024 * 1024 {
             // v3 snapshots are manifests — the topology files must exist first.
+            db.merge_bm25_deltas();
             if db.write_topology_files(dir).is_ok() {
             if let Ok(snap_json) = serde_json::to_vec(&db.build_snapshot()) {
                 let snap_tmp = snap_path.with_extension("json.tmp");
@@ -1915,7 +1916,16 @@ impl CoreDB {
             }
         } else {
             for field in bm25_fields {
-                self.build_bm25_index(&field);
+                // Index this one document rather than rebuilding the corpus.
+                // build_bm25_index is O(rows): at 20 000 rows it made a single
+                // INSERT cost 134 ms, and it grew with the table.
+                let text = payload.get(field.as_str())
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                match (text, self.bm25_indexes.get_mut(&field)) {
+                    (Some(text), Some(ix)) => ix.insert_doc(hash, &text),
+                    _ => self.build_bm25_index(&field),
+                }
             }
         }
 
@@ -2767,6 +2777,30 @@ impl CoreDB {
     /// Remove a change subscription registered with [`subscribe_changes`].
     pub fn unsubscribe_changes(&mut self, id: u64) {
         self.change_listeners.retain(|(i, _)| *i != id);
+    }
+
+    /// Fold every BM25 delta into its base.
+    ///
+    /// The on-disk BM25 format holds a single contiguous segment, so an index
+    /// carrying an unmerged delta cannot be serialised — `write_binary` refuses,
+    /// rather than silently writing an index that omits the newest documents.
+    /// Anything that persists indexes calls this first.
+    fn merge_bm25_deltas(&mut self) {
+        let dir = self.data_dir.clone();
+        for (field, ix) in self.bm25_indexes.iter_mut() {
+            if ix.delta_len() == 0 {
+                continue;
+            }
+            ix.merge_delta();
+            // Merging rebuilds the postings blob, so the dictionary offsets about
+            // to be written no longer address the spilled file. Rewrite it in the
+            // same breath — a dictionary that outlives its postings is exactly the
+            // kind of split-brain that makes an index unreadable on reopen.
+            #[cfg(unix)]
+            if let Some(ref dir) = dir {
+                let _ = ix.spill_to_disk(&dir.join(format!("bm25_{field}.postings")));
+            }
+        }
     }
 
     fn flush_deferred_indexes(&mut self) {
@@ -3759,6 +3793,7 @@ impl CoreDB {
         // exist. Crash between the two leaves the OLD snapshot + NEW topology
         // files, which reopens fine (old snapshot is still self-sufficient or
         // points at the previous, still-valid files; WAL not yet truncated).
+        self.merge_bm25_deltas();
         self.write_topology_files(&dir)?;
 
         // Persist btree field indexes as mmap'able sidecars so a reopened paged DB
