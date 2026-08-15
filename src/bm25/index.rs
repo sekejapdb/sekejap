@@ -209,6 +209,89 @@ pub struct Bm25Hit {
     pub score: f64,
 }
 
+/// How many documents may accumulate in the delta before it is folded into the
+/// base. Bounds the per-query cost of scanning the delta, and makes the
+/// amortised cost of a merge (`O(corpus) / DELTA_MERGE_DOCS` per insert)
+/// negligible: at 20 k documents that is single-digit microseconds per write.
+const DELTA_MERGE_DOCS: usize = 4096;
+
+/// Documents indexed since the last full build, held as a small in-RAM inverted
+/// index.
+///
+/// # Why this exists
+///
+/// The base is a *contiguous* structure: every term owns one byte range in
+/// `postings_bytes`, so adding a document to a term means rewriting that term's
+/// range. Doing that per write made a single INSERT cost `O(corpus)` — 134 ms at
+/// 20 000 rows, and growing. Rather than fight the layout, new documents land
+/// here and queries read both segments; the base stays untouched until a merge
+/// folds the delta in.
+///
+/// This is the same base-plus-overlay shape the storage engine uses for nodes,
+/// and it has the same rule: **every read path must consult both halves.**
+/// Consulting only the base is how documents silently vanish from search.
+#[derive(Clone, Debug, Default)]
+struct Bm25Delta {
+    /// term -> postings for delta documents only, kept sorted by `doc_id`.
+    terms: std::collections::BTreeMap<String, Vec<Posting>>,
+    /// Token count per delta document. Also the liveness set for the delta:
+    /// absent means deleted, exactly as `doc_id_to_idx` works for the base.
+    doc_lengths: HashMap<u64, u32>,
+    /// Running total of `doc_lengths`, so `avg_doc_len` stays O(1).
+    sum_doc_len: u64,
+}
+
+impl Bm25Delta {
+    fn is_empty(&self) -> bool { self.doc_lengths.is_empty() }
+    fn len(&self) -> usize { self.doc_lengths.len() }
+
+    /// Drop a document. Its postings are left in place and gated by
+    /// `doc_lengths`, mirroring how the base gates on `doc_id_to_idx`.
+    fn remove(&mut self, doc_id: u64) -> bool {
+        match self.doc_lengths.remove(&doc_id) {
+            Some(dl) => { self.sum_doc_len -= dl as u64; true }
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, doc_id: u64, text: &str) {
+        self.remove(doc_id);
+        let tokens = tokenize(text);
+        self.doc_lengths.insert(doc_id, tokens.len() as u32);
+        self.sum_doc_len += tokens.len() as u64;
+
+        let mut freqs: HashMap<String, u32> = HashMap::new();
+        for t in tokens { *freqs.entry(t).or_default() += 1; }
+        for (term, freq) in freqs {
+            let list = self.terms.entry(term).or_default();
+            let p = Posting { doc_id, freq };
+            match list.binary_search_by_key(&doc_id, |p| p.doc_id) {
+                Ok(i) => list[i] = p,
+                Err(i) => list.insert(i, p),
+            }
+        }
+    }
+
+    /// Live postings for `term` — deleted delta docs are filtered out here,
+    /// since their entries stay in `terms`.
+    fn postings(&self, term: &str) -> Vec<Posting> {
+        match self.terms.get(term) {
+            Some(list) => list.iter()
+                .filter(|p| self.doc_lengths.contains_key(&p.doc_id))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn mem_bytes(&self) -> usize {
+        let terms: usize = self.terms.iter()
+            .map(|(t, v)| t.len() + 32 + v.len() * std::mem::size_of::<Posting>())
+            .sum();
+        terms + self.doc_lengths.len() * 16
+    }
+}
+
 /// Lightweight BM25 index for a single text field.
 ///
 /// # Deletion without a tombstone set
@@ -262,6 +345,9 @@ pub struct Bm25Index {
     /// [`delete`]: Bm25Index::delete
     /// [`avg_doc_len`]: Bm25Index::avg_doc_len
     sum_doc_len: u64,
+    /// Documents written since the last merge. See [`Bm25Delta`] — every read
+    /// path must consult this as well as the base.
+    delta: Bm25Delta,
 }
 
 impl Bm25Index {
@@ -272,6 +358,7 @@ impl Bm25Index {
             + self.dict.mem_bytes()
             + match &self.doc_lengths { DocLens::Owned(v) => v.capacity() * 4, DocLens::Mapped { .. } => 0 }
             + match &self.doc_id_to_idx { DocIdx::Owned(m) => m.capacity() * 24, DocIdx::Mapped { .. } => 0 }
+            + self.delta.mem_bytes()
     }
 
     /// Spill the postings blob to `path` and switch to disk-backed reads,
@@ -280,6 +367,9 @@ impl Bm25Index {
     #[cfg(unix)]
     pub fn spill_to_disk(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
+        // The blob about to be written must be the whole index — fold in anything
+        // still sitting in the delta first.
+        self.merge_delta();
         if let PostingsBlob::Memory(blob) = &self.postings {
             // Write a NEW file and rename it into place rather than truncating the
             // existing one. A snapshot holds its own descriptor onto this file
@@ -309,6 +399,16 @@ impl Bm25Index {
     /// to the bm25.bin container. Postings stay in the separate `bm25_<field>.postings`
     /// file (already spilled). Format is documented in `open_mapped`.
     pub(crate) fn write_binary<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        // Guard rail. The on-disk format stores one contiguous segment and has no
+        // room for a delta, so persisting an unmerged index would silently drop
+        // every recently-written document from search on the next open. Callers
+        // must merge_delta() first; refusing here makes that impossible to forget.
+        if !self.delta.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bm25: refusing to serialise an index with an unmerged delta",
+            ));
+        }
         let fb = self.meta.field.as_bytes();
         w.write_all(&(fb.len() as u16).to_le_bytes())?;
         w.write_all(fb)?;
@@ -385,6 +485,14 @@ impl Bm25Index {
         let pfile = std::fs::File::open(&ppath)?;
         let plen = pfile.metadata()?.len();
         #[cfg(unix)]
+        // Sanity check: the dictionary and the postings file must belong to the
+        // same generation. If a merge ever rewrote one without the other, every
+        // offset here would address the wrong bytes; refusing makes the caller
+        // rebuild from the data instead of serving nonsense.
+        let needed = dict.iter().map(|(_, e)| e.postings_offset + e.postings_len as u64).max().unwrap_or(0);
+        if needed > plen {
+            return Err(bad("bm25 postings file is older than its dictionary"));
+        }
         let postings = PostingsBlob::Disk { file: std::sync::Arc::new(pfile), len: plen };
         #[cfg(not(unix))]
         let postings = { let _ = (pfile, plen); PostingsBlob::Memory(std::fs::read(&ppath)?) };
@@ -397,6 +505,7 @@ impl Bm25Index {
             doc_lengths: DocLens::Mapped { view: view.clone(), off: dl_off, count: doc_count },
             doc_id_to_idx: DocIdx::Mapped { view: view.clone(), off: idmap_off, count: idmap_count },
             sum_doc_len,
+            delta: Bm25Delta::default(),
         };
         Ok((index, p))
     }
@@ -508,6 +617,7 @@ impl Bm25Index {
             doc_lengths: DocLens::Owned(doc_lengths),
             doc_id_to_idx: DocIdx::Owned(doc_id_to_idx),
             sum_doc_len,
+            delta: Bm25Delta::default(),
         }
     }
 
@@ -547,13 +657,16 @@ impl Bm25Index {
         let idf: HashMap<&str, f64> = query_terms
             .iter()
             .filter_map(|t| {
-                if let Some(entry) = self.dict.get(t) {
-                    let postings = self.get_postings(entry);
+                // Document frequency spans both segments. Taking it from the base
+                // alone would score a term as rarer than it is the moment any
+                // document holding it lands in the delta.
+                let postings = self.term_postings(t);
+                if !postings.is_empty() {
                     let df = postings.len() as f64;
                     // Smoothed IDF (Lucene / BM25+ variant): `ln(1 + …)` stays
                     // positive even when a term appears in >50% of docs, instead
                     // of the classic RSJ form which floors to 0 for common terms.
-                    let idf = (1.0 + (self.meta.num_docs as f64 - df + 0.5) / (df + 0.5)).ln();
+                    let idf = (1.0 + (self.num_docs() as f64 - df + 0.5) / (df + 0.5)).ln();
                     Some((t.as_str(), idf.max(0.0)))
                 } else {
                     None
@@ -572,17 +685,13 @@ impl Bm25Index {
         let mut scores: HashMap<u64, f64> = HashMap::new();
 
         for (term, term_idf) in &idf {
-            let entry = self.dict.get(term).unwrap();
-            let postings = self.get_postings(entry);
-
-            for posting in postings {
-                let doc_idx = match self.doc_id_to_index(posting.doc_id) {
-                    Some(idx) => idx,
-                    // Document was deleted (entry removed from doc_id_to_idx).
+            for posting in self.term_postings(term) {
+                // Liveness gate, spanning both segments: the base drops deleted
+                // documents from doc_id_to_idx, the delta from its doc_lengths.
+                let doc_len = match self.live_doc_len(posting.doc_id) {
+                    Some(dl) => dl as f64,
                     None => continue,
                 };
-
-                let doc_len = self.doc_lengths.get(doc_idx) as f64;
                 let tf = posting.freq as f64;
 
                 // Standard BM25 formula:
@@ -647,6 +756,11 @@ impl Bm25Index {
     /// [`orphan_count`]: Bm25Index::orphan_count
     /// [`needs_rebuild`]: Bm25Index::needs_rebuild
     pub fn delete(&mut self, doc_id: u64) -> bool {
+        // A document can live in either segment (never both — insert_doc retires
+        // the base copy first), so try the delta as well.
+        if self.delta.remove(doc_id) {
+            return true;
+        }
         if let Some(idx) = self.doc_id_to_idx.get(doc_id) {
             let doc_len = self.doc_lengths.get(idx) as u64;
             self.sum_doc_len = self.sum_doc_len.saturating_sub(doc_len);
@@ -671,10 +785,11 @@ impl Bm25Index {
     /// [`delete`]: Bm25Index::delete
     #[inline]
     pub fn avg_doc_len(&self) -> f64 {
-        if self.meta.num_docs == 0 {
+        let n = self.meta.num_docs + self.delta.len() as u64;
+        if n == 0 {
             1.0
         } else {
-            self.sum_doc_len as f64 / self.meta.num_docs as f64
+            (self.sum_doc_len + self.delta.sum_doc_len) as f64 / n as f64
         }
     }
 
@@ -728,17 +843,159 @@ impl Bm25Index {
 
     /// Total number of live (non-deleted) documents in the index.
     pub fn num_docs(&self) -> u64 {
-        self.meta.num_docs
+        self.meta.num_docs + self.delta.len() as u64
     }
 
-    /// Number of unique terms in the dictionary.
+    /// Number of unique terms across the dictionary and the delta.
     pub fn num_terms(&self) -> usize {
-        self.dict.num_terms()
+        let extra = self.delta.terms.keys().filter(|t| self.dict.get(t).is_none()).count();
+        self.dict.num_terms() + extra
+    }
+
+    /// How many documents are waiting in the delta. Exposed so callers can
+    /// decide when to [`merge_delta`]; the index also merges itself once the
+    /// delta passes `DELTA_MERGE_DOCS`.
+    ///
+    /// [`merge_delta`]: Bm25Index::merge_delta
+    pub fn delta_len(&self) -> usize { self.delta.len() }
+
+    /// Index one document without rebuilding the corpus.
+    ///
+    /// Cost is proportional to the length of `text`, not to the size of the
+    /// index — that is the whole point. Re-inserting an existing `doc_id`
+    /// replaces it: the base copy is retired through [`delete`] and the new
+    /// content lands in the delta.
+    ///
+    /// [`delete`]: Bm25Index::delete
+    pub fn insert_doc(&mut self, doc_id: u64, text: &str) {
+        self.delete(doc_id);
+        self.delta.insert(doc_id, text);
+        if self.delta.len() >= DELTA_MERGE_DOCS {
+            self.merge_delta();
+        }
+    }
+
+    /// Fold the delta into the base, producing a single contiguous segment.
+    ///
+    /// This is a purely structural merge: postings are decoded, combined and
+    /// re-encoded, so it needs no access to the original documents. It also
+    /// reclaims the orphan slots left behind by [`delete`], which is why it
+    /// doubles as the rebuild that [`needs_rebuild`] asks for.
+    ///
+    /// [`delete`]: Bm25Index::delete
+    /// [`needs_rebuild`]: Bm25Index::needs_rebuild
+    pub fn merge_delta(&mut self) {
+        if self.delta.is_empty() && self.orphan_count() == 0 {
+            return;
+        }
+
+        // Gather every live document length first, so the merged segment is
+        // compact (no orphan slots) and slot indices can be reassigned.
+        let mut live: Vec<(u64, u32)> = self.doc_id_to_idx.sorted()
+            .into_iter()
+            .map(|(doc_id, idx)| (doc_id, self.doc_lengths.get(idx as usize)))
+            .collect();
+        for (&doc_id, &dl) in &self.delta.doc_lengths {
+            live.push((doc_id, dl));
+        }
+        live.sort_unstable_by_key(|(d, _)| *d);
+
+        let mut doc_lengths: Vec<u32> = Vec::with_capacity(live.len());
+        let mut doc_id_to_idx: HashMap<u64, usize> = HashMap::with_capacity(live.len());
+        let mut sum_doc_len: u64 = 0;
+        for (doc_id, dl) in &live {
+            doc_id_to_idx.insert(*doc_id, doc_lengths.len());
+            doc_lengths.push(*dl);
+            sum_doc_len += *dl as u64;
+        }
+
+        // Union of base and delta terms, in sorted order (the dictionary is
+        // sorted, and BTreeMap iterates sorted, so this stays cheap).
+        let mut terms: Vec<String> = self.dict.iter().map(|(t, _)| t.to_string()).collect();
+        for t in self.delta.terms.keys() {
+            if self.dict.get(t).is_none() { terms.push(t.clone()); }
+        }
+        terms.sort();
+        terms.dedup();
+
+        let mut dict = TermDict::new();
+        let mut blob: Vec<u8> = Vec::new();
+        let mut offset: u64 = 0;
+        for term in terms {
+            let mut postings: Vec<Posting> = match self.dict.get(&term) {
+                Some(entry) => self.get_postings(entry)
+                    .into_iter()
+                    .filter(|p| doc_id_to_idx.contains_key(&p.doc_id))
+                    .collect(),
+                None => Vec::new(),
+            };
+            for p in self.delta.postings(&term) {
+                match postings.binary_search_by_key(&p.doc_id, |q| q.doc_id) {
+                    Ok(i) => postings[i] = p,
+                    Err(i) => postings.insert(i, p),
+                }
+            }
+            if postings.is_empty() { continue; }
+
+            let bytes = encode_postings_to_file(&postings);
+            // Keep every list 8-byte aligned, as `build` does, so the blob stays
+            // mmap-friendly.
+            while offset % 8 != 0 { blob.push(0); offset += 1; }
+            dict.insert(term, offset, bytes.len() as u32);
+            blob.extend_from_slice(&bytes);
+            offset += bytes.len() as u64;
+        }
+
+        self.meta.num_docs = doc_lengths.len() as u64;
+        self.meta.avg_doc_len = if doc_lengths.is_empty() {
+            1.0
+        } else {
+            sum_doc_len as f64 / doc_lengths.len() as f64
+        };
+        self.dict = dict;
+        self.postings = PostingsBlob::Memory(blob);
+        self.doc_lengths = DocLens::Owned(doc_lengths);
+        self.doc_id_to_idx = DocIdx::Owned(doc_id_to_idx);
+        self.sum_doc_len = sum_doc_len;
+        self.delta = Bm25Delta::default();
     }
 
     // ── Private helpers ───────────────────────────────────────────────
 
     /// Decode the postings list for a term dictionary entry.
+    /// Live postings for `term` across the base and the delta.
+    ///
+    /// This is the one place the two segments are joined, so every scoring path
+    /// that goes through it is automatically delta-aware. Base postings for
+    /// deleted documents are filtered here; the delta filters its own.
+    fn term_postings(&self, term: &str) -> Vec<Posting> {
+        let mut postings: Vec<Posting> = match self.dict.get(term) {
+            Some(entry) => self.get_postings(entry)
+                .into_iter()
+                .filter(|p| self.doc_id_to_idx.get(p.doc_id).is_some())
+                .collect(),
+            None => Vec::new(),
+        };
+        if !self.delta.is_empty() {
+            for p in self.delta.postings(term) {
+                match postings.binary_search_by_key(&p.doc_id, |q| q.doc_id) {
+                    Ok(i) => postings[i] = p,
+                    Err(i) => postings.insert(i, p),
+                }
+            }
+        }
+        postings
+    }
+
+    /// Token count for a live document, whichever segment holds it.
+    /// `None` means deleted or never indexed.
+    fn live_doc_len(&self, doc_id: u64) -> Option<u32> {
+        if let Some(idx) = self.doc_id_to_idx.get(doc_id) {
+            return Some(self.doc_lengths.get(idx));
+        }
+        self.delta.doc_lengths.get(&doc_id).copied()
+    }
+
     fn get_postings(&self, entry: &super::dict::TermEntry) -> Vec<Posting> {
         let bytes = self.postings.read(entry.postings_offset, entry.postings_len);
         if bytes.is_empty() { return Vec::new(); }
