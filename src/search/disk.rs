@@ -24,6 +24,15 @@ pub const SEARCH_INDEX_VERSION: u32 = 4;
 
 impl SearchIndex {
     pub fn write_binary<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        // Guard rail, matching BM25: the on-disk format stores one segment, so
+        // serialising an index that still holds a delta would drop the newest
+        // documents from search on the next open. Callers rebuild first.
+        if self.delta.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "search: refusing to serialise an index with an unmerged delta",
+            ));
+        }
         w.write_all(MAGIC)?;
         w.write_all(&SEARCH_INDEX_VERSION.to_le_bytes())?;
 
@@ -152,6 +161,8 @@ impl SearchIndex {
             postings_data,
             field_post,
             position_post,
+            delta: None,
+            delta_docs: Vec::new(),
         })
     }
 
@@ -229,6 +240,8 @@ impl SearchIndex {
             postings_data,
             field_post,
             position_post,
+            delta: None,
+            delta_docs: Vec::new(),
         }, consumed))
     }
 }

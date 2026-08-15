@@ -261,6 +261,12 @@ fn apply_store_migrations(
 /// Bump each constant when the corresponding index algorithm changes in a way
 /// that makes indexes built by the previous version produce wrong results.
 const GIN_INDEX_VERSION:     u32 = 3; // sorted trigram dir + blob (mmap-served) 2026-08
+/// How many rows may sit in a search index's delta before the collection's index
+/// is rebuilt. The delta is itself rebuilt per write, so its cost is `O(delta)`;
+/// this bounds that, and the amortised rebuild works out far below the `O(rows)`
+/// it replaces.
+const SEARCH_DELTA_MERGE_DOCS: usize = 256;
+
 const BM25_INDEX_VERSION:    u32 = 1;
 const BTREE_INDEX_VERSION:   u32 = 1;
 const HNSW_INDEX_VERSION:    u32 = 1;
@@ -1529,7 +1535,7 @@ impl CoreDB {
         // Use 500 MB as the threshold — safely above any real snapshot, far below bloated ones.
         if snap_file_size > 500 * 1024 * 1024 {
             // v3 snapshots are manifests — the topology files must exist first.
-            db.merge_bm25_deltas();
+            db.merge_index_deltas();
             if db.write_topology_files(dir).is_ok() {
             if let Ok(snap_json) = serde_json::to_vec(&db.build_snapshot()) {
                 let snap_tmp = snap_path.with_extension("json.tmp");
@@ -1936,13 +1942,13 @@ impl CoreDB {
             }
         }
 
-        // Search index: immutable FST → rebuild the collection's index
-        // (deferred in a batch). Keeps new docs searchable, matching BM25.
+        // Search index: the FST is immutable, so this row joins the delta segment
+        // rather than forcing a rebuild (deferred in a batch).
         // Skipped during WAL replay — open() rebuilds search once at the end.
         if !self.replaying {
             let coll_for_search = self.nodes.get(&hash).map(|n| n.collection.clone());
             if let Some(coll) = coll_for_search {
-                self.touch_search_index(&coll);
+                self.touch_search_index_row(&coll, hash);
             }
         }
 
@@ -2026,12 +2032,17 @@ impl CoreDB {
                 bm25_idx.delete(hash);
             }
 
-            // Search + GIN have no incremental delete (immutable FST / trigram
-            // bitmaps) → rebuild affected indexes, deferred inside a batch.
+            // Search deletes incrementally: dropping the hash from id_to_slot is
+            // enough, because slot_to_hash gates on it. GIN has no incremental
+            // delete (trigram bitmaps) → rebuild, deferred inside a batch.
             // Skipped during replay: open() rebuilds everything once at the end.
             if !self.replaying {
                 let coll = node.collection.clone();
-                self.touch_search_index(&coll);
+                let skey = Self::search_index_key(&coll);
+                match self.search_indexes.get_mut(&skey) {
+                    Some(ix) => ix.delete(hash),
+                    None => self.touch_search_index(&coll),
+                }
 
                 if !self.gin_indexes.is_empty() {
                     let gin_fields: Vec<String> = self.gin_indexes.keys().cloned().collect();
@@ -2785,7 +2796,25 @@ impl CoreDB {
     /// carrying an unmerged delta cannot be serialised — `write_binary` refuses,
     /// rather than silently writing an index that omits the newest documents.
     /// Anything that persists indexes calls this first.
-    fn merge_bm25_deltas(&mut self) {
+    fn merge_index_deltas(&mut self) {
+        self.merge_search_deltas();
+        self.merge_bm25_deltas_inner();
+    }
+
+    /// Fold every search delta into its base by rebuilding the collection's index.
+    /// Unlike BM25 this needs the base documents' text, so it lives here rather
+    /// than inside the index.
+    fn merge_search_deltas(&mut self) {
+        let stale: Vec<String> = self.search_indexes.iter()
+            .filter(|(_, ix)| ix.delta_len() > 0)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for coll in stale {
+            self.rebuild_search_for_collection(&coll);
+        }
+    }
+
+    fn merge_bm25_deltas_inner(&mut self) {
         let dir = self.data_dir.clone();
         for (field, ix) in self.bm25_indexes.iter_mut() {
             if ix.delta_len() == 0 {
@@ -2838,6 +2867,38 @@ impl CoreDB {
 
     /// Mark a collection's search index for rebuild — deferred inside a batch,
     /// immediate otherwise. No-op if the collection has no search index.
+    /// Index a single row into `collection`'s search index.
+    ///
+    /// The collection-wide rebuild this replaces was `O(rows)` — 144 ms per INSERT
+    /// at 20 000 rows. Falls back to a rebuild when there is nothing to add to
+    /// (no index yet) or when the delta has grown enough to be worth folding in.
+    fn touch_search_index_row(&mut self, collection: &str, hash: u64) {
+        if collection.is_empty() || !self.collection_has_search_index(collection) {
+            return;
+        }
+        if self.defer_index_rebuild {
+            self.dirty_search.insert(collection.to_string());
+            return;
+        }
+        let key = Self::search_index_key(collection);
+        let fields = match self.search_indexes.get(&key) {
+            Some(ix) if ix.delta_len() < SEARCH_DELTA_MERGE_DOCS => ix.fields.clone(),
+            // No index yet, or the delta has earned a merge: only the database can
+            // do that, since folding in needs the base documents' text.
+            _ => return self.rebuild_search_for_collection(collection),
+        };
+        let payload = match self.get_payload(hash) {
+            Some(p) => p,
+            None => return self.rebuild_search_for_collection(collection),
+        };
+        let field_values: Vec<String> = fields.iter()
+            .map(|f| payload.get(f).and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect();
+        if let Some(ix) = self.search_indexes.get_mut(&key) {
+            ix.insert_doc(search::index::DocFields { hash, field_values });
+        }
+    }
+
     fn touch_search_index(&mut self, collection: &str) {
         if collection.is_empty() || !self.collection_has_search_index(collection) {
             return;
@@ -3793,7 +3854,7 @@ impl CoreDB {
         // exist. Crash between the two leaves the OLD snapshot + NEW topology
         // files, which reopens fine (old snapshot is still self-sufficient or
         // points at the previous, still-valid files; WAL not yet truncated).
-        self.merge_bm25_deltas();
+        self.merge_index_deltas();
         self.write_topology_files(&dir)?;
 
         // Persist btree field indexes as mmap'able sidecars so a reopened paged DB
