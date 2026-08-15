@@ -276,3 +276,107 @@ fn uncompacted_writes_survive_a_crash_in_both_modes() {
         assert!(db.get("v/n14").is_some(), "paged={paged}: the last write replayed");
     }
 }
+
+/// Every `Engine` write path must be on disk before it returns.
+///
+/// In service mode the engine takes over the log's fsync so that writers
+/// committing at the same time can share one — the fsync moves out of the write
+/// lock, but nothing is deferred and no write is acknowledged early. If any write
+/// path were to miss the commit, its records would sit in the log unsynced and a
+/// power cut would lose data the caller was told was written.
+#[test]
+fn every_engine_write_path_is_durable() {
+    use sekejap::engine::Engine;
+    use serde_json::json;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let eng = Engine::open_as_service(dir.path().to_str().unwrap()).unwrap();
+        eng.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
+
+        eng.execute("INSERT INTO d (_key, body) VALUES ('a', 'via execute')").unwrap();
+        eng.execute_params("INSERT INTO d (_key, body) VALUES ($1, $2)",
+                           &[json!("b"), json!("via params")]).unwrap();
+        eng.execute("UPDATE d SET body = 'updated' WHERE _key = 'a'").unwrap();
+        eng.execute("INSERT INTO d (_key, body) VALUES ('c', 'to be deleted')").unwrap();
+        eng.execute("DELETE FROM d WHERE _key = 'c'").unwrap();
+        // Dropped without compacting — what a killed process leaves behind.
+        std::mem::drop(eng);
+    }
+
+    let db = sekejap::CoreDB::open(dir.path()).unwrap();
+    assert!(db.get("d/a").unwrap().contains("updated"), "execute + UPDATE lost");
+    assert!(db.get("d/b").unwrap().contains("via params"), "execute_params lost");
+    assert!(db.get("d/c").is_none(), "DELETE lost");
+}
+
+/// Compaction replaces the log with a new file, restarting its record count.
+///
+/// A coordinator that did not notice would keep syncing a descriptor onto the
+/// removed inode, and — because the count restarts at zero — would conclude every
+/// later write was already durable and stop syncing altogether. Auto-compaction
+/// runs on its own, so this is the ordinary path, not an edge case.
+#[test]
+fn writes_stay_durable_across_a_compaction() {
+    use sekejap::engine::Engine;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let eng = Engine::open_as_service(dir.path().to_str().unwrap()).unwrap();
+        eng.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        for i in 0..5 {
+            eng.execute(&format!("INSERT INTO d (_key, n) VALUES ('before{i}', {i})")).unwrap();
+        }
+        eng.compact().unwrap();                       // log generation advances
+        for i in 0..5 {
+            eng.execute(&format!("INSERT INTO d (_key, n) VALUES ('after{i}', {i})")).unwrap();
+        }
+        eng.compact().unwrap();                       // and again
+        for i in 0..5 {
+            eng.execute(&format!("INSERT INTO d (_key, n) VALUES ('later{i}', {i})")).unwrap();
+        }
+        std::mem::drop(eng);                          // no final compaction
+    }
+
+    let db = sekejap::CoreDB::open(dir.path()).unwrap();
+    for prefix in ["before", "after", "later"] {
+        for i in 0..5 {
+            assert!(db.get(&format!("d/{prefix}{i}")).is_some(),
+                    "{prefix}{i} lost — a write after a compaction was not synced");
+        }
+    }
+}
+
+/// Concurrent writers share an fsync; every one of their writes must still land.
+#[test]
+fn concurrent_writers_all_land() {
+    use sekejap::engine::Engine;
+    use std::sync::Arc;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let eng = Arc::new(Engine::open_as_service(dir.path().to_str().unwrap()).unwrap());
+        eng.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, t INTEGER)").unwrap();
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let eng = Arc::clone(&eng);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..20 {
+                    eng.execute(&format!(
+                        "INSERT INTO d (_key, t) VALUES ('t{t}r{i}', {t})"
+                    )).unwrap();
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        std::mem::drop(eng);
+    }
+
+    let db = sekejap::CoreDB::open(dir.path()).unwrap();
+    for t in 0..8 {
+        for i in 0..20 {
+            assert!(db.get(&format!("d/t{t}r{i}")).is_some(),
+                    "t{t}r{i} lost under concurrent commit");
+        }
+    }
+}

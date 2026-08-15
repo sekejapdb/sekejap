@@ -1001,6 +1001,21 @@ pub struct CoreDB {
     /// When true, `wal_write` appends without fsync.
     /// Used by batch operations (UPDATE, DELETE, COMMIT) to coalesce syncs.
     defer_wal_sync: bool,
+    /// The caller fsyncs the log itself, so this database appends without one.
+    ///
+    /// Set by `Engine` in service mode: several writers that commit at the same
+    /// time then share a single fsync instead of each paying for their own. The
+    /// record is still appended and flushed to the OS here — only the fsync moves
+    /// out, and the engine does not report a write committed until it has run.
+    /// Never set for an embedded `CoreDB`, which fsyncs inline as before.
+    group_commit: bool,
+    /// Bumped whenever the log file is replaced — which compaction does, renaming
+    /// the old one away and creating a new one.
+    ///
+    /// A caller coordinating fsyncs must notice this: the descriptor it holds now
+    /// points at a removed inode, and the record count has restarted from zero.
+    /// Without it, syncs would silently stop covering anything.
+    wal_generation: u64,
     /// When `Some`, `put_raw_inner` uses this timestamp instead of calling
     /// `chrono::Utc::now()` per row — set once per batch to skip N time syscalls.
     batch_now: Option<i64>,
@@ -1251,6 +1266,8 @@ impl CoreDB {
             replaying: false,
             pending_txn: None,
             defer_wal_sync: false,
+            group_commit: false,
+            wal_generation: 0,
             batch_now: None,
             defer_index_rebuild: false,
             dirty_bm25: HashSet::new(),
@@ -2657,7 +2674,7 @@ impl CoreDB {
                 .expect("sekejap: WAL write failed — disk error");
             // Force-flush to physical disk only when durability is Full and we're
             // not inside a batch (`defer_wal_sync`), which fsyncs once at the end.
-            if !self.defer_wal_sync && self.wal_sync == SyncMode::Full {
+            if !self.defer_wal_sync && !self.group_commit && self.wal_sync == SyncMode::Full {
                 wal.sync()
                     .expect("sekejap: WAL fsync failed — disk error");
             }
@@ -2723,7 +2740,7 @@ impl CoreDB {
     }
 
     fn wal_flush(&mut self) {
-        if self.wal_sync != SyncMode::Full { return; }
+        if self.wal_sync != SyncMode::Full || self.group_commit { return; }
         if let Some(wal) = &mut self.wal {
             wal.sync()
                 .expect("sekejap: WAL fsync failed — disk error");
@@ -3108,7 +3125,7 @@ impl CoreDB {
                 if let Some(wal) = &mut self.wal {
                     wal.append_batch(&wal_entries)
                         .expect("sekejap: WAL batch write failed");
-                    if !self.defer_wal_sync && self.wal_sync == SyncMode::Full {
+                    if !self.defer_wal_sync && !self.group_commit && self.wal_sync == SyncMode::Full {
                         wal.sync().expect("sekejap: WAL fsync failed");
                     }
                 }
@@ -3445,7 +3462,7 @@ impl CoreDB {
         // on open, so this ordering is crash-safe). One batch each, one fsync.
         if let Some(wal) = &mut self.wal {
             wal.append_batch(&wal_entries).expect("sekejap: WAL batch append failed");
-            if !self.defer_wal_sync && self.wal_sync == SyncMode::Full {
+            if !self.defer_wal_sync && !self.group_commit && self.wal_sync == SyncMode::Full {
                 wal.sync().expect("sekejap: WAL fsync failed");
             }
         }
@@ -3957,6 +3974,9 @@ impl CoreDB {
         let mut new_wal = WalWriter::open_with_format(&wal_path, self.wal_format)?;
         new_wal.set_sync_level(self.wal_sync_level);
         self.wal = Some(new_wal);
+        // New file, new inode, record count restarting at zero: anyone
+        // coordinating fsyncs on our behalf has to be told.
+        self.wal_generation += 1;
         if wal_old.exists() {
             std::fs::remove_file(&wal_old)?;
         }
@@ -4741,6 +4761,40 @@ impl CoreDB {
     /// Where a node's payload lives in the payload store — overlay first, then
     /// the mapped base. Lean (no string materialization): this sits on the
     /// payload-read hot path.
+    /// Hand the log's fsync duty to the caller.
+    ///
+    /// Returns a second descriptor onto the log and the strength to sync it at,
+    /// or `None` when there is no log (in-memory) or durability is not `Full`, in
+    /// which case there is nothing to coordinate. From here on this database
+    /// appends without fsyncing; the caller must fsync that descriptor before
+    /// reporting any write committed.
+    pub(crate) fn take_over_wal_sync(&mut self) -> Option<(std::fs::File, storage::wal::SyncLevel)> {
+        if self.wal_sync != SyncMode::Full {
+            return None;
+        }
+        let wal = self.wal.as_ref()?;
+        let file = wal.try_clone_file().ok()?;
+        let level = wal.sync_level();
+        self.group_commit = true;
+        Some((file, level))
+    }
+
+    /// Records appended to the log so far — the handle a caller waits on to learn
+    /// that its own write has been made durable.
+    /// Where the log stands: which generation of the file, and how many records
+    /// have been appended to it.
+    ///
+    /// A caller waits on this pair. The generation must be compared first — a
+    /// count is only meaningful within the generation that produced it.
+    pub(crate) fn wal_mark(&self) -> (u64, u64) {
+        (self.wal_generation, self.wal.as_ref().map_or(0, |w| w.seq()))
+    }
+
+    /// A fresh descriptor onto the current log file.
+    pub(crate) fn wal_clone_file(&self) -> Option<std::fs::File> {
+        self.wal.as_ref()?.try_clone_file().ok()
+    }
+
     pub(crate) fn payload_loc(&self, hash: u64) -> Option<(u64, u32)> {
         // `is_empty` first: with no pending base deletes this is a length check,
         // not a hash lookup, so the hot read path pays essentially nothing.
@@ -4844,6 +4898,8 @@ impl CoreDB {
             autocompacting: false,
             writes_since_compact_check: 0,
             defer_wal_sync: false,
+            group_commit: false,
+            wal_generation: 0,
             batch_now: None,
             defer_index_rebuild: false,
             dirty_bm25: HashSet::new(),
