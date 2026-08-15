@@ -432,6 +432,12 @@ impl HnswGraph {
     ) -> Vec<u64> {
         let (mut ep_id, ep_level) = match self.entry_point {
             Some(ep) => ep,
+            // No entry point but nodes exist: scan rather than claim there are no
+            // neighbours (see the correctness floor below).
+            None if !self.nodes.is_empty() => (
+                *self.nodes.keys().next().expect("non-empty"),
+                0,
+            ),
             None => return vec![],
         };
 
@@ -448,6 +454,29 @@ impl HnswGraph {
         // Beam search at layer 0.
         let ef_actual = ef.max(k);
         let mut results = search_layer::<D, V>(&self.nodes, query, ep_id, ef_actual, 0, vectors);
+
+        // CORRECTNESS FLOOR: a nearest-neighbour search over a NON-EMPTY index must
+        // never come back empty. The graph is built by walking `ids` in HashMap
+        // order, so the level assignment — and therefore the graph shape — differs
+        // per process; on very small or awkwardly-linked graphs the beam search can
+        // start somewhere it cannot traverse and return nothing. Falling back to a
+        // direct scan keeps the answer correct at a cost paid only in the case that
+        // would otherwise be a silent wrong answer.
+        if results.is_empty() && !self.nodes.is_empty() {
+            let mut scanned: Vec<MinCand> = self
+                .nodes
+                .keys()
+                .filter_map(|&id| {
+                    vectors
+                        .get(id)
+                        .map(|v| MinCand { id, dist: D::eval(query, v) })
+                })
+                .collect();
+            scanned.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+            scanned.truncate(k);
+            return scanned.into_iter().map(|c| c.id).collect();
+        }
+
         results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
         results.truncate(k);
         results.into_iter().map(|c| c.id).collect()
@@ -485,6 +514,22 @@ impl HnswGraph {
         // Beam search at layer 0.
         let ef_actual = ef.max(k);
         let mut results = search_layer_quant(&self.nodes, q_code, ep_id, ef_actual, 0, codes);
+
+        // CORRECTNESS FLOOR — see `search`: a non-empty index must never answer with
+        // nothing, whatever shape the graph happens to have taken.
+        if results.is_empty() && !self.nodes.is_empty() {
+            let mut scanned: Vec<MinCand> = self
+                .nodes
+                .keys()
+                .filter_map(|&id| {
+                    codes.code(id).map(|c| MinCand { id, dist: l2_u8(q_code, c) as f32 })
+                })
+                .collect();
+            scanned.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+            scanned.truncate(k);
+            return scanned.into_iter().map(|c| c.id).collect();
+        }
+
         results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
         results.truncate(k);
         results.into_iter().map(|c| c.id).collect()
