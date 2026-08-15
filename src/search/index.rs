@@ -264,8 +264,27 @@ pub struct SearchIndex {
     pub(crate) field_post: MappedPostings,
     /// Position/proximity bitmaps keyed by `term \0 bucket` (for proximity ranking).
     pub(crate) position_post: MappedPostings,
+    /// Documents written since the last full build, held as their own segment.
+    ///
+    /// The term dictionary is an FST — genuinely immutable — so a new document
+    /// cannot be threaded into it. Rebuilding instead made one INSERT cost
+    /// `O(corpus)`: 144 ms at 20 000 rows, growing with the table. New documents
+    /// go into this second, small index and queries read both.
+    ///
+    /// Unlike BM25 this needs no statistical stitching: [`score`] is computed
+    /// entirely from one document (matched terms, edit distance, field order,
+    /// proximity) with no corpus-wide term statistics, so a document scores the
+    /// same whichever segment holds it.
+    ///
+    /// [`score`]: SearchIndex::score
+    pub(crate) delta: Option<Box<SearchIndex>>,
+    /// Source rows behind `delta`. The segment is rebuilt from these as writes
+    /// arrive, so they must be retained; a full merge needs the base documents
+    /// too, which only the database has, so `CoreDB` drives that.
+    pub(crate) delta_docs: Vec<DocFields>,
 }
 
+#[derive(Clone)]
 pub struct DocFields {
     pub hash: u64,
     pub field_values: Vec<String>,
@@ -366,6 +385,8 @@ impl SearchIndex {
             postings_data: Bytes::Owned(postings_data),
             field_post,
             position_post,
+            delta: None,
+            delta_docs: Vec::new(),
         }
     }
 
@@ -441,6 +462,18 @@ impl SearchIndex {
     /// < 5 chars, 1 for 5–8, 2 for 9+). Exact matches are preferred; a term that isn't
     /// found exactly is fuzzy-expanded to within its edit distance.
     pub fn search_typo(&self, query: &str, typo: Option<u32>) -> RoaringBitmap {
+        let mut hits = self.search_typo_segment(query, typo);
+        if let Some(d) = &self.delta {
+            let base = self.delta_slot_base();
+            for slot in d.search_typo_segment(query, typo) {
+                hits.insert(slot + base);
+            }
+        }
+        hits
+    }
+
+    /// `search_typo` against this segment alone — the base half of the union.
+    fn search_typo_segment(&self, query: &str, typo: Option<u32>) -> RoaringBitmap {
         let unique_terms = deduplicate_tokens(query);
         if unique_terms.is_empty() {
             return RoaringBitmap::new();
@@ -472,6 +505,18 @@ impl SearchIndex {
     /// a separate magnitude band so a better words score always beats a worse one
     /// regardless of lower-tier rules.
     pub fn score(&self, query: &str, slot: u32) -> f64 {
+        if slot >= self.delta_slot_base() {
+            return match &self.delta {
+                Some(d) => d.score(query, slot - self.delta_slot_base()),
+                None => 0.0,
+            };
+        }
+        self.score_segment(query, slot)
+    }
+
+    /// `score` against this segment alone. Safe to compute independently: the
+    /// cascade reads only per-document signals, never corpus statistics.
+    fn score_segment(&self, query: &str, slot: u32) -> f64 {
         let terms = deduplicate_tokens(query);
         if terms.is_empty() { return 0.0; }
 
@@ -613,12 +658,56 @@ impl SearchIndex {
         0.0
     }
 
+    /// Slot numbers of delta documents start here, so the two segments share one
+    /// flat slot space and callers never learn there are two of them.
+    #[inline]
+    fn delta_slot_base(&self) -> u32 { self.doc_count }
+
+    /// How many documents are waiting in the delta.
+    pub fn delta_len(&self) -> usize { self.delta_docs.len() }
+
+    /// Index one document without rebuilding the corpus.
+    ///
+    /// The delta segment is rebuilt, not the whole index — its cost is bounded by
+    /// the number of documents written since the last merge, not by table size.
+    /// Re-inserting a hash replaces it.
+    pub fn insert_doc(&mut self, doc: DocFields) {
+        self.delete(doc.hash);
+        self.delta_docs.retain(|d| d.hash != doc.hash);
+        self.delta_docs.push(doc);
+        self.rebuild_delta();
+    }
+
+    fn rebuild_delta(&mut self) {
+        self.delta = if self.delta_docs.is_empty() {
+            None
+        } else {
+            Some(Box::new(SearchIndex::build(
+                self.fields.clone(),
+                self.delta_docs.iter().cloned(),
+            )))
+        };
+    }
+
     pub fn slot_to_hash(&self, slot: u32) -> Option<u64> {
-        self.id_map.get(slot as usize)
+        if slot >= self.delta_slot_base() {
+            return self.delta.as_ref()?.slot_to_hash(slot - self.delta_slot_base());
+        }
+        let hash = self.id_map.get(slot as usize)?;
+        // Liveness gate. `delete` only removes the hash from id_to_slot — the term
+        // data is immutable and may be mmap-backed — so a deleted document keeps a
+        // slot in every bitmap. Filtering here is what makes the deletion visible,
+        // and is why a delete no longer needs a full rebuild.
+        self.id_to_slot.get(hash)?;
+        Some(hash)
     }
 
     pub fn hash_to_slot(&self, hash: u64) -> Option<u32> {
-        self.id_to_slot.get(hash)
+        if let Some(slot) = self.id_to_slot.get(hash) {
+            return Some(slot);
+        }
+        let d = self.delta.as_ref()?;
+        d.hash_to_slot(hash).map(|s| s + self.delta_slot_base())
     }
 
     pub fn delete(&mut self, hash: u64) {
@@ -627,6 +716,9 @@ impl SearchIndex {
         // Deleted docs are excluded at search time via id_to_slot; score() only runs
         // on live slots, so a stale slot lingering in a bitmap is harmless.
         self.id_to_slot.remove(hash);
+        if let Some(d) = self.delta.as_mut() {
+            d.id_to_slot.remove(hash);
+        }
     }
 }
 
