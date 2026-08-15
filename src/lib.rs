@@ -7192,8 +7192,9 @@ impl CoreDB {
     fn rebuild_text_indexes(&mut self) {
         let mut field_values: HashMap<String, Vec<(u64, String)>> = HashMap::new();
 
-        for (&hash, node) in &self.nodes {
-            if let Some(payload) = self.payload_store.get(node.payload_offset, node.payload_len) {
+        // Base-aware — see build_bm25_index.
+        for hash in self.all_hashes() {
+            if let Some(payload) = self.get_payload(hash) {
                 extract_string_fields(&payload, "", &mut field_values, hash);
             }
         }
@@ -7333,11 +7334,12 @@ impl CoreDB {
     /// `CREATE INDEX ON <collection> USING gin (<field>)`, which records the
     /// declaration and rebuilds on open.
     pub fn build_gin_index(&mut self, field: &str) {
+        // Base-aware — see build_bm25_index.
         let owned: Vec<(u64, String)> = self
-            .nodes
-            .iter()
-            .filter_map(|(&hash, node)| {
-                let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+            .all_hashes()
+            .into_iter()
+            .filter_map(|hash| {
+                let payload = self.get_payload(hash)?;
                 payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
@@ -7401,11 +7403,14 @@ impl CoreDB {
     /// after reopen. For a durable index use `CREATE INDEX ON <collection>
     /// USING bm25 (<field>)`, which records the declaration and rebuilds on open.
     pub fn build_bm25_index(&mut self, field: &str) {
+        // Base-aware: `self.nodes` is only the write overlay in paged mode, so
+        // enumerating it would rebuild an index covering just the recent writes and
+        // silently drop every base-resident document from text search.
         let owned: Vec<(u64, String)> = self
-            .nodes
-            .iter()
-            .filter_map(|(&hash, node)| {
-                let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+            .all_hashes()
+            .into_iter()
+            .filter_map(|hash| {
+                let payload = self.get_payload(hash)?;
                 payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
@@ -8253,13 +8258,15 @@ impl CoreDB {
     /// Build a positional search index for a collection.
     fn build_search_index(&mut self, collection: &str, fields: &[String]) {
         let coll_hash = sk_hash(collection);
-        let members = match self.collections.get(&coll_hash) {
-            Some(m) => m.clone(),
+        // Base-aware: collection_members merges the mmap'd base with the overlay
+        // (and drops tombstones); self.collections alone is overlay-only.
+        let members: Vec<u64> = match self.collection_members(coll_hash) {
+            Some(m) => m.into_owned(),
             None => return,
         };
 
         let docs = members.iter().filter_map(|&hash| {
-            let node = self.nodes.get(&hash)?;
+            let node = self.node_data(hash)?;
             let payload = self.get_payload(hash)?;
             let _ = node; // ensure node exists
             let field_values: Vec<String> = fields.iter().map(|f| {

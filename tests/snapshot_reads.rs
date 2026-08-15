@@ -548,3 +548,115 @@ fn accessors_report_the_same_in_both_storage_modes() {
     assert_eq!(paged.stats().nodes, r_stats, "stats differ by mode");
     assert_eq!(paged.query("SELECT _key FROM alpha").unwrap().collect().len(), r_alpha);
 }
+
+/// **P1.24 pre-condition.** Index maintenance is deferred during bulk writes
+/// (`defer_index_rebuild` + the `dirty_*` sets, flushed at the end). A snapshot must
+/// never observe that half-built state: it must either see the indexes complete, or
+/// not see the writes at all — never rows present with an index that omits them.
+///
+/// Written BEFORE extending deferral to single writes, so the guarantee is pinned
+/// first rather than assumed.
+#[test]
+fn snapshot_never_sees_a_half_built_index() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
+        for i in 0..30 {
+            db.execute(&format!(
+                "INSERT INTO d (_key, body) VALUES ('d{i}', 'grilled chicken number {i}')"
+            )).unwrap();
+        }
+        db.execute("CREATE INDEX ON d USING bm25 (body)").unwrap();
+        db.execute("CREATE INDEX ON d USING search (body)").unwrap();
+        db.compact().unwrap();
+    }
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+
+    let bm25 = |db: &CoreDB| db
+        .query("SELECT _key FROM d WHERE BM25(body,'grilled chicken') > 0")
+        .map(|s| s.collect().len()).unwrap_or(0);
+    let search = |db: &CoreDB| db
+        .query("SELECT _key FROM d WHERE SEARCH('grilled chicken')")
+        .map(|s| s.collect().len()).unwrap_or(0);
+    let rows = |db: &CoreDB| db.query("SELECT _key FROM d").unwrap().collect().len();
+
+    let before = db.snapshot_db().unwrap();
+    assert_eq!(rows(&before), 30);
+    assert_eq!(bm25(&before), 30, "baseline: every row is indexed");
+    assert_eq!(search(&before), 30);
+
+    // A bulk write — this is the path that defers index maintenance.
+    let batch: Vec<(String, serde_json::Value)> = (30..60)
+        .map(|i| (format!("d/d{i}"),
+                  json!({"_collection":"d","_key":format!("d{i}"),"body":"grilled chicken number {i}"})))
+        .collect();
+    db.put_value_bulk(batch).unwrap();
+
+    // The earlier snapshot is frozen: it must still be internally consistent.
+    assert_eq!(rows(&before), 30, "old snapshot unchanged");
+    assert_eq!(bm25(&before), 30, "old snapshot's index still matches its rows");
+
+    // A snapshot taken after the bulk write must see rows and indexes agreeing —
+    // this is the half-built-index guarantee.
+    let after = db.snapshot_db().unwrap();
+    let r = rows(&after);
+    assert_eq!(r, 60, "new snapshot sees the bulk rows");
+    assert_eq!(bm25(&after), r, "BM25 index covers every row the snapshot can see");
+    assert_eq!(search(&after), r, "search index covers every row the snapshot can see");
+
+    // And the live database agrees.
+    assert_eq!(bm25(&db), rows(&db));
+}
+
+/// Rebuilding a text index in paged mode must not drop the base.
+///
+/// In paged mode `self.nodes` is only the *write overlay* — the rows written since
+/// the last compaction. Every index builder that enumerated it therefore rebuilt an
+/// index covering a fraction of the database and silently discarded the rest. This
+/// pins all four builders (bm25, gin, trigram, positional search) to the base-aware
+/// enumeration, so the fallacy cannot come back one builder at a time.
+#[test]
+fn rebuilding_an_index_in_paged_mode_keeps_the_base() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
+        for i in 0..30 {
+            db.execute(&format!(
+                "INSERT INTO d (_key, body) VALUES ('d{i}', 'grilled chicken number {i}')"
+            )).unwrap();
+        }
+        db.compact().unwrap();
+    }
+
+    // Reopened paged: all 30 rows live in the mmap'd base, the overlay is empty.
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM d").unwrap().collect().len(), 30);
+
+    let count = |db: &CoreDB, sql: &str| db.query(sql).map(|s| s.collect().len()).unwrap_or(0);
+
+    db.build_bm25_index("body");
+    assert_eq!(
+        count(&db, "SELECT _key FROM d WHERE BM25(body,'grilled chicken') > 0"), 30,
+        "BM25 rebuild kept the base documents",
+    );
+
+    db.build_gin_index("body");
+    assert_eq!(
+        count(&db, "SELECT _key FROM d WHERE body ILIKE '%chicken%'"), 30,
+        "GIN rebuild kept the base documents",
+    );
+
+    db.build_text_indexes();
+    assert_eq!(
+        count(&db, "SELECT _key FROM d WHERE body ILIKE '%chicken%'"), 30,
+        "trigram rebuild kept the base documents",
+    );
+
+    db.execute("CREATE INDEX ON d USING search (body)").unwrap();
+    assert_eq!(
+        count(&db, "SELECT _key FROM d WHERE SEARCH('grilled chicken')"), 30,
+        "positional search build kept the base documents",
+    );
+}
