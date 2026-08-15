@@ -7384,6 +7384,38 @@ fn search_view_multimodal_text_geo_vector() {
 }
 
 #[test]
+fn vector_near_is_scoped_to_its_collection() {
+    // P0.S8 regression. The vector store and its HNSW index are keyed by FIELD NAME,
+    // so collections sharing a field name share one index — a materialised view
+    // mirroring its source's vectors is the common case. The planner's
+    // "Collection + VECTOR_NEAR → HNSW starter" fast path took the top-k GLOBALLY and
+    // only then gated on _collection, so when the nearest rows belonged to the other
+    // collection the query answered EMPTY despite having matches. With identical
+    // embeddings on both sides the winner was decided by graph order, which varies
+    // with the per-process hash seed — hence a ~30% intermittent failure.
+    let mut db = CoreDB::new();
+    db.execute("CREATE TABLE src (_key TEXT PRIMARY KEY, emb VECTOR)").unwrap();
+    db.execute("CREATE TABLE mirror (_key TEXT PRIMARY KEY, emb VECTOR)").unwrap();
+    for (k, v) in [("a", "[0.9,0.1,0.0]"), ("b", "[0.1,0.9,0.0]")] {
+        db.execute(&format!("INSERT INTO src (_key, emb) VALUES ('{k}', {v})")).unwrap();
+        // identical vectors in a second collection, same field name
+        db.execute(&format!("INSERT INTO mirror (_key, emb) VALUES ('{k}', {v})")).unwrap();
+    }
+    db.execute("CREATE INDEX ON src USING hnsw (emb)").unwrap();
+    db.execute("CREATE INDEX ON mirror USING hnsw (emb)").unwrap();
+
+    let keys = |db: &CoreDB, q: &str| -> Vec<String> {
+        db.query(q).unwrap().collect().iter()
+            .filter_map(|h| h.payload.as_ref()?.get("_key")?.as_str().map(String::from)).collect()
+    };
+    // Each collection must answer from its own rows, never be emptied by the other.
+    assert_eq!(keys(&db, "SELECT _key FROM src WHERE VECTOR_NEAR(emb, [0.9,0.1,0.0], 1)"), vec!["a"]);
+    assert_eq!(keys(&db, "SELECT _key FROM mirror WHERE VECTOR_NEAR(emb, [0.9,0.1,0.0], 1)"), vec!["a"]);
+    // k is still honoured after scoping.
+    assert_eq!(keys(&db, "SELECT _key FROM mirror WHERE VECTOR_NEAR(emb, [0.9,0.1,0.0], 2)").len(), 2);
+}
+
+#[test]
 fn search_typo_tolerance() {
     let mut db = CoreDB::new();
     db.execute("CREATE TABLE movie (_key TEXT PRIMARY KEY, title TEXT)").unwrap();
