@@ -44,6 +44,23 @@ const PAGE_HEADER: usize = 8;
 /// Bytes per directory entry: offset (u16) and length (u16).
 const SLOT_SIZE: usize = 4;
 
+/// Slot number marking a record too large for one page, held instead in a chain
+/// of pages beginning at the id's page. A real slot number cannot reach this: a
+/// 4 KB page has room for a few hundred at most.
+const OVERFLOW_SLOT: u16 = u16::MAX;
+
+/// Per-page bookkeeping in an overflow chain: next page (u64), a marker (u32),
+/// then bytes-in-this-page (u32).
+///
+/// The marker sits *after* the next-page field deliberately. Freeing a page writes
+/// the free-list link over its first eight bytes, which would leave the rest of a
+/// chain page looking entirely valid — a deleted record would still read, and worse,
+/// would follow the free list as though it were the rest of its data. Deletion
+/// clears the marker before freeing, and a read that does not find it returns
+/// nothing rather than whatever the bytes happen to say.
+const OVERFLOW_HEADER: usize = 16;
+const OVERFLOW_MAGIC: u32 = 0x534B_4F56; // "SKOV"
+
 /// Where a record lives: page number and directory slot, packed.
 ///
 /// 48 bits of page number at 4 KB a page is a petabyte of addressable store; 16
@@ -130,14 +147,87 @@ impl RecordStore {
         heap_start(p).saturating_sub(len) >= dir_end
     }
 
-    /// Store `bytes` and return where it went.
+    /// Bytes of payload an overflow page carries.
+    fn overflow_capacity(&self) -> usize {
+        self.pages.page_size() - OVERFLOW_HEADER
+    }
+
+    /// Store a record too large for one page as a chain of pages.
+    ///
+    /// Written back to front so each page can record the one that follows it,
+    /// which means the chain is complete the moment its head exists — there is no
+    /// window where a reader could follow a half-built chain.
+    fn insert_overflow(&mut self, bytes: &[u8]) -> io::Result<RecordId> {
+        let cap = self.overflow_capacity();
+        let chunks: Vec<&[u8]> = bytes.chunks(cap).collect();
+        let mut next: u64 = 0;
+        let mut head: u64 = 0;
+        for chunk in chunks.iter().rev() {
+            let page = self.pages.alloc()?;
+            let mut buf = vec![0u8; self.pages.page_size()];
+            buf[0..8].copy_from_slice(&next.to_le_bytes());
+            buf[8..12].copy_from_slice(&OVERFLOW_MAGIC.to_le_bytes());
+            buf[12..16].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+            buf[OVERFLOW_HEADER..OVERFLOW_HEADER + chunk.len()].copy_from_slice(chunk);
+            self.pages.write(page, &buf)?;
+            next = page;
+            head = page;
+        }
+        Ok(RecordId::new(head, OVERFLOW_SLOT))
+    }
+
+    fn read_overflow(&mut self, head: u64) -> io::Result<Option<Vec<u8>>> {
+        let ps = self.pages.page_size();
+        let mut out = Vec::new();
+        let mut page = head;
+        let mut buf = vec![0u8; ps];
+        while page != 0 {
+            if self.pages.read(page, &mut buf).is_err() {
+                return Ok(None);
+            }
+            let next = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            if u32::from_le_bytes(buf[8..12].try_into().unwrap()) != OVERFLOW_MAGIC {
+                return Ok(None); // freed, or never a chain page — do not read on
+            }
+            let n = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+            if n > ps - OVERFLOW_HEADER {
+                return Ok(None);
+            }
+            out.extend_from_slice(&buf[OVERFLOW_HEADER..OVERFLOW_HEADER + n]);
+            page = next;
+        }
+        Ok(Some(out))
+    }
+
+    fn delete_overflow(&mut self, head: u64) -> io::Result<bool> {
+        let ps = self.pages.page_size();
+        let mut buf = vec![0u8; ps];
+        let mut page = head;
+        let mut freed = false;
+        while page != 0 {
+            if self.pages.read(page, &mut buf).is_err() {
+                break;
+            }
+            let next = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            if u32::from_le_bytes(buf[8..12].try_into().unwrap()) != OVERFLOW_MAGIC {
+                break; // already freed — stop rather than walk the free list
+            }
+            // Clear the marker first, so the page cannot be mistaken for live data
+            // once the free list has written its link over the next-page field.
+            buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+            self.pages.write(page, &buf)?;
+            self.pages.free(page)?;
+            freed = true;
+            page = next;
+        }
+        Ok(freed)
+    }
+
+    /// Store `bytes` and return where it went. Records larger than a page are
+    /// held in a chain of pages instead of being refused.
     pub(crate) fn insert(&mut self, bytes: &[u8]) -> io::Result<RecordId> {
         if bytes.len() > self.max_record_len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("record of {} bytes exceeds the {} a page can hold",
-                        bytes.len(), self.max_record_len()),
-            ));
+            return self.insert_overflow(bytes);
         }
         let ps = self.pages.page_size();
         self.buf.resize(ps, 0);
@@ -178,6 +268,9 @@ impl RecordStore {
     }
 
     pub(crate) fn read(&mut self, id: RecordId) -> io::Result<Option<Vec<u8>>> {
+        if id.slot() == OVERFLOW_SLOT {
+            return self.read_overflow(id.page());
+        }
         let ps = self.pages.page_size();
         self.buf.resize(ps, 0);
         if self.pages.read(id.page(), &mut self.buf).is_err() {
@@ -197,6 +290,9 @@ impl RecordStore {
     /// Delete a record. When a page's last live record goes, the page itself is
     /// returned to the free list — which is what stops the file growing.
     pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool> {
+        if id.slot() == OVERFLOW_SLOT {
+            return self.delete_overflow(id.page());
+        }
         let ps = self.pages.page_size();
         self.buf.resize(ps, 0);
         if self.pages.read(id.page(), &mut self.buf).is_err() {
@@ -335,16 +431,40 @@ mod tests {
         }
     }
 
+    /// Records larger than a page are chained across pages, including the awkward
+    /// sizes either side of the boundary and a multi-megabyte one.
     #[test]
-    fn an_oversized_record_is_refused_rather_than_truncated() {
+    fn oversized_records_are_chained_across_pages() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut s = store(&dir);
-        let big = vec![b'x'; DEFAULT_PAGE_SIZE + 1];
-        assert!(s.insert(&big).is_err(),
-                "a record too large for a page must be refused, not silently cut short");
-        // The boundary itself must work.
-        let exact = vec![b'y'; s.max_record_len()];
-        let id = s.insert(&exact).unwrap();
-        assert_eq!(s.read(id).unwrap().map(|v| v.len()), Some(exact.len()));
+        let max = s.max_record_len();
+        for len in [max, max + 1, DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE * 3 + 17, 2_000_000] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let id = s.insert(&payload).unwrap();
+            assert_eq!(s.read(id).unwrap().as_deref(), Some(payload.as_slice()),
+                       "a {len}-byte record did not read back intact");
+        }
+    }
+
+    #[test]
+    fn deleting_a_chained_record_returns_every_page() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+        let payload = vec![b'z'; DEFAULT_PAGE_SIZE * 10];
+        let before = s.page_count();
+        let id = s.insert(&payload).unwrap();
+        assert!(s.page_count() > before + 5, "a 10-page record used too few pages");
+
+        assert!(s.delete(id).unwrap());
+        assert_eq!(s.read(id).unwrap(), None, "a deleted chained record still reads");
+        assert!(s.free_page_count() >= 10,
+                "only {} pages came back from a ten-page record", s.free_page_count());
+
+        // And the space is genuinely reusable.
+        let high_water = s.page_count();
+        let id2 = s.insert(&payload).unwrap();
+        assert_eq!(s.page_count(), high_water,
+                   "the file grew instead of reusing the freed chain");
+        assert_eq!(s.read(id2).unwrap().map(|v| v.len()), Some(payload.len()));
     }
 }
