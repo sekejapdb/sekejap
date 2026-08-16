@@ -4268,8 +4268,8 @@ impl CoreDB {
             .iter()
             .map(|(&h, n)| TopoNode {
                 hash: h,
-                slug: n.slug.clone(),
-                collection: n.collection.clone(),
+                slug: n.slug.as_str(),
+                collection: n.collection.as_str(),
                 payload_offset: n.payload_offset,
                 payload_len: n.payload_len,
                 spatial: n.spatial_meta.as_ref().map(|m| [
@@ -4294,8 +4294,11 @@ impl CoreDB {
                 let edge_type = self
                     .edges
                     .type_name(e.edge_type)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{:016x}", e.edge_type));
+                    // Borrowed when the type has a registered name, which is the
+                    // normal case — cloning produced one String per edge, all
+                    // duplicates of a handful of distinct names.
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|| std::borrow::Cow::Owned(format!("{:016x}", e.edge_type)));
                 topo_edges.push(TopoEdge {
                     from_hash: from_h,
                     to_hash: e.other,

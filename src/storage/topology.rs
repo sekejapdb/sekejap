@@ -68,10 +68,13 @@ fn node_recsize(version: u32) -> usize {
 
 // ── Input (what the builder consumes) ─────────────────────────────────────────
 
-pub struct TopoNode {
+pub struct TopoNode<'a> {
     pub hash: u64,
-    pub slug: String,
-    pub collection: String,
+    /// Borrowed, not owned. Building this list used to clone the slug and the
+    /// collection name for every node — two million String allocations on a
+    /// million-node compaction, of data the caller already holds.
+    pub slug: &'a str,
+    pub collection: &'a str,
     pub payload_offset: u64,
     pub payload_len: u32,
     /// Spatial metadata, if the node has geometry: 6 f64s =
@@ -80,10 +83,12 @@ pub struct TopoNode {
     pub spatial: Option<[f64; 6]>,
 }
 
-pub struct TopoEdge {
+pub struct TopoEdge<'a> {
     pub from_hash: u64,
     pub to_hash: u64,
-    pub edge_type: String,
+    /// Borrowed when the type has a registered name — which is the normal case and
+    /// there are only a handful of distinct names — owned only for the hex fallback.
+    pub edge_type: std::borrow::Cow<'a, str>,
     /// Raw JSON edge metadata, if any (stored sparsely in `edgemeta.bin`).
     pub meta: Option<String>,
 }
@@ -300,7 +305,7 @@ fn serialize_csr(magic: &[u8; 8], per_node: &[Vec<(u64, u32, u32)>]) -> Vec<u8> 
 
 /// Build the five topology files from an in-memory graph. Dense ids are assigned in
 /// `nodes` order (0..n). Edges whose endpoints aren't in `nodes` are skipped.
-pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
+pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
     let n = nodes.len();
 
     // hash → dense id
@@ -360,7 +365,7 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
         else {
             continue; // dangling edge — skip
         };
-        let type_id = types.intern(&e.edge_type);
+        let type_id = types.intern(e.edge_type.as_ref());
         let meta_ref = match &e.meta {
             Some(m) => {
                 let r = meta_blobs.len() as u32;
@@ -427,7 +432,7 @@ pub fn build(nodes: &[TopoNode], edges: &[TopoEdge]) -> TopologyBlob {
     let mut coll_members: Vec<Vec<u64>> = vec![Vec::new(); colls.list.len()];
     for (i, node) in nodes.iter().enumerate() {
         if !node.collection.is_empty() {
-            if let Some(&cid) = colls.map.get(&node.collection) {
+            if let Some(&cid) = colls.map.get(node.collection) {
                 coll_members[cid as usize].push(i as u64);
             }
         }
@@ -1151,10 +1156,10 @@ mod tests {
     fn topology_roundtrip_nodes_edges_names() {
         // Bali-themed mini graph: tourists → places, places → area.
         let nodes = vec![
-            TopoNode { hash: h("t/chloe"),  slug: "t/chloe".into(),  collection: "tourist".into(), payload_offset: 0,   payload_len: 10, spatial: None },
-            TopoNode { hash: h("p/uluwatu"),slug: "p/uluwatu".into(),collection: "place".into(),   payload_offset: 10,  payload_len: 20, spatial: None },
-            TopoNode { hash: h("p/ubud"),   slug: "p/ubud".into(),   collection: "place".into(),   payload_offset: 30,  payload_len: 15, spatial: None },
-            TopoNode { hash: h("a/south"),  slug: "a/south".into(),  collection: "area".into(),    payload_offset: 45,  payload_len: 5, spatial: None  },
+            TopoNode { hash: h("t/chloe"),  slug: "t/chloe",  collection: "tourist", payload_offset: 0,   payload_len: 10, spatial: None },
+            TopoNode { hash: h("p/uluwatu"),slug: "p/uluwatu",collection: "place",   payload_offset: 10,  payload_len: 20, spatial: None },
+            TopoNode { hash: h("p/ubud"),   slug: "p/ubud",   collection: "place",   payload_offset: 30,  payload_len: 15, spatial: None },
+            TopoNode { hash: h("a/south"),  slug: "a/south",  collection: "area",    payload_offset: 45,  payload_len: 5, spatial: None  },
         ];
         let edges = vec![
             TopoEdge { from_hash: h("t/chloe"),   to_hash: h("p/uluwatu"), edge_type: "visited".into(), meta: None },
@@ -1170,7 +1175,7 @@ mod tests {
         // and slugs.bin gives the reverse mapping back.
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(view.resolve(node.hash), Some(i as u64), "resolve {}", node.slug);
-            assert_eq!(view.slug(i as u64), Some(node.slug.as_str()), "slug of id {i}");
+            assert_eq!(view.slug(i as u64), Some(node.slug), "slug of id {i}");
         }
         assert_eq!(view.resolve(h("does/not/exist")), None);
         assert_eq!(view.slug(99), None);
