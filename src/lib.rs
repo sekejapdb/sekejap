@@ -4383,17 +4383,14 @@ impl CoreDB {
         }
 
         Self::rss_probe("topo vecs built");
-        let blob = topology::build(&topo_nodes, &topo_edges);
-        Self::rss_probe("topo blob built");
-        Self::write_atomic(dir, "nodes.bin", &blob.nodes)?;
-        Self::write_atomic(dir, "adj_fwd.bin", &blob.fwd)?;
-        Self::write_atomic(dir, "adj_rev.bin", &blob.rev)?;
-        Self::write_atomic(dir, "idx.bin", &blob.idx)?;
-        Self::write_atomic(dir, "slugs.bin", &blob.slugs)?;
-        Self::write_atomic(dir, "dict.bin", &blob.dict)?;
-        Self::write_atomic(dir, "spatial.bin", &blob.spat)?;
-        Self::write_atomic(dir, "edgemeta.bin", &blob.emeta)?;
-        Self::write_atomic(dir, "collections.bin", &blob.colls)?;
+        // Each file is written and released as it is produced, so peak memory is
+        // the largest single file rather than the sum of all nine.
+        topology::build_into(&topo_nodes, &topo_edges, |name, bytes| {
+            Self::write_atomic(dir, name, bytes)
+        })?;
+        drop(topo_edges);
+        drop(topo_nodes);
+        Self::rss_probe("topology written");
         // Spatial grid (cell index + per-node meta) sidecar — lets a paged reopen
         // serve the grid straight from the mmap instead of rebuilding it resident.
         // Built fresh from all node metas (overlay + base) so it is complete even
