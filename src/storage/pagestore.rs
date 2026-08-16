@@ -73,13 +73,56 @@ pub(crate) struct PageStore {
     /// entry count here, so reopening needs no scan to find where the tree starts.
     user_a: u64,
     user_b: u64,
+    /// A read-only mapping of the pages written so far.
+    ///
+    /// Reads came off the descriptor with `pread`, one syscall per page. That is
+    /// fine in isolation and ruinous in aggregate: the structures built on this
+    /// store answer a lookup in three or four page reads, so a query touching
+    /// 200 000 nodes made close to a million syscalls where the mmap'd layout it
+    /// replaces made none. The mapping turns each of those into a memory read.
+    ///
+    /// `MAP_SHARED`, because this process writes the same file — under a private
+    /// mapping a write through the descriptor may or may not be visible, and
+    /// "may or may not" means serving a stale page with nothing to show for it.
+    ///
+    /// Covers `mapped_pages` from the start of the file; anything allocated since
+    /// the last remap falls back to reading from the descriptor, which is always
+    /// correct and only slower.
+    map: Option<super::mmap::MmapView>,
+    mapped_pages: u64,
 }
 
 impl PageStore {
-    /// Create a new store, replacing anything already at `path`.
+    /// Create a new store at `path`, replacing an empty file or one of ours.
+    ///
+    /// **Refuses to replace a file it does not recognise.** This used to truncate
+    /// whatever was there, and the pattern `open(path)? else create(path)?` is the
+    /// only way anything opens a store — so pointing it at a file written in some
+    /// other format silently emptied it. Turning on `paged_payloads` for a database
+    /// whose `payloads.bin` was written flat took it from 23 216 bytes to 4 096
+    /// before a single query ran, and every row in the database with it.
+    ///
+    /// A store cannot always tell what it is being handed. It can always tell that
+    /// it was handed something, and refuse: nothing that can be wrong about what
+    /// exists may delete it.
     pub(crate) fn create(path: &Path, page_size: usize) -> io::Result<Self> {
         assert!(page_size >= 64 && page_size.is_power_of_two(),
                 "page size must be a power of two and at least 64 bytes");
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > 0 && !Self::has_our_magic(path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "sekejap: {} already holds {} bytes that were not written as \
+                         a page store, so creating one here would destroy them. This \
+                         usually means a paged storage mode was switched on for a \
+                         database written without it, which needs a migration rather \
+                         than a reopen.",
+                        path.display(), meta.len(),
+                    ),
+                ));
+            }
+        }
         let file = OpenOptions::new()
             .read(true).write(true).create(true).truncate(true).open(path)?;
         let mut s = Self {
@@ -91,10 +134,19 @@ impl PageStore {
             dirty: true,
             user_a: 0,
             user_b: 0,
+            map: None,
+            mapped_pages: 0,
         };
         s.file.set_len(page_size as u64)?;
         s.sync()?;
         Ok(s)
+    }
+
+    /// Whether `path` begins with this format's magic — i.e. we wrote it.
+    fn has_our_magic(path: &Path) -> bool {
+        let Ok(file) = OpenOptions::new().read(true).open(path) else { return false };
+        let mut magic = [0u8; 8];
+        read_exact_at(&file, &mut magic, 0).is_ok() && magic == MAGIC
     }
 
     /// Open an existing store. `None` if the file is absent or not one of ours.
@@ -119,7 +171,7 @@ impl PageStore {
         if page_size < 64 || !page_size.is_power_of_two() {
             return Ok(None);
         }
-        Ok(Some(Self {
+        let mut store = Self {
             file,
             page_size,
             high_water: u64::from_le_bytes(hdr[16..24].try_into().unwrap()),
@@ -128,7 +180,27 @@ impl PageStore {
             dirty: false,
             user_a: u64::from_le_bytes(hdr[40..48].try_into().unwrap()),
             user_b: u64::from_le_bytes(hdr[48..56].try_into().unwrap()),
-        }))
+            map: None,
+            mapped_pages: 0,
+        };
+        store.remap();
+        Ok(Some(store))
+    }
+
+    /// Point the read mapping at everything currently in the file.
+    ///
+    /// Cheap — one `mmap` call, no I/O, since pages load lazily on first touch. It
+    /// runs when the store is opened and whenever it is synced, so a store that is
+    /// being written falls back to the descriptor only for pages allocated since
+    /// the last sync.
+    ///
+    /// A failure is not an error: the mapping is an optimisation, and reading from
+    /// the descriptor is always correct.
+    fn remap(&mut self) {
+        let bytes = self.high_water * self.page_size as u64;
+        self.map = usize::try_from(bytes).ok()
+            .and_then(|n| super::mmap::MmapView::try_new_shared(&self.file, n));
+        self.mapped_pages = if self.map.is_some() { self.high_water } else { 0 };
     }
 
     pub(crate) fn page_size(&self) -> usize { self.page_size }
@@ -190,7 +262,19 @@ impl PageStore {
         if page >= self.high_water || buf.len() > self.page_size {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "page out of range"));
         }
-        read_exact_at(&self.file, buf, page * self.page_size as u64)
+        let at = page * self.page_size as u64;
+        // From the mapping when it reaches this page: a copy out of the page cache
+        // instead of a syscall into it. Pages allocated since the last remap are
+        // not covered, so those take the descriptor — correct either way.
+        if page < self.mapped_pages {
+            if let Some(src) = self.map.as_ref()
+                .and_then(|m| usize::try_from(at).ok().and_then(|o| m.slice(o, buf.len())))
+            {
+                buf.copy_from_slice(src);
+                return Ok(());
+            }
+        }
+        read_exact_at(&self.file, buf, at)
     }
 
     pub(crate) fn write(&mut self, page: u64, buf: &[u8]) -> io::Result<()> {
@@ -219,6 +303,11 @@ impl PageStore {
         write_all_at(&self.file, &hdr, 0)?;
         self.file.sync_data()?;
         self.dirty = false;
+        // Extend the read mapping over everything allocated since the last sync,
+        // so those pages stop taking the descriptor.
+        if self.mapped_pages != self.high_water {
+            self.remap();
+        }
         Ok(())
     }
 }
@@ -384,5 +473,96 @@ mod tests {
         std::fs::write(&path, vec![0xABu8; 4096]).unwrap();
         assert!(PageStore::open(&path).unwrap().is_none());
         assert!(PageStore::open(&dir.path().join("absent.bin")).unwrap().is_none());
+    }
+
+    /// Reads come from a mapping and writes go through the descriptor, so the two
+    /// have to agree — and when they do not, nothing says so. A stale page is
+    /// returned as if it were current.
+    ///
+    /// This is why the mapping is `MAP_SHARED`. Under `MAP_PRIVATE` the visibility
+    /// of a write through the descriptor is unspecified by POSIX, and "unspecified"
+    /// here means a store that silently serves data it has already overwritten.
+    #[test]
+    fn a_write_is_visible_through_the_read_mapping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("pages.bin");
+        let mut s = PageStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+
+        let pages: Vec<u64> = (0..8).map(|_| s.alloc().unwrap()).collect();
+        for (i, &p) in pages.iter().enumerate() {
+            s.write(p, &vec![i as u8; DEFAULT_PAGE_SIZE]).unwrap();
+        }
+        // Sync so the mapping covers them, then read once so the pages are resident
+        // in it — a mapping that had never been touched could hide the problem.
+        s.sync().unwrap();
+        let mut buf = vec![0u8; DEFAULT_PAGE_SIZE];
+        for (i, &p) in pages.iter().enumerate() {
+            s.read(p, &mut buf).unwrap();
+            assert_eq!(buf[0], i as u8, "page {p} came back wrong before any overwrite");
+        }
+
+        // Now overwrite through the descriptor and read straight back through the
+        // mapping, with no sync in between.
+        for (i, &p) in pages.iter().enumerate() {
+            s.write(p, &vec![0xF0 | i as u8; DEFAULT_PAGE_SIZE]).unwrap();
+        }
+        for (i, &p) in pages.iter().enumerate() {
+            s.read(p, &mut buf).unwrap();
+            assert_eq!(buf[0], 0xF0 | i as u8,
+                       "page {p} read back its old contents — the mapping is not \
+                        coherent with writes, so this store serves stale data");
+            assert!(buf.iter().all(|&b| b == 0xF0 | i as u8), "page {p} partially stale");
+        }
+
+        // And a page allocated after the last remap, which the mapping does not
+        // cover, must still read correctly from the descriptor.
+        let fresh = s.alloc().unwrap();
+        s.write(fresh, &vec![0x5A; DEFAULT_PAGE_SIZE]).unwrap();
+        s.read(fresh, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x5A),
+                "a page beyond the mapping did not fall back to the descriptor");
+    }
+
+    /// **The Law 3 test.** Creating a store must never destroy a file it did not
+    /// write.
+    ///
+    /// `open(path)? else create(path)?` is how every store in this codebase is
+    /// opened, and `create` truncated unconditionally. So pointing any of them at a
+    /// file in another format emptied it — measured on a real database, turning on
+    /// `paged_payloads` took `payloads.bin` from 23 216 bytes to 4 096 before a
+    /// single query ran, taking every row with it. Nothing reported anything; the
+    /// first symptom was an out-of-bounds read some operations later.
+    #[test]
+    fn creating_a_store_refuses_to_destroy_a_file_it_did_not_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("someone_elses.bin");
+        let contents = b"this is not a page store, it is somebody's data".to_vec();
+        std::fs::write(&path, &contents).unwrap();
+
+        let Err(err) = PageStore::create(&path, DEFAULT_PAGE_SIZE) else {
+            panic!("creating a store over a foreign file was allowed");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), contents,
+                   "the file was modified even though the call failed");
+
+        // An empty file is not somebody's data — creating over it is the ordinary
+        // path and must still work.
+        let fresh = dir.path().join("fresh.bin");
+        std::fs::write(&fresh, b"").unwrap();
+        assert!(PageStore::create(&fresh, DEFAULT_PAGE_SIZE).is_ok(),
+                "creating a store over an empty file was refused");
+
+        // And one of ours may be replaced: that is what create is for.
+        let ours = dir.path().join("ours.bin");
+        {
+            let mut s = PageStore::create(&ours, DEFAULT_PAGE_SIZE).unwrap();
+            for _ in 0..4 { s.alloc().unwrap(); }
+            s.sync().unwrap();
+        }
+        let Ok(s) = PageStore::create(&ours, DEFAULT_PAGE_SIZE) else {
+            panic!("creating over a store we wrote was refused");
+        };
+        assert_eq!(s.page_count(), 1, "recreating did not start from empty");
     }
 }
