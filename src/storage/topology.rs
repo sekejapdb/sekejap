@@ -1062,6 +1062,32 @@ impl MappedTopology {
         self.type_hashes.iter().copied().zip(self.edge_types.iter().cloned()).collect()
     }
 
+    /// Total forward edges, without decoding any of them.
+    ///
+    /// Each CSR block begins with a varint count, so the total is one varint read
+    /// per node — no delta decoding, no prefix sums, no allocation. Used by the
+    /// post-compaction verification, which has to be cheap enough to run on every
+    /// compaction or it will not be run at all.
+    pub fn edge_count(&self) -> usize {
+        let csr = self.fwd.bytes();
+        let offsets_start = HEADER_LEN + 8 + 8;
+        let need = offsets_start + (self.node_count + 1) * 8;
+        if csr.len() < need {
+            return 0;
+        }
+        let mut total = 0usize;
+        for k in 0..self.node_count {
+            let start = rd_u64(csr, offsets_start + k * 8) as usize;
+            let end = rd_u64(csr, offsets_start + (k + 1) * 8) as usize;
+            if end <= start || end > csr.len() {
+                continue;
+            }
+            let (count, _) = read_varint(&csr[start..end], 0);
+            total += count as usize;
+        }
+        total
+    }
+
     pub fn rev_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>> {
         self.edges_by_hash(hash, /*fwd=*/ false)
     }
