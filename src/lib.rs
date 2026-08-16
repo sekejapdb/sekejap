@@ -1362,6 +1362,16 @@ pub struct Config {
     /// reads, 1-record corruption isolation (values never leave their record).
     /// Incremental writes stay raw JSON until the next `compact()`. Default on.
     pub payload_binary: bool,
+    /// **Experimental.** Keep payloads in slotted pages with a free list, so an
+    /// updated or deleted row returns its bytes immediately rather than leaving a
+    /// hole for compaction to squeeze out later.
+    ///
+    /// This is the write path SQLite, LMDB and DuckDB use, and the reason they have
+    /// no compaction step: space comes back continuously as it is freed. Off by
+    /// default while the rest of the store still expects byte offsets — the batch
+    /// read that coalesces neighbouring records, and head-and-tail extraction of
+    /// large records, both fall back to per-record reads when this is on.
+    pub paged_payloads: bool,
     /// **Experimental.** Serve topology (nodes + edges) from the mmap'd files
     /// written at `compact()` instead of loading it into RAM. The OS page cache
     /// keeps the hot working set resident and pages the rest — topology size is
@@ -1392,6 +1402,7 @@ impl Default for Config {
             // Fuzzed decoder, integrated across DML/DDL + resident/paged. Set
             // false for legacy raw-JSON payloads.
             payload_binary: true,
+            paged_payloads: false,
             paged_topology: false,
         }
     }
@@ -1681,7 +1692,11 @@ impl CoreDB {
         let pay_path = dir.join("payloads.bin");
         let preserve      = snap.as_ref().map_or(false, |s| s.is_disk_backed) || topo_recovery;
         let has_vec_files = snap.as_ref().map_or(false, |s| s.has_vector_files);
-        if preserve && pay_path.exists() {
+        if config.paged_payloads {
+            // Slotted pages with a free list: space returns as records die, so
+            // there is nothing for a rewrite to reclaim later.
+            db.payload_store = PayloadStore::open_paged(&pay_path)?;
+        } else if preserve && pay_path.exists() {
             let existing_len = std::fs::metadata(&pay_path)?.len();
             db.payload_store = PayloadStore::open_existing(&pay_path, existing_len)?;
         } else {
@@ -2074,6 +2089,13 @@ impl CoreDB {
 
         let spatial_meta = geo::extract_spatial_meta(&payload);
 
+        // The previous version's bytes are now garbage. A paged store takes them
+        // back immediately; the append-only ones have nowhere to put them, which is
+        // the debt compaction later pays off.
+        if let Some((_, old_off, _)) = old_info {
+            self.payload_store.free(old_off);
+        }
+
         // Remove old collection + field-index entries for this hash (if updating)
         if let Some((ref old_coll, old_off, old_len)) = old_info {
             if !old_coll.is_empty() {
@@ -2223,6 +2245,9 @@ impl CoreDB {
             // tombstones, so afterwards its own payload is unreachable and the
             // index cleanup below would silently do nothing.
             let doomed = self.get_payload(hash);
+            if let Some((off, _)) = self.payload_loc(hash) {
+                self.payload_store.free(off);
+            }
             self.tombstones.insert(hash);
             self.slug_map.remove(slug);
             // The base row cannot be edited in place, but everything derived from
@@ -2270,6 +2295,8 @@ impl CoreDB {
             return;
         }
         if let Some(node) = self.nodes.remove(&hash) {
+            // The row's bytes are dead now; a paged store reclaims them at once.
+            self.payload_store.free(node.payload_offset);
             self.slug_map.remove(slug);
             if !node.collection.is_empty() {
                 let coll_hash = sk_hash(&node.collection);
@@ -4156,7 +4183,19 @@ impl CoreDB {
         // Base-aware: every live record, not just the ones in the write overlay.
         let node_keys: Vec<u64> = self.all_hashes();
         self.compact_payload_moves.clear();
-        if self.payload_store.is_disk() {
+
+        // A paged payload store has nothing for this phase to do. Space belonging
+        // to updated and deleted records was returned to its free list as they
+        // died, so there are no holes to squeeze out — and record ids are not byte
+        // positions, so rewriting the file would invalidate every one of them.
+        //
+        // Skipping it is the point rather than an exception: rewriting payloads is
+        // the largest part of compaction, and continuous reclamation is what makes
+        // it unnecessary.
+        let paged_payloads = !self.payload_store.absolute_offsets();
+        if paged_payloads {
+            self.payload_store.sync_pages()?;
+        } else if self.payload_store.is_disk() {
             // Disk-backed: stream each live node's bytes through a temp file.
             let pay_tmp  = dir.join("payloads.bin.tmp");
             let pay_path = dir.join("payloads.bin");
@@ -5527,6 +5566,16 @@ impl CoreDB {
             let full = self.payload_store.get_raw(off, len as u32)?;
             return Some((full.clone(), full));
         }
+        // Reading only the ends is an optimisation that needs byte positions. A
+        // paged store addresses by record id, so it reads the record and slices —
+        // the same answer, without the saving.
+        if !self.payload_store.absolute_offsets() {
+            let full = self.payload_store.get_raw(off, p_len)?;
+            let n = full.len();
+            let h = full[..head_size.min(n)].to_vec();
+            let t = full[n.saturating_sub(tail_size)..].to_vec();
+            return Some((h, t));
+        }
         let head = self.payload_store.get_raw_at(off, head_size)?;
         let tail_off = off + (len - tail_size) as u64;
         let tail = self.payload_store.get_raw_at(tail_off, tail_size)?;
@@ -5573,6 +5622,20 @@ impl CoreDB {
         sorted.sort_unstable_by_key(|&(_, off, _)| off);
 
         let mut result = HashMap::with_capacity(hashes.len());
+
+        // Coalescing neighbouring records into one read needs them to be adjacent
+        // at known byte positions. A paged store addresses by record id, where
+        // "adjacent" means nothing, so it reads each record individually — the same
+        // answers, without the syscall saving.
+        if !self.payload_store.absolute_offsets() {
+            for &(hash, off, len) in &sorted {
+                if let Some(bytes) = self.payload_store.get_raw(off, len) {
+                    result.insert(hash, bytes);
+                }
+            }
+            return result;
+        }
+
         let mut i = 0;
 
         while i < sorted.len() {
