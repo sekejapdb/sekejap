@@ -350,6 +350,57 @@ impl FieldKey {
 /// Unifies `get`/`range`/`iter` so the query executor shares one code path for
 /// paged and in-memory indexes. Mapped lookups decode postings into transient
 /// owned `Vec`s; the retained bytes stay in reclaimable mmap page cache.
+/// The compacted store as an ordered list of immutable segments, oldest first.
+///
+/// Today there is exactly one, and every accessor below behaves precisely as the
+/// single `Option<Arc<MappedTopology>>` it replaces. The type exists so that
+/// "consult the base" becomes "consult the segments" at every call site *before*
+/// there is more than one — the alternative is changing the meaning of a field
+/// while its type stays the same, which is the mistake that produced twelve
+/// silent bugs in this file already.
+#[derive(Clone, Default)]
+pub(crate) struct Segments {
+    segs: Vec<std::sync::Arc<storage::topology::MappedTopology>>,
+}
+
+impl Segments {
+    pub(crate) fn is_empty(&self) -> bool { self.segs.is_empty() }
+
+    /// Newest first — a later segment shadows an earlier one for the same key.
+    pub(crate) fn newest_first(
+        &self,
+    ) -> impl Iterator<Item = &std::sync::Arc<storage::topology::MappedTopology>> {
+        self.segs.iter().rev()
+    }
+
+    /// Replace everything with a single segment. What compaction does today.
+    pub(crate) fn replace_with(
+        &mut self,
+        seg: std::sync::Arc<storage::topology::MappedTopology>,
+    ) {
+        self.segs.clear();
+        self.segs.push(seg);
+    }
+
+    pub(crate) fn clear(&mut self) { self.segs.clear(); }
+
+    /// The segment holding `hash`, and its local id, searching newest first.
+    pub(crate) fn resolve(
+        &self,
+        hash: u64,
+    ) -> Option<(&storage::topology::MappedTopology, u64)> {
+        self.newest_first().find_map(|s| s.resolve(hash).map(|id| (s.as_ref(), id)))
+    }
+
+    /// First non-`None` answer, newest segment first.
+    pub(crate) fn find<T>(
+        &self,
+        mut f: impl FnMut(&storage::topology::MappedTopology) -> Option<T>,
+    ) -> Option<T> {
+        self.newest_first().find_map(|s| f(s.as_ref()))
+    }
+}
+
 pub(crate) enum FieldIndexRef<'a> {
     Heap(&'a std::collections::BTreeMap<FieldKey, Vec<u64>>),
     Mapped(&'a storage::fieldstore::MappedFieldStore),
@@ -926,7 +977,13 @@ pub struct CoreDB {
     /// this immutable base for free (a refcount bump, no bytes copied) — the base
     /// never changes, only the overlay does. See
     /// `docs/developer/notes/snapshot-reads-design.md`.
-    topo_base: Option<std::sync::Arc<storage::topology::MappedTopology>>,
+    /// The compacted store, oldest first.
+    ///
+    /// One entry today. The list exists because compaction is meant to *append* a
+    /// segment holding only what changed, rather than rewrite everything — the
+    /// latter is O(store) for O(change) input and is what Laws 1 and 2 forbid.
+    /// Reads consult the overlay, then segments newest-first.
+    segments: Segments,
     /// collection_hash → member slug hashes
     collections: HashMap<u64, Vec<u64>>,
     /// collection_hash → collection name (for O(1) SHOW TABLES without node scan)
@@ -1256,7 +1313,7 @@ impl CoreDB {
             compact_on_close: false,
             writes_since_compact_check: 0,
             autocompacting: false,
-            topo_base: None,
+            segments: Segments::default(),
             edges: storage::edgestore::EdgeStore::new_fat(),
             collections: HashMap::new(),
             collection_names_map: HashMap::new(),
@@ -1528,7 +1585,7 @@ impl CoreDB {
                 for (h, name) in base.edge_type_table() {
                     db.edges.register_type_name(h, name);
                 }
-                db.topo_base = Some(base);
+                db.segments.replace_with(base);
                 db.load_snapshot_parts(snap, /*load_topology=*/ false);
                 // Serve btree indexes from the mmap'd sidecars, not the heap: mmap
                 // them into field_base and drop any heap copies the snapshot loaded
@@ -1709,7 +1766,7 @@ impl CoreDB {
             let _ = db.save_search_binary(&search_bin_path);
             // Paged mode: drop the just-built resident search blobs and re-serve
             // them from the mmap'd search.bin (disk-first) — same as the load path.
-            if db.topo_base.is_some() {
+            if !db.segments.is_empty() {
                 db.search_indexes.clear();
                 let _ = db.load_search_binary(&search_bin_path);
             }
@@ -1728,7 +1785,7 @@ impl CoreDB {
             // so here vectors are unchanged — no rebuild needed). In paged mode, mmap the
             // compact vector indexes from vecidx.bin (disk-first) so vector queries use the
             // int8+CSR fast path without a resident graph rebuild.
-            if db.topo_base.is_some() {
+            if !db.segments.is_empty() {
                 let _ = db.load_vector_base(&dir.join("vecidx.bin"));
                 // BM25: mmap dict/doc-arrays from bm25.bin (disk-first) — doc arrays off
                 // the map, dict resident, postings pread. Also covers the clean-reopen
@@ -2024,7 +2081,7 @@ impl CoreDB {
         // in place, so record a tombstone that every base-aware lookup honours
         // until the next compact() folds it away for real.
         if !self.nodes.contains_key(&hash)
-            && self.topo_base.as_ref().is_some_and(|b| b.resolve(hash).is_some())
+            && self.segments.resolve(hash).is_some()
         {
             // Read the row before tombstoning it: every base-aware accessor honours
             // tombstones, so afterwards its own payload is unreachable and the
@@ -2811,7 +2868,7 @@ impl CoreDB {
             return true;
         }
         // Paged mode: the resident maps are the RAM write-overlay.
-        self.topo_base.is_some() && self.nodes.len() >= self.compact_thresholds.overlay_entries
+        !self.segments.is_empty() && self.nodes.len() >= self.compact_thresholds.overlay_entries
     }
 
     /// Compact **iff** the auto-compaction thresholds are crossed. The idle-time
@@ -3952,7 +4009,7 @@ impl CoreDB {
         // the mmap, adjacency through fwd_edges — and the new base replaces it at
         // the end. Copying the store into memory in order to compact it is exactly
         // what Law 1 forbids, and it was the single largest allocation here.
-        let had_base = self.topo_base.is_some();
+        let had_base = !self.segments.is_empty();
 
         // 1. Compact payload store: rebuild from live nodes only.
         // Must happen BEFORE build_snapshot() so the snapshot records the
@@ -4167,7 +4224,7 @@ impl CoreDB {
             for (h, name) in nb.edge_type_table() {
                 self.edges.register_type_name(h, name);
             }
-            self.topo_base = Some(std::sync::Arc::new(nb));
+            self.segments.replace_with(std::sync::Arc::new(nb));
             self.nodes.clear();
             self.collections.clear();
             self.collection_names_map.clear();
@@ -4304,7 +4361,7 @@ impl CoreDB {
         // the entire base into RAM first so it would not be destroyed. Copying the
         // store into memory to compact it is what Law 1 forbids; the slugs and
         // collection names below are borrowed straight out of the mmap instead.
-        let base = self.topo_base.clone();
+        let segments = self.segments.clone();
 
         // Nodes — overlay first, then base entries the overlay does not shadow.
         let mut topo_nodes: Vec<TopoNode> = Vec::with_capacity(self.nodes.len());
@@ -4325,7 +4382,7 @@ impl CoreDB {
                 ])),
             });
         }
-        if let Some(b) = base.as_deref() {
+        if let Some(b) = segments.newest_first().next() {
             for id in 0..b.node_count() as u64 {
                 let Some(h) = b.hash_of(id) else { continue };
                 if self.tombstones.contains(&h) || self.nodes.contains_key(&h) {
@@ -4702,7 +4759,7 @@ impl CoreDB {
 
     fn load_gin_binary(&mut self, path: &Path) -> bool {
         // Paged (disk-first): mmap the container instead of reading it into heap.
-        if self.topo_base.is_some() && self.load_gin_base(path) {
+        if !self.segments.is_empty() && self.load_gin_base(path) {
             return true;
         }
         use std::io::Read;
@@ -4756,7 +4813,7 @@ impl CoreDB {
         // set; building it from the overlay while a base is mapped would persist a
         // truncated store.
         debug_assert!(
-            self.topo_base.is_none(),
+            self.segments.is_empty(),
             "build_snapshot() called with a paged base still mapped — would persist \
              only the overlay and lose base nodes"
         );
@@ -5094,7 +5151,7 @@ impl CoreDB {
         if let Some(n) = self.nodes.get(&hash) {
             return Some((n.payload_offset, n.payload_len));
         }
-        let base = self.topo_base.as_ref()?;
+        let base = self.segments.newest_first().next()?;
         let rec = base.node_record(base.resolve(hash)?)?;
         Some((rec.payload_offset, rec.payload_len))
     }
@@ -5136,7 +5193,14 @@ impl CoreDB {
     #[cfg(unix)]
     pub fn snapshot_db(&self) -> Option<std::sync::Arc<CoreDB>> {
         let t0 = std::time::Instant::now();
-        let topo_base = Some(self.topo_base.clone()?); // shared immutable base
+        // Snapshots require the compacted store to be mapped: a resident database
+        // has no immutable half to share, so there is nothing to snapshot. The
+        // `?` here is load-bearing — dropping it makes snapshot_db succeed in
+        // embedded mode, which two tests correctly object to.
+        if self.segments.is_empty() {
+            return None;
+        }
+        let segments = self.segments.clone(); // shared immutable segments
         let payload_store = self.payload_store.read_only_clone()?; // own fd, shared mmap
 
         let snap = std::sync::Arc::new(CoreDB {
@@ -5150,7 +5214,7 @@ impl CoreDB {
             edges: self.edges.clone(),
 
             // ── shared immutable base (no bytes copied) ─────────────────────
-            topo_base,
+            segments,
             field_base: self.field_base.clone(), // MappedFieldStore shares its mmap
             payload_store,
 
@@ -5415,7 +5479,7 @@ impl CoreDB {
             return false;
         }
         self.nodes.contains_key(&h)
-            || self.topo_base.as_ref().map_or(false, |b| b.resolve(h).is_some())
+            || self.segments.resolve(h).is_some()
     }
 
     /// Total number of nodes.
@@ -5446,10 +5510,10 @@ impl CoreDB {
             collections: self.collection_names().len(),
             // In paged mode the resident map IS the overlay; resident mode holds
             // everything, so "overlay" is only meaningful when paged.
-            overlay_nodes: if self.topo_base.is_some() { self.nodes.len() } else { 0 },
+            overlay_nodes: if !self.segments.is_empty() { self.nodes.len() } else { 0 },
             payload_bytes: file_len("payloads.bin"),
             wal_bytes: file_len("wal.log"),
-            paged: self.topo_base.is_some(),
+            paged: !self.segments.is_empty(),
 
             field_indexes: self.field_indexes.len() + self.field_base.len(),
             hnsw_indexes: self.hnsw_indexes.len(),
@@ -5472,7 +5536,7 @@ impl CoreDB {
     }
 
     pub fn node_count(&self) -> usize {
-        let Some(base) = &self.topo_base else {
+        let Some(base) = self.segments.newest_first().next() else {
             return self.nodes.len(); // resident: the map IS the store
         };
         // Paged: base + overlay-only nodes - tombstones. An overlay entry that also
@@ -5517,7 +5581,7 @@ impl CoreDB {
         }
         // Paged: collections whose members all live in the mmap'd base are absent
         // from the overlay entirely, so they must be read from the base too.
-        if let Some(base) = &self.topo_base {
+        if let Some(base) = self.segments.newest_first().next() {
             for name in base.collection_names() {
                 if !name.is_empty() {
                     names.insert(name.clone());
@@ -7230,7 +7294,7 @@ impl CoreDB {
         if let Some(n) = self.nodes.get(&hash) {
             return Some(std::borrow::Cow::Borrowed(n));
         }
-        let base = self.topo_base.as_ref()?;
+        let base = self.segments.newest_first().next()?;
         let id = base.resolve(hash)?;
         let rec = base.node_record(id)?;
         Some(std::borrow::Cow::Owned(NodeData {
@@ -7253,11 +7317,12 @@ impl CoreDB {
         if let Some(s) = self.collection_names_map.get(&coll_hash) {
             return Some(s.as_str());
         }
-        self.topo_base.as_ref()?.collection_name_by_hash(coll_hash)
+        // Borrowed from whichever segment knows the name, newest first.
+        self.segments.newest_first().find_map(|b| b.collection_name_by_hash(coll_hash))
     }
 
     pub(crate) fn all_hashes(&self) -> Vec<u64> {
-        match &self.topo_base {
+        match self.segments.newest_first().next() {
             None => self.nodes.keys().copied().collect(),
             Some(base) => {
                 // Base ∪ overlay (the overlay may hold updates of base nodes —
@@ -7277,7 +7342,7 @@ impl CoreDB {
         let dropped = self.edge_tombstones.contains(&hash);
         let edges = Self::merged_edges(self.edges.fwd_edges(hash), || {
             if dropped { return None; }
-            self.topo_base.as_ref().and_then(|b| b.fwd_by_hash(hash))
+            self.segments.find(|b| b.fwd_by_hash(hash))
         })?;
         Some(self.drop_dangling(edges))
     }
@@ -7286,7 +7351,7 @@ impl CoreDB {
         let dropped = self.edge_tombstones.contains(&hash);
         let edges = Self::merged_edges(self.edges.rev_edges(hash), || {
             if dropped { return None; }
-            self.topo_base.as_ref().and_then(|b| b.rev_by_hash(hash))
+            self.segments.find(|b| b.rev_by_hash(hash))
         })?;
         Some(self.drop_dangling(edges))
     }
@@ -7363,7 +7428,9 @@ impl CoreDB {
         // Base edges carry an edgemeta.bin reference (high bit); overlay edges
         // resolve through the resident meta store.
         if let Some(meta_ref) = edge.base_meta_ref() {
-            let bytes = self.topo_base.as_ref()?.edge_meta_bytes(meta_ref)?;
+            let bytes = self.segments
+                .newest_first()
+                .find_map(|b| b.edge_meta_bytes(meta_ref))?;
             return serde_json::from_slice(bytes).ok();
         }
         self.edges.edge_meta(edge)
@@ -7475,7 +7542,7 @@ impl CoreDB {
         // tombstoned member has to be filtered out of every scan.
         if !self.tombstones.is_empty() {
             let mut merged: Vec<u64> = Vec::new();
-            if let Some(b) = self.topo_base.as_ref().and_then(|b| b.members_by_coll_hash(hash)) {
+            if let Some(b) = self.segments.find(|b| b.members_by_coll_hash(hash)) {
                 merged.extend(b);
             }
             if let Some(o) = self.collections.get(&hash) {
@@ -7489,10 +7556,7 @@ impl CoreDB {
             return Some(std::borrow::Cow::Owned(merged));
         }
         let overlay = self.collections.get(&hash);
-        let base = self
-            .topo_base
-            .as_ref()
-            .and_then(|b| b.members_by_coll_hash(hash));
+        let base = self.segments.find(|b| b.members_by_coll_hash(hash));
         match (overlay, base) {
             (Some(o), None) => Some(std::borrow::Cow::Borrowed(o.as_slice())),
             (overlay, Some(mut b)) => {
@@ -7690,7 +7754,7 @@ impl CoreDB {
             .collect();
         // Paged mode: base nodes live in the mmap, not in self.nodes — pull their
         // spatial records from the side-table (48 B each; only geometry nodes).
-        if let Some(base) = &self.topo_base {
+        if let Some(base) = self.segments.newest_first().next() {
             for id in 0..base.node_count() as u64 {
                 if let Some(v) = base.spatial(id) {
                     if let Some(h) = base.hash_of(id) {
@@ -7722,7 +7786,7 @@ impl CoreDB {
         //    O(total geometry) resident RAM (~360 MB for 7k complex polygons) and
         //    defeats bounded serving. Rings load on demand in the query path; open
         //    stays O(1) RAM regardless of geometry size.
-        let eager = self.topo_base.is_none();
+        let eager = self.segments.is_empty();
         let polys: Vec<(u64, Vec<Vec<[f64; 2]>>)> = if eager {
             items.iter()
                 .filter(|(_, m)| m.bbox_min_lat != m.bbox_max_lat || m.bbox_min_lon != m.bbox_max_lon)
@@ -8946,7 +9010,7 @@ impl CoreDB {
     fn load_search_binary(&mut self, path: &std::path::Path) -> bool {
         // In paged (disk-first) mode, mmap the container instead of reading it
         // into RAM. Fall through to the resident path if mmap serving fails.
-        if self.topo_base.is_some() && self.load_search_base(path) {
+        if !self.segments.is_empty() && self.load_search_base(path) {
             return true;
         }
         use std::io::Read;
@@ -9743,7 +9807,7 @@ mod hybrid_query_tests {
         };
 
         let paged = CoreDB::open_paged(dir.path()).unwrap();
-        assert!(paged.topo_base.is_some(), "paged open must attach the mmap base");
+        assert!(!paged.segments.is_empty(), "paged open must attach a mapped segment");
         assert!(paged.nodes.is_empty(), "paged open must not load nodes into RAM");
         for (q, expected) in queries.iter().zip(&resident_results) {
             let p: Vec<_> = paged.query(q).unwrap().collect()
