@@ -4474,6 +4474,16 @@ impl CoreDB {
         // the end. Copying the store into memory in order to compact it is exactly
         // what Law 1 forbids, and it was the single largest allocation here.
         let had_base = !self.segments.is_empty();
+        // Whether the overlay's contents are durable somewhere else by the end of
+        // this compaction, and can therefore be dropped from RAM.
+        //
+        // This used to be `had_base` alone, which is the same question only while
+        // a mapped segment is the sole durable store. With paged nodes it is not:
+        // a fresh paged database has no segment at all, so `had_base` was false,
+        // the overlay was never cleared, and every compaction folded every node
+        // written since the process started — 456 ms to make 200 writes durable on
+        // a 50 000-row store, growing without bound in both time and RAM.
+        let overlay_becomes_durable = had_base || self.paged_nodes.is_some();
 
         // 1. Compact payload store: rebuild from live nodes only.
         // Must happen BEFORE build_snapshot() so the snapshot records the
@@ -4761,6 +4771,11 @@ impl CoreDB {
                 .flatten()
                 .map(std::sync::Arc::new);
             self.segments.set_slots(slots);
+        }
+        if overlay_becomes_durable {
+            // Everything the overlay held is in the durable store now, so it goes —
+            // which is what returns RAM to where it was before the compaction
+            // rather than leaving the whole database resident.
             self.nodes.clear();
             self.collections.clear();
             self.collection_names_map.clear();

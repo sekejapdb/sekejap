@@ -155,7 +155,7 @@ pub(crate) struct NodeStore {
 
 impl NodeStore {
     pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self> {
-        let mut tree = |name: &str| -> io::Result<BTree> {
+        let tree = |name: &str| -> io::Result<BTree> {
             let path = dir.join(name);
             match BTree::open(&path)? {
                 Some(t) => Ok(t),
