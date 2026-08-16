@@ -4038,8 +4038,53 @@ impl CoreDB {
         // exist. Crash between the two leaves the OLD snapshot + NEW topology
         // files, which reopens fine (old snapshot is still self-sufficient or
         // points at the previous, still-valid files; WAL not yet truncated).
+        // What this compaction must not lose. Counted from the hydrated overlay,
+        // which at this point holds the whole database.
+        let expect_nodes = self.nodes.len();
+        let expect_edges: usize = self.nodes.keys()
+            .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
+            .sum();
+
+        // Keep the outgoing generation reachable until the incoming one has been
+        // read back and found complete.
+        let staged = Self::stage_previous_generation(&dir);
+
         self.merge_index_deltas();
-        self.write_topology_files(&dir)?;
+        if let Err(e) = self.write_topology_files(&dir) {
+            Self::restore_previous_generation(&staged);
+            return Err(e);
+        }
+
+        // Read the new files back, from disk, with a reader that shares nothing with
+        // the writer. Only if they hold everything do we go on to drop the old
+        // generation and truncate the log.
+        match Self::count_generation_on_disk(&dir) {
+            Ok((n, e)) if n >= expect_nodes && e >= expect_edges => {}
+            Ok((n, e)) => {
+                Self::restore_previous_generation(&staged);
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "sekejap: compaction wrote an incomplete store \
+                         ({n} nodes / {e} edges on disk, expected {expect_nodes} / \
+                         {expect_edges}). The previous files have been put back and \
+                         the write-ahead log is untouched, so nothing is lost. This \
+                         is a bug; please report it with the database layout."
+                    ),
+                ));
+            }
+            Err(err) => {
+                Self::restore_previous_generation(&staged);
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "sekejap: could not read back the store compaction just wrote \
+                         ({err}). The previous files have been put back and the \
+                         write-ahead log is untouched, so nothing is lost."
+                    ),
+                ));
+            }
+        }
 
         // Persist btree field indexes as mmap'able sidecars so a reopened paged DB
         // serves indexed queries from page cache (not heap). One file per
@@ -4078,6 +4123,9 @@ impl CoreDB {
         if wal_old.exists() {
             std::fs::remove_file(&wal_old)?;
         }
+        // The new generation has been read back and is complete, and the log has
+        // been rotated. Only here does the old generation stop being needed.
+        Self::discard_previous_generation(&staged);
 
         // Regenerate gin.bin so the next open loads GIN instantly.
         if let Some(ref gin_bin_path) = self.data_dir.as_ref().map(|d| d.join("gin.bin")) {
@@ -4133,6 +4181,69 @@ impl CoreDB {
     /// assigned in hash order for deterministic output), then writes the five files
     /// atomically. Read back by `open()` for snapshot-missing recovery and by the
     /// paged-topology mode — see `docs/developer/notes/topology-format.md`.
+    /// The files that together are the compacted base — one generation of it.
+    const BASE_FILES: [&'static str; 9] = [
+        "nodes.bin", "idx.bin", "slugs.bin", "collections.bin",
+        "adj_fwd.bin", "adj_rev.bin", "edgemeta.bin", "dict.bin", "spatial.bin",
+    ];
+
+    /// Park a copy of the current generation before it is overwritten.
+    ///
+    /// Hard links, so this costs one inode entry per file and no data copy — the
+    /// old bytes stay reachable under `<name>.prev` even after the rename replaces
+    /// `<name>`. Nothing is duplicated and nothing is read.
+    ///
+    /// This works because every base file is replaced by writing a new file and
+    /// renaming it over the old name: the rename swings the directory entry to a
+    /// new inode while this link still holds the old one. A base file written *in
+    /// place* would destroy the parked copy along with the live one, so that must
+    /// never happen — see `write_atomic`, which is the only sanctioned way to
+    /// replace one.
+    fn stage_previous_generation(dir: &Path) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+        let mut staged = Vec::new();
+        for name in Self::BASE_FILES {
+            let live = dir.join(name);
+            if !live.exists() {
+                continue;
+            }
+            let prev = dir.join(format!("{name}.prev"));
+            let _ = std::fs::remove_file(&prev);
+            if std::fs::hard_link(&live, &prev).is_ok() {
+                staged.push((live, prev));
+            }
+        }
+        staged
+    }
+
+    /// Put the previous generation back, undoing a compaction that did not verify.
+    fn restore_previous_generation(staged: &[(std::path::PathBuf, std::path::PathBuf)]) {
+        for (live, prev) in staged {
+            let _ = std::fs::rename(prev, live);
+        }
+    }
+
+    fn discard_previous_generation(staged: &[(std::path::PathBuf, std::path::PathBuf)]) {
+        for (_, prev) in staged {
+            let _ = std::fs::remove_file(prev);
+        }
+    }
+
+    /// Read the generation just written back off disk and count what is in it.
+    ///
+    /// This is the whole point of the exercise, so it deliberately shares nothing
+    /// with the code that produced the files: a fresh `MappedTopology` opened from
+    /// the directory, walked directly. The previous guard rail counted through the
+    /// same accessors that had written the data, so when those accessors were wrong
+    /// it agreed with them and confirmed a compaction that had just deleted the
+    /// entire graph. A check that can agree with the bug is not a check.
+    fn count_generation_on_disk(dir: &Path) -> io::Result<(usize, usize)> {
+        let base = storage::topology::MappedTopology::open(dir)?;
+        // Both counts come straight off the mapped headers and offset tables —
+        // no edges are decoded and nothing is allocated per node, so this stays
+        // cheap enough to run on every compaction.
+        Ok((base.node_count(), base.edge_count()))
+    }
+
     fn write_topology_files(&self, dir: &Path) -> io::Result<()> {
         use storage::topology::{self, TopoEdge, TopoNode};
 
@@ -9323,6 +9434,90 @@ struct SnapBtree {
     field: String,
     /// Sorted (key, Vec<node_hash>) pairs — reconstructs the BTreeMap directly.
     entries: Vec<(FieldKey, Vec<u64>)>,
+}
+
+#[cfg(test)]
+mod compaction_safety_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The post-compaction check must count the store as it really is on disk.
+    ///
+    /// This is the property the whole safety mechanism rests on. The previous guard
+    /// rail counted through the same accessors that had written the data, so when
+    /// those were wrong it agreed with them and waved through a compaction that had
+    /// just deleted every edge. This counts by re-opening the files, so it can only
+    /// agree with what is actually stored.
+    #[test]
+    fn the_on_disk_count_matches_what_was_written() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        for i in 0..50 {
+            db.put(&format!("p/n{i}"),
+                   &json!({"_collection":"p","_key":format!("n{i}")}).to_string()).unwrap();
+        }
+        for i in 0..49 {
+            db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next");
+        }
+        db.compact().unwrap();
+
+        let (nodes, edges) = CoreDB::count_generation_on_disk(dir.path()).unwrap();
+        assert_eq!(nodes, 50, "the check under-counts nodes and would wave loss through");
+        assert_eq!(edges, 49, "the check under-counts edges and would wave loss through");
+    }
+
+    /// Restoring the parked generation must bring the exact bytes back.
+    #[test]
+    fn a_parked_generation_can_be_put_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        for i in 0..20 {
+            db.put(&format!("p/n{i}"),
+                   &json!({"_collection":"p","_key":format!("n{i}")}).to_string()).unwrap();
+        }
+        for i in 0..19 {
+            db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next");
+        }
+        db.compact().unwrap();
+        drop(db);
+
+        let before = CoreDB::count_generation_on_disk(dir.path()).unwrap();
+        assert_eq!(before, (20, 19));
+
+        // Park it, then destroy the live files the way a bad compaction would.
+        let staged = CoreDB::stage_previous_generation(dir.path());
+        assert!(!staged.is_empty(), "nothing was parked");
+        // Damage them the way compaction replaces files: write a new file and
+        // rename it over the old name. That is what leaves the parked copy intact —
+        // rename swings the directory entry to a NEW inode while the parked link
+        // still points at the old one. Truncating in place would destroy both,
+        // which is exactly why the base files must only ever be replaced this way.
+        for name in CoreDB::BASE_FILES {
+            let p = dir.path().join(name);
+            if p.exists() {
+                let t = dir.path().join(format!("{name}.damaged"));
+                std::fs::write(&t, b"").unwrap();
+                std::fs::rename(&t, &p).unwrap();
+            }
+        }
+        assert_ne!(
+            CoreDB::count_generation_on_disk(dir.path()).unwrap_or((0, 0)), before,
+            "the damage was not even detectable, so the check proves nothing",
+        );
+
+        CoreDB::restore_previous_generation(&staged);
+        assert_eq!(
+            CoreDB::count_generation_on_disk(dir.path()).unwrap(), before,
+            "restoring the parked generation did not bring the data back",
+        );
+
+        // And the database itself opens with everything intact.
+        let db = CoreDB::open(dir.path()).unwrap();
+        assert_eq!(db.node_count(), 20);
+        assert_eq!(
+            db.query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)").unwrap().collect().len(), 19,
+        );
+    }
 }
 
 #[cfg(test)]
