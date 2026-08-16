@@ -1077,33 +1077,33 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    232  mod tests
 ```
 
-### `recordstore.rs` · 350L — Why
+### `recordstore.rs` · 470L — Why
 
 ```
-    52  pub(crate) struct RecordId(pub u64)
-    54  impl RecordId
-    56    pub(crate) fn new(page: u64, slot: u16) -> Self
-    61    pub(crate) fn page(self) -> u64 { self.0 >> 16 }
-    63    pub(crate) fn slot(self) -> u16 { (self.0 & 0xFFFF) as u16 }
-    67  pub(crate) struct RecordStore
-    79  fn rd16(p: &[u8], at: usize) -> u16 { u16::from_le_bytes([p[at], p[at + 1]]) }
-    80  fn wr16(p: &mut [u8], at: usize, v: u16) { p[at..at + 2].copy_from_slice(&v.to_le_bytes()); }
-    82  fn slot_count(p: &[u8]) -> usize { rd16(p, 0) as usize }
-    83  fn live_count(p: &[u8]) -> usize { rd16(p, 2) as usize }
-    84  fn heap_start(p: &[u8]) -> usize { rd16(p, 4) as usize }
-    86  fn slot_entry(p: &[u8], i: usize) -> (usize, usize)
-    91  fn set_slot(p: &mut [u8], i: usize, off: usize, len: usize)
-    97  impl RecordStore
-    98    pub(crate) fn create(path: &std::path::Path, page_size: usize) -> io::Result<Self>
-   102    pub(crate) fn open(path: &std::path::Path) -> io::Result<Option<Self>>
-   107    pub(crate) fn page_count(&self) -> u64 { self.pages.page_count() }
-   108    pub(crate) fn free_page_count(&self) -> u64 { self.pages.free_count() }
-   109    pub(crate) fn sync(&mut self) -> io::Result<()> { self.pages.sync() }
-   112    pub(crate) fn max_record_len(&self) -> usize
-   134    pub(crate) fn insert(&mut self, bytes: &[u8]) -> io::Result<RecordId>
-   180    pub(crate) fn read(&mut self, id: RecordId) -> io::Result<Option<Vec<u8>>>
-   199    pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool>
-   231  mod tests
+    69  pub(crate) struct RecordId(pub u64)
+    71  impl RecordId
+    73    pub(crate) fn new(page: u64, slot: u16) -> Self
+    78    pub(crate) fn page(self) -> u64 { self.0 >> 16 }
+    80    pub(crate) fn slot(self) -> u16 { (self.0 & 0xFFFF) as u16 }
+    84  pub(crate) struct RecordStore
+    96  fn rd16(p: &[u8], at: usize) -> u16 { u16::from_le_bytes([p[at], p[at + 1]]) }
+    97  fn wr16(p: &mut [u8], at: usize, v: u16) { p[at..at + 2].copy_from_slice(&v.to_le_bytes()); }
+    99  fn slot_count(p: &[u8]) -> usize { rd16(p, 0) as usize }
+   100  fn live_count(p: &[u8]) -> usize { rd16(p, 2) as usize }
+   101  fn heap_start(p: &[u8]) -> usize { rd16(p, 4) as usize }
+   103  fn slot_entry(p: &[u8], i: usize) -> (usize, usize)
+   108  fn set_slot(p: &mut [u8], i: usize, off: usize, len: usize)
+   114  impl RecordStore
+   115    pub(crate) fn create(path: &std::path::Path, page_size: usize) -> io::Result<Self>
+   119    pub(crate) fn open(path: &std::path::Path) -> io::Result<Option<Self>>
+   124    pub(crate) fn page_count(&self) -> u64 { self.pages.page_count() }
+   125    pub(crate) fn free_page_count(&self) -> u64 { self.pages.free_count() }
+   126    pub(crate) fn sync(&mut self) -> io::Result<()> { self.pages.sync() }
+   129    pub(crate) fn max_record_len(&self) -> usize
+   228    pub(crate) fn insert(&mut self, bytes: &[u8]) -> io::Result<RecordId>
+   270    pub(crate) fn read(&mut self, id: RecordId) -> io::Result<Option<Vec<u8>>>
+   292    pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool>
+   327  mod tests
 ```
 
 ### `skbin.rs` · 610L — SKBIN — a compact binary format for record payloads
