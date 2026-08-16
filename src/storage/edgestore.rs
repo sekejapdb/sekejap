@@ -28,7 +28,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-/// Compact edge stored in adjacency lists. 20 bytes on 64-bit.
+/// Compact edge stored in adjacency lists. 24 bytes on 64-bit.
 ///
 /// An edge is a naked connector: who it points to and what type it is. Nothing
 /// else — a relation is not a body. Any weight/attribute is opt-in, and rides
@@ -40,22 +40,33 @@ use serde_json::Value;
 pub(crate) struct Edge {
     pub other: u64,
     pub edge_type: u64,
-    /// Index into the meta store.  `u32::MAX` = no metadata.
-    meta_id: u32,
+    /// Where the edge's attributes are. `NO_META` = none; high bit set = a
+    /// reference into the durable base; otherwise an index into this store's
+    /// resident `MetaStore`.
+    ///
+    /// Widened from `u32` when the base reference stopped being a small index into
+    /// a rebuilt `edgemeta.bin` and became a record id, which is a page number and
+    /// a slot. **This costs nothing**: `u64 + u64 + u32` pads to 24 bytes and
+    /// `u64 + u64 + u64` is 24 bytes, so an adjacency list is exactly the size it
+    /// was. A `u32` would have capped durable edge metadata at 65 536 pages.
+    meta_id: u64,
 }
 
-const NO_META: u32 = u32::MAX;
+const NO_META: u64 = u64::MAX;
 
-/// High bit of `meta_id` marks a paged-topology base metadata reference
-/// (an index into `edgemeta.bin`) rather than an index into this store's
-/// `MetaStore`. `NO_META` (all ones) is checked first, so it never collides.
-const BASE_META_BIT: u32 = 0x8000_0000;
+/// High bit of `meta_id` marks a durable base metadata reference rather than an
+/// index into this store's `MetaStore`. `NO_META` (all ones) is checked first, so
+/// it never collides.
+const BASE_META_BIT: u64 = 1 << 63;
 
 impl Edge {
-    /// Construct an edge for the paged-topology base. `base_meta_ref` is the
-    /// `edgemeta.bin` index (`u32::MAX` = no metadata).
-    pub(crate) fn from_base(other: u64, edge_type: u64, base_meta_ref: u32) -> Self {
-        let meta_id = if base_meta_ref == u32::MAX {
+    /// Construct an edge whose attributes live in the durable base.
+    ///
+    /// `base_meta_ref` is whatever that base uses to find them — an index into
+    /// `edgemeta.bin` for a mapped segment, a record id for paged adjacency.
+    /// `u64::MAX` means the edge is naked.
+    pub(crate) fn from_base(other: u64, edge_type: u64, base_meta_ref: u64) -> Self {
+        let meta_id = if base_meta_ref == u64::MAX {
             NO_META
         } else {
             base_meta_ref | BASE_META_BIT
@@ -70,13 +81,13 @@ impl Edge {
         if self.meta_id == NO_META || self.base_meta_ref().is_some() {
             None
         } else {
-            Some(self.meta_id)
+            Some(self.meta_id as u32)
         }
     }
 
-    /// If this edge's metadata lives in the paged base (`edgemeta.bin`), return
-    /// the base index. `None` = no metadata or resident-store metadata.
-    pub(crate) fn base_meta_ref(&self) -> Option<u32> {
+    /// If this edge's metadata lives in the durable base, return the reference the
+    /// base needs. `None` = no metadata, or resident-store metadata.
+    pub(crate) fn base_meta_ref(&self) -> Option<u64> {
         if self.meta_id != NO_META && self.meta_id & BASE_META_BIT != 0 {
             Some(self.meta_id & !BASE_META_BIT)
         } else {
@@ -114,8 +125,10 @@ impl DiskAdj {
         if cnt == 0 { return Some(&[]); }
         let byte_off = off as usize * std::mem::size_of::<Edge>();
         let bytes = self.mmap.slice(byte_off, cnt as usize * std::mem::size_of::<Edge>())?;
-        // Safety: bytes come from mmap of edges written as [Edge] (same binary/layout);
-        // Edge is 24 B (8-aligned fields), records start at 24·i, mmap base is page-aligned.
+        // Safety: bytes come from an mmap of edges this same process wrote as
+        // [Edge] in build_csr, so the layout is identical by construction. Edge is
+        // 24 B of three 8-aligned u64s with no padding, records start at 24*i, and
+        // the mmap base is page-aligned.
         Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const Edge, cnt as usize) })
     }
     /// Resident **heap** RAM: the node→offset index only. The edge blob is mmap'd
@@ -352,12 +365,12 @@ impl EdgeStore {
         let edge_fwd = Edge {
             other: to_hash,
             edge_type,
-            meta_id: mid,
+            meta_id: mid as u64,
         };
         let edge_rev = Edge {
             other: from_hash,
             edge_type,
-            meta_id: mid,
+            meta_id: mid as u64,
         };
         self.fwd.entry(from_hash).or_default().push(edge_fwd);
         self.rev.entry(to_hash).or_default().push(edge_rev);
@@ -405,8 +418,8 @@ impl EdgeStore {
                 .or_insert_with(|| EdgeColumn::new(is_bool))
                 .set(slot, v);
         }
-        let fwd = Edge { other: to_hash, edge_type, meta_id: slot };
-        let rev = Edge { other: from_hash, edge_type, meta_id: slot };
+        let fwd = Edge { other: to_hash, edge_type, meta_id: slot as u64 };
+        let rev = Edge { other: from_hash, edge_type, meta_id: slot as u64 };
         self.fwd.entry(from_hash).or_default().push(fwd);
         self.rev.entry(to_hash).or_default().push(rev);
     }
@@ -444,8 +457,8 @@ impl EdgeStore {
         // NEW keyed edge: allocate a slot, store attrs, record the identity → slot.
         let slot = self.store_meta(json.unwrap_or(Value::Null));
         self.set_cols(edge_type, slot, cols);
-        let fwd = Edge { other: to_hash, edge_type, meta_id: slot };
-        let rev = Edge { other: from_hash, edge_type, meta_id: slot };
+        let fwd = Edge { other: to_hash, edge_type, meta_id: slot as u64 };
+        let rev = Edge { other: from_hash, edge_type, meta_id: slot as u64 };
         self.fwd.entry(from_hash).or_default().push(fwd);
         self.rev.entry(to_hash).or_default().push(rev);
         self.keyed.insert(id, slot);
@@ -777,7 +790,12 @@ impl EdgeStore {
         let mut buf: Vec<u8> = Vec::with_capacity(map.values().map(|v| v.len()).sum::<usize>() * esz);
         for (&node, edges) in map.iter() {
             index.insert(node, (edge_i, edges.len() as u32));
-            // SAFETY: Edge is POD (u64/u64/u32) — serialise its raw bytes.
+            // SAFETY: Edge is POD — three u64s, no padding, no pointers — so its
+            // raw bytes are a faithful serialisation. It used to be u64/u64/u32,
+            // which meant four bytes of *uninitialised* padding went into the file
+            // on every edge; widening the third field to u64 removed them. The file
+            // is rewritten from scratch on every spill and its index is never
+            // persisted, so nothing on disk outlives this layout.
             let bytes = unsafe { std::slice::from_raw_parts(edges.as_ptr() as *const u8, edges.len() * esz) };
             buf.extend_from_slice(bytes);
             edge_i += edges.len() as u64;
@@ -831,10 +849,12 @@ impl EdgeStore {
     /// already knows the EXACT edge's slot (from traversal), so there's no
     /// first-match ambiguity across parallel edges.
     pub(crate) fn json_at(&self, slot: u32) -> Option<Value> {
-        if slot == NO_META {
+        // A resident slot is a Vec index, so `u32::MAX` is its "none", not the
+        // widened `NO_META` the edge field now uses.
+        if slot == u32::MAX {
             return None;
         }
-        let synth = Edge { other: 0, edge_type: 0, meta_id: slot };
+        let synth = Edge { other: 0, edge_type: 0, meta_id: slot as u64 };
         self.edge_meta(&synth)
     }
 

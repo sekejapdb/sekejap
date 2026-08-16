@@ -32,7 +32,7 @@
 //! numbering. On a 48-million-node store `nodes.bin` is 1.5 GB, so that is a likely
 //! page fault per edge traversed.
 //!
-//! Storing the hash directly costs 20 bytes an edge against roughly 13.6, and buys:
+//! Storing the hash directly costs 24 bytes an edge against roughly 13.6, and buys:
 //! insert in place, no numbering to keep consistent, and no per-neighbour lookup.
 //!
 //! # The layout
@@ -42,8 +42,8 @@
 //! edge list:
 //!
 //! ```text
-//!   key: owner_hash            record: [ neighbour u64 | type u64 | meta u32 ] × n
-//!                                        └──────────── 20 bytes ────────────┘
+//!   key: owner_hash            record: [ neighbour u64 | type u64 | meta u64 ] × n
+//!                                        └──────────── 24 bytes ────────────┘
 //! ```
 //!
 //! Reading a node's edges is one tree descent plus one record read, and the record
@@ -64,9 +64,22 @@ use super::pagedstore::PagedStore;
 use std::io;
 use std::path::Path;
 
-/// One stored edge: who it points at, what type it is, and where its attributes
-/// live. 20 bytes, fixed — the same three fields CSR keeps, without the numbering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One stored edge: who it points at, what type it is, and where its attributes are.
+///
+/// 24 bytes, fixed — the same three fields CSR keeps, without the numbering.
+///
+/// # Why the attribute reference is a record id
+///
+/// CSR keeps a 4-byte index into `edgemeta.bin`, a side file rebuilt in full by
+/// every compaction. That is fine while adjacency is rebuilt alongside it and
+/// fatal as soon as it is not: an adjacency that survived a compaction would hold
+/// indices into a file renumbered underneath it.
+///
+/// A record id has no such dependency — the record does not move, so the reference
+/// stays good for as long as the edge does. It is 8 bytes rather than 4 because a
+/// record id is a page number and a slot, and capping the page number at 16 bits
+/// would cap durable edge attributes at 256 MB.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdjEdge {
     /// `sk_hash(slug)` of the node at the other end.
     pub other: u64,
@@ -74,13 +87,26 @@ pub(crate) struct AdjEdge {
     /// every caller already speaks hashes, and because interning needs a dictionary
     /// that itself has to be maintained in place.
     pub edge_type: u64,
-    /// Index into the edge-metadata store, or `NO_META` when the edge is naked.
-    pub meta_ref: u32,
+    /// Where this edge's attributes are, or `NO_META` when it is naked.
+    ///
+    /// A record id in a companion store, not an index into a rebuilt side file.
+    /// The difference is the whole point: an index into `edgemeta.bin` is only
+    /// valid until the next compaction renumbers it, which is fine while adjacency
+    /// is rebuilt alongside and fatal as soon as it is not. A record id stays valid
+    /// because the record does not move.
+    pub meta_ref: u64,
 }
 
-pub(crate) const NO_META: u32 = u32::MAX;
+pub(crate) const NO_META: u64 = u64::MAX;
 
-const EDGE_BYTES: usize = 20;
+impl AdjEdge {
+    pub(crate) fn naked(other: u64, edge_type: u64) -> Self {
+        Self { other, edge_type, meta_ref: NO_META }
+    }
+}
+
+/// neighbour u64 + type u64 + attribute reference u64.
+const EDGE_BYTES: usize = 24;
 
 fn encode(edges: &[AdjEdge], out: &mut Vec<u8>) {
     out.clear();
@@ -92,8 +118,11 @@ fn encode(edges: &[AdjEdge], out: &mut Vec<u8>) {
     }
 }
 
-/// Decode a stored list. A trailing partial edge is dropped rather than trusted:
-/// this is disk data, and a short read must not become a panic.
+/// Decode a stored list.
+///
+/// A truncated tail is dropped rather than trusted. This is disk data reached
+/// through a length it carries itself, so a short read or a bad length must end
+/// the walk, never index past the end.
 fn decode(bytes: &[u8]) -> Vec<AdjEdge> {
     let n = bytes.len() / EDGE_BYTES;
     let mut out = Vec::with_capacity(n);
@@ -102,7 +131,7 @@ fn decode(bytes: &[u8]) -> Vec<AdjEdge> {
         out.push(AdjEdge {
             other: u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()),
             edge_type: u64::from_le_bytes(bytes[o + 8..o + 16].try_into().unwrap()),
-            meta_ref: u32::from_le_bytes(bytes[o + 16..o + 20].try_into().unwrap()),
+            meta_ref: u64::from_le_bytes(bytes[o + 16..o + 24].try_into().unwrap()),
         });
     }
     out
@@ -112,17 +141,27 @@ pub(crate) struct AdjStore {
     store: PagedStore,
     /// Reused across writes so adding an edge does not allocate.
     scratch: Vec<u8>,
+    /// Running total of stored edges, kept in the record store's spare header word.
+    ///
+    /// Maintained rather than counted because the one caller that needs it is
+    /// compaction's verify-before-commit rail, which runs every time. Walking the
+    /// graph to answer it made that rail O(edges) — the precise cost this store
+    /// exists to remove, reintroduced by the check that guards it. Measured: it
+    /// more than doubled a 200k-node compaction.
+    edges: u64,
 }
 
 impl AdjStore {
     /// Open or create an adjacency under `dir`, with files named `<name>.rec` and
     /// `<name>.idx`. Two of these make a graph: one forward, one reverse.
     pub(crate) fn open(dir: &Path, name: &str, page_size: usize) -> io::Result<Self> {
-        Ok(Self {
-            store: PagedStore::open_named(dir, name, page_size)?,
-            scratch: Vec::new(),
-        })
+        let store = PagedStore::open_named(dir, name, page_size)?;
+        let edges = store.user_meta().0;
+        Ok(Self { store, scratch: Vec::new(), edges })
     }
+
+    /// How many edges are stored, without reading any of them.
+    pub(crate) fn edge_count(&self) -> u64 { self.edges }
 
     /// Nodes that have at least one edge. Not the node count — a node with no
     /// edges has no entry here at all, which is why the offsets array CSR needs
@@ -131,7 +170,10 @@ impl AdjStore {
 
     pub(crate) fn page_counts(&self) -> (u64, u64) { self.store.page_counts() }
 
-    pub(crate) fn sync(&mut self) -> io::Result<()> { self.store.sync() }
+    pub(crate) fn sync(&mut self) -> io::Result<()> {
+        self.store.set_user_meta(self.edges, 0);
+        self.store.sync()
+    }
 
     /// Every edge leaving `owner`, or `None` if it has none.
     ///
@@ -165,7 +207,9 @@ impl AdjStore {
         encode(&list, &mut scratch);
         let r = self.store.put(owner as u128, &scratch);
         self.scratch = scratch;
-        r
+        r?;
+        self.edges += edges.len() as u64;
+        Ok(())
     }
 
     /// Drop the first edge from `owner` to `other`, optionally of a given type.
@@ -192,13 +236,20 @@ impl AdjStore {
             self.scratch = scratch;
             r?;
         }
+        self.edges -= 1;
         Ok(true)
     }
 
     /// Drop every edge belonging to `owner`. This is what deleting a node does to
     /// its own side of the graph.
     pub(crate) fn remove_owner(&mut self, owner: u64) -> io::Result<bool> {
-        self.store.delete(owner as u128)
+        let had = match self.store.get(owner as u128)? {
+            Some(bytes) => bytes.len() / EDGE_BYTES,
+            None => return Ok(false),
+        };
+        self.store.delete(owner as u128)?;
+        self.edges -= had as u64;
+        Ok(true)
     }
 
     /// Drop every edge pointing *at* `other`, wherever it comes from.
@@ -271,8 +322,9 @@ mod tests {
         AdjStore::open(dir.path(), "adj_fwd", DEFAULT_PAGE_SIZE).unwrap()
     }
     fn h(i: u64) -> u64 { i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5851_F42D_4C95_7F2D }
-    fn e(other: u64, t: u64) -> AdjEdge {
-        AdjEdge { other: h(other), edge_type: t, meta_ref: NO_META }
+    fn e(other: u64, t: u64) -> AdjEdge { AdjEdge::naked(h(other), t) }
+    fn e_meta(other: u64, t: u64, meta_ref: u64) -> AdjEdge {
+        AdjEdge { other: h(other), edge_type: t, meta_ref }
     }
 
     #[test]
@@ -336,7 +388,7 @@ mod tests {
         for i in 0..8_000u64 {
             let owner = h(i % 900);
             let edge = e(i % 700, i % 5);
-            s.add(owner, edge).unwrap();
+            s.add(owner, edge.clone()).unwrap();
             oracle.entry(owner).or_default().push(edge);
 
             if i % 3 == 0 {
@@ -365,6 +417,102 @@ mod tests {
                 assert_eq!(s.edges(owner).unwrap(), None, "phantom edges for {owner:x}");
             }
         }
+    }
+
+    /// An attribute reference is data the edge carries, so it has to come back
+    /// exactly — including for an edge sitting between two naked ones, where an
+    /// offset wrong by a field silently reinterprets the rest of the list.
+    #[test]
+    fn attribute_references_survive_alongside_naked_edges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+
+        s.add(h(1), e(10, 1)).unwrap();
+        s.add(h(1), e_meta(11, 2, 77)).unwrap();
+        s.add(h(1), e(12, 3)).unwrap();
+        s.add(h(1), e_meta(13, 4, u64::MAX - 1)).unwrap();
+        s.add(h(1), e(14, 5)).unwrap();
+
+        let got = s.edges(h(1)).unwrap().unwrap();
+        assert_eq!(got.len(), 5, "an attributed edge disturbed the list");
+        assert_eq!(got[0], e(10, 1));
+        assert_eq!(got[1], e_meta(11, 2, 77));
+        assert_eq!(got[2], e(12, 3), "the edge after an attributed one was misread");
+        assert_eq!(got[3], e_meta(13, 4, u64::MAX - 1),
+                   "a reference one below the naked marker was misread");
+        assert_eq!(got[4], e(14, 5));
+        assert!(got[0].meta_ref == NO_META && got[2].meta_ref == NO_META,
+                "a naked edge picked up an attribute reference");
+
+        // Removing an attributed edge must not disturb its neighbours' references.
+        assert!(s.remove(h(1), h(13), None).unwrap());
+        let got = s.edges(h(1)).unwrap().unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[1].meta_ref, 77, "an unrelated edge lost its attributes");
+        assert_eq!(got[3], e(14, 5));
+
+        s.sync().unwrap();
+        drop(s);
+        let s = store(&dir);
+        assert_eq!(s.edges(h(1)).unwrap().unwrap()[1], e_meta(11, 2, 77),
+                   "attribute references did not survive a reopen");
+    }
+
+    /// A record cut short must stop cleanly rather than panic or invent an edge.
+    /// Records come off disk, and a truncated one is a torn write, not a bug to
+    /// crash on.
+    #[test]
+    fn a_truncated_list_stops_rather_than_panicking() {
+        let mut full = Vec::new();
+        encode(&[e(1, 1), e_meta(2, 2, 9), e(3, 3)], &mut full);
+        assert_eq!(decode(&full).len(), 3);
+        for cut in 0..full.len() {
+            let got = decode(&full[..cut]);
+            assert_eq!(got.len(), cut / EDGE_BYTES,
+                       "cutting to {cut} bytes produced {} edges", got.len());
+            for (i, e) in got.iter().enumerate() {
+                assert_eq!(*e, decode(&full)[i],
+                           "cutting to {cut} bytes changed edge {i}");
+            }
+        }
+    }
+
+    /// The running count has to match a walk, or compaction's safety rail is
+    /// checking a number it made up. It is maintained rather than counted because
+    /// counting made that rail O(edges) — which is the cost this store exists to
+    /// remove, reintroduced by the check meant to guard it.
+    #[test]
+    fn the_edge_count_matches_a_walk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+        let walk = |s: &AdjStore| {
+            let mut n = 0u64;
+            s.for_each_owner(|_, list| { n += list.len() as u64; true }).unwrap();
+            n
+        };
+
+        for i in 0..2_000u64 {
+            s.add_many(h(i), &[e(i + 1, 1), e(i + 2, 2)]).unwrap();
+        }
+        assert_eq!(s.edge_count(), walk(&s), "after adds");
+        assert_eq!(s.edge_count(), 4_000);
+
+        for i in (0..2_000u64).step_by(3) { s.remove(h(i), h(i + 1), None).unwrap(); }
+        assert_eq!(s.edge_count(), walk(&s), "after single removals");
+
+        for i in (0..2_000u64).step_by(7) { s.remove_owner(h(i)).unwrap(); }
+        assert_eq!(s.edge_count(), walk(&s), "after dropping whole owners");
+
+        // A removal that finds nothing must not decrement.
+        let before = s.edge_count();
+        assert!(!s.remove(h(999_999), h(1), None).unwrap());
+        assert!(!s.remove_owner(h(999_999)).unwrap());
+        assert_eq!(s.edge_count(), before, "a failed removal changed the count");
+
+        s.sync().unwrap();
+        drop(s);
+        let s = store(&dir);
+        assert_eq!(s.edge_count(), walk(&s), "the count did not survive a reopen");
     }
 
     #[test]
@@ -446,22 +594,31 @@ mod tests {
     /// array, but records sit in pages that are not perfectly full and the index
     /// costs an entry per owner.
     ///
-    /// The estimate the design was chosen on was ~1.2x. **The real number is 2.3x**,
-    /// and this test is where that was found. The gap is not in the records — 300k
-    /// edges at 20 bytes fill 1564 pages, which is 1.07x the bytes they contain, so
-    /// slotted pages are packing near perfectly. It is in the index: 518 pages for
-    /// 50 000 owners is 42 bytes each, because a B+tree entry is a 16-byte key plus
-    /// an 8-byte value and random keys leave leaves about 57% full.
+    /// The estimate the design was chosen on was ~1.2x. **The real number is 2.65x**,
+    /// and this test is where both that and a later regression were found. The
+    /// records are not the problem: slotted pages pack at 1.05x the bytes they
+    /// hold. The other two thirds are named below, with what each would take back.
     ///
-    /// Two levers are known, both measured from the numbers above:
+    /// It measured 2.33x when the edge was 20 bytes. Widening the attribute
+    /// reference from `u32` to `u64` — needed because it became a record id, which
+    /// is a page number and a slot rather than an index into a rebuilt side file —
+    /// moved it to 2.65x. That is the cost of the reference staying valid across a
+    /// compaction, and it is 8 bytes on every edge to describe an attribute that
+    /// most edges do not have.
     ///
-    /// - **The key is twice as wide as it needs to be.** The tree takes `u128` to
-    ///   carry composite keys elsewhere; an owner hash is a `u64`. A narrow key
-    ///   would make an entry 16 bytes rather than 24 — worth ~2.3 bytes an edge.
+    /// Three levers are known, all measured from the numbers this prints:
+    ///
     /// - **The index should not exist.** Reaching a node's edges already requires
     ///   looking the node up, so its adjacency record id belongs *in the node
-    ///   record*. That deletes all 7 bytes an edge this index costs and takes the
-    ///   ratio to about 1.75x, and it is free once nodes move onto records.
+    ///   record*. That deletes all 7 bytes an edge the index costs, and it is free
+    ///   once nodes move onto records.
+    /// - **The key is twice as wide as it needs to be.** The tree takes `u128` to
+    ///   carry composite keys elsewhere; an owner hash is a `u64`. Worth ~2.3 bytes
+    ///   an edge — and moot if the index goes away entirely.
+    /// - **Naked edges should not carry a reference at all.** Attributes are opt-in
+    ///   and rare; 8 bytes of `NO_META` on every edge in the graph pays for a
+    ///   feature most of them do not use. A per-list flag would recover it at the
+    ///   cost of a variable-width record.
     ///
     /// The assertion sits just above the measured number, so it fails on a
     /// regression rather than restating an intention.
@@ -495,9 +652,9 @@ mod tests {
                  idx_bytes as f64 / edges, idx_bytes as f64 / nodes as f64);
         println!("    total   {per_edge:.2} bytes/edge against {csr:.2} for CSR \
                   → {:.2}x", per_edge / csr);
-        assert!(per_edge / csr < 2.5,
+        assert!(per_edge / csr < 2.8,
                 "{per_edge:.2} bytes an edge against CSR's {csr:.2} is {:.2}x, worse \
-                 than the 2.3x measured when this layout was accepted",
+                 than the 2.65x measured when this layout was accepted",
                 per_edge / csr);
         assert!(rec_bytes as f64 / edges / EDGE_BYTES as f64 > 0.95,
                 "records are packing at {:.2}x the bytes they hold, which is under \

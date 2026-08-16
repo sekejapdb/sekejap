@@ -367,6 +367,129 @@ pub(crate) struct Segments {
     slots: Option<std::sync::Arc<storage::slotmap::MappedSlots>>,
 }
 
+/// The durable graph, forward and reverse, in slotted pages keyed by slug hash.
+///
+/// This is the base a read falls through to when `Config::paged_adjacency` is on,
+/// in place of a segment's `adj_fwd.bin` / `adj_rev.bin`. The two are the same
+/// data and answer the same questions; the difference is that CSR can only be
+/// rebuilt and this can be written.
+///
+/// Both directions are kept because both are asked for — `edges_from` walks one
+/// and `edges_to` the other — and neither can be derived from the other without a
+/// scan. An edge is therefore stored twice, which is what CSR does too.
+pub(crate) struct PagedAdjacency {
+    fwd: storage::adjstore::AdjStore,
+    rev: storage::adjstore::AdjStore,
+    /// Edge attributes, one record each, addressed by the record id the edge
+    /// carries. A plain record store rather than an indexed one: the record id
+    /// *is* the reference, so there is nothing to look up and no id to allocate.
+    ///
+    /// Separate from the edges themselves because an edge is reached through a
+    /// `storage::edgestore::Edge`, which carries a single reference and no way
+    /// back to the owner whose record the attributes would otherwise sit in.
+    meta: storage::recordstore::RecordStore,
+}
+
+impl PagedAdjacency {
+    fn open(dir: &Path) -> io::Result<Self> {
+        let page = storage::pagestore::DEFAULT_PAGE_SIZE;
+        let meta_path = dir.join("adjp_meta.rec");
+        let meta = match storage::recordstore::RecordStore::open(&meta_path)? {
+            Some(m) => m,
+            None => storage::recordstore::RecordStore::create(&meta_path, page)?,
+        };
+        Ok(Self {
+            fwd: storage::adjstore::AdjStore::open(dir, "adjp_fwd", page)?,
+            rev: storage::adjstore::AdjStore::open(dir, "adjp_rev", page)?,
+            meta,
+        })
+    }
+
+    fn dir(&self, forward: bool) -> &storage::adjstore::AdjStore {
+        if forward { &self.fwd } else { &self.rev }
+    }
+
+    /// A node's stored edges in the shape the merge expects.
+    ///
+    /// Returns `None` both when the node has no edges and when the read fails. An
+    /// unreadable base reads as absent rather than propagating an error into every
+    /// graph query, which is the contract the mapped base already has.
+    fn edges(&self, hash: u64, forward: bool) -> Option<Vec<storage::topology::MappedEdge>> {
+        let list = self.dir(forward).edges(hash).ok().flatten()?;
+        Some(list.into_iter()
+            .map(|e| storage::topology::MappedEdge {
+                other_hash: e.other,
+                edge_type_hash: e.edge_type,
+                meta_ref: e.meta_ref,
+            })
+            .collect())
+    }
+
+    /// The stored bytes of one edge's attributes.
+    fn meta_bytes(&self, meta_ref: u64) -> Option<Vec<u8>> {
+        self.meta.read(storage::recordstore::RecordId(meta_ref)).ok().flatten()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fwd.owner_count() == 0 && self.rev.owner_count() == 0
+    }
+
+    /// Copy a store's existing CSR graph into pages, once.
+    ///
+    /// Turning paged adjacency on makes this the base a read falls through to,
+    /// *instead of* the segments — consulting both would double every edge that had
+    /// been folded in. So a store whose graph is still in `adj_fwd.bin` has to have
+    /// it moved across, or the flag would appear to delete the entire graph.
+    ///
+    /// This is a migration and it is honestly O(edges): every edge is read once and
+    /// written once. It runs at open, only when the paged store is empty and a
+    /// segment has edges, so it happens once in a database's life rather than on
+    /// every compaction — which is the difference this whole direction is about.
+    ///
+    /// It streams node by node. Collecting the graph first would cost RAM
+    /// proportional to the store, which is what Law 1 forbids and what made
+    /// compaction unaffordable in the first place.
+    fn migrate_from(&mut self, base: &storage::topology::MappedTopology) -> io::Result<usize> {
+        use storage::adjstore::{AdjEdge, NO_META};
+        let mut moved = 0usize;
+        for id in 0..base.node_count() as u64 {
+            let Some(hash) = base.hash_of(id) else { continue };
+            for (forward, edges) in [
+                (true, base.fwd_by_hash(hash)),
+                (false, base.rev_by_hash(hash)),
+            ] {
+                let Some(edges) = edges else { continue };
+                let mut list = Vec::with_capacity(edges.len());
+                for e in edges {
+                    // Attributes move too, out of the side file and into a record
+                    // whose id does not change when anything is rebuilt.
+                    let meta_ref = match base.edge_meta_bytes(e.meta_ref as u32) {
+                        Some(bytes) if e.meta_ref != u64::MAX => self.meta.insert(bytes)?.0,
+                        _ => NO_META,
+                    };
+                    list.push(AdjEdge {
+                        other: e.other_hash,
+                        edge_type: e.edge_type_hash,
+                        meta_ref,
+                    });
+                }
+                if list.is_empty() { continue }
+                if forward { moved += list.len() }
+                let store = if forward { &mut self.fwd } else { &mut self.rev };
+                store.add_many(hash, &list)?;
+            }
+        }
+        self.sync()?;
+        Ok(moved)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.fwd.sync()?;
+        self.rev.sync()?;
+        self.meta.sync()
+    }
+}
+
 impl Segments {
     pub(crate) fn is_empty(&self) -> bool { self.segs.is_empty() }
 
@@ -1115,6 +1238,13 @@ pub struct CoreDB {
     /// latter is O(store) for O(change) input and is what Laws 1 and 2 forbid.
     /// Reads consult the overlay, then segments newest-first.
     segments: Segments,
+    /// Durable adjacency in slotted pages, when `Config::paged_adjacency` is on.
+    ///
+    /// Takes the place of a segment's `adj_fwd.bin` / `adj_rev.bin` as the base
+    /// that reads fall through to. The difference is that this one can be written:
+    /// `compact()` folds the overlay into it owner by owner instead of rebuilding
+    /// the graph, so the cost follows the change rather than the store.
+    paged_adj: Option<PagedAdjacency>,
     /// collection_hash → member slug hashes
     collections: HashMap<u64, Vec<u64>>,
     /// collection_hash → collection name (for O(1) SHOW TABLES without node scan)
@@ -1206,6 +1336,17 @@ pub struct CoreDB {
     ///
     /// Cleared by compaction, which folds the base away entirely.
     edge_tombstones: HashSet<u64>,
+    /// `(from, to, edge_type)` for single edges withdrawn by `unlink`.
+    ///
+    /// `EdgeStore::unlink` can only retain-out of the RAM adjacency maps, and in
+    /// paged mode most edges are not there — they are in the immutable base, and a
+    /// read merges the two. Without this set, unlinking a base edge did nothing at
+    /// all: the call returned, the overlay had never held the edge, and the next
+    /// read produced it again from the base. A delete that does not delete.
+    ///
+    /// So the withdrawal is recorded here and applied where the base is read.
+    /// Cleared by compaction, which writes a base that no longer contains them.
+    unlinked_edges: HashSet<(u64, u64, u64)>,
     /// The caller fsyncs the log itself, so this database appends without one.
     ///
     /// Set by `Engine` in service mode: several writers that commit at the same
@@ -1372,6 +1513,19 @@ pub struct Config {
     /// read that coalesces neighbouring records, and head-and-tail extraction of
     /// large records, both fall back to per-record reads when this is on.
     pub paged_payloads: bool,
+    /// **Experimental.** Keep adjacency in slotted pages keyed by slug hash, so a
+    /// new edge is written where it belongs instead of waiting for a rebuild.
+    ///
+    /// The CSR layout in `adj_fwd.bin` / `adj_rev.bin` cannot absorb one edge: a
+    /// node's block grows, every block after it shifts, every offset after it
+    /// changes. So edges accumulate in RAM until `compact()` folds the whole graph
+    /// back, at a cost set by the size of the graph rather than the size of the
+    /// change — and adjacency is about two thirds of what a compaction rewrites.
+    ///
+    /// Off by default. The sacrifice is disk: 2.3x CSR, because a B+tree entry per
+    /// owner is 42 bytes and CSR's offset array is 8. Most of that comes back when
+    /// nodes move onto records and the adjacency index stops being separate.
+    pub paged_adjacency: bool,
     /// **Experimental.** Serve topology (nodes + edges) from the mmap'd files
     /// written at `compact()` instead of loading it into RAM. The OS page cache
     /// keeps the hot working set resident and pages the rest — topology size is
@@ -1403,6 +1557,7 @@ impl Default for Config {
             // false for legacy raw-JSON payloads.
             payload_binary: true,
             paged_payloads: false,
+            paged_adjacency: false,
             paged_topology: false,
         }
     }
@@ -1445,6 +1600,8 @@ impl CoreDB {
             tombstones: HashSet::new(),
             nodes: HashMap::new(),
             slug_map: HashMap::new(),
+            // An in-memory database has no directory to put pages in.
+            paged_adj: None,
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
             compact_thresholds: CompactThresholds::default(),
             wal_sync: SyncMode::Full,
@@ -1483,6 +1640,7 @@ impl CoreDB {
             pending_txn: None,
             defer_wal_sync: false,
             edge_tombstones: HashSet::new(),
+            unlinked_edges: HashSet::new(),
             compact_payload_moves: HashMap::new(),
             group_commit: false,
             wal_generation: 0,
@@ -1692,6 +1850,10 @@ impl CoreDB {
         let pay_path = dir.join("payloads.bin");
         let preserve      = snap.as_ref().map_or(false, |s| s.is_disk_backed) || topo_recovery;
         let has_vec_files = snap.as_ref().map_or(false, |s| s.has_vector_files);
+        if config.paged_adjacency {
+            // The durable graph, written where it belongs instead of rebuilt.
+            db.paged_adj = Some(PagedAdjacency::open(dir)?);
+        }
         if config.paged_payloads {
             // Slotted pages with a free list: space returns as records die, so
             // there is nothing for a rewrite to reclaim later.
@@ -1755,6 +1917,22 @@ impl CoreDB {
         } else if topo_recovery {
             // Best-effort: a failure here degrades to the old behavior (WAL replay).
             let _ = db.load_topology_files(dir);
+        }
+
+        // A store whose graph is still in CSR has to have it moved onto pages
+        // before anything reads it. Paged adjacency *replaces* the segments as the
+        // base rather than adding to them — consulting both would double every edge
+        // once folding starts — so without this, turning the flag on would look
+        // exactly like the graph having been deleted.
+        //
+        // Guarded on the paged store being empty, so it is a migration and not a
+        // step in the open path: it runs once in a database's life.
+        if db.paged_adj.as_ref().is_some_and(|pa| pa.is_empty()) {
+            if let Some(base) = db.segments.newest_first().next().cloned() {
+                if let Some(pa) = db.paged_adj.as_mut() {
+                    pa.migrate_from(&base)?;
+                }
+            }
         }
 
         // Open disk-backed vector stores directly from .bin files.
@@ -2936,6 +3114,10 @@ impl CoreDB {
         let to_h = sk_hash(to);
         let type_h = sk_hash(edge_type);
         self.edges.unlink(from_h, to_h, type_h);
+        // The overlay is only half the graph. Anything already in the durable base
+        // is untouched by the line above, so the withdrawal has to be recorded
+        // where reads of the base can see it.
+        self.unlinked_edges.insert((from_h, to_h, type_h));
     }
 
     /// Delete only edges from→to of `edge_type` whose attributes match the JSON
@@ -4098,9 +4280,10 @@ impl CoreDB {
         // success — the rail passed because the rows it watched were all still there.
         // Count what a full traversal can actually reach, not what one map happens
         // to hold, or a spilled adjacency reads as zero and the check is worthless.
-        let expected_edges: usize = self.all_hashes().iter()
-            .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
-            .sum();
+        //
+        // Through the same function the inner rail uses, so the two cannot drift
+        // apart and both get the cheap count where one is available.
+        let (_, expected_edges) = self.compaction_expectation();
         let r = self.compact_inner();
         if r.is_ok() {
             let actual = self.node_count();
@@ -4116,9 +4299,7 @@ impl CoreDB {
                     ),
                 ));
             }
-            let actual_edges: usize = self.all_hashes().iter()
-                .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
-                .sum();
+            let (_, actual_edges) = self.compaction_expectation();
             if actual_edges < expected_edges {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -4139,6 +4320,18 @@ impl CoreDB {
 
 
     /// Temporary: report RSS at a labelled point when SK_COMPACT_RSS is set.
+    /// Print how long a compaction phase took, when `SK_COMPACT_TIME` is set.
+    ///
+    /// Compaction is the operation the whole storage direction is judged on, and
+    /// "it got slower" is not a finding — which phase got slower is. Reasoning from
+    /// file sizes said adjacency was two thirds of the work; it is two thirds of the
+    /// *bytes*, which turned out to be a different question.
+    fn phase_probe(label: &str, since: &mut std::time::Instant) {
+        if std::env::var_os("SK_COMPACT_TIME").is_none() { return; }
+        eprintln!("    {:>8.1} ms  {label}", since.elapsed().as_secs_f64() * 1e3);
+        *since = std::time::Instant::now();
+    }
+
     fn rss_probe(label: &str) {
         if std::env::var_os("SK_COMPACT_RSS").is_none() { return; }
         if let Ok(o) = std::process::Command::new("ps")
@@ -4166,6 +4359,7 @@ impl CoreDB {
         // tombstoned nodes, which is where a delete against the immutable base
         // finally takes effect.
         Self::rss_probe("compact start");
+        let mut phase = std::time::Instant::now();
         // The base is NOT copied into RAM. Every phase below reads it in place —
         // payload locations through payload_loc, records and slugs straight out of
         // the mmap, adjacency through fwd_edges — and the new base replaces it at
@@ -4300,6 +4494,7 @@ impl CoreDB {
         // exist. Crash between the two leaves the OLD snapshot + NEW topology
         // files, which reopens fine (old snapshot is still self-sufficient or
         // points at the previous, still-valid files; WAL not yet truncated).
+        Self::phase_probe("rewriting payloads + indexes", &mut phase);
         // What this compaction must not lose.
         //
         // This must count the same population `write_topology_files` writes: base
@@ -4313,22 +4508,42 @@ impl CoreDB {
         // truncated and the old generation dropped; this is the check that can still
         // put everything back.
         let (expect_nodes, expect_edges) = self.compaction_expectation();
+        Self::phase_probe("counting what must survive", &mut phase);
 
         // Keep the outgoing generation reachable until the incoming one has been
         // read back and found complete.
         Self::rss_probe("after payloads + indexes");
         let staged = Self::stage_previous_generation(&dir);
 
+        // Make every edge written since the last fold durable, in place. This is
+        // what stands in for rebuilding adjacency, and it happens *before* the
+        // topology is written so the readback below sees a settled graph.
+        if let Err(e) = self.fold_edges_into_paged() {
+            Self::restore_previous_generation(&staged);
+            return Err(e);
+        }
+        Self::phase_probe("folding edges into pages", &mut phase);
+
         self.merge_index_deltas();
+        Self::phase_probe("merging index deltas", &mut phase);
         if let Err(e) = self.write_topology_files(&dir) {
             Self::restore_previous_generation(&staged);
             return Err(e);
         }
+        Self::phase_probe("writing topology files", &mut phase);
 
         // Read the new files back, from disk, with a reader that shares nothing with
         // the writer. Only if they hold everything do we go on to drop the old
         // generation and truncate the log.
-        match Self::count_generation_on_disk(&dir) {
+        //
+        // The paged graph is not in those files, so it is counted here and passed
+        // in. It is counted by walking it, not by trusting a header — the point of
+        // the rail is to read back what was actually written.
+        // Read off the store's running total, not by walking it. Walking made this
+        // rail O(edges) and more than doubled a 200 000-node compaction — the exact
+        // cost this direction removes, put back by the check that guards it.
+        let paged_edges = self.paged_adj.as_ref().map(|pa| pa.fwd.edge_count() as usize);
+        match Self::count_generation_on_disk(&dir, paged_edges) {
             Ok((n, e)) if n >= expect_nodes && e >= expect_edges => {}
             Ok((n, e)) => {
                 Self::restore_previous_generation(&staged);
@@ -4356,6 +4571,8 @@ impl CoreDB {
             }
         }
 
+        Self::phase_probe("reading the new generation back", &mut phase);
+
         // Persist btree field indexes as mmap'able sidecars so a reopened paged DB
         // serves indexed queries from page cache (not heap). One file per
         // (collection, field); the field name is hex-encoded so any identifier
@@ -4364,6 +4581,8 @@ impl CoreDB {
             let fname = format!("fieldidx_{}_{}.bin", coll_hash, hex_encode(field));
             storage::fieldstore::write(&dir.join(fname), btree)?;
         }
+
+        Self::phase_probe("field index sidecars", &mut phase);
 
         let snap_json = serde_json::to_vec(&self.build_snapshot())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -4419,7 +4638,12 @@ impl CoreDB {
             self.edge_tombstones.clear();
             self.edges.reset_adjacency();
         }
+        // Unconditionally: the generation just written contains none of the edges
+        // these record, whether or not there was a base before it. Leaving them
+        // would subtract the same edges from a base that never had them.
+        self.unlinked_edges.clear();
         self.compact_payload_moves.clear();
+        Self::phase_probe("snapshot + adopting the generation", &mut phase);
 
         // Regenerate gin.bin so the next open loads GIN instantly.
         if let Some(ref gin_bin_path) = self.data_dir.as_ref().map(|d| d.join("gin.bin")) {
@@ -4429,6 +4653,7 @@ impl CoreDB {
         if let Some(ref search_bin_path) = self.data_dir.as_ref().map(|d| d.join("search.bin")) {
             let _ = self.save_search_binary(search_bin_path);
         }
+        Self::phase_probe("gin.bin + search.bin", &mut phase);
 
         // Reclaim excess RAM capacity as part of compaction (so auto-compact also
         // trims memory automatically, not just disk).
@@ -4530,12 +4755,16 @@ impl CoreDB {
     /// same accessors that had written the data, so when those accessors were wrong
     /// it agreed with them and confirmed a compaction that had just deleted the
     /// entire graph. A check that can agree with the bug is not a check.
-    fn count_generation_on_disk(dir: &Path) -> io::Result<(usize, usize)> {
+    fn count_generation_on_disk(dir: &Path, paged_edges: Option<usize>) -> io::Result<(usize, usize)> {
         let base = storage::topology::MappedTopology::open(dir)?;
         // Both counts come straight off the mapped headers and offset tables —
         // no edges are decoded and nothing is allocated per node, so this stays
         // cheap enough to run on every compaction.
-        Ok((base.node_count(), base.edge_count()))
+        //
+        // With paged adjacency the CSR files are deliberately empty, so their edge
+        // count would be zero and the rail would report catastrophic loss on every
+        // compaction. The caller counts the paged graph instead and passes it in.
+        Ok((base.node_count(), paged_edges.unwrap_or_else(|| base.edge_count())))
     }
 
     fn write_topology_files(&self, dir: &Path) -> io::Result<()> {
@@ -4597,7 +4826,13 @@ impl CoreDB {
         // a large store for information already sitting in the vector.
         let live = |h: u64| topo_nodes.binary_search_by_key(&h, |n| n.hash).is_ok();
         let mut topo_edges: Vec<TopoEdge> = Vec::new();
+        // With paged adjacency the graph is already durable and was never taken
+        // apart, so there is nothing to write here. Writing it anyway would not be
+        // wrong — reads prefer the paged store — but it is the exact work this
+        // direction exists to stop doing: two thirds of a compaction's bytes.
+        let rebuild_edges = self.paged_adj.is_none();
         for i in 0..topo_nodes.len() {
+            if !rebuild_edges { break }
             let from_h = topo_nodes[i].hash;
             let Some(edge_list) = self.fwd_edges(from_h) else { continue };
             for e in edge_list.iter() {
@@ -5403,6 +5638,13 @@ impl CoreDB {
             counters: Counters::default(), // a snapshot starts its own tally
             tombstones: self.tombstones.clone(),
             nodes: self.nodes.clone(),
+            // A snapshot cannot share the paged adjacency: its stores hold their
+            // own file handles and a write cursor, and a snapshot must not be able
+            // to write. Falling back to the segments is correct rather than
+            // convenient, and a store using paged adjacency simply has no segment
+            // edges to find - which is why snapshot_reads is refused for it in
+            // `open_with_config` rather than quietly answering an empty graph.
+            paged_adj: None,
             slug_map: self.slug_map.clone(),
             collections: self.collections.clone(),
             collection_names_map: self.collection_names_map.clone(),
@@ -5448,6 +5690,7 @@ impl CoreDB {
             writes_since_compact_check: 0,
             defer_wal_sync: false,
             edge_tombstones: HashSet::new(),
+            unlinked_edges: HashSet::new(),
             compact_payload_moves: HashMap::new(),
             group_commit: false,
             wal_generation: 0,
@@ -7540,6 +7783,122 @@ impl CoreDB {
         self.segments.newest_first().find_map(|b| b.collection_name_by_hash(coll_hash))
     }
 
+    /// Drop, from a base node's edge list, the single edges `unlink` withdrew.
+    ///
+    /// The base is immutable, so a withdrawal cannot be applied to it — it is
+    /// recorded and subtracted here instead, the same way `tombstones` subtracts a
+    /// deleted node. Without this an `unlink` against a base edge did nothing at
+    /// all, since `EdgeStore::unlink` can only retain-out of the RAM overlay.
+    ///
+    /// `owner` is whichever end of the edge this list belongs to, so the recorded
+    /// `(from, to, type)` is reassembled from the right side for each direction.
+    fn without_unlinked(
+        &self,
+        owner: u64,
+        edges: Vec<storage::topology::MappedEdge>,
+        forward: bool,
+    ) -> Vec<storage::topology::MappedEdge> {
+        if self.unlinked_edges.is_empty() { return edges }
+        edges.into_iter()
+            .filter(|e| {
+                let key = if forward {
+                    (owner, e.other_hash, e.edge_type_hash)
+                } else {
+                    (e.other_hash, owner, e.edge_type_hash)
+                };
+                !self.unlinked_edges.contains(&key)
+            })
+            .collect()
+    }
+
+    /// Move every edge written since the last fold into the durable paged graph.
+    ///
+    /// This is what replaces rebuilding `adj_fwd.bin` / `adj_rev.bin`. The old
+    /// phase read the whole graph and wrote the whole graph; this one touches only
+    /// the nodes whose edges changed, which is what Law 2 asks for — cost
+    /// proportional to the change, not to the store.
+    ///
+    /// The reverse direction is derived from the forward one rather than read from
+    /// its own overlay. Every edge `a → b` is exactly the edge `b ← a`, so deriving
+    /// it makes the two directions incapable of disagreeing; reading both would
+    /// make that a thing to get right, and adjacency getting out of step with
+    /// itself is not a bug a caller could ever diagnose.
+    ///
+    /// Deletions are applied first. An edge removed and re-added in the same window
+    /// has to end up present, and a node deleted after its edges were written has
+    /// to end up with none.
+    fn fold_edges_into_paged(&mut self) -> io::Result<()> {
+        let Some(mut pa) = self.paged_adj.take() else { return Ok(()) };
+        let result = self.fold_edges_into(&mut pa);
+        self.paged_adj = Some(pa);
+        result
+    }
+
+    fn fold_edges_into(&mut self, pa: &mut PagedAdjacency) -> io::Result<()> {
+        use storage::adjstore::{AdjEdge, NO_META};
+
+        // 1. Nodes whose edges were dropped wholesale — a deleted node, or one
+        //    whose edges were cleared. Both directions, and the edges pointing at
+        //    them, which is the expensive half and the reason `remove_all_to`
+        //    exists rather than leaving dangling edges to be filtered on read.
+        let dropped: Vec<u64> = self.edge_tombstones.iter()
+            .chain(self.tombstones.iter())
+            .copied()
+            .collect();
+        for h in dropped {
+            pa.fwd.remove_owner(h)?;
+            pa.rev.remove_owner(h)?;
+            pa.fwd.remove_all_to(h)?;
+            pa.rev.remove_all_to(h)?;
+        }
+
+        // 2. Individual edges withdrawn by `unlink`. The base could not be edited
+        //    when the call came in, so the withdrawal was recorded; this is where
+        //    it is finally applied to the durable graph.
+        let withdrawn: Vec<(u64, u64, u64)> = self.unlinked_edges.iter().copied().collect();
+        for (from, to, ty) in withdrawn {
+            pa.fwd.remove(from, to, Some(ty))?;
+            pa.rev.remove(to, from, Some(ty))?;
+        }
+
+        // 3. Everything added. Grouped per owner so the forward side is one rewrite
+        //    per node rather than one per edge — the difference between O(d) and
+        //    O(d^2) on a node that gained several edges.
+        let mut by_owner: Vec<(u64, Vec<AdjEdge>)> = Vec::new();
+        let mut reverse: HashMap<u64, Vec<AdjEdge>> = HashMap::new();
+        for (&owner, edges) in self.edges.iter_fwd() {
+            if self.tombstones.contains(&owner) { continue }
+            let mut list = Vec::with_capacity(edges.len());
+            for e in edges {
+                if self.tombstones.contains(&e.other) { continue }
+                // Fast-lane columns are folded back into the JSON bag, the same
+                // way the CSR path folded them into edgemeta.bin. On read the
+                // routing re-splits them, so columns survive without the durable
+                // format having to know about them.
+                let meta_ref = match self.edge_all_attrs(e) {
+                    Some(v) => pa.meta.insert(v.to_string().as_bytes())?.0,
+                    None => NO_META,
+                };
+                list.push(AdjEdge { other: e.other, edge_type: e.edge_type, meta_ref });
+                reverse.entry(e.other).or_default()
+                    .push(AdjEdge { other: owner, edge_type: e.edge_type, meta_ref });
+            }
+            if !list.is_empty() { by_owner.push((owner, list)) }
+        }
+        for (owner, list) in by_owner {
+            pa.fwd.add_many(owner, &list)?;
+        }
+        for (owner, list) in reverse {
+            pa.rev.add_many(owner, &list)?;
+        }
+
+        // The overlay has been made durable, so it must go — leaving it would
+        // double every edge on the next read, since reads merge the two.
+        self.edges.reset_adjacency();
+        self.edge_tombstones.clear();
+        pa.sync()
+    }
+
     /// How many nodes and edges a compaction of this store must produce.
     ///
     /// Named rather than inlined because it is the number the verify-before-commit
@@ -7553,6 +7912,33 @@ impl CoreDB {
     #[doc(hidden)]
     pub fn compaction_expectation(&self) -> (usize, usize) {
         let live = self.all_hashes();
+        // Walking every node's edges to count them dominated compaction: 893 ms of
+        // a 1478 ms rebuild at 200 000 nodes, so the check cost more than twice the
+        // work it was checking. It is done that way because a walk drops dangling
+        // edges, and only a walk knows which those are.
+        //
+        // With paged adjacency the walk is not merely expensive but pointless: the
+        // graph is not rewritten by a compaction, so the number before and the
+        // number after are the same number, read off a total the store maintains as
+        // it is written. There is nothing for a readback to disagree with because
+        // nothing was rewritten. `the_edge_count_matches_a_walk` is what stands
+        // behind that total, since a rail checking a made-up number is worse than
+        // no rail at all.
+        //
+        // Only when nothing is pending, though. The stored total is what the graph
+        // holds *now*; a compaction is about to fold in withdrawals and deletions
+        // that will make it smaller, and a rail expecting the larger number fails
+        // every compaction that follows an `unlink`. When anything is pending, the
+        // walk is what tells the truth, and paying for it is the right answer to
+        // "the cheap number would be wrong here".
+        if let Some(pa) = &self.paged_adj {
+            let pending = !self.unlinked_edges.is_empty()
+                || !self.tombstones.is_empty()
+                || !self.edge_tombstones.is_empty();
+            if !pending {
+                return (live.len(), pa.fwd.edge_count() as usize);
+            }
+        }
         let edges = live.iter()
             .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
             .sum();
@@ -7580,7 +7966,15 @@ impl CoreDB {
         let dropped = self.edge_tombstones.contains(&hash);
         let edges = Self::merged_edges(self.edges.fwd_edges(hash), || {
             if dropped { return None; }
-            self.segments.find(|b| b.fwd_by_hash(hash))
+            // Paged adjacency *replaces* the segments as the durable base rather
+            // than adding to them. Consulting both would double every edge that
+            // had been folded in, since folding does not erase the segment it
+            // came from until the segment itself is dropped.
+            let base = match &self.paged_adj {
+                Some(pa) => pa.edges(hash, true),
+                None => self.segments.find(|b| b.fwd_by_hash(hash)),
+            };
+            base.map(|v| self.without_unlinked(hash, v, true))
         })?;
         Some(self.drop_dangling(edges))
     }
@@ -7589,7 +7983,15 @@ impl CoreDB {
         let dropped = self.edge_tombstones.contains(&hash);
         let edges = Self::merged_edges(self.edges.rev_edges(hash), || {
             if dropped { return None; }
-            self.segments.find(|b| b.rev_by_hash(hash))
+            // Paged adjacency *replaces* the segments as the durable base rather
+            // than adding to them. Consulting both would double every edge that
+            // had been folded in, since folding does not erase the segment it
+            // came from until the segment itself is dropped.
+            let base = match &self.paged_adj {
+                Some(pa) => pa.edges(hash, false),
+                None => self.segments.find(|b| b.rev_by_hash(hash)),
+            };
+            base.map(|v| self.without_unlinked(hash, v, false))
         })?;
         Some(self.drop_dangling(edges))
     }
@@ -7663,12 +8065,19 @@ impl CoreDB {
     }
 
     pub(crate) fn edge_meta(&self, edge: &Edge) -> Option<Value> {
-        // Base edges carry an edgemeta.bin reference (high bit); overlay edges
-        // resolve through the resident meta store.
+        // Base edges carry a reference into whichever durable store produced them
+        // (high bit set); overlay edges resolve through the resident meta store.
         if let Some(meta_ref) = edge.base_meta_ref() {
+            // Paged adjacency owns the edges when it is on, so its references are
+            // the only ones that can appear — a record id in its attribute store,
+            // not an index into any segment's edgemeta.bin.
+            if let Some(pa) = &self.paged_adj {
+                let bytes = pa.meta_bytes(meta_ref)?;
+                return serde_json::from_slice(&bytes).ok();
+            }
             let bytes = self.segments
                 .newest_first()
-                .find_map(|b| b.edge_meta_bytes(meta_ref))?;
+                .find_map(|b| b.edge_meta_bytes(meta_ref as u32))?;
             return serde_json::from_slice(bytes).ok();
         }
         self.edges.edge_meta(edge)
@@ -9867,7 +10276,7 @@ mod compaction_safety_tests {
         }
         db.compact().unwrap();
 
-        let (nodes, edges) = CoreDB::count_generation_on_disk(dir.path()).unwrap();
+        let (nodes, edges) = CoreDB::count_generation_on_disk(dir.path(), None).unwrap();
         assert_eq!(nodes, 50, "the check under-counts nodes and would wave loss through");
         assert_eq!(edges, 49, "the check under-counts edges and would wave loss through");
     }
@@ -9887,7 +10296,7 @@ mod compaction_safety_tests {
         db.compact().unwrap();
         drop(db);
 
-        let before = CoreDB::count_generation_on_disk(dir.path()).unwrap();
+        let before = CoreDB::count_generation_on_disk(dir.path(), None).unwrap();
         assert_eq!(before, (20, 19));
 
         // Park it, then destroy the live files the way a bad compaction would.
@@ -9907,13 +10316,13 @@ mod compaction_safety_tests {
             }
         }
         assert_ne!(
-            CoreDB::count_generation_on_disk(dir.path()).unwrap_or((0, 0)), before,
+            CoreDB::count_generation_on_disk(dir.path(), None).unwrap_or((0, 0)), before,
             "the damage was not even detectable, so the check proves nothing",
         );
 
         CoreDB::restore_previous_generation(&staged);
         assert_eq!(
-            CoreDB::count_generation_on_disk(dir.path()).unwrap(), before,
+            CoreDB::count_generation_on_disk(dir.path(), None).unwrap(), before,
             "restoring the parked generation did not bring the data back",
         );
 
