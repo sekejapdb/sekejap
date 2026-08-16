@@ -1049,10 +1049,32 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    188    pub fn len(&self) -> usize
 ```
 
-### `mod.rs` · 29L — Storage — the on-disk building blocks
+### `mod.rs` · 30L — Storage — the on-disk building blocks
 
 ```
 (no top-level items)
+```
+
+### `pagestore.rs` · 368L — Why this exists
+
+```
+    61  pub(crate) struct PageStore
+    74  impl PageStore
+    76    pub(crate) fn create(path: &Path, page_size: usize) -> io::Result<Self>
+    95    pub(crate) fn open(path: &Path) -> io::Result<Option<Self>>
+   126    pub(crate) fn page_size(&self) -> usize { self.page_size }
+   129    pub(crate) fn page_count(&self) -> u64 { self.high_water }
+   132    pub(crate) fn free_count(&self) -> u64 { self.free_count }
+   139    pub(crate) fn alloc(&mut self) -> io::Result<u64>
+   157    pub(crate) fn free(&mut self, page: u64) -> io::Result<()>
+   172    pub(crate) fn read(&self, page: u64, buf: &mut [u8]) -> io::Result<()>
+   179    pub(crate) fn write(&mut self, page: u64, buf: &[u8]) -> io::Result<()>
+   188    pub(crate) fn sync(&mut self) -> io::Result<()>
+   207  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
+   212  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
+   217  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
+   224  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
+   232  mod tests
 ```
 
 ### `skbin.rs` · 610L — SKBIN — a compact binary format for record payloads
@@ -1429,4 +1451,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 43 files, 1187 items -->
+<!-- 44 files, 1204 items -->
