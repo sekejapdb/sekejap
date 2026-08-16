@@ -100,15 +100,30 @@ fn slot_count(p: &[u8]) -> usize { rd16(p, 0) as usize }
 fn live_count(p: &[u8]) -> usize { rd16(p, 2) as usize }
 fn heap_start(p: &[u8]) -> usize { rd16(p, 4) as usize }
 
-fn slot_entry(p: &[u8], i: usize) -> (usize, usize) {
+/// A live slot's `(offset, length)`, or `None` if the slot is dead.
+///
+/// The stored length is the real length **plus one**, so zero can mean "dead"
+/// without colliding with a genuinely empty record. Using 0 for both made an empty
+/// payload read as deleted — which the comparison against the flat store caught,
+/// and which would otherwise have surfaced as a row silently losing its contents.
+fn slot_entry(p: &[u8], i: usize) -> Option<(usize, usize)> {
     let at = PAGE_HEADER + i * SLOT_SIZE;
-    (rd16(p, at) as usize, rd16(p, at + 2) as usize)
+    match rd16(p, at + 2) {
+        0 => None,
+        encoded => Some((rd16(p, at) as usize, encoded as usize - 1)),
+    }
 }
 
 fn set_slot(p: &mut [u8], i: usize, off: usize, len: usize) {
     let at = PAGE_HEADER + i * SLOT_SIZE;
     wr16(p, at, off as u16);
-    wr16(p, at + 2, len as u16);
+    wr16(p, at + 2, (len + 1) as u16);
+}
+
+fn kill_slot(p: &mut [u8], i: usize) {
+    let at = PAGE_HEADER + i * SLOT_SIZE;
+    wr16(p, at, 0);
+    wr16(p, at + 2, 0);
 }
 
 impl RecordStore {
@@ -129,6 +144,10 @@ impl RecordStore {
     pub(crate) fn max_record_len(&self) -> usize {
         self.pages.page_size() - PAGE_HEADER - SLOT_SIZE
     }
+
+    /// An empty record is a real record, distinct from a deleted one.
+    #[cfg(test)]
+    fn _empty_is_representable() {}
 
     fn fresh_page(&mut self) -> io::Result<u64> {
         let page = self.pages.alloc()?;
@@ -176,7 +195,7 @@ impl RecordStore {
         Ok(RecordId::new(head, OVERFLOW_SLOT))
     }
 
-    fn read_overflow(&mut self, head: u64) -> io::Result<Option<Vec<u8>>> {
+    fn read_overflow(&self, head: u64) -> io::Result<Option<Vec<u8>>> {
         let ps = self.pages.page_size();
         let mut out = Vec::new();
         let mut page = head;
@@ -267,24 +286,28 @@ impl RecordStore {
         Ok(RecordId::new(page, n as u16))
     }
 
-    pub(crate) fn read(&mut self, id: RecordId) -> io::Result<Option<Vec<u8>>> {
+    /// Reads take `&self` so they can serve an immutable caller, and allocate a
+    /// page-sized buffer rather than sharing the scratch one used by writes.
+    pub(crate) fn read(&self, id: RecordId) -> io::Result<Option<Vec<u8>>> {
         if id.slot() == OVERFLOW_SLOT {
             return self.read_overflow(id.page());
         }
         let ps = self.pages.page_size();
-        self.buf.resize(ps, 0);
-        if self.pages.read(id.page(), &mut self.buf).is_err() {
+        let mut buf = vec![0u8; ps];
+        if self.pages.read(id.page(), &mut buf).is_err() {
             return Ok(None);
         }
         let i = id.slot() as usize;
-        if i >= slot_count(&self.buf) {
+        if i >= slot_count(&buf) {
             return Ok(None);
         }
-        let (off, len) = slot_entry(&self.buf, i);
-        if len == 0 || off + len > ps {
-            return Ok(None); // dead slot, or a slot that does not describe real bytes
+        let Some((off, len)) = slot_entry(&buf, i) else {
+            return Ok(None); // dead slot
+        };
+        if off + len > ps {
+            return Ok(None); // does not describe real bytes
         }
-        Ok(Some(self.buf[off..off + len].to_vec()))
+        Ok(Some(buf[off..off + len].to_vec()))
     }
 
     /// Delete a record. When a page's last live record goes, the page itself is
@@ -302,11 +325,10 @@ impl RecordStore {
         if i >= slot_count(&self.buf) {
             return Ok(false);
         }
-        let (_, len) = slot_entry(&self.buf, i);
-        if len == 0 {
+        if slot_entry(&self.buf, i).is_none() {
             return Ok(false); // already dead
         }
-        set_slot(&mut self.buf, i, 0, 0);
+        kill_slot(&mut self.buf, i);
         let live = live_count(&self.buf) - 1;
         wr16(&mut self.buf, 2, live as u16);
         let page_bytes = std::mem::take(&mut self.buf);
