@@ -956,37 +956,40 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
 
 ## `src/storage/`
 
-### `btree.rs` · 430L — Why
+### `btree.rs` · 525L — Why
 
 ```
-    52  fn rd8(p: &[u8], at: usize) -> u64 { u64::from_le_bytes(p[at..at + 8].try_into().unwrap()) }
-    53  fn wr8(p: &mut [u8], at: usize, v: u64) { p[at..at + 8].copy_from_slice(&v.to_le_bytes()); }
-    54  fn count(p: &[u8]) -> usize { u16::from_le_bytes([p[2], p[3]]) as usize }
-    55  fn set_count(p: &mut [u8], n: usize) { p[2..4].copy_from_slice(&(n as u16).to_le_bytes()); }
-    56  fn kind(p: &[u8]) -> u8 { p[0] }
-    57  fn next_leaf(p: &[u8]) -> u64 { rd8(p, 8) }
-    58  fn set_next_leaf(p: &mut [u8], v: u64) { wr8(p, 8, v) }
-    61  fn leaf_key(p: &[u8], i: usize) -> u64 { rd8(p, HDR + i * ENTRY) }
-    62  fn leaf_val(p: &[u8], i: usize) -> u64 { rd8(p, HDR + i * ENTRY + 8) }
-    63  fn set_leaf(p: &mut [u8], i: usize, k: u64, v: u64)
-    69  fn child0(p: &[u8]) -> u64 { rd8(p, HDR) }
-    70  fn set_child0(p: &mut [u8], v: u64) { wr8(p, HDR, v) }
-    71  fn int_key(p: &[u8], i: usize) -> u64 { rd8(p, HDR + 8 + i * ENTRY) }
-    72  fn int_child(p: &[u8], i: usize) -> u64 { rd8(p, HDR + 8 + i * ENTRY + 8) }
-    73  fn set_int(p: &mut [u8], i: usize, k: u64, c: u64)
-    79  struct Split { key: u64, right: u64 }
-    81  pub(crate) struct BTree
-    87  impl BTree
-    91    pub(crate) fn create(path: &std::path::Path, page_size: usize) -> io::Result<Self>
-   113    pub(crate) fn open(path: &std::path::Path) -> io::Result<Option<Self>>
-   120    pub(crate) fn len(&self) -> u64 { self.len }
-   121    pub(crate) fn page_count(&self) -> u64 { self.pages.page_count() }
-   122    pub(crate) fn sync(&mut self) -> io::Result<()>
-   154    pub(crate) fn get(&self, key: u64) -> io::Result<Option<u64>>
-   169    pub(crate) fn insert(&mut self, key: u64, value: u64) -> io::Result<()>
-   292    pub(crate) fn remove(&mut self, key: u64) -> io::Result<bool>
-   317    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u64, u64)>>
-   337  mod tests
+    54  fn rd8(p: &[u8], at: usize) -> u64 { u64::from_le_bytes(p[at..at + 8].try_into().unwrap()) }
+    55  fn wr8(p: &mut [u8], at: usize, v: u64) { p[at..at + 8].copy_from_slice(&v.to_le_bytes()); }
+    56  fn rd16b(p: &[u8], at: usize) -> u128 { u128::from_le_bytes(p[at..at + 16].try_into().unwrap())…
+    57  fn wr16b(p: &mut [u8], at: usize, v: u128) { p[at..at + 16].copy_from_slice(&v.to_le_bytes()); }
+    58  fn count(p: &[u8]) -> usize { u16::from_le_bytes([p[2], p[3]]) as usize }
+    59  fn set_count(p: &mut [u8], n: usize) { p[2..4].copy_from_slice(&(n as u16).to_le_bytes()); }
+    60  fn kind(p: &[u8]) -> u8 { p[0] }
+    61  fn next_leaf(p: &[u8]) -> u64 { rd8(p, 8) }
+    62  fn set_next_leaf(p: &mut [u8], v: u64) { wr8(p, 8, v) }
+    65  fn leaf_key(p: &[u8], i: usize) -> u128 { rd16b(p, HDR + i * ENTRY) }
+    66  fn leaf_val(p: &[u8], i: usize) -> u64 { rd8(p, HDR + i * ENTRY + 16) }
+    67  fn set_leaf(p: &mut [u8], i: usize, k: u128, v: u64)
+    73  fn child0(p: &[u8]) -> u64 { rd8(p, HDR) }
+    74  fn set_child0(p: &mut [u8], v: u64) { wr8(p, HDR, v) }
+    75  fn int_key(p: &[u8], i: usize) -> u128 { rd16b(p, HDR + 8 + i * ENTRY) }
+    76  fn int_child(p: &[u8], i: usize) -> u64 { rd8(p, HDR + 8 + i * ENTRY + 16) }
+    77  fn set_int(p: &mut [u8], i: usize, k: u128, c: u64)
+    83  struct Split { key: u128, right: u64 }
+    85  pub(crate) struct BTree
+    91  impl BTree
+    95    pub(crate) fn create(path: &std::path::Path, page_size: usize) -> io::Result<Self>
+   117    pub(crate) fn open(path: &std::path::Path) -> io::Result<Option<Self>>
+   124    pub(crate) fn len(&self) -> u64 { self.len }
+   125    pub(crate) fn page_count(&self) -> u64 { self.pages.page_count() }
+   126    pub(crate) fn sync(&mut self) -> io::Result<()>
+   158    pub(crate) fn get(&self, key: u128) -> io::Result<Option<u64>>
+   173    pub(crate) fn insert(&mut self, key: u128, value: u64) -> io::Result<()>
+   296    pub(crate) fn remove(&mut self, key: u128) -> io::Result<bool>
+   324    pub(crate) fn range(&self, lo: u128, hi: u128) -> io::Result<Vec<(u128, u64)>>
+   345    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>>
+   365  mod tests
 ```
 
 ### `edgestore.rs` · 892L — Edge storage — the graph's connections
@@ -1086,7 +1089,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    188    pub fn len(&self) -> usize
 ```
 
-### `mod.rs` · 33L — Storage — the on-disk building blocks
+### `mod.rs` · 38L — Storage — the on-disk building blocks
 
 ```
 (no top-level items)
@@ -1100,9 +1103,9 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     39    pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self>
     53    pub(crate) fn len(&self) -> u64 { self.index.len() }
     56    pub(crate) fn page_counts(&self) -> (u64, u64)
-    64    pub(crate) fn put(&mut self, key: u64, bytes: &[u8]) -> io::Result<()>
-    74    pub(crate) fn get(&self, key: u64) -> io::Result<Option<Vec<u8>>>
-    81    pub(crate) fn delete(&mut self, key: u64) -> io::Result<bool>
+    64    pub(crate) fn put(&mut self, key: u128, bytes: &[u8]) -> io::Result<()>
+    74    pub(crate) fn get(&self, key: u128) -> io::Result<Option<Vec<u8>>>
+    81    pub(crate) fn delete(&mut self, key: u128) -> io::Result<bool>
     88    pub(crate) fn sync(&mut self) -> io::Result<()>
     95  mod tests
 ```
@@ -1535,4 +1538,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 47 files, 1273 items -->
+<!-- 47 files, 1276 items -->

@@ -19,9 +19,11 @@
 //!
 //! # Shape
 //!
-//! Keys and values are both `u64`: a record hash and the slot it lives in. Fixed
-//! width keeps a page a plain array, so a lookup within one is a binary search over
-//! `count` entries rather than a walk.
+//! A key is a `u128` and a value a `u64`. The wide key is what lets a *composite*
+//! key — `(collection, node)`, or `(node, sequence)` — be a single ordered key, so
+//! "every member of this collection" or "every edge from this node" is a range scan
+//! rather than a structure of its own. Fixed width keeps a page a plain array, so a
+//! lookup within one is a binary search over `count` entries rather than a walk.
 //!
 //! ```text
 //!   internal:  [ hdr | child₀ | k₀ child₁ | k₁ child₂ | … ]   descend on key < kᵢ
@@ -47,36 +49,38 @@ const KIND_INTERNAL: u8 = 1;
 
 /// kind(1) pad(1) count(2) pad(4) next(8)
 const HDR: usize = 16;
-const ENTRY: usize = 16; // u64 key + u64 value/child
+const ENTRY: usize = 24; // u128 key + u64 value/child
 
 fn rd8(p: &[u8], at: usize) -> u64 { u64::from_le_bytes(p[at..at + 8].try_into().unwrap()) }
 fn wr8(p: &mut [u8], at: usize, v: u64) { p[at..at + 8].copy_from_slice(&v.to_le_bytes()); }
+fn rd16b(p: &[u8], at: usize) -> u128 { u128::from_le_bytes(p[at..at + 16].try_into().unwrap()) }
+fn wr16b(p: &mut [u8], at: usize, v: u128) { p[at..at + 16].copy_from_slice(&v.to_le_bytes()); }
 fn count(p: &[u8]) -> usize { u16::from_le_bytes([p[2], p[3]]) as usize }
 fn set_count(p: &mut [u8], n: usize) { p[2..4].copy_from_slice(&(n as u16).to_le_bytes()); }
 fn kind(p: &[u8]) -> u8 { p[0] }
 fn next_leaf(p: &[u8]) -> u64 { rd8(p, 8) }
 fn set_next_leaf(p: &mut [u8], v: u64) { wr8(p, 8, v) }
 
-// Leaf entry i: key at HDR + i*16, value at +8.
-fn leaf_key(p: &[u8], i: usize) -> u64 { rd8(p, HDR + i * ENTRY) }
-fn leaf_val(p: &[u8], i: usize) -> u64 { rd8(p, HDR + i * ENTRY + 8) }
-fn set_leaf(p: &mut [u8], i: usize, k: u64, v: u64) {
-    wr8(p, HDR + i * ENTRY, k);
-    wr8(p, HDR + i * ENTRY + 8, v);
+// Leaf entry i: key at HDR + i*ENTRY, value 16 bytes further in.
+fn leaf_key(p: &[u8], i: usize) -> u128 { rd16b(p, HDR + i * ENTRY) }
+fn leaf_val(p: &[u8], i: usize) -> u64 { rd8(p, HDR + i * ENTRY + 16) }
+fn set_leaf(p: &mut [u8], i: usize, k: u128, v: u64) {
+    wr16b(p, HDR + i * ENTRY, k);
+    wr8(p, HDR + i * ENTRY + 16, v);
 }
 
 // Internal node: child0 at HDR, then (key, child) pairs from HDR+8.
 fn child0(p: &[u8]) -> u64 { rd8(p, HDR) }
 fn set_child0(p: &mut [u8], v: u64) { wr8(p, HDR, v) }
-fn int_key(p: &[u8], i: usize) -> u64 { rd8(p, HDR + 8 + i * ENTRY) }
-fn int_child(p: &[u8], i: usize) -> u64 { rd8(p, HDR + 8 + i * ENTRY + 8) }
-fn set_int(p: &mut [u8], i: usize, k: u64, c: u64) {
-    wr8(p, HDR + 8 + i * ENTRY, k);
-    wr8(p, HDR + 8 + i * ENTRY + 8, c);
+fn int_key(p: &[u8], i: usize) -> u128 { rd16b(p, HDR + 8 + i * ENTRY) }
+fn int_child(p: &[u8], i: usize) -> u64 { rd8(p, HDR + 8 + i * ENTRY + 16) }
+fn set_int(p: &mut [u8], i: usize, k: u128, c: u64) {
+    wr16b(p, HDR + 8 + i * ENTRY, k);
+    wr8(p, HDR + 8 + i * ENTRY + 16, c);
 }
 
 /// What an insert reports back up the descent when a child had to split.
-struct Split { key: u64, right: u64 }
+struct Split { key: u128, right: u64 }
 
 pub(crate) struct BTree {
     pages: PageStore,
@@ -131,7 +135,7 @@ impl BTree {
     }
 
     /// Index of the first entry with key >= `key`.
-    fn lower_bound_leaf(p: &[u8], key: u64) -> usize {
+    fn lower_bound_leaf(p: &[u8], key: u128) -> usize {
         let (mut lo, mut hi) = (0usize, count(p));
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -141,7 +145,7 @@ impl BTree {
     }
 
     /// Which child to descend into for `key`.
-    fn descend_to(p: &[u8], key: u64) -> u64 {
+    fn descend_to(p: &[u8], key: u128) -> u64 {
         let n = count(p);
         let (mut lo, mut hi) = (0usize, n);
         while lo < hi {
@@ -151,7 +155,7 @@ impl BTree {
         if lo == 0 { child0(p) } else { int_child(p, lo - 1) }
     }
 
-    pub(crate) fn get(&self, key: u64) -> io::Result<Option<u64>> {
+    pub(crate) fn get(&self, key: u128) -> io::Result<Option<u64>> {
         let mut page = self.root;
         loop {
             let buf = self.read_page(page)?;
@@ -166,7 +170,7 @@ impl BTree {
         }
     }
 
-    pub(crate) fn insert(&mut self, key: u64, value: u64) -> io::Result<()> {
+    pub(crate) fn insert(&mut self, key: u128, value: u64) -> io::Result<()> {
         let root = self.root;
         if let Some(split) = self.insert_into(root, key, value)? {
             // The root split: a new root above the old one keeps the tree balanced,
@@ -184,7 +188,7 @@ impl BTree {
         Ok(())
     }
 
-    fn insert_into(&mut self, page: u64, key: u64, value: u64) -> io::Result<Option<Split>> {
+    fn insert_into(&mut self, page: u64, key: u128, value: u64) -> io::Result<Option<Split>> {
         let mut buf = self.read_page(page)?;
         if kind(&buf) == KIND_LEAF {
             let n = count(&buf);
@@ -230,7 +234,7 @@ impl BTree {
         self.split_internal(page, buf, at, split).map(Some)
     }
 
-    fn split_leaf(&mut self, page: u64, mut buf: Vec<u8>, key: u64, value: u64)
+    fn split_leaf(&mut self, page: u64, mut buf: Vec<u8>, key: u128, value: u64)
         -> io::Result<Split>
     {
         let n = count(&buf);
@@ -264,7 +268,7 @@ impl BTree {
     {
         // Rebuild the full separator list including the pending one, then halve it.
         let n = count(&buf);
-        let mut keys: Vec<(u64, u64)> = Vec::with_capacity(n + 1);
+        let mut keys: Vec<(u128, u64)> = Vec::with_capacity(n + 1);
         for i in 0..n { keys.push((int_key(&buf, i), int_child(&buf, i))); }
         keys.insert(at, (pending.key, pending.right));
 
@@ -289,7 +293,7 @@ impl BTree {
         Ok(Split { key: sep, right })
     }
 
-    pub(crate) fn remove(&mut self, key: u64) -> io::Result<bool> {
+    pub(crate) fn remove(&mut self, key: u128) -> io::Result<bool> {
         let mut page = self.root;
         loop {
             let mut buf = self.read_page(page)?;
@@ -313,8 +317,32 @@ impl BTree {
         }
     }
 
+    /// Every entry whose key falls in `lo ..= hi`, in order.
+    ///
+    /// With a composite key this is a prefix scan: all members of one collection,
+    /// or all edges from one node, are a contiguous run.
+    pub(crate) fn range(&self, lo: u128, hi: u128) -> io::Result<Vec<(u128, u64)>> {
+        let mut page = self.root;
+        loop {
+            let buf = self.read_page(page)?;
+            if kind(&buf) == KIND_LEAF { break }
+            page = Self::descend_to(&buf, lo);
+        }
+        let mut out = Vec::new();
+        while page != 0 {
+            let buf = self.read_page(page)?;
+            for i in 0..count(&buf) {
+                let k = leaf_key(&buf, i);
+                if k > hi { return Ok(out) }
+                if k >= lo { out.push((k, leaf_val(&buf, i))) }
+            }
+            page = next_leaf(&buf);
+        }
+        Ok(out)
+    }
+
     /// Every entry in key order, by walking the linked leaves.
-    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u64, u64)>> {
+    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>> {
         let mut page = self.root;
         loop {
             let buf = self.read_page(page)?;
@@ -350,7 +378,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut t = tree(&dir);
         // Deterministic scatter — no dependency on a random source.
-        let keys: Vec<u64> = (0..5_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let keys: Vec<u128> = (0..5_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128).collect();
         for (v, &k) in keys.iter().enumerate() {
             t.insert(k, v as u64).unwrap();
         }
@@ -358,15 +386,15 @@ mod tests {
         for (v, &k) in keys.iter().enumerate() {
             assert_eq!(t.get(k).unwrap(), Some(v as u64), "key {k} lost");
         }
-        assert_eq!(t.get(12345).unwrap(), None, "an absent key was found");
+        assert_eq!(t.get(12345u128).unwrap(), None, "an absent key was found");
     }
 
     #[test]
     fn ascending_inserts_work_too() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut t = tree(&dir);
-        for i in 0..5_000u64 { t.insert(i, i * 2).unwrap(); }
-        for i in 0..5_000u64 { assert_eq!(t.get(i).unwrap(), Some(i * 2), "key {i}"); }
+        for i in 0..5_000u64 { t.insert(i as u128, i * 2).unwrap(); }
+        for i in 0..5_000u64 { assert_eq!(t.get(i as u128).unwrap(), Some(i * 2), "key {i}"); }
         let all = t.iter_all().unwrap();
         assert_eq!(all.len(), 5_000, "ordered walk lost entries");
         assert!(all.windows(2).all(|w| w[0].0 < w[1].0), "ordered walk is not ordered");
@@ -376,23 +404,23 @@ mod tests {
     fn reinserting_a_key_replaces_its_value() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut t = tree(&dir);
-        for i in 0..1_000u64 { t.insert(i, i).unwrap(); }
-        for i in 0..1_000u64 { t.insert(i, i + 7_000).unwrap(); }
+        for i in 0..1_000u64 { t.insert(i as u128, i).unwrap(); }
+        for i in 0..1_000u64 { t.insert(i as u128, i + 7_000).unwrap(); }
         assert_eq!(t.len(), 1_000, "replacing a key changed the entry count");
-        for i in 0..1_000u64 { assert_eq!(t.get(i).unwrap(), Some(i + 7_000)); }
+        for i in 0..1_000u64 { assert_eq!(t.get(i as u128).unwrap(), Some(i + 7_000)); }
     }
 
     #[test]
     fn removed_keys_are_gone_and_the_rest_survive() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut t = tree(&dir);
-        for i in 0..2_000u64 { t.insert(i, i).unwrap(); }
-        for i in (0..2_000u64).step_by(2) { assert!(t.remove(i).unwrap()); }
-        assert!(!t.remove(0).unwrap(), "removing twice reported success");
+        for i in 0..2_000u64 { t.insert(i as u128, i).unwrap(); }
+        for i in (0..2_000u64).step_by(2) { assert!(t.remove(i as u128).unwrap()); }
+        assert!(!t.remove(0u128).unwrap(), "removing twice reported success");
         assert_eq!(t.len(), 1_000);
         for i in 0..2_000u64 {
             let expect = if i % 2 == 0 { None } else { Some(i) };
-            assert_eq!(t.get(i).unwrap(), expect, "key {i}");
+            assert_eq!(t.get(i as u128).unwrap(), expect, "key {i}");
         }
     }
 
@@ -404,12 +432,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut t = tree(&dir);
         for i in 0..50_000u64 {
-            t.insert(i.wrapping_mul(0x9E37_79B9_7F4A_7C15), i).unwrap();
+            t.insert(i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128, i).unwrap();
         }
-        // 4 KB pages hold 255 entries; 50k entries is three levels at most, so the
-        // page count is dominated by leaves rather than by internal nodes.
-        assert!(t.page_count() < 50_000 / 100,
+        // A 4 KB page holds (4096-16)/24 = 170 entries. Splitting down the middle
+        // leaves each page around half full under random keys, so 50k entries want
+        // roughly 600 leaves plus a thin spine above them. The bound below is
+        // deliberately loose: what it catches is pages that are not filling at all.
+        assert!(t.page_count() < 50_000 / 50,
                 "{} pages for 50k entries suggests pages are not filling", t.page_count());
+        println!("  50k entries → {} pages ({:.0} entries per page)",
+                 t.page_count(), 50_000.0 / t.page_count() as f64);
     }
 
     #[test]
@@ -418,13 +450,76 @@ mod tests {
         let path = dir.path().join("idx.bin");
         {
             let mut t = BTree::create(&path, DEFAULT_PAGE_SIZE).unwrap();
-            for i in 0..3_000u64 { t.insert(i.wrapping_mul(2_654_435_761), i).unwrap(); }
+            for i in 0..3_000u64 { t.insert(i.wrapping_mul(2_654_435_761) as u128, i).unwrap(); }
             t.sync().unwrap();
         }
         let t = BTree::open(&path).unwrap().expect("tree should reopen");
         assert_eq!(t.len(), 3_000, "entry count did not survive");
         for i in 0..3_000u64 {
-            assert_eq!(t.get(i.wrapping_mul(2_654_435_761)).unwrap(), Some(i), "key {i}");
+            assert_eq!(t.get(i.wrapping_mul(2_654_435_761) as u128).unwrap(), Some(i), "key {i}");
         }
+    }
+
+    /// `range` against a `BTreeMap` that cannot be wrong, over every awkward
+    /// boundary: a window that starts before the first key, one that ends after the
+    /// last, one that lands between two keys, and empty ones.
+    #[test]
+    fn range_matches_a_btreemap_oracle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut t = tree(&dir);
+        let mut oracle = std::collections::BTreeMap::new();
+        for i in 0..20_000u64 {
+            let k = (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 100_000) as u128;
+            t.insert(k, i).unwrap();
+            oracle.insert(k, i);
+        }
+        for i in (0..20_000u64).step_by(7) {
+            let k = (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 100_000) as u128;
+            t.remove(k).unwrap();
+            oracle.remove(&k);
+        }
+        let windows: &[(u128, u128)] = &[
+            (0, u128::MAX), (0, 0), (u128::MAX, u128::MAX), (5, 4),
+            (0, 500), (99_500, 200_000), (40_000, 40_100), (12_345, 12_345),
+        ];
+        for &(lo, hi) in windows {
+            let got = t.range(lo, hi).unwrap();
+            let want: Vec<(u128, u64)> = if lo > hi {
+                Vec::new()
+            } else {
+                oracle.range(lo..=hi).map(|(k, v)| (*k, *v)).collect()
+            };
+            assert_eq!(got, want, "range({lo}, {hi}) disagreed with the oracle");
+        }
+    }
+
+    /// The shape the topology needs: a composite key `(owner, member)` turns "every
+    /// member of one owner" into one contiguous run, so a collection's rows or a
+    /// node's edges are a scan rather than a separate structure.
+    #[test]
+    fn a_composite_key_makes_a_prefix_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut t = tree(&dir);
+        let compose = |owner: u64, member: u64| ((owner as u128) << 64) | member as u128;
+
+        for owner in 0..50u64 {
+            for member in 0..200u64 {
+                t.insert(compose(owner, member), owner * 1_000 + member).unwrap();
+            }
+        }
+        for owner in 0..50u64 {
+            let got = t.range(compose(owner, 0), compose(owner, u64::MAX)).unwrap();
+            assert_eq!(got.len(), 200, "owner {owner} scanned {} members", got.len());
+            for (i, (k, v)) in got.iter().enumerate() {
+                assert_eq!(*k, compose(owner, i as u64), "owner {owner} member {i} out of order");
+                assert_eq!(*v, owner * 1_000 + i as u64);
+            }
+        }
+        // Removing one owner entirely must not disturb its neighbours, which is the
+        // case that matters when a collection is dropped.
+        for member in 0..200u64 { t.remove(compose(7, member)).unwrap(); }
+        assert!(t.range(compose(7, 0), compose(7, u64::MAX)).unwrap().is_empty());
+        assert_eq!(t.range(compose(6, 0), compose(6, u64::MAX)).unwrap().len(), 200);
+        assert_eq!(t.range(compose(8, 0), compose(8, u64::MAX)).unwrap().len(), 200);
     }
 }
