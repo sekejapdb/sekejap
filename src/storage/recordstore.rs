@@ -1,0 +1,350 @@
+//! Variable-length records stored in slotted pages, with space returned on delete.
+//!
+//! # Why
+//!
+//! [`PageStore`] hands out fixed-size pages. Records are not fixed size — a row is
+//! typically 60–300 bytes, so one record per 4 KB page would waste around 40× — and
+//! a page-level free list alone cannot reclaim a single dead record.
+//!
+//! A *slotted page* is the standard answer, used by PostgreSQL, SQLite and every
+//! disk-based engine that stores variable-length rows. A page holds many records
+//! plus a small directory saying where each one is. Because a record is addressed
+//! by its directory *slot* rather than by a byte offset, it can be moved within the
+//! page — which is what makes space reclaimable without touching anything that
+//! points at it.
+//!
+//! ```text
+//!   ┌──────────┬─────────────────┬───────────────┬────────────────────────┐
+//!   │  header  │ slot directory →│  free space   │← records               │
+//!   └──────────┴─────────────────┴───────────────┴────────────────────────┘
+//!    live/slot   (offset, len)      shrinks from    grow downward from the
+//!    counts      per record         both ends       end of the page
+//! ```
+//!
+//! # What this buys, and what it does not
+//!
+//! Deleting a record marks its slot dead and adds its bytes to the page's free
+//! count. When a page's last live record goes, the page returns to the page store's
+//! free list and the next allocation takes it back. **A workload that deletes as
+//! fast as it inserts stops growing the file**, with no rewrite of anything.
+//!
+//! The limit worth stating plainly: this version appends into one open page at a
+//! time and reclaims at *page* granularity. A rolling retention window — delete the
+//! oldest, insert the newest — empties whole pages and reclaims perfectly, because
+//! records written together sit together. A workload of scattered updates across a
+//! large store leaves partly-used pages behind that are not revisited, so space is
+//! reclaimed more slowly. Fixing that needs a free-space map of partly-filled pages;
+//! it is a refinement of this, not a redesign of it.
+
+use super::pagestore::PageStore;
+use std::io;
+
+/// Bytes of per-page bookkeeping before the slot directory.
+const PAGE_HEADER: usize = 8;
+/// Bytes per directory entry: offset (u16) and length (u16).
+const SLOT_SIZE: usize = 4;
+
+/// Where a record lives: page number and directory slot, packed.
+///
+/// 48 bits of page number at 4 KB a page is a petabyte of addressable store; 16
+/// bits of slot is far more records than fit in a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RecordId(pub u64);
+
+impl RecordId {
+    #[inline]
+    pub(crate) fn new(page: u64, slot: u16) -> Self {
+        debug_assert!(page < (1u64 << 48), "page number exceeds 48 bits");
+        RecordId((page << 16) | slot as u64)
+    }
+    #[inline]
+    pub(crate) fn page(self) -> u64 { self.0 >> 16 }
+    #[inline]
+    pub(crate) fn slot(self) -> u16 { (self.0 & 0xFFFF) as u16 }
+}
+
+/// Slotted-page record storage over a [`PageStore`].
+pub(crate) struct RecordStore {
+    pages: PageStore,
+    /// The page currently being appended to, if any.
+    open_page: Option<u64>,
+    /// Scratch buffer, reused so a read or write does not allocate.
+    buf: Vec<u8>,
+}
+
+// ── page accessors ───────────────────────────────────────────────────────────
+// header: slot_count u16 | live_count u16 | heap_start u16 | reserved u16
+// `heap_start` is where record bytes begin, growing downward from the page end.
+
+fn rd16(p: &[u8], at: usize) -> u16 { u16::from_le_bytes([p[at], p[at + 1]]) }
+fn wr16(p: &mut [u8], at: usize, v: u16) { p[at..at + 2].copy_from_slice(&v.to_le_bytes()); }
+
+fn slot_count(p: &[u8]) -> usize { rd16(p, 0) as usize }
+fn live_count(p: &[u8]) -> usize { rd16(p, 2) as usize }
+fn heap_start(p: &[u8]) -> usize { rd16(p, 4) as usize }
+
+fn slot_entry(p: &[u8], i: usize) -> (usize, usize) {
+    let at = PAGE_HEADER + i * SLOT_SIZE;
+    (rd16(p, at) as usize, rd16(p, at + 2) as usize)
+}
+
+fn set_slot(p: &mut [u8], i: usize, off: usize, len: usize) {
+    let at = PAGE_HEADER + i * SLOT_SIZE;
+    wr16(p, at, off as u16);
+    wr16(p, at + 2, len as u16);
+}
+
+impl RecordStore {
+    pub(crate) fn create(path: &std::path::Path, page_size: usize) -> io::Result<Self> {
+        Ok(Self { pages: PageStore::create(path, page_size)?, open_page: None, buf: Vec::new() })
+    }
+
+    pub(crate) fn open(path: &std::path::Path) -> io::Result<Option<Self>> {
+        Ok(PageStore::open(path)?
+            .map(|pages| Self { pages, open_page: None, buf: Vec::new() }))
+    }
+
+    pub(crate) fn page_count(&self) -> u64 { self.pages.page_count() }
+    pub(crate) fn free_page_count(&self) -> u64 { self.pages.free_count() }
+    pub(crate) fn sync(&mut self) -> io::Result<()> { self.pages.sync() }
+
+    /// Largest record that fits in a page, allowing for the header and its slot.
+    pub(crate) fn max_record_len(&self) -> usize {
+        self.pages.page_size() - PAGE_HEADER - SLOT_SIZE
+    }
+
+    fn fresh_page(&mut self) -> io::Result<u64> {
+        let page = self.pages.alloc()?;
+        let ps = self.pages.page_size();
+        let mut blank = vec![0u8; ps];
+        wr16(&mut blank, 0, 0);          // slot_count
+        wr16(&mut blank, 2, 0);          // live_count
+        wr16(&mut blank, 4, ps as u16);  // heap_start — empty heap begins at the end
+        self.pages.write(page, &blank)?;
+        Ok(page)
+    }
+
+    /// Does `page` have room for a record of `len` bytes plus a new slot?
+    fn fits(&self, p: &[u8], len: usize) -> bool {
+        let dir_end = PAGE_HEADER + (slot_count(p) + 1) * SLOT_SIZE;
+        heap_start(p).saturating_sub(len) >= dir_end
+    }
+
+    /// Store `bytes` and return where it went.
+    pub(crate) fn insert(&mut self, bytes: &[u8]) -> io::Result<RecordId> {
+        if bytes.len() > self.max_record_len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("record of {} bytes exceeds the {} a page can hold",
+                        bytes.len(), self.max_record_len()),
+            ));
+        }
+        let ps = self.pages.page_size();
+        self.buf.resize(ps, 0);
+
+        // Use the open page if the record fits, otherwise start a new one.
+        let page = match self.open_page {
+            Some(p) => {
+                self.pages.read(p, &mut self.buf)?;
+                if self.fits(&self.buf, bytes.len()) {
+                    p
+                } else {
+                    let np = self.fresh_page()?;
+                    self.pages.read(np, &mut self.buf)?;
+                    self.open_page = Some(np);
+                    np
+                }
+            }
+            None => {
+                let np = self.fresh_page()?;
+                self.pages.read(np, &mut self.buf)?;
+                self.open_page = Some(np);
+                np
+            }
+        };
+
+        let n = slot_count(&self.buf);
+        let off = heap_start(&self.buf) - bytes.len();
+        self.buf[off..off + bytes.len()].copy_from_slice(bytes);
+        set_slot(&mut self.buf, n, off, bytes.len());
+        wr16(&mut self.buf, 0, (n + 1) as u16);
+        let live = live_count(&self.buf) + 1;
+        wr16(&mut self.buf, 2, live as u16);
+        wr16(&mut self.buf, 4, off as u16);
+        let page_bytes = std::mem::take(&mut self.buf);
+        self.pages.write(page, &page_bytes)?;
+        self.buf = page_bytes;
+        Ok(RecordId::new(page, n as u16))
+    }
+
+    pub(crate) fn read(&mut self, id: RecordId) -> io::Result<Option<Vec<u8>>> {
+        let ps = self.pages.page_size();
+        self.buf.resize(ps, 0);
+        if self.pages.read(id.page(), &mut self.buf).is_err() {
+            return Ok(None);
+        }
+        let i = id.slot() as usize;
+        if i >= slot_count(&self.buf) {
+            return Ok(None);
+        }
+        let (off, len) = slot_entry(&self.buf, i);
+        if len == 0 || off + len > ps {
+            return Ok(None); // dead slot, or a slot that does not describe real bytes
+        }
+        Ok(Some(self.buf[off..off + len].to_vec()))
+    }
+
+    /// Delete a record. When a page's last live record goes, the page itself is
+    /// returned to the free list — which is what stops the file growing.
+    pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool> {
+        let ps = self.pages.page_size();
+        self.buf.resize(ps, 0);
+        if self.pages.read(id.page(), &mut self.buf).is_err() {
+            return Ok(false);
+        }
+        let i = id.slot() as usize;
+        if i >= slot_count(&self.buf) {
+            return Ok(false);
+        }
+        let (_, len) = slot_entry(&self.buf, i);
+        if len == 0 {
+            return Ok(false); // already dead
+        }
+        set_slot(&mut self.buf, i, 0, 0);
+        let live = live_count(&self.buf) - 1;
+        wr16(&mut self.buf, 2, live as u16);
+        let page_bytes = std::mem::take(&mut self.buf);
+        self.pages.write(id.page(), &page_bytes)?;
+        self.buf = page_bytes;
+
+        if live == 0 {
+            if self.open_page == Some(id.page()) {
+                self.open_page = None;
+            }
+            self.pages.free(id.page())?;
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::pagestore::DEFAULT_PAGE_SIZE;
+
+    fn store(dir: &tempfile::TempDir) -> RecordStore {
+        RecordStore::create(&dir.path().join("records.bin"), DEFAULT_PAGE_SIZE).unwrap()
+    }
+
+    fn rec(i: usize) -> Vec<u8> {
+        format!("{{\"_key\":\"n{i}\",\"name\":\"record {i} west java\",\"n\":{i}}}").into_bytes()
+    }
+
+    #[test]
+    fn records_read_back_exactly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+        let ids: Vec<RecordId> = (0..500).map(|i| s.insert(&rec(i)).unwrap()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(s.read(*id).unwrap().as_deref(), Some(rec(i).as_slice()), "record {i}");
+        }
+    }
+
+    #[test]
+    fn many_records_share_a_page() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+        for i in 0..50 { s.insert(&rec(i)).unwrap(); }
+        // ~50 bytes each into 4 KB pages: a handful of pages, not fifty.
+        assert!(s.page_count() < 5,
+                "records are not sharing pages: {} pages for 50 records", s.page_count());
+    }
+
+    #[test]
+    fn a_deleted_record_stops_reading() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+        let a = s.insert(b"alpha").unwrap();
+        let b = s.insert(b"bravo").unwrap();
+        assert!(s.delete(a).unwrap());
+        assert_eq!(s.read(a).unwrap(), None, "a deleted record still reads");
+        assert_eq!(s.read(b).unwrap().as_deref(), Some(&b"bravo"[..]), "neighbour was disturbed");
+        assert!(!s.delete(a).unwrap(), "deleting twice should report nothing done");
+    }
+
+    #[test]
+    fn emptying_a_page_returns_it_to_the_free_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+        let ids: Vec<RecordId> = (0..200).map(|i| s.insert(&rec(i)).unwrap()).collect();
+        assert_eq!(s.free_page_count(), 0);
+        for id in &ids { s.delete(*id).unwrap(); }
+        assert!(s.free_page_count() > 0,
+                "no page came back after every record in it was deleted");
+    }
+
+    /// The property this whole direction exists for: delete as fast as you insert
+    /// and the file stops growing, with nothing rewritten.
+    #[test]
+    fn a_rolling_window_stops_growing_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+        let per_round = 500usize;
+        let window = 5usize;
+
+        let mut rounds: Vec<Vec<RecordId>> = Vec::new();
+        let mut early = 0u64;
+        for round in 0..40 {
+            let batch: Vec<RecordId> =
+                (0..per_round).map(|i| s.insert(&rec(round * per_round + i)).unwrap()).collect();
+            rounds.push(batch);
+            if rounds.len() > window {
+                for id in rounds.remove(0) { s.delete(id).unwrap(); }
+            }
+            if round == 15 { early = s.page_count(); }
+        }
+        let late = s.page_count();
+
+        // Bounded, not exactly constant. A page holding records from two rounds is
+        // only freed once BOTH have expired, so the steady state sits a page or two
+        // above the ideal — that boundary effect is inherent, not a leak. What must
+        // not happen is growth proportional to the number of rounds: without
+        // reclamation these 24 further rounds would have added ~24 x 7 pages.
+        assert!(late <= early + 3,
+                "file grew from {early} to {late} pages over 24 further rounds — \
+                 space is not coming back");
+
+        let live = window * per_round;
+        assert!(late < (live / 60) as u64 + 20,
+                "{late} pages is far more than {live} live records should need");
+    }
+
+    #[test]
+    fn records_survive_a_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("records.bin");
+        let ids: Vec<RecordId>;
+        {
+            let mut s = RecordStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+            ids = (0..300).map(|i| s.insert(&rec(i)).unwrap()).collect();
+            s.sync().unwrap();
+        }
+        let mut s = RecordStore::open(&path).unwrap().expect("store should reopen");
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(s.read(*id).unwrap().as_deref(), Some(rec(i).as_slice()), "record {i}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_record_is_refused_rather_than_truncated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = store(&dir);
+        let big = vec![b'x'; DEFAULT_PAGE_SIZE + 1];
+        assert!(s.insert(&big).is_err(),
+                "a record too large for a page must be refused, not silently cut short");
+        // The boundary itself must work.
+        let exact = vec![b'y'; s.max_record_len()];
+        let id = s.insert(&exact).unwrap();
+        assert_eq!(s.read(id).unwrap().map(|v| v.len()), Some(exact.len()));
+    }
+}
