@@ -16,7 +16,7 @@
 //! Keep this green. It is the thing standing between a storage change and silent
 //! data loss.
 
-use sekejap::CoreDB;
+use sekejap::{Config, CoreDB};
 use serde_json::json;
 
 // ── dataset ──────────────────────────────────────────────────────────────────
@@ -209,30 +209,49 @@ fn ground_truth(db: &CoreDB, mode: &str) {
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
+/// Every storage mode the engine can be opened in.
+///
+/// The third exists because a mode that is not in this list is a mode nothing
+/// compares against: paged adjacency keeps the graph in slotted pages instead of
+/// rebuilding CSR, and every edge probe below has to answer identically through it
+/// or it is silently returning a different graph.
+fn modes() -> Vec<(&'static str, Config)> {
+    vec![
+        ("resident", Config::default()),
+        ("paged", Config { paged_topology: true, ..Config::default() }),
+        ("paged+adj", Config {
+            paged_topology: true, paged_adjacency: true, ..Config::default()
+        }),
+    ]
+}
+
 fn run(name: &str, mutate: fn(&mut CoreDB)) {
-    let dir_r = tempfile::TempDir::new().unwrap();
-    build(dir_r.path());
-    let mut resident = CoreDB::open(dir_r.path()).unwrap();
-    mutate(&mut resident);
+    let mut built: Vec<(&str, tempfile::TempDir, CoreDB)> = Vec::new();
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        build(dir.path());
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        mutate(&mut db);
+        ground_truth(&db, label);
+        built.push((label, dir, db));
+    }
 
-    let dir_p = tempfile::TempDir::new().unwrap();
-    build(dir_p.path());
-    let mut paged = CoreDB::open_paged(dir_p.path()).unwrap();
-    mutate(&mut paged);
-
-    ground_truth(&resident, "resident");
-    ground_truth(&paged, "paged");
-
+    // Every mode is compared against the first, which is the plain in-RAM engine —
+    // the one with no base, no overlay and nothing to merge, so a disagreement
+    // names the mode that is wrong rather than leaving two suspects.
     let mut bad = Vec::new();
     for (label, f) in &probes() {
-        let r = f(&mut resident);
-        let p = f(&mut paged);
-        if r != p {
-            bad.push(format!("  {label:<24} resident={r}\n  {:<24} paged   ={p}", ""));
+        let reference = f(&mut built[0].2);
+        for (mode, _, db) in built.iter_mut().skip(1) {
+            let got = f(db);
+            if got != reference {
+                bad.push(format!(
+                    "  {label:<24} resident ={reference}\n  {:<24} {mode:<9}={got}", ""));
+            }
         }
     }
     assert!(bad.is_empty(),
-            "[{name}] the two storage modes disagree — this is a base/overlay bug:\n{}",
+            "[{name}] storage modes disagree — this is a base/overlay bug:\n{}",
             bad.join("\n"));
 }
 
@@ -279,5 +298,51 @@ fn rewrite_deleted_keys() {
 fn update_base_rows_in_place() {
     run("UPDATED", |db| {
         db.execute("UPDATE p SET name = 'updated' WHERE n < 5").unwrap();
+    });
+}
+
+/// Withdrawing edges that live in the immutable base.
+///
+/// This scenario was missing, and it hid a real one: `EdgeStore::unlink` can only
+/// retain-out of the RAM adjacency maps, so in paged mode — where the edges are in
+/// the mapped base and a read merges the two — unlinking did *nothing*. The call
+/// returned, the overlay had never held the edge, and the next read produced it
+/// again from the base. Resident mode was correct, paged mode silently kept the
+/// edge, and the two modes had never been compared on a delete.
+#[test]
+fn unlinked_base_edges() {
+    run("UNLINK", |db| {
+        db.unlink("p/n0", "p/n1", "next");
+        db.unlink("p/n5", "p/n6", "next");
+        // One that never existed must stay a no-op rather than removing a
+        // neighbour's edge by association.
+        db.unlink("p/n20", "p/n25", "next");
+    });
+}
+
+/// The same, but survived across a compaction — the withdrawal is recorded outside
+/// the base, so the base being rewritten is exactly when it could be lost.
+#[test]
+fn unlinked_base_edges_then_compacted() {
+    run("UNLINK-COMPACT", |db| {
+        db.unlink("p/n0", "p/n1", "next");
+        db.unlink("p/n5", "p/n6", "next");
+        db.compact().unwrap();
+        db.unlink("p/n10", "p/n11", "next");
+    });
+}
+
+/// Edges added and withdrawn on both sides of a compaction, mixed with new nodes,
+/// so the fold has to apply removals and additions in an order that survives both.
+#[test]
+fn edges_added_and_withdrawn_around_a_compaction() {
+    run("EDGE-CHURN", |db| {
+        db.link("p/n2", "p/n8", "next");
+        db.unlink("p/n2", "p/n8", "next");
+        db.link("p/n3", "p/n9", "next");
+        db.compact().unwrap();
+        db.unlink("p/n3", "p/n9", "next");
+        db.link("p/n4", "p/n7", "next");
+        seed(db, 40..45);
     });
 }

@@ -111,6 +111,11 @@ impl PagedStore {
         self.records.sync()?;
         self.index.sync()
     }
+
+    /// Spare header words in the *record* store — the index keeps its own root and
+    /// length in the equivalent words of its file, so these are free.
+    pub(crate) fn user_meta(&self) -> (u64, u64) { self.records.user_meta() }
+    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64) { self.records.set_user_meta(a, b) }
 }
 
 #[cfg(test)]

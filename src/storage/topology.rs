@@ -899,8 +899,12 @@ impl Backing {
 pub struct MappedEdge {
     pub other_hash: u64,
     pub edge_type_hash: u64,
-    /// Index into `edgemeta.bin` (`NO_ID` = none).
-    pub meta_ref: u32,
+    /// Where the durable base keeps this edge's attributes, or `u64::MAX` for none.
+    ///
+    /// A `u32` index into `edgemeta.bin` for a mapped segment; a record id for
+    /// paged adjacency, which is a page number and a slot and so needs the width.
+    /// Both are opaque here — only whoever produced the edge knows how to read it.
+    pub meta_ref: u64,
 }
 
 /// mmap-backed topology store with a **hash-keyed** API mirroring the engine's
@@ -1189,7 +1193,9 @@ impl MappedTopology {
                     Some(MappedEdge {
                         other_hash,
                         edge_type_hash,
-                        meta_ref: e.meta_ref,
+                        // A mapped segment's NO_ID widens to the u64 "none" the
+                        // edge field uses, rather than to the number 4294967295.
+                        meta_ref: if e.meta_ref == NO_ID { u64::MAX } else { e.meta_ref as u64 },
                     })
                 })
                 .collect(),
