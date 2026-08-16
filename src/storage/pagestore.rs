@@ -69,6 +69,10 @@ pub(crate) struct PageStore {
     free_count: u64,
     /// Set when the header no longer matches what is on disk.
     dirty: bool,
+    /// Two words the owner of the store may use. A B+tree keeps its root page and
+    /// entry count here, so reopening needs no scan to find where the tree starts.
+    user_a: u64,
+    user_b: u64,
 }
 
 impl PageStore {
@@ -85,6 +89,8 @@ impl PageStore {
             free_head: NO_PAGE,
             free_count: 0,
             dirty: true,
+            user_a: 0,
+            user_b: 0,
         };
         s.file.set_len(page_size as u64)?;
         s.sync()?;
@@ -120,6 +126,8 @@ impl PageStore {
             free_head: u64::from_le_bytes(hdr[24..32].try_into().unwrap()),
             free_count: u64::from_le_bytes(hdr[32..40].try_into().unwrap()),
             dirty: false,
+            user_a: u64::from_le_bytes(hdr[40..48].try_into().unwrap()),
+            user_b: u64::from_le_bytes(hdr[48..56].try_into().unwrap()),
         }))
     }
 
@@ -130,6 +138,15 @@ impl PageStore {
 
     /// Pages available for reuse without growing the file.
     pub(crate) fn free_count(&self) -> u64 { self.free_count }
+
+    /// Two words reserved for whatever is built on top of this store.
+    pub(crate) fn user_meta(&self) -> (u64, u64) { (self.user_a, self.user_b) }
+
+    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64) {
+        self.user_a = a;
+        self.user_b = b;
+        self.dirty = true;
+    }
 
     /// Take a page — from the free list if there is one, otherwise by growing.
     ///
@@ -190,12 +207,15 @@ impl PageStore {
             return Ok(());
         }
         let mut hdr = vec![0u8; self.page_size.min(64)];
+        debug_assert!(hdr.len() >= 56, "header must hold the user words");
         hdr[0..8].copy_from_slice(&MAGIC);
         hdr[8..12].copy_from_slice(&VERSION.to_le_bytes());
         hdr[12..16].copy_from_slice(&(self.page_size as u32).to_le_bytes());
         hdr[16..24].copy_from_slice(&self.high_water.to_le_bytes());
         hdr[24..32].copy_from_slice(&self.free_head.to_le_bytes());
         hdr[32..40].copy_from_slice(&self.free_count.to_le_bytes());
+        hdr[40..48].copy_from_slice(&self.user_a.to_le_bytes());
+        hdr[48..56].copy_from_slice(&self.user_b.to_le_bytes());
         write_all_at(&self.file, &hdr, 0)?;
         self.file.sync_data()?;
         self.dirty = false;

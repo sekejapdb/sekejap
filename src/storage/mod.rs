@@ -17,6 +17,7 @@
 //! Everything here follows the same rule: bulk bytes live on disk; RAM holds
 //! only offsets and hot structures.
 
+pub(crate) mod btree;
 pub(crate) mod edgestore;
 pub(crate) mod fieldstore;
 pub(crate) mod ginstore;
