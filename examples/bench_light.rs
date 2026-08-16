@@ -37,8 +37,14 @@ fn row(i: usize) -> String {
 }
 
 /// Build a database of `n` rows and `n-1` edges, compacted into the base.
-fn build(dir: &std::path::Path, n: usize, indexed: bool) {
-    let mut db = CoreDB::open(dir).unwrap();
+///
+/// `paged` has to match the mode it will be reopened in. A database whose
+/// payloads were written flat cannot be reopened with paged payloads — the two
+/// layouts are not the same file, and the reopen is refused rather than
+/// reinterpreting one as the other. Building it the way it will be read is also
+/// the honest measurement: nobody switches storage layout between writes.
+fn build(dir: &std::path::Path, n: usize, indexed: bool, paged: bool) {
+    let mut db = open(dir, paged);
     db.set_wal_sync(SyncMode::Off);              // measuring structure, not fsync
     db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
     for i in 0..n { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
@@ -50,7 +56,7 @@ fn build(dir: &std::path::Path, n: usize, indexed: bool) {
     db.compact().unwrap();
 }
 
-struct Row { label: String, small: String, large: String, scales: bool }
+struct Row { label: String, small: String, large: String, growth: f64, scales: bool }
 
 /// Paged mode, with payloads and adjacency either rebuilt or written in place.
 ///
@@ -67,6 +73,10 @@ fn open(dir: &std::path::Path, paged: bool) -> CoreDB {
     }).unwrap()
 }
 
+/// Where a row is measured only in one mode, that mode is the paged one — the
+/// direction under construction, not the one being left behind.
+const DEFAULT_PAGED: bool = false;
+
 fn main() {
     const SMALL: usize = 20_000;
     const LARGE: usize = 200_000;
@@ -82,6 +92,7 @@ fn main() {
             label: label.to_string(),
             small: format!("{s:.2}{unit}"),
             large: format!("{l:.2}{unit}"),
+            growth: if s > 0.0 { l / s } else { 1.0 },
             scales,
         });
     };
@@ -89,8 +100,8 @@ fn main() {
     // ── writes on top of a compacted base ────────────────────────────────────
     measure("insert (no index)", &|n| {
         let dir = tempfile::TempDir::new().unwrap();
-        build(dir.path(), n, false);
-        let mut db = CoreDB::open_paged(dir.path()).unwrap();
+        build(dir.path(), n, false, DEFAULT_PAGED);
+        let mut db = open(dir.path(), DEFAULT_PAGED);
         db.set_wal_sync(SyncMode::Off);
         let t = Instant::now();
         for i in n..n + 200 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
@@ -99,8 +110,8 @@ fn main() {
 
     measure("insert (btree + bm25)", &|n| {
         let dir = tempfile::TempDir::new().unwrap();
-        build(dir.path(), n, true);
-        let mut db = CoreDB::open_paged(dir.path()).unwrap();
+        build(dir.path(), n, true, DEFAULT_PAGED);
+        let mut db = open(dir.path(), DEFAULT_PAGED);
         db.set_wal_sync(SyncMode::Off);
         let t = Instant::now();
         for i in n..n + 200 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
@@ -109,8 +120,8 @@ fn main() {
 
     measure("delete", &|n| {
         let dir = tempfile::TempDir::new().unwrap();
-        build(dir.path(), n, true);
-        let mut db = CoreDB::open_paged(dir.path()).unwrap();
+        build(dir.path(), n, true, DEFAULT_PAGED);
+        let mut db = open(dir.path(), DEFAULT_PAGED);
         db.set_wal_sync(SyncMode::Off);
         let t = Instant::now();
         for i in 0..200 { db.remove(&format!("p/n{i}")); }
@@ -120,8 +131,8 @@ fn main() {
     // ── reads ────────────────────────────────────────────────────────────────
     measure("point read", &|n| {
         let dir = tempfile::TempDir::new().unwrap();
-        build(dir.path(), n, false);
-        let db = CoreDB::open_paged(dir.path()).unwrap();
+        build(dir.path(), n, false, DEFAULT_PAGED);
+        let db = open(dir.path(), DEFAULT_PAGED);
         let t = Instant::now();
         for i in 0..2000 { std::hint::black_box(db.get(&format!("p/n{}", i % n))); }
         ms(t) * 1000.0 / 2000.0
@@ -131,7 +142,7 @@ fn main() {
         let label = if adj { "1-hop traversal (paged)" } else { "1-hop traversal" };
         measure(label, &|n| {
             let dir = tempfile::TempDir::new().unwrap();
-            build(dir.path(), n, false);
+            build(dir.path(), n, false, adj);
             let db = open(dir.path(), adj);
             let t = Instant::now();
             for i in 0..2000 {
@@ -144,9 +155,9 @@ fn main() {
 
     measure("open_paged", &|n| {
         let dir = tempfile::TempDir::new().unwrap();
-        build(dir.path(), n, false);
+        build(dir.path(), n, false, DEFAULT_PAGED);
         let t = Instant::now();
-        std::hint::black_box(CoreDB::open_paged(dir.path()).unwrap());
+        std::hint::black_box(open(dir.path(), DEFAULT_PAGED));
         ms(t)
     }, "ms");
 
@@ -155,7 +166,7 @@ fn main() {
         let label = if adj { "compact after 200 writes (paged)" } else { "compact after 200 writes" };
         measure(label, &|n| {
             let dir = tempfile::TempDir::new().unwrap();
-            build(dir.path(), n, false);
+            build(dir.path(), n, false, adj);
             let mut db = open(dir.path(), adj);
             db.set_wal_sync(SyncMode::Off);
             for i in n..n + 200 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
@@ -176,16 +187,22 @@ fn main() {
 
     // ── report ───────────────────────────────────────────────────────────────
     println!("\n  light benchmark — {SMALL} vs {LARGE} rows (10x)\n");
-    println!("  {:<38}{:>12}{:>12}   {}", "", "20k", "200k", "verdict");
+    println!("  {:<38}{:>12}{:>12}{:>9}   {}", "", "20k", "200k", "growth", "verdict");
     println!("  {}", "-".repeat(80));
     let mut violations = 0;
     for r in &out {
         let verdict = if r.scales { violations += 1; "SCALES WITH SIZE  <-- Law 2" } else { "flat" };
-        println!("  {:<38}{:>12}{:>12}   {verdict}", r.label, r.small, r.large);
+        println!("  {:<38}{:>12}{:>12}{:>8.2}x   {verdict}",
+                 r.label, r.small, r.large, r.growth);
     }
     println!();
+    println!("\n  growth is the 200k figure over the 20k one. A cost proportional to the");
+    println!("  change would sit at 1.00x; the verdict only fires past 3x, so read the");
+    println!("  number rather than the word. examples/compact_shape.rs measures the same");
+    println!("  thing over 25x, where a slope too small to see here is unmistakable.");
+    println!();
     if violations == 0 {
-        println!("  every measured operation is flat across a 10x database.");
+        println!("  nothing crossed the 3x threshold across a 10x database.");
     } else {
         println!("  {violations} operation(s) scale with database size — see .workbench/CONTRACT.md Law 2.");
     }
