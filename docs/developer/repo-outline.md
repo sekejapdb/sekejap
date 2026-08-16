@@ -957,7 +957,29 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
 
 ## `src/storage/`
 
-### `btree.rs` · 525L — Why
+### `adjstore.rs` · 534L — The structure this replaces
+
+```
+    70  pub(crate) struct AdjEdge
+    85  fn encode(edges: &[AdjEdge], out: &mut Vec<u8>)
+    97  fn decode(bytes: &[u8]) -> Vec<AdjEdge>
+   111  pub(crate) struct AdjStore
+   117  impl AdjStore
+   120    pub(crate) fn open(dir: &Path, name: &str, page_size: usize) -> io::Result<Self>
+   130    pub(crate) fn owner_count(&self) -> u64 { self.store.len() }
+   132    pub(crate) fn page_counts(&self) -> (u64, u64) { self.store.page_counts() }
+   134    pub(crate) fn sync(&mut self) -> io::Result<()> { self.store.sync() }
+   142    pub(crate) fn edges(&self, owner: u64) -> io::Result<Option<Vec<AdjEdge>>>
+   148    pub(crate) fn add(&mut self, owner: u64, edge: AdjEdge) -> io::Result<()>
+   157    pub(crate) fn add_many(&mut self, owner: u64, edges: &[AdjEdge]) -> io::Result<()>
+   177    pub(crate) fn remove(&mut self, owner: u64, other: u64, edge_type: Option<u64>)
+   200    pub(crate) fn remove_owner(&mut self, owner: u64) -> io::Result<bool>
+   219    pub(crate) fn remove_all_to(&mut self, other: u64) -> io::Result<usize>
+   248    pub(crate) fn for_each_owner(&self, mut f: impl FnMut(u64, Vec<AdjEdge>) -> bool)
+   264  mod tests
+```
+
+### `btree.rs` · 546L — Why
 
 ```
     54  fn rd8(p: &[u8], at: usize) -> u64 { u64::from_le_bytes(p[at..at + 8].try_into().unwrap()) }
@@ -989,8 +1011,9 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    173    pub(crate) fn insert(&mut self, key: u128, value: u64) -> io::Result<()>
    296    pub(crate) fn remove(&mut self, key: u128) -> io::Result<bool>
    324    pub(crate) fn range(&self, lo: u128, hi: u128) -> io::Result<Vec<(u128, u64)>>
-   345    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>>
-   365  mod tests
+   354    pub(crate) fn for_each(&self, mut f: impl FnMut(u128, u64) -> bool) -> io::Result<()>
+   378    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>>
+   386  mod tests
 ```
 
 ### `edgestore.rs` · 892L — Edge storage — the graph's connections
@@ -1090,25 +1113,27 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    188    pub fn len(&self) -> usize
 ```
 
-### `mod.rs` · 38L — Storage — the on-disk building blocks
+### `mod.rs` · 40L — Storage — the on-disk building blocks
 
 ```
 (no top-level items)
 ```
 
-### `pagedstore.rs` · 211L — What this is for
+### `pagedstore.rs` · 233L — What this is for
 
 ```
     32  pub(crate) struct PagedStore
     37  impl PagedStore
     39    pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self>
-    53    pub(crate) fn len(&self) -> u64 { self.index.len() }
-    56    pub(crate) fn page_counts(&self) -> (u64, u64)
-    64    pub(crate) fn put(&mut self, key: u128, bytes: &[u8]) -> io::Result<()>
-    74    pub(crate) fn get(&self, key: u128) -> io::Result<Option<Vec<u8>>>
-    81    pub(crate) fn delete(&mut self, key: u128) -> io::Result<bool>
-    88    pub(crate) fn sync(&mut self) -> io::Result<()>
-    95  mod tests
+    45    pub(crate) fn open_named(dir: &Path, name: &str, page_size: usize) -> io::Result<Self>
+    64    pub(crate) fn len(&self) -> u64 { self.index.len() }
+    67    pub(crate) fn page_counts(&self) -> (u64, u64)
+    75    pub(crate) fn put(&mut self, key: u128, bytes: &[u8]) -> io::Result<()>
+    85    pub(crate) fn get(&self, key: u128) -> io::Result<Option<Vec<u8>>>
+    92    pub(crate) fn delete(&mut self, key: u128) -> io::Result<bool>
+   106    pub(crate) fn for_each_key(&self, f: impl FnMut(u128, u64) -> bool) -> io::Result<()>
+   110    pub(crate) fn sync(&mut self) -> io::Result<()>
+   117  mod tests
 ```
 
 ### `pagestore.rs` · 388L — Why this exists
@@ -1539,4 +1564,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 47 files, 1277 items -->
+<!-- 48 files, 1297 items -->
