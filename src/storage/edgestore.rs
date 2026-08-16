@@ -867,6 +867,11 @@ impl EdgeStore {
         self.type_names.entry(type_hash).or_insert(name);
     }
 
+    /// Every edge type name this store knows, for persisting them.
+    pub fn type_table(&self) -> Vec<(u64, &str)> {
+        self.type_names.iter().map(|(&h, n)| (h, n.as_str())).collect()
+    }
+
     pub fn type_name(&self, type_hash: u64) -> Option<&str> {
         self.type_names.get(&type_hash).map(|s| s.as_str())
     }

@@ -53,8 +53,10 @@ fn seed_other(db: &mut CoreDB, range: std::ops::Range<usize>) {
     }
 }
 
-fn build(dir: &std::path::Path) {
-    let mut db = CoreDB::open(dir).unwrap();
+fn build(dir: &std::path::Path) { build_with(dir, Config::default()) }
+
+fn build_with(dir: &std::path::Path, cfg: Config) {
+    let mut db = CoreDB::open_with_config(dir, cfg).unwrap();
     db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, name TEXT, body TEXT, n INTEGER, grp INTEGER)").unwrap();
     seed(&mut db, 0..30);
     seed_other(&mut db, 0..8);
@@ -222,6 +224,10 @@ fn modes() -> Vec<(&'static str, Config)> {
         ("paged+adj", Config {
             paged_topology: true, paged_adjacency: true, ..Config::default()
         }),
+        ("paged+all", Config {
+            paged_topology: true, paged_adjacency: true, paged_nodes: true,
+            paged_payloads: true, ..Config::default()
+        }),
     ]
 }
 
@@ -229,7 +235,11 @@ fn run(name: &str, mutate: fn(&mut CoreDB)) {
     let mut built: Vec<(&str, tempfile::TempDir, CoreDB)> = Vec::new();
     for (label, cfg) in modes() {
         let dir = tempfile::TempDir::new().unwrap();
-        build(dir.path());
+        // Built in the mode it will be read in. A database whose payloads were
+        // written flat cannot be reopened with paged payloads — the two are not the
+        // same file, and the reopen is refused rather than reinterpreting one as
+        // the other.
+        build_with(dir.path(), cfg.clone());
         let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
         mutate(&mut db);
         ground_truth(&db, label);
