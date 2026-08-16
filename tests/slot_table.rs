@@ -106,3 +106,47 @@ fn the_table_tracks_the_store_across_compactions() {
     assert!(db.get("p/n50").is_some(), "a row written before the compaction is gone");
     assert!(db.get("p/n2").is_none(), "a deleted row came back");
 }
+
+/// The verify-before-commit rail has to know how big the store is.
+///
+/// Compaction writes a new generation, reads it back from disk, and only then
+/// drops the old files and truncates the log. That readback compares against a
+/// count taken beforehand — so if the count is too small, the rail passes
+/// whatever it is handed and the safety net is not there.
+///
+/// It was taken from the RAM overlay, which was correct while compaction began by
+/// hydrating the base into it. Hydration was removed (Law 1: compacting a store
+/// must not require holding it in memory), and the count silently became "writes
+/// since the last compaction" — 20 out of 60 in the setup below.
+#[test]
+fn the_compaction_expectation_spans_the_base_not_just_the_overlay() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build(dir.path(), 40);
+
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    // Twenty new rows and nineteen edges live in the overlay; the other forty rows
+    // and thirty-nine edges are in the immutable base and are never touched, so a
+    // count taken from the overlay alone sees a third of the store.
+    for i in 40..60 {
+        db.put(&format!("p/n{i}"),
+               &json!({"_collection":"p","_key":format!("n{i}"),"n":i as i64}).to_string()).unwrap();
+        if i > 40 { db.link(&format!("p/n{}", i - 1), &format!("p/n{i}"), "next"); }
+    }
+
+    let (nodes, edges) = db.compaction_expectation();
+    assert_eq!(nodes, 60,
+               "compaction expects {nodes} nodes where the store holds 60 — the base \
+                is not being counted, so the readback cannot fail");
+    assert_eq!(edges, 39 + 19,
+               "compaction expects {edges} edges where the store holds 58 — the \
+                base's edges are not being counted");
+
+    // And a delete against the base has to come off the expectation, because
+    // compaction is where that delete finally takes effect.
+    db.execute("DELETE FROM p WHERE n IN (1,2,3)").unwrap();
+    let (nodes, _) = db.compaction_expectation();
+    assert_eq!(nodes, 57, "a row deleted from the base is still expected to survive");
+
+    db.compact().unwrap();
+    assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 57);
+}

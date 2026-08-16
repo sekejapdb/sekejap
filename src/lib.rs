@@ -4158,14 +4158,13 @@ impl CoreDB {
             None => return Ok(()),
         };
 
-        // Paged mode: the store is `immutable base + RAM overlay`, but everything
-        // below rebuilds payloads.bin and the topology from `self.nodes` alone. Pull
-        // the base into the overlay first, or compaction would write a store
-        // containing only what had been written since the last compact — silently
-        // destroying every base-resident node.
-        //
-        // Tombstoned nodes are deliberately skipped: this is where a delete against
-        // the immutable base finally takes effect.
+        // Paged mode: the store is `immutable base + RAM overlay`. Everything below
+        // must therefore read *both*, and a phase that consults `self.nodes` alone
+        // sees only the writes since the last compaction — a fraction of the store,
+        // reported as the whole of it. That mistake has been made here more than
+        // once; `all_hashes()` is the enumeration that includes the base and drops
+        // tombstoned nodes, which is where a delete against the immutable base
+        // finally takes effect.
         Self::rss_probe("compact start");
         // The base is NOT copied into RAM. Every phase below reads it in place —
         // payload locations through payload_loc, records and slugs straight out of
@@ -4301,12 +4300,19 @@ impl CoreDB {
         // exist. Crash between the two leaves the OLD snapshot + NEW topology
         // files, which reopens fine (old snapshot is still self-sufficient or
         // points at the previous, still-valid files; WAL not yet truncated).
-        // What this compaction must not lose. Counted from the hydrated overlay,
-        // which at this point holds the whole database.
-        let expect_nodes = self.nodes.len();
-        let expect_edges: usize = self.nodes.keys()
-            .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
-            .sum();
+        // What this compaction must not lose.
+        //
+        // This must count the same population `write_topology_files` writes: base
+        // plus overlay, minus tombstones. It used to count `self.nodes`, which was
+        // right only while compaction began by hydrating the base into the overlay.
+        // Once hydration was removed — Law 1 forbids pulling the store into RAM to
+        // compact it — `self.nodes` became the writes since the last compaction, a
+        // fraction of the store, so the readback below was comparing the new
+        // generation against a number it could not fail to beat. The outer rail in
+        // `compact()` still caught real loss, but only after the log had been
+        // truncated and the old generation dropped; this is the check that can still
+        // put everything back.
+        let (expect_nodes, expect_edges) = self.compaction_expectation();
 
         // Keep the outgoing generation reachable until the incoming one has been
         // read back and found complete.
@@ -7532,6 +7538,25 @@ impl CoreDB {
         }
         // Borrowed from whichever segment knows the name, newest first.
         self.segments.newest_first().find_map(|b| b.collection_name_by_hash(coll_hash))
+    }
+
+    /// How many nodes and edges a compaction of this store must produce.
+    ///
+    /// Named rather than inlined because it is the number the verify-before-commit
+    /// rail compares against, and because getting it from the wrong place is a
+    /// silent failure: too small a number and the rail passes whatever it is given.
+    /// `all_hashes` is the enumeration that spans the immutable base as well as the
+    /// RAM overlay, which is exactly the population `write_topology_files` writes.
+    ///
+    /// Exposed to tests so the arithmetic can be checked without having to make a
+    /// compaction go wrong on purpose.
+    #[doc(hidden)]
+    pub fn compaction_expectation(&self) -> (usize, usize) {
+        let live = self.all_hashes();
+        let edges = live.iter()
+            .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
+            .sum();
+        (live.len(), edges)
     }
 
     pub(crate) fn all_hashes(&self) -> Vec<u64> {
