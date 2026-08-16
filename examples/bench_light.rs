@@ -143,16 +143,14 @@ fn main() {
         ms(t)
     }, "ms");
 
-    measure("compact peak RSS", &|n| {
-        let dir = tempfile::TempDir::new().unwrap();
-        build(dir.path(), n, false);
-        let mut db = CoreDB::open_paged(dir.path()).unwrap();
-        db.set_wal_sync(SyncMode::Off);
-        for i in n..n + 200 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
-        let before = rss_mb();
-        db.compact().unwrap();
-        (rss_mb() - before).max(0.0)
-    }, "MB");
+    // NOTE: peak RSS during compaction is deliberately NOT measured here. Within a
+    // single process the build phase has already set the high-water mark, so the
+    // delta reads as ~0 and would falsely report a violation as clean. Measure it
+    // per-process instead:
+    //
+    //     cargo run --release --example compact_ram 1000000
+    //
+    // A misleading green is worse than a missing row.
 
     // ── report ───────────────────────────────────────────────────────────────
     println!("\n  light benchmark — {SMALL} vs {LARGE} rows (10x)\n");
