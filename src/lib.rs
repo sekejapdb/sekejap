@@ -361,6 +361,10 @@ impl FieldKey {
 #[derive(Clone, Default)]
 pub(crate) struct Segments {
     segs: Vec<std::sync::Arc<storage::topology::MappedTopology>>,
+    /// `slot -> (segment, local id)`. Absent means the identity mapping, which is
+    /// what a single-segment store is — so every database written before this file
+    /// existed reads correctly without migration.
+    slots: Option<std::sync::Arc<storage::slotmap::MappedSlots>>,
 }
 
 impl Segments {
@@ -385,11 +389,41 @@ impl Segments {
     pub(crate) fn clear(&mut self) { self.segs.clear(); }
 
     /// The segment holding `hash`, and its local id, searching newest first.
+    ///
+    /// `idx.bin` answers with a **slot**, which the slot table turns into a
+    /// concrete location. With one segment the two coincide, which is why a store
+    /// written before `slots.bin` existed resolves correctly with no table at all.
     pub(crate) fn resolve(
         &self,
         hash: u64,
     ) -> Option<(&storage::topology::MappedTopology, u64)> {
-        self.newest_first().find_map(|s| s.resolve(hash).map(|id| (s.as_ref(), id)))
+        for seg in self.newest_first() {
+            let Some(slot) = seg.resolve(hash) else { continue };
+            return self.locate(slot).or(Some((seg.as_ref(), slot)));
+        }
+        None
+    }
+
+    /// Turn a slot into the segment and local id currently holding it.
+    #[inline]
+    pub(crate) fn locate(
+        &self,
+        slot: u64,
+    ) -> Option<(&storage::topology::MappedTopology, u64)> {
+        let Some(map) = self.slots.as_ref() else {
+            // No table: the identity mapping of a single-segment store.
+            return self.segs.first().map(|s| (s.as_ref(), slot));
+        };
+        let (seg, local) = map.locate(slot)?;
+        self.segs.get(seg as usize).map(|s| (s.as_ref(), local))
+    }
+
+    /// Attach the slot table read from disk. `None` keeps the identity mapping.
+    pub(crate) fn set_slots(
+        &mut self,
+        slots: Option<std::sync::Arc<storage::slotmap::MappedSlots>>,
+    ) {
+        self.slots = slots;
     }
 
     /// First non-`None` answer, newest segment first.
@@ -1586,6 +1620,11 @@ impl CoreDB {
                     db.edges.register_type_name(h, name);
                 }
                 db.segments.replace_with(base);
+                let slots = storage::slotmap::MappedSlots::open(&dir.join("slots.bin"))
+                    .ok()
+                    .flatten()
+                    .map(std::sync::Arc::new);
+                db.segments.set_slots(slots);
                 db.load_snapshot_parts(snap, /*load_topology=*/ false);
                 // Serve btree indexes from the mmap'd sidecars, not the heap: mmap
                 // them into field_base and drop any heap copies the snapshot loaded
@@ -4225,6 +4264,11 @@ impl CoreDB {
                 self.edges.register_type_name(h, name);
             }
             self.segments.replace_with(std::sync::Arc::new(nb));
+            let slots = storage::slotmap::MappedSlots::open(&dir.join("slots.bin"))
+                .ok()
+                .flatten()
+                .map(std::sync::Arc::new);
+            self.segments.set_slots(slots);
             self.nodes.clear();
             self.collections.clear();
             self.collection_names_map.clear();
@@ -4445,6 +4489,15 @@ impl CoreDB {
         topology::build_into(&topo_nodes, &topo_edges, |name, bytes| {
             Self::write_atomic(dir, name, bytes)
         })?;
+        // The slot table for the generation just written. One segment, so it is the
+        // identity mapping — slot n lives at local id n of segment 0. It is written
+        // now so that the moment a second segment exists there is a table to extend
+        // rather than a meaning to change.
+        let slots: Vec<u64> = (0..topo_nodes.len() as u64)
+            .map(|id| storage::slotmap::pack(0, id))
+            .collect();
+        Self::write_atomic(dir, "slots.bin", &storage::slotmap::write(&slots))?;
+        drop(slots);
         drop(topo_edges);
         drop(topo_nodes);
         Self::rss_probe("topology written");
