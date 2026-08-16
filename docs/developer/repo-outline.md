@@ -1086,10 +1086,25 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    188    pub fn len(&self) -> usize
 ```
 
-### `mod.rs` · 32L — Storage — the on-disk building blocks
+### `mod.rs` · 33L — Storage — the on-disk building blocks
 
 ```
 (no top-level items)
+```
+
+### `pagedstore.rs` · 211L — What this is for
+
+```
+    32  pub(crate) struct PagedStore
+    37  impl PagedStore
+    39    pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self>
+    53    pub(crate) fn len(&self) -> u64 { self.index.len() }
+    56    pub(crate) fn page_counts(&self) -> (u64, u64)
+    64    pub(crate) fn put(&mut self, key: u64, bytes: &[u8]) -> io::Result<()>
+    74    pub(crate) fn get(&self, key: u64) -> io::Result<Option<Vec<u8>>>
+    81    pub(crate) fn delete(&mut self, key: u64) -> io::Result<bool>
+    88    pub(crate) fn sync(&mut self) -> io::Result<()>
+    95  mod tests
 ```
 
 ### `pagestore.rs` · 388L — Why this exists
@@ -1520,4 +1535,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 46 files, 1263 items -->
+<!-- 47 files, 1273 items -->

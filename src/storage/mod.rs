@@ -22,6 +22,7 @@ pub(crate) mod edgestore;
 pub(crate) mod fieldstore;
 pub(crate) mod ginstore;
 pub(crate) mod mmap;
+pub(crate) mod pagedstore;
 pub(crate) mod pagestore;
 pub(crate) mod recordstore;
 pub(crate) mod skbin;
