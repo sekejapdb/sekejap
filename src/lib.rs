@@ -1001,6 +1001,15 @@ pub struct CoreDB {
     /// When true, `wal_write` appends without fsync.
     /// Used by batch operations (UPDATE, DELETE, COMMIT) to coalesce syncs.
     defer_wal_sync: bool,
+    /// Where each live record's payload moved to during the compaction currently
+    /// in progress. Empty at all other times.
+    ///
+    /// The payload rewrite happens before the topology is written, and it used to
+    /// record the new locations by mutating `self.nodes` — which only works if
+    /// every node is in `self.nodes`, which is why the base was copied into RAM
+    /// first. Publishing them here instead lets a base-resident record learn its
+    /// new payload location without being hydrated.
+    compact_payload_moves: HashMap<u64, (u64, u32)>,
     /// Nodes whose edges in the immutable base have been cascade-deleted.
     ///
     /// Separate from `tombstones` because it must outlive them: writing the key
@@ -1275,6 +1284,7 @@ impl CoreDB {
             pending_txn: None,
             defer_wal_sync: false,
             edge_tombstones: HashSet::new(),
+            compact_payload_moves: HashMap::new(),
             group_commit: false,
             wal_generation: 0,
             batch_now: None,
@@ -3907,6 +3917,20 @@ impl CoreDB {
         r
     }
 
+
+    /// Temporary: report RSS at a labelled point when SK_COMPACT_RSS is set.
+    fn rss_probe(label: &str) {
+        if std::env::var_os("SK_COMPACT_RSS").is_none() { return; }
+        if let Ok(o) = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()]).output() {
+            if let Ok(t) = String::from_utf8(o.stdout) {
+                if let Ok(kb) = t.trim().parse::<f64>() {
+                    eprintln!("    RSS {:>7.0} MB  {label}", kb / 1024.0);
+                }
+            }
+        }
+    }
+
     fn compact_inner(&mut self) -> io::Result<()> {
         // No data directory ⇒ ephemeral in-memory DB ⇒ nothing on disk to compact.
         let dir = match self.data_dir.clone() {
@@ -3922,9 +3946,13 @@ impl CoreDB {
         //
         // Tombstoned nodes are deliberately skipped: this is where a delete against
         // the immutable base finally takes effect.
-        if self.topo_base.is_some() {
-            self.hydrate_base_into_overlay();
-        }
+        Self::rss_probe("compact start");
+        // The base is NOT copied into RAM. Every phase below reads it in place —
+        // payload locations through payload_loc, records and slugs straight out of
+        // the mmap, adjacency through fwd_edges — and the new base replaces it at
+        // the end. Copying the store into memory in order to compact it is exactly
+        // what Law 1 forbids, and it was the single largest allocation here.
+        let had_base = self.topo_base.is_some();
 
         // 1. Compact payload store: rebuild from live nodes only.
         // Must happen BEFORE build_snapshot() so the snapshot records the
@@ -3932,7 +3960,9 @@ impl CoreDB {
         // Memory DB: rebuild Vec<u8> in-place.
         // Disk DB: streaming rewrite to payloads.bin.tmp then atomic rename.
         // Neither approach loads all payloads into RAM simultaneously.
-        let node_keys: Vec<u64> = self.nodes.keys().copied().collect();
+        // Base-aware: every live record, not just the ones in the write overlay.
+        let node_keys: Vec<u64> = self.all_hashes();
+        self.compact_payload_moves.clear();
         if self.payload_store.is_disk() {
             // Disk-backed: stream each live node's bytes through a temp file.
             let pay_tmp  = dir.join("payloads.bin.tmp");
@@ -3948,8 +3978,8 @@ impl CoreDB {
                         .read(true).write(true).create(true).truncate(true)
                         .open(&pay_tmp)?;
                     for &h in &node_keys {
-                        let (off, len) = match self.nodes.get(&h) {
-                            Some(n) => (n.payload_offset, n.payload_len),
+                        let (off, len) = match self.payload_loc(h) {
+                            Some(loc) => loc,
                             None => continue,
                         };
                         if let Some(bytes) = self.payload_store.get_raw(off, len) {
@@ -3978,12 +4008,15 @@ impl CoreDB {
                 #[cfg(not(unix))]
                 let _ = write_cursor; // non-unix fallback — no-op
             }
-            // Apply the new offsets now that tmp_file is closed.
+            // Apply the new offsets now that tmp_file is closed. Overlay records
+            // are updated in place; every record's new location is also published
+            // so the topology writer can find it without the node being resident.
             for &(h, new_off, new_len) in &node_new_offsets {
                 if let Some(node) = self.nodes.get_mut(&h) {
                     node.payload_offset = new_off;
                     node.payload_len    = new_len;
                 }
+                self.compact_payload_moves.insert(h, (new_off, new_len));
             }
             // Persist the SKBIN field table DURABLY before swapping payloads.
             // IDs are append-only, so this (superset) table decodes both the old
@@ -4009,17 +4042,15 @@ impl CoreDB {
             // Memory DB: rebuild Vec<u8> without touching disk.
             let mut new_slab: Vec<u8> = Vec::new();
             for h in node_keys {
-                if let Some(node) = self.nodes.get(&h) {
-                    let old_off = node.payload_offset;
-                    let old_len = node.payload_len;
-                    if let Some(bytes) = self.payload_store.get_raw(old_off, old_len) {
-                        let new_off = new_slab.len() as u64;
-                        new_slab.extend_from_slice(&bytes);
-                        if let Some(n) = self.nodes.get_mut(&h) {
-                            n.payload_offset = new_off;
-                            n.payload_len    = old_len;
-                        }
+                let Some((old_off, old_len)) = self.payload_loc(h) else { continue };
+                if let Some(bytes) = self.payload_store.get_raw(old_off, old_len) {
+                    let new_off = new_slab.len() as u64;
+                    new_slab.extend_from_slice(&bytes);
+                    if let Some(n) = self.nodes.get_mut(&h) {
+                        n.payload_offset = new_off;
+                        n.payload_len    = old_len;
                     }
+                    self.compact_payload_moves.insert(h, (new_off, old_len));
                 }
             }
             self.payload_store.reset(new_slab);
@@ -4047,6 +4078,7 @@ impl CoreDB {
 
         // Keep the outgoing generation reachable until the incoming one has been
         // read back and found complete.
+        Self::rss_probe("after payloads + indexes");
         let staged = Self::stage_previous_generation(&dir);
 
         self.merge_index_deltas();
@@ -4126,6 +4158,25 @@ impl CoreDB {
         // The new generation has been read back and is complete, and the log has
         // been rotated. Only here does the old generation stop being needed.
         Self::discard_previous_generation(&staged);
+
+        // Adopt the generation just written. Everything the overlay held is in it
+        // now, so the overlay empties — which is what returns RAM to where it was
+        // before the compaction rather than leaving the whole store resident.
+        if had_base {
+            let nb = storage::topology::MappedTopology::open(&dir)?;
+            for (h, name) in nb.edge_type_table() {
+                self.edges.register_type_name(h, name);
+            }
+            self.topo_base = Some(std::sync::Arc::new(nb));
+            self.nodes.clear();
+            self.collections.clear();
+            self.collection_names_map.clear();
+            self.slug_map.clear();
+            self.tombstones.clear();
+            self.edge_tombstones.clear();
+            self.edges.reset_adjacency();
+        }
+        self.compact_payload_moves.clear();
 
         // Regenerate gin.bin so the next open loads GIN instantly.
         if let Some(ref gin_bin_path) = self.data_dir.as_ref().map(|d| d.join("gin.bin")) {
@@ -4247,26 +4298,21 @@ impl CoreDB {
     fn write_topology_files(&self, dir: &Path) -> io::Result<()> {
         use storage::topology::{self, TopoEdge, TopoNode};
 
-        // INVARIANT GUARD (data safety). This rewrites the whole topology from the
-        // resident map. In paged mode that map is only the *overlay*, so running
-        // this with a base still mapped writes a store containing just the recent
-        // writes and destroys every base-resident node — the exact bug fixed in
-        // fc86a44. Callers must hydrate the base first (compact() does).
-        if self.topo_base.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "sekejap: refusing to rewrite topology while a paged base is still \
-                 mapped — the base must be hydrated into the overlay first, or every \
-                 base-resident node would be lost. This is an internal invariant \
-                 violation; please report it.",
-            ));
-        }
+        // This reads the base AND the overlay, so it may run with a base still
+        // mapped — that is now the point. It used to rewrite from the resident map
+        // alone, which in paged mode is only the overlay, and callers had to copy
+        // the entire base into RAM first so it would not be destroyed. Copying the
+        // store into memory to compact it is what Law 1 forbids; the slugs and
+        // collection names below are borrowed straight out of the mmap instead.
+        let base = self.topo_base.clone();
 
-        // Nodes — sorted by hash so dense-id assignment is deterministic.
-        let mut topo_nodes: Vec<TopoNode> = self
-            .nodes
-            .iter()
-            .map(|(&h, n)| TopoNode {
+        // Nodes — overlay first, then base entries the overlay does not shadow.
+        let mut topo_nodes: Vec<TopoNode> = Vec::with_capacity(self.nodes.len());
+        for (&h, n) in &self.nodes {
+            if self.tombstones.contains(&h) {
+                continue;
+            }
+            topo_nodes.push(TopoNode {
                 hash: h,
                 slug: n.slug.as_str(),
                 collection: n.collection.as_str(),
@@ -4277,18 +4323,38 @@ impl CoreDB {
                     m.bbox_min_lat, m.bbox_min_lon,
                     m.bbox_max_lat, m.bbox_max_lon,
                 ]),
-            })
-            .collect();
+            });
+        }
+        if let Some(b) = base.as_deref() {
+            for id in 0..b.node_count() as u64 {
+                let Some(h) = b.hash_of(id) else { continue };
+                if self.tombstones.contains(&h) || self.nodes.contains_key(&h) {
+                    continue; // deleted, or the overlay holds a newer version
+                }
+                let Some(rec) = b.node_record(id) else { continue };
+                // The payload rewrite has already moved this record; the mapped
+                // base still holds its OLD location.
+                let (off, len) = self.compact_payload_moves.get(&h).copied()
+                    .unwrap_or((rec.payload_offset, rec.payload_len));
+                topo_nodes.push(TopoNode {
+                    hash: h,
+                    slug: b.slug_of(id).unwrap_or(""),
+                    collection: b.collection_name(rec.collection_id).unwrap_or(""),
+                    payload_offset: off,
+                    payload_len: len,
+                    spatial: b.spatial(id),
+                });
+            }
+        }
         topo_nodes.sort_by_key(|n| n.hash);
 
-        // Edges — forward adjacency; skip any dangling endpoints.
+        // Edges — forward adjacency over the same merged node set; skip dangling.
+        let live: HashSet<u64> = topo_nodes.iter().map(|n| n.hash).collect();
         let mut topo_edges: Vec<TopoEdge> = Vec::new();
-        for (&from_h, edge_list) in self.edges.iter_fwd() {
-            if !self.nodes.contains_key(&from_h) {
-                continue;
-            }
-            for e in edge_list {
-                if !self.nodes.contains_key(&e.other) {
+        for &from_h in &live {
+            let Some(edge_list) = self.fwd_edges(from_h) else { continue };
+            for e in edge_list.iter() {
+                if !live.contains(&e.other) {
                     continue;
                 }
                 let edge_type = self
@@ -4312,7 +4378,9 @@ impl CoreDB {
             }
         }
 
+        Self::rss_probe("topo vecs built");
         let blob = topology::build(&topo_nodes, &topo_edges);
+        Self::rss_probe("topo blob built");
         Self::write_atomic(dir, "nodes.bin", &blob.nodes)?;
         Self::write_atomic(dir, "adj_fwd.bin", &blob.fwd)?;
         Self::write_atomic(dir, "adj_rev.bin", &blob.rev)?;
@@ -5013,6 +5081,15 @@ impl CoreDB {
         if !self.tombstones.is_empty() && self.tombstones.contains(&hash) {
             return None;
         }
+        // Mid-compaction the payloads have already been rewritten, so the mapped
+        // base and the overlay both hold pre-rewrite locations. The moves table is
+        // authoritative until the new base is adopted. Empty at every other moment,
+        // so the hot path pays a length check.
+        if !self.compact_payload_moves.is_empty() {
+            if let Some(&loc) = self.compact_payload_moves.get(&hash) {
+                return Some(loc);
+            }
+        }
         if let Some(n) = self.nodes.get(&hash) {
             return Some((n.payload_offset, n.payload_len));
         }
@@ -5111,6 +5188,7 @@ impl CoreDB {
             writes_since_compact_check: 0,
             defer_wal_sync: false,
             edge_tombstones: HashSet::new(),
+            compact_payload_moves: HashMap::new(),
             group_commit: false,
             wal_generation: 0,
             batch_now: None,
@@ -7175,90 +7253,6 @@ impl CoreDB {
             return Some(s.as_str());
         }
         self.topo_base.as_ref()?.collection_name_by_hash(coll_hash)
-    }
-
-    /// Materialise every base-resident node into the RAM overlay, skipping
-    /// tombstones, and drop the base. Used by `compact()` in paged mode so the
-    /// rewrite covers the whole store rather than just recent writes.
-    ///
-    /// This is deliberately the one place that trades bounded RAM for correctness:
-    /// compaction rewrites everything anyway, and only node *metadata* is pulled in
-    /// — payload bytes stay on disk and are streamed through the temp file.
-    fn hydrate_base_into_overlay(&mut self) {
-        let Some(base) = self.topo_base.clone() else { return };
-        // Every node that survives this compaction — used below to decide which
-        // edges are still meaningful.
-        let live: Vec<u64> = self.all_hashes();
-        for h in base.all_hashes() {
-            if self.tombstones.contains(&h) || self.nodes.contains_key(&h) {
-                continue; // deleted, or the overlay already has a newer version
-            }
-            if let Some(nd) = self.node_data(h) {
-                let nd = nd.into_owned();
-                self.slug_map.insert(nd.slug.clone(), h);
-                if !nd.collection.is_empty() {
-                    let ch = sk_hash(&nd.collection);
-                    let members = self.collections.entry(ch).or_default();
-                    if !members.contains(&h) {
-                        members.push(h);
-                    }
-                    self.collection_names_map.entry(ch).or_insert_with(|| nd.collection.clone());
-                }
-                self.nodes.insert(h, nd);
-            }
-        }
-        // Edges have exactly the same problem as nodes, and it is worse: the
-        // adjacency lives in TWO places the resident maps do not cover — the mmap'd
-        // topology base, and the spilled CSR files that `fwd_edges` serves from
-        // while `self.fwd` sits empty. Compaction rebuilds the topology from
-        // `iter_fwd()`, which sees only `self.fwd`, so without this it wrote a graph
-        // with no edges at all and destroyed every one of them on disk.
-        //
-        // Take a merged snapshot of the whole adjacency first, then rebuild the
-        // store from it, so what compaction writes is the complete graph.
-        // Edge type names are interned once rather than cloned per edge. Cloning
-        // the name for every edge meant a million heap allocations of a handful of
-        // distinct strings on a million-edge database — pure waste, and RAM the
-        // contract does not allow us to spend.
-        let type_names: HashMap<u64, String> = live.iter()
-            .filter_map(|&h| self.fwd_edges(h))
-            .flat_map(|edges| {
-                edges.iter().map(|e| e.edge_type).collect::<Vec<_>>()
-            })
-            .collect::<HashSet<u64>>()
-            .into_iter()
-            .filter_map(|t| self.edges.type_name(t).map(|n| (t, n.to_string())))
-            .collect();
-
-        let carried: Vec<(u64, u64, u64, Option<Value>)> = {
-            let mut out = Vec::new();
-            for &from in &live {
-                let Some(edges) = self.fwd_edges(from) else { continue };
-                for e in edges.iter() {
-                    // An edge into a node that has been deleted is not carried
-                    // forward — this is where such an edge finally goes away.
-                    // fwd_edges already drops tombstoned targets; this catches a
-                    // target that was never there, without holding a set of every
-                    // live hash in memory to do it.
-                    if !self.node_exists(e.other) {
-                        continue;
-                    }
-                    out.push((from, e.other, e.edge_type, self.edge_all_attrs(e)));
-                }
-            }
-            out
-        };
-        self.edges.reset_adjacency();
-        for (from, to, etype, attrs) in carried {
-            let name = type_names.get(&etype).map(|s| s.as_str()).unwrap_or_default();
-            self.edges.link_with_attrs(from, to, etype, name, &[], attrs);
-        }
-
-        // Everything now lives in the overlay; the old base is finished with and the
-        // tombstones it needed are satisfied.
-        self.topo_base = None;
-        self.tombstones.clear();
-        self.edge_tombstones.clear();
     }
 
     pub(crate) fn all_hashes(&self) -> Vec<u64> {
