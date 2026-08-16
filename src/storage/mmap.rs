@@ -91,6 +91,28 @@ impl MmapView {
     ///
     /// [`slice`]: Self::slice
     pub fn try_new(file: &std::fs::File, len: usize) -> Option<Self> {
+        Self::map(file, len, /*shared=*/ false)
+    }
+
+    /// Map the first `len` bytes read-only, **coherent with writes to the file**.
+    ///
+    /// The difference from [`try_new`](Self::try_new) is `MAP_SHARED` rather than
+    /// `MAP_PRIVATE`, and it matters for exactly one situation: a file this process
+    /// also writes to. Under `MAP_PRIVATE`, POSIX leaves it *unspecified* whether a
+    /// write through the file descriptor becomes visible in the mapping — so a page
+    /// store serving reads from a private map could hand back a page it had already
+    /// overwritten, with nothing to indicate it. `MAP_SHARED` puts the mapping and
+    /// the descriptor on the same page cache, so a write is visible immediately.
+    ///
+    /// The mapping stays `PROT_READ`: nothing writes through it, and a stray store
+    /// to a shared mapping would reach the file.
+    ///
+    /// Use this for a store that is written; use `try_new` for one that is not.
+    pub fn try_new_shared(file: &std::fs::File, len: usize) -> Option<Self> {
+        Self::map(file, len, /*shared=*/ true)
+    }
+
+    fn map(file: &std::fs::File, len: usize, shared: bool) -> Option<Self> {
         if len == 0 { return None; } // an empty mapping is meaningless — bail early
         use std::os::unix::io::AsRawFd; // brings the `.as_raw_fd()` method into scope
         // `extern "C" { ... }` is Rust's FFI (Foreign Function Interface): it
@@ -107,11 +129,13 @@ impl MmapView {
         }
         const PROT_READ: i32 = 1;    // pages are readable, never writable
         const MAP_PRIVATE: i32 = 2;  // our own view; the file on disk is never modified
+        const MAP_SHARED: i32 = 1;   // same page cache as the descriptor
+        let flags = if shared { MAP_SHARED } else { MAP_PRIVATE };
         // Calling a C function is `unsafe`: the compiler can't verify the OS keeps
         // its promises, so we take responsibility. addr = null (let the kernel
         // choose the address), offset = 0 (map from the start of the file).
         let ptr = unsafe {
-            mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
+            mmap(std::ptr::null_mut(), len, PROT_READ, flags, file.as_raw_fd(), 0)
         };
         // mmap signals failure with the sentinel MAP_FAILED (all-ones), not null.
         if ptr == !0usize as *mut std::ffi::c_void {
@@ -175,6 +199,10 @@ pub(crate) struct MmapView {
 #[cfg(not(unix))]
 #[allow(dead_code)]
 impl MmapView {
+    pub fn try_new_shared(_file: &std::fs::File, _len: usize) -> Option<Self> {
+        None
+    }
+
     pub fn try_new(_file: &std::fs::File, _len: usize) -> Option<Self> {
         None
     }
