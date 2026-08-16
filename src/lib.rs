@@ -7186,7 +7186,6 @@ impl CoreDB {
         // Every node that survives this compaction — used below to decide which
         // edges are still meaningful.
         let live: Vec<u64> = self.all_hashes();
-        let live_set: HashSet<u64> = live.iter().copied().collect();
         for h in base.all_hashes() {
             if self.tombstones.contains(&h) || self.nodes.contains_key(&h) {
                 continue; // deleted, or the overlay already has a newer version
@@ -7214,25 +7213,42 @@ impl CoreDB {
         //
         // Take a merged snapshot of the whole adjacency first, then rebuild the
         // store from it, so what compaction writes is the complete graph.
-        let carried: Vec<(u64, u64, u64, String, Option<Value>)> = {
+        // Edge type names are interned once rather than cloned per edge. Cloning
+        // the name for every edge meant a million heap allocations of a handful of
+        // distinct strings on a million-edge database — pure waste, and RAM the
+        // contract does not allow us to spend.
+        let type_names: HashMap<u64, String> = live.iter()
+            .filter_map(|&h| self.fwd_edges(h))
+            .flat_map(|edges| {
+                edges.iter().map(|e| e.edge_type).collect::<Vec<_>>()
+            })
+            .collect::<HashSet<u64>>()
+            .into_iter()
+            .filter_map(|t| self.edges.type_name(t).map(|n| (t, n.to_string())))
+            .collect();
+
+        let carried: Vec<(u64, u64, u64, Option<Value>)> = {
             let mut out = Vec::new();
             for &from in &live {
                 let Some(edges) = self.fwd_edges(from) else { continue };
                 for e in edges.iter() {
                     // An edge into a node that has been deleted is not carried
                     // forward — this is where such an edge finally goes away.
-                    if !live_set.contains(&e.other) {
+                    // fwd_edges already drops tombstoned targets; this catches a
+                    // target that was never there, without holding a set of every
+                    // live hash in memory to do it.
+                    if !self.node_exists(e.other) {
                         continue;
                     }
-                    let name = self.edges.type_name(e.edge_type).unwrap_or_default().to_string();
-                    out.push((from, e.other, e.edge_type, name, self.edge_all_attrs(e)));
+                    out.push((from, e.other, e.edge_type, self.edge_all_attrs(e)));
                 }
             }
             out
         };
         self.edges.reset_adjacency();
-        for (from, to, etype, name, attrs) in carried {
-            self.edges.link_with_attrs(from, to, etype, &name, &[], attrs);
+        for (from, to, etype, attrs) in carried {
+            let name = type_names.get(&etype).map(|s| s.as_str()).unwrap_or_default();
+            self.edges.link_with_attrs(from, to, etype, name, &[], attrs);
         }
 
         // Everything now lives in the overlay; the old base is finished with and the
