@@ -1001,6 +1001,14 @@ pub struct CoreDB {
     /// When true, `wal_write` appends without fsync.
     /// Used by batch operations (UPDATE, DELETE, COMMIT) to coalesce syncs.
     defer_wal_sync: bool,
+    /// Nodes whose edges in the immutable base have been cascade-deleted.
+    ///
+    /// Separate from `tombstones` because it must outlive them: writing the key
+    /// again retires the node tombstone, but the edges that were deleted along with
+    /// the node must stay deleted. Sharing one set resurrected them.
+    ///
+    /// Cleared by compaction, which folds the base away entirely.
+    edge_tombstones: HashSet<u64>,
     /// The caller fsyncs the log itself, so this database appends without one.
     ///
     /// Set by `Engine` in service mode: several writers that commit at the same
@@ -1266,6 +1274,7 @@ impl CoreDB {
             replaying: false,
             pending_txn: None,
             defer_wal_sync: false,
+            edge_tombstones: HashSet::new(),
             group_commit: false,
             wal_generation: 0,
             batch_now: None,
@@ -1900,6 +1909,15 @@ impl CoreDB {
                 members.push(hash);
             }
             self.collection_names_map.entry(coll_hash).or_insert_with(|| coll.to_string());
+            // A btree index that lives only in the mmap base has to be brought into
+            // the heap before it can be updated, or this write is silently dropped.
+            let mapped_fields: Vec<String> = self.field_base.keys()
+                .filter(|(c, _)| *c == coll_hash)
+                .map(|(_, f)| f.clone())
+                .collect();
+            for f in mapped_fields {
+                self.ensure_field_index_writable(coll_hash, &f);
+            }
             for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
                 if *idx_coll == coll_hash {
                     if let Some(key) = FieldKey::from_json(
@@ -1935,6 +1953,13 @@ impl CoreDB {
             .to_string();
 
         self.slug_map.insert(slug.to_string(), hash);
+        // Writing a key retires any tombstone left by an earlier delete. Without
+        // this the row was written and logged but stayed invisible — get() and
+        // contains() both said no — until the next compaction cleared the tombstone
+        // and it silently reappeared.
+        if !self.tombstones.is_empty() {
+            self.tombstones.remove(&hash);
+        }
         self.nodes.insert(hash, NodeData {
             slug: slug.to_string(),
             collection: collection_str,
@@ -1991,8 +2016,54 @@ impl CoreDB {
         if !self.nodes.contains_key(&hash)
             && self.topo_base.as_ref().is_some_and(|b| b.resolve(hash).is_some())
         {
+            // Read the row before tombstoning it: every base-aware accessor honours
+            // tombstones, so afterwards its own payload is unreachable and the
+            // index cleanup below would silently do nothing.
+            let doomed = self.get_payload(hash);
             self.tombstones.insert(hash);
             self.slug_map.remove(slug);
+            // The base row cannot be edited in place, but everything derived from
+            // it still can — and this used to return here, skipping the whole
+            // cascade a normal delete performs. The row then stayed in the text
+            // indexes, kept its geometry in the spatial grid, kept its vectors and
+            // its place in the HNSW graph, and its edges stayed traversable.
+            if !self.replaying {
+                for ix in self.bm25_indexes.values_mut() { ix.delete(hash); }
+                for ix in self.gin_indexes.values_mut() { ix.delete(hash); }
+                for ix in self.search_indexes.values_mut() { ix.delete(hash); }
+                for graph in self.hnsw_indexes.values_mut() { graph.remove(hash); }
+            }
+            // Btree indexes too, or the deleted row keeps matching `WHERE` — and
+            // writing the key again stacks a second posting for the same row, which
+            // is how `WHERE n = 7` started returning the same row twice.
+            if let Some(payload) = doomed {
+                if let Some(coll) = payload.get("_collection").and_then(|v| v.as_str()) {
+                    let ch = sk_hash(coll);
+                    let mapped: Vec<String> = self.field_base.keys()
+                        .filter(|(c, _)| *c == ch).map(|(_, f)| f.clone()).collect();
+                    for f in mapped { self.ensure_field_index_writable(ch, &f); }
+                    for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
+                        if *idx_coll != ch { continue; }
+                        if let Some(key) = FieldKey::from_json(
+                            payload.get(idx_field.as_str()).unwrap_or(&Value::Null)
+                        ) {
+                            if let Some(ids) = btree.get_mut(&key) {
+                                ids.retain(|&id| id != hash);
+                                if ids.is_empty() { btree.remove(&key); }
+                            }
+                        }
+                    }
+                }
+            }
+            for field_vecs in self.vectors.values_mut() { field_vecs.remove(hash); }
+            if let Some(grid) = &mut self.spatial_grid { grid.remove(hash); }
+            // Resident edges can be dropped outright; edges held in the immutable
+            // base cannot, so record that this node's base adjacency is gone and
+            // filter it at read time. This is deliberately NOT the node tombstone:
+            // writing the key again brings the row back, but must not bring back
+            // the edges that were deleted with it.
+            self.edges.remove_node(hash);
+            self.edge_tombstones.insert(hash);
             return;
         }
         if let Some(node) = self.nodes.remove(&hash) {
@@ -3792,6 +3863,14 @@ impl CoreDB {
         // the overlay alone and dropped every base-resident node). Count what must
         // survive first, and refuse to report success if it did not.
         let expected = self.node_count().saturating_sub(self.tombstones.len());
+        // Edges are counted too. The first version of this guard checked only nodes,
+        // and compaction went on to destroy every edge in the graph while reporting
+        // success — the rail passed because the rows it watched were all still there.
+        // Count what a full traversal can actually reach, not what one map happens
+        // to hold, or a spilled adjacency reads as zero and the check is worthless.
+        let expected_edges: usize = self.all_hashes().iter()
+            .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
+            .sum();
         let r = self.compact_inner();
         if r.is_ok() {
             let actual = self.node_count();
@@ -3804,6 +3883,19 @@ impl CoreDB {
                         "sekejap: compaction would lose data ({expected} nodes before, \
                          {actual} after) — aborted before it could be trusted. This is \
                          a bug; please report it with the database layout."
+                    ),
+                ));
+            }
+            let actual_edges: usize = self.all_hashes().iter()
+                .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
+                .sum();
+            if actual_edges < expected_edges {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "sekejap: compaction would lose edges ({expected_edges} before, \
+                         {actual_edges} after) — aborted before it could be trusted. \
+                         This is a bug; please report it with the database layout."
                     ),
                 ));
             }
@@ -4904,6 +4996,7 @@ impl CoreDB {
             autocompacting: false,
             writes_since_compact_check: 0,
             defer_wal_sync: false,
+            edge_tombstones: HashSet::new(),
             group_commit: false,
             wal_generation: 0,
             batch_now: None,
@@ -5211,7 +5304,12 @@ impl CoreDB {
 
     /// Returns the number of directed edges currently stored.
     pub fn edge_count(&self) -> usize {
-        self.edges.edge_count()
+        // Base-aware. EdgeStore::edge_count sums the resident map, which is empty
+        // once adjacency spills to CSR and never holds the mmap'd base at all — it
+        // reported 0 for a database with a full graph.
+        self.all_hashes().iter()
+            .filter_map(|&h| self.fwd_edges(h).map(|e| e.len()))
+            .sum()
     }
 
     /// Returns all distinct collection names present in the graph, sorted.
@@ -5412,8 +5510,10 @@ impl CoreDB {
     /// Get all outgoing edges from a node, resolved to slugs where available.
     pub fn edges_from(&self, slug: &str) -> Vec<EdgeHit> {
         let hash = sk_hash(slug);
-        self.edges
-            .fwd_edges(hash)
+        // `self.fwd_edges`, not `self.edges.fwd_edges`: the former merges the mmap
+        // base with the overlay, the latter sees only resident edges and returned
+        // nothing at all in paged mode — taking edge attributes with it.
+        self.fwd_edges(hash)
             .map(|edges| {
                 edges
                     .iter()
@@ -5432,8 +5532,8 @@ impl CoreDB {
     /// Get all incoming edges to a node, resolved to slugs where available.
     pub fn edges_to(&self, slug: &str) -> Vec<EdgeHit> {
         let hash = sk_hash(slug);
-        self.edges
-            .rev_edges(hash)
+        // Base-aware — see edges_from.
+        self.rev_edges(hash)
             .map(|edges| {
                 edges
                     .iter()
@@ -5484,9 +5584,10 @@ impl CoreDB {
         self.edges_from_collection(from_collection)
             .into_iter()
             .filter(|e| {
+                // Base-aware: slug_map and self.nodes are overlay-only, so this
+                // discarded every edge whose target had been compacted away.
                 e.to_slug.as_deref()
-                    .and_then(|s| self.slug_map.get(s))
-                    .and_then(|h| self.nodes.get(h))
+                    .and_then(|s| self.node_data(sk_hash(s)))
                     .map(|n| !n.collection.is_empty() && sk_hash(&n.collection) == to_col_h)
                     .unwrap_or(false)
             })
@@ -6026,12 +6127,19 @@ impl CoreDB {
                 // Insert actual counts first, then seed declared-but-empty schemas with 0.
                 let mut stats: std::collections::BTreeMap<String, (usize, u64)> =
                     std::collections::BTreeMap::new();
-                for (hash, name) in &self.collection_names_map {
-                    let (count, size) = self.collections.get(hash)
+                // Base-aware: collection_names() and collection_members() merge the
+                // mmap base with the overlay. Reading collection_names_map and
+                // self.collections directly reported only what had been written
+                // since the last compaction — one collection instead of two, with
+                // zero rows.
+                let names: Vec<(u64, String)> = self.collection_names()
+                    .into_iter().map(|n| (sk_hash(&n), n)).collect();
+                for (hash, name) in &names {
+                    let (count, size) = self.collection_members(*hash)
                         .map(|members| {
                             let c = members.len();
                             let s: u64 = members.iter()
-                                .filter_map(|h| self.nodes.get(h).map(|n| n.payload_len as u64))
+                                .filter_map(|h| self.payload_loc(*h).map(|(_, len)| len as u64))
                                 .sum();
                             (c, s)
                         })
@@ -6964,6 +7072,10 @@ impl CoreDB {
     /// — payload bytes stay on disk and are streamed through the temp file.
     fn hydrate_base_into_overlay(&mut self) {
         let Some(base) = self.topo_base.clone() else { return };
+        // Every node that survives this compaction — used below to decide which
+        // edges are still meaningful.
+        let live: Vec<u64> = self.all_hashes();
+        let live_set: HashSet<u64> = live.iter().copied().collect();
         for h in base.all_hashes() {
             if self.tombstones.contains(&h) || self.nodes.contains_key(&h) {
                 continue; // deleted, or the overlay already has a newer version
@@ -6982,10 +7094,41 @@ impl CoreDB {
                 self.nodes.insert(h, nd);
             }
         }
+        // Edges have exactly the same problem as nodes, and it is worse: the
+        // adjacency lives in TWO places the resident maps do not cover — the mmap'd
+        // topology base, and the spilled CSR files that `fwd_edges` serves from
+        // while `self.fwd` sits empty. Compaction rebuilds the topology from
+        // `iter_fwd()`, which sees only `self.fwd`, so without this it wrote a graph
+        // with no edges at all and destroyed every one of them on disk.
+        //
+        // Take a merged snapshot of the whole adjacency first, then rebuild the
+        // store from it, so what compaction writes is the complete graph.
+        let carried: Vec<(u64, u64, u64, String, Option<Value>)> = {
+            let mut out = Vec::new();
+            for &from in &live {
+                let Some(edges) = self.fwd_edges(from) else { continue };
+                for e in edges.iter() {
+                    // An edge into a node that has been deleted is not carried
+                    // forward — this is where such an edge finally goes away.
+                    if !live_set.contains(&e.other) {
+                        continue;
+                    }
+                    let name = self.edges.type_name(e.edge_type).unwrap_or_default().to_string();
+                    out.push((from, e.other, e.edge_type, name, self.edge_all_attrs(e)));
+                }
+            }
+            out
+        };
+        self.edges.reset_adjacency();
+        for (from, to, etype, name, attrs) in carried {
+            self.edges.link_with_attrs(from, to, etype, &name, &[], attrs);
+        }
+
         // Everything now lives in the overlay; the old base is finished with and the
         // tombstones it needed are satisfied.
         self.topo_base = None;
         self.tombstones.clear();
+        self.edge_tombstones.clear();
     }
 
     pub(crate) fn all_hashes(&self) -> Vec<u64> {
@@ -7006,15 +7149,47 @@ impl CoreDB {
     }
 
     pub(crate) fn fwd_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>> {
-        Self::merged_edges(self.edges.fwd_edges(hash), || {
+        let dropped = self.edge_tombstones.contains(&hash);
+        let edges = Self::merged_edges(self.edges.fwd_edges(hash), || {
+            if dropped { return None; }
             self.topo_base.as_ref().and_then(|b| b.fwd_by_hash(hash))
-        })
+        })?;
+        Some(self.drop_dangling(edges))
     }
 
     pub(crate) fn rev_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>> {
-        Self::merged_edges(self.edges.rev_edges(hash), || {
+        let dropped = self.edge_tombstones.contains(&hash);
+        let edges = Self::merged_edges(self.edges.rev_edges(hash), || {
+            if dropped { return None; }
             self.topo_base.as_ref().and_then(|b| b.rev_by_hash(hash))
-        })
+        })?;
+        Some(self.drop_dangling(edges))
+    }
+
+    /// Hide edges whose far end has been deleted.
+    ///
+    /// An edge stored in the immutable base cannot be erased when one of its
+    /// endpoints is tombstoned, so it is filtered here instead. Without this a
+    /// traversal walked straight through deleted nodes — `SHORTEST` reported paths
+    /// that no longer existed — and `edges_from_collection` returned edges into
+    /// rows that were gone.
+    ///
+    /// The `is_empty` check keeps the common case free: with no pending deletes
+    /// this is a length test and the borrowed slice is handed straight back.
+    fn drop_dangling<'a>(
+        &self,
+        edges: std::borrow::Cow<'a, [Edge]>,
+    ) -> std::borrow::Cow<'a, [Edge]> {
+        let dead = |h: &u64| self.tombstones.contains(h) || self.edge_tombstones.contains(h);
+        if self.tombstones.is_empty() && self.edge_tombstones.is_empty() {
+            return edges;
+        }
+        if edges.iter().all(|e| !dead(&e.other)) {
+            return edges;
+        }
+        std::borrow::Cow::Owned(
+            edges.iter().filter(|e| !dead(&e.other)).cloned().collect(),
+        )
     }
 
     /// Merge overlay edges (resident, written since open) with base edges (mapped).
@@ -7280,6 +7455,33 @@ impl CoreDB {
         self.field_base
             .get(&(coll_hash, field.to_string()))
             .map(FieldIndexRef::Mapped)
+    }
+
+    /// Pull a btree index out of the mmap base and into the heap so it can be
+    /// written to.
+    ///
+    /// The two stores are consulted in preference order, not merged: `field_index_ref`
+    /// returns the heap entry if there is one and the mapped base otherwise. On a
+    /// paged reopen only the base exists, so a write updated nothing — the loop over
+    /// `field_indexes` had no entry to touch — while reads kept answering from the
+    /// stale mapped copy. `WHERE n > 15` then returned nothing for rows that were
+    /// plainly there, and `MIN`/`MAX`/`SUM`/`ORDER BY` answered from the pre-write
+    /// data, permanently: neither compaction nor reopening rebuilt it.
+    ///
+    /// Materialising on first write keeps the disk-first behaviour for databases that
+    /// are only read, and makes the heap authoritative the moment one is written.
+    fn ensure_field_index_writable(&mut self, coll_hash: u64, field: &str) {
+        let key = (coll_hash, field.to_string());
+        if self.field_indexes.contains_key(&key) {
+            return;
+        }
+        let Some(base) = self.field_base.get(&key) else { return };
+        let mut btree: std::collections::BTreeMap<FieldKey, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for (k, ids) in base.iter_kv(false) {
+            btree.insert(k, ids);
+        }
+        self.field_indexes.insert(key, btree);
     }
 
     /// Whether a btree index exists for `(collection, field)` — heap or mmap base.
