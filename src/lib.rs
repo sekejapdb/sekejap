@@ -548,6 +548,16 @@ use storage::mmap::MmapView;
 enum PayloadInner {
     /// Ephemeral database: all record bytes held in one growing `Vec<u8>`.
     Memory { data: Vec<u8> },
+    /// Persistent database, paged: bytes live in slotted pages with a free list,
+    /// so deleting or updating a record returns its space immediately instead of
+    /// leaving a hole for a later rewrite to squeeze out.
+    ///
+    /// The `offset` half of a `(offset, len)` pair is a
+    /// [`RecordId`](storage::recordstore::RecordId) here, not a byte position —
+    /// which is why [`PayloadStore::absolute_offsets`] exists: the read paths that
+    /// do arithmetic on byte offsets, or coalesce neighbouring records into one
+    /// read, have to take a different route.
+    Paged { store: storage::recordstore::RecordStore },
     /// Persistent database: bytes in the `payloads.bin` file. Reads go through
     /// the `mmap` view when present (zero-copy), else fall back to `pread`.
     Disk {
@@ -632,10 +642,67 @@ impl PayloadStore {
         matches!(self.inner, PayloadInner::Disk { .. })
     }
 
+    /// Whether `(offset, len)` pairs are byte positions in one flat region.
+    ///
+    /// True for the memory and disk variants, where a record's bytes sit at a
+    /// known offset and neighbouring records are adjacent. False when paged: an
+    /// offset is an opaque record id, so callers that slice within a record or
+    /// read several at once must go through `get_raw` per record instead.
+    fn absolute_offsets(&self) -> bool {
+        !matches!(self.inner, PayloadInner::Paged { .. })
+    }
+
+    /// Open (or create) a paged payload store at `path`.
+    fn open_paged(path: &std::path::Path) -> io::Result<Self> {
+        let store = match storage::recordstore::RecordStore::open(path)? {
+            Some(s) => s,
+            None => storage::recordstore::RecordStore::create(
+                path, storage::pagestore::DEFAULT_PAGE_SIZE)?,
+        };
+        Ok(Self {
+            binary: false,
+            field_table: storage::skbin::FieldTable::default(),
+            inner: PayloadInner::Paged { store },
+        })
+    }
+
+    /// Release a record's space. The point of the paged variant: an updated or
+    /// deleted row's bytes come back now, rather than waiting for a rewrite of the
+    /// whole store to squeeze them out. A no-op for the append-only variants,
+    /// which have nowhere to put reclaimed space.
+    pub(crate) fn free(&mut self, offset: u64) -> bool {
+        match &mut self.inner {
+            PayloadInner::Paged { store } => store
+                .delete(storage::recordstore::RecordId(offset))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn sync_pages(&mut self) -> io::Result<()> {
+        match &mut self.inner {
+            PayloadInner::Paged { store } => store.sync(),
+            _ => Ok(()),
+        }
+    }
+
+    /// Pages held and pages free — paged variant only.
+    pub(crate) fn page_stats(&self) -> Option<(u64, u64)> {
+        match &self.inner {
+            PayloadInner::Paged { store } => Some((store.page_count(), store.free_page_count())),
+            _ => None,
+        }
+    }
+
     /// Append raw bytes; returns `(offset, len)`.
     /// Panics on disk write failure (disk-full etc.) — callers do not recover.
     fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
         match &mut self.inner {
+            // The "offset" is a record id here, not a byte position.
+            PayloadInner::Paged { store } => {
+                let id = store.insert(bytes).expect("sekejap: payload page write failed");
+                (id.0, bytes.len() as u32)
+            }
             PayloadInner::Memory { data } => {
                 let offset = data.len() as u64;
                 data.extend_from_slice(bytes);
@@ -666,6 +733,10 @@ impl PayloadStore {
     fn append_batch(&mut self, items: &[&[u8]]) -> Vec<(u64, u32)> {
         if items.is_empty() { return vec![]; }
         match &mut self.inner {
+            PayloadInner::Paged { store } => items.iter().map(|bytes| {
+                let id = store.insert(bytes).expect("sekejap: payload page write failed");
+                (id.0, bytes.len() as u32)
+            }).collect(),
             PayloadInner::Memory { data } => {
                 items.iter().map(|bytes| {
                     let offset = data.len() as u64;
@@ -706,8 +777,21 @@ impl PayloadStore {
     /// the query engine. SKBIN records decode DIRECTLY to `Value` (binary decode,
     /// no JSON round-trip — faster than parsing text); raw JSON records parse; a
     /// retired `0x01` zstd record yields `None`.
+    /// The stored bytes of one record, however this store addresses them.
+    ///
+    /// Paged stores treat `offset` as a record id; the others as a byte position.
+    /// Every read of a whole record goes through here so the two never diverge.
+    fn stored_record(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
+        match &self.inner {
+            PayloadInner::Paged { store } => {
+                store.read(storage::recordstore::RecordId(offset)).ok().flatten()
+            }
+            _ => self.get_raw_at(offset, len as usize),
+        }
+    }
+
     fn get(&self, offset: u64, len: u32) -> Option<Value> {
-        let stored = self.get_raw_at(offset, len as usize)?;
+        let stored = self.stored_record(offset, len)?;
         if storage::skbin::is_skbin(&stored) {
             return storage::skbin::decode(&stored, &self.field_table);
         }
@@ -719,7 +803,7 @@ impl PayloadStore {
     /// `{` raw JSON, `0x01` = retired zstd → `None`) so mixed files need no
     /// migration.
     pub(crate) fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
-        let stored = self.get_raw_at(offset, len as usize)?;
+        let stored = self.stored_record(offset, len)?;
         if storage::skbin::is_skbin(&stored) {
             // SKBIN → reconstruct JSON bytes using the shared field-name table.
             let v = storage::skbin::decode(&stored, &self.field_table)?;
@@ -735,6 +819,12 @@ impl PayloadStore {
             return Some(vec![]);
         }
         match &self.inner {
+            // Deliberately unsupported: an offset is an opaque record id here, so
+            // slicing at a byte position, or reading across neighbouring records,
+            // has no meaning. Callers check `absolute_offsets()` and take the
+            // per-record route instead — returning None rather than guessing keeps
+            // a mistake visible instead of quietly returning the wrong bytes.
+            PayloadInner::Paged { .. } => None,
             PayloadInner::Memory { data } => {
                 let start = abs_offset as usize;
                 let end = start.checked_add(read_len)?;
@@ -768,6 +858,9 @@ impl PayloadStore {
     fn get_slice(&self, abs_offset: u64, read_len: usize) -> Option<&[u8]> {
         if read_len == 0 { return Some(&[]); }
         match &self.inner {
+            // No borrowed view: a paged record may span pages and is assembled on
+            // read, so there is nothing contiguous to lend out.
+            PayloadInner::Paged { .. } => None,
             PayloadInner::Memory { data } => {
                 let start = abs_offset as usize;
                 let end = start.checked_add(read_len)?;
@@ -800,6 +893,10 @@ impl PayloadStore {
     #[cfg(unix)]
     fn read_only_clone(&self) -> Option<PayloadStore> {
         let inner = match &self.inner {
+            // A snapshot shares the base store's descriptor; the paged store owns a
+            // writable handle that cannot be shared, so paged databases fall back
+            // to the locked read path rather than snapshotting.
+            PayloadInner::Paged { .. } => return None,
             PayloadInner::Memory { data } => PayloadInner::Memory { data: data.clone() },
             PayloadInner::Disk { file, total_len, mmap } => PayloadInner::Disk {
                 file: file.try_clone().ok()?,
@@ -9565,6 +9662,96 @@ struct SnapBtree {
     field: String,
     /// Sorted (key, Vec<node_hash>) pairs — reconstructs the BTreeMap directly.
     entries: Vec<(FieldKey, Vec<u64>)>,
+}
+
+#[cfg(test)]
+mod payload_paging_tests {
+    use super::*;
+
+    fn rec(i: usize) -> Vec<u8> {
+        format!("{{\"_key\":\"n{i}\",\"name\":\"record {i} west java\",\"n\":{i}}}")
+            .into_bytes()
+    }
+
+    /// The paged store must return exactly what the append-only one does. If the
+    /// two ever disagree, the paged path is silently corrupting payloads.
+    #[test]
+    fn paged_payloads_read_back_the_same_as_flat_ones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut flat = PayloadStore::open_file(&dir.path().join("flat.bin")).unwrap();
+        let mut paged = PayloadStore::open_paged(&dir.path().join("paged.bin")).unwrap();
+
+        let sizes: Vec<Vec<u8>> = (0..300).map(rec)
+            .chain(std::iter::once(vec![b'x'; 200_000]))   // spans many pages
+            .chain(std::iter::once(vec![b'y'; 4096]))      // straddles the boundary
+            .chain(std::iter::once(Vec::new()))            // empty
+            .collect();
+
+        for bytes in &sizes {
+            let (fo, fl) = flat.append(bytes);
+            let (po, pl) = paged.append(bytes);
+            assert_eq!(fl, pl, "lengths disagree");
+            assert_eq!(
+                flat.get_raw(fo, fl).as_deref(),
+                paged.get_raw(po, pl).as_deref(),
+                "paged and flat disagree on a {}-byte record", bytes.len(),
+            );
+        }
+    }
+
+    /// The whole point: freeing a record returns its space, so a workload that
+    /// deletes as fast as it writes stops growing the file. The flat store cannot
+    /// do this at all — that is what compaction exists to work around.
+    #[test]
+    fn freeing_a_paged_payload_returns_its_space() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut p = PayloadStore::open_paged(&dir.path().join("paged.bin")).unwrap();
+
+        let mut live: Vec<(u64, u32)> = (0..400).map(|i| p.append(&rec(i))).collect();
+        let settled = p.page_stats().unwrap().0;
+
+        // Churn: free the oldest, write a new one, far more times than there are
+        // records, so any failure to reclaim shows up as unbounded growth.
+        for i in 0..4000 {
+            let (off, _) = live.remove(0);
+            assert!(p.free(off), "free reported nothing reclaimed");
+            live.push(p.append(&rec(10_000 + i)));
+        }
+        let after = p.page_stats().unwrap().0;
+        assert!(after <= settled + 4,
+                "file grew from {settled} to {after} pages over 4000 replacements — \
+                 space is not coming back");
+
+        // Everything still live must still read.
+        for (off, len) in &live {
+            assert!(p.get_raw(*off, *len).is_some(), "a live record stopped reading");
+        }
+    }
+
+    #[test]
+    fn a_freed_paged_payload_stops_reading() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut p = PayloadStore::open_paged(&dir.path().join("paged.bin")).unwrap();
+        let (a, al) = p.append(b"alpha");
+        let (b, bl) = p.append(b"bravo");
+        assert!(p.free(a));
+        assert_eq!(p.get_raw(a, al), None, "a freed payload still reads");
+        assert_eq!(p.get_raw(b, bl).as_deref(), Some(&b"bravo"[..]), "neighbour disturbed");
+    }
+
+    /// Byte-offset arithmetic is meaningless once offsets are record ids, so those
+    /// paths must decline rather than return whatever bytes are at that position.
+    #[test]
+    fn paged_stores_decline_absolute_offset_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut p = PayloadStore::open_paged(&dir.path().join("paged.bin")).unwrap();
+        let flat = PayloadStore::open_file(&dir.path().join("flat.bin")).unwrap();
+        let (off, _) = p.append(b"hello world");
+
+        assert!(!p.absolute_offsets(), "paged stores must not claim byte offsets");
+        assert!(flat.absolute_offsets(), "flat stores do have byte offsets");
+        assert_eq!(p.get_raw_at(off, 4), None, "a paged store answered a byte-offset read");
+    }
 }
 
 #[cfg(test)]
