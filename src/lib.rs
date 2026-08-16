@@ -367,6 +367,62 @@ pub(crate) struct Segments {
     slots: Option<std::sync::Arc<storage::slotmap::MappedSlots>>,
 }
 
+/// Edge type names, as a file of their own.
+///
+/// `dict.bin` carries them normally, but it is built from the edge list a
+/// compaction writes — and paged adjacency deliberately writes no edge list, so
+/// every edge came back nameless on reopen and `SHOW EDGES` was empty. The names
+/// are the one part of the graph that is not in the paged store: an edge holds its
+/// type as a hash, and a hash does not turn back into a word by itself.
+///
+/// There are a handful of them, so this is a few hundred bytes rewritten whenever
+/// the set changes, not something whose cost tracks the store.
+///
+/// Layout: `[magic 8][count u32][ (hash u64, len u16, bytes) x count ]`.
+mod edge_type_names {
+    use std::io;
+    use std::path::Path;
+
+    const MAGIC: &[u8; 8] = b"SKETYP\0\0";
+    pub(super) const FILE: &str = "edge_types.bin";
+
+    pub(super) fn write(path: &Path, types: &[(u64, &str)]) -> io::Result<()> {
+        let mut out = Vec::with_capacity(16 + types.len() * 24);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        for (hash, name) in types {
+            out.extend_from_slice(&hash.to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &out)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Read the table back. Anything malformed yields the entries read so far
+    /// rather than an error: a lost name makes `SHOW EDGES` less informative, and
+    /// refusing to open the database over it would be the worse failure.
+    pub(super) fn read(path: &Path) -> Vec<(u64, String)> {
+        let Ok(b) = std::fs::read(path) else { return Vec::new() };
+        if b.len() < 12 || &b[0..8] != MAGIC { return Vec::new() }
+        let count = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(count);
+        let mut at = 12usize;
+        for _ in 0..count {
+            if at + 10 > b.len() { break }
+            let hash = u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+            let len = u16::from_le_bytes(b[at + 8..at + 10].try_into().unwrap()) as usize;
+            at += 10;
+            if at + len > b.len() { break }
+            let Ok(name) = std::str::from_utf8(&b[at..at + len]) else { break };
+            out.push((hash, name.to_string()));
+            at += len;
+        }
+        out
+    }
+}
+
 /// The durable graph, forward and reverse, in slotted pages keyed by slug hash.
 ///
 /// This is the base a read falls through to when `Config::paged_adjacency` is on,
@@ -1245,6 +1301,13 @@ pub struct CoreDB {
     /// `compact()` folds the overlay into it owner by owner instead of rebuilding
     /// the graph, so the cost follows the change rather than the store.
     paged_adj: Option<PagedAdjacency>,
+    /// Durable nodes in slotted pages, when `Config::paged_nodes` is on.
+    ///
+    /// Takes the place of a segment's `nodes.bin` / `idx.bin` / `slugs.bin` /
+    /// `collections.bin` as the store that reads fall through to. Every question
+    /// the engine asks of it goes through the `base_*` accessors, which is the
+    /// only place either backend is chosen.
+    paged_nodes: Option<storage::nodestore::NodeStore>,
     /// collection_hash → member slug hashes
     collections: HashMap<u64, Vec<u64>>,
     /// collection_hash → collection name (for O(1) SHOW TABLES without node scan)
@@ -1526,6 +1589,19 @@ pub struct Config {
     /// owner is 42 bytes and CSR's offset array is 8. Most of that comes back when
     /// nodes move onto records and the adjacency index stops being separate.
     pub paged_adjacency: bool,
+    /// **Experimental.** Keep nodes in slotted pages keyed by slug hash, so a new
+    /// or changed node is written where it belongs instead of waiting for a
+    /// rebuild.
+    ///
+    /// `nodes.bin`, `idx.bin`, `slugs.bin` and `collections.bin` are the whole of
+    /// what a compaction still rewrites once adjacency and payloads are paged.
+    /// None of them can absorb a write: a dense id is a *position*, so inserting
+    /// one node renumbers the rest; a sorted array has nowhere to put an entry; an
+    /// offsets array shifts when anything before it grows.
+    ///
+    /// Off by default. The sacrifice is disk: about 1.8x what the four files spend,
+    /// almost all of it the two B+trees, where the files are packed arrays.
+    pub paged_nodes: bool,
     /// **Experimental.** Serve topology (nodes + edges) from the mmap'd files
     /// written at `compact()` instead of loading it into RAM. The OS page cache
     /// keeps the hot working set resident and pages the rest — topology size is
@@ -1558,6 +1634,7 @@ impl Default for Config {
             payload_binary: true,
             paged_payloads: false,
             paged_adjacency: false,
+            paged_nodes: false,
             paged_topology: false,
         }
     }
@@ -1602,6 +1679,7 @@ impl CoreDB {
             slug_map: HashMap::new(),
             // An in-memory database has no directory to put pages in.
             paged_adj: None,
+            paged_nodes: None,
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
             compact_thresholds: CompactThresholds::default(),
             wal_sync: SyncMode::Full,
@@ -1854,6 +1932,15 @@ impl CoreDB {
             // The durable graph, written where it belongs instead of rebuilt.
             db.paged_adj = Some(PagedAdjacency::open(dir)?);
         }
+        if config.paged_nodes {
+            db.paged_nodes = Some(storage::nodestore::NodeStore::open(
+                dir, storage::pagestore::DEFAULT_PAGE_SIZE)?);
+        }
+        // dict.bin carries these when a compaction writes the edge list; paged
+        // adjacency writes no edge list, so they come from their own file.
+        for (hash, name) in edge_type_names::read(&dir.join(edge_type_names::FILE)) {
+            db.edges.register_type_name(hash, name);
+        }
         if config.paged_payloads {
             // Slotted pages with a free list: space returns as records die, so
             // there is nothing for a rewrite to reclaim later.
@@ -1931,6 +2018,28 @@ impl CoreDB {
             if let Some(base) = db.segments.newest_first().next().cloned() {
                 if let Some(pa) = db.paged_adj.as_mut() {
                     pa.migrate_from(&base)?;
+                }
+            }
+        }
+        // The same for nodes, and for the same reason: paged nodes *replace* the
+        // segments as the store reads fall through to, so a database whose nodes
+        // are still in nodes.bin would look empty rather than paged.
+        if db.paged_nodes.as_ref().is_some_and(|ns| ns.len() == 0) {
+            if let Some(base) = db.segments.newest_first().next().cloned() {
+                if let Some(ns) = db.paged_nodes.as_mut() {
+                    for id in 0..base.node_count() as u64 {
+                        let (Some(hash), Some(rec)) = (base.hash_of(id), base.node_record(id))
+                        else { continue };
+                        ns.put(hash, &storage::nodestore::StoredNode {
+                            collection: base.collection_name(rec.collection_id)
+                                .unwrap_or("").to_string(),
+                            payload_offset: rec.payload_offset,
+                            payload_len: rec.payload_len,
+                            spatial: base.spatial(id),
+                            slug: base.slug_of(id).unwrap_or("").to_string(),
+                        })?;
+                    }
+                    ns.sync()?;
                 }
             }
         }
@@ -4373,7 +4482,14 @@ impl CoreDB {
         // Disk DB: streaming rewrite to payloads.bin.tmp then atomic rename.
         // Neither approach loads all payloads into RAM simultaneously.
         // Base-aware: every live record, not just the ones in the write overlay.
-        let node_keys: Vec<u64> = self.all_hashes();
+        // Only the payload rewrite needs this, and enumerating the whole store
+        // costs time proportional to the store — 28 ms per compaction at 500 000
+        // rows, spent building a list nothing then reads when payloads are paged.
+        let node_keys: Vec<u64> = if self.payload_store.absolute_offsets() {
+            self.all_hashes()
+        } else {
+            Vec::new()
+        };
         self.compact_payload_moves.clear();
 
         // A paged payload store has nothing for this phase to do. Space belonging
@@ -4522,6 +4638,21 @@ impl CoreDB {
             return Err(e);
         }
         Self::phase_probe("folding edges into pages", &mut phase);
+        if let Err(e) = self.fold_nodes_into_paged() {
+            Self::restore_previous_generation(&staged);
+            return Err(e);
+        }
+        Self::phase_probe("folding nodes into pages", &mut phase);
+        // The names the paged graph cannot carry. Written whenever it is on, before
+        // the topology files, so a crash between the two leaves names for a
+        // generation that still exists rather than for one that does not.
+        if self.paged_adj.is_some() {
+            let types = self.edges.type_table();
+            if let Err(e) = edge_type_names::write(&dir.join(edge_type_names::FILE), &types) {
+                Self::restore_previous_generation(&staged);
+                return Err(e);
+            }
+        }
 
         self.merge_index_deltas();
         Self::phase_probe("merging index deltas", &mut phase);
@@ -4542,7 +4673,8 @@ impl CoreDB {
         // rail O(edges) and more than doubled a 200 000-node compaction — the exact
         // cost this direction removes, put back by the check that guards it.
         let paged_edges = self.paged_adj.as_ref().map(|pa| pa.fwd.edge_count() as usize);
-        match Self::count_generation_on_disk(&dir, paged_edges) {
+        let paged_node_count = self.paged_nodes.as_ref().map(|ns| ns.len() as usize);
+        match Self::count_generation_on_disk(&dir, paged_node_count, paged_edges) {
             Ok((n, e)) if n >= expect_nodes && e >= expect_edges => {}
             Ok((n, e)) => {
                 Self::restore_previous_generation(&staged);
@@ -4754,7 +4886,11 @@ impl CoreDB {
     /// same accessors that had written the data, so when those accessors were wrong
     /// it agreed with them and confirmed a compaction that had just deleted the
     /// entire graph. A check that can agree with the bug is not a check.
-    fn count_generation_on_disk(dir: &Path, paged_edges: Option<usize>) -> io::Result<(usize, usize)> {
+    fn count_generation_on_disk(
+        dir: &Path,
+        paged_nodes: Option<usize>,
+        paged_edges: Option<usize>,
+    ) -> io::Result<(usize, usize)> {
         let base = storage::topology::MappedTopology::open(dir)?;
         // Both counts come straight off the mapped headers and offset tables —
         // no edges are decoded and nothing is allocated per node, so this stays
@@ -4763,7 +4899,14 @@ impl CoreDB {
         // With paged adjacency the CSR files are deliberately empty, so their edge
         // count would be zero and the rail would report catastrophic loss on every
         // compaction. The caller counts the paged graph instead and passes it in.
-        Ok((base.node_count(), paged_edges.unwrap_or_else(|| base.edge_count())))
+        // Whichever half is paged is not in these files — deliberately, since not
+        // rewriting it is the point — so its count comes from the store that does
+        // hold it. Reading a zero out of a file nobody writes any more and calling
+        // it data loss is how this rail cried wolf on every compaction.
+        Ok((
+            paged_nodes.unwrap_or_else(|| base.node_count()),
+            paged_edges.unwrap_or_else(|| base.edge_count()),
+        ))
     }
 
     fn write_topology_files(&self, dir: &Path) -> io::Result<()> {
@@ -4777,8 +4920,15 @@ impl CoreDB {
         // collection names below are borrowed straight out of the mmap instead.
         let segments = self.segments.clone();
 
+        // With paged nodes the store is already durable and was never taken apart,
+        // so there is nothing to write. The files still exist and still hold the
+        // generation they were written with — they are simply no longer where the
+        // nodes are, which is what `base_node` and its siblings decide.
+        let rebuild_nodes = self.paged_nodes.is_none();
+
         // Nodes — overlay first, then base entries the overlay does not shadow.
         let mut topo_nodes: Vec<TopoNode> = Vec::with_capacity(self.nodes.len());
+        if rebuild_nodes {
         for (&h, n) in &self.nodes {
             if self.tombstones.contains(&h) {
                 continue;
@@ -4816,6 +4966,7 @@ impl CoreDB {
                     spatial: b.spatial(id).map(Box::new),
                 });
             }
+        }
         }
         topo_nodes.sort_by_key(|n| n.hash);
 
@@ -4860,6 +5011,7 @@ impl CoreDB {
         }
 
         Self::rss_probe("topo vecs built");
+        let mut inner = std::time::Instant::now();
         // Each file is written and released as it is produced, so peak memory is
         // the largest single file rather than the sum of all nine.
         topology::build_into(&topo_nodes, &topo_edges, |name, bytes| {
@@ -4881,6 +5033,7 @@ impl CoreDB {
         // serve the grid straight from the mmap instead of rebuilding it resident.
         // Built fresh from all node metas (overlay + base) so it is complete even
         // when compacting in paged mode; ring caches are not persisted.
+        Self::phase_probe("  topology files + slot table", &mut inner);
         if self.spatial_grid.is_some() {
             let grid = geo::SpatialGrid::build(self.all_spatial_items().into_iter());
             let mut buf = Vec::new();
@@ -4889,9 +5042,11 @@ impl CoreDB {
         }
         // Compact vector indexes (int8 + CSR) sidecar — lets a paged reopen mmap them
         // instead of rebuilding the HNSW graph resident.
+        Self::phase_probe("  spatial grid", &mut inner);
         self.save_vector_binary(&dir.join("vecidx.bin"))?;
         // BM25 metadata sidecar (dict + doc arrays) for disk-first paged reopen.
         self.save_bm25_binary(&dir.join("bm25.bin"))?;
+        Self::phase_probe("  vector + bm25 sidecars", &mut inner);
         Ok(())
     }
 
@@ -5642,6 +5797,7 @@ impl CoreDB {
             // edges to find - which is why snapshot_reads is refused for it in
             // `open_with_config` rather than quietly answering an empty graph.
             paged_adj: None,
+            paged_nodes: None,
             slug_map: self.slug_map.clone(),
             collections: self.collections.clone(),
             collection_names_map: self.collection_names_map.clone(),
@@ -7765,6 +7921,20 @@ impl CoreDB {
 
     /// One node as the durable store holds it.
     fn base_node(&self, hash: u64) -> Option<NodeData> {
+        if let Some(ns) = &self.paged_nodes {
+            let n = ns.get(hash).ok().flatten()?;
+            return Some(NodeData {
+                slug: n.slug,
+                collection: n.collection,
+                spatial_meta: n.spatial.map(|v| Box::new(geo::SpatialMeta {
+                    centroid_lat: v[0], centroid_lon: v[1],
+                    bbox_min_lat: v[2], bbox_min_lon: v[3],
+                    bbox_max_lat: v[4], bbox_max_lon: v[5],
+                })),
+                payload_offset: n.payload_offset,
+                payload_len: n.payload_len,
+            });
+        }
         let base = self.segments.newest_first().next()?;
         let id = base.resolve(hash)?;
         let rec = base.node_record(id)?;
@@ -7784,11 +7954,18 @@ impl CoreDB {
     /// Whether the durable store holds this node — without reading its record,
     /// where the backend can answer that more cheaply.
     fn base_contains(&self, hash: u64) -> bool {
+        if let Some(ns) = &self.paged_nodes {
+            return ns.contains(hash).unwrap_or(false);
+        }
         self.segments.resolve(hash).is_some()
     }
 
     /// Where a node's payload is, according to the durable store.
     fn base_payload_loc(&self, hash: u64) -> Option<(u64, u32)> {
+        if let Some(ns) = &self.paged_nodes {
+            let n = ns.get(hash).ok().flatten()?;
+            return Some((n.payload_offset, n.payload_len));
+        }
         let base = self.segments.newest_first().next()?;
         let rec = base.node_record(base.resolve(hash)?)?;
         Some((rec.payload_offset, rec.payload_len))
@@ -7796,27 +7973,91 @@ impl CoreDB {
 
     /// How many nodes the durable store holds.
     fn base_node_count(&self) -> usize {
+        if let Some(ns) = &self.paged_nodes {
+            return ns.len() as usize;
+        }
         self.segments.newest_first().next().map_or(0, |b| b.node_count())
     }
 
     /// Whether there is a durable store at all. `false` means the overlay is the
     /// whole database, which is what resident mode is.
     fn has_base(&self) -> bool {
-        !self.segments.is_empty()
+        self.paged_nodes.is_some() || !self.segments.is_empty()
     }
 
     /// Every node hash the durable store holds.
     fn base_hashes(&self) -> Vec<u64> {
+        if let Some(ns) = &self.paged_nodes {
+            let mut out = Vec::with_capacity(ns.len() as usize);
+            let _ = ns.for_each_hash(|h| { out.push(h); true });
+            return out;
+        }
         self.segments.newest_first().next().map_or_else(Vec::new, |b| b.all_hashes())
     }
 
     /// The members of one collection, as the durable store has them.
     fn base_members(&self, coll_hash: u64) -> Option<Vec<u64>> {
+        if let Some(ns) = &self.paged_nodes {
+            let m = ns.members(coll_hash).ok()?;
+            return if m.is_empty() { None } else { Some(m) };
+        }
         self.segments.find(|b| b.members_by_coll_hash(coll_hash))
+    }
+
+    /// Every node in the durable store that has geometry, with its extent.
+    ///
+    /// Its own accessor rather than `base_hashes` + `base_node` because the two
+    /// backends answer it very differently: a segment keeps geometry in a 48-byte
+    /// side table it can scan without touching a node record, while the paged store
+    /// keeps it inside the record and has to read them. Going through the generic
+    /// pair would make the segment path read every slug and collection name in the
+    /// database to find the handful of rows that are places.
+    fn base_spatial_items(&self) -> Vec<(u64, geo::SpatialMeta)> {
+        let mut items = Vec::new();
+        if let Some(ns) = &self.paged_nodes {
+            // Through the geometry index, not a walk of every node: on a store with
+            // no geometry that reads nothing, where the walk read every record to
+            // discover exactly that — 183 ms per compaction on 200 000 rows.
+            for (h, v) in ns.spatial_items().unwrap_or_default() {
+                items.push((h, geo::SpatialMeta {
+                    centroid_lat: v[0], centroid_lon: v[1],
+                    bbox_min_lat: v[2], bbox_min_lon: v[3],
+                    bbox_max_lat: v[4], bbox_max_lon: v[5],
+                }));
+            }
+            return items;
+        }
+        let Some(base) = self.segments.newest_first().next() else { return items };
+        for id in 0..base.node_count() as u64 {
+            let (Some(v), Some(h)) = (base.spatial(id), base.hash_of(id)) else { continue };
+            items.push((h, geo::SpatialMeta {
+                centroid_lat: v[0], centroid_lon: v[1],
+                bbox_min_lat: v[2], bbox_min_lon: v[3],
+                bbox_max_lat: v[4], bbox_max_lon: v[5],
+            }));
+        }
+        items
     }
 
     /// Every collection name the durable store knows.
     fn base_collection_names(&self) -> Vec<String> {
+        if let Some(ns) = &self.paged_nodes {
+            // No dictionary to consult: the name is in each node's record, which is
+            // why it is stored there rather than as a hash needing a table. Walking
+            // for it is the price, and this is asked by SHOW TABLES, not by a read.
+            let mut names = std::collections::BTreeSet::new();
+            let mut err = false;
+            let _ = ns.for_each_hash(|h| {
+                match ns.get(h) {
+                    Ok(Some(n)) if !n.collection.is_empty() => { names.insert(n.collection); }
+                    Err(_) => { err = true; return false }
+                    _ => {}
+                }
+                true
+            });
+            let _ = err;
+            return names.into_iter().collect();
+        }
         self.segments.newest_first().next()
             .map_or_else(Vec::new, |b| b.collection_names().to_vec())
     }
@@ -7873,6 +8114,43 @@ impl CoreDB {
     /// Deletions are applied first. An edge removed and re-added in the same window
     /// has to end up present, and a node deleted after its edges were written has
     /// to end up with none.
+    /// Move every node written since the last fold into the durable paged store.
+    ///
+    /// The counterpart of `fold_edges_into_paged`, and the reason the four node
+    /// files stop being rewritten: what changed is written, and what did not is
+    /// left alone.
+    fn fold_nodes_into_paged(&mut self) -> io::Result<()> {
+        let Some(mut ns) = self.paged_nodes.take() else { return Ok(()) };
+        let result = (|| -> io::Result<()> {
+            // Deletions first: a node written and then deleted in the same window
+            // has to end up absent, not present.
+            for &h in &self.tombstones {
+                ns.delete(h)?;
+            }
+            for (&hash, n) in &self.nodes {
+                if self.tombstones.contains(&hash) { continue }
+                // The payload rewrite may already have moved this record; the
+                // overlay still holds where it used to be.
+                let (off, len) = self.compact_payload_moves.get(&hash).copied()
+                    .unwrap_or((n.payload_offset, n.payload_len));
+                ns.put(hash, &storage::nodestore::StoredNode {
+                    collection: n.collection.clone(),
+                    payload_offset: off,
+                    payload_len: len,
+                    spatial: n.spatial_meta.as_ref().map(|m| [
+                        m.centroid_lat, m.centroid_lon,
+                        m.bbox_min_lat, m.bbox_min_lon,
+                        m.bbox_max_lat, m.bbox_max_lon,
+                    ]),
+                    slug: n.slug.clone(),
+                })?;
+            }
+            ns.sync()
+        })();
+        self.paged_nodes = Some(ns);
+        result
+    }
+
     fn fold_edges_into_paged(&mut self) -> io::Result<()> {
         let Some(mut pa) = self.paged_adj.take() else { return Ok(()) };
         let result = self.fold_edges_into(&mut pa);
@@ -7957,6 +8235,18 @@ impl CoreDB {
     /// compaction go wrong on purpose.
     #[doc(hidden)]
     pub fn compaction_expectation(&self) -> (usize, usize) {
+        // Both counts without enumerating the store, when the store can answer
+        // them. `all_hashes` builds a set of every node in the database, which is
+        // 26 ms at 500 000 rows — paid by the rail on every compaction, to count
+        // rows that a paged store has been counting all along.
+        let pending = !self.unlinked_edges.is_empty()
+            || !self.tombstones.is_empty()
+            || !self.edge_tombstones.is_empty();
+        if !pending {
+            if let (Some(_), Some(pa)) = (&self.paged_nodes, &self.paged_adj) {
+                return (self.node_count(), pa.fwd.edge_count() as usize);
+            }
+        }
         let live = self.all_hashes();
         // Walking every node's edges to count them dominated compaction: 893 ms of
         // a 1478 ms rebuild at 200 000 nodes, so the check cost more than twice the
@@ -8443,27 +8733,16 @@ impl CoreDB {
         let mut items: Vec<(u64, geo::SpatialMeta)> = self.nodes.iter()
             .filter_map(|(&hash, node)| node.spatial_meta.clone().map(|m| (hash, *m)))
             .collect();
-        // Paged mode: base nodes live in the mmap, not in self.nodes — pull their
-        // spatial records from the side-table (48 B each; only geometry nodes).
-        if let Some(base) = self.segments.newest_first().next() {
-            for id in 0..base.node_count() as u64 {
-                if let Some(v) = base.spatial(id) {
-                    if let Some(h) = base.hash_of(id) {
-                        // Skip deleted base nodes, or the grid would keep matching
-                        // geometry for rows that are gone.
-                        if self.tombstones.contains(&h) {
-                            continue;
-                        }
-                        if !self.nodes.contains_key(&h) {
-                            items.push((h, geo::SpatialMeta {
-                                centroid_lat: v[0], centroid_lon: v[1],
-                                bbox_min_lat: v[2], bbox_min_lon: v[3],
-                                bbox_max_lat: v[4], bbox_max_lon: v[5],
-                            }));
-                        }
-                    }
-                }
-            }
+        // Nodes already written down are not in `self.nodes` — that map is the
+        // overlay. This used to reach into `segments` itself, which is how paged
+        // nodes ended up with an empty spatial index while every other read of them
+        // worked: the accessor exists so a backend is chosen once, and a call site
+        // that goes around it is a backend nobody chose.
+        for (h, m) in self.base_spatial_items() {
+            // Skip deleted rows, or the grid keeps matching geometry for rows that
+            // are gone, and rows the overlay holds a newer version of.
+            if self.tombstones.contains(&h) || self.nodes.contains_key(&h) { continue }
+            items.push((h, m));
         }
         items
     }
@@ -10320,7 +10599,7 @@ mod compaction_safety_tests {
         }
         db.compact().unwrap();
 
-        let (nodes, edges) = CoreDB::count_generation_on_disk(dir.path(), None).unwrap();
+        let (nodes, edges) = CoreDB::count_generation_on_disk(dir.path(), None, None).unwrap();
         assert_eq!(nodes, 50, "the check under-counts nodes and would wave loss through");
         assert_eq!(edges, 49, "the check under-counts edges and would wave loss through");
     }
@@ -10340,7 +10619,7 @@ mod compaction_safety_tests {
         db.compact().unwrap();
         drop(db);
 
-        let before = CoreDB::count_generation_on_disk(dir.path(), None).unwrap();
+        let before = CoreDB::count_generation_on_disk(dir.path(), None, None).unwrap();
         assert_eq!(before, (20, 19));
 
         // Park it, then destroy the live files the way a bad compaction would.
@@ -10360,13 +10639,13 @@ mod compaction_safety_tests {
             }
         }
         assert_ne!(
-            CoreDB::count_generation_on_disk(dir.path(), None).unwrap_or((0, 0)), before,
+            CoreDB::count_generation_on_disk(dir.path(), None, None).unwrap_or((0, 0)), before,
             "the damage was not even detectable, so the check proves nothing",
         );
 
         CoreDB::restore_previous_generation(&staged);
         assert_eq!(
-            CoreDB::count_generation_on_disk(dir.path(), None).unwrap(), before,
+            CoreDB::count_generation_on_disk(dir.path(), None, None).unwrap(), before,
             "restoring the parked generation did not bring the data back",
         );
 

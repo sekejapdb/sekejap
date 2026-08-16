@@ -9,7 +9,9 @@ fn main() {
     for (pay, adj) in [(false, false), (false, true), (true, false), (true, true)] {
         let dir = tempfile::TempDir::new().unwrap();
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), Config {
+                paged_topology: true, paged_adjacency: adj, paged_payloads: pay,
+                paged_nodes: adj, ..Config::default() }).unwrap();
             db.set_wal_sync(SyncMode::Off);
             db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
             for i in 0..n { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
@@ -18,10 +20,10 @@ fn main() {
         }
         let mut db = CoreDB::open_with_config(dir.path(), Config {
             paged_topology: true, paged_adjacency: adj, paged_payloads: pay,
-            ..Config::default() }).unwrap();
+            paged_nodes: adj, ..Config::default() }).unwrap();
         db.set_wal_sync(SyncMode::Off);
         for i in n..n + 200 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
-        eprintln!("\n  === {n} rows, paged payloads = {pay}, paged adjacency = {adj} ===");
+        eprintln!("\n  === {n} rows, paged payloads = {pay}, paged nodes+adjacency = {adj} ===");
         let t = std::time::Instant::now();
         db.compact().unwrap();
         eprintln!("    {:>8.1} ms  TOTAL", t.elapsed().as_secs_f64() * 1e3);

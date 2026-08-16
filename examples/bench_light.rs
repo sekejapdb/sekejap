@@ -69,6 +69,7 @@ fn open(dir: &std::path::Path, paged: bool) -> CoreDB {
         paged_topology: true,
         paged_adjacency: paged,
         paged_payloads: paged,
+        paged_nodes: paged,
         ..Config::default()
     }).unwrap()
 }

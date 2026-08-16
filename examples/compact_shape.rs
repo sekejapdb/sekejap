@@ -26,6 +26,7 @@ fn main() {
             let dir = tempfile::TempDir::new().unwrap();
             let cfg = Config {
                 paged_topology: true, paged_adjacency: paged, paged_payloads: paged,
+                paged_nodes: paged,
                 ..Config::default()
             };
             {

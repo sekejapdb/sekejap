@@ -22,11 +22,13 @@
 //! # The record
 //!
 //! ```text
-//!   0  collection_hash u64     which collection the node belongs to
-//!   8  payload_offset  u64     where its JSON lives (a byte offset, or a record id)
-//!  16  payload_len     u32
-//!  20  flags           u32     bit 0: a spatial extent follows
-//!  24  [6 x f64]               centroid lat/lon and bounding box, when flagged
+//!   0  payload_offset u64      where its JSON lives (a byte offset, or a record id)
+//!   8  payload_len    u32
+//!  12  flags          u32      bit 0: a spatial extent follows
+//!  16  collection_len u16
+//!  18  (padding)      u16
+//!  20  [6 x f64]               centroid lat/lon and bounding box, when flagged
+//!  ..  collection bytes
 //!  ..  slug bytes              to the end of the record
 //! ```
 //!
@@ -34,6 +36,13 @@
 //! extent is present only for nodes that have geometry — it is 48 bytes, and
 //! inline it would cost that on every node in the database whether or not it is a
 //! place.
+//!
+//! The collection is stored by **name**, not by the hash the membership index is
+//! keyed on. Storing the hash and recovering the name from somewhere else needs a
+//! durable name table, and the obvious shortcut — take the slug's prefix, since a
+//! slug is `collection/key` — is wrong for a collection whose name contains a
+//! slash: `has/slash` + `k` is the slug `has/slash/k`, whose prefix is `has`. It
+//! costs the length of the name per node and it is right for every name.
 //!
 //! Roughly 40 bytes for a typical node against the 48 the two files it replaces
 //! spend (32 in `nodes.bin`, 16 in `slugs.bin`), plus the index. See
@@ -55,7 +64,8 @@ use std::path::Path;
 /// A node as stored: everything about it except its edges and its payload bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StoredNode {
-    pub collection: u64,
+    /// The collection's name, empty for a node that belongs to none.
+    pub collection: String,
     pub payload_offset: u64,
     pub payload_len: u32,
     /// `[centroid_lat, centroid_lon, min_lat, min_lon, max_lat, max_lon]`.
@@ -63,23 +73,27 @@ pub(crate) struct StoredNode {
     pub slug: String,
 }
 
-const HEADER: usize = 24;
+const HEADER: usize = 20;
 const SPATIAL_BYTES: usize = 48;
 const FLAG_SPATIAL: u32 = 1;
 
+fn rd16(b: &[u8], at: usize) -> u16 { u16::from_le_bytes(b[at..at + 2].try_into().unwrap()) }
 fn rd32(b: &[u8], at: usize) -> u32 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) }
 fn rd64(b: &[u8], at: usize) -> u64 { u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) }
 
 fn encode(n: &StoredNode, out: &mut Vec<u8>) {
     out.clear();
-    out.reserve(HEADER + n.slug.len() + if n.spatial.is_some() { SPATIAL_BYTES } else { 0 });
-    out.extend_from_slice(&n.collection.to_le_bytes());
+    out.reserve(HEADER + n.collection.len() + n.slug.len()
+                + if n.spatial.is_some() { SPATIAL_BYTES } else { 0 });
     out.extend_from_slice(&n.payload_offset.to_le_bytes());
     out.extend_from_slice(&n.payload_len.to_le_bytes());
     out.extend_from_slice(&if n.spatial.is_some() { FLAG_SPATIAL } else { 0 }.to_le_bytes());
+    out.extend_from_slice(&(n.collection.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // padding, keeps the f64s 8-aligned
     if let Some(s) = &n.spatial {
         for v in s { out.extend_from_slice(&v.to_le_bytes()) }
     }
+    out.extend_from_slice(n.collection.as_bytes());
     out.extend_from_slice(n.slug.as_bytes());
 }
 
@@ -90,7 +104,8 @@ fn encode(n: &StoredNode, out: &mut Vec<u8>) {
 /// every length here is checked against what was actually returned.
 fn decode(b: &[u8]) -> Option<StoredNode> {
     if b.len() < HEADER { return None }
-    let flags = rd32(b, 20);
+    let flags = rd32(b, 12);
+    let coll_len = rd16(b, 16) as usize;
     let mut at = HEADER;
     let spatial = if flags & FLAG_SPATIAL != 0 {
         if b.len() < HEADER + SPATIAL_BYTES { return None }
@@ -103,14 +118,17 @@ fn decode(b: &[u8]) -> Option<StoredNode> {
     } else {
         None
     };
+    // The collection length comes off disk, so it is checked against what the
+    // record actually holds rather than trusted into a slice that runs past it.
+    let coll_end = at.checked_add(coll_len).filter(|&e| e <= b.len())?;
     Some(StoredNode {
-        collection: rd64(b, 0),
-        payload_offset: rd64(b, 8),
-        payload_len: rd32(b, 16),
+        collection: std::str::from_utf8(&b[at..coll_end]).ok()?.to_string(),
+        payload_offset: rd64(b, 0),
+        payload_len: rd32(b, 8),
         spatial,
-        // A slug that is not valid UTF-8 is damage, not a node. Losing the slug
-        // would make the node unaddressable, so the record is refused instead.
-        slug: std::str::from_utf8(&b[at..]).ok()?.to_string(),
+        // Text that is not valid UTF-8 is damage, not a node. Losing the slug would
+        // make the node unaddressable, so the record is refused instead.
+        slug: std::str::from_utf8(&b[coll_end..]).ok()?.to_string(),
     })
 }
 
@@ -124,19 +142,32 @@ pub(crate) struct NodeStore {
     /// `(collection hash, node hash) -> 1`. The value is unused; the key is the
     /// whole point, because a range over one collection's prefix is its membership.
     members: BTree,
+    /// The nodes that have geometry, and nothing else.
+    ///
+    /// Geometry is stored inside the node record, so finding every node that has
+    /// some means reading every record — 183 ms on a 200 000-node store that
+    /// contained no geometry whatsoever, paid on every compaction to discover
+    /// nothing. `spatial.bin` never had that problem because it is a side table of
+    /// only the rows that are places, and this is that side table's index.
+    geo: BTree,
     scratch: Vec<u8>,
 }
 
 impl NodeStore {
     pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self> {
-        let members_path = dir.join("nodesp_coll.idx");
-        let members = match BTree::open(&members_path)? {
-            Some(t) => t,
-            None => BTree::create(&members_path, page_size)?,
+        let mut tree = |name: &str| -> io::Result<BTree> {
+            let path = dir.join(name);
+            match BTree::open(&path)? {
+                Some(t) => Ok(t),
+                None => BTree::create(&path, page_size),
+            }
         };
+        let members = tree("nodesp_coll.idx")?;
+        let geo = tree("nodesp_geo.idx")?;
         Ok(Self {
             store: PagedStore::open_named(dir, "nodesp", page_size)?,
             members,
+            geo,
             scratch: Vec::new(),
         })
     }
@@ -146,7 +177,7 @@ impl NodeStore {
     /// Pages held by the node records, their index, and the membership index.
     pub(crate) fn page_counts(&self) -> (u64, u64, u64) {
         let (rec, idx) = self.store.page_counts();
-        (rec, idx, self.members.page_count())
+        (rec, idx, self.members.page_count() + self.geo.page_count())
     }
 
     pub(crate) fn get(&self, hash: u64) -> io::Result<Option<StoredNode>> {
@@ -170,13 +201,23 @@ impl NodeStore {
         let r = self.store.put(hash as u128, &scratch);
         self.scratch = scratch;
         r?;
+        // Geometry comes and goes with an update, so both directions matter: a node
+        // that gains an extent has to appear here, and one that loses it has to stop
+        // appearing or the grid keeps an extent for a row that no longer has one.
+        match (previous.as_ref().is_some_and(|p| p.spatial.is_some()), node.spatial.is_some()) {
+            (false, true) => { self.geo.insert(hash as u128, 1)?; }
+            (true, false) => { self.geo.remove(hash as u128)?; }
+            _ => {}
+        }
         match previous {
             Some(p) if p.collection == node.collection => {}
             Some(p) => {
-                self.members.remove(member_key(p.collection, hash))?;
-                self.members.insert(member_key(node.collection, hash), 1)?;
+                self.members.remove(member_key(crate::sk_hash(&p.collection), hash))?;
+                self.members.insert(member_key(crate::sk_hash(&node.collection), hash), 1)?;
             }
-            None => { self.members.insert(member_key(node.collection, hash), 1)?; }
+            None => {
+                self.members.insert(member_key(crate::sk_hash(&node.collection), hash), 1)?;
+            }
         }
         Ok(())
     }
@@ -184,7 +225,8 @@ impl NodeStore {
     pub(crate) fn delete(&mut self, hash: u64) -> io::Result<bool> {
         let Some(node) = self.get(hash)? else { return Ok(false) };
         self.store.delete(hash as u128)?;
-        self.members.remove(member_key(node.collection, hash))?;
+        self.members.remove(member_key(crate::sk_hash(&node.collection), hash))?;
+        if node.spatial.is_some() { self.geo.remove(hash as u128)?; }
         Ok(true)
     }
 
@@ -210,9 +252,25 @@ impl NodeStore {
         self.store.for_each_key(|k, _| f(k as u64))
     }
 
+    /// Every node that has geometry, with its extent.
+    ///
+    /// Reads only the records of nodes that are places, which on a store with no
+    /// geometry is none of them.
+    pub(crate) fn spatial_items(&self) -> io::Result<Vec<(u64, [f64; 6])>> {
+        let mut out = Vec::new();
+        for (key, _) in self.geo.iter_all()? {
+            let hash = key as u64;
+            if let Some(n) = self.get(hash)? {
+                if let Some(v) = n.spatial { out.push((hash, v)) }
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn sync(&mut self) -> io::Result<()> {
         self.store.sync()?;
-        self.members.sync()
+        self.members.sync()?;
+        self.geo.sync()
     }
 }
 
@@ -231,7 +289,7 @@ mod tests {
 
     fn node(i: u64, c: &str) -> StoredNode {
         StoredNode {
-            collection: coll(c),
+            collection: c.to_string(),
             payload_offset: i * 97,
             payload_len: (i % 500) as u32,
             spatial: None,
@@ -364,7 +422,7 @@ mod tests {
         for c in ["p", "q", "r"] {
             let got: HashSet<u64> = s.members(coll(c)).unwrap().into_iter().collect();
             let want: HashSet<u64> = oracle.iter()
-                .filter(|(_, n)| n.collection == coll(c))
+                .filter(|(_, n)| n.collection == c)
                 .map(|(h, _)| *h)
                 .collect();
             assert_eq!(got, want, "collection {c} membership disagreed");
@@ -403,14 +461,22 @@ mod tests {
         let mut full = Vec::new();
         encode(&geo_node(1, "p"), &mut full);
         assert!(decode(&full).is_some());
+        // Everything before the slug has a length that must be present in full:
+        // the header, then the geometry the flag promises, then the collection
+        // name. A record cut anywhere inside that is refused.
+        let complete = HEADER + SPATIAL_BYTES + geo_node(1, "p").collection.len();
         for cut in 0..full.len() {
             let got = decode(&full[..cut]);
-            if cut < HEADER + SPATIAL_BYTES {
+            if cut < complete {
                 assert!(got.is_none(), "a record cut to {cut} bytes decoded anyway");
             } else {
-                // Past the geometry only the slug is truncated, which is damage the
-                // decoder cannot detect — but it must still not read out of bounds.
-                assert!(got.is_some_and(|n| n.slug.len() <= 5), "cut {cut}");
+                // Past that, only the slug is short — damage the decoder cannot
+                // detect, but it must still not read out of bounds or lose the
+                // fields that did arrive.
+                let n = got.expect("a record cut to {cut} bytes was refused wrongly");
+                assert_eq!(n.collection, "p", "cut {cut} lost the collection");
+                assert_eq!(n.spatial, geo_node(1, "p").spatial, "cut {cut} lost the geometry");
+                assert!(full[..cut].ends_with(n.slug.as_bytes()), "cut {cut} invented a slug");
             }
         }
         // A slug that is not valid UTF-8 is damage, not a node.
