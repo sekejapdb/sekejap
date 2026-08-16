@@ -751,3 +751,93 @@ fn the_graph_surface_agrees_in_both_storage_modes() {
     assert_eq!(r, p, "SHOW EDGES differs between modes");
     assert!(r > 0, "SHOW EDGES found nothing even in resident mode");
 }
+
+/// Compaction must not destroy the graph.
+///
+/// Adjacency lives in two places the resident maps do not cover: the memory-mapped
+/// topology base, and the spilled CSR files that reads are served from while the
+/// RAM maps sit empty. Compaction rebuilt the topology from the RAM maps alone, so
+/// it wrote a graph with no edges and destroyed every one of them on disk —
+/// permanently, in both modes, and `dump_sql` lost them too. The node guard rail
+/// passed the whole time, because every node was still there.
+#[test]
+fn paged_compaction_preserves_base_edges() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        for i in 0..10 {
+            db.execute(&format!("INSERT INTO p (_key, n) VALUES ('n{i}', {i})")).unwrap();
+        }
+        for i in 0..9 {
+            db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next");
+        }
+        db.compact().unwrap();
+    }
+
+    let edges = |db: &CoreDB| db
+        .query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)")
+        .map(|s| s.collect().len()).unwrap_or(0);
+    let dumped = |db: &CoreDB| db.dump_sql().lines()
+        .filter(|l| l.starts_with("INSERT")).count();
+
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    assert_eq!(edges(&db), 9, "baseline");
+    assert_eq!(dumped(&db), 19, "baseline dump carries nodes and edges");
+
+    // Write, then compact — twice, because a service does this continuously.
+    for round in 0..2 {
+        let lo = 10 + round * 5;
+        for i in lo..lo + 5 {
+            db.execute(&format!("INSERT INTO p (_key, n) VALUES ('n{i}', {i})")).unwrap();
+        }
+        db.compact().unwrap();
+        assert_eq!(edges(&db), 9, "edges lost at compaction round {round}");
+    }
+    assert_eq!(dumped(&db), 29, "dump_sql lost edges");
+    db.compact().unwrap();
+    drop(db);
+
+    // And they must still be there for a fresh handle, in either mode.
+    assert_eq!(edges(&CoreDB::open_paged(dir.path()).unwrap()), 9, "lost across a paged reopen");
+    assert_eq!(edges(&CoreDB::open(dir.path()).unwrap()), 9, "lost across a resident reopen");
+}
+
+/// Writing a key again after deleting it must bring the row back.
+///
+/// A delete against the immutable base records a tombstone, and every base-aware
+/// lookup honours it. Nothing retired that tombstone when the key was written
+/// again, so the new row was logged and stored but invisible — `get` returned
+/// nothing, `contains` said false, the count was short — and then the next
+/// compaction cleared the tombstone and the row silently reappeared.
+#[test]
+fn rewriting_a_deleted_base_key_brings_it_back() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, v TEXT)").unwrap();
+        for i in 0..5 {
+            db.execute(&format!("INSERT INTO p (_key, v) VALUES ('n{i}', 'original')")).unwrap();
+        }
+        db.compact().unwrap();      // all five live in the base
+    }
+
+    let mut db = CoreDB::open_paged(dir.path()).unwrap();
+    db.remove("p/n2");
+    assert!(db.get("p/n2").is_none(), "the delete did not take effect");
+    assert_eq!(db.node_count(), 4);
+
+    db.execute("INSERT INTO p (_key, v) VALUES ('n2', 'rewritten')").unwrap();
+    let back = db.get("p/n2").expect("the rewritten row is invisible");
+    assert!(back.contains("rewritten"), "stale content: {back}");
+    assert!(db.contains("p/n2"), "contains() still says the row is absent");
+    assert_eq!(db.node_count(), 5, "node_count did not see the rewrite");
+    assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 5);
+
+    // And it must survive, rather than depend on a later compaction to appear.
+    db.compact().unwrap();
+    drop(db);
+    let db = CoreDB::open(dir.path()).unwrap();
+    assert!(db.get("p/n2").unwrap().contains("rewritten"), "lost across a reopen");
+    assert_eq!(db.node_count(), 5);
+}

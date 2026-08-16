@@ -363,6 +363,24 @@ impl EdgeStore {
         self.rev.entry(to_hash).or_default().push(edge_rev);
     }
 
+    /// Drop every edge and detach any spilled CSR files, keeping only the edge
+    /// type names.
+    ///
+    /// Used by compaction, which rebuilds the adjacency from a merged view of the
+    /// mmap base plus the overlay. Without this the spilled CSR would keep
+    /// shadowing the rebuilt maps and the resident edges would never be written.
+    pub fn reset_adjacency(&mut self) {
+        self.fwd.clear();
+        self.rev.clear();
+        self.columns.clear();
+        self.keyed.clear();
+        #[cfg(unix)]
+        {
+            self.fwd_disk = None;
+            self.rev_disk = None;
+        }
+    }
+
     /// Insert an edge carrying fast-lane columns and/or a JSON bag. One attribute
     /// slot is shared by both: primitives ride the columns, the rest the JSON.
     pub fn link_with_attrs(

@@ -112,7 +112,35 @@ impl DocIdx {
                 v.sort_unstable_by_key(|(k, _)| *k);
                 v
             }
-            DocIdx::Mapped { .. } => Vec::new(),
+            // Read the mapped array straight through. Returning an empty list here
+            // was catastrophic: merge_delta builds the surviving document set from
+            // this, so on a paged database it rebuilt the index out of the delta
+            // alone and silently discarded every document already in the base —
+            // BM25 dropped from nine matches to two at the first compaction and
+            // degraded further from there.
+            DocIdx::Mapped { view, off, count } => {
+                let Some(data) = view.slice(*off, count * 12) else { return Vec::new() };
+                (0..*count)
+                    .filter_map(|i| {
+                        let o = i * 12;
+                        let id = u64::from_le_bytes(data[o..o + 8].try_into().ok()?);
+                        let slot = u32::from_le_bytes(data[o + 8..o + 12].try_into().ok()?);
+                        Some((id, slot))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Drop a document from the mapped array by materialising it first.
+    ///
+    /// `remove` was a no-op for the mapped variant, so deleting a document from a
+    /// paged BM25 index did nothing at all.
+    pub fn materialize(&mut self) {
+        if let DocIdx::Mapped { .. } = self {
+            let owned: HashMap<u64, usize> =
+                self.sorted().into_iter().map(|(id, slot)| (id, slot as usize)).collect();
+            *self = DocIdx::Owned(owned);
         }
     }
 }
@@ -760,6 +788,11 @@ impl Bm25Index {
         // the base copy first), so try the delta as well.
         if self.delta.remove(doc_id) {
             return true;
+        }
+        // The liveness map is the only thing that excludes a document, and the
+        // mapped form cannot be edited — materialise it so the removal sticks.
+        if self.doc_id_to_idx.get(doc_id).is_some() {
+            self.doc_id_to_idx.materialize();
         }
         if let Some(idx) = self.doc_id_to_idx.get(doc_id) {
             let doc_len = self.doc_lengths.get(idx) as u64;
