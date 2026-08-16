@@ -17,6 +17,8 @@
 //! Everything here follows the same rule: bulk bytes live on disk; RAM holds
 //! only offsets and hot structures.
 
+#[allow(dead_code)]
+pub(crate) mod adjstore;
 // The paged trio is complete and tested but only the record half is wired into
 // `CoreDB` so far; the index half waits on the topology moving onto pages. The
 // allow comes off as each one gains its first caller.

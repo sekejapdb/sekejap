@@ -37,8 +37,19 @@ pub(crate) struct PagedStore {
 impl PagedStore {
     /// Open or create a store under `dir`, using `records.bin` and `index.bin`.
     pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self> {
-        let rec_path = dir.join("records.bin");
-        let idx_path = dir.join("index.bin");
+        Self::open_named(dir, "", page_size)
+    }
+
+    /// Open or create a store under `dir` whose files are `<name>.rec` and
+    /// `<name>.idx`, so several independent stores can share a directory.
+    pub(crate) fn open_named(dir: &Path, name: &str, page_size: usize) -> io::Result<Self> {
+        let (rec, idx) = if name.is_empty() {
+            ("records.bin".to_string(), "index.bin".to_string())
+        } else {
+            (format!("{name}.rec"), format!("{name}.idx"))
+        };
+        let rec_path = dir.join(rec);
+        let idx_path = dir.join(idx);
         let records = match RecordStore::open(&rec_path)? {
             Some(r) => r,
             None => RecordStore::create(&rec_path, page_size)?,
@@ -83,6 +94,17 @@ impl PagedStore {
         self.index.remove(key)?;
         self.records.delete(RecordId(id))?;
         Ok(true)
+    }
+
+    /// Every `(key, record id)` in key order, one index page at a time.
+    ///
+    /// Streams rather than collects: an index over a real store has too many
+    /// entries to hold, and holding them is the RAM-proportional-to-the-store that
+    /// Law 1 forbids. Passes ids rather than bytes so a scan that only needs keys
+    /// does not read the records, which are the bulk. `f` returning `false` stops
+    /// the walk.
+    pub(crate) fn for_each_key(&self, f: impl FnMut(u128, u64) -> bool) -> io::Result<()> {
+        self.index.for_each(f)
     }
 
     pub(crate) fn sync(&mut self) -> io::Result<()> {

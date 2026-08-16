@@ -341,22 +341,43 @@ impl BTree {
         Ok(out)
     }
 
-    /// Every entry in key order, by walking the linked leaves.
-    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>> {
+    /// Every entry in key order, one leaf page at a time.
+    ///
+    /// This is the form a full scan should take. Collecting the tree into a `Vec`
+    /// first costs 24 bytes per entry with nothing bounding it — 1.2 GB on a
+    /// 48-million-entry index — which is exactly the "RAM proportional to the
+    /// store" that Law 1 forbids. Here the resident cost is one page, whatever the
+    /// index holds.
+    ///
+    /// `f` returning `false` stops the walk, so a search does not have to read
+    /// what it no longer needs.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(u128, u64) -> bool) -> io::Result<()> {
         let mut page = self.root;
         loop {
             let buf = self.read_page(page)?;
             if kind(&buf) == KIND_LEAF { break }
             page = child0(&buf);
         }
-        let mut out = Vec::with_capacity(self.len as usize);
         while page != 0 {
             let buf = self.read_page(page)?;
             for i in 0..count(&buf) {
-                out.push((leaf_key(&buf, i), leaf_val(&buf, i)));
+                if !f(leaf_key(&buf, i), leaf_val(&buf, i)) { return Ok(()) }
             }
             page = next_leaf(&buf);
         }
+        Ok(())
+    }
+
+    /// Every entry in key order, materialised.
+    ///
+    /// Convenience for tests and for indexes small enough that holding them is not
+    /// a question. Anything that scans a real store should use [`for_each`], which
+    /// is bounded by one page rather than by the number of entries.
+    ///
+    /// [`for_each`]: Self::for_each
+    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>> {
+        let mut out = Vec::with_capacity(self.len as usize);
+        self.for_each(|k, v| { out.push((k, v)); true })?;
         Ok(out)
     }
 }
