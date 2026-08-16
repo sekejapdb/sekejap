@@ -1047,7 +1047,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    188    pub fn len(&self) -> usize
 ```
 
-### `mod.rs` · 28L — Storage — the on-disk building blocks
+### `mod.rs` · 29L — Storage — the on-disk building blocks
 
 ```
 (no top-level items)
@@ -1081,6 +1081,20 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    350  pub fn get_field(rec: &[u8], name: &str, ft: &FieldTable) -> Option<Value>
    369  fn skip_value(b: &[u8], p: &mut usize) -> Option<()>
    412  mod tests
+```
+
+### `slotmap.rs` · 200L — Why this file exists
+
+```
+    58  pub(crate) fn pack(segment: u16, local_id: u64) -> u64
+    66  pub(crate) fn unpack(entry: u64) -> Option<(u16, u64)>
+    74  pub(crate) fn write(entries: &[u64]) -> Vec<u8>
+    87  pub(crate) struct MappedSlots
+    93  impl MappedSlots
+    94    pub(crate) fn open(path: &std::path::Path) -> std::io::Result<Option<Self>>
+   121    pub(crate) fn len(&self) -> usize
+   127    pub(crate) fn locate(&self, slot: u64) -> Option<(u16, u64)>
+   138  mod tests
 ```
 
 ### `spatialstore.rs` · 122L — Spatial index — finding things by location, on disk
@@ -1413,4 +1427,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 42 files, 1176 items -->
+<!-- 43 files, 1185 items -->
