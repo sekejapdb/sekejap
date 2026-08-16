@@ -324,7 +324,18 @@ fn serialize_csr(magic: &[u8; 8], rows: &[(u64, u64, u32, u32)], n: usize) -> Ve
 
 /// Build the five topology files from an in-memory graph. Dense ids are assigned in
 /// `nodes` order (0..n). Edges whose endpoints aren't in `nodes` are skipped.
-pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
+/// Build the topology files, handing each to `sink` as soon as it is finished and
+/// releasing it immediately.
+///
+/// The nine buffers used to be built up and returned together, so peak memory was
+/// their *sum* — around 160 MB on a million-node graph — even though the caller
+/// wrote them one at a time and never needed more than one at once. Emitting them
+/// as they complete makes the peak the largest single file instead.
+pub fn build_into(
+    nodes: &[TopoNode<'_>],
+    edges: &[TopoEdge<'_>],
+    mut sink: impl FnMut(&str, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let n = nodes.len();
 
     // hash → dense id
@@ -372,6 +383,10 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
         nodes_buf.extend_from_slice(&[0u8, 0u8]); // pad → 32
     }
     spat_buf[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&spat_count.to_le_bytes());
+    sink("nodes.bin", &nodes_buf)?;
+    drop(nodes_buf);
+    sink("spatial.bin", &spat_buf)?;
+    drop(spat_buf);
 
     // Adjacency (fwd by from, rev by to), neighbors sorted. Edge metadata is
     // interned into edgemeta.bin; both directions share one meta_ref.
@@ -421,8 +436,18 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
         emeta_buf.extend_from_slice(b.as_bytes());
     }
 
+    sink("edgemeta.bin", &emeta_buf)?;
+    drop(emeta_buf);
+    drop(meta_blobs);
+
     let fwd_buf = serialize_csr(&MAGIC_ADJF, &fwd, n);
+    drop(fwd);
+    sink("adj_fwd.bin", &fwd_buf)?;
+    drop(fwd_buf);
     let rev_buf = serialize_csr(&MAGIC_ADJR, &rev, n);
+    drop(rev);
+    sink("adj_rev.bin", &rev_buf)?;
+    drop(rev_buf);
 
     // idx.bin — sorted (hash, dense_id)
     let mut entries: Vec<(u64, u64)> =
@@ -438,6 +463,9 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
 
     // slugs.bin — dense_id → slug string (reverse of idx.bin).
     // Layout: header, count, offsets[(n+1)] into the blob, then the UTF-8 blob.
+    sink("idx.bin", &idx_buf)?;
+    drop(idx_buf);
+
     let mut slugs_buf = Vec::new();
     write_header(&mut slugs_buf, &MAGIC_SLUG, 0);
     slugs_buf.extend_from_slice(&(n as u64).to_le_bytes());
@@ -481,6 +509,9 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
             block
         })
         .collect();
+    sink("slugs.bin", &slugs_buf)?;
+    drop(slugs_buf);
+
     let mut colls_buf = Vec::new();
     write_header(&mut colls_buf, &MAGIC_COLL, 0);
     let ncolls = coll_blocks.len();
@@ -496,22 +527,45 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
     }
 
     // dict.bin — collections then edge types
+    sink("collections.bin", &colls_buf)?;
+    drop(colls_buf);
+
     let mut dict_buf = Vec::new();
     write_header(&mut dict_buf, &MAGIC_DICT, 0);
     write_string_table(&mut dict_buf, &colls.list);
     write_string_table(&mut dict_buf, &types.list);
 
-    TopologyBlob {
-        nodes: nodes_buf,
-        fwd: fwd_buf,
-        rev: rev_buf,
-        idx: idx_buf,
-        slugs: slugs_buf,
-        dict: dict_buf,
-        spat: spat_buf,
-        emeta: emeta_buf,
-        colls: colls_buf,
-    }
+    sink("dict.bin", &dict_buf)?;
+    Ok(())
+}
+
+/// Collect every file into one `TopologyBlob`. Convenience for tests and any
+/// caller that genuinely wants them all at once; production writes them straight
+/// out through [`build_into`].
+pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
+    let mut b = TopologyBlob {
+        nodes: Vec::new(), fwd: Vec::new(), rev: Vec::new(), idx: Vec::new(),
+        slugs: Vec::new(), dict: Vec::new(), spat: Vec::new(), emeta: Vec::new(),
+        colls: Vec::new(),
+    };
+    build_into(nodes, edges, |name, bytes| {
+        let slot = match name {
+            "nodes.bin" => &mut b.nodes,
+            "adj_fwd.bin" => &mut b.fwd,
+            "adj_rev.bin" => &mut b.rev,
+            "idx.bin" => &mut b.idx,
+            "slugs.bin" => &mut b.slugs,
+            "dict.bin" => &mut b.dict,
+            "spatial.bin" => &mut b.spat,
+            "edgemeta.bin" => &mut b.emeta,
+            "collections.bin" => &mut b.colls,
+            other => unreachable!("unknown topology file {other}"),
+        };
+        *slot = bytes.to_vec();
+        Ok(())
+    })
+    .expect("in-memory sink cannot fail");
+    b
 }
 
 fn write_string_table(out: &mut Vec<u8>, list: &[String]) {
