@@ -96,7 +96,17 @@ pub(crate) struct RecordStore {
 fn rd16(p: &[u8], at: usize) -> u16 { u16::from_le_bytes([p[at], p[at + 1]]) }
 fn wr16(p: &mut [u8], at: usize, v: u16) { p[at..at + 2].copy_from_slice(&v.to_le_bytes()); }
 
-fn slot_count(p: &[u8]) -> usize { rd16(p, 0) as usize }
+/// How many slots this page claims, capped at how many it could physically hold.
+///
+/// The count comes off disk, so it can be anything — a page that was freed holds a
+/// free-list pointer in these bytes, and a file in some other format holds whatever
+/// it holds. Uncapped, a claim of 19 283 slots sent `slot_entry` reading 51 962
+/// bytes into a 4 096-byte page. Capping it means a nonsense page reads as empty or
+/// as garbage records, never as a panic and never past the end of the buffer.
+fn slot_count(p: &[u8]) -> usize {
+    let max = (p.len().saturating_sub(PAGE_HEADER)) / SLOT_SIZE;
+    (rd16(p, 0) as usize).min(max)
+}
 fn live_count(p: &[u8]) -> usize { rd16(p, 2) as usize }
 fn heap_start(p: &[u8]) -> usize { rd16(p, 4) as usize }
 
@@ -139,6 +149,11 @@ impl RecordStore {
     pub(crate) fn page_count(&self) -> u64 { self.pages.page_count() }
     pub(crate) fn free_page_count(&self) -> u64 { self.pages.free_count() }
     pub(crate) fn sync(&mut self) -> io::Result<()> { self.pages.sync() }
+
+    /// Two words in the page header that this store does not use, for whoever owns
+    /// it to keep a tally in. Written when the header is, which is on `sync`.
+    pub(crate) fn user_meta(&self) -> (u64, u64) { self.pages.user_meta() }
+    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64) { self.pages.set_user_meta(a, b) }
 
     /// Largest record that fits in a page, allowing for the header and its slot.
     pub(crate) fn max_record_len(&self) -> usize {
@@ -525,5 +540,49 @@ mod tests {
         assert_eq!(s.page_count(), high_water,
                    "the file grew instead of reusing the freed chain");
         assert_eq!(s.read(id2).unwrap().map(|v| v.len()), Some(payload.len()));
+    }
+
+    /// A page that is not a slotted page must read as empty, not as a panic.
+    ///
+    /// Pages come off disk. A freed one holds a free-list pointer in the bytes the
+    /// header occupies, and a file in another format holds whatever it holds — so
+    /// the slot count is not a number this code may trust. Uncapped, a page
+    /// claiming 19 283 slots sent a read 51 962 bytes into a 4 096-byte buffer.
+    #[test]
+    fn a_page_that_is_not_a_slotted_page_reads_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rec.bin");
+        let mut s = RecordStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+        let good = s.insert(b"a real record").unwrap();
+
+        // Slots far past what a page can hold, on the live page and on pages that
+        // do not exist. None may panic and none may read past the end of a buffer.
+        // Slot 0 of the live page is left alone: deleting it would succeed, which
+        // is correct behaviour and not what is under test.
+        for page in [good.page(), good.page() + 1, u64::MAX >> 16] {
+            for slot in [1u16, 1_021, 1_022, 4_000, 19_282, u16::MAX - 1] {
+                assert!(s.read(RecordId::new(page, slot)).unwrap().is_none(),
+                        "page {page} slot {slot} produced a record out of nothing");
+                assert!(!s.delete(RecordId::new(page, slot)).unwrap(),
+                        "page {page} slot {slot} reported deleting something");
+            }
+        }
+        // The real record is still there and still right.
+        assert_eq!(s.read(good).unwrap().as_deref(), Some(b"a real record".as_slice()));
+
+        // And the same against a page holding a free-list pointer rather than a
+        // slotted header, which is what a freed page actually looks like. Its own
+        // store, and one record big enough to have the page to itself, so deleting
+        // it really does return the page to the free list.
+        let solo_path = dir.path().join("solo.bin");
+        let mut solo = RecordStore::create(&solo_path, DEFAULT_PAGE_SIZE).unwrap();
+        let filler = vec![b'z'; solo.max_record_len()];
+        let victim = solo.insert(&filler).unwrap();
+        assert!(solo.delete(victim).unwrap());
+        assert!(solo.free_page_count() > 0, "the page did not reach the free list");
+        for slot in [0u16, 1, 1_022, 19_282] {
+            assert!(solo.read(RecordId::new(victim.page(), slot)).unwrap().is_none(),
+                    "a freed page produced a record at slot {slot}");
+        }
     }
 }
