@@ -2416,8 +2416,7 @@ impl CoreDB {
         // Paged mode: a node that lives in the immutable base cannot be removed
         // in place, so record a tombstone that every base-aware lookup honours
         // until the next compact() folds it away for real.
-        if !self.nodes.contains_key(&hash)
-            && self.segments.resolve(hash).is_some()
+        if !self.nodes.contains_key(&hash) && self.base_contains(hash)
         {
             // Read the row before tombstoning it: every base-aware accessor honours
             // tombstones, so afterwards its own payload is unreachable and the
@@ -5581,9 +5580,7 @@ impl CoreDB {
         if let Some(n) = self.nodes.get(&hash) {
             return Some((n.payload_offset, n.payload_len));
         }
-        let base = self.segments.newest_first().next()?;
-        let rec = base.node_record(base.resolve(hash)?)?;
-        Some((rec.payload_offset, rec.payload_len))
+        self.base_payload_loc(hash)
     }
 
     /// Take a cheap, point-in-time **snapshot** for lock-free reads — the
@@ -5940,8 +5937,7 @@ impl CoreDB {
         if !self.tombstones.is_empty() && self.tombstones.contains(&h) {
             return false;
         }
-        self.nodes.contains_key(&h)
-            || self.segments.resolve(h).is_some()
+        self.nodes.contains_key(&h) || self.base_contains(h)
     }
 
     /// Total number of nodes.
@@ -5998,18 +5994,14 @@ impl CoreDB {
     }
 
     pub fn node_count(&self) -> usize {
-        let Some(base) = self.segments.newest_first().next() else {
+        if !self.has_base() {
             return self.nodes.len(); // resident: the map IS the store
-        };
-        // Paged: base + overlay-only nodes - tombstones. An overlay entry that also
-        // exists in the base is an update, not an addition, so it must not be
+        }
+        // Base + overlay-only nodes - tombstones. An overlay entry that also exists
+        // in the durable store is an update, not an addition, so it must not be
         // double-counted.
-        let overlay_new = self
-            .nodes
-            .keys()
-            .filter(|h| base.resolve(**h).is_none())
-            .count();
-        (base.node_count() + overlay_new).saturating_sub(self.tombstones.len())
+        let overlay_new = self.nodes.keys().filter(|h| !self.base_contains(**h)).count();
+        (self.base_node_count() + overlay_new).saturating_sub(self.tombstones.len())
     }
 
     /// Every node's slug (resident overlay ∪ mmap base). Order is unspecified.
@@ -6043,11 +6035,9 @@ impl CoreDB {
         }
         // Paged: collections whose members all live in the mmap'd base are absent
         // from the overlay entirely, so they must be read from the base too.
-        if let Some(base) = self.segments.newest_first().next() {
-            for name in base.collection_names() {
-                if !name.is_empty() {
-                    names.insert(name.clone());
-                }
+        for name in self.base_collection_names() {
+            if !name.is_empty() {
+                names.insert(name);
             }
         }
         names.into_iter().collect()
@@ -7756,15 +7746,31 @@ impl CoreDB {
         if let Some(n) = self.nodes.get(&hash) {
             return Some(std::borrow::Cow::Borrowed(n));
         }
+        self.base_node(hash).map(std::borrow::Cow::Owned)
+    }
+
+    // ── the durable node store ────────────────────────────────────────────────
+    //
+    // Below this line is every question the engine asks of the nodes it has
+    // already written down, as opposed to the ones in the RAM overlay. There is
+    // one implementation of each, so a storage backend is chosen in one place
+    // rather than in the ten call sites that used to reach into `segments`
+    // themselves. That is not tidiness: "which of these consults the base?" is
+    // precisely the question this codebase has answered wrongly a dozen times, and
+    // a call site that cannot get it wrong is worth more than a careful one.
+    //
+    // Each returns what the durable store holds, ignoring the overlay and
+    // ignoring tombstones — the callers layer those on, because which of them
+    // apply differs by question.
+
+    /// One node as the durable store holds it.
+    fn base_node(&self, hash: u64) -> Option<NodeData> {
         let base = self.segments.newest_first().next()?;
         let id = base.resolve(hash)?;
         let rec = base.node_record(id)?;
-        Some(std::borrow::Cow::Owned(NodeData {
+        Some(NodeData {
             slug: base.slug_of(id)?.to_string(),
-            collection: base
-                .collection_name(rec.collection_id)
-                .unwrap_or("")
-                .to_string(),
+            collection: base.collection_name(rec.collection_id).unwrap_or("").to_string(),
             spatial_meta: base.spatial(id).map(|v| Box::new(geo::SpatialMeta {
                 centroid_lat: v[0], centroid_lon: v[1],
                 bbox_min_lat: v[2], bbox_min_lon: v[3],
@@ -7772,7 +7778,47 @@ impl CoreDB {
             })),
             payload_offset: rec.payload_offset,
             payload_len: rec.payload_len,
-        }))
+        })
+    }
+
+    /// Whether the durable store holds this node — without reading its record,
+    /// where the backend can answer that more cheaply.
+    fn base_contains(&self, hash: u64) -> bool {
+        self.segments.resolve(hash).is_some()
+    }
+
+    /// Where a node's payload is, according to the durable store.
+    fn base_payload_loc(&self, hash: u64) -> Option<(u64, u32)> {
+        let base = self.segments.newest_first().next()?;
+        let rec = base.node_record(base.resolve(hash)?)?;
+        Some((rec.payload_offset, rec.payload_len))
+    }
+
+    /// How many nodes the durable store holds.
+    fn base_node_count(&self) -> usize {
+        self.segments.newest_first().next().map_or(0, |b| b.node_count())
+    }
+
+    /// Whether there is a durable store at all. `false` means the overlay is the
+    /// whole database, which is what resident mode is.
+    fn has_base(&self) -> bool {
+        !self.segments.is_empty()
+    }
+
+    /// Every node hash the durable store holds.
+    fn base_hashes(&self) -> Vec<u64> {
+        self.segments.newest_first().next().map_or_else(Vec::new, |b| b.all_hashes())
+    }
+
+    /// The members of one collection, as the durable store has them.
+    fn base_members(&self, coll_hash: u64) -> Option<Vec<u64>> {
+        self.segments.find(|b| b.members_by_coll_hash(coll_hash))
+    }
+
+    /// Every collection name the durable store knows.
+    fn base_collection_names(&self) -> Vec<String> {
+        self.segments.newest_first().next()
+            .map_or_else(Vec::new, |b| b.collection_names().to_vec())
     }
 
     pub(crate) fn collection_name(&self, coll_hash: u64) -> Option<&str> {
@@ -7946,20 +7992,18 @@ impl CoreDB {
     }
 
     pub(crate) fn all_hashes(&self) -> Vec<u64> {
-        match self.segments.newest_first().next() {
-            None => self.nodes.keys().copied().collect(),
-            Some(base) => {
-                // Base ∪ overlay (the overlay may hold updates of base nodes —
-                // dedup keeps each hash once).
-                let mut set: HashSet<u64> = base.all_hashes().into_iter().collect();
-                set.extend(self.nodes.keys().copied());
-                // Deleted base nodes must not reappear in a full enumeration.
-                for t in &self.tombstones {
-                    set.remove(t);
-                }
-                set.into_iter().collect()
-            }
+        if !self.has_base() {
+            return self.nodes.keys().copied().collect();
         }
+        // Base ∪ overlay (the overlay may hold updates of base nodes — dedup keeps
+        // each hash once).
+        let mut set: HashSet<u64> = self.base_hashes().into_iter().collect();
+        set.extend(self.nodes.keys().copied());
+        // Deleted base nodes must not reappear in a full enumeration.
+        for t in &self.tombstones {
+            set.remove(t);
+        }
+        set.into_iter().collect()
     }
 
     pub(crate) fn fwd_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>> {
@@ -8189,7 +8233,7 @@ impl CoreDB {
         // tombstoned member has to be filtered out of every scan.
         if !self.tombstones.is_empty() {
             let mut merged: Vec<u64> = Vec::new();
-            if let Some(b) = self.segments.find(|b| b.members_by_coll_hash(hash)) {
+            if let Some(b) = self.base_members(hash) {
                 merged.extend(b);
             }
             if let Some(o) = self.collections.get(&hash) {
@@ -8203,7 +8247,7 @@ impl CoreDB {
             return Some(std::borrow::Cow::Owned(merged));
         }
         let overlay = self.collections.get(&hash);
-        let base = self.segments.find(|b| b.members_by_coll_hash(hash));
+        let base = self.base_members(hash);
         match (overlay, base) {
             (Some(o), None) => Some(std::borrow::Cow::Borrowed(o.as_slice())),
             (overlay, Some(mut b)) => {
