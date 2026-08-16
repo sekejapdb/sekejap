@@ -1131,7 +1131,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    252  mod tests
 ```
 
-### `recordstore.rs` · 492L — Why
+### `recordstore.rs` · 529L — Why
 
 ```
     69  pub(crate) struct RecordId(pub u64)
@@ -1155,10 +1155,10 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    140    pub(crate) fn free_page_count(&self) -> u64 { self.pages.free_count() }
    141    pub(crate) fn sync(&mut self) -> io::Result<()> { self.pages.sync() }
    144    pub(crate) fn max_record_len(&self) -> usize
-   247    pub(crate) fn insert(&mut self, bytes: &[u8]) -> io::Result<RecordId>
-   291    pub(crate) fn read(&self, id: RecordId) -> io::Result<Option<Vec<u8>>>
-   315    pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool>
-   349  mod tests
+   276    pub(crate) fn insert(&mut self, bytes: &[u8]) -> io::Result<RecordId>
+   328    pub(crate) fn read(&self, id: RecordId) -> io::Result<Option<Vec<u8>>>
+   352    pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool>
+   386  mod tests
 ```
 
 ### `skbin.rs` · 610L — SKBIN — a compact binary format for record payloads
