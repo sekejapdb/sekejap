@@ -80,7 +80,12 @@ pub struct TopoNode<'a> {
     /// Spatial metadata, if the node has geometry: 6 f64s =
     /// [centroid_lat, centroid_lon, bbox_min_lat, bbox_min_lon, bbox_max_lat, bbox_max_lon].
     /// Stored in the `spatial.bin` side-table; `NodeRecord.spatial_ref` points at it.
-    pub spatial: Option<[f64; 6]>,
+    ///
+    /// Boxed because it is almost always `None`: inline, the six f64s cost 56 bytes
+    /// on every node in the graph whether it has geometry or not — tens of megabytes
+    /// of zeroes on a large store. Boxed it is 8 bytes for a node without geometry
+    /// and one allocation for a node with it.
+    pub spatial: Option<Box<[f64; 6]>>,
 }
 
 pub struct TopoEdge<'a> {
@@ -275,10 +280,27 @@ fn encode_block(sorted: &[(u64, u32, u32)]) -> Vec<u8> {
     out
 }
 
-fn serialize_csr(magic: &[u8; 8], per_node: &[Vec<(u64, u32, u32)>]) -> Vec<u8> {
-    let n = per_node.len();
-    // Encode each block, remembering its length.
-    let blocks: Vec<Vec<u8>> = per_node.iter().map(|e| encode_block(e)).collect();
+/// `rows` must be sorted by `(owner_id, neighbour_id)` — CSR order.
+///
+/// Encodes into one shared blob rather than a `Vec<u8>` per node: the previous
+/// version allocated a vector for every node in the graph, twice over, purely to
+/// concatenate them a moment later.
+fn serialize_csr(magic: &[u8; 8], rows: &[(u64, u64, u32, u32)], n: usize) -> Vec<u8> {
+    let mut blob: Vec<u8> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(n);
+    let mut scratch: Vec<(u64, u32, u32)> = Vec::new();
+    let mut cur = 0usize;
+    for owner in 0..n as u64 {
+        scratch.clear();
+        while cur < rows.len() && rows[cur].0 == owner {
+            let (_, nid, t, m) = rows[cur];
+            scratch.push((nid, t, m));
+            cur += 1;
+        }
+        let start = blob.len();
+        blob.extend_from_slice(&encode_block(&scratch));
+        spans.push((start, blob.len() - start));
+    }
 
     // header(16) + count(8) + block_region_start(8) + offsets((n+1)*8) + blocks
     let offsets_start = HEADER_LEN + 8 + 8;
@@ -291,15 +313,12 @@ fn serialize_csr(magic: &[u8; 8], per_node: &[Vec<(u64, u32, u32)>]) -> Vec<u8> 
 
     // Offsets = absolute byte offset of each block; offsets[n] = end.
     let mut cursor = block_region_start as u64;
-    for b in &blocks {
+    for &(_, len) in &spans {
         out.extend_from_slice(&cursor.to_le_bytes());
-        cursor += b.len() as u64;
+        cursor += len as u64;
     }
     out.extend_from_slice(&cursor.to_le_bytes()); // sentinel end
-
-    for b in &blocks {
-        out.extend_from_slice(b);
-    }
+    out.extend_from_slice(&blob);
     out
 }
 
@@ -336,7 +355,7 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
         let spatial_ref = match &node.spatial {
             Some(vals) => {
                 let r = spat_count as u32;
-                for v in vals {
+                for v in vals.iter() {
                     spat_buf.extend_from_slice(&v.to_le_bytes());
                 }
                 spat_count += 1;
@@ -356,8 +375,13 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
 
     // Adjacency (fwd by from, rev by to), neighbors sorted. Edge metadata is
     // interned into edgemeta.bin; both directions share one meta_ref.
-    let mut fwd: Vec<Vec<(u64, u32, u32)>> = vec![Vec::new(); n];
-    let mut rev: Vec<Vec<(u64, u32, u32)>> = vec![Vec::new(); n];
+    // Flat `(owner_id, neighbour_id, type, meta)` rows, one allocation per
+    // direction, sorted once at the end. This used to be `vec![Vec::new(); n]`
+    // twice — two million vector headers plus a small allocation every time an
+    // edge was pushed, which on a million-node graph is where both the time and
+    // the fragmentation came from.
+    let mut fwd: Vec<(u64, u64, u32, u32)> = Vec::with_capacity(edges.len());
+    let mut rev: Vec<(u64, u64, u32, u32)> = Vec::with_capacity(edges.len());
     let mut meta_blobs: Vec<&str> = Vec::new();
     for e in edges {
         let (Some(&fid), Some(&tid)) =
@@ -374,12 +398,13 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
             }
             None => NO_ID,
         };
-        fwd[fid as usize].push((tid, type_id, meta_ref));
-        rev[tid as usize].push((fid, type_id, meta_ref));
+        fwd.push((fid, tid, type_id, meta_ref));
+        rev.push((tid, fid, type_id, meta_ref));
     }
-    for v in fwd.iter_mut().chain(rev.iter_mut()) {
-        v.sort_by_key(|&(nid, _, _)| nid);
-    }
+    // Sorted by owner then neighbour, which is exactly CSR order — so the blocks
+    // can be walked straight out of these without regrouping.
+    fwd.sort_unstable_by_key(|&(owner, nid, _, _)| (owner, nid));
+    rev.sort_unstable_by_key(|&(owner, nid, _, _)| (owner, nid));
 
     // edgemeta.bin — sparse blobs: header, count, offsets[(m+1)], JSON bytes.
     let mut emeta_buf = Vec::new();
@@ -396,8 +421,8 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
         emeta_buf.extend_from_slice(b.as_bytes());
     }
 
-    let fwd_buf = serialize_csr(&MAGIC_ADJF, &fwd);
-    let rev_buf = serialize_csr(&MAGIC_ADJR, &rev);
+    let fwd_buf = serialize_csr(&MAGIC_ADJF, &fwd, n);
+    let rev_buf = serialize_csr(&MAGIC_ADJR, &rev, n);
 
     // idx.bin — sorted (hash, dense_id)
     let mut entries: Vec<(u64, u64)> =

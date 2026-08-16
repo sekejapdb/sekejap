@@ -4318,11 +4318,11 @@ impl CoreDB {
                 collection: n.collection.as_str(),
                 payload_offset: n.payload_offset,
                 payload_len: n.payload_len,
-                spatial: n.spatial_meta.as_ref().map(|m| [
+                spatial: n.spatial_meta.as_ref().map(|m| Box::new([
                     m.centroid_lat, m.centroid_lon,
                     m.bbox_min_lat, m.bbox_min_lon,
                     m.bbox_max_lat, m.bbox_max_lon,
-                ]),
+                ])),
             });
         }
         if let Some(b) = base.as_deref() {
@@ -4342,19 +4342,23 @@ impl CoreDB {
                     collection: b.collection_name(rec.collection_id).unwrap_or(""),
                     payload_offset: off,
                     payload_len: len,
-                    spatial: b.spatial(id),
+                    spatial: b.spatial(id).map(Box::new),
                 });
             }
         }
         topo_nodes.sort_by_key(|n| n.hash);
 
         // Edges — forward adjacency over the same merged node set; skip dangling.
-        let live: HashSet<u64> = topo_nodes.iter().map(|n| n.hash).collect();
+        // `topo_nodes` is already sorted by hash, so it doubles as the liveness set
+        // via binary search. A HashSet of every live hash cost tens of megabytes on
+        // a large store for information already sitting in the vector.
+        let live = |h: u64| topo_nodes.binary_search_by_key(&h, |n| n.hash).is_ok();
         let mut topo_edges: Vec<TopoEdge> = Vec::new();
-        for &from_h in &live {
+        for i in 0..topo_nodes.len() {
+            let from_h = topo_nodes[i].hash;
             let Some(edge_list) = self.fwd_edges(from_h) else { continue };
             for e in edge_list.iter() {
-                if !live.contains(&e.other) {
+                if !live(e.other) {
                     continue;
                 }
                 let edge_type = self
