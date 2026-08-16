@@ -484,7 +484,7 @@ mod tests {
             ids = (0..300).map(|i| s.insert(&rec(i)).unwrap()).collect();
             s.sync().unwrap();
         }
-        let mut s = RecordStore::open(&path).unwrap().expect("store should reopen");
+        let s = RecordStore::open(&path).unwrap().expect("store should reopen");
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(s.read(*id).unwrap().as_deref(), Some(rec(i).as_slice()), "record {i}");
         }

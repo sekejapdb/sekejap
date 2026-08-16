@@ -61,7 +61,7 @@ impl PagedStore {
     ///
     /// The old version's space is returned *after* the new one is written, so a
     /// failure part-way leaves the previous record intact rather than neither.
-    pub(crate) fn put(&mut self, key: u64, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn put(&mut self, key: u128, bytes: &[u8]) -> io::Result<()> {
         let previous = self.index.get(key)?;
         let id = self.records.insert(bytes)?;
         self.index.insert(key, id.0)?;
@@ -71,14 +71,14 @@ impl PagedStore {
         Ok(())
     }
 
-    pub(crate) fn get(&self, key: u64) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) fn get(&self, key: u128) -> io::Result<Option<Vec<u8>>> {
         match self.index.get(key)? {
             Some(id) => self.records.read(RecordId(id)),
             None => Ok(None),
         }
     }
 
-    pub(crate) fn delete(&mut self, key: u64) -> io::Result<bool> {
+    pub(crate) fn delete(&mut self, key: u128) -> io::Result<bool> {
         let Some(id) = self.index.get(key)? else { return Ok(false) };
         self.index.remove(key)?;
         self.records.delete(RecordId(id))?;
@@ -104,7 +104,7 @@ mod tests {
     fn rec(i: u64) -> Vec<u8> {
         format!("{{\"_key\":\"n{i}\",\"name\":\"record {i} west java\",\"n\":{i}}}").into_bytes()
     }
-    fn key(i: u64) -> u64 { i.wrapping_mul(0x9E37_79B9_7F4A_7C15) }
+    fn key(i: u64) -> u128 { i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128 }
 
     #[test]
     fn records_round_trip_through_the_index() {
