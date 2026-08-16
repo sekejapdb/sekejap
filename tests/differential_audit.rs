@@ -1,0 +1,283 @@
+//! Every read path must answer the same in both storage modes.
+//!
+//! Paged mode splits the database in two — compacted rows in an immutable mmap
+//! ("the base"), recent writes in a small RAM map ("the overlay"). Any read path
+//! that consults the overlay alone sees a fraction of the data and reports it as
+//! the whole truth, silently. That one mistake produced twelve separate bugs,
+//! including compaction deleting every edge in the graph.
+//!
+//! This runs the same operations against both modes and requires identical
+//! answers, and separately computes ground truth in Rust with no index involved.
+//! Both halves are necessary. Every self-consistency check we had — `MAX` agreeing
+//! with `ORDER BY`, `COUNT` agreeing with a scan — *passed* while a stale btree
+//! index was returning nothing for `WHERE n > 15`, because both sides were reading
+//! the same stale index and agreeing with each other. Only ground truth caught it.
+//!
+//! Keep this green. It is the thing standing between a storage change and silent
+//! data loss.
+
+use sekejap::CoreDB;
+use serde_json::json;
+
+// ── dataset ──────────────────────────────────────────────────────────────────
+
+fn seed(db: &mut CoreDB, range: std::ops::Range<usize>) {
+    for i in range {
+        let animal = ["fox", "dog", "heron"][i % 3];
+        db.put(&format!("p/n{i}"), &json!({
+            "_collection": "p", "_key": format!("n{i}"),
+            "name": format!("node {i}"),
+            "body": format!("the quick brown {animal} number {i} leaps the lazy riverbank"),
+            "n": i as i64, "grp": (i % 4) as i64,
+            "geometry": {"type": "Point",
+                         "coordinates": [144.96 + (i as f64) * 0.002, -37.81 + (i as f64) * 0.002]},
+        }).to_string()).unwrap();
+        // Deliberately irregular so no two vectors tie on cosine distance. A
+        // regular formula produced collinear pairs — n0=[0,2,1] and n2=[2,4,0] are
+        // both exactly 0.9129 from [1,2,1] — and which one lands in the top-k is
+        // then arbitrary, not a property either mode owes the other.
+        db.put_vector(&format!("p/n{i}"), "vec", &[
+            ((i * 37 % 97) as f32) / 10.0,
+            ((i * 61 % 89) as f32) / 10.0,
+            ((i * 17 % 83) as f32) / 10.0,
+        ]).unwrap();
+    }
+}
+
+fn seed_other(db: &mut CoreDB, range: std::ops::Range<usize>) {
+    for i in range {
+        db.put(&format!("q/m{i}"), &json!({
+            "_collection": "q", "_key": format!("m{i}"),
+            "label": format!("tag {i}"), "n": (i * 3) as i64,
+        }).to_string()).unwrap();
+    }
+}
+
+fn build(dir: &std::path::Path) {
+    let mut db = CoreDB::open(dir).unwrap();
+    db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, name TEXT, body TEXT, n INTEGER, grp INTEGER)").unwrap();
+    seed(&mut db, 0..30);
+    seed_other(&mut db, 0..8);
+    for i in 0..29 { db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next"); }
+    for i in (0..29).step_by(3) {
+        db.link_meta(&format!("p/n{i}"), &format!("q/m{}", i % 5), "tagged",
+                     &json!({"weight": i as i64}).to_string()).unwrap();
+    }
+    db.execute("CREATE INDEX ON p USING btree (n)").unwrap();
+    db.execute("CREATE INDEX ON p USING gin (body)").unwrap();
+    db.execute("CREATE INDEX ON p USING bm25 (body)").unwrap();
+    db.execute("CREATE INDEX ON p USING search (body)").unwrap();
+    db.build_spatial_index();
+    db.build_hnsw_index("vec", 16, 100).expect("hnsw build");
+    db.compact().unwrap();
+}
+
+// ── probes ───────────────────────────────────────────────────────────────────
+
+fn rows(db: &CoreDB, sql: &str) -> String {
+    match db.query(sql) {
+        Ok(s) => {
+            let mut k: Vec<String> = s.collect().iter().map(|h| h.slug.clone()).collect();
+            k.sort();
+            k.join(",")
+        }
+        Err(e) => format!("ERR {e:?}"),
+    }
+}
+
+fn vals(db: &CoreDB, sql: &str) -> String {
+    match db.query(sql) {
+        Ok(s) => {
+            let mut v: Vec<String> = s.collect().iter()
+                .map(|h| h.payload.as_ref().map(|p| p.to_string()).unwrap_or_default())
+                .collect();
+            v.sort();
+            v.join("|")
+        }
+        Err(e) => format!("ERR {e:?}"),
+    }
+}
+
+type Probe = (&'static str, fn(&mut CoreDB) -> String);
+
+fn probes() -> Vec<Probe> {
+    vec![
+        ("node_count",            |d| d.node_count().to_string()),
+        ("edge_count",            |d| d.edge_count().to_string()),
+        ("collection_names",      |d| { let mut c = d.collection_names(); c.sort(); c.join(",") }),
+        ("all_slugs.len",         |d| d.all_slugs().len().to_string()),
+        ("contains",              |d| d.contains("p/n7").to_string()),
+        ("get",                   |d| d.get("p/n7").map(|s| s.len().to_string()).unwrap_or("NONE".into())),
+        ("stats.nodes",           |d| d.stats().nodes.to_string()),
+        ("dump_sql inserts",      |d| d.dump_sql().lines().filter(|l| l.starts_with("INSERT")).count().to_string()),
+
+        ("scan p",                |d| rows(d, "SELECT _key FROM p")),
+        ("scan q",                |d| rows(d, "SELECT _key FROM q")),
+        ("where eq",              |d| rows(d, "SELECT _key FROM p WHERE n = 7")),
+        ("where range",           |d| rows(d, "SELECT _key FROM p WHERE n > 10 AND n < 25")),
+        ("where between",         |d| rows(d, "SELECT _key FROM p WHERE n BETWEEN 5 AND 15")),
+        ("where in",              |d| rows(d, "SELECT _key FROM p WHERE n IN (1,2,3)")),
+        ("order by desc",         |d| rows(d, "SELECT _key FROM p ORDER BY n DESC LIMIT 5")),
+        ("count",                 |d| vals(d, "SELECT COUNT(*) AS c FROM p")),
+        ("sum/avg/min/max",       |d| vals(d, "SELECT SUM(n) AS s, AVG(n) AS a, MIN(n) AS mn, MAX(n) AS mx FROM p")),
+        ("group by",              |d| vals(d, "SELECT grp, COUNT(*) AS c FROM p GROUP BY grp")),
+
+        ("ilike",                 |d| rows(d, "SELECT _key FROM p WHERE body ILIKE '%fox%'")),
+        ("bm25 set",              |d| rows(d, "SELECT _key FROM p WHERE BM25(body,'heron') > 0")),
+        ("search",                |d| rows(d, "SELECT _key FROM p WHERE SEARCH('riverbank')")),
+        ("gin direct",            |d| d.gin_ilike("body", "%fox%", None).len().to_string()),
+        // Scores, not ranks: with many documents scoring identically the top-k
+        // selection among exact ties is arbitrary and not a guarantee we make.
+        ("bm25 scores",           |d| d.bm25_search("body", "heron", 5).iter()
+                                       .map(|(_, s)| format!("{s:.6}")).collect::<Vec<_>>().join(",")),
+
+        ("spatial order",         |d| { d.build_spatial_index();
+                                        rows(d, "SELECT _key FROM p ORDER BY ST_DISTANCE(geometry, POINT(144.96 -37.81)) ASC LIMIT 5") }),
+        ("get_vector",            |d| d.get_vector("p/n7", "vec").map(|v| format!("{v:?}")).unwrap_or("NONE".into())),
+        ("vector_near",           |d| rows(d, "SELECT _key FROM p WHERE VECTOR_NEAR(vec, [1.0,2.0,1.0], 5)")),
+
+        ("forward hop",           |d| d.one("p/n0").forward("next").collect().len().to_string()),
+        ("backward hop",          |d| d.one("p/n5").backward("next").collect().len().to_string()),
+        ("edges_from",            |d| d.edges_from("p/n0").len().to_string()),
+        ("edges_to",              |d| d.edges_to("p/n5").len().to_string()),
+        ("edges_from_collection", |d| d.edges_from_collection("p").len().to_string()),
+        ("edges_between",         |d| d.edges_between("p", "q").len().to_string()),
+        ("edge_types_from",       |d| { let mut t = d.edge_types_from("p/n0"); t.sort(); t.join(",") }),
+        ("edge_schema",           |d| { let mut t: Vec<String> = d.edge_schema().iter()
+                                           .map(|(a,b,c)| format!("{a}-{b}->{c}")).collect();
+                                        t.sort(); t.join(",") }),
+        ("edge attrs",            |d| d.edges_from("p/n0").iter()
+                                       .filter_map(|e| e.meta.as_ref().map(|m| m.to_string()))
+                                       .collect::<Vec<_>>().join("|")),
+        ("MATCH",                 |d| rows(d, "SELECT _key FROM MATCH (a:p)-[:next]->(b:p)")),
+        ("MATCH cross",           |d| rows(d, "SELECT _key FROM MATCH (a:p)-[:tagged]->(b:q)")),
+        ("SHORTEST",              |d| rows(d, "SELECT _key FROM MATCH SHORTEST (a)-[r*]->(b) \
+                                               WHERE a._key = 'p/n0' AND b._key = 'p/n9'")),
+
+        ("SHOW TABLES",           |d| d.show("SHOW TABLES").map(|h| h.len().to_string()).unwrap_or("ERR".into())),
+        ("SHOW EDGES",            |d| d.show("SHOW EDGES").map(|h| h.len().to_string()).unwrap_or("ERR".into())),
+
+        ("snapshot == live",      |d| match d.snapshot_db() {
+                                       Some(s) => {
+                                           let a = rows(&s, "SELECT _key FROM p");
+                                           let b = rows(d, "SELECT _key FROM p");
+                                           if a == b { "agree".into() } else { format!("snap={a} live={b}") }
+                                       }
+                                       None => "agree".into() }),
+    ]
+}
+
+// ── ground truth ─────────────────────────────────────────────────────────────
+//
+// A cross-mode diff cannot catch a bug that is wrong in BOTH modes — a stale index
+// answers whoever asks. These answers are computed from the stored rows directly.
+
+fn ground_truth(db: &CoreDB, mode: &str) {
+    let rows_p: Vec<serde_json::Value> = db.all_slugs().iter()
+        .filter(|s| s.starts_with("p/"))
+        .filter_map(|s| db.get(s))
+        .filter_map(|j| serde_json::from_str(&j).ok())
+        .collect();
+    let ns: Vec<i64> = rows_p.iter().filter_map(|r| r.get("n").and_then(|v| v.as_i64())).collect();
+    let cnt = |sql: &str| db.query(sql).map(|s| s.collect().len()).unwrap_or(0);
+    let num = |sql: &str, k: &str| {
+        let v = vals(db, sql);
+        let pat = format!("\"{k}\":");
+        v.find(&pat).map(|i| v[i + pat.len()..].trim_end_matches('}').trim_end_matches(".0").to_string())
+            .unwrap_or(v)
+    };
+
+    assert_eq!(num("SELECT COUNT(*) AS c FROM p", "c"), rows_p.len().to_string(), "[{mode}] COUNT");
+    assert_eq!(num("SELECT MAX(n) AS mx FROM p", "mx"),
+               ns.iter().max().unwrap().to_string(), "[{mode}] MAX");
+    assert_eq!(num("SELECT MIN(n) AS mn FROM p", "mn"),
+               ns.iter().min().unwrap().to_string(), "[{mode}] MIN");
+    assert_eq!(num("SELECT SUM(n) AS s FROM p", "s"),
+               ns.iter().sum::<i64>().to_string(), "[{mode}] SUM");
+    assert_eq!(cnt("SELECT _key FROM p WHERE n > 15"),
+               ns.iter().filter(|&&v| v > 15).count(), "[{mode}] WHERE n > 15");
+    assert_eq!(cnt("SELECT _key FROM p WHERE n BETWEEN 5 AND 15"),
+               ns.iter().filter(|&&v| (5..=15).contains(&v)).count(), "[{mode}] BETWEEN");
+
+    let has = |needle: &str| rows_p.iter()
+        .filter(|r| r.get("body").and_then(|v| v.as_str()).map_or(false, |b| b.contains(needle)))
+        .count();
+    assert_eq!(cnt("SELECT _key FROM p WHERE body ILIKE '%fox%'"), has("fox"), "[{mode}] ILIKE");
+    assert_eq!(cnt("SELECT _key FROM p WHERE BM25(body,'fox') > 0"), has("fox"), "[{mode}] BM25");
+    assert_eq!(cnt("SELECT _key FROM p WHERE SEARCH('fox')"), has("fox"), "[{mode}] SEARCH");
+}
+
+// ── harness ──────────────────────────────────────────────────────────────────
+
+fn run(name: &str, mutate: fn(&mut CoreDB)) {
+    let dir_r = tempfile::TempDir::new().unwrap();
+    build(dir_r.path());
+    let mut resident = CoreDB::open(dir_r.path()).unwrap();
+    mutate(&mut resident);
+
+    let dir_p = tempfile::TempDir::new().unwrap();
+    build(dir_p.path());
+    let mut paged = CoreDB::open_paged(dir_p.path()).unwrap();
+    mutate(&mut paged);
+
+    ground_truth(&resident, "resident");
+    ground_truth(&paged, "paged");
+
+    let mut bad = Vec::new();
+    for (label, f) in &probes() {
+        let r = f(&mut resident);
+        let p = f(&mut paged);
+        if r != p {
+            bad.push(format!("  {label:<24} resident={r}\n  {:<24} paged   ={p}", ""));
+        }
+    }
+    assert!(bad.is_empty(),
+            "[{name}] the two storage modes disagree — this is a base/overlay bug:\n{}",
+            bad.join("\n"));
+}
+
+#[test]
+fn all_base() { run("ALL-BASE", |_| {}); }
+
+#[test]
+fn mixed_base_and_overlay() {
+    run("MIXED", |db| {
+        seed(db, 30..40);
+        db.link("p/n29", "p/n30", "next");
+        db.execute("UPDATE p SET name = 'renamed' WHERE n = 3").unwrap();
+    });
+}
+
+#[test]
+fn tombstoned_base_rows() {
+    run("TOMBSTONED", |db| {
+        db.execute("DELETE FROM p WHERE n IN (2,3,4)").unwrap();
+        db.remove("p/n11");
+    });
+}
+
+#[test]
+fn churn_write_then_compact() {
+    run("CHURN", |db| {
+        for round in 0..3 {
+            let lo = 30 + round * 5;
+            seed(db, lo..lo + 5);
+            db.compact().unwrap();
+        }
+    });
+}
+
+#[test]
+fn rewrite_deleted_keys() {
+    run("REWRITE", |db| {
+        db.execute("DELETE FROM p WHERE n IN (5,6,7)").unwrap();
+        seed(db, 5..8);
+    });
+}
+
+#[test]
+fn update_base_rows_in_place() {
+    run("UPDATED", |db| {
+        db.execute("UPDATE p SET name = 'updated' WHERE n < 5").unwrap();
+    });
+}
