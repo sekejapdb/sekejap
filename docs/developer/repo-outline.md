@@ -1120,10 +1120,34 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    216    pub fn len(&self) -> usize
 ```
 
-### `mod.rs` · 40L — Storage — the on-disk building blocks
+### `mod.rs` · 42L — Storage — the on-disk building blocks
 
 ```
 (no top-level items)
+```
+
+### `nodestore.rs` · 489L — What this replaces
+
+```
+    57  pub(crate) struct StoredNode
+    70  fn rd32(b: &[u8], at: usize) -> u32 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) }
+    71  fn rd64(b: &[u8], at: usize) -> u64 { u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) }
+    73  fn encode(n: &StoredNode, out: &mut Vec<u8>)
+    91  fn decode(b: &[u8]) -> Option<StoredNode>
+   118  fn member_key(collection: u64, node: u64) -> u128
+   122  pub(crate) struct NodeStore
+   130  impl NodeStore
+   131    pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self>
+   144    pub(crate) fn len(&self) -> u64 { self.store.len() }
+   147    pub(crate) fn page_counts(&self) -> (u64, u64, u64)
+   152    pub(crate) fn get(&self, hash: u64) -> io::Result<Option<StoredNode>>
+   157    pub(crate) fn contains(&self, hash: u64) -> io::Result<bool>
+   166    pub(crate) fn put(&mut self, hash: u64, node: &StoredNode) -> io::Result<()>
+   184    pub(crate) fn delete(&mut self, hash: u64) -> io::Result<bool>
+   196    pub(crate) fn members(&self, collection: u64) -> io::Result<Vec<u64>>
+   209    pub(crate) fn for_each_hash(&self, mut f: impl FnMut(u64) -> bool) -> io::Result<()>
+   213    pub(crate) fn sync(&mut self) -> io::Result<()>
+   220  mod tests
 ```
 
 ### `pagedstore.rs` · 238L — What this is for
@@ -1575,4 +1599,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 48 files, 1308 items -->
+<!-- 49 files, 1327 items -->
