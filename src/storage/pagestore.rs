@@ -305,6 +305,22 @@ impl PageStore {
         Ok(())
     }
 
+    /// A page borrowed straight out of the mapping, without copying it.
+    ///
+    /// `read` copies a page into a caller's buffer, and every structure built on
+    /// this store was allocating that buffer per read — three heap allocations and
+    /// three 4 KB copies for one B+tree descent, six for a graph hop, on the hot
+    /// path of every paged operation.
+    ///
+    /// `None` when the page is not in the mapping: past what was mapped at the last
+    /// remap, or the mapping failed. Callers fall back to `read`, which is always
+    /// correct and only slower.
+    pub(crate) fn page_slice(&self, page: u64) -> Option<&[u8]> {
+        if page >= self.high_water || page >= self.mapped_pages { return None }
+        let at = usize::try_from(page * self.page_size as u64).ok()?;
+        self.map.as_ref()?.slice(at, self.page_size)
+    }
+
     pub(crate) fn read(&self, page: u64, buf: &mut [u8]) -> io::Result<()> {
         if page >= self.high_water || buf.len() > self.page_size {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "page out of range"));

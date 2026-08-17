@@ -178,6 +178,19 @@ impl BTree {
         Ok(buf)
     }
 
+    /// A page for reading, borrowed from the mapping when it can be.
+    ///
+    /// Descending a tree touches three or four pages and every one of them was a
+    /// fresh `Vec` plus a 4 KB copy. Borrowing costs neither. The owned fallback
+    /// stays for pages the mapping does not reach — anything allocated since the
+    /// last sync — so this is a speed-up with no behaviour attached to it.
+    fn page_for_read(&self, page: u64) -> io::Result<std::borrow::Cow<'_, [u8]>> {
+        if let Some(b) = self.pages.page_slice(page) {
+            return Ok(std::borrow::Cow::Borrowed(b));
+        }
+        Ok(std::borrow::Cow::Owned(self.read_page(page)?))
+    }
+
     /// Index of the first entry with key >= `key`.
     fn lower_bound_leaf(p: &[u8], key: u128) -> usize {
         let (mut lo, mut hi) = (0usize, count(p));
@@ -217,7 +230,7 @@ impl BTree {
         let mut budget = self.walk_budget();
         loop {
             budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(None) };
-            let buf = self.read_page(page)?;
+            let buf = self.page_for_read(page)?;
             if kind(&buf) == KIND_LEAF {
                 let i = Self::lower_bound_leaf(&buf, key);
                 if i < count(&buf) && leaf_key(&buf, i) == key {
@@ -387,7 +400,7 @@ impl BTree {
         let mut page = self.root;
         loop {
             budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(Vec::new()) };
-            let buf = self.read_page(page)?;
+            let buf = self.page_for_read(page)?;
             if kind(&buf) == KIND_LEAF { break }
             page = Self::descend_to(&buf, lo);
         }
@@ -395,7 +408,7 @@ impl BTree {
         let mut budget = self.walk_budget();
         while page != 0 {
             budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(out) };
-            let buf = self.read_page(page)?;
+            let buf = self.page_for_read(page)?;
             for i in 0..count(&buf) {
                 let k = leaf_key(&buf, i);
                 if k > hi { return Ok(out) }
@@ -421,14 +434,14 @@ impl BTree {
         let mut page = self.root;
         loop {
             budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(()) };
-            let buf = self.read_page(page)?;
+            let buf = self.page_for_read(page)?;
             if kind(&buf) == KIND_LEAF { break }
             page = child0(&buf);
         }
         let mut budget = self.walk_budget();
         while page != 0 {
             budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(()) };
-            let buf = self.read_page(page)?;
+            let buf = self.page_for_read(page)?;
             for i in 0..count(&buf) {
                 if !f(leaf_key(&buf, i), leaf_val(&buf, i)) { return Ok(()) }
             }
