@@ -49,7 +49,7 @@ use buffer::{RowBuffer, WriteBuffer};
 use guard::ReadWriteGuard;
 
 use crate::query::Hit;
-use crate::CoreDB;
+use crate::{Config, CoreDB};
 use serde_json::Value;
 
 /// Concurrent database engine wrapping [`CoreDB`].
@@ -252,6 +252,7 @@ impl Engine {
             buffer_size: None,
             read_only: false,
             snapshot_reads: false,
+            config: None,
             publish_interval: std::time::Duration::from_millis(5),
             scan_max_rows: None,
             scan_max_bytes: None,
@@ -705,6 +706,9 @@ pub struct EngineBuilder {
     /// Safety-valve caps for `Engine::scan` (`None` = unbounded).
     scan_max_rows: Option<usize>,
     scan_max_bytes: Option<usize>,
+    /// Storage layout for the underlying [`CoreDB`], when the caller wants one
+    /// this builder does not have a switch for.
+    config: Option<Config>,
 }
 
 impl EngineBuilder {
@@ -739,6 +743,31 @@ impl EngineBuilder {
     /// embedded use, which should leave it off (the default) and pay nothing.
     pub fn snapshot_reads(mut self, enabled: bool) -> Self {
         self.snapshot_reads = enabled;
+        self
+    }
+
+    /// Open the database with an explicit [`Config`].
+    ///
+    /// Without this the builder could only ever open in two layouts — plain, or
+    /// `paged_topology` alone — so a store written with `paged_payloads`,
+    /// `paged_nodes` or `paged_adjacency` was **unreachable from the service API**.
+    /// Pointing the engine at one served an empty database and truncated its
+    /// payload file.
+    ///
+    /// For an existing store you rarely need this: the open reads the files and
+    /// adopts the layout they were written in, so plain
+    /// [`open_as_service`](Self::open_as_service) works on any of them. Name a
+    /// config when *creating* a store through the service API, where nothing on
+    /// disk can answer the question yet.
+    ///
+    /// The config given here decides the layout. `snapshot_reads` still asks for
+    /// the immutable-base layout on top of it, so a config that leaves
+    /// `paged_topology` off will have it turned on rather than silently ignored.
+    /// Note that snapshots are unavailable with `paged_nodes` or `paged_adjacency`
+    /// — see [`CoreDB::snapshot_db`] for why — and reads fall back to taking the
+    /// lock, which is correct and slower.
+    pub fn config(mut self, config: Config) -> Self {
+        self.config = Some(config);
         self
     }
 
@@ -803,9 +832,16 @@ impl EngineBuilder {
         let mut db = if self.read_only {
             CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
         } else if want_paged {
-            CoreDB::open_paged(&self.path).map_err(|e| e.to_string())?
+            CoreDB::open_with_config(&self.path, Config {
+                paged_topology: true,
+                ..self.config.clone().unwrap_or_default()
+            }).map_err(|e| e.to_string())?
         } else {
-            CoreDB::open(&self.path).map_err(|e| e.to_string())?
+            match &self.config {
+                Some(cfg) => CoreDB::open_with_config(&self.path, cfg.clone())
+                    .map_err(|e| e.to_string())?,
+                None => CoreDB::open(&self.path).map_err(|e| e.to_string())?,
+            }
         };
 
         // Seed the initial published snapshot (unix + paged). If the store isn't

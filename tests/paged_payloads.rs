@@ -158,3 +158,116 @@ fn oversized_payloads_round_trip_in_a_paged_database() {
         assert!(got.contains(&"x".repeat(*len)), "a {len}-byte payload came back wrong");
     }
 }
+
+// ── reaching a paged store through the service API ──────────────────────────
+//
+// `Engine` is how a long-running process opens the database, and until now its
+// builder could ask for exactly two layouts: plain, or `paged_topology` alone.
+// Every other paged store was unreachable — and worse than unreachable, because
+// opening one without its flags served an empty database and then overwrote it.
+
+/// A store written with paged payloads must open through the service API and
+/// still hold its rows.
+#[test]
+fn a_paged_store_opens_as_a_service() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open_with_config(dir.path(), paged()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+        for i in 0..50 {
+            db.put(&format!("p/n{i}"),
+                   &json!({"_collection":"p","_key":format!("n{i}"),"name":"kept"}).to_string())
+              .unwrap();
+        }
+    }
+
+    let eng = sekejap::engine::Engine::builder(dir.path().to_str().unwrap())
+        .config(paged())
+        .build()
+        .expect("a paged store was refused by the service API");
+    assert_eq!(eng.query("SELECT _key FROM p").unwrap().len(), 50,
+               "the service saw a different database than the one on disk");
+    assert!(eng.get("p/n7").is_some(), "a row vanished behind the service API");
+}
+
+/// And it must open through the *plain* service entry point too, which names no
+/// config at all. The files say what they are; the caller does not have to know.
+#[test]
+fn open_as_service_adopts_the_layout_already_on_disk() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open_with_config(dir.path(), paged()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+        for i in 0..50 {
+            db.put(&format!("p/n{i}"),
+                   &json!({"_collection":"p","_key":format!("n{i}"),"name":"kept"}).to_string())
+              .unwrap();
+        }
+    }
+
+    {
+        let eng = sekejap::open_as_service(dir.path().to_str().unwrap())
+            .expect("open_as_service refused a paged store");
+        assert_eq!(eng.query("SELECT _key FROM p").unwrap().len(), 50,
+                   "open_as_service served an empty database over a paged store");
+        eng.execute("INSERT INTO p (_key, name) VALUES ('later', 'written')").unwrap();
+    }
+
+    // The write went to the paged store, not to a flat file that replaced it.
+    let db = CoreDB::open_with_config(dir.path(), paged()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 51,
+               "the service wrote somewhere the paged store cannot see");
+    assert!(db.get("p/n7").is_some(), "the service overwrote what was already there");
+}
+
+/// The reverse direction: a flat store must not be re-read as paged because the
+/// caller asked for paged. Same rule, other way round — the bytes decide.
+#[test]
+fn a_flat_store_is_not_reopened_as_paged_on_request() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+        for i in 0..20 {
+            db.put(&format!("p/n{i}"),
+                   &json!({"_collection":"p","_key":format!("n{i}"),"name":"kept"}).to_string())
+              .unwrap();
+        }
+    }
+    let db = CoreDB::open_with_config(dir.path(), paged())
+        .expect("asking for paged over a flat store was refused instead of corrected");
+    assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 20,
+               "a flat store lost its rows when opened with paged_payloads");
+}
+
+/// The full paged layout — payloads, nodes, adjacency, topology — through the
+/// plain service entry point, graph included. If snapshots are unavailable in
+/// this shape the engine must take the lock and answer correctly, not answer
+/// less.
+#[test]
+fn the_full_paged_layout_serves_graph_queries_as_a_service() {
+    let full = || Config {
+        paged_payloads: true, paged_nodes: true,
+        paged_adjacency: true, paged_topology: true,
+        ..Default::default()
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open_with_config(dir.path(), full()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, name TEXT)").unwrap();
+        for i in 0..30 {
+            db.put(&format!("p/n{i}"),
+                   &json!({"_collection":"p","_key":format!("n{i}"),"name":"kept"}).to_string())
+              .unwrap();
+        }
+        for i in 0..29 { db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next"); }
+    }
+
+    let eng = sekejap::open_as_service(dir.path().to_str().unwrap())
+        .expect("open_as_service refused a fully paged store");
+    assert_eq!(eng.query("SELECT _key FROM p").unwrap().len(), 30,
+               "the service saw fewer rows than the store holds");
+    let hops = eng.query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p) WHERE a._key = 'n0'")
+        .expect("a graph query failed behind the service API");
+    assert_eq!(hops.len(), 1, "the paged adjacency was invisible to the service");
+}
