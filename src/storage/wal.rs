@@ -315,7 +315,12 @@ impl<'a> BinaryReader<'a> {
 
     fn read_vec_f32(&mut self) -> Option<Vec<f32>> {
         let count = self.read_u32()? as usize;
-        let mut v = Vec::with_capacity(count);
+        // Reserved against what the frame can actually contain, not against the
+        // number it claims. The count is four bytes of file, so a thirty-byte frame
+        // declaring 0xFFFF_FFFF elements asked for 16 GB before reading the first
+        // one and failing — a memory-exhaustion denial of service out of a tiny
+        // crafted file, and the CRC is no obstacle because a CRC is not a signature.
+        let mut v = Vec::with_capacity(count.min(self.remaining() / 4));
         for _ in 0..count {
             v.push(self.read_f32()?);
         }
@@ -324,7 +329,9 @@ impl<'a> BinaryReader<'a> {
 
     fn read_vec_str(&mut self) -> Option<Vec<String>> {
         let count = self.read_u32()? as usize;
-        let mut v = Vec::with_capacity(count);
+        // As above. A `String` is 24 bytes of header, and the shortest one a frame
+        // can encode is its 4-byte length — so the claim is capped by what is left.
+        let mut v = Vec::with_capacity(count.min(self.remaining() / 4));
         for _ in 0..count {
             v.push(self.read_str()?);
         }
@@ -1080,5 +1087,49 @@ mod tests {
         let data = vec![254]; // unknown tag
         let entry = binary_decode(&data);
         assert!(matches!(entry, Some(WalEntry::Unknown)));
+    }
+
+    /// **A frame must not be able to ask for memory it cannot contain.**
+    ///
+    /// The element count in a vector frame is four bytes of file, and it was passed
+    /// straight to `Vec::with_capacity` before a single element was read. A
+    /// thirty-byte frame declaring `0xFFFF_FFFF` elements therefore asked for
+    /// roughly 16 GB and then failed as "corrupted" — a memory-exhaustion denial of
+    /// service out of a tiny crafted file. A CRC does not stop this: it proves the
+    /// bytes are intact, not that they are friendly.
+    #[test]
+    fn a_lying_element_count_does_not_reserve_the_world() {
+        // A PutVector frame: tag, slug, field, then a count with no body behind it.
+        let mut frame = Vec::new();
+        frame.push(6u8); // TAG_PUT_VECTOR
+        for s in ["p/n1", "emb"] {
+            frame.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            frame.extend_from_slice(s.as_bytes());
+        }
+        frame.extend_from_slice(&u32::MAX.to_le_bytes()); // "four billion floats follow"
+
+        // Decoding must decline rather than allocate against the claim. Reaching
+        // this line at all is the assertion: a reservation of that size either
+        // aborts the process or leaves it swapping.
+        let got = binary_decode(&frame);
+        assert!(got.is_none(), "a frame claiming {} elements with no body decoded", u32::MAX);
+
+        // And an honest frame still round-trips, so the cap did not break decoding.
+        let mut good = Vec::new();
+        good.push(6u8);
+        for s in ["p/n1", "emb"] {
+            good.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            good.extend_from_slice(s.as_bytes());
+        }
+        good.extend_from_slice(&3u32.to_le_bytes());
+        for v in [1.0f32, 2.0, 3.0] { good.extend_from_slice(&v.to_le_bytes()); }
+        match binary_decode(&good) {
+            Some(WalEntry::PutVector { slug, field, data }) => {
+                assert_eq!(slug, "p/n1");
+                assert_eq!(field, "emb");
+                assert_eq!(data, vec![1.0, 2.0, 3.0]);
+            }
+            other => panic!("an honest vector frame no longer decodes: {other:?}"),
+        }
     }
 }
