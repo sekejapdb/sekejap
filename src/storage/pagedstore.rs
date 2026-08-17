@@ -107,6 +107,14 @@ impl PagedStore {
         self.index.for_each(f)
     }
 
+    /// The record a key's index entry points at, given the id the index yielded.
+    ///
+    /// For a scan that already walked the index, this is the rest of the work:
+    /// `get` would descend the tree again for a key the walk just handed over.
+    pub(crate) fn read_at(&self, id: u64) -> io::Result<Option<Vec<u8>>> {
+        self.records.read(RecordId(id))
+    }
+
     pub(crate) fn sync(&mut self) -> io::Result<()> {
         self.records.sync()?;
         self.index.sync()

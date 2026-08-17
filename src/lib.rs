@@ -385,6 +385,11 @@ mod edge_type_names {
 
     const MAGIC: &[u8; 8] = b"SKETYP\0\0";
     pub(super) const FILE: &str = "edge_types.bin";
+    /// The same table, for collection names. Identical shape, different file — a
+    /// paged store keys collections by hash and keeps the name in each node
+    /// record, so without this `SHOW TABLES` had to read every node in the
+    /// database to learn what the tables were called.
+    pub(super) const COLL_FILE: &str = "coll_names.bin";
 
     pub(super) fn write(path: &Path, types: &[(u64, &str)]) -> io::Result<()> {
         let mut out = Vec::with_capacity(16 + types.len() * 24);
@@ -1940,6 +1945,9 @@ impl CoreDB {
         // adjacency writes no edge list, so they come from their own file.
         for (hash, name) in edge_type_names::read(&dir.join(edge_type_names::FILE)) {
             db.edges.register_type_name(hash, name);
+        }
+        for (hash, name) in edge_type_names::read(&dir.join(edge_type_names::COLL_FILE)) {
+            db.collection_names_map.entry(hash).or_insert(name);
         }
         if config.paged_payloads {
             // Slotted pages with a free list: space returns as records die, so
@@ -4663,6 +4671,19 @@ impl CoreDB {
                 return Err(e);
             }
         }
+        if self.paged_nodes.is_some() {
+            // Collections are keyed by hash and named only inside each node record,
+            // so this is what stops `SHOW TABLES` from being a full scan.
+            let names: Vec<(u64, &str)> = self.collection_names_map.iter()
+                .map(|(&h, n)| (h, n.as_str()))
+                .collect();
+            if let Err(e) = edge_type_names::write(
+                &dir.join(edge_type_names::COLL_FILE), &names)
+            {
+                Self::restore_previous_generation(&staged);
+                return Err(e);
+            }
+        }
 
         self.merge_index_deltas();
         Self::phase_probe("merging index deltas", &mut phase);
@@ -4778,7 +4799,10 @@ impl CoreDB {
             // rather than leaving the whole database resident.
             self.nodes.clear();
             self.collections.clear();
-            self.collection_names_map.clear();
+            // Kept when nodes are paged: this map is the in-RAM side of
+            // coll_names.bin, and clearing it would send `SHOW TABLES` back to
+            // reading every node record to learn the names again.
+            if self.paged_nodes.is_none() { self.collection_names_map.clear(); }
             self.slug_map.clear();
             self.tombstones.clear();
             self.edge_tombstones.clear();
@@ -7014,17 +7038,50 @@ impl CoreDB {
                 // zero rows.
                 let names: Vec<(u64, String)> = self.collection_names()
                     .into_iter().map(|n| (sk_hash(&n), n)).collect();
-                for (hash, name) in &names {
-                    let (count, size) = self.collection_members(*hash)
-                        .map(|members| {
-                            let c = members.len();
-                            let s: u64 = members.iter()
-                                .filter_map(|h| self.payload_loc(*h).map(|(_, len)| len as u64))
-                                .sum();
-                            (c, s)
-                        })
-                        .unwrap_or((0, 0));
-                    stats.insert(name.clone(), (count, size));
+                // With nodes on pages, one streaming pass over the store answers
+                // this for every collection at once. The per-collection version
+                // below asks `payload_loc` for each member, and in this mode that
+                // is a B+tree descent per row — 400 000 of them on a 400 000-row
+                // store, to report a size. The walk reads each record once from the
+                // id the index already handed over.
+                let mut done = false;
+                if let Some(ns) = &self.paged_nodes {
+                    let mut totals: std::collections::HashMap<String, (usize, u64)> =
+                        std::collections::HashMap::new();
+                    if ns.for_each_node(|hash, n| {
+                        if !n.collection.is_empty() && !self.tombstones.contains(&hash) {
+                            let e = totals.entry(n.collection).or_insert((0, 0));
+                            e.0 += 1;
+                            e.1 += n.payload_len as u64;
+                        }
+                        true
+                    }).is_ok() {
+                        // Overlay rows the durable store has not taken yet.
+                        for (&h, node) in &self.nodes {
+                            if node.collection.is_empty() || self.tombstones.contains(&h) { continue }
+                            if ns.contains(h).unwrap_or(false) { continue }
+                            let e = totals.entry(node.collection.clone()).or_insert((0, 0));
+                            e.0 += 1;
+                            e.1 += node.payload_len as u64;
+                        }
+                        for (name, v) in totals { stats.insert(name, v); }
+                        for (_, name) in &names { stats.entry(name.clone()).or_insert((0, 0)); }
+                        done = true;
+                    }
+                }
+                if !done {
+                    for (hash, name) in &names {
+                        let (count, size) = self.collection_members(*hash)
+                            .map(|members| {
+                                let c = members.len();
+                                let s: u64 = members.iter()
+                                    .filter_map(|h| self.payload_loc(*h).map(|(_, len)| len as u64))
+                                    .sum();
+                                (c, s)
+                            })
+                            .unwrap_or((0, 0));
+                        stats.insert(name.clone(), (count, size));
+                    }
                 }
                 for name in self.schemas.keys() {
                     stats.entry(name.clone()).or_insert((0, 0));
@@ -8057,20 +8114,22 @@ impl CoreDB {
     /// Every collection name the durable store knows.
     fn base_collection_names(&self) -> Vec<String> {
         if let Some(ns) = &self.paged_nodes {
-            // No dictionary to consult: the name is in each node's record, which is
-            // why it is stored there rather than as a hash needing a table. Walking
-            // for it is the price, and this is asked by SHOW TABLES, not by a read.
-            let mut names = std::collections::BTreeSet::new();
-            let mut err = false;
-            let _ = ns.for_each_hash(|h| {
-                match ns.get(h) {
-                    Ok(Some(n)) if !n.collection.is_empty() => { names.insert(n.collection); }
-                    Err(_) => { err = true; return false }
-                    _ => {}
-                }
-                true
-            });
-            let _ = err;
+            // From the name table, not by reading the store. This used to walk every
+            // node and decode its record to collect the distinct names — O(store)
+            // work behind `SHOW TABLES`, and more expensive still once records were
+            // checksummed. The table is written at every compaction and loaded at
+            // open; a collection whose name is somehow missing from it is still
+            // found by the fallback below, so the cheap path cannot lose a table.
+            let mut names: std::collections::BTreeSet<String> =
+                self.collection_names_map.values().cloned().collect();
+            if names.is_empty() {
+                let _ = ns.for_each_hash(|h| {
+                    if let Ok(Some(n)) = ns.get(h) {
+                        if !n.collection.is_empty() { names.insert(n.collection); }
+                    }
+                    true
+                });
+            }
             return names.into_iter().collect();
         }
         self.segments.newest_first().next()

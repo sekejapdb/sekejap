@@ -114,9 +114,22 @@ fn setup_sekejap() -> (CoreDB, tempfile::TempDir) {
     // that alone can take 20+ minutes and dominates the whole run. Setup is NOT
     // measured (only the queries below are), and SQLite's setup likewise batches
     // in one BEGIN/COMMIT, so this keeps the comparison fair and the run reliable.
+    // `SK_PAGED=1` runs every scenario below against the paged storage
+    // configuration instead of the default one — slotted pages with free lists for
+    // payloads, nodes and adjacency, where compaction no longer rebuilds the store.
+    // Same dataset, same queries, same measurement: the only way to know what that
+    // configuration costs a real workload is to run the real workload on it.
+    let paged = std::env::var_os("SK_PAGED").is_some();
     let mut db = CoreDB::open_with_config(
         dir.path(),
-        Config { wal_sync: SyncMode::Normal, ..Default::default() },
+        Config {
+            wal_sync: SyncMode::Normal,
+            paged_topology: paged,
+            paged_payloads: paged,
+            paged_adjacency: paged,
+            paged_nodes: paged,
+            ..Default::default()
+        },
     )
     .unwrap();
 

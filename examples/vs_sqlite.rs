@@ -201,19 +201,21 @@ fn main() {
     // This is where today's storage change would show up if it cost anything.
     let single = 2_000usize;
     let t = Instant::now();
-    for i in n..n + single {
-        sq.execute(
-            "INSERT INTO venues VALUES (?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![
+    {
+        // Prepared once and reused, as SQLite is meant to be used — re-preparing
+        // per row would be measuring the parser.
+        let mut st = sq.prepare("INSERT INTO venues VALUES (?1,?2,?3,?4,?5,?6)").unwrap();
+        for i in n..n + single {
+            st.execute(rusqlite::params![
                 format!("v{i}"),
                 format!("Venue {i}"),
                 CATEGORIES[i % CATEGORIES.len()],
                 format!("suburb{}", i % 40),
                 (i % 500) as i64,
                 (i % 50) as f64 / 10.0,
-            ],
-        )
-        .unwrap();
+            ])
+            .unwrap();
+        }
     }
     let sq_one = ms(t) / single as f64 * 1000.0; // µs per row
     let t = Instant::now();
@@ -376,76 +378,115 @@ fn main() {
     });
 
     // ── 4. update and delete ─────────────────────────────────────────────────
+    //
+    // Two fairness traps here, both of which this got wrong before.
+    //
+    // *Batching.* Giving SQLite one transaction for a thousand operations while
+    // the other side commits each one separately compares transactions, not
+    // engines. Both shapes are measured instead, matched on both sides: an import
+    // batches, a request handler does not.
+    //
+    // *Semantics.* `UPDATE ... SET price` changes one column. Reaching for
+    // sekejap's `put` instead makes it rewrite the whole row and every index entry
+    // on it — a different, larger operation that happens to have the same effect.
+    // The comparison is against sekejap's own `UPDATE`, which is the same
+    // statement doing the same thing.
     let churn = 1_000usize;
-    let t = Instant::now();
-    {
-        let tx = sq.unchecked_transaction().unwrap();
-        for i in 0..churn {
-            tx.execute(
-                "UPDATE venues SET price = price + 1 WHERE key = ?1",
-                rusqlite::params![format!("v{i}")],
-            )
-            .unwrap();
-        }
-        tx.commit().unwrap();
-    }
-    let a = ms(t) / churn as f64 * 1000.0;
-    let t = Instant::now();
-    for i in 0..churn {
-        sk.execute(&format!(
-            "UPDATE venues SET price = {} WHERE _key = 'v{i}'",
-            (i % 500) + 1
-        ))
-        .unwrap();
-    }
-    let b = ms(t) / churn as f64 * 1000.0;
-    let t = Instant::now();
-    for i in 0..churn {
-        pg.execute(&format!(
-            "UPDATE venues SET price = {} WHERE _key = 'v{i}'",
-            (i % 500) + 1
-        ))
-        .unwrap();
-    }
-    let c = ms(t) / churn as f64 * 1000.0;
-    cases.push(Case {
-        name: "update (us/row)",
-        sqlite_ms: a,
-        sekejap_ms: b,
-        paged_ms: c,
-        comparable: true,
-    });
 
+    // Set-based: one statement, many rows. What both engines are actually built to
+    // do, and the shape with no per-row overhead on either side.
+    let t = Instant::now();
+    sq.execute("UPDATE venues SET price = price + 1 WHERE price < 20", []).unwrap();
+    let a = ms(t);
+    let mut sek_set_update = |db: &mut CoreDB| {
+        let t = Instant::now();
+        db.execute("UPDATE venues SET rating = 1.5 WHERE price < 20").unwrap();
+        ms(t)
+    };
+    let b = sek_set_update(&mut sk);
+    let c = sek_set_update(&mut pg);
+    cases.push(Case { name: "update, set-based (ms)", sqlite_ms: a,
+                      sekejap_ms: b, paged_ms: c, comparable: true });
+
+    // Per key, one statement at a time, auto-commit on both sides.
+    let solo = 300usize;
+    let t = Instant::now();
+    {
+        let mut st = sq.prepare("UPDATE venues SET price = ?2 WHERE key = ?1").unwrap();
+        for i in 0..solo {
+            st.execute(rusqlite::params![format!("v{i}"), ((i % 500) + 7) as i64]).unwrap();
+        }
+    }
+    let a = ms(t) / solo as f64 * 1000.0;
+    let mut sek_solo_update = |db: &mut CoreDB| {
+        let t = Instant::now();
+        for i in 0..solo {
+            db.execute(&format!(
+                "UPDATE venues SET price = {} WHERE _key = 'v{i}'", (i % 500) + 7)).unwrap();
+        }
+        ms(t) / solo as f64 * 1000.0
+    };
+    let b = sek_solo_update(&mut sk);
+    let c = sek_solo_update(&mut pg);
+    cases.push(Case { name: "update, per key (us/row)", sqlite_ms: a,
+                      sekejap_ms: b, paged_ms: c, comparable: true });
+
+    // Delete, set-based.
+    let t = Instant::now();
+    sq.execute("DELETE FROM venues WHERE price = 499", []).unwrap();
+    let a = ms(t);
+    let mut sek_set_delete = |db: &mut CoreDB| {
+        let t = Instant::now();
+        db.execute("DELETE FROM venues WHERE price = 499").unwrap();
+        ms(t)
+    };
+    let b = sek_set_delete(&mut sk);
+    let c = sek_set_delete(&mut pg);
+    cases.push(Case { name: "delete, set-based (ms)", sqlite_ms: a,
+                      sekejap_ms: b, paged_ms: c, comparable: true });
+
+    // Delete, per key, auto-commit on both.
+    let t = Instant::now();
+    {
+        let mut st = sq.prepare("DELETE FROM venues WHERE key = ?1").unwrap();
+        for i in 0..solo {
+            st.execute(rusqlite::params![format!("v{}", n + i)]).unwrap();
+        }
+    }
+    let a = ms(t) / solo as f64 * 1000.0;
+    let mut sek_solo_delete = |db: &mut CoreDB| {
+        let t = Instant::now();
+        for i in 0..solo { db.remove(&format!("venues/v{}", n + i)); }
+        ms(t) / solo as f64 * 1000.0
+    };
+    let b = sek_solo_delete(&mut sk);
+    let c = sek_solo_delete(&mut pg);
+    cases.push(Case { name: "delete, per key (us/row)", sqlite_ms: a,
+                      sekejap_ms: b, paged_ms: c, comparable: true });
+
+    // Batched writes, matched: one transaction each, same operations.
     let t = Instant::now();
     {
         let tx = sq.unchecked_transaction().unwrap();
+        let mut st = tx.prepare("DELETE FROM venues WHERE key = ?1").unwrap();
         for i in 0..churn {
-            tx.execute(
-                "DELETE FROM venues WHERE key = ?1",
-                rusqlite::params![format!("v{}", n + i)],
-            )
-            .unwrap();
+            st.execute(rusqlite::params![format!("v{}", n + solo + i)]).unwrap();
         }
+        drop(st);
         tx.commit().unwrap();
     }
     let a = ms(t) / churn as f64 * 1000.0;
-    let t = Instant::now();
-    for i in 0..churn {
-        sk.remove(&format!("venues/v{}", n + i));
-    }
-    let b = ms(t) / churn as f64 * 1000.0;
-    let t = Instant::now();
-    for i in 0..churn {
-        pg.remove(&format!("venues/v{}", n + i));
-    }
-    let c = ms(t) / churn as f64 * 1000.0;
-    cases.push(Case {
-        name: "delete (us/row)",
-        sqlite_ms: a,
-        sekejap_ms: b,
-        paged_ms: c,
-        comparable: true,
-    });
+    let mut sek_batch_delete = |db: &mut CoreDB| {
+        let t = Instant::now();
+        let mut tx = db.begin();
+        for i in 0..churn { tx.remove(&format!("venues/v{}", n + solo + i)); }
+        tx.commit().unwrap();
+        ms(t) / churn as f64 * 1000.0
+    };
+    let b = sek_batch_delete(&mut sk);
+    let c = sek_batch_delete(&mut pg);
+    cases.push(Case { name: "delete, in a txn (us/row)", sqlite_ms: a,
+                      sekejap_ms: b, paged_ms: c, comparable: true });
 
     // ── 5. one graph hop ─────────────────────────────────────────────────────
     // SQLite has no adjacency, so this is the join it would have to do, with both
