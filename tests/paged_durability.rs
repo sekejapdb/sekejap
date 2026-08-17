@@ -607,3 +607,58 @@ fn paged_mode_without_snapshots_says_so() {
     assert_eq!(snap.query("SELECT _key FROM p").unwrap().collect().len(), 61,
                "the snapshot disagrees with the store it was taken from");
 }
+
+/// **Opening a paged store without the flags that wrote it must be refused.**
+///
+/// This was the most destructive bug the paged work produced, and it was reachable
+/// from the public service API. `EngineBuilder::build()` calls `open_paged`, which
+/// sets `paged_topology` alone and has no way to ask for the others. Opening a
+/// store written with the full configuration through it:
+///
+/// - reported itself healthy, `snapshot_reads` and all
+/// - served a completely **empty** database — 0 rows, 0 count, empty MATCH
+/// - **truncated `payloads.bin` from 8192 bytes to 0**, on open, with no write
+///   issued, because the flat payload path takes a file it does not recognise
+/// - and one write plus a compaction made the loss permanent
+///
+/// The reverse direction was already guarded — a flat payload file opened *with*
+/// `paged_payloads` is refused — so this was an asymmetry rather than an oversight
+/// about whether guarding matters.
+#[test]
+fn opening_a_paged_store_with_the_wrong_config_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build(dir.path(), 40);
+    let before: Vec<(String, u64)> = std::fs::read_dir(dir.path()).unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| (e.file_name().to_string_lossy().to_string(),
+                  e.metadata().map(|m| m.len()).unwrap_or(0)))
+        .collect();
+
+    for (label, cfg) in [
+        ("what Engine does", Config { paged_topology: true, ..Config::default() }),
+        ("plain default", Config::default()),
+        ("payloads only", Config { paged_topology: true, paged_payloads: true,
+                                   ..Config::default() }),
+    ] {
+        let err = CoreDB::open_with_config(dir.path(), cfg).err().unwrap_or_else(|| {
+            panic!("[{label}] a paged store opened with a config that ignores its \
+                    files was accepted; that serves an empty database and then \
+                    overwrites it")
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("paged_"), "[{label}] the error should name the flag: {msg}");
+
+        // And nothing may have been touched by the refused open.
+        for (name, len) in &before {
+            let now = std::fs::metadata(dir.path().join(name)).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(now, *len,
+                       "[{label}] {name} changed from {len} to {now} bytes during an \
+                        open that failed");
+        }
+    }
+
+    // The right config still reads everything.
+    let db = CoreDB::open_with_config(dir.path(), paged()).unwrap();
+    assert_eq!(rows(&db), 40, "the store did not survive the refused opens");
+    assert_eq!(db.one("p/n0").forward("next").collect().len(), 1);
+}
