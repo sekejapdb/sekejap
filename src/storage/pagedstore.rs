@@ -75,7 +75,16 @@ impl PagedStore {
     pub(crate) fn put(&mut self, key: u128, bytes: &[u8]) -> io::Result<()> {
         let previous = self.index.get(key)?;
         let id = self.records.insert(bytes)?;
-        self.index.insert(key, id.0)?;
+        // If the index cannot record where the bytes went, the bytes are
+        // unreachable — nothing points at them and nothing ever will. Leaving them
+        // there leaks a record's worth of space on every such failure, so the
+        // insert is undone before the error is returned. The previous version is
+        // untouched either way, so the key keeps its old value rather than losing
+        // both.
+        if let Err(e) = self.index.insert(key, id.0) {
+            let _ = self.records.delete(id);
+            return Err(e);
+        }
         if let Some(old) = previous {
             self.records.delete(RecordId(old))?;
         }

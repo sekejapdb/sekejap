@@ -190,8 +190,28 @@ impl AdjStore {
     /// `<name>.idx`. Two of these make a graph: one forward, one reverse.
     pub(crate) fn open(dir: &Path, name: &str, page_size: usize) -> io::Result<Self> {
         let store = PagedStore::open_named(dir, name, page_size)?;
-        let edges = store.user_meta().0;
-        Ok(Self { store, scratch: Vec::new(), edges })
+        // The running total lives in the store's header word, which is written on
+        // `sync`. Records are written as they arrive, so a crash between the two
+        // leaves records on disk that the total does not know about — and the total
+        // reads back as zero on a store that plainly has owners in it. Left alone
+        // that becomes an underflow on the next removal, and a compaction rail
+        // comparing against a number smaller than the truth.
+        //
+        // A total of zero on a non-empty store is the one state that cannot be
+        // right, so it is the one worth paying to repair. The walk is bounded by
+        // the store and happens once, after a crash, rather than on every open.
+        let mut me = Self { store, scratch: Vec::new(), edges: 0 };
+        let stored = me.store.user_meta().0;
+        me.edges = if stored == 0 && me.store.len() > 0 { me.recount()? } else { stored };
+        Ok(me)
+    }
+
+    /// Count the edges by reading them. Only for repairing a total that cannot be
+    /// right; everything else uses the running one.
+    fn recount(&self) -> io::Result<u64> {
+        let mut n = 0u64;
+        self.for_each_owner(|_, list| { n += list.len() as u64; true })?;
+        Ok(n)
     }
 
     /// How many edges are stored, without reading any of them.
@@ -234,16 +254,29 @@ impl AdjStore {
         if edges.is_empty() { return Ok(()) }
         // A list that fails its own checks is not extended — it is replaced. The
         // alternative is appending to bytes that are not this node's edges.
-        let mut list = self.store.get(owner as u128)?
+        let stored = self.store.get(owner as u128)?;
+        // What the total currently believes this owner holds, so a discarded list
+        // can be subtracted rather than double-counted.
+        let had = stored.as_ref().map_or(0, |b| {
+            b.len().saturating_sub(LIST_HEADER) / EDGE_BYTES
+        });
+        let mut list = stored
             .and_then(|b| decode(owner, &b))
             .unwrap_or_else(|| Vec::with_capacity(edges.len()));
+        let kept = list.len();
         list.extend_from_slice(edges);
         let mut scratch = std::mem::take(&mut self.scratch);
         encode(owner, &list, &mut scratch);
         let r = self.store.put(owner as u128, &scratch);
         self.scratch = scratch;
         r?;
-        self.edges += edges.len() as u64;
+        // By the difference between what this owner now holds and what the total
+        // already counted for it — not by simply adding the new edges. Those agree
+        // in the ordinary case, and disagree exactly when the stored list failed
+        // its checks and was replaced rather than extended: the discarded edges are
+        // no longer there, and adding on top would leave the total permanently high.
+        self.edges = (self.edges + list.len() as u64).saturating_sub(had as u64);
+        debug_assert_eq!(kept + edges.len(), list.len(), "the list grew by something else");
         Ok(())
     }
 
@@ -271,7 +304,7 @@ impl AdjStore {
             self.scratch = scratch;
             r?;
         }
-        self.edges -= 1;
+        self.edges = self.edges.saturating_sub(1);
         Ok(true)
     }
 
@@ -283,7 +316,7 @@ impl AdjStore {
             None => return Ok(false),
         };
         self.store.delete(owner as u128)?;
-        self.edges -= had as u64;
+        self.edges = self.edges.saturating_sub(had as u64);
         Ok(true)
     }
 
