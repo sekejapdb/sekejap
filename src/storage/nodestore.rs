@@ -109,7 +109,12 @@ fn encode(n: &StoredNode, out: &mut Vec<u8>) {
     out.extend_from_slice(&n.payload_offset.to_le_bytes());
     out.extend_from_slice(&n.payload_len.to_le_bytes());
     out.extend_from_slice(&if n.spatial.is_some() { FLAG_SPATIAL } else { 0 }.to_le_bytes());
-    out.extend_from_slice(&(n.collection.len() as u16).to_le_bytes());
+    // Truncating this cast silently corrupts the record: a name longer than 64 KiB
+    // would write a shorter length, the checksum would cover the same wrong layout
+    // and verify, and the decoded node would carry a cut-short collection and a slug
+    // starting mid-name. Clamping keeps the record self-consistent, and `put`
+    // refuses such a name outright rather than storing a clamped one.
+    out.extend_from_slice(&(n.collection.len().min(u16::MAX as usize) as u16).to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // padding, keeps the f64s 8-aligned
     if let Some(s) = &n.spatial {
         for v in s { out.extend_from_slice(&v.to_le_bytes()) }
@@ -250,6 +255,17 @@ impl NodeStore {
     /// as join the new one's, or it would be returned by scans of both. That is the
     /// reason this reads the previous record first.
     pub(crate) fn put(&mut self, hash: u64, node: &StoredNode) -> io::Result<()> {
+        // The record stores this length in two bytes. A longer name cannot be
+        // written back faithfully, so it is refused rather than silently cut — the
+        // checksum would happily cover the truncated layout and the node would read
+        // back with a mangled collection and slug.
+        if node.collection.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("sekejap: collection name is {} bytes; a node record stores \
+                         at most {}", node.collection.len(), u16::MAX),
+            ));
+        }
         let previous = self.get(hash)?;
         let mut scratch = std::mem::take(&mut self.scratch);
         encode(node, &mut scratch);
