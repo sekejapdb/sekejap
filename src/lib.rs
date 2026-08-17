@@ -2002,6 +2002,54 @@ impl CoreDB {
         let pay_path = dir.join("payloads.bin");
         let preserve      = snap.as_ref().map_or(false, |s| s.is_disk_backed) || topo_recovery;
         let has_vec_files = snap.as_ref().map_or(false, |s| s.has_vector_files);
+        // ── refuse a config that does not match how the store was written ────
+        //
+        // The reverse direction was already guarded: a flat `payloads.bin` opened
+        // with `paged_payloads` is refused, because creating a page store over it
+        // would truncate it. This direction was not, and it is worse.
+        //
+        // A store written with the paged flags, opened without them, reports itself
+        // healthy and serves an **empty database** — the paged stores hold the data
+        // and nothing looks at them. `payloads.bin` is then truncated to zero by the
+        // flat payload path on open, before any write is issued, and the first
+        // compaction makes the loss permanent. Reachable from `open_as_service()`,
+        // because `EngineBuilder` sets `paged_topology` alone and has no way to ask
+        // for the others.
+        //
+        // So the store's own files decide. Each check is "these bytes exist and this
+        // config would ignore them".
+        {
+            let mismatched = |file: &str, flag: bool| -> bool {
+                !flag && std::fs::metadata(dir.join(file)).is_ok_and(|m| m.len() > 0)
+            };
+            let flat_payloads_but_paged_file = !config.paged_payloads
+                && std::fs::read(dir.join("payloads.bin")).is_ok_and(|b| {
+                    b.len() >= 8 && &b[0..8] == b"SKPAGE\0\0"
+                });
+            let offender = if flat_payloads_but_paged_file {
+                Some(("payloads.bin", "paged_payloads"))
+            } else if mismatched("nodesp.rec", config.paged_nodes) {
+                Some(("nodesp.rec", "paged_nodes"))
+            } else if mismatched("adjp_fwd.rec", config.paged_adjacency) {
+                Some(("adjp_fwd.rec", "paged_adjacency"))
+            } else {
+                None
+            };
+            if let Some((file, flag)) = offender {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "sekejap: {} holds data written with `{flag}`, but this open \
+                         did not ask for it. Continuing would serve an empty database \
+                         and then overwrite what is there. Open it with \
+                         Config {{ {flag}: true, .. }}. Note that Engine/open_as_service \
+                         sets paged_topology only and cannot yet express the others.",
+                        dir.join(file).display(),
+                    ),
+                ));
+            }
+        }
+
         if config.paged_adjacency {
             // The durable graph, written where it belongs instead of rebuilt.
             db.paged_adj = Some(PagedAdjacency::open(dir)?);
