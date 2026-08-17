@@ -4131,6 +4131,23 @@ impl CoreDB {
             payload: payload_json.to_string(),
         });
 
+        let hash = self.put_raw_indexed(slug, payload_json, payload)?;
+        self.after_mutation();
+        Ok(hash)
+    }
+
+    /// Store a row and maintain every index that depends on it, without touching
+    /// the WAL — the caller decides how the intent is logged.
+    ///
+    /// This is the body `put` used to carry inline, and carrying it inline is why a
+    /// transaction's rows were stored but never indexed: `Transaction::commit`
+    /// applies its operations with `put_raw`, which reaches `put_raw_inner` and so
+    /// maintains bm25, spatial and search — but the GIN maintenance lived out here,
+    /// in `put`, where a transaction never went. Ten committed rows containing
+    /// "fox" left `ILIKE '%fox%'` answering eleven where the data said sixteen.
+    fn put_raw_indexed(&mut self, slug: &str, payload_json: &str, payload: Value)
+        -> Result<u64, serde_json::Error>
+    {
         let node_hash = sk_hash(slug);
         // Whether this is a fresh insert or an overwrite decides index bookkeeping
         // (an update must first retract the node's old index entries).
@@ -4168,8 +4185,6 @@ impl CoreDB {
                 }
             }
         }
-
-        self.after_mutation();
         Ok(hash)
     }
 
@@ -10652,7 +10667,10 @@ impl<'db> Transaction<'db> {
         // Apply all ops to in-memory store in order
         for op in &self.ops {
             match op {
-                TxnOp::Put(slug, json) => { self.db.put_raw(slug, json)?; }
+                TxnOp::Put(slug, json) => {
+                    let payload: Value = serde_json::from_str(json)?;
+                    self.db.put_raw_indexed(slug, json, payload)?;
+                }
                 TxnOp::Remove(slug) => { self.db.remove_raw(slug); }
                 TxnOp::Link(from, to, et) => {
                     self.db.link_raw(from, to, et);
@@ -10698,6 +10716,11 @@ impl<'db> Transaction<'db> {
         }
         self.db.defer_wal_sync = false;
         self.db.wal_flush();
+        // A committed transaction is a mutation like any other: it has to emit its
+        // change events and count towards auto-compaction. Skipping this meant a
+        // subscriber never heard about anything written in a transaction, and a
+        // workload that only ever wrote in transactions never compacted.
+        self.db.after_mutation();
         Ok(count)
     }
 

@@ -356,3 +356,144 @@ fn edges_added_and_withdrawn_around_a_compaction() {
         seed(db, 40..45);
     });
 }
+
+// ── mutating comparison ──────────────────────────────────────────────────────
+//
+// Everything above compares the storage modes on *reading the same data*. Every
+// write happens in `build_with`, before the comparison starts, so the path that
+// takes a write from the RAM overlay down into the durable store was never
+// compared at all — it was exercised once, identically, in setup.
+//
+// That gap is where the bugs were. Five of the seven found in one afternoon lived
+// there: UPDATE not maintaining a btree index, ALTER TABLE changing a schema
+// without touching a row, DROP TABLE dropping nothing. All of them read the
+// overlay directly and so did nothing on a paged store, and every read probe above
+// happily agreed, because the data they compared had been written before the bug
+// could act on it.
+//
+// So: apply a mutation to every mode, then compare every read probe, then apply
+// the next. A divergence names the mutation that caused it rather than appearing
+// at the end of a long script.
+
+/// One step: a name, and the mutation applied to each mode in turn.
+type Step = (&'static str, fn(&mut CoreDB));
+
+fn steps() -> Vec<Step> {
+    vec![
+        ("put new rows", |db| { seed(db, 100..110); }),
+        ("put over existing rows", |db| { seed(db, 0..5); }),
+        ("remove rows", |db| { for i in 20..25 { db.remove(&format!("p/n{i}")); } }),
+        ("SQL UPDATE on an indexed column", |db| {
+            db.execute("UPDATE p SET n = 5000 WHERE n = 12").unwrap();
+        }),
+        ("SQL UPDATE on a text column", |db| {
+            db.execute("UPDATE p SET name = 'renamed' WHERE n < 4").unwrap();
+        }),
+        ("SQL DELETE by predicate", |db| {
+            db.execute("DELETE FROM p WHERE n > 26 AND n < 29").unwrap();
+        }),
+        ("link new edges", |db| {
+            for i in 100..108 { db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next"); }
+        }),
+        ("unlink an edge", |db| { db.unlink("p/n1", "p/n2", "next"); }),
+        ("link_meta then update_edge", |db| {
+            db.link_meta("p/n0", "p/n9", "tagged", &json!({"weight": 1}).to_string()).unwrap();
+            db.update_edge("p/n0", "p/n9", "tagged", "{}", &json!({"weight": 42}).to_string());
+        }),
+        ("unlink_where by attribute", |db| {
+            db.unlink_where("p/n0", "p/n9", "tagged", &json!({"weight": 42}).to_string());
+        }),
+        ("compact", |db| { db.compact().unwrap(); }),
+        ("write after a compaction", |db| { seed(db, 200..205); }),
+        ("remove after a compaction", |db| { for i in 200..202 { db.remove(&format!("p/n{i}")); } }),
+        ("a transaction that commits", |db| {
+            let mut tx = db.begin();
+            for i in 300..305 {
+                tx.put(&format!("p/n{i}"),
+                       &json!({"_collection":"p","_key":format!("n{i}"),"n":i as i64,
+                               "name":format!("row {i}"),"body":"the quick brown fox",
+                               "grp": (i % 3) as i64}).to_string()).unwrap();
+            }
+            tx.link("p/n300", "p/n301", "next");
+            tx.commit().unwrap();
+        }),
+        ("a transaction that rolls back", |db| {
+            let mut tx = db.begin();
+            tx.put("p/n999", &json!({"_collection":"p","_key":"n999","n":999}).to_string()).unwrap();
+            tx.rollback();
+        }),
+        ("bulk write", |db| {
+            let rows: Vec<(String, serde_json::Value)> = (400..410)
+                .map(|i| (format!("p/n{i}"), json!({
+                    "_collection":"p","_key":format!("n{i}"),"n":i as i64,
+                    "name":format!("row {i}"),"body":"the quick brown fox",
+                    "grp": (i % 3) as i64})))
+                .collect();
+            db.put_value_bulk(rows).unwrap();
+        }),
+        ("vectors written after the index exists", |db| {
+            for i in 400..405 {
+                db.put_vector(&format!("p/n{i}"), "vec",
+                              &[i as f32 * 0.1, 1.0, 2.0]).unwrap();
+            }
+        }),
+        ("geometry written after the index exists", |db| {
+            for i in 405..408 {
+                db.put(&format!("p/n{i}"), &json!({
+                    "_collection":"p","_key":format!("n{i}"),"n":i as i64,
+                    "name":format!("row {i}"),"body":"the quick brown fox",
+                    "grp":0,"geometry":{"type":"Point","coordinates":[144.96, -37.81]}
+                }).to_string()).unwrap();
+            }
+            db.build_spatial_index();
+        }),
+        ("compact again", |db| { db.compact().unwrap(); }),
+        ("ALTER TABLE ADD COLUMN", |db| {
+            db.execute("ALTER TABLE p ADD COLUMN extra TEXT").unwrap();
+        }),
+        ("ALTER TABLE DROP COLUMN", |db| {
+            db.execute("ALTER TABLE p DROP COLUMN grp").unwrap();
+        }),
+        ("final compaction", |db| { db.compact().unwrap(); }),
+    ]
+}
+
+/// **The permanent net.** Every mutation, compared across every storage mode,
+/// immediately after it happens.
+#[test]
+fn every_mutation_leaves_the_modes_agreeing() {
+    let mut built: Vec<(&str, tempfile::TempDir, CoreDB)> = Vec::new();
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        build_with(dir.path(), cfg.clone());
+        let db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        built.push((label, dir, db));
+    }
+
+    for (step, apply) in steps() {
+        for (_, _, db) in built.iter_mut() {
+            apply(db);
+        }
+        let mut bad = Vec::new();
+        for (label, f) in &probes() {
+            let reference = f(&mut built[0].2);
+            for (mode, _, db) in built.iter_mut().skip(1) {
+                let got = f(db);
+                if got != reference {
+                    bad.push(format!(
+                        "  {label:<24} resident ={reference}\n  {:<24} {mode:<9}={got}", ""));
+                }
+            }
+        }
+        assert!(bad.is_empty(),
+                "after `{step}` the storage modes disagree — a write reached one and \
+                 not the others:\n{}", bad.join("\n"));
+        // And ground truth, so a mutation that is wrong in *every* mode is caught
+        // too rather than agreed upon. The step is named in the mode label, because
+        // "ILIKE disagrees" without knowing which write caused it is a bug report
+        // with the useful half missing.
+        for (label, _, db) in built.iter() {
+            ground_truth(db, &format!("{label} after `{step}`"));
+        }
+    }
+}
