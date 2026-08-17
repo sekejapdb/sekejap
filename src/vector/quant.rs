@@ -87,7 +87,17 @@ impl ScalarQuantizer {
 /// touching `scale²` — the exact f32 re-rank supplies real distances afterward.
 #[inline]
 pub fn l2_u8(a: &[u8], b: &[u8]) -> u32 {
+    // The kernels below walk to `a.len()` and index `b` at the same offset, with
+    // unchecked SIMD loads. `debug_assert_eq!` compiled that guarantee out of every
+    // release build, so a shorter `b` — two vectors of different dimension reaching
+    // here — read past its end. That is an out-of-bounds read, not a wrong answer.
+    //
+    // Truncating both to the shorter is the safe reading of a comparison between
+    // mismatched vectors; the assertion stays so a debug build still says the
+    // caller was wrong.
     debug_assert_eq!(a.len(), b.len());
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -292,5 +302,32 @@ mod tests {
         f.insert(10, &[9.0, 9.0, 9.0, 9.0]);
         assert_eq!(f.code(10), Some(&[9u8, 9, 9, 9][..]));
         assert_eq!(f.len(), 2);
+    }
+
+    /// **Mismatched lengths must not read past the shorter vector.**
+    ///
+    /// The kernels walk to `a.len()` and index `b` at the same offset with
+    /// unchecked SIMD loads, and the only thing that promised equal lengths was a
+    /// `debug_assert_eq!` — which is compiled out of every release build. A shorter
+    /// `b` was therefore an out-of-bounds read in release, reachable from any path
+    /// that compares two vectors of different dimension.
+    ///
+    /// Run under `cargo test --release` this exercises the very build where the
+    /// assertion is gone; under Miri or ASan it would have been a hard failure.
+    #[test]
+    fn comparing_vectors_of_different_lengths_stays_in_bounds() {
+        for (la, lb) in [(64usize, 8usize), (8, 64), (33, 1), (1, 33), (0, 16), (16, 0),
+                         (17, 16), (16, 17), (128, 127)] {
+            let a: Vec<u8> = (0..la).map(|i| (i * 7 % 251) as u8).collect();
+            let b: Vec<u8> = (0..lb).map(|i| (i * 13 % 241) as u8).collect();
+            let got = l2_u8(&a, &b);
+            // The answer is the distance over the overlap, which is what comparing
+            // two vectors of different length can honestly mean.
+            let n = la.min(lb);
+            let want: u32 = (0..n)
+                .map(|i| { let d = a[i] as i32 - b[i] as i32; (d * d) as u32 })
+                .sum();
+            assert_eq!(got, want, "l2_u8 over {la} vs {lb} bytes");
+        }
     }
 }

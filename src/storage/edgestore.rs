@@ -36,7 +36,15 @@ use serde_json::Value;
 ///
 /// Used by both Fat and Compact modes — the only difference is where
 /// metadata lives (RAM vs disk), pointed to by `meta_id`.
+///
+/// `repr(C)` because this struct's bytes are written to `adj_*_csr.bin` and read
+/// back by casting the mapping to `&[Edge]`. Under the default representation the
+/// compiler is free to reorder fields or change padding, and the file's stride
+/// arithmetic — "24 bytes, records at 24*i" — is asserted by hand in a safety
+/// comment rather than guaranteed. Pinning the layout makes the assertion true by
+/// construction instead of by inspection.
 #[derive(Clone)]
+#[repr(C)]
 pub(crate) struct Edge {
     pub other: u64,
     pub edge_type: u64,

@@ -1026,53 +1026,53 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    468  mod tests
 ```
 
-### `edgestore.rs` · 917L — Edge storage — the graph's connections
+### `edgestore.rs` · 925L — Edge storage — the graph's connections
 
 ```
-    40  pub(crate) struct Edge
-    62  impl Edge
-    68    pub(crate) fn from_base(other: u64, edge_type: u64, base_meta_ref: u64) -> Self
-    80    pub(crate) fn attr_slot(&self) -> Option<u32>
-    90    pub(crate) fn base_meta_ref(&self) -> Option<u64>
-   101  pub enum EdgeMode
-   114  pub(crate) struct DiskAdj
-   121  impl DiskAdj
-   143  pub(crate) struct EdgeStore
-   178  pub(crate) struct EdgeColumn
-   183  impl EdgeColumn
-   197    pub(crate) fn at(&self, slot: u32) -> Option<Value>
-   216  pub(crate) enum ColVal
-   223  fn val_eq(a: &Value, b: &Value) -> bool
-   231  enum MetaStore
-   248  impl EdgeStore
-   252    pub fn new_fat() -> Self
-   269    pub fn new_compact(dir: &Path) -> io::Result<Self>
-   298    pub fn open_compact(dir: &Path) -> io::Result<Self>
-   330    pub fn link(
-   354    pub fn link_meta(
-   385    pub fn reset_adjacency(&mut self)
-   399    pub fn link_with_attrs(
-   432    pub fn link_keyed(
-   514    pub fn edge_column(&self, edge_type: u64, attr: &str) -> Option<&EdgeColumn>
-   521    pub fn edge_col(&self, edge: &Edge, attr: &str) -> Option<Value>
-   528    pub fn edge_cols(&self, edge: &Edge) -> Vec<(String, Value)>
-   541    pub(crate) fn columns_for_type(&self, edge_type: u64) -> Vec<(&str, &EdgeColumn)>
-   581    pub fn unlink(
-   613    pub fn unlink_matching(
-   665    pub fn update_matching(
-   709    pub fn remove_node(&mut self, hash: u64) -> Vec<(u64, bool)>
-   737    pub fn fwd_edges(&self, hash: u64) -> Option<&[Edge]>
-   745    pub fn rev_edges(&self, hash: u64) -> Option<&[Edge]>
-   752    pub fn adjacency_mem_bytes(&self) -> usize
-   771    pub fn spill_to_disk(&mut self, dir: &Path) -> io::Result<()>
-   812    pub fn edge_meta(&self, edge: &Edge) -> Option<Value>
-   851    pub(crate) fn json_at(&self, slot: u32) -> Option<Value>
-   866    pub fn register_type_name(&mut self, type_hash: u64, name: String)
-   871    pub fn type_table(&self) -> Vec<(u64, &str)>
-   875    pub fn type_name(&self, type_hash: u64) -> Option<&str>
-   882    pub fn edge_count(&self) -> usize
-   887    pub fn iter_fwd(&self) -> impl Iterator<Item = (&u64, &[Edge])>
-   895    pub fn remap_meta(&mut self)
+    48  pub(crate) struct Edge
+    70  impl Edge
+    76    pub(crate) fn from_base(other: u64, edge_type: u64, base_meta_ref: u64) -> Self
+    88    pub(crate) fn attr_slot(&self) -> Option<u32>
+    98    pub(crate) fn base_meta_ref(&self) -> Option<u64>
+   109  pub enum EdgeMode
+   122  pub(crate) struct DiskAdj
+   129  impl DiskAdj
+   151  pub(crate) struct EdgeStore
+   186  pub(crate) struct EdgeColumn
+   191  impl EdgeColumn
+   205    pub(crate) fn at(&self, slot: u32) -> Option<Value>
+   224  pub(crate) enum ColVal
+   231  fn val_eq(a: &Value, b: &Value) -> bool
+   239  enum MetaStore
+   256  impl EdgeStore
+   260    pub fn new_fat() -> Self
+   277    pub fn new_compact(dir: &Path) -> io::Result<Self>
+   306    pub fn open_compact(dir: &Path) -> io::Result<Self>
+   338    pub fn link(
+   362    pub fn link_meta(
+   393    pub fn reset_adjacency(&mut self)
+   407    pub fn link_with_attrs(
+   440    pub fn link_keyed(
+   522    pub fn edge_column(&self, edge_type: u64, attr: &str) -> Option<&EdgeColumn>
+   529    pub fn edge_col(&self, edge: &Edge, attr: &str) -> Option<Value>
+   536    pub fn edge_cols(&self, edge: &Edge) -> Vec<(String, Value)>
+   549    pub(crate) fn columns_for_type(&self, edge_type: u64) -> Vec<(&str, &EdgeColumn)>
+   589    pub fn unlink(
+   621    pub fn unlink_matching(
+   673    pub fn update_matching(
+   717    pub fn remove_node(&mut self, hash: u64) -> Vec<(u64, bool)>
+   745    pub fn fwd_edges(&self, hash: u64) -> Option<&[Edge]>
+   753    pub fn rev_edges(&self, hash: u64) -> Option<&[Edge]>
+   760    pub fn adjacency_mem_bytes(&self) -> usize
+   779    pub fn spill_to_disk(&mut self, dir: &Path) -> io::Result<()>
+   820    pub fn edge_meta(&self, edge: &Edge) -> Option<Value>
+   859    pub(crate) fn json_at(&self, slot: u32) -> Option<Value>
+   874    pub fn register_type_name(&mut self, type_hash: u64, name: String)
+   879    pub fn type_table(&self) -> Vec<(u64, &str)>
+   883    pub fn type_name(&self, type_hash: u64) -> Option<&str>
+   890    pub fn edge_count(&self) -> usize
+   895    pub fn iter_fwd(&self) -> impl Iterator<Item = (&u64, &[Edge])>
+   903    pub fn remap_meta(&mut self)
 ```
 
 ### `fieldstore.rs` · 507L — Scalar (btree) field index — fast `WHERE x = / < / BETWEEN` and `ORDER BY`
@@ -1388,7 +1388,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    476  impl IterableVectors for VectorStore
 ```
 
-### `wal.rs` · 1084L — The write-ahead log (WAL) — how a crash can't lose your data
+### `wal.rs` · 1135L — The write-ahead log (WAL) — how a crash can't lose your data
 
 ```
     47  pub enum WalFormat
@@ -1404,31 +1404,31 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    256  fn put_vec_f32(buf: &mut Vec<u8>, v: &[f32])
    263  fn put_vec_str(buf: &mut Vec<u8>, v: &[String])
    270  struct BinaryReader<'a>
-   335  pub fn binary_encode(entry: &WalEntry) -> Vec<u8>
-   426  pub fn binary_decode(data: &[u8]) -> Option<WalEntry>
-   505  pub(crate) struct WalWriter
-   513  impl WalWriter
-   519    pub fn open(path: &Path) -> io::Result<Self>
-   529    pub fn open_with_format(path: &Path, format: WalFormat) -> io::Result<Self>
-   557    pub fn format(&self) -> WalFormat { self.format }
-   560    pub fn set_sync_level(&mut self, level: SyncLevel)
-   566    pub fn append(&mut self, entry: &WalEntry) -> io::Result<()>
-   582    pub fn append_batch(&mut self, entries: &[WalEntry]) -> io::Result<()>
-   602    pub fn sync(&mut self) -> io::Result<()>
-   613    pub fn seq(&self) -> u64 { self.seq }
-   616    pub fn sync_level(&self) -> SyncLevel { self.sync_level }
-   623    pub fn try_clone_file(&self) -> io::Result<File>
-   632  pub(crate) fn sync_file(file: &File, level: SyncLevel) -> io::Result<()>
-   668  fn detect_format(path: &Path) -> io::Result<WalFormat>
-   682  fn has_magic_header(path: &Path) -> io::Result<bool>
-   693  pub(crate) struct WalReader
-   698  impl WalReader
-   699    pub fn open(path: &Path) -> io::Result<Self>
-   715    pub fn format(&self) -> WalFormat { self.format }
-   722    pub fn replay_all<F: FnMut(WalEntry)>(mut self, mut cb: F) -> bool
-   764    pub fn read_all(self) -> (Vec<WalEntry>, bool)
-   779  pub(crate) fn migrate_wal(
-   812  mod tests
+   342  pub fn binary_encode(entry: &WalEntry) -> Vec<u8>
+   433  pub fn binary_decode(data: &[u8]) -> Option<WalEntry>
+   512  pub(crate) struct WalWriter
+   520  impl WalWriter
+   526    pub fn open(path: &Path) -> io::Result<Self>
+   536    pub fn open_with_format(path: &Path, format: WalFormat) -> io::Result<Self>
+   564    pub fn format(&self) -> WalFormat { self.format }
+   567    pub fn set_sync_level(&mut self, level: SyncLevel)
+   573    pub fn append(&mut self, entry: &WalEntry) -> io::Result<()>
+   589    pub fn append_batch(&mut self, entries: &[WalEntry]) -> io::Result<()>
+   609    pub fn sync(&mut self) -> io::Result<()>
+   620    pub fn seq(&self) -> u64 { self.seq }
+   623    pub fn sync_level(&self) -> SyncLevel { self.sync_level }
+   630    pub fn try_clone_file(&self) -> io::Result<File>
+   639  pub(crate) fn sync_file(file: &File, level: SyncLevel) -> io::Result<()>
+   675  fn detect_format(path: &Path) -> io::Result<WalFormat>
+   689  fn has_magic_header(path: &Path) -> io::Result<bool>
+   700  pub(crate) struct WalReader
+   705  impl WalReader
+   706    pub fn open(path: &Path) -> io::Result<Self>
+   722    pub fn format(&self) -> WalFormat { self.format }
+   729    pub fn replay_all<F: FnMut(WalEntry)>(mut self, mut cb: F) -> bool
+   771    pub fn read_all(self) -> (Vec<WalEntry>, bool)
+   786  pub(crate) fn migrate_wal(
+   819  mod tests
 ```
 
 ## `src/text_index/`
@@ -1591,7 +1591,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    333  mod tests
 ```
 
-### `quant.rs` · 296L — Quantization — shrinking vectors from `f32` to `int8` to save RAM
+### `quant.rs` · 333L — Quantization — shrinking vectors from `f32` to `int8` to save RAM
 
 ```
     47  pub struct ScalarQuantizer
@@ -1599,16 +1599,16 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     59    pub fn calibrate(sample: &mut [f32]) -> Self
     73    pub fn quantize(&self, v: &[f32]) -> Vec<u8>
     89  pub fn l2_u8(a: &[u8], b: &[u8]) -> u32
-   106  fn l2_u8_scalar(a: &[u8], b: &[u8]) -> u32
-   178  pub struct QuantizedField
-   185  impl QuantizedField
-   186    pub fn new(quantizer: ScalarQuantizer, dim: usize) -> Self
-   191    pub fn with_capacity(quantizer: ScalarQuantizer, dim: usize, n: usize) -> Self
-   201    pub fn insert(&mut self, id: u64, v: &[f32])
-   219    pub fn quantize_query(&self, q: &[f32]) -> Vec<u8>
-   224    pub fn mem_bytes(&self) -> usize
-   229  impl QuantAccess for QuantizedField
-   244  mod tests
+   116  fn l2_u8_scalar(a: &[u8], b: &[u8]) -> u32
+   188  pub struct QuantizedField
+   195  impl QuantizedField
+   196    pub fn new(quantizer: ScalarQuantizer, dim: usize) -> Self
+   201    pub fn with_capacity(quantizer: ScalarQuantizer, dim: usize, n: usize) -> Self
+   211    pub fn insert(&mut self, id: u64, v: &[f32])
+   229    pub fn quantize_query(&self, q: &[f32]) -> Vec<u8>
+   234    pub fn mem_bytes(&self) -> usize
+   239  impl QuantAccess for QuantizedField
+   254  mod tests
 ```
 
 <!-- 49 files, 1339 items -->
