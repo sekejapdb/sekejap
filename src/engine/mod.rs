@@ -674,9 +674,27 @@ impl Engine {
     /// Increments after each successful [`compact()`](Self::compact) upload
     /// or [`refresh()`](Self::refresh) download.
 
-    /// Consume the engine and return the inner `CoreDB`.
-    pub fn into_inner(self) -> CoreDB {
-        self.guard.into_inner()
+    /// Consume the engine and return the inner `CoreDB`, flushing anything the
+    /// write buffer still holds.
+    ///
+    /// The buffer is opt-in ([`EngineBuilder::buffer_size`]) and documented as
+    /// not applying a statement until [`flush`](Self::flush) runs — a trade of
+    /// durability for speed that the caller asks for. But this method *consumes*
+    /// the engine: there is no later opportunity to flush, so dropping the buffer
+    /// here would turn "not yet durable" into "gone", with the writes already
+    /// reported as accepted.
+    ///
+    /// A failed flush is returned as an error rather than swallowed, which is why
+    /// this is fallible where it used to be infallible: handing back a `CoreDB`
+    /// while quietly discarding writes is the thing being fixed, and doing it
+    /// with an error on the floor would be the same bug with extra steps.
+    ///
+    /// Note that plain `drop` does **not** flush — `Engine` has no `Drop`
+    /// impl — so a buffered engine that goes out of scope still loses what it
+    /// holds. Closing one properly means `flush()` or `into_inner()`.
+    pub fn into_inner(self) -> Result<CoreDB, String> {
+        self.flush()?;
+        Ok(self.guard.into_inner())
     }
 }
 

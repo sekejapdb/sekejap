@@ -4663,6 +4663,14 @@ impl CoreDB {
         &mut self,
         items: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<Vec<u64>, serde_json::Error> {
+        // Saved and restored, not set and cleared. Called inside a larger batch —
+        // `begin_bulk`, a transaction, another bulk helper — a hard reset ends the
+        // outer group early, and every write after it fsyncs one at a time while
+        // the caller believes it is still batching. `link_meta_many` documents
+        // this and handles it; its two siblings did not, and `put_many` was
+        // already saving `batch_now` for the same reason two lines below.
+        let prev_defer = self.defer_wal_sync;
+        let prev_index = self.defer_index_rebuild;
         self.defer_wal_sync = true;
         self.defer_index_rebuild = true;
         // One timestamp for the whole batch — skip a per-row time syscall.
@@ -4677,9 +4685,10 @@ impl CoreDB {
         if !had_batch_now {
             self.batch_now = None;
         }
-        self.defer_wal_sync = false;
+        self.defer_wal_sync = prev_defer;
         self.wal_flush();
         self.flush_deferred_indexes();
+        self.defer_index_rebuild = prev_index;
         self.after_mutation();
         result
     }
@@ -4950,11 +4959,13 @@ impl CoreDB {
         &mut self,
         edges: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
     ) {
+        // Nesting-safe, as `link_meta_many` already is — see the note there.
+        let prev = self.defer_wal_sync;
         self.defer_wal_sync = true;
         for (from, to, edge_type) in edges {
             self.link(from, to, edge_type);
         }
-        self.defer_wal_sync = false;
+        self.defer_wal_sync = prev;
         self.wal_flush();
         self.after_mutation();
     }
