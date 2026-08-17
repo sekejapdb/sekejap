@@ -243,12 +243,44 @@ impl PageStore {
     pub(crate) fn alloc(&mut self) -> io::Result<u64> {
         if self.free_head != NO_PAGE {
             let page = self.free_head;
-            let mut link = [0u8; 8];
-            read_exact_at(&self.file, &mut link, page * self.page_size as u64)?;
-            self.free_head = u64::from_le_bytes(link);
-            self.free_count -= 1;
-            self.dirty = true;
-            return Ok(page);
+            // The free list lives *in* the free pages, so a damaged free page is a
+            // damaged list, and following one is worse than losing it:
+            //
+            // - a page that points at itself is a cycle, and allocation hands the
+            //   same page out over and over — two records both owning it, which is
+            //   silent corruption rather than an error
+            // - a page past the end of the file makes every allocation fail from
+            //   then on, because the head never advances
+            // - page 0 is the header, and handing it out lets a record overwrite
+            //   the store's own metadata
+            //
+            // So the list is abandoned rather than followed. That leaks the pages
+            // still on it, which is precisely the failure this design accepts —
+            // a leaked page is one nothing points at.
+            if page == HEADER_PAGE || page >= self.high_water {
+                self.free_head = NO_PAGE;
+                self.free_count = 0;
+                self.dirty = true;
+            } else {
+                let mut link = [0u8; 8];
+                let next = match read_exact_at(&self.file, &mut link,
+                                               page * self.page_size as u64) {
+                    Ok(()) => u64::from_le_bytes(link),
+                    // An unreadable free page ends the list; the pages behind it
+                    // are unreachable either way.
+                    Err(_) => NO_PAGE,
+                };
+                // `NO_PAGE` is the ordinary terminator. Anything else that is not a
+                // page of this store, or is this page again, is damage.
+                self.free_head = if next == NO_PAGE || next >= self.high_water || next == page {
+                    NO_PAGE
+                } else {
+                    next
+                };
+                self.free_count = self.free_count.saturating_sub(1);
+                self.dirty = true;
+                return Ok(page);
+            }
         }
         let page = self.high_water;
         self.high_water += 1;
@@ -628,5 +660,94 @@ mod tests {
         }
         assert!(ok > 0, "a store cut to a third returned nothing at all");
         assert!(ok < pages.len(), "a store cut to a third returned every page, which cannot be");
+    }
+
+    /// A free list that points somewhere impossible must not be followed there.
+    ///
+    /// The list lives *in* the free pages — each holds the next one's number in its
+    /// first eight bytes — so a damaged free page is a damaged list. Three shapes
+    /// matter: a page that points at itself (a cycle, so allocation never ends), a
+    /// page that points past the end of the file, and one that points at the header
+    /// page, which would hand out page 0 and let a record overwrite the store's own
+    /// metadata.
+    #[test]
+    fn a_corrupt_free_list_is_not_followed_off_the_end() {
+        use std::io::{Seek, SeekFrom, Write};
+        for (name, bad) in [
+            ("points at itself", None),       // filled in below, needs the page number
+            ("points past the end", Some(9_999_999u64)),
+            ("points at the header", Some(0u64)),
+            ("points at a huge number", Some(u64::MAX)),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("pages.bin");
+            let mut s = PageStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+            let pages: Vec<u64> = (0..8).map(|_| s.alloc().unwrap()).collect();
+            for &p in &pages { s.write(p, &vec![7u8; DEFAULT_PAGE_SIZE]).unwrap(); }
+            // Free three, so there is a list to corrupt.
+            let freed = [pages[1], pages[3], pages[5]];
+            for &p in &freed { s.free(p).unwrap() }
+            s.sync().unwrap();
+            let head = freed[2]; // most recently freed is the head
+            drop(s);
+
+            let target = bad.unwrap_or(head); // "points at itself"
+            {
+                let mut fh = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                fh.seek(SeekFrom::Start(head * DEFAULT_PAGE_SIZE as u64)).unwrap();
+                fh.write_all(&target.to_le_bytes()).unwrap();
+            }
+
+            let mut s = PageStore::open(&path).unwrap().expect("should still open");
+            // Allocating repeatedly must terminate, and must never hand out the
+            // header page or one past the end of the file.
+            for i in 0..20 {
+                let p = s.alloc().unwrap();
+                assert_ne!(p, HEADER_PAGE,
+                           "{name}: allocation {i} handed out the header page, which a \
+                            record would then overwrite");
+                assert!(p < s.page_count(),
+                        "{name}: allocation {i} handed out page {p} with only {} pages",
+                        s.page_count());
+                // And it must be writable, i.e. really part of the file.
+                s.write(p, &vec![1u8; DEFAULT_PAGE_SIZE]).unwrap();
+            }
+            // The store still reads the pages that were never freed.
+            let mut buf = vec![0u8; DEFAULT_PAGE_SIZE];
+            for &p in [pages[0], pages[2], pages[4]].iter() {
+                s.read(p, &mut buf).unwrap();
+                assert_eq!(buf[0], 7, "{name}: a live page was clobbered by the bad free list");
+            }
+        }
+    }
+
+    /// A header claiming a page size the file cannot have must be declined.
+    ///
+    /// Page size drives every offset in the store, so a wrong one does not read
+    /// wrong data occasionally — it reads the wrong *bytes* for everything.
+    #[test]
+    fn an_impossible_header_is_declined() {
+        use std::io::{Seek, SeekFrom, Write};
+        for (name, offset, value) in [
+            ("page size zero",        12u64, 0u32),
+            ("page size not a power of two", 12, 3000),
+            ("page size below the minimum",  12, 8),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("pages.bin");
+            {
+                let mut s = PageStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+                let p = s.alloc().unwrap();
+                s.write(p, &vec![3u8; DEFAULT_PAGE_SIZE]).unwrap();
+                s.sync().unwrap();
+            }
+            {
+                let mut fh = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                fh.seek(SeekFrom::Start(offset)).unwrap();
+                fh.write_all(&value.to_le_bytes()).unwrap();
+            }
+            assert!(PageStore::open(&path).unwrap().is_none(),
+                    "{name}: a header that cannot describe a real store was accepted");
+        }
     }
 }
