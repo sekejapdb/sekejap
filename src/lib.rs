@@ -4233,6 +4233,18 @@ impl CoreDB {
         // (slug, hash, collection, spatial_meta, is_new)
         let mut metas: Vec<(String, u64, String, Option<geo::SpatialMeta>, bool)> =
             Vec::with_capacity(rows.len());
+        // Which fields carry a btree index, per collection — read once, because the
+        // payload is only in scope inside the loop below and `field_indexes` cannot
+        // be borrowed mutably while it runs.
+        let indexed_by_coll: HashMap<u64, Vec<String>> = {
+            let mut m: HashMap<u64, Vec<String>> = HashMap::new();
+            for (c, f) in self.field_indexes.keys().chain(self.field_base.keys()) {
+                let v = m.entry(*c).or_default();
+                if !v.contains(f) { v.push(f.clone()) }
+            }
+            m
+        };
+        let mut pending_keys: Vec<Vec<(String, FieldKey)>> = Vec::with_capacity(rows.len());
 
         for (slug, mut val) in rows {
             let hash = sk_hash(&slug);
@@ -4276,6 +4288,13 @@ impl CoreDB {
             // its bytes are borrowed for the payload append below.
             let s = serde_json::to_string(&val)?;
             wal_entries.push(WalEntry::Put { slug: slug.clone(), payload: s });
+            pending_keys.push(
+                indexed_by_coll.get(&sk_hash(&coll)).map_or_else(Vec::new, |fields| {
+                    fields.iter()
+                        .filter_map(|f| FieldKey::from_json(val.get(f.as_str()).unwrap_or(&Value::Null))
+                            .map(|k| (f.clone(), k)))
+                        .collect()
+                }));
             metas.push((slug, hash, coll, spatial_meta, is_new));
         }
 
@@ -4313,6 +4332,27 @@ impl CoreDB {
                 self.collection_names_map.entry(coll_hash).or_insert_with(|| coll.clone());
                 if has_any_search {
                     colls_touched.insert(coll.clone());
+                }
+                // Btree indexes, which this path never maintained. It refreshes
+                // bm25, GIN and search and stops there, so a row written through it
+                // was invisible to every indexed `WHERE` until the process
+                // restarted and the index was rebuilt from disk — a full scan found
+                // it, `WHERE t = 5` did not. This is the buffered prepared-insert
+                // route, so it is the IoT write path specifically.
+                //
+                // Same two halves as the single-row path: bring an index that lives
+                // only in the mmap base into the heap first, or the update lands
+                // nowhere.
+                let mapped: Vec<String> = self.field_base.keys()
+                    .filter(|(c, _)| *c == coll_hash)
+                    .map(|(_, f)| f.clone())
+                    .collect();
+                for f in mapped { self.ensure_field_index_writable(coll_hash, &f); }
+                for (field, key) in pending_keys[i].drain(..) {
+                    let ids = self.field_indexes
+                        .entry((coll_hash, field)).or_default()
+                        .entry(key).or_default();
+                    if is_new || !ids.contains(&hash) { ids.push(hash); }
                 }
             }
             self.slug_map.insert(slug.clone(), hash);
