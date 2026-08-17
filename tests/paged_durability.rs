@@ -851,3 +851,38 @@ fn ddl_and_edge_slugs_reach_the_durable_store() {
         }
     }
 }
+
+/// **A bulk write must maintain btree indexes.**
+///
+/// `put_value_bulk` refreshed bm25, GIN and search and stopped there, so a row
+/// written through it was invisible to every indexed `WHERE` — a full scan found
+/// it, `WHERE t = 5` did not — until the process restarted and the index was
+/// rebuilt from disk. That is the buffered prepared-insert route, so it is the IoT
+/// write path specifically, and it is wrong in *both* storage modes.
+#[test]
+fn a_bulk_write_maintains_btree_indexes() {
+    for (label, cfg) in [("paged", paged()), ("default", Config::default())] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+        db.put("p/n0", &row(0)).unwrap();
+        db.execute("CREATE INDEX ON p USING btree (n)").unwrap();
+
+        let rows: Vec<(String, serde_json::Value)> = (1..30)
+            .map(|i| (format!("p/n{i}"), serde_json::from_str(&row(i)).unwrap()))
+            .collect();
+        db.put_value_bulk(rows).unwrap();
+
+        let hits = |db: &CoreDB, sql: &str| db.query(sql).unwrap().collect().len();
+        assert_eq!(hits(&db, "SELECT _key FROM p"), 30, "[{label}] rows are missing entirely");
+        assert_eq!(hits(&db, "SELECT _key FROM p WHERE n = 17"), 1,
+                   "[{label}] a bulk-written row is invisible to its own index");
+        assert_eq!(hits(&db, "SELECT _key FROM p WHERE n > 5 AND n < 12"), 6,
+                   "[{label}] a range over the index misses bulk-written rows");
+
+        // And still right once the index has been through a compaction.
+        db.compact().unwrap();
+        assert_eq!(hits(&db, "SELECT _key FROM p WHERE n = 17"), 1,
+                   "[{label}] the index lost the row at compaction");
+    }
+}
