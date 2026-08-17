@@ -1504,6 +1504,20 @@ pub struct CoreDB {
     /// `compact()` folds the overlay into it owner by owner instead of rebuilding
     /// the graph, so the cost follows the change rather than the store.
     paged_adj: Option<PagedAdjacency>,
+    /// Topology is served from the mapped files rather than loaded into RAM.
+    ///
+    /// Remembered because compaction needs it. A compaction writes the topology
+    /// files and then adopts them — maps them as the new base and empties the
+    /// overlay they came from, which is what returns the RAM. It only did that
+    /// when a base already existed, so the *first* compaction in a fresh process
+    /// wrote the files and walked past them: the overlay stayed resident, the
+    /// segments stayed empty, and neither changed again until the database was
+    /// reopened.
+    ///
+    /// That is the service case exactly — `open_as_service` uses this layout, and
+    /// a service that creates its database and never restarts got no overlay
+    /// compaction at all.
+    paged_topology: bool,
     /// Opened read-only: every mutation is refused rather than accepted and
     /// dropped.
     ///
@@ -2051,6 +2065,7 @@ impl CoreDB {
             slug_map: HashMap::new(),
             // An in-memory database has no directory to put pages in.
             paged_adj: None,
+            paged_topology: false,
             read_only: false,
             write_error: None,
             paged_nodes: None,
@@ -2626,6 +2641,7 @@ impl CoreDB {
 
         // 3. Open WAL in append mode (skip for read-only replicas).
         db.read_only = config.read_only;
+        db.paged_topology = config.paged_topology;
         if !config.read_only {
             let wal = WalWriter::open_with_format(&wal_path, config.wal_format)?;
             db.wal_format = wal.format();
@@ -3954,8 +3970,23 @@ impl CoreDB {
         if wal_len > self.compact_thresholds.wal_bytes {
             return true;
         }
-        // Paged mode: the resident maps are the RAM write-overlay.
-        !self.segments.is_empty() && self.nodes.len() >= self.compact_thresholds.overlay_entries
+        // The other trigger: the RAM write-overlay has grown past its bound.
+        //
+        // `has_base`, not `!segments.is_empty()`. The guard is asking "would a
+        // compaction actually move these nodes out of RAM" — pointless in a purely
+        // resident database, where the maps *are* the database and folding them
+        // changes nothing — and a mapped segment is only one of the two things
+        // that make the answer yes. Paged nodes are the other, and they are the
+        // default.
+        //
+        // `compact()` had this exact bug and it was fixed there (see
+        // `overlay_becomes_durable`); the eligibility check that decides whether
+        // to call it never got the same correction. So the threshold documented as
+        // bounding RAM growth in paged mode never fired: 5 500 nodes against a
+        // 1 000-node bound left `maybe_compact` returning false, and the only live
+        // trigger was the 64 MB log.
+        self.has_base()
+            && self.nodes.len() >= self.compact_thresholds.overlay_entries
     }
 
     /// Compact **iff** the auto-compaction thresholds are crossed. The idle-time
@@ -5277,7 +5308,12 @@ impl CoreDB {
         // the overlay was never cleared, and every compaction folded every node
         // written since the process started — 456 ms to make 200 writes durable on
         // a 50 000-row store, growing without bound in both time and RAM.
-        let overlay_becomes_durable = had_base || self.paged_nodes.is_some();
+        // …and paged topology, for the same reason: the files this compaction is
+        // about to write become the base, so what the overlay held is durable in
+        // them. Without it the first compaction of a fresh paged-topology database
+        // left every node resident.
+        let overlay_becomes_durable =
+            had_base || self.paged_nodes.is_some() || self.paged_topology;
 
         // 1. Compact payload store: rebuild from live nodes only.
         // Must happen BEFORE build_snapshot() so the snapshot records the
@@ -5583,7 +5619,10 @@ impl CoreDB {
         // Adopt the generation just written. Everything the overlay held is in it
         // now, so the overlay empties — which is what returns RAM to where it was
         // before the compaction rather than leaving the whole store resident.
-        if had_base {
+        // Adopting the base and emptying the overlay are one decision: map without
+        // clearing and every node is in both, counted twice by anything that reads
+        // the merge.
+        if overlay_becomes_durable && self.paged_topology {
             let nb = storage::topology::MappedTopology::open(&dir)?;
             for (h, name) in nb.edge_type_table() {
                 self.edges.register_type_name(h, name);
@@ -6674,6 +6713,7 @@ impl CoreDB {
             // edges to find - which is why snapshot_reads is refused for it in
             // `open_with_config` rather than quietly answering an empty graph.
             paged_adj: None,
+            paged_topology: false,
             read_only: false,
             write_error: None,
             paged_nodes: None,

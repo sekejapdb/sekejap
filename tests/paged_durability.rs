@@ -938,3 +938,67 @@ fn a_bulk_write_maintains_btree_indexes() {
                    "[{label}] the index lost the row at compaction");
     }
 }
+
+/// **Auto-compaction's overlay trigger actually fires.**
+///
+/// There are two triggers. The log-size one works. The other — "compact when the
+/// RAM write-overlay holds this many nodes", documented as what bounds RAM growth
+/// in paged mode — never fired at all, in any layout: 5 500 nodes against a
+/// 1 000-node bound left `maybe_compact()` returning `false`.
+///
+/// It guarded on `!segments.is_empty()`, which asks whether a *mapped topology
+/// segment* exists. The question it meant to ask is whether a compaction would
+/// move these nodes out of RAM, and a mapped segment is only one of the two
+/// things that make the answer yes — paged nodes are the other, and they are the
+/// default. `compact()` had the identical bug and it was fixed there; the check
+/// that decides whether to call `compact()` never got the same correction.
+///
+/// Underneath that was a second one. A compaction adopts what it writes — maps
+/// the new topology as the base and empties the overlay it came from, which is
+/// what returns the RAM — but only when a base already existed. So the *first*
+/// compaction in a fresh process wrote the files and walked past them, and
+/// nothing changed until the database was reopened. That is the service case
+/// exactly: `open_as_service` uses this layout, and a service that creates its
+/// database and never restarts got no overlay compaction at all.
+///
+/// The resident layout is the one that correctly does **not** fire: there is no
+/// base, the maps *are* the database, and folding them would return nothing while
+/// looping forever.
+#[test]
+fn the_overlay_threshold_triggers_a_compaction() {
+    use sekejap::{AutoCompact, CompactThresholds};
+
+    let run = |base: Config| -> (bool, usize) {
+        let cfg = Config {
+            auto_compact: AutoCompact::Manual,
+            // Small enough to reach in a test, and the log bound put out of reach
+            // so only the overlay trigger can fire.
+            compact_thresholds: CompactThresholds { wal_bytes: 1 << 40, overlay_entries: 1_000 },
+            ..base
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+        for i in 0..500 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
+        db.compact().unwrap();                       // establish a base
+        for i in 500..6_000 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
+        let fired = db.maybe_compact().unwrap();
+        (fired, rows(&db))
+    };
+
+    let (fired, n) = run(Config::default());
+    assert!(fired, "the overlay threshold did not fire in the default layout — this \
+                    is the bound that keeps RAM from growing with the writes");
+    assert_eq!(n, 6_000, "the compaction it triggered lost rows");
+
+    let (fired, n) = run(Config { paged_topology: true, ..Config::resident() });
+    assert!(fired, "the overlay threshold did not fire with paged topology — a \
+                    service that never restarts would never compact on it");
+    assert_eq!(n, 6_000, "the compaction it triggered lost rows");
+
+    let (fired, n) = run(Config::resident());
+    assert!(!fired, "the overlay threshold fired in the resident layout, where the \
+                     maps are the database and folding them returns nothing — that \
+                     is a compaction loop, not a bound");
+    assert_eq!(n, 6_000, "rows went missing without a compaction running at all");
+}
