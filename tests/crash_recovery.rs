@@ -148,7 +148,13 @@ fn skbin_and_raw_recover_identically() {
 /// Contrast of a DIFFERENT KIND — the batch-durability contract of the buffered
 /// Engine path: a FLUSHED batch survives a crash, an UN-FLUSHED one is lost by
 /// design, and the database stays fully consistent + writable afterward.
-#[cfg(feature = "engine")]
+///
+/// This carried `#[cfg(feature = "engine")]` and had therefore not run since that
+/// feature was removed — see the note in `Cargo.toml`, which explains that the
+/// engine code is always compiled now because gating zero-dependency code bought
+/// nothing. The gate outlived the flag, so the test compiled to nothing and
+/// reported success by not existing. The suite counted one fewer test and nobody
+/// counts.
 #[test]
 fn buffered_flushed_survives_unflushed_lost_db_stays_consistent() {
     use sekejap::engine::Engine;
@@ -557,4 +563,47 @@ fn a_read_only_database_refuses_writes() {
                "a read-only session changed the stored database");
     assert!(db.get("p/a").is_some(), "a read-only session deleted a row");
     assert_eq!(db.edges_from("p/a").len(), 1, "a read-only session changed the graph");
+}
+
+/// **Closing an engine does not throw away what it accepted.**
+///
+/// The write buffer is opt-in and trades durability for speed: a buffered
+/// statement is not applied until `flush()`. That is the caller's choice and it
+/// is documented.
+///
+/// `into_inner()` is different, because it *consumes* the engine. There is no
+/// later opportunity to flush, so dropping the buffer there turns "not yet
+/// durable" into "gone" — for writes the engine already reported as accepted.
+///
+/// Plain `drop` still discards them: `Engine` has no `Drop` impl, and adding one
+/// means running a flush inside a destructor that may be unwinding through the
+/// same lock. That gap is documented on `into_inner` rather than papered over.
+#[test]
+fn closing_an_engine_flushes_what_it_buffered() {
+    use sekejap::engine::Engine;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+    }
+    {
+        let engine = Engine::builder(&path)
+            .buffer_size(1_000)          // large enough that nothing auto-flushes
+            .build()
+            .unwrap();
+        for i in 0..20 {
+            engine.execute(&format!("INSERT INTO p (_key, n) VALUES ('n{i}', {i})"))
+                .unwrap();
+        }
+        // Handed back as a CoreDB — the buffer must have been applied first.
+        let db = engine.into_inner().expect("into_inner refused to flush");
+        assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 20,
+                   "into_inner returned a database missing the writes the engine \
+                    had accepted");
+    }
+    let db = CoreDB::open(dir.path()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 20,
+               "the writes did not reach disk");
 }
