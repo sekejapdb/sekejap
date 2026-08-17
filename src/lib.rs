@@ -1735,6 +1735,50 @@ impl Default for Config {
     }
 }
 
+/// Make `config` agree with the store already on disk.
+///
+/// The paged flags read like options, and for a directory that holds nothing yet
+/// they are: the first open decides where the data will live. For a directory
+/// that already holds a store they are not options at all. They name the format
+/// of files that exist, and files do not change format because the next caller
+/// preferred a different one.
+///
+/// So each flag is decided by the bytes when the bytes have an opinion:
+///
+/// * `payloads.bin` starts with the page-store magic → `paged_payloads` on;
+///   the file exists, is not empty, and is not a page store → off. This is the
+///   only flag that gets turned *off*, because it is the only one whose two
+///   layouts share a filename.
+/// * `nodesp.rec` / `adjp_fwd.rec` hold bytes → `paged_nodes` /
+///   `paged_adjacency` on. Their absence says nothing: a flat store asked to
+///   open with paged nodes is being migrated, and the file appears on the first
+///   write.
+///
+/// What this prevents is not an inconvenience but a silent deletion. A paged
+/// store opened without its flags finds its data in files nothing reads, reports
+/// an empty database, truncates `payloads.bin`, and loses the lot at the next
+/// compaction. `EngineBuilder` reached that state by construction until it
+/// learned to carry a [`Config`], and any caller that opens a directory it did
+/// not create can still reach it. The refusal that follows this call stays as a
+/// backstop — it should now be unreachable.
+fn adopt_layout_from_disk(dir: &Path, config: &mut Config) {
+    let nonempty = |file: &str| -> bool {
+        std::fs::metadata(dir.join(file)).is_ok_and(|m| m.len() > 0)
+    };
+    if nonempty("payloads.bin") {
+        let paged = std::fs::File::open(dir.join("payloads.bin"))
+            .and_then(|mut f| {
+                use std::io::Read;
+                let mut magic = [0u8; 8];
+                f.read_exact(&mut magic).map(|_| magic)
+            })
+            .is_ok_and(|magic| &magic == b"SKPAGE\0\0");
+        config.paged_payloads = paged;
+    }
+    config.paged_nodes     |= nonempty("nodesp.rec");
+    config.paged_adjacency |= nonempty("adjp_fwd.rec");
+}
+
 impl Default for CoreDB {
     fn default() -> Self {
         Self::new()
@@ -1894,6 +1938,7 @@ impl CoreDB {
     /// parsed, or the WAL file cannot be opened.
     pub fn open_with_config(dir: impl AsRef<Path>, config: Config) -> io::Result<Self> {
         let dir = dir.as_ref();
+        let mut config = config;
         std::fs::create_dir_all(dir)?;
 
         // Take an exclusive lock on a `db.lock` file so a second process can't
@@ -2040,6 +2085,16 @@ impl CoreDB {
         //
         // So the store's own files decide. Each check is "these bytes exist and this
         // config would ignore them".
+        //
+        // Refusing is the floor, not the answer. A paged flag is not a preference
+        // about behaviour — it names a file format, and the format was settled when
+        // the store was written. Asking for flat payloads over a paged
+        // `payloads.bin` is not a different taste; it is a false statement about
+        // bytes that already exist. So before refusing, the open adopts what the
+        // files say: flags the store needs are turned on, and `paged_payloads` is
+        // turned off when the file on disk is flat. The caller's config still
+        // decides the layout of a store that does not exist yet.
+        adopt_layout_from_disk(dir, &mut config);
         {
             let mismatched = |file: &str, flag: bool| -> bool {
                 !flag && std::fs::metadata(dir.join(file)).is_ok_and(|m| m.len() > 0)
@@ -2062,10 +2117,11 @@ impl CoreDB {
                     io::ErrorKind::InvalidInput,
                     format!(
                         "sekejap: {} holds data written with `{flag}`, but this open \
-                         did not ask for it. Continuing would serve an empty database \
-                         and then overwrite what is there. Open it with \
-                         Config {{ {flag}: true, .. }}. Note that Engine/open_as_service \
-                         sets paged_topology only and cannot yet express the others.",
+                         did not ask for it and the layout could not be adopted from \
+                         the files. Continuing would serve an empty database and then \
+                         overwrite what is there. Open it with \
+                         Config {{ {flag}: true, .. }} — through \
+                         `Engine::builder(..).config(..)` if this is a service.",
                         dir.join(file).display(),
                     ),
                 ));
