@@ -774,3 +774,80 @@ fn edge_attribute_writes_reach_the_durable_store() {
                    "[{label}] the updated attributes were lost by the compaction");
     }
 }
+
+/// **DDL that rewrites rows, and edge slug resolution, must reach the durable
+/// store.**
+///
+/// All four read the RAM overlay directly — `self.collections`, `self.nodes`,
+/// `self.slug_map` — which holds only what was written since the last compaction.
+/// On a paged database that is nothing, so the schema changed and the data did
+/// not; `DROP TABLE` was a no-op in *any* mode after a reopen, leaving rows
+/// queryable under a table that no longer had a schema, and permanently
+/// unreachable by a second DROP.
+#[test]
+fn ddl_and_edge_slugs_reach_the_durable_store() {
+    for (label, cfg) in [("paged", paged()), ("default", Config::default())] {
+        // Each case gets a store built, compacted and reopened, so nothing it
+        // needs is left in the overlay.
+        let fresh = || {
+            let dir = tempfile::TempDir::new().unwrap();
+            {
+                let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+                db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+                for i in 0..25 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
+                for i in 0..10 { db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next"); }
+                db.compact().unwrap();
+            }
+            (CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap(), dir)
+        };
+
+        // Edge endpoints must resolve to slugs.
+        {
+            let (db, _d) = fresh();
+            let e = db.edges_from("p/n0");
+            assert_eq!(e.len(), 1, "[{label}] edges_from found nothing");
+            assert_eq!(e[0].to_slug.as_deref(), Some("p/n1"),
+                       "[{label}] edges_from could not name the far end");
+            let back = db.edges_to("p/n1");
+            assert_eq!(back[0].from_slug.as_deref(), Some("p/n0"),
+                       "[{label}] edges_to could not name the near end");
+        }
+
+        // DROP COLUMN must actually leave the rows.
+        {
+            let (mut db, _d) = fresh();
+            db.execute("ALTER TABLE p DROP COLUMN body").unwrap();
+            let raw = db.get("p/n7").expect("row vanished");
+            assert!(!raw.contains("\"body\""),
+                    "[{label}] DROP COLUMN left the column in the row: {raw}");
+        }
+
+        // RENAME COLUMN must move the values.
+        {
+            let (mut db, _d) = fresh();
+            db.execute("ALTER TABLE p RENAME COLUMN n TO idx").unwrap();
+            let raw = db.get("p/n7").expect("row vanished");
+            assert!(raw.contains("\"idx\"") && !raw.contains("\"n\":"),
+                    "[{label}] RENAME COLUMN did not rewrite the row: {raw}");
+        }
+
+        // RENAME TABLE must take every row with it.
+        {
+            let (mut db, _d) = fresh();
+            db.execute("ALTER TABLE p RENAME TO q").unwrap();
+            assert_eq!(db.query("SELECT _key FROM q").unwrap().collect().len(), 25,
+                       "[{label}] the renamed table did not bring its rows");
+            assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 0,
+                       "[{label}] rows are still under the old name");
+        }
+
+        // DROP TABLE must actually drop.
+        {
+            let (mut db, _d) = fresh();
+            db.execute("DROP TABLE p").unwrap();
+            assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 0,
+                       "[{label}] DROP TABLE left every row queryable");
+            assert!(db.get("p/n7").is_none(), "[{label}] a dropped row is still readable");
+        }
+    }
+}
