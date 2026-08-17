@@ -107,6 +107,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
+/// A numeric literal as the narrowest JSON number that represents it exactly.
+///
+/// The lexer hands back `f64` for every number it sees, so without this every
+/// literal in every statement became a float — and a column of integers acquired
+/// floats the moment anyone wrote to it through SQL.
+fn int_or_float(n: f64) -> Option<serde_json::Number> {
+    if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        return Some(serde_json::Number::from(n as i64));
+    }
+    serde_json::Number::from_f64(n)
+}
+
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1652,9 +1665,17 @@ impl Parser {
         match self.advance() {
             Tok::Str(s) => Ok(Value::String(s)),
             Tok::Num(n) => {
-                let num = serde_json::Number::from_f64(n)
-                    .ok_or_else(|| SqlError::InvalidNumber(n.to_string()))?;
-                Ok(Value::Number(num))
+                // A whole number stays whole. The lexer produces `f64` for every
+                // numeric literal, and routing all of them through `from_f64` made
+                // `UPDATE p SET n = 5000` store `5000.0` in a column that had held
+                // integers — after which every reader asking for an integer skipped
+                // the row silently, because a JSON float is not an integer however
+                // round it looks. `INSERT ... VALUES (5)` had the same effect.
+                //
+                // Only values that are exactly representable convert: anything with
+                // a fractional part, or beyond what an i64 holds, stays a float.
+                Ok(Value::Number(int_or_float(n)
+                    .ok_or_else(|| SqlError::InvalidNumber(n.to_string()))?))
             }
             Tok::Kw(Kw::True) => Ok(Value::Bool(true)),
             Tok::Kw(Kw::False) => Ok(Value::Bool(false)),
