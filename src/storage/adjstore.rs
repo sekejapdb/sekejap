@@ -154,6 +154,15 @@ fn encode(owner: u64, edges: &[AdjEdge], out: &mut Vec<u8>) {
 /// were altered, which the checksum catches. Either way the answer is that this
 /// node's edges are unavailable — never another node's edges presented as them.
 fn decode(owner: u64, bytes: &[u8]) -> Option<Vec<AdjEdge>> {
+    decode_as(owner, bytes, |other, edge_type, meta_ref| AdjEdge { other, edge_type, meta_ref })
+}
+
+/// The checked decode, building whatever the caller asked for.
+///
+/// `make` receives the three stored fields in order — neighbour, type, attribute
+/// reference — so a caller with its own edge struct never pays for an
+/// intermediate one.
+fn decode_as<T>(owner: u64, bytes: &[u8], make: impl Fn(u64, u64, u64) -> T) -> Option<Vec<T>> {
     if bytes.len() < LIST_HEADER { return None }
     if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != crc(&bytes[4..]) { return None }
     if u64::from_le_bytes(bytes[4..12].try_into().unwrap()) != owner { return None }
@@ -162,11 +171,11 @@ fn decode(owner: u64, bytes: &[u8]) -> Option<Vec<AdjEdge>> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let o = i * EDGE_BYTES;
-        out.push(AdjEdge {
-            other: u64::from_le_bytes(body[o..o + 8].try_into().unwrap()),
-            edge_type: u64::from_le_bytes(body[o + 8..o + 16].try_into().unwrap()),
-            meta_ref: u64::from_le_bytes(body[o + 16..o + 24].try_into().unwrap()),
-        });
+        out.push(make(
+            u64::from_le_bytes(body[o..o + 8].try_into().unwrap()),
+            u64::from_le_bytes(body[o + 8..o + 16].try_into().unwrap()),
+            u64::from_le_bytes(body[o + 16..o + 24].try_into().unwrap()),
+        ));
     }
     Some(out)
 }
@@ -236,7 +245,28 @@ impl AdjStore {
     /// where each neighbour costs a random read into `nodes.bin` to recover its
     /// hash from its dense id.
     pub(crate) fn edges(&self, owner: u64) -> io::Result<Option<Vec<AdjEdge>>> {
-        Ok(self.store.get(owner as u128)?.and_then(|b| decode(owner, &b)))
+        self.edges_as(owner, |other, edge_type, meta_ref| AdjEdge { other, edge_type, meta_ref })
+    }
+
+    /// The same read, decoded straight into the caller's own edge type.
+    ///
+    /// # Why the shape is a callback and not a `Vec<AdjEdge>`
+    ///
+    /// Every caller of the adjacency wants a different struct — the graph surface
+    /// wants `topology::MappedEdge`, compaction wants something else again — and
+    /// converting after the fact means a second `Vec` and a second pass over the
+    /// list, for a lookup that exists to be cheap. Building the caller's type
+    /// during the decode makes one allocation do the whole job.
+    ///
+    /// Combined with [`PagedStore::with_value`], a one-hop read now allocates
+    /// exactly once: the result. Before, it allocated a page, copied the page,
+    /// allocated the decoded list, then allocated the converted list.
+    pub(crate) fn edges_as<T>(
+        &self,
+        owner: u64,
+        make: impl Fn(u64, u64, u64) -> T,
+    ) -> io::Result<Option<Vec<T>>> {
+        Ok(self.store.with_value(owner as u128, |b| decode_as(owner, b, make))?.flatten())
     }
 
     /// Add one edge. Duplicates are allowed: two nodes may be connected twice by
