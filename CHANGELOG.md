@@ -97,6 +97,45 @@ This is separate from the existing write buffer (`EngineBuilder::buffer_size`),
 which is still opt-in and still trades durability for speed: buffered statements
 are not applied or logged until `flush()`.
 
+### Changed — NULL now behaves the way PostgreSQL says it does
+
+`!=`, `<>` and `NOT IN` used to return rows where the column was NULL or the
+field was absent. PostgreSQL drops those rows, and now so does sekejap.
+
+```sql
+-- four rows: 'open', 'shut', an explicit null, and no status field at all
+SELECT _key FROM p WHERE status != 'open';
+-- before: shut, null-row, no-field-row
+-- now:    shut          (what PostgreSQL returns)
+```
+
+Nothing errored before; the result was simply larger than the query asked for,
+which is the kind of difference that is found in production rather than in
+testing. Comparing a value that is not there answers neither true nor false —
+SQL calls it *unknown*, and only rows where the condition is **true** come back.
+
+This applies throughout, not just to `!=`:
+
+| condition | rows where the value is NULL or absent |
+| --- | --- |
+| `x != 'a'`, `x <> 'a'`, `NOT IN (...)` | dropped |
+| `NOT (x = 'a')`, `NOT (x LIKE 'a%')` | dropped — `NOT unknown` is still unknown |
+| `x > 1`, `x BETWEEN 1 AND 2`, `x LIKE 'a%'` | dropped |
+| `x = NULL`, `x != NULL` | no rows at all; use `IS NULL` / `IS NOT NULL` |
+| `x IN ('a', NULL)` | matches `'a'` only — a NULL in the list never matches |
+| `x NOT IN ('a', NULL)` | no rows at all, as in PostgreSQL |
+| `IS NULL`, `IS NOT NULL` | unchanged |
+
+**If you were relying on the old behaviour**, `WHERE x != 'a'` becomes
+`WHERE x != 'a' OR x IS NULL`.
+
+Two bugs came out of the same work. `IN` and `BETWEEN` were missing from one of
+the two condition evaluators, so `NOT IN (...)` nested inside an `OR` answered
+the opposite of `NOT IN (...)` on its own. And `IN ('a', NULL)` matched every row
+whose field was missing, because a missing field is stored in the index as NULL
+and the literal NULL in the list looked it up. Both are fixed, and the two
+evaluators are now one.
+
 ### Changed — how you open a database
 
 Which behaviour you get is now chosen at runtime instead of at build time:

@@ -76,6 +76,35 @@ ORDER BY n DESC;
 Filters: `=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN (...)`,
 `IS [NOT] NULL`, `LIKE` / `ILIKE` (case-insensitive), `AND`/`OR`/`NOT`.
 
+### NULL and missing fields
+
+A comparison against a value that is not there answers neither true nor false.
+SQL calls that *unknown*, and only rows where the condition comes out **true**
+are returned. sekejap follows PostgreSQL here, and a field that is absent from a
+record counts as NULL — the row has nothing to say about that column.
+
+```sql
+SELECT _key FROM p WHERE status != 'open';
+```
+
+This returns rows whose status is some other value. It does **not** return rows
+where `status` is NULL or missing: those are unknown, not different. The same
+holds for `NOT IN`, for `NOT (...)` around any comparison, and for `>`, `<`,
+`BETWEEN` and `LIKE`.
+
+To include them, ask for them:
+
+```sql
+SELECT _key FROM p WHERE status != 'open' OR status IS NULL;
+```
+
+Two consequences worth knowing, both inherited from SQL:
+
+- `x = NULL` and `x != NULL` return no rows whatever the data holds. `IS NULL`
+  and `IS NOT NULL` are how that question is asked.
+- `x NOT IN ('a', NULL)` returns no rows, because comparing against the NULL in
+  the list is unknown for every row. This surprises people in PostgreSQL too.
+
 Scalar functions in projections and filters: `NOW()`, `AGE_DAYS(ts)`,
 `AGE_HOURS(ts)`, `LOWER`/`UPPER`, `CONCAT`/`CONCAT_WS`, `COALESCE`,
 `JSON_ARRAY_LENGTH`, and `CASE WHEN … THEN … ELSE … END`.
