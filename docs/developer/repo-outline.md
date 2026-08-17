@@ -962,29 +962,30 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
 
 ## `src/storage/`
 
-### `adjstore.rs` · 691L — The structure this replaces
+### `adjstore.rs` · 715L — The structure this replaces
 
 ```
-    83  pub(crate) struct AdjEdge
-   102  impl AdjEdge
-   103    pub(crate) fn naked(other: u64, edge_type: u64) -> Self
-   111  fn encode(edges: &[AdjEdge], out: &mut Vec<u8>)
-   126  fn decode(bytes: &[u8]) -> Vec<AdjEdge>
-   140  pub(crate) struct AdjStore
-   154  impl AdjStore
-   157    pub(crate) fn open(dir: &Path, name: &str, page_size: usize) -> io::Result<Self>
-   164    pub(crate) fn edge_count(&self) -> u64 { self.edges }
-   169    pub(crate) fn owner_count(&self) -> u64 { self.store.len() }
-   171    pub(crate) fn page_counts(&self) -> (u64, u64) { self.store.page_counts() }
-   173    pub(crate) fn sync(&mut self) -> io::Result<()>
-   184    pub(crate) fn edges(&self, owner: u64) -> io::Result<Option<Vec<AdjEdge>>>
-   190    pub(crate) fn add(&mut self, owner: u64, edge: AdjEdge) -> io::Result<()>
-   199    pub(crate) fn add_many(&mut self, owner: u64, edges: &[AdjEdge]) -> io::Result<()>
-   221    pub(crate) fn remove(&mut self, owner: u64, other: u64, edge_type: Option<u64>)
-   245    pub(crate) fn remove_owner(&mut self, owner: u64) -> io::Result<bool>
-   270    pub(crate) fn remove_all_to(&mut self, other: u64) -> io::Result<usize>
-   299    pub(crate) fn for_each_owner(&self, mut f: impl FnMut(u64, Vec<AdjEdge>) -> bool)
-   315  mod tests
+    95  pub(crate) struct AdjEdge
+   114  impl AdjEdge
+   115    pub(crate) fn naked(other: u64, edge_type: u64) -> Self
+   125  fn crc(bytes: &[u8]) -> u32
+   131  fn encode(owner: u64, edges: &[AdjEdge], out: &mut Vec<u8>)
+   156  fn decode(owner: u64, bytes: &[u8]) -> Option<Vec<AdjEdge>>
+   174  pub(crate) struct AdjStore
+   188  impl AdjStore
+   191    pub(crate) fn open(dir: &Path, name: &str, page_size: usize) -> io::Result<Self>
+   198    pub(crate) fn edge_count(&self) -> u64 { self.edges }
+   203    pub(crate) fn owner_count(&self) -> u64 { self.store.len() }
+   205    pub(crate) fn page_counts(&self) -> (u64, u64) { self.store.page_counts() }
+   207    pub(crate) fn sync(&mut self) -> io::Result<()>
+   218    pub(crate) fn edges(&self, owner: u64) -> io::Result<Option<Vec<AdjEdge>>>
+   224    pub(crate) fn add(&mut self, owner: u64, edge: AdjEdge) -> io::Result<()>
+   233    pub(crate) fn add_many(&mut self, owner: u64, edges: &[AdjEdge]) -> io::Result<()>
+   256    pub(crate) fn remove(&mut self, owner: u64, other: u64, edge_type: Option<u64>)
+   280    pub(crate) fn remove_owner(&mut self, owner: u64) -> io::Result<bool>
+   305    pub(crate) fn remove_all_to(&mut self, other: u64) -> io::Result<usize>
+   336    pub(crate) fn for_each_owner(&self, mut f: impl FnMut(u64, Vec<AdjEdge>) -> bool)
+   355  mod tests
 ```
 
 ### `btree.rs` · 664L — Why
@@ -1606,4 +1607,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 49 files, 1334 items -->
+<!-- 49 files, 1335 items -->
