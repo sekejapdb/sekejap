@@ -1473,6 +1473,16 @@ pub struct CoreDB {
     ///
     /// Cleared by compaction, which folds the base away entirely.
     edge_tombstones: HashSet<u64>,
+    /// Collections whose membership in the durable store must be ignored.
+    ///
+    /// Renaming a table moves its rows to a new collection hash in the overlay, but
+    /// the durable membership index still lists them under the old one — so both
+    /// names answered, and `SELECT FROM the_old_name` kept returning every row. The
+    /// base cannot be edited in place, so the old name is recorded here and
+    /// subtracted where base membership is read, the same way a withdrawn edge is.
+    ///
+    /// Cleared by compaction, which writes membership that no longer has them.
+    renamed_collections: HashSet<u64>,
     /// `(from, to, edge_type)` for single edges withdrawn by `unlink`.
     ///
     /// `EdgeStore::unlink` can only retain-out of the RAM adjacency maps, and in
@@ -1793,6 +1803,7 @@ impl CoreDB {
             defer_wal_sync: false,
             edge_tombstones: HashSet::new(),
             unlinked_edges: HashSet::new(),
+            renamed_collections: HashSet::new(),
             compact_payload_moves: HashMap::new(),
             group_commit: false,
             wal_generation: 0,
@@ -2802,18 +2813,21 @@ impl CoreDB {
     fn drop_table_raw(&mut self, collection: &str) -> usize {
         let col_hash = sk_hash(collection);
 
-        // Build a set of node hashes belonging to this collection
-        let member_hashes: std::collections::HashSet<u64> = self.collections
-            .get(&col_hash)
-            .into_iter()
-            .flat_map(|v| v.iter().copied())
-            .collect();
+        // Members and their slugs from the base-aware accessors, not from the
+        // overlay maps. Reading `self.collections` and `self.slug_map` directly
+        // meant this saw only rows written since the last compaction: on a paged
+        // database it dropped nothing at all, and in *any* mode after a reopen it
+        // removed the schema while leaving every row queryable — and a second
+        // `DROP TABLE IF EXISTS` then reported nothing to do, because neither the
+        // schema nor the overlay rows were there any more. The rows became
+        // permanently unreachable by DROP.
+        let member_hashes: Vec<u64> = self.collection_members(col_hash)
+            .map(|m| m.into_owned())
+            .unwrap_or_default();
 
         // Collect slugs (cannot hold borrow while mutating)
-        let slugs: Vec<String> = self.slug_map
-            .iter()
-            .filter(|(_, h)| member_hashes.contains(h))
-            .map(|(s, _)| s.clone())
+        let slugs: Vec<String> = member_hashes.iter()
+            .filter_map(|h| self.node_data(*h).map(|n| n.slug.clone()))
             .collect();
 
         let count = slugs.len();
@@ -2903,9 +2917,17 @@ impl CoreDB {
                 // Remove field from all nodes in the collection.
                 // This must happen BEFORE rebuilding global indexes so the rebuild
                 // naturally sees the field absent from this collection's nodes.
-                let node_meta: Vec<(u64, u64, u32)> = self.collections
-                    .get(&col_hash).into_iter().flatten()
-                    .filter_map(|&h| self.nodes.get(&h).map(|n| (h, n.payload_offset, n.payload_len)))
+                // Members and their payload locations from the base-aware
+                // accessors. Built from `self.collections` and `self.nodes`, this
+                // saw only rows written since the last compaction — so on a paged
+                // database it visited none of them and the column changed in the
+                // schema while every row kept its old shape.
+                let node_meta: Vec<(u64, u64, u32)> = self
+                    .collection_members(col_hash)
+                    .map(|m| m.into_owned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|h| self.payload_loc(h).map(|(o, l)| (h, o, l)))
                     .collect();
                 let mut count = 0usize;
                 let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
@@ -2922,10 +2944,7 @@ impl CoreDB {
                     }
                 }
                 for (h, new_off, new_len) in node_updates {
-                    if let Some(node) = self.nodes.get_mut(&h) {
-                        node.payload_offset = new_off;
-                        node.payload_len = new_len;
-                    }
+                    self.set_payload_loc(h, new_off, new_len);
                 }
 
                 // Rebuild global indexes from remaining data (nodes for the dropped
@@ -2958,9 +2977,17 @@ impl CoreDB {
 
                 // Rename the field key in every node of the collection
                 let col_hash = sk_hash(collection);
-                let node_meta: Vec<(u64, u64, u32)> = self.collections
-                    .get(&col_hash).into_iter().flatten()
-                    .filter_map(|&h| self.nodes.get(&h).map(|n| (h, n.payload_offset, n.payload_len)))
+                // Members and their payload locations from the base-aware
+                // accessors. Built from `self.collections` and `self.nodes`, this
+                // saw only rows written since the last compaction — so on a paged
+                // database it visited none of them and the column changed in the
+                // schema while every row kept its old shape.
+                let node_meta: Vec<(u64, u64, u32)> = self
+                    .collection_members(col_hash)
+                    .map(|m| m.into_owned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|h| self.payload_loc(h).map(|(o, l)| (h, o, l)))
                     .collect();
                 let mut count = 0usize;
                 let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
@@ -2980,10 +3007,7 @@ impl CoreDB {
                     }
                 }
                 for (h, new_off, new_len) in node_updates {
-                    if let Some(node) = self.nodes.get_mut(&h) {
-                        node.payload_offset = new_off;
-                        node.payload_len = new_len;
-                    }
+                    self.set_payload_loc(h, new_off, new_len);
                 }
 
                 // Move the btree index data from old field name to new field name
@@ -3031,8 +3055,25 @@ impl CoreDB {
                 // Move collection bucket to new hash
                 let old_hash = sk_hash(collection);
                 let new_hash = sk_hash(&new_name);
-                let node_hashes: Vec<u64> =
-                    self.collections.remove(&old_hash).unwrap_or_default();
+                // Every member, not just the ones in the overlay — otherwise a
+                // renamed table takes only its recent rows with it and the rest
+                // stay under the old name.
+                let node_hashes: Vec<u64> = self.collection_members(old_hash)
+                    .map(|m| m.into_owned())
+                    .unwrap_or_default();
+                self.collections.remove(&old_hash);
+                self.renamed_collections.insert(old_hash);
+                // Every member has to appear in the overlay under the new name, so
+                // that the collection it belongs to is what the new hash reports.
+                for &h in &node_hashes {
+                    if !self.nodes.contains_key(&h) {
+                        if let Some(n) = self.base_node(h) {
+                            self.slug_map.insert(n.slug.clone(), h);
+                            self.nodes.insert(h, n);
+                        }
+                    }
+                    if let Some(n) = self.nodes.get_mut(&h) { n.collection = new_name.clone(); }
+                }
                 let count = node_hashes.len();
                 self.collections.insert(new_hash, node_hashes.clone());
                 // Update the O(1) name map
@@ -3041,7 +3082,7 @@ impl CoreDB {
 
                 // Update _collection field in every node payload + cached collection field
                 let node_meta: Vec<(u64, u64, u32)> = node_hashes.iter()
-                    .filter_map(|&h| self.nodes.get(&h).map(|n| (h, n.payload_offset, n.payload_len)))
+                    .filter_map(|&h| self.payload_loc(h).map(|(o, l)| (h, o, l)))
                     .collect();
                 let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
                 for (h, off, len) in node_meta {
@@ -5012,6 +5053,7 @@ impl CoreDB {
         // these record, whether or not there was a base before it. Leaving them
         // would subtract the same edges from a base that never had them.
         self.unlinked_edges.clear();
+        self.renamed_collections.clear();
         self.compact_payload_moves.clear();
         Self::phase_probe("snapshot + adopting the generation", &mut phase);
 
@@ -5676,7 +5718,7 @@ impl CoreDB {
                 None => continue, // dangling edge, skip
             };
             for e in edge_list {
-                let to_slug = match self.nodes.get(&e.other) {
+                let to_slug = match self.node_data(e.other) {
                     Some(n) => n.slug.clone(),
                     None => continue,
                 };
@@ -6102,6 +6144,7 @@ impl CoreDB {
             defer_wal_sync: false,
             edge_tombstones: HashSet::new(),
             unlinked_edges: HashSet::new(),
+            renamed_collections: HashSet::new(),
             compact_payload_moves: HashMap::new(),
             group_commit: false,
             wal_generation: 0,
@@ -6646,7 +6689,11 @@ impl CoreDB {
                     .iter()
                     .map(|e| EdgeHit {
                         from_slug: Some(slug.to_string()),
-                        to_slug: self.nodes.get(&e.other).map(|n| n.slug.clone()),
+                        // Through the base-aware accessor. The adjacency here is
+                        // already merged with the durable store, but the slug was
+                        // looked up in the overlay alone — so on a paged database
+                        // every neighbour came back as `None`.
+                        to_slug: self.node_data(e.other).map(|n| n.slug.clone()),
                         edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
                         meta: self.edge_all_attrs(e),
@@ -6665,7 +6712,7 @@ impl CoreDB {
                 edges
                     .iter()
                     .map(|e| EdgeHit {
-                        from_slug: self.nodes.get(&e.other).map(|n| n.slug.clone()),
+                        from_slug: self.node_data(e.other).map(|n| n.slug.clone()),
                         to_slug: Some(slug.to_string()),
                         edge_type: self.edges.type_name(e.edge_type).map(|s| s.to_string()),
                         edge_type_hash: e.edge_type,
@@ -8296,6 +8343,10 @@ impl CoreDB {
 
     /// The members of one collection, as the durable store has them.
     fn base_members(&self, coll_hash: u64) -> Option<Vec<u64>> {
+        // A renamed collection's durable membership is stale by definition: the
+        // rows moved to a new hash in the overlay and the base still lists them
+        // here. Ignoring it is what makes the old name stop answering.
+        if self.renamed_collections.contains(&coll_hash) { return None }
         if let Some(ns) = &self.paged_nodes {
             let m = ns.members(coll_hash).ok()?;
             return if m.is_empty() { None } else { Some(m) };
@@ -8336,6 +8387,28 @@ impl CoreDB {
             }));
         }
         items
+    }
+
+    /// Point a node at a payload it has just been rewritten into.
+    ///
+    /// A node already in the overlay is edited in place. A node in the durable
+    /// store cannot be: it is copied into the overlay carrying the new location,
+    /// which is what an update to an immutable record means and what the next
+    /// compaction folds back down.
+    ///
+    /// Writing only to the overlay — which is what every DDL rewrite did — left
+    /// base nodes pointing at their old payloads, so the bytes were rewritten and
+    /// nothing ever read them.
+    fn set_payload_loc(&mut self, hash: u64, off: u64, len: u32) {
+        if let Some(node) = self.nodes.get_mut(&hash) {
+            node.payload_offset = off;
+            node.payload_len = len;
+            return;
+        }
+        if let Some(n) = self.base_node(hash) {
+            self.slug_map.insert(n.slug.clone(), hash);
+            self.nodes.insert(hash, NodeData { payload_offset: off, payload_len: len, ..n });
+        }
     }
 
     /// Every collection name the durable store knows.
