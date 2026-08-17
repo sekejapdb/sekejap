@@ -524,7 +524,21 @@ fn random_byte_damage_never_panics_or_hangs() {
                     }
                 }
             }
-            let _ = db.edges_from(&h.slug);
+            // Edge lists are records too, keyed by owner hash and holding anonymous
+            // bytes — the same exposure the node records had. The dataset links
+            // n{i} -> n{i+1} and nothing else, so an edge from n{i} to anything but
+            // n{i+1} is another node's edge list returned as this one's.
+            if let Some(i) = h.slug.strip_prefix("p/n").and_then(|d| d.parse::<usize>().ok()) {
+                for e in db.edges_from(&h.slug) {
+                    let Some(to) = e.to_slug.as_deref() else { continue };
+                    let Some(j) = to.strip_prefix("p/n").and_then(|d| d.parse::<usize>().ok())
+                    else { continue };
+                    assert_eq!(j, i + 1,
+                               "{ctx}: {} has an edge to {to}, but this store only ever \
+                                linked each node to the next — that is another node's \
+                                edge list", h.slug);
+                }
+            }
             let _ = db.one(&h.slug).forward("next").collect();
         }
         let _ = db.query("SELECT _key FROM p WHERE n > 10 AND n < 40").map(|s| s.collect());

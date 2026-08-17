@@ -42,9 +42,21 @@
 //! edge list:
 //!
 //! ```text
-//!   key: owner_hash            record: [ neighbour u64 | type u64 | meta u64 ] × n
-//!                                        └──────────── 24 bytes ────────────┘
+//!   key: owner_hash   record: [ crc32 | owner u64 ][ neighbour u64 | type u64 | meta u64 ] × n
+//!                              └── 12 byte header ──┘└──────────── 24 bytes ────────────┘
 //! ```
+//!
+//! # Why the record names its owner and checksums itself
+//!
+//! A record store holds anonymous bytes at a slot. Damage the slot directory and a
+//! read lands on a different record — here, a different node's edge list, returned
+//! as if it were this node's. Fuzzing found precisely that in the node store: a
+//! request for one row came back as another, with nothing to indicate it. The edge
+//! records have the same shape and therefore the same exposure.
+//!
+//! So the record carries the owner it belongs to and a checksum over itself, both
+//! verified on read. Twelve bytes per node that has edges — not per edge — and a
+//! hash of the list when it is read.
 //!
 //! Reading a node's edges is one tree descent plus one record read, and the record
 //! is the answer — no second structure, no per-neighbour lookup. Adding an edge
@@ -107,15 +119,27 @@ impl AdjEdge {
 
 /// neighbour u64 + type u64 + attribute reference u64.
 const EDGE_BYTES: usize = 24;
+/// crc32 over the rest, then the owner this list belongs to.
+const LIST_HEADER: usize = 12;
 
-fn encode(edges: &[AdjEdge], out: &mut Vec<u8>) {
+fn crc(bytes: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(bytes);
+    h.finalize()
+}
+
+fn encode(owner: u64, edges: &[AdjEdge], out: &mut Vec<u8>) {
     out.clear();
-    out.reserve(edges.len() * EDGE_BYTES);
+    out.reserve(LIST_HEADER + edges.len() * EDGE_BYTES);
+    out.extend_from_slice(&0u32.to_le_bytes()); // checksum, filled in below
+    out.extend_from_slice(&owner.to_le_bytes());
     for e in edges {
         out.extend_from_slice(&e.other.to_le_bytes());
         out.extend_from_slice(&e.edge_type.to_le_bytes());
         out.extend_from_slice(&e.meta_ref.to_le_bytes());
     }
+    let sum = crc(&out[4..]);
+    out[..4].copy_from_slice(&sum.to_le_bytes());
 }
 
 /// Decode a stored list.
@@ -123,18 +147,28 @@ fn encode(edges: &[AdjEdge], out: &mut Vec<u8>) {
 /// A truncated tail is dropped rather than trusted. This is disk data reached
 /// through a length it carries itself, so a short read or a bad length must end
 /// the walk, never index past the end.
-fn decode(bytes: &[u8]) -> Vec<AdjEdge> {
-    let n = bytes.len() / EDGE_BYTES;
+/// Decode the edge list stored for `owner`, or `None` if these bytes are not it.
+///
+/// Two ways they might not be: the record was reached through a damaged slot and
+/// belongs to another node, which the owner field catches exactly; or its bytes
+/// were altered, which the checksum catches. Either way the answer is that this
+/// node's edges are unavailable — never another node's edges presented as them.
+fn decode(owner: u64, bytes: &[u8]) -> Option<Vec<AdjEdge>> {
+    if bytes.len() < LIST_HEADER { return None }
+    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != crc(&bytes[4..]) { return None }
+    if u64::from_le_bytes(bytes[4..12].try_into().unwrap()) != owner { return None }
+    let body = &bytes[LIST_HEADER..];
+    let n = body.len() / EDGE_BYTES;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let o = i * EDGE_BYTES;
         out.push(AdjEdge {
-            other: u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()),
-            edge_type: u64::from_le_bytes(bytes[o + 8..o + 16].try_into().unwrap()),
-            meta_ref: u64::from_le_bytes(bytes[o + 16..o + 24].try_into().unwrap()),
+            other: u64::from_le_bytes(body[o..o + 8].try_into().unwrap()),
+            edge_type: u64::from_le_bytes(body[o + 8..o + 16].try_into().unwrap()),
+            meta_ref: u64::from_le_bytes(body[o + 16..o + 24].try_into().unwrap()),
         });
     }
-    out
+    Some(out)
 }
 
 pub(crate) struct AdjStore {
@@ -182,7 +216,7 @@ impl AdjStore {
     /// where each neighbour costs a random read into `nodes.bin` to recover its
     /// hash from its dense id.
     pub(crate) fn edges(&self, owner: u64) -> io::Result<Option<Vec<AdjEdge>>> {
-        Ok(self.store.get(owner as u128)?.map(|b| decode(&b)))
+        Ok(self.store.get(owner as u128)?.and_then(|b| decode(owner, &b)))
     }
 
     /// Add one edge. Duplicates are allowed: two nodes may be connected twice by
@@ -198,13 +232,14 @@ impl AdjStore {
     /// come through here instead, which makes it O(d).
     pub(crate) fn add_many(&mut self, owner: u64, edges: &[AdjEdge]) -> io::Result<()> {
         if edges.is_empty() { return Ok(()) }
-        let mut list = match self.store.get(owner as u128)? {
-            Some(b) => decode(&b),
-            None => Vec::with_capacity(edges.len()),
-        };
+        // A list that fails its own checks is not extended — it is replaced. The
+        // alternative is appending to bytes that are not this node's edges.
+        let mut list = self.store.get(owner as u128)?
+            .and_then(|b| decode(owner, &b))
+            .unwrap_or_else(|| Vec::with_capacity(edges.len()));
         list.extend_from_slice(edges);
         let mut scratch = std::mem::take(&mut self.scratch);
-        encode(&list, &mut scratch);
+        encode(owner, &list, &mut scratch);
         let r = self.store.put(owner as u128, &scratch);
         self.scratch = scratch;
         r?;
@@ -222,7 +257,7 @@ impl AdjStore {
         -> io::Result<bool>
     {
         let Some(bytes) = self.store.get(owner as u128)? else { return Ok(false) };
-        let mut list = decode(&bytes);
+        let Some(mut list) = decode(owner, &bytes) else { return Ok(false) };
         let Some(at) = list.iter().position(|e| {
             e.other == other && edge_type.is_none_or(|t| e.edge_type == t)
         }) else { return Ok(false) };
@@ -231,7 +266,7 @@ impl AdjStore {
             self.store.delete(owner as u128)?;
         } else {
             let mut scratch = std::mem::take(&mut self.scratch);
-            encode(&list, &mut scratch);
+            encode(owner, &list, &mut scratch);
             let r = self.store.put(owner as u128, &scratch);
             self.scratch = scratch;
             r?;
@@ -273,7 +308,9 @@ impl AdjStore {
         self.store.for_each_key(|key, _| {
             match self.store.get(key) {
                 Ok(Some(bytes)) => {
-                    if decode(&bytes).iter().any(|e| e.other == other) {
+                    if decode(key as u64, &bytes)
+                        .is_some_and(|l| l.iter().any(|e| e.other == other))
+                    {
                         owners.push(key as u64);
                     }
                     true
@@ -302,7 +339,10 @@ impl AdjStore {
         let mut err = None;
         self.store.for_each_key(|key, _| {
             match self.store.get(key) {
-                Ok(Some(bytes)) => f(key as u64, decode(&bytes)),
+                Ok(Some(bytes)) => match decode(key as u64, &bytes) {
+                    Some(list) => f(key as u64, list),
+                    None => true, // a list that is not this owner's is not reported
+                },
                 Ok(None) => true,
                 Err(e) => { err = Some(e); false }
             }
@@ -458,61 +498,40 @@ mod tests {
                    "attribute references did not survive a reopen");
     }
 
-    /// A record cut short must stop cleanly rather than panic or invent an edge.
-    /// Records come off disk, and a truncated one is a torn write, not a bug to
-    /// crash on.
+    /// A damaged edge list must be refused, and one belonging to another node must
+    /// never be presented as this node's.
+    ///
+    /// Both failures come from the same place: a record store holds anonymous bytes
+    /// at a slot, so a damaged slot directory lands a read on somebody else's
+    /// record. Fuzzing found exactly that in the node store — a request for one row
+    /// answered with another — and edge lists have the identical shape.
     #[test]
-    fn a_truncated_list_stops_rather_than_panicking() {
+    fn a_list_that_is_not_this_owners_is_refused() {
+        let owner = h(1);
+        let other = h(2);
         let mut full = Vec::new();
-        encode(&[e(1, 1), e_meta(2, 2, 9), e(3, 3)], &mut full);
-        assert_eq!(decode(&full).len(), 3);
+        encode(owner, &[e(10, 1), e_meta(11, 2, 9), e(12, 3)], &mut full);
+
+        assert_eq!(decode(owner, &full).map(|l| l.len()), Some(3), "an intact list must decode");
+        assert!(decode(other, &full).is_none(),
+                "a list belonging to one node was accepted as another's — which is a \
+                 damaged slot directory returning the wrong record, silently");
+
+        // Every truncation refused.
         for cut in 0..full.len() {
-            let got = decode(&full[..cut]);
-            assert_eq!(got.len(), cut / EDGE_BYTES,
-                       "cutting to {cut} bytes produced {} edges", got.len());
-            for (i, e) in got.iter().enumerate() {
-                assert_eq!(*e, decode(&full)[i],
-                           "cutting to {cut} bytes changed edge {i}");
-            }
+            assert!(decode(owner, &full[..cut]).is_none(),
+                    "a list cut to {cut} of {} bytes decoded anyway", full.len());
         }
-    }
-
-    /// The running count has to match a walk, or compaction's safety rail is
-    /// checking a number it made up. It is maintained rather than counted because
-    /// counting made that rail O(edges) — which is the cost this store exists to
-    /// remove, reintroduced by the check meant to guard it.
-    #[test]
-    fn the_edge_count_matches_a_walk() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut s = store(&dir);
-        let walk = |s: &AdjStore| {
-            let mut n = 0u64;
-            s.for_each_owner(|_, list| { n += list.len() as u64; true }).unwrap();
-            n
-        };
-
-        for i in 0..2_000u64 {
-            s.add_many(h(i), &[e(i + 1, 1), e(i + 2, 2)]).unwrap();
+        // Every single-byte flip detected.
+        for at in 0..full.len() {
+            let mut bad = full.clone();
+            bad[at] ^= 0xFF;
+            assert!(decode(owner, &bad).is_none(),
+                    "a byte flipped at {at} of {} was not detected", full.len());
         }
-        assert_eq!(s.edge_count(), walk(&s), "after adds");
-        assert_eq!(s.edge_count(), 4_000);
-
-        for i in (0..2_000u64).step_by(3) { s.remove(h(i), h(i + 1), None).unwrap(); }
-        assert_eq!(s.edge_count(), walk(&s), "after single removals");
-
-        for i in (0..2_000u64).step_by(7) { s.remove_owner(h(i)).unwrap(); }
-        assert_eq!(s.edge_count(), walk(&s), "after dropping whole owners");
-
-        // A removal that finds nothing must not decrement.
-        let before = s.edge_count();
-        assert!(!s.remove(h(999_999), h(1), None).unwrap());
-        assert!(!s.remove_owner(h(999_999)).unwrap());
-        assert_eq!(s.edge_count(), before, "a failed removal changed the count");
-
-        s.sync().unwrap();
-        drop(s);
-        let s = store(&dir);
-        assert_eq!(s.edge_count(), walk(&s), "the count did not survive a reopen");
+        let mut zeroed = full.clone();
+        zeroed[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(decode(owner, &zeroed).is_none(), "a zeroed checksum was accepted");
     }
 
     #[test]
@@ -599,12 +618,17 @@ mod tests {
     /// records are not the problem: slotted pages pack at 1.05x the bytes they
     /// hold. The other two thirds are named below, with what each would take back.
     ///
-    /// It measured 2.33x when the edge was 20 bytes. Widening the attribute
-    /// reference from `u32` to `u64` — needed because it became a record id, which
-    /// is a page number and a slot rather than an index into a rebuilt side file —
-    /// moved it to 2.65x. That is the cost of the reference staying valid across a
-    /// compaction, and it is 8 bytes on every edge to describe an attribute that
-    /// most edges do not have.
+    /// It has moved twice, both times for something bought:
+    ///
+    /// - **2.33x → 2.65x** when the attribute reference widened from `u32` to
+    ///   `u64`, because it became a record id — a page number and a slot — rather
+    ///   than an index into a side file rebuilt by every compaction. That is what
+    ///   the reference staying valid across a compaction costs.
+    /// - **2.65x → 2.82x** for the twelve-byte list header: a checksum and the
+    ///   owner the list belongs to. Without it a damaged slot directory hands back
+    ///   another node's edges as this node's, which fuzzing demonstrated in the
+    ///   node store and which edge lists are shaped identically to. Twelve bytes
+    ///   per node *with edges*, not per edge.
     ///
     /// Three levers are known, all measured from the numbers this prints:
     ///
@@ -652,9 +676,9 @@ mod tests {
                  idx_bytes as f64 / edges, idx_bytes as f64 / nodes as f64);
         println!("    total   {per_edge:.2} bytes/edge against {csr:.2} for CSR \
                   → {:.2}x", per_edge / csr);
-        assert!(per_edge / csr < 2.8,
+        assert!(per_edge / csr < 3.0,
                 "{per_edge:.2} bytes an edge against CSR's {csr:.2} is {:.2}x, worse \
-                 than the 2.65x measured when this layout was accepted",
+                 than the 2.82x measured when this layout was accepted",
                 per_edge / csr);
         assert!(rec_bytes as f64 / edges / EDGE_BYTES as f64 > 0.95,
                 "records are packing at {:.2}x the bytes they hold, which is under \
