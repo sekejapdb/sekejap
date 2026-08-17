@@ -1175,28 +1175,28 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    122  mod tests
 ```
 
-### `pagestore.rs` · 568L — Why this exists
+### `pagestore.rs` · 632L — Why this exists
 
 ```
     61  pub(crate) struct PageStore
     95  impl PageStore
    108    pub(crate) fn create(path: &Path, page_size: usize) -> io::Result<Self>
    153    pub(crate) fn open(path: &Path) -> io::Result<Option<Self>>
-   206    pub(crate) fn page_size(&self) -> usize { self.page_size }
-   209    pub(crate) fn page_count(&self) -> u64 { self.high_water }
-   212    pub(crate) fn free_count(&self) -> u64 { self.free_count }
-   215    pub(crate) fn user_meta(&self) -> (u64, u64) { (self.user_a, self.user_b) }
-   217    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64)
-   228    pub(crate) fn alloc(&mut self) -> io::Result<u64>
-   246    pub(crate) fn free(&mut self, page: u64) -> io::Result<()>
-   261    pub(crate) fn read(&self, page: u64, buf: &mut [u8]) -> io::Result<()>
-   280    pub(crate) fn write(&mut self, page: u64, buf: &[u8]) -> io::Result<()>
-   289    pub(crate) fn sync(&mut self) -> io::Result<()>
-   316  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
-   321  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
-   326  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
-   333  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
-   341  mod tests
+   221    pub(crate) fn page_size(&self) -> usize { self.page_size }
+   224    pub(crate) fn page_count(&self) -> u64 { self.high_water }
+   227    pub(crate) fn free_count(&self) -> u64 { self.free_count }
+   230    pub(crate) fn user_meta(&self) -> (u64, u64) { (self.user_a, self.user_b) }
+   232    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64)
+   243    pub(crate) fn alloc(&mut self) -> io::Result<u64>
+   261    pub(crate) fn free(&mut self, page: u64) -> io::Result<()>
+   276    pub(crate) fn read(&self, page: u64, buf: &mut [u8]) -> io::Result<()>
+   295    pub(crate) fn write(&mut self, page: u64, buf: &[u8]) -> io::Result<()>
+   304    pub(crate) fn sync(&mut self) -> io::Result<()>
+   331  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
+   336  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
+   341  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
+   348  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
+   356  mod tests
 ```
 
 ### `recordstore.rs` · 588L — Why

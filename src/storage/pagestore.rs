@@ -197,10 +197,25 @@ impl PageStore {
     /// A failure is not an error: the mapping is an optimisation, and reading from
     /// the descriptor is always correct.
     fn remap(&mut self) {
-        let bytes = self.high_water * self.page_size as u64;
+        // **Only as far as the file actually goes.** The header says how many pages
+        // were allocated; it does not say how many the file still contains. Mapping
+        // past the end of a file is permitted and touching what you mapped is
+        // SIGBUS — not an error a caller can handle, not a `None` to fall back on,
+        // but the process dying. A file truncated by damage, a full disk or a
+        // half-finished copy is exactly the case where the store most needs to
+        // return an error rather than take the process with it.
+        //
+        // Clamping means pages past the real end fall to the descriptor, which
+        // reports a short read as the error it is.
+        let want = self.high_water * self.page_size as u64;
+        let on_disk = self.file.metadata().map(|m| m.len()).unwrap_or(0);
+        let bytes = want.min(on_disk);
         self.map = usize::try_from(bytes).ok()
             .and_then(|n| super::mmap::MmapView::try_new_shared(&self.file, n));
-        self.mapped_pages = if self.map.is_some() { self.high_water } else { 0 };
+        self.mapped_pages = match &self.map {
+            Some(_) => bytes / self.page_size as u64,
+            None => 0,
+        };
     }
 
     pub(crate) fn page_size(&self) -> usize { self.page_size }
@@ -564,5 +579,54 @@ mod tests {
             panic!("creating over a store we wrote was refused");
         };
         assert_eq!(s.page_count(), 1, "recreating did not start from empty");
+    }
+
+    /// **The SIGBUS test.** A file shorter than its header claims must not take the
+    /// process down.
+    ///
+    /// `remap` mapped `high_water * page_size` bytes, which is what the header says
+    /// was allocated, not what the file still holds. Mapping past the end of a file
+    /// is allowed; *reading* what you mapped there raises SIGBUS, which is not an
+    /// error a caller can catch, not a `None` to fall back on — the process dies.
+    /// A file truncated by damage, a full disk, or a half-finished copy is exactly
+    /// where a store most needs to return an error instead.
+    #[test]
+    fn a_file_shorter_than_its_header_claims_errors_rather_than_dying() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("pages.bin");
+        let pages: Vec<u64>;
+        {
+            let mut s = PageStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+            pages = (0..12).map(|_| s.alloc().unwrap()).collect();
+            for (i, &p) in pages.iter().enumerate() {
+                s.write(p, &vec![i as u8 + 1; DEFAULT_PAGE_SIZE]).unwrap();
+            }
+            s.sync().unwrap();
+        }
+
+        // Cut the file to a third. The header still says thirteen pages exist.
+        let full = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            .set_len(full / 3).unwrap();
+
+        let s = PageStore::open(&path).unwrap().expect("a truncated store should still open");
+        assert_eq!(s.page_count(), 13, "the header should still claim every page");
+
+        // Every page: the ones that survived read correctly, the ones that did not
+        // return an error. Neither may kill the process.
+        let mut buf = vec![0u8; DEFAULT_PAGE_SIZE];
+        let mut ok = 0;
+        for (i, &p) in pages.iter().enumerate() {
+            match s.read(p, &mut buf) {
+                Ok(()) => {
+                    assert_eq!(buf[0], i as u8 + 1,
+                               "page {p} survived truncation but came back as another page");
+                    ok += 1;
+                }
+                Err(_) => {} // past the end of what is left — the right answer
+            }
+        }
+        assert!(ok > 0, "a store cut to a third returned nothing at all");
+        assert!(ok < pages.len(), "a store cut to a third returned every page, which cannot be");
     }
 }
