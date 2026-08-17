@@ -322,6 +322,30 @@ impl NodeStore {
         Ok(out)
     }
 
+    /// Every node in the store, one index page at a time.
+    ///
+    /// The index walk already yields each key's record id, so the record is read
+    /// directly rather than by descending the tree again — which is what calling
+    /// `get` per hash does, and it is the difference between one page read per node
+    /// and a whole descent. `f` returning `false` stops the walk.
+    ///
+    /// Records that fail their own checks are skipped rather than reported: a walk
+    /// is not a place to hand back a row that is not the row it claims to be.
+    pub(crate) fn for_each_node(&self, mut f: impl FnMut(u64, StoredNode) -> bool)
+        -> io::Result<()>
+    {
+        self.store.for_each_key(|key, id| {
+            let hash = key as u64;
+            match self.store.read_at(id) {
+                Ok(Some(bytes)) => match decode(&bytes) {
+                    Some(n) if crate::sk_hash(&n.slug) == hash => f(hash, n),
+                    _ => true,
+                },
+                _ => true,
+            }
+        })
+    }
+
     pub(crate) fn sync(&mut self) -> io::Result<()> {
         self.store.sync()?;
         self.members.sync()?;
