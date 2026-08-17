@@ -55,15 +55,46 @@ fn rd8(p: &[u8], at: usize) -> u64 { u64::from_le_bytes(p[at..at + 8].try_into()
 fn wr8(p: &mut [u8], at: usize, v: u64) { p[at..at + 8].copy_from_slice(&v.to_le_bytes()); }
 fn rd16b(p: &[u8], at: usize) -> u128 { u128::from_le_bytes(p[at..at + 16].try_into().unwrap()) }
 fn wr16b(p: &mut [u8], at: usize, v: u128) { p[at..at + 16].copy_from_slice(&v.to_le_bytes()); }
-fn count(p: &[u8]) -> usize { u16::from_le_bytes([p[2], p[3]]) as usize }
+/// How many entries this page claims, capped at how many it could physically hold.
+///
+/// The count comes off disk and drives every index into the page, so an uncapped
+/// one reads wherever it likes: a page whose header bytes happen to say 60 000
+/// sends `leaf_key` 1.4 MB into a 4 KB buffer. The same shape of bug in the record
+/// store's slot count sent a read 51 962 bytes into a 4 096-byte page. Capping
+/// makes a nonsense page read as a page full of nonsense entries, which the tree
+/// then fails to find anything in — a wrong answer is recoverable, a panic in the
+/// middle of a query is not.
+///
+/// The cap is the leaf capacity, which is the larger of the two layouts; the
+/// internal accessors bound themselves, so both are safe without either being
+/// short by an entry. Capping at the *internal* capacity instead cost a full leaf
+/// its last entry, which the tree's own tests caught immediately — a bound that
+/// changes correct behaviour is not a bound, it is a bug with a rationale.
+fn count(p: &[u8]) -> usize {
+    let max = p.len().saturating_sub(HDR) / ENTRY;
+    (u16::from_le_bytes([p[2], p[3]]) as usize).min(max)
+}
 fn set_count(p: &mut [u8], n: usize) { p[2..4].copy_from_slice(&(n as u16).to_le_bytes()); }
 fn kind(p: &[u8]) -> u8 { p[0] }
 fn next_leaf(p: &[u8]) -> u64 { rd8(p, 8) }
 fn set_next_leaf(p: &mut [u8], v: u64) { wr8(p, 8, v) }
 
 // Leaf entry i: key at HDR + i*ENTRY, value 16 bytes further in.
-fn leaf_key(p: &[u8], i: usize) -> u128 { rd16b(p, HDR + i * ENTRY) }
-fn leaf_val(p: &[u8], i: usize) -> u64 { rd8(p, HDR + i * ENTRY + 16) }
+//
+// Both bound themselves against the page. `count` is capped, so a well-formed
+// page never reaches these guards; a page whose bytes are anything at all cannot
+// walk out of the buffer through them either. A key read past the end comes back
+// as the maximum, which sorts after everything and so is simply not found.
+fn leaf_key(p: &[u8], i: usize) -> u128 {
+    let at = HDR + i * ENTRY;
+    if at + 16 > p.len() { return u128::MAX }
+    rd16b(p, at)
+}
+fn leaf_val(p: &[u8], i: usize) -> u64 {
+    let at = HDR + i * ENTRY + 16;
+    if at + 8 > p.len() { return 0 }
+    rd8(p, at)
+}
 fn set_leaf(p: &mut [u8], i: usize, k: u128, v: u64) {
     wr16b(p, HDR + i * ENTRY, k);
     wr8(p, HDR + i * ENTRY + 16, v);
@@ -72,8 +103,21 @@ fn set_leaf(p: &mut [u8], i: usize, k: u128, v: u64) {
 // Internal node: child0 at HDR, then (key, child) pairs from HDR+8.
 fn child0(p: &[u8]) -> u64 { rd8(p, HDR) }
 fn set_child0(p: &mut [u8], v: u64) { wr8(p, HDR, v) }
-fn int_key(p: &[u8], i: usize) -> u128 { rd16b(p, HDR + 8 + i * ENTRY) }
-fn int_child(p: &[u8], i: usize) -> u64 { rd8(p, HDR + 8 + i * ENTRY + 16) }
+fn int_key(p: &[u8], i: usize) -> u128 {
+    let at = HDR + 8 + i * ENTRY;
+    if at + 16 > p.len() { return u128::MAX }
+    rd16b(p, at)
+}
+fn int_child(p: &[u8], i: usize) -> u64 {
+    let at = HDR + 8 + i * ENTRY + 16;
+    if at + 8 > p.len() { return NO_CHILD }
+    rd8(p, at)
+}
+
+/// A child pointer that is not a page. Page 0 is the store's header, so a descent
+/// that reaches it reads a page that is not a tree node and finds nothing — wrong,
+/// bounded, and reachable only from a damaged page.
+const NO_CHILD: u64 = 0;
 fn set_int(p: &mut [u8], i: usize, k: u128, c: u64) {
     wr16b(p, HDR + 8 + i * ENTRY, k);
     wr8(p, HDR + 8 + i * ENTRY + 16, c);
@@ -155,9 +199,24 @@ impl BTree {
         if lo == 0 { child0(p) } else { int_child(p, lo - 1) }
     }
 
+    /// The most pages any single descent or leaf walk may touch.
+    ///
+    /// A tree's structure is pointers stored in its own pages, so damage makes them
+    /// point anywhere — including back at a page already visited. `range` and
+    /// `iter_all` followed `next_leaf` with no bound at all, so one corrupted
+    /// pointer forming a cycle looped forever, collecting into a `Vec` until memory
+    /// ran out. A descent has the same exposure through `int_child`.
+    ///
+    /// No walk can legitimately visit more pages than the store contains, so that
+    /// is the bound. It cannot cut a healthy walk short, and it turns an unbounded
+    /// one into a truncated answer.
+    fn walk_budget(&self) -> u64 { self.pages.page_count().saturating_add(1) }
+
     pub(crate) fn get(&self, key: u128) -> io::Result<Option<u64>> {
         let mut page = self.root;
+        let mut budget = self.walk_budget();
         loop {
+            budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(None) };
             let buf = self.read_page(page)?;
             if kind(&buf) == KIND_LEAF {
                 let i = Self::lower_bound_leaf(&buf, key);
@@ -295,7 +354,9 @@ impl BTree {
 
     pub(crate) fn remove(&mut self, key: u128) -> io::Result<bool> {
         let mut page = self.root;
+        let mut budget = self.walk_budget();
         loop {
+            budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(false) };
             let mut buf = self.read_page(page)?;
             if kind(&buf) == KIND_LEAF {
                 let n = count(&buf);
@@ -322,14 +383,18 @@ impl BTree {
     /// With a composite key this is a prefix scan: all members of one collection,
     /// or all edges from one node, are a contiguous run.
     pub(crate) fn range(&self, lo: u128, hi: u128) -> io::Result<Vec<(u128, u64)>> {
+        let mut budget = self.walk_budget();
         let mut page = self.root;
         loop {
+            budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(Vec::new()) };
             let buf = self.read_page(page)?;
             if kind(&buf) == KIND_LEAF { break }
             page = Self::descend_to(&buf, lo);
         }
         let mut out = Vec::new();
+        let mut budget = self.walk_budget();
         while page != 0 {
+            budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(out) };
             let buf = self.read_page(page)?;
             for i in 0..count(&buf) {
                 let k = leaf_key(&buf, i);
@@ -352,13 +417,17 @@ impl BTree {
     /// `f` returning `false` stops the walk, so a search does not have to read
     /// what it no longer needs.
     pub(crate) fn for_each(&self, mut f: impl FnMut(u128, u64) -> bool) -> io::Result<()> {
+        let mut budget = self.walk_budget();
         let mut page = self.root;
         loop {
+            budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(()) };
             let buf = self.read_page(page)?;
             if kind(&buf) == KIND_LEAF { break }
             page = child0(&buf);
         }
+        let mut budget = self.walk_budget();
         while page != 0 {
+            budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(()) };
             let buf = self.read_page(page)?;
             for i in 0..count(&buf) {
                 if !f(leaf_key(&buf, i), leaf_val(&buf, i)) { return Ok(()) }
@@ -542,5 +611,54 @@ mod tests {
         assert!(t.range(compose(7, 0), compose(7, u64::MAX)).unwrap().is_empty());
         assert_eq!(t.range(compose(6, 0), compose(6, u64::MAX)).unwrap().len(), 200);
         assert_eq!(t.range(compose(8, 0), compose(8, u64::MAX)).unwrap().len(), 200);
+    }
+
+    /// A damaged tree page must not read outside itself.
+    ///
+    /// Every index into a page is driven by a count read from that page, and a page
+    /// can hold anything after a torn write. This walks a real tree, corrupts one
+    /// page at a time in the ways that matter, and requires every operation to
+    /// return *something* — right, wrong, or absent — rather than panic.
+    #[test]
+    fn a_damaged_page_never_reads_outside_itself() {
+        use std::io::{Seek, SeekFrom, Write};
+        let corruptions: &[(&str, usize, Vec<u8>)] = &[
+            ("count says 65535",        2, u16::MAX.to_le_bytes().to_vec()),
+            ("count says 60000",        2, 60_000u16.to_le_bytes().to_vec()),
+            ("kind byte is garbage",    0, vec![0xFF]),
+            ("next-leaf points far away", 8, u64::MAX.to_le_bytes().to_vec()),
+            ("header all ones",         0, vec![0xFF; 16]),
+        ];
+        for (name, offset, bytes) in corruptions {
+            for target_page in [1u64, 2, 3] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("t.bin");
+                {
+                    let mut t = BTree::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+                    for i in 0..4_000u64 {
+                        t.insert(i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128, i).unwrap();
+                    }
+                    t.sync().unwrap();
+                }
+                if target_page * DEFAULT_PAGE_SIZE as u64
+                    >= std::fs::metadata(&path).unwrap().len() { continue }
+                {
+                    let mut fh = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    fh.seek(SeekFrom::Start(
+                        target_page * DEFAULT_PAGE_SIZE as u64 + *offset as u64)).unwrap();
+                    fh.write_all(bytes).unwrap();
+                }
+                let Some(t) = BTree::open(&path).unwrap() else { continue };
+                // Lookups, a range and a full walk: none may panic.
+                for i in 0..500u64 {
+                    let _ = t.get(i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128);
+                }
+                let _ = t.range(0, u128::MAX);
+                let _ = t.iter_all();
+                let mut n = 0usize;
+                let _ = t.for_each(|_, _| { n += 1; n < 100_000 });
+                assert!(n <= 100_000, "{name} on page {target_page}: the walk did not terminate");
+            }
+        }
     }
 }
