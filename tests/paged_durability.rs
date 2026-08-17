@@ -457,7 +457,6 @@ fn random_byte_damage_never_panics_or_hangs() {
     let seed: u64 = std::env::var("SK_FUZZ_SEED").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(0x5EE_D0_5EE_D);
     let mut rng = Rng(seed);
-    let started = std::time::Instant::now();
 
     for round in 0..rounds {
         let dir = tempfile::TempDir::new().unwrap();
@@ -488,6 +487,7 @@ fn random_byte_damage_never_panics_or_hangs() {
         if damage.is_empty() { continue }
 
         let ctx = format!("round {round} (seed {seed}): {damage:?}");
+        let round_started = std::time::Instant::now();
 
         // Opening may fail. That is an answer.
         let Ok(db) = CoreDB::open_with_config(dir.path(), paged()) else { continue };
@@ -503,24 +503,45 @@ fn random_byte_damage_never_panics_or_hangs() {
                 // wrong is a very different failure from a byte read wrong, and
                 // only the first is the store's fault.
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(k) = v["_key"].as_str() {
-                        // Distinguishing the two failures that look alike from
-                        // outside. A key whose *text* was flipped — "n\u{fffd}9" —
-                        // is the right record with a damaged byte in it, which a
-                        // store without payload checksums cannot detect and is not
-                        // being asked to. A key that is a **different real key of
-                        // this dataset** is a record boundary read wrong: the store
-                        // handed back another row and said it was this one. Only
-                        // the second is a bug, and only the second is checked.
-                        let looks_real = k.strip_prefix('n')
-                            .and_then(|d| d.parse::<usize>().ok())
-                            .is_some_and(|n| n < 80);
-                        if looks_real {
-                            assert!(h.slug.ends_with(k),
-                                    "{ctx}: asked for {} and got {k}, which is a \
-                                     different row of this store — a record boundary \
-                                     was read wrong", h.slug);
-                        }
+                    // Distinguishing the two failures that look alike from outside.
+                    // A byte flipped *inside* the right record is not the store's
+                    // fault — payload records carry no checksum and are not being
+                    // asked to. A record **boundary** read wrong is: the store
+                    // handed back another row and said it was this one.
+                    //
+                    // Reading `_key` alone cannot tell them apart, and said so
+                    // wrongly: one flipped digit turns `n51` into `n58`, which is
+                    // also a real key of an 80-row dataset, so a single-byte flip
+                    // was reported as a substitution. That cost a fuzz campaign and
+                    // a wrong diagnosis before the payload was printed in full and
+                    // showed `{"_key":"n58", "n":51, "_id":"p/n51"}` — n51's record
+                    // with one character changed.
+                    //
+                    // So it takes **two** independent fields to agree that this is
+                    // a different row. `_key`, `_id` and `n` are written from the
+                    // same source and stored apart; one flip can move one of them.
+                    // A boundary error moves all three at once.
+                    let key_says = v["_key"].as_str()
+                        .and_then(|k| k.strip_prefix('n'))
+                        .and_then(|d| d.parse::<usize>().ok())
+                        .filter(|n| *n < 80);
+                    let id_says = v["_id"].as_str()
+                        .and_then(|s| s.strip_prefix("p/n"))
+                        .and_then(|d| d.parse::<usize>().ok())
+                        .filter(|n| *n < 80);
+                    let n_says = v["n"].as_u64().map(|n| n as usize).filter(|n| *n < 80);
+                    let asked = h.slug.strip_prefix("p/n")
+                        .and_then(|d| d.parse::<usize>().ok());
+                    if let Some(asked) = asked {
+                        let disagree = [key_says, id_says, n_says]
+                            .into_iter()
+                            .flatten()
+                            .filter(|got| *got != asked)
+                            .collect::<Vec<_>>();
+                        assert!(disagree.len() < 2,
+                                "{ctx}: asked for {} and got a record claiming to be \
+                                 {disagree:?} in more than one field — a record \
+                                 boundary was read wrong, not a byte", h.slug);
                     }
                 }
             }
@@ -547,9 +568,25 @@ fn random_byte_damage_never_panics_or_hangs() {
         let _ = db.node_count();
         let _ = db.collection_names();
 
-        assert!(started.elapsed().as_secs() < 1800,
-                "{ctx}: the fuzz loop is taking far longer than it should — something \
-                 is spinning rather than answering");
+        // Per round, not for the whole loop.
+        //
+        // This was one 1800-second budget for the entire run, which is a sensible
+        // bound for the committed 240 rounds and a wrong one for a campaign: a
+        // 3000-round run legitimately passes it, so it aborted at whatever round
+        // happened to cross the line, reported "something is spinning", and stopped
+        // the campaign exploring the rounds it had not reached yet. A guard that
+        // fires on healthy work is worse than no guard — it makes every long
+        // campaign look like a failure and hides whatever the remaining rounds
+        // would have found.
+        //
+        // What it is actually watching for is *one* round that does not terminate:
+        // a corrupt page pointing back at itself, a walk with no bound. A healthy
+        // round here takes well under a second, so a round that takes half a minute
+        // is spinning whatever the campaign length.
+        assert!(round_started.elapsed().as_secs() < 30,
+                "{ctx}: this round took {}s — a healthy one takes under a second, so \
+                 something is spinning rather than answering",
+                round_started.elapsed().as_secs());
     }
 }
 

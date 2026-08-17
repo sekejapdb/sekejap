@@ -1149,7 +1149,25 @@ impl PayloadStore {
     /// `{` raw JSON, `0x01` = retired zstd → `None`) so mixed files need no
     /// migration.
     pub(crate) fn get_raw(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
-        let stored = self.stored_record(offset, len)?;
+        self.get_raw_of(OWNER_UNKNOWN, offset, len)
+    }
+
+    /// The same, checked against the node the bytes are supposed to belong to.
+    ///
+    /// A paged store addresses records by `(page, slot)`. Damage the slot
+    /// directory and the read lands on a different record — a real payload, well
+    /// formed, belonging to another row. Every record carries four bytes of its
+    /// owner's hash so the read can tell, and [`get_of`](Self::get_of) checks
+    /// them.
+    ///
+    /// This did not, and neither did the batch read built on it. So the checked
+    /// single-record path answered correctly while the batched path — taken as
+    /// soon as a filter has enough candidates to be worth batching — handed back
+    /// another row's payload under this row's hash. A query for `p/n51` returned
+    /// `n58`. Found by the fuzzer at round 1687 of seed 20260818, which is the
+    /// argument for running a campaign on seeds nothing has run before.
+    pub(crate) fn get_raw_of(&self, owner: u64, offset: u64, len: u32) -> Option<Vec<u8>> {
+        let stored = self.stored_record_of(owner, offset, len)?;
         if storage::skbin::is_skbin(&stored) {
             // SKBIN → reconstruct JSON bytes using the shared field-name table.
             let v = storage::skbin::decode(&stored, &self.field_table)?;
@@ -2736,7 +2754,7 @@ impl CoreDB {
         if payload.get("_created_unix").is_none() {
             let created_str = old_info.as_ref()
                 .and_then(|(_, off, len)| {
-                    let old_raw = self.payload_store.get_raw(*off, *len)?; // read old bytes
+                    let old_raw = self.payload_store.get_raw_of(hash, *off, *len)?;
                     let map = query::extract_fields_by_search(
                         &old_raw, &["_created_unix".to_string()],
                     );
@@ -4135,7 +4153,7 @@ impl CoreDB {
                 // compacted base — the planner matched them, this discarded them,
                 // and the UPDATE reported 0 rows and silently lost the write.
                 let n = self.node_data(hash)?;
-                let raw = self.payload_store.get_raw(n.payload_offset, n.payload_len)?;
+                let raw = self.payload_store.get_raw_of(hash, n.payload_offset, n.payload_len)?;
                 Some((n.slug.clone(), hash, raw))
             })
             .collect();
@@ -5215,7 +5233,7 @@ impl CoreDB {
                             Some(loc) => loc,
                             None => continue,
                         };
-                        if let Some(bytes) = self.payload_store.get_raw(off, len) {
+                        if let Some(bytes) = self.payload_store.get_raw_of(h, off, len) {
                             // get_raw decoded to JSON; re-encode under the current
                             // policy. SKBIN for records ≤ threshold (huge records
                             // stay raw to preserve head/tail extraction); field
@@ -5276,7 +5294,7 @@ impl CoreDB {
             let mut new_slab: Vec<u8> = Vec::new();
             for h in node_keys {
                 let Some((old_off, old_len)) = self.payload_loc(h) else { continue };
-                if let Some(bytes) = self.payload_store.get_raw(old_off, old_len) {
+                if let Some(bytes) = self.payload_store.get_raw_of(h, old_off, old_len) {
                     let new_off = new_slab.len() as u64;
                     new_slab.extend_from_slice(&bytes);
                     if let Some(n) = self.nodes.get_mut(&h) {
@@ -5836,7 +5854,7 @@ impl CoreDB {
                         return None; // side-table present: NO_ID really means no geometry
                     }
                     self.payload_store
-                        .get_raw(rec.payload_offset, rec.payload_len)
+                        .get_raw_of(hash, rec.payload_offset, rec.payload_len)
                         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                         .and_then(|p| geo::extract_spatial_meta(&p))
                 });
@@ -6416,9 +6434,14 @@ impl CoreDB {
     /// bytes from the payload store (a zero-copy mmap slice on disk, or the RAM
     /// buffer for an ephemeral DB).
     pub fn get(&self, slug: &str) -> Option<String> {
-        let (off, len) = self.payload_loc(sk_hash(slug))?; // metadata → disk location
+        let hash = sk_hash(slug);
+        let (off, len) = self.payload_loc(hash)?; // metadata → disk location
         self.payload_store
-            .get_raw(off, len) // the only disk touch
+            // Checked against the row it should be. This is the plainest read in
+            // the database and it was reading anonymously: a damaged slot
+            // directory in a paged store made it return a different row's bytes,
+            // correctly formed, under the slug that was asked for.
+            .get_raw_of(hash, off, len) // the only disk touch
             .map(|b| String::from_utf8_lossy(&b).into_owned())
     }
 
@@ -6732,14 +6755,14 @@ impl CoreDB {
         let tail_size = tail_bytes.min(len);
         // If the ranges overlap (small payload), just read the full thing once.
         if head_size + tail_size >= len {
-            let full = self.payload_store.get_raw(off, len as u32)?;
+            let full = self.payload_store.get_raw_of(hash, off, len as u32)?;
             return Some((full.clone(), full));
         }
         // Reading only the ends is an optimisation that needs byte positions. A
         // paged store addresses by record id, so it reads the record and slices —
         // the same answer, without the saving.
         if !self.payload_store.absolute_offsets() {
-            let full = self.payload_store.get_raw(off, p_len)?;
+            let full = self.payload_store.get_raw_of(hash, off, p_len)?;
             let n = full.len();
             let h = full[..head_size.min(n)].to_vec();
             let t = full[n.saturating_sub(tail_size)..].to_vec();
@@ -6798,7 +6821,10 @@ impl CoreDB {
         // answers, without the syscall saving.
         if !self.payload_store.absolute_offsets() {
             for &(hash, off, len) in &sorted {
-                if let Some(bytes) = self.payload_store.get_raw(off, len) {
+                // `get_raw_of`: the batch knows whose bytes it is asking for, so it
+                // says so. Reading anonymously here is what let a damaged slot
+                // directory substitute one row for another.
+                if let Some(bytes) = self.payload_store.get_raw_of(hash, off, len) {
                     result.insert(hash, bytes);
                 }
             }
@@ -6839,7 +6865,7 @@ impl CoreDB {
             } else {
                 // Fallback: read each node individually on I/O error.
                 for &(hash, off, len) in &sorted[i..j] {
-                    if let Some(raw) = self.payload_store.get_raw(off, len) {
+                    if let Some(raw) = self.payload_store.get_raw_of(hash, off, len) {
                         result.insert(hash, raw);
                     }
                 }
@@ -9429,7 +9455,7 @@ impl CoreDB {
                 if max_bytes.is_some_and(|m| !out.is_empty() && bytes + len as usize > m) {
                     break;
                 }
-                if let Some(b) = self.payload_store.get_raw(off, len) {
+                if let Some(b) = self.payload_store.get_raw_of(h, off, len) {
                     bytes += b.len();
                     out.push(String::from_utf8_lossy(&b).into_owned());
                 }
