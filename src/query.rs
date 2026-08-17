@@ -1091,6 +1091,7 @@ impl<'db> Set<'db> {
         // Look up the btree for this (collection, field) pair.
         let btree = self.db.field_index_ref(collection_hash, gf)?;
 
+
         // For aggregate args that aren't "*", verify btree indexes exist and
         // build hash→f64 reverse maps from those indexes.
         let mut arg_val_maps: HashMap<String, HashMap<u64, f64>> = HashMap::new();
@@ -1446,9 +1447,7 @@ impl<'db> Set<'db> {
                 if let Some(payload) = self.db.get_payload(h) {
                     // Build composite group key — one JSON-encoded segment per GROUP BY field.
                     let key = group_fields.iter()
-                        .map(|f| serde_json::to_string(
-                            payload.get(f).unwrap_or(&Value::Null)
-                        ).unwrap_or_default())
+                        .map(|f| group_key_of(payload.get(f).unwrap_or(&Value::Null)))
                         .collect::<Vec<_>>()
                         .join("\x00");
 
@@ -3847,6 +3846,23 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
 ///
 /// `DISTINCT` is the same trap and is why it is *not* skipped over here: rows that
 /// dedup away still had to be produced, so no early exit is sound before it.
+/// The grouping identity of a value.
+///
+/// `GROUP BY` groups equal values, and `1` and `1.0` are the same number however
+/// they were written. Serialising the JSON instead made them `"1"` and `"1.0"` and
+/// so two groups — while the btree, which stores numbers as numbers, made one. The
+/// same query answered differently depending on whether an index existed, and here
+/// it was the *scan* that was wrong.
+///
+/// Numbers key on their `f64` value; everything else keys on its JSON text, which
+/// already distinguishes a string from a bool from null.
+fn group_key_of(v: &Value) -> String {
+    match v.as_f64() {
+        Some(n) if v.is_number() => format!("#{n}"),
+        _ => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
+
 fn find_take_limit(remaining_steps: &[Step]) -> Option<usize> {
     let mut skipped = 0usize;
     for step in remaining_steps {
