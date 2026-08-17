@@ -76,6 +76,32 @@ ORDER BY n DESC;
 Filters: `=`, `!=`/`<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN (...)`,
 `IS [NOT] NULL`, `LIKE` / `ILIKE` (case-insensitive), `AND`/`OR`/`NOT`.
 
+### Pattern matching with LIKE
+
+`LIKE` and `ILIKE` are patterns, not substring searches — the same as PostgreSQL:
+
+| in the pattern | means |
+| --- | --- |
+| `%` | any run of characters, including none |
+| `_` | exactly one character, whatever it is |
+| `\%`, `\_` | a literal `%` or `_` |
+
+The pattern must match the **whole value**, so anchor it with `%` when you want a
+substring:
+
+```sql
+SELECT _key FROM t WHERE v LIKE 'open';    -- only the value "open"
+SELECT _key FROM t WHERE v LIKE 'open%';   -- values starting with "open"
+SELECT _key FROM t WHERE v LIKE '%open%';  -- values containing "open"
+```
+
+`ILIKE` is the same, case-insensitively. Matching runs over characters rather than
+bytes, so `'é' LIKE '_'` is true.
+
+The Rust builder's `.like()` and `.ilike()` are a different thing and keep their
+own documented meaning: they take a literal needle and search for it anywhere in
+the value, with `%` and `_` treated as ordinary characters.
+
 ### NULL and missing fields
 
 A comparison against a value that is not there answers neither true nor false.

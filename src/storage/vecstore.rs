@@ -153,7 +153,34 @@ impl VectorStore {
     }
 
     /// Insert or replace a vector.
-    pub fn put(&mut self, id: u64, data: Vec<f32>) {
+    /// The largest vector the on-disk record can describe.
+    ///
+    /// The record header stores the dimension in two bytes, so a longer vector
+    /// cannot be written down truthfully. It used to be written down *untruthfully*:
+    /// `data.len() as u16` wrapped, so a 65 536-element vector recorded a
+    /// dimension of zero, every float was still written to the file, and the
+    /// record length the store advanced by was computed from the wrapped value —
+    /// so the next vector was written into the middle of this one. Reads returned
+    /// a truncated vector and the file layout drifted from that point on, with
+    /// nothing reporting a problem.
+    ///
+    /// No real embedding comes near this: the largest models in common use are a
+    /// few thousand dimensions.
+    pub const MAX_DIM: usize = u16::MAX as usize;
+
+    /// Store a vector. Fails rather than truncate — see [`MAX_DIM`](Self::MAX_DIM).
+    pub fn put(&mut self, id: u64, data: Vec<f32>) -> io::Result<()> {
+        if data.len() > Self::MAX_DIM {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "sekejap: vector has {} dimensions; the stored record can \
+                     describe at most {}",
+                    data.len(),
+                    Self::MAX_DIM
+                ),
+            ));
+        }
         match &mut self.inner {
             VectorStoreInner::Memory { vecs } => {
                 vecs.insert(id, data);
@@ -180,14 +207,17 @@ impl VectorStore {
                     buf.extend_from_slice(&f.to_le_bytes());
                 }
                 use std::os::unix::fs::FileExt;
-                file.write_all_at(&buf, *total_len)
-                    .expect("sekejap: vector disk write failed");
+                // Reported, not fatal: a full disk is not a reason to abort the
+                // process. The index is left untouched, so the vector reads as
+                // absent rather than as bytes that were never written.
+                file.write_all_at(&buf, *total_len)?;
                 index.insert(id, *total_len);
                 *total_len += record_len as u64;
                 // Note: mmap is NOT updated here — reads of newly-appended
                 // data fall back to pread until the next remap (on compact).
             }
         }
+        Ok(())
     }
 
     /// Remove a vector by id. Returns the removed vector if it existed.

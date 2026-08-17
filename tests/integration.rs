@@ -1211,7 +1211,10 @@ fn match_reverse_anchor_not_applicable() {
 fn ilike_filter() {
     let db = setup_music_db();
     let hits = db.query(
-        "SELECT * FROM artist WHERE name ILIKE 'VINES'"
+        // `%…%` because `ILIKE` is a pattern, not a substring search: bare
+    // 'VINES' matches a value that *is* "VINES". It used to match "The Vines",
+    // which is what PostgreSQL spells `'%VINES%'`.
+    "SELECT * FROM artist WHERE name ILIKE '%VINES%'"
     ).unwrap().collect();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].payload.as_ref().unwrap().get("name").unwrap().as_str() == Some("The Vines"));
@@ -4314,10 +4317,10 @@ fn drop_index_gin_shared_field_only_removes_one_collection() {
     db.execute("CREATE INDEX ON posts USING gin (body)").unwrap();
 
     // Both collections searchable via ILIKE (uses GIN)
-    let hit_articles = db.query("SELECT * FROM articles WHERE body ILIKE 'Fitzroy'")
+    let hit_articles = db.query("SELECT * FROM articles WHERE body ILIKE '%Fitzroy%'")
         .unwrap().collect();
     assert_eq!(hit_articles.len(), 1);
-    let hit_posts = db.query("SELECT * FROM posts WHERE body ILIKE 'live'")
+    let hit_posts = db.query("SELECT * FROM posts WHERE body ILIKE '%live%'")
         .unwrap().collect();
     assert_eq!(hit_posts.len(), 1);
 
@@ -4325,7 +4328,7 @@ fn drop_index_gin_shared_field_only_removes_one_collection() {
     db.execute("DROP INDEX ON articles USING gin (body)").unwrap();
 
     // Posts GIN data must still work
-    let still_posts = db.query("SELECT * FROM posts WHERE body ILIKE 'live'")
+    let still_posts = db.query("SELECT * FROM posts WHERE body ILIKE '%live%'")
         .unwrap().collect();
     assert_eq!(still_posts.len(), 1, "posts GIN must survive when articles drops theirs");
 }

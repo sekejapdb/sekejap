@@ -246,7 +246,15 @@ enum MetaStore {
     #[cfg(unix)]
     Disk {
         /// (byte_offset, byte_len) per meta entry.
-        offsets: Vec<(u32, u16)>,
+        ///
+        /// `u64`/`u32`, not `u32`/`u16`. This table lives in memory and is rebuilt
+        /// as metadata is spilled, so the widths were free to be wrong and were:
+        /// an edge attribute larger than 65 535 bytes had its length wrap, so the
+        /// whole JSON was written and a truncated span was read back — an edge
+        /// whose attributes silently became unparseable. The offset wrapped once
+        /// the blob passed 4 GiB, and a read then landed on a different edge's
+        /// metadata and returned it as this one's.
+        offsets: Vec<(u64, u32)>,
         file: std::sync::Arc<std::fs::File>,
         total_len: u64,
         mmap: Option<super::mmap::MmapView>,
@@ -366,10 +374,10 @@ impl EdgeStore {
         edge_type: u64,
         edge_type_name: &str,
         meta: Value,
-    ) {
+    ) -> io::Result<()> {
         self.type_names
             .insert(edge_type, edge_type_name.to_string());
-        let mid = self.store_meta(meta);
+        let mid = self.store_meta(meta)?;
         let edge_fwd = Edge {
             other: to_hash,
             edge_type,
@@ -382,6 +390,7 @@ impl EdgeStore {
         };
         self.fwd.entry(from_hash).or_default().push(edge_fwd);
         self.rev.entry(to_hash).or_default().push(edge_rev);
+        Ok(())
     }
 
     /// Drop every edge and detach any spilled CSR files, keeping only the edge
@@ -412,10 +421,10 @@ impl EdgeStore {
         edge_type_name: &str,
         cols: &[(String, ColVal)],
         json: Option<Value>,
-    ) {
+    ) -> io::Result<()> {
         self.type_names.insert(edge_type, edge_type_name.to_string());
         // One slot in the meta store's slot space, shared by columns + json.
-        let slot = self.store_meta(json.unwrap_or(Value::Null));
+        let slot = self.store_meta(json.unwrap_or(Value::Null))?;
         for (name, val) in cols {
             let (v, is_bool) = match val {
                 ColVal::Num(n) => (*n, false),
@@ -430,6 +439,7 @@ impl EdgeStore {
         let rev = Edge { other: from_hash, edge_type, meta_id: slot as u64 };
         self.fwd.entry(from_hash).or_default().push(fwd);
         self.rev.entry(to_hash).or_default().push(rev);
+        Ok(())
     }
 
     /// Insert or UPSERT a KEYED edge, identity `(from, type, key)`. If no such edge
@@ -446,7 +456,7 @@ impl EdgeStore {
         key_hash: u64,
         cols: &[(String, ColVal)],
         json: Option<Value>,
-    ) -> bool {
+    ) -> io::Result<bool> {
         self.type_names.insert(edge_type, edge_type_name.to_string());
         let id = (from_hash, edge_type, key_hash);
         if let Some(&slot) = self.keyed.get(&id) {
@@ -459,18 +469,18 @@ impl EdgeStore {
                 }
             }
             self.set_cols(edge_type, slot, cols);
-            self.set_meta(slot, json.unwrap_or(Value::Null));
-            return false;
+            self.set_meta(slot, json.unwrap_or(Value::Null))?;
+            return Ok(false);
         }
         // NEW keyed edge: allocate a slot, store attrs, record the identity → slot.
-        let slot = self.store_meta(json.unwrap_or(Value::Null));
+        let slot = self.store_meta(json.unwrap_or(Value::Null))?;
         self.set_cols(edge_type, slot, cols);
         let fwd = Edge { other: to_hash, edge_type, meta_id: slot as u64 };
         let rev = Edge { other: from_hash, edge_type, meta_id: slot as u64 };
         self.fwd.entry(from_hash).or_default().push(fwd);
         self.rev.entry(to_hash).or_default().push(rev);
         self.keyed.insert(id, slot);
-        true
+        Ok(true)
     }
 
     /// Write fast-lane columns for one edge at `slot`.
@@ -490,7 +500,7 @@ impl EdgeStore {
     /// Overwrite the JSON meta at an existing `slot` (upsert). RAM overwrites in
     /// place; Disk appends the new bytes and repoints the offset (reads fall back to
     /// `pread`, so the stale mmap is fine until the next remap/compaction).
-    fn set_meta(&mut self, slot: u32, meta: Value) {
+    fn set_meta(&mut self, slot: u32, meta: Value) -> io::Result<()> {
         match &mut self.meta {
             MetaStore::Ram { metas } => {
                 if let Some(m) = metas.get_mut(slot as usize) {
@@ -500,17 +510,22 @@ impl EdgeStore {
             #[cfg(unix)]
             MetaStore::Disk { offsets, file, total_len, .. } => {
                 let json_bytes = serde_json::to_vec(&meta).unwrap_or_default();
-                let offset = *total_len as u32;
-                let len = json_bytes.len() as u16;
+                let offset = *total_len;
+                let len = json_bytes.len() as u32;
                 use std::os::unix::fs::FileExt;
-                file.write_all_at(&json_bytes, *total_len)
-                    .expect("sekejap: edge meta disk write failed");
+                // A failed write leaves the offset table untouched, so the edge
+                // keeps whatever attributes it had rather than pointing at bytes
+                // that are not there. Reported, not fatal.
+                if let Err(e) = file.write_all_at(&json_bytes, *total_len) {
+                    return Err(e);
+                }
                 *total_len += json_bytes.len() as u64;
                 if let Some(e) = offsets.get_mut(slot as usize) {
                     *e = (offset, len);
                 }
             }
         }
+        Ok(())
     }
 
     /// Resolve a fast-lane column ONCE for `(edge_type, attr)`. The hot path calls
@@ -555,12 +570,15 @@ impl EdgeStore {
     }
 
     /// Store metadata and return its id.
-    fn store_meta(&mut self, meta: Value) -> u32 {
+    ///
+    /// Fallible because the disk-backed variant writes: a full disk used to abort
+    /// the process here rather than fail the edge write that caused it.
+    fn store_meta(&mut self, meta: Value) -> io::Result<u32> {
         match &mut self.meta {
             MetaStore::Ram { metas } => {
                 let id = metas.len() as u32;
                 metas.push(meta);
-                id
+                Ok(id)
             }
             #[cfg(unix)]
             MetaStore::Disk {
@@ -570,15 +588,14 @@ impl EdgeStore {
                 ..
             } => {
                 let json_bytes = serde_json::to_vec(&meta).unwrap_or_default();
-                let offset = *total_len as u32;
-                let len = json_bytes.len() as u16;
+                let offset = *total_len;
+                let len = json_bytes.len() as u32;
                 use std::os::unix::fs::FileExt;
-                file.write_all_at(&json_bytes, *total_len)
-                    .expect("sekejap: edge meta disk write failed");
+                file.write_all_at(&json_bytes, *total_len)?;
                 *total_len += json_bytes.len() as u64;
                 let id = offsets.len() as u32;
                 offsets.push((offset, len));
-                id
+                Ok(id)
             }
         }
     }
@@ -678,7 +695,7 @@ impl EdgeStore {
         pred: &[(String, Value)],
         set_cols: &[(String, ColVal)],
         set_json: &serde_json::Map<String, Value>,
-    ) -> usize {
+    ) -> io::Result<usize> {
         // Immutable pass: find the slots of matching edges.
         let mut slots: Vec<u32> = Vec::new();
         if let Some(edges) = self.fwd.get(&from_hash) {
@@ -706,10 +723,10 @@ impl EdgeStore {
                 for (k, v) in set_json {
                     cur.insert(k.clone(), v.clone());
                 }
-                self.set_meta(slot, Value::Object(cur));
+                self.set_meta(slot, Value::Object(cur))?;
             }
         }
-        slots.len()
+        Ok(slots.len())
     }
 
     /// Remove all edges involving `hash` (both directions).

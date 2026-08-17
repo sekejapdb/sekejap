@@ -595,13 +595,13 @@ fn paged_mode_without_snapshots_says_so() {
     let dir2 = tempfile::TempDir::new().unwrap();
     {
         let mut db = CoreDB::open_with_config(dir2.path(), Config {
-            paged_topology: true, ..Config::default() }).unwrap();
+            paged_topology: true, ..Config::resident() }).unwrap();
         db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
         for i in 0..60 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
         db.compact().unwrap();
     }
     let mut db = CoreDB::open_with_config(dir2.path(), Config {
-        paged_topology: true, ..Config::default() }).unwrap();
+        paged_topology: true, ..Config::resident() }).unwrap();
     db.put("p/n999", &row(999)).unwrap();
     let snap = db.snapshot_db().expect("paged topology alone must still be snapshottable");
     assert_eq!(snap.query("SELECT _key FROM p").unwrap().collect().len(), 61,
@@ -652,10 +652,10 @@ fn opening_a_paged_store_with_the_wrong_config_does_not_destroy_it() {
     assert!(!before.is_empty(), "the fixture wrote no data files");
 
     for (label, cfg) in [
-        ("what Engine used to do", Config { paged_topology: true, ..Config::default() }),
-        ("plain default", Config::default()),
+        ("what Engine used to do", Config { paged_topology: true, ..Config::resident() }),
+        ("plain resident", Config::resident()),
         ("payloads only", Config { paged_topology: true, paged_payloads: true,
-                                   ..Config::default() }),
+                                   ..Config::resident() }),
     ] {
         {
             let db = CoreDB::open_with_config(dir.path(), cfg)
@@ -693,7 +693,7 @@ fn opening_a_paged_store_with_the_wrong_config_does_not_destroy_it() {
 /// made an update behave differently from a write to the same column.
 #[test]
 fn update_maintains_the_btree_index_in_paged_mode() {
-    for (label, cfg) in [("paged", paged()), ("default", Config::default())] {
+    for (label, cfg) in [("paged", paged()), ("resident", Config::resident())] {
         let dir = tempfile::TempDir::new().unwrap();
         {
             let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
@@ -741,7 +741,7 @@ fn update_maintains_the_btree_index_in_paged_mode() {
 /// method over and never got the same treatment.
 #[test]
 fn edge_attribute_writes_reach_the_durable_store() {
-    for (label, cfg) in [("paged", paged()), ("default", Config::default())] {
+    for (label, cfg) in [("paged", paged()), ("resident", Config::resident())] {
         let dir = tempfile::TempDir::new().unwrap();
         {
             let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
@@ -801,7 +801,7 @@ fn edge_attribute_writes_reach_the_durable_store() {
 /// unreachable by a second DROP.
 #[test]
 fn ddl_and_edge_slugs_reach_the_durable_store() {
-    for (label, cfg) in [("paged", paged()), ("default", Config::default())] {
+    for (label, cfg) in [("paged", paged()), ("resident", Config::resident())] {
         // Each case gets a store built, compacted and reopened, so nothing it
         // needs is left in the overlay.
         let fresh = || {
@@ -876,7 +876,7 @@ fn ddl_and_edge_slugs_reach_the_durable_store() {
 /// write path specifically, and it is wrong in *both* storage modes.
 #[test]
 fn a_bulk_write_maintains_btree_indexes() {
-    for (label, cfg) in [("paged", paged()), ("default", Config::default())] {
+    for (label, cfg) in [("paged", paged()), ("resident", Config::resident())] {
         let dir = tempfile::TempDir::new().unwrap();
         let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
         db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();

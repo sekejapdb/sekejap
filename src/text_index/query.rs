@@ -89,131 +89,118 @@ pub struct ILikeResult {
 /// # Returns
 /// * `bool` - True if text matches pattern
 pub fn ilike_matches(text: &str, pattern: &str) -> bool {
-    let text_lower = text.to_lowercase();
-    let pattern_lower = pattern.to_lowercase();
-
-    let pattern = pattern_lower.trim();
-    let text = text_lower.as_str();
-
-    if pattern.is_empty() {
-        return true;
-    }
-
-    if pattern == "%" {
-        return true;
-    }
-
-    let leading_pct = pattern.chars().take_while(|&c| c == '%').count();
-    let trailing_pct = pattern.chars().rev().take_while(|&c| c == '%').count();
-
-    let stripped = pattern.trim_matches('%');
-
-    if stripped.is_empty() {
-        return true;
-    }
-
-    if leading_pct > 0 && trailing_pct > 0 {
-        let fixed_parts: Vec<&str> = stripped.split('%').filter(|s| !s.is_empty()).collect();
-        if fixed_parts.is_empty() {
-            return true;
-        }
-        let mut pos = 0usize;
-        for part in &fixed_parts {
-            if let Some(found) = text[pos..].find(part) {
-                pos += found + part.len();
-            } else {
-                return false;
-            }
-        }
-        true
-    } else if leading_pct > 0 {
-        // Pattern has leading %
-        let fixed_parts: Vec<&str> = stripped.split('%').filter(|s| !s.is_empty()).collect();
-        if fixed_parts.is_empty() {
-            return true;
-        }
-        let mut pos = 0usize;
-        for part in &fixed_parts {
-            if let Some(found) = text[pos..].find(part) {
-                pos += found + part.len();
-            } else {
-                return false;
-            }
-        }
-        true
-    } else if trailing_pct > 0 {
-        let fixed_parts: Vec<&str> = stripped.split('%').filter(|s| !s.is_empty()).collect();
-        if fixed_parts.is_empty() {
-            return true;
-        }
-        if let Some(pos) = text.find(fixed_parts[0]) {
-            let mut search_pos = pos;
-            for part in &fixed_parts[1..] {
-                if let Some(found) = text[search_pos..].find(part) {
-                    search_pos += found + part.len();
-                } else {
-                    return false;
-                }
-            }
-            text[search_pos..].starts_with(*fixed_parts.last().unwrap())
-        } else {
-            false
-        }
-    } else {
-        // Pattern has internal % - split and check all parts appear in order
-        let fixed_parts: Vec<&str> = stripped.split('%').filter(|s| !s.is_empty()).collect();
-        if fixed_parts.is_empty() {
-            return true;
-        }
-        if fixed_parts.len() == 1 {
-            // Single fixed part anywhere in text
-            return text.contains(fixed_parts[0]);
-        }
-        // Multiple parts must appear in order
-        let mut pos = 0usize;
-        for part in &fixed_parts {
-            if let Some(found) = text[pos..].find(part) {
-                pos += found + part.len();
-            } else {
-                return false;
-            }
-        }
-        true
-    }
+    matches_like(text, pattern, true)
 }
 
-/// Case-sensitive LIKE pattern matching (same wildcard logic as `ilike_matches`, no lowercasing).
+/// Case-sensitive `LIKE`.
 pub fn like_matches(text: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim();
-    if pattern.is_empty() { return true; }
-    if pattern == "%" { return true; }
-    let leading_pct  = pattern.chars().take_while(|&c| c == '%').count();
-    let trailing_pct = pattern.chars().rev().take_while(|&c| c == '%').count();
-    let stripped = pattern.trim_matches('%');
-    if stripped.is_empty() { return true; }
-    let fixed_parts: Vec<&str> = stripped.split('%').filter(|s| !s.is_empty()).collect();
-    if fixed_parts.is_empty() { return true; }
-    if leading_pct > 0 || trailing_pct > 0 {
-        let mut pos = 0usize;
-        for part in &fixed_parts {
-            if let Some(found) = text[pos..].find(part) {
-                pos += found + part.len();
-            } else {
-                return false;
-            }
+    matches_like(text, pattern, false)
+}
+
+/// One element of a compiled `LIKE` pattern.
+#[derive(PartialEq)]
+enum Tok {
+    /// `%` — any run of characters, including none.
+    Any,
+    /// `_` — exactly one character, whatever it is.
+    One,
+    /// A character that must appear as itself.
+    Lit(char),
+}
+
+/// PostgreSQL's default `ESCAPE` character. `\%` is a literal percent sign.
+const DEFAULT_ESCAPE: char = '\\';
+
+/// Turn a pattern into tokens, honouring the escape character.
+fn compile(pattern: &str, fold: bool) -> Vec<Tok> {
+    let mut out = Vec::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' => out.push(Tok::Any),
+            '_' => out.push(Tok::One),
+            DEFAULT_ESCAPE => match chars.next() {
+                // An escaped character is always a literal, wildcard or not.
+                Some(n) => out.push(Tok::Lit(if fold { fold_char(n) } else { n })),
+                // A trailing lone escape. PostgreSQL raises an error; matching
+                // nothing is the closest thing to that which this signature can
+                // express.
+                None => out.push(Tok::Lit('\u{0}')),
+            },
+            c => out.push(Tok::Lit(if fold { fold_char(c) } else { c })),
         }
-        true
-    } else {
-        let mut pos = 0usize;
-        for part in &fixed_parts {
-            if let Some(found) = text[pos..].find(part) {
-                pos += found + part.len();
-            } else {
-                return false;
-            }
-        }
-        true
     }
+    out
+}
+
+/// Lowercase a single character. Multi-character foldings (`İ`, `ß`) collapse to
+/// the first, which keeps one pattern character matching one text character —
+/// the property `_` depends on.
+fn fold_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// SQL `LIKE`, as PostgreSQL defines it.
+///
+/// # What this replaced, and why it mattered
+///
+/// The old implementation stripped the `%` signs off the pattern and then
+/// checked that the remaining fragments appeared **somewhere in the text, in
+/// order**. That is `contains`, not `LIKE`, and it is wrong in both directions:
+///
+/// ```text
+///   'reopened' LIKE 'open'   was true    — an unanchored pattern matched a substring
+///   'foo'      LIKE 'o%'     was true    — a prefix pattern matched in the middle
+///   anything   LIKE ''       was true    — only the empty string matches ''
+///   'open'     LIKE '_pen'   was false   — `_` was treated as a literal underscore
+///   '100%'     LIKE '100\%'  was false   — there was no escape character at all
+///   'open'     LIKE ' open'  was true    — the pattern was `.trim()`ed
+/// ```
+///
+/// A query that looked like it asked for one row returned every row that
+/// happened to contain the word. There was no error and no way to notice from
+/// the outside.
+///
+/// # The algorithm
+///
+/// Two pointers with one backtrack point, which is the standard way to match a
+/// pattern whose only unbounded construct is `%`. When the text stops matching,
+/// the walk returns to the most recent `%` and lets it consume one more
+/// character. Linear in the text for every pattern without adjacent wildcards,
+/// and it never recurses, so a pathological pattern costs time rather than
+/// stack.
+///
+/// Matching runs over `char`s, not bytes, so `_` means one character in the
+/// user's sense — `'é' LIKE '_'` is true, as it is in PostgreSQL.
+fn matches_like(text: &str, pattern: &str, fold: bool) -> bool {
+    let pat = compile(pattern, fold);
+    let txt: Vec<char> = if fold {
+        text.chars().map(fold_char).collect()
+    } else {
+        text.chars().collect()
+    };
+
+    let (mut ti, mut pi) = (0usize, 0usize);
+    // Where to resume if the current attempt fails: the last `%` seen, and how
+    // much text it had consumed at the time.
+    let (mut star, mut star_ti) = (None, 0usize);
+
+    while ti < txt.len() {
+        match pat.get(pi) {
+            Some(Tok::One) => { pi += 1; ti += 1; }
+            Some(Tok::Lit(c)) if *c == txt[ti] => { pi += 1; ti += 1; }
+            Some(Tok::Any) => { star = Some(pi); star_ti = ti; pi += 1; }
+            // Mismatch, or the pattern ran out with text left over. Either is
+            // recoverable only if some `%` behind us can absorb one more
+            // character.
+            _ => match star {
+                Some(s) => { pi = s + 1; star_ti += 1; ti = star_ti; }
+                None => return false,
+            },
+        }
+    }
+    // Text exhausted: the rest of the pattern must be able to match nothing.
+    pat[pi..].iter().all(|t| *t == Tok::Any)
 }
 
 /// Execute ILIKE query using GiST index with verification.

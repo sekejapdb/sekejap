@@ -505,17 +505,29 @@ impl<'db> Set<'db> {
         self
     }
 
-    /// Case-sensitive substring filter.
-    pub fn like(mut self, field: &str, pattern: &str) -> Self {
+    /// Case-sensitive **substring** filter: keeps rows where `field` contains
+    /// `needle` anywhere.
+    ///
+    /// This is not SQL `LIKE`, and the difference started mattering when `LIKE`
+    /// was corrected. SQL `LIKE 'example.com'` matches a value that *is*
+    /// `example.com`; this matches one that *contains* it. The builder is a Rust
+    /// API with its own documented meaning, so it keeps the meaning it always had
+    /// — it now says so by wrapping the needle rather than by relying on the
+    /// matcher being wrong.
+    ///
+    /// `%` and `_` in `needle` are literal characters, as they are in any other
+    /// substring search. Use [`CoreDB::query`] with a `LIKE` clause for patterns.
+    pub fn like(mut self, field: &str, needle: &str) -> Self {
         self.steps
-            .push(Step::Like(field.to_string(), pattern.to_string(), false));
+            .push(Step::Like(field.to_string(), contains_pattern(needle), false));
         self
     }
 
-    /// Case-insensitive substring filter (ILIKE).
-    pub fn ilike(mut self, field: &str, pattern: &str) -> Self {
+    /// Case-insensitive substring filter. See [`like`](Self::like) — the same
+    /// distinction from SQL `ILIKE` applies.
+    pub fn ilike(mut self, field: &str, needle: &str) -> Self {
         self.steps
-            .push(Step::Like(field.to_string(), pattern.to_string(), true));
+            .push(Step::Like(field.to_string(), contains_pattern(needle), true));
         self
     }
 
@@ -920,11 +932,84 @@ struct AggAccum {
     func: String,
     arg: String,
     all_count: usize,
-    sum: f64,
     count_notnull: usize,
-    min: Option<f64>,
-    max: Option<f64>,
+    /// How many of the summed values were whole numbers, so an integer column
+    /// can come back as an integer instead of a float. PostgreSQL's `SUM` over
+    /// `bigint` is a `bigint`; answering `6.0` where the data says `6` is a type
+    /// change the caller did not ask for, and for large integers it silently
+    /// loses precision.
+    sum_is_integral: bool,
+    /// `None` until the first non-null value. This is what makes `SUM` over an
+    /// empty set answer NULL rather than zero — the two are different facts, and
+    /// "no rows" is not "the total is nothing".
+    sum: Option<f64>,
+    /// `MIN`/`MAX` over whatever the column holds, compared by the same total
+    /// order `ORDER BY` uses. They used to read `v.as_f64()`, so `MIN(name)` over
+    /// a column of names answered NULL — the aggregate was silently numeric-only.
+    min: Option<Value>,
+    max: Option<Value>,
     distinct: Option<HashSet<String>>,
+}
+
+/// Turn a literal needle into the `LIKE` pattern that means "contains it".
+///
+/// The wildcards go on the outside; anything inside that would have been a
+/// wildcard is escaped, because a substring search for `50%` is a search for the
+/// characters `5`, `0`, `%`.
+fn contains_pattern(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len() + 2);
+    out.push('%');
+    for c in needle.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// The key a `DISTINCT` row is deduplicated by.
+///
+/// Serializing the projected row directly made `{"s": null}` and `{}` two
+/// different strings, so a row whose column was explicitly NULL and a row where
+/// the column was absent survived as separate results. In SQL they are the same
+/// value, and `DISTINCT` returns it once. Dropping the null-valued keys makes the
+/// two rows produce the same string, which is all the dedup needs.
+///
+/// It also folds numerically-equal numbers together, for the same reason
+/// `group_key_of` does: `1` and `1.0` are one value, and which one a row holds
+/// depends on how it was written rather than on what it means.
+fn distinct_key_of(payload: Option<&Value>) -> String {
+    match payload {
+        Some(Value::Object(map)) => {
+            let normalised: serde_json::Map<String, Value> = map
+                .iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), match v.as_f64() {
+                    Some(n) if v.is_number() => Value::from(n),
+                    _ => v.clone(),
+                }))
+                .collect();
+            serde_json::to_string(&normalised).unwrap_or_default()
+        }
+        other => serde_json::to_string(other.unwrap_or(&Value::Null)).unwrap_or_default(),
+    }
+}
+
+/// Render a total that came from whole numbers as a whole number.
+///
+/// Summing runs through `f64` because a column may hold both kinds. When every
+/// value that went in was an integer, the answer is presented as one — `6`, not
+/// `6.0`. Beyond 2^53 an `f64` can no longer represent consecutive integers, so
+/// past that the float is kept rather than printing a whole number that is not
+/// the true total.
+fn whole_or_float(f: f64) -> Value {
+    if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 {
+        serde_json::json!(f as i64)
+    } else {
+        serde_json::json!(f)
+    }
 }
 
 impl AggAccum {
@@ -935,7 +1020,8 @@ impl AggAccum {
             func,
             arg: arg.to_string(),
             all_count: 0,
-            sum: 0.0,
+            sum: None,
+            sum_is_integral: true,
             count_notnull: 0,
             min: None,
             max: None,
@@ -973,9 +1059,19 @@ impl AggAccum {
                 self.count_notnull += 1;
             }
             if let Some(f) = v.as_f64() {
-                self.sum += f;
-                self.min = Some(self.min.map_or(f, |m: f64| m.min(f)));
-                self.max = Some(self.max.map_or(f, |m: f64| m.max(f)));
+                self.sum = Some(self.sum.unwrap_or(0.0) + f);
+                self.sum_is_integral &= v.is_i64() || v.is_u64();
+            }
+            // MIN/MAX take every non-null value, not only the numeric ones, and
+            // order them the way `ORDER BY` does — so `MIN` really is the row
+            // that would come first.
+            if !v.is_null() {
+                if self.min.as_ref().is_none_or(|m| cmp_json(Some(v), Some(m)).is_lt()) {
+                    self.min = Some(v.clone());
+                }
+                if self.max.as_ref().is_none_or(|m| cmp_json(Some(v), Some(m)).is_gt()) {
+                    self.max = Some(v.clone());
+                }
             }
         }
     }
@@ -990,16 +1086,22 @@ impl AggAccum {
                 let n = if self.arg == "*" { self.all_count } else { self.count_notnull };
                 Value::Number(serde_json::Number::from(n as i64))
             }
-            "SUM" => serde_json::json!(self.sum),
-            "AVG" => {
-                if self.count_notnull > 0 {
-                    serde_json::json!(self.sum / self.count_notnull as f64)
-                } else {
-                    Value::Null
+            // NULL, not zero, when there was nothing to add. PostgreSQL draws
+            // that distinction and so does anything reading the result: a total
+            // of zero is a claim about the data, and "no rows" is not.
+            "SUM" => match self.sum {
+                None => Value::Null,
+                Some(f) if self.sum_is_integral => whole_or_float(f),
+                Some(f) => serde_json::json!(f),
+            },
+            "AVG" => match self.sum {
+                Some(f) if self.count_notnull > 0 => {
+                    serde_json::json!(f / self.count_notnull as f64)
                 }
-            }
-            "MIN" => self.min.map(|v| serde_json::json!(v)).unwrap_or(Value::Null),
-            "MAX" => self.max.map(|v| serde_json::json!(v)).unwrap_or(Value::Null),
+                _ => Value::Null,
+            },
+            "MIN" => self.min.clone().unwrap_or(Value::Null),
+            "MAX" => self.max.clone().unwrap_or(Value::Null),
             _ => Value::Null,
         }
     }
@@ -1093,19 +1195,25 @@ impl<'db> Set<'db> {
 
 
         // For aggregate args that aren't "*", verify btree indexes exist and
-        // build hash→f64 reverse maps from those indexes.
-        let mut arg_val_maps: HashMap<String, HashMap<u64, f64>> = HashMap::new();
+        // build hash→value reverse maps from those indexes.
+        //
+        // `Value`, not `f64`. Keeping only what parsed as a number meant every
+        // aggregate on this path was silently numeric-only: `COUNT(name)` over a
+        // text column answered 0 and `MIN(name)` answered NULL — but only once
+        // the column was indexed, so the answer depended on whether somebody had
+        // run CREATE INDEX. NULL keys are skipped because a missing field is
+        // stored as one, and an absent value is not a value.
+        let mut arg_val_maps: HashMap<String, HashMap<u64, Value>> = HashMap::new();
         for af in &agg_fields {
             if af.arg == "*" { continue; }
             let arg_idx = self.db.field_index_ref(collection_hash, &af.arg)?;
             if !arg_val_maps.contains_key(&af.arg) {
-                let mut m: HashMap<u64, f64> = HashMap::new();
+                let mut m: HashMap<u64, Value> = HashMap::new();
                 for (key, node_hashes) in arg_idx.iter_kv(false) {
                     let val = CoreDB::field_key_to_value(&key);
-                    if let Some(f) = val.as_f64() {
-                        for &h in &node_hashes {
-                            m.insert(h, f);
-                        }
+                    if val.is_null() { continue }
+                    for &h in &node_hashes {
+                        m.insert(h, val.clone());
                     }
                 }
                 arg_val_maps.insert(af.arg.clone(), m);
@@ -1143,16 +1251,15 @@ impl<'db> Set<'db> {
                             serde_json::json!(0)
                         }
                     } else if let Some(vm) = arg_val_maps.get(&af.arg) {
+                        // Through `push`, so this path applies the same rules as
+                        // the scan rather than its own numeric-only copy of them.
                         let mut acc = AggAccum::new(&af.func, &af.arg);
-                        acc.all_count = group_hashes.len();
                         for &h in &group_hashes {
-                            if let Some(&f) = vm.get(&h) {
-                                acc.count_notnull += 1;
-                                acc.sum += f;
-                                acc.min = Some(acc.min.map_or(f, |m: f64| m.min(f)));
-                                acc.max = Some(acc.max.map_or(f, |m: f64| m.max(f)));
+                            if let Some(v) = vm.get(&h) {
+                                acc.push(&serde_json::json!({ af.arg.as_str(): v }));
                             }
                         }
+                        acc.all_count = group_hashes.len();
                         acc.finalize()
                     } else {
                         Value::Null
@@ -1327,7 +1434,7 @@ impl<'db> Set<'db> {
             }
             false
         };
-        for (k, ids) in idx.iter_kv(!asc) {
+        for (k, ids) in iter_kv_sql_order(&idx, asc) {
             if emit(&CoreDB::field_key_to_value(&k), &ids) { break; }
         }
         Some(hits)
@@ -1561,10 +1668,7 @@ impl<'db> Set<'db> {
             if let Some(n) = take_n { results.truncate(n); }
             if distinct {
                 let mut seen: HashSet<String> = HashSet::new();
-                results.retain(|hit| {
-                    let key = serde_json::to_string(hit.payload.as_ref().unwrap_or(&Value::Null)).unwrap_or_default();
-                    seen.insert(key)
-                });
+                results.retain(|hit| seen.insert(distinct_key_of(hit.payload.as_ref())));
             }
             return results;
         }
@@ -1662,16 +1766,23 @@ impl<'db> Set<'db> {
                     let mut acc = AggAccum::new(&info.func, &info.arg);
                     acc.all_count = total;
                     // Iterate btree entries and accumulate for matching hashes.
+                    // Feed the index's values through the same accumulator the
+                    // scan uses, instead of a numeric-only copy of it. The copy
+                    // gated *everything* — including `count_notnull` — behind
+                    // `as_f64()`, so `COUNT(status)` over a text column answered
+                    // 0 as soon as the column was indexed, and `MIN`/`MAX` over
+                    // text answered NULL. One accumulator, one set of rules.
                     for (key, node_hashes) in idx.iter_kv(false) {
                         let val = CoreDB::field_key_to_value(&key);
-                        if let Some(f) = val.as_f64() {
-                            for &h in &node_hashes {
-                                if hash_set.contains(&h) {
-                                    acc.count_notnull += 1;
-                                    acc.sum += f;
-                                    acc.min = Some(acc.min.map_or(f, |m: f64| m.min(f)));
-                                    acc.max = Some(acc.max.map_or(f, |m: f64| m.max(f)));
-                                }
+                        if val.is_null() {
+                            continue; // a missing field is stored as NULL here
+                        }
+                        let row = serde_json::json!({ info.arg.as_str(): val });
+                        for &h in &node_hashes {
+                            if hash_set.contains(&h) {
+                                let before = acc.all_count;
+                                acc.push(&row);
+                                acc.all_count = before; // `all_count` came from `total`
                             }
                         }
                     }
@@ -1679,6 +1790,24 @@ impl<'db> Set<'db> {
                 }
 
                 return vec![Hit { slug: String::new(), slug_hash: 0, payload: Some(Value::Object(map)) }];
+            }
+
+            // Every requested aggregate gets its accumulator before the rows are
+            // walked, not during. Created inside the loop, a query matching no
+            // rows produced no accumulators and therefore no columns: `SELECT
+            // COUNT(n) FROM t` came back as `{}` instead of `0`, and adding a
+            // second aggregate made even `COUNT(*)` disappear. An aggregate over
+            // nothing has an answer — `COUNT` is 0 and the rest are NULL — and it
+            // is the accumulator's `finalize` that already knows how to say so.
+            for f in fields {
+                if let Some(agg_expr) = agg_inner(f) {
+                    let rest = agg_expr.strip_prefix("__AGG__").unwrap_or(agg_expr);
+                    let mut parts = rest.splitn(2, "__");
+                    let func = parts.next().unwrap_or("COUNT").to_uppercase();
+                    let arg = parts.next().unwrap_or("*");
+                    states.entry(field_output_key(f))
+                        .or_insert_with(|| AggAccum::new(&func, arg));
+                }
             }
 
             for &hash in &hashes {
@@ -1807,12 +1936,7 @@ impl<'db> Set<'db> {
             let distinct = self.steps.iter().any(|s| matches!(s, Step::Distinct));
             if distinct {
                 let mut seen: HashSet<String> = HashSet::new();
-                hits.retain(|hit| {
-                    let key = serde_json::to_string(
-                        hit.payload.as_ref().unwrap_or(&Value::Null),
-                    ).unwrap_or_default();
-                    seen.insert(key)
-                });
+                hits.retain(|hit| seen.insert(distinct_key_of(hit.payload.as_ref())));
                 Self::apply_offset_limit(&mut hits, &self.steps);
             }
             Self::resolve_vectors(self.db, &mut hits, &select_fields, &self.steps);
@@ -1912,11 +2036,7 @@ impl<'db> Set<'db> {
         let distinct = self.steps.iter().any(|s| matches!(s, Step::Distinct));
         if distinct {
             let mut seen: HashSet<String> = HashSet::new();
-            hits.retain(|hit| {
-                let key = serde_json::to_string(hit.payload.as_ref().unwrap_or(&Value::Null))
-                    .unwrap_or_default();
-                seen.insert(key)
-            });
+            hits.retain(|hit| seen.insert(distinct_key_of(hit.payload.as_ref())));
             Self::apply_offset_limit(&mut hits, &self.steps);
         }
         Self::resolve_vectors(self.db, &mut hits, &select_fields, &self.steps);
@@ -2534,7 +2654,7 @@ fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>> {
         }
         out.len() >= limit
     };
-    for (_, ids) in idx.iter_kv(!asc) {
+    for (_, ids) in iter_kv_sql_order(&idx, asc) {
         for &h in &ids { if push(h, &mut out) { return Some(out); } }
     }
     Some(out)
@@ -2794,7 +2914,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     }
                 }
             }
-            Step::WhereNeq(field, value) => {
+            Step::WhereNeq(field, _value) => {
                 const FILTER_BATCH_MIN: usize = 64;
                 // A row is kept only where the comparison is *true*. Absent and
                 // NULL are unknown, not "different from", so they go — see
@@ -3013,8 +3133,19 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 // If GIN index exists for this field and returns 0 candidates, the index
                 // is complete (every document trigram was indexed), so 0 means no match.
                 // Skip the expensive brute-force scan entirely.
-                let gin_has_index = db.gin_indexes.contains_key(field.as_str());
-                let gin_results = db.gin_ilike(field, pattern, take_limit);
+                //
+                // A pattern the trigram extractor cannot represent — one holding
+                // `_` or an escape — is scanned instead. Consulting the index for
+                // it produced an empty candidate list, which the shortcut below
+                // reads as "no rows match", and the matching rows were dropped
+                // without being looked at.
+                let gin_has_index = db.gin_indexes.contains_key(field.as_str())
+                    && crate::text_index::trigram::pattern_is_indexable(pattern);
+                let gin_results = if gin_has_index {
+                    db.gin_ilike(field, pattern, take_limit)
+                } else {
+                    Vec::new()
+                };
                 if gin_has_index && gin_results.is_empty() {
                     candidates.clear();
                 } else if !gin_results.is_empty() {
@@ -3681,7 +3812,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             let limit = find_take_limit(remaining).unwrap_or(usize::MAX);
                             let mut sorted_result: Vec<u64> =
                                 Vec::with_capacity(limit.min(candidate_set.len()));
-                            'scan: for (_, ids) in idx.iter_kv(!*asc) {
+                            'scan: for (_, ids) in iter_kv_sql_order(&idx, *asc) {
                                 for &h in &ids {
                                     if candidate_set.contains(&h) {
                                         sorted_result.push(h);
@@ -5938,23 +6069,12 @@ fn eval_with_out_over_group(expr: &WithOutExpr, group: &[WithRow]) -> Value {
 }
 
 /// Compare two optional JSON values for ordering.
+/// The MATCH pipeline's sort comparator. One function, not two: this was a
+/// character-for-character copy of [`cmp_json`], so it carried the same
+/// non-transitive comparison and scrambled `ORDER BY` in graph queries in exactly
+/// the same way — and would have kept carrying it after the other was fixed.
 fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(a), Some(b)) => match (a, b) {
-            (Value::Number(na), Value::Number(nb)) => na
-                .as_f64()
-                .unwrap_or(0.0)
-                .partial_cmp(&nb.as_f64().unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
-            (Value::String(sa), Value::String(sb)) => sa.cmp(sb),
-            (Value::Bool(ba), Value::Bool(bb)) => ba.cmp(bb),
-            _ => Ordering::Equal,
-        },
-    }
+    cmp_json(a, b)
 }
 
 /// Execute a multi-stage [`MatchAggStmt`] with WITH stages.
@@ -8295,12 +8415,82 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
     finalize_rows(result_rows, stmt.order_by.as_ref(), stmt.limit)
 }
 
+/// Walk a field index in the order `ORDER BY` wants, NULLs included.
+///
+/// The index is a btree and `FieldKey::Null` is its lowest key, so walking it
+/// ascending puts NULLs first — the opposite end from PostgreSQL, and the
+/// opposite end from what the scan path does with the same data. The same query
+/// answered differently depending on whether somebody had run `CREATE INDEX`.
+///
+/// Every row is in the index: a missing field is stored as `Null`, so the NULL
+/// bucket is exactly the rows that have no value. It is lifted out of the walk
+/// and put where SQL puts it — last for `ASC`, first for `DESC` — which is also
+/// what reversing [`cmp_json`] produces, so the two paths agree by construction.
+///
+/// Returns the whole ordering rather than an iterator because `iter_kv` already
+/// materialises it; there is nothing extra being held.
+pub(crate) fn iter_kv_sql_order(
+    idx: &crate::FieldIndexRef,
+    asc: bool,
+) -> Vec<(FieldKey, Vec<u64>)> {
+    let mut kv = idx.iter_kv(!asc);
+    let Some(at) = kv.iter().position(|(k, _)| *k == FieldKey::Null) else {
+        return kv;
+    };
+    let nulls = kv.remove(at);
+    if asc { kv.push(nulls) } else { kv.insert(0, nulls) }
+    kv
+}
+
+/// Order two column values the way `ORDER BY` needs them ordered.
+///
+/// # Why this has to be a *total* order
+///
+/// It used to answer `Equal` for any pair of values of different types, NULL
+/// included. That is not a weaker ordering, it is an inconsistent one: with rows
+/// `3, NULL, 1`, NULL compares equal to both, so `3 < 1` and `3 = NULL = 1` at
+/// the same time. `sort_by` requires a total order and is entitled to do anything
+/// when it does not get one — here it left the rows exactly as they were, so
+/// `ORDER BY b ASC` returned them unsorted, `DESC` returned the identical
+/// sequence, and `ORDER BY b ASC LIMIT 1` handed back the *largest* value.
+///
+/// One NULL anywhere in the column corrupted the order of every non-NULL row
+/// around it. Nothing errored.
+///
+/// # Where NULL goes
+///
+/// Last. PostgreSQL sorts NULLs last for `ASC` and first for `DESC`, and the
+/// caller gets `DESC` by reversing this comparator — so "greater than
+/// everything" produces both. A missing field is a NULL, per the same rule the
+/// `WHERE` clause follows: the row has nothing to say about that column.
+///
+/// # Mixed types
+///
+/// PostgreSQL never has to answer this, because a column has one type. A
+/// document store does, so the types are ranked and compared within a rank.
+/// The ranking is arbitrary but it is *fixed*, which is the property that
+/// matters: any consistent answer sorts correctly, and no consistent answer can
+/// scramble the rows that do share a type.
 fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    /// Bool < Number < String < Array < Object < Null.
+    fn rank(v: &Value) -> u8 {
+        match v {
+            Value::Bool(_) => 0,
+            Value::Number(_) => 1,
+            Value::String(_) => 2,
+            Value::Array(_) => 3,
+            Value::Object(_) => 4,
+            Value::Null => 5,
+        }
+    }
+    // A field that is absent and a field that is NULL are the same thing here.
+    let a = a.filter(|v| !v.is_null());
+    let b = b.filter(|v| !v.is_null());
     match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
         (Some(a), Some(b)) => match (a, b) {
             (Value::Number(na), Value::Number(nb)) => na
                 .as_f64()
@@ -8309,7 +8499,13 @@ fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
                 .unwrap_or(Ordering::Equal),
             (Value::String(sa), Value::String(sb)) => sa.cmp(sb),
             (Value::Bool(ba), Value::Bool(bb)) => ba.cmp(bb),
-            _ => Ordering::Equal,
+            // Different types, or a composite. Rank first; within a rank that
+            // has no natural order, the serialized form — deterministic, which
+            // is all that is being asked of it.
+            (a, b) => rank(a).cmp(&rank(b)).then_with(|| {
+                serde_json::to_string(a).unwrap_or_default()
+                    .cmp(&serde_json::to_string(b).unwrap_or_default())
+            }),
         },
     }
 }
