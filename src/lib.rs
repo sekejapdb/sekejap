@@ -302,6 +302,17 @@ pub(crate) enum FieldKey {
 }
 
 impl FieldKey {
+    /// The open ends of a *numeric* range, in this ordering.
+    ///
+    /// Keys sort `Null < Bool < Number < Str`, so an unbounded end on a numeric
+    /// predicate sweeps straight out of the numbers: `WHERE age > 20` answered from
+    /// a btree included rows whose `age` is the string "25", because `Str` outranks
+    /// every `Number`. A scan of the same predicate excluded them, since a string
+    /// is not greater than twenty — so the answer depended on whether an index
+    /// existed. These bracket the numbers and nothing else.
+    pub(crate) fn numbers_start() -> Self { FieldKey::Bool(true) }
+    pub(crate) fn numbers_end() -> Self { FieldKey::Str(String::new()) }
+
     pub(crate) fn from_json(v: &Value) -> Option<Self> {
         match v {
             Value::Null => Some(FieldKey::Null),
@@ -9813,7 +9824,9 @@ impl CoreDB {
                         return if let Some((pair_j, upper_bound)) = upper {
                             Some((idx.range_postings(lo_b.as_ref(), upper_bound.as_ref()), j, Some(pair_j)))
                         } else {
-                            Some((idx.range_postings(lo_b.as_ref(), Bound::Unbounded), j, None))
+                            Some((idx.range_postings(
+                                lo_b.as_ref(),
+                                Bound::Excluded(&FieldKey::numbers_end())), j, None))
                         };
                     }
                 }
@@ -9834,7 +9847,9 @@ impl CoreDB {
                         return if let Some((pair_j, lower_bound)) = lower {
                             Some((idx.range_postings(lower_bound.as_ref(), hi_b.as_ref()), j, Some(pair_j)))
                         } else {
-                            Some((idx.range_postings(Bound::Unbounded, hi_b.as_ref()), j, None))
+                            Some((idx.range_postings(
+                                Bound::Excluded(&FieldKey::numbers_start()),
+                                hi_b.as_ref()), j, None))
                         };
                     }
                 }
@@ -9854,7 +9869,9 @@ impl CoreDB {
                         return if let Some((pair_j, upper_bound)) = upper {
                             Some((idx.range_postings(lo_b.as_ref(), upper_bound.as_ref()), j, Some(pair_j)))
                         } else {
-                            Some((idx.range_postings(lo_b.as_ref(), Bound::Unbounded), j, None))
+                            Some((idx.range_postings(
+                                lo_b.as_ref(),
+                                Bound::Excluded(&FieldKey::numbers_end())), j, None))
                         };
                     }
                 }
@@ -9874,7 +9891,9 @@ impl CoreDB {
                         return if let Some((pair_j, lower_bound)) = lower {
                             Some((idx.range_postings(lower_bound.as_ref(), hi_b.as_ref()), j, Some(pair_j)))
                         } else {
-                            Some((idx.range_postings(Bound::Unbounded, hi_b.as_ref()), j, None))
+                            Some((idx.range_postings(
+                                Bound::Excluded(&FieldKey::numbers_start()),
+                                hi_b.as_ref()), j, None))
                         };
                     }
                 }
