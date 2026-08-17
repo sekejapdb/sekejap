@@ -798,6 +798,58 @@ const PAYLOAD_TAG_ZSTD: u8 = 0x01;
 /// payload path, so such a record can only come from a DB that opted into the
 /// now-deleted `payload_compression` feature. Return `None` (a loud decode
 /// failure) rather than silently mis-serving it.
+/// Carry a disk failure out through an error type that cannot name one.
+///
+/// The public write API returns `Result<_, serde_json::Error>`, chosen when the
+/// only thing that could go wrong with a write was the JSON. That is why every
+/// disk write on the path below it used to `.expect()`: there was nowhere to put
+/// an `io::Error`, so the code took the only other exit and aborted the process.
+///
+/// A full disk is not a reason to kill the application. Until the signature can
+/// carry an `io::Error` properly — a change that reaches every language binding —
+/// the failure travels as a message, and the caller gets an `Err` it can act on
+/// instead of a crash it cannot.
+fn wal_write_failed(e: io::Error) -> serde_json::Error {
+    use serde::ser::Error as _;
+    serde_json::Error::custom(format!("sekejap: WAL write failed: {e}"))
+}
+
+/// Make the *names* in a directory durable, not just the bytes behind them.
+///
+/// Writing a file safely is two separate promises. `sync_all` on the file
+/// promises its contents survive a power cut. `rename` promises the new contents
+/// replace the old ones atomically — but that promise is a change to the
+/// **directory**, and a directory is a file like any other: until it is synced,
+/// the rename lives in the page cache and a crash may undo it.
+///
+/// Every durable file in a sekejap store is published by rename, so without this
+/// a compaction had no crash-atomic commit point at all. Recovery could restore
+/// the old `nodes.bin` while keeping the new `snapshot.json` that describes the
+/// new one, and the pointers in the surviving snapshot would address a file that
+/// no longer matched. Nothing would report an error; the reads would simply be
+/// of the wrong bytes.
+///
+/// Not an error if the platform declines. Directory fsync is a POSIX
+/// requirement; on Windows the equivalent guarantee comes from the filesystem
+/// and opening a directory as a file is not permitted, so the call is skipped
+/// rather than failed.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+fn payload_write_failed(e: io::Error) -> serde_json::Error {
+    use serde::ser::Error as _;
+    serde_json::Error::custom(format!("sekejap: payload write failed: {e}"))
+}
+
 fn decode_payload_record(stored: Vec<u8>) -> Option<Vec<u8>> {
     match stored.first() {
         Some(&PAYLOAD_TAG_ZSTD) => None,
@@ -902,7 +954,7 @@ impl PayloadStore {
 
     /// Append raw bytes; returns `(offset, len)`.
     /// Panics on disk write failure (disk-full etc.) — callers do not recover.
-    fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+    fn append(&mut self, bytes: &[u8]) -> io::Result<(u64, u32)> {
         self.append_owned(OWNER_UNKNOWN, bytes)
     }
 
@@ -922,39 +974,48 @@ impl PayloadStore {
     ///
     /// The append-only variants are untouched — their offsets are byte positions,
     /// so a read cannot land on a neighbouring record by arithmetic.
-    fn append_owned(&mut self, owner: u64, bytes: &[u8]) -> (u64, u32) {
+    /// # Why this returns an error instead of panicking
+    ///
+    /// It used to `.expect()` on the write, on the reasoning that a caller cannot
+    /// recover from a failed disk write without risking corruption. The
+    /// conclusion does not follow. A full disk is an ordinary condition — the
+    /// commonest one a long-running database meets — and aborting the process
+    /// takes the whole application down with it, on a machine that may be a robot
+    /// or a gateway with nobody to restart it. Worse, it aborts *mid-write*,
+    /// which is precisely the crash the write-ahead log exists to survive: the
+    /// recovery path was being triggered by the code meant to avoid needing it.
+    ///
+    /// Returning the error lets the write fail and the database keep running.
+    fn append_owned(&mut self, owner: u64, bytes: &[u8]) -> io::Result<(u64, u32)> {
         match &mut self.inner {
             // The "offset" is a record id here, not a byte position.
             PayloadInner::Paged { store } => {
                 let mut tagged = Vec::with_capacity(OWNER_TAG + bytes.len());
                 tagged.extend_from_slice(&owner_tag(owner).to_le_bytes());
                 tagged.extend_from_slice(bytes);
-                let id = store.insert(&tagged).expect("sekejap: payload page write failed");
-                (id.0, bytes.len() as u32)
+                let id = store.insert(&tagged)?;
+                Ok((id.0, bytes.len() as u32))
             }
             PayloadInner::Memory { data } => {
                 let offset = data.len() as u64;
                 data.extend_from_slice(bytes);
-                (offset, bytes.len() as u32)
+                Ok((offset, bytes.len() as u32))
             }
             PayloadInner::Disk { file, total_len, .. } => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::FileExt;
-                    file.write_all_at(bytes, *total_len)
-                        .expect("sekejap: payload disk write failed");
+                    file.write_all_at(bytes, *total_len)?;
                 }
                 #[cfg(not(unix))]
                 {
                     use std::io::{Seek, SeekFrom, Write};
-                    file.seek(SeekFrom::Start(*total_len))
-                        .expect("sekejap: payload disk seek failed");
-                    file.write_all(bytes)
-                        .expect("sekejap: payload disk write failed");
+                    file.seek(SeekFrom::Start(*total_len))?;
+                    file.write_all(bytes)?;
                 }
                 let offset = *total_len;
                 *total_len += bytes.len() as u64;
-                (offset, bytes.len() as u32)
+                Ok((offset, bytes.len() as u32))
             }
         }
     }
@@ -966,8 +1027,10 @@ impl PayloadStore {
     /// read asked for a specific one, so the record was refused and the row read as
     /// absent. The differential audit caught it as two collections' SEARCH results
     /// coming back short.
-    fn append_batch(&mut self, items: &[&[u8]], owners: &[u64]) -> Vec<(u64, u32)> {
-        if items.is_empty() { return vec![]; }
+    fn append_batch(&mut self, items: &[&[u8]], owners: &[u64])
+        -> io::Result<Vec<(u64, u32)>>
+    {
+        if items.is_empty() { return Ok(vec![]); }
         debug_assert_eq!(items.len(), owners.len(), "an owner per record, or none can be checked");
         match &mut self.inner {
             PayloadInner::Paged { store } => items.iter().enumerate().map(|(i, bytes)| {
@@ -975,15 +1038,15 @@ impl PayloadStore {
                 let mut tagged = Vec::with_capacity(OWNER_TAG + bytes.len());
                 tagged.extend_from_slice(&owner_tag(owner).to_le_bytes());
                 tagged.extend_from_slice(bytes);
-                let id = store.insert(&tagged).expect("sekejap: payload page write failed");
-                (id.0, bytes.len() as u32)
+                let id = store.insert(&tagged)?;
+                Ok((id.0, bytes.len() as u32))
             }).collect(),
             PayloadInner::Memory { data } => {
-                items.iter().map(|bytes| {
+                Ok(items.iter().map(|bytes| {
                     let offset = data.len() as u64;
                     data.extend_from_slice(bytes);
                     (offset, bytes.len() as u32)
-                }).collect()
+                }).collect())
             }
             PayloadInner::Disk { file, total_len, .. } => {
                 let total_bytes: usize = items.iter().map(|b| b.len()).sum();
@@ -997,19 +1060,20 @@ impl PayloadStore {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::FileExt;
-                    file.write_all_at(&buf, base)
-                        .expect("sekejap: payload batch write failed");
+                    file.write_all_at(&buf, base)?;
                 }
                 #[cfg(not(unix))]
                 {
                     use std::io::{Seek, SeekFrom, Write};
-                    file.seek(SeekFrom::Start(base))
-                        .expect("sekejap: payload batch seek failed");
-                    file.write_all(&buf)
-                        .expect("sekejap: payload batch write failed");
+                    file.seek(SeekFrom::Start(base))?;
+                    file.write_all(&buf)?;
                 }
+                // Only after the bytes are down. Advancing the cursor first would
+                // leave the store believing it holds a record that was never
+                // written, and the next append would place its neighbour past a
+                // gap of nothing.
                 *total_len = base + buf.len() as u64;
-                results
+                Ok(results)
             }
         }
     }
@@ -1404,6 +1468,24 @@ pub struct CoreDB {
     /// `compact()` folds the overlay into it owner by owner instead of rebuilding
     /// the graph, so the cost follows the change rather than the store.
     paged_adj: Option<PagedAdjacency>,
+    /// The first disk failure that could not be reported to whoever caused it.
+    ///
+    /// [`wal_write`](CoreDB::wal_write) returns nothing — it is called from the
+    /// middle of a mutation whose in-memory half has already happened — so a
+    /// failed WAL append had no way out and used to abort the process. That is
+    /// the wrong end of the trade: a full disk is an ordinary condition, and the
+    /// abort lands mid-write, which is exactly the crash the log exists to
+    /// survive.
+    ///
+    /// So the failure is remembered instead. Reads keep working — what is in
+    /// memory is still true — and anything that would make the loss permanent
+    /// refuses: `compact()` above all, because a compaction folds the overlay
+    /// into the base and drops the log, and a log that is missing entries must
+    /// not be dropped. Nothing that can be wrong about what exists may delete it.
+    ///
+    /// Cleared by nothing. A database that has failed to write stays failed until
+    /// it is reopened, at which point WAL replay decides what is actually there.
+    write_error: Option<String>,
     /// Durable nodes in slotted pages, when `Config::paged_nodes` is on.
     ///
     /// Takes the place of a segment's `nodes.bin` / `idx.bin` / `slugs.bin` /
@@ -1679,18 +1761,19 @@ pub struct Config {
     /// reads, 1-record corruption isolation (values never leave their record).
     /// Incremental writes stay raw JSON until the next `compact()`. Default on.
     pub payload_binary: bool,
-    /// **Experimental.** Keep payloads in slotted pages with a free list, so an
-    /// updated or deleted row returns its bytes immediately rather than leaving a
-    /// hole for compaction to squeeze out later.
+    /// Keep payloads in slotted pages with a free list, so an updated or deleted
+    /// row returns its bytes immediately rather than leaving a hole for
+    /// compaction to squeeze out later.
     ///
     /// This is the write path SQLite, LMDB and DuckDB use, and the reason they have
-    /// no compaction step: space comes back continuously as it is freed. Off by
-    /// default while the rest of the store still expects byte offsets — the batch
-    /// read that coalesces neighbouring records, and head-and-tail extraction of
-    /// large records, both fall back to per-record reads when this is on.
+    /// no compaction step: space comes back continuously as it is freed.
+    ///
+    /// **On by default.** What it gives up: two read optimisations that assume
+    /// byte offsets — the batch read that coalesces neighbouring records, and
+    /// head-and-tail extraction of large records — fall back to per-record reads.
     pub paged_payloads: bool,
-    /// **Experimental.** Keep adjacency in slotted pages keyed by slug hash, so a
-    /// new edge is written where it belongs instead of waiting for a rebuild.
+    /// Keep adjacency in slotted pages keyed by slug hash, so a new edge is
+    /// written where it belongs instead of waiting for a rebuild.
     ///
     /// The CSR layout in `adj_fwd.bin` / `adj_rev.bin` cannot absorb one edge: a
     /// node's block grows, every block after it shifts, every offset after it
@@ -1698,13 +1781,13 @@ pub struct Config {
     /// back, at a cost set by the size of the graph rather than the size of the
     /// change — and adjacency is about two thirds of what a compaction rewrites.
     ///
-    /// Off by default. The sacrifice is disk: 2.3x CSR, because a B+tree entry per
-    /// owner is 42 bytes and CSR's offset array is 8. Most of that comes back when
-    /// nodes move onto records and the adjacency index stops being separate.
+    /// **On by default.** The sacrifice is disk — 2.3x CSR, because a B+tree entry
+    /// per owner is 42 bytes and CSR's offset array is 8 — and traversal speed: a
+    /// one-hop read is about 0.65x the mmap'd CSR it replaces, a tree descent and
+    /// a record read where CSR had two array reads.
     pub paged_adjacency: bool,
-    /// **Experimental.** Keep nodes in slotted pages keyed by slug hash, so a new
-    /// or changed node is written where it belongs instead of waiting for a
-    /// rebuild.
+    /// Keep nodes in slotted pages keyed by slug hash, so a new or changed node is
+    /// written where it belongs instead of waiting for a rebuild.
     ///
     /// `nodes.bin`, `idx.bin`, `slugs.bin` and `collections.bin` are the whole of
     /// what a compaction still rewrites once adjacency and payloads are paged.
@@ -1712,21 +1795,57 @@ pub struct Config {
     /// one node renumbers the rest; a sorted array has nowhere to put an entry; an
     /// offsets array shifts when anything before it grows.
     ///
-    /// Off by default. The sacrifice is disk: about 1.8x what the four files spend,
-    /// almost all of it the two B+trees, where the files are packed arrays.
+    /// **On by default.** The sacrifice is disk: about 1.8x what the four files
+    /// spend, almost all of it the two B+trees, where the files are packed arrays.
+    /// Point reads are faster than the layout it replaces.
     pub paged_nodes: bool,
-    /// **Experimental.** Serve topology (nodes + edges) from the mmap'd files
-    /// written at `compact()` instead of loading it into RAM. The OS page cache
-    /// keeps the hot working set resident and pages the rest — topology size is
-    /// no longer bounded by RAM. Writes since open live in a RAM overlay merged
-    /// with the mapped base on every read; `compact()` folds them together.
+    /// Serve topology (nodes + edges) from the mmap'd files written at
+    /// `compact()` instead of loading it into RAM. The OS page cache keeps the
+    /// hot working set resident and pages the rest — topology size is no longer
+    /// bounded by RAM. Writes since open live in a RAM overlay merged with the
+    /// mapped base on every read; `compact()` folds them together.
     ///
-    /// Current limitations (documented, to be lifted): spatial metadata and edge
-    /// metadata are not served from the base (spatial/meta-dependent queries see
-    /// only overlay data); `remove`/`unlink` of base data does not take effect
-    /// until tombstones land. (Compatible with `payload_binary` (SKBIN): base
-    /// payload reads resolve offsets via the mmap base and decode SKBIN.)
+    /// **On by default.** This is Law 1 — disk-first — and the reason a store
+    /// larger than memory opens at all.
+    ///
+    /// Unlike the other three flags this one is not a file format. It says where
+    /// topology is *served from* in this process, so it can be turned on or off
+    /// for any store, and `adopt_layout_from_disk` leaves it alone.
+    ///
+    /// The base and the overlay disagreeing was the source of most of the bugs
+    /// this mode has had — a read that consulted only the overlay saw a fraction
+    /// of the database and reported it as the whole. `tests/differential_audit.rs`
+    /// exists for that: it answers every query in every mode, before and after a
+    /// restart, and fails on any disagreement.
     pub paged_topology: bool,
+}
+
+impl Config {
+    /// The layout used before paged became the default: topology loaded into RAM,
+    /// payloads appended to a flat file, nodes and adjacency rebuilt by
+    /// compaction.
+    ///
+    /// Kept because it is the thing the paged layout has to agree with. Every
+    /// answer either mode gives is compared against the other in
+    /// `tests/differential_audit.rs`, and a mode that nothing compares against is
+    /// a mode nothing checks.
+    ///
+    /// It is also the right choice for a database that is written once and read
+    /// many times — a shipped dataset, a build artefact — where compaction never
+    /// runs twice and the packed files are smaller and traverse faster. For
+    /// anything that keeps being written, the default is what you want.
+    ///
+    /// This decides a **new** store. Pointing it at a directory holding a paged
+    /// store does not reinterpret those files; the layout on disk wins.
+    pub fn resident() -> Self {
+        Self {
+            paged_payloads: false,
+            paged_adjacency: false,
+            paged_nodes: false,
+            paged_topology: false,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for Config {
@@ -1745,10 +1864,37 @@ impl Default for Config {
             // Fuzzed decoder, integrated across DML/DDL + resident/paged. Set
             // false for legacy raw-JSON payloads.
             payload_binary: true,
-            paged_payloads: false,
-            paged_adjacency: false,
-            paged_nodes: false,
-            paged_topology: false,
+            // Paged is the default layout, and the four flags come as a set: a
+            // compaction that no longer rewrites payloads still rewrites nodes,
+            // and one that rewrites neither still rewrites adjacency. Turning on
+            // three of four leaves the rebuild in place and pays the disk for
+            // nothing.
+            //
+            // What this buys is Law 2 — cost proportional to the change rather
+            // than to the store. Compaction at 500 000 rows went from 4 816 ms to
+            // 132 ms and stopped growing: 108-130 ms all the way to two million.
+            //
+            // What it costs, stated where the choice is made:
+            //
+            //  * **Disk.** About 2.3x CSR for adjacency and 1.8x for the node
+            //    files, almost all of it B+tree entries where the old files were
+            //    packed arrays.
+            //  * **Traversal.** A one-hop read is roughly 0.65x the speed of the
+            //    mmap'd CSR it replaces: a tree descent and a record read where
+            //    CSR had two array reads. Point reads are faster.
+            //  * **Snapshots.** `snapshot_db` returns `None` over paged nodes or
+            //    adjacency, because those files are written in place and a
+            //    snapshot sharing them would see a writer's later edits appear
+            //    underneath it. Reads fall back to taking the lock, which is
+            //    correct and slower. See `.workbench/snapshot-over-paged-design.md`.
+            //
+            // An existing database is unaffected: `adopt_layout_from_disk` reads
+            // the files and opens it in the layout it was written in. This
+            // default decides new stores only.
+            paged_payloads: true,
+            paged_adjacency: true,
+            paged_nodes: true,
+            paged_topology: true,
         }
     }
 }
@@ -1756,33 +1902,48 @@ impl Default for Config {
 /// Make `config` agree with the store already on disk.
 ///
 /// The paged flags read like options, and for a directory that holds nothing yet
-/// they are: the first open decides where the data will live. For a directory
-/// that already holds a store they are not options at all. They name the format
-/// of files that exist, and files do not change format because the next caller
-/// preferred a different one.
+/// they are: the first open decides where the data will live, and that is what
+/// [`Config::default`] is for. For a directory that already holds a store they
+/// are not options at all. They name the format of files that exist, and files
+/// do not change format because the next caller preferred a different one.
 ///
-/// So each flag is decided by the bytes when the bytes have an opinion:
+/// So for an existing store the **files decide, in both directions**:
 ///
-/// * `payloads.bin` starts with the page-store magic → `paged_payloads` on;
-///   the file exists, is not empty, and is not a page store → off. This is the
-///   only flag that gets turned *off*, because it is the only one whose two
-///   layouts share a filename.
+/// * `payloads.bin` starts with the page-store magic → `paged_payloads` on,
+///   otherwise off
 /// * `nodesp.rec` / `adjp_fwd.rec` hold bytes → `paged_nodes` /
-///   `paged_adjacency` on. Their absence says nothing: a flat store asked to
-///   open with paged nodes is being migrated, and the file appears on the first
-///   write.
+///   `paged_adjacency` on, otherwise off
 ///
-/// What this prevents is not an inconvenience but a silent deletion. A paged
-/// store opened without its flags finds its data in files nothing reads, reports
-/// an empty database, truncates `payloads.bin`, and loses the lot at the next
-/// compaction. `EngineBuilder` reached that state by construction until it
-/// learned to carry a [`Config`], and any caller that opens a directory it did
-/// not create can still reach it. The refusal that follows this call stays as a
-/// backstop — it should now be unreachable.
+/// Turning a flag *off* matters as much as turning it on, and it started
+/// mattering the day paged became the default. A database written by an older
+/// version has flat files; opening it with the new default would have found
+/// empty paged stores, migrated the graph into them, and left a store half in
+/// each format. Nothing would have been lost — the migration is real — but the
+/// number of shapes a store can be in would have doubled, silently, for every
+/// existing database. Converting a store is a thing to ask for, not a thing that
+/// happens because you opened it.
+///
+/// Turning a flag on is the older half and the one that prevents deletion: a
+/// paged store opened without its flags finds its data in files nothing reads,
+/// reports an empty database, truncates `payloads.bin`, and loses the lot at the
+/// next compaction. The refusal that follows this call stays as a backstop.
+///
+/// `paged_topology` is not decided here. It says whether topology is *served*
+/// from the mapping or loaded into RAM, which is a choice about this process, not
+/// a fact about the files.
 fn adopt_layout_from_disk(dir: &Path, config: &mut Config) {
     let nonempty = |file: &str| -> bool {
         std::fs::metadata(dir.join(file)).is_ok_and(|m| m.len() > 0)
     };
+    // Whether there is a store here at all. Any one of these means a previous
+    // open got far enough to write something, so the layout is already settled.
+    // A directory that holds none of them is new, and the caller's config stands.
+    let existing = ["snapshot.json", "wal.log", "nodes.bin", "payloads.bin"]
+        .iter()
+        .any(|f| nonempty(f));
+    if !existing {
+        return;
+    }
     if nonempty("payloads.bin") {
         let paged = std::fs::File::open(dir.join("payloads.bin"))
             .and_then(|mut f| {
@@ -1793,8 +1954,8 @@ fn adopt_layout_from_disk(dir: &Path, config: &mut Config) {
             .is_ok_and(|magic| &magic == b"SKPAGE\0\0");
         config.paged_payloads = paged;
     }
-    config.paged_nodes     |= nonempty("nodesp.rec");
-    config.paged_adjacency |= nonempty("adjp_fwd.rec");
+    config.paged_nodes     = nonempty("nodesp.rec");
+    config.paged_adjacency = nonempty("adjp_fwd.rec");
 }
 
 impl Default for CoreDB {
@@ -1836,6 +1997,7 @@ impl CoreDB {
             slug_map: HashMap::new(),
             // An in-memory database has no directory to put pages in.
             paged_adj: None,
+            write_error: None,
             paged_nodes: None,
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
             compact_thresholds: CompactThresholds::default(),
@@ -1908,13 +2070,16 @@ impl CoreDB {
         Self::open_with_config(dir, Config::default())
     }
 
-    /// **Experimental.** Open with paged topology: nodes + edges are served from
-    /// the mmap'd files written at the last `compact()` (OS page cache holds the
-    /// hot working set), while writes since open live in a RAM overlay. Falls
-    /// back to a normal resident open when the topology files are absent.
-    /// See [`Config::paged_topology`] for current limitations.
+    /// Open with paged topology and nothing else paged: nodes + edges are served
+    /// from the mmap'd files written at the last `compact()` (the OS page cache
+    /// holds the hot working set), while writes since open live in a RAM overlay.
+    /// Falls back to a normal resident open when the topology files are absent.
+    ///
+    /// Narrower than [`CoreDB::open`], which now gives the full paged layout.
+    /// This exists for the one shape it names, and for the tests that compare a
+    /// single change against the resident layout rather than four at once.
     pub fn open_paged(dir: impl AsRef<Path>) -> io::Result<Self> {
-        Self::open_with_config(dir, Config { paged_topology: true, ..Config::default() })
+        Self::open_with_config(dir, Config { paged_topology: true, ..Config::resident() })
     }
 
     /// Open a database in read-only mode (no lock, no WAL writer).
@@ -2475,7 +2640,10 @@ impl CoreDB {
                     let mut disk_store =
                         storage::vecstore::VectorStore::open_disk(dir, &field)?;
                     for (id, data) in mem_store.iter() {
-                        disk_store.put(id, data.to_vec());
+                        // Migrating an in-memory store to disk: a failure here means
+                        // the vector is not on disk, so the migration is abandoned
+                        // rather than half-done.
+                        disk_store.put(id, data.to_vec())?;
                     }
                     disk_store.remap();
                     db.vectors.insert(field, disk_store);
@@ -2648,6 +2816,10 @@ impl CoreDB {
                 .filter(|(c, _)| *c == coll_hash)
                 .map(|(_, f)| f.clone())
                 .collect();
+            // Which of this collection's indexes were seeded from an immutable
+            // base — see the note on the containment check below.
+            let from_base: std::collections::HashSet<String> =
+                mapped_fields.iter().cloned().collect();
             for f in mapped_fields {
                 self.ensure_field_index_writable(coll_hash, &f);
             }
@@ -2657,9 +2829,26 @@ impl CoreDB {
                         payload.get(idx_field.as_str()).unwrap_or(&Value::Null)
                     ) {
                         let ids = btree.entry(key).or_default();
-                        // Same O(n²) guard as collection membership: a fresh insert's
-                        // hash can't already be in the posting list.
-                        if old_info.is_none() || !ids.contains(&hash) { ids.push(hash); }
+                        // The fast path skips an O(n) scan on the reasoning that a
+                        // *new* row's hash cannot already be in the posting list.
+                        // That holds for an index this database built from nothing.
+                        // It does not hold for one materialised out of the mmap
+                        // base: the base is immutable, so it still lists rows that
+                        // have since been deleted, and a slug written again gets
+                        // the same hash. Delete `p/n5` and write it back and the
+                        // hash was pushed on top of the copy already there — the
+                        // row was then counted twice by every aggregate that reads
+                        // the index. Row counts stayed right, so it showed up as
+                        // `SUM` disagreeing with the rows it summed, and only after
+                        // a restart.
+                        //
+                        // Where a base exists the scan is paid. Where one does not —
+                        // a fresh database being loaded — the fast path stands.
+                        if (old_info.is_none() && !from_base.contains(idx_field))
+                            || !ids.contains(&hash)
+                        {
+                            ids.push(hash);
+                        }
                     }
                 }
             }
@@ -2679,12 +2868,28 @@ impl CoreDB {
 
         // Store spliced bytes directly — no re-serialize. Tagged with the node it
         // belongs to, so a read that lands on a different record can tell.
-        let (offset, len) = self.payload_store.append_owned(hash, &buf);
+        // A failed disk write is reported, not fatal. The error type here cannot
+        // name an `io::Error`, so the failure is carried as a message rather than
+        // being turned into a process abort — which is what it used to be.
+        let (offset, len) = self.payload_store.append_owned(hash, &buf)
+            .map_err(payload_write_failed)?;
 
         let collection_str = payload.get("_collection")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Refused here rather than truncated at compaction. The name goes into a
+        // dictionary whose entries carry a two-byte length, so a longer one
+        // cannot be written down truthfully — and a store is better off rejecting
+        // a name it cannot keep than accepting it and returning a different one.
+        if collection_str.len() > storage::topology::MAX_NAME_BYTES {
+            use serde::ser::Error as _;
+            return Err(serde_json::Error::custom(format!(
+                "sekejap: collection name is {} bytes; the limit is {}",
+                collection_str.len(),
+                storage::topology::MAX_NAME_BYTES,
+            )));
+        }
 
         self.slug_map.insert(slug.to_string(), hash);
         // Writing a key retires any tombstone left by an earlier delete. Without
@@ -3022,7 +3227,9 @@ impl CoreDB {
                             let new_json = serde_json::to_string(&p)
                                 .unwrap_or_else(|_| "{}".to_string());
                             let (new_off, new_len) =
-                                self.payload_store.append_owned(h, new_json.as_bytes());
+                                self.payload_store.append_owned(h, new_json.as_bytes())
+                                    .map_err(|e| sql::SqlError::InvalidValue(
+                                        format!("sekejap: payload write failed: {e}")))?;
                             node_updates.push((h, new_off, new_len));
                             count += 1;
                         }
@@ -3084,7 +3291,9 @@ impl CoreDB {
                                 let new_json = serde_json::to_string(&p)
                                     .unwrap_or_else(|_| "{}".to_string());
                                 let (new_off, new_len) =
-                                    self.payload_store.append_owned(h, new_json.as_bytes());
+                                    self.payload_store.append_owned(h, new_json.as_bytes())
+                                        .map_err(|e| sql::SqlError::InvalidValue(
+                                            format!("sekejap: payload write failed: {e}")))?;
                                 node_updates.push((h, new_off, new_len));
                                 count += 1;
                             }
@@ -3178,7 +3387,9 @@ impl CoreDB {
                         let new_json = serde_json::to_string(&p)
                             .unwrap_or_else(|_| "{}".to_string());
                         let (new_off, new_len) =
-                            self.payload_store.append_owned(h, new_json.as_bytes());
+                            self.payload_store.append_owned(h, new_json.as_bytes())
+                                .map_err(|e| sql::SqlError::InvalidValue(
+                                    format!("sekejap: payload write failed: {e}")))?;
                         node_updates.push((h, new_off, new_len));
                     }
                 }
@@ -3455,19 +3666,31 @@ impl CoreDB {
                     Self::route_edge_attrs(m.into_iter().collect());
                 match key_hash {
                     Some(kh) => {
-                        self.edges
-                            .link_keyed(from_h, to_h, type_h, edge_type, kh, &cols, json);
+                        // A failed spill of the attribute bytes is recorded, not
+                        // fatal — see `write_error`. The edge itself is in memory
+                        // either way; what is at risk is its attributes.
+                        if let Err(e) = self.edges
+                            .link_keyed(from_h, to_h, type_h, edge_type, kh, &cols, json)
+                        {
+                            self.note_write_error(format!("edge attribute write failed: {e}"));
+                        }
                     }
                     None => {
-                        self.edges
-                            .link_with_attrs(from_h, to_h, type_h, edge_type, &cols, json);
+                        if let Err(e) = self.edges
+                            .link_with_attrs(from_h, to_h, type_h, edge_type, &cols, json)
+                        {
+                            self.note_write_error(format!("edge attribute write failed: {e}"));
+                        }
                     }
                 }
             }
             // Non-object meta (rare): keep whole in the JSON bag as before.
             other => {
-                self.edges
-                    .link_meta(from_h, to_h, type_h, edge_type, other);
+                if let Err(e) = self.edges
+                    .link_meta(from_h, to_h, type_h, edge_type, other)
+                {
+                    self.note_write_error(format!("edge attribute write failed: {e}"));
+                }
             }
         }
         Ok(())
@@ -3554,18 +3777,48 @@ impl CoreDB {
     ///   physical disk. We only fsync per-write under `Full` durability; `Normal`/
     ///   `Off` defer the fsync to the next checkpoint/compact. That's the standard
     ///   mobile trade-off — a per-write fsync on phone flash costs tens of ms.
+    /// Remember a disk failure that had nowhere to be returned to.
+    ///
+    /// Only the first is kept. What matters is that the database stopped being
+    /// able to write, not how many times it noticed.
+    fn note_write_error(&mut self, msg: String) {
+        if self.write_error.is_none() {
+            self.write_error = Some(format!("sekejap: {msg}"));
+        }
+    }
+
+    /// The disk failure this database has hit, if any.
+    ///
+    /// `Some` means at least one write reached the in-memory maps but did not
+    /// reach the log, so it is not durable and will not survive a restart. Reads
+    /// still answer from memory and are still true for this process; compaction
+    /// refuses, because folding an overlay into the base and dropping an
+    /// incomplete log is how a failed write becomes a lost one.
+    ///
+    /// A database in this state should be closed and reopened. Replay will decide
+    /// what is actually on disk.
+    pub fn write_error(&self) -> Option<&str> {
+        self.write_error.as_deref()
+    }
+
     fn wal_write(&mut self, entry: WalEntry) {
         self.counters.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(wal) = &mut self.wal {
-            // `.expect(...)` panics on failure: a disk write error here is not
-            // something the caller can recover from without risking corruption.
-            wal.append(&entry)
-                .expect("sekejap: WAL write failed — disk error");
+            // Recorded rather than fatal — see `write_error`. The write that
+            // triggered this has already changed the in-memory maps, so it is
+            // reported as durable when it is not; the flag is how that gets told,
+            // and it stops the compaction that would make it permanent.
+            let mut failed = wal.append(&entry).err();
             // Force-flush to physical disk only when durability is Full and we're
             // not inside a batch (`defer_wal_sync`), which fsyncs once at the end.
-            if !self.defer_wal_sync && !self.group_commit && self.wal_sync == SyncMode::Full {
-                wal.sync()
-                    .expect("sekejap: WAL fsync failed — disk error");
+            if failed.is_none()
+                && !self.defer_wal_sync && !self.group_commit
+                && self.wal_sync == SyncMode::Full
+            {
+                failed = wal.sync().err();
+            }
+            if let Some(e) = failed {
+                self.note_write_error(format!("WAL write failed: {e}"));
             }
         }
     }
@@ -3632,7 +3885,9 @@ impl CoreDB {
         if self.wal_sync != SyncMode::Full || self.group_commit { return; }
         if let Some(wal) = &mut self.wal {
             wal.sync()
-                .expect("sekejap: WAL fsync failed — disk error");
+                .map_err(|e| format!("WAL fsync failed: {e}"))
+                .err()
+                .map(|e| self.note_write_error(e));
         }
     }
 
@@ -3994,6 +4249,8 @@ impl CoreDB {
                 .map(|(_, _, buf)| buf.as_slice()).collect();
             let owners: Vec<u64> = batch.iter().map(|(_, h, _)| *h).collect();
             self.payload_store.append_batch(&refs, &owners)
+                .map_err(|e| SqlError::InvalidValue(
+                    format!("sekejap: payload write failed: {e}")))?
         };
 
         // ── Phase 3: update node metadata ────────────────────────
@@ -4030,9 +4287,11 @@ impl CoreDB {
                 }
                 if let Some(wal) = &mut self.wal {
                     wal.append_batch(&wal_entries)
-                        .expect("sekejap: WAL batch write failed");
+                        .map_err(|e| SqlError::InvalidValue(
+                            format!("sekejap: WAL write failed: {e}")))?;
                     if !self.defer_wal_sync && !self.group_commit && self.wal_sync == SyncMode::Full {
-                        wal.sync().expect("sekejap: WAL fsync failed");
+                        wal.sync().map_err(|e| SqlError::InvalidValue(
+                            format!("sekejap: WAL fsync failed: {e}")))?;
                     }
                 }
             }
@@ -4136,7 +4395,9 @@ impl CoreDB {
             }
             WalEntry::PutVector { slug, field, data } => {
                 let hash = sk_hash(&slug);
-                self.vectors.entry(field).or_default().put(hash, data);
+                if let Err(e) = self.vectors.entry(field).or_default().put(hash, data) {
+                    self.note_write_error(format!("vector write failed: {e}"));
+                }
             }
             WalEntry::CreateIndex { collection, method, fields } => {
                 use sql::IndexMethod;
@@ -4401,9 +4662,9 @@ impl CoreDB {
         // WAL first (durable), then payloads (payloads.bin is rebuilt from the WAL
         // on open, so this ordering is crash-safe). One batch each, one fsync.
         if let Some(wal) = &mut self.wal {
-            wal.append_batch(&wal_entries).expect("sekejap: WAL batch append failed");
+            wal.append_batch(&wal_entries).map_err(wal_write_failed)?;
             if !self.defer_wal_sync && !self.group_commit && self.wal_sync == SyncMode::Full {
-                wal.sync().expect("sekejap: WAL fsync failed");
+                wal.sync().map_err(wal_write_failed)?;
             }
         }
         // Payload bytes borrowed straight from the WAL entries — no extra copy.
@@ -4412,7 +4673,8 @@ impl CoreDB {
             _ => &[][..],
         }).collect();
         let owners: Vec<u64> = metas.iter().map(|(_, h, _, _, _)| *h).collect();
-        let offsets = self.payload_store.append_batch(&refs, &owners);
+        let offsets = self.payload_store.append_batch(&refs, &owners)
+            .map_err(payload_write_failed)?;
 
         // Which index kinds need refreshing? Track touched collections only when a
         // search index exists (zero overhead for the common index-free IoT case).
@@ -4447,12 +4709,18 @@ impl CoreDB {
                     .filter(|(c, _)| *c == coll_hash)
                     .map(|(_, f)| f.clone())
                     .collect();
+                // Same rule as `put_raw_indexed`: an index materialised from the
+                // immutable base still lists rows that were deleted, so "this row
+                // is new" does not imply "its hash is not already here".
+                let from_base: std::collections::HashSet<String> =
+                    mapped.iter().cloned().collect();
                 for f in mapped { self.ensure_field_index_writable(coll_hash, &f); }
                 for (field, key) in pending_keys[i].drain(..) {
+                    let fresh = is_new && !from_base.contains(&field);
                     let ids = self.field_indexes
                         .entry((coll_hash, field)).or_default()
                         .entry(key).or_default();
-                    if is_new || !ids.contains(&hash) { ids.push(hash); }
+                    if fresh || !ids.contains(&hash) { ids.push(hash); }
                 }
             }
             self.slug_map.insert(slug.clone(), hash);
@@ -4686,7 +4954,15 @@ impl CoreDB {
             Some(Value::Object(m)) => m,
             _ => serde_json::Map::new(),
         };
-        let mut n = self.edges.update_matching(from_h, to_h, type_h, &pred, &set_cols, &set_json);
+        let mut n = match self.edges.update_matching(
+            from_h, to_h, type_h, &pred, &set_cols, &set_json)
+        {
+            Ok(n) => n,
+            Err(e) => {
+                self.note_write_error(format!("edge attribute write failed: {e}"));
+                0
+            }
+        };
 
         // A durable edge cannot be edited where it lies — the base is immutable and
         // the paged store is written only by a fold. So it is withdrawn and written
@@ -4705,9 +4981,12 @@ impl CoreDB {
             for (k, v) in &set_json { merged.insert(k.clone(), v.clone()); }
             for (k, _) in &set_cols { merged.remove(k); }
             self.unlinked_edges.insert((from_h, to_h, type_h));
-            self.edges.link_with_attrs(
+            if let Err(e) = self.edges.link_with_attrs(
                 from_h, to_h, type_h, edge_type,
-                &set_cols, Some(Value::Object(merged)));
+                &set_cols, Some(Value::Object(merged)))
+            {
+                self.note_write_error(format!("edge attribute write failed: {e}"));
+            }
             n += 1;
         }
         n
@@ -4766,6 +5045,21 @@ impl CoreDB {
     /// the old, still-valid files in place. Memory-only databases have no files,
     /// so this is a no-op for them.
     pub fn compact(&mut self) -> io::Result<()> {
+        // A database that has already failed to write does not get to rewrite
+        // itself. Compaction folds the overlay into the base and drops the log —
+        // and if a write reached memory but not the log, the log is the only
+        // record that it is missing. Folding here would write the in-memory state
+        // out as the truth and throw away the evidence that it is not.
+        //
+        // Nothing that can be wrong about what exists may delete it. This is that
+        // law at the one place in the codebase that deletes.
+        if let Some(err) = &self.write_error {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("{err} — refusing to compact: reopen the database so the \
+                         write-ahead log can be replayed"),
+            ));
+        }
         let t0 = std::time::Instant::now();
         // GUARD RAIL — data safety. Compaction rewrites the entire store; a bug here
         // silently destroys data (paged compaction did exactly that: it rebuilt from
@@ -5138,6 +5432,17 @@ impl CoreDB {
             sf.sync_all()?;
         }
         std::fs::rename(&snap_tmp, &snap_path)?;
+        // The commit point of the whole compaction. Every base file has been
+        // written and renamed by now, and the snapshot that names them has just
+        // landed; this is the moment all of it becomes durable together.
+        //
+        // It has to happen *before* the log is rotated below. The log is the only
+        // record of the writes that the new base is supposed to contain, so
+        // throwing it away while the base is still in the page cache trades a
+        // recoverable state for an unrecoverable one. The completeness rail that
+        // runs above reads the new files back and finds them correct — from the
+        // page cache, which is exactly what a power cut discards.
+        fsync_dir(&dir)?;
 
         // 3. Truncate WAL: close current writer → rename → open fresh → delete old
         self.wal = None;
@@ -5152,6 +5457,11 @@ impl CoreDB {
         // New file, new inode, record count restarting at zero: anyone
         // coordinating fsyncs on our behalf has to be told.
         self.wal_generation += 1;
+        // Both renames — the old log out of the way and the new one into place —
+        // before the old log is destroyed. Otherwise a crash can leave no
+        // `wal.log` at all: the rename that created it undone, and the file it
+        // replaced already deleted.
+        fsync_dir(&dir)?;
         if wal_old.exists() {
             std::fs::remove_file(&wal_old)?;
         }
@@ -5581,6 +5891,12 @@ impl CoreDB {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &path)?;
+        // The rename is the commit, and until the *directory* is synced the
+        // rename itself is not durable — only the bytes inside the temp file
+        // are. A crash here could restore the old name over the new contents on
+        // one file and not another, leaving files from two generations
+        // pointing at each other. See `fsync_dir`.
+        fsync_dir(dir)?;
         Ok(())
     }
 
@@ -6000,7 +6316,12 @@ impl CoreDB {
             if let Some(vecs) = snap.vectors {
                 for sv in vecs {
                     let hash = sk_hash(&sv.slug);
-                    self.vectors.entry(sv.field).or_default().put(hash, sv.data);
+                    let field = sv.field.clone();
+                    if let Err(e) = self.vectors.entry(sv.field).or_default()
+                        .put(hash, sv.data)
+                    {
+                        self.note_write_error(format!("vector write failed on {field}: {e}"));
+                    }
                 }
             }
         }
@@ -6237,6 +6558,7 @@ impl CoreDB {
             // edges to find - which is why snapshot_reads is refused for it in
             // `open_with_config` rather than quietly answering an empty graph.
             paged_adj: None,
+            write_error: None,
             paged_nodes: None,
             slug_map: self.slug_map.clone(),
             collections: self.collections.clone(),
@@ -8063,7 +8385,9 @@ impl CoreDB {
                     self.wal_write(WalEntry::PutVector { slug: slug.clone(), field: field.clone(), data: data.clone() });
                     let hash = sk_hash(&slug);
                     self.ensure_vector_store(&field);
-                    self.vectors.get_mut(&field).unwrap().put(hash, data);
+                    if let Err(e) = self.vectors.get_mut(&field).unwrap().put(hash, data) {
+                        self.note_write_error(format!("vector write failed: {e}"));
+                    }
                 }
                 self.defer_wal_sync = false;
                 self.wal_flush();
@@ -8260,7 +8584,9 @@ impl CoreDB {
                             });
                             let hash = sk_hash(&slug);
                             self.ensure_vector_store(&field);
-                            self.vectors.get_mut(&field).unwrap().put(hash, data);
+                            if let Err(e) = self.vectors.get_mut(&field).unwrap().put(hash, data) {
+                                self.note_write_error(format!("vector write failed: {e}"));
+                            }
                             affected_vec_fields.insert(field);
                         }
                     }
@@ -9217,10 +9543,25 @@ impl CoreDB {
         match key {
             FieldKey::Null        => Value::Null,
             FieldKey::Bool(b)     => Value::Bool(*b),
+            // A whole number comes back whole. The index stores every number as
+            // an `f64` because that is what makes them one ordered key space, but
+            // rendering the key that way put the float back into the *answer*:
+            // `GROUP BY n` returned `1.0` where the row holds `1`, and `SUM(n)`
+            // over an indexed integer column came out `6.0`. The same query
+            // without an index returned `1` and `6`, so whether a value looked
+            // like an integer depended on whether somebody had run CREATE INDEX.
+            //
+            // Past 2^53 an `f64` can no longer tell consecutive integers apart,
+            // so above that the float is kept rather than printing a whole number
+            // that is not the value.
             FieldKey::Number(OrdF64(f)) => {
-                serde_json::Number::from_f64(*f)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
+                if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 {
+                    Value::Number(serde_json::Number::from(*f as i64))
+                } else {
+                    serde_json::Number::from_f64(*f)
+                        .map(Value::Number)
+                        .unwrap_or(Value::Null)
+                }
             }
             FieldKey::Str(s)      => Value::String(s.clone()),
         }
@@ -9630,7 +9971,8 @@ impl CoreDB {
         });
         let hash = sk_hash(slug);
         self.ensure_vector_store(field);
-        self.vectors.get_mut(field).unwrap().put(hash, data.to_vec());
+        self.vectors.get_mut(field).unwrap().put(hash, data.to_vec())
+            .map_err(|e| { use serde::ser::Error as _; serde_json::Error::custom(e.to_string()) })?;
         let hnsw_declared = self.schemas.values()
             .any(|s| s.indexes.vector.contains(&field.to_string()));
         if hnsw_declared {
@@ -10061,8 +10403,14 @@ impl CoreDB {
             .iter()
             .find_map(|s| if let Step::Take(n) = s { Some(n.saturating_add(skip_n)) } else { None });
 
-        let result: Vec<u64> = idx
-            .iter_kv(!*asc)
+        // `iter_kv_sql_order`, not `iter_kv`. This seed does not merely order the
+        // rows — it tells the executor to **skip the Sort step**, so whatever
+        // order comes out of here is the answer, with nothing downstream to
+        // correct it. Walking the btree raw puts NULLs first on `ASC`, because
+        // `FieldKey::Null` is its lowest key, and a missing field is stored as
+        // NULL. `ORDER BY b ASC` therefore led with every row that has no `b`,
+        // and the same query without an index led with the smallest value.
+        let result: Vec<u64> = crate::query::iter_kv_sql_order(&idx, *asc)
             .into_iter()
             .flat_map(|(_, ids)| ids)
             .collect();
@@ -10811,7 +11159,9 @@ impl<'db> Transaction<'db> {
                 TxnOp::PutVector(slug, field, data) => {
                     let hash = sk_hash(slug);
                     self.db.ensure_vector_store(field);
-                    self.db.vectors.get_mut(field).unwrap().put(hash, data.clone());
+                    if let Err(e) = self.db.vectors.get_mut(field).unwrap().put(hash, data.clone()) {
+                        self.db.note_write_error(format!("vector write failed: {e}"));
+                    }
                 }
             }
         }
@@ -11074,8 +11424,8 @@ mod payload_paging_tests {
             .collect();
 
         for bytes in &sizes {
-            let (fo, fl) = flat.append(bytes);
-            let (po, pl) = paged.append(bytes);
+            let (fo, fl) = flat.append(bytes).unwrap();
+            let (po, pl) = paged.append(bytes).unwrap();
             assert_eq!(fl, pl, "lengths disagree");
             assert_eq!(
                 flat.get_raw(fo, fl).as_deref(),
@@ -11093,7 +11443,7 @@ mod payload_paging_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut p = PayloadStore::open_paged(&dir.path().join("paged.bin")).unwrap();
 
-        let mut live: Vec<(u64, u32)> = (0..400).map(|i| p.append(&rec(i))).collect();
+        let mut live: Vec<(u64, u32)> = (0..400).map(|i| p.append(&rec(i)).unwrap()).collect();
         let settled = p.page_stats().unwrap().0;
 
         // Churn: free the oldest, write a new one, far more times than there are
@@ -11101,7 +11451,7 @@ mod payload_paging_tests {
         for i in 0..4000 {
             let (off, _) = live.remove(0);
             assert!(p.free(off), "free reported nothing reclaimed");
-            live.push(p.append(&rec(10_000 + i)));
+            live.push(p.append(&rec(10_000 + i)).unwrap());
         }
         let after = p.page_stats().unwrap().0;
         assert!(after <= settled + 4,
@@ -11118,8 +11468,8 @@ mod payload_paging_tests {
     fn a_freed_paged_payload_stops_reading() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut p = PayloadStore::open_paged(&dir.path().join("paged.bin")).unwrap();
-        let (a, al) = p.append(b"alpha");
-        let (b, bl) = p.append(b"bravo");
+        let (a, al) = p.append(b"alpha").unwrap();
+        let (b, bl) = p.append(b"bravo").unwrap();
         assert!(p.free(a));
         assert_eq!(p.get_raw(a, al), None, "a freed payload still reads");
         assert_eq!(p.get_raw(b, bl).as_deref(), Some(&b"bravo"[..]), "neighbour disturbed");
@@ -11132,7 +11482,7 @@ mod payload_paging_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut p = PayloadStore::open_paged(&dir.path().join("paged.bin")).unwrap();
         let flat = PayloadStore::open_file(&dir.path().join("flat.bin")).unwrap();
-        let (off, _) = p.append(b"hello world");
+        let (off, _) = p.append(b"hello world").unwrap();
 
         assert!(!p.absolute_offsets(), "paged stores must not claim byte offsets");
         assert!(flat.absolute_offsets(), "flat stores do have byte offsets");
@@ -11155,7 +11505,7 @@ mod compaction_safety_tests {
     #[test]
     fn the_on_disk_count_matches_what_was_written() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         for i in 0..50 {
             db.put(&format!("p/n{i}"),
                    &json!({"_collection":"p","_key":format!("n{i}")}).to_string()).unwrap();
@@ -11174,7 +11524,7 @@ mod compaction_safety_tests {
     #[test]
     fn a_parked_generation_can_be_put_back() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         for i in 0..20 {
             db.put(&format!("p/n{i}"),
                    &json!({"_collection":"p","_key":format!("n{i}")}).to_string()).unwrap();
@@ -11216,7 +11566,7 @@ mod compaction_safety_tests {
         );
 
         // And the database itself opens with everything intact.
-        let db = CoreDB::open(dir.path()).unwrap();
+        let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         assert_eq!(db.node_count(), 20);
         assert_eq!(
             db.query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)").unwrap().collect().len(), 19,
@@ -11262,7 +11612,7 @@ mod hybrid_query_tests {
 
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
             db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
             db.put("place/ubud", r#"{"_collection":"place","_key":"ubud"}"#).unwrap();
@@ -11491,7 +11841,7 @@ mod hybrid_query_tests {
     fn snapshot_is_isolated_from_later_writes() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe","v":1}"#).unwrap();
             db.put("place/uluwatu", r#"{"_collection":"place","_key":"uluwatu"}"#).unwrap();
             db.compact().unwrap();
@@ -11528,7 +11878,7 @@ mod hybrid_query_tests {
 
         // Resident/ephemeral mode has no immutable base → snapshots are unsupported.
         let resident_dir = tempfile::tempdir().unwrap();
-        let resident = CoreDB::open(resident_dir.path()).unwrap();
+        let resident = CoreDB::open_with_config(resident_dir.path(), Config::resident()).unwrap();
         assert!(resident.snapshot_db().is_none(), "resident mode must not offer snapshots");
     }
 
@@ -11795,7 +12145,7 @@ mod hybrid_query_tests {
         // postings pread) must match resident and be asserted disk-backed.
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
             db.execute("CREATE TABLE docs (body TEXT)").unwrap();
             let bodies = ["rust systems programming", "python is easy", "rust async runtime fast",
                           "coffee and rust", "great coffee place", "melbourne coffee roasters",
@@ -11810,10 +12160,13 @@ mod hybrid_query_tests {
             "SELECT _key FROM docs WHERE BM25(body, 'rust') > 0.0 ORDER BY _key ASC",
             "SELECT _key FROM docs WHERE BM25(body, 'coffee') > 0.0 ORDER BY _key ASC",
             "SELECT _key FROM docs WHERE BM25(body, 'zzznope') > 0.0 ORDER BY _key ASC",
-            "SELECT _key FROM docs ORDER BY BM25(body, 'rust fast') DESC, _key ASC LIMIT 3",
+            // No secondary key: a tie-break after a scoring expression is refused
+            // rather than dropped, which is what used to happen — silently, taking
+            // the LIMIT with it.
+            "SELECT _key FROM docs ORDER BY BM25(body, 'rust fast') DESC LIMIT 3",
         ];
         let resident: Vec<Vec<String>> = {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
             db.build_bm25_index("body"); // heap reopen rebuilds; ensure present for the baseline
             queries.iter().map(|q| db.query(q).unwrap().collect()
                 .iter().map(|h| h.slug.clone()).collect()).collect()
@@ -11964,7 +12317,7 @@ mod hybrid_query_tests {
     fn manifest_snapshot_shrinks_and_reopens_complete() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
             db.execute("CREATE TABLE place (_key TEXT PRIMARY KEY, city TEXT)").unwrap();
             db.put("tourist/chloe", r#"{"_collection":"tourist","_key":"chloe"}"#).unwrap();
             db.execute("INSERT INTO place (_key, city) VALUES ('uluwatu', 'Bali')").unwrap();
@@ -11981,7 +12334,7 @@ mod hybrid_query_tests {
 
         // Reopen resident: everything intact — nodes, edges, edge meta, schema.
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
             assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 1);
             let hits = db.query(
                 "SELECT b.city AS c, r.days AS d FROM MATCH (a:tourist)-[r:visited]->(b:place) \
@@ -11996,7 +12349,7 @@ mod hybrid_query_tests {
             db.put("place/ubud", r#"{"_collection":"place","_key":"ubud","city":"Bali"}"#).unwrap();
         }
         {
-            let db = CoreDB::open(dir.path()).unwrap();
+            let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
             assert_eq!(db.query("SELECT * FROM place").unwrap().collect().len(), 2,
                 "WAL write after manifest compact must survive reopen");
         }
@@ -12009,7 +12362,7 @@ mod hybrid_query_tests {
 #[test]
     fn skbin_field_table_recovers_from_corrupt_primary_copy() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config { payload_binary: true, ..Config::default() };
+        let cfg = Config { payload_binary: true, ..Config::resident() };
         {
             let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
             for i in 0..20 {
@@ -12042,7 +12395,7 @@ mod hybrid_query_tests {
     #[test]
     fn skbin_payload_roundtrips_shrinks_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config { payload_binary: true, ..Config::default() };
+        let cfg = Config { payload_binary: true, ..Config::resident() };
         // Realistic records exercising every value type.
         let mk = |i: usize| format!(
             r#"{{"_collection":"orders","_key":"ord-{i:05}","customer":"cust-{}","qty":{},"price":{}.{},"active":{},"tags":["a","b","c"],"note":"order number {i} shipped","ts":1700000000}}"#,

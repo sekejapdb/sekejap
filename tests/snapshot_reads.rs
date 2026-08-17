@@ -5,8 +5,15 @@
 //! point-in-time photo — it reads the base + the overlay frozen at mint time, and
 //! never sees writes that land afterward. See
 //! `docs/developer/notes/snapshot-reads-design.md`.
+//!
+//! Every fixture here builds its store with [`Config::resident`], not the
+//! default. Snapshots need a durable half that is *immutable* — compaction
+//! writes a new generation and swaps it in, so a snapshot holding the old one
+//! keeps reading. The default layout writes nodes and adjacency **in place**, so
+//! `snapshot_db` declines and reads fall back to taking the lock. Building these
+//! in the default layout would test the fallback, not the feature.
 
-use sekejap::CoreDB;
+use sekejap::{Config, CoreDB};
 use serde_json::json;
 
 /// Build a disk store with `venues/v0..vN`, compact it into an immutable base,
@@ -14,7 +21,7 @@ use serde_json::json;
 fn paged_db(n: usize) -> (CoreDB, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         for i in 0..n {
             db.put(
                 &format!("venues/v{i}"),
@@ -153,7 +160,7 @@ fn snapshot_scan_and_count() {
 #[test]
 fn resident_mode_is_not_snapshottable() {
     let dir = tempfile::TempDir::new().unwrap();
-    let mut db = CoreDB::open(dir.path()).unwrap(); // resident: topo_base = None
+    let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap(); // resident: topo_base = None
     db.put(
         "venues/v0",
         &json!({"_collection":"venues","_key":"v0","n":0}).to_string(),
@@ -168,7 +175,7 @@ fn resident_mode_is_not_snapshottable() {
 fn snapshot_db_runs_indexed_sql() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute("CREATE TABLE venues (_key TEXT PRIMARY KEY, name TEXT, cat TEXT, n INTEGER)")
             .unwrap();
         for i in 0..50 {
@@ -230,7 +237,7 @@ fn snapshot_db_is_inert_on_drop() {
 #[test]
 fn stats_report_reality() {
     let dir = tempfile::TempDir::new().unwrap();
-    let mut db = CoreDB::open(dir.path()).unwrap();
+    let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
     db.execute("CREATE TABLE v (_key TEXT PRIMARY KEY, cat TEXT)").unwrap();
     for i in 0..20 {
         db.execute(&format!("INSERT INTO v (_key, cat) VALUES ('v{i}', 'cafe')")).unwrap();
@@ -275,7 +282,7 @@ fn stats_report_reality() {
 fn snapshot_never_sees_an_uncommitted_transaction() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute("CREATE TABLE v (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
         db.execute("INSERT INTO v (_key, n) VALUES ('base', 0)").unwrap();
         db.compact().unwrap();
@@ -307,7 +314,7 @@ fn snapshot_never_sees_an_uncommitted_transaction() {
 fn snapshot_never_sees_a_rolled_back_transaction() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute("CREATE TABLE v (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
         db.execute("INSERT INTO v (_key, n) VALUES ('base', 0)").unwrap();
         db.compact().unwrap();
@@ -331,7 +338,7 @@ fn snapshot_never_sees_a_rolled_back_transaction() {
 fn snapshot_matches_live_for_every_index_family() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute(
             "CREATE TABLE p (_key TEXT PRIMARY KEY, name TEXT, cat TEXT, n INTEGER, \
              descr TEXT, geometry GEO, emb VECTOR)",
@@ -402,7 +409,7 @@ fn snapshot_matches_live_for_every_index_family() {
 fn paged_compaction_preserves_base_nodes() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         for i in 0..5 {
             db.put(&format!("v/n{i}"), &json!({"_collection":"v","_key":format!("n{i}")}).to_string()).unwrap();
         }
@@ -442,7 +449,7 @@ fn paged_compaction_preserves_base_nodes() {
 fn deleting_a_base_node_takes_effect() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         for i in 0..5 {
             db.put(&format!("v/n{i}"), &json!({"_collection":"v","_key":format!("n{i}")}).to_string()).unwrap();
         }
@@ -485,7 +492,7 @@ fn compaction_never_reports_success_after_losing_data() {
     for paged in [false, true] {
         let dir = tempfile::TempDir::new().unwrap();
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
             for i in 0..25 {
                 let c = if i % 2 == 0 { "a" } else { "b" };
                 db.put(&format!("{c}/n{i}"),
@@ -496,7 +503,7 @@ fn compaction_never_reports_success_after_losing_data() {
         let mut db = if paged {
             CoreDB::open_paged(dir.path()).unwrap()
         } else {
-            CoreDB::open(dir.path()).unwrap()
+            CoreDB::open_with_config(dir.path(), Config::resident()).unwrap()
         };
         db.put("a/late", &json!({"_collection":"a","_key":"late"}).to_string()).unwrap();
 
@@ -512,7 +519,7 @@ fn compaction_never_reports_success_after_losing_data() {
         // ...and it must still be true after a reopen, which is where the original
         // bug actually showed up.
         drop(db);
-        let db = CoreDB::open(dir.path()).unwrap();
+        let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         assert_eq!(db.node_count(), before, "paged={paged}: data lost across reopen");
         assert_eq!(db.collection_names(), vec!["a".to_string(), "b".to_string()]);
     }
@@ -526,7 +533,7 @@ fn compaction_never_reports_success_after_losing_data() {
 fn accessors_report_the_same_in_both_storage_modes() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         for i in 0..12 {
             let c = if i < 7 { "alpha" } else { "beta" };
             db.put(&format!("{c}/n{i}"), &json!({"_collection":c,"_key":format!("n{i}")}).to_string()).unwrap();
@@ -535,7 +542,7 @@ fn accessors_report_the_same_in_both_storage_modes() {
     }
     // One writer at a time — the exclusive lock is real, so measure them in turn.
     let (r_nodes, r_colls, r_stats, r_alpha) = {
-        let db = CoreDB::open(dir.path()).unwrap();
+        let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         (db.node_count(), db.collection_names(), db.stats().nodes,
          db.query("SELECT _key FROM alpha").unwrap().collect().len())
     };
@@ -560,7 +567,7 @@ fn accessors_report_the_same_in_both_storage_modes() {
 fn snapshot_never_sees_a_half_built_index() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
         for i in 0..30 {
             db.execute(&format!(
@@ -620,7 +627,7 @@ fn snapshot_never_sees_a_half_built_index() {
 fn rebuilding_an_index_in_paged_mode_keeps_the_base() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
         for i in 0..30 {
             db.execute(&format!(
@@ -672,7 +679,7 @@ fn rebuilding_an_index_in_paged_mode_keeps_the_base() {
 fn updating_a_base_node_takes_effect() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute("CREATE TABLE d (_key TEXT PRIMARY KEY, body TEXT, n INTEGER)").unwrap();
         for i in 0..5 {
             db.execute(&format!(
@@ -694,7 +701,7 @@ fn updating_a_base_node_takes_effect() {
     db.compact().unwrap();
     drop(db);
 
-    let db = CoreDB::open(dir.path()).unwrap();
+    let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
     assert!(db.get("d/d0").unwrap().contains("quebec"), "update lost across a reopen");
     assert!(db.get("d/d4").unwrap().contains("sierra"), "range update lost across a reopen");
     assert!(db.get("d/d1").unwrap().contains("alpha 1"), "an untouched row changed");
@@ -713,7 +720,7 @@ fn the_graph_surface_agrees_in_both_storage_modes() {
 
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         for i in 0..6 {
             db.put(&format!("p/n{i}"), &json!({
                 "_collection": "p", "_key": format!("n{i}"), "name": format!("node {i}")
@@ -739,14 +746,14 @@ fn the_graph_surface_agrees_in_both_storage_modes() {
          db.edges_from_collection("p").len())
     };
 
-    let resident = measure(&CoreDB::open(dir.path()).unwrap());
+    let resident = measure(&CoreDB::open_with_config(dir.path(), Config::resident()).unwrap());
     let paged = measure(&CoreDB::open_paged(dir.path()).unwrap());
 
     assert_eq!(resident, paged, "paged mode answers differently from resident");
     assert_eq!(resident, (1, 1, 1, 1, 1, 5), "the baseline itself is wrong: {resident:?}");
 
     // SHOW must agree too — it walks the same structures.
-    let r = CoreDB::open(dir.path()).unwrap().show("SHOW EDGES").unwrap().len();
+    let r = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap().show("SHOW EDGES").unwrap().len();
     let p = CoreDB::open_paged(dir.path()).unwrap().show("SHOW EDGES").unwrap().len();
     assert_eq!(r, p, "SHOW EDGES differs between modes");
     assert!(r > 0, "SHOW EDGES found nothing even in resident mode");
@@ -764,7 +771,7 @@ fn the_graph_surface_agrees_in_both_storage_modes() {
 fn paged_compaction_preserves_base_edges() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
         for i in 0..10 {
             db.execute(&format!("INSERT INTO p (_key, n) VALUES ('n{i}', {i})")).unwrap();
@@ -800,7 +807,7 @@ fn paged_compaction_preserves_base_edges() {
 
     // And they must still be there for a fresh handle, in either mode.
     assert_eq!(edges(&CoreDB::open_paged(dir.path()).unwrap()), 9, "lost across a paged reopen");
-    assert_eq!(edges(&CoreDB::open(dir.path()).unwrap()), 9, "lost across a resident reopen");
+    assert_eq!(edges(&CoreDB::open_with_config(dir.path(), Config::resident()).unwrap()), 9, "lost across a resident reopen");
 }
 
 /// Writing a key again after deleting it must bring the row back.
@@ -814,7 +821,7 @@ fn paged_compaction_preserves_base_edges() {
 fn rewriting_a_deleted_base_key_brings_it_back() {
     let dir = tempfile::TempDir::new().unwrap();
     {
-        let mut db = CoreDB::open(dir.path()).unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, v TEXT)").unwrap();
         for i in 0..5 {
             db.execute(&format!("INSERT INTO p (_key, v) VALUES ('n{i}', 'original')")).unwrap();
@@ -837,7 +844,7 @@ fn rewriting_a_deleted_base_key_brings_it_back() {
     // And it must survive, rather than depend on a later compaction to appear.
     db.compact().unwrap();
     drop(db);
-    let db = CoreDB::open(dir.path()).unwrap();
+    let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
     assert!(db.get("p/n2").unwrap().contains("rewritten"), "lost across a reopen");
     assert_eq!(db.node_count(), 5);
 }

@@ -73,6 +73,33 @@ pub fn extract_trigrams(text: &str) -> Vec<String> {
     trigrams
 }
 
+/// Whether a trigram index can be trusted to answer this pattern at all.
+///
+/// The extractor below treats every character that is not `%` as literal text to
+/// look up, which is right for `%` and wrong for everything else a pattern can
+/// contain:
+///
+/// * `_` matches any single character, so a segment holding one asks the index
+///   for trigrams containing a literal underscore. Those are not there, the
+///   index reports no matches, and rows that do match are never looked at.
+///   `'open' LIKE '_pen'` is the smallest example.
+/// * an escaped wildcard (`\%`) is literal text, but the backslash is not, so
+///   the segment fed to the index contains a character the value does not.
+///
+/// A pattern like that is not unindexable in principle — it is unindexable by
+/// *this* extractor — so the honest answer is to say so and let the caller scan.
+/// The alternative is an index that silently subtracts rows, which is the one
+/// thing an index may never do.
+/// * a pattern with no segment of three characters yields no trigrams at all, so
+///   the lookup is empty for a reason that has nothing to do with the data.
+///   `LIKE ''` matches exactly the empty string; through the index it matched
+///   nothing.
+pub fn pattern_is_indexable(pattern: &str) -> bool {
+    !pattern.contains('_')
+        && !pattern.contains('\\')
+        && !extract_pattern_trigrams(pattern).is_empty()
+}
+
 /// Trigrams a `%…%` pattern requires — the ones that MUST appear in any match.
 ///
 /// An `ILIKE` pattern has `%` wildcards ("any run of characters"), so we keep

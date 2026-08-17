@@ -1530,6 +1530,41 @@ impl Parser {
             | "VECTOR_L1" | "ST_DISTANCE" | "SEARCH_SCORE"))
     }
 
+    /// The one-argument scalar functions, for contexts that are not a projection.
+    ///
+    /// `SELECT LENGTH(name) … ORDER BY LENGTH(name)` parsed the projection but
+    /// not the sort: the sort parser read `LENGTH` as a *column name*, stopped at
+    /// the `(`, and the rest of the clause was dropped. No column is called
+    /// `LENGTH`, so every row tied and the query came back in whatever order the
+    /// scan produced — sorted by nothing, with no error.
+    ///
+    /// Encodes to the same `__FUNC__NAME__arg` sentinel the projection uses, which
+    /// `resolve_field` already knows how to evaluate, so the sort works on the
+    /// value rather than on the name.
+    ///
+    /// `None` when the identifier is not a function call, leaving the parser where
+    /// it was. Multi-argument forms (`SUBSTRING`, `REPLACE`, `CONCAT`,
+    /// `DATE_TRUNC`) are deliberately not here — they are reported as unsupported
+    /// in a sort by the end-of-statement check rather than being silently ignored.
+    fn parse_scalar_func_call(&mut self, ident: &str) -> Result<Option<String>, SqlError> {
+        if !matches!(self.peek(), Tok::LParen) {
+            return Ok(None);
+        }
+        let func = ident.to_uppercase();
+        const ONE_ARG: &[&str] = &[
+            "LENGTH", "LEN", "LOWER", "UPPER", "TRIM", "LTRIM", "RTRIM",
+            "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DOW", "QUARTER",
+            "AGE_DAYS", "AGE_HOURS", "JSON_ARRAY_LENGTH",
+        ];
+        if !ONE_ARG.contains(&func.as_str()) {
+            return Ok(None);
+        }
+        self.advance(); // consume (
+        let arg = self.expect_ident()?;
+        self.expect_rparen()?;
+        Ok(Some(format!("__FUNC__{func}__{arg}")))
+    }
+
     /// Consume an optional `ASC`/`DESC`; returns `true` for ascending (default).
     fn parse_sort_dir(&mut self) -> bool {
         if matches!(self.peek(), Tok::Kw(Kw::Desc)) { self.advance(); false }
@@ -1842,6 +1877,25 @@ impl Parser {
                 self.advance(); // consume operator
                 let query = self.parse_f32_array_or_param()?;
                 order_by = Some(OrderKey::Vector { field, query, metric });
+            } else if let Some(sentinel) = {
+                // `ORDER BY LENGTH(name)` and friends: parsed here because the
+                // score-expression parser below reads `LENGTH` as a column name
+                // and stops at the `(`.
+                match self.peek().clone() {
+                    Tok::Ident(name) if matches!(self.tokens.get(self.pos + 1), Some(Tok::LParen)) => {
+                        self.advance();
+                        match self.parse_scalar_func_call(&name)? {
+                            Some(sentinel) => Some(sentinel),
+                            // Not a function we can sort by. Put the identifier
+                            // back so the normal path reports it.
+                            None => { self.pos -= 1; None }
+                        }
+                    }
+                    _ => None,
+                }
+            } {
+                let ascending = self.parse_sort_dir();
+                order_by = Some(OrderKey::Fields(vec![(sentinel, ascending)]));
             } else {
                 // Arithmetic score expression (handles plain fields, BM25, VECTOR_SIM,
                 // and any combination with +, -, *, /, parentheses).
@@ -1881,6 +1935,19 @@ impl Parser {
                     }
                     // Everything else — arithmetic score expression.
                     other => {
+                        // A secondary key after a scoring expression has nowhere to
+                        // go: `OrderKey::Expr` holds one expression and one
+                        // direction. It used to be dropped in silence *along with
+                        // everything after it* — `ORDER BY BM25(...) DESC, _key ASC
+                        // LIMIT 3` lost the tie-break and the `LIMIT`, so the query
+                        // returned every row instead of three.
+                        if matches!(self.peek(), Tok::Comma) {
+                            return Err(SqlError::UnexpectedToken {
+                                expected: "end of ORDER BY",
+                                got: "a second sort key after a scoring expression — \
+                                      not supported; sort by the score alone".into(),
+                            });
+                        }
                         order_by = Some(OrderKey::Expr(other, ascending));
                     }
                 }
@@ -6386,6 +6453,22 @@ fn lower_tokens(tokens: Vec<Tok>, params: Vec<Value>) -> Result<MatchOrAgg, SqlE
                 .into(),
         });
     }
+    // Nothing may be left over. Without this the parser stopped at whatever it
+    // understood and dropped the rest in silence, so a clause it does not
+    // implement read as if it had been applied: `ORDER BY n ASC NULLS LAST`
+    // returned the plain `ASC` order, and `WHERE a > 1 GARBAGE HERE` ran. Both
+    // answered a different question from the one that was asked, with nothing to
+    // say so.
+    //
+    // Reporting the leftover token is the whole value of the check — "end of
+    // query" alone would leave the author guessing which part was not understood.
+    if !matches!(parser.peek(), Tok::Eof) {
+        return Err(SqlError::UnexpectedToken {
+            expected: "end of query",
+            got: format!("{:?} — this part of the statement was not understood, and \
+                          ignoring it would answer a different question", parser.peek()),
+        });
+    }
     Ok(MatchOrAgg::Steps(compile(stmt)))
 }
 
@@ -6609,6 +6692,28 @@ fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutatio
 
     let tokens = tokenize(sql)?;
     let mut parser = Parser::with_params(tokens, params);
+    let parsed = parse_mutation_body(&mut parser)?;
+    // Nothing may be left over — and on a mutation this is not a nicety.
+    //
+    // `DELETE FROM p GARBAGE WHERE n = 1` parsed as `DELETE FROM p`, found an
+    // identifier where it looked for `WHERE`, concluded there was no `WHERE`, and
+    // deleted **every row in the table**. The rest of the statement was dropped in
+    // silence. A typo between the table name and the predicate was the difference
+    // between removing one row and emptying the collection, with no error and
+    // nothing in the result to say which had happened.
+    if !matches!(parser.peek(), Tok::Eof) {
+        return Err(SqlError::UnexpectedToken {
+            expected: "end of statement",
+            got: format!("{:?} — this part of the statement was not understood, and \
+                          ignoring it would run a different statement", parser.peek()),
+        });
+    }
+    Ok(parsed)
+}
+
+/// The statement dispatch itself. Split out so [`parse_mutation_inner`] can check
+/// that the whole statement was consumed before acting on it.
+fn parse_mutation_body(parser: &mut Parser) -> Result<CompiledMutation, SqlError> {
     match parser.peek().clone() {
         Tok::Kw(Kw::Insert) => {
             parser.advance(); // consume INSERT

@@ -832,9 +832,27 @@ impl EngineBuilder {
         let mut db = if self.read_only {
             CoreDB::open_read_only(&self.path).map_err(|e| e.to_string())?
         } else if want_paged {
+            // Paged topology and nothing else, unless the caller named a config.
+            //
+            // `snapshot_reads` is a promise that reads do not wait behind writes,
+            // and the only layout that can keep it is one whose durable half is
+            // immutable — compaction writes a new generation and swaps it in, so a
+            // snapshot holding the old one keeps reading. Paged nodes and paged
+            // adjacency are written *in place*: a snapshot sharing them would see
+            // a writer's later edits appear underneath it, so `snapshot_db`
+            // declines and reads fall back to taking the lock.
+            //
+            // Taking `Config::default()` here would therefore have made every new
+            // service database quietly give up the feature it was opened for. The
+            // embedded default trades snapshots for a compaction that no longer
+            // rebuilds; a service makes the opposite trade, and says so.
+            //
+            // `.config()` overrides this — including with the full paged layout,
+            // for a service that would rather have the cheap compaction. And an
+            // existing store is opened in the layout it was written in regardless.
             CoreDB::open_with_config(&self.path, Config {
                 paged_topology: true,
-                ..self.config.clone().unwrap_or_default()
+                ..self.config.clone().unwrap_or_else(Config::resident)
             }).map_err(|e| e.to_string())?
         } else {
             match &self.config {
@@ -915,7 +933,11 @@ mod snapshot_read_tests {
         let dir = tempfile::tempdir().unwrap();
         // Pre-create + compact so the paged open has an immutable base.
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            // Built in the layout a service uses. `CoreDB::open` gives the paged
+            // layout now, whose files are written in place and therefore cannot be
+            // snapshotted — and the engine opens a store in the layout it finds,
+            // so building it that way here would be testing the fallback.
+            let mut db = CoreDB::open_with_config(dir.path(), crate::Config::resident()).unwrap();
             db.put(
                 "venues/v1",
                 &json!({"_collection":"venues","_key":"v1","n":1}).to_string(),
@@ -1038,9 +1060,10 @@ mod snapshot_read_tests {
     #[test]
     fn open_as_service_gives_lock_free_reads() {
         let dir = tempfile::tempdir().unwrap();
-        // Pre-create + compact so the paged open has an immutable base.
+        // Pre-create + compact so the paged open has an immutable base. Resident,
+        // for the reason given in `engine_snapshot_reads_served_and_refreshed`.
         {
-            let mut db = CoreDB::open(dir.path()).unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), crate::Config::resident()).unwrap();
             db.put("venues/v1", &json!({"_collection":"venues","_key":"v1","n":1}).to_string())
                 .unwrap();
             db.compact().unwrap();

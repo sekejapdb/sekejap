@@ -11,7 +11,7 @@ use sekejap::{Config, CoreDB};
 use serde_json::json;
 
 fn paged() -> Config {
-    Config { paged_payloads: true, ..Default::default() }
+    Config { paged_payloads: true, ..Config::resident() }
 }
 
 /// One field of a stored record, so comparisons ignore the wall-clock timestamps
@@ -75,7 +75,7 @@ fn a_paged_database_answers_the_same_as_a_flat_one() {
 
     let d1 = tempfile::TempDir::new().unwrap();
     let d2 = tempfile::TempDir::new().unwrap();
-    let flat = work(d1.path(), Config::default());
+    let flat = work(d1.path(), Config::resident());
     let pagd = work(d2.path(), paged());
 
     for (i, (f, p)) in flat.iter().zip(&pagd).enumerate() {

@@ -4,11 +4,17 @@
 //! the two things that must hold before a second segment can exist: the table is
 //! actually written and consulted, and a store that predates it still reads.
 
-use sekejap::CoreDB;
+use sekejap::{Config, CoreDB};
 use serde_json::json;
 
 fn build(dir: &std::path::Path, n: usize) {
-    let mut db = CoreDB::open(dir).unwrap();
+    // Resident. `slots.bin` maps a node to a **byte offset** in `payloads.bin`,
+    // which is a fact about the append-only payload layout: paged payloads
+    // address records by id and have no offsets to tabulate. Building this in the
+    // default layout would be asking whether a file exists that is not supposed
+    // to. `open_paged` below is `paged_topology` alone, which is the mode the
+    // table is read in.
+    let mut db = CoreDB::open_with_config(dir, Config::resident()).unwrap();
     db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
     for i in 0..n {
         db.put(&format!("p/n{i}"),

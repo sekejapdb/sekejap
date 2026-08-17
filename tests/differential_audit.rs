@@ -53,7 +53,7 @@ fn seed_other(db: &mut CoreDB, range: std::ops::Range<usize>) {
     }
 }
 
-fn build(dir: &std::path::Path) { build_with(dir, Config::default()) }
+fn build(dir: &std::path::Path) { build_with(dir, Config::resident()) }
 
 fn build_with(dir: &std::path::Path, cfg: Config) {
     let mut db = CoreDB::open_with_config(dir, cfg).unwrap();
@@ -219,36 +219,24 @@ fn ground_truth(db: &CoreDB, mode: &str) {
 /// or it is silently returning a different graph.
 fn modes() -> Vec<(&'static str, Config)> {
     vec![
-        ("resident", Config::default()),
-        ("paged", Config { paged_topology: true, ..Config::default() }),
+        ("resident", Config::resident()),
+        ("paged", Config { paged_topology: true, ..Config::resident() }),
         ("paged+adj", Config {
-            paged_topology: true, paged_adjacency: true, ..Config::default()
+            paged_topology: true, paged_adjacency: true, ..Config::resident()
         }),
         ("paged+all", Config {
             paged_topology: true, paged_adjacency: true, paged_nodes: true,
-            paged_payloads: true, ..Config::default()
+            paged_payloads: true, ..Config::resident()
         }),
     ]
 }
 
-fn run(name: &str, mutate: fn(&mut CoreDB)) {
-    let mut built: Vec<(&str, tempfile::TempDir, CoreDB)> = Vec::new();
-    for (label, cfg) in modes() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // Built in the mode it will be read in. A database whose payloads were
-        // written flat cannot be reopened with paged payloads — the two are not the
-        // same file, and the reopen is refused rather than reinterpreting one as
-        // the other.
-        build_with(dir.path(), cfg.clone());
-        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
-        mutate(&mut db);
-        ground_truth(&db, label);
-        built.push((label, dir, db));
-    }
-
-    // Every mode is compared against the first, which is the plain in-RAM engine —
-    // the one with no base, no overlay and nothing to merge, so a disagreement
-    // names the mode that is wrong rather than leaving two suspects.
+/// Compare every mode against the resident one, probe by probe.
+///
+/// The first mode is the plain in-RAM engine — no base, no overlay, nothing to
+/// merge — so a disagreement names the mode that is wrong rather than leaving two
+/// suspects.
+fn compare(name: &str, phase: &str, built: &mut [(&str, Config, CoreDB)]) {
     let mut bad = Vec::new();
     for (label, f) in &probes() {
         let reference = f(&mut built[0].2);
@@ -261,8 +249,54 @@ fn run(name: &str, mutate: fn(&mut CoreDB)) {
         }
     }
     assert!(bad.is_empty(),
-            "[{name}] storage modes disagree — this is a base/overlay bug:\n{}",
+            "[{name}] storage modes disagree {phase} — this is a base/overlay bug:\n{}",
             bad.join("\n"));
+}
+
+fn run(name: &str, mutate: fn(&mut CoreDB)) {
+    let dirs: Vec<tempfile::TempDir> =
+        modes().iter().map(|_| tempfile::TempDir::new().unwrap()).collect();
+    let mut built: Vec<(&str, Config, CoreDB)> = Vec::new();
+    for ((label, cfg), dir) in modes().into_iter().zip(&dirs) {
+        // Built in the mode it will be read in. A database whose payloads were
+        // written flat cannot be reopened with paged payloads — the two are not the
+        // same file, and the reopen is refused rather than reinterpreting one as
+        // the other.
+        build_with(dir.path(), cfg.clone());
+        let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+        mutate(&mut db);
+        ground_truth(&db, label);
+        built.push((label, cfg, db));
+    }
+
+    compare(name, "in memory", &mut built);
+
+    // ── and again after a restart ────────────────────────────────────────────
+    //
+    // Everything above runs in one process against a database that has been open
+    // the whole time, so it compares what the modes *believe*. A storage layout is
+    // also a claim about what survives being closed, and that claim was never
+    // checked here: the whole audit had no reopen in it.
+    //
+    // This is the axis a change of default storage layout breaks. A sidecar index
+    // that is rebuilt on open instead of loaded, an overlay folded into the wrong
+    // place, a file whose name was never made durable — none of it shows until the
+    // database is opened again, and then it shows as *fewer rows*, silently.
+    let reopened: Vec<(&str, Config, CoreDB)> = built
+        .into_iter()
+        .zip(&dirs)
+        .map(|((label, cfg, db), dir)| {
+            drop(db); // release the lock and flush before reopening
+            let db = CoreDB::open_with_config(dir.path(), cfg.clone())
+                .unwrap_or_else(|e| panic!("[{name}] {label} would not reopen: {e}"));
+            (label, cfg, db)
+        })
+        .collect();
+    let mut reopened = reopened;
+    for (label, _, db) in &reopened {
+        ground_truth(db, label);
+    }
+    compare(name, "after a restart", &mut reopened);
 }
 
 #[test]

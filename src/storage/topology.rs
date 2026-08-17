@@ -568,10 +568,33 @@ pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob {
     b
 }
 
+/// The longest name this table can describe: collection names and edge-type
+/// names are stored with a two-byte length.
+pub(crate) const MAX_NAME_BYTES: usize = u16::MAX as usize;
+
+/// Write the dictionary of collection and edge-type names.
+///
+/// A name longer than [`MAX_NAME_BYTES`] is **truncated to that length** rather
+/// than written with a wrapped length word. The old code emitted every byte and
+/// recorded `len as u16`, so on read the slice advanced by the wrapped number —
+/// mangling that name and desynchronising every entry after it, which is the
+/// whole dictionary. Losing the tail of one absurdly long name is a small,
+/// contained wrong answer; losing the alignment of the table is not.
+///
+/// Reaching this is not something an application does by accident: it needs a
+/// collection or edge-type name of 64 KB. `CoreDB::put` refuses one before it
+/// ever gets here, and this stays as the backstop for a store written by
+/// something that did not.
 fn write_string_table(out: &mut Vec<u8>, list: &[String]) {
     out.extend_from_slice(&(list.len() as u32).to_le_bytes());
     for s in list {
-        let bytes = s.as_bytes();
+        let mut bytes = s.as_bytes();
+        if bytes.len() > MAX_NAME_BYTES {
+            // On a character boundary, so the result is still valid UTF-8.
+            let mut cut = MAX_NAME_BYTES;
+            while cut > 0 && !s.is_char_boundary(cut) { cut -= 1 }
+            bytes = &bytes[..cut];
+        }
         out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
         out.extend_from_slice(bytes);
     }
