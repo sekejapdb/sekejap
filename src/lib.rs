@@ -896,8 +896,26 @@ impl PayloadStore {
         } })
     }
 
+    /// Whether the record bytes are on disk rather than in this process's memory.
+    ///
+    /// **Paged counts.** It was written when `Disk` was the only durable variant,
+    /// and paged payloads were added beside it without revisiting the question —
+    /// so a paged store answered "not on disk" about a file it had just written.
+    ///
+    /// What that decided was the shape of `snapshot.json`. A durable store gets a
+    /// *manifest* snapshot: the nodes and edges live in the files, and the
+    /// snapshot carries only schemas and index metadata. A store that answers
+    /// "not on disk" gets every node embedded in the JSON **with its whole
+    /// payload**, because for an in-memory database that is the only durable copy.
+    ///
+    /// So the default layout wrote its entire dataset twice — once into the paged
+    /// files, once into `snapshot.json` — and the JSON copy was the bigger of the
+    /// two: 39.8 MB against 36.4 MB of payloads at 200 000 rows, growing linearly.
+    /// Every open then parsed all of it, which is 81% of the time an open took and
+    /// the reason opening cost 8.5x more for 10x the rows. Both laws, on the path
+    /// every process takes.
     fn is_disk(&self) -> bool {
-        matches!(self.inner, PayloadInner::Disk { .. })
+        matches!(self.inner, PayloadInner::Disk { .. } | PayloadInner::Paged { .. })
     }
 
     /// Whether `(offset, len)` pairs are byte positions in one flat region.

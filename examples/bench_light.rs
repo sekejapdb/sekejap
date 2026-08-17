@@ -74,9 +74,13 @@ fn open(dir: &std::path::Path, paged: bool) -> CoreDB {
     }).unwrap()
 }
 
-/// Where a row is measured only in one mode, that mode is the paged one — the
-/// direction under construction, not the one being left behind.
-const DEFAULT_PAGED: bool = false;
+/// Where a row is measured in one mode only, that mode is the one that ships.
+///
+/// This was `false` while paged was opt-in, and stayed `false` after it became
+/// the default — so every headline row was measuring the layout almost nobody
+/// gets. A benchmark whose job is to name Law 2 violations has to measure what
+/// is actually running.
+const DEFAULT_PAGED: bool = true;
 
 fn main() {
     const SMALL: usize = 20_000;
@@ -88,7 +92,17 @@ fn main() {
         let l = f(LARGE);
         // "Scales" = grew by more than 3x for a 10x bigger database. A change-
         // proportional operation should be flat; some growth is noise and cache.
-        let scales = l > s * 3.0 && l > 1.0;
+        //
+        // The floor is in the row's own unit, which is the bug this replaces: the
+        // old one compared against a bare `1.0` while rows are printed in either
+        // microseconds or milliseconds, so a sub-millisecond operation could grow
+        // 3.69x and be called flat while the identical slope in microseconds would
+        // not be. `insert (no index)` did exactly that. A floor is still wanted —
+        // at a fraction of a microsecond the measurement is cache and noise — so it
+        // is stated once, in microseconds, and converted.
+        const FLOOR_US: f64 = 5.0;
+        let floor = if unit == "ms" { FLOOR_US / 1000.0 } else { FLOOR_US };
+        let scales = l > s * 3.0 && l > floor;
         out.push(Row {
             label: label.to_string(),
             small: format!("{s:.2}{unit}"),
@@ -140,7 +154,7 @@ fn main() {
     }, "us");
 
     for adj in [false, true] {
-        let label = if adj { "1-hop traversal (paged)" } else { "1-hop traversal" };
+        let label = if adj { "1-hop traversal" } else { "1-hop traversal (resident)" };
         measure(label, &|n| {
             let dir = tempfile::TempDir::new().unwrap();
             build(dir.path(), n, false, adj);
@@ -164,7 +178,8 @@ fn main() {
 
     // ── the operation the contract exists because of ─────────────────────────
     for adj in [false, true] {
-        let label = if adj { "compact after 200 writes (paged)" } else { "compact after 200 writes" };
+        let label = if adj { "compact after 200 writes" }
+                    else { "compact after 200 writes (resident)" };
         measure(label, &|n| {
             let dir = tempfile::TempDir::new().unwrap();
             build(dir.path(), n, false, adj);
