@@ -97,6 +97,50 @@ This is separate from the existing write buffer (`EngineBuilder::buffer_size`),
 which is still opt-in and still trades durability for speed: buffered statements
 are not applied or logged until `flush()`.
 
+### Fixed — a read-only database accepted writes and threw them away
+
+`open_read_only` documented that "write operations will silently skip WAL
+persistence". What happened was worse: `put` returned `Ok`, `DELETE` returned the
+number of rows it claimed to have removed, reads in the same session answered
+from the changed overlay — so the handle disagreed with the file it was reading —
+and everything vanished at close with nothing raised.
+
+Writes are refused now. `PermissionDenied` from the `io::Result` methods, an
+error from statements, and the three that return nothing (`remove`, `link`,
+`unlink`) do nothing and record the refusal, readable through
+`CoreDB::write_error()`. `CoreDB::is_read_only()` lets a caller ask.
+
+`EngineBuilder::read_only` had always documented the opposite — writes return an
+error — for the same idea. Both behave that way now.
+
+### Fixed — the compaction trigger that bounds memory never fired
+
+Auto-compaction has two triggers: log size, and the number of rows held in the
+RAM write-overlay. The second is what `CompactThresholds::overlay_entries` is
+for, and it never fired in any layout — 5 500 rows against a 1 000-row bound left
+`maybe_compact()` returning false. Memory grew until the 64 MB log bound fired
+instead, well past the ceiling the setting promises.
+
+Underneath it, the first compaction in a fresh process wrote its topology files
+and did not adopt them, so the overlay stayed resident and nothing changed until
+the database was reopened. That is the service case exactly — a long-running
+service that creates its own database never restarts.
+
+### Fixed — closing an engine threw away what it had accepted
+
+`Engine::into_inner()` consumes the engine and returned the inner database
+*without flushing the write buffer*, so anything buffered was lost with no later
+opportunity to flush it. It flushes now and returns `Result<CoreDB, String>`
+rather than `CoreDB`.
+
+**`Engine` still has no `Drop`**, so a buffered engine that simply goes out of
+scope loses what it holds. Close one with `flush()` or `into_inner()`.
+
+`put_many` and `link_many` also reset the deferred-sync flag instead of restoring
+it, so calling either inside a larger batch ended the outer group early and every
+later write fsynced individually. Slower, not wrong — but not what the caller
+asked for.
+
 ### Fixed — the default layout wrote the whole dataset twice
 
 `snapshot.json` was 39.8 MB for a 200 000-row database — larger than the 36.4 MB
