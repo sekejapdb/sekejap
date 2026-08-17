@@ -271,3 +271,53 @@ fn the_full_paged_layout_serves_graph_queries_as_a_service() {
         .expect("a graph query failed behind the service API");
     assert_eq!(hops.len(), 1, "the paged adjacency was invisible to the service");
 }
+
+/// **`snapshot.json` is metadata, not data.**
+///
+/// It records schemas and index parameters. The rows live in the files written
+/// beside it — that is what a v3 *manifest* snapshot means, and it is the reason
+/// opening a database does not cost more as the database grows.
+///
+/// The default layout broke this without anyone noticing, because the switch is
+/// `PayloadStore::is_disk()` and a paged store answered "not on disk" about files
+/// it had just written. It therefore took the branch meant for in-memory
+/// databases, where the JSON *is* the only durable copy, and embedded every node
+/// with its whole payload: 39.8 MB for 200 000 rows, larger than the payload file
+/// it duplicated, and 81% of the time an open took.
+///
+/// So the property is asserted directly rather than inferred from a timing: the
+/// snapshot must not grow with the row count. Ten times the rows, the same
+/// handful of bytes.
+#[test]
+fn the_snapshot_does_not_grow_with_the_store() {
+    let size_at = |rows: usize| -> u64 {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut db = CoreDB::open(dir.path()).unwrap();
+            db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+            for i in 0..rows {
+                db.put(&format!("p/n{i}"), &json!({
+                    "_collection": "p", "_key": format!("n{i}"), "n": i as i64,
+                    "body": format!("record {i} on the lazy riverbank"),
+                }).to_string()).unwrap();
+            }
+            db.compact().unwrap();
+        }
+        let bytes = std::fs::metadata(dir.path().join("snapshot.json"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        // The rows must still be there — a snapshot can always be made small by
+        // losing them, and that is the failure this guards against becoming.
+        let db = CoreDB::open(dir.path()).unwrap();
+        assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), rows,
+                   "the store lost rows");
+        bytes
+    };
+
+    let small = size_at(200);
+    let large = size_at(2_000);
+    assert!(large < small + 4096,
+            "snapshot.json grew from {small} to {large} bytes for 10x the rows — it is \
+             carrying row data again, which makes every open cost more as the database \
+             grows");
+}

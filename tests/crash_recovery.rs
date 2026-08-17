@@ -380,3 +380,113 @@ fn concurrent_writers_all_land() {
         }
     }
 }
+
+/// **Killed in the middle of a compaction, the store still holds every row.**
+///
+/// Process death, not power loss — see "What this does not prove" below.
+///
+/// Compaction rewrites the whole durable half and publishes it by renaming files
+/// into place. Whether that moment is atomic is not something the other tests
+/// here can ask: they crash the process between writes, and `compact()` is
+/// synchronous — a panic inside it still unwinds and still runs destructors,
+/// which a power cut does not.
+///
+/// So this spawns a real process, lets it get into a compaction, and sends it
+/// SIGKILL at a different point each round. What must hold afterwards is simple
+/// and absolute: the rows committed before it started are all still there. A
+/// compaction adds nothing and removes nothing; if a reopen finds fewer, the
+/// publication was not atomic and the crash landed inside it.
+///
+/// # What this does not prove
+///
+/// It does **not** verify the directory fsync, and it is worth being exact about
+/// why. `SIGKILL` destroys a process; it does not touch the page cache. Every
+/// write and every rename the victim made is still visible to the next opener
+/// whether or not it ever reached the platter. Only a power cut or a kernel crash
+/// loses that, and neither is reachable from a test.
+///
+/// Confirmed by removing the `fsync_dir` calls and re-running this: it still
+/// passes. So the fsync's value is argued from the write ordering — a rename is a
+/// change to the directory, and an unsynced directory entry can be rolled back by
+/// recovery — and not from this test.
+///
+/// What it does prove is the other half, and the half a test can reach: no
+/// half-applied in-memory state, no reliance on destructors or a final flush, and
+/// no logical torn state between the base files, the snapshot and the log at any
+/// point in the sequence.
+#[cfg(unix)]
+#[test]
+fn a_compaction_killed_part_way_through_loses_nothing() {
+    const ROWS: usize = 1_500;
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        for i in 0..ROWS {
+            db.put(&format!("p/n{i}"),
+                   &format!(r#"{{"_collection":"p","_key":"n{i}","n":{i}}}"#)).unwrap();
+        }
+        db.compact().unwrap();
+    }
+
+    // The example binary sits beside this test's own directory:
+    // `target/<profile>/examples/compact_victim`. `CARGO_BIN_EXE_` covers `[[bin]]`
+    // targets only, and this is deliberately an example — it exists to be killed,
+    // not to be shipped.
+    let victim = std::env::current_exe()
+        .ok()
+        .and_then(|p| Some(p.parent()?.parent()?.join("examples").join("compact_victim")))
+        .filter(|p| p.exists());
+    let Some(victim) = victim else {
+        eprintln!("compact_victim was not built; skipping the mid-compaction crash test");
+        return;
+    };
+    // A spread of delays, so the kill lands at a different phase each time —
+    // mid-write, between renames, during the log rotation.
+    // How many rounds actually killed a process that was still running. A test
+    // that passes because the victim had already exited every time is not testing
+    // anything, and would look identical from the outside.
+    let mut killed_live = 0;
+    for (round, delay_ms) in [40u64, 90, 150, 220, 300, 420, 600].into_iter().enumerate() {
+        let mut child = match std::process::Command::new(&victim)
+            .arg(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => { eprintln!("could not spawn the victim ({e}); skipping"); return }
+        };
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        // SIGKILL, not SIGTERM: no unwinding, no destructors, no final flush.
+        // `try_wait` first, so a victim that had already exited on its own is not
+        // counted as a crash that was survived.
+        let still_running = matches!(child.try_wait(), Ok(None));
+        let _ = child.kill();
+        let _ = child.wait();
+        if still_running { killed_live += 1 }
+
+        let db = CoreDB::open(dir.path()).unwrap_or_else(|e| {
+            panic!("round {round} (killed after {delay_ms}ms): the store would not \
+                    reopen after a compaction was interrupted: {e}")
+        });
+        let live: std::collections::HashSet<String> = db
+            .query("SELECT _key FROM p")
+            .unwrap_or_else(|e| panic!("round {round}: the store would not answer: {e:?}"))
+            .collect()
+            .iter()
+            .map(|h| h.slug.clone())
+            .collect();
+        for i in 0..ROWS {
+            let slug = format!("p/n{i}");
+            assert!(live.contains(&slug),
+                    "round {round} (killed after {delay_ms}ms): {slug} was committed \
+                     before the compaction started and is not there afterwards — the \
+                     rewrite was published without being atomic");
+        }
+    }
+    assert!(killed_live >= 3,
+            "only {killed_live} of 7 rounds killed a process that was still running — \
+             the victim is exiting before the kill lands, so this test is not \
+             interrupting a compaction and is proving nothing");
+}

@@ -97,6 +97,32 @@ This is separate from the existing write buffer (`EngineBuilder::buffer_size`),
 which is still opt-in and still trades durability for speed: buffered statements
 are not applied or logged until `flush()`.
 
+### Fixed — the default layout wrote the whole dataset twice
+
+`snapshot.json` was 39.8 MB for a 200 000-row database — larger than the 36.4 MB
+of payloads it duplicated — and it grew in step with the store. Opening that
+database took 280 ms, and 81% of that was parsing the JSON.
+
+The snapshot is supposed to be a *manifest*: schemas and index metadata, with the
+rows in the files written beside it. Which shape gets written is decided by
+whether the payload store is on disk, and a paged store answered that question
+with "no" about files it had just written — so it took the branch meant for
+in-memory databases, where the JSON is the only durable copy, and embedded every
+row in it.
+
+| | before | after |
+| --- | --- | --- |
+| `snapshot.json` at 200k rows | 39.8 MB | 1 032 bytes, constant |
+| open at 200k rows | 280.8 ms | 5.8 ms |
+| open, 20k → 200k | 8.55x | 1.03x |
+
+**Existing databases fix themselves.** The oversized snapshot is replaced by a
+manifest at the next `compact()`, and until then it is read exactly as before.
+No migration, no action needed.
+
+`tests/paged_payloads.rs` now asserts the snapshot does not grow with the row
+count, so this cannot come back quietly.
+
 ### Changed — paged storage is the default
 
 A new database is now written in the paged layout: payloads, nodes and adjacency
