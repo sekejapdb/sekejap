@@ -487,14 +487,14 @@ impl PagedAdjacency {
     /// unreadable base reads as absent rather than propagating an error into every
     /// graph query, which is the contract the mapped base already has.
     fn edges(&self, hash: u64, forward: bool) -> Option<Vec<storage::topology::MappedEdge>> {
-        let list = self.dir(forward).edges(hash).ok().flatten()?;
-        Some(list.into_iter()
-            .map(|e| storage::topology::MappedEdge {
-                other_hash: e.other,
-                edge_type_hash: e.edge_type,
-                meta_ref: e.meta_ref,
+        // `edges_as`, not `edges`: decoded straight into the type the graph
+        // surface reads, so the lookup allocates once instead of four times.
+        self.dir(forward)
+            .edges_as(hash, |other_hash, edge_type_hash, meta_ref| {
+                storage::topology::MappedEdge { other_hash, edge_type_hash, meta_ref }
             })
-            .collect())
+            .ok()
+            .flatten()
     }
 
     /// The stored bytes of one edge's attributes.
@@ -1047,6 +1047,24 @@ impl PayloadStore {
 
     /// Read a whole record known to belong to `owner`.
     fn get_of(&self, owner: u64, offset: u64, len: u32) -> Option<Value> {
+        // The paged case decodes against the mapped page rather than taking a
+        // copy of it. `stored_record_of` allocates twice — a page, then the
+        // record cut out of it — and both copies exist only to be parsed and
+        // dropped. This is the hottest read in the database; it should not
+        // allocate to answer.
+        if let PayloadInner::Paged { store } = &self.inner {
+            return store.with_record(storage::recordstore::RecordId(offset), |raw| {
+                if raw.len() < OWNER_TAG { return None }
+                let tag = u32::from_le_bytes(raw[..OWNER_TAG].try_into().ok()?);
+                if owner != OWNER_UNKNOWN && tag != owner_tag(owner) { return None }
+                let stored = &raw[OWNER_TAG..];
+                if storage::skbin::is_skbin(stored) {
+                    return storage::skbin::decode(stored, &self.field_table);
+                }
+                decode_payload_record(stored.to_vec())
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+            }).ok().flatten().flatten();
+        }
         let stored = self.stored_record_of(owner, offset, len)?;
         if storage::skbin::is_skbin(&stored) {
             return storage::skbin::decode(&stored, &self.field_table);

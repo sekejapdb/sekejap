@@ -98,6 +98,23 @@ impl PagedStore {
         }
     }
 
+    /// A key's record bytes without copying them — see
+    /// [`RecordStore::with_record`](super::recordstore::RecordStore::with_record).
+    ///
+    /// Use this over `get` wherever the value is decoded on the spot rather than
+    /// kept: `get` allocates a whole page and copies it to deliver a record that
+    /// is usually a few dozen bytes.
+    pub(crate) fn with_value<R>(
+        &self,
+        key: u128,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> io::Result<Option<R>> {
+        match self.index.get(key)? {
+            Some(id) => self.records.with_record(RecordId(id), f),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn delete(&mut self, key: u128) -> io::Result<bool> {
         let Some(id) = self.index.get(key)? else { return Ok(false) };
         self.index.remove(key)?;
@@ -122,6 +139,20 @@ impl PagedStore {
     /// `get` would descend the tree again for a key the walk just handed over.
     pub(crate) fn read_at(&self, id: u64) -> io::Result<Option<Vec<u8>>> {
         self.records.read(RecordId(id))
+    }
+
+    /// The same, without copying the page — see
+    /// [`RecordStore::with_record`](super::recordstore::RecordStore::with_record).
+    ///
+    /// This is the one that matters for a scan: `read_at` allocates and copies a
+    /// page *per record*, so walking a 200 000-node store moved most of a gigabyte
+    /// through memory to read a few megabytes of records.
+    pub(crate) fn with_value_at<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> io::Result<Option<R>> {
+        self.records.with_record(RecordId(id), f)
     }
 
     pub(crate) fn sync(&mut self) -> io::Result<()> {

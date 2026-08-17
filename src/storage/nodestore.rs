@@ -235,7 +235,9 @@ impl NodeStore {
     /// was damaged anyway; returning it would be answering a question with another
     /// row's data.
     pub(crate) fn get(&self, hash: u64) -> io::Result<Option<StoredNode>> {
-        let Some(node) = self.store.get(hash as u128)?.and_then(|b| decode(&b)) else {
+        // `with_value`, not `get`: decoding happens against the mapped page, so
+        // the read no longer allocates and copies 4 KB to deliver one record.
+        let Some(node) = self.store.with_value(hash as u128, decode)?.flatten() else {
             return Ok(None);
         };
         if crate::sk_hash(&node.slug) != hash {
@@ -246,7 +248,13 @@ impl NodeStore {
 
     /// Whether the store holds this node, without reading its record.
     pub(crate) fn contains(&self, hash: u64) -> io::Result<bool> {
-        Ok(self.store.get(hash as u128)?.is_some())
+        // Deliberately not the index-only `PagedStore::contains`. That would
+        // answer "the index has this key", and this answers "the record is
+        // there and readable" — the same question `get` answers. A node whose
+        // record cannot be read reporting as present while `get` returns nothing
+        // is a disagreement no caller could diagnose. What the borrow buys is the
+        // page copy, not the record read.
+        Ok(self.store.with_value(hash as u128, |_| ())?.is_some())
     }
 
     /// Store a node, replacing any previous version.
@@ -352,11 +360,8 @@ impl NodeStore {
     {
         self.store.for_each_key(|key, id| {
             let hash = key as u64;
-            match self.store.read_at(id) {
-                Ok(Some(bytes)) => match decode(&bytes) {
-                    Some(n) if crate::sk_hash(&n.slug) == hash => f(hash, n),
-                    _ => true,
-                },
+            match self.store.with_value_at(id, decode) {
+                Ok(Some(Some(n))) if crate::sk_hash(&n.slug) == hash => f(hash, n),
                 _ => true,
             }
         })

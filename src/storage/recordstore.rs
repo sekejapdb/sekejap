@@ -357,8 +357,54 @@ impl RecordStore {
         Ok(RecordId::new(page, n as u16))
     }
 
+    /// A record's bytes without copying them, when the page is in the mapping.
+    ///
+    /// # Why this exists
+    ///
+    /// [`read`](Self::read) hands back an owned `Vec`, and to build it, it
+    /// allocates a whole page and copies the whole page out of the mapping — 4 096
+    /// zeroed bytes and a 4 096-byte `memcpy` to deliver a 36-byte edge list. On a
+    /// one-hop traversal that is the entire cost of the operation, and it is why
+    /// paged adjacency read at roughly a third of the speed of the mmap'd CSR it
+    /// replaced. The CSR did not copy anything: it returned a slice of the map.
+    ///
+    /// So does this. The page is already in memory — the mapping *is* the page
+    /// cache — and a record inside it is a subslice. The closure form is what
+    /// makes the borrow expressible: the slice lives as long as the map, not as
+    /// long as a returned value, and callers decode inside it rather than taking
+    /// the bytes away.
+    ///
+    /// Falls back to `read` when the page is not mapped (allocated since the last
+    /// remap) or the record overflows its page, so the answer is the same either
+    /// way and only the copy differs.
+    pub(crate) fn with_record<R>(
+        &self,
+        id: RecordId,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> io::Result<Option<R>> {
+        if id.slot() != OVERFLOW_SLOT {
+            if let Some(page) = self.pages.page_slice(id.page()) {
+                let i = id.slot() as usize;
+                if i >= slot_count(page) {
+                    return Ok(None);
+                }
+                let Some((off, len)) = slot_entry(page, i) else {
+                    return Ok(None); // dead slot
+                };
+                if off + len > page.len() {
+                    return Ok(None); // does not describe real bytes
+                }
+                return Ok(Some(f(&page[off..off + len])));
+            }
+        }
+        Ok(self.read(id)?.map(|bytes| f(&bytes)))
+    }
+
     /// Reads take `&self` so they can serve an immutable caller, and allocate a
     /// page-sized buffer rather than sharing the scratch one used by writes.
+    ///
+    /// Prefer [`with_record`](Self::with_record) where the bytes are only decoded
+    /// and not kept: it skips the page-sized allocation and the copy.
     pub(crate) fn read(&self, id: RecordId) -> io::Result<Option<Vec<u8>>> {
         if id.slot() == OVERFLOW_SLOT {
             return self.read_overflow(id.page());
