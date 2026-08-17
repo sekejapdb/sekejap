@@ -1504,6 +1504,24 @@ pub struct CoreDB {
     /// `compact()` folds the overlay into it owner by owner instead of rebuilding
     /// the graph, so the cost follows the change rather than the store.
     paged_adj: Option<PagedAdjacency>,
+    /// Opened read-only: every mutation is refused rather than accepted and
+    /// dropped.
+    ///
+    /// The flag lived on `Config` and stopped there. It decided whether to take
+    /// the directory lock and whether to open a log writer, and nothing
+    /// downstream ever learned about it — so a write to a read-only handle went
+    /// through the ordinary path, changed the in-memory maps, found no log to
+    /// append to, and returned `Ok`.
+    ///
+    /// The documented behaviour was "writes silently skip WAL persistence", which
+    /// undersells it. `put` reported success. `DELETE` reported the number of rows
+    /// it had removed. Reads in that session then answered from the mutated
+    /// overlay, so the handle disagreed with the file it was supposedly reading,
+    /// and everything vanished at close with nothing raised at any point.
+    ///
+    /// `EngineBuilder::read_only` documented the opposite — that writes return an
+    /// error — for the same idea. That is now the behaviour of both.
+    read_only: bool,
     /// The first disk failure that could not be reported to whoever caused it.
     ///
     /// [`wal_write`](CoreDB::wal_write) returns nothing — it is called from the
@@ -2033,6 +2051,7 @@ impl CoreDB {
             slug_map: HashMap::new(),
             // An in-memory database has no directory to put pages in.
             paged_adj: None,
+            read_only: false,
             write_error: None,
             paged_nodes: None,
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
@@ -2118,10 +2137,21 @@ impl CoreDB {
         Self::open_with_config(dir, Config { paged_topology: true, ..Config::resident() })
     }
 
-    /// Open a database in read-only mode (no lock, no WAL writer).
+    /// Open a database in read-only mode (no lock, no log writer).
     ///
     /// Suitable for read replicas alongside a writer process.
-    /// Write operations will silently skip WAL persistence.
+    ///
+    /// **Writes are refused**, not ignored. Anything that would change the store
+    /// returns an error — `PermissionDenied` for the `io::Result` methods, and an
+    /// `SqlError` for statements. The three that return nothing (`remove`,
+    /// `link`, `unlink`) do nothing and record the refusal, readable through
+    /// [`write_error`](Self::write_error).
+    ///
+    /// It used to say "write operations will silently skip WAL persistence",
+    /// which undersold what happened: `put` returned `Ok`, `DELETE` returned the
+    /// number of rows it claimed to have removed, reads in that session answered
+    /// from the changed overlay, and the whole lot disappeared at close without
+    /// anything being raised.
     pub fn open_read_only(dir: impl AsRef<Path>) -> io::Result<Self> {
         Self::open_with_config(
             dir,
@@ -2595,6 +2625,7 @@ impl CoreDB {
         db.edges.remap_meta();
 
         // 3. Open WAL in append mode (skip for read-only replicas).
+        db.read_only = config.read_only;
         if !config.read_only {
             let wal = WalWriter::open_with_format(&wal_path, config.wal_format)?;
             db.wal_format = wal.format();
@@ -2712,6 +2743,10 @@ impl CoreDB {
     /// bytes to the payload store, update the node metadata + collection
     /// membership, and refresh any affected indexes. Returns the node's id hash.
     fn put_raw_inner(&mut self, slug: &str, raw: &[u8], payload: Value) -> Result<u64, serde_json::Error> {
+        if self.read_only {
+            use serde::ser::Error as _;
+            return Err(serde_json::Error::custom(self.refuse_write("write").to_string()));
+        }
         self.note_key_change(slug); // remember this key changed (for the change feed)
         let hash = sk_hash(slug);   // the node's u64 identity
         // In a bulk batch every row shares one timestamp, so we take the clock
@@ -3823,6 +3858,24 @@ impl CoreDB {
         }
     }
 
+    /// Refuse a mutation on a handle opened read-only.
+    ///
+    /// Returned as an error rather than ignored. A write that is dropped in
+    /// silence is worse than one that fails: the caller carries on believing the
+    /// row is there, reads it back from the overlay in the same session, and only
+    /// finds out at the next open — if anyone is looking.
+    fn refuse_write(&self, what: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("sekejap: {what} on a database opened read-only"),
+        )
+    }
+
+    /// Whether this handle was opened read-only, so writes are refused.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// The disk failure this database has hit, if any.
     ///
     /// `Some` means at least one write reached the in-memory maps but did not
@@ -4620,6 +4673,10 @@ impl CoreDB {
     /// BM25/GIN/search indexes, per-row rebuild markers are set (rebuilt once at
     /// the end), matching `put_many` semantics.
     pub fn put_value_bulk(&mut self, rows: Vec<(String, Value)>) -> Result<usize, serde_json::Error> {
+        if self.read_only {
+            use serde::ser::Error as _;
+            return Err(serde_json::Error::custom(self.refuse_write("bulk write").to_string()));
+        }
         if rows.is_empty() {
             return Ok(0);
         }
@@ -4915,6 +4972,11 @@ impl CoreDB {
     /// `after_mutation` (fire the change feed, maybe auto-compact). `put`, `link`,
     /// and `remove` are all this same three-step dance.
     pub fn remove(&mut self, slug: &str) {
+        if self.read_only {
+            let e = self.refuse_write("remove").to_string();
+            self.note_write_error(e);
+            return;
+        }
         self.wal_write(WalEntry::Remove { slug: slug.to_string() }); // 1. log
         self.remove_raw(slug);   // 2. apply to maps/indexes (no WAL)
         self.after_mutation();   // 3. notify + maybe compact
@@ -4930,6 +4992,11 @@ impl CoreDB {
     /// edge is stored by the id hashes of its slugs, so you can wire up the graph
     /// before (or without) inserting the nodes themselves.
     pub fn link(&mut self, from: &str, to: &str, edge_type: &str) {
+        if self.read_only {
+            let e = self.refuse_write("link").to_string();
+            self.note_write_error(e);
+            return;
+        }
         // Same WAL-first pattern as `put`/`remove` (see `remove` above).
         self.wal_write(WalEntry::Link {
             from: from.to_string(),
@@ -4963,6 +5030,11 @@ impl CoreDB {
 
     /// Remove all directed edges from → to with the given type.
     pub fn unlink(&mut self, from: &str, to: &str, edge_type: &str) {
+        if self.read_only {
+            let e = self.refuse_write("unlink").to_string();
+            self.note_write_error(e);
+            return;
+        }
         self.wal_write(WalEntry::Unlink {
             from: from.to_string(),
             to: to.to_string(),
@@ -5081,6 +5153,9 @@ impl CoreDB {
     /// the old, still-valid files in place. Memory-only databases have no files,
     /// so this is a no-op for them.
     pub fn compact(&mut self) -> io::Result<()> {
+        if self.read_only {
+            return Err(self.refuse_write("compact"));
+        }
         // A database that has already failed to write does not get to rewrite
         // itself. Compaction folds the overlay into the base and drops the log —
         // and if a write reached memory but not the log, the log is the only
@@ -6599,6 +6674,7 @@ impl CoreDB {
             // edges to find - which is why snapshot_reads is refused for it in
             // `open_with_config` rather than quietly answering an empty graph.
             paged_adj: None,
+            read_only: false,
             write_error: None,
             paged_nodes: None,
             slug_map: self.slug_map.clone(),
@@ -8189,6 +8265,11 @@ impl CoreDB {
 
     /// Internal: execute an already-parsed mutation.
     fn execute_mutation(&mut self, mutation: sql::CompiledMutation) -> Result<usize, SqlError> {
+        // Every SQL mutation funnels through here, so one guard covers INSERT,
+        // UPDATE, DELETE, the DDL forms and COMPACT alike.
+        if self.read_only {
+            return Err(SqlError::InvalidValue(self.refuse_write("statement").to_string()));
+        }
         // ── Transaction control ──────────────────────────────────────
         match &mutation {
             sql::CompiledMutation::Begin => {
@@ -10008,6 +10089,10 @@ impl CoreDB {
     ///
     /// Returns the slug hash on success.
     pub fn put_vector(&mut self, slug: &str, field: &str, data: &[f32]) -> Result<u64, serde_json::Error> {
+        if self.read_only {
+            use serde::ser::Error as _;
+            return Err(serde_json::Error::custom(self.refuse_write("vector write").to_string()));
+        }
         self.wal_write(WalEntry::PutVector {
             slug: slug.to_string(),
             field: field.to_string(),

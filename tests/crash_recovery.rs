@@ -490,3 +490,71 @@ fn a_compaction_killed_part_way_through_loses_nothing() {
              the victim is exiting before the kill lands, so this test is not \
              interrupting a compaction and is proving nothing");
 }
+
+/// **A read-only handle refuses writes rather than swallowing them.**
+///
+/// `read_only` lived on `Config` and stopped there — it decided whether to take
+/// the directory lock and whether to open a log writer, and nothing downstream
+/// learned about it. So a write went through the ordinary path, changed the
+/// in-memory maps, found no log to append to, and returned `Ok`.
+///
+/// The documented behaviour was "writes silently skip WAL persistence". What
+/// actually happened was worse: `put` reported success, `DELETE` reported the
+/// number of rows it had removed, and reads in the same session answered from the
+/// changed overlay — so the handle disagreed with the file it was supposedly
+/// reading, and everything vanished at close with nothing raised at any point.
+///
+/// A dropped write is worse than a failed one. The caller carries on believing
+/// the row is there, reads it back in the same session, and finds out at the next
+/// open if anyone is looking.
+#[test]
+fn a_read_only_database_refuses_writes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        db.put("p/a", r#"{"_collection":"p","_key":"a","n":1}"#).unwrap();
+        db.link("p/a", "p/a", "self");
+        db.compact().unwrap();
+    }
+
+    {
+        let mut ro = CoreDB::open_read_only(dir.path()).unwrap();
+        assert!(ro.is_read_only(), "the handle does not know it is read-only");
+
+        // Reads still work — that is the whole point of the mode.
+        assert_eq!(ro.query("SELECT _key FROM p").unwrap().collect().len(), 1);
+        assert!(ro.get("p/a").is_some());
+
+        // Writes are refused, and say so.
+        assert!(ro.put("p/b", r#"{"_collection":"p","_key":"b","n":2}"#).is_err(),
+                "put was accepted on a read-only database");
+        assert!(ro.execute("INSERT INTO p (_key, n) VALUES ('c', 3)").is_err(),
+                "INSERT was accepted on a read-only database");
+        assert!(ro.execute("DELETE FROM p WHERE n = 1").is_err(),
+                "DELETE was accepted on a read-only database — it used to report \
+                 the row count it had removed");
+        assert!(ro.execute("UPDATE p SET n = 9 WHERE n = 1").is_err(),
+                "UPDATE was accepted on a read-only database");
+        assert!(ro.compact().is_err(), "compact was accepted on a read-only database");
+
+        // The ones whose signature cannot return an error do nothing and record it.
+        ro.remove("p/a");
+        ro.link("p/a", "p/a", "another");
+        assert!(ro.write_error().is_some(),
+                "a refused `remove`/`link` left no trace for the caller to find");
+
+        // And after all of that, the handle still agrees with the file.
+        assert_eq!(ro.query("SELECT _key FROM p").unwrap().collect().len(), 1,
+                   "a refused write still changed what this handle reports");
+        assert_eq!(ro.edges_from("p/a").len(), 1,
+                   "a refused link/unlink still changed the graph");
+    }
+
+    // Nothing reached the disk.
+    let db = CoreDB::open(dir.path()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 1,
+               "a read-only session changed the stored database");
+    assert!(db.get("p/a").is_some(), "a read-only session deleted a row");
+    assert_eq!(db.edges_from("p/a").len(), 1, "a read-only session changed the graph");
+}
