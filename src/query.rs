@@ -2204,130 +2204,172 @@ fn is_simple_field(expr: &str) -> bool {
         && !expr.contains(')')
 }
 
-fn eval_step_on_payload(step: &Step, payload: &Value) -> bool {
-    match step {
-        Step::WhereEq(field, value) => resolve_field(field, payload)
-            .map(|v| values_eq(&v, value))
-            .unwrap_or(false),
-        Step::WhereNeq(field, value) => resolve_field(field, payload)
-            .map(|v| !values_eq(&v, value))
-            .unwrap_or(true),
-        Step::WhereGt(field, t) => resolve_field(field, payload)
-            .and_then(|v| v.as_f64())
-            .map(|f| f > *t)
-            .unwrap_or(false),
-        Step::WhereLt(field, t) => resolve_field(field, payload)
-            .and_then(|v| v.as_f64())
-            .map(|f| f < *t)
-            .unwrap_or(false),
-        Step::WhereGte(field, t) => resolve_field(field, payload)
-            .and_then(|v| v.as_f64())
-            .map(|f| f >= *t)
-            .unwrap_or(false),
-        Step::WhereLte(field, t) => resolve_field(field, payload)
-            .and_then(|v| v.as_f64())
-            .map(|f| f <= *t)
-            .unwrap_or(false),
-        Step::ArrayContains(field, values) => resolve_field(field, payload)
-            .and_then(|v| v.as_array().cloned())
-            .map(|arr| values.iter().all(|needle| arr.contains(needle)))
-            .unwrap_or(false),
-        Step::WhereIsNull(field, negated) => {
-            let is_null = resolve_field(field, payload)
-                .map(|v| v.is_null())
-                .unwrap_or(true);
-            if *negated { !is_null } else { is_null }
+/// SQL three-valued logic, as PostgreSQL implements it.
+///
+/// # Why a query needs a third answer
+///
+/// A row either matches a condition or it does not — except when the condition
+/// cannot be decided. `status != 'open'` is not true for a row whose `status` is
+/// NULL, and it is not false either: nothing is known about a value that is not
+/// there, so the comparison is **unknown**, and only rows where the whole `WHERE`
+/// comes out *true* are returned.
+///
+/// This database used to answer with a plain `bool`, and unknown had to be
+/// spelled as one or the other. `!=` chose true, so `WHERE status != 'open'`
+/// returned every row with no status at all — rows PostgreSQL drops. Someone
+/// arriving from PostgreSQL got extra rows and no error, which is the kind of
+/// difference that is found in production rather than in testing.
+///
+/// A missing field counts as NULL here, because in a document store that is what
+/// it is: the row has nothing to say about that column.
+///
+/// # The tables
+///
+/// ```text
+///   NOT:  true → false    false → true    unknown → unknown
+///
+///   AND:  false if anything is false, else unknown if anything is unknown
+///   OR:   true  if anything is true,  else unknown if anything is unknown
+/// ```
+///
+/// `NOT` leaving unknown alone is the part worth pausing on, and it is what makes
+/// `NOT (x = 'a')` and `x != 'a'` agree — patching one operator without the other
+/// would have left them disagreeing on the same row.
+type Truth = Option<bool>;
+
+const TRUE: Truth = Some(true);
+const FALSE: Truth = Some(false);
+const UNKNOWN: Truth = None;
+
+/// `AND` over three-valued operands, short-circuiting on the first false.
+fn and3(mut terms: impl Iterator<Item = Truth>) -> Truth {
+    let mut unknown = false;
+    loop {
+        match terms.next() {
+            Some(FALSE) => return FALSE,
+            Some(UNKNOWN) => unknown = true,
+            Some(_) => {}
+            None => return if unknown { UNKNOWN } else { TRUE },
         }
-        Step::WhereNot(inner) => !eval_step_on_payload(inner, payload),
-        Step::WhereOr(branches) => branches
-            .iter()
-            .any(|branch| branch.iter().all(|s| eval_step_on_payload(s, payload))),
-        _ => true,
     }
+}
+
+/// `OR` over three-valued operands, short-circuiting on the first true.
+fn or3(mut terms: impl Iterator<Item = Truth>) -> Truth {
+    let mut unknown = false;
+    loop {
+        match terms.next() {
+            Some(TRUE) => return TRUE,
+            Some(UNKNOWN) => unknown = true,
+            Some(_) => {}
+            None => return if unknown { UNKNOWN } else { FALSE },
+        }
+    }
+}
+
+/// A field that is absent, or present and NULL, is nothing to compare against.
+fn known(v: Option<Value>) -> Option<Value> {
+    match v {
+        Some(Value::Null) | None => None,
+        other => other,
+    }
+}
+
+/// Evaluate one filter step to true, false or unknown.
+///
+/// `field_of` resolves a column on the row under test. Both the payload-only
+/// evaluator and the database-backed one go through here, so the two cannot drift
+/// — which they had: `IN` and `BETWEEN` were missing from the payload path
+/// entirely and fell through to "passes", so `NOT IN (...)` nested inside an `OR`
+/// answered the opposite of `NOT IN (...)` on its own.
+///
+/// Steps that are not scalar SQL — spatial, vector, BM25, search — answer `true`
+/// in a nested position exactly as before. They are ours to define, and none of
+/// them has a NULL to reason about.
+fn eval3(step: &Step, field_of: &mut dyn FnMut(&str) -> Option<Value>) -> Truth {
+    /// Compare a column against a numeric threshold.
+    ///
+    /// A value that is present and not a number is *false*, not unknown: the row
+    /// has an answer, it is simply not one that orders against a number. Only
+    /// absence and NULL are unknown.
+    fn num(v: Option<Value>, f: impl Fn(f64) -> bool) -> Truth {
+        match known(v) {
+            None => UNKNOWN,
+            Some(v) => Some(v.as_f64().is_some_and(&f)),
+        }
+    }
+    match step {
+        Step::WhereEq(field, value) | Step::WhereNeq(field, value) if value.is_null() => {
+            // `x = NULL` and `x != NULL` are unknown for every row, whatever x
+            // holds. `IS NULL` is how the question gets asked.
+            let _ = field;
+            UNKNOWN
+        }
+        Step::WhereEq(field, value) => known(field_of(field)).map(|v| values_eq(&v, value)),
+        Step::WhereNeq(field, value) => known(field_of(field)).map(|v| !values_eq(&v, value)),
+        Step::WhereGt(field, t) => num(field_of(field), |f| f > *t),
+        Step::WhereLt(field, t) => num(field_of(field), |f| f < *t),
+        Step::WhereGte(field, t) => num(field_of(field), |f| f >= *t),
+        Step::WhereLte(field, t) => num(field_of(field), |f| f <= *t),
+        Step::WhereBetween(field, lo, hi) => num(field_of(field), |f| f >= *lo && f <= *hi),
+        Step::WhereIn(field, values) => match known(field_of(field)) {
+            None => UNKNOWN,
+            Some(v) if value_in(&v, values) => TRUE,
+            // No match, but a NULL in the list means one of the comparisons was
+            // unknown rather than false — so the answer is unknown. This is why
+            // `x NOT IN (1, NULL)` returns nothing in PostgreSQL, and it surprises
+            // people there too. Matching it is the point.
+            Some(_) if values.iter().any(|c| c.is_null()) => UNKNOWN,
+            Some(_) => FALSE,
+        },
+        Step::ArrayContains(field, values) => match known(field_of(field)) {
+            None => UNKNOWN,
+            Some(v) => Some(v.as_array()
+                .is_some_and(|arr| values.iter().all(|needle| arr.contains(needle)))),
+        },
+        // `IS NULL` is the one test that is never unknown — it asks whether the
+        // value is missing, which is always answerable.
+        Step::WhereIsNull(field, negated) => {
+            let is_null = known(field_of(field)).is_none();
+            Some(if *negated { !is_null } else { is_null })
+        }
+        Step::Like(field, pattern, case_insensitive) => {
+            use crate::text_index::query::{ilike_matches, like_matches};
+            match known(field_of(field)) {
+                None => UNKNOWN,
+                Some(v) => Some(v.as_str().is_some_and(|s| {
+                    if *case_insensitive { ilike_matches(s, pattern) }
+                    else { like_matches(s, pattern) }
+                })),
+            }
+        }
+        Step::WhereNot(inner) => eval3(inner, field_of).map(|b| !b),
+        Step::WhereOr(branches) => or3(branches.iter()
+            .map(|branch| and3(branch.iter().map(|s| eval3(s, field_of))))),
+        _ => TRUE,
+    }
+}
+
+/// A row passes a filter only when the filter is *true* for it. Unknown does not
+/// pass, which is the whole point of [`eval3`].
+fn passes(step: &Step, field_of: &mut dyn FnMut(&str) -> Option<Value>) -> bool {
+    eval3(step, field_of) == TRUE
+}
+
+fn eval_step_on_payload(step: &Step, payload: &Value) -> bool {
+    passes(step, &mut |field| resolve_field(field, payload))
 }
 
 /// Complex steps (spatial, vector, BM25, index-backed Like) fall back to
 /// `true` when nested inside NOT/OR — callers should avoid those patterns
 /// for best results.
 fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool {
-    match step {
-        Step::WhereEq(field, value) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .map(|v| values_eq(&v, value))
-            .unwrap_or(false),
-        Step::WhereNeq(field, value) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .map(|v| !values_eq(&v, value))
-            .unwrap_or(true),
-        Step::WhereGt(field, t) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .and_then(|v| v.as_f64())
-            .map(|f| f > *t)
-            .unwrap_or(false),
-        Step::WhereLt(field, t) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .and_then(|v| v.as_f64())
-            .map(|f| f < *t)
-            .unwrap_or(false),
-        Step::WhereGte(field, t) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .and_then(|v| v.as_f64())
-            .map(|f| f >= *t)
-            .unwrap_or(false),
-        Step::WhereLte(field, t) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .and_then(|v| v.as_f64())
-            .map(|f| f <= *t)
-            .unwrap_or(false),
-        Step::WhereBetween(field, lo, hi) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .and_then(|v| v.as_f64())
-            .map(|f| f >= *lo && f <= *hi)
-            .unwrap_or(false),
-        Step::WhereIn(field, values) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .map(|v| value_in(&v, values))
-            .unwrap_or(false),
-        Step::ArrayContains(field, values) => db
-            .get_payload(h)
-            .and_then(|p| resolve_field(field, &p))
-            .and_then(|v| v.as_array().cloned())
-            .map(|arr| values.iter().all(|needle| arr.contains(needle)))
-            .unwrap_or(false),
-        Step::WhereIsNull(field, negated) => {
-            let v = db.get_payload(h).and_then(|p| resolve_field(field, &p));
-            let is_null = v.is_none() || matches!(v, Some(Value::Null));
-            if *negated { !is_null } else { is_null }
-        }
-        Step::Like(field, pattern, case_insensitive) => {
-            use crate::text_index::query::{ilike_matches, like_matches};
-            let v = db.get_payload(h).and_then(|p| resolve_field(field, &p));
-            v.as_ref()
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    if *case_insensitive {
-                        ilike_matches(s, pattern)
-                    } else {
-                        like_matches(s, pattern)
-                    }
-                })
-                .unwrap_or(false)
-        }
-        Step::WhereNot(inner) => !eval_cond(db, h, inner),
-        Step::WhereOr(branches) => branches
-            .iter()
-            .any(|branch| branch.iter().all(|s| eval_cond(db, h, s))),
-        // Non-filter steps always pass in nested context
-        _ => true,
-    }
+    // The payload is read once for the whole condition rather than once per
+    // comparison, which is what the old per-arm `db.get_payload(h)` did.
+    let payload = db.get_payload(h);
+    passes(step, &mut |field| {
+        payload.as_ref().and_then(|p| resolve_field(field, p))
+    })
 }
 
 // ── ScoreExpr helpers ─────────────────────────────────────────────────────────
@@ -2754,24 +2796,23 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::WhereNeq(field, value) => {
                 const FILTER_BATCH_MIN: usize = 64;
+                // A row is kept only where the comparison is *true*. Absent and
+                // NULL are unknown, not "different from", so they go — see
+                // [`eval3`]. This used to keep them, which is how a PostgreSQL
+                // user's `!=` came back with rows PostgreSQL drops.
                 if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
                     let raw_map = db.read_raw_payloads_batched(&candidates);
                     candidates.retain(|&h| {
-                        // field absent → keep (same semantics as individual path)
-                        raw_map.get(&h)
-                            .map(|bytes| {
-                                db.extract_stored_field(bytes, field)
-                                    .map(|v| !values_eq(&v, value))
-                                    .unwrap_or(true)
-                            })
-                            .unwrap_or(true)
+                        let v = raw_map.get(&h)
+                            .and_then(|bytes| db.extract_stored_field(bytes, field));
+                        passes(step, &mut |_| v.clone())
                     });
                 } else {
                     candidates.retain(|&h| {
-                        db.get_payload(h)
-                            .and_then(|p| resolve_field(field, &p))
-                            .map(|v| !values_eq(&v, value))
-                            .unwrap_or(true) // field absent → keep
+                        let payload = db.get_payload(h);
+                        passes(step, &mut |f| {
+                            payload.as_ref().and_then(|p| resolve_field(f, p))
+                        })
                     });
                 }
             }
@@ -2917,28 +2958,30 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 }
             }
             Step::WhereIn(field, values) => {
+                let by_scan = |db: &CoreDB, h: u64| {
+                    let payload = db.get_payload(h);
+                    passes(step, &mut |f| payload.as_ref().and_then(|p| resolve_field(f, p)))
+                };
                 if let Some(coll) = current_coll_hash {
                     if let Some(idx) = db.field_index_ref(coll, field) {
+                        // A NULL in the list is not a value to look up. Left in,
+                        // `FieldKey::Null` matched every row whose field is
+                        // missing — since that is how a missing field is indexed
+                        // — so `IN ('open', NULL)` returned rows that hold
+                        // nothing at all. In SQL a NULL in the list can only turn
+                        // a non-match into unknown, and unknown is dropped here
+                        // anyway, so the matches are the whole answer.
                         let btree_set: HashSet<u64> = values.iter()
-                            .filter_map(|v| FieldKey::from_json(v))
+                            .filter(|v| !v.is_null())
+                            .filter_map(FieldKey::from_json)
                             .flat_map(|fk| idx.get_eq(&fk).map(|c| c.into_owned()).unwrap_or_default())
                             .collect();
                         candidates.retain(|h| btree_set.contains(h));
                     } else {
-                        candidates.retain(|&h| {
-                            db.get_payload(h)
-                                .and_then(|p| resolve_field(field, &p))
-                                .map(|v| value_in(&v, values))
-                                .unwrap_or(false)
-                        });
+                        candidates.retain(|&h| by_scan(db, h));
                     }
                 } else {
-                    candidates.retain(|&h| {
-                        db.get_payload(h)
-                            .and_then(|p| resolve_field(field, &p))
-                            .map(|v| value_in(&v, values))
-                            .unwrap_or(false)
-                    });
+                    candidates.retain(|&h| by_scan(db, h));
                 }
             }
             Step::ArrayContains(field, values) => {

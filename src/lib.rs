@@ -9852,6 +9852,13 @@ impl CoreDB {
         use std::ops::Bound;
         for (j, step) in remaining.iter().enumerate() {
             match step {
+                // `x = NULL` and `x != NULL` are unknown for every row, so both
+                // return nothing. Handled before the index is consulted, because
+                // the index would happily answer `= NULL` with the rows whose
+                // field is missing — a different question, asked by `IS NULL`.
+                Step::WhereEq(_, value) | Step::WhereNeq(_, value) if value.is_null() => {
+                    return Some((Vec::new(), j, None));
+                }
                 Step::WhereEq(field, value) => {
                     if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         if let Some(fk) = FieldKey::from_json(value) {
@@ -9863,11 +9870,22 @@ impl CoreDB {
                 Step::WhereNeq(field, value) => {
                     if let Some(idx) = self.field_index_ref(coll_hash, field) {
                         if let Some(fk) = FieldKey::from_json(value) {
-                            // Set-difference: all collection members minus those matching value.
-                            let excluded: std::collections::HashSet<u64> = idx
+                            // Set-difference: all collection members minus those
+                            // matching the value — and minus the ones that hold
+                            // NULL, which includes every row where the field is
+                            // absent, since that is how a missing field is
+                            // indexed. `!=` is not true for those rows, it is
+                            // unknown, and unknown does not pass a filter. The
+                            // scan drops them too; an index that kept them would
+                            // make the answer depend on whether a column happened
+                            // to be indexed.
+                            let mut excluded: std::collections::HashSet<u64> = idx
                                 .get_eq(&fk)
                                 .map(|ids| ids.iter().copied().collect())
                                 .unwrap_or_default();
+                            if let Some(nulls) = idx.get_eq(&FieldKey::Null) {
+                                excluded.extend(nulls.iter().copied());
+                            }
                             let all = self
                                 .collection_members(coll_hash)
                                 .map(|c| c.into_owned())
