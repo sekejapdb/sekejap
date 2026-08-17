@@ -702,6 +702,17 @@ fn hex_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Bytes of owner tag on a paged payload record.
+const OWNER_TAG: usize = 4;
+/// "This read has no node hash to check against." Also what a payload written
+/// without one is tagged with, so such records stay readable from every path.
+const OWNER_UNKNOWN: u64 = 0;
+/// The low 32 bits of a node hash, which is what a paged payload record carries.
+/// `0` is reserved for "unknown", so a hash that would land there is nudged.
+fn owner_tag(owner: u64) -> u32 {
+    match owner as u32 { 0 => 1, t => t }
+}
+
 /// Payload storage backend — either an in-memory `Vec<u8>` (ephemeral DB) or
 /// a memory-mapped append file `payloads.bin` (persistent DB).
 ///
@@ -881,10 +892,33 @@ impl PayloadStore {
     /// Append raw bytes; returns `(offset, len)`.
     /// Panics on disk write failure (disk-full etc.) — callers do not recover.
     fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+        self.append_owned(OWNER_UNKNOWN, bytes)
+    }
+
+    /// Append raw bytes, recording which node they belong to.
+    ///
+    /// In the paged variant the record is prefixed with `owner`'s low 32 bits, so a
+    /// read can tell whether it landed on the right record. A record store holds
+    /// anonymous bytes at a slot: damage the slot directory and the read lands on a
+    /// different row's payload, returned as if it were this row's. Fuzzing produced
+    /// exactly that after the node and edge records had been protected — the node
+    /// record was intact and its checksum passed, and the payload it pointed at
+    /// belonged to somebody else.
+    ///
+    /// Four bytes a row, and one comparison on read. A truncated hash makes a false
+    /// accept a one-in-four-billion accident, which is the right trade for a damage
+    /// detector: it is not defending against a forger.
+    ///
+    /// The append-only variants are untouched — their offsets are byte positions,
+    /// so a read cannot land on a neighbouring record by arithmetic.
+    fn append_owned(&mut self, owner: u64, bytes: &[u8]) -> (u64, u32) {
         match &mut self.inner {
             // The "offset" is a record id here, not a byte position.
             PayloadInner::Paged { store } => {
-                let id = store.insert(bytes).expect("sekejap: payload page write failed");
+                let mut tagged = Vec::with_capacity(OWNER_TAG + bytes.len());
+                tagged.extend_from_slice(&owner_tag(owner).to_le_bytes());
+                tagged.extend_from_slice(bytes);
+                let id = store.insert(&tagged).expect("sekejap: payload page write failed");
                 (id.0, bytes.len() as u32)
             }
             PayloadInner::Memory { data } => {
@@ -914,11 +948,23 @@ impl PayloadStore {
         }
     }
 
-    fn append_batch(&mut self, items: &[&[u8]]) -> Vec<(u64, u32)> {
+    /// Append many records at once, each tagged with the node it belongs to.
+    ///
+    /// `owners` is parallel to `items`. Tagging these with "unknown" instead was a
+    /// quiet way to break every bulk-loaded row: the write said "no owner" and the
+    /// read asked for a specific one, so the record was refused and the row read as
+    /// absent. The differential audit caught it as two collections' SEARCH results
+    /// coming back short.
+    fn append_batch(&mut self, items: &[&[u8]], owners: &[u64]) -> Vec<(u64, u32)> {
         if items.is_empty() { return vec![]; }
+        debug_assert_eq!(items.len(), owners.len(), "an owner per record, or none can be checked");
         match &mut self.inner {
-            PayloadInner::Paged { store } => items.iter().map(|bytes| {
-                let id = store.insert(bytes).expect("sekejap: payload page write failed");
+            PayloadInner::Paged { store } => items.iter().enumerate().map(|(i, bytes)| {
+                let owner = owners.get(i).copied().unwrap_or(OWNER_UNKNOWN);
+                let mut tagged = Vec::with_capacity(OWNER_TAG + bytes.len());
+                tagged.extend_from_slice(&owner_tag(owner).to_le_bytes());
+                tagged.extend_from_slice(bytes);
+                let id = store.insert(&tagged).expect("sekejap: payload page write failed");
                 (id.0, bytes.len() as u32)
             }).collect(),
             PayloadInner::Memory { data } => {
@@ -966,12 +1012,35 @@ impl PayloadStore {
     /// Paged stores treat `offset` as a record id; the others as a byte position.
     /// Every read of a whole record goes through here so the two never diverge.
     fn stored_record(&self, offset: u64, len: u32) -> Option<Vec<u8>> {
+        self.stored_record_of(OWNER_UNKNOWN, offset, len)
+    }
+
+    /// The stored record, refusing one that does not belong to `owner`.
+    ///
+    /// `OWNER_UNKNOWN` skips the check, for the paths that read a payload without a
+    /// node hash in hand. Those are the minority and are no worse than before; the
+    /// ones that do know are the whole-record reads, which is where a substitution
+    /// would actually be served to a caller.
+    fn stored_record_of(&self, owner: u64, offset: u64, len: u32) -> Option<Vec<u8>> {
         match &self.inner {
             PayloadInner::Paged { store } => {
-                store.read(storage::recordstore::RecordId(offset)).ok().flatten()
+                let raw = store.read(storage::recordstore::RecordId(offset)).ok().flatten()?;
+                if raw.len() < OWNER_TAG { return None }
+                let tag = u32::from_le_bytes(raw[..OWNER_TAG].try_into().ok()?);
+                if owner != OWNER_UNKNOWN && tag != owner_tag(owner) { return None }
+                Some(raw[OWNER_TAG..].to_vec())
             }
             _ => self.get_raw_at(offset, len as usize),
         }
+    }
+
+    /// Read a whole record known to belong to `owner`.
+    fn get_of(&self, owner: u64, offset: u64, len: u32) -> Option<Value> {
+        let stored = self.stored_record_of(owner, offset, len)?;
+        if storage::skbin::is_skbin(&stored) {
+            return storage::skbin::decode(&stored, &self.field_table);
+        }
+        decode_payload_record(stored).and_then(|b| serde_json::from_slice(&b).ok())
     }
 
     fn get(&self, offset: u64, len: u32) -> Option<Value> {
@@ -2400,7 +2469,7 @@ impl CoreDB {
                 }
                 let has_fi = self.field_indexes.keys().any(|(c, _)| *c == coll_hash);
                 if has_fi {
-                    let old_payload = self.payload_store.get(old_off, old_len)
+                    let old_payload = self.payload_store.get_of(hash, old_off, old_len)
                         .unwrap_or(Value::Null);
                     for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
                         if *idx_coll == coll_hash {
@@ -2464,8 +2533,9 @@ impl CoreDB {
                 .collect()
         };
 
-        // Store spliced bytes directly — no re-serialize.
-        let (offset, len) = self.payload_store.append(&buf);
+        // Store spliced bytes directly — no re-serialize. Tagged with the node it
+        // belongs to, so a read that lands on a different record can tell.
+        let (offset, len) = self.payload_store.append_owned(hash, &buf);
 
         let collection_str = payload.get("_collection")
             .and_then(|v| v.as_str())
@@ -2792,11 +2862,12 @@ impl CoreDB {
                 let mut count = 0usize;
                 let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
                 for (h, off, len) in node_meta {
-                    if let Some(mut p) = self.payload_store.get(off, len) {
+                    if let Some(mut p) = self.payload_store.get_of(h, off, len) {
                         if p.as_object_mut().map(|o| o.remove(&name).is_some()).unwrap_or(false) {
                             let new_json = serde_json::to_string(&p)
                                 .unwrap_or_else(|_| "{}".to_string());
-                            let (new_off, new_len) = self.payload_store.append(new_json.as_bytes());
+                            let (new_off, new_len) =
+                                self.payload_store.append_owned(h, new_json.as_bytes());
                             node_updates.push((h, new_off, new_len));
                             count += 1;
                         }
@@ -2846,13 +2917,14 @@ impl CoreDB {
                 let mut count = 0usize;
                 let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
                 for (h, off, len) in node_meta {
-                    if let Some(mut p) = self.payload_store.get(off, len) {
+                    if let Some(mut p) = self.payload_store.get_of(h, off, len) {
                         if let Some(obj) = p.as_object_mut() {
                             if let Some(val) = obj.remove(&old_name) {
                                 obj.insert(new_name.clone(), val);
                                 let new_json = serde_json::to_string(&p)
                                     .unwrap_or_else(|_| "{}".to_string());
-                                let (new_off, new_len) = self.payload_store.append(new_json.as_bytes());
+                                let (new_off, new_len) =
+                                    self.payload_store.append_owned(h, new_json.as_bytes());
                                 node_updates.push((h, new_off, new_len));
                                 count += 1;
                             }
@@ -2925,13 +2997,14 @@ impl CoreDB {
                     .collect();
                 let mut node_updates: Vec<(u64, u64, u32)> = Vec::new();
                 for (h, off, len) in node_meta {
-                    if let Some(mut p) = self.payload_store.get(off, len) {
+                    if let Some(mut p) = self.payload_store.get_of(h, off, len) {
                         if let Some(obj) = p.as_object_mut() {
                             obj.insert("_collection".to_string(), serde_json::json!(new_name));
                         }
                         let new_json = serde_json::to_string(&p)
                             .unwrap_or_else(|_| "{}".to_string());
-                        let (new_off, new_len) = self.payload_store.append(new_json.as_bytes());
+                        let (new_off, new_len) =
+                            self.payload_store.append_owned(h, new_json.as_bytes());
                         node_updates.push((h, new_off, new_len));
                     }
                 }
@@ -3086,7 +3159,8 @@ impl CoreDB {
             .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
             .filter_map(|hash| {
                 let node = self.nodes.get(&hash)?;
-                let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+                let payload =
+                    self.payload_store.get_of(hash, node.payload_offset, node.payload_len)?;
                 payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
@@ -3117,7 +3191,8 @@ impl CoreDB {
             .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
             .filter_map(|hash| {
                 let node = self.nodes.get(&hash)?;
-                let payload = self.payload_store.get(node.payload_offset, node.payload_len)?;
+                let payload =
+                    self.payload_store.get_of(hash, node.payload_offset, node.payload_len)?;
                 payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
@@ -3692,7 +3767,8 @@ impl CoreDB {
         let offsets = {
             let refs: Vec<&[u8]> = batch.iter()
                 .map(|(_, _, buf)| buf.as_slice()).collect();
-            self.payload_store.append_batch(&refs)
+            let owners: Vec<u64> = batch.iter().map(|(_, h, _)| *h).collect();
+            self.payload_store.append_batch(&refs, &owners)
         };
 
         // ── Phase 3: update node metadata ────────────────────────
@@ -4037,7 +4113,7 @@ impl CoreDB {
                 None
             } else {
                 self.payload_loc(hash)
-                    .and_then(|(o, l)| self.payload_store.get(o, l))
+                    .and_then(|(o, l)| self.payload_store.get_of(hash, o, l))
                     .and_then(|v| v.get("_created_unix").cloned())
             };
             let coll = match val {
@@ -4076,7 +4152,8 @@ impl CoreDB {
             WalEntry::Put { payload, .. } => payload.as_bytes(),
             _ => &[][..],
         }).collect();
-        let offsets = self.payload_store.append_batch(&refs);
+        let owners: Vec<u64> = metas.iter().map(|(_, h, _, _, _)| *h).collect();
+        let offsets = self.payload_store.append_batch(&refs, &owners);
 
         // Which index kinds need refreshing? Track touched collections only when a
         // search index exists (zero overhead for the common index-free IoT case).
@@ -5929,7 +6006,11 @@ impl CoreDB {
     /// the node does not exist or the payload cannot be parsed.
     pub(crate) fn get_payload(&self, hash: u64) -> Option<Value> {
         let (off, len) = self.payload_loc(hash)?;
-        self.payload_store.get(off, len)
+        // Checked against the node it should belong to. Everything above this has
+        // already been verified — the node record carries a checksum — but the
+        // payload it points at is a separate record in a separate store, and a
+        // damaged slot directory there lands this read on another row's bytes.
+        self.payload_store.get_of(hash, off, len)
     }
 
     /// Extract ONE field from a stored (undecoded) payload record, dispatching on
@@ -6886,7 +6967,8 @@ impl CoreDB {
                 let hit = query::Hit {
                     slug: node.slug.clone(),
                     slug_hash: start,
-                    payload: self.payload_store.get(node.payload_offset, node.payload_len),
+                    payload: self.payload_store
+                        .get_of(start, node.payload_offset, node.payload_len),
                 };
                 return Some(BfsPath { nodes: vec![hit], edges: vec![], length: 0 });
             } else {
@@ -7270,7 +7352,9 @@ impl CoreDB {
                     .unwrap_or_default();
                 for h in members {
                     if let Some(node) = self.node_data(h) {
-                        if let Some(payload) = self.payload_store.get(node.payload_offset, node.payload_len) {
+                        if let Some(payload) =
+                            self.payload_store.get_of(h, node.payload_offset, node.payload_len)
+                        {
                             if let serde_json::Value::Object(map) = payload {
                                 for (k, v) in &map {
                                     if SKIP.contains(&k.as_str()) { continue; }
@@ -7803,7 +7887,8 @@ impl CoreDB {
                         .into_iter()
                         .filter_map(|h| {
                             let n = self.nodes.get(&h.slug_hash)?;
-                            let payload = self.payload_store.get(n.payload_offset, n.payload_len)?;
+                            let payload = self.payload_store
+                                .get_of(h.slug_hash, n.payload_offset, n.payload_len)?;
                             Some((n.slug.clone(), payload))
                         })
                         .collect();
@@ -10447,7 +10532,7 @@ impl CoreDB {
     pub fn centroid(&self, slug: &str) -> Option<(f64, f64)> {
         let hash = *self.slug_map.get(slug)?;
         let (off, len) = self.payload_loc(hash)?;
-        let payload = self.payload_store.get(off, len)?;
+        let payload = self.payload_store.get_of(hash, off, len)?;
         geo::extract_centroid(&payload)
     }
 }
