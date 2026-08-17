@@ -563,3 +563,47 @@ impl<E> OrNoHits for Result<sekejap::Set<'_>, E> {
         self.map(|s| s.collect()).unwrap_or_default()
     }
 }
+
+/// Snapshot reads are unavailable in the paged configuration, and that has to be
+/// visible rather than assumed.
+///
+/// A snapshot shares the durable base by `Arc` and freezes a copy of the overlay.
+/// That is sound because the base is immutable: a compaction writes a *new*
+/// generation, so a snapshot holding the old one keeps reading the old one. Paged
+/// stores are mutated in place, so a snapshot sharing them would watch the writer
+/// change rows underneath it — not a stale photograph but an inconsistent one.
+///
+/// So `snapshot_db()` returns `None` and the caller falls back to locked reads.
+/// This test exists so that stays a decision: if page-level copy-on-write is built
+/// and snapshots become possible, this test fails and is deleted deliberately.
+#[test]
+fn paged_mode_without_snapshots_says_so() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build(dir.path(), 60);
+    {
+        let mut db = CoreDB::open_with_config(dir.path(), paged()).unwrap();
+        db.put("p/n999", &row(999)).unwrap();
+        assert!(db.snapshot_db().is_none(),
+                "a paged store offered a snapshot; if copy-on-write now makes that \
+                 sound, this test should be removed on purpose rather than left \
+                 passing by accident");
+        // And the reads it falls back to still answer correctly.
+        assert_eq!(rows(&db), 61);
+    }
+    // The same database without the paged stores does offer one, so the `None`
+    // above is about the configuration and not about the data.
+    let dir2 = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open_with_config(dir2.path(), Config {
+            paged_topology: true, ..Config::default() }).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+        for i in 0..60 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
+        db.compact().unwrap();
+    }
+    let mut db = CoreDB::open_with_config(dir2.path(), Config {
+        paged_topology: true, ..Config::default() }).unwrap();
+    db.put("p/n999", &row(999)).unwrap();
+    let snap = db.snapshot_db().expect("paged topology alone must still be snapshottable");
+    assert_eq!(snap.query("SELECT _key FROM p").unwrap().collect().len(), 61,
+               "the snapshot disagrees with the store it was taken from");
+}

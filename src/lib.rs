@@ -5811,6 +5811,25 @@ impl CoreDB {
     ///
     /// Returns `None` unless this is a paged-mode store (unix only), same as
     /// [`snapshot`](Self::snapshot).
+    /// # Not available with paged nodes or paged adjacency
+    ///
+    /// Returns `None` for those configurations, and the reason is structural
+    /// rather than missing work. A snapshot is a photograph: it shares the durable
+    /// base by `Arc` and freezes a copy of the overlay, and that is sound precisely
+    /// because the base is *immutable* — a compaction writes a new generation and
+    /// swaps it in, so an existing snapshot keeps reading the old one.
+    ///
+    /// Paged stores are mutated **in place**. A snapshot sharing them would see the
+    /// writer's later edits appear underneath it, which is not a stale photograph
+    /// but an inconsistent one — rows from two different moments in the same read.
+    /// Giving them their own file handles would not help either: the same pages
+    /// change on disk.
+    ///
+    /// The fix is page-level copy-on-write, so a write allocates a new page and
+    /// leaves the old one for readers holding the previous root. That is a real
+    /// piece of design, not an oversight, and until it exists this returns `None`
+    /// so callers fall back to locked reads — correct and slower, rather than fast
+    /// and wrong. `paged_mode_without_snapshots_says_so` pins it.
     #[cfg(unix)]
     pub fn snapshot_db(&self) -> Option<std::sync::Arc<CoreDB>> {
         let t0 = std::time::Instant::now();
