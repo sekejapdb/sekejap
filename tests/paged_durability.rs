@@ -413,3 +413,139 @@ fn a_damaged_store_never_contradicts_itself() {
         }
     }
 }
+
+// ── fuzz ─────────────────────────────────────────────────────────────────────
+
+/// Deterministic xorshift, so a failure is reproducible from its seed rather than
+/// being a story about a run that once went wrong.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn below(&mut self, n: u64) -> u64 { if n == 0 { 0 } else { self.next() % n } }
+}
+
+/// Random byte damage, everywhere, over and over.
+///
+/// The hand-written corruptions above test the failures I could think of, which is
+/// a bounded and biased set — every bug found so far was in a place I had not
+/// thought to look until something made me. This flips bytes at random across
+/// every paged file and requires the same thing of all of them: answer or refuse,
+/// but do not panic, do not hang, and do not invent.
+///
+/// Seeded, so any failure reproduces exactly.
+#[test]
+fn random_byte_damage_never_panics_or_hangs() {
+    let dir0 = tempfile::TempDir::new().unwrap();
+    build(dir0.path(), 80);
+    let files = paged_files(dir0.path());
+    drop(dir0);
+    assert!(!files.is_empty(), "no paged files to fuzz");
+
+    // The committed run is small enough to keep the suite quick. A campaign is
+    // `SK_FUZZ_ROUNDS=5000 SK_FUZZ_SEED=... cargo test --release --test
+    // paged_durability random_byte` — same code, more of it, so a campaign that
+    // finds something produces a seed the committed test can be pinned to.
+    let rounds: u64 = std::env::var("SK_FUZZ_ROUNDS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(240);
+    let seed: u64 = std::env::var("SK_FUZZ_SEED").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(0x5EE_D0_5EE_D);
+    let mut rng = Rng(seed);
+    let started = std::time::Instant::now();
+
+    for round in 0..rounds {
+        let dir = tempfile::TempDir::new().unwrap();
+        build(dir.path(), 80);
+
+        // One to three files at a time, a handful of bytes each — enough to break
+        // structure, not so much that every case degenerates into "the file is
+        // gone". Damaging several at once matters because the stores cross-
+        // reference: an index in one file points at a record in another.
+        let how_many = 1 + rng.below(3);
+        let mut damage = Vec::new();
+        for _ in 0..how_many {
+            let file = files[rng.below(files.len() as u64) as usize].clone();
+            let path = dir.path().join(&file);
+            let Ok(mut bytes) = std::fs::read(&path) else { continue };
+            if bytes.is_empty() { continue }
+            let flips = 1 + rng.below(12);
+            let mut where_ = Vec::new();
+            for _ in 0..flips {
+                let at = rng.below(bytes.len() as u64) as usize;
+                let val = (rng.next() & 0xFF) as u8;
+                bytes[at] = val;
+                where_.push((at, val));
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            damage.push((file, where_));
+        }
+        if damage.is_empty() { continue }
+
+        let ctx = format!("round {round} (seed {seed}): {damage:?}");
+
+        // Opening may fail. That is an answer.
+        let Ok(db) = CoreDB::open_with_config(dir.path(), paged()) else { continue };
+
+        // Everything a caller might do, none of which may panic or hang.
+        let listed = db.query("SELECT _key FROM p").unwrap_or_default_hits();
+        assert!(listed.len() <= 80, "{ctx}: listed {} rows in an 80-row store", listed.len());
+        for h in listed.iter().take(40) {
+            if let Some(raw) = db.get(&h.slug) {
+                // A payload whose own bytes were flipped comes back flipped: records
+                // carry no checksum, so the store cannot know. What it must not do
+                // is hand back *another row's* payload — a record boundary read
+                // wrong is a very different failure from a byte read wrong, and
+                // only the first is the store's fault.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(k) = v["_key"].as_str() {
+                        // Distinguishing the two failures that look alike from
+                        // outside. A key whose *text* was flipped — "n\u{fffd}9" —
+                        // is the right record with a damaged byte in it, which a
+                        // store without payload checksums cannot detect and is not
+                        // being asked to. A key that is a **different real key of
+                        // this dataset** is a record boundary read wrong: the store
+                        // handed back another row and said it was this one. Only
+                        // the second is a bug, and only the second is checked.
+                        let looks_real = k.strip_prefix('n')
+                            .and_then(|d| d.parse::<usize>().ok())
+                            .is_some_and(|n| n < 80);
+                        if looks_real {
+                            assert!(h.slug.ends_with(k),
+                                    "{ctx}: asked for {} and got {k}, which is a \
+                                     different row of this store — a record boundary \
+                                     was read wrong", h.slug);
+                        }
+                    }
+                }
+            }
+            let _ = db.edges_from(&h.slug);
+            let _ = db.one(&h.slug).forward("next").collect();
+        }
+        let _ = db.query("SELECT _key FROM p WHERE n > 10 AND n < 40").map(|s| s.collect());
+        let _ = db.query("SELECT COUNT(*) AS c FROM p").map(|s| s.collect());
+        let _ = db.query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)").map(|s| s.collect());
+        let _ = db.node_count();
+        let _ = db.collection_names();
+
+        assert!(started.elapsed().as_secs() < 1800,
+                "{ctx}: the fuzz loop is taking far longer than it should — something \
+                 is spinning rather than answering");
+    }
+}
+
+/// Small helper so the fuzz body reads as what it checks rather than as error
+/// plumbing: a query that fails is a legitimate answer to a damaged store.
+trait OrNoHits {
+    fn unwrap_or_default_hits(self) -> Vec<sekejap::Hit>;
+}
+impl<E> OrNoHits for Result<sekejap::Set<'_>, E> {
+    fn unwrap_or_default_hits(self) -> Vec<sekejap::Hit> {
+        self.map(|s| s.collect()).unwrap_or_default()
+    }
+}

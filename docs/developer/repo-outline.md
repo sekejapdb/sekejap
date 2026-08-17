@@ -1130,30 +1130,31 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
 (no top-level items)
 ```
 
-### `nodestore.rs` · 555L — What this replaces
+### `nodestore.rs` · 623L — What this replaces
 
 ```
-    66  pub(crate) struct StoredNode
-    80  fn rd16(b: &[u8], at: usize) -> u16 { u16::from_le_bytes(b[at..at + 2].try_into().unwrap()) }
-    81  fn rd32(b: &[u8], at: usize) -> u32 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) }
-    82  fn rd64(b: &[u8], at: usize) -> u64 { u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) }
-    84  fn encode(n: &StoredNode, out: &mut Vec<u8>)
-   105  fn decode(b: &[u8]) -> Option<StoredNode>
-   136  fn member_key(collection: u64, node: u64) -> u128
-   140  pub(crate) struct NodeStore
-   156  impl NodeStore
-   157    pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self>
-   175    pub(crate) fn len(&self) -> u64 { self.store.len() }
-   178    pub(crate) fn page_counts(&self) -> (u64, u64, u64)
-   183    pub(crate) fn get(&self, hash: u64) -> io::Result<Option<StoredNode>>
-   188    pub(crate) fn contains(&self, hash: u64) -> io::Result<bool>
-   197    pub(crate) fn put(&mut self, hash: u64, node: &StoredNode) -> io::Result<()>
-   225    pub(crate) fn delete(&mut self, hash: u64) -> io::Result<bool>
-   238    pub(crate) fn members(&self, collection: u64) -> io::Result<Vec<u64>>
-   251    pub(crate) fn for_each_hash(&self, mut f: impl FnMut(u64) -> bool) -> io::Result<()>
-   259    pub(crate) fn spatial_items(&self) -> io::Result<Vec<(u64, [f64; 6])>>
-   270    pub(crate) fn sync(&mut self) -> io::Result<()>
-   278  mod tests
+    80  pub(crate) struct StoredNode
+    94  fn crc(bytes: &[u8]) -> u32
+   100  fn rd16(b: &[u8], at: usize) -> u16 { u16::from_le_bytes(b[at..at + 2].try_into().unwrap()) }
+   101  fn rd32(b: &[u8], at: usize) -> u32 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) }
+   102  fn rd64(b: &[u8], at: usize) -> u64 { u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) }
+   104  fn encode(n: &StoredNode, out: &mut Vec<u8>)
+   128  fn decode(b: &[u8]) -> Option<StoredNode>
+   164  fn member_key(collection: u64, node: u64) -> u128
+   176  pub(crate) struct NodeStore
+   192  impl NodeStore
+   193    pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self>
+   211    pub(crate) fn len(&self) -> u64 { self.store.len() }
+   214    pub(crate) fn page_counts(&self) -> (u64, u64, u64)
+   232    pub(crate) fn get(&self, hash: u64) -> io::Result<Option<StoredNode>>
+   243    pub(crate) fn contains(&self, hash: u64) -> io::Result<bool>
+   252    pub(crate) fn put(&mut self, hash: u64, node: &StoredNode) -> io::Result<()>
+   280    pub(crate) fn delete(&mut self, hash: u64) -> io::Result<bool>
+   293    pub(crate) fn members(&self, collection: u64) -> io::Result<Vec<u64>>
+   306    pub(crate) fn for_each_hash(&self, mut f: impl FnMut(u64) -> bool) -> io::Result<()>
+   314    pub(crate) fn spatial_items(&self) -> io::Result<Vec<(u64, [f64; 6])>>
+   325    pub(crate) fn sync(&mut self) -> io::Result<()>
+   333  mod tests
 ```
 
 ### `pagedstore.rs` · 238L — What this is for
@@ -1605,4 +1606,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 49 files, 1333 items -->
+<!-- 49 files, 1334 items -->

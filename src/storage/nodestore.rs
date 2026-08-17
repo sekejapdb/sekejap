@@ -22,15 +22,29 @@
 //! # The record
 //!
 //! ```text
-//!   0  payload_offset u64      where its JSON lives (a byte offset, or a record id)
-//!   8  payload_len    u32
-//!  12  flags          u32      bit 0: a spatial extent follows
-//!  16  collection_len u16
-//!  18  (padding)      u16
-//!  20  [6 x f64]               centroid lat/lon and bounding box, when flagged
+//!   0  crc32          u32      over everything after it
+//!   4  payload_offset u64      where its JSON lives (a byte offset, or a record id)
+//!  12  payload_len    u32
+//!  16  flags          u32      bit 0: a spatial extent follows
+//!  20  collection_len u16
+//!  22  (padding)      u16
+//!  24  [6 x f64]               centroid lat/lon and bounding box, when flagged
 //!  ..  collection bytes
 //!  ..  slug bytes              to the end of the record
 //! ```
+//!
+//! # Why the record is checksummed
+//!
+//! A record store holds anonymous bytes at a slot. Damage the slot directory and a
+//! read lands on a different record; damage a field and the record points
+//! somewhere it should not. Fuzzing found both: a request for `p/n69` returned
+//! `n51`, and — after the slug was checked — a request for `p/n9` returned `n0`'s
+//! payload, because the *payload offset* inside an otherwise intact-looking record
+//! had been flipped to another row's.
+//!
+//! Checking the slug catches the first and not the second. A CRC over the whole
+//! record catches both, and everything else in it, for four bytes a node and a
+//! hash of about thirty bytes on each read.
 //!
 //! The slug runs to the end so it needs no length of its own, and the spatial
 //! extent is present only for nodes that have geometry — it is 48 bytes, and
@@ -73,9 +87,15 @@ pub(crate) struct StoredNode {
     pub slug: String,
 }
 
-const HEADER: usize = 20;
+const HEADER: usize = 24;
 const SPATIAL_BYTES: usize = 48;
 const FLAG_SPATIAL: u32 = 1;
+
+fn crc(bytes: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(bytes);
+    h.finalize()
+}
 
 fn rd16(b: &[u8], at: usize) -> u16 { u16::from_le_bytes(b[at..at + 2].try_into().unwrap()) }
 fn rd32(b: &[u8], at: usize) -> u32 { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) }
@@ -85,6 +105,7 @@ fn encode(n: &StoredNode, out: &mut Vec<u8>) {
     out.clear();
     out.reserve(HEADER + n.collection.len() + n.slug.len()
                 + if n.spatial.is_some() { SPATIAL_BYTES } else { 0 });
+    out.extend_from_slice(&0u32.to_le_bytes()); // checksum, filled in at the end
     out.extend_from_slice(&n.payload_offset.to_le_bytes());
     out.extend_from_slice(&n.payload_len.to_le_bytes());
     out.extend_from_slice(&if n.spatial.is_some() { FLAG_SPATIAL } else { 0 }.to_le_bytes());
@@ -95,6 +116,8 @@ fn encode(n: &StoredNode, out: &mut Vec<u8>) {
     }
     out.extend_from_slice(n.collection.as_bytes());
     out.extend_from_slice(n.slug.as_bytes());
+    let sum = crc(&out[4..]);
+    out[..4].copy_from_slice(&sum.to_le_bytes());
 }
 
 /// Decode a stored node, or `None` if the bytes cannot be one.
@@ -104,8 +127,13 @@ fn encode(n: &StoredNode, out: &mut Vec<u8>) {
 /// every length here is checked against what was actually returned.
 fn decode(b: &[u8]) -> Option<StoredNode> {
     if b.len() < HEADER { return None }
-    let flags = rd32(b, 12);
-    let coll_len = rd16(b, 16) as usize;
+    // Before anything is read out of it. A record that does not match its own
+    // checksum is not this node's record — it may be another node's, reached
+    // through a damaged slot directory, and returning it would answer a question
+    // with a different row's data.
+    if rd32(b, 0) != crc(&b[4..]) { return None }
+    let flags = rd32(b, 16);
+    let coll_len = rd16(b, 20) as usize;
     let mut at = HEADER;
     let spatial = if flags & FLAG_SPATIAL != 0 {
         if b.len() < HEADER + SPATIAL_BYTES { return None }
@@ -123,8 +151,8 @@ fn decode(b: &[u8]) -> Option<StoredNode> {
     let coll_end = at.checked_add(coll_len).filter(|&e| e <= b.len())?;
     Some(StoredNode {
         collection: std::str::from_utf8(&b[at..coll_end]).ok()?.to_string(),
-        payload_offset: rd64(b, 0),
-        payload_len: rd32(b, 8),
+        payload_offset: rd64(b, 4),
+        payload_len: rd32(b, 12),
         spatial,
         // Text that is not valid UTF-8 is damage, not a node. Losing the slug would
         // make the node unaddressable, so the record is refused instead.
@@ -137,6 +165,14 @@ fn member_key(collection: u64, node: u64) -> u128 {
     ((collection as u128) << 64) | node as u128
 }
 
+/// Nodes in slotted pages, keyed by `sk_hash(slug)`.
+///
+/// **The key must be the hash of the node's own slug.** That is how the engine
+/// addresses nodes, and [`get`](NodeStore::get) relies on it to tell whether the
+/// record it read is the record it asked for — a record store holds anonymous
+/// bytes at a slot, so a damaged slot directory otherwise returns a different row
+/// silently. Storing a node under any other key makes it unreadable, which is the
+/// safe direction for a mistake to fail in.
 pub(crate) struct NodeStore {
     store: PagedStore,
     /// `(collection hash, node hash) -> 1`. The value is unused; the key is the
@@ -180,8 +216,27 @@ impl NodeStore {
         (rec, idx, self.members.page_count() + self.geo.page_count())
     }
 
+    /// The node stored under `hash`, or `None`.
+    ///
+    /// **The record is checked against the key it was fetched by.** A record store
+    /// holds anonymous bytes at a slot: corrupt the slot directory and the read
+    /// lands on a different record, which is returned as if it were the one asked
+    /// for. Fuzzing found exactly that — a request for `p/n69` came back as `n51`,
+    /// a real row of the same store, with nothing to indicate the substitution.
+    ///
+    /// A node record carries its own slug, so the check is one hash of a short
+    /// string, and it is exact: the only way to pass it is to be the right record.
+    /// Returning `None` for a record that is not the one requested loses a row that
+    /// was damaged anyway; returning it would be answering a question with another
+    /// row's data.
     pub(crate) fn get(&self, hash: u64) -> io::Result<Option<StoredNode>> {
-        Ok(self.store.get(hash as u128)?.and_then(|b| decode(&b)))
+        let Some(node) = self.store.get(hash as u128)?.and_then(|b| decode(&b)) else {
+            return Ok(None);
+        };
+        if crate::sk_hash(&node.slug) != hash {
+            return Ok(None);
+        }
+        Ok(Some(node))
     }
 
     /// Whether the store holds this node, without reading its record.
@@ -284,16 +339,30 @@ mod tests {
     fn store(dir: &tempfile::TempDir) -> NodeStore {
         NodeStore::open(dir.path(), DEFAULT_PAGE_SIZE).unwrap()
     }
-    fn h(i: u64) -> u64 { i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5851_F42D_4C95_7F2D }
+    /// The key a node is stored under: the hash of its slug, which is the
+    /// invariant `get` checks against. Tests that key by anything else are
+    /// testing a way the store is never used.
+    fn h(i: u64) -> u64 { crate::sk_hash(&slug_of(i)) }
+    fn slug_of(i: u64) -> String { format!("{}/n{i}", ["p", "q", "r"][(i % 3) as usize]) }
     fn coll(name: &str) -> u64 { crate::sk_hash(name) }
 
+    /// Store a node under the key the engine would use: the hash of its own slug.
+    fn put(s: &mut NodeStore, n: &StoredNode) -> u64 {
+        let key = crate::sk_hash(&n.slug);
+        s.put(key, n).unwrap();
+        key
+    }
+
+    /// A node whose slug matches the key `h(i)` produces, so it round-trips.
+    /// `c` names the collection it claims; the slug's prefix is fixed by `slug_of`
+    /// because that is what the key was hashed from.
     fn node(i: u64, c: &str) -> StoredNode {
         StoredNode {
             collection: c.to_string(),
             payload_offset: i * 97,
             payload_len: (i % 500) as u32,
             spatial: None,
-            slug: format!("{c}/n{i}"),
+            slug: slug_of(i),
         }
     }
     fn geo_node(i: u64, c: &str) -> StoredNode {
@@ -324,8 +393,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut s = store(&dir);
         for i in 0..1_000 {
-            if i % 3 == 0 { s.put(h(i), &geo_node(i, "p")).unwrap() }
-            else { s.put(h(i), &node(i, "p")).unwrap() }
+            if i % 3 == 0 { put(&mut s, &geo_node(i, "p")); }
+            else { put(&mut s, &node(i, "p")); }
         }
         for i in 0..1_000 {
             let got = s.get(h(i)).unwrap().expect("node vanished");
@@ -335,7 +404,7 @@ mod tests {
                 assert_eq!(got, node(i, "p"), "node {i} gained geometry it never had");
                 assert!(got.spatial.is_none());
             }
-            assert_eq!(got.slug, format!("p/n{i}"), "node {i} slug shifted");
+            assert_eq!(got.slug, slug_of(i), "node {i} slug shifted");
         }
     }
 
@@ -353,12 +422,13 @@ mod tests {
             &format!("p/{}", "x".repeat(3_000)),   // longer than a page's free space
             &format!("p/{}", "y".repeat(60_000)),  // spans several pages
         ];
+        let mut keys = Vec::new();
         for (i, slug) in slugs.iter().enumerate() {
-            s.put(h(i as u64), &StoredNode { slug: slug.to_string(), ..node(i as u64, "p") })
-                .unwrap();
+            let n = StoredNode { slug: slug.to_string(), ..node(i as u64, "p") };
+            keys.push(put(&mut s, &n));
         }
         for (i, slug) in slugs.iter().enumerate() {
-            assert_eq!(s.get(h(i as u64)).unwrap().unwrap().slug, *slug, "slug {i}");
+            assert_eq!(s.get(keys[i]).unwrap().unwrap().slug, *slug, "slug {i}");
         }
     }
 
@@ -401,10 +471,9 @@ mod tests {
         let mut oracle: HashMap<u64, StoredNode> = HashMap::new();
 
         for i in 0..6_000u64 {
-            let key = h(i % 1_500);
             let c = ["p", "q", "r"][(i % 3) as usize];
-            let n = if i % 7 == 0 { geo_node(i, c) } else { node(i, c) };
-            s.put(key, &n).unwrap();
+            let n = if i % 7 == 0 { geo_node(i % 1_500, c) } else { node(i % 1_500, c) };
+            let key = put(&mut s, &n);
             oracle.insert(key, n);
 
             if i % 4 == 0 {
@@ -454,37 +523,36 @@ mod tests {
                    2_999, "membership did not survive");
     }
 
-    /// A record that is too short, or claims geometry it does not carry, must be
-    /// refused rather than read past. These bytes come off disk.
+    /// A damaged record must be refused, not read past and not partly believed.
+    ///
+    /// This used to allow a record cut after its geometry to decode with a short
+    /// slug, on the grounds that the decoder could not tell. With the record
+    /// checksummed it can: **every** truncation now fails, because the checksum
+    /// covers the whole record. That is the stronger property, and the reason the
+    /// checksum is worth four bytes a node.
     #[test]
     fn a_damaged_record_is_refused_rather_than_read_past() {
         let mut full = Vec::new();
         encode(&geo_node(1, "p"), &mut full);
-        assert!(decode(&full).is_some());
-        // Everything before the slug has a length that must be present in full:
-        // the header, then the geometry the flag promises, then the collection
-        // name. A record cut anywhere inside that is refused.
-        let complete = HEADER + SPATIAL_BYTES + geo_node(1, "p").collection.len();
+        assert!(decode(&full).is_some(), "an intact record must decode");
+
         for cut in 0..full.len() {
-            let got = decode(&full[..cut]);
-            if cut < complete {
-                assert!(got.is_none(), "a record cut to {cut} bytes decoded anyway");
-            } else {
-                // Past that, only the slug is short — damage the decoder cannot
-                // detect, but it must still not read out of bounds or lose the
-                // fields that did arrive.
-                let n = got.expect("a record cut to {cut} bytes was refused wrongly");
-                assert_eq!(n.collection, "p", "cut {cut} lost the collection");
-                assert_eq!(n.spatial, geo_node(1, "p").spatial, "cut {cut} lost the geometry");
-                assert!(full[..cut].ends_with(n.slug.as_bytes()), "cut {cut} invented a slug");
-            }
+            assert!(decode(&full[..cut]).is_none(),
+                    "a record cut to {cut} of {} bytes decoded anyway", full.len());
         }
-        // A slug that is not valid UTF-8 is damage, not a node.
-        let mut bad = Vec::new();
-        encode(&node(1, "p"), &mut bad);
-        let last = bad.len() - 1;
-        bad[last] = 0xFF;
-        assert!(decode(&bad).is_none(), "a record with an unreadable slug was accepted");
+        // A flip anywhere in the record must be caught, including in the parts a
+        // reader would otherwise never validate: the payload offset, the flags, the
+        // collection length, the text.
+        for at in 0..full.len() {
+            let mut bad = full.clone();
+            bad[at] ^= 0xFF;
+            assert!(decode(&bad).is_none(),
+                    "a byte flipped at {at} of {} was not detected", full.len());
+        }
+        // And the checksum must not be trivially satisfiable: zeroing it fails too.
+        let mut zeroed = full.clone();
+        zeroed[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(decode(&zeroed).is_none(), "a zeroed checksum was accepted");
     }
 
     /// **The measurement the direction exists for.**
