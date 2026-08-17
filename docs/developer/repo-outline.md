@@ -989,7 +989,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    355  mod tests
 ```
 
-### `btree.rs` · 664L — Why
+### `btree.rs` · 677L — Why
 
 ```
     54  fn rd8(p: &[u8], at: usize) -> u64 { u64::from_le_bytes(p[at..at + 8].try_into().unwrap()) }
@@ -1017,13 +1017,13 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    168    pub(crate) fn len(&self) -> u64 { self.len }
    169    pub(crate) fn page_count(&self) -> u64 { self.pages.page_count() }
    170    pub(crate) fn sync(&mut self) -> io::Result<()>
-   215    pub(crate) fn get(&self, key: u128) -> io::Result<Option<u64>>
-   232    pub(crate) fn insert(&mut self, key: u128, value: u64) -> io::Result<()>
-   355    pub(crate) fn remove(&mut self, key: u128) -> io::Result<bool>
-   385    pub(crate) fn range(&self, lo: u128, hi: u128) -> io::Result<Vec<(u128, u64)>>
-   419    pub(crate) fn for_each(&self, mut f: impl FnMut(u128, u64) -> bool) -> io::Result<()>
-   447    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>>
-   455  mod tests
+   228    pub(crate) fn get(&self, key: u128) -> io::Result<Option<u64>>
+   245    pub(crate) fn insert(&mut self, key: u128, value: u64) -> io::Result<()>
+   368    pub(crate) fn remove(&mut self, key: u128) -> io::Result<bool>
+   398    pub(crate) fn range(&self, lo: u128, hi: u128) -> io::Result<Vec<(u128, u64)>>
+   432    pub(crate) fn for_each(&self, mut f: impl FnMut(u128, u64) -> bool) -> io::Result<()>
+   460    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>>
+   468  mod tests
 ```
 
 ### `edgestore.rs` · 917L — Edge storage — the graph's connections
@@ -1180,7 +1180,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    130  mod tests
 ```
 
-### `pagestore.rs` · 753L — Why this exists
+### `pagestore.rs` · 769L — Why this exists
 
 ```
     61  pub(crate) struct PageStore
@@ -1194,17 +1194,18 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    232    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64)
    243    pub(crate) fn alloc(&mut self) -> io::Result<u64>
    293    pub(crate) fn free(&mut self, page: u64) -> io::Result<()>
-   308    pub(crate) fn read(&self, page: u64, buf: &mut [u8]) -> io::Result<()>
-   327    pub(crate) fn write(&mut self, page: u64, buf: &[u8]) -> io::Result<()>
-   336    pub(crate) fn sync(&mut self) -> io::Result<()>
-   363  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
-   368  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
-   373  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
-   380  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
-   388  mod tests
+   318    pub(crate) fn page_slice(&self, page: u64) -> Option<&[u8]>
+   324    pub(crate) fn read(&self, page: u64, buf: &mut [u8]) -> io::Result<()>
+   343    pub(crate) fn write(&mut self, page: u64, buf: &[u8]) -> io::Result<()>
+   352    pub(crate) fn sync(&mut self) -> io::Result<()>
+   379  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
+   384  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
+   389  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
+   396  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
+   404  mod tests
 ```
 
-### `recordstore.rs` · 588L — Why
+### `recordstore.rs` · 694L — Why
 
 ```
     69  pub(crate) struct RecordId(pub u64)
@@ -1227,13 +1228,13 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    149    pub(crate) fn page_count(&self) -> u64 { self.pages.page_count() }
    150    pub(crate) fn free_page_count(&self) -> u64 { self.pages.free_count() }
    151    pub(crate) fn sync(&mut self) -> io::Result<()> { self.pages.sync() }
-   155    pub(crate) fn user_meta(&self) -> (u64, u64) { self.pages.user_meta() }
-   156    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64) { self.pages.set_user_meta(a, b) }
-   159    pub(crate) fn max_record_len(&self) -> usize
-   291    pub(crate) fn insert(&mut self, bytes: &[u8]) -> io::Result<RecordId>
-   343    pub(crate) fn read(&self, id: RecordId) -> io::Result<Option<Vec<u8>>>
-   367    pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool>
-   401  mod tests
+   158    pub(crate) fn user_meta(&self) -> (u64, u64) { self.pages.user_meta() }
+   159    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64) { self.pages.set_user_meta(a, b) }
+   162    pub(crate) fn max_record_len(&self) -> usize
+   310    pub(crate) fn insert(&mut self, bytes: &[u8]) -> io::Result<RecordId>
+   362    pub(crate) fn read(&self, id: RecordId) -> io::Result<Option<Vec<u8>>>
+   386    pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool>
+   424  mod tests
 ```
 
 ### `skbin.rs` · 610L — SKBIN — a compact binary format for record payloads
@@ -1610,4 +1611,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    244  mod tests
 ```
 
-<!-- 49 files, 1338 items -->
+<!-- 49 files, 1339 items -->

@@ -150,6 +150,9 @@ impl RecordStore {
     pub(crate) fn free_page_count(&self) -> u64 { self.pages.free_count() }
     pub(crate) fn sync(&mut self) -> io::Result<()> { self.pages.sync() }
 
+    #[cfg(test)]
+    fn pages_for_test(&self) -> &PageStore { &self.pages }
+
     /// Two words in the page header that this store does not use, for whoever owns
     /// it to keep a tally in. Written when the header is, which is on `sync`.
     pub(crate) fn user_meta(&self) -> (u64, u64) { self.pages.user_meta() }
@@ -198,8 +201,17 @@ impl RecordStore {
     fn compact_page(&self, p: &mut [u8]) {
         let ps = p.len();
         let n = slot_count(p);
+        // Bounded, because `off` and `len` come off disk. `read` already refuses a
+        // slot that does not describe real bytes; this path did not, so a page whose
+        // directory said "offset 4000, length 200" panicked here instead — reached
+        // from `insert` whenever a page looks full and its dead space looks
+        // reclaimable. A slot that cannot be believed is dropped rather than moved.
         let live: Vec<(usize, Vec<u8>)> = (0..n)
-            .filter_map(|i| slot_entry(p, i).map(|(off, len)| (i, p[off..off + len].to_vec())))
+            .filter_map(|i| {
+                let (off, len) = slot_entry(p, i)?;
+                if off.checked_add(len)? > ps { return None }
+                Some((i, p[off..off + len].to_vec()))
+            })
             .collect();
         let mut cursor = ps;
         for (i, bytes) in &live {
@@ -244,7 +256,14 @@ impl RecordStore {
         let mut out = Vec::new();
         let mut page = head;
         let mut buf = vec![0u8; ps];
+        // A chain is pointers stored in the pages it links, so damage makes it point
+        // anywhere — including back at a page already visited. Following that with no
+        // bound appends forever until memory runs out. No chain can legitimately
+        // visit more pages than the store holds, so that is the bound; the B+tree
+        // walks are bounded the same way.
+        let mut budget = self.pages.page_count().saturating_add(1);
         while page != 0 {
+            budget = match budget.checked_sub(1) { Some(b) => b, None => return Ok(None) };
             if self.pages.read(page, &mut buf).is_err() {
                 return Ok(None);
             }
@@ -381,7 +400,11 @@ impl RecordStore {
             return Ok(false); // already dead
         }
         kill_slot(&mut self.buf, i);
-        let live = live_count(&self.buf) - 1;
+        // Saturating, because `live_count` is a number off disk like every other:
+        // a page whose header says zero live records while a slot still reads as
+        // live would otherwise underflow to `usize::MAX` and write `0xFFFF` back as
+        // the count, turning one damaged page into a permanently wrong one.
+        let live = live_count(&self.buf).saturating_sub(1);
         wr16(&mut self.buf, 2, live as u16);
         let page_bytes = std::mem::take(&mut self.buf);
         self.pages.write(id.page(), &page_bytes)?;
@@ -583,6 +606,89 @@ mod tests {
         for slot in [0u16, 1, 1_022, 19_282] {
             assert!(solo.read(RecordId::new(victim.page(), slot)).unwrap().is_none(),
                     "a freed page produced a record at slot {slot}");
+        }
+    }
+
+    /// Three page states that a damaged store can be in, each of which used to
+    /// break a path that the read path already defended against.
+    ///
+    /// Found by an independent review rather than by fuzzing: they need a *specific*
+    /// page shape, and random byte flips reach them only by luck. All three are the
+    /// same mistake as the ones fuzzing did find — a number off disk used without
+    /// asking whether it could be one — in the three places that had been missed.
+    #[test]
+    fn damaged_pages_do_not_break_the_write_paths() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        // (1) A slot claiming bytes past the end of its page. `read` refuses such a
+        // slot; `compact_page` sliced with it, and is reached from `insert` whenever
+        // a page looks full and its dead space looks reclaimable.
+        {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("r.bin");
+            let mut s = RecordStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+            let first = s.insert(&vec![b'a'; 200]).unwrap();
+            for _ in 0..8 { s.insert(&vec![b'b'; 300]).unwrap(); }
+            s.sync().unwrap();
+            drop(s);
+            // Slot 0 of that page: offset 4000, length 200 — 4200 > 4096.
+            {
+                let mut fh = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                let at = first.page() * DEFAULT_PAGE_SIZE as u64 + PAGE_HEADER as u64;
+                fh.seek(SeekFrom::Start(at)).unwrap();
+                fh.write_all(&4000u16.to_le_bytes()).unwrap();
+                fh.write_all(&201u16.to_le_bytes()).unwrap(); // stored length + 1
+            }
+            let mut s = RecordStore::open(&path).unwrap().unwrap();
+            // Inserts must keep working rather than panicking in compaction.
+            for i in 0..40 {
+                s.insert(&vec![b'c'; 300]).unwrap_or_else(|e| panic!("insert {i} failed: {e}"));
+            }
+        }
+
+        // (2) An overflow chain that points at itself. Following it appended
+        // forever, filling memory; every other walk in this crate is bounded.
+        {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("o.bin");
+            let mut s = RecordStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+            let big = s.insert(&vec![b'z'; DEFAULT_PAGE_SIZE * 3]).unwrap();
+            s.sync().unwrap();
+            drop(s);
+            {
+                // Point the head page's `next` back at itself.
+                let mut fh = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                fh.seek(SeekFrom::Start(big.page() * DEFAULT_PAGE_SIZE as u64)).unwrap();
+                fh.write_all(&big.page().to_le_bytes()).unwrap();
+            }
+            let s = RecordStore::open(&path).unwrap().unwrap();
+            let got = s.read(big).unwrap();
+            // Whatever it returns, it must return: bounded, not endless.
+            assert!(got.map_or(true, |v| v.len() <= DEFAULT_PAGE_SIZE * 64),
+                    "a self-referencing overflow chain produced an unbounded record");
+        }
+
+        // (3) A page whose header says nothing is live while a slot still reads as
+        // live. `live_count - 1` underflowed to usize::MAX and wrote 0xFFFF back.
+        {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("d.bin");
+            let mut s = RecordStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+            let id = s.insert(b"a record").unwrap();
+            s.sync().unwrap();
+            drop(s);
+            {
+                let mut fh = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                fh.seek(SeekFrom::Start(id.page() * DEFAULT_PAGE_SIZE as u64 + 2)).unwrap();
+                fh.write_all(&0u16.to_le_bytes()).unwrap(); // live_count = 0
+            }
+            let mut s = RecordStore::open(&path).unwrap().unwrap();
+            let _ = s.delete(id); // must not panic, must not write 0xFFFF back
+            let mut probe = vec![0u8; DEFAULT_PAGE_SIZE];
+            s.pages_for_test().read(id.page(), &mut probe).unwrap();
+            assert!(rd16(&probe, 2) < 1000,
+                    "deleting from a page with a zeroed live count wrote {} back",
+                    rd16(&probe, 2));
         }
     }
 }
