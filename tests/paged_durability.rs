@@ -662,3 +662,115 @@ fn opening_a_paged_store_with_the_wrong_config_is_refused() {
     assert_eq!(rows(&db), 40, "the store did not survive the refused opens");
     assert_eq!(db.one("p/n0").forward("next").collect().len(), 1);
 }
+
+/// **`UPDATE` must maintain the btree index in paged mode.**
+///
+/// `field_indexes` is the writable index map. On a paged store the index is loaded
+/// as an mmap'd sidecar into `field_base` instead, so that map is empty and every
+/// column looked unindexed to `UPDATE` — neither the old key was removed nor the
+/// new one inserted, and the index went on answering from before the update.
+///
+/// The result is a query that lies in both directions and does not heal: `WHERE
+/// n = 5` returns the row that is now 9999, `WHERE n = 9999` returns nothing, and
+/// `MAX(n)` reports a value no row holds. It survives a compaction and a reopen.
+///
+/// `put_raw` hydrates the index before maintaining it. This path did not — which
+/// made an update behave differently from a write to the same column.
+#[test]
+fn update_maintains_the_btree_index_in_paged_mode() {
+    for (label, cfg) in [("paged", paged()), ("default", Config::default())] {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+            db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+            for i in 0..60 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
+            db.execute("CREATE INDEX ON p USING btree (n)").unwrap();
+            db.compact().unwrap();
+        }
+        // Reopen, so a paged store serves the index from its mmap'd sidecar — the
+        // state in which the writable map is empty.
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("UPDATE p SET n = 9999 WHERE n = 5").unwrap();
+
+        let by = |db: &CoreDB, sql: &str| -> Vec<String> {
+            let mut v: Vec<String> = db.query(sql).unwrap().collect()
+                .iter().map(|h| h.slug.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(by(&db, "SELECT _key FROM p WHERE n = 9999"), vec!["p/n5".to_string()],
+                   "[{label}] the index does not know the new value");
+        assert!(by(&db, "SELECT _key FROM p WHERE n = 5").is_empty(),
+                "[{label}] the index still returns the row under its old value");
+        let max = db.query("SELECT MAX(n) AS m FROM p").unwrap().collect();
+        let m = max[0].payload.as_ref().unwrap()["m"].clone();
+        let m = m.as_i64().or_else(|| m.as_f64().map(|f| f as i64));
+        assert_eq!(m, Some(9999),
+                   "[{label}] MAX answers from before the update (payload was {:?})",
+                   max[0].payload);
+
+        // And it must still be right after a compaction and a reopen, because the
+        // original failure survived both.
+        db.compact().unwrap();
+        assert_eq!(by(&db, "SELECT _key FROM p WHERE n = 9999"), vec!["p/n5".to_string()],
+                   "[{label}] the update was lost by the compaction");
+    }
+}
+
+/// **`update_edge` and `unlink_where` must reach edges in the durable store.**
+///
+/// Both go straight to `EdgeStore`, which only ever sees the RAM overlay. Against
+/// a compacted graph they reported a count and changed nothing: the edge kept its
+/// old attributes, or stayed linked. `unlink` had exactly this hole and was fixed
+/// by recording the withdrawal where base reads subtract it — these two are one
+/// method over and never got the same treatment.
+#[test]
+fn edge_attribute_writes_reach_the_durable_store() {
+    for (label, cfg) in [("paged", paged()), ("default", Config::default())] {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+            db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+            for i in 0..20 { db.put(&format!("p/n{i}"), &row(i)).unwrap(); }
+            for i in 0..10 {
+                db.link_meta(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next",
+                             &json!({"weight": i as i64}).to_string()).unwrap();
+            }
+            // Compact so every edge is durable rather than in the overlay.
+            db.compact().unwrap();
+        }
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        let before = db.edge_count();
+
+        // update_edge against a durable edge.
+        let n = db.update_edge("p/n3", "p/n4", "next", "{}", &json!({"weight": 777}).to_string());
+        assert_eq!(n, 1, "[{label}] update_edge reported {n} edges updated");
+        let got = db.edges_from("p/n3").into_iter()
+            .find(|e| e.edge_type.as_deref() == Some("next"))
+            .and_then(|e| e.meta)
+            .and_then(|m| m.get("weight").and_then(|w| w.as_i64()));
+        assert_eq!(got, Some(777),
+                   "[{label}] the edge still carries its old attributes after update_edge");
+        assert_eq!(db.edge_count(), before,
+                   "[{label}] updating an edge changed how many there are");
+
+        // unlink_where against a durable edge, matching on an attribute.
+        let removed = db.unlink_where("p/n6", "p/n7", "next", &json!({"weight": 6}).to_string());
+        assert_eq!(removed, 1, "[{label}] unlink_where reported {removed} removed");
+        assert!(db.one("p/n6").forward("next").collect().is_empty(),
+                "[{label}] the edge is still there after unlink_where");
+        assert_eq!(db.edge_count(), before - 1,
+                   "[{label}] the edge count did not follow the removal");
+
+        // And both survive a compaction.
+        db.compact().unwrap();
+        assert!(db.one("p/n6").forward("next").collect().is_empty(),
+                "[{label}] the removed edge came back after a compaction");
+        let after = db.edges_from("p/n3").into_iter()
+            .find(|e| e.edge_type.as_deref() == Some("next"))
+            .and_then(|e| e.meta)
+            .and_then(|m| m.get("weight").and_then(|w| w.as_i64()));
+        assert_eq!(after, Some(777),
+                   "[{label}] the updated attributes were lost by the compaction");
+    }
+}
