@@ -9927,10 +9927,28 @@ impl CoreDB {
 
         let idx = self.field_index_ref(coll_hash, field)?;
 
-        // Look ahead for a Take limit — enables O(k) extraction instead of O(N)
-        let take_n = remaining[sort_pos + 1..]
+        // Look ahead for a Take limit — enables O(k) extraction instead of O(N).
+        //
+        // The bound is OFFSET + LIMIT, not LIMIT. This took the LIMIT alone, so a
+        // query with an offset seeded exactly `limit` rows and the `Skip` that ran
+        // afterwards drained from those: `ORDER BY v LIMIT 5 OFFSET 3` returned two
+        // rows with an index on `v` and five without one. An answer that depends on
+        // whether an index happens to exist is the worst shape a query bug takes,
+        // because nothing in the query says which path it took.
+        //
+        // A `Distinct` between here and the Take rules the shortcut out entirely:
+        // rows that dedup away were still produced, so no count taken before the
+        // dedup can bound what comes after it.
+        let tail = &remaining[sort_pos + 1..];
+        if tail.iter().any(|s| matches!(s, Step::Distinct)) {
+            return None;
+        }
+        let skip_n: usize = tail.iter()
+            .filter_map(|s| if let Step::Skip(n) = s { Some(*n) } else { None })
+            .sum();
+        let take_n = tail
             .iter()
-            .find_map(|s| if let Step::Take(n) = s { Some(*n) } else { None });
+            .find_map(|s| if let Step::Take(n) = s { Some(n.saturating_add(skip_n)) } else { None });
 
         let result: Vec<u64> = idx
             .iter_kv(!*asc)

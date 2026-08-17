@@ -960,11 +960,23 @@ impl AggAccum {
             }
             return;
         }
-        if let Some(f) = field_val.and_then(|v| v.as_f64()) {
-            self.count_notnull += 1;
-            self.sum += f;
-            self.min = Some(self.min.map_or(f, |m: f64| m.min(f)));
-            self.max = Some(self.max.map_or(f, |m: f64| m.max(f)));
+        // `COUNT(col)` counts values that are present and not null, whatever their
+        // type. It used to be folded into the numeric branch below, so it counted
+        // only what parsed as a number: `COUNT(name)` over three names answered
+        // zero, and every text column was uncountable.
+        //
+        // The numeric accumulators stay numeric — summing a name means nothing, and
+        // a column of mixed types should contribute only its numbers to SUM while
+        // still contributing all of its values to COUNT.
+        if let Some(v) = field_val {
+            if !v.is_null() {
+                self.count_notnull += 1;
+            }
+            if let Some(f) = v.as_f64() {
+                self.sum += f;
+                self.min = Some(self.min.map_or(f, |m: f64| m.min(f)));
+                self.max = Some(self.max.map_or(f, |m: f64| m.max(f)));
+            }
         }
     }
 
@@ -1802,6 +1814,7 @@ impl<'db> Set<'db> {
                     ).unwrap_or_default();
                     seen.insert(key)
                 });
+                Self::apply_offset_limit(&mut hits, &self.steps);
             }
             Self::resolve_vectors(self.db, &mut hits, &select_fields, &self.steps);
             return hits;
@@ -1905,9 +1918,30 @@ impl<'db> Set<'db> {
                     .unwrap_or_default();
                 seen.insert(key)
             });
+            Self::apply_offset_limit(&mut hits, &self.steps);
         }
         Self::resolve_vectors(self.db, &mut hits, &select_fields, &self.steps);
         hits
+    }
+
+    /// Apply OFFSET and LIMIT to already-shaped rows.
+    ///
+    /// `execute` holds both back whenever a DISTINCT is in the pipeline, because
+    /// deduplication happens here on payloads and a limit taken before it counts
+    /// the rows that *produced* the answer rather than the answer. There are two
+    /// places rows get deduplicated, and only fixing one left
+    /// `SELECT DISTINCT x ... LIMIT 2` returning every distinct row instead of two.
+    fn apply_offset_limit(hits: &mut Vec<Hit>, steps: &[Step]) {
+        for step in steps {
+            match step {
+                Step::Skip(n) => {
+                    let n = *n;
+                    if n >= hits.len() { hits.clear() } else { hits.drain(..n); }
+                }
+                Step::Take(n) => hits.truncate(*n),
+                _ => {}
+            }
+        }
     }
 
     /// Return the number of matching nodes without resolving payloads.
@@ -2487,6 +2521,9 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
         return fast;
     }
 
+    // Whether a DISTINCT waits downstream, which decides if this function may
+    // apply OFFSET/LIMIT at all — see the Skip/Take arms below.
+    let has_distinct = steps.iter().any(|s| matches!(s, Step::Distinct));
     let mut candidates: Vec<u64> = Vec::new(); // the working set of node ids
     // Step indices already applied by `btree_seed` — the main loop skips these so
     // an index-seeded filter isn't also run as a full scan.
@@ -3765,16 +3802,25 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 });
                 candidates = scored.into_iter().map(|(h, _)| h).collect();
             }
+            // With a DISTINCT in the pipeline these wait. Deduplication happens in
+            // `Set::collect`, on payloads, after this function has finished — so
+            // trimming here trims *rows*, and `SELECT DISTINCT x ... LIMIT 2` over
+            // two duplicates and two others returned one row instead of two. SQL
+            // deduplicates and then limits; so does this now.
             Step::Skip(n) => {
-                let n = *n;
-                if n >= candidates.len() {
-                    candidates.clear();
-                } else {
-                    candidates.drain(..n);
+                if !has_distinct {
+                    let n = *n;
+                    if n >= candidates.len() {
+                        candidates.clear();
+                    } else {
+                        candidates.drain(..n);
+                    }
                 }
             }
             Step::Take(n) => {
-                candidates.truncate(*n);
+                if !has_distinct {
+                    candidates.truncate(*n);
+                }
             }
             // Select / GroupBy / Having / Distinct are projection / shaping steps
             // handled in Set::collect(), not here.
@@ -3789,11 +3835,25 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
 
 /// Look ahead in remaining steps to find a Take limit.
 /// Skips Skip and Select which don't affect the limit.
+/// How many rows a producer must emit before it is allowed to stop.
+///
+/// Every caller uses this to end a scan early, and "enough rows" is `OFFSET +
+/// LIMIT` — not `LIMIT`. This walked *over* the `Skip` and returned the `Take`
+/// alone, so a producer stopped at `LIMIT` rows and the offset then drained from
+/// what little it had: `ORDER BY v LIMIT 5 OFFSET 3` returned two rows through the
+/// index-assisted sort and five through the ordinary one. An answer that depends on
+/// whether an index happens to exist is the worst shape a query bug takes, because
+/// nothing about the query says which path it took.
+///
+/// `DISTINCT` is the same trap and is why it is *not* skipped over here: rows that
+/// dedup away still had to be produced, so no early exit is sound before it.
 fn find_take_limit(remaining_steps: &[Step]) -> Option<usize> {
+    let mut skipped = 0usize;
     for step in remaining_steps {
         match step {
-            Step::Take(n) => return Some(*n),
-            Step::Skip(_) | Step::Select(_) | Step::Distinct | Step::GroupBy(_) | Step::Having(_) => continue,
+            Step::Take(n) => return Some(n.saturating_add(skipped)),
+            Step::Skip(n) => { skipped = skipped.saturating_add(*n); }
+            Step::Select(_) | Step::GroupBy(_) | Step::Having(_) => continue,
             _ => break,
         }
     }
