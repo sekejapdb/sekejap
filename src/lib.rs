@@ -3361,6 +3361,33 @@ impl CoreDB {
 
     /// Delete only edges from→to of `edge_type` whose attributes match the JSON
     /// `props` object (equality). Empty object = delete all. Returns count removed.
+    /// Edges from→to of this type, living in the durable base rather than the
+    /// overlay, whose attributes match `props`.
+    ///
+    /// `EdgeStore` only ever sees the overlay, so anything that filters edges by
+    /// attribute — `unlink_where`, `update_edge` — silently did nothing to a base
+    /// edge. `unlink` had the same hole and was fixed by recording the withdrawal
+    /// where base reads could subtract it; these two never got the same treatment.
+    fn matching_base_edges(&self, from_h: u64, to_h: u64, type_h: u64,
+                           props: &[(String, Value)]) -> Vec<Edge> {
+        let Some(edges) = self.fwd_edges(from_h) else { return Vec::new() };
+        edges.iter()
+            .filter(|e| e.other == to_h && e.edge_type == type_h)
+            // Only the ones the overlay does not already hold: those it does are
+            // handled by `EdgeStore` itself, and withdrawing them here as well
+            // would double-count.
+            .filter(|e| e.base_meta_ref().is_some() || self.edges.fwd_edges(from_h)
+                .is_none_or(|o| !o.iter().any(|x| x.other == e.other
+                                              && x.edge_type == e.edge_type)))
+            .filter(|e| {
+                if props.is_empty() { return true }
+                let have = self.edge_all_attrs(e).unwrap_or(Value::Null);
+                props.iter().all(|(k, v)| have.get(k) == Some(v))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn unlink_where_raw(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str) -> usize {
         let from_h = sk_hash(from);
         let to_h = sk_hash(to);
@@ -3372,7 +3399,15 @@ impl CoreDB {
                 _ => None,
             })
             .unwrap_or_default();
-        self.edges.unlink_matching(from_h, to_h, type_h, &props)
+        // The overlay's own copies, then the durable ones — which `EdgeStore`
+        // cannot see and which used to be left in place, so an `unlink_where`
+        // against a compacted graph reported a count and changed nothing.
+        let mut n = self.edges.unlink_matching(from_h, to_h, type_h, &props);
+        for _ in self.matching_base_edges(from_h, to_h, type_h, &props) {
+            self.unlinked_edges.insert((from_h, to_h, type_h));
+            n += 1;
+        }
+        n
     }
 
     // ── WAL helpers ───────────────────────────────────────────────────────────
@@ -3746,6 +3781,22 @@ impl CoreDB {
             .collect();
 
         // Which updated fields have btree indexes?
+        //
+        // `field_indexes` is the *writable* map. On a paged store the index was
+        // loaded as an mmap'd sidecar into `field_base` instead, so this map is
+        // empty and every field looked unindexed — neither the old key nor the new
+        // one was maintained, and the index kept answering from before the update.
+        // That survives a compaction and a reopen: `WHERE n = 5` returns the row
+        // that is now 9999, `WHERE n = 9999` returns nothing, and `MAX(n)` reports
+        // a value no row holds any more.
+        //
+        // `put_raw` gets this right by hydrating first. This path never did, which
+        // is the difference between a write and an update on the same column.
+        if let Some(ch) = coll_hash {
+            for (field, _) in updates.iter() {
+                self.ensure_field_index_writable(ch, field);
+            }
+        }
         let indexed_fields: Vec<&str> = if let Some(ch) = coll_hash {
             updates.iter()
                 .filter(|(f, _)| self.field_indexes.contains_key(&(ch, f.clone())))
@@ -4454,7 +4505,31 @@ impl CoreDB {
             Some(Value::Object(m)) => m,
             _ => serde_json::Map::new(),
         };
-        self.edges.update_matching(from_h, to_h, type_h, &pred, &set_cols, &set_json)
+        let mut n = self.edges.update_matching(from_h, to_h, type_h, &pred, &set_cols, &set_json);
+
+        // A durable edge cannot be edited where it lies — the base is immutable and
+        // the paged store is written only by a fold. So it is withdrawn and written
+        // again into the overlay with the new attributes, which is what an update
+        // of an immutable record is. Reads merge the two and see one edge with the
+        // new values; the next compaction folds the overlay copy in and the
+        // withdrawal removes the old one.
+        let base_matches = self.matching_base_edges(from_h, to_h, type_h, &pred);
+        for e in base_matches {
+            let mut merged = match self.edge_all_attrs(&e) {
+                Some(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+            // Only the JSON bag here; the fast-lane columns go to `link_with_attrs`
+            // as columns, and a read merges them over the bag afterwards.
+            for (k, v) in &set_json { merged.insert(k.clone(), v.clone()); }
+            for (k, _) in &set_cols { merged.remove(k); }
+            self.unlinked_edges.insert((from_h, to_h, type_h));
+            self.edges.link_with_attrs(
+                from_h, to_h, type_h, edge_type,
+                &set_cols, Some(Value::Object(merged)));
+            n += 1;
+        }
+        n
     }
 
     /// Set attributes on edges from→to of `edge_type` matching `props_json`.
