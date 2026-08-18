@@ -1930,11 +1930,41 @@ impl<'db> Set<'db> {
                             map.entry(k).or_insert(v);
                         }
                     }
+                    // Anything the sampled bytes did not yield is read in full.
+                    //
+                    // The head/tail read is an optimisation resting on an
+                    // assumption — that the fields a caller selects live near the
+                    // start or the end, past the bulk. When the assumption is
+                    // wrong the optimisation was silently *dropping the field*:
+                    // `SELECT mid FROM p` returned `{}` for a row whose `mid` sat
+                    // between two 60 KB values, and returned it correctly for a
+                    // small row beside it. A wrong answer on exactly the rows the
+                    // optimisation exists for.
+                    //
+                    // A field that is genuinely absent also reaches here and costs
+                    // a full read. That is the right way round: the optimisation
+                    // may cost time when its guess is wrong, never correctness.
+                    if fields.iter().any(|f| !map.contains_key(f.as_str())) {
+                        if let Some(full) = self.db.get_payload(hash) {
+                            for f in fields {
+                                if !map.contains_key(f.as_str()) {
+                                    if let Some(v) = eval_field_expr(f, &full) {
+                                        map.insert(f.clone(), v);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let mut out = serde_json::Map::new();
                     for f in fields {
-                        if let Some(v) = map.remove(f.as_str()) {
-                            out.insert(field_output_key(f), v);
-                        }
+                        // A selected column is always in the result, `null` when
+                        // the row has no value for it. Omitting it made the same
+                        // query return rows of two different shapes — a caller
+                        // reading `row["v"]` got a value or a missing key
+                        // depending on which path served the row, and after a
+                        // compaction the shape changed under them.
+                        out.insert(field_output_key(f),
+                                   map.remove(f.as_str()).unwrap_or(Value::Null));
                     }
                     out
                 } else if let Some(bytes) = raw_map.get(&hash) {
@@ -1943,9 +1973,9 @@ impl<'db> Set<'db> {
                     let mut found = self.db.extract_stored_fields(bytes, fields);
                     let mut out = serde_json::Map::new();
                     for f in fields {
-                        if let Some(v) = found.remove(f.as_str()) {
-                            out.insert(field_output_key(f), v);
-                        }
+                        // Always present — see the note on the head/tail branch.
+                        out.insert(field_output_key(f),
+                                   found.remove(f.as_str()).unwrap_or(Value::Null));
                     }
                     out
                 } else {
@@ -2017,13 +2047,24 @@ impl<'db> Set<'db> {
                                     map.entry(k).or_insert(v);
                                 }
                             }
+                            // Full read for anything the sample missed — see the
+                            // note on the other head/tail path.
+                            if fields.iter().any(|f| !map.contains_key(f.as_str())) {
+                                if let Some(full) = self.db.get_payload(hash) {
+                                    for f in fields {
+                                        if !map.contains_key(f.as_str()) {
+                                            if let Some(v) = eval_field_expr(f, &full) {
+                                                map.insert(f.clone(), v);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // Build output map with correct output key names.
                             let mut out = serde_json::Map::new();
                             for f in fields {
-                                let key = field_output_key(f);
-                                if let Some(v) = map.remove(f.as_str()) {
-                                    out.insert(key, v);
-                                }
+                                out.insert(field_output_key(f),
+                                           map.remove(f.as_str()).unwrap_or(Value::Null));
                             }
                             Some(Value::Object(out))
                         } else {
@@ -2031,9 +2072,8 @@ impl<'db> Set<'db> {
                             let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
                             let mut out = serde_json::Map::new();
                             for f in fields {
-                                if let Some(v) = eval_field_expr(f, &raw_payload) {
-                                    out.insert(field_output_key(f), v);
-                                }
+                                out.insert(field_output_key(f),
+                                           eval_field_expr(f, &raw_payload).unwrap_or(Value::Null));
                             }
                             Some(Value::Object(out))
                         }
@@ -2042,9 +2082,8 @@ impl<'db> Set<'db> {
                         let raw_payload = self.db.get_payload(hash).unwrap_or(Value::Null);
                         let mut map = serde_json::Map::new();
                         for f in fields {
-                            if let Some(v) = eval_field_expr(f, &raw_payload) {
-                                map.insert(field_output_key(f), v);
-                            }
+                            map.insert(field_output_key(f),
+                                       eval_field_expr(f, &raw_payload).unwrap_or(Value::Null));
                         }
                         // Inject score projections
                         if let Some(projs) = score_project {

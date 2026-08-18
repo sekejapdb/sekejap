@@ -229,3 +229,46 @@ fn a_committed_transaction_survives_a_restart() {
             "[{label}] a committed transaction did not survive a restart");
     }
 }
+
+/// **A selected field is returned even when it sits in the middle of a big row.**
+///
+/// Projection has a fast path for payloads over 64 KB: read the first 512 bytes
+/// and the last 16 KB and search those, so selecting a name out of a row holding
+/// a 12 MB polygon does not read the polygon. It rests on an assumption — that
+/// the fields a caller selects live near one end, past the bulk.
+///
+/// When the assumption was wrong the field was **silently dropped**.
+/// `SELECT mid FROM p` returned `{}` for a row whose `mid` sat between two 60 KB
+/// values, and returned it correctly for a small row beside it: a wrong answer on
+/// exactly the rows the optimisation exists for, with nothing to indicate it.
+///
+/// There is a full read now for anything the sample misses. A genuinely absent
+/// field costs one too, which is the right way round — the optimisation may cost
+/// time when its guess is wrong, never correctness.
+#[test]
+fn a_field_in_the_middle_of_a_large_payload_is_still_returned() {
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, a TEXT, mid TEXT, z TEXT)").unwrap();
+        // `mid` between two 60 KB values: past the 512-byte head, before the
+        // 16 KB tail, in a payload over the 64 KB fast-path threshold.
+        db.put("p/big", &serde_json::json!({
+            "_collection": "p", "_key": "big",
+            "a": "x".repeat(60_000), "mid": "FOUND_ME", "z": "y".repeat(60_000),
+        }).to_string()).unwrap();
+        db.put("p/small", &serde_json::json!({
+            "_collection": "p", "_key": "small", "a": "s", "mid": "ALSO_HERE", "z": "s",
+        }).to_string()).unwrap();
+        db.compact().unwrap();
+
+        for sql in ["SELECT mid FROM p", "SELECT _key, mid FROM p"] {
+            let hits = db.query(sql).unwrap().collect();
+            let big = hits.iter().find(|h| h.slug == "p/big")
+                .unwrap_or_else(|| panic!("[{label}] `{sql}` lost the large row entirely"));
+            assert_eq!(big.payload.as_ref().and_then(|p| p["mid"].as_str()), Some("FOUND_ME"),
+                "[{label}] `{sql}` dropped `mid` from the large row — it sits outside \
+                 the sampled head and tail, and the sample is not the answer");
+        }
+    }
+}
