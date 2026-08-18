@@ -151,9 +151,9 @@ fn probes() -> Vec<Probe> {
         ("edge attrs",            |d| d.edges_from("p/n0").iter()
                                        .filter_map(|e| e.meta.as_ref().map(|m| m.to_string()))
                                        .collect::<Vec<_>>().join("|")),
-        ("MATCH",                 |d| rows(d, "SELECT _key FROM MATCH (a:p)-[:next]->(b:p)")),
-        ("MATCH cross",           |d| rows(d, "SELECT _key FROM MATCH (a:p)-[:tagged]->(b:q)")),
-        ("SHORTEST",              |d| rows(d, "SELECT _key FROM MATCH SHORTEST (a)-[r*]->(b) \
+        ("MATCH",                 |d| rows(d, "SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)")),
+        ("MATCH cross",           |d| rows(d, "SELECT b._key FROM MATCH (a:p)-[:tagged]->(b:q)")),
+        ("SHORTEST",              |d| rows(d, "SELECT b._key FROM MATCH SHORTEST (a)-[r*]->(b) \
                                                WHERE a._key = 'p/n0' AND b._key = 'p/n9'")),
 
         ("SHOW TABLES",           |d| d.show("SHOW TABLES").map(|h| h.len().to_string()).unwrap_or("ERR".into())),

@@ -908,7 +908,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    188  fn graph_delete(db: &Arc<RwLock<CoreDB>>, body: &[u8], read_only: bool) -> HttpResponse
 ```
 
-### `sql.rs` · 7895L — SGQL — turning query text into a runnable plan
+### `sql.rs` · 7929L — SGQL — turning query text into a runnable plan
 
 ```
    115  fn int_or_float(n: f64) -> Option<serde_json::Number>
@@ -949,44 +949,44 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   1293  fn max_nesting(tokens: &[Tok]) -> usize
   1305  struct Parser
   1311  impl Parser
-  5925  fn compile_cond(cond: CondExpr) -> Step
-  5981  fn append_tail(
-  6027  fn is_grid_starter_cond(c: &CondExpr) -> bool
-  6034  fn compile(stmt: SelectStmt) -> Vec<Step>
-  6191  fn push_group_having_distinct(
-  6211  fn value_as_f32_vec(v: &Value) -> Option<Vec<f32>>
-  6223  fn maybe_parse_json_string(value: Value) -> Value
-  6239  fn compile_insert_row(
-  6282  fn compile_insert(stmt: InsertStmt) -> Result<CompiledMutation, SqlError>
-  6303  fn compile_keyed_steps(collection: &str, conditions: Vec<CondExpr>) -> Vec<Step>
-  6329  fn compile_delete(stmt: DeleteStmt) -> Vec<Step>
-  6340  fn compile_update(stmt: UpdateStmt) -> CompiledMutation
-  6351  pub enum MatchOrAgg
-  6365  fn parse_match_or_agg_inner(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError>
-  6380  pub struct PreparedQuery
-  6384  impl PreparedQuery
-  6385    pub(crate) fn compile(sql: &str) -> Result<Self, SqlError>
-  6396    pub(crate) fn lower(&self, params: Vec<Value>) -> Result<MatchOrAgg, SqlError>
-  6404  fn lower_tokens(tokens: Vec<Tok>, params: Vec<Value>) -> Result<MatchOrAgg, SqlError>
-  6482  pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError>
-  6487  pub fn parse_match_or_agg_params(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError>
-  6498  fn is_select_from_match(tokens: &[Tok]) -> bool
-  6508  fn is_select_from_match_shortest(tokens: &[Tok]) -> bool
-  6520  fn is_multi_from(tokens: &[Tok]) -> bool
-  6548  fn path_func_variant(
-  6582  pub fn parse_and_compile(sql: &str) -> Result<Vec<Step>, SqlError>
-  6606  fn find_kw(hay: &str, kw: &str) -> Option<usize>
-  6624  fn parse_view_ddl(sql: &str) -> Option<CompiledMutation>
-  6670  pub fn extract_root_collection(sql: &str) -> Option<String>
-  6684  fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutation, SqlError>
-  6716  fn parse_mutation_body(parser: &mut Parser) -> Result<CompiledMutation, SqlError>
-  6976  pub fn parse_mutation(sql: &str) -> Result<CompiledMutation, SqlError>
-  6981  pub fn parse_mutation_params(sql: &str, params: Vec<Value>) -> Result<CompiledMutation, SqlErro…
-  6988  mod tests
-  7689  mod debug_tests
-  7796  pub struct ShowEdgesStmt
-  7804  pub enum ShowStmt
-  7823  pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError>
+  5959  fn compile_cond(cond: CondExpr) -> Step
+  6015  fn append_tail(
+  6061  fn is_grid_starter_cond(c: &CondExpr) -> bool
+  6068  fn compile(stmt: SelectStmt) -> Vec<Step>
+  6225  fn push_group_having_distinct(
+  6245  fn value_as_f32_vec(v: &Value) -> Option<Vec<f32>>
+  6257  fn maybe_parse_json_string(value: Value) -> Value
+  6273  fn compile_insert_row(
+  6316  fn compile_insert(stmt: InsertStmt) -> Result<CompiledMutation, SqlError>
+  6337  fn compile_keyed_steps(collection: &str, conditions: Vec<CondExpr>) -> Vec<Step>
+  6363  fn compile_delete(stmt: DeleteStmt) -> Vec<Step>
+  6374  fn compile_update(stmt: UpdateStmt) -> CompiledMutation
+  6385  pub enum MatchOrAgg
+  6399  fn parse_match_or_agg_inner(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError>
+  6414  pub struct PreparedQuery
+  6418  impl PreparedQuery
+  6419    pub(crate) fn compile(sql: &str) -> Result<Self, SqlError>
+  6430    pub(crate) fn lower(&self, params: Vec<Value>) -> Result<MatchOrAgg, SqlError>
+  6438  fn lower_tokens(tokens: Vec<Tok>, params: Vec<Value>) -> Result<MatchOrAgg, SqlError>
+  6516  pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError>
+  6521  pub fn parse_match_or_agg_params(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError>
+  6532  fn is_select_from_match(tokens: &[Tok]) -> bool
+  6542  fn is_select_from_match_shortest(tokens: &[Tok]) -> bool
+  6554  fn is_multi_from(tokens: &[Tok]) -> bool
+  6582  fn path_func_variant(
+  6616  pub fn parse_and_compile(sql: &str) -> Result<Vec<Step>, SqlError>
+  6640  fn find_kw(hay: &str, kw: &str) -> Option<usize>
+  6658  fn parse_view_ddl(sql: &str) -> Option<CompiledMutation>
+  6704  pub fn extract_root_collection(sql: &str) -> Option<String>
+  6718  fn parse_mutation_inner(sql: &str, params: Vec<Value>) -> Result<CompiledMutation, SqlError>
+  6750  fn parse_mutation_body(parser: &mut Parser) -> Result<CompiledMutation, SqlError>
+  7010  pub fn parse_mutation(sql: &str) -> Result<CompiledMutation, SqlError>
+  7015  pub fn parse_mutation_params(sql: &str, params: Vec<Value>) -> Result<CompiledMutation, SqlErro…
+  7022  mod tests
+  7723  mod debug_tests
+  7830  pub struct ShowEdgesStmt
+  7838  pub enum ShowStmt
+  7857  pub fn parse_show(sql: &str) -> Result<ShowStmt, SqlError>
 ```
 
 ## `src/storage/`

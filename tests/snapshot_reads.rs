@@ -737,7 +737,7 @@ fn the_graph_surface_agrees_in_both_storage_modes() {
         let five_hop = db.one("p/n0").forward("next").forward("next").forward("next")
             .forward("next").forward("next").collect().len();
         let shortest = db
-            .query("SELECT _key FROM MATCH SHORTEST (a)-[r*]->(b) \
+            .query("SELECT b._key FROM MATCH SHORTEST (a)-[r*]->(b) \
                     WHERE a._key = 'p/n0' AND b._key = 'p/n5'")
             .map(|s| s.collect().len()).unwrap_or(0);
         (one_hop, five_hop, shortest,
@@ -783,7 +783,7 @@ fn paged_compaction_preserves_base_edges() {
     }
 
     let edges = |db: &CoreDB| db
-        .query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)")
+        .query("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)")
         .map(|s| s.collect().len()).unwrap_or(0);
     let dumped = |db: &CoreDB| db.dump_sql().lines()
         .filter(|l| l.starts_with("INSERT")).count();

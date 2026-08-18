@@ -29,7 +29,7 @@ fn build(dir: &std::path::Path, n: usize) {
 fn shape(db: &CoreDB) -> (usize, usize, usize) {
     (
         db.query("SELECT _key FROM p").unwrap().collect().len(),
-        db.query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)").unwrap().collect().len(),
+        db.query("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)").unwrap().collect().len(),
         db.one("p/n0").forward("next").collect().len(),
     )
 }

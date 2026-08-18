@@ -87,8 +87,8 @@ const PROBES: &[(&str, bool)] = &[
     ("SELECT _key FROM p ORDER BY w ASC, _key ASC", false),
     ("SELECT COUNT(*), COUNT(w), SUM(w), MIN(w), MAX(w) FROM p", true),
     ("SELECT v, COUNT(*) FROM p GROUP BY v", true),
-    ("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)", false),
-    ("SELECT _key FROM MATCH (a:p)-[:also]->(b:p)", false),
+    ("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)", false),
+    ("SELECT b._key FROM MATCH (a:p)-[:also]->(b:p)", false),
 ];
 
 fn answers(db: &CoreDB) -> Vec<String> {
