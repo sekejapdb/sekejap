@@ -1369,6 +1369,19 @@ struct Parser {
     tokens: Vec<Tok>,
     pos: usize,
     params: Vec<Value>,
+    /// How many recursive-descent frames are currently open.
+    ///
+    /// `max_nesting` bounds parentheses before parsing, and its comment states
+    /// the assumption that broke: "the recursion consumes an opening token per
+    /// level". So do `NOT` and unary `-`, and neither is a parenthesis —
+    /// `WHERE NOT NOT NOT … a = 1` with 200 000 `NOT`s walked straight past the
+    /// guard and overflowed the stack. A Rust stack overflow is `SIGABRT`: not an
+    /// error, not catchable, the process is gone. One query string, from anyone
+    /// able to send SQL.
+    ///
+    /// Counting frames instead of tokens bounds every recursive path, including
+    /// ones added later that no pre-scan would know to look for.
+    depth: usize,
     /// Collections a plain `SELECT ... FROM <name>` reads.
     ///
     /// A name that no collection has silently produced no rows, so a typo in a
@@ -1398,11 +1411,30 @@ struct Parser {
 
 impl Parser {
     fn new(tokens: Vec<Tok>) -> Self {
-        Self { tokens, pos: 0, params: vec![], from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
+        Self { tokens, pos: 0, params: vec![], depth: 0, from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
     }
 
     fn with_params(tokens: Vec<Tok>, params: Vec<Value>) -> Self {
-        Self { tokens, pos: 0, params, from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
+        Self { tokens, pos: 0, params, depth: 0, from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
+    }
+
+    /// Run `f` one level deeper, refusing past [`MAX_NEST_DEPTH`].
+    ///
+    /// The depth is restored however `f` returns, so an error deep in an
+    /// expression does not leave the counter raised for the rest of the parse.
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, SqlError>,
+    ) -> Result<T, SqlError> {
+        if self.depth >= MAX_NEST_DEPTH {
+            return Err(SqlError::InvalidValue(format!(
+                "expression nested too deeply (> {MAX_NEST_DEPTH} levels)"
+            )));
+        }
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
     }
 
     /// The index requirements gathered while parsing.
@@ -2645,6 +2677,10 @@ impl Parser {
     }
 
     fn parse_condition(&mut self) -> Result<CondExpr, SqlError> {
+        self.nested(Self::parse_condition_inner)
+    }
+
+    fn parse_condition_inner(&mut self) -> Result<CondExpr, SqlError> {
         // Parenthesized group: (a OR b) AND c, (a AND b), etc.
         if matches!(self.peek(), Tok::LParen) {
             self.advance(); // consume (
@@ -3056,6 +3092,10 @@ impl Parser {
     ///             | number
     /// ```
     fn parse_score_expr(&mut self) -> Result<ScoreExpr, SqlError> {
+        self.nested(Self::parse_score_expr_inner)
+    }
+
+    fn parse_score_expr_inner(&mut self) -> Result<ScoreExpr, SqlError> {
         let mut left = self.parse_score_mul()?;
         loop {
             match self.peek() {
@@ -3078,6 +3118,10 @@ impl Parser {
     }
 
     fn parse_score_mul(&mut self) -> Result<ScoreExpr, SqlError> {
+        self.nested(Self::parse_score_mul_inner)
+    }
+
+    fn parse_score_mul_inner(&mut self) -> Result<ScoreExpr, SqlError> {
         let mut left = self.parse_score_unary()?;
         loop {
             match self.peek() {
@@ -3098,6 +3142,10 @@ impl Parser {
     }
 
     fn parse_score_unary(&mut self) -> Result<ScoreExpr, SqlError> {
+        self.nested(Self::parse_score_unary_inner)
+    }
+
+    fn parse_score_unary_inner(&mut self) -> Result<ScoreExpr, SqlError> {
         if matches!(self.peek(), Tok::Dash) {
             self.advance();
             let inner = self.parse_score_unary()?;

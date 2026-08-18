@@ -794,6 +794,19 @@ impl EdgeStore {
     /// freeing the in-RAM adjacency HashMaps. Only the node→offset index stays resident.
     #[cfg(unix)]
     pub fn spill_to_disk(&mut self, dir: &Path) -> io::Result<()> {
+        // Nothing in RAM is not a failure to move it.
+        //
+        // `build_csr` mmaps the file it writes, and an mmap of zero bytes is
+        // refused, so an empty adjacency map came back as
+        // `Other: "adjacency mmap failed"`. In the paged layout the RAM map is
+        // *always* empty — the edges are already on disk, which is the whole
+        // point of that layout — so `spill_edges_to_disk()` reported a failure on
+        // every paged database for having nothing to do. The state was left
+        // untouched, so this was a misleading error rather than a loss, but a
+        // caller with `?` cannot tell those apart.
+        if self.fwd.is_empty() && self.rev.is_empty() {
+            return Ok(());
+        }
         let fd = Self::build_csr(&self.fwd, &dir.join("adj_fwd_csr.bin"))?;
         let rd = Self::build_csr(&self.rev, &dir.join("adj_rev_csr.bin"))?;
         self.fwd = HashMap::new();

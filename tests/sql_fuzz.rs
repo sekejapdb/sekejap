@@ -86,3 +86,52 @@ fn guardrails_allow_normal_queries() {
     assert!(db.query("SELECT COUNT(*) AS n FROM t").is_ok());
     assert!(db.query("SELECT * FROM t WHERE v NOT IN (0, 1)").unwrap().collect().len() == 48);
 }
+
+/// **A query string may not abort the process.**
+///
+/// `max_nesting` bounds parentheses before parsing, and its comment states the
+/// assumption that broke: "the recursion consumes an opening token per level".
+/// So does `NOT`, and so does unary `-`, and neither is a parenthesis. A `WHERE`
+/// with 200 000 leading `NOT`s walked straight past the guard and overflowed the
+/// stack — and a Rust stack overflow is `SIGABRT`, not an error: not catchable,
+/// not recoverable, the process is simply gone.
+///
+/// Verified before the fix by running each case in its own process: the paren
+/// case exited 0 with a refusal, the other two exited 134 with
+/// "fatal runtime error: stack overflow, aborting". Reachable by anyone able to
+/// send SQL, which includes every client of the PostgreSQL wire server.
+///
+/// The bound is now on recursion frames rather than on tokens, so it holds for
+/// paths nobody thought to pre-scan for.
+#[test]
+fn deeply_nested_expressions_are_refused_not_fatal() {
+    let (mut db, _dir) = db_with_rows(3);
+
+    for (what, sql) in [
+        ("parentheses", format!("SELECT _key FROM t WHERE {}v = 1{}",
+                                "(".repeat(5_000), ")".repeat(5_000))),
+        ("NOT prefixes", format!("SELECT _key FROM t WHERE {} v = 1", "NOT ".repeat(5_000))),
+        ("unary minus",  format!("SELECT _key FROM t ORDER BY {} 1", "- ".repeat(5_000))),
+        ("NOT in HAVING", format!("SELECT COUNT(*) FROM t GROUP BY v HAVING {} COUNT(*) > 0",
+                                  "NOT ".repeat(5_000))),
+    ] {
+        // The assertion is that we get here at all: an abort would take the test
+        // binary with it. Either answer is acceptable, a dead process is not.
+        let refused = db.query(&sql).is_err();
+        assert!(refused, "`{what}` was accepted; it should be refused as too deep");
+    }
+
+    // …and the depth counter must not reject ordinary queries. It is restored on
+    // the way out of every frame, including the erroring ones above, so these run
+    // after the refusals on purpose.
+    for sql in [
+        "SELECT _key FROM t WHERE v = 1",
+        "SELECT _key FROM t WHERE NOT v = 1",
+        "SELECT _key FROM t WHERE NOT (v = 1 AND v = 2)",
+        "SELECT _key FROM t WHERE ((v = 1))",
+        "SELECT _key FROM t ORDER BY v DESC LIMIT 2",
+        "SELECT COUNT(*) FROM t",
+    ] {
+        assert!(db.query(sql).is_ok(), "`{sql}` is ordinary SQL and was refused");
+    }
+}

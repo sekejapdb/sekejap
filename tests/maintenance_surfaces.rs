@@ -283,3 +283,54 @@ fn a_field_in_the_middle_of_a_large_payload_is_still_returned() {
         }
     }
 }
+
+/// **`spill_edges_to_disk` must not report a failure for having nothing to do.**
+///
+/// It writes the RAM adjacency map to a CSR file and mmaps it — and an mmap of
+/// zero bytes is refused, so an empty map came back as `"adjacency mmap failed"`.
+/// In the paged layout that map is *always* empty, because the edges already live
+/// on disk, which is the point of the layout. So the call failed on every paged
+/// database, for having nothing to move. Nothing was lost — the state is untouched
+/// when it fails — but a caller writing `db.spill_edges_to_disk()?` cannot tell a
+/// misleading error from a real one.
+#[test]
+fn spilling_edges_reports_what_actually_happened() {
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        for i in 0..30 {
+            db.put(&format!("p/n{i}"), &json!({
+                "_collection": "p", "_key": format!("n{i}"), "n": i as i64,
+            }).to_string()).unwrap();
+        }
+        for i in 0..29 {
+            db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next");
+        }
+        db.compact().unwrap();
+
+        let before = (db.edge_count(), db.edges_from("p/n0").len(),
+                      db.one("p/n0").forward("next").collect().len());
+        assert_eq!(before, (29, 1, 1), "[{label}] the fixture is wrong: {before:?}");
+
+        db.spill_edges_to_disk()
+            .unwrap_or_else(|e| panic!("[{label}] spilling edges reported: {e}"));
+
+        // Every edge is still reachable, by every route, after the spill…
+        assert_eq!((db.edge_count(), db.edges_from("p/n0").len(),
+                    db.one("p/n0").forward("next").collect().len()), before,
+            "[{label}] the spill changed what the graph answers");
+        assert_eq!(db.query("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)")
+                       .unwrap().collect().len(), 29,
+            "[{label}] MATCH lost edges across the spill");
+
+        // …and after a compaction and a restart, which is where a half-moved
+        // adjacency would show up.
+        db.compact().unwrap();
+        drop(db);
+        let db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        assert_eq!((db.edge_count(), db.edges_from("p/n0").len(),
+                    db.one("p/n0").forward("next").collect().len()), before,
+            "[{label}] edges did not survive spill + compact + restart");
+    }
+}
