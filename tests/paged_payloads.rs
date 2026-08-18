@@ -59,7 +59,7 @@ fn a_paged_database_answers_the_same_as_a_flat_one() {
             q(&db, "SELECT _key FROM p ORDER BY n DESC LIMIT 5"),
             q(&db, "SELECT _key FROM p WHERE body ILIKE '%fox%'"),
             q(&db, "SELECT _key FROM p WHERE BM25(body,'riverbank') > 0"),
-            q(&db, "SELECT _key FROM MATCH (a:p)-[:next]->(b:p)"),
+            q(&db, "SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)"),
             // The stored name, not the whole record: a payload carries
             // _created_unix and _updated_unix, which are wall-clock and so differ
             // between two runs for reasons that have nothing to do with storage.
@@ -267,7 +267,7 @@ fn the_full_paged_layout_serves_graph_queries_as_a_service() {
         .expect("open_as_service refused a fully paged store");
     assert_eq!(eng.query("SELECT _key FROM p").unwrap().len(), 30,
                "the service saw fewer rows than the store holds");
-    let hops = eng.query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p) WHERE a._key = 'n0'")
+    let hops = eng.query("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p) WHERE a._key = 'n0'")
         .expect("a graph query failed behind the service API");
     assert_eq!(hops.len(), 1, "the paged adjacency was invisible to the service");
 }

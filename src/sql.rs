@@ -4525,6 +4525,40 @@ impl Parser {
             }
         }
 
+        // A bare identifier in the projection is a **variable reference** — that is
+        // what makes `SELECT a FROM MATCH (a)-[:t]->(b)` mean "the whole of a".
+        // So a bare identifier that names no bound variable is not a column, it is
+        // a reference to something that does not exist, and it was resolving to
+        // `null` in silence: `SELECT _key FROM MATCH (a:p)-[:next]->(b:p)` returned
+        // `{"_key": null}` for every row, as did `SELECT n`, on a query that looks
+        // exactly like the plain-SELECT form that works.
+        //
+        // Checked here because it is the first point at which both halves are
+        // known: the projection is parsed before the pattern, so the bound names do
+        // not exist yet when the reference is read.
+        //
+        // WITH stages introduce their own aliases, and a stage can rename anything,
+        // so statements carrying one are left alone rather than guessed at.
+        if with_stages.as_ref().map_or(true, |w| w.is_empty()) {
+            let mut bound: Vec<&str> = Vec::new();
+            if let Some(v) = &start_var { bound.push(v.as_str()) }
+            for h in &hops {
+                bound.push(h.node_bind.as_str());
+                if let Some(e) = &h.edge_bind { bound.push(e.as_str()) }
+            }
+            for (ret, _alias) in &returns {
+                if let crate::query::MatchAggReturn::Field { var, field } = ret {
+                    if field == "*" && !bound.iter().any(|b| b == var) {
+                        return Err(SqlError::InvalidValue(format!(
+                            "`{var}` is not a bound variable in this MATCH. A bare \
+                             name in the projection refers to a pattern variable; \
+                             for a column of one end write `<var>.{var}`. Bound \
+                             here: {}",
+                            if bound.is_empty() { "none".to_string() } else { bound.join(", ") })));
+                    }
+                }
+            }
+        }
         Ok(MatchAggStmt { start, start_var, hops, returns, group_by, order_by, order_score, limit, dest_where, func_filters, with_stages, distinct, graph_output, path_var })
     }
 

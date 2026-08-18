@@ -101,7 +101,7 @@ const PROBES: &[(&str, bool)] = &[
     ("SELECT SUM(w), MIN(w), MAX(w) FROM p", false),
     ("SELECT v, COUNT(*) FROM p GROUP BY v", false),
     ("SELECT DISTINCT v FROM p", true),
-    ("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)", false),
+    ("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)", false),
 ];
 
 fn answers(db: &CoreDB) -> Vec<String> {

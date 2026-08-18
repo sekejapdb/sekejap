@@ -11869,7 +11869,7 @@ mod compaction_safety_tests {
         let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
         assert_eq!(db.node_count(), 20);
         assert_eq!(
-            db.query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)").unwrap().collect().len(), 19,
+            db.query("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)").unwrap().collect().len(), 19,
         );
     }
 }

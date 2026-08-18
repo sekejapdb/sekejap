@@ -564,7 +564,7 @@ fn random_byte_damage_never_panics_or_hangs() {
         }
         let _ = db.query("SELECT _key FROM p WHERE n > 10 AND n < 40").map(|s| s.collect());
         let _ = db.query("SELECT COUNT(*) AS c FROM p").map(|s| s.collect());
-        let _ = db.query("SELECT _key FROM MATCH (a:p)-[:next]->(b:p)").map(|s| s.collect());
+        let _ = db.query("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)").map(|s| s.collect());
         let _ = db.node_count();
         let _ = db.collection_names();
 

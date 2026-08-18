@@ -273,7 +273,7 @@ fn snapshot_of(db: &CoreDB) -> Vec<String> {
     for sql in ["SELECT _key FROM p",
                 "SELECT _key FROM p WHERE n > 55",
                 "SELECT _key FROM p WHERE n = 42",
-                "SELECT _key FROM MATCH (a:p)-[:next]->(b:p)"] {
+                "SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)"] {
         let mut v: Vec<String> = db.query(sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
             .collect().iter().map(|h| h.slug.clone()).collect();
         v.sort();
