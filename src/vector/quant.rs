@@ -60,7 +60,7 @@ impl ScalarQuantizer {
         if sample.is_empty() {
             return Self { offset: 0.0, scale: 1.0 };
         }
-        sample.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sample.sort_by(|a, b| a.total_cmp(b));
         let n = sample.len();
         let lo = sample[((n as f64 * 0.005) as usize).min(n - 1)];
         let hi = sample[((n as f64 * 0.995) as usize).min(n - 1)];

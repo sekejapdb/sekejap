@@ -57,10 +57,21 @@ impl PartialOrd for MinCand {
 impl Ord for MinCand {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse so BinaryHeap (which is max by default) acts as min-heap.
+        //
+        // `total_cmp`, not `partial_cmp(..).unwrap_or(Equal)`. `BinaryHeap`
+        // requires a consistent `Ord`; give it an inconsistent one and the heap
+        // invariant itself breaks, which is worse than a misordered answer
+        // because the search stops visiting the nodes it should.
+        //
+        // And it was inconsistent. A NaN distance compared `Equal` to everything,
+        // so ordering fell to the id tie-break — which produces cycles: with
+        // dist(a)=NaN, dist(b)=1, dist(c)=2 and the right ids, `c < a`, `a < b`
+        // and `b < c` all hold at once. NaN reaches here through the data: L2,
+        // dot and L1 propagate it from a vector holding one, and nothing rejects
+        // such a vector on the way in.
         other
             .dist
-            .partial_cmp(&self.dist)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&self.dist)
             .then_with(|| self.id.cmp(&other.id))
     }
 }
@@ -79,9 +90,9 @@ impl PartialOrd for MaxCand {
 }
 impl Ord for MaxCand {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Total, for the reason given on `MinCand`.
         self.dist
-            .partial_cmp(&other.dist)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&other.dist)
             .then_with(|| other.id.cmp(&self.id))
     }
 }
@@ -273,7 +284,7 @@ impl HnswGraph {
                                 .iter()
                                 .map(|&x| (D::eval(nbv, &flat[x as usize * dim..(x as usize + 1) * dim]), x))
                                 .collect();
-                            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+                            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
                             scored.truncate(mm);
                             layers[l] = scored.into_iter().map(|(_, x)| x).collect();
                         }
@@ -384,7 +395,7 @@ impl HnswGraph {
                                 .iter()
                                 .map(|&x| (D::eval(nbv, &flat[x as usize * dim..(x as usize + 1) * dim]), x))
                                 .collect();
-                            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+                            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
                             scored.truncate(mm);
                             gnb[l] = scored.into_iter().map(|(_, x)| x).collect();
                         }
@@ -445,7 +456,7 @@ impl HnswGraph {
         for level in (1..=ep_level).rev() {
             let cands = search_layer::<D, V>(&self.nodes, query, ep_id, 1, level, vectors);
             if let Some(best) = cands.into_iter().min_by(|a, b| {
-                a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal)
+                a.dist.total_cmp(&b.dist)
             }) {
                 ep_id = best.id;
             }
@@ -472,12 +483,12 @@ impl HnswGraph {
                         .map(|v| MinCand { id, dist: D::eval(query, v) })
                 })
                 .collect();
-            scanned.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+            scanned.sort_by(|a, b| a.dist.total_cmp(&b.dist));
             scanned.truncate(k);
             return scanned.into_iter().map(|c| c.id).collect();
         }
 
-        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+        results.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         results.truncate(k);
         results.into_iter().map(|c| c.id).collect()
     }
@@ -505,7 +516,7 @@ impl HnswGraph {
         for level in (1..=ep_level).rev() {
             let cands = search_layer_quant(&self.nodes, q_code, ep_id, 1, level, codes);
             if let Some(best) = cands.into_iter().min_by(|a, b| {
-                a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal)
+                a.dist.total_cmp(&b.dist)
             }) {
                 ep_id = best.id;
             }
@@ -525,12 +536,12 @@ impl HnswGraph {
                     codes.code(id).map(|c| MinCand { id, dist: l2_u8(q_code, c) as f32 })
                 })
                 .collect();
-            scanned.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+            scanned.sort_by(|a, b| a.dist.total_cmp(&b.dist));
             scanned.truncate(k);
             return scanned.into_iter().map(|c| c.id).collect();
         }
 
-        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+        results.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         results.truncate(k);
         results.into_iter().map(|c| c.id).collect()
     }
@@ -679,7 +690,7 @@ impl HnswGraph {
             let cands =
                 search_layer::<D, V>(&self.nodes, query, curr_ep, 1, level, vectors);
             if let Some(best) = cands.into_iter().min_by(|a, b| {
-                a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal)
+                a.dist.total_cmp(&b.dist)
             }) {
                 curr_ep = best.id;
             }
@@ -698,7 +709,7 @@ impl HnswGraph {
 
             // Best candidate becomes entry for the next (lower) level.
             if let Some(best) = cands.iter().min_by(|a, b| {
-                a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal)
+                a.dist.total_cmp(&b.dist)
             }) {
                 curr_ep = best.id;
             }
@@ -892,7 +903,7 @@ fn search_layer<D: Distance, V: VectorAccess>(
         .into_iter()
         .map(|mc| MinCand { id: mc.id, dist: mc.dist })
         .collect();
-    out.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+    out.sort_by(|a, b| a.dist.total_cmp(&b.dist));
     out
 }
 
@@ -957,7 +968,7 @@ fn search_layer_quant<Q: QuantAccess>(
         .into_iter()
         .map(|mc| MinCand { id: mc.id, dist: mc.dist })
         .collect();
-    out.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+    out.sort_by(|a, b| a.dist.total_cmp(&b.dist));
     out
 }
 
@@ -1056,7 +1067,7 @@ fn search_layer_dense<D: Distance>(
         }
     }
     let mut out: Vec<(f32, u32)> = results.into_iter().map(|mc| (mc.dist, mc.id as u32)).collect();
-    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
     out
 }
 
@@ -1134,7 +1145,7 @@ fn search_layer_dense_locked<D: Distance>(
         }
     }
     let mut out: Vec<(f32, u32)> = results.into_iter().map(|mc| (mc.dist, mc.id as u32)).collect();
-    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
     out
 }
 
@@ -1153,7 +1164,7 @@ fn prune_neighbors<D: Distance, V: VectorAccess>(
                 .map(|v| MinCand { id, dist: D::eval(query, v) })
         })
         .collect();
-    candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+    candidates.sort_by(|a, b| a.dist.total_cmp(&b.dist));
     select_neighbors_heuristic::<D, V>(&candidates, m, vectors)
 }
 
@@ -1250,7 +1261,7 @@ mod tests {
             .iter()
             .map(|(&id, v)| (id, CosineDistance::eval(&query, v)))
             .collect();
-        brute.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        brute.sort_by(|a, b| a.1.total_cmp(&b.1));
         let ground_truth: HashSet<u64> = brute.iter().take(k).map(|(id, _)| *id).collect();
 
         let hnsw_results: HashSet<u64> =

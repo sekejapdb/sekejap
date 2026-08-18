@@ -67,7 +67,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     61  mod tests
 ```
 
-### `index.rs` · 1152L — The BM25 index — building it and scoring queries
+### `index.rs` · 1158L — The BM25 index — building it and scoring queries
 
 ```
     60  pub enum DocLens
@@ -98,16 +98,16 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    564    pub fn build<'a>(field: &str, docs: impl Iterator<Item = (u64, &'a str)>) -> Self
    660    pub fn search(&self, query: &str, top_k: usize) -> Vec<Bm25Hit>
    670    pub fn search_all(&self, query: &str) -> Vec<Bm25Hit>
-   786    pub fn delete(&mut self, doc_id: u64) -> bool
-   820    pub fn avg_doc_len(&self) -> f64
-   843    pub fn orphan_count(&self) -> usize
-   869    pub fn needs_rebuild(&self, threshold: f64) -> bool
-   878    pub fn num_docs(&self) -> u64
-   883    pub fn num_terms(&self) -> usize
-   893    pub fn delta_len(&self) -> usize { self.delta.len() }
-   903    pub fn insert_doc(&mut self, doc_id: u64, text: &str)
-   920    pub fn merge_delta(&mut self)
-  1047  mod tests
+   792    pub fn delete(&mut self, doc_id: u64) -> bool
+   826    pub fn avg_doc_len(&self) -> f64
+   849    pub fn orphan_count(&self) -> usize
+   875    pub fn needs_rebuild(&self, threshold: f64) -> bool
+   884    pub fn num_docs(&self) -> u64
+   889    pub fn num_terms(&self) -> usize
+   899    pub fn delta_len(&self) -> usize { self.delta.len() }
+   909    pub fn insert_doc(&mut self, doc_id: u64, text: &str)
+   926    pub fn merge_delta(&mut self)
+  1053  mod tests
 ```
 
 ### `mod.rs` · 57L — BM25 — ranking documents by how relevant they are to a query
@@ -598,7 +598,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   1227  fn query_err<E: std::fmt::Display>(e: E) -> SqlFail { ("42601", e.to_string()) }
 ```
 
-### `query.rs` · 8543L — The query engine — building and running queries
+### `query.rs` · 8547L — The query engine — building and running queries
 
 ```
     70  pub struct Hit
@@ -1567,50 +1567,50 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    369    pub(crate) fn open_mapped(view: &Arc<MmapView>, base: usize) -> std::io::Result<(Self, usize)>
 ```
 
-### `hnsw.rs` · 1268L — HNSW — finding near neighbours without checking every vector
+### `hnsw.rs` · 1279L — HNSW — finding near neighbours without checking every vector
 
 ```
     47  struct MinCand
     51  impl Eq for MinCand {}
     52  impl PartialOrd for MinCand
     57  impl Ord for MinCand
-    70  struct MaxCand
-    74  impl Eq for MaxCand {}
-    75  impl PartialOrd for MaxCand
-    80  impl Ord for MaxCand
-    94  fn random_unit(seed: u64) -> f64
-   129  pub struct HnswGraph
-   139  impl HnswGraph
-   151    pub fn empty(m: usize) -> Self
-   186    pub fn build<D: Distance, V: VectorAccess>(
-   208    pub fn build_dense<D: Distance>(
-   308    pub fn build_dense_parallel<D: Distance>(
-   426    pub fn search<D: Distance, V: VectorAccess>(
-   492    pub fn search_quant<Q: QuantAccess>(
-   539    pub fn len(&self) -> usize
-   544    pub fn is_empty(&self) -> bool
-   549    pub fn entry_point_id(&self) -> Option<u64>
-   555    pub(crate) fn raw_nodes(&self) -> &HashMap<u64, Vec<Vec<u64>>>
-   560    pub(crate) fn raw_entry(&self) -> Option<(u64, usize)>
-   567    pub fn mem_bytes(&self) -> usize
-   600    pub fn insert<D: Distance, V: VectorAccess>(
-   623    pub fn remove(&mut self, node_id: u64)
-   766  pub trait IterableVectors
-   771  impl IterableVectors for HashMap<u64, Vec<f32>>
-   786  pub struct DenseVectors
-   793  impl DenseVectors
-   795    pub fn snapshot<V: IterableVectors>(src: &V) -> Self
-   809    pub fn parts(&self) -> (&[f32], usize, &[u64]) { (&self.data, self.dim, &self.ids) }
-   812  impl VectorAccess for DenseVectors
-   820  impl IterableVectors for DenseVectors
-   832  fn search_layer<D: Distance, V: VectorAccess>(
-   904  fn search_layer_quant<Q: QuantAccess>(
-   968  fn select_neighbors_heuristic<D: Distance, V: VectorAccess>(
-  1018  fn search_layer_dense<D: Distance>(
-  1065  fn select_neighbors_dense<D: Distance>(cands: &[(f32, u32)], m: usize, flat: &[f32], dim: usize…
-  1097  fn search_layer_dense_locked<D: Distance>(
-  1142  fn prune_neighbors<D: Distance, V: VectorAccess>(
-  1163  mod tests
+    81  struct MaxCand
+    85  impl Eq for MaxCand {}
+    86  impl PartialOrd for MaxCand
+    91  impl Ord for MaxCand
+   105  fn random_unit(seed: u64) -> f64
+   140  pub struct HnswGraph
+   150  impl HnswGraph
+   162    pub fn empty(m: usize) -> Self
+   197    pub fn build<D: Distance, V: VectorAccess>(
+   219    pub fn build_dense<D: Distance>(
+   319    pub fn build_dense_parallel<D: Distance>(
+   437    pub fn search<D: Distance, V: VectorAccess>(
+   503    pub fn search_quant<Q: QuantAccess>(
+   550    pub fn len(&self) -> usize
+   555    pub fn is_empty(&self) -> bool
+   560    pub fn entry_point_id(&self) -> Option<u64>
+   566    pub(crate) fn raw_nodes(&self) -> &HashMap<u64, Vec<Vec<u64>>>
+   571    pub(crate) fn raw_entry(&self) -> Option<(u64, usize)>
+   578    pub fn mem_bytes(&self) -> usize
+   611    pub fn insert<D: Distance, V: VectorAccess>(
+   634    pub fn remove(&mut self, node_id: u64)
+   777  pub trait IterableVectors
+   782  impl IterableVectors for HashMap<u64, Vec<f32>>
+   797  pub struct DenseVectors
+   804  impl DenseVectors
+   806    pub fn snapshot<V: IterableVectors>(src: &V) -> Self
+   820    pub fn parts(&self) -> (&[f32], usize, &[u64]) { (&self.data, self.dim, &self.ids) }
+   823  impl VectorAccess for DenseVectors
+   831  impl IterableVectors for DenseVectors
+   843  fn search_layer<D: Distance, V: VectorAccess>(
+   915  fn search_layer_quant<Q: QuantAccess>(
+   979  fn select_neighbors_heuristic<D: Distance, V: VectorAccess>(
+  1029  fn search_layer_dense<D: Distance>(
+  1076  fn select_neighbors_dense<D: Distance>(cands: &[(f32, u32)], m: usize, flat: &[f32], dim: usize…
+  1108  fn search_layer_dense_locked<D: Distance>(
+  1153  fn prune_neighbors<D: Distance, V: VectorAccess>(
+  1174  mod tests
 ```
 
 ### `mod.rs` · 391L — Vector search — finding the nearest embeddings
