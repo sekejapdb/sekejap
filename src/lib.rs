@@ -7888,6 +7888,19 @@ impl CoreDB {
     /// Execute an already-parsed plan. Shared by `query`, `query_params`, and the
     /// prepared-statement path so all three run identically.
     fn run_plan(&self, plan: sql::MatchOrAgg, needs: &sql::PlanNeeds) -> Result<Set<'_>, SqlError> {
+        // A vector query of the wrong width. It cannot match anything, and before
+        // 2026-08-19 it aborted the process rather than saying so.
+        for (field, width) in &needs.vector_widths {
+            if let Some(dim) = self.vector_dim(field) {
+                if *width != dim {
+                    return Err(SqlError::VectorDimensionMismatch {
+                        field: field.clone(),
+                        field_dim: dim,
+                        query_dim: *width,
+                    });
+                }
+            }
+        }
         // A name that names nothing. Postgres raises `relation "x" does not
         // exist`; this returned no rows, so a typo read as an empty table and the
         // caller went looking for missing data instead of a missing letter.
@@ -11142,6 +11155,14 @@ impl CoreDB {
         #[cfg(target_os = "linux")]
         { extern "C" { fn malloc_trim(pad: usize) -> std::os::raw::c_int; } unsafe { malloc_trim(0); } }
         Ok(())
+    }
+
+    /// The dimension every vector in `field` has, or `None` when it holds none.
+    ///
+    /// Used to refuse a query vector of another width before it reaches a kernel
+    /// that would index past the end of a buffer.
+    pub(crate) fn vector_dim(&self, field: &str) -> Option<usize> {
+        self.vectors.get(field).and_then(|v| v.dim())
     }
 
     pub(crate) fn quant_field(&self, field: &str) -> Option<&vector::QuantizedField> {
