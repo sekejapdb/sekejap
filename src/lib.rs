@@ -10953,10 +10953,29 @@ impl CoreDB {
         // `FieldKey::Null` is its lowest key, and a missing field is stored as
         // NULL. `ORDER BY b ASC` therefore led with every row that has no `b`,
         // and the same query without an index led with the smallest value.
-        let result: Vec<u64> = crate::query::iter_kv_sql_order(&idx, *asc)
+        let result: Vec<u64> = crate::query::iter_kv_sql_order(self, &idx, *asc)
             .into_iter()
             .flat_map(|(_, ids)| ids)
+            .filter(|h| self.node_data(*h).is_some())
             .collect();
+
+        // **Only when the index holds every live row of the collection.**
+        //
+        // This seed replaces the candidate list *and* removes the Sort step, so
+        // whatever comes out of the index is the final answer with nothing
+        // downstream to repair it. A row the index has no entry for is therefore
+        // not mis-ordered — it is gone. A missing field is safe, because absence
+        // is stored as `FieldKey::Null`, but a value the index cannot represent
+        // has no key at all: with an array in the column,
+        // `SELECT _key FROM c ORDER BY tags` returned nothing while the same
+        // query without the index returned every row.
+        //
+        // Comparing counts is enough because the walk above already dropped
+        // tombstoned ids, and a node appears under exactly one key.
+        let live_members = self.collection_members(coll_hash).map_or(0, |m| m.len());
+        if result.len() != live_members {
+            return None; // fall back to the scan, which reads the values themselves
+        }
 
         let candidates = match take_n {
             Some(n) => result.into_iter().take(n).collect(),
