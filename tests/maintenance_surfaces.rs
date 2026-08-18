@@ -114,3 +114,56 @@ fn drop_index_changes_no_answer() {
 fn sync_changes_no_answer() {
     unchanged_by("sync", |db| { db.sync().expect("sync failed"); });
 }
+
+/// **`stats()` must describe the database that exists, not the one that has
+/// compacted.**
+///
+/// `paged` and `overlay_nodes` were both answered from `!segments.is_empty()` —
+/// "is a mapped topology segment present". That is false for a paged database
+/// until a compaction has written and adopted one, so a fresh store in the
+/// default layout reported itself resident with an empty overlay while holding
+/// every row in RAM. A diagnostic that lies is worse than no diagnostic: it is
+/// what someone reads when they are trying to work out why memory is climbing.
+///
+/// The same narrow proxy decided something much more expensive elsewhere —
+/// whether to parse every geometry into RAM at open — which is why this is worth
+/// a test rather than a one-line change.
+#[test]
+fn stats_describes_the_layout_it_is_actually_in() {
+    for (label, cfg, want_paged) in [
+        ("default", Config::default(), true),
+        ("resident", Config::resident(), false),
+    ] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        for i in 0..50 {
+            db.put(&format!("p/n{i}"), &serde_json::json!({
+                "_collection": "p", "_key": format!("n{i}"), "n": i as i64,
+            }).to_string()).unwrap();
+        }
+
+        // Before any compaction — the case that was wrong.
+        let s = db.stats();
+        assert_eq!(s.paged, want_paged,
+            "[{label}] stats reported paged={} before the first compaction; the \
+             layout is decided when the database is opened, not when it compacts",
+            s.paged);
+        if want_paged {
+            assert_eq!(s.overlay_nodes, 50,
+                "[{label}] 50 rows are held in the write overlay and stats reported \
+                 {} — this is the number someone reads when memory is climbing",
+                s.overlay_nodes);
+        }
+
+        // And after, where the overlay has been folded into the base.
+        db.compact().unwrap();
+        let s = db.stats();
+        assert_eq!(s.paged, want_paged, "[{label}] stats changed its mind after a compaction");
+        if want_paged {
+            assert_eq!(s.overlay_nodes, 0,
+                "[{label}] the overlay still reports {} rows after a compaction \
+                 folded them into the base", s.overlay_nodes);
+        }
+    }
+}
