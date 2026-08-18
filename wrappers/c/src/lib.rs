@@ -15,6 +15,14 @@
 //! - **Explicit ownership.** Any `char*` this library *returns* is heap-owned by
 //!   the caller and must be freed with [`sekejap_string_free`] — exactly once.
 //!   Strings the caller *passes in* are borrowed and never freed here.
+//!
+//!   The one exception is [`sekejap_version`], which returns a pointer into
+//!   static program data and is typed `*const c_char` to say so. Passing it to
+//!   `sekejap_string_free` hands `CString::from_raw` a pointer the allocator
+//!   never gave out, which corrupts the allocator rather than freeing anything.
+//!   Every binding in this repository already treats it as static; the rule is
+//!   stated here because a rule with an unstated exception is how that stops
+//!   being true.
 //! - **No panic ever crosses the boundary.** Every entry point is wrapped in
 //!   `catch_unwind`; a panic becomes an error return, never undefined behavior.
 //! - **NULL is the failure sentinel** for pointer returns; `-1` for integer

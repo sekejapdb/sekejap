@@ -251,9 +251,38 @@ impl Connection {
                     }
                 };
                 // Parameter format codes.
-                let nfmt = r.i16() as usize;
+                //
+                // These counts arrive as Int16 from the network and were cast
+                // straight to `usize`. A negative one — `0xFFFF`, two bytes any
+                // client can send — sign-extends to `usize::MAX`, and both uses
+                // of it were fatal: `(0..usize::MAX).map(|_| r.i16())` never
+                // finishes, because reads past the end of the frame return 0
+                // rather than stopping, so it grows a `Vec` until the process is
+                // killed; and `Vec::with_capacity(usize::MAX)` panics outright
+                // with "capacity overflow", taking the connection thread with it.
+                // Both are reachable by anyone who can open a socket, after a
+                // `Parse` naming any statement.
+                //
+                // A count is also rejected when the frame has no room for what it
+                // claims: a format code needs two bytes and a parameter needs at
+                // least four for its own length prefix, so a message declaring
+                // more than the remaining bytes can hold is malformed whatever
+                // its sign.
+                let nfmt = r.i16();
+                if nfmt < 0 || (nfmt as usize).saturating_mul(2) > r.remaining() {
+                    error_response(out, "08P01", "invalid parameter format code count");
+                    self.skip_until_sync = true;
+                    return;
+                }
+                let nfmt = nfmt as usize;
                 let formats: Vec<i16> = (0..nfmt).map(|_| r.i16()).collect();
-                let nparams = r.i16() as usize;
+                let nparams = r.i16();
+                if nparams < 0 || (nparams as usize).saturating_mul(4) > r.remaining() {
+                    error_response(out, "08P01", "invalid parameter count");
+                    self.skip_until_sync = true;
+                    return;
+                }
+                let nparams = nparams as usize;
                 let mut params: Vec<Value> = Vec::with_capacity(nparams);
                 for i in 0..nparams {
                     let plen = r.i32();
@@ -1166,6 +1195,15 @@ impl<'a> Reader<'a> {
         let mut a = [0u8; 4];
         for x in &mut a { *x = self.byte(); }
         i32::from_be_bytes(a)
+    }
+    /// Bytes still unread in this frame.
+    ///
+    /// A count field says how many items follow; this says how many could
+    /// possibly fit. A message claiming more than it has room for is malformed,
+    /// and believing it is how a two-byte field turned into an allocation of
+    /// `usize::MAX`.
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.pos)
     }
     fn bytes(&mut self, n: usize) -> &'a [u8] {
         let end = (self.pos + n).min(self.b.len());
