@@ -981,6 +981,50 @@ fn contains_pattern(needle: &str) -> String {
 /// It also folds numerically-equal numbers together, for the same reason
 /// `group_key_of` does: `1` and `1.0` are one value, and which one a row holds
 /// depends on how it was written rather than on what it means.
+/// Deduplicate `hits` for `DISTINCT`, keeping a representative that does not
+/// depend on the order rows were scanned in.
+///
+/// Two rows are one group when [`distinct_key_of`] agrees about them, and that
+/// key normalises numbers — JSON `1` and `1.0` denote the same value, and
+/// `WHERE v = 1` matches both. So a group can contain rows whose payloads render
+/// *differently* while being equal, and first-wins deduplication then let the
+/// scan order decide which rendering came back.
+///
+/// A compaction changes scan order. `SELECT DISTINCT v FROM p` returned
+/// `{"v":1.0}` before one and `{"v":1}` after it, over data that had not changed
+/// — found by `compaction_agreement_fuzz` on seed 20260818778, in both storage
+/// layouts and in both directions.
+///
+/// PostgreSQL leaves the choice of representative unspecified, so nothing forces
+/// it to be unstable; taking the lowest slug costs one comparison per duplicate
+/// and makes the output reproducible for the same data, whatever the layout and
+/// whenever it was last compacted. The values are untouched: this picks a row, it
+/// does not rewrite one.
+fn dedup_distinct(hits: &mut Vec<Hit>) {
+    let mut best: HashMap<String, (String, usize)> = HashMap::new();
+    for (i, hit) in hits.iter().enumerate() {
+        let key = distinct_key_of(hit.payload.as_ref());
+        match best.get_mut(&key) {
+            Some((slug, idx)) => {
+                if hit.slug < *slug {
+                    *slug = hit.slug.clone();
+                    *idx = i;
+                }
+            }
+            None => {
+                best.insert(key, (hit.slug.clone(), i));
+            }
+        }
+    }
+    let keep: HashSet<usize> = best.into_values().map(|(_, i)| i).collect();
+    let mut i = 0;
+    hits.retain(|_| {
+        let k = keep.contains(&i);
+        i += 1;
+        k
+    });
+}
+
 fn distinct_key_of(payload: Option<&Value>) -> String {
     match payload {
         Some(Value::Object(map)) => {
@@ -1700,8 +1744,7 @@ impl<'db> Set<'db> {
             }
             if let Some(n) = take_n { results.truncate(n); }
             if distinct {
-                let mut seen: HashSet<String> = HashSet::new();
-                results.retain(|hit| seen.insert(distinct_key_of(hit.payload.as_ref())));
+                dedup_distinct(&mut results);
             }
             return results;
         }
@@ -1998,8 +2041,7 @@ impl<'db> Set<'db> {
             }).collect();
             let distinct = self.steps.iter().any(|s| matches!(s, Step::Distinct));
             if distinct {
-                let mut seen: HashSet<String> = HashSet::new();
-                hits.retain(|hit| seen.insert(distinct_key_of(hit.payload.as_ref())));
+                dedup_distinct(&mut hits);
                 Self::apply_offset_limit(&mut hits, &self.steps);
             }
             Self::resolve_vectors(self.db, &mut hits, &select_fields, &self.steps);
@@ -2107,8 +2149,7 @@ impl<'db> Set<'db> {
         // ── DISTINCT deduplication ────────────────────────────────────────────
         let distinct = self.steps.iter().any(|s| matches!(s, Step::Distinct));
         if distinct {
-            let mut seen: HashSet<String> = HashSet::new();
-            hits.retain(|hit| seen.insert(distinct_key_of(hit.payload.as_ref())));
+            dedup_distinct(&mut hits);
             Self::apply_offset_limit(&mut hits, &self.steps);
         }
         Self::resolve_vectors(self.db, &mut hits, &select_fields, &self.steps);
