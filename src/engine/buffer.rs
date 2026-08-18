@@ -66,6 +66,27 @@ impl WriteBuffer {
         std::mem::take(&mut *buf)
     }
 
+    /// Put statements back at the **front** of the buffer.
+    ///
+    /// A flush drains the buffer before it applies anything, so a batch that
+    /// fails part-way has statements that exist nowhere else. They used to be
+    /// dropped — writes the engine had already answered `Ok` to, gone, with a
+    /// retry finding nothing to retry.
+    ///
+    /// At the front, not the end: other threads may have buffered statements
+    /// during the flush, and appending would run the returned statements *after*
+    /// writes that were issued later. An `UPDATE` that was queued before an
+    /// `INSERT` has to stay before it.
+    pub fn restore(&self, stmts: Vec<String>) {
+        if stmts.is_empty() {
+            return;
+        }
+        let mut buf = self.pending.lock().expect("WriteBuffer poisoned");
+        let queued = std::mem::take(&mut *buf);
+        buf.extend(stmts);
+        buf.extend(queued);
+    }
+
     /// Number of pending (unflushed) statements.
     pub fn len(&self) -> usize {
         self.pending.lock().expect("WriteBuffer poisoned").len()

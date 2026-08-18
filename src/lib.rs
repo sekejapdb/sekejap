@@ -5083,13 +5083,30 @@ impl CoreDB {
     /// Nesting-safe: the previous defer state is saved and restored, so an inner
     /// batch (e.g. a multi-row INSERT) never prematurely flushes an outer group.
     pub(crate) fn execute_batch_grouped(&mut self, stmts: &[String]) -> Result<usize, SqlError> {
+        self.execute_batch_grouped_from(stmts).map_err(|(_, e)| e)
+    }
+
+    /// The same, reporting **how many statements were applied** before the one
+    /// that failed.
+    ///
+    /// A batch stops at its first error, so some statements have run and the rest
+    /// have not. Without that count the caller cannot tell the two apart, and
+    /// `Engine::flush` — which has already drained its buffer by the time it calls
+    /// this — had no way to hand the unapplied remainder back. It dropped them:
+    /// four buffered inserts with one bad statement among them left two rows
+    /// stored, two writes gone, and a retry with nothing to retry.
+    pub(crate) fn execute_batch_grouped_from(
+        &mut self,
+        stmts: &[String],
+    ) -> Result<usize, (usize, SqlError)> {
         let prev = self.defer_wal_sync;
         self.defer_wal_sync = true;
         let mut total = 0usize;
+        let mut applied = 0usize;
         let mut result = Ok(());
         for s in stmts {
             match self.execute(s) {
-                Ok(n) => total += n,
+                Ok(n) => { total += n; applied += 1; }
                 Err(e) => { result = Err(e); break; }
             }
         }
@@ -5113,7 +5130,7 @@ impl CoreDB {
                 self.writes_since_compact_check = 0;
             }
         }
-        result.map(|_| total)
+        result.map(|_| total).map_err(|e| (applied, e))
     }
 
     pub fn begin_bulk(&mut self) { self.defer_wal_sync = true; }

@@ -499,6 +499,14 @@ impl Engine {
             return Err("database is read-only".to_string());
         }
         if let Some(ref buf) = self.buffer {
+            // Compiled before it is accepted. A buffered statement is applied
+            // much later, in a batch, and a statement that cannot be parsed used
+            // to be taken here with `Ok(0)` and then fail the whole batch — so
+            // the error arrived at whoever called `flush`, naming a statement
+            // they may not have written, and the writes buffered after it were
+            // discarded. Parsing costs a fraction of what applying costs, and it
+            // returns the error to the caller who can actually fix it.
+            crate::sql::parse_mutation(sql).map_err(|e| e.to_string())?;
             let should_flush = buf.push(sql.to_string());
             if should_flush {
                 return self.flush();
@@ -593,6 +601,11 @@ impl Engine {
             return Ok(0);
         }
 
+        // `(rows applied, statements to put back, error)` — the failure has to
+        // travel out of the closure with the remainder, because only out here is
+        // there a buffer to put it back into.
+        let mut unapplied: Vec<String> = Vec::new();
+        let mut failure: Option<String> = None;
         let total = self.write_durable(|db| {
             let mut total = 0usize;
             // Prepared rows: pre-built (slug, Value) → put_value_bulk (one shared
@@ -601,13 +614,48 @@ impl Engine {
                 total += db.put_value_bulk(rows).map_err(|e| e.to_string())?;
             }
             // Buffered SQL: the whole batch applied under one lock.
+            //
+            // A batch stops at its first failure, and the buffer was drained
+            // before any of this ran, so the statements after the failure exist
+            // nowhere else. Returning the error on its own threw them away —
+            // writes this engine had already answered `Ok` to. They go back in
+            // the buffer instead, where a later flush can apply them.
+            //
+            // The failing statement itself is not returned: it is named in the
+            // error, and it would fail identically every time, blocking every
+            // write queued behind it.
             if !statements.is_empty() {
-                total += db.execute_batch_grouped(&statements).map_err(|e| e.to_string())?;
+                match db.execute_batch_grouped_from(&statements) {
+                    Ok(n) => total += n,
+                    Err((applied, e)) => {
+                        // Everything after the one that failed. The failing
+                        // statement itself is not returned: it is named in the
+                        // error and would fail identically every time, blocking
+                        // every write queued behind it.
+                        unapplied = statements[(applied + 1).min(statements.len())..].to_vec();
+                        failure = Some(format!(
+                            "{e}\n  statement {} of {} failed: {}\n  {} applied, {}                              returned to the buffer",
+                            applied + 1,
+                            statements.len(),
+                            statements[applied],
+                            applied,
+                            unapplied.len(),
+                        ));
+                    }
+                }
             }
             // Auto-compaction is core's job (`CoreDB::set_auto_compact` +
             // `CompactThresholds`), applied inside the bulk write paths above.
             Ok(total)
         })?;
+        if let Some(err) = failure {
+            if let Some(buf) = self.buffer.as_ref() {
+                buf.restore(unapplied);
+            }
+            // Whatever did apply is still durable and still published.
+            self.maybe_republish();
+            return Err(err);
+        }
         self.maybe_republish();
 
         Ok(total)

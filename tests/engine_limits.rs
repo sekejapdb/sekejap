@@ -236,3 +236,79 @@ fn link_meta_many_writes_edges_and_their_attributes() {
     assert!(db.edges_from("p/n1").first().is_some_and(|e| e.meta.is_none()),
             "the naked-edge lane invented attributes");
 }
+
+// ── The write buffer ─────────────────────────────────────────────────────────
+//
+// `Engine::execute` with a buffer answers `Ok(0)` and applies the statement
+// later, in a batch. Two things follow from that, and neither was true:
+//
+//   * an `Ok` is a promise the statement will be applied, so a statement that
+//     cannot possibly be applied must not be accepted
+//   * a batch stops at its first failure, and the buffer is drained before the
+//     batch runs, so the statements after the failure exist nowhere else
+
+/// **A statement that cannot be parsed must be refused, not buffered.**
+///
+/// `execute("THIS IS NOT SQL AT ALL")` returned `Ok(0)`. The error surfaced
+/// later, out of `flush`, naming a statement its caller may not have written —
+/// and it took the writes buffered behind it down with it.
+#[test]
+fn an_unparseable_statement_is_refused_when_it_is_offered() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let eng = Engine::builder(dir.path().to_str().unwrap())
+        .buffer_size(100).build().unwrap();
+    eng.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+    eng.flush().unwrap();
+
+    assert!(eng.execute("THIS IS NOT SQL AT ALL").is_err(),
+        "an unparseable statement was accepted into the buffer");
+
+    // And the writes around it are unaffected.
+    eng.execute("INSERT INTO p (_key, n) VALUES ('a', 1)").unwrap();
+    eng.execute("INSERT INTO p (_key, n) VALUES ('b', 2)").unwrap();
+    assert_eq!(eng.flush().unwrap(), 2, "the good statements did not all apply");
+    assert_eq!(eng.query("SELECT _key FROM p").unwrap().len(), 2);
+}
+
+/// **A batch that fails part-way keeps the statements it has not applied.**
+///
+/// Some statements parse and still cannot be applied — this one names a table
+/// that does not exist. The batch stops there, which is right; what was wrong is
+/// what happened to the two statements queued after it. They were drained out of
+/// the buffer before the batch began, so when `flush` returned the error they
+/// were gone: two writes the engine had answered `Ok` to, lost, with a retry
+/// finding nothing to retry.
+#[test]
+fn a_failed_flush_does_not_discard_the_writes_it_never_applied() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let eng = Engine::builder(dir.path().to_str().unwrap())
+        .buffer_size(100).build().unwrap();
+    eng.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+    eng.flush().unwrap();
+
+    for sql in [
+        "INSERT INTO p (_key, n) VALUES ('a', 1)",
+        "INSERT INTO p (_key, n) VALUES ('b', 2)",
+        // Parses, so the check above lets it through; fails when applied.
+        "ALTER TABLE no_such_table ADD COLUMN x TEXT",
+        "INSERT INTO p (_key, n) VALUES ('c', 3)",
+        "INSERT INTO p (_key, n) VALUES ('d', 4)",
+    ] {
+        eng.execute(sql).expect("everything here parses");
+    }
+
+    let err = eng.flush().expect_err("the batch must report the failure");
+    assert!(err.contains("no_such_table"), "the error must name the statement: {err}");
+    assert_eq!(eng.query("SELECT _key FROM p").unwrap().len(), 2,
+        "the statements before the failure are applied and durable");
+
+    // The two after it were held, not dropped, and a second flush applies them.
+    assert_eq!(eng.flush().unwrap(), 2,
+        "the writes queued after the failing statement were discarded");
+    assert_eq!(eng.query("SELECT _key FROM p").unwrap().len(), 4,
+        "every write the engine answered Ok to is stored");
+
+    // The failing statement is not retried for ever: it is named in the error and
+    // dropped, so it cannot block the writes queued behind it.
+    assert_eq!(eng.flush().unwrap(), 0, "the buffer should now be empty");
+}
