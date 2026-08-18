@@ -58,10 +58,19 @@ pattern you choose. Every guideline below follows from this rule.
    92 s to 0.16 s. Finish a bulk import with `compact()` — it truncates the
    WAL (write-ahead log), writes the topology files, and makes reopen instant.
 
-5. **Open large data with `open_paged()`.**
-   Paged mode memory-maps the topology: it opens in about 4 ms regardless of
-   database size, and the OS page cache keeps the hot working set in memory.
-   Query speed holds compared to the resident mode.
+5. **You already have paged storage — `open()` gives it.**
+   The default layout memory-maps the topology and keeps payloads, nodes and
+   adjacency in slotted pages, so opening does not cost more as the database
+   grows and the OS page cache holds the hot working set. It also means
+   compaction is not a rebuild: at 500 000 rows it is ~130 ms and stays there.
+
+   The trade is disk and traversal speed — roughly 2.3x the adjacency files and
+   a one-hop read at about 0.65x the packed layout — and no snapshot reads, since
+   pages written in place cannot be shared with a reader. `Config::resident()`
+   selects the older layout, which suits data written once and read many times.
+
+   An existing database keeps whichever layout it was written in; nothing is
+   converted by opening it.
 
 ## Don't
 

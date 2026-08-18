@@ -81,8 +81,9 @@ let n    = engine.count("venues");      // COUNT(*)
 - **A live snapshot pins memory.** The frozen overlay and the base pages it
   references stay alive until the snapshot drops. Keep snapshots **short-lived**
   (one request); don't stash one for minutes.
-- **Paged mode only, unix only.** `snapshot_reads(true)` is a no-op in resident
-  mode, in read-only mode, and on non-unix — `get`/`scan`/`count` transparently
+- **Needs an immutable base, and unix.** `snapshot_reads(true)` opens with paged
+  *topology*, which is the layout whose durable half a snapshot can share. It is
+  a no-op in resident mode, in read-only mode, and on non-unix — `get`/`scan`/`count` transparently
   fall back to the shared read lock there, so the same code still runs.
 - **Embedded/single-threaded users: leave it off.** The write path is unchanged
   and nothing is minted, so you pay nothing. This feature is for concurrent servers.
@@ -102,9 +103,12 @@ This is write-once/read-many scale-out from an embedded database — see
 
 Honest caveats for production planning:
 
-- **Paged base deletes land at `compact()`.** In paged mode, `remove`/`unlink` of a
-  node that lives in the base takes effect when the next `compact()` rewrites the
-  base. Overlay (recent) deletes are immediate. `scan`/`count` follow the same rule.
+- **Deletes are immediate, including in the base.** `remove`/`unlink` of a node
+  that lives in the immutable base takes effect at once — the withdrawal is
+  recorded where reads of the base subtract it, rather than waiting for a
+  `compact()` to rewrite anything. `get`, `scan`, `count` and traversal all agree.
+  (This page used to warn that base deletes landed only at the next compaction.
+  That was true once and is not any more.)
 - **Spatial is WGS84/4326 only and subtype-less.** A `GEO` column accepts any
   GeoJSON geometry (point, polygon, multipolygon, …) mixed across rows — there is no
   per-column geometry-type or SRID declaration like PostGIS. `GeometryCollection` is
