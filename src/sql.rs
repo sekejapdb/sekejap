@@ -130,13 +130,24 @@ pub enum SqlError {
     MissingField { field: &'static str },
     FieldValueCountMismatch { fields: usize, values: usize },
     InvalidValue(String),
-    /// The in-memory GIN index was declared in the schema but not built.
-    /// Returned by `query()` when a step that needs the index would silently
-    /// produce wrong or degraded results (e.g. ILIKE on a field with no gin_index entry).
+    /// A step needs an index that is not there, and cannot answer without it.
+    ///
+    /// Returned by `query()` before anything executes, for filters that are served
+    /// entirely from an index — `SEARCH` and `BM25`. Without this they returned no
+    /// rows, which reads as "nothing matches" rather than "nothing was consulted".
+    ///
+    /// Filters that can still answer by scanning (`ILIKE`, and any `WHERE` on an
+    /// unindexed field) do not raise this: there the index is a matter of speed,
+    /// not of the answer.
+    ///
+    /// `declared` separates the two ways an index can be absent, because the fix
+    /// differs: `false` means no `CREATE INDEX` was ever issued, `true` means one
+    /// was and the index is not currently built.
     IndexNotBuilt {
         collection: String,
         method: String,
         field: String,
+        declared: bool,
     },
     /// An explicit index build failed (e.g. HNSW with no stored vectors).
     IndexBuildFailed {
@@ -176,10 +187,33 @@ impl fmt::Display for SqlError {
             ),
             SqlError::InvalidValue(s) => write!(f, "invalid value: {s}"),
             SqlError::UndefinedSchema(s) => write!(f, "schema \"{s}\" does not exist"),
-            SqlError::IndexNotBuilt { collection, method, field } => write!(
-                f,
-                "{method} index on {collection}.{field} is declared but not built.\n  Hint: REINDEX ON {collection} USING {method} ({field})"
-            ),
+            SqlError::IndexNotBuilt { collection, method, field, declared } => {
+                // A search index covers the collection rather than one field, so
+                // naming a field it does not have would send the reader looking
+                // for the wrong thing.
+                let target = match (collection.is_empty(), field.is_empty()) {
+                    (true, _) => format!("field {field}"),
+                    (false, true) => collection.clone(),
+                    (false, false) => format!("{collection}.{field}"),
+                };
+                let collection = if collection.is_empty() { "<table>" } else { collection };
+                let args = if field.is_empty() { "…".to_string() } else { field.clone() };
+                if *declared {
+                    write!(
+                        f,
+                        "{method} index on {target} is declared but not built, and \
+                         {method} cannot answer without it.\n  \
+                         Hint: REINDEX ON {collection} USING {method} ({args})"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "there is no {method} index on {target}, and {method} cannot \
+                         answer without one — it reads the index, not the rows.\n  \
+                         Hint: CREATE INDEX ON {collection} USING {method} ({args})"
+                    )
+                }
+            }
             SqlError::IndexBuildFailed { collection, method, field, reason } => write!(
                 f,
                 "cannot build {method} index on {collection}.{field}: {reason}.\n  Hint: once data is ready, run: REINDEX ON {collection} USING {method} ({field})"
@@ -1306,15 +1340,24 @@ struct Parser {
     tokens: Vec<Tok>,
     pos: usize,
     params: Vec<Value>,
+    /// Fields a `BM25(...)` in this statement needs an index for, recorded as the
+    /// call is parsed.
+    ///
+    /// The alternative was to walk the finished plan looking for BM25 uses, and
+    /// the plan has five shapes with the calls nested differently in each — a walk
+    /// that missed one would restore the silent wrong answer for exactly the shape
+    /// it missed, and nothing would report that it had. Recording the requirement
+    /// where the call is *parsed* is the one place every shape passes through.
+    bm25_needs: Vec<String>,
 }
 
 impl Parser {
     fn new(tokens: Vec<Tok>) -> Self {
-        Self { tokens, pos: 0, params: vec![] }
+        Self { tokens, pos: 0, params: vec![], bm25_needs: Vec::new() }
     }
 
     fn with_params(tokens: Vec<Tok>, params: Vec<Value>) -> Self {
-        Self { tokens, pos: 0, params }
+        Self { tokens, pos: 0, params, bm25_needs: Vec::new() }
     }
 
     fn peek(&self) -> &Tok {
@@ -1517,6 +1560,7 @@ impl Parser {
                 self.expect_rparen()?;
                 let op = self.parse_cmp_op()?;
                 let threshold = self.expect_num()?;
+                self.bm25_needs.push(field.clone());
                 Ok(MatchFuncFilter::Bm25 { field, query, op, threshold })
             }
             _ => unreachable!("peek_is_match_filter_fn gates this"),
@@ -2857,6 +2901,7 @@ impl Parser {
         self.expect_comma()?;
         let query = self.expect_str()?;
         self.expect_rparen()?;
+        self.bm25_needs.push(field.clone());
         Ok(CondExpr::Bm25Func { field, query })
     }
 
@@ -3034,6 +3079,7 @@ impl Parser {
                         self.expect_comma()?;
                         let query = self.expect_str()?;
                         self.expect_rparen()?;
+                        self.bm25_needs.push(field.clone());
                         Ok(ScoreExpr::Bm25 { field, query })
                     }
                     "BM25_NORM" => {
@@ -3052,6 +3098,7 @@ impl Parser {
                             1.0
                         };
                         self.expect_rparen()?;
+                        self.bm25_needs.push(field.clone());
                         Ok(ScoreExpr::Bm25Norm { field, query, k })
                     }
                     "SEARCH_SCORE" => {
@@ -6396,7 +6443,10 @@ pub enum MatchOrAgg {
     MultiFrom(crate::query::MultiFromStmt),
 }
 
-fn parse_match_or_agg_inner(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
+fn parse_match_or_agg_inner(
+    sql: &str,
+    params: Vec<Value>,
+) -> Result<(MatchOrAgg, Vec<String>), SqlError> {
     let tokens = tokenize(sql)?;
     // Bound parser recursion by rejecting pathologically-nested input up front.
     if max_nesting(&tokens) > MAX_NEST_DEPTH {
@@ -6427,7 +6477,7 @@ impl PreparedQuery {
     }
 
     /// Lower the cached tokens into a plan, binding the given parameters.
-    pub(crate) fn lower(&self, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
+    pub(crate) fn lower(&self, params: Vec<Value>) -> Result<(MatchOrAgg, Vec<String>), SqlError> {
         lower_tokens(self.tokens.clone(), params)
     }
 }
@@ -6435,18 +6485,25 @@ impl PreparedQuery {
 /// Turn a token stream + parameters into an executable plan. This is the second
 /// half of `parse_match_or_agg_inner` — reused by [`PreparedQuery`] so the
 /// (already-tokenized) SQL need not be re-tokenized on every execution.
-fn lower_tokens(tokens: Vec<Tok>, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
+/// Lower tokens to a plan, together with the index requirements the statement
+/// carries — see [`Parser::bm25_needs`].
+fn lower_tokens(
+    tokens: Vec<Tok>,
+    params: Vec<Value>,
+) -> Result<(MatchOrAgg, Vec<String>), SqlError> {
     // Multi-FROM: SELECT … FROM source1, source2, … (comma between FROM sources)
     if is_multi_from(&tokens) {
-        let stmt = Parser::with_params(tokens, params).parse_select_multi_from()?;
-        return Ok(MatchOrAgg::MultiFrom(stmt));
+        let mut parser = Parser::with_params(tokens, params);
+        let stmt = parser.parse_select_multi_from()?;
+        return Ok((MatchOrAgg::MultiFrom(stmt), parser.bm25_needs));
     }
 
     // SELECT … FROM MATCH [SHORTEST] — check before regular SELECT routing.
     if is_select_from_match(&tokens) {
         if is_select_from_match_shortest(&tokens) {
-            let stmt = Parser::with_params(tokens, params).parse_select_from_match_shortest()?;
-            return Ok(MatchOrAgg::Shortest(stmt));
+            let mut parser = Parser::with_params(tokens, params);
+            let stmt = parser.parse_select_from_match_shortest()?;
+            return Ok((MatchOrAgg::Shortest(stmt), parser.bm25_needs));
         }
         let mut parser = Parser::with_params(tokens, params);
         let first = parser.parse_select_from_match()?;
@@ -6456,9 +6513,9 @@ fn lower_tokens(tokens: Vec<Tok>, params: Vec<Value>) -> Result<MatchOrAgg, SqlE
                 parser.advance();
                 stmts.push(parser.parse_select_from_match()?);
             }
-            return Ok(MatchOrAgg::AggUnion(stmts));
+            return Ok((MatchOrAgg::AggUnion(stmts), parser.bm25_needs));
         }
-        return Ok(MatchOrAgg::Agg(first));
+        return Ok((MatchOrAgg::Agg(first), parser.bm25_needs));
     }
 
     // Bare `MATCH ...` (Cypher-style `MATCH ... RETURN` / `MATCH ... WITH`) is no
@@ -6503,7 +6560,7 @@ fn lower_tokens(tokens: Vec<Tok>, params: Vec<Value>) -> Result<MatchOrAgg, SqlE
                           ignoring it would answer a different question", parser.peek()),
         });
     }
-    Ok(MatchOrAgg::Steps(compile(stmt)))
+    Ok((MatchOrAgg::Steps(compile(stmt)), parser.bm25_needs))
 }
 
 /// Parse a MATCH statement and determine whether it is a simple graph query
@@ -6514,12 +6571,21 @@ fn lower_tokens(tokens: Vec<Tok>, params: Vec<Value>) -> Result<MatchOrAgg, SqlE
 /// # Errors
 /// Returns [`SqlError`] if the statement is syntactically invalid.
 pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
-    parse_match_or_agg_inner(sql, vec![])
+    parse_match_or_agg_inner(sql, vec![]).map(|(plan, _)| plan)
+}
+
+/// The same, keeping the index requirements the statement carries. `query()` uses
+/// this one: dropping them is what let a `BM25` with no index answer "no rows".
+pub(crate) fn parse_plan(
+    sql: &str,
+    params: Vec<Value>,
+) -> Result<(MatchOrAgg, Vec<String>), SqlError> {
+    parse_match_or_agg_inner(sql, params)
 }
 
 /// Parse a MATCH/SELECT statement with parameter bindings (`$1`, `$2`, …).
 pub fn parse_match_or_agg_params(sql: &str, params: Vec<Value>) -> Result<MatchOrAgg, SqlError> {
-    parse_match_or_agg_inner(sql, params)
+    parse_match_or_agg_inner(sql, params).map(|(plan, _)| plan)
 }
 
 /// Return `true` when `MATCH` is the first token and the stream contains a `WITH`
