@@ -34,7 +34,8 @@
 //! 1. Extract trigrams: [" al", " alp", "alp", "lph", "pha", "ha "]
 //! 2. Look up each trigram → get RoaringBitmaps
 //! 3. Intersect all bitmaps → candidates (documents with ALL trigrams)
-//! 4. Return candidates (exact — no verification needed)
+//! 4. Return candidates — **which may include false positives**, so the caller
+//!    verifies each one with a real substring match
 //! ```
 //!
 //! ### When to Use GIN vs GiST
@@ -249,7 +250,17 @@ impl GINIndex {
 
     /// Query the index for documents matching an ILIKE pattern.
     ///
-    /// Returns doc IDs that match (exact — no verification needed).
+    /// Returns **candidate** doc IDs, which may include false positives.
+    ///
+    /// Two things make this a filter rather than an answer: trigrams are keyed by
+    /// a 32-bit FNV hash, so distinct trigrams can collide, and an interior
+    /// pattern is not space-padded, so a document can hold every trigram of a
+    /// pattern without containing the pattern itself. The query executor verifies
+    /// each candidate with `ilike_matches`/`like_matches` for exactly that reason.
+    ///
+    /// This said "exact — no verification needed", which contradicted both the
+    /// module header a few lines above and its only caller. Anyone reading it and
+    /// skipping the re-check would return rows that do not match.
     ///
     /// # Arguments
     /// * `pattern` - ILIKE pattern (e.g., "%Alpha%")
@@ -430,8 +441,14 @@ impl GINIndex {
 
         let mut u64buf = [0u8; 8];
         r.read_exact(&mut u64buf)?;
-        let id_map_len = u64::from_le_bytes(u64buf) as usize;
-        let mut id_map = Vec::with_capacity(id_map_len);
+        let id_map_len = u64::from_le_bytes(u64buf) as usize;        // Reserved against a ceiling, not against the declared length. This reader
+        // is generic over any `Read`, so it cannot know how many bytes remain —
+        // and `id_map_len` comes straight from the file. Four corrupt bytes could
+        // name 4 000 000 000 entries and ask for 32 GB before a single one was
+        // read. The loop below grows the vector as it reads, and `read_exact`
+        // fails at the end of a truncated file, so an honest length costs a few
+        // reallocations and a lying one costs nothing.
+        let mut id_map = Vec::with_capacity(id_map_len.min(4096));
         for _ in 0..id_map_len {
             r.read_exact(&mut u64buf)?;
             id_map.push(u64::from_le_bytes(u64buf));
@@ -453,7 +470,19 @@ impl GINIndex {
         }
         r.read_exact(&mut u64buf)?;
         let blob_len = u64::from_le_bytes(u64buf) as usize;
-        let mut blob = vec![0u8; blob_len];
+        // Read up to the declared length rather than allocating it outright: the
+        // length is from the file, and `vec![0u8; 1 << 40]` from four corrupt
+        // bytes is a terabyte asked for in one go. `take` stops at the end of the
+        // file, and a short read is then reported as the corrupt index it is.
+        let mut blob = Vec::new();
+        let mut limited = std::io::Read::take(r.by_ref(), blob_len as u64);
+        std::io::Read::read_to_end(&mut limited, &mut blob)?;
+        if blob.len() != blob_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("gin blob truncated: {} of {blob_len} bytes", blob.len()),
+            ));
+        }
         r.read_exact(&mut blob)?;
         let mut postings = HashMap::with_capacity(trigram_count);
         for (hash, off, len) in dir {

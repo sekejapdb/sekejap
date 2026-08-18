@@ -478,9 +478,25 @@ impl Bm25Index {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
         let total = view.len();
         let b = view.slice(base, total.saturating_sub(base)).ok_or_else(|| bad("bm25 blob range"))?;
-        let ru16 = |b: &[u8], p: usize| u16::from_le_bytes([b[p], b[p + 1]]);
-        let ru32 = |b: &[u8], p: usize| u32::from_le_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]]);
-        let ru64 = |b: &[u8], p: usize| u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
+        // Every number below comes out of the file, and each one advances `p` by
+        // `count * stride` before the next is read — so a corrupt count jumps `p`
+        // far past the blob and the next read indexes out of range. These helpers
+        // indexed directly: one flipped byte in `bm25.bin` panicked at open, which
+        // aborts the process instead of reporting a corrupt index.
+        //
+        // Reading zero past the end turns that into an ordinary failure: the
+        // lengths and counts then describe a table this code cannot find data for,
+        // and the `get(..).ok_or_else(bad(..))` checks below report it as the
+        // corrupt index it is.
+        let ru16 = |b: &[u8], p: usize| -> u16 {
+            b.get(p..p + 2).map_or(0, |x| u16::from_le_bytes([x[0], x[1]]))
+        };
+        let ru32 = |b: &[u8], p: usize| -> u32 {
+            b.get(p..p + 4).map_or(0, |x| u32::from_le_bytes(x.try_into().unwrap()))
+        };
+        let ru64 = |b: &[u8], p: usize| -> u64 {
+            b.get(p..p + 8).map_or(0, |x| u64::from_le_bytes(x.try_into().unwrap()))
+        };
 
         let mut p = 0usize;
         let flen = ru16(b, p) as usize; p += 2;
@@ -490,13 +506,20 @@ impl Bm25Index {
         let num_docs = ru64(b, p); p += 8;
         let sum_doc_len = ru64(b, p); p += 8;
 
-        let doc_count = ru32(b, p) as usize; p += 4;
+        // Each count is capped by what the blob could hold at its stride, so a
+        // corrupt one cannot walk `p` off the end or make the term loop below run
+        // for billions of iterations.
+        let room = |p: usize, stride: usize| -> usize {
+            b.len().saturating_sub(p) / stride
+        };
+        let doc_count = (ru32(b, p) as usize).min(room(p + 4, 4)); p += 4;
         let dl_off = base + p; p += doc_count * 4;
 
-        let idmap_count = ru32(b, p) as usize; p += 4;
+        let idmap_count = (ru32(b, p) as usize).min(room(p + 4, 12)); p += 4;
         let idmap_off = base + p; p += idmap_count * 12;
 
-        let term_count = ru32(b, p) as usize; p += 4;
+        // A term needs at least its two length bytes plus an offset and a length.
+        let term_count = (ru32(b, p) as usize).min(room(p + 4, 14)); p += 4;
         let mut dict = TermDict::new();
         for _ in 0..term_count {
             let tlen = ru16(b, p) as usize; p += 2;
