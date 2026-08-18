@@ -198,3 +198,60 @@ fn shortest_finds_a_path_exactly_when_one_exists() {
         assert_eq!(checked, 7);
     }
 }
+
+/// **A shortest-path pattern must not have its constraints thrown away.**
+///
+/// The bracket contents of `-[r:type*1..5]->` were consumed by a loop and
+/// discarded, so a written edge type and hop range had no effect. That is worse
+/// than an ignored hint: `-[r:nonexistent*]->`, naming a type with no edges
+/// anywhere, still reported a one-hop path, because the search never looked at
+/// the type at all.
+///
+/// The rule the rest of the parser keeps — a clause it cannot apply is refused,
+/// not shrugged off — now holds here too. Implementing typed or bounded shortest
+/// paths is a feature; refusing is the honest state until then.
+#[test]
+fn shortest_refuses_the_constraints_it_cannot_apply() {
+    use sekejap::CoreDB;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut db = CoreDB::open(dir.path()).unwrap();
+    db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY)").unwrap();
+    for k in ["a", "b", "c", "z"] {
+        db.put(&format!("p/{k}"),
+               &format!(r#"{{"_collection":"p","_key":"{k}"}}"#)).unwrap();
+    }
+    // Two routes from a to z: three hops over `slow`, one hop over `fast`.
+    db.link("p/a", "p/b", "slow");
+    db.link("p/b", "p/c", "slow");
+    db.link("p/c", "p/z", "slow");
+    db.link("p/a", "p/z", "fast");
+    db.compact().unwrap();
+
+    // The supported form still answers, and answers correctly: one hop.
+    let hits = db.query(
+        "SELECT length(r) AS hops FROM MATCH SHORTEST (a:p)-[r*]->(b:p) \
+         WHERE a._key = 'a' AND b._key = 'z'").unwrap().collect();
+    assert_eq!(hits.len(), 1, "the unconstrained form must still work");
+    assert_eq!(hits[0].payload.as_ref().unwrap()["hops"].as_i64(), Some(1),
+        "the shortest route from a to z is the single `fast` edge");
+
+    for pattern in [
+        "(a:p)-[r:slow*]->(b:p)",        // a type that exists, and would change the answer
+        "(a:p)-[r:fast*]->(b:p)",        // a type that exists and matches the answer anyway
+        "(a:p)-[r:nonexistent*]->(b:p)", // a type with no edges — used to report a path
+        "(a:p)-[r*1..2]->(b:p)",         // a hop range
+        "(a:p)-[r*..3]->(b:p)",
+    ] {
+        let sql = format!(
+            "SELECT length(r) AS hops FROM MATCH SHORTEST {pattern} \
+             WHERE a._key = 'a' AND b._key = 'z'");
+        match db.query(&sql) {
+            Err(_) => {}
+            Ok(set) => panic!(
+                "`{pattern}` was accepted and answered with {} row(s); its \
+                 constraint is discarded, so the answer describes a different \
+                 query from the one written", set.collect().len()),
+        }
+    }
+}

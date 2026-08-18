@@ -4753,12 +4753,40 @@ impl Parser {
             }
             _ => None,
         };
-        // Consume everything inside [...] (*, ranges, type labels)
-        loop {
-            match self.peek() {
-                Tok::RBracket | Tok::Eof => break,
-                _ => { self.advance(); }
+        // Only `*` — an unconstrained walk — is supported here, and anything else
+        // inside the brackets is refused rather than swallowed.
+        //
+        // This used to consume every token up to the `]` and drop it. So
+        // `-[r:slow*]->` searched over *every* edge type, and `-[r*1..2]->`
+        // searched to any depth: the constraints were parsed and thrown away with
+        // nothing said. Worse than an ignored hint, it produced wrong answers —
+        // `-[r:nonexistent*]->`, naming a type with no edges anywhere, still
+        // reported a one-hop path, because the search never looked at the type.
+        //
+        // Refusing follows the rule the rest of the parser now keeps: a clause it
+        // cannot apply is an error, not a shrug. Implementing typed or bounded
+        // shortest paths is a feature, and this is the honest state until then.
+        match self.peek().clone() {
+            Tok::Star => { self.advance(); }
+            Tok::Colon => {
+                let ty = { self.advance(); self.expect_ident().unwrap_or_default() };
+                return Err(SqlError::InvalidValue(format!(
+                    "MATCH SHORTEST does not support an edge type yet, and `:{ty}` would be ignored: the search would run over every edge type and could return a path made of others. Write `-[{}*]->` for an unconstrained shortest path.",
+                    path_bind.clone().unwrap_or_else(|| "r".into()))));
             }
+            other => {
+                return Err(SqlError::UnexpectedToken {
+                    expected: "`*` — MATCH SHORTEST supports only an unconstrained walk, and a hop range would be ignored rather than applied",
+                    got: format!("{other:?}"),
+                });
+            }
+        }
+        // A hop range after the `*` is refused for the same reason.
+        if !matches!(self.peek(), Tok::RBracket) {
+            return Err(SqlError::UnexpectedToken {
+                expected: "`]` — MATCH SHORTEST does not support a hop range yet, and one written here would be ignored rather than applied",
+                got: format!("{:?}", self.peek()),
+            });
         }
         self.expect_rbracket()?;
         if !matches!(self.peek(), Tok::Arrow) {
