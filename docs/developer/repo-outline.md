@@ -140,7 +140,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
 
 ## `src/engine/`
 
-### `buffer.rs` · 123L — Batching writes to amortize the lock — the write buffer
+### `buffer.rs` · 124L — Batching writes to amortize the lock — the write buffer
 
 ```
     37  pub struct WriteBuffer
@@ -171,7 +171,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     78    pub fn into_inner(self) -> CoreDB
 ```
 
-### `mod.rs` · 1285L — Quick start
+### `mod.rs` · 1303L — Quick start
 
 ```
     62  pub struct Engine
@@ -198,21 +198,21 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    546    pub fn prepare_insert(&self, collection: &str, columns: &[&str]) -> Result<PreparedInsert, Stri…
    560    pub fn insert_prepared(&self, p: &PreparedInsert, params: &[Value]) -> Result<(), String>
    597    pub fn flush(&self) -> Result<usize, String>
-   669    pub fn stats(&self) -> crate::Stats
-   676    pub fn trim_memory(&self)
-   689    pub fn compact(&self) -> Result<(), String>
-   751    pub fn into_inner(self) -> Result<CoreDB, String>
-   772  pub struct EngineBuilder
-   788  impl EngineBuilder
-   791    pub fn buffer_size(mut self, size: usize) -> Self
-   802    pub fn read_only(mut self, ro: bool) -> Self
-   818    pub fn snapshot_reads(mut self, enabled: bool) -> Self
-   843    pub fn config(mut self, config: Config) -> Self
-   852    pub fn publish_interval(mut self, interval: std::time::Duration) -> Self
-   861    pub fn max_scan_rows(mut self, rows: usize) -> Self
-   869    pub fn max_scan_bytes(mut self, bytes: usize) -> Self
-   901    pub fn build(self) -> Result<Engine, String>
-   999  mod snapshot_read_tests
+   687    pub fn stats(&self) -> crate::Stats
+   694    pub fn trim_memory(&self)
+   707    pub fn compact(&self) -> Result<(), String>
+   769    pub fn into_inner(self) -> Result<CoreDB, String>
+   790  pub struct EngineBuilder
+   806  impl EngineBuilder
+   809    pub fn buffer_size(mut self, size: usize) -> Self
+   820    pub fn read_only(mut self, ro: bool) -> Self
+   836    pub fn snapshot_reads(mut self, enabled: bool) -> Self
+   861    pub fn config(mut self, config: Config) -> Self
+   870    pub fn publish_interval(mut self, interval: std::time::Duration) -> Self
+   879    pub fn max_scan_rows(mut self, rows: usize) -> Self
+   887    pub fn max_scan_bytes(mut self, bytes: usize) -> Self
+   919    pub fn build(self) -> Result<Engine, String>
+  1017  mod snapshot_read_tests
 ```
 
 ## `src/`

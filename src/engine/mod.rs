@@ -611,6 +611,24 @@ impl Engine {
             // Prepared rows: pre-built (slug, Value) → put_value_bulk (one shared
             // timestamp, zero parsing). The fast IoT write path.
             if !rows.is_empty() {
+                // Not preserved on failure, unlike the SQL batch below, and the
+                // reason is worth stating because the asymmetry looks like an
+                // oversight.
+                //
+                // Every way `put_value_bulk` can fail — a read-only store, a hash
+                // collision, a payload that is not an object, a serialisation
+                // error — is raised while it builds its WAL entries, before it
+                // writes any of them. And none of them is reachable from here:
+                // this path always hands it a `Value::Object`, and a `Value`
+                // cannot hold a NaN to fail serialisation on. Keeping the rows
+                // recoverable would cost a clone of the whole batch on every
+                // flush, on the path the IoT writers use, to protect against a
+                // failure the API cannot produce.
+                //
+                // If `put_value_bulk` ever gains a failure that can happen after
+                // it has written part of a batch, this needs the same treatment
+                // as the statements below — and a prepared row is a `put`, so
+                // the whole batch can go back rather than a suffix.
                 total += db.put_value_bulk(rows).map_err(|e| e.to_string())?;
             }
             // Buffered SQL: the whole batch applied under one lock.
@@ -634,7 +652,7 @@ impl Engine {
                         // every write queued behind it.
                         unapplied = statements[(applied + 1).min(statements.len())..].to_vec();
                         failure = Some(format!(
-                            "{e}\n  statement {} of {} failed: {}\n  {} applied, {}                              returned to the buffer",
+                            "{e}\n  statement {} of {} failed: {}\n  {} applied, {} returned to the buffer",
                             applied + 1,
                             statements.len(),
                             statements[applied],

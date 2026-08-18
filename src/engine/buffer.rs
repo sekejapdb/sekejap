@@ -120,4 +120,5 @@ impl RowBuffer {
         let mut b = self.pending.lock().expect("RowBuffer poisoned");
         std::mem::take(&mut *b)
     }
+
 }
