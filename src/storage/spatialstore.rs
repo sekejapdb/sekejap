@@ -106,8 +106,14 @@ impl MappedSpatialGrid {
             let k = (rd_i32(dir, o), rd_i32(dir, o + 4));
             if k == key {
                 let off = rd_u64(dir, o + 8) as usize;
-                let n = rd_u32(dir, o + 16) as usize;
                 let blob = self.view.slice(self.blob_off, self.blob_len)?;
+                // Capped by the blob before it sizes anything. `n` is a `u32` from
+                // the file, so a corrupt one reserves up to 4.3 billion entries —
+                // 32 GB — and the loop's `p + 8 > blob.len()` guard below cannot
+                // help, because the allocation happens first. Every posting is
+                // eight bytes from `off`, so the blob says how many there can be.
+                let room = blob.len().saturating_sub(off) / 8;
+                let n = (rd_u32(dir, o + 16) as usize).min(room);
                 let mut out = Vec::with_capacity(n);
                 for i in 0..n {
                     let p = off + i * 8;

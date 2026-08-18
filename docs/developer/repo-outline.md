@@ -1330,7 +1330,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    138  mod tests
 ```
 
-### `spatialstore.rs` · 122L — Spatial index — finding things by location, on disk
+### `spatialstore.rs` · 128L — Spatial index — finding things by location, on disk
 
 ```
     32  pub(crate) struct MappedSpatialGrid
