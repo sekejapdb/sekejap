@@ -1033,7 +1033,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    418  mod tests
 ```
 
-### `btree.rs` · 677L — Why
+### `btree.rs` · 683L — Why
 
 ```
     54  fn rd8(p: &[u8], at: usize) -> u64 { u64::from_le_bytes(p[at..at + 8].try_into().unwrap()) }
@@ -1067,7 +1067,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    398    pub(crate) fn range(&self, lo: u128, hi: u128) -> io::Result<Vec<(u128, u64)>>
    432    pub(crate) fn for_each(&self, mut f: impl FnMut(u128, u64) -> bool) -> io::Result<()>
    460    pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>>
-   468  mod tests
+   474  mod tests
 ```
 
 ### `edgestore.rs` · 955L — Edge storage — the graph's connections
@@ -1226,29 +1226,30 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    170  mod tests
 ```
 
-### `pagestore.rs` · 769L — Why this exists
+### `pagestore.rs` · 887L — Why this exists
 
 ```
     61  pub(crate) struct PageStore
     95  impl PageStore
    108    pub(crate) fn create(path: &Path, page_size: usize) -> io::Result<Self>
    153    pub(crate) fn open(path: &Path) -> io::Result<Option<Self>>
-   221    pub(crate) fn page_size(&self) -> usize { self.page_size }
-   224    pub(crate) fn page_count(&self) -> u64 { self.high_water }
-   227    pub(crate) fn free_count(&self) -> u64 { self.free_count }
-   230    pub(crate) fn user_meta(&self) -> (u64, u64) { (self.user_a, self.user_b) }
-   232    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64)
-   243    pub(crate) fn alloc(&mut self) -> io::Result<u64>
-   293    pub(crate) fn free(&mut self, page: u64) -> io::Result<()>
-   318    pub(crate) fn page_slice(&self, page: u64) -> Option<&[u8]>
-   324    pub(crate) fn read(&self, page: u64, buf: &mut [u8]) -> io::Result<()>
-   343    pub(crate) fn write(&mut self, page: u64, buf: &[u8]) -> io::Result<()>
-   352    pub(crate) fn sync(&mut self) -> io::Result<()>
-   379  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
-   384  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
-   389  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
-   396  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
-   404  mod tests
+   286    pub(crate) fn page_size(&self) -> usize { self.page_size }
+   289    pub(crate) fn page_count(&self) -> u64 { self.high_water }
+   292    pub(crate) fn free_count(&self) -> u64 { self.free_count }
+   295    pub(crate) fn user_meta(&self) -> (u64, u64) { (self.user_a, self.user_b) }
+   297    pub(crate) fn set_user_meta(&mut self, a: u64, b: u64)
+   308    pub(crate) fn alloc(&mut self) -> io::Result<u64>
+   358    pub(crate) fn free(&mut self, page: u64) -> io::Result<()>
+   383    pub(crate) fn page_slice(&self, page: u64) -> Option<&[u8]>
+   389    pub(crate) fn read(&self, page: u64, buf: &mut [u8]) -> io::Result<()>
+   408    pub(crate) fn write(&mut self, page: u64, buf: &[u8]) -> io::Result<()>
+   417    pub(crate) fn sync(&mut self) -> io::Result<()>
+   444  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
+   449  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
+   454  fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()>
+   461  fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()>
+   469  mod tests
+   837  mod damaged_free_list_tests
 ```
 
 ### `recordstore.rs` · 740L — Why
@@ -1664,4 +1665,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    254  mod tests
 ```
 
-<!-- 49 files, 1392 items -->
+<!-- 49 files, 1393 items -->

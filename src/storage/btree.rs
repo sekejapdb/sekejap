@@ -458,7 +458,13 @@ impl BTree {
     ///
     /// [`for_each`]: Self::for_each
     pub(crate) fn iter_all(&self) -> io::Result<Vec<(u128, u64)>> {
-        let mut out = Vec::with_capacity(self.len as usize);
+        // Reserved against a sane ceiling, not against `self.len`. That length is
+        // read verbatim from the store header and never cross-checked with the
+        // tree, so a corrupt or foreign header could ask for `len * 24` bytes up
+        // front — gigabytes from four bad bytes, before a single entry is read.
+        // The walk below grows the vector as it finds real entries, so a truthful
+        // length costs at most a few reallocations and a lying one costs nothing.
+        let mut out = Vec::with_capacity((self.len as usize).min(4096));
         self.for_each(|k, v| { out.push((k, v)); true })?;
         Ok(out)
     }
