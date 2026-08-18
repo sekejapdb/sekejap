@@ -906,6 +906,40 @@ fn wal_write_failed(e: io::Error) -> serde_json::Error {
 /// requirement; on Windows the equivalent guarantee comes from the filesystem
 /// and opening a directory as a file is not permitted, so the call is skipped
 /// rather than failed.
+/// Record a durability-critical step, so its **order** can be asserted.
+///
+/// A compaction's safety rests on a sequence: every base file written and
+/// renamed, the snapshot that names them fsynced and renamed, the directory
+/// fsynced — and only then the log rotated away. Get that order wrong and a
+/// power cut lands between the log being discarded and the base reaching the
+/// platter, which turns a recoverable state into an unrecoverable one.
+///
+/// That order was argued in a comment and enforced by nothing. This does not
+/// prove the platter did what it was told — that needs a filesystem that can drop
+/// unsynced writes, which is still the open item — but it does pin the sequence
+/// the argument depends on, so reordering it fails a test rather than a machine.
+///
+/// Compiled away entirely outside `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn durability_trace(event: &'static str) {
+    DURABILITY_TRACE.with(|t| t.borrow_mut().push(event));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn durability_trace(_event: &'static str) {}
+
+#[cfg(test)]
+thread_local! {
+    static DURABILITY_TRACE: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn durability_trace_take() -> Vec<&'static str> {
+    DURABILITY_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+}
+
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -5788,6 +5822,7 @@ impl CoreDB {
             sf.sync_all()?;
         }
         std::fs::rename(&snap_tmp, &snap_path)?;
+        durability_trace("snapshot.renamed");
         // The commit point of the whole compaction. Every base file has been
         // written and renamed by now, and the snapshot that names them has just
         // landed; this is the moment all of it becomes durable together.
@@ -5799,12 +5834,14 @@ impl CoreDB {
         // runs above reads the new files back and finds them correct — from the
         // page cache, which is exactly what a power cut discards.
         fsync_dir(&dir)?;
+        durability_trace("dir.fsynced");
 
         // 3. Truncate WAL: close current writer → rename → open fresh → delete old
         self.wal = None;
         let wal_path = dir.join("wal.log");
         let wal_old = dir.join("wal.old");
         if wal_path.exists() {
+            durability_trace("wal.rotated");
             std::fs::rename(&wal_path, &wal_old)?;
         }
         let mut new_wal = WalWriter::open_with_format(&wal_path, self.wal_format)?;
@@ -13776,5 +13813,59 @@ fn dump_edge_attrs(meta: Option<&Value>) -> String {
         String::new()
     } else {
         format!(" {{{}}}", parts.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod durability_ordering_tests {
+    use super::*;
+
+    /// **The log may not be rotated until the base it replaces is durable.**
+    ///
+    /// A compaction writes a new base, renames the snapshot that names it, fsyncs
+    /// the directory so all of it becomes durable together, and only then throws
+    /// away the log. The log is the sole record of the writes the new base is
+    /// supposed to contain, so discarding it while the base is still in the page
+    /// cache trades a recoverable state for an unrecoverable one — a power cut in
+    /// that window loses committed writes that are sitting on neither side.
+    ///
+    /// That order was argued in a comment and enforced by nothing. Someone moving
+    /// the rotation earlier, or dropping the directory fsync as redundant, would
+    /// pass every test in the suite: nothing observable changes until the machine
+    /// loses power, which is the one thing the tests cannot do.
+    ///
+    /// This does not prove the platter obeyed. Proving that needs a filesystem
+    /// layer that can drop unsynced writes, and it remains the open item on the
+    /// bar. What it does is pin the sequence the durability argument rests on, so
+    /// a regression fails here rather than in the field.
+    #[test]
+    fn the_wal_is_rotated_only_after_the_new_base_is_durable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        for i in 0..64 {
+            db.put(&format!("p/n{i}"),
+                   &format!(r#"{{"_collection":"p","_key":"n{i}","n":{i}}}"#)).unwrap();
+        }
+
+        let _ = durability_trace_take(); // ignore anything from the open above
+        db.compact().unwrap();
+        let trace = durability_trace_take();
+
+        let at = |what: &str| trace.iter().position(|e| *e == what);
+        let snapshot = at("snapshot.renamed")
+            .expect("a compaction that never renamed a snapshot has no commit point");
+        let fsync = at("dir.fsynced")
+            .expect("the directory was never fsynced, so no rename is durable");
+        let rotate = at("wal.rotated")
+            .expect("the WAL was never rotated — this test would pass vacuously");
+
+        assert!(snapshot < fsync,
+            "the directory was fsynced before the snapshot was renamed into place, \
+             so the rename it was meant to make durable had not happened yet: {trace:?}");
+        assert!(fsync < rotate,
+            "the WAL was rotated before the directory fsync, so a power cut between \
+             them loses every write the new base has not yet reached the platter \
+             with, and the log that could have replayed them is gone: {trace:?}");
     }
 }
