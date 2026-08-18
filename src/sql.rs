@@ -165,6 +165,16 @@ pub enum SqlError {
     ParamTypeMismatch { index: usize, expected: &'static str },
     /// Transaction protocol error (nested BEGIN, COMMIT/ROLLBACK without active transaction).
     TransactionError(String),
+    /// A vector query whose width differs from the field's.
+    ///
+    /// A field holds one dimension — whatever its first vector established — and
+    /// vectors of different lengths cannot be compared. This used to abort the
+    /// process: the kernels walked one slice's length while indexing the other.
+    VectorDimensionMismatch {
+        field: String,
+        field_dim: usize,
+        query_dim: usize,
+    },
     /// A schema qualifier other than `public` was used on a table name. sekejap
     /// has a single implicit namespace exposed as `public` (Postgres' default).
     UndefinedSchema(String),
@@ -193,6 +203,13 @@ impl fmt::Display for SqlError {
             ),
             SqlError::InvalidValue(s) => write!(f, "invalid value: {s}"),
             SqlError::UndefinedSchema(s) => write!(f, "schema \"{s}\" does not exist"),
+            SqlError::VectorDimensionMismatch { field, field_dim, query_dim } => write!(
+                f,
+                "vector query has {query_dim} dimensions and `{field}` holds \
+                 {field_dim}. A field has one dimension — the one its first vector \
+                 established — because vectors of different lengths cannot be \
+                 compared."
+            ),
             SqlError::UndefinedTable(t) => write!(
                 f,
                 "relation \"{t}\" does not exist.\n  Hint: SHOW TABLES lists the \
@@ -1357,6 +1374,8 @@ fn max_nesting(tokens: &[Tok]) -> usize {
 /// five shapes and these calls nest differently in each, so a walk that missed one
 /// would restore the silent wrong answer for exactly the shape it missed.
 pub(crate) struct PlanNeeds {
+    /// `(field, width)` for each vector query, so a mismatch can be named.
+    pub(crate) vector_widths: Vec<(String, usize)>,
     /// Collections a plain `SELECT` reads, which must exist.
     pub(crate) from_tables: Vec<String>,
     /// `SEARCH_SCORE(...)` appears, so some search index must exist.
@@ -1382,6 +1401,14 @@ struct Parser {
     /// Counting frames instead of tokens bounds every recursive path, including
     /// ones added later that no pre-scan would know to look for.
     depth: usize,
+    /// `(field, width)` for each vector query in this statement.
+    ///
+    /// A vector of the wrong width cannot match anything, and until 2026-08-19 it
+    /// did worse than that — the kernels indexed past the end of a buffer and the
+    /// process aborted. The executor now yields no rows, which is right for the
+    /// builder API but silent; recording the width here lets the SQL surface say
+    /// what was wrong instead.
+    vector_needs: Vec<(String, usize)>,
     /// Collections a plain `SELECT ... FROM <name>` reads.
     ///
     /// A name that no collection has silently produced no rows, so a typo in a
@@ -1411,11 +1438,11 @@ struct Parser {
 
 impl Parser {
     fn new(tokens: Vec<Tok>) -> Self {
-        Self { tokens, pos: 0, params: vec![], depth: 0, from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
+        Self { tokens, pos: 0, params: vec![], depth: 0, vector_needs: Vec::new(), from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
     }
 
     fn with_params(tokens: Vec<Tok>, params: Vec<Value>) -> Self {
-        Self { tokens, pos: 0, params, depth: 0, from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
+        Self { tokens, pos: 0, params, depth: 0, vector_needs: Vec::new(), from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
     }
 
     /// Run `f` one level deeper, refusing past [`MAX_NEST_DEPTH`].
@@ -1440,6 +1467,7 @@ impl Parser {
     /// The index requirements gathered while parsing.
     fn needs(self) -> PlanNeeds {
         PlanNeeds {
+            vector_widths: self.vector_needs,
             from_tables: self.from_tables,
             search_index: self.needs_search_index,
             bm25_fields: self.bm25_needs,
@@ -3009,6 +3037,7 @@ impl Parser {
             return Err(SqlError::InvalidValue(format!("VECTOR_NEAR k too large (> {MAX_VECTOR_K})")));
         }
         self.expect_rparen()?;
+        self.vector_needs.push((field.clone(), query.len()));
         Ok(CondExpr::VectorNear { field, query, k })
     }
 

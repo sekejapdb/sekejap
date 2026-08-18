@@ -170,6 +170,36 @@ impl VectorStore {
 
     /// Store a vector. Fails rather than truncate — see [`MAX_DIM`](Self::MAX_DIM).
     pub fn put(&mut self, id: u64, data: Vec<f32>) -> io::Result<()> {
+        // **One dimension per field.**
+        //
+        // Nothing established that before, so a field could hold a 3-dimensional
+        // vector and a 5-dimensional one at once. The dense snapshot the HNSW
+        // build works from takes its width from the *first* vector and appends
+        // each later one at its own length, so the buffer stops lining up with
+        // `n * dim` and a read slices past the end. And a query vector of the
+        // wrong width panicked outright: `db.collection("p").vector_near(..)` and
+        // `WHERE VECTOR_NEAR(vec, [..], k)` both aborted the process on ordinary
+        // user input.
+        //
+        // Refusing at the door is where this belongs — the alternative is
+        // comparing vectors of different lengths, which produces a number that
+        // means nothing rather than an error. The dimension is whatever the first
+        // vector in the field established; there is no separate declaration to
+        // keep in step.
+        if let Some(dim) = self.dim() {
+            if !data.is_empty() && data.len() != dim {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "sekejap: this field holds {dim}-dimensional vectors and \
+                         this one has {}. A field has one dimension — the one its \
+                         first vector established — because vectors of different \
+                         lengths cannot be compared.",
+                        data.len()
+                    ),
+                ));
+            }
+        }
         if data.len() > Self::MAX_DIM {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -230,6 +260,25 @@ impl VectorStore {
                 // We don't return the old data to avoid an I/O read on every delete.
                 index.remove(&id);
                 None
+            }
+        }
+    }
+
+    /// The dimension every vector in this field has, or `None` when it is empty.
+    ///
+    /// Read from the first vector rather than declared, so there is nothing to
+    /// keep in step and it survives a reopen for free.
+    pub fn dim(&self) -> Option<usize> {
+        match &self.inner {
+            VectorStoreInner::Memory { vecs } => vecs.values().next().map(|v| v.len()),
+            // The disk variant records the width it was created with. Asking
+            // `iter()` would have been wrong here: it yields nothing at all until
+            // the file has been mapped, and skips anything appended since the last
+            // remap, so the dimension check below would have been silently
+            // disabled on exactly the stores that have one.
+            #[cfg(unix)]
+            VectorStoreInner::Disk { dim, index, .. } => {
+                if index.is_empty() { None } else { Some(*dim as usize) }
             }
         }
     }
@@ -506,5 +555,28 @@ impl VectorAccess for VectorStore {
 impl IterableVectors for VectorStore {
     fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, &[f32])> + '_> {
         self.iter()
+    }
+}
+
+#[cfg(test)]
+mod dimension_tests {
+    use super::*;
+
+    /// **A field holds one dimension.** See the note on [`VectorStore::put`].
+    #[test]
+    fn a_vector_of_another_dimension_is_refused() {
+        let mut s = VectorStore::default();
+        s.put(1, vec![1.0, 2.0, 3.0]).unwrap();
+        s.put(2, vec![4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(s.dim(), Some(3));
+
+        let err = s.put(3, vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap_err();
+        assert!(err.to_string().contains("3-dimensional"),
+            "the error must say what the field holds: {err}");
+        assert_eq!(s.iter().count(), 2, "the refused vector must not be stored");
+
+        // And the right dimension still goes in.
+        s.put(3, vec![7.0, 8.0, 9.0]).unwrap();
+        assert_eq!(s.iter().count(), 3);
     }
 }

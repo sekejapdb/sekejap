@@ -3814,6 +3814,23 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
             }
             Step::VectorNear { field, query, k } => {
                 use crate::vector::{CosineDistance, DotProduct, L1Distance, L2Distance, Distance};
+                // A query vector of the wrong width used to **abort the process**.
+                // The dense buffer the search reads is `n * dim` wide, and the SIMD
+                // kernels walk one slice's length while indexing the other, so a
+                // five-element query against three-element vectors panicked — from
+                // `db.collection("p").vector_near(..)` and from
+                // `WHERE VECTOR_NEAR(vec, [..], k)` alike, on ordinary user input.
+                //
+                // Nothing can match a vector of a different width, so no candidate
+                // survives. The SQL path says so — `run_plan` refuses the statement
+                // with the two dimensions named — while this builder path can only
+                // return rows, so it returns none.
+                if let Some(dim) = db.vector_dim(field) {
+                    if query.len() != dim {
+                        candidates.clear();
+                        continue;
+                    }
+                }
                 let metric = db.hnsw_metric(field);
                 let dist = |v: &[f32]| -> f32 { match metric {
                     VecMetric::Cosine => CosineDistance::eval(query, v),

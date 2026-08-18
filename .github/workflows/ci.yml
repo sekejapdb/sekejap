@@ -8,6 +8,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 03:17 UTC daily — the fuzz job below, on a seed derived from the date.
+    - cron: '17 3 * * *'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -21,9 +24,44 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --lib
-      - run: cargo test --release --test integration
-      - run: cargo test --release --test persistence
+      # The WHOLE suite, not three targets of it.
+      #
+      # This ran `--lib`, `--test integration` and `--test persistence` and
+      # nothing else — three binaries out of thirty-eight. The differential audit,
+      # the four agreement fuzzers, the corruption sweep, the crash-recovery
+      # tests, the wire-protocol tests and every invariant sweep were all invisible
+      # to CI, so a change could reintroduce any bug they cover and stay green.
+      # Every defect found on 2026-08-18/19 was caught by a binary in that
+      # invisible set.
+      #
+      # `--no-fail-fast` because cargo stops at the first failing binary
+      # otherwise, and a summary read from that output reports the binaries that
+      # did run as though they were all of them.
+      - run: cargo test --release --no-fail-fast
+
+  # The agreement fuzzers on a seed nobody has run before.
+  #
+  # A campaign that is clean on a seed already used proves very little — it
+  # re-walks ground already walked. The seed here comes from the date, so every
+  # run explores shapes the last one did not, and a failure prints the seed that
+  # reproduces it exactly.
+  #
+  # Nightly rather than per-push: these take twenty minutes, and the per-push
+  # suite above already runs each fuzzer at its small default round count.
+  fuzz:
+    name: Fuzz (fresh seed)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Seed from the date
+        run: echo "SEED=$(date +%Y%m%d%H)" >> $GITHUB_ENV
+      - run: SK_COMPFUZZ_SEED=$SEED SK_COMPFUZZ_ROUNDS=600 cargo test --release --test compaction_agreement_fuzz
+      - run: SK_IDXFUZZ_SEED=$SEED SK_IDXFUZZ_ROUNDS=900 cargo test --release --test index_agreement_fuzz
+      - run: SK_REPFUZZ_SEED=$SEED SK_REPFUZZ_ROUNDS=500 cargo test --release --test replay_agreement_fuzz
+      - run: SK_ENCFUZZ_SEED=$SEED SK_ENCFUZZ_ROUNDS=500 cargo test --release --test encoding_agreement_fuzz
 
   windows-compile:
     name: Windows compile check

@@ -125,3 +125,56 @@ fn a_nan_vector_does_not_break_the_search() {
             "querying a row's own vector did not return that row once a NaN vector \
              was present: {got:?}");
 }
+
+/// **A field holds one dimension, and a query of another width is refused.**
+///
+/// Nothing established a field's dimension, so a 3-dimensional field accepted a
+/// 5-dimensional vector without complaint. The dense buffer the search reads is
+/// `n * dim` wide and the SIMD kernels walk one slice's length while indexing the
+/// other, so a query of the wrong width **aborted the process** — from
+/// `vector_near` and from `WHERE VECTOR_NEAR(..)` alike, on ordinary user input.
+///
+/// Three surfaces, three answers, none of them a crash:
+/// * `put_vector` refuses the mismatched write, naming both widths
+/// * SQL refuses the query, naming both widths
+/// * the builder API returns no rows — it hands back rows rather than a `Result`,
+///   and nothing can match a vector of a different width
+#[test]
+fn a_vector_of_the_wrong_width_is_refused_rather_than_fatal() {
+    use sekejap::SqlError;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut db = CoreDB::open(dir.path()).unwrap();
+    db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY)").unwrap();
+    for i in 0..8 {
+        db.put(&format!("p/n{i}"),
+               &json!({"_collection": "p", "_key": format!("n{i}")}).to_string()).unwrap();
+        db.put_vector(&format!("p/n{i}"), "vec", &[i as f32, 1.0, 2.0]).unwrap();
+    }
+
+    // The write.
+    let err = db.put_vector("p/n0", "vec", &[1.0, 2.0, 3.0, 4.0, 5.0])
+        .expect_err("a 5-dimensional vector must not join a 3-dimensional field");
+    assert!(err.to_string().contains('3') && err.to_string().contains('5'),
+        "the error must name both widths: {err}");
+
+    db.build_hnsw_index("vec", 16, 100).expect("hnsw");
+
+    // The right width still answers, on both surfaces.
+    assert_eq!(db.collection("p").vector_near("vec", vec![1.0, 1.0, 2.0], 5).collect().len(), 5);
+    assert_eq!(db.query("SELECT _key FROM p WHERE VECTOR_NEAR(vec, [1.0,1.0,2.0], 5)")
+                   .unwrap().collect().len(), 5);
+
+    // The wrong width: refused by SQL, empty from the builder, fatal from neither.
+    match db.query("SELECT _key FROM p WHERE VECTOR_NEAR(vec, [1.0,1.0,2.0,3.0,4.0], 5)") {
+        Err(SqlError::VectorDimensionMismatch { field_dim, query_dim, .. }) => {
+            assert_eq!((field_dim, query_dim), (3, 5));
+        }
+        Err(other) => panic!("wrong error for a mismatched vector: {other:?}"),
+        Ok(set) => panic!("a 5-dimensional query matched {} row(s) in a \
+                          3-dimensional field", set.collect().len()),
+    }
+    assert_eq!(db.collection("p").vector_near("vec", vec![1.0, 1.0, 2.0, 3.0, 4.0], 5)
+                   .collect().len(), 0,
+        "nothing can match a vector of a different width");
+}
