@@ -577,6 +577,17 @@ impl<'db> Set<'db> {
     /// Acts as a STARTER when no prior steps have produced candidates, otherwise
     /// re-ranks the existing candidate set. Results are sorted ascending by cosine
     /// distance (lower = more similar).
+    ///
+    /// **The sacrifice:** with an HNSW index built, this is an *approximate*
+    /// nearest-neighbour search; without one it is an exact scan. So an index can
+    /// change which k rows come back, unlike every other index in this database,
+    /// where it may only change the speed. That is inherent to ANN rather than a
+    /// defect — the graph is what makes the search sub-linear — but it is a real
+    /// difference and it is stated here because the caller cannot see which path
+    /// ran. `tests/vector_recall.rs` measures the gap: on a few hundred vectors
+    /// with ordinary parameters the two agree completely, and a graph that has
+    /// stopped finding neighbours degrades silently — the query still returns k
+    /// rows, they are simply the wrong ones.
     pub fn vector_near(mut self, field: &str, query: Vec<f32>, k: usize) -> Self {
         self.steps
             .push(Step::VectorNear { field: field.to_string(), query, k });
@@ -586,6 +597,18 @@ impl<'db> Set<'db> {
     // ── BM25 full-text filter ──────────────────────────────────────────────
 
     /// Keep nodes where BM25 score on `field` for `query` exceeds `min_score`.
+    ///
+    /// **Returns no rows when `field` has no BM25 index.** BM25 is read out of its
+    /// index and has no scan behind it, so without one there is nothing to
+    /// consult — and an empty answer here is indistinguishable from a term that
+    /// genuinely occurs nowhere.
+    ///
+    /// The SQL surface refuses instead: `WHERE BM25(body,'x') > 0` raises
+    /// [`SqlError::IndexNotBuilt`](crate::SqlError::IndexNotBuilt) naming the DDL
+    /// that would fix it. This builder cannot, because it returns `Self` rather
+    /// than a `Result` and the query is not executed until `collect`. Build the
+    /// index — `CREATE INDEX ON <collection> USING bm25 (<field>)` — or use the
+    /// SQL path, which will tell you when it is missing.
     pub fn bm25_filter(mut self, field: &str, query: &str, min_score: f64) -> Self {
         self.steps.push(Step::Bm25Filter(
             field.to_string(),
