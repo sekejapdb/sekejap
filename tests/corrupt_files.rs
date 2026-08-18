@@ -111,7 +111,11 @@ fn a_flipped_byte_in_any_durable_file_never_aborts() {
     let mut damaged = 0;
     let mut opened = 0;
     for file in &files {
-        for &pos in &[3usize, 41, 97, 211, 457, 971] {
+        // Weighted towards the start of the file, because that is where the
+        // headers are and headers hold the counts and lengths that drive
+        // allocations and cursor jumps. The `bm25.bin` abort found on 2026-08-19
+        // was at **byte 9**, which a spread of large offsets missed entirely.
+        for &pos in &[1usize, 5, 9, 13, 17, 21, 29, 37, 53, 97, 211, 457, 971] {
             let dir = tempfile::TempDir::new().unwrap();
             build(dir.path());
             let path = dir.path().join(file);

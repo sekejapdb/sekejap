@@ -9331,7 +9331,13 @@ impl CoreDB {
     /// Every node hash the durable store holds.
     fn base_hashes(&self) -> Vec<u64> {
         if let Some(ns) = &self.paged_nodes {
-            let mut out = Vec::with_capacity(ns.len() as usize);
+            // Reserved against a ceiling, not against the store's declared length.
+            // That length comes from the paged node store's header, and a corrupt
+            // one asked for `memory allocation of 2243003720663360 bytes` — two
+            // petabytes — and aborted. The walk below pushes only hashes it
+            // actually finds, so a truthful length costs a few reallocations and a
+            // lying one costs nothing.
+            let mut out = Vec::with_capacity((ns.len() as usize).min(64 * 1024));
             let _ = ns.for_each_hash(|h| { out.push(h); true });
             return out;
         }
