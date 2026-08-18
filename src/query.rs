@@ -1278,7 +1278,7 @@ impl<'db> Set<'db> {
                     let va = a.get(col.as_str());
                     let vb = b.get(col.as_str());
                     ord = match (va.and_then(|v| v.as_f64()), vb.and_then(|v| v.as_f64())) {
-                        (Some(fa), Some(fb)) => fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal),
+                        (Some(fa), Some(fb)) => fa.total_cmp(&fb),
                         (None, Some(_)) => std::cmp::Ordering::Less,
                         (Some(_), None) => std::cmp::Ordering::Greater,
                         (None, None) => {
@@ -2604,7 +2604,21 @@ fn eval_score(
         ScoreExpr::Mul(a, b) => rec!(a) * rec!(b),
         ScoreExpr::Div(a, b) => {
             let denom = rec!(b);
-            if denom == 0.0 { 0.0 } else { rec!(a) / denom }
+            // Undefined, not zero — see the note on `MathExpr::Div`.
+            // Returning `0.0` was a claim about the data: it says the ratio
+            // is nought, and a row with an impossible denominator then sorted
+            // among the genuinely small ones. PostgreSQL raises an error here;
+            // this expression language cannot, because every evaluator on the
+            // path returns a bare `f64` and making them fallible reaches every
+            // sort and projection in the engine.
+            //
+            // `NaN` is the honest answer for a value that does not exist, and
+            // it is now a *safe* one: the comparators these feed use
+            // `total_cmp`, so an undefined score has a defined place — last on
+            // an ascending sort, beside where NULL goes. Under `partial_cmp`
+            // it would have compared equal to everything and scrambled the
+            // rows around it, which is the same defect `cmp_json` had.
+            if denom == 0.0 { f64::NAN } else { rec!(a) / denom }
         }
         ScoreExpr::Neg(a) => -rec!(a),
     }
@@ -3660,7 +3674,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                                 let mut rescored: Vec<(u64, f32)> = approx.iter()
                                     .filter_map(|&id| field_vecs.get_owned(id).map(|v| (id, dist(&v))))
                                     .collect();
-                                rescored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                                rescored.sort_by(|a, b| a.1.total_cmp(&b.1));
                                 rescored.truncate(*k);
                                 candidates = rescored.into_iter().map(|(id, _)| id).collect();
                                 continue;
@@ -3705,8 +3719,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             .collect()
                     };
                     scored.sort_unstable_by(|a, b| {
-                        a.1.partial_cmp(&b.1)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        a.1.total_cmp(&b.1)
                     });
                     scored.truncate(*k);
                     candidates = scored.into_iter().map(|(h, _)| h).collect();
@@ -3911,7 +3924,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         (h, dist)
                     }).collect();
                     scored.sort_unstable_by(|a, b| {
-                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        a.1.total_cmp(&b.1)
                     });
                     candidates = scored.into_iter().map(|(h, _)| h).collect();
                 }
@@ -3970,7 +3983,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     })
                     .collect();
                 scored.sort_by(|a, b| {
-                    let ord = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = a.1.total_cmp(&b.1);
                     if asc { ord } else { ord.reverse() }
                 });
                 candidates = scored.into_iter().map(|(h, _)| h).collect();
@@ -4111,7 +4124,22 @@ impl MathExpr {
             MathExpr::Sub(a, b) => a.eval(row) - b.eval(row),
             MathExpr::Div(a, b) => {
                 let d = b.eval(row);
-                if d == 0.0 { 0.0 } else { a.eval(row) / d }
+                // Undefined, not zero.
+                //
+                // Returning `0.0` was a claim about the data: it says the ratio
+                // is nought, and a row with an impossible denominator then sorted
+                // among the genuinely small ones. PostgreSQL raises an error here;
+                // this expression language cannot, because every evaluator on the
+                // path returns a bare `f64` and making them fallible reaches every
+                // sort and projection in the engine.
+                //
+                // `NaN` is the honest answer for a value that does not exist, and
+                // it is now a *safe* one: the comparators these feed use
+                // `total_cmp`, so an undefined score has a defined place — last on
+                // an ascending sort, beside where NULL goes. Under `partial_cmp`
+                // it would have compared equal to everything and scrambled the
+                // rows around it, which is the same defect `cmp_json` had.
+                if d == 0.0 { f64::NAN } else { a.eval(row) / d }
             }
         }
     }
@@ -4805,7 +4833,8 @@ impl WithExpr {
             WithExpr::Sub(a, b) => a.eval(row) - b.eval(row),
             WithExpr::Div(a, b) => {
                 let d = b.eval(row);
-                if d == 0.0 { 0.0 } else { a.eval(row) / d }
+                // Undefined, not zero — see the note on `MathExpr::Div`.
+                if d == 0.0 { f64::NAN } else { a.eval(row) / d }
             }
         }
     }
@@ -6293,7 +6322,8 @@ fn eval_math_on_with_row(expr: &MathExpr, row: &WithRow) -> f64 {
         MathExpr::Sub(a, b) => eval_math_on_with_row(a, row) - eval_math_on_with_row(b, row),
         MathExpr::Div(a, b) => {
             let d = eval_math_on_with_row(b, row);
-            if d == 0.0 { 0.0 } else { eval_math_on_with_row(a, row) / d }
+            // Undefined, not zero — see the note on `MathExpr::Div`.
+            if d == 0.0 { f64::NAN } else { eval_math_on_with_row(a, row) / d }
         }
     }
 }
@@ -6615,7 +6645,7 @@ pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
             (score, h)
         }).collect();
         keyed.sort_by(|a, b| {
-            let o = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+            let o = a.0.total_cmp(&b.0);
             if ascending { o } else { o.reverse() }
         });
         hits = keyed.into_iter().map(|(_, h)| h).collect();
@@ -6627,7 +6657,7 @@ pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit> {
         keyed.sort_by(|a, b| {
             use std::cmp::Ordering;
             let o = match (a.0, b.0) {
-                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                (Some(x), Some(y)) => x.total_cmp(&y),
                 (None, Some(_)) => Ordering::Less,
                 (Some(_), None) => Ordering::Greater,
                 (None, None) => a.1.cmp(&b.1),
@@ -6760,7 +6790,8 @@ fn eval_edge_math(expr: &MathExpr, edge_var: &str, vals: &[(&str, f64)]) -> f64 
         MathExpr::Sub(a, b) => eval_edge_math(a, edge_var, vals) - eval_edge_math(b, edge_var, vals),
         MathExpr::Div(a, b) => {
             let d = eval_edge_math(b, edge_var, vals);
-            if d == 0.0 { 0.0 } else { eval_edge_math(a, edge_var, vals) / d }
+            // Undefined, not zero — see the note on `MathExpr::Div`.
+            if d == 0.0 { f64::NAN } else { eval_edge_math(a, edge_var, vals) / d }
         }
     }
 }
@@ -7283,7 +7314,7 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                         let va = a.get(order_field.as_str()).and_then(|v| v.as_f64());
                         let vb = b.get(order_field.as_str()).and_then(|v| v.as_f64());
                         let ord = match (va, vb) {
-                            (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                            (Some(na), Some(nb)) => na.total_cmp(&nb),
                             (None, Some(_)) => std::cmp::Ordering::Less,
                             (Some(_), None) => std::cmp::Ordering::Greater,
                             (None, None) => {
@@ -7434,7 +7465,7 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                     let va = a.get(order_field.as_str()).and_then(|v| v.as_f64());
                     let vb = b.get(order_field.as_str()).and_then(|v| v.as_f64());
                     let ord = match (va, vb) {
-                        (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                        (Some(na), Some(nb)) => na.total_cmp(&nb),
                         (None, Some(_)) => std::cmp::Ordering::Less,
                         (Some(_), None) => std::cmp::Ordering::Greater,
                         (None, None) => {
@@ -7608,7 +7639,7 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                         let va = a.get(order_field.as_str()).and_then(|v| v.as_f64());
                         let vb = b.get(order_field.as_str()).and_then(|v| v.as_f64());
                         let ord = match (va, vb) {
-                            (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                            (Some(na), Some(nb)) => na.total_cmp(&nb),
                             (None, Some(_)) => std::cmp::Ordering::Less,
                             (Some(_), None) => std::cmp::Ordering::Greater,
                             (None, None) => {
@@ -7801,7 +7832,8 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                     MathExpr::Sub(a, b) => eval_math(a, rp, f) - eval_math(b, rp, f),
                     MathExpr::Div(a, b) => {
                         let d = eval_math(b, rp, f);
-                        if d == 0.0 { 0.0 } else { eval_math(a, rp, f) / d }
+                        // Undefined, not zero — see the note on `MathExpr::Div`.
+                        if d == 0.0 { f64::NAN } else { eval_math(a, rp, f) / d }
                     }
                 }
             }
@@ -7923,7 +7955,7 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
                     let vb = b.get(order_field.as_str()).and_then(|v| v.as_f64());
                     let ord = match (va, vb) {
                         (Some(na), Some(nb)) => {
-                            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+                            na.total_cmp(&nb)
                         }
                         (None, Some(_)) => std::cmp::Ordering::Less,
                         (Some(_), None) => std::cmp::Ordering::Greater,
@@ -8069,7 +8101,7 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             let va = a.get(order_field.as_str()).and_then(|v| v.as_f64());
             let vb = b.get(order_field.as_str()).and_then(|v| v.as_f64());
             let ord = match (va, vb) {
-                (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(na), Some(nb)) => na.total_cmp(&nb),
                 (None, Some(_)) => std::cmp::Ordering::Less,
                 (Some(_), None) => std::cmp::Ordering::Greater,
                 (None, None) => {
@@ -8218,7 +8250,7 @@ fn finalize_rows(
             let va = a.get(field.as_str()).and_then(|v| v.as_f64());
             let vb = b.get(field.as_str()).and_then(|v| v.as_f64());
             let ord = match (va, vb) {
-                (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(na), Some(nb)) => na.total_cmp(&nb),
                 (None, Some(_)) => std::cmp::Ordering::Less,
                 (Some(_), None) => std::cmp::Ordering::Greater,
                 (None, None) => {
