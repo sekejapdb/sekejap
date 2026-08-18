@@ -3715,6 +3715,49 @@ impl CoreDB {
         true
     }
 
+    /// Every `(node, value)` pair for `field` across `col_hashes`, base included.
+    ///
+    /// The three "rebuild from the collections that remain" paths each walked
+    /// `self.collections` for members and `self.nodes` for the record. Both are
+    /// the overlay, which a compaction empties by moving everything into the mmap
+    /// base — so on the default layout a rebuild after `ALTER TABLE … DROP
+    /// COLUMN` produced an index over nothing, and the collections that still
+    /// declared the index lost every row from it. Resident stores were unaffected,
+    /// which is why it went unnoticed: the bug only exists where the base does.
+    fn field_values_for_collections(
+        &self,
+        col_hashes: &[u64],
+        field: &str,
+    ) -> Vec<(u64, String)> {
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut out: Vec<(u64, String)> = Vec::new();
+        for &ch in col_hashes {
+            let Some(members) = self.collection_members(ch) else { continue };
+            for &hash in members.iter() {
+                if !seen.insert(hash) {
+                    continue;
+                }
+                let Some(payload) = self.get_payload(hash) else { continue };
+                if let Some(v) = payload.get(field).and_then(|v| v.as_str()) {
+                    out.push((hash, v.to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The members of `col_hashes`, base included — see
+    /// [`field_values_for_collections`](Self::field_values_for_collections).
+    fn members_of_collections(&self, col_hashes: &[u64]) -> HashSet<u64> {
+        let mut out: HashSet<u64> = HashSet::new();
+        for &ch in col_hashes {
+            if let Some(members) = self.collection_members(ch) {
+                out.extend(members.iter().copied());
+            }
+        }
+        out
+    }
+
     /// Rebuild `gin_indexes[field]` from only the collections whose schema
     /// still declares a `fulltext` index on this field.
     fn rebuild_gin_for_remaining(&mut self, field: &str) {
@@ -3728,15 +3771,7 @@ impl CoreDB {
             return;
         }
 
-        let values: Vec<(u64, String)> = col_hashes.iter()
-            .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
-            .filter_map(|hash| {
-                let node = self.nodes.get(&hash)?;
-                let payload =
-                    self.payload_store.get_of(hash, node.payload_offset, node.payload_len)?;
-                payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
-            })
-            .collect();
+        let values = self.field_values_for_collections(&col_hashes, field);
 
         if values.is_empty() {
             self.gin_indexes.remove(field);
@@ -3760,15 +3795,7 @@ impl CoreDB {
             return;
         }
 
-        let values: Vec<(u64, String)> = col_hashes.iter()
-            .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
-            .filter_map(|hash| {
-                let node = self.nodes.get(&hash)?;
-                let payload =
-                    self.payload_store.get_of(hash, node.payload_offset, node.payload_len)?;
-                payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
-            })
-            .collect();
+        let values = self.field_values_for_collections(&col_hashes, field);
 
         if values.is_empty() {
             self.bm25_indexes.remove(field);
@@ -3792,9 +3819,7 @@ impl CoreDB {
             return;
         }
 
-        let member_hashes: std::collections::HashSet<u64> = col_hashes.iter()
-            .flat_map(|ch| self.collections.get(ch).into_iter().flatten().copied())
-            .collect();
+        let member_hashes = self.members_of_collections(&col_hashes);
 
         if let Some(field_vecs) = self.vectors.get(field) {
             let filtered: HashMap<u64, Vec<f32>> = field_vecs.iter()
