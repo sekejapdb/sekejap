@@ -229,3 +229,84 @@ fn dump_is_idempotent() {
     b.load_sql(&a.dump_sql()).unwrap();
     assert_eq!(normalized(&a.dump_sql()), normalized(&b.dump_sql()));
 }
+
+// ── the backup path against a real, persistent store ────────────────────────
+//
+// Every test above builds with `CoreDB::new()` — an in-memory database. So the
+// backup path had never been exercised against a store on disk at all, let alone
+// one with a **compacted base**, where `dump_sql` has to read through the merge of
+// the immutable base and the RAM overlay.
+//
+// That is the exact shape of hazard that produced most of the bugs in this store:
+// a read that consults only the overlay sees a fraction of the database and
+// reports it as the whole. In a backup it would be silent and total — the dump
+// would restore "successfully" and be missing most of the rows.
+
+use sekejap::Config;
+
+/// Build a store that has data in both halves: rows and edges folded into the
+/// base by a compaction, then more written on top.
+fn build_persistent(dir: &std::path::Path, cfg: Config) {
+    let mut db = CoreDB::open_with_config(dir, cfg).unwrap();
+    db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+    for i in 0..60 {
+        db.put(&format!("p/n{i}"), &serde_json::json!({
+            "_collection": "p", "_key": format!("n{i}"),
+            "n": i as i64, "body": format!("row {i} riverbank"),
+        }).to_string()).unwrap();
+    }
+    for i in 0..30 {
+        db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next");
+    }
+    db.execute("CREATE INDEX ON p USING btree (n)").unwrap();
+    db.compact().unwrap();                       // everything above is now base
+    for i in 60..70 {                            // and this is overlay
+        db.put(&format!("p/n{i}"), &serde_json::json!({
+            "_collection": "p", "_key": format!("n{i}"),
+            "n": i as i64, "body": format!("row {i} riverbank"),
+        }).to_string()).unwrap();
+    }
+}
+
+fn snapshot_of(db: &CoreDB) -> Vec<String> {
+    let mut out = Vec::new();
+    for sql in ["SELECT _key FROM p",
+                "SELECT _key FROM p WHERE n > 55",
+                "SELECT _key FROM p WHERE n = 42",
+                "SELECT _key FROM MATCH (a:p)-[:next]->(b:p)"] {
+        let mut v: Vec<String> = db.query(sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+            .collect().iter().map(|h| h.slug.clone()).collect();
+        v.sort();
+        out.push(format!("{sql} => {}", v.join(",")));
+    }
+    out.push(format!("edges_from(p/n0) => {}", db.edges_from("p/n0").len()));
+    out
+}
+
+#[test]
+fn a_dump_of_a_persistent_store_restores_the_whole_thing() {
+    for (label, cfg) in [("default", Config::default()), ("resident", Config::resident())] {
+        let dir = tempfile::TempDir::new().unwrap();
+        build_persistent(dir.path(), cfg.clone());
+
+        let (dump, original) = {
+            let db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+            (db.dump_sql(), snapshot_of(&db))
+        };
+
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let mut restored = CoreDB::open(dir2.path()).unwrap();
+        let applied = restored.load_sql(&dump)
+            .unwrap_or_else(|e| panic!("[{label}] restoring the dump failed: {e:?}"));
+        assert!(applied > 0, "[{label}] the dump applied no statements");
+
+        assert_eq!(original, snapshot_of(&restored),
+            "[{label}] the restored database does not answer what the original did — \
+             a backup that restores successfully and is missing rows is the worst \
+             failure this path can have");
+
+        // And the dump is stable: dumping the restoration reproduces it.
+        assert_eq!(normalized(&dump), normalized(&restored.dump_sql()),
+            "[{label}] re-dumping the restored store diverged from the original dump");
+    }
+}
