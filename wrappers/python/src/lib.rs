@@ -478,7 +478,7 @@ impl PyDB {
         let db = self.db()?;
         Ok(db.bm25_search(field, query, top_k)
             .into_iter()
-            .filter_map(|(h, s)| db.slug_of(h).map(|slug| (slug.to_string(), s)))
+            .filter_map(|(h, s)| db.slug_of(h).map(|slug| (slug, s)))
             .collect())
     }
 

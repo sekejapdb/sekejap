@@ -253,3 +253,55 @@ fn dropping_a_column_leaves_another_collection_s_index_intact() {
             "[{label}] `p` no longer has the column and must match nothing");
     }
 }
+
+/// **An accessor that reads only the overlay reports half the database.**
+///
+/// `slug_of` read `self.nodes` and `centroid` read `self.slug_map`. Both are the
+/// overlay, and a compaction moves every row out of it into the mmap base — so on
+/// the default layout, after the first compaction, both answered `None` for every
+/// row in the database.
+///
+/// `slug_of` is not an internal detail: the Python and Node bindings map search
+/// result hashes back to keys through it, inside a `filter_map`. A `bm25_search`
+/// that found four documents handed those callers an empty list, with nothing to
+/// distinguish "dropped on the way out" from "found nothing".
+///
+/// The check is before *and* after a compaction, because before it they were
+/// right — the answer changed under a maintenance operation that is supposed to
+/// change only where the bytes live.
+#[test]
+fn accessors_answer_the_same_before_and_after_a_compaction() {
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE z (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
+        for i in 0..4 {
+            db.put(&format!("z/z{i}"), &json!({
+                "_collection": "z", "_key": format!("z{i}"),
+                "body": "a heron by the water",
+                "geometry": {"type": "Polygon", "coordinates": [[
+                    [144.95, -37.80], [144.98, -37.80], [144.98, -37.83],
+                    [144.95, -37.83], [144.95, -37.80]]]},
+            }).to_string()).unwrap();
+        }
+        db.execute("CREATE INDEX ON z USING bm25 (body)").unwrap();
+
+        for when in ["before a compaction", "after a compaction"] {
+            if when == "after a compaction" { db.compact().unwrap(); }
+
+            let hits = db.bm25_search("body", "heron", 10);
+            assert_eq!(hits.len(), 4, "[{label}] {when}: the search itself lost rows");
+
+            // The binding's own step: name every hit. This is where they vanished.
+            let named = hits.iter().filter(|(h, _)| db.slug_of(*h).is_some()).count();
+            assert_eq!(named, 4,
+                "[{label}] {when}: {} of 4 search hits could not be named, which is \
+                 what the Python and Node bindings silently drop", 4 - named);
+
+            for i in 0..4 {
+                assert!(db.centroid(&format!("z/z{i}")).is_some(),
+                    "[{label}] {when}: z/z{i} has a polygon and no centroid");
+            }
+        }
+    }
+}
