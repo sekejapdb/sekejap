@@ -170,7 +170,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     78    pub fn into_inner(self) -> CoreDB
 ```
 
-### `mod.rs` · 1229L — Quick start
+### `mod.rs` · 1237L — Quick start
 
 ```
     62  pub struct Engine
@@ -200,18 +200,18 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    621    pub fn stats(&self) -> crate::Stats
    628    pub fn trim_memory(&self)
    641    pub fn compact(&self) -> Result<(), String>
-   695    pub fn into_inner(self) -> Result<CoreDB, String>
-   716  pub struct EngineBuilder
-   732  impl EngineBuilder
-   735    pub fn buffer_size(mut self, size: usize) -> Self
-   746    pub fn read_only(mut self, ro: bool) -> Self
-   762    pub fn snapshot_reads(mut self, enabled: bool) -> Self
-   787    pub fn config(mut self, config: Config) -> Self
-   796    pub fn publish_interval(mut self, interval: std::time::Duration) -> Self
-   805    pub fn max_scan_rows(mut self, rows: usize) -> Self
-   813    pub fn max_scan_bytes(mut self, bytes: usize) -> Self
-   845    pub fn build(self) -> Result<Engine, String>
-   943  mod snapshot_read_tests
+   703    pub fn into_inner(self) -> Result<CoreDB, String>
+   724  pub struct EngineBuilder
+   740  impl EngineBuilder
+   743    pub fn buffer_size(mut self, size: usize) -> Self
+   754    pub fn read_only(mut self, ro: bool) -> Self
+   770    pub fn snapshot_reads(mut self, enabled: bool) -> Self
+   795    pub fn config(mut self, config: Config) -> Self
+   804    pub fn publish_interval(mut self, interval: std::time::Duration) -> Self
+   813    pub fn max_scan_rows(mut self, rows: usize) -> Self
+   821    pub fn max_scan_bytes(mut self, bytes: usize) -> Self
+   853    pub fn build(self) -> Result<Engine, String>
+   951  mod snapshot_read_tests
 ```
 
 ## `src/`
