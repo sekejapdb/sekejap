@@ -115,3 +115,55 @@ fn the_caps_apply_on_the_snapshot_path_too() {
                    "the row cap is not applied when reads are served from a snapshot");
     }
 }
+
+// ── the snapshot the service reads through ──────────────────────────────────
+
+/// **`refresh_snapshot` makes a write visible, and without it a read may not be.**
+///
+/// Snapshot reads are the point of the service mode: a `get` does not queue
+/// behind a writer. The cost is staleness — the published snapshot is re-minted
+/// on a debounce, so a write is not immediately visible through it. That is the
+/// trade, and `refresh_snapshot` is the escape hatch the docs point at for
+/// read-your-own-write.
+///
+/// Nothing tested either half. A `refresh_snapshot` that did not actually
+/// re-mint would leave a caller reading stale data forever with the documented
+/// remedy in hand and no way to tell it was not working.
+#[cfg(unix)]
+#[test]
+fn refresh_snapshot_makes_a_write_visible() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        // Resident: the layout that can be snapshotted. `CoreDB::open` gives the
+        // paged layout, whose files are written in place and therefore cannot be
+        // shared with a reader — the engine would fall back to locked reads and
+        // this test would be exercising the fallback.
+        let mut db = CoreDB::open_with_config(dir.path(), sekejap::Config::resident()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        db.put("p/a", r#"{"_collection":"p","_key":"a","n":1}"#).unwrap();
+        db.compact().unwrap();
+    }
+
+    let engine = Engine::builder(dir.path().to_str().unwrap())
+        .snapshot_reads(true)
+        // A long debounce, so the snapshot cannot re-mint on its own and the
+        // test is measuring `refresh_snapshot` rather than a timer.
+        .publish_interval(std::time::Duration::from_secs(3_600))
+        .build()
+        .unwrap();
+
+    assert!(engine.get("p/a").is_some(), "the pre-existing row is not visible");
+
+    engine.execute("INSERT INTO p (_key, n) VALUES ('b', 2)").unwrap();
+
+    // Whether `b` is visible before the refresh is a timing question and not
+    // something to assert on. What must hold is that it *is* visible after.
+    engine.refresh_snapshot();
+    assert!(engine.get("p/b").is_some(),
+            "a row inserted through the engine is still not visible after \
+             refresh_snapshot — the documented remedy for read-your-own-write \
+             does not work");
+
+    // The write is real, not just visible through the snapshot.
+    assert_eq!(engine.count("p"), 2, "count disagrees with get after a refresh");
+}
