@@ -67,7 +67,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     61  mod tests
 ```
 
-### `index.rs` · 1181L — The BM25 index — building it and scoring queries
+### `index.rs` · 1193L — The BM25 index — building it and scoring queries
 
 ```
     60  pub enum DocLens
@@ -93,21 +93,21 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    396    pub fn spill_to_disk(&mut self, path: &std::path::Path) -> std::io::Result<()>
    429    pub(crate) fn write_binary<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>
    477    pub(crate) fn open_mapped(view: &Arc<MmapView>, base: usize, dir: &std::path::Path) -> std::io:…
-   565    pub(crate) fn is_disk_backed(&self) -> bool
-   570    pub(crate) fn field_name(&self) -> &str
-   587    pub fn build<'a>(field: &str, docs: impl Iterator<Item = (u64, &'a str)>) -> Self
-   683    pub fn search(&self, query: &str, top_k: usize) -> Vec<Bm25Hit>
-   693    pub fn search_all(&self, query: &str) -> Vec<Bm25Hit>
-   815    pub fn delete(&mut self, doc_id: u64) -> bool
-   849    pub fn avg_doc_len(&self) -> f64
-   872    pub fn orphan_count(&self) -> usize
-   898    pub fn needs_rebuild(&self, threshold: f64) -> bool
-   907    pub fn num_docs(&self) -> u64
-   912    pub fn num_terms(&self) -> usize
-   922    pub fn delta_len(&self) -> usize { self.delta.len() }
-   932    pub fn insert_doc(&mut self, doc_id: u64, text: &str)
-   949    pub fn merge_delta(&mut self)
-  1076  mod tests
+   577    pub(crate) fn is_disk_backed(&self) -> bool
+   582    pub(crate) fn field_name(&self) -> &str
+   599    pub fn build<'a>(field: &str, docs: impl Iterator<Item = (u64, &'a str)>) -> Self
+   695    pub fn search(&self, query: &str, top_k: usize) -> Vec<Bm25Hit>
+   705    pub fn search_all(&self, query: &str) -> Vec<Bm25Hit>
+   827    pub fn delete(&mut self, doc_id: u64) -> bool
+   861    pub fn avg_doc_len(&self) -> f64
+   884    pub fn orphan_count(&self) -> usize
+   910    pub fn needs_rebuild(&self, threshold: f64) -> bool
+   919    pub fn num_docs(&self) -> u64
+   924    pub fn num_terms(&self) -> usize
+   934    pub fn delta_len(&self) -> usize { self.delta.len() }
+   944    pub fn insert_doc(&mut self, doc_id: u64, text: &str)
+   961    pub fn merge_delta(&mut self)
+  1088  mod tests
 ```
 
 ### `mod.rs` · 57L — BM25 — ranking documents by how relevant they are to a query

@@ -535,16 +535,28 @@ impl Bm25Index {
         let ppath = dir.join(format!("bm25_{field}.postings"));
         let pfile = std::fs::File::open(&ppath)?;
         let plen = pfile.metadata()?.len();
+        // `#[cfg(unix)]` binds to the *statement that follows it*, and it followed
+        // only the `let needed = …` line. So on Windows `needed` did not exist
+        // while the `if needed > plen` below it still compiled, and
+        // `PostingsBlob::Disk` — a unix-only variant — was named unconditionally.
+        // Two errors, and the crate has not built for Windows since. The whole
+        // unix branch is one block now, so the attribute covers what it means to.
         #[cfg(unix)]
-        // Sanity check: the dictionary and the postings file must belong to the
-        // same generation. If a merge ever rewrote one without the other, every
-        // offset here would address the wrong bytes; refusing makes the caller
-        // rebuild from the data instead of serving nonsense.
-        let needed = dict.iter().map(|(_, e)| e.postings_offset + e.postings_len as u64).max().unwrap_or(0);
-        if needed > plen {
-            return Err(bad("bm25 postings file is older than its dictionary"));
-        }
-        let postings = PostingsBlob::Disk { file: std::sync::Arc::new(pfile), len: plen };
+        let postings = {
+            // Sanity check: the dictionary and the postings file must belong to
+            // the same generation. If a merge ever rewrote one without the other,
+            // every offset here would address the wrong bytes; refusing makes the
+            // caller rebuild from the data instead of serving nonsense.
+            let needed = dict
+                .iter()
+                .map(|(_, e)| e.postings_offset + e.postings_len as u64)
+                .max()
+                .unwrap_or(0);
+            if needed > plen {
+                return Err(bad("bm25 postings file is older than its dictionary"));
+            }
+            PostingsBlob::Disk { file: std::sync::Arc::new(pfile), len: plen }
+        };
         #[cfg(not(unix))]
         let postings = { let _ = (pfile, plen); PostingsBlob::Memory(std::fs::read(&ppath)?) };
 
