@@ -689,9 +689,17 @@ impl Engine {
     /// while quietly discarding writes is the thing being fixed, and doing it
     /// with an error on the floor would be the same bug with extra steps.
     ///
-    /// Note that plain `drop` does **not** flush — `Engine` has no `Drop`
-    /// impl — so a buffered engine that goes out of scope still loses what it
-    /// holds. Closing one properly means `flush()` or `into_inner()`.
+    /// Plain `drop` deliberately does **not** flush. `flush()` is the commit
+    /// point of the buffered path and the whole of what it promises: buffered
+    /// statements are not applied or logged until it runs, which is the trade
+    /// `buffer_size` exists to offer, and `buffered_flushed_survives_unflushed_lost_db_stays_consistent`
+    /// pins it. An implicit commit at scope exit would make the commit point
+    /// ambiguous, and a flush that failed inside a destructor could not be
+    /// reported — "usually durable, sometimes silently not" is a worse contract
+    /// than "durable exactly when you say so".
+    ///
+    /// This method is different because it is an *explicit* close: the caller has
+    /// said the engine is finished with, so there is no later flush to wait for.
     pub fn into_inner(self) -> Result<CoreDB, String> {
         self.flush()?;
         Ok(self.guard.into_inner())

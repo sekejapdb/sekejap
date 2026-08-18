@@ -619,3 +619,4 @@ fn closing_an_engine_flushes_what_it_buffered() {
     assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 20,
                "the writes did not reach disk");
 }
+
