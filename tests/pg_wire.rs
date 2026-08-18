@@ -372,3 +372,146 @@ fn an_error_is_confined_to_its_own_extended_exchange() {
     assert!(good.errors.is_empty(), "the connection was wedged: {:?}", good.errors);
     assert_eq!(good.rows.len(), 6, "the connection lost its way after an error");
 }
+
+// ── Malformed input ──────────────────────────────────────────────────────────
+//
+// Every byte here comes off a socket, so all of it is attacker-controlled. The
+// tests above only ever sent well-formed frames, which is how a two-byte field
+// went unnoticed: `Bind` read its counts as Int16 and cast them straight to
+// `usize`, so `0xFFFF` sign-extended to `usize::MAX` and
+// `Vec::with_capacity(usize::MAX)` panicked — a remote client killing the
+// connection thread, after a `Parse` naming any statement.
+
+fn raw(typ: u8, body: Vec<u8>) -> Vec<u8> {
+    let mut m = vec![typ];
+    m.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    m.extend_from_slice(&body);
+    m
+}
+
+/// A `Bind` referring to a statement that has been `Parse`d, with the two count
+/// fields set by the caller.
+fn hostile_bind(nfmt: i16, nparams: i16) -> Vec<u8> {
+    let mut b = vec![0u8];                        // portal ""
+    b.extend_from_slice(b"s\0");                  // statement "s"
+    b.extend_from_slice(&nfmt.to_be_bytes());
+    b.extend_from_slice(&nparams.to_be_bytes());
+    b.extend_from_slice(&0i16.to_be_bytes());     // result format codes
+    raw(b'B', b)
+}
+
+fn with_parsed_statement(db: &Arc<RwLock<CoreDB>>) -> sekejap::pg::Connection {
+    let mut conn = connect(db);
+    let mut p = b"s\0".to_vec();
+    p.extend_from_slice(b"SELECT _key FROM p\0");
+    p.extend_from_slice(&0u16.to_be_bytes());
+    conn.feed(&raw(b'P', p));
+    conn
+}
+
+/// **A count field from the network may not be believed.**
+///
+/// `-1` as an Int16 is `usize::MAX` once cast. One use of it panicked
+/// (`Vec::with_capacity`), the other never terminated: reads past the end of a
+/// frame return zero rather than stopping, so `(0..usize::MAX)` collecting
+/// `i16`s grows until the process is killed. The second is not exercised
+/// directly — before the fix it would take the machine down with it — but it is
+/// the same field and the same check.
+#[test]
+fn a_negative_count_in_bind_is_refused_not_believed() {
+    let (_d, db) = fixture();
+
+    for (nfmt, nparams, what) in [
+        (0i16, -1i16, "parameter count"),
+        (-1i16, 0i16, "format code count"),
+        (-32768i16, 0i16, "most negative format code count"),
+        (0i16, -32768i16, "most negative parameter count"),
+    ] {
+        let mut conn = with_parsed_statement(&db);
+        let reply = decode(&conn.feed(&hostile_bind(nfmt, nparams)));
+        assert!(!reply.errors.is_empty(),
+            "a Bind with a negative {what} was accepted rather than refused");
+
+        // And the connection is still usable: a protocol error must not be fatal.
+        let after = decode(&conn.feed(&sync()));
+        assert!(after.errors.is_empty(), "Sync after the error also failed: {:?}", after.errors);
+    }
+}
+
+/// A count larger than the frame has room for is malformed whatever its sign —
+/// a format code needs two bytes, a parameter at least four for its own length.
+#[test]
+fn a_count_larger_than_the_frame_is_refused() {
+    let (_d, db) = fixture();
+    for (nfmt, nparams) in [(0i16, 4000i16), (4000i16, 0i16)] {
+        let mut conn = with_parsed_statement(&db);
+        let reply = decode(&conn.feed(&hostile_bind(nfmt, nparams)));
+        assert!(!reply.errors.is_empty(),
+            "a Bind claiming {nfmt} formats and {nparams} params in a 9-byte body \
+             was accepted");
+    }
+}
+
+/// **No sequence of bytes may panic the parser.**
+///
+/// A catch-all for the shapes nobody thought to write down: truncated frames,
+/// lengths that disagree with the body, unknown message types, and random noise
+/// arriving in arbitrary chunk boundaries. The assertion is only that the server
+/// survives and stays responsive — what it replies to nonsense is its own
+/// business.
+#[test]
+fn malformed_bytes_never_panic_the_parser() {
+    let (_d, db) = fixture();
+
+    // A tiny deterministic PRNG, so a failure reproduces from the seed.
+    let mut state: u64 = 0xC0FFEE_1234_5678;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    for round in 0..400 {
+        let mut conn = connect(&db);
+        // Half the rounds start from a real Parse, so Bind's statement lookup
+        // succeeds and the parser reaches the code behind it.
+        if round % 2 == 0 {
+            let mut p = b"s\0".to_vec();
+            p.extend_from_slice(b"SELECT _key FROM p\0");
+            p.extend_from_slice(&0u16.to_be_bytes());
+            conn.feed(&raw(b'P', p));
+        }
+
+        let types = [b'P', b'B', b'D', b'E', b'S', b'Q', b'X', b'C', b'H', 0u8, 0xFF];
+        let typ = types[(next() % types.len() as u64) as usize];
+        let len = (next() % 64) as usize;
+        let mut body: Vec<u8> = (0..len).map(|_| (next() % 256) as u8).collect();
+
+        // Sometimes lie about the length rather than the content.
+        let mut frame = vec![typ];
+        let declared = match next() % 4 {
+            0 => (body.len() + 4) as i32,          // honest
+            1 => (body.len() + 4) as i32 + 1000,   // claims more than it sent
+            2 => 3,                                // below the legal minimum
+            _ => -5,                               // negative
+        };
+        frame.extend_from_slice(&declared.to_be_bytes());
+        frame.append(&mut body);
+
+        // Deliver it in one or two pieces, so partial-frame handling is exercised.
+        if frame.len() > 4 && next() % 2 == 0 {
+            let split = 1 + (next() as usize % (frame.len() - 1));
+            conn.feed(&frame[..split]);
+            conn.feed(&frame[split..]);
+        } else {
+            conn.feed(&frame);
+        }
+    }
+
+    // Still alive, and a clean connection still answers correctly.
+    let mut conn = connect(&db);
+    let reply = ask(&mut conn, "SELECT _key FROM p");
+    assert!(reply.errors.is_empty(), "the parser survived but the server did not: {:?}", reply.errors);
+    assert_eq!(reply.rows.len(), 6);
+}

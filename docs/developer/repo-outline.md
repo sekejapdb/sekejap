@@ -540,7 +540,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
  13820  mod durability_ordering_tests
 ```
 
-### `pg.rs` · 1227L — Speaking PostgreSQL's language — the wire protocol, sans-IO
+### `pg.rs` · 1265L — Speaking PostgreSQL's language — the wire protocol, sans-IO
 
 ```
     65  fn is_geojson_geometry(v: &Value) -> bool
@@ -552,57 +552,57 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    119    pub fn new(db: Arc<RwLock<CoreDB>>, read_only: bool) -> Self
    134    pub fn is_closed(&self) -> bool
    141    pub fn feed(&mut self, data: &[u8]) -> Vec<u8>
-   364  fn emit_startup_ok(out: &mut Vec<u8>)
-   383  fn ensure_portal_described(
-   407  fn run_portal(
-   425  fn handle_simple_query(
-   449  fn run_statement(
-   497  fn emit_outcome(out: &mut Vec<u8>, outcome: Outcome)
-   515  fn build_rows(hits: &[Hit]) -> Outcome
-   552  fn infer_oid(hits: &[Hit], col: &str) -> i32
-   594  fn value_text(v: &Value) -> Option<Vec<u8>>
-   610  fn decode_param(bytes: &[u8], is_binary: bool) -> Value
-   632  fn command_tag(first: &str, stmt: &str, n: usize) -> String
-   649  fn first_word(s: &str) -> String
-   653  fn second_word(s: &str) -> String
-   659  fn one_cell(col: &str, val: &str) -> Outcome
-   667  fn pg_version() -> String
-   672  fn guc_value(var: &str) -> &'static str
-   694  fn pg_shim(
-   716  fn catalog_response(db: &Arc<RwLock<CoreDB>>, upper: &str, params: &[Value]) -> Outcome
-   778  fn type_info(oid: i64) -> Option<(&'static str, &'static str, &'static str)>
-   793  fn table_oid(name: &str) -> i64
-   803  fn list_collections(guard: &CoreDB) -> Vec<String>
-   817  fn collection_columns(guard: &CoreDB, name: &str) -> Vec<(String, i64, String, bool, bool)>
-   857  fn s(v: &str) -> Option<Vec<u8>> { Some(v.as_bytes().to_vec()) }
-   858  fn i(v: i64) -> Option<Vec<u8>> { Some(v.to_string().into_bytes()) }
-   859  fn boolcell(v: bool) -> Option<Vec<u8>> { Some(if v { b"t".to_vec() } else { b"f".to_vec() }) }
-   861  fn build(cols: &[(&str, i32)], rows: Vec<Vec<Option<Vec<u8>>>>) -> Outcome
-   869  fn empty_set() -> Outcome
-   873  fn catalog_namespaces() -> Outcome
-   879  fn catalog_database(params: &[Value]) -> Outcome
-   889  fn catalog_tables(db: &Arc<RwLock<CoreDB>>) -> Outcome
-   907  fn catalog_columns(db: &Arc<RwLock<CoreDB>>, upper: &str) -> Outcome
-   934  fn catalog_types() -> Outcome
-   962  fn catalog_geometry_columns(db: &Arc<RwLock<CoreDB>>) -> Outcome
-   982  fn catalog_spatial_ref_sys() -> Outcome
-   996  fn extract_int_after(upper: &str, key: &str) -> Option<i64>
-  1006  fn pg_session_shim(first: &str, sql: &str) -> Option<Outcome>
-  1068  fn is_read(first: &str) -> bool
-  1075  fn msg(out: &mut Vec<u8>, typ: u8, body: &[u8])
-  1081  fn emit_row_description(out: &mut Vec<u8>, columns: &[String], oids: &[i32])
-  1096  fn emit_data_rows(out: &mut Vec<u8>, rows: &[Vec<Option<Vec<u8>>>])
-  1113  fn param_status(out: &mut Vec<u8>, key: &str, val: &str)
-  1120  fn ready_for_query(out: &mut Vec<u8>)
-  1124  fn command_complete(out: &mut Vec<u8>, tag: &str)
-  1130  fn empty_query_response(out: &mut Vec<u8>)
-  1134  fn error_response(out: &mut Vec<u8>, sqlstate: &str, message: &str)
-  1144  fn cstr(out: &mut Vec<u8>, s: &str)
-  1152  struct Reader<'a> { b: &'a [u8], pos: usize }
-  1186  fn cstr_from(body: &[u8]) -> String
-  1194  fn split_statements(sql: &str) -> Vec<String>
-  1226  fn lock_err<T>(_: T) -> SqlFail { ("XX000", "internal lock poisoned".to_string()) }
-  1227  fn query_err<E: std::fmt::Display>(e: E) -> SqlFail { ("42601", e.to_string()) }
+   393  fn emit_startup_ok(out: &mut Vec<u8>)
+   412  fn ensure_portal_described(
+   436  fn run_portal(
+   454  fn handle_simple_query(
+   478  fn run_statement(
+   526  fn emit_outcome(out: &mut Vec<u8>, outcome: Outcome)
+   544  fn build_rows(hits: &[Hit]) -> Outcome
+   581  fn infer_oid(hits: &[Hit], col: &str) -> i32
+   623  fn value_text(v: &Value) -> Option<Vec<u8>>
+   639  fn decode_param(bytes: &[u8], is_binary: bool) -> Value
+   661  fn command_tag(first: &str, stmt: &str, n: usize) -> String
+   678  fn first_word(s: &str) -> String
+   682  fn second_word(s: &str) -> String
+   688  fn one_cell(col: &str, val: &str) -> Outcome
+   696  fn pg_version() -> String
+   701  fn guc_value(var: &str) -> &'static str
+   723  fn pg_shim(
+   745  fn catalog_response(db: &Arc<RwLock<CoreDB>>, upper: &str, params: &[Value]) -> Outcome
+   807  fn type_info(oid: i64) -> Option<(&'static str, &'static str, &'static str)>
+   822  fn table_oid(name: &str) -> i64
+   832  fn list_collections(guard: &CoreDB) -> Vec<String>
+   846  fn collection_columns(guard: &CoreDB, name: &str) -> Vec<(String, i64, String, bool, bool)>
+   886  fn s(v: &str) -> Option<Vec<u8>> { Some(v.as_bytes().to_vec()) }
+   887  fn i(v: i64) -> Option<Vec<u8>> { Some(v.to_string().into_bytes()) }
+   888  fn boolcell(v: bool) -> Option<Vec<u8>> { Some(if v { b"t".to_vec() } else { b"f".to_vec() }) }
+   890  fn build(cols: &[(&str, i32)], rows: Vec<Vec<Option<Vec<u8>>>>) -> Outcome
+   898  fn empty_set() -> Outcome
+   902  fn catalog_namespaces() -> Outcome
+   908  fn catalog_database(params: &[Value]) -> Outcome
+   918  fn catalog_tables(db: &Arc<RwLock<CoreDB>>) -> Outcome
+   936  fn catalog_columns(db: &Arc<RwLock<CoreDB>>, upper: &str) -> Outcome
+   963  fn catalog_types() -> Outcome
+   991  fn catalog_geometry_columns(db: &Arc<RwLock<CoreDB>>) -> Outcome
+  1011  fn catalog_spatial_ref_sys() -> Outcome
+  1025  fn extract_int_after(upper: &str, key: &str) -> Option<i64>
+  1035  fn pg_session_shim(first: &str, sql: &str) -> Option<Outcome>
+  1097  fn is_read(first: &str) -> bool
+  1104  fn msg(out: &mut Vec<u8>, typ: u8, body: &[u8])
+  1110  fn emit_row_description(out: &mut Vec<u8>, columns: &[String], oids: &[i32])
+  1125  fn emit_data_rows(out: &mut Vec<u8>, rows: &[Vec<Option<Vec<u8>>>])
+  1142  fn param_status(out: &mut Vec<u8>, key: &str, val: &str)
+  1149  fn ready_for_query(out: &mut Vec<u8>)
+  1153  fn command_complete(out: &mut Vec<u8>, tag: &str)
+  1159  fn empty_query_response(out: &mut Vec<u8>)
+  1163  fn error_response(out: &mut Vec<u8>, sqlstate: &str, message: &str)
+  1173  fn cstr(out: &mut Vec<u8>, s: &str)
+  1181  struct Reader<'a> { b: &'a [u8], pos: usize }
+  1224  fn cstr_from(body: &[u8]) -> String
+  1232  fn split_statements(sql: &str) -> Vec<String>
+  1264  fn lock_err<T>(_: T) -> SqlFail { ("XX000", "internal lock poisoned".to_string()) }
+  1265  fn query_err<E: std::fmt::Display>(e: E) -> SqlFail { ("42601", e.to_string()) }
 ```
 
 ### `query.rs` · 8748L — The query engine — building and running queries
