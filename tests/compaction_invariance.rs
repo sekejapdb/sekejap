@@ -182,3 +182,61 @@ fn compaction_changes_where_bytes_live_and_nothing_else() {
         }
     }
 }
+
+/// **`DISTINCT` must return the same representative however the rows are laid out.**
+///
+/// `distinct_key_of` normalises numbers, so JSON `1` and `1.0` are one value —
+/// which is right, and matches `WHERE v = 1` matching both, and matches
+/// PostgreSQL, where `'1.0'::jsonb = '1'::jsonb` holds. A group can therefore
+/// contain rows that render differently while being equal, and deduplication used
+/// to keep whichever the scan reached first.
+///
+/// A compaction changes scan order. `SELECT DISTINCT v FROM p` answered
+/// `{"v":1.0}` before one and `{"v":1}` after, over data nobody had touched.
+/// Found by `compaction_agreement_fuzz` on seed 20260818778 at rounds 786 and
+/// 796, in both layouts and in both directions — which is what ruled out a
+/// simple encode/decode asymmetry and pointed at the representative instead.
+///
+/// PostgreSQL does not specify which row represents a group, so nothing required
+/// this to be unstable. The rule is now the lowest slug, which costs a comparison
+/// per duplicate and rewrites nothing.
+#[test]
+fn distinct_returns_the_same_representative_after_a_compaction() {
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, v REAL)").unwrap();
+        // Equal values written in both JSON forms, in both orders, so a
+        // first-wins rule cannot accidentally agree with a lowest-slug rule.
+        db.put("p/a", r#"{"_collection":"p","_key":"a","v":1.0}"#).unwrap();
+        db.put("p/b", r#"{"_collection":"p","_key":"b","v":2.5}"#).unwrap();
+        db.put("p/c", r#"{"_collection":"p","_key":"c","v":3}"#).unwrap();
+        db.put("p/d", r#"{"_collection":"p","_key":"d","v":1}"#).unwrap();
+        db.put("p/e", r#"{"_collection":"p","_key":"e","v":3.0}"#).unwrap();
+
+        let distinct = |db: &CoreDB| -> String {
+            let mut v: Vec<String> = db.query("SELECT DISTINCT v FROM p").unwrap()
+                .collect().iter()
+                .map(|h| h.payload.as_ref().map(|p| p.to_string()).unwrap_or_default())
+                .collect();
+            v.sort();
+            v.join("|")
+        };
+
+        // The grouping itself: 1 and 1.0 are one value, 3 and 3.0 are one value.
+        let before = distinct(&db);
+        assert_eq!(before.matches('|').count() + 1, 3,
+            "[{label}] equal numbers written in different forms must be one group: {before}");
+        assert_eq!(db.query("SELECT _key FROM p WHERE v = 1").unwrap().collect().len(), 2,
+            "[{label}] `v = 1` must match both 1 and 1.0, which is why they group");
+
+        db.compact().unwrap();
+        assert_eq!(before, distinct(&db),
+            "[{label}] the DISTINCT representative moved across a compaction");
+
+        drop(db);
+        let db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        assert_eq!(before, distinct(&db),
+            "[{label}] the DISTINCT representative moved across a restart");
+    }
+}
