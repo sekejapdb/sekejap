@@ -40,13 +40,26 @@ const MAGIC: [u8; 8] = *b"SKFIDX\0\0";
 const HEADER_LEN: usize = 16; // magic(8) + nkeys(8)
 const DIR_ENTRY: usize = 24; // key_off u64, key_len u32, post_off u64, post_cnt u32
 
+/// Read a little-endian `u64` at `o`, or `0` if the file does not reach that far.
+///
+/// Every offset handed to these comes out of the file — the directory entry that
+/// says where a key or a posting list lives. They indexed the mapped bytes
+/// directly, so one flipped byte in a `fieldidx_*.bin` aborted the process:
+/// eleven of thirteen corruptions of a single such file crashed, most of them
+/// here and the rest in `key_at`.
+///
+/// Zero is not a *good* answer, but it is a value the callers already handle —
+/// an offset of zero points at the magic, whose bytes decode as an empty or
+/// absent key — where a panic is an abort nobody can catch. See
+/// `tests/corrupt_files.rs`.
 #[inline]
 fn rd_u64(b: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+    b.get(o..o + 8).map_or(0, |x| u64::from_le_bytes(x.try_into().unwrap()))
 }
+/// The `u32` counterpart — see [`rd_u64`].
 #[inline]
 fn rd_u32(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    b.get(o..o + 4).map_or(0, |x| u32::from_le_bytes(x.try_into().unwrap()))
 }
 
 /// mmap-or-owned backing (mirrors the private `Backing` in `topology.rs`).
@@ -167,7 +180,13 @@ impl MappedFieldStore {
         if b.len() < HEADER_LEN || b[0..8] != MAGIC {
             return Ok(None);
         }
-        let nkeys = rd_u64(b, 8) as usize;
+        // Capped by the file. `nkeys` bounds every binary search and every loop in
+        // this store, and it was believed: a corrupt header could claim
+        // `u64::MAX` keys, so a search would compute a midpoint far past the end
+        // and read there. Each key needs a `DIR_ENTRY` in the directory, so the
+        // file's own length says how many there can be.
+        let entries_possible = b.len().saturating_sub(HEADER_LEN) / DIR_ENTRY;
+        let nkeys = (rd_u64(b, 8) as usize).min(entries_possible);
         Ok(Some(Self { backing, nkeys }))
     }
 
@@ -181,14 +200,23 @@ impl MappedFieldStore {
         let e = HEADER_LEN + i * DIR_ENTRY;
         let koff = rd_u64(b, e) as usize;
         let klen = rd_u32(b, e + 8) as usize;
-        FieldKey::decode(&b[koff..koff + klen])
+        // The offset and length are the file's, and slicing with them directly
+        // aborted the process on a corrupt directory entry. A key that does not
+        // fit inside the file is not a key; `FieldKey::decode` of nothing is the
+        // same absent-key answer this store gives for a hole in the directory.
+        FieldKey::decode(b.get(koff..koff + klen).unwrap_or(&[]))
     }
 
     fn postings_at(&self, i: usize) -> Vec<u64> {
         let b = self.backing.bytes();
         let e = HEADER_LEN + i * DIR_ENTRY;
         let poff = rd_u64(b, e + 12) as usize;
-        let cnt = rd_u32(b, e + 20) as usize;
+        // Capped by what remains after the offset: every posting is eight bytes,
+        // so a count larger than that cannot be real. Uncapped, a corrupt `cnt`
+        // both reserved for billions of entries and walked `poff + j * 8` off the
+        // end of the mapping.
+        let room = b.len().saturating_sub(poff) / 8;
+        let cnt = (rd_u32(b, e + 20) as usize).min(room);
         (0..cnt).map(|j| rd_u64(b, poff + j * 8)).collect()
     }
 
