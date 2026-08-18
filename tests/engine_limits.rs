@@ -167,3 +167,72 @@ fn refresh_snapshot_makes_a_write_visible() {
     // The write is real, not just visible through the snapshot.
     assert_eq!(engine.count("p"), 2, "count disagrees with get after a refresh");
 }
+
+// ── public API that nothing had ever called ─────────────────────────────────
+
+/// `Engine::memory()` — the ephemeral engine. A whole constructor with no test
+/// behind it, which is the state in which a constructor quietly stops working.
+#[test]
+fn an_in_memory_engine_works() {
+    let m = Engine::memory();
+    m.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+    for i in 0..5 {
+        m.execute(&format!("INSERT INTO p (_key, n) VALUES ('n{i}', {i})")).unwrap();
+    }
+    assert_eq!(m.count("p"), 5);
+    assert!(m.get("p/n3").is_some());
+    assert_eq!(m.scan("p").len(), 5);
+}
+
+/// `begin_bulk` / `end_bulk` defer the per-write log sync and flush once. The
+/// deferral is the whole point, so what has to be true is that it *ends*: the
+/// batch is durable after `end_bulk`, not merely present in memory.
+#[test]
+fn a_bulk_batch_is_durable_after_end_bulk() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        db.begin_bulk();
+        for i in 0..50 {
+            db.put(&format!("p/n{i}"),
+                   &format!(r#"{{"_collection":"p","_key":"n{i}","n":{i}}}"#)).unwrap();
+        }
+        db.end_bulk();
+    }
+    let db = CoreDB::open(dir.path()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 50,
+               "a batch written between begin_bulk and end_bulk did not survive");
+}
+
+/// `link_meta_many` — the batch edge writer that carries attributes, and one of
+/// the three writers that ignored read-only until this branch. It had no test of
+/// its own: that the edges land, that a `None` takes the naked-edge lane, and
+/// that the attributes survive a restart.
+#[test]
+fn link_meta_many_writes_edges_and_their_attributes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        for i in 0..4 {
+            db.put(&format!("p/n{i}"),
+                   &format!(r#"{{"_collection":"p","_key":"n{i}","n":{i}}}"#)).unwrap();
+        }
+        db.link_meta_many(vec![
+            ("p/n0", "p/n1", "next", Some(r#"{"w":1}"#)),
+            ("p/n1", "p/n2", "next", None),          // the naked-edge lane
+            ("p/n2", "p/n3", "next", Some(r#"{"w":3}"#)),
+        ]).unwrap();
+    }
+    let db = CoreDB::open(dir.path()).unwrap();
+    assert_eq!(db.edges_from("p/n0").len(), 1);
+    assert_eq!(db.edges_from("p/n1").len(), 1);
+    assert_eq!(db.edges_from("p/n2").len(), 1);
+    let meta = db.edges_from("p/n0").first().and_then(|e| e.meta.clone())
+        .expect("the attributes on the first edge did not survive a restart");
+    assert_eq!(meta["w"].as_i64(), Some(1));
+    // The `None` entry is a real edge with no attributes, not a missing one.
+    assert!(db.edges_from("p/n1").first().is_some_and(|e| e.meta.is_none()),
+            "the naked-edge lane invented attributes");
+}
