@@ -715,6 +715,26 @@ fn hex_decode(s: &str) -> Option<String> {
 
 /// Bytes of owner tag on a paged payload record.
 const OWNER_TAG: usize = 4;
+/// Bytes of CRC-32 in front of a paged payload record, when the store carries
+/// them. Sits after the owner tag: `[owner u32][crc u32][record bytes]`.
+const PAYLOAD_CRC: usize = 4;
+/// Marker in the payload page store's first spare header word saying its records
+/// are checksummed.
+///
+/// # Why a store-level flag rather than a per-record one
+///
+/// A record's first bytes are the owner tag, which is a truncated hash — any
+/// value is possible, so nothing in an existing record can be read as "this one
+/// has no checksum". The question has to be answered before the bytes are looked
+/// at, and the store header is the only place that can answer it.
+///
+/// Set when a paged payload store is **created**. A store written by an earlier
+/// version has the word clear and keeps its current behaviour exactly: reads
+/// unchecked, writes unchecked, nothing to migrate and nothing that can break.
+/// Compaction does not rewrite paged payloads — that is the whole point of the
+/// free list — so such a store never gains checksums, and says so rather than
+/// pretending.
+const PAYLOAD_CHECKSUMMED: u64 = 1;
 /// "This read has no node hash to check against." Also what a payload written
 /// without one is tagged with, so such records stay readable from every path.
 const OWNER_UNKNOWN: u64 = 0;
@@ -754,6 +774,8 @@ use storage::mmap::MmapView;
 enum PayloadInner {
     /// Ephemeral database: all record bytes held in one growing `Vec<u8>`.
     Memory { data: Vec<u8> },
+    /// Whether records in this store carry a CRC — see [`PAYLOAD_CHECKSUMMED`].
+    ///
     /// Persistent database, paged: bytes live in slotted pages with a free list,
     /// so deleting or updating a record returns its space immediately instead of
     /// leaving a hole for a later rewrite to squeeze out.
@@ -763,7 +785,7 @@ enum PayloadInner {
     /// which is why [`PayloadStore::absolute_offsets`] exists: the read paths that
     /// do arithmetic on byte offsets, or coalesce neighbouring records into one
     /// read, have to take a different route.
-    Paged { store: storage::recordstore::RecordStore },
+    Paged { store: storage::recordstore::RecordStore, checksummed: bool },
     /// Persistent database: bytes in the `payloads.bin` file. Reads go through
     /// the `mmap` view when present (zero-copy), else fall back to `pread`.
     Disk {
@@ -798,6 +820,57 @@ const PAYLOAD_TAG_ZSTD: u8 = 0x01;
 /// payload path, so such a record can only come from a DB that opted into the
 /// now-deleted `payload_compression` feature. Return `None` (a loud decode
 /// failure) rather than silently mis-serving it.
+/// Frame a payload record: owner tag, optional CRC, then the bytes.
+///
+/// `[owner u32][crc32 u32][bytes]` when the store is checksummed, and
+/// `[owner u32][bytes]` when it is not — see [`PAYLOAD_CHECKSUMMED`]. Written in
+/// one place because the two callers (single append and batch append) had already
+/// drifted once: the batch path tagged every record "unknown" while the single
+/// path tagged the owner, and every bulk-loaded row read as absent.
+fn frame_payload(owner: u64, bytes: &[u8], checksummed: bool, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(OWNER_TAG + if checksummed { PAYLOAD_CRC } else { 0 } + bytes.len());
+    out.extend_from_slice(&owner_tag(owner).to_le_bytes());
+    if checksummed {
+        let mut h = crc32fast::Hasher::new();
+        h.update(bytes);
+        out.extend_from_slice(&h.finalize().to_le_bytes());
+    }
+    out.extend_from_slice(bytes);
+}
+
+/// The record bytes inside a frame, or `None` if the frame does not describe them.
+///
+/// # What this catches that the owner tag does not
+///
+/// The tag says *which row* the record belongs to, so a read that lands on a
+/// different record is refused. It says nothing about whether the bytes are the
+/// bytes that were written. A flipped bit inside the correct record passed every
+/// check the store had and was returned as truth — the row came back with a wrong
+/// value and nothing anywhere raised.
+///
+/// Every other record type in this store was already protected: node records
+/// carry a CRC and their slug, adjacency records carry a CRC and their owner.
+/// Payloads — the part holding the user's data — carried identity alone.
+fn unframe_payload(owner: u64, raw: &[u8], checksummed: bool) -> Option<&[u8]> {
+    if raw.len() < OWNER_TAG { return None }
+    let tag = u32::from_le_bytes(raw[..OWNER_TAG].try_into().ok()?);
+    if owner != OWNER_UNKNOWN && tag != owner_tag(owner) { return None }
+    if !checksummed {
+        return Some(&raw[OWNER_TAG..]);
+    }
+    if raw.len() < OWNER_TAG + PAYLOAD_CRC { return None }
+    let want = u32::from_le_bytes(raw[OWNER_TAG..OWNER_TAG + PAYLOAD_CRC].try_into().ok()?);
+    let body = &raw[OWNER_TAG + PAYLOAD_CRC..];
+    let mut h = crc32fast::Hasher::new();
+    h.update(body);
+    // Refused rather than returned. A record that does not match its own checksum
+    // is not this row's data, and answering with it is the failure this exists to
+    // prevent.
+    if h.finalize() != want { return None }
+    Some(body)
+}
+
 /// Carry a disk failure out through an error type that cannot name one.
 ///
 /// The public write API returns `Result<_, serde_json::Error>`, chosen when the
@@ -930,15 +1003,25 @@ impl PayloadStore {
 
     /// Open (or create) a paged payload store at `path`.
     fn open_paged(path: &std::path::Path) -> io::Result<Self> {
-        let store = match storage::recordstore::RecordStore::open(path)? {
-            Some(s) => s,
-            None => storage::recordstore::RecordStore::create(
-                path, storage::pagestore::DEFAULT_PAGE_SIZE)?,
+        let (store, checksummed) = match storage::recordstore::RecordStore::open(path)? {
+            // Existing store: it decides. An older one has the word clear and
+            // keeps behaving exactly as it did.
+            Some(s) => {
+                let flagged = s.user_meta().0 == PAYLOAD_CHECKSUMMED;
+                (s, flagged)
+            }
+            // New store: checksummed from the first record.
+            None => {
+                let mut s = storage::recordstore::RecordStore::create(
+                    path, storage::pagestore::DEFAULT_PAGE_SIZE)?;
+                s.set_user_meta(PAYLOAD_CHECKSUMMED, 0);
+                (s, true)
+            }
         };
         Ok(Self {
             binary: false,
             field_table: storage::skbin::FieldTable::default(),
-            inner: PayloadInner::Paged { store },
+            inner: PayloadInner::Paged { store, checksummed },
         })
     }
 
@@ -948,7 +1031,7 @@ impl PayloadStore {
     /// which have nowhere to put reclaimed space.
     pub(crate) fn free(&mut self, offset: u64) -> bool {
         match &mut self.inner {
-            PayloadInner::Paged { store } => store
+            PayloadInner::Paged { store, .. } => store
                 .delete(storage::recordstore::RecordId(offset))
                 .unwrap_or(false),
             _ => false,
@@ -957,7 +1040,7 @@ impl PayloadStore {
 
     pub(crate) fn sync_pages(&mut self) -> io::Result<()> {
         match &mut self.inner {
-            PayloadInner::Paged { store } => store.sync(),
+            PayloadInner::Paged { store, .. } => store.sync(),
             _ => Ok(()),
         }
     }
@@ -965,7 +1048,7 @@ impl PayloadStore {
     /// Pages held and pages free — paged variant only.
     pub(crate) fn page_stats(&self) -> Option<(u64, u64)> {
         match &self.inner {
-            PayloadInner::Paged { store } => Some((store.page_count(), store.free_page_count())),
+            PayloadInner::Paged { store, .. } => Some((store.page_count(), store.free_page_count())),
             _ => None,
         }
     }
@@ -1007,11 +1090,10 @@ impl PayloadStore {
     fn append_owned(&mut self, owner: u64, bytes: &[u8]) -> io::Result<(u64, u32)> {
         match &mut self.inner {
             // The "offset" is a record id here, not a byte position.
-            PayloadInner::Paged { store } => {
-                let mut tagged = Vec::with_capacity(OWNER_TAG + bytes.len());
-                tagged.extend_from_slice(&owner_tag(owner).to_le_bytes());
-                tagged.extend_from_slice(bytes);
-                let id = store.insert(&tagged)?;
+            PayloadInner::Paged { store, checksummed } => {
+                let mut framed = Vec::new();
+                frame_payload(owner, bytes, *checksummed, &mut framed);
+                let id = store.insert(&framed)?;
                 Ok((id.0, bytes.len() as u32))
             }
             PayloadInner::Memory { data } => {
@@ -1051,14 +1133,16 @@ impl PayloadStore {
         if items.is_empty() { return Ok(vec![]); }
         debug_assert_eq!(items.len(), owners.len(), "an owner per record, or none can be checked");
         match &mut self.inner {
-            PayloadInner::Paged { store } => items.iter().enumerate().map(|(i, bytes)| {
-                let owner = owners.get(i).copied().unwrap_or(OWNER_UNKNOWN);
-                let mut tagged = Vec::with_capacity(OWNER_TAG + bytes.len());
-                tagged.extend_from_slice(&owner_tag(owner).to_le_bytes());
-                tagged.extend_from_slice(bytes);
-                let id = store.insert(&tagged)?;
-                Ok((id.0, bytes.len() as u32))
-            }).collect(),
+            PayloadInner::Paged { store, checksummed } => {
+                let checksummed = *checksummed;
+                let mut framed = Vec::new();
+                items.iter().enumerate().map(|(i, bytes)| {
+                    let owner = owners.get(i).copied().unwrap_or(OWNER_UNKNOWN);
+                    frame_payload(owner, bytes, checksummed, &mut framed);
+                    let id = store.insert(&framed)?;
+                    Ok((id.0, bytes.len() as u32))
+                }).collect()
+            }
             PayloadInner::Memory { data } => {
                 Ok(items.iter().map(|bytes| {
                     let offset = data.len() as u64;
@@ -1116,12 +1200,9 @@ impl PayloadStore {
     /// would actually be served to a caller.
     fn stored_record_of(&self, owner: u64, offset: u64, len: u32) -> Option<Vec<u8>> {
         match &self.inner {
-            PayloadInner::Paged { store } => {
+            PayloadInner::Paged { store, checksummed } => {
                 let raw = store.read(storage::recordstore::RecordId(offset)).ok().flatten()?;
-                if raw.len() < OWNER_TAG { return None }
-                let tag = u32::from_le_bytes(raw[..OWNER_TAG].try_into().ok()?);
-                if owner != OWNER_UNKNOWN && tag != owner_tag(owner) { return None }
-                Some(raw[OWNER_TAG..].to_vec())
+                unframe_payload(owner, &raw, *checksummed).map(|b| b.to_vec())
             }
             _ => self.get_raw_at(offset, len as usize),
         }
@@ -1134,12 +1215,9 @@ impl PayloadStore {
         // record cut out of it — and both copies exist only to be parsed and
         // dropped. This is the hottest read in the database; it should not
         // allocate to answer.
-        if let PayloadInner::Paged { store } = &self.inner {
+        if let PayloadInner::Paged { store, checksummed } = &self.inner {
             return store.with_record(storage::recordstore::RecordId(offset), |raw| {
-                if raw.len() < OWNER_TAG { return None }
-                let tag = u32::from_le_bytes(raw[..OWNER_TAG].try_into().ok()?);
-                if owner != OWNER_UNKNOWN && tag != owner_tag(owner) { return None }
-                let stored = &raw[OWNER_TAG..];
+                let stored = unframe_payload(owner, raw, *checksummed)?;
                 if storage::skbin::is_skbin(stored) {
                     return storage::skbin::decode(stored, &self.field_table);
                 }
