@@ -279,7 +279,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   1225  mod tests
 ```
 
-### `lib.rs` · 13543L — sekejap core — the database engine (`CoreDB`)
+### `lib.rs` · 13567L — sekejap core — the database engine (`CoreDB`)
 
 ```
    109  pub fn open(path: impl AsRef<Path>) -> io::Result<CoreDB>
@@ -407,130 +407,130 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   7115    pub fn contains(&self, slug: &str) -> bool
   7120    pub(crate) fn node_exists(&self, h: u64) -> bool
   7140    pub fn stats(&self) -> Stats
-  7180    pub fn node_count(&self) -> usize
-  7193    pub fn all_slugs(&self) -> Vec<String>
-  7201    pub fn edge_count(&self) -> usize
-  7213    pub fn collection_names(&self) -> Vec<String>
-  7232    pub fn schema_ddl(&self, collection: &str) -> Option<String>
-  7267    pub fn dump_sql(&self) -> String
-  7383    pub fn load_sql(&mut self, dump: &str) -> Result<usize, SqlError>
-  7402    pub fn table_schema(&self, collection: &str) -> Option<&TableSchema>
-  7407    pub fn edges_from(&self, slug: &str) -> Vec<EdgeHit>
-  7433    pub fn edges_to(&self, slug: &str) -> Vec<EdgeHit>
-  7453    pub fn edges_from_collection(&self, from_collection: &str) -> Vec<EdgeHit>
-  7482    pub fn edges_between(&self, from_collection: &str, to_collection: &str) -> Vec<EdgeHit>
-  7508    pub fn edge_types_from(&self, slug: &str) -> Vec<String>
-  7536    pub fn edge_types_from_collection(&self, collection: &str) -> Vec<String>
-  7575    pub fn edge_schema(&self) -> Vec<(String, String, String)>
-  7611    pub fn one(&self, slug: &str) -> Set<'_>
-  7616    pub fn many<'a>(&self, slugs: impl IntoIterator<Item = &'a str>) -> Set<'_>
-  7621    pub fn all(&self) -> Set<'_>
-  7626    pub fn collection(&self, name: &str) -> Set<'_>
-  7687    pub fn query(&self, sql: &str) -> Result<Set<'_>, SqlError>
-  7735    pub fn prepare(&self, sql: &str) -> Result<sql::PreparedQuery, SqlError>
-  7740    pub fn query_prepared(
-  7765    pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Set<'_>, SqlError>
-  7770    pub fn explain(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError>
-  7820    pub fn explain_analyze(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError>
-  7847    pub(crate) fn bfs_shortest_path(&self, start: u64, end: u64) -> Option<BfsPath>
-  7959    pub(crate) fn bfs_shortest_len(&self, start: u64, end: u64) -> Option<usize>
-  8015    pub fn show(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError>
-  8296    pub fn execute(&mut self, sql: &str) -> Result<usize, SqlError>
-  8317    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<usize, SqlError>
-  8977    pub(crate) fn node_data(&self, hash: u64) -> Option<std::borrow::Cow<'_, NodeData>>
-  9174    pub(crate) fn collection_name(&self, coll_hash: u64) -> Option<&str>
-  9346    pub fn compaction_expectation(&self) -> (usize, usize)
-  9393    pub(crate) fn all_hashes(&self) -> Vec<u64>
-  9408    pub(crate) fn fwd_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>>
-  9425    pub(crate) fn rev_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>>
-  9493    pub(crate) fn resolve_edge_type(&self, hash: u64) -> Option<String>
-  9499    pub(crate) fn edge_all_attrs(&self, edge: &Edge) -> Option<Value>
-  9510    pub(crate) fn edge_meta(&self, edge: &Edge) -> Option<Value>
-  9538    pub(crate) fn edge_locate(
-  9556    pub(crate) fn edge_json_at(&self, slot: u32) -> Option<Value>
-  9564    pub(crate) fn edge_between(
-  9589    pub fn link_attr(
-  9630    pub(crate) fn collection_members(&self, hash: u64) -> Option<std::borrow::Cow<'_, [u64]>>
-  9673    pub(crate) fn collection_payloads(&self, collection: &str) -> Vec<String>
-  9680    pub(crate) fn collection_payloads_bounded(
-  9713    pub(crate) fn collection_count(&self, collection: &str) -> usize
-  9719    pub(crate) fn field_index(
-  9730    pub(crate) fn field_index_ref(&self, coll_hash: u64, field: &str) -> Option<FieldIndexRef<'_>>
-  9767    pub(crate) fn has_field_index(&self, coll_hash: u64, field: &str) -> bool
-  9811    pub(crate) fn field_key_to_value(key: &FieldKey) -> Value
-  9839    pub(crate) fn spatial_grid(&self) -> Option<&geo::SpatialGrid>
-  9850    pub fn build_spatial_index(&mut self)
-  9933    pub fn build_text_indexes(&mut self)
-  9966    pub fn text_index_candidates(&self, field: &str, pattern: &str) -> Option<Vec<u64>>
-  9972    pub fn text_index_candidates_with_limit(
-  9987    pub fn ilike_candidates(&self, field: &str, pattern: &str) -> Vec<u64>
-  9995    pub fn ilike_verify(&self, field: &str, pattern: &str, candidates: &[u64]) -> Vec<u64>
- 10035    pub fn ilike(&self, field: &str, pattern: &str, limit: Option<usize>) -> Vec<u64>
- 10081    pub fn build_gin_index(&mut self, field: &str)
- 10108    pub fn gin_ilike(&self, field: &str, pattern: &str, limit: Option<usize>) -> Vec<u64>
- 10150    pub fn build_bm25_index(&mut self, field: &str)
- 10211    pub fn bm25_search(&self, field: &str, query: &str, top_k: usize) -> Vec<(u64, f64)>
- 10235    pub fn put_vector(&mut self, slug: &str, field: &str, data: &[f32]) -> Result<u64, serde_json::…
- 10280    pub fn get_vector(&self, slug: &str, field: &str) -> Option<Vec<f32>>
- 10291    pub(crate) fn vector_field(&self, field: &str) -> Option<&storage::vecstore::VectorStore>
- 10296    pub(crate) fn hnsw_index(&self, field: &str) -> Option<&vector::HnswGraph>
- 10325    pub fn build_field_index(&mut self, collection: &str, field: &str)
- 10375    pub(crate) fn btree_multi_range_seed(
- 10382      struct R
- 10462    pub(crate) fn btree_seed(
- 10631    pub(crate) fn btree_sorted_seed_from_steps(
- 10702    pub(crate) fn spatial_knn_seed(&self, coll_hash: u64, remaining: &[Step]) -> Option<(Vec<u64>, …
- 10745    pub fn build_hnsw_index(
- 10755    pub fn build_hnsw_index_metric(
- 10793    pub fn build_hnsw_index_disk(
- 10844    pub(crate) fn quant_field(&self, field: &str) -> Option<&vector::QuantizedField>
- 10849    pub fn spill_edges_to_disk(&mut self) -> std::io::Result<()>
- 10857    pub(crate) fn compact_index(&self, field: &str) -> Option<&vector::CompactDiskIndex>
- 10861    pub fn memory_report(&self) -> Vec<(&'static str, usize)>
- 10885    pub(crate) fn hnsw_metric(&self, field: &str) -> crate::query::VecMetric
- 10889    pub fn set_hnsw_ef_search(&mut self, ef: Option<usize>) { self.hnsw_ef_search = ef; }
- 10896    pub fn set_wal_sync(&mut self, mode: SyncMode)
- 10909    pub fn set_auto_compact(&mut self, policy: AutoCompact)
- 10912    pub(crate) fn hnsw_ef_search(&self) -> Option<usize> { self.hnsw_ef_search }
- 11054    pub(crate) fn search_index_key(coll_name: &str) -> String
- 11229  fn field_type_matches(ty: &sql::FieldType, v: &Value) -> bool
- 11248  fn validate_payload_against_schema(schema: &sql::TableSchema, payload: &Value) -> Option<SqlErr…
- 11267  fn validate_updates_against_schema(
- 11288  fn is_filter_or_traversal(s: &Step) -> bool
- 11341  pub struct Transaction<'db>
- 11346  enum TxnOp
- 11355  impl CoreDB
- 11359    pub fn begin(&mut self) -> Transaction<'_>
- 11366    pub fn put(&mut self, slug: &str, payload_json: &str) -> Result<(), serde_json::Error>
- 11373    pub fn remove(&mut self, slug: &str)
- 11378    pub fn link(&mut self, from: &str, to: &str, edge_type: &str)
- 11385    pub fn link_meta(
- 11400    pub fn unlink(&mut self, from: &str, to: &str, edge_type: &str)
- 11407    pub fn put_vector(&mut self, slug: &str, field: &str, data: Vec<f32>)
- 11418    pub fn commit(self) -> Result<usize, serde_json::Error>
- 11483    pub fn rollback(self)
- 11489  fn extract_string_fields(
- 11526  impl CoreDB
- 11546    pub fn centroid(&self, slug: &str) -> Option<(f64, f64)>
- 11558  fn value_as_f32_vec(v: &Value) -> Option<Vec<f32>>
- 11574  struct Ignored
- 11583  struct Snapshot
- 11622  struct SnapHnsw
- 11634  fn default_hnsw_m() -> usize { 16 }
- 11635  fn default_hnsw_ef() -> usize { 200 }
- 11638  struct SnapNode
- 11655  struct SnapEdge
- 11664  struct SnapVector
- 11672  struct SnapBtree
- 11680  mod payload_paging_tests
- 11770  mod compaction_safety_tests
- 11854  mod hybrid_query_tests
- 13467  fn is_internal_field(name: &str) -> bool
- 13475  fn sql_str_escape(s: &str) -> String
- 13480  fn field_type_sql(ty: sql::FieldType) -> &'static str
- 13496  fn fmt_f32(x: f32) -> String
- 13508  fn sql_value_literal(v: &Value, ty: Option<sql::FieldType>) -> String
- 13531  fn dump_edge_attrs(meta: Option<&Value>) -> String
+  7183    pub fn node_count(&self) -> usize
+  7196    pub fn all_slugs(&self) -> Vec<String>
+  7204    pub fn edge_count(&self) -> usize
+  7216    pub fn collection_names(&self) -> Vec<String>
+  7235    pub fn schema_ddl(&self, collection: &str) -> Option<String>
+  7270    pub fn dump_sql(&self) -> String
+  7386    pub fn load_sql(&mut self, dump: &str) -> Result<usize, SqlError>
+  7405    pub fn table_schema(&self, collection: &str) -> Option<&TableSchema>
+  7410    pub fn edges_from(&self, slug: &str) -> Vec<EdgeHit>
+  7436    pub fn edges_to(&self, slug: &str) -> Vec<EdgeHit>
+  7456    pub fn edges_from_collection(&self, from_collection: &str) -> Vec<EdgeHit>
+  7485    pub fn edges_between(&self, from_collection: &str, to_collection: &str) -> Vec<EdgeHit>
+  7511    pub fn edge_types_from(&self, slug: &str) -> Vec<String>
+  7539    pub fn edge_types_from_collection(&self, collection: &str) -> Vec<String>
+  7578    pub fn edge_schema(&self) -> Vec<(String, String, String)>
+  7614    pub fn one(&self, slug: &str) -> Set<'_>
+  7619    pub fn many<'a>(&self, slugs: impl IntoIterator<Item = &'a str>) -> Set<'_>
+  7624    pub fn all(&self) -> Set<'_>
+  7629    pub fn collection(&self, name: &str) -> Set<'_>
+  7690    pub fn query(&self, sql: &str) -> Result<Set<'_>, SqlError>
+  7738    pub fn prepare(&self, sql: &str) -> Result<sql::PreparedQuery, SqlError>
+  7743    pub fn query_prepared(
+  7768    pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Set<'_>, SqlError>
+  7773    pub fn explain(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError>
+  7823    pub fn explain_analyze(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError>
+  7850    pub(crate) fn bfs_shortest_path(&self, start: u64, end: u64) -> Option<BfsPath>
+  7962    pub(crate) fn bfs_shortest_len(&self, start: u64, end: u64) -> Option<usize>
+  8018    pub fn show(&self, sql: &str) -> Result<Vec<query::Hit>, SqlError>
+  8299    pub fn execute(&mut self, sql: &str) -> Result<usize, SqlError>
+  8320    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<usize, SqlError>
+  8980    pub(crate) fn node_data(&self, hash: u64) -> Option<std::borrow::Cow<'_, NodeData>>
+  9190    pub(crate) fn collection_name(&self, coll_hash: u64) -> Option<&str>
+  9362    pub fn compaction_expectation(&self) -> (usize, usize)
+  9409    pub(crate) fn all_hashes(&self) -> Vec<u64>
+  9424    pub(crate) fn fwd_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>>
+  9441    pub(crate) fn rev_edges(&self, hash: u64) -> Option<std::borrow::Cow<'_, [Edge]>>
+  9509    pub(crate) fn resolve_edge_type(&self, hash: u64) -> Option<String>
+  9515    pub(crate) fn edge_all_attrs(&self, edge: &Edge) -> Option<Value>
+  9526    pub(crate) fn edge_meta(&self, edge: &Edge) -> Option<Value>
+  9554    pub(crate) fn edge_locate(
+  9572    pub(crate) fn edge_json_at(&self, slot: u32) -> Option<Value>
+  9580    pub(crate) fn edge_between(
+  9605    pub fn link_attr(
+  9646    pub(crate) fn collection_members(&self, hash: u64) -> Option<std::borrow::Cow<'_, [u64]>>
+  9689    pub(crate) fn collection_payloads(&self, collection: &str) -> Vec<String>
+  9696    pub(crate) fn collection_payloads_bounded(
+  9729    pub(crate) fn collection_count(&self, collection: &str) -> usize
+  9735    pub(crate) fn field_index(
+  9746    pub(crate) fn field_index_ref(&self, coll_hash: u64, field: &str) -> Option<FieldIndexRef<'_>>
+  9783    pub(crate) fn has_field_index(&self, coll_hash: u64, field: &str) -> bool
+  9827    pub(crate) fn field_key_to_value(key: &FieldKey) -> Value
+  9855    pub(crate) fn spatial_grid(&self) -> Option<&geo::SpatialGrid>
+  9866    pub fn build_spatial_index(&mut self)
+  9957    pub fn build_text_indexes(&mut self)
+  9990    pub fn text_index_candidates(&self, field: &str, pattern: &str) -> Option<Vec<u64>>
+  9996    pub fn text_index_candidates_with_limit(
+ 10011    pub fn ilike_candidates(&self, field: &str, pattern: &str) -> Vec<u64>
+ 10019    pub fn ilike_verify(&self, field: &str, pattern: &str, candidates: &[u64]) -> Vec<u64>
+ 10059    pub fn ilike(&self, field: &str, pattern: &str, limit: Option<usize>) -> Vec<u64>
+ 10105    pub fn build_gin_index(&mut self, field: &str)
+ 10132    pub fn gin_ilike(&self, field: &str, pattern: &str, limit: Option<usize>) -> Vec<u64>
+ 10174    pub fn build_bm25_index(&mut self, field: &str)
+ 10235    pub fn bm25_search(&self, field: &str, query: &str, top_k: usize) -> Vec<(u64, f64)>
+ 10259    pub fn put_vector(&mut self, slug: &str, field: &str, data: &[f32]) -> Result<u64, serde_json::…
+ 10304    pub fn get_vector(&self, slug: &str, field: &str) -> Option<Vec<f32>>
+ 10315    pub(crate) fn vector_field(&self, field: &str) -> Option<&storage::vecstore::VectorStore>
+ 10320    pub(crate) fn hnsw_index(&self, field: &str) -> Option<&vector::HnswGraph>
+ 10349    pub fn build_field_index(&mut self, collection: &str, field: &str)
+ 10399    pub(crate) fn btree_multi_range_seed(
+ 10406      struct R
+ 10486    pub(crate) fn btree_seed(
+ 10655    pub(crate) fn btree_sorted_seed_from_steps(
+ 10726    pub(crate) fn spatial_knn_seed(&self, coll_hash: u64, remaining: &[Step]) -> Option<(Vec<u64>, …
+ 10769    pub fn build_hnsw_index(
+ 10779    pub fn build_hnsw_index_metric(
+ 10817    pub fn build_hnsw_index_disk(
+ 10868    pub(crate) fn quant_field(&self, field: &str) -> Option<&vector::QuantizedField>
+ 10873    pub fn spill_edges_to_disk(&mut self) -> std::io::Result<()>
+ 10881    pub(crate) fn compact_index(&self, field: &str) -> Option<&vector::CompactDiskIndex>
+ 10885    pub fn memory_report(&self) -> Vec<(&'static str, usize)>
+ 10909    pub(crate) fn hnsw_metric(&self, field: &str) -> crate::query::VecMetric
+ 10913    pub fn set_hnsw_ef_search(&mut self, ef: Option<usize>) { self.hnsw_ef_search = ef; }
+ 10920    pub fn set_wal_sync(&mut self, mode: SyncMode)
+ 10933    pub fn set_auto_compact(&mut self, policy: AutoCompact)
+ 10936    pub(crate) fn hnsw_ef_search(&self) -> Option<usize> { self.hnsw_ef_search }
+ 11078    pub(crate) fn search_index_key(coll_name: &str) -> String
+ 11253  fn field_type_matches(ty: &sql::FieldType, v: &Value) -> bool
+ 11272  fn validate_payload_against_schema(schema: &sql::TableSchema, payload: &Value) -> Option<SqlErr…
+ 11291  fn validate_updates_against_schema(
+ 11312  fn is_filter_or_traversal(s: &Step) -> bool
+ 11365  pub struct Transaction<'db>
+ 11370  enum TxnOp
+ 11379  impl CoreDB
+ 11383    pub fn begin(&mut self) -> Transaction<'_>
+ 11390    pub fn put(&mut self, slug: &str, payload_json: &str) -> Result<(), serde_json::Error>
+ 11397    pub fn remove(&mut self, slug: &str)
+ 11402    pub fn link(&mut self, from: &str, to: &str, edge_type: &str)
+ 11409    pub fn link_meta(
+ 11424    pub fn unlink(&mut self, from: &str, to: &str, edge_type: &str)
+ 11431    pub fn put_vector(&mut self, slug: &str, field: &str, data: Vec<f32>)
+ 11442    pub fn commit(self) -> Result<usize, serde_json::Error>
+ 11507    pub fn rollback(self)
+ 11513  fn extract_string_fields(
+ 11550  impl CoreDB
+ 11570    pub fn centroid(&self, slug: &str) -> Option<(f64, f64)>
+ 11582  fn value_as_f32_vec(v: &Value) -> Option<Vec<f32>>
+ 11598  struct Ignored
+ 11607  struct Snapshot
+ 11646  struct SnapHnsw
+ 11658  fn default_hnsw_m() -> usize { 16 }
+ 11659  fn default_hnsw_ef() -> usize { 200 }
+ 11662  struct SnapNode
+ 11679  struct SnapEdge
+ 11688  struct SnapVector
+ 11696  struct SnapBtree
+ 11704  mod payload_paging_tests
+ 11794  mod compaction_safety_tests
+ 11878  mod hybrid_query_tests
+ 13491  fn is_internal_field(name: &str) -> bool
+ 13499  fn sql_str_escape(s: &str) -> String
+ 13504  fn field_type_sql(ty: sql::FieldType) -> &'static str
+ 13520  fn fmt_f32(x: f32) -> String
+ 13532  fn sql_value_literal(v: &Value, ty: Option<sql::FieldType>) -> String
+ 13555  fn dump_edge_attrs(meta: Option<&Value>) -> String
 ```
 
 ### `pg.rs` · 1227L — Speaking PostgreSQL's language — the wire protocol, sans-IO

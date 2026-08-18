@@ -7152,10 +7152,13 @@ impl CoreDB {
             collections: self.collection_names().len(),
             // In paged mode the resident map IS the overlay; resident mode holds
             // everything, so "overlay" is only meaningful when paged.
-            overlay_nodes: if !self.segments.is_empty() { self.nodes.len() } else { 0 },
+            overlay_nodes: if self.is_paged() { self.nodes.len() } else { 0 },
             payload_bytes: file_len("payloads.bin"),
             wal_bytes: file_len("wal.log"),
-            paged: !self.segments.is_empty(),
+            // Answered from the configuration, not from whether a compaction has
+            // happened to run yet: a paged database that has never compacted is
+            // still paged, and reporting otherwise is a diagnostic that lies.
+            paged: self.is_paged(),
 
             field_indexes: self.field_indexes.len() + self.field_base.len(),
             hnsw_indexes: self.hnsw_indexes.len(),
@@ -9066,6 +9069,19 @@ impl CoreDB {
         self.paged_nodes.is_some() || !self.segments.is_empty()
     }
 
+    /// Whether this database serves from disk rather than holding everything
+    /// resident — the question "am I in paged mode", as opposed to
+    /// [`has_base`](Self::has_base)'s "is there a durable base *yet*".
+    ///
+    /// The two differ before the first compaction, and that gap was being read as
+    /// the answer to both. `!segments.is_empty()` asks whether a mapped topology
+    /// segment exists, which is false for a paged database until a compaction has
+    /// written and adopted one — so a fresh store in the default layout looked
+    /// resident to anything that asked that way.
+    fn is_paged(&self) -> bool {
+        self.paged_topology || self.paged_nodes.is_some() || !self.segments.is_empty()
+    }
+
     /// Every node hash the durable store holds.
     fn base_hashes(&self) -> Vec<u64> {
         if let Some(ns) = &self.paged_nodes {
@@ -9880,7 +9896,15 @@ impl CoreDB {
         //    O(total geometry) resident RAM (~360 MB for 7k complex polygons) and
         //    defeats bounded serving. Rings load on demand in the query path; open
         //    stays O(1) RAM regardless of geometry size.
-        let eager = self.segments.is_empty();
+        // Whether to parse every geometry into RAM up front. That is the right
+        // trade for a resident database and the wrong one for a paged store,
+        // where it costs RAM proportional to the geometry — ~360 MB for 7 000
+        // complex polygons — and defeats the bounded serving the mode exists for.
+        //
+        // It asked `segments.is_empty()`, which is true for a paged database that
+        // has not compacted yet. So a fresh store in the default layout took the
+        // eager path and loaded the lot, which is Law 1 broken on the default.
+        let eager = !self.is_paged();
         let polys: Vec<(u64, Vec<Vec<[f64; 2]>>)> = if eager {
             items.iter()
                 .filter(|(_, m)| m.bbox_min_lat != m.bbox_max_lat || m.bbox_min_lon != m.bbox_max_lon)
