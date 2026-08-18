@@ -321,3 +321,79 @@ fn the_snapshot_does_not_grow_with_the_store() {
              carrying row data again, which makes every open cost more as the database \
              grows");
 }
+
+/// **A flipped byte inside the right record is refused, not served.**
+///
+/// Every other record type in a paged store was already protected. Node records
+/// carry a CRC and their slug; adjacency records carry a CRC and their owner. The
+/// payload record — the part holding the user's data — carried a four-byte owner
+/// tag and nothing else.
+///
+/// The tag answers "which row is this", so a read that lands on a *different*
+/// record is refused. It says nothing about whether the bytes are the bytes that
+/// were written, so a flipped bit inside the correct record passed every check the
+/// store had and came back as truth: the row returned a wrong value and nothing
+/// anywhere raised. The fuzzer says so in as many words — "records carry no
+/// checksum, so the store cannot know" — which was the store admitting the gap
+/// rather than closing it.
+///
+/// A store written by an earlier version has no checksums and keeps behaving
+/// exactly as it did; the flag lives in the page store's header and is set when a
+/// store is created, so there is nothing to migrate and nothing that can break.
+#[test]
+fn a_damaged_payload_is_refused_rather_than_returned() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("payloads.bin");
+    {
+        let mut db = CoreDB::open_with_config(dir.path(), paged()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER, body TEXT)").unwrap();
+        for i in 0..40 {
+            db.put(&format!("p/n{i}"), &json!({
+                "_collection": "p", "_key": format!("n{i}"), "n": i as i64,
+                "body": format!("record {i} on the lazy riverbank"),
+            }).to_string()).unwrap();
+        }
+        // Compacted, so `payloads.bin` is the authority and the log is empty.
+        // Without this the reopen replays the log and rebuilds the payloads from
+        // it, and damage to the file is simply not read — the test would pass
+        // while proving nothing about the checksum.
+        db.compact().unwrap();
+    }
+
+    // Flip a byte that is provably *inside a record*, not in the page header, the
+    // slot directory or free space — the case identity alone cannot detect. Found
+    // by searching for a row's own text rather than by picking an offset, because
+    // a store this small is mostly slack and an arbitrary offset lands in it.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let needle = b"record 7 on the lazy riverbank";
+    let at = bytes.windows(needle.len()).position(|w| w == needle)
+        .expect("row 7's text is not in the payload file");
+    bytes[at + 7] ^= 0x40;      // inside the text, well past any header
+    std::fs::write(&path, &bytes).unwrap();
+
+    let db = CoreDB::open_with_config(dir.path(), paged()).unwrap();
+
+    // Whatever survives must be *correct*. A row either reads as its own stored
+    // value or does not read at all; what it must never do is hand back a value
+    // that was never written.
+    let mut readable = 0usize;
+    for i in 0..40 {
+        let slug = format!("p/n{i}");
+        let Some(raw) = db.get(&slug) else { continue };
+        readable += 1;
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{slug} came back as invalid JSON: {e}"));
+        assert_eq!(v["n"].as_i64(), Some(i as i64),
+                   "{slug} came back holding another row's value — a damaged record \
+                    was served instead of refused");
+        assert_eq!(v["body"].as_str(), Some(format!("record {i} on the lazy riverbank").as_str()),
+                   "{slug} came back with damaged text presented as its own");
+    }
+    assert_eq!(readable, 39,
+               "a single flipped byte inside one record left {readable} of 40 rows \
+                readable — it should cost exactly the record it landed in, no more \
+                and no less");
+    assert!(db.get("p/n7").is_none(),
+            "the row whose bytes were damaged still reads — its checksum did not \
+             catch the flip, so a wrong value is being served as its own");
+}
