@@ -1344,72 +1344,72 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
     99    pub(crate) fn cell_members(&self, cy: i32, cx: i32) -> Option<Vec<u64>>
 ```
 
-### `topology.rs` · 1334L — Topology — the graph (nodes + edges) as memory-mappable files
+### `topology.rs` · 1426L — Topology — the graph (nodes + edges) as memory-mappable files
 
 ```
     65  fn node_recsize(version: u32) -> usize
     71  pub struct TopoNode<'a>
     91  pub struct TopoEdge<'a>
    103  pub struct TopologyBlob
-   125  fn rd_u32(b: &[u8], o: usize) -> u32
-   129  fn rd_u64(b: &[u8], o: usize) -> u64
-   132  fn write_header(out: &mut Vec<u8>, magic: &[u8; 8], flags: u32)
-   138  fn check_header(b: &[u8], magic: &[u8; 8]) -> Result<(), String>
-   151  fn write_varint(out: &mut Vec<u8>, mut v: u64)
-   163  fn read_varint(b: &[u8], mut pos: usize) -> (u64, usize)
-   181  fn len_class(v: u64) -> u8
-   193  fn class_bytes(c: u8) -> usize
-   203  fn svb_encode(values: &[u64], control: &mut Vec<u8>, data: &mut Vec<u8>)
-   217  fn svb_decode(control: &[u8], data: &[u8], count: usize) -> (Vec<u64>, usize)
-   235  struct Interner
-   239  impl Interner
-   255  fn encode_block(sorted: &[(u64, u32, u32)]) -> Vec<u8>
-   288  fn serialize_csr(magic: &[u8; 8], rows: &[(u64, u64, u32, u32)], n: usize) -> Vec<u8>
-   334  pub fn build_into(
-   545  pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob
-   588  fn write_string_table(out: &mut Vec<u8>, list: &[String])
-   603  fn read_string_table(b: &[u8], mut pos: usize) -> (Vec<String>, usize)
-   618  pub struct NodeRec
-   628  pub struct EdgeRec
-   635  pub struct TopologyView<'a>
-   649    pub fn new(blob: &'a TopologyBlob) -> Result<Self, String>
-   654    pub fn from_slices(
-   689    pub fn hash_of(&self, id: u64) -> Option<u64>
-   703    pub fn slug(&self, id: u64) -> Option<&'a str>
-   707    pub fn node_count(&self) -> usize
-   712    pub fn resolve(&self, hash: u64) -> Option<u64>
-   717    pub fn node_record(&self, id: u64) -> Option<NodeRec>
-   742    pub fn fwd_edges(&self, id: u64) -> Vec<EdgeRec>
-   745    pub fn rev_edges(&self, id: u64) -> Vec<EdgeRec>
-   790    pub fn collection_name(&self, id: u32) -> Option<&str>
-   797    pub fn edge_type_name(&self, id: u32) -> Option<&str>
-   807  fn resolve_in(idx: &[u8], hash: u64, sparse: Option<&[u64]>) -> Option<u64>
-   834  fn slug_in(slugs: &[u8], node_count: usize, id: u64) -> Option<&str>
-   851  pub(crate) fn spatial_at(spat: &[u8], spatial_ref: u32) -> Option<[f64; 6]>
-   870  pub(crate) fn emeta_bytes_at(emeta: &[u8], meta_ref: u32) -> Option<&[u8]>
-   889  enum Backing
-   899  impl Backing
-   922  pub struct MappedEdge
-   937  pub struct MappedTopology
-   961  impl MappedTopology
-   962    pub fn open(dir: &std::path::Path) -> std::io::Result<Self>
-  1053    pub fn node_count(&self) -> usize
-  1059    pub fn members_by_coll_hash(&self, coll_hash: u64) -> Option<Vec<u64>>
-  1088    pub fn edge_meta_bytes(&self, meta_ref: u32) -> Option<&[u8]>
-  1093    pub fn spatial(&self, id: u64) -> Option<[f64; 6]>
-  1100    pub fn all_hashes(&self) -> Vec<u64>
-  1107    pub fn collection_names(&self) -> &[String]
-  1111    pub fn collection_name_by_hash(&self, coll_hash: u64) -> Option<&str>
-  1119    pub fn resolve(&self, hash: u64) -> Option<u64>
-  1123    pub fn slug_of(&self, id: u64) -> Option<&str>
-  1127    pub fn node_record(&self, id: u64) -> Option<NodeRec>
-  1153    pub fn collection_name(&self, id: u32) -> Option<&str>
-  1163    pub fn fwd_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>>
-  1172    pub fn edge_type_table(&self) -> Vec<(u64, String)>
-  1182    pub fn edge_count(&self) -> usize
-  1202    pub fn rev_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>>
-  1229    pub fn hash_of(&self, id: u64) -> Option<u64>
-  1245  mod tests
+   145  fn rd_u32(b: &[u8], o: usize) -> u32
+   154  fn rd_u64(b: &[u8], o: usize) -> u64
+   160  fn write_header(out: &mut Vec<u8>, magic: &[u8; 8], flags: u32)
+   166  fn check_header(b: &[u8], magic: &[u8; 8]) -> Result<(), String>
+   179  fn write_varint(out: &mut Vec<u8>, mut v: u64)
+   197  fn read_varint(b: &[u8], mut pos: usize) -> (u64, usize)
+   215  fn len_class(v: u64) -> u8
+   227  fn class_bytes(c: u8) -> usize
+   237  fn svb_encode(values: &[u64], control: &mut Vec<u8>, data: &mut Vec<u8>)
+   251  fn svb_decode(control: &[u8], data: &[u8], count: usize) -> (Vec<u64>, usize)
+   282  struct Interner
+   286  impl Interner
+   302  fn encode_block(sorted: &[(u64, u32, u32)]) -> Vec<u8>
+   335  fn serialize_csr(magic: &[u8; 8], rows: &[(u64, u64, u32, u32)], n: usize) -> Vec<u8>
+   381  pub fn build_into(
+   592  pub fn build(nodes: &[TopoNode<'_>], edges: &[TopoEdge<'_>]) -> TopologyBlob
+   635  fn write_string_table(out: &mut Vec<u8>, list: &[String])
+   662  fn read_string_table(b: &[u8], mut pos: usize) -> (Vec<String>, usize)
+   685  pub struct NodeRec
+   695  pub struct EdgeRec
+   702  pub struct TopologyView<'a>
+   716    pub fn new(blob: &'a TopologyBlob) -> Result<Self, String>
+   721    pub fn from_slices(
+   756    pub fn hash_of(&self, id: u64) -> Option<u64>
+   770    pub fn slug(&self, id: u64) -> Option<&'a str>
+   774    pub fn node_count(&self) -> usize
+   779    pub fn resolve(&self, hash: u64) -> Option<u64>
+   784    pub fn node_record(&self, id: u64) -> Option<NodeRec>
+   809    pub fn fwd_edges(&self, id: u64) -> Vec<EdgeRec>
+   812    pub fn rev_edges(&self, id: u64) -> Vec<EdgeRec>
+   862    pub fn collection_name(&self, id: u32) -> Option<&str>
+   869    pub fn edge_type_name(&self, id: u32) -> Option<&str>
+   879  fn resolve_in(idx: &[u8], hash: u64, sparse: Option<&[u64]>) -> Option<u64>
+   906  fn slug_in(slugs: &[u8], node_count: usize, id: u64) -> Option<&str>
+   923  pub(crate) fn spatial_at(spat: &[u8], spatial_ref: u32) -> Option<[f64; 6]>
+   942  pub(crate) fn emeta_bytes_at(emeta: &[u8], meta_ref: u32) -> Option<&[u8]>
+   961  enum Backing
+   971  impl Backing
+   994  pub struct MappedEdge
+  1009  pub struct MappedTopology
+  1033  impl MappedTopology
+  1034    pub fn open(dir: &std::path::Path) -> std::io::Result<Self>
+  1140    pub fn node_count(&self) -> usize
+  1146    pub fn members_by_coll_hash(&self, coll_hash: u64) -> Option<Vec<u64>>
+  1180    pub fn edge_meta_bytes(&self, meta_ref: u32) -> Option<&[u8]>
+  1185    pub fn spatial(&self, id: u64) -> Option<[f64; 6]>
+  1192    pub fn all_hashes(&self) -> Vec<u64>
+  1199    pub fn collection_names(&self) -> &[String]
+  1203    pub fn collection_name_by_hash(&self, coll_hash: u64) -> Option<&str>
+  1211    pub fn resolve(&self, hash: u64) -> Option<u64>
+  1215    pub fn slug_of(&self, id: u64) -> Option<&str>
+  1219    pub fn node_record(&self, id: u64) -> Option<NodeRec>
+  1245    pub fn collection_name(&self, id: u32) -> Option<&str>
+  1255    pub fn fwd_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>>
+  1264    pub fn edge_type_table(&self) -> Vec<(u64, String)>
+  1274    pub fn edge_count(&self) -> usize
+  1294    pub fn rev_by_hash(&self, hash: u64) -> Option<Vec<MappedEdge>>
+  1321    pub fn hash_of(&self, id: u64) -> Option<u64>
+  1337  mod tests
 ```
 
 ### `vecstore.rs` · 510L — Vector storage — the raw embeddings behind vector search
