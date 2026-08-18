@@ -3307,6 +3307,18 @@ impl CoreDB {
         // Remove declared schema (if any)
         self.schemas.remove(collection);
 
+        // And the name itself. Without this the collection kept resolving from the
+        // name map — so `SELECT … FROM p` after `DROP TABLE p` answered "no rows"
+        // rather than "no such table", and then *changed its mind* at the next
+        // compaction, which rewrites the map from the rows that are left. The same
+        // query giving two different answers either side of a maintenance
+        // operation is worse than either answer on its own.
+        self.collection_names_map.remove(&col_hash);
+        // The base still lists the dropped rows as members; this is the same set
+        // that makes a renamed collection's old name stop answering, and a drop
+        // makes the base membership stale for exactly the same reason.
+        self.renamed_collections.insert(col_hash);
+
         // Rebuild GIN/BM25 dirtied by the deletes (from remaining data), unless
         // we were already inside a larger deferred batch that will flush later.
         if !was_deferring {
@@ -7215,15 +7227,41 @@ impl CoreDB {
     /// Includes collections that have nodes but no explicit `CREATE TABLE` schema.
     pub fn collection_names(&self) -> Vec<String> {
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for node in self.nodes.values() {
-            if !node.collection.is_empty() {
+
+        // A declared table exists whether or not anything was ever put in it.
+        // Without this, `CREATE TABLE t (...)` followed by `SHOW TABLES` did not
+        // list `t` — the catalogue was derived purely from stored rows, so an
+        // empty table was indistinguishable from one that had never been created.
+        for name in self.schemas.keys() {
+            names.insert(name.clone());
+        }
+
+        for (hash, node) in &self.nodes {
+            if !node.collection.is_empty() && !self.tombstones.contains(hash) {
                 names.insert(node.collection.clone());
             }
         }
+
         // Paged: collections whose members all live in the mmap'd base are absent
-        // from the overlay entirely, so they must be read from the base too.
+        // from the overlay entirely, so they must be read from the base too — but
+        // the base is immutable, so its name table still lists collections whose
+        // rows have since been deleted. `DROP TABLE p` removed every row and the
+        // schema and `SHOW TABLES` went on listing `p`, before and after a
+        // restart, because the name was read from the base and the tombstones
+        // that emptied it live in the overlay. The same base/overlay split, in the
+        // catalogue this time.
+        //
+        // `collection_members` merges both halves and drops tombstones, so it is
+        // the one question that can be asked here: does this collection still have
+        // a member? The cost is one lookup per *collection*, not per row.
         for name in self.base_collection_names() {
-            if !name.is_empty() {
+            if name.is_empty() || names.contains(&name) {
+                continue;
+            }
+            let alive = self
+                .collection_members(sk_hash(&name))
+                .map_or(false, |m| !m.is_empty());
+            if alive {
                 names.insert(name);
             }
         }
@@ -7705,7 +7743,30 @@ impl CoreDB {
 
     /// Execute an already-parsed plan. Shared by `query`, `query_params`, and the
     /// prepared-statement path so all three run identically.
-    fn run_plan(&self, plan: sql::MatchOrAgg, bm25_needs: &[String]) -> Result<Set<'_>, SqlError> {
+    fn run_plan(&self, plan: sql::MatchOrAgg, needs: &sql::PlanNeeds) -> Result<Set<'_>, SqlError> {
+        // A name that names nothing. Postgres raises `relation "x" does not
+        // exist`; this returned no rows, so a typo read as an empty table and the
+        // caller went looking for missing data instead of a missing letter.
+        //
+        // "Exists" is deliberately generous, because a collection here need not be
+        // declared: a schema counts, and so does a single stored row. Only a name
+        // with neither is refused.
+        //
+        // Not inside a transaction. `BEGIN; INSERT INTO users …; SELECT … FROM
+        // users` creates the collection with the insert, but the insert is
+        // buffered until COMMIT, so the collection does not exist yet in
+        // anything this check can see. Refusing there would reject a statement
+        // about the caller's own uncommitted work. Both forms of transaction
+        // count: `commit_depth` for the API, `pending_txn` for SQL `BEGIN`.
+        if self.commit_depth == 0 && self.pending_txn.is_none() {
+            for table in &needs.from_tables {
+                if !self.schemas.contains_key(table)
+                    && self.collection_name(sk_hash(table)).is_none()
+                {
+                    return Err(SqlError::UndefinedTable(table.clone()));
+                }
+            }
+        }
         // A plain SELECT knows which collection it reads, so its own walk runs
         // first and can name the table in the error. The requirement list below
         // is the backstop that covers the shapes it cannot see into.
@@ -7715,7 +7776,18 @@ impl CoreDB {
         // Every plan shape, before anything runs. `BM25` reads its index and
         // nothing else, so without one it reported that no document matched —
         // a statement about the data, from code that never looked at it.
-        for field in bm25_needs {
+        // `SEARCH_SCORE` scores every row 0.0 with no index, so an `ORDER BY` over
+        // it hands back the rows in the order they already had — a ranking that
+        // silently did not happen, which is worse than one that refuses.
+        if needs.search_index && self.search_indexes.is_empty() {
+            return Err(SqlError::IndexNotBuilt {
+                collection: String::new(),
+                method: "search".into(),
+                field: String::new(),
+                declared: self.schemas.values().any(|s| !s.indexes.search.is_empty()),
+            });
+        }
+        for field in &needs.bm25_fields {
             if !self.bm25_indexes.contains_key(field) {
                 let declared = self
                     .schemas
@@ -7737,6 +7809,16 @@ impl CoreDB {
                 Set::from_hits(self, query::execute_match_agg_union(self, stmts))
             }
             sql::MatchOrAgg::Shortest(stmt) => {
+                // A named endpoint that does not exist gives no rows, which is a
+                // deliberate contract — see `shortest_path_missing_node_returns_none`.
+                // An earlier version of this code refused instead, on the reasoning
+                // that "no path" misdescribes a node that is not there; the test
+                // that already decided it is the older authority, and a query for an
+                // absent key returning nothing is what every other surface does.
+                //
+                // The refusal that remains is in the parser, and covers only the
+                // form that *cannot* name a node — `(a)` with a value containing no
+                // `/`, when every slug has one. Absent is not the same as impossible.
                 Set::from_hits(self, query::execute_shortest_select(self, stmt))
             }
             sql::MatchOrAgg::MultiFrom(stmt) => {

@@ -153,8 +153,15 @@ fn probes() -> Vec<Probe> {
                                        .collect::<Vec<_>>().join("|")),
         ("MATCH",                 |d| rows(d, "SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)")),
         ("MATCH cross",           |d| rows(d, "SELECT b._key FROM MATCH (a:p)-[:tagged]->(b:q)")),
-        ("SHORTEST",              |d| rows(d, "SELECT b._key FROM MATCH SHORTEST (a)-[r*]->(b) \
+        // `vals`, not `rows`: a SHORTEST projection row carries its answer in the
+        // payload and has no slug, so comparing slugs compared "" against "" in
+        // every mode and could not have failed.
+        ("SHORTEST",              |d| vals(d, "SELECT b._key AS k, length(r) AS hops \
+                                               FROM MATCH SHORTEST (a)-[r*]->(b) \
                                                WHERE a._key = 'p/n0' AND b._key = 'p/n9'")),
+        ("SHORTEST labelled",     |d| vals(d, "SELECT b._key AS k, length(r) AS hops \
+                                               FROM MATCH SHORTEST (a:p)-[r*]->(b:p) \
+                                               WHERE a._key = 'n0' AND b._key = 'n9'")),
 
         ("SHOW TABLES",           |d| d.show("SHOW TABLES").map(|h| h.len().to_string()).unwrap_or("ERR".into())),
         ("SHOW EDGES",            |d| d.show("SHOW EDGES").map(|h| h.len().to_string()).unwrap_or("ERR".into())),
@@ -530,4 +537,37 @@ fn every_mutation_leaves_the_modes_agreeing() {
             ground_truth(db, &format!("{label} after `{step}`"));
         }
     }
+}
+
+/// **A probe that answers nothing cannot detect a disagreement.**
+///
+/// The audit compares four storage modes probe by probe. Two modes that both
+/// answer "no rows" agree, so a probe matching nothing passes in every mode
+/// forever and reports a clean audit while checking nothing at all.
+///
+/// This is not hypothetical. The `search` probe in `maintenance_surfaces` did
+/// exactly that for as long as it existed, because its fixture never declared a
+/// search index — it compared no rows against no rows through every maintenance
+/// operation, and could not have failed.
+///
+/// Run against the unmutated fixture, where every probe is written to find
+/// something.
+#[test]
+fn every_probe_can_detect_a_difference() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_with(dir.path(), Config::resident());
+    let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
+
+    let mut empty = Vec::new();
+    for (label, f) in &probes() {
+        let v = f(&mut db);
+        let vacuous = v.is_empty() || v == "0" || v == "NONE" || v.starts_with("ERR");
+        if vacuous {
+            empty.push(format!("  {label:<24} = {}", if v.is_empty() { "<no rows>" } else { &v }));
+        }
+    }
+    assert!(empty.is_empty(),
+            "these probes answer nothing, so every mode agrees with every other \
+             mode about them and the audit is not checking them:\n{}",
+            empty.join("\n"));
 }

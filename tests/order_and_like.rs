@@ -20,7 +20,7 @@
 //! column — because both features had *five* code paths between them and the
 //! index disagreed with the scan on nearly all of them.
 
-use sekejap::CoreDB;
+use sekejap::{Config, CoreDB};
 
 fn ordered(db: &CoreDB, sql: &str) -> String {
     db.query(sql)
@@ -167,5 +167,60 @@ fn the_sort_comparator_is_consistent_on_mixed_types() {
         assert_eq!(o, first,
             "insertion order {i} produced [{o}], but order 0 produced [{first}] — \
              the comparator is not a total order");
+    }
+}
+
+/// **A table name that names nothing is an error, not an empty table.**
+///
+/// `SELECT _key FROM custmers` returned no rows, which is exactly what an empty
+/// `customers` table returns. The reply to a typo was a statement about data that
+/// was never consulted, and the reader's next move is to go looking for missing
+/// records rather than a missing letter. PostgreSQL raises `relation "x" does not
+/// exist`, and a table name is not a graph question.
+///
+/// "Exists" is generous on purpose. A collection here does not have to be
+/// declared — `put` into a name creates it — so a declared schema counts and so
+/// does a single stored row. Only a name with neither is refused, which is why
+/// the empty-but-declared case below must still answer normally.
+#[test]
+fn a_table_that_does_not_exist_is_an_error() {
+    use sekejap::SqlError;
+
+    for (label, cfg) in [("default", Config::default()), ("resident", Config::resident())] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE customers (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        db.put("customers/c1", r#"{"_collection":"customers","_key":"c1","n":1}"#).unwrap();
+        // Declared and empty — a real table with nothing in it.
+        db.execute("CREATE TABLE empty_but_real (_key TEXT PRIMARY KEY)").unwrap();
+        // Undeclared but holding a row — `put` is allowed to create a collection.
+        db.put("adhoc/a1", r#"{"_collection":"adhoc","_key":"a1"}"#).unwrap();
+        db.compact().unwrap();
+
+        for sql in [
+            "SELECT _key FROM customers",
+            "SELECT _key FROM empty_but_real",
+            "SELECT _key FROM adhoc",
+            "SELECT COUNT(*) FROM empty_but_real",
+        ] {
+            assert!(db.query(sql).is_ok(), "[{label}] `{sql}` is a real table and was refused");
+        }
+
+        for sql in [
+            "SELECT _key FROM custmers",
+            "SELECT COUNT(*) FROM custmers",
+            "SELECT _key FROM customers_2024",
+        ] {
+            match db.query(sql) {
+                Err(SqlError::UndefinedTable(name)) => {
+                    assert!(!name.is_empty(), "[{label}] the error must name the table");
+                }
+                Err(other) => panic!("[{label}] `{sql}` gave the wrong error: {other:?}"),
+                Ok(set) => panic!(
+                    "[{label}] `{sql}` answered with {} row(s) as though the table \
+                     existed and was empty", set.collect().len()
+                ),
+            }
+        }
     }
 }

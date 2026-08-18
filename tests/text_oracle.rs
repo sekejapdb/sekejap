@@ -187,6 +187,8 @@ fn a_text_tool_without_its_index_says_so() {
             // Scoring rather than filtering: with no index every score used to be
             // 0, which reorders the results silently instead of emptying them.
             "SELECT _key, BM25(body, 'heron') AS s FROM d ORDER BY s DESC",
+            // `SEARCH_SCORE` is the same shape with a different index behind it.
+            "SELECT _key, SEARCH_SCORE('heron') AS s FROM d ORDER BY s DESC",
         ] {
             match db.query(sql) {
                 Err(SqlError::IndexNotBuilt { declared, .. }) => {
