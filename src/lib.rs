@@ -3734,6 +3734,10 @@ impl CoreDB {
         edge_type: &str,
         meta_json: &str,
     ) -> Result<(), serde_json::Error> {
+        if self.read_only {
+            use serde::ser::Error as _;
+            return Err(serde_json::Error::custom(self.refuse_write("link_meta").to_string()));
+        }
         self.note_edge_change(edge_type);
         let meta: Value = serde_json::from_str(meta_json)?;
         let from_h = sk_hash(from);
@@ -5145,6 +5149,14 @@ impl CoreDB {
     /// Set attributes on edges from→to of `edge_type` matching `props_json`.
     /// Returns count updated. `sets_json` is a JSON object of field→value.
     pub fn update_edge(&mut self, from: &str, to: &str, edge_type: &str, props_json: &str, sets_json: &str) -> usize {
+        // Returns a count, so the refusal is recorded rather than returned — the
+        // number it used to give back on a read-only handle was the number of
+        // edges it claimed to have changed.
+        if self.read_only {
+            let e = self.refuse_write("update_edge").to_string();
+            self.note_write_error(e);
+            return 0;
+        }
         self.wal_write(WalEntry::UpdateEdge {
             from: from.to_string(),
             to: to.to_string(),
@@ -7291,6 +7303,9 @@ impl CoreDB {
     /// non-comment line is one SGQL statement, run through the same execution
     /// path as a normal query. Returns the number of statements applied.
     pub fn load_sql(&mut self, dump: &str) -> Result<usize, SqlError> {
+        if self.read_only {
+            return Err(SqlError::InvalidValue(self.refuse_write("load_sql").to_string()));
+        }
         let mut applied = 0usize;
         for raw in dump.lines() {
             let line = raw.trim();
@@ -10754,6 +10769,9 @@ impl CoreDB {
 
     #[cfg(unix)]
     pub fn spill_edges_to_disk(&mut self) -> std::io::Result<()> {
+        if self.read_only {
+            return Err(self.refuse_write("spill_edges_to_disk"));
+        }
         if let Some(dir) = self.data_dir.clone() { self.edges.spill_to_disk(&dir)?; }
         Ok(())
     }
