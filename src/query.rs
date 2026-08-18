@@ -997,6 +997,29 @@ fn distinct_key_of(payload: Option<&Value>) -> String {
     }
 }
 
+/// One representation for a number, whichever way it was written.
+///
+/// JSON `1` and `1.0` denote the same value, and a btree index stores both as the
+/// same `f64` — the distinction is gone by the time the index answers. So a query
+/// served from the index said `1` where the same query served by a scan said
+/// `1.0`, for `SUM`, `MIN`/`MAX` and the `GROUP BY` key alike. Whether an integer
+/// looked like an integer depended on whether somebody had run `CREATE INDEX`.
+///
+/// Rather than teach the index to remember a distinction that does not mean
+/// anything, both paths canonicalise: a number with no fractional part is a whole
+/// number. `group_key_of` already grouped them together on that reasoning; this
+/// makes what is *reported* agree with what was grouped.
+///
+/// Above 2^53 an `f64` can no longer tell consecutive integers apart, so the
+/// float is kept rather than printing a whole number that is not the value.
+fn canonical_number(v: &Value) -> Value {
+    match v.as_f64() {
+        Some(f) if v.is_number() && f.fract() == 0.0
+            && f.abs() <= 9_007_199_254_740_992.0 => Value::from(f as i64),
+        _ => v.clone(),
+    }
+}
+
 /// Render a total that came from whole numbers as a whole number.
 ///
 /// Summing runs through `f64` because a column may hold both kinds. When every
@@ -1060,7 +1083,9 @@ impl AggAccum {
             }
             if let Some(f) = v.as_f64() {
                 self.sum = Some(self.sum.unwrap_or(0.0) + f);
-                self.sum_is_integral &= v.is_i64() || v.is_u64();
+                // A stored `1.0` is as whole as a stored `1`; the index cannot
+                // tell them apart and neither should this.
+                self.sum_is_integral &= f.fract() == 0.0;
             }
             // MIN/MAX take every non-null value, not only the numeric ones, and
             // order them the way `ORDER BY` does — so `MIN` really is the row
@@ -1100,8 +1125,8 @@ impl AggAccum {
                 }
                 _ => Value::Null,
             },
-            "MIN" => self.min.clone().unwrap_or(Value::Null),
-            "MAX" => self.max.clone().unwrap_or(Value::Null),
+            "MIN" => self.min.as_ref().map(canonical_number).unwrap_or(Value::Null),
+            "MAX" => self.max.as_ref().map(canonical_number).unwrap_or(Value::Null),
             _ => Value::Null,
         }
     }
@@ -1562,9 +1587,16 @@ impl<'db> Set<'db> {
                         group_order.push(key.clone());
                         let mut gv = HashMap::new();
                         for gf in group_fields {
-                            if let Some(v) = payload.get(gf) {
-                                gv.insert(gf.clone(), v.clone());
-                            }
+                            // Always present, and canonical. A row whose grouping
+                            // field is absent belongs to the NULL group, and the
+                            // index-served path says so by emitting `null` — the
+                            // scan used to omit the column entirely, so the same
+                            // query returned rows of two different shapes
+                            // depending on whether the column was indexed. Absent
+                            // and null are one group either way; this makes the
+                            // reported row agree with the grouping.
+                            let v = payload.get(gf).cloned().unwrap_or(Value::Null);
+                            gv.insert(gf.clone(), canonical_number(&v));
                         }
                         groups.insert(key.clone(), GroupState {
                             accums: HashMap::new(),
