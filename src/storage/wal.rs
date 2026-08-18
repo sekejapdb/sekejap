@@ -539,6 +539,28 @@ impl WalWriter {
 
         if exists && existing_len >= 8 {
             let detected = detect_format(path)?;
+            // **Stand on the last frame that is actually whole.**
+            //
+            // This used to append straight onto whatever was there. A crash
+            // leaves a torn final frame — a complete 8-byte header whose payload
+            // is short — and the next writer put its records immediately after
+            // those bytes. On replay the torn header's declared length then
+            // swallowed the new frames as its own payload, the CRC failed, and
+            // replay stopped *before* them. Writes that had been acknowledged and
+            // fsynced were gone at the next open: five committed rows, five rows
+            // lost, with the four from before the tear still present so nothing
+            // looked broken.
+            //
+            // Truncating to the end of the last CRC-valid frame costs one pass
+            // over a log that is about to be replayed anyway, and it turns the
+            // torn tail into what it should always have been — the end of the
+            // file.
+            let good = WalReader::last_intact_offset(path)?;
+            if good < existing_len {
+                let f = OpenOptions::new().write(true).open(path)?;
+                f.set_len(good)?;
+                f.sync_all()?;
+            }
             let file = OpenOptions::new().append(true).open(path)?;
             return Ok(Self {
                 inner: BufWriter::new(file),
@@ -546,6 +568,16 @@ impl WalWriter {
                 sync_level: SyncLevel::Full,
                 seq: 0,
             });
+        }
+
+        // A file too short to hold even a header is a stub from a crash during
+        // the very first write. The header below is written in *append* mode, so
+        // without clearing it first the magic would land after the stale bytes
+        // and every later frame would be read at the wrong offset.
+        if exists && existing_len > 0 {
+            let f = OpenOptions::new().write(true).open(path)?;
+            f.set_len(0)?;
+            f.sync_all()?;
         }
 
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -760,6 +792,56 @@ impl WalReader {
             }
         }
         corrupted
+    }
+
+    /// Byte offset just past the last frame that is complete and passes its CRC.
+    ///
+    /// Mirrors the frame walk in [`replay_all`](Self::replay_all) — header, then
+    /// `len` bytes of payload, then the CRC over both — and stops at the first
+    /// frame that is torn, oversized or fails its checksum. That offset is where
+    /// the log's usable content ends, and therefore where the next record must
+    /// go: anything appended past it is unreachable, because replay stops here.
+    ///
+    /// Returns the header length for a file whose every frame is bad, so an
+    /// unreadable log is emptied rather than grown.
+    pub(crate) fn last_intact_offset(path: &Path) -> io::Result<u64> {
+        use std::io::Read;
+        const HEADER: u64 = 8; // magic + version, written once at creation
+        let mut f = std::fs::File::open(path)?;
+        let total = f.metadata()?.len();
+        if total <= HEADER {
+            return Ok(total);
+        }
+        let mut reader = io::BufReader::new(&mut f);
+        let mut skip = vec![0u8; HEADER as usize];
+        reader.read_exact(&mut skip)?;
+
+        let mut good = HEADER;
+        loop {
+            let mut header = [0u8; 8];
+            match reader.read_exact(&mut header) {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+                Ok(()) => {}
+            }
+            let stored_crc = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+            if len > 64 << 20 {
+                break;
+            }
+            let mut payload = vec![0u8; len];
+            if reader.read_exact(&mut payload).is_err() {
+                break; // torn payload — the frame never finished being written
+            }
+            let mut crc_input = Vec::with_capacity(4 + len);
+            crc_input.extend_from_slice(&(len as u32).to_le_bytes());
+            crc_input.extend_from_slice(&payload);
+            if crc32(&crc_input) != stored_crc {
+                break;
+            }
+            good += 8 + len as u64;
+        }
+        Ok(good)
     }
 
     /// Read every valid frame from the WAL into a Vec.

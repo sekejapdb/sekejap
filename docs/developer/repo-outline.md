@@ -1435,7 +1435,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    506  impl IterableVectors for VectorStore
 ```
 
-### `wal.rs` · 1135L — The write-ahead log (WAL) — how a crash can't lose your data
+### `wal.rs` · 1217L — The write-ahead log (WAL) — how a crash can't lose your data
 
 ```
     47  pub enum WalFormat
@@ -1457,25 +1457,26 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    520  impl WalWriter
    526    pub fn open(path: &Path) -> io::Result<Self>
    536    pub fn open_with_format(path: &Path, format: WalFormat) -> io::Result<Self>
-   564    pub fn format(&self) -> WalFormat { self.format }
-   567    pub fn set_sync_level(&mut self, level: SyncLevel)
-   573    pub fn append(&mut self, entry: &WalEntry) -> io::Result<()>
-   589    pub fn append_batch(&mut self, entries: &[WalEntry]) -> io::Result<()>
-   609    pub fn sync(&mut self) -> io::Result<()>
-   620    pub fn seq(&self) -> u64 { self.seq }
-   623    pub fn sync_level(&self) -> SyncLevel { self.sync_level }
-   630    pub fn try_clone_file(&self) -> io::Result<File>
-   639  pub(crate) fn sync_file(file: &File, level: SyncLevel) -> io::Result<()>
-   675  fn detect_format(path: &Path) -> io::Result<WalFormat>
-   689  fn has_magic_header(path: &Path) -> io::Result<bool>
-   700  pub(crate) struct WalReader
-   705  impl WalReader
-   706    pub fn open(path: &Path) -> io::Result<Self>
-   722    pub fn format(&self) -> WalFormat { self.format }
-   729    pub fn replay_all<F: FnMut(WalEntry)>(mut self, mut cb: F) -> bool
-   771    pub fn read_all(self) -> (Vec<WalEntry>, bool)
-   786  pub(crate) fn migrate_wal(
-   819  mod tests
+   596    pub fn format(&self) -> WalFormat { self.format }
+   599    pub fn set_sync_level(&mut self, level: SyncLevel)
+   605    pub fn append(&mut self, entry: &WalEntry) -> io::Result<()>
+   621    pub fn append_batch(&mut self, entries: &[WalEntry]) -> io::Result<()>
+   641    pub fn sync(&mut self) -> io::Result<()>
+   652    pub fn seq(&self) -> u64 { self.seq }
+   655    pub fn sync_level(&self) -> SyncLevel { self.sync_level }
+   662    pub fn try_clone_file(&self) -> io::Result<File>
+   671  pub(crate) fn sync_file(file: &File, level: SyncLevel) -> io::Result<()>
+   707  fn detect_format(path: &Path) -> io::Result<WalFormat>
+   721  fn has_magic_header(path: &Path) -> io::Result<bool>
+   732  pub(crate) struct WalReader
+   737  impl WalReader
+   738    pub fn open(path: &Path) -> io::Result<Self>
+   754    pub fn format(&self) -> WalFormat { self.format }
+   761    pub fn replay_all<F: FnMut(WalEntry)>(mut self, mut cb: F) -> bool
+   807    pub(crate) fn last_intact_offset(path: &Path) -> io::Result<u64>
+   853    pub fn read_all(self) -> (Vec<WalEntry>, bool)
+   868  pub(crate) fn migrate_wal(
+   901  mod tests
 ```
 
 ## `src/text_index/`
@@ -1663,4 +1664,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    254  mod tests
 ```
 
-<!-- 49 files, 1391 items -->
+<!-- 49 files, 1392 items -->

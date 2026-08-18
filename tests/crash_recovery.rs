@@ -620,3 +620,88 @@ fn closing_an_engine_flushes_what_it_buffered() {
                "the writes did not reach disk");
 }
 
+
+/// **A write committed after a torn tail must survive the next open.**
+///
+/// The existing torn-tail tests all check the same thing: after damage, the
+/// intact prefix comes back. None of them wrote anything *afterwards*, and that
+/// is where the log was broken.
+///
+/// `open_with_format` appended straight onto whatever was in the file. A crash
+/// leaves a complete 8-byte header whose payload is short, so the next writer put
+/// its records immediately after those bytes — and on replay the torn header's
+/// declared length swallowed them as its own payload, failed its CRC, and stopped
+/// replay before reaching them.
+///
+/// Five rows written and fsynced were gone at the following open, with the four
+/// from before the tear still present, so nothing looked broken. The writer now
+/// truncates to the end of the last CRC-valid frame before appending.
+#[test]
+fn writes_after_a_torn_tail_survive_the_next_open() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        for i in 0..5 {
+            db.put(&format!("p/n{i}"),
+                   &format!(r#"{{"_collection":"p","_key":"n{i}","n":{i}}}"#)).unwrap();
+        }
+        db.sync().unwrap();
+    }
+
+    // Tear the final frame: its header survives, its payload does not.
+    let wal = dir.path().join("wal.log");
+    let len = std::fs::metadata(&wal).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(&wal).unwrap()
+        .set_len(len - 3).unwrap();
+
+    let before_tear = {
+        let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
+        let survived = db.query("SELECT _key FROM p").unwrap().collect().len();
+        assert!(survived >= 4,
+            "the intact prefix should survive a torn tail; only {survived} rows did");
+
+        // The part nothing tested: commit more, durably, on top of the damage.
+        for i in 100..105 {
+            db.put(&format!("p/n{i}"),
+                   &format!(r#"{{"_collection":"p","_key":"n{i}","n":{i}}}"#)).unwrap();
+        }
+        db.sync().unwrap();
+        assert_eq!(db.query("SELECT _key FROM p WHERE n >= 100").unwrap().collect().len(), 5);
+        survived
+    };
+
+    let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
+    assert_eq!(db.query("SELECT _key FROM p WHERE n >= 100").unwrap().collect().len(), 5,
+        "the five rows committed and fsynced after the tear did not survive the reopen");
+    assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), before_tear + 5,
+        "the rows from before the tear were lost instead");
+}
+
+/// A log too short to hold even its own header must not be built on.
+///
+/// A crash during the very first write can leave a 1–7 byte stub. The header is
+/// written in *append* mode, so without clearing the stub first the magic lands
+/// after it and every frame afterwards is read at the wrong offset — the database
+/// then fails to reopen at all.
+#[test]
+fn a_stub_wal_shorter_than_its_header_is_not_appended_to() {
+    for stub in [&b"S"[..], &b"SKWJ"[..], &b"SKWJ\x01\x00\x00"[..]] {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("wal.log"), stub).unwrap();
+
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
+            db.execute("CREATE TABLE q (_key TEXT PRIMARY KEY)").unwrap();
+            db.put("q/a", r#"{"_collection":"q","_key":"a"}"#).unwrap();
+            db.sync().unwrap();
+        }
+
+        let db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
+        let rows = db.query("SELECT _key FROM q")
+            .unwrap_or_else(|e| panic!("a {}-byte stub WAL broke the reopen: {e}", stub.len()))
+            .collect();
+        assert_eq!(rows.len(), 1,
+            "the row written over a {}-byte stub WAL did not survive", stub.len());
+    }
+}
