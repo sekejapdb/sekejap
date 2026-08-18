@@ -6745,9 +6745,20 @@ impl CoreDB {
 
     // ── Reads ─────────────────────────────────────────────────────────────────
 
-    /// Get raw JSON payload for a slug. Returns `None` if not found.
-    pub fn slug_of(&self, hash: u64) -> Option<&str> {
-        self.nodes.get(&hash).map(|n| n.slug.as_str())
+    /// The slug a node hash belongs to, or `None` if no such node exists.
+    ///
+    /// Returns an owned `String` rather than a borrow because the answer may come
+    /// from the mmap base, where it is decoded on demand rather than held.
+    ///
+    /// It used to read `self.nodes` alone — the overlay — and a compaction moves
+    /// every row out of the overlay and into the base. So on the default layout,
+    /// after the first compaction, this answered `None` for every row in the
+    /// database. That is not a cosmetic loss: the Python binding's `bm25_search`
+    /// maps result hashes back to keys through here inside a `filter_map`, so a
+    /// search returning four hits handed back an empty list, with nothing to say
+    /// the results had been dropped rather than not found.
+    pub fn slug_of(&self, hash: u64) -> Option<String> {
+        self.node_data(hash).map(|n| n.slug.clone())
     }
 
     /// Fetch one node's raw JSON payload by slug, or `None` if it doesn't exist.
@@ -11749,7 +11760,11 @@ impl CoreDB {
     /// }
     /// ```
     pub fn centroid(&self, slug: &str) -> Option<(f64, f64)> {
-        let hash = *self.slug_map.get(slug)?;
+        // `sk_hash`, not `slug_map`: the hash is derived from the slug, so the map
+        // is only an overlay convenience and consulting it made this answer `None`
+        // for every row a compaction had moved into the base. `get` has always
+        // done it this way, which is why it never had the bug.
+        let hash = sk_hash(slug);
         let (off, len) = self.payload_loc(hash)?;
         let payload = self.payload_store.get_of(hash, off, len)?;
         geo::extract_centroid(&payload)

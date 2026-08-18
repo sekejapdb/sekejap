@@ -370,7 +370,7 @@ impl Db {
         let rows: Vec<(String, f64)> = db
             .bm25_search(&field, &query, top_k as usize)
             .into_iter()
-            .filter_map(|(h, sc)| db.slug_of(h).map(|s| (s.to_string(), sc)))
+            .filter_map(|(h, sc)| db.slug_of(h).map(|s| (s, sc)))
             .collect();
         serde_json::to_string(&rows).map_err(|e| Error::from_reason(e.to_string()))
     }
