@@ -24,7 +24,13 @@ fn build(dir: &std::path::Path, cfg: Config) {
     }
     db.execute("CREATE INDEX ON p USING btree (n)").unwrap();
     db.execute("CREATE INDEX ON p USING gin (body)").unwrap();
-    db.build_bm25_index("body");
+    db.execute("CREATE INDEX ON p USING bm25 (body)").unwrap();
+    // This line was missing, and its absence made the `search` probe below
+    // compare no rows against no rows through every maintenance operation. The
+    // probe passed because it was empty on both sides, not because anything was
+    // preserved. It only surfaced once `SEARCH` began refusing to answer without
+    // an index rather than returning nothing.
+    db.execute("CREATE INDEX ON p USING search (body)").unwrap();
     db.compact().unwrap();
 }
 
@@ -44,6 +50,11 @@ fn answers(db: &CoreDB) -> Vec<(String, String)> {
             .unwrap_or_else(|e| panic!("`{sql}` did not run: {e:?}"))
             .collect().iter().map(|h| h.slug.clone()).collect();
         v.sort();
+        // A probe that finds nothing cannot detect a maintenance operation that
+        // loses rows: empty before and empty after compares equal and reports
+        // success. Every probe here is written to match at least one record, so
+        // an empty result means the probe is broken, not that the answer is.
+        assert!(!v.is_empty(), "probe `{name}` matches nothing — it cannot detect a change");
         (name.to_string(), v.join(","))
     }).collect()
 }

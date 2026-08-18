@@ -51,6 +51,7 @@
 //! steps-over-ids foundation.
 
 use crate::{sk_hash, CoreDB, FieldKey};
+use crate::sql::SqlError;
 use crate::vector::VectorAccess;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8615,4 +8616,102 @@ fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
             }),
         },
     }
+}
+
+// ── Refusing a plan that cannot be answered ──────────────────────────────────
+
+/// **A filter whose index does not exist must say so, not answer "no rows".**
+///
+/// `SEARCH('heron')` and `BM25(body, 'heron') > 0` are served entirely from their
+/// indexes. When the index was never declared, both steps used to hand back an
+/// empty candidate set — a claim about the data ("no document contains that
+/// word") made by code that had not looked at any document. A test fixture that
+/// forgot the `CREATE INDEX` got the same silence as a genuinely empty table, and
+/// so would a caller who renamed a collection or restored a database without its
+/// indexes.
+///
+/// [`SqlError::IndexNotBuilt`] was declared for exactly this and never once
+/// constructed, so the guarantee its doc comment describes was not in force
+/// anywhere. This is that guarantee.
+///
+/// `ILIKE` is deliberately not checked: it answers correctly without an index by
+/// scanning, so the index only makes it faster. That is the line — a missing
+/// index that costs speed is fine, a missing index that changes the answer is
+/// not.
+pub(crate) fn validate_plan(db: &CoreDB, steps: &[Step]) -> Result<(), SqlError> {
+    validate_steps(db, steps, &mut None)
+}
+
+fn validate_steps(
+    db: &CoreDB,
+    steps: &[Step],
+    coll: &mut Option<String>,
+) -> Result<(), SqlError> {
+    for step in steps {
+        match step {
+            Step::Collection(hash) => {
+                *coll = db.collection_name(*hash).map(|s| s.to_string());
+            }
+
+            Step::SearchFilter(..) => {
+                // The index is per collection and covers the fields its `CREATE
+                // INDEX` named, so there is no field set to fall back to: a scan
+                // would have to invent one and would then disagree with the
+                // indexed answer.
+                let missing = match coll.as_deref() {
+                    Some(c) => !db.search_indexes.contains_key(&CoreDB::search_index_key(c)),
+                    // No `FROM` collection in the plan — a spatial or vector
+                    // starter can leave it unset, and the executor then resolves
+                    // the index per candidate. Only refuse when no collection
+                    // anywhere has one, which is unambiguous.
+                    None => db.search_indexes.is_empty(),
+                };
+                if missing {
+                    let collection = coll.clone().unwrap_or_else(|| "<unknown>".into());
+                    let declared = db.collection_has_search_index(&collection);
+                    return Err(SqlError::IndexNotBuilt {
+                        collection,
+                        method: "search".into(),
+                        field: String::new(),
+                        declared,
+                    });
+                }
+            }
+
+            Step::Bm25Filter(field, ..) => {
+                if !db.bm25_indexes.contains_key(field) {
+                    let collection = coll.clone().unwrap_or_else(|| "<unknown>".into());
+                    let declared = db
+                        .schemas
+                        .get(&collection)
+                        .map_or(false, |s| s.indexes.bm25.iter().any(|f| f == field));
+                    return Err(SqlError::IndexNotBuilt {
+                        collection,
+                        method: "bm25".into(),
+                        field: field.clone(),
+                        declared,
+                    });
+                }
+            }
+
+            // Nested plans. A set-algebra arm is a plan of its own and starts
+            // from its own collection, so it does not inherit this one.
+            Step::Intersect(inner) | Step::Union(inner) | Step::Subtract(inner) => {
+                validate_steps(db, inner, &mut None)?;
+            }
+            // These run against the candidates in hand, so they keep the
+            // surrounding collection.
+            Step::Having(inner) => validate_steps(db, inner, coll)?,
+            Step::WhereNot(inner) => {
+                validate_steps(db, std::slice::from_ref(&**inner), coll)?
+            }
+            Step::WhereOr(branches) => {
+                for branch in branches {
+                    validate_steps(db, branch, coll)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

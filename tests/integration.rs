@@ -6511,9 +6511,26 @@ fn search_index_drop() {
     let rows: Vec<_> = db.query("SELECT * FROM articles WHERE SEARCH('rust')").unwrap().collect();
     assert_eq!(rows.len(), 1);
 
+    // Dropping the index must not change the answer to "nothing matches" — the
+    // article still contains "rust". `SEARCH` is served entirely from the index,
+    // so with the index gone the only truthful reply is that it cannot answer.
+    //
+    // This test previously asserted `rows.len() == 0` here, which is how the
+    // behaviour survived: a document that plainly contained the word was reported
+    // as not containing it, and the suite agreed.
     db.execute("DROP INDEX ON articles USING search (title)").unwrap();
-    let rows: Vec<_> = db.query("SELECT * FROM articles WHERE SEARCH('rust')").unwrap().collect();
-    assert_eq!(rows.len(), 0, "after DROP INDEX, search should return no results");
+    match db.query("SELECT * FROM articles WHERE SEARCH('rust')") {
+        Err(sekejap::SqlError::IndexNotBuilt { ref method, .. }) if method == "search" => {}
+        Err(other) => panic!("wrong error after DROP INDEX: {other:?}"),
+        Ok(set) => panic!(
+            "after DROP INDEX, SEARCH answered with {} row(s) instead of saying the \
+             index is gone", set.collect().len()
+        ),
+    }
+    // And the row is still there, which is what makes the old answer wrong.
+    let rows: Vec<_> = db.query("SELECT * FROM articles WHERE body ILIKE '%rust%'")
+        .unwrap().collect();
+    assert_eq!(rows.len(), 1, "the document itself was never in question");
 }
 
 #[test]

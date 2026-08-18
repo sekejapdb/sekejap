@@ -7699,13 +7699,39 @@ impl CoreDB {
         {
             return Ok(Set::from_hits(self, self.show(sql)?));
         }
-        Ok(self.run_plan(sql::parse_match_or_agg(sql)?))
+        let (plan, needs) = sql::parse_plan(sql, vec![])?;
+        self.run_plan(plan, &needs)
     }
 
     /// Execute an already-parsed plan. Shared by `query`, `query_params`, and the
     /// prepared-statement path so all three run identically.
-    fn run_plan(&self, plan: sql::MatchOrAgg) -> Set<'_> {
-        match plan {
+    fn run_plan(&self, plan: sql::MatchOrAgg, bm25_needs: &[String]) -> Result<Set<'_>, SqlError> {
+        // A plain SELECT knows which collection it reads, so its own walk runs
+        // first and can name the table in the error. The requirement list below
+        // is the backstop that covers the shapes it cannot see into.
+        if let sql::MatchOrAgg::Steps(steps) = &plan {
+            query::validate_plan(self, steps)?;
+        }
+        // Every plan shape, before anything runs. `BM25` reads its index and
+        // nothing else, so without one it reported that no document matched —
+        // a statement about the data, from code that never looked at it.
+        for field in bm25_needs {
+            if !self.bm25_indexes.contains_key(field) {
+                let declared = self
+                    .schemas
+                    .values()
+                    .any(|s| s.indexes.bm25.iter().any(|f| f == field));
+                return Err(SqlError::IndexNotBuilt {
+                    // The collection is not known here: a MATCH can reach several,
+                    // and the index is keyed by field across all of them.
+                    collection: String::new(),
+                    method: "bm25".into(),
+                    field: field.clone(),
+                    declared,
+                });
+            }
+        }
+        Ok(match plan {
             sql::MatchOrAgg::Agg(stmt) => Set::from_hits(self, query::execute_match_agg(self, stmt)),
             sql::MatchOrAgg::AggUnion(stmts) => {
                 Set::from_hits(self, query::execute_match_agg_union(self, stmts))
@@ -7717,7 +7743,7 @@ impl CoreDB {
                 Set::from_hits(self, query::execute_multi_from(self, stmt))
             }
             sql::MatchOrAgg::Steps(steps) => Set::from_steps(self, steps),
-        }
+        })
     }
 
     /// Compile a query once for repeated execution — a **prepared statement**.
@@ -7745,7 +7771,8 @@ impl CoreDB {
         prepared: &sql::PreparedQuery,
         params: &[Value],
     ) -> Result<Set<'_>, SqlError> {
-        Ok(self.run_plan(prepared.lower(params.to_vec())?))
+        let (plan, needs) = prepared.lower(params.to_vec())?;
+        self.run_plan(plan, &needs)
     }
 
     /// Parameterized SELECT / MATCH query.
@@ -7766,7 +7793,8 @@ impl CoreDB {
     /// assert_eq!(hits[0].slug, "users/alice");
     /// ```
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Set<'_>, SqlError> {
-        Ok(self.run_plan(sql::parse_match_or_agg_params(sql, params.to_vec())?))
+        let (plan, needs) = sql::parse_plan(sql, params.to_vec())?;
+        self.run_plan(plan, &needs)
     }
 
     /// `EXPLAIN SELECT ...` — return the query plan as result rows.
