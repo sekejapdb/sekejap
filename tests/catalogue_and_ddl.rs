@@ -193,3 +193,63 @@ fn a_name_that_was_never_anything_is_refused() {
             "[{label}] IF EXISTS must stay quiet");
     }
 }
+
+/// **Dropping a column from one table must not empty another table's index.**
+///
+/// When `ALTER TABLE … DROP COLUMN` removes a column that other collections
+/// still index under the same name, the shared index is rebuilt from the
+/// collections that remain. All three rebuilds — GIN, BM25 and HNSW — walked
+/// `self.collections` for members and `self.nodes` for the record, and both of
+/// those are the overlay. A compaction empties the overlay by moving every row
+/// into the mmap base, so on the default layout the rebuild ran over nothing and
+/// the surviving collection lost every entry: `gin_ilike("body", "%heron%")`
+/// answered 0 where 6 was right.
+///
+/// The resident layout was correct throughout, which is why this went unnoticed
+/// — the bug only exists where a base exists. That makes cross-layout agreement
+/// the test: the two layouts must answer the same, and both must answer 6.
+#[test]
+fn dropping_a_column_leaves_another_collection_s_index_intact() {
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
+        db.execute("CREATE TABLE q (_key TEXT PRIMARY KEY, body TEXT)").unwrap();
+        for i in 0..6 {
+            for coll in ["p", "q"] {
+                db.put(&format!("{coll}/{coll}{i}"), &json!({
+                    "_collection": coll, "_key": format!("{coll}{i}"),
+                    "body": "a heron by the water",
+                }).to_string()).unwrap();
+            }
+        }
+        db.execute("CREATE INDEX ON p USING gin (body)").unwrap();
+        db.execute("CREATE INDEX ON q USING gin (body)").unwrap();
+        db.execute("CREATE INDEX ON p USING bm25 (body)").unwrap();
+        db.execute("CREATE INDEX ON q USING bm25 (body)").unwrap();
+        // The step that decides this: every row moves out of the overlay.
+        db.compact().unwrap();
+
+        assert_eq!(db.gin_ilike("body", "%heron%", None).len(), 12,
+            "[{label}] the fixture itself is wrong — both collections should be indexed");
+
+        db.execute("ALTER TABLE p DROP COLUMN body").unwrap();
+
+        assert_eq!(db.gin_ilike("body", "%heron%", None).len(), 6,
+            "[{label}] the GIN index over `q` was rebuilt from the overlay, so it \
+             lost every row that had already been compacted into the base");
+        assert_eq!(db.bm25_search("body", "heron", 20).len(), 6,
+            "[{label}] the BM25 index over `q` lost its rows the same way");
+
+        // And the query surface agrees, in both directions.
+        assert_eq!(db.query("SELECT _key FROM q WHERE body ILIKE '%heron%'")
+                       .unwrap().collect().len(), 6,
+            "[{label}] `q` lost rows from ILIKE");
+        assert_eq!(db.query("SELECT _key FROM q WHERE BM25(body, 'heron') > 0")
+                       .unwrap().collect().len(), 6,
+            "[{label}] `q` lost rows from BM25");
+        assert_eq!(db.query("SELECT _key FROM p WHERE body ILIKE '%heron%'")
+                       .unwrap().collect().len(), 0,
+            "[{label}] `p` no longer has the column and must match nothing");
+    }
+}
