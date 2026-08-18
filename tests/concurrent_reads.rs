@@ -77,6 +77,7 @@ fn run(snapshot_reads: bool) {
     let stop = Arc::new(AtomicBool::new(false));
     let bad = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let reads = Arc::new(AtomicUsize::new(0));
+    let compactions = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::new();
     for _ in 0..4 {
@@ -125,6 +126,21 @@ fn run(snapshot_reads: bool) {
         }));
     }
 
+    // …and a compactor, which is the dangerous one. Compaction rewrites the
+    // durable half and swaps it in while readers are holding the old one. If a
+    // reader can be handed a base that is being replaced underneath it, this is
+    // where it shows: as a torn row, a vanished row, or a panic in a reader
+    // thread.
+    {
+        let (e, stop, compactions) = (engine.clone(), stop.clone(), compactions.clone());
+        handles.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if e.compact().is_ok() { compactions.fetch_add(1, Ordering::Relaxed); }
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+        }));
+    }
+
     std::thread::sleep(std::time::Duration::from_millis(1_500));
     stop.store(true, Ordering::Relaxed);
     for h in handles {
@@ -135,6 +151,9 @@ fn run(snapshot_reads: bool) {
     assert!(failures.is_empty(),
             "snapshot_reads={snapshot_reads}: {} incoherent read(s), first: {}",
             failures.len(), failures[0]);
+    assert!(compactions.load(Ordering::Relaxed) > 0,
+            "snapshot_reads={snapshot_reads}: no compaction completed during the run, \
+             so nothing was read while the base was being replaced");
     assert!(reads.load(Ordering::Relaxed) > 100,
             "snapshot_reads={snapshot_reads}: only {} reads completed — the readers \
              were starved or blocked, so this proved nothing",
