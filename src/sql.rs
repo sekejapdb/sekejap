@@ -168,6 +168,12 @@ pub enum SqlError {
     /// A schema qualifier other than `public` was used on a table name. sekejap
     /// has a single implicit namespace exposed as `public` (Postgres' default).
     UndefinedSchema(String),
+    /// `SELECT … FROM <name>` where no such collection exists — no declared
+    /// schema and no stored row belongs to it.
+    ///
+    /// It used to return no rows, so a mistyped table name was indistinguishable
+    /// from an empty one. PostgreSQL raises `relation "x" does not exist`.
+    UndefinedTable(String),
 }
 
 impl fmt::Display for SqlError {
@@ -187,12 +193,21 @@ impl fmt::Display for SqlError {
             ),
             SqlError::InvalidValue(s) => write!(f, "invalid value: {s}"),
             SqlError::UndefinedSchema(s) => write!(f, "schema \"{s}\" does not exist"),
+            SqlError::UndefinedTable(t) => write!(
+                f,
+                "relation \"{t}\" does not exist.\n  Hint: SHOW TABLES lists the \
+                 collections this database holds"
+            ),
             SqlError::IndexNotBuilt { collection, method, field, declared } => {
                 // A search index covers the collection rather than one field, so
                 // naming a field it does not have would send the reader looking
                 // for the wrong thing.
                 let target = match (collection.is_empty(), field.is_empty()) {
-                    (true, _) => format!("field {field}"),
+                    // Neither is known: `SEARCH_SCORE` resolves against whichever
+                    // index holds the document, so the requirement is that one
+                    // exists at all rather than that a named table has one.
+                    (true, true) => "this database".to_string(),
+                    (true, false) => format!("field {field}"),
                     (false, true) => collection.clone(),
                     (false, false) => format!("{collection}.{field}"),
                 };
@@ -1336,10 +1351,40 @@ fn max_nesting(tokens: &[Tok]) -> usize {
     max
 }
 
+/// What a parsed statement needs from the indexes before it can be answered.
+///
+/// Collected while parsing rather than by walking the finished plan: the plan has
+/// five shapes and these calls nest differently in each, so a walk that missed one
+/// would restore the silent wrong answer for exactly the shape it missed.
+pub(crate) struct PlanNeeds {
+    /// Collections a plain `SELECT` reads, which must exist.
+    pub(crate) from_tables: Vec<String>,
+    /// `SEARCH_SCORE(...)` appears, so some search index must exist.
+    pub(crate) search_index: bool,
+    /// Fields each `BM25(field, …)` scores against.
+    pub(crate) bm25_fields: Vec<String>,
+}
+
 struct Parser {
     tokens: Vec<Tok>,
     pos: usize,
     params: Vec<Value>,
+    /// Collections a plain `SELECT ... FROM <name>` reads.
+    ///
+    /// A name that no collection has silently produced no rows, so a typo in a
+    /// table name was reported as an empty table. PostgreSQL raises `relation
+    /// "x" does not exist`, and this is not a graph question — see the rule that
+    /// non-graph query semantics follow PostgreSQL.
+    from_tables: Vec<String>,
+    /// Set when the statement contains `SEARCH_SCORE(...)`, which reads the
+    /// positional search index and scores every row 0.0 without one — an
+    /// `ORDER BY` over it then returns the rows in whatever order they were
+    /// already in, with nothing to say the ranking never happened.
+    ///
+    /// A flag rather than a collection name because the score is resolved against
+    /// whichever search index holds the document, not the one on the `FROM`
+    /// collection, so "any index at all" is the honest requirement.
+    needs_search_index: bool,
     /// Fields a `BM25(...)` in this statement needs an index for, recorded as the
     /// call is parsed.
     ///
@@ -1353,11 +1398,20 @@ struct Parser {
 
 impl Parser {
     fn new(tokens: Vec<Tok>) -> Self {
-        Self { tokens, pos: 0, params: vec![], bm25_needs: Vec::new() }
+        Self { tokens, pos: 0, params: vec![], from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
     }
 
     fn with_params(tokens: Vec<Tok>, params: Vec<Value>) -> Self {
-        Self { tokens, pos: 0, params, bm25_needs: Vec::new() }
+        Self { tokens, pos: 0, params, from_tables: Vec::new(), needs_search_index: false, bm25_needs: Vec::new() }
+    }
+
+    /// The index requirements gathered while parsing.
+    fn needs(self) -> PlanNeeds {
+        PlanNeeds {
+            from_tables: self.from_tables,
+            search_index: self.needs_search_index,
+            bm25_fields: self.bm25_needs,
+        }
     }
 
     fn peek(&self) -> &Tok {
@@ -2377,8 +2431,10 @@ impl Parser {
                     if !name.eq_ignore_ascii_case("public") {
                         return Err(SqlError::UndefinedSchema(name));
                     }
+                    self.from_tables.push(table.clone());
                     return Ok(Source::Collection(table));
                 }
+                self.from_tables.push(name.clone());
                 Ok(Source::Collection(name))
             }
             Tok::Eof => Err(SqlError::UnexpectedEnd {
@@ -3105,6 +3161,7 @@ impl Parser {
                         self.expect_lparen()?;
                         let query = self.expect_str()?;
                         self.expect_rparen()?;
+                        self.needs_search_index = true;
                         Ok(ScoreExpr::SearchScore { query })
                     }
                     "VECTOR_COSINE" => {
@@ -4729,15 +4786,10 @@ impl Parser {
                     let value = self.parse_value()?;
                     let key_val = value.as_str().unwrap_or("").to_string();
                     if binding == start_bind && field == "_key" {
-                        from_slug = Some(match &start_col {
-                            Some(col) => format!("{}/{}", col, key_val),
-                            None      => key_val,
-                        });
+                        from_slug =
+                            Some(shortest_slug(start_col.as_ref(), &key_val, &start_bind)?);
                     } else if binding == end_bind && field == "_key" {
-                        to_slug = Some(match &end_col {
-                            Some(col) => format!("{}/{}", col, key_val),
-                            None      => key_val,
-                        });
+                        to_slug = Some(shortest_slug(end_col.as_ref(), &key_val, &end_bind)?);
                     }
                     // Other conditions (e.g. _collection) are parsed but not acted on
                 }
@@ -4862,15 +4914,13 @@ impl Parser {
                             let value = self.parse_value()?;
                             let key_val = value.as_str().unwrap_or("").to_string();
                             if binding == start_bind && field == "_key" {
-                                from_slug = Some(match &start_col {
-                                    Some(col) => format!("{}/{}", col, key_val),
-                                    None      => key_val,
-                                });
+                                from_slug = Some(
+                                    shortest_slug(start_col.as_ref(), &key_val, &start_bind)?,
+                                );
                             } else if binding == end_bind && field == "_key" {
-                                to_slug = Some(match &end_col {
-                                    Some(col) => format!("{}/{}", col, key_val),
-                                    None      => key_val,
-                                });
+                                to_slug = Some(
+                                    shortest_slug(end_col.as_ref(), &key_val, &end_bind)?,
+                                );
                             }
                             if matches!(self.peek(), Tok::Kw(Kw::And)) {
                                 // Check if next is another _key condition (not a predicate)
@@ -6003,6 +6053,37 @@ impl Parser {
 // ── Compiler ──────────────────────────────────────────────────────────────────
 
 /// Convert a single CondExpr to a Step.
+/// Resolve a `_key` comparison in a `SHORTEST` pattern to the slug it names.
+///
+/// The two pattern forms identify a node differently, which is forced rather
+/// than chosen: `(a:p)` supplies the collection, so `_key` is the bare key and
+/// the slug is built from both; a bare `(a)` has no collection to build with, so
+/// the caller must give the whole slug.
+///
+/// Mixing them up produced silence. `(a)` with `'n0'` cannot match anything —
+/// every slug contains a `/`, so no node is ever named `n0` — and the query
+/// returned no rows as though the path did not exist. That is a statement about
+/// the graph in answer to a question the graph was never asked, and it is
+/// refusable without risk: the form is impossible, not merely unusual.
+///
+/// The mirror case, `(a:p)` with `'p/n0'`, builds `p/p/n0`. A key containing a
+/// slash is legal, so that one *could* be someone's actual node and is left
+/// alone.
+fn shortest_slug(collection: Option<&String>, key_val: &str, binding: &str)
+    -> Result<String, SqlError>
+{
+    match collection {
+        Some(col) => Ok(format!("{col}/{key_val}")),
+        None if key_val.contains('/') => Ok(key_val.to_string()),
+        None => Err(SqlError::InvalidValue(format!(
+            "`{binding}._key = '{key_val}'` cannot match any node: the pattern gives \
+             `{binding}` no collection, so `_key` has to be a full slug like \
+             'collection/{key_val}'. Either write it that way, or label the pattern \
+             — `({binding}:collection)` — and keep the bare key."
+        ))),
+    }
+}
+
 fn compile_cond(cond: CondExpr) -> Step {
     match cond {
         CondExpr::Compare { field, op, value } => match op {
@@ -6446,7 +6527,7 @@ pub enum MatchOrAgg {
 fn parse_match_or_agg_inner(
     sql: &str,
     params: Vec<Value>,
-) -> Result<(MatchOrAgg, Vec<String>), SqlError> {
+) -> Result<(MatchOrAgg, PlanNeeds), SqlError> {
     let tokens = tokenize(sql)?;
     // Bound parser recursion by rejecting pathologically-nested input up front.
     if max_nesting(&tokens) > MAX_NEST_DEPTH {
@@ -6477,7 +6558,7 @@ impl PreparedQuery {
     }
 
     /// Lower the cached tokens into a plan, binding the given parameters.
-    pub(crate) fn lower(&self, params: Vec<Value>) -> Result<(MatchOrAgg, Vec<String>), SqlError> {
+    pub(crate) fn lower(&self, params: Vec<Value>) -> Result<(MatchOrAgg, PlanNeeds), SqlError> {
         lower_tokens(self.tokens.clone(), params)
     }
 }
@@ -6490,12 +6571,12 @@ impl PreparedQuery {
 fn lower_tokens(
     tokens: Vec<Tok>,
     params: Vec<Value>,
-) -> Result<(MatchOrAgg, Vec<String>), SqlError> {
+) -> Result<(MatchOrAgg, PlanNeeds), SqlError> {
     // Multi-FROM: SELECT … FROM source1, source2, … (comma between FROM sources)
     if is_multi_from(&tokens) {
         let mut parser = Parser::with_params(tokens, params);
         let stmt = parser.parse_select_multi_from()?;
-        return Ok((MatchOrAgg::MultiFrom(stmt), parser.bm25_needs));
+        return Ok((MatchOrAgg::MultiFrom(stmt), parser.needs()));
     }
 
     // SELECT … FROM MATCH [SHORTEST] — check before regular SELECT routing.
@@ -6503,7 +6584,7 @@ fn lower_tokens(
         if is_select_from_match_shortest(&tokens) {
             let mut parser = Parser::with_params(tokens, params);
             let stmt = parser.parse_select_from_match_shortest()?;
-            return Ok((MatchOrAgg::Shortest(stmt), parser.bm25_needs));
+            return Ok((MatchOrAgg::Shortest(stmt), parser.needs()));
         }
         let mut parser = Parser::with_params(tokens, params);
         let first = parser.parse_select_from_match()?;
@@ -6513,9 +6594,9 @@ fn lower_tokens(
                 parser.advance();
                 stmts.push(parser.parse_select_from_match()?);
             }
-            return Ok((MatchOrAgg::AggUnion(stmts), parser.bm25_needs));
+            return Ok((MatchOrAgg::AggUnion(stmts), parser.needs()));
         }
-        return Ok((MatchOrAgg::Agg(first), parser.bm25_needs));
+        return Ok((MatchOrAgg::Agg(first), parser.needs()));
     }
 
     // Bare `MATCH ...` (Cypher-style `MATCH ... RETURN` / `MATCH ... WITH`) is no
@@ -6560,7 +6641,7 @@ fn lower_tokens(
                           ignoring it would answer a different question", parser.peek()),
         });
     }
-    Ok((MatchOrAgg::Steps(compile(stmt)), parser.bm25_needs))
+    Ok((MatchOrAgg::Steps(compile(stmt)), parser.needs()))
 }
 
 /// Parse a MATCH statement and determine whether it is a simple graph query
@@ -6579,7 +6660,7 @@ pub fn parse_match_or_agg(sql: &str) -> Result<MatchOrAgg, SqlError> {
 pub(crate) fn parse_plan(
     sql: &str,
     params: Vec<Value>,
-) -> Result<(MatchOrAgg, Vec<String>), SqlError> {
+) -> Result<(MatchOrAgg, PlanNeeds), SqlError> {
     parse_match_or_agg_inner(sql, params)
 }
 

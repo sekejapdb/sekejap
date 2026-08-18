@@ -8214,18 +8214,14 @@ fn build_shortest_path_row(
     // Diagnose missing endpoints before running BFS.
     // Common cause: no collection type in pattern e.g. (a)-[r*]->(b) instead of (a:col)-[r*]->(b:col)
     // so the slug is built as "key" instead of "collection/key".
+    // Missing endpoints are reported by `CoreDB::run_plan` before execution, as an
+    // error naming the node. They used to be written to stderr from here — on a
+    // query path, once per query — which put the one useful fact in the one place
+    // the caller could not read it, and returned "no path" instead.
     if db.node_data(start).is_none() {
-        eprintln!(
-            "MATCH SHORTEST: start node '{}' not found — did you specify the collection? e.g. ({}:collection)",
-            stmt.from_slug, stmt.start_bind
-        );
         return None;
     }
     if db.node_data(end).is_none() {
-        eprintln!(
-            "MATCH SHORTEST: end node '{}' not found — did you specify the collection? e.g. ({}:collection)",
-            stmt.to_slug, stmt.end_bind
-        );
         return None;
     }
 
@@ -8375,14 +8371,8 @@ fn try_fast_shortest(db: &CoreDB, stmt: &ShortestSelectStmt) -> Option<Vec<Hit>>
     let len = match db.bfs_shortest_len(start, end) {
         Some(l) => l,
         None => {
-            // Diagnose a genuinely-missing endpoint (cold path only).
-            if db.node_data(start).is_none() {
-                eprintln!("MATCH SHORTEST: start node '{}' not found — did you specify the collection? e.g. ({}:collection)",
-                    stmt.from_slug, stmt.start_bind);
-            } else if db.node_data(end).is_none() {
-                eprintln!("MATCH SHORTEST: end node '{}' not found — did you specify the collection? e.g. ({}:collection)",
-                    stmt.to_slug, stmt.end_bind);
-            }
+            // A missing endpoint has already been refused by `run_plan`, so
+            // reaching here means both nodes exist and there is simply no path.
             return Some(vec![]); // handled: no path → no rows
         }
     };

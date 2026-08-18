@@ -889,16 +889,20 @@ fn ddl_and_edge_slugs_reach_the_durable_store() {
             db.execute("ALTER TABLE p RENAME TO q").unwrap();
             assert_eq!(db.query("SELECT _key FROM q").unwrap().collect().len(), 25,
                        "[{label}] the renamed table did not bring its rows");
-            assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 0,
-                       "[{label}] rows are still under the old name");
+            // The old name stops naming anything, which is an error rather than
+            // an empty table — the same answer PostgreSQL gives after a rename.
+            assert!(matches!(db.query("SELECT _key FROM p"),
+                             Err(sekejap::SqlError::UndefinedTable(_))),
+                    "[{label}] the old name still resolves after the rename");
         }
 
         // DROP TABLE must actually drop.
         {
             let (mut db, _d) = fresh();
             db.execute("DROP TABLE p").unwrap();
-            assert_eq!(db.query("SELECT _key FROM p").unwrap().collect().len(), 0,
-                       "[{label}] DROP TABLE left every row queryable");
+            assert!(matches!(db.query("SELECT _key FROM p"),
+                             Err(sekejap::SqlError::UndefinedTable(_))),
+                    "[{label}] DROP TABLE left the name resolving");
             assert!(db.get("p/n7").is_none(), "[{label}] a dropped row is still readable");
         }
     }

@@ -4014,9 +4014,17 @@ fn alter_table_rename_table() {
     let count = db.execute("ALTER TABLE bands RENAME TO artists").unwrap();
     assert_eq!(count, 2); // two nodes reclassified
 
-    // Old collection query returns nothing
-    let old_hits = db.query("SELECT * FROM bands").unwrap().collect();
-    assert_eq!(old_hits.len(), 0);
+    // The old name no longer names anything, which is an error rather than an
+    // empty table — `ALTER TABLE … RENAME TO` leaves nothing behind, and
+    // PostgreSQL answers `relation "bands" does not exist` here too. Asserting
+    // "0 rows" could not tell a completed rename from a rename that quietly did
+    // nothing and left the rows unreachable under both names.
+    match db.query("SELECT * FROM bands") {
+        Err(sekejap::SqlError::UndefinedTable(name)) => assert_eq!(name, "bands"),
+        Err(other) => panic!("wrong error for the renamed-away table: {other:?}"),
+        Ok(set) => panic!("`bands` still answers with {} row(s) after the rename",
+                          set.collect().len()),
+    }
 
     // New collection query returns both nodes
     let new_hits = db.query("SELECT * FROM artists").unwrap().collect();
@@ -6238,6 +6246,12 @@ fn sql_begin_commit_inserts() {
 #[test]
 fn sql_begin_rollback_discards() {
     let mut db = CoreDB::new();
+    // Declared up front so the assertion below is about the rows the rollback
+    // discarded. Without it the table is created by the insert, the rollback
+    // takes the table with the rows, and `SELECT … FROM users` is then a query
+    // against a name that does not exist — which is now an error, and would have
+    // let this test pass without the rollback having discarded anything.
+    db.execute("CREATE TABLE users (_key TEXT, name TEXT)").unwrap();
     db.execute("BEGIN").unwrap();
     db.execute("INSERT INTO users (_key, name) VALUES ('alice', 'Alice')").unwrap();
     db.execute("ROLLBACK").unwrap();
