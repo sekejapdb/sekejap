@@ -1252,7 +1252,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    837  mod damaged_free_list_tests
 ```
 
-### `recordstore.rs` · 740L — Why
+### `recordstore.rs` · 817L — Why
 
 ```
     69  pub(crate) struct RecordId(pub u64)
@@ -1283,6 +1283,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    408    pub(crate) fn read(&self, id: RecordId) -> io::Result<Option<Vec<u8>>>
    432    pub(crate) fn delete(&mut self, id: RecordId) -> io::Result<bool>
    470  mod tests
+   743  mod address_uniqueness_tests
 ```
 
 ### `skbin.rs` · 610L — SKBIN — a compact binary format for record payloads
@@ -1665,4 +1666,4 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
    254  mod tests
 ```
 
-<!-- 49 files, 1393 items -->
+<!-- 49 files, 1394 items -->

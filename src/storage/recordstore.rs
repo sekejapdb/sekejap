@@ -738,3 +738,80 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod address_uniqueness_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// **No two live records may share an address, through any sequence of work.**
+    ///
+    /// The free-list cycle found on 2026-08-19 was exactly this failure: `alloc`
+    /// handed the same page out twice, so two records owned the same bytes and
+    /// each write destroyed the other. Nothing failed — no panic, no error, no
+    /// short read — which is why every fuzzer and every corruption sweep missed
+    /// it. They all watch for something going wrong.
+    ///
+    /// This watches the invariant instead. A record id is a physical address, so
+    /// two live records holding the same id is the defect itself, whatever caused
+    /// it. Churned deliberately — sizes that cross the page boundary, deletes
+    /// interleaved with inserts, and reuse of freed space — because it is reuse
+    /// that gets addresses wrong.
+    #[test]
+    fn no_two_live_records_ever_share_an_address() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("records.bin");
+        let mut s = RecordStore::create(&path, crate::storage::pagestore::DEFAULT_PAGE_SIZE).unwrap();
+
+        // Deterministic churn: insert, delete some, insert more, in sizes that
+        // straddle the page limit so pages empty and are reused.
+        let mut rng: u64 = 0x5EED_1234;
+        let mut next = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+        let mut live: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut inserted = 0usize;
+        let mut deleted = 0usize;
+
+        for round in 0..40 {
+            for _ in 0..25 {
+                let len = 8 + (next() % 900) as usize;
+                let fill = (next() % 251) as u8;
+                let bytes = vec![fill; len];
+                let id = s.insert(&bytes).unwrap();
+                inserted += 1;
+                assert!(live.insert(id.0, bytes).is_none(),
+                    "record id {} was handed out while still live — two records now \
+                     own the same address (round {round})", id.0);
+            }
+            // Free about a third of what is live, so space comes back for reuse.
+            let doomed: Vec<u64> = live.keys().copied()
+                .filter(|_| next() % 3 == 0).collect();
+            for id in doomed {
+                assert!(s.delete(RecordId(id)).unwrap(), "deleting {id} reported nothing");
+                live.remove(&id);
+                deleted += 1;
+            }
+            // Every survivor must still read back exactly, which is what an
+            // address collision destroys.
+            for (id, want) in &live {
+                let got = s.read(RecordId(*id)).unwrap();
+                assert_eq!(got.as_deref(), Some(want.as_slice()),
+                    "record {id} changed under it (round {round}) — the usual cause \
+                     is another record having been given the same address");
+            }
+        }
+
+        // The guard that matters is not how many records survived — it is whether
+        // freed space was handed out again, because reuse is what gets an address
+        // wrong. If the store had simply appended, its pages would scale with
+        // every insert ever made rather than with what is live.
+        let (pages, _) = (s.page_count(), 0);
+        assert!(deleted > 150 && inserted > 800,
+            "the churn did too little to exercise reuse: {inserted} inserts, \
+             {deleted} deletes");
+        let appended_worst_case = inserted as u64 / 4; // ~4 records per page at these sizes
+        assert!(pages < appended_worst_case,
+            "the store holds {pages} pages after {inserted} inserts and {deleted} \
+             deletes, which is what never reusing freed space would cost — so this \
+             test never exercised the reuse path where addresses collide");
+    }
+}
