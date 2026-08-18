@@ -167,3 +167,65 @@ fn stats_describes_the_layout_it_is_actually_in() {
         }
     }
 }
+
+/// **A rolled-back transaction leaves nothing behind, including after a restart.**
+///
+/// `ROLLBACK` discards the buffered statements without ever executing them, so
+/// there is nothing to undo — a clean design that cannot leak by construction.
+/// What was never checked is the part that would make a leak permanent: the same
+/// thing after closing and reopening, in the layout that writes in place.
+///
+/// The existing rollback tests are all in-memory or resident. A write that
+/// escaped a rollback into a paged base would be unrecoverable, and would look
+/// like a row appearing from nowhere on the next open.
+#[test]
+fn a_rolled_back_transaction_survives_nothing() {
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+            db.execute("CREATE TABLE t (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+            db.execute("INSERT INTO t (_key, n) VALUES ('keep', 1)").unwrap();
+            db.compact().unwrap();
+
+            db.execute("BEGIN").unwrap();
+            for i in 0..20 {
+                db.execute(&format!("INSERT INTO t (_key, n) VALUES ('gone{i}', {i})")).unwrap();
+            }
+            db.execute("DELETE FROM t WHERE n = 1").unwrap();
+            db.execute("ROLLBACK").unwrap();
+
+            assert_eq!(db.query("SELECT _key FROM t").unwrap().collect().len(), 1,
+                "[{label}] a rolled-back transaction changed the live database");
+            assert!(db.get("t/keep").is_some(),
+                "[{label}] a rolled-back DELETE removed a row");
+        }
+        // The part that matters: none of it reached disk either.
+        let db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+        assert_eq!(db.query("SELECT _key FROM t").unwrap().collect().len(), 1,
+            "[{label}] rolled-back rows appeared after a restart");
+        assert!(db.get("t/keep").is_some(),
+            "[{label}] a rolled-back DELETE took effect across a restart");
+    }
+}
+
+/// And the other half: a committed transaction survives a restart in full. A
+/// rollback test that passes because *nothing* is being persisted proves nothing.
+#[test]
+fn a_committed_transaction_survives_a_restart() {
+    for (label, cfg) in modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+            db.execute("CREATE TABLE t (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+            db.execute("BEGIN").unwrap();
+            for i in 0..20 {
+                db.execute(&format!("INSERT INTO t (_key, n) VALUES ('n{i}', {i})")).unwrap();
+            }
+            db.execute("COMMIT").unwrap();
+        }
+        let db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        assert_eq!(db.query("SELECT _key FROM t").unwrap().collect().len(), 20,
+            "[{label}] a committed transaction did not survive a restart");
+    }
+}
