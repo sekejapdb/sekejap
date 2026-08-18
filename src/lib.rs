@@ -10375,6 +10375,14 @@ impl CoreDB {
     /// * `field` - The field name to search
     /// * `pattern` - ILIKE pattern (e.g., "%Alpha%")
     /// * `limit` - Maximum results (None for all)
+    ///
+    /// **Candidates, not an answer.** These are the documents the trigram index
+    /// thinks *could* match, and they may include ones that do not: trigrams are
+    /// keyed by a 32-bit hash, so distinct trigrams can collide, and an interior
+    /// pattern is not space-padded, so a document can hold every trigram of a
+    /// pattern without containing the pattern. `WHERE … ILIKE …` re-checks each
+    /// candidate with a real substring match; a caller using this directly has to
+    /// do the same, or accept extra rows.
     pub fn gin_ilike(&self, field: &str, pattern: &str, limit: Option<usize>) -> Vec<u64> {
         // Belt-and-suspenders: filter out hashes whose nodes were deleted after
         // the GIN index was last built.  Mirrors the same guard in bm25_search().

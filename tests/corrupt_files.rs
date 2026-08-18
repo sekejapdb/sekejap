@@ -49,6 +49,12 @@ fn build(dir: &std::path::Path) {
     for i in 0..39 {
         db.link(&format!("p/n{i}"), &format!("p/n{}", i + 1), "next");
     }
+    // Text and vector indexes too, so their files are in the directory listing
+    // below: `bm25.bin` panicked at open from one flipped byte, and the GIN reader
+    // sized allocations from a length the file was free to invent.
+    db.execute("CREATE INDEX ON p USING gin (body)").unwrap();
+    db.execute("CREATE INDEX ON p USING bm25 (body)").unwrap();
+    db.execute("CREATE INDEX ON p USING search (body)").unwrap();
     db.build_spatial_index();
     db.compact().unwrap();
 }
@@ -62,6 +68,10 @@ fn interrogate(db: &CoreDB) -> usize {
     n += db.query("SELECT COUNT(*) FROM p").map(|s| s.collect().len()).unwrap_or(0);
     n += db.query("SELECT b._key FROM MATCH (a:p)-[:next]->(b:p)").map(|s| s.collect().len()).unwrap_or(0);
     n += db.query("SELECT _key FROM p WHERE body ILIKE '%riverbank%'").map(|s| s.collect().len()).unwrap_or(0);
+    n += db.query("SELECT _key FROM p WHERE BM25(body,'riverbank') > 0").map(|s| s.collect().len()).unwrap_or(0);
+    n += db.query("SELECT _key FROM p WHERE SEARCH('riverbank')").map(|s| s.collect().len()).unwrap_or(0);
+    n += db.gin_ilike("body", "%riverbank%", None).len();
+    n += db.bm25_search("body", "riverbank", 50).len();
     n += db.query("SELECT _key FROM p WHERE ST_DWithin(geometry, POINT(144.96 -37.81), 5000)")
             .map(|s| s.collect().len()).unwrap_or(0);
     n += db.one("p/n0").forward("next").collect().len();
