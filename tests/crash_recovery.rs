@@ -544,6 +544,18 @@ fn a_read_only_database_refuses_writes() {
                 "UPDATE was accepted on a read-only database");
         assert!(ro.compact().is_err(), "compact was accepted on a read-only database");
 
+        // The attributed-edge writers, which the first sweep of guards missed.
+        // They are a separate family — `link_meta`, `link_attr` and `update_edge`
+        // carry edge attributes and do not share a chokepoint with `link` — and
+        // every one of them wrote through: the graph went from 0 edges to 2 on a
+        // handle that is not allowed to write, and `update_edge` returned the
+        // number it claimed to have changed.
+        assert!(ro.link_meta("p/a", "p/a", "t", r#"{"w":1}"#).is_err(),
+                "link_meta was accepted on a read-only database");
+        ro.link_attr("p/a", "p/a", "t2", vec![("w".to_string(), serde_json::json!(1))]);
+        assert_eq!(ro.update_edge("p/a", "p/a", "t", "{}", r#"{"w":9}"#), 0,
+                   "update_edge reported changing edges on a read-only database");
+
         // The ones whose signature cannot return an error do nothing and record it.
         ro.remove("p/a");
         ro.link("p/a", "p/a", "another");
@@ -554,7 +566,7 @@ fn a_read_only_database_refuses_writes() {
         assert_eq!(ro.query("SELECT _key FROM p").unwrap().collect().len(), 1,
                    "a refused write still changed what this handle reports");
         assert_eq!(ro.edges_from("p/a").len(), 1,
-                   "a refused link/unlink still changed the graph");
+                   "a refused link/unlink/link_meta/link_attr still changed the graph");
     }
 
     // Nothing reached the disk.
