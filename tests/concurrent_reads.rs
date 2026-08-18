@@ -183,3 +183,82 @@ fn readers_never_see_a_half_written_row_under_a_snapshot() {
 fn readers_never_see_a_half_written_row_under_the_lock() {
     run(false);
 }
+
+/// **Under many writers, a write the engine accepted is a write that is stored.**
+///
+/// The write buffer is shared: several threads push into one `Mutex<Vec<String>>`
+/// and any of them may cross the threshold and flush the whole batch, including
+/// statements other threads put there. That makes it the place where a lost write
+/// would be hardest to notice — the thread that loses it is not the thread that
+/// flushed it.
+///
+/// The buffer also gained a repair on 2026-08-18: a batch that fails part-way
+/// returns its unapplied statements to the front of the buffer. That interacts
+/// with concurrency directly, because other threads are pushing while a flush is
+/// draining, so it is checked here under load rather than only in isolation.
+///
+/// The count is the whole assertion. Every statement is an insert of a distinct
+/// key, so the number of rows at the end must equal the number of `Ok`s the
+/// engine handed out — no more (nothing applied twice) and no fewer (nothing
+/// dropped).
+#[test]
+fn no_accepted_write_is_lost_when_many_threads_write_at_once() {
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 60;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut db = CoreDB::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, t INTEGER, i INTEGER)").unwrap();
+    }
+    let eng = Arc::new(
+        Engine::builder(dir.path().to_str().unwrap())
+            // Small enough that threshold flushes happen mid-run, which is the
+            // interleaving that matters: one thread flushing another's writes.
+            .buffer_size(16)
+            .build()
+            .unwrap(),
+    );
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let eng = Arc::clone(&eng);
+        let accepted = Arc::clone(&accepted);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..PER_THREAD {
+                let sql = format!(
+                    "INSERT INTO p (_key, t, i) VALUES ('t{t}i{i}', {t}, {i})"
+                );
+                match eng.execute(&sql) {
+                    Ok(_) => { accepted.fetch_add(1, Ordering::Relaxed); }
+                    Err(e) => panic!("thread {t} write {i} refused: {e}"),
+                }
+            }
+        }));
+    }
+    for h in handles { h.join().unwrap(); }
+    eng.flush().expect("the final flush must apply what is left");
+
+    let accepted = accepted.load(Ordering::Relaxed);
+    assert_eq!(accepted, THREADS * PER_THREAD, "some writes were refused outright");
+
+    let rows = eng.query("SELECT _key FROM p").unwrap().len();
+    assert_eq!(rows, accepted,
+        "{accepted} writes were accepted and {rows} are stored — \
+         {} went missing between the two",
+        accepted as i64 - rows as i64);
+
+    // And every one of them individually, so a count that happens to match by
+    // losing one row and duplicating another cannot pass.
+    for t in 0..THREADS {
+        for i in 0..PER_THREAD {
+            let slug = format!("t{t}i{i}");
+            let found = eng
+                .query(&format!("SELECT _key FROM p WHERE _key = '{slug}'"))
+                .unwrap()
+                .len();
+            assert_eq!(found, 1, "`p/{slug}` was accepted and is stored {found} times");
+        }
+    }
+}
