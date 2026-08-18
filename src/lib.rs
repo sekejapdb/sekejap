@@ -3335,8 +3335,9 @@ impl CoreDB {
         match op {
             // ── ADD COLUMN ────────────────────────────────────────────────────
             AlterTableOp::AddColumn { def } => {
+                let known = self.collection_is_known(collection);
                 let schema = self.schemas.get_mut(collection).ok_or_else(|| {
-                    sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                    Self::no_declaration_error(collection, known)
                 })?;
                 if schema.fields.iter().any(|f| f.name == def.name) {
                     return Err(sql::SqlError::InvalidValue(format!(
@@ -3350,9 +3351,10 @@ impl CoreDB {
 
             // ── DROP COLUMN ───────────────────────────────────────────────────
             AlterTableOp::DropColumn { name, if_exists } => {
+                let known = self.collection_is_known(collection);
                 let (had_fulltext, had_bm25, had_hnsw) = {
                     let schema = self.schemas.get_mut(collection).ok_or_else(|| {
-                        sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                        Self::no_declaration_error(collection, known)
                     })?;
                     let idx = schema.fields.iter().position(|f| f.name == name);
                     match idx {
@@ -3428,9 +3430,10 @@ impl CoreDB {
 
             // ── RENAME COLUMN ─────────────────────────────────────────────────
             AlterTableOp::RenameColumn { old_name, new_name } => {
+                let known = self.collection_is_known(collection);
                 {
                     let schema = self.schemas.get_mut(collection).ok_or_else(|| {
-                        sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                        Self::no_declaration_error(collection, known)
                     })?;
                     let idx = schema.fields.iter().position(|f| f.name == old_name)
                         .ok_or_else(|| sql::SqlError::InvalidValue(format!(
@@ -3517,11 +3520,18 @@ impl CoreDB {
                         "table '{new_name}' already exists"
                     )));
                 }
-                let mut schema = self.schemas.remove(collection).ok_or_else(|| {
-                    sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
-                })?;
-                schema.collection = new_name.clone();
-                self.schemas.insert(new_name.clone(), schema);
+                if !self.collection_is_known(collection) {
+                    return Err(sql::SqlError::UndefinedTable(collection.to_string()));
+                }
+                // A collection created by `put` alone has no schema, and renaming
+                // it is still meaningful: the rows carry their collection name and
+                // the rename reclassifies them. Requiring a declaration here meant
+                // an undeclared collection could never be renamed, with an error
+                // saying it did not exist while `SELECT` from it returned rows.
+                if let Some(mut schema) = self.schemas.remove(collection) {
+                    schema.collection = new_name.clone();
+                    self.schemas.insert(new_name.clone(), schema);
+                }
 
                 // Move collection bucket to new hash
                 let old_hash = sk_hash(collection);
@@ -3597,9 +3607,10 @@ impl CoreDB {
             // If a btree index exists for this field it is rebuilt from scratch
             // so FieldKey variants match the new type (mirrors PostgreSQL REINDEX).
             AlterTableOp::AlterColumnType { name, ty } => {
+                let known = self.collection_is_known(collection);
                 let has_btree = {
                     let schema = self.schemas.get_mut(collection).ok_or_else(|| {
-                        sql::SqlError::InvalidValue(format!("table '{collection}' does not exist"))
+                        Self::no_declaration_error(collection, known)
                     })?;
                     let field = schema.fields.iter_mut().find(|f| f.name == name)
                         .ok_or_else(|| sql::SqlError::InvalidValue(format!(
@@ -4247,6 +4258,49 @@ impl CoreDB {
             self.rebuild_search_for_collection(&coll);
         }
         self.defer_index_rebuild = false;
+    }
+
+    /// The error for an operation that needs a declared schema and did not find
+    /// one, distinguishing the two ways that happens.
+    ///
+    /// A collection can exist here without ever being declared — `put` creates
+    /// one. Every `ALTER TABLE … COLUMN` used to answer "table 'x' does not
+    /// exist" for such a collection, which the next `SELECT` disproves by
+    /// returning its rows. The operation is unavailable; the table is not absent.
+    fn no_declaration_error(collection: &str, known: bool) -> sql::SqlError {
+        if known {
+            sql::SqlError::InvalidValue(format!(
+                "table '{collection}' has no declared schema, and this operation \
+                 changes the declaration. Its rows are there and can be selected, \
+                 inserted, updated and deleted; declare it with CREATE TABLE \
+                 {collection} (…) to alter its columns."
+            ))
+        } else {
+            sql::SqlError::UndefinedTable(collection.to_string())
+        }
+    }
+
+    /// Is `collection` a name this database knows?
+    ///
+    /// True for a declared schema and for a name that rows have been stored
+    /// under, which are the two ways a collection comes into existence here —
+    /// `put` creates one without any `CREATE TABLE`.
+    ///
+    /// Base-aware, and that is the whole point: the callers that used to ask this
+    /// read `self.collections`, the overlay, which holds only what has been
+    /// written since the last compaction. On a compacted database every row lives
+    /// in the mmap base and the overlay is empty, so `DROP TABLE adhoc` decided
+    /// the collection did not exist and refused — while `SELECT … FROM adhoc`
+    /// answered with its rows. An undeclared collection could not be dropped at
+    /// all.
+    ///
+    /// Deliberately a cheap superset: it answers "known", not "non-empty". A
+    /// collection whose rows have all been deleted still answers yes, and a query
+    /// against it returns no rows, which is the right answer for an empty table.
+    /// What it excludes is a name that was never anything — the typo case.
+    pub(crate) fn collection_is_known(&self, collection: &str) -> bool {
+        self.schemas.contains_key(collection)
+            || self.collection_name(sk_hash(collection)).is_some()
     }
 
     /// Does `collection` have at least one declared `search` index?
@@ -9025,19 +9079,11 @@ impl CoreDB {
                 Ok(n)
             }
             sql::CompiledMutation::DropTable { collection, if_exists } => {
-                let has_schema = self.schemas.contains_key(&collection);
-                let has_nodes  = self.collections
-                    .get(&sk_hash(&collection))
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false);
-
-                if !has_schema && !has_nodes {
+                if !self.collection_is_known(&collection) {
                     if if_exists {
                         return Ok(0);
                     } else {
-                        return Err(sql::SqlError::InvalidValue(
-                            format!("table '{collection}' does not exist")
-                        ));
+                        return Err(sql::SqlError::UndefinedTable(collection.clone()));
                     }
                 }
 
