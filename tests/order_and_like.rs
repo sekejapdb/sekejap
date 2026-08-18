@@ -106,8 +106,19 @@ fn order_by_and_like_follow_postgres() {
         let plan = if indexed { "with an index" } else { "on a scan" };
         for (sql, pg) in ORDERS {
             let got = ordered(&db, sql);
-            let tie_swapped = pg.replace("q,t", "t,q");
-            assert!(got == *pg || got == tie_swapped,
+            // `q` and `t` are the two NULL rows and are interchangeable in every
+            // one of these orderings, so both are folded to the same marker
+            // before comparing. Everything else — where `r` and `p` land, and how
+            // many rows come back — is still checked exactly.
+            //
+            // The previous tolerance swapped the literal text "q,t", which
+            // covered the full listings and not `LIMIT 1`, where only one of the
+            // pair appears. That went unnoticed while the tie order happened to
+            // match; it stopped matching when ties were made deterministic by
+            // node id, and the test then failed for a difference SQL does not
+            // define.
+            let fold = |s: &str| s.replace('q', "N").replace('t', "N");
+            assert_eq!(fold(&got), fold(pg),
                 "`{sql}` {plan} gave [{got}], PostgreSQL gives [{pg}]");
         }
         for (cond, pg) in PATTERNS {

@@ -10953,7 +10953,7 @@ impl CoreDB {
         // `FieldKey::Null` is its lowest key, and a missing field is stored as
         // NULL. `ORDER BY b ASC` therefore led with every row that has no `b`,
         // and the same query without an index led with the smallest value.
-        let result: Vec<u64> = crate::query::iter_kv_sql_order(self, &idx, *asc)
+        let result: Vec<u64> = crate::query::iter_kv_sql_order(&idx, *asc)
             .into_iter()
             .flat_map(|(_, ids)| ids)
             .filter(|h| self.node_data(*h).is_some())

@@ -1004,14 +1004,6 @@ fn contains_pattern(needle: &str) -> String {
 /// It also folds numerically-equal numbers together, for the same reason
 /// `group_key_of` does: `1` and `1.0` are one value, and which one a row holds
 /// depends on how it was written rather than on what it means.
-/// A node's slug, for breaking ties in an order that does not depend on storage.
-///
-/// Reads the node record, not the payload, so it costs no disk read beyond what
-/// the sort already did.
-fn slug_of_hash(db: &CoreDB, h: u64) -> String {
-    db.node_data(h).map(|n| n.slug.clone()).unwrap_or_default()
-}
-
 /// Deduplicate `hits` for `DISTINCT`, keeping a representative that does not
 /// depend on the order rows were scanned in.
 ///
@@ -1541,7 +1533,7 @@ impl<'db> Set<'db> {
             }
             false
         };
-        for (k, ids) in iter_kv_sql_order(self.db, &idx, asc) {
+        for (k, ids) in iter_kv_sql_order(&idx, asc) {
             if emit(&CoreDB::field_key_to_value(&k), &ids) { break; }
         }
         if hits.len() != live_members {
@@ -2827,7 +2819,7 @@ fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>> {
     // under DESC the missing rows are exactly the ones that sort first. It still
     // reads no payloads.
     let mut out: Vec<u64> = Vec::new();
-    for (_, ids) in iter_kv_sql_order(db, &idx, asc) {
+    for (_, ids) in iter_kv_sql_order(&idx, asc) {
         for &h in &ids {
             if db.node_data(h).is_some() {
                 out.push(h);
@@ -3992,7 +3984,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                                 candidates.iter().copied().collect();
                             let mut sorted_result: Vec<u64> =
                                 Vec::with_capacity(candidate_set.len());
-                            for (_, ids) in iter_kv_sql_order(db, &idx, *asc) {
+                            for (_, ids) in iter_kv_sql_order(&idx, *asc) {
                                 for &h in &ids {
                                     if candidate_set.contains(&h) {
                                         sorted_result.push(h);
@@ -4094,8 +4086,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             return if *asc { ord } else { ord.reverse() };
                         }
                     }
-                    // Ties broken by slug, so that rows with equal sort keys come
-                    // back in the same order however they are stored.
+                    // Ties broken by node id, so that rows with equal sort keys
+                    // come back in the same order however they are stored.
                     //
                     // SQL does not define the order among equal keys, and leaving
                     // it to whatever the storage produced meant a compaction —
@@ -4108,7 +4100,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     // Deciding it here costs a comparison only among rows that
                     // are already equal, and makes the answer reproducible across
                     // layouts, compactions and index availability.
-                    slug_of_hash(db, *ha).cmp(&slug_of_hash(db, *hb))
+                    ha.cmp(hb)
                 });
                 candidates = keyed.into_iter().map(|(h, _)| h).collect();
             }
@@ -8654,7 +8646,6 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
 /// Returns the whole ordering rather than an iterator because `iter_kv` already
 /// materialises it; there is nothing extra being held.
 pub(crate) fn iter_kv_sql_order(
-    db: &CoreDB,
     idx: &crate::FieldIndexRef,
     asc: bool,
 ) -> Vec<(FieldKey, Vec<u64>)> {
@@ -8664,12 +8655,19 @@ pub(crate) fn iter_kv_sql_order(
     // The same `ORDER BY w ASC` answered `n0,n4,n1` before a compaction and
     // `n1,n0,n4` after it, over data nobody had touched, because the ties moved.
     //
-    // Ordering them by slug costs a comparison only where a key actually has
+    // Ordering them by node id costs a comparison only where a key actually has
     // more than one row, and it is the same rule the payload sort now applies, so
     // the two paths agree with each other as well as with themselves.
+    //
+    // By id rather than by slug: the id **is** `sk_hash(slug)`, so it is just as
+    // deterministic — the same rows order the same way in every layout, on every
+    // machine — while a slug tie-break costs a node lookup and a `String` per
+    // comparison, and `sort_by_key` re-evaluates its key on each one. Nothing
+    // observable is lost, because SQL does not define the order among equal keys;
+    // the requirement is that it not move, not that it read alphabetically.
     for (_, ids) in kv.iter_mut() {
         if ids.len() > 1 {
-            ids.sort_by_key(|h| slug_of_hash(db, *h));
+            ids.sort_unstable();
         }
     }
     let Some(at) = kv.iter().position(|(k, _)| *k == FieldKey::Null) else {
