@@ -981,6 +981,14 @@ fn contains_pattern(needle: &str) -> String {
 /// It also folds numerically-equal numbers together, for the same reason
 /// `group_key_of` does: `1` and `1.0` are one value, and which one a row holds
 /// depends on how it was written rather than on what it means.
+/// A node's slug, for breaking ties in an order that does not depend on storage.
+///
+/// Reads the node record, not the payload, so it costs no disk read beyond what
+/// the sort already did.
+fn slug_of_hash(db: &CoreDB, h: u64) -> String {
+    db.node_data(h).map(|n| n.slug.clone()).unwrap_or_default()
+}
+
 /// Deduplicate `hits` for `DISTINCT`, keeping a representative that does not
 /// depend on the order rows were scanned in.
 ///
@@ -1484,6 +1492,13 @@ impl<'db> Set<'db> {
         let idx = self.db.field_index_ref(coll, &field)?;
         let coll_name = self.db.collection_name(coll).map(|s| s.to_string()).unwrap_or_default();
 
+        // Walked in full, then checked for coverage, for the reason spelled out
+        // in `try_index_order_limit`: this path builds the answer *out of the
+        // index*, so a row the index has no entry for is dropped rather than
+        // ordered. `SELECT _key FROM c ORDER BY tags LIMIT 3` — covered, because
+        // `_key` needs no payload — answered with nothing when `tags` held
+        // arrays, while the same query without the index answered with rows.
+        let live_members = self.db.collection_members(coll).map_or(0, |m| m.len());
         let mut hits: Vec<Hit> = Vec::with_capacity(limit.min(4096));
         let mut emit = |key_val: &Value, ids: &[u64]| -> bool {
             for &h in ids {
@@ -1500,13 +1515,16 @@ impl<'db> Set<'db> {
                     map.insert(field_output_key(f), v);
                 }
                 hits.push(Hit { slug: slug.clone(), slug_hash: h, payload: Some(Value::Object(map)) });
-                if hits.len() >= limit { return true; }
             }
             false
         };
-        for (k, ids) in iter_kv_sql_order(&idx, asc) {
+        for (k, ids) in iter_kv_sql_order(self.db, &idx, asc) {
             if emit(&CoreDB::field_key_to_value(&k), &ids) { break; }
         }
+        if hits.len() != live_members {
+            return None; // the index does not cover the collection — use the scan
+        }
+        hits.truncate(limit);
         Some(hits)
     }
 
@@ -2772,18 +2790,32 @@ fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>> {
         return Some(Vec::new());
     }
     let idx = db.field_index_ref(coll, &field)?;
-    // Walk the btree in the requested order, taking the first `limit` LIVE nodes.
-    // Each key holds nodes sharing that value (ties keep insertion order).
-    let mut out: Vec<u64> = Vec::with_capacity(limit.min(4096));
-    let push = |h: u64, out: &mut Vec<u64>| -> bool {
-        if db.node_data(h).is_some() {
-            out.push(h);
+    // Walk the btree in the requested order, keeping the LIVE nodes.
+    //
+    // The result is only usable if the index holds every live row of the
+    // collection. A row whose value the index cannot represent — an array, say —
+    // has no entry, and taking the top-N from the index would drop it rather than
+    // place it: `ORDER BY tags LIMIT 3` answered with nothing while the same
+    // query without an index answered with rows. A missing field is safe, because
+    // absence is indexed as NULL, which is why this went unnoticed.
+    //
+    // So the walk is no longer cut short at `limit`: stopping early cannot
+    // distinguish "the index holds them all" from "the rest are missing", and
+    // under DESC the missing rows are exactly the ones that sort first. It still
+    // reads no payloads.
+    let mut out: Vec<u64> = Vec::new();
+    for (_, ids) in iter_kv_sql_order(db, &idx, asc) {
+        for &h in &ids {
+            if db.node_data(h).is_some() {
+                out.push(h);
+            }
         }
-        out.len() >= limit
-    };
-    for (_, ids) in iter_kv_sql_order(&idx, asc) {
-        for &h in &ids { if push(h, &mut out) { return Some(out); } }
     }
+    let live_members = db.collection_members(coll).map_or(0, |m| m.len());
+    if out.len() != live_members {
+        return None; // the index does not cover the collection — use the scan
+    }
+    out.truncate(limit);
     Some(out)
 }
 
@@ -3935,21 +3967,41 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         if let Some(idx) = db.field_index_ref(coll, sort_field) {
                             let candidate_set: HashSet<u64> =
                                 candidates.iter().copied().collect();
-                            let limit = find_take_limit(remaining).unwrap_or(usize::MAX);
                             let mut sorted_result: Vec<u64> =
-                                Vec::with_capacity(limit.min(candidate_set.len()));
-                            'scan: for (_, ids) in iter_kv_sql_order(&idx, *asc) {
+                                Vec::with_capacity(candidate_set.len());
+                            for (_, ids) in iter_kv_sql_order(db, &idx, *asc) {
                                 for &h in &ids {
                                     if candidate_set.contains(&h) {
                                         sorted_result.push(h);
-                                        if sorted_result.len() >= limit {
-                                            break 'scan;
-                                        }
                                     }
                                 }
                             }
-                            candidates = sorted_result;
-                            continue; // Sort done — skip payload-read fallback below.
+                            // **Only when the index holds every candidate.**
+                            //
+                            // This replaced `candidates` with whatever the index
+                            // walk found, so any row the index does not hold was
+                            // not merely mis-ordered — it was gone. A missing
+                            // field survives, because absence is indexed as NULL,
+                            // but a value the index cannot represent has no entry
+                            // at all: with an array in the sorted column,
+                            // `SELECT _key FROM c ORDER BY tags` returned nothing
+                            // while the same query without the index returned
+                            // every row. Adding an index deleted the answer.
+                            //
+                            // The walk no longer stops at the LIMIT either, since
+                            // stopping early cannot tell "the index holds them
+                            // all" from "the rest are missing" — and under DESC
+                            // the missing rows are the ones that sort first.
+                            // Cost is a full index walk, still with no payload
+                            // reads; the fused `try_index_order_limit` path
+                            // handles the top-N shape separately.
+                            if sorted_result.len() == candidate_set.len() {
+                                candidates = sorted_result;
+                                continue; // Sort done — skip payload-read fallback.
+                            }
+                            // Otherwise fall through to the payload sort below,
+                            // which reads every candidate's value and orders them
+                            // by the same rules a scan would.
                         }
                     }
                 }
@@ -4010,7 +4062,7 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         (h, vals)
                     })
                     .collect();
-                keyed.sort_by(|(_, ka), (_, kb)| {
+                keyed.sort_by(|(ha, ka), (hb, kb)| {
                     for (i, (_, asc)) in columns.iter().enumerate() {
                         let va = ka.get(i).and_then(|v| v.as_ref());
                         let vb = kb.get(i).and_then(|v| v.as_ref());
@@ -4019,7 +4071,21 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                             return if *asc { ord } else { ord.reverse() };
                         }
                     }
-                    std::cmp::Ordering::Equal
+                    // Ties broken by slug, so that rows with equal sort keys come
+                    // back in the same order however they are stored.
+                    //
+                    // SQL does not define the order among equal keys, and leaving
+                    // it to whatever the storage produced meant a compaction —
+                    // which moves rows from the overlay into the base and changes
+                    // the order they are scanned in — reordered them. The same
+                    // query answered `n0,n4,n1` before and `n1,n0,n4` after, over
+                    // data nobody had touched. The two sort paths also disagreed
+                    // with each other, so which one ran decided the order.
+                    //
+                    // Deciding it here costs a comparison only among rows that
+                    // are already equal, and makes the answer reproducible across
+                    // layouts, compactions and index availability.
+                    slug_of_hash(db, *ha).cmp(&slug_of_hash(db, *hb))
                 });
                 candidates = keyed.into_iter().map(|(h, _)| h).collect();
             }
@@ -8565,10 +8631,24 @@ pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit> {
 /// Returns the whole ordering rather than an iterator because `iter_kv` already
 /// materialises it; there is nothing extra being held.
 pub(crate) fn iter_kv_sql_order(
+    db: &CoreDB,
     idx: &crate::FieldIndexRef,
     asc: bool,
 ) -> Vec<(FieldKey, Vec<u64>)> {
     let mut kv = idx.iter_kv(!asc);
+    // Rows sharing a key are returned in the order they were indexed, which is
+    // the order they happened to be written in — and a compaction rewrites that.
+    // The same `ORDER BY w ASC` answered `n0,n4,n1` before a compaction and
+    // `n1,n0,n4` after it, over data nobody had touched, because the ties moved.
+    //
+    // Ordering them by slug costs a comparison only where a key actually has
+    // more than one row, and it is the same rule the payload sort now applies, so
+    // the two paths agree with each other as well as with themselves.
+    for (_, ids) in kv.iter_mut() {
+        if ids.len() > 1 {
+            ids.sort_by_key(|h| slug_of_hash(db, *h));
+        }
+    }
     let Some(at) = kv.iter().position(|(k, _)| *k == FieldKey::Null) else {
         return kv;
     };

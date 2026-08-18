@@ -724,14 +724,40 @@ impl SpatialGrid {
         )
     }
 
+    /// How many grid cells a bbox covers, in arithmetic that cannot wrap.
+    ///
+    /// Its own function so the cap can be tested without walking the cells it is
+    /// there to prevent: the failure it guards against is a hang, and a test that
+    /// hangs is worse than one that fails.
+    fn bbox_cell_count(min_cy: i32, max_cy: i32, min_cx: i32, max_cx: i32) -> u128 {
+        let span_y = (max_cy as i64 - min_cy as i64 + 1).max(0) as u128;
+        let span_x = (max_cx as i64 - min_cx as i64 + 1).max(0) as u128;
+        span_y * span_x
+    }
+
     fn cells_for_bbox(&self, meta: &SpatialMeta) -> Vec<(i32, i32)> {
         let min_cy = (meta.bbox_min_lat / self.cell_size).floor() as i32;
         let max_cy = (meta.bbox_max_lat / self.cell_size).floor() as i32;
         let min_cx = (meta.bbox_min_lon / self.cell_size).floor() as i32;
         let max_cx = (meta.bbox_max_lon / self.cell_size).floor() as i32;
 
-        // Cap at 10,000 cells to avoid blow-up for huge polygons
-        let cell_count = (max_cy - min_cy + 1) as u64 * (max_cx - min_cx + 1) as u64;
+        // Cap at 10,000 cells to avoid blow-up for huge polygons.
+        //
+        // Computed in `i64`, because in `i32` the cap could be stepped around by
+        // the very input it exists to stop. A coordinate does not have to be a
+        // real latitude — nothing rejects `1e9` — and `(1e9 / 0.01).floor() as
+        // i32` saturates to `i32::MAX`, with the other end at `i32::MIN`. Their
+        // difference overflows `i32`, wraps to `-1`, and `-1 + 1` is `0`: the
+        // guard read a cell count of zero for a bbox covering 1.8e19 cells, and
+        // the loop below then walked the whole `i32` range, pushing a tuple per
+        // step until the process was killed. In a debug build the subtraction
+        // panicked instead. Either way, one row written by anyone who can write
+        // rows took the database down with it.
+        //
+        // `i64` cannot overflow here: both operands are `i32`, so the widest
+        // possible span is 2^32, and the product of two of those still fits in
+        // `u128`.
+        let cell_count = Self::bbox_cell_count(min_cy, max_cy, min_cx, max_cx);
         if cell_count > 10_000 {
             // Fall back to centroid cell only
             return vec![self.cell_key(meta.centroid_lat, meta.centroid_lon)];
@@ -1499,5 +1525,68 @@ mod tests {
             [-37.83, 144.95],
         ];
         assert!(geom_intersects_polygon(&payload, &ring));
+    }
+}
+
+#[cfg(test)]
+mod hostile_geometry_tests {
+    use super::*;
+
+    /// **A bbox too large to index must be seen as too large.**
+    ///
+    /// The cap that keeps a huge polygon from being written into every grid cell
+    /// was computed in `i32`. Nothing rejects a coordinate of `1e9` — it is a
+    /// finite `f64` and JSON accepts it — and `(1e9 / 0.01).floor() as i32`
+    /// saturates to `i32::MAX`, with the other end saturating to `i32::MIN`.
+    /// Their difference overflows, wraps to `-1`, and `-1 + 1` is `0`, so the cap
+    /// read a cell count of **zero** for a bbox covering 1.8e19 cells and let the
+    /// loop run over the whole `i32` range, pushing a tuple per step until the
+    /// process died. A debug build panicked on the subtraction instead.
+    ///
+    /// One row, written by anyone able to write rows.
+    ///
+    /// This checks the arithmetic rather than the loop, deliberately: the bug's
+    /// symptom is a hang, and a test that hangs tells you less than one that
+    /// fails.
+    #[test]
+    fn a_bbox_too_large_to_index_is_counted_as_too_large() {
+        // What the saturating casts produce for a +/-1e9 degree span.
+        let count = SpatialGrid::bbox_cell_count(i32::MIN, i32::MAX, i32::MIN, i32::MAX);
+        assert!(count > 10_000,
+            "a bbox spanning the whole cell space counted as {count} cells, so the \
+             cap that should send it to its centroid cell never fires");
+
+        // An ordinary bbox still counts small enough to be indexed properly, so
+        // the fix cannot have been to send everything to the fallback.
+        let ordinary = SpatialGrid::bbox_cell_count(-9000, 9000, -18000, 18000);
+        assert!(ordinary > 10_000, "a world-sized bbox is still above the cap");
+        let small = SpatialGrid::bbox_cell_count(-5, 5, -5, 5);
+        assert_eq!(small, 121, "an 11x11 bbox must count as 121 cells, not {small}");
+    }
+
+    /// The same input through the grid itself: it must land in one cell rather
+    /// than being written into every cell there is.
+    #[test]
+    fn a_geometry_with_an_absurd_span_lands_in_one_cell() {
+        let meta = SpatialMeta {
+            centroid_lat: 0.0,
+            centroid_lon: 0.0,
+            bbox_min_lat: -1.0e9,
+            bbox_max_lat: 1.0e9,
+            bbox_min_lon: -1.0e9,
+            bbox_max_lon: 1.0e9,
+        };
+        let grid = SpatialGrid::build(std::iter::once((1u64, meta)));
+        let cells = grid.cells_for_bbox(&SpatialMeta {
+            centroid_lat: 0.0,
+            centroid_lon: 0.0,
+            bbox_min_lat: -1.0e9,
+            bbox_max_lat: 1.0e9,
+            bbox_min_lon: -1.0e9,
+            bbox_max_lon: 1.0e9,
+        });
+        assert_eq!(cells.len(), 1,
+            "a bbox past the cap was spread over {} cells instead of falling back \
+             to its centroid", cells.len());
     }
 }

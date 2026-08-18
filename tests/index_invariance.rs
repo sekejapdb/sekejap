@@ -175,3 +175,73 @@ fn dropping_a_search_index_is_refused_not_answered_empty() {
         }
     }
 }
+
+/// **A value the index cannot represent must not be dropped from an ORDER BY.**
+///
+/// Four separate paths built an ordered answer *out of the btree* — the Sort
+/// step's index-assisted branch, `try_index_order_limit`, `try_covered_sort_limit`
+/// and `btree_sorted_seed_from_steps` — and each replaced the candidate list with
+/// what it found there. A row the index has no entry for was therefore not
+/// mis-ordered but gone.
+///
+/// A missing field is safe, because absence is stored as `FieldKey::Null`, and
+/// that is why this went unnoticed for so long. An array is not: it has no btree
+/// key at all. `SELECT _key FROM c ORDER BY tags` returned **nothing** with an
+/// index on `tags` and every row without one. Creating an index deleted the
+/// answer.
+///
+/// The comparison is against the same query with no index, in full and in order,
+/// because a count alone would not catch a row that merely moved.
+#[test]
+fn ordering_by_a_column_the_index_cannot_hold_still_returns_every_row() {
+    const QUERIES: &[&str] = &[
+        "SELECT _key FROM c ORDER BY tags",
+        "SELECT _key FROM c ORDER BY tags LIMIT 3",
+        "SELECT _key FROM c ORDER BY tags DESC",
+        "SELECT _key FROM c ORDER BY tags DESC LIMIT 3",
+        "SELECT _key FROM c ORDER BY tags LIMIT 3 OFFSET 2",
+        "SELECT _key, n FROM c ORDER BY tags",
+        "SELECT * FROM c ORDER BY tags",
+        "SELECT _key FROM c WHERE n >= 0 ORDER BY tags",
+        // The scalar column must keep working, so the fix cannot have been to
+        // stop using the index at all.
+        "SELECT _key FROM c ORDER BY n",
+        "SELECT _key FROM c ORDER BY n DESC LIMIT 4",
+    ];
+
+    for (label, cfg) in modes() {
+        let build = |indexed: bool| -> (tempfile::TempDir, CoreDB) {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut db = CoreDB::open_with_config(dir.path(), cfg.clone()).unwrap();
+            db.execute("CREATE TABLE c (_key TEXT PRIMARY KEY, tags JSON, n INTEGER)").unwrap();
+            for i in 0..6 {
+                db.put(&format!("c/x{i}"), &json!({
+                    "_collection": "c", "_key": format!("x{i}"),
+                    "tags": [format!("t{i}"), "shared"], "n": i as i64,
+                }).to_string()).unwrap();
+            }
+            // A row with no `tags` at all, which the index *does* hold (as NULL),
+            // so the two kinds of unindexable row are both in play.
+            db.put("c/none", &json!({"_collection": "c", "_key": "none", "n": 99}).to_string())
+                .unwrap();
+            if indexed {
+                db.execute("CREATE INDEX ON c USING btree (tags)").unwrap();
+                db.execute("CREATE INDEX ON c USING btree (n)").unwrap();
+            }
+            db.compact().unwrap();
+            (dir, db)
+        };
+
+        let (_d1, scan) = build(false);
+        let (_d2, idx) = build(true);
+
+        for sql in QUERIES {
+            let a = rows(&scan, sql);
+            let b = rows(&idx, sql);
+            assert!(!a.is_empty(), "[{label}] `{sql}` found nothing even unindexed");
+            assert_eq!(a, b,
+                "[{label}] `{sql}` answers differently once the column is indexed\n  \
+                 without index = {a}\n  with index    = {b}");
+        }
+    }
+}
