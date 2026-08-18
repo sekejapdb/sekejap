@@ -740,7 +740,13 @@ impl Bm25Index {
             .collect();
         // Deterministic total order: score DESC, ties broken by doc_id ASC.
         hits.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap().then(a.doc_id.cmp(&b.doc_id))
+            // `total_cmp`, not `partial_cmp(..).unwrap()`. A NaN score panicked
+            // the query outright, and a NaN is reachable: scores are arithmetic
+            // over term statistics, and the comparator is not the place to
+            // discover that one came out undefined. Total by construction, so an
+            // undefined score sorts to one end instead of crashing or scrambling
+            // the ones around it.
+            b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id))
         });
         hits
     }

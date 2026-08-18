@@ -8524,11 +8524,15 @@ fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
         (Some(a), Some(b)) => match (a, b) {
+            // `total_cmp` for uniformity rather than necessity: JSON has no NaN,
+            // so `serde_json::Number` cannot hold one and this comparison was
+            // already total. Left as `partial_cmp(..).unwrap_or(Equal)` it reads
+            // like the dozen places that were **not** safe, and the next person
+            // has to re-derive why this one is.
             (Value::Number(na), Value::Number(nb)) => na
                 .as_f64()
                 .unwrap_or(0.0)
-                .partial_cmp(&nb.as_f64().unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
+                .total_cmp(&nb.as_f64().unwrap_or(0.0)),
             (Value::String(sa), Value::String(sb)) => sa.cmp(sb),
             (Value::Bool(ba), Value::Bool(bb)) => ba.cmp(bb),
             // Different types, or a composite. Rank first; within a rank that
