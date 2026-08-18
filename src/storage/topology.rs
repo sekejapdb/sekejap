@@ -121,13 +121,41 @@ pub struct TopologyBlob {
 
 // ── Little-endian read helpers ────────────────────────────────────────────────
 
+/// Read a little-endian `u32` at `o`, or `0` if the segment does not extend that
+/// far.
+///
+/// These two are the primitives under every decode path in this file — 47 call
+/// sites — and they indexed the mapped bytes directly. Every offset they are
+/// given is ultimately derived from the file itself, so a single flipped byte
+/// produced an offset past the end and the process aborted: four crashes in
+/// forty-two single-byte corruptions of `dict.bin` and `idx.bin`, at
+/// `read_string_table` and here.
+///
+/// A crash is never the right answer to a damaged file. Reading zero is not a
+/// *good* answer either — it is data the file does not contain — but a zero hash
+/// or offset resolves to "no such record" in every caller here, so a corrupt
+/// segment reads as missing rather than as somebody else's row.
+///
+/// **The gap this does not close:** topology segments carry no per-block
+/// checksum, unlike node, adjacency and payload records. A corrupted byte that
+/// lands inside a valid extent is still decoded and served. Closing that is a
+/// durable-format change — a CRC per block — and is recorded in
+/// `.workbench/STABLE.md` rather than done quietly here.
 #[inline]
 fn rd_u32(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    match b.get(o..o + 4) {
+        Some(x) => u32::from_le_bytes(x.try_into().unwrap()),
+        None => 0,
+    }
 }
+
+/// The `u64` counterpart — see [`rd_u32`].
 #[inline]
 fn rd_u64(b: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+    match b.get(o..o + 8) {
+        Some(x) => u64::from_le_bytes(x.try_into().unwrap()),
+        None => 0,
+    }
 }
 fn write_header(out: &mut Vec<u8>, magic: &[u8; 8], flags: u32) {
     out.extend_from_slice(magic);
@@ -160,11 +188,17 @@ fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
+/// Decode a LEB128 varint, stopping at the end of the buffer.
+///
+/// Indexed `b[pos]` unconditionally and let `shift` grow without limit, so a
+/// truncated varint at the end of a damaged block read past the mapping, and a
+/// corrupt one with the continuation bit always set shifted past 64. Both panic.
+/// Ten bytes is the most a `u64` can need.
 fn read_varint(b: &[u8], mut pos: usize) -> (u64, usize) {
     let mut v = 0u64;
     let mut shift = 0u32;
-    loop {
-        let byte = b[pos];
+    while shift < 64 {
+        let Some(&byte) = b.get(pos) else { break };
         pos += 1;
         v |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
@@ -215,13 +249,26 @@ fn svb_encode(values: &[u64], control: &mut Vec<u8>, data: &mut Vec<u8>) {
 /// Decode `count` values from `control` (starting at bit 0) and `data`. Returns the
 /// values and the number of `data` bytes consumed.
 fn svb_decode(control: &[u8], data: &[u8], count: usize) -> (Vec<u64>, usize) {
-    let mut out = Vec::with_capacity(count);
+    // `count` arrives from a varint in the file and was trusted twice: to size
+    // the allocation, and to bound the loop reading `control` and `data`. One
+    // flipped byte in `idx.bin` asked for `memory allocation of
+    // 574208952489738240 bytes` -- half an exabyte -- and aborted; a smaller
+    // corruption walked off the end of either slice instead.
+    //
+    // Every value needs two control bits and at least one data byte, so the
+    // buffers bound how many there can be. Reserving against the data length
+    // means a lie in the count costs nothing.
+    let mut out = Vec::with_capacity(count.min(data.len()).min(4096));
     let mut pos = 0usize;
     for i in 0..count {
-        let c = (control[i / 4] >> ((i % 4) * 2)) & 0b11;
+        let Some(&ctrl) = control.get(i / 4) else { break };
+        let c = (ctrl >> ((i % 4) * 2)) & 0b11;
         let nb = class_bytes(c);
         let mut buf = [0u8; 8];
-        buf[..nb].copy_from_slice(&data[pos..pos + nb]);
+        match data.get(pos..pos + nb) {
+            Some(x) => buf[..nb].copy_from_slice(x),
+            None => break, // the block ends mid-value: keep what was whole
+        }
         out.push(u64::from_le_bytes(buf));
         pos += nb;
     }
@@ -600,14 +647,34 @@ fn write_string_table(out: &mut Vec<u8>, list: &[String]) {
     }
 }
 
+/// Decode a length-prefixed string table, stopping at the end of the buffer.
+///
+/// `count` and every entry length come from the file. Both were trusted: the
+/// count sized a `Vec::with_capacity` before a single byte was validated, and the
+/// entries indexed `b[pos]` and `b[pos..pos + len]` directly, so a flipped byte
+/// in `dict.bin` either asked for a multi-gigabyte allocation or read past the
+/// mapping and aborted.
+///
+/// Now the count is capped by what the buffer could possibly hold — every entry
+/// needs at least its two length bytes — and each read stops at the end. A
+/// truncated table yields the entries that were whole, which is what the rest of
+/// the open path already expects from a partial segment.
 fn read_string_table(b: &[u8], mut pos: usize) -> (Vec<String>, usize) {
-    let count = rd_u32(b, pos) as usize;
+    let declared = rd_u32(b, pos) as usize;
     pos += 4;
-    let mut out = Vec::with_capacity(count);
+    let possible = b.len().saturating_sub(pos) / 2;
+    let count = declared.min(possible);
+    let mut out = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
-        let len = u16::from_le_bytes([b[pos], b[pos + 1]]) as usize;
+        let len = match b.get(pos..pos + 2) {
+            Some(x) => u16::from_le_bytes([x[0], x[1]]) as usize,
+            None => break,
+        };
         pos += 2;
-        out.push(String::from_utf8_lossy(&b[pos..pos + len]).into_owned());
+        match b.get(pos..pos + len) {
+            Some(x) => out.push(String::from_utf8_lossy(x).into_owned()),
+            None => break,
+        }
         pos += len;
     }
     (out, pos)
@@ -761,14 +828,19 @@ impl<'a> TopologyView<'a> {
         if count == 0 {
             return Vec::new();
         }
+        // Capped by the block: the control array alone needs one byte per four
+        // values, so a `count` larger than four times what is left cannot be
+        // real. Taken with `get`, because a declared length overrunning the block
+        // used to panic here rather than decode nothing.
+        let count = count.min(block.len().saturating_sub(pos).saturating_mul(4));
         let ctrl_len = (count + 3) / 4;
-        let control = &block[pos..pos + ctrl_len];
+        let Some(control) = block.get(pos..pos + ctrl_len) else { return Vec::new() };
         pos += ctrl_len;
         let (deltas, used) = svb_decode(control, &block[pos..], count);
         pos += used;
 
         // prefix-sum deltas → absolute neighbor ids
-        let mut neighbors = Vec::with_capacity(count);
+        let mut neighbors = Vec::with_capacity(deltas.len());
         let mut acc = 0u64;
         for d in deltas {
             acc += d;
@@ -1009,8 +1081,23 @@ impl MappedTopology {
 
         // Resident sparse index over idx.bin (every SPARSE_STRIDE-th hash).
         let idx_bytes = idx.bytes();
-        let count = rd_u64(idx_bytes, HEADER_LEN) as usize;
         let base = HEADER_LEN + 8;
+        // Capped by the file, because this runs at **open**.
+        //
+        // The entry count is a `u64` read from `idx.bin` and it was believed:
+        // `(0..count).step_by(..).collect()` reserves `count / STRIDE` elements
+        // from the iterator's size hint before reading anything. A single flipped
+        // byte in a high byte of that field asked for
+        // `memory allocation of 574208952489738240 bytes` — half an exabyte — and
+        // aborted the process while opening the database, so there was no query
+        // to fail and nothing to report.
+        //
+        // Each entry occupies 16 bytes at `base + i * 16`, so the file's own
+        // length says how many there can be. Reading past the end already yields
+        // zero rather than crashing (see `rd_u64`); this stops the *allocation*
+        // from being sized by a number the file was free to invent.
+        let entries_possible = idx_bytes.len().saturating_sub(base) / 16;
+        let count = (rd_u64(idx_bytes, HEADER_LEN) as usize).min(entries_possible);
         let sparse: Vec<u64> = (0..count)
             .step_by(SPARSE_STRIDE)
             .map(|i| rd_u64(idx_bytes, base + i * 16))
@@ -1068,13 +1155,18 @@ impl MappedTopology {
         let end = rd_u64(b, offsets + (cid + 1) * 8) as usize;
         let block = &b[start..end];
         let (count, mut pos) = read_varint(block, 0);
-        let count = count as usize;
+        // Capped and checked for the same reason as in `edges_of`: the control
+        // array needs one byte per four values, so a `count` larger than four
+        // times what is left in the block cannot be real, and slicing a declared
+        // length that overruns it used to panic rather than decode nothing.
+        let count = (count as usize)
+            .min(block.len().saturating_sub(pos).saturating_mul(4));
         let ctrl_len = (count + 3) / 4;
-        let control = &block[pos..pos + ctrl_len];
+        let Some(control) = block.get(pos..pos + ctrl_len) else { return None };
         pos += ctrl_len;
         let (deltas, _) = svb_decode(control, &block[pos..], count);
         let mut acc = 0u64;
-        let mut out = Vec::with_capacity(count);
+        let mut out = Vec::with_capacity(deltas.len());
         for d in deltas {
             acc += d;
             if let Some(h) = self.hash_of(acc) {

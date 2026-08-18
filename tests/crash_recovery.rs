@@ -705,3 +705,111 @@ fn a_stub_wal_shorter_than_its_header_is_not_appended_to() {
             "the row written over a {}-byte stub WAL did not survive", stub.len());
     }
 }
+
+/// **After any damage, whatever the database still accepts must stay accepted.**
+///
+/// Generalises the torn-tail data loss found on 2026-08-19. Every recovery test
+/// in this file asked the same question — does the intact prefix survive the
+/// damage? — and the answer was always yes. The bug lived in the question none
+/// of them asked: *can you keep writing afterwards?* Building on the damage was
+/// what lost data, not the damage itself.
+///
+/// So each kind of damage is followed by a write, a sync, and a second reopen.
+/// A database is allowed to refuse to open a file it cannot trust — that is
+/// failing loudly, which is fine. What it may not do is accept a write, report
+/// success, and lose it.
+#[test]
+fn a_write_accepted_after_damage_is_still_there_after_a_reopen() {
+    #[derive(Clone, Copy)]
+    enum Damage { WalTail, WalMiddle, PayloadTail, SnapshotTruncated }
+
+    // A case that refuses to open, or refuses every write, proves nothing — and
+    // if every case did that the test would pass while checking nothing. At least
+    // half must reach the write-and-reopen check.
+    let mut exercised = 0;
+
+    for (name, damage) in [
+        ("a torn WAL tail", Damage::WalTail),
+        ("a corrupt frame mid-WAL", Damage::WalMiddle),
+        ("a truncated payload file", Damage::PayloadTail),
+        ("a truncated snapshot", Damage::SnapshotTruncated),
+    ] {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut db = CoreDB::open_with_config(dir.path(), Config::resident()).unwrap();
+            db.execute("CREATE TABLE p (_key TEXT PRIMARY KEY, n INTEGER)").unwrap();
+            for i in 0..8 {
+                db.put(&format!("p/n{i}"),
+                       &format!(r#"{{"_collection":"p","_key":"n{i}","n":{i}}}"#)).unwrap();
+            }
+            if matches!(damage, Damage::PayloadTail | Damage::SnapshotTruncated) {
+                db.compact().unwrap(); // so there is a payload file and a snapshot
+                for i in 8..12 {
+                    db.put(&format!("p/n{i}"),
+                           &format!(r#"{{"_collection":"p","_key":"n{i}","n":{i}}}"#)).unwrap();
+                }
+            }
+            db.sync().unwrap();
+        }
+
+        let shorten = |file: &str, by: u64| {
+            let p = dir.path().join(file);
+            if let Ok(md) = std::fs::metadata(&p) {
+                if md.len() > by {
+                    std::fs::OpenOptions::new().write(true).open(&p).unwrap()
+                        .set_len(md.len() - by).unwrap();
+                }
+            }
+        };
+        match damage {
+            Damage::WalTail => shorten("wal.log", 3),
+            Damage::WalMiddle => {
+                // Flip a byte in the middle of the log, so a frame fails its CRC
+                // with valid frames on both sides of it.
+                let p = dir.path().join("wal.log");
+                let mut bytes = std::fs::read(&p).unwrap();
+                let mid = bytes.len() / 2;
+                bytes[mid] ^= 0xFF;
+                std::fs::write(&p, bytes).unwrap();
+            }
+            Damage::PayloadTail => shorten("payloads.bin", 5),
+            Damage::SnapshotTruncated => shorten("snapshot.json", 20),
+        }
+
+        // The database may refuse to open damaged files — that is failing loudly.
+        let opened = CoreDB::open_with_config(dir.path(), Config::resident());
+        let mut db = match opened {
+            Ok(db) => db,
+            Err(_) => continue, // refused outright: nothing was promised, nothing lost
+        };
+
+        // Whatever it does accept from here has to be kept.
+        let accepted = (0..4).filter(|i| {
+            db.put(&format!("p/fresh{i}"),
+                   &format!(r#"{{"_collection":"p","_key":"fresh{i}","n":{}}}"#, 900 + i)).is_ok()
+        }).count();
+        if accepted == 0 {
+            continue; // it refused every write, which is honest
+        }
+        db.sync().unwrap();
+        let seen_before = db.query("SELECT _key FROM p WHERE n >= 900")
+            .unwrap().collect().len();
+        assert_eq!(seen_before, accepted,
+            "[{name}] accepted {accepted} writes but only {seen_before} are readable \
+             before the reopen");
+        drop(db);
+
+        let db = CoreDB::open_with_config(dir.path(), Config::resident())
+            .unwrap_or_else(|e| panic!("[{name}] reopening after writing failed: {e}"));
+        let after = db.query("SELECT _key FROM p WHERE n >= 900").unwrap().collect().len();
+        assert_eq!(after, accepted,
+            "[{name}] {accepted} writes were accepted and synced after the damage, \
+             and {after} survived the reopen");
+        exercised += 1;
+    }
+
+    assert!(exercised >= 2,
+        "only {exercised} of the four damage cases got as far as writing and \
+         reopening; the rest refused to open or refused every write, so this test \
+         is not checking what it claims to");
+}
