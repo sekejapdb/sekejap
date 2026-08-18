@@ -598,7 +598,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   1227  fn query_err<E: std::fmt::Display>(e: E) -> SqlFail { ("42601", e.to_string()) }
 ```
 
-### `query.rs` · 8579L — The query engine — building and running queries
+### `query.rs` · 8618L — The query engine — building and running queries
 
 ```
     70  pub struct Hit
@@ -661,128 +661,128 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   1468    pub fn collect(self) -> Vec<Hit>
   1566        struct GroupState
   1763        struct AggInfo { func: String, arg: String, out_key: String }
-  2099    pub fn count(self) -> usize
-  2107    pub fn first(self) -> Option<Hit>
-  2113    pub fn exists(self) -> bool
-  2127  fn values_eq(a: &Value, b: &Value) -> bool
-  2143  fn resolve_field(field: &str, payload: &Value) -> Option<Value>
-  2154  fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize>
-  2170  fn extract_simple_value(bytes: &[u8], start: usize) -> Option<(Value, usize)>
-  2233  pub(crate) fn find_value_end(bytes: &[u8], start: usize) -> Option<usize>
-  2287  pub(crate) fn splice_json_field(bytes: &[u8], field: &str, new_value_bytes: &[u8]) -> Option<Ve…
-  2324  pub(crate) fn extract_fields_by_search(
-  2351  fn is_simple_field(expr: &str) -> bool
-  2390  type Truth = Option<bool>
-  2397  fn and3(mut terms: impl Iterator<Item = Truth>) -> Truth
-  2410  fn or3(mut terms: impl Iterator<Item = Truth>) -> Truth
-  2423  fn known(v: Option<Value>) -> Option<Value>
-  2441  fn eval3(step: &Step, field_of: &mut dyn FnMut(&str) -> Option<Value>) -> Truth
-  2507  fn passes(step: &Step, field_of: &mut dyn FnMut(&str) -> Option<Value>) -> bool
-  2511  fn eval_step_on_payload(step: &Step, payload: &Value) -> bool
-  2518  fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool
-  2530  fn gather_bm25_keys(expr: &ScoreExpr, out: &mut HashSet<(String, String)>)
-  2545  fn gather_vector_keys(expr: &ScoreExpr, out: &mut HashMap<(VecMetric, String), Vec<f32>>)
-  2570  fn eval_score(
-  2579    macro_rules! rec
-  2671  fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>>
-  2724  fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64>
-  4078  fn group_key_of(v: &Value) -> String
-  4085  fn find_take_limit(remaining_steps: &[Step]) -> Option<usize>
-  4102  pub type PathRow = HashMap<String, Value>
-  4106  pub enum MathExpr
-  4121  impl MathExpr
-  4123    pub fn collect_fields(&self, out: &mut Vec<(String, String)>)
-  4135    pub fn references_var(&self, var: &str) -> bool
-  4146    pub fn eval(&self, row: &PathRow) -> f64
-  4182  pub enum CmpOp
-  4192  impl CmpOp
-  4195    pub fn apply(&self, a: &Value, b: &Value) -> bool
-  4236  pub struct CaseCond
-  4243  impl CaseCond
-  4244    pub fn references_var(&self, var: &str) -> bool
-  4256  pub struct PlainCase
-  4261  impl PlainCase
-  4263    pub fn eval(&self, payload: &Value) -> Value
-  4276  pub struct SimpleCond
-  4284  pub enum PathPredicate
-  4297  pub struct ShortestSelectStmt
-  4320  pub enum FromSource
-  4331  pub struct MultiFromStmt
-  4343  pub enum MatchAggReturn
-  4400  pub enum MatchStr
-  4409  impl MatchStr
-  4410    pub fn eval(&self, row: &PathRow) -> String
-  4430    pub fn references_var(&self, var: &str) -> bool
-  4443  pub enum PathFnKind { Length, Nodes, Relationships }
-  4445  impl PathFnKind
-  4456  impl MatchAggReturn
-  4459    pub fn references_var(&self, var: &str) -> bool
-  4487    pub fn eval_group(&self, rows: &[PathRow]) -> Value
-  4642  fn path_field_nums(rows: &[PathRow], var: &str, field: &str) -> Vec<f64>
-  4652  fn eval_cmp(actual: &Value, op: &CmpOp, rhs: &Value) -> bool
-  4666  fn cmp_ordered(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
-  4679  fn field_as_epoch(v: &Value) -> Option<i64>
-  4711  fn ymd_to_epoch(y: i64, m: i64, d: i64) -> i64
-  4720  fn now_secs() -> i64
-  4729  pub enum MatchAggStart
-  4740  pub struct HopSpec
-  4770  pub struct DestWhere
-  4779  pub enum WhereValue
-  4790  pub enum MatchFuncFilter
-  4801  pub struct WithStage
-  4816  pub enum WithOutExpr
-  4825  impl WithOutExpr
-  4826    pub fn is_agg(&self) -> bool
-  4833  pub enum WithExpr
-  4847  pub type WithRow = HashMap<String, Value>
-  4849  impl WithExpr
-  4851    pub fn eval(&self, row: &WithRow) -> f64
-  4875    pub fn eval_as_value(&self, row: &WithRow) -> Value
-  4890  pub struct MatchAggStmt
-  4938  pub(crate) struct RawPath
-  4959  pub(crate) fn collect_raw_paths(
-  4973  pub(crate) fn collect_raw_paths_opts(
-  4988    struct Partial
-  5243  fn collect_final_dest_counts(
-  5315  fn try_reverse_anchor(
-  5411  fn oriented_edge(db: &CoreDB, a: &str, b: &str, hop: &HopSpec) -> (String, String, String, Valu…
-  5430  pub(crate) fn build_path_rows_from_raw(
-  5603  fn filter_raw_by_func_filters(
-  5636  fn filter_raw_by_dest_where(
-  5890  pub fn collect_paths(
-  5908  fn resolve_match_start(db: &CoreDB, start: &MatchAggStart) -> Vec<u64>
-  5925  fn node_hash_from_row_value(v: &Value) -> Option<u64>
-  5932  fn expand_match_stage(
-  6045  fn project_with_stage(
-  6109  fn eval_with_out_over_group(expr: &WithOutExpr, group: &[WithRow]) -> Value
-  6137  fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering
-  6144  fn execute_match_agg_with_stages(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit>
-  6287  fn eval_return_over_with_rows(expr: &MatchAggReturn, rows: &[WithRow]) -> Value
-  6337  fn eval_math_on_with_row(expr: &MathExpr, row: &WithRow) -> f64
-  6366  fn build_score_maps(
-  6407  fn cmp_f64(op: &CmpOp, a: f64, b: f64) -> bool
-  6437  fn execute_match_graph(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit>
-  6540  pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit>
-  6723  fn math_refs_edge_field(m: &MathExpr, edge_binds: &[&str]) -> bool
-  6740  fn stmt_needs_edge_meta(stmt: &MatchAggStmt) -> bool
-  6772  fn stmt_needs_var_path(stmt: &MatchAggStmt) -> bool
-  6792  fn spread_or_insert(
-  6810  fn eval_edge_math(expr: &MathExpr, edge_var: &str, vals: &[(&str, f64)]) -> f64
-  6837  fn try_stream_edge_agg(db: &CoreDB, stmt: &MatchAggStmt, starts: &[u64]) -> Option<Vec<Hit>>
-  6874    enum Acc { Count, Now, Sum(f64), Avg(f64), Min(f64), Max(f64) }
-  6952  pub fn execute_match_agg_union(db: &CoreDB, stmts: Vec<MatchAggStmt>) -> Vec<Hit>
-  6968  fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit>
-  7874        enum Acc
-  8165  fn build_shortest_path_row(
-  8240  fn eval_path_predicate(db: &CoreDB, pred: &PathPredicate, row: &PathRow) -> bool
-  8275  fn finalize_rows(
-  8311  fn try_fast_shortest(db: &CoreDB, stmt: &ShortestSelectStmt) -> Option<Vec<Hit>>
-  8313    enum FastRet { Len, StartKey, EndKey, StartId, EndId }
-  8366  pub fn execute_shortest_select(db: &CoreDB, stmt: ShortestSelectStmt) -> Vec<Hit>
-  8401  fn cartesian_product(sources: Vec<Vec<PathRow>>) -> Vec<PathRow>
-  8418  pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit>
-  8496  pub(crate) fn iter_kv_sql_order(
-  8538  fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering
+  2138    pub fn count(self) -> usize
+  2146    pub fn first(self) -> Option<Hit>
+  2152    pub fn exists(self) -> bool
+  2166  fn values_eq(a: &Value, b: &Value) -> bool
+  2182  fn resolve_field(field: &str, payload: &Value) -> Option<Value>
+  2193  fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize>
+  2209  fn extract_simple_value(bytes: &[u8], start: usize) -> Option<(Value, usize)>
+  2272  pub(crate) fn find_value_end(bytes: &[u8], start: usize) -> Option<usize>
+  2326  pub(crate) fn splice_json_field(bytes: &[u8], field: &str, new_value_bytes: &[u8]) -> Option<Ve…
+  2363  pub(crate) fn extract_fields_by_search(
+  2390  fn is_simple_field(expr: &str) -> bool
+  2429  type Truth = Option<bool>
+  2436  fn and3(mut terms: impl Iterator<Item = Truth>) -> Truth
+  2449  fn or3(mut terms: impl Iterator<Item = Truth>) -> Truth
+  2462  fn known(v: Option<Value>) -> Option<Value>
+  2480  fn eval3(step: &Step, field_of: &mut dyn FnMut(&str) -> Option<Value>) -> Truth
+  2546  fn passes(step: &Step, field_of: &mut dyn FnMut(&str) -> Option<Value>) -> bool
+  2550  fn eval_step_on_payload(step: &Step, payload: &Value) -> bool
+  2557  fn eval_cond(db: &CoreDB, h: u64, step: &Step) -> bool
+  2569  fn gather_bm25_keys(expr: &ScoreExpr, out: &mut HashSet<(String, String)>)
+  2584  fn gather_vector_keys(expr: &ScoreExpr, out: &mut HashMap<(VecMetric, String), Vec<f32>>)
+  2609  fn eval_score(
+  2618    macro_rules! rec
+  2710  fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>>
+  2763  fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64>
+  4117  fn group_key_of(v: &Value) -> String
+  4124  fn find_take_limit(remaining_steps: &[Step]) -> Option<usize>
+  4141  pub type PathRow = HashMap<String, Value>
+  4145  pub enum MathExpr
+  4160  impl MathExpr
+  4162    pub fn collect_fields(&self, out: &mut Vec<(String, String)>)
+  4174    pub fn references_var(&self, var: &str) -> bool
+  4185    pub fn eval(&self, row: &PathRow) -> f64
+  4221  pub enum CmpOp
+  4231  impl CmpOp
+  4234    pub fn apply(&self, a: &Value, b: &Value) -> bool
+  4275  pub struct CaseCond
+  4282  impl CaseCond
+  4283    pub fn references_var(&self, var: &str) -> bool
+  4295  pub struct PlainCase
+  4300  impl PlainCase
+  4302    pub fn eval(&self, payload: &Value) -> Value
+  4315  pub struct SimpleCond
+  4323  pub enum PathPredicate
+  4336  pub struct ShortestSelectStmt
+  4359  pub enum FromSource
+  4370  pub struct MultiFromStmt
+  4382  pub enum MatchAggReturn
+  4439  pub enum MatchStr
+  4448  impl MatchStr
+  4449    pub fn eval(&self, row: &PathRow) -> String
+  4469    pub fn references_var(&self, var: &str) -> bool
+  4482  pub enum PathFnKind { Length, Nodes, Relationships }
+  4484  impl PathFnKind
+  4495  impl MatchAggReturn
+  4498    pub fn references_var(&self, var: &str) -> bool
+  4526    pub fn eval_group(&self, rows: &[PathRow]) -> Value
+  4681  fn path_field_nums(rows: &[PathRow], var: &str, field: &str) -> Vec<f64>
+  4691  fn eval_cmp(actual: &Value, op: &CmpOp, rhs: &Value) -> bool
+  4705  fn cmp_ordered(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
+  4718  fn field_as_epoch(v: &Value) -> Option<i64>
+  4750  fn ymd_to_epoch(y: i64, m: i64, d: i64) -> i64
+  4759  fn now_secs() -> i64
+  4768  pub enum MatchAggStart
+  4779  pub struct HopSpec
+  4809  pub struct DestWhere
+  4818  pub enum WhereValue
+  4829  pub enum MatchFuncFilter
+  4840  pub struct WithStage
+  4855  pub enum WithOutExpr
+  4864  impl WithOutExpr
+  4865    pub fn is_agg(&self) -> bool
+  4872  pub enum WithExpr
+  4886  pub type WithRow = HashMap<String, Value>
+  4888  impl WithExpr
+  4890    pub fn eval(&self, row: &WithRow) -> f64
+  4914    pub fn eval_as_value(&self, row: &WithRow) -> Value
+  4929  pub struct MatchAggStmt
+  4977  pub(crate) struct RawPath
+  4998  pub(crate) fn collect_raw_paths(
+  5012  pub(crate) fn collect_raw_paths_opts(
+  5027    struct Partial
+  5282  fn collect_final_dest_counts(
+  5354  fn try_reverse_anchor(
+  5450  fn oriented_edge(db: &CoreDB, a: &str, b: &str, hop: &HopSpec) -> (String, String, String, Valu…
+  5469  pub(crate) fn build_path_rows_from_raw(
+  5642  fn filter_raw_by_func_filters(
+  5675  fn filter_raw_by_dest_where(
+  5929  pub fn collect_paths(
+  5947  fn resolve_match_start(db: &CoreDB, start: &MatchAggStart) -> Vec<u64>
+  5964  fn node_hash_from_row_value(v: &Value) -> Option<u64>
+  5971  fn expand_match_stage(
+  6084  fn project_with_stage(
+  6148  fn eval_with_out_over_group(expr: &WithOutExpr, group: &[WithRow]) -> Value
+  6176  fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering
+  6183  fn execute_match_agg_with_stages(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit>
+  6326  fn eval_return_over_with_rows(expr: &MatchAggReturn, rows: &[WithRow]) -> Value
+  6376  fn eval_math_on_with_row(expr: &MathExpr, row: &WithRow) -> f64
+  6405  fn build_score_maps(
+  6446  fn cmp_f64(op: &CmpOp, a: f64, b: f64) -> bool
+  6476  fn execute_match_graph(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit>
+  6579  pub fn execute_match_agg(db: &CoreDB, mut stmt: MatchAggStmt) -> Vec<Hit>
+  6762  fn math_refs_edge_field(m: &MathExpr, edge_binds: &[&str]) -> bool
+  6779  fn stmt_needs_edge_meta(stmt: &MatchAggStmt) -> bool
+  6811  fn stmt_needs_var_path(stmt: &MatchAggStmt) -> bool
+  6831  fn spread_or_insert(
+  6849  fn eval_edge_math(expr: &MathExpr, edge_var: &str, vals: &[(&str, f64)]) -> f64
+  6876  fn try_stream_edge_agg(db: &CoreDB, stmt: &MatchAggStmt, starts: &[u64]) -> Option<Vec<Hit>>
+  6913    enum Acc { Count, Now, Sum(f64), Avg(f64), Min(f64), Max(f64) }
+  6991  pub fn execute_match_agg_union(db: &CoreDB, stmts: Vec<MatchAggStmt>) -> Vec<Hit>
+  7007  fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit>
+  7913        enum Acc
+  8204  fn build_shortest_path_row(
+  8279  fn eval_path_predicate(db: &CoreDB, pred: &PathPredicate, row: &PathRow) -> bool
+  8314  fn finalize_rows(
+  8350  fn try_fast_shortest(db: &CoreDB, stmt: &ShortestSelectStmt) -> Option<Vec<Hit>>
+  8352    enum FastRet { Len, StartKey, EndKey, StartId, EndId }
+  8405  pub fn execute_shortest_select(db: &CoreDB, stmt: ShortestSelectStmt) -> Vec<Hit>
+  8440  fn cartesian_product(sources: Vec<Vec<PathRow>>) -> Vec<PathRow>
+  8457  pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit>
+  8535  pub(crate) fn iter_kv_sql_order(
+  8577  fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering
 ```
 
 ### `scalar.rs` · 447L — Scalar functions — the per-value helpers SQL expressions call
