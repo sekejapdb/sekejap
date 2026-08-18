@@ -184,7 +184,64 @@ impl PageStore {
             mapped_pages: 0,
         };
         store.remap();
+        store.abandon_free_list_if_cyclic();
         Ok(Some(store))
+    }
+
+    /// Give up on the free list if it loops back on itself.
+    ///
+    /// The list is a chain threaded through the free pages: the header points at
+    /// the first, and each free page's first eight bytes point at the next.
+    /// `alloc` pops the head and follows that link, rejecting a link that is out
+    /// of range, is the header, or points at *itself* — but not one that points
+    /// back into the chain. Damage producing a two-page cycle (A → B → A) handed
+    /// out A, then B, then **A again**, without A having been freed in between.
+    /// Two live records then own the same page and each write destroys the other:
+    /// corruption reported as success, which is worse than any refusal.
+    ///
+    /// Detected with two pointers at different speeds, so it costs no memory and
+    /// one pass — a visited set would be RAM proportional to the free space, which
+    /// is the kind of growth this store exists to avoid.
+    ///
+    /// **The sacrifice, named:** a cyclic list is abandoned whole rather than
+    /// repaired. The pages it held stay allocated and unused — leaked space, until
+    /// a compaction rewrites the store — and the store carries on by extending
+    /// past the high-water mark. Surgery on a damaged chain would recover that
+    /// space and risks getting it wrong; forgoing reuse of free space cannot lose
+    /// a record.
+    fn abandon_free_list_if_cyclic(&mut self) {
+        if self.free_head == NO_PAGE {
+            return;
+        }
+        let next_of = |page: u64| -> u64 {
+            if page == NO_PAGE || page == HEADER_PAGE || page >= self.high_water {
+                return NO_PAGE;
+            }
+            let mut link = [0u8; 8];
+            match read_exact_at(&self.file, &mut link, page * self.page_size as u64) {
+                Ok(()) => {
+                    let n = u64::from_le_bytes(link);
+                    if n == NO_PAGE || n == HEADER_PAGE || n >= self.high_water { NO_PAGE } else { n }
+                }
+                Err(_) => NO_PAGE,
+            }
+        };
+
+        let (mut slow, mut fast) = (self.free_head, self.free_head);
+        loop {
+            fast = next_of(fast);
+            if fast == NO_PAGE { return } // a clean end: nothing to abandon
+            fast = next_of(fast);
+            if fast == NO_PAGE { return }
+            slow = next_of(slow);
+            if slow == fast {
+                break; // the chain meets itself
+            }
+        }
+
+        self.free_head = NO_PAGE;
+        self.free_count = 0;
+        self.dirty = true;
     }
 
     /// Point the read mapping at everything currently in the file.
@@ -207,7 +264,15 @@ impl PageStore {
         //
         // Clamping means pages past the real end fall to the descriptor, which
         // reports a short read as the error it is.
-        let want = self.high_water * self.page_size as u64;
+        // `checked_mul`, because `high_water` comes from the header and a corrupt
+        // one overflows the product: a debug build panics on it, which is the
+        // build every test runs, and an abort while opening a damaged file is the
+        // one thing this store must not do. A page count that cannot be a byte
+        // count clamps to the file's real length below, and pages past the end
+        // then fall to the descriptor, which reports a short read as an error.
+        let want = self.high_water
+            .checked_mul(self.page_size as u64)
+            .unwrap_or(u64::MAX);
         let on_disk = self.file.metadata().map(|m| m.len()).unwrap_or(0);
         let bytes = want.min(on_disk);
         self.map = usize::try_from(bytes).ok()
@@ -764,6 +829,59 @@ mod tests {
             }
             assert!(PageStore::open(&path).unwrap().is_none(),
                     "{name}: a header that cannot describe a real store was accepted");
+        }
+    }
+}
+
+#[cfg(test)]
+mod damaged_free_list_tests {
+    use super::*;
+
+    /// **A damaged free list must not hand the same page out twice.**
+    ///
+    /// The free list is a chain threaded through the free pages themselves: the
+    /// header points at the first, each free page's first eight bytes point at the
+    /// next. `alloc` pops the head and follows that link.
+    ///
+    /// The link is checked for being out of range, for being the header, and for
+    /// pointing at *itself* — but not for pointing back into the chain. Damage
+    /// that produces a two-page cycle (A → B → A) therefore yields A, then B, then
+    /// A again, with A never having been freed in between. Two live records then
+    /// own the same page, and each write silently destroys the other: corruption
+    /// reported as success, which is worse than any refusal.
+    #[test]
+    fn a_cyclic_free_list_does_not_hand_out_a_page_twice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cycle.bin");
+
+        // Four pages, two of them freed, so the list is B → A.
+        let (a, b) = {
+            let mut s = PageStore::create(&path, DEFAULT_PAGE_SIZE).unwrap();
+            let a = s.alloc().unwrap();
+            let b = s.alloc().unwrap();
+            let _c = s.alloc().unwrap();
+            s.free(a).unwrap();
+            s.free(b).unwrap();
+            s.sync().unwrap();
+            (a, b)
+        };
+
+        // Damage: make A point back at B, closing the cycle B → A → B.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(a * DEFAULT_PAGE_SIZE as u64)).unwrap();
+            f.write_all(&b.to_le_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let mut s = PageStore::open(&path).unwrap().expect("the store still opens");
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..6 {
+            let p = s.alloc().unwrap_or_else(|e| panic!("alloc {i} failed: {e}"));
+            assert!(seen.insert(p),
+                "page {p} was handed out twice — the free list was damaged into a \
+                 cycle, and two records now own the same bytes");
         }
     }
 }

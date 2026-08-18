@@ -1,5 +1,10 @@
 //! A damaged durable file must not kill the process.
 //!
+//! Every file the database writes is damaged here, one byte at a time — the paged
+//! record and index stores, the payload blob, the slot map, the spatial grid and
+//! the topology segments. The list is discovered from the directory rather than
+//! written down, so a file added later is covered without anyone remembering.
+//!
 //! The topology segments — `idx.bin`, `dict.bin`, `nodes.bin`, the adjacency and
 //! collection blobs — are memory-mapped and decoded directly. Every length,
 //! offset and count in them comes *from the file*, and they were believed:
@@ -67,23 +72,36 @@ fn interrogate(db: &CoreDB) -> usize {
     n
 }
 
-/// **No single-byte corruption of a topology file may abort the process.**
+/// **No single-byte corruption of any durable file may abort the process.**
 ///
 /// A test in the same binary cannot survive an abort, so a failure here shows up
 /// as the whole binary dying rather than as an assertion — which is exactly the
 /// severity of the bug: uncatchable, unreportable.
 #[test]
-fn a_flipped_byte_in_a_topology_file_never_aborts() {
-    const FILES: &[&str] = &[
-        "idx.bin", "dict.bin", "nodes.bin", "slugs.bin", "collections.bin",
-        "adj_fwd.bin", "adj_rev.bin", "edge_types.bin", "spatial.bin",
-        "coll_names.bin", "edgemeta.bin",
-    ];
+fn a_flipped_byte_in_any_durable_file_never_aborts() {
+    // Every file the database wrote, discovered rather than listed — the paged
+    // record and index stores, the payload blob, the slot map and the spatial
+    // grid as well as the topology segments. A file added later is damaged too,
+    // without anyone remembering to add it here.
+    let files: Vec<String> = {
+        let dir = tempfile::TempDir::new().unwrap();
+        build(dir.path());
+        let mut v: Vec<String> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "db.lock")
+            .collect();
+        v.sort();
+        v
+    };
+    assert!(files.len() >= 15,
+        "expected the fixture to write a good many files, found {}: {files:?}",
+        files.len());
 
     let mut damaged = 0;
     let mut opened = 0;
-    for file in FILES {
-        for &pos in &[3usize, 17, 41, 71, 97, 149, 211, 307, 457, 613, 733, 971] {
+    for file in &files {
+        for &pos in &[3usize, 41, 97, 211, 457, 971] {
             let dir = tempfile::TempDir::new().unwrap();
             build(dir.path());
             let path = dir.path().join(file);
@@ -103,7 +121,7 @@ fn a_flipped_byte_in_a_topology_file_never_aborts() {
         }
     }
 
-    assert!(damaged >= 100,
+    assert!(damaged >= 80,
         "only {damaged} corruptions were actually applied — the fixture is not \
          producing the files this is meant to damage");
     assert!(opened >= damaged / 2,
