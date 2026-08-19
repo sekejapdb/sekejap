@@ -607,7 +607,7 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   1265  fn query_err<E: std::fmt::Display>(e: E) -> SqlFail { ("42601", e.to_string()) }
 ```
 
-### `query.rs` · 8866L — The query engine — building and running queries
+### `query.rs` · 8877L — The query engine — building and running queries
 
 ```
     71  pub struct Hit
@@ -782,19 +782,19 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
   7053    enum Acc { Count, Now, Sum(f64), Avg(f64), Min(f64), Max(f64) }
   7131  pub fn execute_match_agg_union(db: &CoreDB, stmts: Vec<MatchAggStmt>) -> Vec<Hit>
   7147  fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit>
-  8053        enum Acc
-  8344  fn build_shortest_path_row(
-  8415  fn eval_path_predicate(db: &CoreDB, pred: &PathPredicate, row: &PathRow) -> bool
-  8450  fn finalize_rows(
-  8486  fn try_fast_shortest(db: &CoreDB, stmt: &ShortestSelectStmt) -> Option<Vec<Hit>>
-  8488    enum FastRet { Len, StartKey, EndKey, StartId, EndId }
-  8535  pub fn execute_shortest_select(db: &CoreDB, stmt: ShortestSelectStmt) -> Vec<Hit>
-  8570  fn cartesian_product(sources: Vec<Vec<PathRow>>) -> Vec<PathRow>
-  8587  pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit>
-  8665  pub(crate) fn iter_kv_sql_order(
-  8727  fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering
-  8790  pub(crate) fn validate_plan(db: &CoreDB, steps: &[Step]) -> Result<(), SqlError>
-  8794  fn validate_steps(
+  8064        enum Acc
+  8355  fn build_shortest_path_row(
+  8426  fn eval_path_predicate(db: &CoreDB, pred: &PathPredicate, row: &PathRow) -> bool
+  8461  fn finalize_rows(
+  8497  fn try_fast_shortest(db: &CoreDB, stmt: &ShortestSelectStmt) -> Option<Vec<Hit>>
+  8499    enum FastRet { Len, StartKey, EndKey, StartId, EndId }
+  8546  pub fn execute_shortest_select(db: &CoreDB, stmt: ShortestSelectStmt) -> Vec<Hit>
+  8581  fn cartesian_product(sources: Vec<Vec<PathRow>>) -> Vec<PathRow>
+  8598  pub fn execute_multi_from(db: &CoreDB, stmt: MultiFromStmt) -> Vec<Hit>
+  8676  pub(crate) fn iter_kv_sql_order(
+  8738  fn cmp_json(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering
+  8801  pub(crate) fn validate_plan(db: &CoreDB, steps: &[Step]) -> Result<(), SqlError>
+  8805  fn validate_steps(
 ```
 
 ### `scalar.rs` · 447L — Scalar functions — the per-value helpers SQL expressions call

@@ -7940,11 +7940,22 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             && effective_start_var.is_none() && !start_conds
     };
 
-    // Phase 1: topology. Foldable shapes never read per-path slug strings.
+    // Phase 1: topology.
+    //
+    // `with_slugs` was `!foldable`, which is a statement about aggregate folding,
+    // not about slugs. So every ordinary projection built a `Vec<String>` of node
+    // slugs per path — one clone per hop, per path — and then never looked at it.
+    // The only reader is the GQL path variable below, and `needs_var_path` is
+    // already exactly "a path variable or a path intrinsic is referenced".
+    //
+    // On a 5-hop walk over 20 000 nodes returning 5 000 rows, that was ~25 000
+    // string allocations for nothing: `SELECT b._key FROM MATCH (a)-[*1..5]->(b)`
+    // cost 946 µs against the builder's 198 µs for the same traversal, and the
+    // gap was not payload reading — `SELECT b.*` adds only a third on top.
     let mut raw = if let Some(reversed) = try_reverse_anchor(db, &starts, &stmt.hops, &stmt.dest_where) {
         reversed
     } else {
-        collect_raw_paths_opts(db, &starts, &stmt.hops, traversal_limit, needs_var_path, !foldable)
+        collect_raw_paths_opts(db, &starts, &stmt.hops, traversal_limit, needs_var_path, needs_var_path)
     };
     if raw.is_empty() && !is_bare_agg { return vec![]; }
 
