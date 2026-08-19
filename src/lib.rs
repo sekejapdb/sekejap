@@ -6492,13 +6492,32 @@ impl CoreDB {
         // Built fresh from all node metas (overlay + base) so it is complete even
         // when compacting in paged mode; ring caches are not persisted.
         Self::phase_probe("  topology files + slot table", &mut inner);
-        if self.spatial_grid.is_some() {
-            let grid = geo::SpatialGrid::build(self.all_spatial_items().into_iter());
-            // Rendered straight into the file. The grid itself is unavoidable
-            // here — the meta section is ordered by hash and the cell directory
-            // by cell, so writing without one of the two orderings held would
-            // need an external sort — but the serialised copy beside it is not.
-            Self::write_atomic_with(dir, "spatialgrid.bin", |w| grid.write_binary(w))?;
+        if let Some(grid) = self.spatial_grid.as_ref() {
+            if grid.is_disk_backed() {
+                // Steady state: merge the mapped base with the overlay. The base
+                // already holds its metas by hash and its cells by (cy,cx), the
+                // two orders this format wants, so the fold costs the change
+                // rather than the store.
+                //
+                // The gate is the whole node overlay, not just the grid's. A row
+                // updated to *drop* its geometry is in `nodes` and never reaches
+                // `grid.insert`, so gating on the grid alone would leave the base
+                // reporting a location the row no longer has. `all_spatial_items`
+                // got this right by rebuilding from `nodes`; the merge has to get
+                // it right explicitly.
+                let mut gate: std::collections::HashSet<u64> =
+                    self.tombstones.iter().copied().collect();
+                gate.extend(self.nodes.keys().copied());
+                Self::write_atomic_with(dir, "spatialgrid.bin", |w| {
+                    grid.write_binary_merged(w, &gate)
+                })?;
+            } else {
+                // First fold: there is no base to merge with, so the grid is
+                // built once from every item. Proportional to the data, which is
+                // what building an index for the first time costs.
+                let built = geo::SpatialGrid::build(self.all_spatial_items().into_iter());
+                Self::write_atomic_with(dir, "spatialgrid.bin", |w| built.write_binary(w))?;
+            }
         }
         // Compact vector indexes (int8 + CSR) sidecar — lets a paged reopen mmap them
         // instead of rebuilding the HNSW graph resident.

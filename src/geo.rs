@@ -450,6 +450,159 @@ impl SpatialGrid {
         Ok(())
     }
 
+    /// Write the mmap base unioned with the resident overlay, holding neither.
+    ///
+    /// `write_binary` serialises whatever is resident, so a fold had to first
+    /// rebuild the entire grid from every node in the store — 126.8 MB of heap
+    /// for a thousand-row change at 500 000 rows, and rising. The base already
+    /// carries its metas sorted by hash and its cells sorted by `(cy, cx)`, which
+    /// are exactly the two orderings this format wants, so the fold is a merge of
+    /// two sorted runs and costs the overlay, not the store.
+    ///
+    /// `gate` names the hashes the base is out of date about — deleted rows, and
+    /// rows the overlay holds a newer position for. Without it the base goes on
+    /// reporting geometry for rows that have moved or gone.
+    ///
+    /// The counts precede the records in this format and cannot be patched
+    /// afterwards through a `Write`, so each section is walked twice: once to
+    /// count, once to emit. The base is a mapping, so the extra walk is page
+    /// cache rather than memory.
+    pub fn write_binary_merged<W: std::io::Write>(
+        &self,
+        w: &mut W,
+        gate: &std::collections::HashSet<u64>,
+    ) -> std::io::Result<()> {
+        let Some(base) = self.mapped.as_ref() else {
+            // Nothing mapped: the resident grid is the whole truth.
+            return self.write_binary(w);
+        };
+
+        // The overlay, sorted into the two orders the file needs. Bounded by the
+        // change, which is the entire point.
+        let mut ov_meta: Vec<(u64, &SpatialMeta)> =
+            self.meta.iter().map(|(h, m)| (*h, m)).collect();
+        ov_meta.sort_unstable_by_key(|(h, _)| *h);
+        let mut ov_cells: Vec<((i32, i32), &Vec<u64>)> =
+            self.cells.iter().map(|(k, v)| (*k, v)).collect();
+        ov_cells.sort_unstable_by_key(|(k, _)| *k);
+
+        // A base row is stale if it was deleted or if the overlay holds it.
+        let stale = |h: u64| gate.contains(&h) || self.meta.contains_key(&h);
+
+        w.write_all(b"SKGRID01")?;
+        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&self.cell_size.to_le_bytes())?;
+
+        // ── meta: base minus stale, merged with the overlay, ascending by hash ──
+        let kept_base = (0..base.len())
+            .filter_map(|i| base.meta_at(i))
+            .filter(|(h, _)| !stale(*h))
+            .count();
+        w.write_all(&((kept_base + ov_meta.len()) as u32).to_le_bytes())?;
+
+        let mut bi = 0usize;
+        let mut oi = 0usize;
+        loop {
+            // Skip base records the overlay or a tombstone has superseded.
+            while bi < base.len() && base.meta_at(bi).is_some_and(|(h, _)| stale(h)) {
+                bi += 1;
+            }
+            let b = if bi < base.len() { base.meta_at(bi) } else { None };
+            let o = ov_meta.get(oi);
+            let (h, m) = match (b, o) {
+                (None, None) => break,
+                (Some((bh, bm)), None) => { bi += 1; (bh, bm) }
+                (None, Some((oh, om))) => { oi += 1; (*oh, (*om).clone()) }
+                (Some((bh, bm)), Some((oh, om))) => {
+                    if bh <= *oh { bi += 1; (bh, bm) } else { oi += 1; (*oh, (*om).clone()) }
+                }
+            };
+            w.write_all(&h.to_le_bytes())?;
+            for v in [m.centroid_lat, m.centroid_lon, m.bbox_min_lat,
+                      m.bbox_min_lon, m.bbox_max_lat, m.bbox_max_lon] {
+                w.write_all(&v.to_le_bytes())?;
+            }
+        }
+
+        // ── cells: same merge, ascending by (cy, cx) ────────────────────────────
+        // Walked once to count the cells that survive gating and the postings
+        // they hold, then again to write. A cell whose every member has moved
+        // away is dropped rather than written empty.
+        // Walked three times — to count, to write the directory, to write the
+        // postings — because the counts and offsets precede the records they
+        // describe and a `Write` cannot go back. Buffering a section instead
+        // would put the store back in memory: the posting blob alone was 4 MB at
+        // 500 000 rows, which is the whole cost this merge exists to remove.
+        let mut merged_cells = |mut emit: Box<dyn FnMut((i32, i32), &[u64]) -> std::io::Result<()> + '_>|
+            -> std::io::Result<()>
+        {
+            let (mut bi, mut oi) = (0usize, 0usize);
+            loop {
+                let b = if bi < base.cell_count() { base.cell_at(bi) } else { None };
+                let o = ov_cells.get(oi);
+                let (key, ids): ((i32, i32), Vec<u64>) = match (b, o) {
+                    (None, None) => break,
+                    (Some((bk, bv)), None) => {
+                        bi += 1;
+                        (bk, bv.into_iter().filter(|h| !stale(*h)).collect())
+                    }
+                    (None, Some((ok, ov))) => { oi += 1; (*ok, (*ov).clone()) }
+                    (Some((bk, bv)), Some((ok, ov))) => {
+                        if bk < *ok {
+                            bi += 1;
+                            (bk, bv.into_iter().filter(|h| !stale(*h)).collect())
+                        } else if bk > *ok {
+                            oi += 1;
+                            (*ok, (*ov).clone())
+                        } else {
+                            bi += 1;
+                            oi += 1;
+                            let mut v: Vec<u64> =
+                                bv.into_iter().filter(|h| !stale(*h)).collect();
+                            v.extend_from_slice(ov);
+                            (bk, v)
+                        }
+                    }
+                };
+                // A cell every one of whose members has moved away is dropped, not
+                // written empty — an empty cell is a hit the refinement pass then
+                // has to reject.
+                if !ids.is_empty() {
+                    emit(key, &ids)?;
+                }
+            }
+            Ok(())
+        };
+
+        let mut cell_count = 0u32;
+        let mut post_total = 0u64;
+        merged_cells(Box::new(|_, ids| {
+            cell_count += 1;
+            post_total += ids.len() as u64;
+            Ok(())
+        }))?;
+
+        w.write_all(&cell_count.to_le_bytes())?;
+        let mut off = 0u64;
+        merged_cells(Box::new(|(cy, cx), ids| {
+            w.write_all(&cy.to_le_bytes())?;
+            w.write_all(&cx.to_le_bytes())?;
+            w.write_all(&off.to_le_bytes())?;
+            w.write_all(&(ids.len() as u32).to_le_bytes())?;
+            off += ids.len() as u64 * 8;
+            Ok(())
+        }))?;
+
+        w.write_all(&(post_total * 8).to_le_bytes())?;
+        merged_cells(Box::new(|_, ids| {
+            for &h in ids {
+                w.write_all(&h.to_le_bytes())?;
+            }
+            Ok(())
+        }))?;
+        Ok(())
+    }
+
     /// Node hashes in cell `(cy,cx)` — resident overlay unioned with the mmap base.
     fn cell_members_at(&self, key: (i32, i32)) -> Option<Vec<u64>> {
         let overlay = self.cells.get(&key);

@@ -94,6 +94,55 @@ impl MappedSpatialGrid {
         None
     }
 
+    /// Number of cells in the directory.
+    pub(crate) fn cell_count(&self) -> usize { self.cell_count }
+
+    /// The `i`th meta record, in the file's order — which is ascending by hash.
+    ///
+    /// `node_meta` binary-searches for one node; this walks them in order, so a
+    /// fold can merge the base with its overlay as two sorted runs instead of
+    /// rebuilding the whole grid to write it.
+    pub(crate) fn meta_at(&self, i: usize) -> Option<(u64, SpatialMeta)> {
+        if i >= self.node_count { return None }
+        let b = self.view.slice(self.meta_off, self.node_count * META_REC)?;
+        let o = i * META_REC;
+        Some((
+            rd_u64(b, o),
+            SpatialMeta {
+                centroid_lat: rd_f64(b, o + 8),
+                centroid_lon: rd_f64(b, o + 16),
+                bbox_min_lat: rd_f64(b, o + 24),
+                bbox_min_lon: rd_f64(b, o + 32),
+                bbox_max_lat: rd_f64(b, o + 40),
+                bbox_max_lon: rd_f64(b, o + 48),
+            },
+        ))
+    }
+
+    /// The `i`th cell, in the file's order — ascending by `(cy, cx)`.
+    ///
+    /// Postings are capped by what the blob can actually hold, for the same
+    /// reason `cell_members` caps them: `n` comes out of the file, and a corrupt
+    /// one would otherwise reserve billions of entries before any bounds check
+    /// could run.
+    pub(crate) fn cell_at(&self, i: usize) -> Option<((i32, i32), Vec<u64>)> {
+        if i >= self.cell_count { return None }
+        let dir = self.view.slice(self.dir_off, self.cell_count * DIR_REC)?;
+        let o = i * DIR_REC;
+        let key = (rd_i32(dir, o), rd_i32(dir, o + 4));
+        let off = rd_u64(dir, o + 8) as usize;
+        let blob = self.view.slice(self.blob_off, self.blob_len)?;
+        let room = blob.len().saturating_sub(off) / 8;
+        let n = (rd_u32(dir, o + 16) as usize).min(room);
+        let mut out = Vec::with_capacity(n);
+        for j in 0..n {
+            let p = off + j * 8;
+            if p + 8 > blob.len() { break }
+            out.push(rd_u64(blob, p));
+        }
+        Some((key, out))
+    }
+
     /// Node hashes in cell `(cy, cx)` — binary search the sorted-by-(cy,cx) dir,
     /// then read the posting run from the blob.
     pub(crate) fn cell_members(&self, cy: i32, cx: i32) -> Option<Vec<u64>> {
