@@ -633,6 +633,21 @@ impl Segments {
 pub(crate) enum FieldIndexRef<'a> {
     Heap(&'a std::collections::BTreeMap<FieldKey, Vec<u64>>),
     Mapped(&'a storage::fieldstore::MappedFieldStore),
+    /// An immutable mapped base plus the heap delta of everything written since,
+    /// with `superseded` naming the rows whose base entry is out of date.
+    ///
+    /// The two halves used to be consulted in preference order rather than
+    /// merged, which is why a write had to copy the entire base onto the heap
+    /// before it could change anything — 23 MB of RAM for one write against a
+    /// 500 000-row index. Merging here is what lets the delta stay a delta.
+    ///
+    /// Same rule as every other base-plus-overlay in this codebase: **both
+    /// halves, every read path.** Reading one is how rows silently vanish.
+    Merged {
+        delta: &'a std::collections::BTreeMap<FieldKey, Vec<u64>>,
+        base: &'a storage::fieldstore::MappedFieldStore,
+        superseded: &'a std::collections::HashSet<u64>,
+    },
 }
 
 impl<'a> FieldIndexRef<'a> {
@@ -640,6 +655,11 @@ impl<'a> FieldIndexRef<'a> {
         match *self {
             FieldIndexRef::Heap(m) => m.len(),
             FieldIndexRef::Mapped(s) => s.len(),
+            // Distinct keys across both halves. An exact count would have to walk
+            // the base to see which of its keys the delta already carries; every
+            // caller uses this to size or to decide whether an index is worth
+            // using, so an upper bound is what it needs and what it gets.
+            FieldIndexRef::Merged { delta, base, .. } => base.len() + delta.len(),
         }
     }
 
@@ -648,6 +668,26 @@ impl<'a> FieldIndexRef<'a> {
         match *self {
             FieldIndexRef::Heap(m) => m.get(k).map(|v| std::borrow::Cow::Borrowed(v.as_slice())),
             FieldIndexRef::Mapped(s) => s.get_eq(k).map(std::borrow::Cow::Owned),
+            FieldIndexRef::Merged { delta, base, superseded } => {
+                // The base's postings minus the rows it is out of date about,
+                // then whatever the delta says about this key.
+                let mut ids: Vec<u64> = base
+                    .get_eq(k)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|id| !superseded.contains(id))
+                    .collect();
+                if let Some(d) = delta.get(k) {
+                    ids.extend(d.iter().copied());
+                }
+                // A row can only sit under one value of a field at a time, so the
+                // two halves cannot both list it — but a delta that was written
+                // twice can, and a duplicate posting is double-counted by every
+                // aggregate downstream.
+                ids.sort_unstable();
+                ids.dedup();
+                if ids.is_empty() { None } else { Some(std::borrow::Cow::Owned(ids)) }
+            }
         }
     }
 
@@ -663,6 +703,20 @@ impl<'a> FieldIndexRef<'a> {
                 .flat_map(|(_, ids)| ids.iter().copied())
                 .collect(),
             FieldIndexRef::Mapped(s) => s.range_postings(lo, hi),
+            FieldIndexRef::Merged { delta, base, superseded } => {
+                // A candidate set for a range predicate: membership matters,
+                // order does not (ORDER BY reads `iter_kv`, which does preserve
+                // key order).
+                let mut ids: Vec<u64> = base
+                    .range_postings(lo, hi)
+                    .into_iter()
+                    .filter(|id| !superseded.contains(id))
+                    .collect();
+                ids.extend(delta.range((lo, hi)).flat_map(|(_, v)| v.iter().copied()));
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            }
         }
     }
 
@@ -677,6 +731,63 @@ impl<'a> FieldIndexRef<'a> {
                 }
             }
             FieldIndexRef::Mapped(s) => s.iter_kv(rev),
+            FieldIndexRef::Merged { delta, base, superseded } => {
+                // Key order is load-bearing here — ORDER BY, MIN and MAX all read
+                // this — so the two halves are merged as sorted runs rather than
+                // concatenated and re-sorted.
+                let b = base.iter_kv(rev);
+                let d: Vec<(FieldKey, Vec<u64>)> = if rev {
+                    delta.iter().rev().map(|(k, v)| (k.clone(), v.clone())).collect()
+                } else {
+                    delta.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                };
+
+                let mut out: Vec<(FieldKey, Vec<u64>)> = Vec::with_capacity(b.len() + d.len());
+                let (mut bi, mut di) = (0usize, 0usize);
+                while bi < b.len() || di < d.len() {
+                    use std::cmp::Ordering;
+                    let ord = match (b.get(bi), d.get(di)) {
+                        (Some((bk, _)), Some((dk, _))) => {
+                            let o = bk.cmp(dk);
+                            if rev { o.reverse() } else { o }
+                        }
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => break,
+                    };
+                    let (key, mut ids) = match ord {
+                        Ordering::Less => {
+                            let (k, v) = b[bi].clone();
+                            bi += 1;
+                            (k, v.into_iter().filter(|id| !superseded.contains(id)).collect::<Vec<u64>>())
+                        }
+                        Ordering::Greater => {
+                            let (k, v) = d[di].clone();
+                            di += 1;
+                            (k, v)
+                        }
+                        Ordering::Equal => {
+                            let (k, bv) = b[bi].clone();
+                            let (_, dv) = d[di].clone();
+                            bi += 1;
+                            di += 1;
+                            let mut v: Vec<u64> =
+                                bv.into_iter().filter(|id| !superseded.contains(id)).collect();
+                            v.extend(dv);
+                            (k, v)
+                        }
+                    };
+                    ids.sort_unstable();
+                    ids.dedup();
+                    // A key every one of whose rows has moved away is *gone*, not
+                    // present-and-empty. Emitting it would let MIN/MAX answer with
+                    // a value no row holds any more.
+                    if !ids.is_empty() {
+                        out.push((key, ids));
+                    }
+                }
+                out
+            }
         }
     }
 }
@@ -1728,6 +1839,16 @@ pub struct CoreDB {
     /// page cache, not the heap). Consulted by `field_index_ref` when a
     /// `(collection, field)` is absent from the heap `field_indexes` overlay.
     field_base: HashMap<(u64, String), storage::fieldstore::MappedFieldStore>,
+    /// Rows whose entry in `field_base` is stale: written, re-written or deleted
+    /// since that base was built, keyed by collection.
+    ///
+    /// The base is immutable, so it still files a row under the value it had when
+    /// the base was written. This set is what lets a read ignore that entry and
+    /// take `field_indexes` as authoritative for the row, which in turn is what
+    /// lets `field_indexes` stay a *delta* instead of a full copy. It holds one
+    /// `u64` per changed row and is cleared when compaction folds the delta into
+    /// a new base, so it is bounded by the change, never by the store.
+    field_super: HashMap<(u64, String), std::collections::HashSet<u64>>,
     /// Build params for each HNSW index: field → (m, ef_construction).
     /// Populated by build_hnsw_index(); used to auto-rebuild on version mismatch.
     hnsw_params: HashMap<String, (usize, usize)>,
@@ -2211,6 +2332,7 @@ impl CoreDB {
             compact_indexes: HashMap::new(),
             field_indexes: HashMap::new(),
             field_base: HashMap::new(),
+            field_super: HashMap::new(),
             hnsw_params: HashMap::new(),
             hnsw_metric: HashMap::new(),
             hnsw_ef_search: None,
@@ -3022,6 +3144,10 @@ impl CoreDB {
             for f in mapped_fields {
                 self.ensure_field_index_writable(coll_hash, &f);
             }
+            // The base still files this row under whatever value it had when the
+            // base was written. Say so, so reads take the delta below as the
+            // authority for it.
+            self.supersede_field_row_all(coll_hash, hash);
             for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
                 if *idx_coll == coll_hash {
                     if let Some(key) = FieldKey::from_json(
@@ -3182,6 +3308,9 @@ impl CoreDB {
                     let mapped: Vec<String> = self.field_base.keys()
                         .filter(|(c, _)| *c == ch).map(|(_, f)| f.clone()).collect();
                     for f in mapped { self.ensure_field_index_writable(ch, &f); }
+                    // Deleting only from the delta would leave the base still
+                    // listing the row, so `WHERE` kept matching a row that is gone.
+                    self.supersede_field_row_all(ch, hash);
                     for ((idx_coll, idx_field), btree) in &mut self.field_indexes {
                         if *idx_coll != ch { continue; }
                         if let Some(key) = FieldKey::from_json(
@@ -3337,6 +3466,11 @@ impl CoreDB {
 
         // Remove the now-empty collection btree index entries
         self.field_indexes.retain(|(c, _), _| *c != col_hash);
+        // The mapped sidecars are keyed the same way. Dropping only the heap side
+        // left the base mapped, so a dropped collection could still answer an
+        // indexed query out of it.
+        self.field_base.retain(|(c, _), _| *c != col_hash);
+        self.field_super.retain(|(c, _), _| *c != col_hash);
 
         // Remove declared schema (if any)
         self.schemas.remove(collection);
@@ -3627,6 +3761,30 @@ impl CoreDB {
                     .filter(|(c, _)| *c == old_hash)
                     .cloned()
                     .collect();
+                // The mapped base and the staleness set are keyed by collection
+                // too, and all three have to move together. Moving the delta alone
+                // leaves the base filed under the old hash, so a merged read finds
+                // a delta with nothing behind it and answers with only the rows
+                // written since the last compaction — the rest of the column gone,
+                // with no error.
+                let base_keys: Vec<(u64, String)> = self.field_base.keys()
+                    .filter(|(c, _)| *c == old_hash)
+                    .cloned()
+                    .collect();
+                for (_, field) in base_keys {
+                    if let Some(base) = self.field_base.remove(&(old_hash, field.clone())) {
+                        self.field_base.insert((new_hash, field), base);
+                    }
+                }
+                let sup_keys: Vec<(u64, String)> = self.field_super.keys()
+                    .filter(|(c, _)| *c == old_hash)
+                    .cloned()
+                    .collect();
+                for (_, field) in sup_keys {
+                    if let Some(sup) = self.field_super.remove(&(old_hash, field.clone())) {
+                        self.field_super.insert((new_hash, field), sup);
+                    }
+                }
                 for (_, field) in old_keys {
                     if let Some(btree) = self.field_indexes.remove(&(old_hash, field.clone())) {
                         self.field_indexes.insert((new_hash, field), btree);
@@ -4521,6 +4679,14 @@ impl CoreDB {
         let mut batch: Vec<(String, u64, Vec<u8>)> = Vec::with_capacity(count);
 
         for (slug, hash, raw) in hits {
+            // The base cannot be edited in place, so it goes on listing this row
+            // under its pre-update value. Retracting from the delta below is only
+            // half the job; this is the other half.
+            if let Some(ch) = coll_hash {
+                for f in &field_names {
+                    self.supersede_field_row(ch, f, hash);
+                }
+            }
             // Remove old btree entries for indexed fields being updated
             if let Some(ch) = coll_hash {
                 let extracted = crate::query::extract_fields_by_search(&raw, &field_names);
@@ -5066,6 +5232,7 @@ impl CoreDB {
                 let from_base: std::collections::HashSet<String> =
                     mapped.iter().cloned().collect();
                 for f in mapped { self.ensure_field_index_writable(coll_hash, &f); }
+                self.supersede_field_row_all(coll_hash, hash);
                 for (field, key) in pending_keys[i].drain(..) {
                     let fresh = is_new && !from_base.contains(&field);
                     let ids = self.field_indexes
@@ -5815,9 +5982,35 @@ impl CoreDB {
         // serves indexed queries from page cache (not heap). One file per
         // (collection, field); the field name is hex-encoded so any identifier
         // round-trips through the filename.
-        for ((coll_hash, field), btree) in &self.field_indexes {
-            let fname = format!("fieldidx_{}_{}.bin", coll_hash, hex_encode(field));
-            storage::fieldstore::write(&dir.join(fname), btree)?;
+        // `field_indexes` is a *delta* against `field_base`. Writing it straight
+        // out would replace a column's sidecar with only the rows touched since
+        // the last compaction and silently drop the rest of the column — the
+        // base/overlay fallacy, in its most destructive position. What goes to
+        // disk is the merged view: the base minus the rows it is stale about,
+        // plus the delta.
+        let had_field_base = !self.field_base.is_empty();
+        let idx_keys: Vec<(u64, String)> = self.field_indexes.keys().cloned().collect();
+        for (coll_hash, field) in idx_keys {
+            let merged: std::collections::BTreeMap<FieldKey, Vec<u64>> =
+                match self.field_index_ref(coll_hash, &field) {
+                    Some(r) => r.iter_kv(false).into_iter().collect(),
+                    None => continue,
+                };
+            let fname = format!("fieldidx_{}_{}.bin", coll_hash, hex_encode(&field));
+            storage::fieldstore::write(&dir.join(fname), &merged)?;
+        }
+        // The sidecars now carry everything, so re-map them and drop both halves
+        // of the overlay. Skipping this would leave `field_super` growing for the
+        // life of the process — one `u64` per row ever written — which is the same
+        // unbounded shape this whole change exists to remove.
+        //
+        // Gated on a base having existed already: a resident database has no
+        // mapped sidecars and its heap index is the only copy, so mapping one in
+        // here would change which layout it is running.
+        if had_field_base {
+            self.load_field_base(&dir)?;
+            self.field_indexes.clear();
+            self.field_super.clear();
         }
 
         Self::phase_probe("field index sidecars", &mut phase);
@@ -6993,6 +7186,10 @@ impl CoreDB {
             // ── shared immutable base (no bytes copied) ─────────────────────
             segments,
             field_base: self.field_base.clone(), // MappedFieldStore shares its mmap
+            // Must travel with the pair it gates. A snapshot that carried the base
+            // and the delta but not this set would read the base's stale entries
+            // as live and answer with values the rows no longer hold.
+            field_super: self.field_super.clone(),
             payload_store,
 
             // ── index overlays the executor needs ───────────────────────────
@@ -10020,12 +10217,24 @@ impl CoreDB {
     /// (paged mode). All query paths should use this, not `field_index`, so a
     /// reopened paged DB serves indexed queries from the mmap.
     pub(crate) fn field_index_ref(&self, coll_hash: u64, field: &str) -> Option<FieldIndexRef<'_>> {
-        if let Some(m) = self.field_indexes.get(&(coll_hash, field.to_string())) {
-            return Some(FieldIndexRef::Heap(m));
+        let key = (coll_hash, field.to_string());
+        // Borrowed when a collection has no superseded rows, which is the common
+        // case: a database that is only read never puts anything in the set.
+        static EMPTY: std::sync::OnceLock<std::collections::HashSet<u64>> =
+            std::sync::OnceLock::new();
+        match (self.field_indexes.get(&key), self.field_base.get(&key)) {
+            (Some(delta), Some(base)) => Some(FieldIndexRef::Merged {
+                delta,
+                base,
+                superseded: self
+                    .field_super
+                    .get(&key)
+                    .unwrap_or_else(|| EMPTY.get_or_init(std::collections::HashSet::new)),
+            }),
+            (Some(delta), None) => Some(FieldIndexRef::Heap(delta)),
+            (None, Some(base)) => Some(FieldIndexRef::Mapped(base)),
+            (None, None) => None,
         }
-        self.field_base
-            .get(&(coll_hash, field.to_string()))
-            .map(FieldIndexRef::Mapped)
     }
 
     /// Pull a btree index out of the mmap base and into the heap so it can be
@@ -10046,13 +10255,50 @@ impl CoreDB {
         if self.field_indexes.contains_key(&key) {
             return;
         }
-        let Some(base) = self.field_base.get(&key) else { return };
-        let mut btree: std::collections::BTreeMap<FieldKey, Vec<u64>> =
-            std::collections::BTreeMap::new();
-        for (k, ids) in base.iter_kv(false) {
-            btree.insert(k, ids);
+        if !self.field_base.contains_key(&key) {
+            return;
         }
-        self.field_indexes.insert(key, btree);
+        // An *empty* delta. The base stays on disk and `field_index_ref` merges
+        // the two, which is the whole point: copying the base in here cost 23 MB
+        // of heap for a single write against a 500 000-row index, and the cost
+        // grew with the store rather than with the write. Law 1 forbids exactly
+        // that, and it is the reason 50 GB of indexed data could not be served
+        // from 1 GB of RAM.
+        self.field_indexes.insert(key, std::collections::BTreeMap::new());
+    }
+
+    /// Record that `hash`'s entry in the mapped field base is out of date.
+    ///
+    /// Called wherever a row's indexed values change — insert, overwrite, delete.
+    /// Without it the base would keep answering with the row's old value, because
+    /// the base is immutable and cannot be told the row moved.
+    fn supersede_field_row(&mut self, coll_hash: u64, field: &str, hash: u64) {
+        // Only worth tracking where an immutable base actually exists; a database
+        // built from nothing has nothing stale to gate.
+        let key = (coll_hash, field.to_string());
+        if self.field_base.contains_key(&key) {
+            self.field_super.entry(key).or_default().insert(hash);
+        }
+    }
+
+    /// Supersede `hash` across every indexed field of the collection.
+    ///
+    /// For a whole-row write or a delete, every one of the row's indexed values
+    /// is being replaced or withdrawn at once, so all of them go stale together.
+    /// A partial update must *not* use this: it only re-files the row under the
+    /// columns it changed, so marking the others stale would withdraw the row
+    /// from indexes nobody touched. `UPDATE p SET name = ...` did exactly that
+    /// and `SUM(n)` quietly lost the row.
+    fn supersede_field_row_all(&mut self, coll_hash: u64, hash: u64) {
+        let fields: Vec<String> = self
+            .field_base
+            .keys()
+            .filter(|(c, _)| *c == coll_hash)
+            .map(|(_, f)| f.clone())
+            .collect();
+        for f in fields {
+            self.supersede_field_row(coll_hash, &f, hash);
+        }
     }
 
     /// Whether a btree index exists for `(collection, field)` — heap or mmap base.
