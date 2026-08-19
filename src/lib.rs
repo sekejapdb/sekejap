@@ -630,6 +630,93 @@ impl Segments {
     }
 }
 
+/// A lazy, key-ordered merge of a mapped field-index base with its heap delta.
+///
+/// `FieldIndexRef::iter_kv` performs the same merge but returns a `Vec`, which is
+/// precisely what compaction cannot afford: materialising the merged column to
+/// write it cost 92 MB at a million rows and rises with the store. This yields
+/// one `(key, postings)` at a time instead, so the fold holds a single posting
+/// list rather than a column.
+///
+/// The rules are the same, and have to stay the same or the file written from
+/// this will disagree with the reads served from that: base postings are filtered
+/// through `superseded`, equal keys combine, and a key whose postings have all
+/// moved away is skipped rather than emitted empty.
+pub(crate) struct MergedFieldIter<'a> {
+    base: Option<&'a storage::fieldstore::MappedFieldStore>,
+    superseded: &'a std::collections::HashSet<u64>,
+    /// Index of the next base key to consider.
+    bi: usize,
+    delta: std::iter::Peekable<std::collections::btree_map::Iter<'a, FieldKey, Vec<u64>>>,
+}
+
+impl<'a> MergedFieldIter<'a> {
+    pub(crate) fn new(
+        base: Option<&'a storage::fieldstore::MappedFieldStore>,
+        delta: Option<&'a std::collections::BTreeMap<FieldKey, Vec<u64>>>,
+        superseded: &'a std::collections::HashSet<u64>,
+    ) -> Self {
+        static EMPTY_DELTA: std::sync::OnceLock<std::collections::BTreeMap<FieldKey, Vec<u64>>> =
+            std::sync::OnceLock::new();
+        let d = delta.unwrap_or_else(|| EMPTY_DELTA.get_or_init(std::collections::BTreeMap::new));
+        Self { base, superseded, bi: 0, delta: d.iter().peekable() }
+    }
+}
+
+impl<'a> Iterator for MergedFieldIter<'a> {
+    type Item = (FieldKey, Vec<u64>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Loops because a key can merge down to nothing, and an empty key must be
+        // skipped rather than returned.
+        loop {
+            let nbase = self.base.map_or(0, |b| b.len());
+            let bkey = if self.bi < nbase { self.base.map(|b| b.key_at(self.bi)) } else { None };
+            let dkey = self.delta.peek().map(|(k, _)| (*k).clone());
+
+            let (key, mut ids): (FieldKey, Vec<u64>) = match (bkey, dkey) {
+                (None, None) => return None,
+                (Some(bk), None) => {
+                    let ids = self.base.map(|b| b.postings_at(self.bi)).unwrap_or_default();
+                    self.bi += 1;
+                    (bk, ids.into_iter().filter(|id| !self.superseded.contains(id)).collect())
+                }
+                (None, Some(_)) => {
+                    let (k, v) = self.delta.next()?;
+                    (k.clone(), v.clone())
+                }
+                (Some(bk), Some(dk)) => match bk.cmp(&dk) {
+                    std::cmp::Ordering::Less => {
+                        let ids = self.base.map(|b| b.postings_at(self.bi)).unwrap_or_default();
+                        self.bi += 1;
+                        (bk, ids.into_iter().filter(|id| !self.superseded.contains(id)).collect())
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let (k, v) = self.delta.next()?;
+                        (k.clone(), v.clone())
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let base_ids = self.base.map(|b| b.postings_at(self.bi)).unwrap_or_default();
+                        self.bi += 1;
+                        let (_, dv) = self.delta.next()?;
+                        let mut v: Vec<u64> = base_ids
+                            .into_iter()
+                            .filter(|id| !self.superseded.contains(id))
+                            .collect();
+                        v.extend(dv.iter().copied());
+                        (bk, v)
+                    }
+                },
+            };
+            ids.sort_unstable();
+            ids.dedup();
+            if !ids.is_empty() {
+                return Some((key, ids));
+            }
+        }
+    }
+}
+
 pub(crate) enum FieldIndexRef<'a> {
     Heap(&'a std::collections::BTreeMap<FieldKey, Vec<u64>>),
     Mapped(&'a storage::fieldstore::MappedFieldStore),
@@ -5991,13 +6078,18 @@ impl CoreDB {
         let had_field_base = !self.field_base.is_empty();
         let idx_keys: Vec<(u64, String)> = self.field_indexes.keys().cloned().collect();
         for (coll_hash, field) in idx_keys {
-            let merged: std::collections::BTreeMap<FieldKey, Vec<u64>> =
-                match self.field_index_ref(coll_hash, &field) {
-                    Some(r) => r.iter_kv(false).into_iter().collect(),
-                    None => continue,
-                };
+            let key = (coll_hash, field.clone());
+            let base = self.field_base.get(&key);
+            let delta = self.field_indexes.get(&key);
+            let superseded = self.superseded_for(&key);
             let fname = format!("fieldidx_{}_{}.bin", coll_hash, hex_encode(&field));
-            storage::fieldstore::write(&dir.join(fname), &merged)?;
+            // Streamed, not collected. Asking for the merged view as a map cost
+            // 92 MB of heap at a million rows and grew with the store; the writer
+            // consumes this twice — once to size the file, once to fill it — and
+            // holds one posting list at a time.
+            storage::fieldstore::write_merged(&dir.join(fname), || {
+                MergedFieldIter::new(base, delta, superseded)
+            })?;
         }
         // The sidecars now carry everything, so re-map them and drop both halves
         // of the overlay. Skipping this would leave `field_super` growing for the
@@ -6007,10 +6099,26 @@ impl CoreDB {
         // Gated on a base having existed already: a resident database has no
         // mapped sidecars and its heap index is the only copy, so mapping one in
         // here would change which layout it is running.
-        if had_field_base {
+        //
+        // `had_field_base` alone was not enough. It is false on the *first*
+        // compaction after `CREATE INDEX`, because no sidecar existed yet — so
+        // the heap copy built by the index build was never dropped and stayed
+        // resident for the life of the process. Measured: 96.6 MB still held at
+        // a million rows, ~96 bytes a row, which is the whole column sitting in
+        // memory long after it was written to disk. A paged layout is asked
+        // directly, so the first fold drops it like every later one.
+        let paged_layout = self.paged_nodes.is_some() || self.paged_adj.is_some();
+        if paged_layout || had_field_base {
             self.load_field_base(&dir)?;
-            self.field_indexes.clear();
-            self.field_super.clear();
+            // Drop a heap copy only where the sidecar it was just written to has
+            // mapped back cleanly. Clearing on trust would turn a failed mmap
+            // into a lost index; nothing that can be wrong about what exists may
+            // delete.
+            let mapped: Vec<(u64, String)> = self.field_base.keys().cloned().collect();
+            for k in mapped {
+                self.field_indexes.remove(&k);
+                self.field_super.remove(&k);
+            }
         }
 
         Self::phase_probe("field index sidecars", &mut phase);
@@ -10216,20 +10324,25 @@ impl CoreDB {
     /// Base-aware btree index handle: the heap overlay first, then the mmap'd base
     /// (paged mode). All query paths should use this, not `field_index`, so a
     /// reopened paged DB serves indexed queries from the mmap.
-    pub(crate) fn field_index_ref(&self, coll_hash: u64, field: &str) -> Option<FieldIndexRef<'_>> {
-        let key = (coll_hash, field.to_string());
-        // Borrowed when a collection has no superseded rows, which is the common
-        // case: a database that is only read never puts anything in the set.
+    /// The staleness set for `(collection, field)`, or an empty one.
+    ///
+    /// Borrowed rather than built, because the common case is a database that is
+    /// only read and never puts anything in it.
+    fn superseded_for(&self, key: &(u64, String)) -> &std::collections::HashSet<u64> {
         static EMPTY: std::sync::OnceLock<std::collections::HashSet<u64>> =
             std::sync::OnceLock::new();
+        self.field_super
+            .get(key)
+            .unwrap_or_else(|| EMPTY.get_or_init(std::collections::HashSet::new))
+    }
+
+    pub(crate) fn field_index_ref(&self, coll_hash: u64, field: &str) -> Option<FieldIndexRef<'_>> {
+        let key = (coll_hash, field.to_string());
         match (self.field_indexes.get(&key), self.field_base.get(&key)) {
             (Some(delta), Some(base)) => Some(FieldIndexRef::Merged {
                 delta,
                 base,
-                superseded: self
-                    .field_super
-                    .get(&key)
-                    .unwrap_or_else(|| EMPTY.get_or_init(std::collections::HashSet::new)),
+                superseded: self.superseded_for(&key),
             }),
             (Some(delta), None) => Some(FieldIndexRef::Heap(delta)),
             (None, Some(base)) => Some(FieldIndexRef::Mapped(base)),
@@ -13462,6 +13575,53 @@ mod hybrid_query_tests {
         // Bounding RAM is worthless if the fold drops rows on the way to disk.
         assert_eq!(db.node_count(), 5_000, "every row must survive the fold");
         assert_eq!(db.query("SELECT * FROM items").unwrap().collect().len(), 5_000);
+    }
+
+    /// After a fold the column belongs to the mapping, not the heap.
+    ///
+    /// `CREATE INDEX` builds the index on the heap, and the first compaction
+    /// writes it to a sidecar. It used to leave the heap copy behind: the fold
+    /// was gated on a base already existing, and on the *first* compaction there
+    /// is none. So the whole column stayed resident until the process reopened
+    /// the database — 96.6 MB still held at a million rows, ~96 bytes a row,
+    /// which is the disk-first premise inverted.
+    ///
+    /// Asserted on postings rather than on the map being absent, because an
+    /// empty delta entry is legitimate; postings on the heap after a fold are
+    /// not.
+    #[test]
+    fn compaction_hands_the_field_index_to_the_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config { auto_compact: AutoCompact::Off, ..Config::default() };
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+        for i in 0..2_000u64 {
+            db.put(
+                &format!("t/n{i}"),
+                &format!(r#"{{"_collection":"t","_key":"n{i}","n":{}}}"#, i % 50),
+            )
+            .unwrap();
+        }
+        db.execute("CREATE INDEX ON t USING btree (n)").unwrap();
+        let built: usize = db.field_indexes.values()
+            .map(|b| b.values().map(|v| v.len()).sum::<usize>())
+            .sum();
+        assert!(built > 0, "the index build is expected to land on the heap first");
+
+        db.compact().unwrap();
+
+        assert!(
+            db.field_base.contains_key(&(sk_hash("t"), "n".to_string())),
+            "the sidecar the fold just wrote was not mapped back"
+        );
+        let left: usize = db.field_indexes.values()
+            .map(|b| b.values().map(|v| v.len()).sum::<usize>())
+            .sum();
+        assert_eq!(left, 0, "the fold left {left} postings resident on the heap");
+
+        // Bounded is worthless if it stopped answering.
+        assert_eq!(db.query("SELECT * FROM t WHERE n = 7").unwrap().collect().len(), 40);
+        assert_eq!(db.query("SELECT * FROM t WHERE n >= 48").unwrap().collect().len(), 80);
     }
 
     #[test]

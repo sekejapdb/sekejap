@@ -101,6 +101,109 @@ impl Backing {
 
 /// Serialize a heap btree (`FieldKey -> sorted node hashes`) to the on-disk
 /// format at `path`, via a temp file + atomic rename.
+/// Write the index from a key-ordered stream, holding none of it.
+///
+/// [`write`] takes the whole index as a `BTreeMap` and builds the directory, the
+/// key blob and the posting blob beside it, so writing a column costs memory
+/// proportional to that column. Measured at fold time: 6 MB at 100 000 rows,
+/// 92 MB at a million, on its way to gigabytes at the sizes this database is
+/// built for. Law 1 does not exempt maintenance — "the occasion is exactly when
+/// the database is largest".
+///
+/// The directory lives at the front of the file but its offsets are only known
+/// once every key has been sized, so the stream is consumed twice: once to
+/// measure, once to write. `make_iter` therefore has to be able to produce the
+/// same sequence twice, and the caller owes that guarantee.
+///
+/// The three regions — directory, keys, postings — are filled through three
+/// handles on the same file, each with its own cursor and its own small buffer.
+/// Nothing proportional to the column is ever resident; peak memory is one
+/// key's posting list plus 192 KB of buffers.
+pub(crate) fn write_merged<F, I>(path: &Path, mut make_iter: F) -> io::Result<()>
+where
+    F: FnMut() -> I,
+    I: Iterator<Item = (FieldKey, Vec<u64>)>,
+{
+    use std::io::{Seek, SeekFrom};
+
+    // Pass 1 — sizes only. Nothing is kept.
+    let (mut nkeys, mut key_bytes, mut npost) = (0usize, 0usize, 0usize);
+    let mut kbuf: Vec<u8> = Vec::new();
+    for (k, ids) in make_iter() {
+        kbuf.clear();
+        k.encode(&mut kbuf);
+        nkeys += 1;
+        key_bytes += kbuf.len();
+        npost += ids.len();
+    }
+
+    let dir_start = HEADER_LEN;
+    let keys_start = dir_start + nkeys * DIR_ENTRY;
+    let mut post_start = keys_start + key_bytes;
+    post_start += (8 - (post_start % 8)) % 8; // 8-aligned, as `write` does
+    let total = post_start + npost * 8;
+
+    let tmp = path.with_extension("bin.tmp");
+    // Sized up front so the three cursors write into a file that already exists
+    // at full length, and so the alignment padding is zero rather than a hole.
+    std::fs::File::create(&tmp)?.set_len(total as u64)?;
+    let open = || std::fs::OpenOptions::new().write(true).open(&tmp);
+
+    {
+        let mut h = open()?;
+        h.write_all(&MAGIC)?;
+        h.write_all(&(nkeys as u64).to_le_bytes())?;
+        h.flush()?;
+    }
+
+    let mut dw = std::io::BufWriter::with_capacity(64 << 10, open()?);
+    let mut kw = std::io::BufWriter::with_capacity(64 << 10, open()?);
+    let mut pw = std::io::BufWriter::with_capacity(64 << 10, open()?);
+    dw.seek(SeekFrom::Start(dir_start as u64))?;
+    kw.seek(SeekFrom::Start(keys_start as u64))?;
+    pw.seek(SeekFrom::Start(post_start as u64))?;
+
+    // Pass 2 — write. The offsets are running totals, so they stay correct only
+    // if this pass sees exactly what the first one did.
+    let (mut koff, mut poff) = (keys_start as u64, post_start as u64);
+    let mut seen = 0usize;
+    for (k, ids) in make_iter() {
+        kbuf.clear();
+        k.encode(&mut kbuf);
+        dw.write_all(&koff.to_le_bytes())?;
+        dw.write_all(&(kbuf.len() as u32).to_le_bytes())?;
+        dw.write_all(&poff.to_le_bytes())?;
+        dw.write_all(&(ids.len() as u32).to_le_bytes())?;
+        kw.write_all(&kbuf)?;
+        koff += kbuf.len() as u64;
+        for &id in &ids {
+            pw.write_all(&id.to_le_bytes())?;
+        }
+        poff += (ids.len() as u64) * 8;
+        seen += 1;
+    }
+    dw.flush()?;
+    kw.flush()?;
+    pw.flush()?;
+    drop(dw);
+    drop(kw);
+    drop(pw);
+
+    // A source that answered differently the second time would leave a directory
+    // pointing at bytes that were never written — an index that reads as garbage
+    // rather than as missing. Refuse to rename it into place.
+    if seen != nkeys {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("field index source yielded {seen} keys on the write pass but {nkeys} on the sizing pass"),
+        ));
+    }
+
+    open()?.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
 pub(crate) fn write(
     path: &Path,
     btree: &std::collections::BTreeMap<FieldKey, Vec<u64>>,
@@ -195,7 +298,7 @@ impl MappedFieldStore {
         self.nkeys
     }
 
-    fn key_at(&self, i: usize) -> FieldKey {
+    pub(crate) fn key_at(&self, i: usize) -> FieldKey {
         let b = self.backing.bytes();
         let e = HEADER_LEN + i * DIR_ENTRY;
         let koff = rd_u64(b, e) as usize;
@@ -207,7 +310,7 @@ impl MappedFieldStore {
         FieldKey::decode(b.get(koff..koff + klen).unwrap_or(&[]))
     }
 
-    fn postings_at(&self, i: usize) -> Vec<u64> {
+    pub(crate) fn postings_at(&self, i: usize) -> Vec<u64> {
         let b = self.backing.bytes();
         let e = HEADER_LEN + i * DIR_ENTRY;
         let poff = rd_u64(b, e + 12) as usize;
