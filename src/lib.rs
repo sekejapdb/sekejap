@@ -6108,6 +6108,25 @@ impl CoreDB {
         // memory long after it was written to disk. A paged layout is asked
         // directly, so the first fold drops it like every later one.
         let paged_layout = self.paged_nodes.is_some() || self.paged_adj.is_some();
+        // The spatial grid has the same shape of bug the field index had, and for
+        // the same reason: the sidecar it was just written to is never mapped
+        // back, so the resident copy survives until the process reopens the
+        // database. It is worse here because a grid exists whether or not anybody
+        // asked for one — `rebuild_spatial_grid` runs at open for any store that
+        // cannot attach a base, and every row carrying a `geometry` is then
+        // pushed into it. Measured with no spatial index declared at all: 64.3 MB
+        // still resident at 500 000 rows, rising with the row count.
+        //
+        // Attached rather than dropped, and only kept if the mapping succeeds —
+        // clearing a grid whose replacement did not map would answer spatial
+        // queries with silence.
+        if paged_layout && self.spatial_grid.is_some() {
+            let attached = self.attach_spatial_base(&dir);
+            debug_assert!(
+                attached || !dir.join("spatialgrid.bin").exists(),
+                "wrote spatialgrid.bin but could not map it back"
+            );
+        }
         if paged_layout || had_field_base {
             self.load_field_base(&dir)?;
             // Drop a heap copy only where the sidecar it was just written to has
@@ -6475,9 +6494,11 @@ impl CoreDB {
         Self::phase_probe("  topology files + slot table", &mut inner);
         if self.spatial_grid.is_some() {
             let grid = geo::SpatialGrid::build(self.all_spatial_items().into_iter());
-            let mut buf = Vec::new();
-            grid.write_binary(&mut buf)?;
-            Self::write_atomic(dir, "spatialgrid.bin", &buf)?;
+            // Rendered straight into the file. The grid itself is unavoidable
+            // here — the meta section is ordered by hash and the cell directory
+            // by cell, so writing without one of the two orderings held would
+            // need an external sort — but the serialised copy beside it is not.
+            Self::write_atomic_with(dir, "spatialgrid.bin", |w| grid.write_binary(w))?;
         }
         // Compact vector indexes (int8 + CSR) sidecar — lets a paged reopen mmap them
         // instead of rebuilding the HNSW graph resident.
@@ -6590,6 +6611,33 @@ impl CoreDB {
     }
 
     /// Write `bytes` to `dir/name` durably: tmp file → fsync → atomic rename.
+    /// `write_atomic` for something that can serialise itself, so the bytes never
+    /// exist as one buffer.
+    ///
+    /// The spatial grid is already a full copy of the store's geometry; rendering
+    /// it into a `Vec<u8>` before writing made two, and the buffer is the copy
+    /// that buys nothing. Same temp-write, sync, rename, sync-the-directory
+    /// sequence as [`write_atomic`] — the rename is the commit either way.
+    fn write_atomic_with<F>(dir: &Path, name: &str, render: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut std::io::BufWriter<std::fs::File>) -> io::Result<()>,
+    {
+        let path = dir.join(name);
+        let tmp = dir.join(format!("{name}.tmp"));
+        {
+            let f = std::fs::File::create(&tmp)?;
+            let mut w = std::io::BufWriter::with_capacity(64 << 10, f);
+            render(&mut w)?;
+            io::Write::flush(&mut w)?;
+            w.into_inner()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                .sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        fsync_dir(dir)?;
+        Ok(())
+    }
+
     fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
         let path = dir.join(name);
         let tmp = dir.join(format!("{name}.tmp"));
@@ -13622,6 +13670,52 @@ mod hybrid_query_tests {
         // Bounded is worthless if it stopped answering.
         assert_eq!(db.query("SELECT * FROM t WHERE n = 7").unwrap().collect().len(), 40);
         assert_eq!(db.query("SELECT * FROM t WHERE n >= 48").unwrap().collect().len(), 80);
+    }
+
+    /// After a fold the spatial grid belongs to the mapping, not the heap.
+    ///
+    /// The same shape as `compaction_hands_the_field_index_to_the_mapping`, and
+    /// worse in one respect: a grid exists whether or not anybody asked for one.
+    /// `rebuild_spatial_grid` runs at open for any store that cannot attach a
+    /// mapped base — a brand-new one included — and every row carrying a
+    /// `geometry` is then pushed into it. Compaction wrote `spatialgrid.bin` and
+    /// then went on holding the resident copy until the process reopened the
+    /// database: 64.3 MB still resident at 500 000 rows, **with no spatial index
+    /// declared at all**, rising with the row count.
+    #[test]
+    fn compaction_hands_the_spatial_grid_to_the_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config { auto_compact: AutoCompact::Off, ..Config::default() };
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+        // No CREATE INDEX anywhere here. Geometry alone is enough.
+        for i in 0..2_000u64 {
+            let lon = 115.0 + (i % 100) as f64 * 0.001;
+            let lat = -8.8 - (i % 97) as f64 * 0.001;
+            db.put(
+                &format!("p/n{i}"),
+                &format!(
+                    r#"{{"_collection":"p","_key":"n{i}","geometry":{{"type":"Point","coordinates":[{lon},{lat}]}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let before = db.query(
+            "SELECT _key FROM p WHERE ST_DWithin(geometry, POINT(115.01 -8.81), 2000)"
+        ).unwrap().collect().len();
+        assert!(before > 0, "the probe query must match something to be worth anything");
+
+        db.compact().unwrap();
+
+        assert!(
+            db.spatial_grid.as_ref().is_some_and(|g| g.is_disk_backed()),
+            "the fold wrote spatialgrid.bin and kept the resident grid anyway"
+        );
+        assert_eq!(
+            db.query("SELECT _key FROM p WHERE ST_DWithin(geometry, POINT(115.01 -8.81), 2000)")
+                .unwrap().collect().len(),
+            before,
+            "handing the grid to the mapping changed what it answers"
+        );
     }
 
     #[test]
