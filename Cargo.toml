@@ -191,3 +191,19 @@ harness = false
 # [[bench]]
 # name = "vector_10k_4096"
 # harness = false
+
+# Dev-profile debug info is the bulk of target/. Line tables keep file:line in
+# panics and backtraces for our own code; dependency symbols we never step
+# through. For a session that needs full symbols:
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo build
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = 1
+
+[profile.test.package."*"]
+debug = 0
