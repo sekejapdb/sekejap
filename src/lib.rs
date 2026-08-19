@@ -10852,11 +10852,21 @@ impl CoreDB {
                 payload.get(field)?.as_str().map(|s| (hash, s.to_string()))
             })
             .collect();
-        if !owned.is_empty() {
-            let refs: Vec<(u64, &str)> = owned.iter().map(|(h, s)| (*h, s.as_str())).collect();
-            let index = GINIndex::build(refs.into_iter(), field);
-            self.gin_indexes.insert(field.to_string(), index);
-        }
+        // Registered even when it indexes nothing yet.
+        //
+        // Skipping the insert on an empty collection meant `CREATE INDEX ... USING
+        // gin` on a fresh table created no index at all. The write path asks
+        // whether any GIN index exists before marking anything dirty, so no later
+        // row built one either, and the index stayed absent for the life of the
+        // database — in the ordinary order of creating a schema and then loading
+        // data.
+        //
+        // It was invisible because `ILIKE` falls back to a full scan when no index
+        // can answer, so results stayed correct and only the plan was wrong. The
+        // opposite of the usual failure here, and harder to notice for it.
+        let refs: Vec<(u64, &str)> = owned.iter().map(|(h, s)| (*h, s.as_str())).collect();
+        let index = GINIndex::build(refs.into_iter(), field);
+        self.gin_indexes.insert(field.to_string(), index);
         self.record_index_version("gin", field, GIN_INDEX_VERSION);
     }
 
