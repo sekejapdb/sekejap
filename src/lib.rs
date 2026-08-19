@@ -4906,7 +4906,18 @@ impl CoreDB {
     pub fn put_value(&mut self, slug: &str, payload: Value) -> Result<u64, serde_json::Error> {
         let raw = serde_json::to_string(&payload)?;
         self.wal_write(WalEntry::Put { slug: slug.to_string(), payload: raw.clone() });
-        self.put_raw_inner(slug, raw.as_bytes(), payload)
+        // The same tail as `put`, and for the same two reasons. Going straight to
+        // `put_raw_inner` skipped both of them: a fulltext column was never told
+        // the row existed, and — the expensive one — nothing ever asked whether the
+        // overlay had outgrown its bound. `after_mutation` is what checks that.
+        //
+        // Without it the RAM overlay grows for the life of the process at ~178
+        // bytes a row and is never folded to disk. That is unbounded by
+        // construction, and it is worst exactly where this function is used: the
+        // service path (`engine/mod.rs`), which is meant to run for months.
+        let hash = self.put_raw_indexed(slug, &raw, payload)?;
+        self.after_mutation();
+        Ok(hash)
     }
 
 
@@ -13165,6 +13176,46 @@ mod hybrid_query_tests {
         assert!(db.maybe_compact().unwrap(), "thresholds crossed → must compact");
         assert!(!db.maybe_compact().unwrap(), "fresh WAL → no-op");
         assert_eq!(db.query("SELECT * FROM t").unwrap().collect().len(), 20);
+    }
+
+    /// `put_value` went straight to `put_raw_inner`, so `after_mutation` never
+    /// ran and the overlay-size trigger was never consulted on that path. The RAM
+    /// overlay then grew for the life of the process, folded only by an explicit
+    /// `compact()`. The service writes through this function, so the leak was
+    /// worst exactly where processes run longest.
+    ///
+    /// The bound is the disk-first premise itself — 50 GB of data has to fit in
+    /// 1 GB of RAM — so it is asserted here rather than left to a benchmark to
+    /// notice.
+    #[test]
+    fn put_value_keeps_the_overlay_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only the overlay trigger, so a WAL that happens to cross 64 MB cannot
+        // fold on its behalf and make this pass for the wrong reason.
+        let cfg = Config {
+            compact_thresholds: CompactThresholds { wal_bytes: u64::MAX, overlay_entries: 500 },
+            ..Config::default()
+        };
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+
+        for i in 0..5_000u64 {
+            db.put_value(
+                &format!("items/n{i}"),
+                serde_json::json!({"_collection": "items", "_key": format!("n{i}"), "n": i}),
+            ).unwrap();
+        }
+
+        // Ten times the bound went in, so an unfolded overlay would hold 5 000.
+        // The eligibility check is amortised to every 64th write, which is the
+        // only slack the bound is allowed.
+        assert!(
+            db.nodes.len() <= 500 + 64,
+            "overlay holds {} nodes against a 500-entry bound - put_value is not folding",
+            db.nodes.len()
+        );
+        // Bounding RAM is worthless if the fold drops rows on the way to disk.
+        assert_eq!(db.node_count(), 5_000, "every row must survive the fold");
+        assert_eq!(db.query("SELECT * FROM items").unwrap().collect().len(), 5_000);
     }
 
     #[test]
