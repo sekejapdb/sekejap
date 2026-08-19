@@ -2994,7 +2994,7 @@ impl CoreDB {
             let _ = db.save_search_binary(&search_bin_path);
             // Paged mode: drop the just-built resident search blobs and re-serve
             // them from the mmap'd search.bin (disk-first) — same as the load path.
-            if !db.segments.is_empty() {
+            if db.has_base() {
                 db.search_indexes.clear();
                 let _ = db.load_search_binary(&search_bin_path);
             }
@@ -3013,7 +3013,11 @@ impl CoreDB {
             // so here vectors are unchanged — no rebuild needed). In paged mode, mmap the
             // compact vector indexes from vecidx.bin (disk-first) so vector queries use the
             // int8+CSR fast path without a resident graph rebuild.
-            if !db.segments.is_empty() {
+            // `has_base`, not `!segments.is_empty()`: the default layout keeps its
+            // base in the paged node store and never writes `nodes.bin`, so this
+            // read "resident" for every shipping database and neither the vector
+            // index nor BM25 ever reached its mapping.
+            if db.has_base() {
                 let _ = db.load_vector_base(&dir.join("vecidx.bin"));
                 // BM25: mmap dict/doc-arrays from bm25.bin (disk-first) — doc arrays off
                 // the map, dict resident, postings pread. Also covers the clean-reopen
@@ -6108,6 +6112,14 @@ impl CoreDB {
         // memory long after it was written to disk. A paged layout is asked
         // directly, so the first fold drops it like every later one.
         let paged_layout = self.paged_nodes.is_some() || self.paged_adj.is_some();
+        // `write_topology_files` wrote bm25.bin but takes `&self`, so the attach
+        // belongs here. Without it the index stays on the heap until something
+        // reopens the database — 19.1 MB at 500 000 rows, about 38 bytes a row —
+        // which is the same omission as the btree index, the spatial grid, GIN
+        // and search.
+        if self.has_base() {
+            let _ = self.load_bm25_base(&dir.join("bm25.bin"), &dir);
+        }
         // The spatial grid has the same shape of bug the field index had, and for
         // the same reason: the sidecar it was just written to is never mapped
         // back, so the resident copy survives until the process reopens the
@@ -6234,13 +6246,33 @@ impl CoreDB {
         self.compact_payload_moves.clear();
         Self::phase_probe("snapshot + adopting the generation", &mut phase);
 
-        // Regenerate gin.bin so the next open loads GIN instantly.
+        // Regenerate gin.bin so the next open loads GIN instantly, then serve
+        // from it. Writing the sidecar and keeping the heap copy is how the btree
+        // index and the spatial grid each ended up holding the whole store until
+        // the process reopened the database; this is the same shape, and the open
+        // path already does exactly this much.
+        let serve_from_disk = self.has_base();
         if let Some(ref gin_bin_path) = self.data_dir.as_ref().map(|d| d.join("gin.bin")) {
             let _ = self.save_gin_binary(gin_bin_path);
+            if serve_from_disk {
+                self.gin_indexes.clear();
+                // Rebuild rather than serve nothing if the mapping fails — an
+                // index that answers slowly is a cost, one that answers empty is
+                // a wrong answer.
+                if !self.load_gin_binary(gin_bin_path) {
+                    self.rebuild_declared_gin_indexes();
+                }
+            }
         }
         // Regenerate search.bin so the next open loads search indexes instantly.
         if let Some(ref search_bin_path) = self.data_dir.as_ref().map(|d| d.join("search.bin")) {
             let _ = self.save_search_binary(search_bin_path);
+            if serve_from_disk {
+                self.search_indexes.clear();
+                if !self.load_search_binary(search_bin_path) {
+                    self.rebuild_declared_search_indexes();
+                }
+            }
         }
         Self::phase_probe("gin.bin + search.bin", &mut phase);
 
@@ -6523,7 +6555,11 @@ impl CoreDB {
         // instead of rebuilding the HNSW graph resident.
         Self::phase_probe("  spatial grid", &mut inner);
         self.save_vector_binary(&dir.join("vecidx.bin"))?;
-        // BM25 metadata sidecar (dict + doc arrays) for disk-first paged reopen.
+        // BM25 metadata sidecar (dict + doc arrays) for disk-first paged reopen —
+        // and then served from it, rather than kept on the heap until something
+        // reopens the database. Same omission as the btree index, the spatial
+        // grid, GIN and search: the file was written and never attached. 19.1 MB
+        // resident at 500 000 rows, about 38 bytes a row.
         self.save_bm25_binary(&dir.join("bm25.bin"))?;
         Self::phase_probe("  vector + bm25 sidecars", &mut inner);
         Ok(())
@@ -6855,7 +6891,9 @@ impl CoreDB {
 
     fn load_gin_binary(&mut self, path: &Path) -> bool {
         // Paged (disk-first): mmap the container instead of reading it into heap.
-        if !self.segments.is_empty() && self.load_gin_base(path) {
+        // Same correction as `load_search_binary`: the default layout has an empty
+        // `segments` and a paged node store, so this never reached the mapping.
+        if self.has_base() && self.load_gin_base(path) {
             return true;
         }
         use std::io::Read;
@@ -11923,7 +11961,14 @@ impl CoreDB {
     fn load_search_binary(&mut self, path: &std::path::Path) -> bool {
         // In paged (disk-first) mode, mmap the container instead of reading it
         // into RAM. Fall through to the resident path if mmap serving fails.
-        if !self.segments.is_empty() && self.load_search_base(path) {
+        // `has_base`, not `!segments.is_empty()`. The question is "is there a
+        // durable base to serve from", and in the default layout that base is the
+        // paged node store — `nodes.bin` is never written, so `segments` is empty
+        // and this test said "resident" for every shipping database. The mmap
+        // path existed and was never taken: 46.7 MB of search index on the heap
+        // at 500 000 rows, about 93 bytes a row. See the same note at the
+        // `has_base` definition.
+        if self.has_base() && self.load_search_base(path) {
             return true;
         }
         use std::io::Read;
