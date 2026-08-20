@@ -113,7 +113,11 @@ fn measure(kind: &str, n: usize) {
     db.compact().unwrap();                       // the fold that should hand it to disk
     let live_after = LIVE.load(Ordering::Relaxed);
 
-    load(&mut db, n, 1_000);                     // a small change against a large store
+    // NODELTA folds with nothing pending, which separates "the fold costs the
+    // store" from "the fold costs whatever the change dragged in".
+    if std::env::var("NODELTA").is_err() {
+        load(&mut db, n, 1_000);                 // a small change against a large store
+    }
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
     db.compact().unwrap();

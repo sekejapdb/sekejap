@@ -836,20 +836,20 @@ Scope: `src`, `skcli/src`. Shows types, `impl` blocks, public functions, and top
 
 ## `src/search/`
 
-### `disk.rs` · 348L — Persisting the search index — write it once, mmap it back
+### `disk.rs` · 371L — Persisting the search index — write it once, mmap it back
 
 ```
     25  impl SearchIndex
     26    pub fn write_binary<W: Write>(&self, w: &mut W) -> io::Result<()>
-    92    pub fn read_binary<R: Read>(r: &mut R) -> io::Result<Self>
-   175    pub(crate) fn open_mapped(view: &Arc<MmapView>, base: usize) -> io::Result<(SearchIndex, usize)>
-   250  fn write_blob<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()>
-   256  fn read_blob<R: Read>(r: &mut R) -> io::Result<Vec<u8>>
-   263  fn read_u16<R: Read>(r: &mut R) -> io::Result<u16>
-   269  fn read_u32<R: Read>(r: &mut R) -> io::Result<u32>
-   275  fn read_u64<R: Read>(r: &mut R) -> io::Result<u64>
-   281  fn read_string<R: Read>(r: &mut R) -> io::Result<String>
-   290  mod tests
+   115    pub fn read_binary<R: Read>(r: &mut R) -> io::Result<Self>
+   198    pub(crate) fn open_mapped(view: &Arc<MmapView>, base: usize) -> io::Result<(SearchIndex, usize)>
+   273  fn write_blob<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()>
+   279  fn read_blob<R: Read>(r: &mut R) -> io::Result<Vec<u8>>
+   286  fn read_u16<R: Read>(r: &mut R) -> io::Result<u16>
+   292  fn read_u32<R: Read>(r: &mut R) -> io::Result<u32>
+   298  fn read_u64<R: Read>(r: &mut R) -> io::Result<u64>
+   304  fn read_string<R: Read>(r: &mut R) -> io::Result<String>
+   313  mod tests
 ```
 
 ### `index.rs` · 925L — The positional search index — words, positions, and ranking

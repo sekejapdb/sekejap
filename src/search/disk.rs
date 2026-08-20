@@ -77,13 +77,36 @@ impl SearchIndex {
 
         // Sorted (hash:u64, slot:u32) reverse index — lets paged mode binary-search
         // hash→slot off the mmap instead of holding the id_to_slot HashMap resident.
-        let mut pairs: Vec<(u64, u32)> = (0..self.id_map.count())
-            .map(|slot| (self.id_map.get(slot).unwrap_or(0), slot as u32)).collect();
-        pairs.sort_unstable_by_key(|(h, _)| *h);
-        w.write_all(&(pairs.len() as u32).to_le_bytes())?;
-        for (hash, slot) in &pairs {
-            w.write_all(&hash.to_le_bytes())?;
-            w.write_all(&slot.to_le_bytes())?;
+        //
+        // When the index is already served from a mapping, this section exists in
+        // that mapping, sorted, in exactly the layout written here — 8 bytes of
+        // hash then 4 of slot, no padding. Copy it through.
+        //
+        // Rebuilding it instead was the entire cost of folding a search index: a
+        // `Vec<(u64, u32)>` is 16 bytes an element after alignment, one element
+        // per document, so the fold allocated 16 bytes a row and then sorted it.
+        // Measured at 7.6 MB for 500 000 rows and 15.2 MB for a million — the
+        // number rose with the store while the change was a thousand rows, and it
+        // was there even when nothing had changed at all.
+        match &self.id_to_slot {
+            crate::search::index::SlotIndex::Mapped(b) => {
+                let data = b.as_slice();
+                let n = (data.len() / 12) as u32;
+                w.write_all(&n.to_le_bytes())?;
+                w.write_all(data)?;
+            }
+            crate::search::index::SlotIndex::Resident(_) => {
+                // The first build, where there is no mapping to copy from. Costs
+                // what building an index over existing data costs, once.
+                let mut pairs: Vec<(u64, u32)> = (0..self.id_map.count())
+                    .map(|slot| (self.id_map.get(slot).unwrap_or(0), slot as u32)).collect();
+                pairs.sort_unstable_by_key(|(h, _)| *h);
+                w.write_all(&(pairs.len() as u32).to_le_bytes())?;
+                for (hash, slot) in &pairs {
+                    w.write_all(&hash.to_le_bytes())?;
+                    w.write_all(&slot.to_le_bytes())?;
+                }
+            }
         }
 
         Ok(())
