@@ -82,7 +82,8 @@ fn rows_added_after_the_first_fold_reach_the_index() {
     rows(&mut db, 0..200);
     db.compact().unwrap();
 
-    // Written against a base rather than an empty index.
+    // Written against a base rather than an empty index, so they land in the
+    // resident overlay on top of the mapping.
     rows(&mut db, 200..300);
     assert_eq!(
         db.gin_ilike("body", "%vine%", None).len(),
@@ -91,4 +92,16 @@ fn rows_added_after_the_first_fold_reach_the_index() {
     );
     db.compact().unwrap();
     assert_eq!(db.gin_ilike("body", "%vine%", None).len(), 300, "after the second fold");
+
+    // The reopen is the part that matters and the part that was missing: until
+    // the file is read back, an in-process index can answer correctly out of a
+    // base and an overlay that were never merged onto disk together. This is
+    // where a fold that wrote only the overlay, or only the base, shows up.
+    drop(db);
+    let db = CoreDB::open(dir.path()).unwrap();
+    assert_eq!(
+        db.gin_ilike("body", "%vine%", None).len(),
+        300,
+        "the second fold did not write base and overlay into one segment"
+    );
 }

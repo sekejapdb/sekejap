@@ -171,6 +171,35 @@ impl MappedGin {
     /// the record gives the bitmap's `(offset, length)` inside the blob, and we
     /// decode just those bytes into a fresh `RoaringBitmap`. The returned bitmap
     /// is owned (a copy), so the caller can freely intersect it with others.
+    /// Number of trigram directory entries.
+    pub(crate) fn trigram_count(&self) -> usize { self.trigram_count }
+
+    /// The `i`th directory entry, in the file's order — which is ascending by
+    /// trigram hash.
+    ///
+    /// `trigram_bitmap` binary-searches for one trigram; this walks them in
+    /// order, so a fold can merge the base with its resident overlay as two
+    /// sorted runs instead of rebuilding the index from every document in the
+    /// store to write it.
+    pub(crate) fn dir_at(&self, i: usize) -> Option<(u32, RoaringBitmap)> {
+        if i >= self.trigram_count { return None }
+        let dir = self.view.slice(self.dir_off, self.trigram_count * DIR_REC)?;
+        let o = i * DIR_REC;
+        let hash = rd_u32(dir, o);
+        let off = rd_u64(dir, o + 4) as usize;
+        let len = rd_u32(dir, o + 12) as usize;
+        let blob = self.view.slice(self.blob_off, self.blob_len)?;
+        let bytes = blob.get(off..off + len)?;
+        RoaringBitmap::deserialize_from(bytes).ok().map(|bm| (hash, bm))
+    }
+
+    /// The `i`th entry of the slot → node-hash map.
+    pub(crate) fn id_map_at(&self, i: usize) -> Option<u64> {
+        if i >= self.doc_count { return None }
+        let m = self.view.slice(self.id_map_off, self.doc_count * 8)?;
+        Some(rd_u64(m, i * 8))
+    }
+
     pub(crate) fn trigram_bitmap(&self, hash: u32) -> Option<RoaringBitmap> {
         let dir = self.view.slice(self.dir_off, self.trigram_count * DIR_REC)?;
         let (mut lo, mut hi) = (0isize, self.trigram_count as isize - 1); // inclusive window

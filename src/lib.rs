@@ -2019,6 +2019,16 @@ pub struct CoreDB {
     dirty_bm25: HashSet<String>,
     /// GIN fields needing rebuild after a deferred batch.
     dirty_gin: HashSet<String>,
+    /// Rows written since the last deferred-index flush.
+    ///
+    /// `dirty_gin` names the *field* that went stale, which is enough to know an
+    /// index needs attention and not enough to do anything but rebuild it. This
+    /// names the rows, so the flush can apply them.
+    ///
+    /// Only filled when an index family exists that will consume it — otherwise
+    /// nothing ever drains it and it grows for the life of the process, which is
+    /// what a first attempt at this did to the tune of 9 MB at 500 000 rows.
+    dirty_docs: HashSet<u64>,
     /// Collections whose `search` index needs rebuild after a deferred batch.
     /// Search uses an immutable FST, so it can't incrementally add terms —
     /// it rebuilds the collection's index (like BM25 rebuilds a field).
@@ -2437,6 +2447,7 @@ impl CoreDB {
             defer_index_rebuild: false,
             dirty_bm25: HashSet::new(),
             dirty_gin: HashSet::new(),
+            dirty_docs: HashSet::new(),
             dirty_search: HashSet::new(),
             logical_wal: false,
             wal_sync_level: storage::wal::SyncLevel::Full,
@@ -4509,16 +4520,16 @@ impl CoreDB {
     /// ones with an overlay — is deliberate: the file is written as a whole, so a
     /// partial rebuild would persist the rebuilt indexes and drop the rest.
     fn merge_gin_overlays(&mut self) {
-        if !self.gin_indexes.values().any(|g| g.has_pending_overlay()) {
-            return;
-        }
-        let fields: Vec<String> = self.gin_indexes.iter()
-            .filter(|(_, g)| g.is_disk_backed())
-            .map(|(k, _)| k.clone())
-            .collect();
-        for field in fields {
-            self.build_gin_index(&field);
-        }
+        // Nothing to do any more. This rebuilt every disk-backed index from every
+        // document in the store, because the overlay had nowhere to be written —
+        // 33.4 MB of heap at half a million rows for a hundred-row batch, and the
+        // reason writes cost the store rather than the change.
+        //
+        // `save_gin_binary` now folds the overlay into the file as it writes it
+        // (`GINIndex::write_binary_merged`), so the fold happens on the way to
+        // disk instead of in memory first. Kept as a named no-op because the
+        // sequence in `merge_index_deltas` reads as one step per index family,
+        // and a silently missing one invites the rebuild back.
     }
 
     /// Fold every search delta into its base by rebuilding the collection's index.
@@ -4557,14 +4568,45 @@ impl CoreDB {
         for field in bm25_fields {
             self.build_bm25_index(&field);
         }
+        // GIN: apply the rows that changed.
+        //
+        // `build_gin_index` walks `all_hashes()` and reads and parses every
+        // payload in the store, so a hundred-row batch cost 33.4 MB of heap at
+        // half a million rows. Worse than the cost, it *replaced* the index: an
+        // index served from the mapping was swapped for a freshly built resident
+        // one on every batch, so the disk-first serving lasted exactly until the
+        // next write.
         let gin_fields: Vec<String> = self.dirty_gin.drain().collect();
+        let dirty: Vec<u64> = self.dirty_docs.iter().copied().collect();
         for field in gin_fields {
-            self.build_gin_index(&field);
+            // No index to apply to yet — the first build costs what the data
+            // costs, and happens once.
+            if !self.gin_indexes.contains_key(&field) {
+                self.build_gin_index(&field);
+                continue;
+            }
+            for &h in &dirty {
+                // `insert_doc` retires the previous copy itself, so the explicit
+                // retraction matters only when the field is gone: there is no text
+                // to re-file, nothing calls `insert_doc`, and the old trigrams
+                // would otherwise stay and keep matching.
+                let text: Option<String> = self
+                    .get_payload(h)
+                    .and_then(|p| p.get(&field).and_then(|v| v.as_str()).map(|t| t.to_string()));
+                if let Some(ix) = self.gin_indexes.get_mut(field.as_str()) {
+                    match text {
+                        Some(t) => ix.insert_doc(h, &t),
+                        None => { ix.delete(h); }
+                    }
+                }
+            }
         }
         let search_colls: Vec<String> = self.dirty_search.drain().collect();
         for coll in search_colls {
             self.rebuild_search_for_collection(&coll);
         }
+        // Consumed by everything above, so drained once here.
+        self.dirty_docs.clear();
         self.defer_index_rebuild = false;
     }
 
@@ -5105,6 +5147,7 @@ impl CoreDB {
         for (gin_field, text_opt) in gin_updates {
             if self.defer_index_rebuild {
                 self.dirty_gin.insert(gin_field);
+                self.dirty_docs.insert(hash);
             } else if is_update {
                 self.build_gin_index(&gin_field);
             } else if let Some(text) = text_opt {
@@ -5289,6 +5332,9 @@ impl CoreDB {
         let have_bm25_gin = !self.bm25_indexes.is_empty() || !self.gin_indexes.is_empty();
         let has_any_search = self.schemas.values().any(|s| !s.indexes.search.is_empty());
         let mut colls_touched: HashSet<String> = HashSet::new();
+        // The rows this batch wrote, so the deferred flush can apply them instead
+        // of rebuilding an index from the whole store.
+        let mut hashes_touched: Vec<u64> = Vec::new();
 
         for (i, (slug, hash, coll, spatial_meta, is_new)) in metas.into_iter().enumerate() {
             let (offset, len) = offsets[i];
@@ -5300,6 +5346,7 @@ impl CoreDB {
                     members.push(hash);
                 }
                 self.collection_names_map.entry(coll_hash).or_insert_with(|| coll.clone());
+                hashes_touched.push(hash);
                 if has_any_search {
                     colls_touched.insert(coll.clone());
                 }
@@ -5356,6 +5403,7 @@ impl CoreDB {
             for f in bm { self.dirty_bm25.insert(f); }
             let gin: Vec<String> = self.gin_indexes.keys().cloned().collect();
             for f in gin { self.dirty_gin.insert(f); }
+            self.dirty_docs.extend(hashes_touched.iter().copied());
         }
         if has_any_search {
             for c in &colls_touched {
@@ -6830,12 +6878,16 @@ impl CoreDB {
 
     fn save_gin_binary(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
-        // If any index is served from the mmap (paged, disk-first), the on-disk
-        // gin.bin is already authoritative and self-contained — don't overwrite it
-        // with the empty resident maps. Rewritten only when indexes are resident.
-        if self.gin_indexes.values().any(|g| g.is_disk_backed()) {
-            return Ok(());
-        }
+        // Refusing to write while any index was served from the mmap was the only
+        // way to avoid replacing an authoritative `gin.bin` with the empty
+        // resident maps beside it — and it is why an overlay had nowhere to go,
+        // and why the index was rebuilt from every document in the store before
+        // persisting. `write_binary_merged` writes the base unioned with the
+        // overlay, so there is nothing left to protect the file from.
+        //
+        // Writing while the file is mapped is safe: the write goes to a temp file
+        // and is renamed over the name, which leaves the existing mapping on the
+        // old inode until the caller re-attaches.
         let tmp = path.with_extension("bin.tmp");
         let mut f = std::io::BufWriter::new(
             std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?
@@ -6845,7 +6897,9 @@ impl CoreDB {
         // Number of GIN indexes
         f.write_all(&(self.gin_indexes.len() as u32).to_le_bytes())?;
         for gin in self.gin_indexes.values() {
-            gin.write_binary(&mut f, GIN_INDEX_VERSION)?;
+            // Falls back to `write_binary` when there is no mapped base, so this
+            // one call covers a resident index and a mapped-plus-overlay one.
+            gin.write_binary_merged(&mut f, GIN_INDEX_VERSION)?;
         }
         f.flush()?;
         f.get_ref().sync_all()?;
@@ -7449,6 +7503,7 @@ impl CoreDB {
             defer_index_rebuild: false,
             dirty_bm25: HashSet::new(),
             dirty_gin: HashSet::new(),
+            dirty_docs: HashSet::new(),
             dirty_search: HashSet::new(),
 
             // ── inert configuration (kept so reads behave identically) ──────

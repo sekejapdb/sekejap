@@ -419,6 +419,121 @@ impl GINIndex {
         Ok(())
     }
 
+    /// Write the mmap base unioned with the resident overlay, holding neither.
+    ///
+    /// `gin.bin` is one flat segment, so an overlay sitting on top of the base has
+    /// nowhere to be written. The answer was to rebuild the index from every
+    /// document in the store before persisting — `merge_gin_overlays` calling
+    /// `build_gin_index`, which walks every hash, reads and parses every payload,
+    /// and collects the whole text corpus. A hundred-row batch therefore cost 33.4
+    /// MB of heap at half a million rows, and would cost gigabytes at fifty
+    /// million: the trigger was the change and the work was the store.
+    ///
+    /// The base's directory is sorted by trigram hash and so is the overlay once
+    /// its keys are ordered, so the segment can be written as a merge of two
+    /// sorted runs instead. Nothing proportional to the corpus is held; the peak
+    /// is one merged bitmap.
+    ///
+    /// Overlay slots are numbered above the base's (see `insert_doc`), so the two
+    /// id maps concatenate and the two bitmaps union without renumbering.
+    /// `dead_slots` is applied here rather than carried: a slot that no live
+    /// document owns is dropped from every bitmap, and its id-map entry stays as
+    /// an unreferenced hole so the numbering above it does not shift.
+    ///
+    /// The counts precede the records they describe and a `Write` cannot go back,
+    /// so the merge is walked three times — to size, to write the directory, to
+    /// write the blob. The base is a mapping, so those walks are page cache.
+    pub fn write_binary_merged<W: std::io::Write>(
+        &self,
+        w: &mut W,
+        version: u32,
+    ) -> std::io::Result<()> {
+        let Some(base) = self.mapped.as_ref() else {
+            // Nothing mapped: the resident index is the whole truth.
+            return self.write_binary(w, version);
+        };
+
+        let field_bytes = self.field.as_bytes();
+        w.write_all(&(field_bytes.len() as u16).to_le_bytes())?;
+        w.write_all(field_bytes)?;
+        w.write_all(&version.to_le_bytes())?;
+
+        // id map: the base's, then the overlay's, in that order.
+        let doc_total = base.doc_count() + self.id_map.len();
+        w.write_all(&(doc_total as u64).to_le_bytes())?;
+        for i in 0..base.doc_count() {
+            w.write_all(&base.id_map_at(i).unwrap_or(0).to_le_bytes())?;
+        }
+        for &h in &self.id_map {
+            w.write_all(&h.to_le_bytes())?;
+        }
+
+        // The overlay in the base's order.
+        let mut ov: Vec<(u32, &roaring::RoaringBitmap)> =
+            self.postings.iter().map(|(h, b)| (*h, b)).collect();
+        ov.sort_unstable_by_key(|(h, _)| *h);
+        let dead = &self.dead_slots;
+
+        let merged = |mut emit: Box<dyn FnMut(u32, &roaring::RoaringBitmap) -> std::io::Result<()> + '_>|
+            -> std::io::Result<()>
+        {
+            let (mut bi, mut oi) = (0usize, 0usize);
+            loop {
+                let b = if bi < base.trigram_count() { base.dir_at(bi) } else { None };
+                let o = ov.get(oi);
+                let (hash, mut bm) = match (b, o) {
+                    (None, None) => break,
+                    (Some((bh, bbm)), None) => { bi += 1; (bh, bbm) }
+                    (None, Some((oh, obm))) => { oi += 1; (*oh, (*obm).clone()) }
+                    (Some((bh, bbm)), Some((oh, obm))) => {
+                        if bh < *oh { bi += 1; (bh, bbm) }
+                        else if bh > *oh { oi += 1; (*oh, (*obm).clone()) }
+                        else {
+                            bi += 1;
+                            oi += 1;
+                            let mut u = bbm;
+                            u |= *obm;
+                            (bh, u)
+                        }
+                    }
+                };
+                if !dead.is_empty() {
+                    bm -= dead;
+                }
+                // A trigram every one of whose documents has gone is dropped, not
+                // written empty: an empty posting list is a candidate set the
+                // caller then has to re-check for nothing.
+                if !bm.is_empty() {
+                    emit(hash, &bm)?;
+                }
+            }
+            Ok(())
+        };
+
+        let mut count = 0u32;
+        let mut blob_len = 0u64;
+        merged(Box::new(|_, bm| {
+            count += 1;
+            blob_len += bm.serialized_size() as u64;
+            Ok(())
+        }))?;
+
+        w.write_all(&count.to_le_bytes())?;
+        let mut off = 0u64;
+        merged(Box::new(|hash, bm| {
+            let len = bm.serialized_size() as u32;
+            w.write_all(&hash.to_le_bytes())?;
+            w.write_all(&off.to_le_bytes())?;
+            w.write_all(&len.to_le_bytes())?;
+            off += len as u64;
+            Ok(())
+        }))?;
+
+        w.write_all(&blob_len.to_le_bytes())?;
+        merged(Box::new(|_, bm| bm.serialize_into(&mut *w)))?;
+        Ok(())
+    }
+
     /// Read one GIN index from a binary stream (written by `write_binary`).
     /// Returns `(field_name, index)`. Returns `Err` on any parse/IO failure.
     pub fn read_binary<R: std::io::Read>(r: &mut R, expected_version: u32) -> std::io::Result<(String, Self)> {
