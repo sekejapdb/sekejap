@@ -4368,12 +4368,35 @@ impl CoreDB {
         {
             return;
         }
+        // The overlay bound is free to test — it is a `len()` against a number —
+        // so it is tested on every mutation. Only the WAL-size trigger costs a
+        // `stat`, and only that one is amortised.
+        //
+        // Counting *calls* amortised the wrong thing. A bulk insert of 25 000
+        // rows arrives here once, so sixty-four of them — 1.6 million rows —
+        // passed before the check ran at all. Measured under a cgroup: a
+        // million-row bulk load never compacted once, the overlay held every row,
+        // and resident memory reached 564 MB against a bound that promises about
+        // 36 MB. The row-at-a-time path hid it, because there one write is one
+        // row and the amortisation is honest.
+        //
+        // This is the third appearance of the same mistake: `compact()` had it,
+        // `compact_eligible` had it (see the note there), and the caller that
+        // decides whether to ask them still had it.
+        let overlay_full = self.has_base()
+            && self.nodes.len() >= self.compact_thresholds.overlay_entries;
+
         self.writes_since_compact_check += 1;
-        if self.writes_since_compact_check < 64 {
+        let check_wal = self.writes_since_compact_check >= 64;
+        if !overlay_full && !check_wal {
             return;
         }
-        self.writes_since_compact_check = 0;
-        if self.compact_eligible() {
+        if check_wal {
+            self.writes_since_compact_check = 0;
+        }
+        // `compact_eligible` is only consulted when the cheap test did not already
+        // answer yes, so the `stat` still happens at most once every 64 writes.
+        if overlay_full || self.compact_eligible() {
             self.autocompacting = true;
             // Best-effort: a failed auto-compact leaves the WAL intact (safe);
             // persistent failures surface on the next explicit compact().
@@ -13844,6 +13867,58 @@ mod hybrid_query_tests {
                 .unwrap().collect().len(),
             before,
             "handing the grid to the mapping changed what it answers"
+        );
+    }
+
+    /// A bulk load folds the overlay, rather than holding every row it wrote.
+    ///
+    /// `autocompact_after_write` amortised its eligibility check to every 64th
+    /// call. One `put_value_bulk` of 25 000 rows is one call, so sixty-four of
+    /// them — 1.6 million rows — went by before the check ran at all. The
+    /// row-at-a-time path hid it completely, because there one write is one row.
+    ///
+    /// Measured under a cgroup on a real node: a million-row bulk load never
+    /// compacted once, the overlay held every row, and resident memory reached
+    /// 564 MB against a bound that promises about 36 MB. After the fix the same
+    /// load peaks at 203 MB with 71 MB of it anonymous.
+    ///
+    /// Ten calls here, far fewer than sixty-four, which is the whole point.
+    #[test]
+    fn a_bulk_load_folds_the_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            // Only the overlay trigger, so a WAL crossing 64 MB cannot fold on its
+            // behalf and make this pass for the wrong reason.
+            compact_thresholds: CompactThresholds { wal_bytes: u64::MAX, overlay_entries: 500 },
+            ..Config::default()
+        };
+        let mut db = CoreDB::open_with_config(dir.path(), cfg).unwrap();
+
+        const CHUNK: usize = 1_000;
+        for c in 0..10 {
+            let rows: Vec<(String, serde_json::Value)> = (c * CHUNK..(c + 1) * CHUNK)
+                .map(|i| {
+                    (
+                        format!("items/n{i}"),
+                        serde_json::json!({"_collection":"items","_key":format!("n{i}"),"n":i}),
+                    )
+                })
+                .collect();
+            db.put_value_bulk(rows).unwrap();
+        }
+
+        // The check runs once per batch, so a batch may overshoot the bound by up
+        // to its own size. Anything beyond that means no fold happened.
+        assert!(
+            db.nodes.len() <= 500 + CHUNK,
+            "overlay holds {} rows against a 500-entry bound - the bulk path never folded",
+            db.nodes.len()
+        );
+        // Bounding memory is worthless if the fold loses rows.
+        assert_eq!(db.node_count(), 10 * CHUNK, "every row must survive the fold");
+        assert_eq!(
+            db.query("SELECT * FROM items").unwrap().collect().len(),
+            10 * CHUNK
         );
     }
 
