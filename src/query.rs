@@ -2849,6 +2849,37 @@ fn try_index_order_limit(db: &CoreDB, steps: &[Step]) -> Option<Vec<u64>> {
 /// - **Seed from an index, don't scan** — `btree_seed` can answer an equality/
 ///   range filter straight from an index. Steps it "used up" are recorded in
 ///   `skip_set` so the main loop doesn't redo them as a scan.
+/// Filter `candidates` by their payload bytes, reading in bounded batches.
+///
+/// `read_raw_payloads_batched` caps the size of each *read*, but it returns one
+/// map holding everything it read. Handing it the whole candidate list therefore
+/// pulled the collection into memory to answer a question about it — a million
+/// rows at a couple of hundred bytes each is roughly 250 MB resident, to return
+/// ten. Measured under a cgroup: `WHERE n = 7` over a million unindexed rows
+/// cost 258 MB of anonymous memory.
+///
+/// Chunking bounds the map by the batch instead of by the collection. The
+/// sequential-read grouping inside the batch reader still applies within a
+/// chunk, so this costs ordering across chunk boundaries and nothing else.
+fn retain_by_raw_payload<F>(db: &CoreDB, candidates: &mut Vec<u64>, mut keep: F)
+where
+    F: FnMut(Option<&[u8]>) -> bool,
+{
+    /// Large enough that batching still buys sequential I/O, small enough that
+    /// the map never becomes the story.
+    const BATCH: usize = 8_192;
+    let mut kept: Vec<u64> = Vec::new();
+    for chunk in candidates.chunks(BATCH) {
+        let raw = db.read_raw_payloads_batched(chunk);
+        for &h in chunk {
+            if keep(raw.get(&h).map(|v| v.as_slice())) {
+                kept.push(h);
+            }
+        }
+    }
+    *candidates = kept;
+}
+
 fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
     // Fast path: `... ORDER BY indexed_col LIMIT k` with no filter reads straight
     // from the btree in sorted order — O(k) instead of sort-everything.
@@ -3051,10 +3082,9 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                         // No index: batch read + byte-search.
                         const FILTER_BATCH_MIN: usize = 64;
                         if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
-                            let raw_map = db.read_raw_payloads_batched(&candidates);
-                            candidates.retain(|&h| {
-                                raw_map.get(&h)
-                                    .and_then(|bytes| db.extract_stored_field(bytes, field))
+                            retain_by_raw_payload(db, &mut candidates, |bytes| {
+                                bytes
+                                    .and_then(|b| db.extract_stored_field(b, field))
                                     .map(|v| values_eq(&v, value))
                                     .unwrap_or(false)
                             });
@@ -3071,10 +3101,9 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                     // No collection context or non-indexable value: batch read + byte-search.
                     const FILTER_BATCH_MIN: usize = 64;
                     if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
-                        let raw_map = db.read_raw_payloads_batched(&candidates);
-                        candidates.retain(|&h| {
-                            raw_map.get(&h)
-                                .and_then(|bytes| db.extract_stored_field(bytes, field))
+                        retain_by_raw_payload(db, &mut candidates, |bytes| {
+                            bytes
+                                .and_then(|b| db.extract_stored_field(b, field))
                                 .map(|v| values_eq(&v, value))
                                 .unwrap_or(false)
                         });
@@ -3095,10 +3124,8 @@ fn execute(db: &CoreDB, steps: &[Step]) -> Vec<u64> {
                 // [`eval3`]. This used to keep them, which is how a PostgreSQL
                 // user's `!=` came back with rows PostgreSQL drops.
                 if is_simple_field(field) && candidates.len() >= FILTER_BATCH_MIN {
-                    let raw_map = db.read_raw_payloads_batched(&candidates);
-                    candidates.retain(|&h| {
-                        let v = raw_map.get(&h)
-                            .and_then(|bytes| db.extract_stored_field(bytes, field));
+                    retain_by_raw_payload(db, &mut candidates, |bytes| {
+                        let v = bytes.and_then(|b| db.extract_stored_field(b, field));
                         passes(step, &mut |_| v.clone())
                     });
                 } else {
@@ -5620,10 +5647,38 @@ pub(crate) fn build_path_rows_from_raw(
     // GQL path variable (`MATCH p = …`): when set, each row binds this name to a
     // `{ length, nodes, relationships }` object read by length(p)/nodes(p)/… .
     path_var: Option<&str>,
+    // Variables every reference to which is `_key`, `_id` or `_collection`.
+    //
+    // Those three are not in the payload — they are the node record, which is
+    // already resident. Reading and parsing the stored document to answer
+    // `SELECT b._key` is the single largest cost in this function: on a 5-hop
+    // walk returning 55 rows it was 145 µs to fetch and parse 55 documents, each
+    // carrying a 64-float embedding, plus ~180 µs to clone them into rows —
+    // against 107 µs for the traversal that found them.
+    //
+    // The caller decides this, conservatively: one reference it cannot classify
+    // and the variable is absent from this set, so the payload is read as before.
+    identity_only: Option<&HashSet<String>>,
 ) -> Vec<PathRow> {
     if raw_paths.is_empty() { return vec![]; }
 
     let var_needed = |name: &str| needed_vars.map_or(true, |s| s.contains(name));
+    let ident_only = |name: &str| identity_only.map_or(false, |s| s.contains(name));
+
+    /// `{_key, _id, _collection}` from the node record, with no payload read.
+    fn identity_value(db: &CoreDB, h: u64) -> Value {
+        match db.node_data(h) {
+            Some(n) => {
+                let key = n.slug.split_once('/').map(|(_, k)| k).unwrap_or(&n.slug);
+                serde_json::json!({
+                    "_key": key,
+                    "_id": n.slug,
+                    "_collection": n.collection,
+                })
+            }
+            None => Value::Null,
+        }
+    }
 
     // Collect unique hashes, sort by payload offset for sequential I/O.
     // Only referenced hop vars are fetched; traversal-only vars are skipped.
@@ -5638,7 +5693,8 @@ pub(crate) fn build_path_rows_from_raw(
         }
         for rp in raw_paths {
             for (hop_idx, hop) in hops.iter().enumerate() {
-                if var_needed(&hop.node_bind) {
+                // An identity-only variable never reaches the payload store.
+                if var_needed(&hop.node_bind) && !ident_only(&hop.node_bind) {
                     if let Some(&h) = rp.dest_per_hop.get(hop_idx) { set.insert(h); }
                 }
             }
@@ -5733,7 +5789,11 @@ pub(crate) fn build_path_rows_from_raw(
                 // Only the referenced hop vars get their (parsed) payload; a
                 // traversal-only var contributes nothing to the row.
                 if var_needed(&hop.node_bind) {
-                    let dest_payload = payload_cache.get(&dest_h).unwrap_or(&null).clone();
+                    let dest_payload = if ident_only(&hop.node_bind) {
+                        identity_value(db, dest_h)
+                    } else {
+                        payload_cache.get(&dest_h).unwrap_or(&null).clone()
+                    };
                     row.insert(hop.node_bind.clone(), dest_payload);
                 }
             }
@@ -6078,7 +6138,7 @@ pub fn collect_paths(
     if hops.is_empty() || starts.is_empty() { return vec![]; }
     // A path variable needs the per-hop slugs to assemble nodes/relationships.
     let raw = collect_raw_paths(db, starts, hops, limit, track || path_var.is_some());
-    build_path_rows_from_raw(db, &raw, hops, start_var, false, None, path_var)
+    build_path_rows_from_raw(db, &raw, hops, start_var, false, None, path_var, None)
 }
 
 // ── Multi-stage executor (WITH chaining) ─────────────────────────────────────
@@ -8232,9 +8292,97 @@ fn execute_match_agg_inner(db: &CoreDB, stmt: MatchAggStmt) -> Vec<Hit> {
             Some(set)
         }
     };
+    // DISTINCT prunes here, not after every row has been built.
+    //
+    // A `-[*1..5]->` pattern enumerates every path, which is the right answer for
+    // `SELECT b._key` — one row per path, as GQL says. But `SELECT DISTINCT
+    // b._key` throws almost all of them away: on a node with three out-edges it
+    // walks 3+9+27+81+243 = 363 paths to return 55 distinct rows, having cloned a
+    // payload and allocated a row map for each one.
+    //
+    // When a row is a pure function of the node hashes it binds — no path
+    // variable, no edge attributes, no path intrinsics — two paths that bind the
+    // same nodes produce byte-identical rows, and DISTINCT would collapse them
+    // anyway. Dropping them here is the same answer for less work.
+    //
+    // The key is every hash the row can see: the start node when it is bound, and
+    // the destination of each hop variable the query actually reads. Anything the
+    // row cannot see cannot make two rows differ.
+    let raw = if stmt.distinct
+        && stmt.path_var.is_none()
+        && !needs_edge_meta
+        && !needs_var_path
+    {
+        let mut seen: HashSet<Vec<u64>> = HashSet::with_capacity(raw.len());
+        let mut kept: Vec<RawPath> = Vec::with_capacity(raw.len());
+        for rp in raw {
+            let mut key: Vec<u64> = Vec::with_capacity(stmt.hops.len() + 1);
+            if effective_start_var.is_some() {
+                key.push(rp.start_hash);
+            }
+            for (hop_idx, hop) in stmt.hops.iter().enumerate() {
+                let referenced = needed_hop_vars
+                    .as_ref()
+                    .map_or(true, |s| s.contains(&hop.node_bind));
+                if referenced {
+                    key.push(rp.dest_per_hop.get(hop_idx).copied().unwrap_or(0));
+                }
+            }
+            if seen.insert(key) {
+                kept.push(rp);
+            }
+        }
+        kept
+    } else {
+        raw
+    };
+
+    // Which variables are read only for their identity?
+    //
+    // `_key`, `_id` and `_collection` come from the node record, which is already
+    // resident; every other field means reading and parsing the stored document.
+    // A variable qualifies only if EVERY reference to it — projection, WHERE,
+    // GROUP BY, ORDER BY — asks for one of those three. One reference that cannot
+    // be classified disqualifies it, so the payload is read exactly as before.
+    //
+    // Deliberately conservative: being wrong here would drop a field from an
+    // answer, which is the failure mode this codebase spent 2026-08-18/19
+    // eliminating. Better to read a payload that was not needed than to omit one
+    // that was.
+    let identity_only: Option<HashSet<String>> = if stmt.order_score.is_some()
+        || !stmt.func_filters.is_empty()
+        || stmt.path_var.is_some()
+        || needs_edge_meta
+    {
+        None // scores, spatial/text filters and path objects can read anything
+    } else {
+        let is_ident = |f: &str| f == "_key" || f == "_id" || f == "_collection";
+        let mut set: HashSet<String> = HashSet::new();
+        for hop in &stmt.hops {
+            let v = hop.node_bind.as_str();
+            let returns_ok = stmt.returns.iter().all(|(r, _)| {
+                !r.references_var(v)
+                    || matches!(r, MatchAggReturn::Field { var, field }
+                                if var == v && is_ident(field))
+            });
+            let where_ok = stmt.dest_where.iter()
+                .all(|dw| dw.var != v || is_ident(&dw.field));
+            let group_ok = stmt.group_by.as_ref().map_or(true, |g| {
+                g.iter().all(|(gv, gf)| gv != v || is_ident(gf))
+            });
+            let order_ok = stmt.order_by.as_ref().map_or(true, |(k, _)| {
+                k.split_once('.').map_or(true, |(ov, of)| ov != v || is_ident(of))
+            });
+            if returns_ok && where_ok && group_ok && order_ok {
+                set.insert(hop.node_bind.clone());
+            }
+        }
+        Some(set)
+    };
+
     let all_paths = build_path_rows_from_raw(
         db, &raw, &stmt.hops, effective_start_var, needs_edge_meta,
-        needed_hop_vars.as_ref(), stmt.path_var.as_deref(),
+        needed_hop_vars.as_ref(), stmt.path_var.as_deref(), identity_only.as_ref(),
     );
     if all_paths.is_empty() && !is_bare_agg { return vec![]; }
 

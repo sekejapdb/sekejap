@@ -160,9 +160,16 @@ fn main() {
         ("scan count", "SELECT COUNT(*) FROM items".into()),
         ("btree eq", "SELECT _key FROM items WHERE n = 7".into()),
         ("btree range", "SELECT _key FROM items WHERE n > 99990".into()),
-        ("ilike/gin", "SELECT _key FROM items WHERE body ILIKE '%heron%'".into()),
-        ("search", "SELECT _key FROM items WHERE SEARCH('riverbank')".into()),
-        ("bm25", "SELECT _key FROM items WHERE BM25(body,'heron') > 0".into()),
+        // Selective on purpose. `%heron%` matches every row, so it measured the
+        // cost of materialising a million results — a fact about the probe, not
+        // about the database. `alpha42` appears in roughly one row in a thousand.
+        ("ilike/gin", "SELECT _key FROM items WHERE body ILIKE '%alpha42 %'".into()),
+        ("search", "SELECT _key FROM items WHERE SEARCH('alpha42')".into()),
+        ("bm25", "SELECT _key FROM items WHERE BM25(body,'alpha42') > 0".into()),
+        // Kept deliberately: a query that really does return every row, so the
+        // cost of a large result set is visible as its own line rather than
+        // hiding inside a query that was meant to be selective.
+        ("full result", "SELECT _key FROM items WHERE body ILIKE '%heron%' LIMIT 1000".into()),
         ("spatial", "SELECT _key FROM items WHERE ST_DWithin(geometry, POINT(115.10 -8.85), 3000)".into()),
     ];
     for (name, sql) in &probes {
