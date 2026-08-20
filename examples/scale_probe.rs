@@ -137,13 +137,27 @@ fn main() {
             // structure rather than inferred from a total.
             let mut report: Vec<(&str, usize)> = db.memory_report();
             report.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+            let accounted: usize = report
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(_, b)| *b)
+                .sum();
             let top: Vec<String> = report
                 .iter()
-                .filter(|(_, b)| *b > 1_048_576)
-                .take(6)
+                .filter(|(k, b)| *b > 1_048_576 && !k.starts_with('_'))
+                .take(8)
                 .map(|(k, b)| format!("{k}={}MB", b / 1_048_576))
                 .collect();
-            println!("            internal: {}", top.join(" "));
+            // Accounted vs anonymous is the number that matters: a large gap means
+            // the report is pointing at the wrong structure, and any conclusion
+            // drawn from it is guesswork wearing a measurement's clothes.
+            let (_, anon_now, _) = mem();
+            println!(
+                "            internal: {}  [accounted {}MB of {}MB anon]",
+                top.join(" "),
+                accounted / 1_048_576,
+                anon_now
+            );
             let (t, anon, file) = mem();
             println!(
                 "{:>10} rows  rss {:>5} MB = anon {:>5} MB + file {:>5} MB  peak {:>5}  {:>7.1}s",

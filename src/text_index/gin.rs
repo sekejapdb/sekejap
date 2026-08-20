@@ -142,6 +142,26 @@ impl GINIndex {
         }
     }
 
+    /// Resident bytes held by this index — the heap side only.
+    ///
+    /// Anything served from `mapped` is file-backed: the kernel can evict it, so
+    /// it is not what the index costs. This counts what cannot be taken away.
+    pub fn mem_bytes(&self) -> usize {
+        let postings: usize = self
+            .postings
+            .iter()
+            .map(|(_, bm)| 4 + bm.serialized_size())
+            .sum::<usize>()
+            + self.postings.capacity() * 16;
+        let id_map = self.id_map.capacity() * 8;
+        let dead = self.dead_slots.serialized_size();
+        let slot_of = self
+            .slot_of
+            .as_ref()
+            .map_or(0, |m| m.capacity() * (8 + 4 + 1));
+        postings + id_map + dead + slot_of + self.field.capacity()
+    }
+
     /// True when postings + id map are served from the mmap base (paged, disk-first).
     pub fn is_disk_backed(&self) -> bool {
         self.mapped.is_some()

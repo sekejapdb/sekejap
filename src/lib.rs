@@ -11754,10 +11754,47 @@ impl CoreDB {
         let graph: usize = self.hnsw_indexes.values().map(|g| g.mem_bytes()).sum();
         let int8: usize = self.quant_fields.values().map(|q| q.mem_bytes()).sum();
         let compact: usize = self.compact_indexes.values().map(|c| c.mem_bytes()).sum();
+        // Everything below this line was missing, and its absence is why the
+        // report accounted for 45 MB of a process holding 395 MB. A memory report
+        // that names a fraction of memory is worse than none: it points at the
+        // wrong structure with the authority of a measurement.
+        let slug_map = self.slug_map.capacity() * (24 + 8 + 1)
+            + self.slug_map.keys().map(|k| k.capacity()).sum::<usize>();
+        let field_delta: usize = self
+            .field_indexes
+            .values()
+            .map(|bt| {
+                bt.iter()
+                    .map(|(_, ids)| ids.capacity() * 8 + 48)
+                    .sum::<usize>()
+            })
+            .sum();
+        let field_super: usize = self
+            .field_super
+            .values()
+            .map(|set| set.capacity() * (8 + 1))
+            .sum();
+        let gin: usize = self.gin_indexes.values().map(|g| g.mem_bytes()).sum();
+        let search: usize = self.search_indexes.values().map(|s| s.mem_bytes()).sum();
+        let spatial = self.spatial_grid.as_ref().map_or(0, |g| g.mem_bytes());
+        let tombs = (self.tombstones.capacity() + self.edge_tombstones.capacity()) * (8 + 1);
+        let coll_names = self.collection_names_map.capacity() * (8 + 24 + 1)
+            + self.collection_names_map.values().map(|v| v.capacity()).sum::<usize>();
+        let dirty = self.dirty_docs.capacity() * (8 + 1);
+
         vec![
             ("nodes.map (NodeData inline)", node_map),
             ("nodes.strings (slug+collection heap)", node_str),
+            ("slug_map (slug -> hash)", slug_map),
             ("collections", colls),
+            ("collection_names", coll_names),
+            ("tombstones", tombs),
+            ("dirty_docs", dirty),
+            ("field_index delta (heap side)", field_delta),
+            ("field_index superseded set", field_super),
+            ("gin_index (heap side)", gin),
+            ("search_index (heap side)", search),
+            ("spatial_grid (heap side)", spatial),
             ("vector_store (id index + mmap)", vec_store),
             ("hnsw_graph (fat)", graph),
             ("int8_codes (fat)", int8),

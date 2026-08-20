@@ -603,6 +603,25 @@ impl SpatialGrid {
         Ok(())
     }
 
+    /// Resident bytes held by the grid — the heap side only.
+    ///
+    /// `mapped` is file-backed and reclaimable, so it is deliberately excluded:
+    /// the question this answers is what the grid costs that the kernel cannot
+    /// take back. `poly_rings` is included because a cached ring is parsed
+    /// geometry, and on a resident open it is the largest thing here.
+    pub fn mem_bytes(&self) -> usize {
+        let cells = self.cells.capacity() * (8 + 24)
+            + self.cells.values().map(|v| v.capacity() * 8).sum::<usize>();
+        let meta = self.meta.capacity() * (8 + std::mem::size_of::<SpatialMeta>() + 1);
+        let rings: usize = self
+            .poly_rings
+            .values()
+            .map(|r| r.iter().map(|ring| ring.capacity() * 16).sum::<usize>() + r.capacity() * 24)
+            .sum::<usize>()
+            + self.poly_rings.capacity() * 32;
+        cells + meta + rings
+    }
+
     /// Node hashes in cell `(cy,cx)` — resident overlay unioned with the mmap base.
     fn cell_members_at(&self, key: (i32, i32)) -> Option<Vec<u64>> {
         let overlay = self.cells.get(&key);

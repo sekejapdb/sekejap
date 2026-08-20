@@ -664,6 +664,37 @@ impl SearchIndex {
     fn delta_slot_base(&self) -> u32 { self.doc_count }
 
     /// How many documents are waiting in the delta.
+    /// Resident bytes held by this index — the heap side only.
+    ///
+    /// `Bytes` is either owned or a window on the mapping; only the owned case
+    /// is counted, because a mapped one is page cache the kernel can reclaim.
+    /// That distinction is the whole point of the number: a mapped index and a
+    /// resident one can be the same size on disk and nothing alike in memory.
+    pub fn mem_bytes(&self) -> usize {
+        let owned = |b: &Bytes| -> usize {
+            match b {
+                Bytes::Owned(v) => v.capacity(),
+                _ => 0,
+            }
+        };
+        let fields: usize = self.fields.iter().map(|f| f.capacity()).sum::<usize>()
+            + self.fields.capacity() * 24;
+        let id_map = match &self.id_map {
+            IdMap::Owned(v) => v.capacity() * 8,
+            IdMap::Mapped { .. } => 0,
+        };
+        let id_to_slot = match &self.id_to_slot {
+            SlotIndex::Resident(m) => m.capacity() * (8 + 4 + 1),
+            SlotIndex::Mapped(_) => 0,
+        };
+        fields
+            + id_map
+            + id_to_slot
+            + owned(&self.fst_data)
+            + owned(&self.postings_data)
+            + self.delta_docs.capacity() * 32
+    }
+
     pub fn delta_len(&self) -> usize { self.delta_docs.len() }
 
     /// Index one document without rebuilding the corpus.
