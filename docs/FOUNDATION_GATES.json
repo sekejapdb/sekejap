@@ -2,7 +2,7 @@
   "version": "F1",
   "prototype": "stable-page page-image WAL",
   "production_promotable": false,
-  "verdict": "Retain v2 architecture candidate; no promotion. Safety coverage expanded; remaining law gates and control scan failure explicit.",
+  "verdict": "Keep committed stale-frame guard; Mac/Pi ordinary raw-KV parity passes. Native old-Store stale-page cause and broader F1 recovery/reader/resize/integration gates remain open.",
   "laws": [
     {
       "id": "L1-MEM",
@@ -22,7 +22,7 @@
       "id": "L3-ATOMIC",
       "law": 3,
       "status": "PENDING",
-      "passed": "356 injected boundary/mode cases, 712 ordinary/simulated-durability reopen checks; four actual checkpoint process exits; torn checkpoint extension defect fixed; source-preserving salvage checks",
+      "passed": "356 injected boundary/mode cases, 712 ordinary/simulated-durability reopen checks; four actual checkpoint process exits; torn checkpoint extension defect fixed; source-preserving salvage checks Successful-but-dropped data-write test catches stale images before WAL deletion and recovers acknowledged rows.",
       "remaining": "Full open/create and repair-destination I/O/interruption matrix, wider crash schedules/sector failure model and verified recovery publication"
     },
     {
@@ -36,7 +36,7 @@
       "id": "L5-DAMAGE",
       "law": 5,
       "status": "FAIL",
-      "passed": "Independent read-only scan and committed WAL overlay; current/candidate separation; leaf/overflow/root/meta/free fixtures; exact source preservation and verified 100K repair on Mac/Pi",
+      "passed": "Independent read-only scan and committed WAL overlay; current/candidate separation; leaf/overflow/root/meta/free fixtures; exact source preservation and verified 100K repair on Mac/Pi Expected frame CRC rejects checksum-valid stale WAL versions; red/green snapshot and checkpoint regression.",
       "remaining": "Corrupt-WAL-region salvage currently refuses; rootless current-membership proof, typed schema dependencies, truncation/unreadable-extent and full mutation/fault corpus remain open"
     },
     {
@@ -214,7 +214,7 @@
     {
       "id": "CONTROL-SCAN",
       "status": "FAIL",
-      "remaining": "Frozen accepted Store control has a persistent round-6 scan/get disagreement. Source-preserving audit and ignored regression retained; cause and its shared-kernel implications unresolved."
+      "remaining": "Unresolved; each failed endpoint differs from a successful endpoint by one stale checksum-valid data page. Parent pointers match. Original failed files and exact successful endpoints preserved. The related page-WAL stale-version reader defect is fixed; the native old-Store failure is not declared fixed."
     }
   ],
   "qualification_v2": {
@@ -234,5 +234,120 @@
     "sqlite_final_size_ratio_inclusive": 1.1,
     "managed_expansion_ratio": 2,
     "authority": "Owner instruction 2026-09-13: elapsed time <1.5x SQLite is acceptable; seven laws unchanged"
+  },
+  "qualification_v3": {
+    "code_commit": "d0b96ee",
+    "source_archive_sha256": "61edacfcdfa05578a4e69d336bae92a64a7a83b73fe1c0111d30ea22bead3354",
+    "platforms": {
+      "Mac": {
+        "arms": {
+          "pagewal-v2": {
+            "mutation_seconds": 40.928102498,
+            "repetitions_seconds": [
+              40.928102498,
+              40.827386749,
+              41.780600333
+            ],
+            "load_seconds": 5.0660295,
+            "final_logical_bytes": 129888256,
+            "final_allocated_bytes": 134963200,
+            "peak_logical_bytes": 134854240,
+            "peak_over_loaded": 1.1421028354494052
+          },
+          "pagewal-v3": {
+            "mutation_seconds": 41.799323500999996,
+            "repetitions_seconds": [
+              41.726003041,
+              41.934496832,
+              41.799323500999996
+            ],
+            "load_seconds": 5.1496731669999996,
+            "final_logical_bytes": 129888256,
+            "final_allocated_bytes": 134963200,
+            "peak_logical_bytes": 134854240,
+            "peak_over_loaded": 1.1421028354494052
+          },
+          "sqlite": {
+            "mutation_seconds": 31.712907666,
+            "repetitions_seconds": [
+              31.751580416000003,
+              31.712907666,
+              31.283902748
+            ],
+            "load_seconds": 4.418569667,
+            "final_logical_bytes": 129445888,
+            "final_allocated_bytes": 135180288,
+            "peak_logical_bytes": 134258128,
+            "peak_over_loaded": 1.1409726845325119
+          }
+        },
+        "v3_over_sqlite_time": 1.3180539590134723,
+        "v3_over_sqlite_size": 1.0034173970825555,
+        "v3_over_v2_time": 1.021286620923669,
+        "tests": {
+          "distinct_passed": 363,
+          "ignored": 2,
+          "pass_events_including_subprocess_helpers": 366,
+          "sha256": "b0f60f967adba91b0b13050b529b1c20e47f3bc27ae42f8370f91f701949926e"
+        }
+      },
+      "Pi": {
+        "arms": {
+          "pagewal-v2": {
+            "mutation_seconds": 74.00348541,
+            "repetitions_seconds": [
+              74.00348541,
+              74.05078286499999,
+              73.223664427
+            ],
+            "load_seconds": 6.648916694,
+            "final_logical_bytes": 129888256,
+            "final_allocated_bytes": 129888256,
+            "peak_logical_bytes": 134854240,
+            "peak_over_loaded": 1.1421028354494052
+          },
+          "pagewal-v3": {
+            "mutation_seconds": 73.055732185,
+            "repetitions_seconds": [
+              73.055732185,
+              73.380775545,
+              72.75014360899999
+            ],
+            "load_seconds": 6.511313041,
+            "final_logical_bytes": 129888256,
+            "final_allocated_bytes": 129888256,
+            "peak_logical_bytes": 134854240,
+            "peak_over_loaded": 1.1421028354494052
+          },
+          "sqlite": {
+            "mutation_seconds": 70.65848994,
+            "repetitions_seconds": [
+              70.65848994,
+              69.98888972799999,
+              71.24511578199998
+            ],
+            "load_seconds": 6.763688995,
+            "final_logical_bytes": 129445888,
+            "final_allocated_bytes": 129445888,
+            "peak_logical_bytes": 134258128,
+            "peak_over_loaded": 1.1409726845325119
+          }
+        },
+        "v3_over_sqlite_time": 1.0339271649738855,
+        "v3_over_sqlite_size": 1.0034173970825555,
+        "v3_over_v2_time": 0.9871931271919264,
+        "tests": {
+          "distinct_passed": 30,
+          "ignored": 0,
+          "pass_events_including_subprocess_helpers": 30,
+          "sha256": "11dcbac161b9cdb8241fb982bca663436ec72d9781d2a120a2e067fb03747eb2"
+        }
+      }
+    },
+    "raw_reports": 18,
+    "ordinary_time_pass": true,
+    "ordinary_size_pass": true,
+    "report": "docs/PAGEWAL_STALE_FRAME.md",
+    "results": "docs/PAGEWAL_STALE_FRAME_RESULTS.json"
   }
 }

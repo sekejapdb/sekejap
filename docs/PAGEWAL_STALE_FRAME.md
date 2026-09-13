@@ -74,21 +74,70 @@ missing WAL contents or provide rootless current-membership proof.
 
 ## Validation and measurements
 
-Mac: full release workspace suite **366 passed, 0 failed, 2 ignored**. The
+Mac: full release workspace suite **363 distinct tests passed, 0 failed,
+2 ignored** (366 pass events when subprocess helpers are counted). The
 ignored tests are the retained failing control fixture and the large forensic
 I/O probe; the latter was run explicitly for 20 rounds without FULL barriers
 and 100 rounds with FULL barriers. The page-WAL fault suite passes four tests,
 including the existing **356 injected cases / 712 reopen checks** and both new
 stale-page cases.
 
-Rotated v2/v3/SQLite comparisons and selected Pi validation are in progress.
-Results will be recorded here before this subloop is closed. The Pi's verified
-stable address is `contributor@example.invalid`.
+Pi: **30 selected tests passed**, including both new fault cases, the full
+page-WAL I/O failure matrix, snapshots, repair and the generated reuse test.
+Its verified stable address is `contributor@example.invalid`.
+
+All **18 benchmark arms** completed and match the independent value/count
+oracle at every round and reopen. Each arm loads 400K raw key/value records,
+then performs 12 rounds: **960K updates + 480K deletes + 480K inserts**, or
+**1.92 million changes**. Results below are medians of three rotated runs;
+mutation time excludes initial load and includes commits and the final
+checkpoint. SQLite uses WAL, native FULL barriers, an 8 MiB cache and a
+`WITHOUT ROWID` table. Pi arms run under a 128 MiB address-space limit.
+
+| Platform | E4 page-WAL v2 | E4 guarded v3 | SQLite | Guarded E4 / SQLite time |
+|---|---:|---:|---:|---:|
+| Mac | 40.93 s | **41.80 s** | 31.71 s | **1.318× — pass** |
+| Pi | 74.00 s | **73.06 s** | 70.66 s | **1.034× — pass** |
+
+Load-only medians for the same 400K records: Mac guarded E4 **5.15 s** versus
+SQLite **4.42 s**; Pi guarded E4 **6.51 s** versus SQLite **6.76 s**.
+The guard costs 2.13% versus v2 on Mac and measured 1.28% faster on Pi. These
+runs establish acceptable cost for the correctness fix, not a new speed claim.
+
+| Disk measure, all database/supporting files | E4 v2 and guarded v3 | SQLite |
+|---|---:|---:|
+| Final logical bytes, both platforms | **129,888,256** | **129,445,888** |
+| Highest observed logical peak | 134,854,240 | 134,258,128 |
+| Mac median final allocated bytes | 134,963,200 | 135,180,288 |
+| Pi median final allocated bytes | 129,888,256 | 129,445,888 |
+
+The guard adds **zero logical disk bytes**. E4's final logical size remains
+**0.34% above SQLite**. Both observed peaks are about **1.14×** the loaded
+footprint. Peaks are 1 ms samples and therefore lower bounds; this benchmark
+does not replace the separate enforced-cap/held-reader tests.
+
+**Decision: keep commit `d0b96ee`.** Ordinary raw-KV time and size pass the
+owner's `<1.5×` time and `≤1.10×` size gates on both platforms. This is a scoped
+correctness acceptance, not full collection or seven-law release qualification.
+Machine-readable reports, hashes and individual repetitions are in
+[PAGEWAL_STALE_FRAME_RESULTS.json](PAGEWAL_STALE_FRAME_RESULTS.json).
 
 Evidence: `<scratch>`, and the
 corresponding `artifacts/pagewal-correctness-20260913` directory under the
 authorized Pi task root. `compare-6.json` and `compare-11.json` describe exact
 page differences. Raw logs, source archives and benchmark binaries are retained.
+
+Cleanup removed six redundant comparison databases per platform, retaining
+each third repetition and every failure/exact endpoint reproduction. This
+freed **810,213,376 allocated bytes on Mac** and **778,379,264 on Pi**. The
+previous loop's deferred Pi cleanup also completed (41 databases,
+1,699,307,520 allocated bytes). Manifests record file hashes and actual file
+allocations; these numbers are not a promise of identical filesystem free-space
+changes. See [this loop's manifest](PAGEWAL_STALE_FRAME_CLEANUP.json).
+
+The benchmark archive predates final formatting/bounds cleanup of forensic
+tools; the recorder verifies that every listed engine source file still
+matches the exact archived bytes used by both platforms.
 
 Corrupt-WAL-region salvage, complete repair failure/budget coverage,
 cross-process readers, large-value resize parity and typed collection

@@ -1,0 +1,272 @@
+{
+  "Mac": {
+    "base": "<scratch>",
+    "mode": "delete",
+    "removed_databases": 6,
+    "removed_logical_bytes": 778379264,
+    "removed_allocated_bytes": 810213376,
+    "removed": [
+      {
+        "path": "comparison/r1/pagewal-v2/db",
+        "report_sha256": "bde154f5e0373035710f397a3bfce7ff09189e559fd55bf526265d96bb267c69",
+        "files": [
+          {
+            "path": "comparison/r1/pagewal-v2/db/data",
+            "logical": 129888256,
+            "allocated": 135028736,
+            "sha256": "8a039f5d031990c5049d7dfef0e80e295cdfb078acd779ad2ef274a0342fa0d1"
+          },
+          {
+            "path": "comparison/r1/pagewal-v2/db/wal",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "path": "comparison/r1/pagewal-v2/db/writer.lock",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r1/pagewal-v3/db",
+        "report_sha256": "8229a2ab99b939f75cdb11ea6a6e5b243b6ea949f16e69cbe2d0509dad41f515",
+        "files": [
+          {
+            "path": "comparison/r1/pagewal-v3/db/data",
+            "logical": 129888256,
+            "allocated": 134963200,
+            "sha256": "8a039f5d031990c5049d7dfef0e80e295cdfb078acd779ad2ef274a0342fa0d1"
+          },
+          {
+            "path": "comparison/r1/pagewal-v3/db/wal",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "path": "comparison/r1/pagewal-v3/db/writer.lock",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r1/sqlite/db",
+        "report_sha256": "8965c1c8c31ff914df41700b2c9d0b03f11648a5bb31c46142bd75b21b7d53f3",
+        "files": [
+          {
+            "path": "comparison/r1/sqlite/db/data.sqlite",
+            "logical": 129413120,
+            "allocated": 135147520,
+            "sha256": "e656518398ead9021df17ec9d5cc4570dc313088c7ea21aa3fb7114e24870aaa"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r2/pagewal-v3/db",
+        "report_sha256": "5965cf10357d51d2d90be63c978fbd74840ca4af547cdd6102b36ed69b122ade",
+        "files": [
+          {
+            "path": "comparison/r2/pagewal-v3/db/data",
+            "logical": 129888256,
+            "allocated": 134963200,
+            "sha256": "8a039f5d031990c5049d7dfef0e80e295cdfb078acd779ad2ef274a0342fa0d1"
+          },
+          {
+            "path": "comparison/r2/pagewal-v3/db/wal",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "path": "comparison/r2/pagewal-v3/db/writer.lock",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r2/sqlite/db",
+        "report_sha256": "d28169768c8adffc3e72e4e41764fcac66d17fc20c6996ad82bbc6f6d4308257",
+        "files": [
+          {
+            "path": "comparison/r2/sqlite/db/data.sqlite",
+            "logical": 129413120,
+            "allocated": 135147520,
+            "sha256": "e656518398ead9021df17ec9d5cc4570dc313088c7ea21aa3fb7114e24870aaa"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r2/pagewal-v2/db",
+        "report_sha256": "c5964246d062ddae220c9c109ce23ab474ecc2d69bcb93be05921f85748a4082",
+        "files": [
+          {
+            "path": "comparison/r2/pagewal-v2/db/data",
+            "logical": 129888256,
+            "allocated": 134963200,
+            "sha256": "8a039f5d031990c5049d7dfef0e80e295cdfb078acd779ad2ef274a0342fa0d1"
+          },
+          {
+            "path": "comparison/r2/pagewal-v2/db/wal",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "path": "comparison/r2/pagewal-v2/db/writer.lock",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      }
+    ],
+    "retained": [
+      "comparison/r3/sqlite/db",
+      "comparison/r3/pagewal-v2/db",
+      "comparison/r3/pagewal-v3/db"
+    ],
+    "also_retained": "All failures, exact endpoint reproductions, source archives, binaries, reports and logs"
+  },
+  "Pi": {
+    "base": "<scratch>",
+    "mode": "delete",
+    "removed_databases": 6,
+    "removed_logical_bytes": 778379264,
+    "removed_allocated_bytes": 778379264,
+    "removed": [
+      {
+        "path": "comparison/r1/pagewal-v2/db",
+        "report_sha256": "9a046cc250f66bd3512b7a31a685d456dae36c9cba14c3168a88610b07386e2b",
+        "files": [
+          {
+            "path": "comparison/r1/pagewal-v2/db/data",
+            "logical": 129888256,
+            "allocated": 129888256,
+            "sha256": "8a039f5d031990c5049d7dfef0e80e295cdfb078acd779ad2ef274a0342fa0d1"
+          },
+          {
+            "path": "comparison/r1/pagewal-v2/db/wal",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "path": "comparison/r1/pagewal-v2/db/writer.lock",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r1/pagewal-v3/db",
+        "report_sha256": "357e10d9823a8778651d344fe8982dff8fe996c8db129e542cbc9e9808880eed",
+        "files": [
+          {
+            "path": "comparison/r1/pagewal-v3/db/data",
+            "logical": 129888256,
+            "allocated": 129888256,
+            "sha256": "8a039f5d031990c5049d7dfef0e80e295cdfb078acd779ad2ef274a0342fa0d1"
+          },
+          {
+            "path": "comparison/r1/pagewal-v3/db/wal",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "path": "comparison/r1/pagewal-v3/db/writer.lock",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r1/sqlite/db",
+        "report_sha256": "6cdd17a56ec64501b71762699a97b9d5d748caeb0c46976ae73d7069aa8e9498",
+        "files": [
+          {
+            "path": "comparison/r1/sqlite/db/data.sqlite",
+            "logical": 129413120,
+            "allocated": 129413120,
+            "sha256": "e656518398ead9021df17ec9d5cc4570dc313088c7ea21aa3fb7114e24870aaa"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r2/pagewal-v3/db",
+        "report_sha256": "2ce9d09e3247501e0993907608b4a231e5f47650afcbba4a6bc5c6f88f812141",
+        "files": [
+          {
+            "path": "comparison/r2/pagewal-v3/db/data",
+            "logical": 129888256,
+            "allocated": 129888256,
+            "sha256": "8a039f5d031990c5049d7dfef0e80e295cdfb078acd779ad2ef274a0342fa0d1"
+          },
+          {
+            "path": "comparison/r2/pagewal-v3/db/wal",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "path": "comparison/r2/pagewal-v3/db/writer.lock",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r2/sqlite/db",
+        "report_sha256": "eea0a7511b2473420671c3be235f5fbf96a42266e8b347ebe6bf38467102b8e4",
+        "files": [
+          {
+            "path": "comparison/r2/sqlite/db/data.sqlite",
+            "logical": 129413120,
+            "allocated": 129413120,
+            "sha256": "e656518398ead9021df17ec9d5cc4570dc313088c7ea21aa3fb7114e24870aaa"
+          }
+        ]
+      },
+      {
+        "path": "comparison/r2/pagewal-v2/db",
+        "report_sha256": "58e3e2a5a9788fc143cfb779a5dee926aee0eb7ab65c83691d64fd7fdeae56d8",
+        "files": [
+          {
+            "path": "comparison/r2/pagewal-v2/db/data",
+            "logical": 129888256,
+            "allocated": 129888256,
+            "sha256": "8a039f5d031990c5049d7dfef0e80e295cdfb078acd779ad2ef274a0342fa0d1"
+          },
+          {
+            "path": "comparison/r2/pagewal-v2/db/wal",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "path": "comparison/r2/pagewal-v2/db/writer.lock",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      }
+    ],
+    "retained": [
+      "comparison/r3/sqlite/db",
+      "comparison/r3/pagewal-v2/db",
+      "comparison/r3/pagewal-v3/db"
+    ],
+    "also_retained": "All failures, exact endpoint reproductions, source archives, binaries, reports and logs"
+  }
+}

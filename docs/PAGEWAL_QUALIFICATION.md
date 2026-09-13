@@ -253,6 +253,8 @@ all 111 reports, logs, source archives and binaries. Allocated-file accounting
 is not a promise of an identical filesystem free-space change.
 
 Pi tests, all comparisons and repair completed, and their results were copied
-before SSH became unreachable. **Pi data was not deleted**; cleanup remains
-pending connectivity. See `PAGEWAL_QUALIFICATION_CLEANUP.json` for the exact
-Mac deletion manifest and Pi status.
+before SSH became unreachable. Follow-up after the owner supplied stable
+address `.40`: **41 verified redundant Pi databases were deleted**, freeing
+**1,699,307,520 allocated bytes** (1,699,265,316 logical bytes). Final engines,
+repair and cap evidence remain. See `PAGEWAL_QUALIFICATION_CLEANUP.json` for
+both exact deletion manifests.

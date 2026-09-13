@@ -29,8 +29,11 @@ reproductions show each old-Store failure contains one stale, checksum-valid
 4 KiB page; all parent pointers match the successful tree. Its native cause
 remains unresolved. A related deterministic page-WAL snapshot defect is fixed
 by binding WAL lookups to the expected frame checksum, with no disk-format or
-lookup-entry size increase. Mac's full suite passes 366 tests; Pi and repeated
-SQLite comparisons are in progress. See the [evidence and open gates](docs/PAGEWAL_STALE_FRAME.md).
+lookup-entry size increase. **363 distinct Mac tests / 30 selected Pi tests
+pass**. Three-run 400K / 1.92M-change medians: guarded E4 versus SQLite
+**41.80 / 31.71 s on Mac**, **73.06 / 70.66 s on Pi**. Final logical size stays
+**129.888 / 129.446 MB**; the fix is retained as `d0b96ee`. See the
+[evidence and open gates](docs/PAGEWAL_STALE_FRAME.md).
 The candidate remains separate from the collection Store and is not promoted.
 
 **Owner acceptance update (2026-09-13):** elapsed time **below 1.5× SQLite is
