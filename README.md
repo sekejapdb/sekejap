@@ -23,6 +23,16 @@ prior context.** Read it top to bottom before touching code.
 
 ## 0. Why e4 exists — the finding that forced it
 
+**Committed foundation / stale-version loop (2026-09-13):** baseline `ee98182`
+and page-WAL v2 `2c56936` are preserved on branch `pagewal-foundation`. Exact
+reproductions show each old-Store failure contains one stale, checksum-valid
+4 KiB page; all parent pointers match the successful tree. Its native cause
+remains unresolved. A related deterministic page-WAL snapshot defect is fixed
+by binding WAL lookups to the expected frame checksum, with no disk-format or
+lookup-entry size increase. Mac's full suite passes 366 tests; Pi and repeated
+SQLite comparisons are in progress. See the [evidence and open gates](docs/PAGEWAL_STALE_FRAME.md).
+The candidate remains separate from the collection Store and is not promoted.
+
 **Owner acceptance update (2026-09-13):** elapsed time **below 1.5× SQLite is
 acceptable**. The page-WAL v2 ordinary 400K workload passes on Mac (1.273×)
 and Pi (1.049×), with final size only 0.34% above SQLite. Keep the architecture

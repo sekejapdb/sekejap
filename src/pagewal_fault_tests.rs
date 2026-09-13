@@ -2,7 +2,7 @@ use super::*;
 use std::fs;
 
 #[derive(Default)]
-struct Plan { nth:usize, count:usize, mode:u8, fired:bool, trace:Vec<String> }
+struct Plan { nth:usize, count:usize, mode:u8, fired:bool, trace:Vec<String>, silent_data_page:Option<u32> }
 struct FaultFile { inner:Arc<dyn FileIo>, name:&'static str, plan:Arc<Mutex<Plan>>, path:PathBuf }
 impl FaultFile {
     fn hit(&self, op:&str)->Option<u8>{
@@ -20,6 +20,7 @@ impl FileIo for FaultFile {
     fn requires_alignment(&self)->bool{false}
     fn read_at(&self,b:&mut[u8],off:u64)->Result<()>{self.simple("read",||self.inner.read_at(b,off))}
     fn write_at(&self,b:&[u8],off:u64)->Result<()>{
+        {let mut p=self.plan.lock().unwrap();if self.name=="data"&&p.silent_data_page==Some((off/PAGE as u64)as u32){p.fired=true;return Ok(());}}
         let hit=self.hit("write");match hit {
             Some(0)=>Err(Self::err(0)),
             Some(mode @ (2|3))=>{self.inner.write_at(&b[..b.len()/2+1],off)?;Err(Self::err(mode))},
@@ -113,4 +114,46 @@ fn partial_checkpoint_extension_can_reopen_from_committed_wal(){
     let mut s=PageWalStore::open(&p,false,32<<10).unwrap();
     for i in 0..160u64{assert_eq!(s.get(&i.to_be_bytes()).unwrap(),Some(value(i,if i<120{1}else{2})));}
     s.checkpoint().unwrap();assert_eq!(fs::metadata(p.join("data")).unwrap().len()%PAGE as u64,0);
+}
+
+#[test]
+fn successful_but_dropped_data_write_preserves_committed_wal(){
+    let temp=tempfile::tempdir().unwrap();let p=temp.path().join("db");seed(&p);
+    let before=fs::read(p.join("data")).unwrap();
+    let no=before.chunks_exact(PAGE).enumerate().skip(2).find(|(n,b)|PageRef::open(b,*n as u32).is_ok_and(|p|p.kind()==PageKind::Leaf)).unwrap().0 as u32;
+    let plan=Arc::new(Mutex::new(Plan::default()));let mut s=hooked(&p,plan.clone());mutate(&mut s).unwrap();
+    let wal=fs::read(p.join("wal")).unwrap();
+    plan.lock().unwrap().silent_data_page=Some(no);
+    assert!(s.checkpoint().is_err(),"a successful syscall cannot substitute for read-back verification");
+    assert!(plan.lock().unwrap().fired);assert!(s.get(b"x").is_err());
+    assert_eq!(fs::read(p.join("wal")).unwrap(),wal,"verification must precede WAL deletion");
+    drop(s);verify(&p,Some(2));
+}
+
+#[test]
+fn checksum_valid_stale_wal_frame_cannot_serve_a_snapshot_or_checkpoint(){
+    let temp=tempfile::tempdir().unwrap();let p=temp.path().join("db");seed(&p);
+    let original_data=fs::read(p.join("data")).unwrap();
+    let mut s=PageWalStore::open(&p,false,32<<10).unwrap();
+    s.put(&1u64.to_be_bytes(),&value(1,2)).unwrap();s.commit().unwrap();
+    let good=fs::read(p.join("wal")).unwrap();
+    let (off,no)=good.chunks_exact(FRAME).enumerate().find_map(|(i,b)|{
+        if u32at(b,8)!=1{return None;}let no=u32at(b,12);let page=PageRef::open(&b[32..],no).ok()?;
+        (page.kind()==PageKind::Leaf).then_some((i*FRAME,no))
+    }).unwrap();
+    let old:[u8;PAGE]=original_data[no as usize*PAGE..(no as usize+1)*PAGE].try_into().unwrap();
+    let stale=frame(1,no,u64at(&good[off..],16),0,&old);
+    assert_ne!(stale,&good[off..off+FRAME]);PageRef::open(&stale[32..],no).unwrap();
+    let snapshot=s.snapshot().unwrap();
+    let (wal,_)=io::open_file(&p.join("wal"),IoMode::Buffered).unwrap();wal.write_at(&stale,off as u64).unwrap();wal.sync_full().unwrap();
+    assert!(snapshot.get(&1u64.to_be_bytes()).is_err(),"valid old bytes are not the published page version");
+    drop(snapshot);let damaged=fs::read(p.join("wal")).unwrap();
+    assert!(s.checkpoint().is_err());assert!(s.get(b"x").is_err());drop(s);
+    assert_eq!(fs::read(p.join("wal")).unwrap(),damaged);
+    assert!(PageWalStore::open(&p,false,32<<10).is_err());
+    assert_eq!(fs::read(p.join("wal")).unwrap(),damaged);
+    // Restore the test's injected byte substitution, then verify acknowledged data.
+    wal.write_at(&good[off..off+FRAME],off as u64).unwrap();wal.sync_full().unwrap();
+    let recovered=PageWalStore::open(&p,false,32<<10).unwrap();
+    assert_eq!(recovered.get(&1u64.to_be_bytes()).unwrap(),Some(value(1,2)));
 }

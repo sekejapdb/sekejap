@@ -13,7 +13,7 @@ impl FileIo for Source {
         if b.len()!=PAGE||off%PAGE as u64!=0||off/PAGE as u64>=self.pages as u64{return Err(bad("repair page bounds"));}
         // Let CandidateReader classify a damaged data page after this raw read.
         let p=(off/PAGE as u64) as u32;
-        if let Some(at)=self.index.get(&p){let f=read_frame(&*self.wal,*at)?;if u32at(&f,12)!=p{return Err(bad("repair WAL identity"));}b.copy_from_slice(&f[32..]);Ok(())}
+        if let Some(at)=self.index.get(&p){let f=read_indexed_frame(&*self.wal,*at)?;if u32at(&f,12)!=p{return Err(bad("repair WAL identity"));}b.copy_from_slice(&f[32..]);Ok(())}
         else{self.data.read_at(b,off)}
     }
     fn write_at(&self,_:&[u8],_:u64)->Result<()>{Err(Error::ReadOnly)}

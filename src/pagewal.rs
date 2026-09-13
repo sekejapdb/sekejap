@@ -10,7 +10,18 @@ const PAGE: usize = 4096;
 const FRAME: usize = PAGE + 32;
 const WAL_CAP: u64 = 16 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"E4PWAL01";
-type Index = BTreeMap<u32, u64>;
+// WAL is capped at 16 MiB, so a 32-bit offset leaves room for the expected
+// frame checksum in the same eight bytes previously used by a u64 offset.
+// A valid checksum alone cannot distinguish an older image of the same page.
+#[derive(Clone, Copy)]
+struct FrameRef { offset:u32, checksum:u32 }
+impl FrameRef {
+    fn new(offset:u64,bytes:&[u8])->Self {
+        assert!(offset<WAL_CAP);
+        Self{offset:offset as u32,checksum:u32at(bytes,28)}
+    }
+}
+type Index = BTreeMap<u32, FrameRef>;
 mod repair;
 pub use repair::recover_to;
 fn bad(why: &'static str) -> Error { Error::CorruptWal { offset: 0, why } }
@@ -31,6 +42,13 @@ fn read_frame(file: &dyn FileIo, off: u64) -> Result<Vec<u8>> {
     let want=u32at(&b,28);b[28..32].fill(0);
     if &b[..8]!=MAGIC || crc32c::crc32c(&b)!=want {return Err(bad("page WAL frame checksum/magic"));}
     b[28..32].copy_from_slice(&want.to_le_bytes());Ok(b)
+}
+fn read_indexed_frame(file:&dyn FileIo,reference:FrameRef)->Result<Vec<u8>> {
+    let bytes=read_frame(file,reference.offset as u64)?;
+    if u32at(&bytes,28)!=reference.checksum {
+        return Err(bad("WAL frame differs from published version"));
+    }
+    Ok(bytes)
 }
 struct State {
     latest: Index, committed: Arc<Index>, end: u64, last_commit: u64,
@@ -63,7 +81,7 @@ impl Pager {
             if u64at(&b,16)!=tx {return Err(bad("WAL transaction sequence"));}
             match u32at(&b,8) {
                 1 => {let p=u32at(&b,12);PageRef::open(&b[32..],p)?;
-                    pending.insert(p,at);crc=crc32c::crc32c_append(crc,&b);},
+                    pending.insert(p,FrameRef::new(at,&b));crc=crc32c::crc32c_append(crc,&b);},
                 2 => {if u32at(&b,32)!=crc {return Err(bad("WAL transaction checksum"));}
                     pages=u32at(&b,24);if pending.keys().any(|p|*p>=pages){return Err(bad("page beyond committed extent"));}
                     committed.append(&mut pending);last=at+FRAME as u64;tx=tx.checked_add(1).ok_or(Error::TooLarge)?;crc=0;},
@@ -106,7 +124,7 @@ impl Pager {
         if s.end!=s.last_commit {return Err(bad("checkpoint with unpublished pages"));}
         if s.end==0{return Ok(true);}
         for (&p,&off) in &s.latest {
-            let b=read_frame(&*self.wal,off)?;
+            let b=read_indexed_frame(&*self.wal,off)?;
             if u32at(&b,12)!=p {return Err(bad("WAL lookup identity"));}
             PageRef::open(&b[32..],p)?;self.data.write_at(&b[32..],p as u64*PAGE as u64)?;
             if fault==1 {std::process::exit(86);}
@@ -116,7 +134,7 @@ impl Pager {
         // Independent read-back precedes dropping the WAL. Cost is measured.
         for (&p,&off) in &s.latest {
             let mut data=[0;PAGE];self.data.read_at(&mut data,p as u64*PAGE as u64)?;
-            let b=read_frame(&*self.wal,off)?;
+            let b=read_indexed_frame(&*self.wal,off)?;
             if data!=b[32..] {return Err(bad("checkpoint read-back mismatch"));}
             PageRef::open(&data,p)?;
         }
@@ -135,7 +153,7 @@ impl Pager {
 }
 fn read_page(data:&dyn FileIo,wal:&dyn FileIo,index:&Index,p:u32,dst:&mut[u8]) -> Result<()> {
     if let Some(off)=index.get(&p) {
-        let b=read_frame(wal,*off)?;if u32at(&b,12)!=p{return Err(bad("WAL page identity"));}
+        let b=read_indexed_frame(wal,*off)?;if u32at(&b,12)!=p{return Err(bad("WAL page identity"));}
         dst.copy_from_slice(&b[32..]);
     } else {data.read_at(dst,p as u64*PAGE as u64)?;}
     PageRef::open(dst,p)?;Ok(())
@@ -154,7 +172,7 @@ impl FileIo for Pager {
         // reallocate this page even while its replacement is still cached.
         let mut page=PageMut::init(&mut b,PageKind::Free,0,p);page.insert_slot(0,b"taken")?;page.finalise(0);kernel::page::seal(&mut b,1);
         let f=frame(1,p,s.tx,0,&b);let at=s.end;self.append(&mut s,&f)?;
-        s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,at);s.free_head=next;Ok(Some(p))
+        s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,FrameRef::new(at,&f));s.free_head=next;Ok(Some(p))
     }
     fn push_free_page(&self,p:u32)->Result<()>{
         let mut s=self.state.lock().unwrap();if p<2{return Err(bad("free page extent"));}
@@ -163,7 +181,7 @@ impl FileIo for Pager {
         let mut b=[0;PAGE];let mut page=PageMut::init(&mut b,PageKind::Free,0,p);
         page.insert_slot(0,&s.free_head.to_le_bytes())?;page.finalise(0);kernel::page::seal(&mut b,1);
         let f=frame(1,p,s.tx,0,&b);let at=s.end;self.append(&mut s,&f)?;
-        s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,at);s.free_head=p;Ok(())
+        s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,FrameRef::new(at,&f));s.free_head=p;Ok(())
     }
     fn requires_alignment(&self)->bool{false}
     fn len(&self)->Result<u64>{Ok(self.state.lock().unwrap().pages as u64*PAGE as u64)}
@@ -178,7 +196,7 @@ impl FileIo for Pager {
         let p=u32::try_from(off/PAGE as u64).map_err(|_|Error::TooLarge)?;PageRef::open(b,p)?;
         let mut s=self.state.lock().unwrap();s.pages=s.pages.max(p.checked_add(1).ok_or(Error::TooLarge)?);
         let f=frame(1,p,s.tx,0,b.try_into().unwrap());let at=s.end;
-        self.append(&mut s,&f)?;s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,at);Ok(())
+        self.append(&mut s,&f)?;s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,FrameRef::new(at,&f));Ok(())
     }
     fn sync_data(&self)->Result<()>{Err(bad("use explicit page-WAL publication"))}
     fn sync_full(&self)->Result<()>{Err(bad("use explicit page-WAL publication"))}

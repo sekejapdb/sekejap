@@ -265,6 +265,10 @@ pub struct Store {
     barriers: Vec<&'static str>,
 }
 
+#[cfg(test)]
+#[path = "store_reuse_probe.rs"]
+mod reuse_probe;
+
 impl Store {
     fn build(dir: &Path, cfg: Config, fresh: bool) -> Result<Store> {
         Self::build_limited(dir, cfg, fresh, None)
