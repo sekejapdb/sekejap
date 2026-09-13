@@ -24,7 +24,7 @@ SQLite uses a WITHOUT ROWID primary-key table with a BLOB value. F-H fixtures
 retain the native SQLite columns/JSONB/unique-key comparator from collections.
 Never mix the two sets of ratios or claim primitive results as collection wins.
 
-N ladder: 1K diagnostic; 10K and 40K smoke; 100K and 400K acceptance; 10M
+N ladder: 1K diagnostic; 10K and 40K smoke; 100K and 400K acceptance; 1M scaling; 10M
 large-data confirmation after smaller gates pass. Overflow fixtures use a
 separate declared N (1K/10K/40K) so dataset size and memory pressure are clear.
 Ordered and deterministically shuffled keys are separate arms. Seed, payload
@@ -98,6 +98,50 @@ Final plateau: cycles 10–12 must not show ongoing file growth beyond a declare
 one-page/metadata rounding allowance. Rebuild/VACUUM is a separate measured arm.
 
 ## Promotion and evidence retention
+
+### Repeatable lean groups and fixed-work scaling
+
+`docs/FOUNDATION_LEAN_GROUPS.json` maps all seven laws to shared executable
+test groups and explicitly lists missing coverage. Each shared command runs
+once. This is fast regression feedback, not a claim that all laws pass.
+
+Run from the project root, using a fresh artifact directory each time:
+
+```sh
+python3 tools/run_foundation.py lean <scratch>
+python3 tools/run_foundation.py scale <scratch>
+python3 tools/run_foundation.py large <scratch>
+```
+
+`lean` runs pager/fault/repair, codec/schema/collection and inherited kernel
+regressions, then four 1K-row E4/SQLite smoke arms. `scale` performs three
+rotated repetitions at 10K, 100K and 1M rows; `large` is a one-run 10M
+confirmation, not three-repetition acceptance. Both are runnable in the
+authorized Pi artifact area; Pi benchmark processes have a 128 MiB
+address-space limit. Source/log/binary hashes and structured reports accompany
+each run. Existing typed tests still use the older collection Store.
+
+The scaling workload holds work fixed: **1,000 inserts, then 1,000 updates,
+then 1,000 deletes**, each as a separate transaction, against each population.
+All rows have 8-byte keys and 256-byte values, 8 MiB engine caches, native FULL
+durability, and explicit ending checkpoints included in each phase's time.
+The base population is loaded in ascending even keys. Local arms append new
+keys and update/delete contiguous existing ranges. Scattered arms insert into
+distributed odd-key gaps and update/delete disjoint evenly spaced ranges in a
+deterministically permuted order. Each locality has a fresh database. Engine
+caches start empty at each phase; OS caches are not flushed. Reopen is priced
+separately. Every changed key is checked, and final reopen streams an exact
+value/order/membership oracle using O(changes) state.
+
+Report absolute times, largest/smallest ratios, adjacent ratios and the
+descriptive exponent `log(cost ratio)/log(population ratio)` for time and E4
+issued reads/writes. E4 FileIo calls are buffered requests, not physical media
+I/O. SQLite cache events exclude checkpoint VFS work and must not be presented
+as equivalent counters. Phase-boundary sizes are not peak-space evidence.
+A passing workload oracle is distinct from passing Law 2. Measured latency
+growth cannot be hidden by SQLite parity or by defining an acceptable exponent
+after seeing the results. The strict law remains unchanged; unresolved growth
+must remain an explicit qualification failure or pending investigation.
 
 Current E4, experimental E4 and native SQLite are named separately in every
 table. One representation or backend cannot be substituted silently. Primitive

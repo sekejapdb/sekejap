@@ -19,3 +19,10 @@ thresholds; the native old-Store stale-page cause is still unresolved.
 This is a development checkpoint, not release promotion. The seven laws and
 the current F1 blockers still apply. The page-WAL module remains separate from
 the collection Store; importing it does not switch the public collection API.
+
+The [fixed-work scaling loop](FOUNDATION_SCALING.md) adds repeatable lean law
+groups and measures identical CRUD work at 10K/100K/1M/10M on Mac and Pi.
+All workload oracles pass, but strict flat latency fails for scattered work,
+and 100K scattered final size exceeds the SQLite target. No storage algorithm
+was changed: the only pager addition exposes existing diagnostic I/O counters.
+These failures remain in the release registry before collection integration.

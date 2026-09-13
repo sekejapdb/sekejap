@@ -2,7 +2,7 @@
   "version": "F1",
   "prototype": "stable-page page-image WAL",
   "production_promotable": false,
-  "verdict": "Keep committed stale-frame guard; Mac/Pi ordinary raw-KV parity passes. Native old-Store stale-page cause and broader F1 recovery/reader/resize/integration gates remain open.",
+  "verdict": "Keep the page-WAL candidate and executable lean suite; fixed-work scaling falsifies strict flat latency on Mac/Pi, and 100K scattered final size fails. Recovery/reader/typed integration gates remain open.",
   "laws": [
     {
       "id": "L1-MEM",
@@ -14,9 +14,9 @@
     {
       "id": "L2-WORK",
       "law": 2,
-      "status": "PENDING",
-      "passed": "Stable-page path, bounded WAL lookup and change-page checkpoint; 10K/40K/100K/400K probes",
-      "remaining": "Fixed-change-count N ladder with I/O counters and exponent gate"
+      "status": "FAIL",
+      "passed": "Fixed 1000-operation insert/update/delete ladder: 10K/100K/1M three rotations and 10M single confirmation on Mac/Pi; exact streamed state oracles and data/WAL issued-I/O counters. Local work is approximately stable; no whole-database complexity claim.",
+      "remaining": "Scattered insertion shows repeated latency and issued-I/O growth; strict flat-latency law is not met. Diagnose packing/cache/tree costs without relaxing the law. See FOUNDATION_SCALING.md."
     },
     {
       "id": "L3-ATOMIC",
@@ -104,6 +104,11 @@
       "id": "W-REPAIR",
       "status": "PENDING",
       "remaining": "Eight raw-KV fault cases and 100K verified repair on both platforms; corrupt WAL/rootless proof/typed/destination failure coverage remains pending"
+    },
+    {
+      "id": "W-FIXED",
+      "status": "PASS",
+      "scope": "80 completed scaling/large arms plus eight lean smoke arms; passing workload correctness does not mean flat latency or SQLite parity"
     }
   ],
   "fixtures": {
@@ -177,6 +182,62 @@
         "size_target": "PASS",
         "acceptance_repetitions": "PASS",
         "evidence": "Historical v1 pilot reclassified under owner time threshold; not newly measured as standalone v2 workload"
+      },
+      {
+        "case": "fixed-10000-local",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-10000-scattered",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-100000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-100000-scattered",
+        "time_target": "FAIL",
+        "size_target": "FAIL",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-1000000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-1000000-scattered",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-10000000-local",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-10000000-scattered",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
       }
     ],
     "Pi": [
@@ -207,6 +268,62 @@
         "size_target": "PASS",
         "acceptance_repetitions": "PASS",
         "evidence": "Page-WAL qualification v2; three rotations; owner accepts time <1.5x SQLite"
+      },
+      {
+        "case": "fixed-10000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-10000-scattered",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-100000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-100000-scattered",
+        "time_target": "PASS",
+        "size_target": "FAIL",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-1000000-local",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-1000000-scattered",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-10000000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
+      },
+      {
+        "case": "fixed-10000000-scattered",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
       }
     ]
   },
@@ -349,5 +466,16 @@
     "ordinary_size_pass": true,
     "report": "docs/PAGEWAL_STALE_FRAME.md",
     "results": "docs/PAGEWAL_STALE_FRAME_RESULTS.json"
+  },
+  "qualification_fixed_work": {
+    "results": "docs/FOUNDATION_SCALING_RESULTS.json",
+    "report": "docs/FOUNDATION_SCALING.md",
+    "validation": "docs/FOUNDATION_SCALING_VALIDATION.json",
+    "lean_groups": "docs/FOUNDATION_LEAN_GROUPS.json",
+    "lean_tests_per_platform": 74,
+    "scaling_arms_per_platform": 40,
+    "smoke_arms_per_platform": 4,
+    "law2": "FAIL",
+    "production_promotable": false
   }
 }

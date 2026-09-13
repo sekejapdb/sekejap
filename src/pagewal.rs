@@ -303,6 +303,13 @@ impl PageWalStore {
         drop(s);out.load_header()?;Ok(out)
     }
     pub fn wal_bytes(&self)->u64 {self.pager.as_ref().map_or(0,|p|p.state.lock().unwrap().end)}
+    /// Diagnostic snapshot/reset of existing FileIo counters, data then WAL.
+    /// Each tuple is (write calls, issued write bytes, read calls). Buffered
+    /// calls are not physical-device I/O. Read-only snapshots return None.
+    pub fn take_file_io_stats(&self)->Option<[(u64,u64,u64);2]> {
+        let p=self.pager.as_ref()?;
+        Some([p.data.stats()?.take(),p.wal.stats()?.take()])
+    }
     /// Pilot fault harness only: abruptly exits inside a checkpoint stage.
     pub fn test_checkpoint_crash(&mut self,stage:u8)->Result<bool>{
         self.writable()?;assert!((1..=4).contains(&stage));assert!(!self.dirty);

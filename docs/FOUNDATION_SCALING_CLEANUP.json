@@ -1,0 +1,1727 @@
+{
+  "Mac": {
+    "action": "delete",
+    "kept": [
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>"
+    ],
+    "deleted": [
+      {
+        "path": "<scratch>",
+        "report_sha256": "65a3db3fbee56c5d79189040d0caf5b5706f216f2e6096b8dbcb0f126e890399",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3256320,
+            "allocated": 3256320,
+            "sha256": "f0a7086f62a3ce1024345cc4bfd05d6f16424e06fc5c02a09f11e743b0498a74",
+            "identity": [
+              16777241,
+              430355,
+              3256320,
+              1789300656744826207
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430356,
+              0,
+              1789300656760352104
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430354,
+              0,
+              1789300656497560412
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "14a3fc85dd513fdf37f24021e4baceebc488c0c2ff2927332edcd279a3e67d67",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3248128,
+            "allocated": 3248128,
+            "sha256": "752b40ccaaef429ef4d0cf99cdc929f0200e6966c9d6c83bb6f2bb13b63a1ec2",
+            "identity": [
+              16777241,
+              430361,
+              3248128,
+              1789300657089553649
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "cb0bc3ac0fb3532558f1f8bf50c63a6ed2199e81acfbc6b1c0ddbdbe4c2c150f",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3833856,
+            "allocated": 3833856,
+            "sha256": "08b0c37391aa5fd2ce1d820b1ef0ebfa616487ce0f7940d963de01f1fef25885",
+            "identity": [
+              16777241,
+              430378,
+              3833856,
+              1789300657514400248
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430379,
+              0,
+              1789300657582101231
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430377,
+              0,
+              1789300657161819234
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "539ffbdd4d3d03bf4f0e95eda23ed29da191379e72fa53bd6c254a622289f305",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3698688,
+            "allocated": 3698688,
+            "sha256": "a57a4dffbdac0e7a1f9fad961f99eeeceb238b9451323a3c30e1421caed2064a",
+            "identity": [
+              16777241,
+              430384,
+              3698688,
+              1789300657970737685
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "c119356e7d0430132f54bdf4178ca2fbb9c84d8aca306014c50b60df03682fce",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29822976,
+            "allocated": 29822976,
+            "sha256": "cdbfd90d37c7d253988197d30a3f4a9dc8f57b4cbae74025453b0fcd88435870",
+            "identity": [
+              16777241,
+              430401,
+              29822976,
+              1789300659914914203
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430402,
+              0,
+              1789300659933011401
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430400,
+              0,
+              1789300658047884415
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "59896419b927a9a9137a373ffd80d8852fc5a3143e9edf874d41e7b0df96f8d6",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29716480,
+            "allocated": 30183424,
+            "sha256": "b6d69bc4e1ce12f1b4cb37e95a87dfc01e07111bcc9c87417ddddf6fb2a175ed",
+            "identity": [
+              16777241,
+              430407,
+              29716480,
+              1789300661671606002
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "0c47d74017679ccbdc2d59be09abc23642c8fee6c3176a6dd6000d8dbc069e89",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 33619968,
+            "allocated": 33619968,
+            "sha256": "bde8cf9ed65714b2eabcdccf57b3df0d8ded4d4d6f530139da5f010de3d880e7",
+            "identity": [
+              16777241,
+              430424,
+              33619968,
+              1789300663985917023
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430425,
+              0,
+              1789300664077301102
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430423,
+              0,
+              1789300661770569112
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "5f2c7f22b424065079c9e547371977ca98d850fe0b15ccd9a19f9de985d49b26",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29417472,
+            "allocated": 29614080,
+            "sha256": "ac19b779bc9ff3c032136432f368d7ca37ad6e6035ab2a2af1b0b64e3276d970",
+            "identity": [
+              16777241,
+              430430,
+              29417472,
+              1789300666222185519
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "561424355710d87e5a83eae3a68e42887000499e1c778682c47090297d90e124",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 295464960,
+            "allocated": 295464960,
+            "sha256": "f59eef2abb411bddb06456a8d70b3e3e63f51ae87f6d17c309ce959f19e9aee5",
+            "identity": [
+              16777241,
+              430447,
+              295464960,
+              1789300681627626064
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430448,
+              0,
+              1789300681642867418
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430446,
+              0,
+              1789300666454741755
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "28ce16dec9f9f5317b80cd72535a453cfc7fd687cc2489e9caa890ffc63d7125",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 294383616,
+            "allocated": 302919680,
+            "sha256": "3f9d4d3bf1784818e6906c27d4ebe6b6cbc6adcff0af65096f795478cc26dbb0",
+            "identity": [
+              16777241,
+              430453,
+              294383616,
+              1789300694100293703
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "2cea2cd438ccea1a26e05c81e43f2e8cb1eb0c614bcb921f6cab2b796a964285",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 299266048,
+            "allocated": 299266048,
+            "sha256": "fab6726fd775554168db8090885ba6eaaf727868e615079689d1ac871eb5ce98",
+            "identity": [
+              16777241,
+              430470,
+              299266048,
+              1789300708998254064
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430471,
+              0,
+              1789300709068916975
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430469,
+              0,
+              1789300695686040641
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "2907e387d6bc26b236ecf8be49bbfcc253b306e4895c453858a80570ce4589e1",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 294084608,
+            "allocated": 302919680,
+            "sha256": "dfceae64d0764d7fa4d529a446cb789a876de8a4891da9828f79ad66c5425aea",
+            "identity": [
+              16777241,
+              430476,
+              294084608,
+              1789300722321801365
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "aa550f10fbc34a4456b6b565f0fe219e571b52960593e39f6c936b407ff38ede",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29716480,
+            "allocated": 30289920,
+            "sha256": "b6d69bc4e1ce12f1b4cb37e95a87dfc01e07111bcc9c87417ddddf6fb2a175ed",
+            "identity": [
+              16777241,
+              430492,
+              29716480,
+              1789300725243550186
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "c451c67901ecbff51bdd22761c9dd46863027a4698b07f2cf7e032b7e0d9b448",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29822976,
+            "allocated": 29822976,
+            "sha256": "cdbfd90d37c7d253988197d30a3f4a9dc8f57b4cbae74025453b0fcd88435870",
+            "identity": [
+              16777241,
+              430509,
+              29822976,
+              1789300726828767788
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430510,
+              0,
+              1789300726844993354
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430508,
+              0,
+              1789300725359360906
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "109ad942e85c578240eade99856b5f2aee3997d34927cfda6d65a7c17d37f9f3",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29417472,
+            "allocated": 30289920,
+            "sha256": "ac19b779bc9ff3c032136432f368d7ca37ad6e6035ab2a2af1b0b64e3276d970",
+            "identity": [
+              16777241,
+              430515,
+              29417472,
+              1789300728510706366
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "1a7518295893c609de1b3d08142d4f59f59fdd6d9fbc13d97c59809a34ccab7a",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 33619968,
+            "allocated": 33619968,
+            "sha256": "bde8cf9ed65714b2eabcdccf57b3df0d8ded4d4d6f530139da5f010de3d880e7",
+            "identity": [
+              16777241,
+              430532,
+              33619968,
+              1789300730583883367
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430533,
+              0,
+              1789300730645099907
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430531,
+              0,
+              1789300728711838641
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "c791f23ef87ede03b603afaf7575cd59e127617ccf735d1989fefb87669e0c83",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 294383616,
+            "allocated": 302919680,
+            "sha256": "3f9d4d3bf1784818e6906c27d4ebe6b6cbc6adcff0af65096f795478cc26dbb0",
+            "identity": [
+              16777241,
+              430538,
+              294383616,
+              1789300742245602172
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "7875b0779ce72a31cd92cb11844ba0f83c6276a5b6bd0c843ee9a3ff10a8ff03",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 295464960,
+            "allocated": 295464960,
+            "sha256": "f59eef2abb411bddb06456a8d70b3e3e63f51ae87f6d17c309ce959f19e9aee5",
+            "identity": [
+              16777241,
+              430555,
+              295464960,
+              1789300760831937215
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430556,
+              0,
+              1789300760851958963
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430554,
+              0,
+              1789300744103127047
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "f230b49f270c3ef01b4d6c15a4ae3f063b75d3c0a0804b1864d6ead87b9a305f",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 294084608,
+            "allocated": 302616576,
+            "sha256": "dfceae64d0764d7fa4d529a446cb789a876de8a4891da9828f79ad66c5425aea",
+            "identity": [
+              16777241,
+              430561,
+              294084608,
+              1789300777839091180
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "263edd19d75c72196faccfbbc104b0210345e86e1e7eb0db28b8531e35cf8887",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 299266048,
+            "allocated": 299266048,
+            "sha256": "fab6726fd775554168db8090885ba6eaaf727868e615079689d1ac871eb5ce98",
+            "identity": [
+              16777241,
+              430578,
+              299266048,
+              1789300791863535744
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430579,
+              0,
+              1789300791916578001
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430577,
+              0,
+              1789300779212004213
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "7ee28067905c1f5b9a1680ceca081b9923ab34cbad66396a4764186834cf35e5",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3248128,
+            "allocated": 3248128,
+            "sha256": "752b40ccaaef429ef4d0cf99cdc929f0200e6966c9d6c83bb6f2bb13b63a1ec2",
+            "identity": [
+              16777241,
+              430584,
+              3248128,
+              1789300792390502342
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "b0194bed6bc4d4008f5b643240662b915ec8e2c798a94917a11f13bdf89e577e",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3256320,
+            "allocated": 3256320,
+            "sha256": "f0a7086f62a3ce1024345cc4bfd05d6f16424e06fc5c02a09f11e743b0498a74",
+            "identity": [
+              16777241,
+              430601,
+              3256320,
+              1789300792663706826
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430602,
+              0,
+              1789300792713970155
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430600,
+              0,
+              1789300792434012019
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "db03e7350649ed9e00a9be3eb0c1592fa4e6728abde3a8cb480f317cc4984011",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3698688,
+            "allocated": 3698688,
+            "sha256": "a57a4dffbdac0e7a1f9fad961f99eeeceb238b9451323a3c30e1421caed2064a",
+            "identity": [
+              16777241,
+              430607,
+              3698688,
+              1789300793047230925
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "d73ad4ee7148e7e9eda6fbea11e210df41d093f1af8f3a78445f0f470279c552",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3833856,
+            "allocated": 3833856,
+            "sha256": "08b0c37391aa5fd2ce1d820b1ef0ebfa616487ce0f7940d963de01f1fef25885",
+            "identity": [
+              16777241,
+              430624,
+              3833856,
+              1789300793384403128
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430625,
+              0,
+              1789300793442374821
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430623,
+              0,
+              1789300793098872635
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "70831e18049f29e1e1f2a644a39c4c40e54d9be8b92c3e8d9c92b2408f0240c3",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 2951909376,
+            "allocated": 2951909376,
+            "sha256": "3522163cdf2e0a40333021ccd1bbaadab6d321d467f29b75abfbc1f3bb36790d",
+            "identity": [
+              16777241,
+              430772,
+              2951909376,
+              1789300978842960750
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430773,
+              0,
+              1789300978888258601
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430771,
+              0,
+              1789300851847833529
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "e9a322c8211a91bfa206654a7b3b748aa44ca1abab87acb7992682b2c6efcbbf",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 2941034496,
+            "allocated": 2953719808,
+            "sha256": "e8f7f872f1b6bf953029be553ddb70c268701b4e9bc9b9ea86dddc69fe1543a8",
+            "identity": [
+              16777241,
+              430778,
+              2941034496,
+              1789301106364403068
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "4f0079681756af9012ef3e8b1e04134807151edb23040e4f8f8a7d4f077500f8",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 2955706368,
+            "allocated": 2955706368,
+            "sha256": "8daf2f0c0fcbb00504bf1417d1adc7f114dcbf18ec15b5f40074654003fa5ebd",
+            "identity": [
+              16777241,
+              430795,
+              2955706368,
+              1789301291299901651
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430796,
+              0,
+              1789301291394347701
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              16777241,
+              430794,
+              0,
+              1789301119636186784
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "8448fb2e414e45106c3f3a39964c9f3a202ea96c194151572767e6360d7d7930",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 2940739584,
+            "allocated": 2953416704,
+            "sha256": "312ee70919e654a28d49edd0b140733aa515cdf767ba3ef80719ad02ded1e06a",
+            "identity": [
+              16777241,
+              430801,
+              2940739584,
+              1789301470874527927
+            ]
+          }
+        ]
+      }
+    ],
+    "logical_bytes": 14429016064,
+    "allocated_bytes": 14490927104
+  },
+  "Pi": {
+    "action": "delete",
+    "kept": [
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>",
+      "<scratch>"
+    ],
+    "deleted": [
+      {
+        "path": "<scratch>",
+        "report_sha256": "59446c509bedd37111625476f7af23583e7fef763a6c4607d0778e891a0b5fbd",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3256320,
+            "allocated": 3256320,
+            "sha256": "f0a7086f62a3ce1024345cc4bfd05d6f16424e06fc5c02a09f11e743b0498a74",
+            "identity": [
+              45826,
+              795167,
+              3256320,
+              1789304387729107321
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795168,
+              0,
+              1789304387741107266
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795166,
+              0,
+              1789304387485108444
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "b27036a581d8b40fdf583f45885778f180a52b141da3d2b91db7429b9d4ffa1d",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3248128,
+            "allocated": 3248128,
+            "sha256": "752b40ccaaef429ef4d0cf99cdc929f0200e6966c9d6c83bb6f2bb13b63a1ec2",
+            "identity": [
+              45826,
+              795173,
+              3248128,
+              1789304388013106015
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "e8eedef9cf0f0100c483a8d36f34f16586237b58019155f9b720243aa28decb7",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3833856,
+            "allocated": 3833856,
+            "sha256": "08b0c37391aa5fd2ce1d820b1ef0ebfa616487ce0f7940d963de01f1fef25885",
+            "identity": [
+              45826,
+              795179,
+              3833856,
+              1789304388557103512
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795180,
+              0,
+              1789304388621103217
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795178,
+              0,
+              1789304388036107650
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "889475914cc03951d7ac79142605e107dc7ab8b928f138d08d7b5c4372e04bd1",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3698688,
+            "allocated": 3698688,
+            "sha256": "a57a4dffbdac0e7a1f9fad961f99eeeceb238b9451323a3c30e1421caed2064a",
+            "identity": [
+              45826,
+              795185,
+              3698688,
+              1789304389097101027
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "8112bd71cccbe3c2494a2805ac24263c102bc6d2cb01e62efadbc5dd7a70c706",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29822976,
+            "allocated": 29827072,
+            "sha256": "cdbfd90d37c7d253988197d30a3f4a9dc8f57b4cbae74025453b0fcd88435870",
+            "identity": [
+              45826,
+              795191,
+              29822976,
+              1789304390881092819
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795192,
+              0,
+              1789304390897092746
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795190,
+              0,
+              1789304389166026377
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "48a785026a816f128f462941bb5ac7da2cdd61cf4180be77378ae25c24cfd54a",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29716480,
+            "allocated": 29720576,
+            "sha256": "b6d69bc4e1ce12f1b4cb37e95a87dfc01e07111bcc9c87417ddddf6fb2a175ed",
+            "identity": [
+              45826,
+              795197,
+              29716480,
+              1789304392565085071
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "555da9e5b9ffc8587b6c8a4e1648a3dc749bf9262b7791b62f66bf6e2a2c3ea1",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 33619968,
+            "allocated": 33624064,
+            "sha256": "bde8cf9ed65714b2eabcdccf57b3df0d8ded4d4d6f530139da5f010de3d880e7",
+            "identity": [
+              45826,
+              795203,
+              33619968,
+              1789304395435983103
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795204,
+              0,
+              1789304395657070845
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795202,
+              0,
+              1789304392632030708
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "c4b9c76ae38bb2e11c017e18ff6312554d68bd14aa07431a4f38ecfb44961282",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29417472,
+            "allocated": 29421568,
+            "sha256": "ac19b779bc9ff3c032136432f368d7ca37ad6e6035ab2a2af1b0b64e3276d970",
+            "identity": [
+              45826,
+              795209,
+              29417472,
+              1789304398241058956
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "03d8e363478dd94f94ab314d118d285f712072796edb1dcc37f19d86a7af960f",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 295464960,
+            "allocated": 295464960,
+            "sha256": "f59eef2abb411bddb06456a8d70b3e3e63f51ae87f6d17c309ce959f19e9aee5",
+            "identity": [
+              45826,
+              795215,
+              295464960,
+              1789304416060976961
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795216,
+              0,
+              1789304416076976888
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795214,
+              0,
+              1789304398582980790
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "f4db976c8eb1bb105f8cb0a4572e9d44c860113b8a731b084af8a8da5179317e",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 294383616,
+            "allocated": 294387712,
+            "sha256": "3f9d4d3bf1784818e6906c27d4ebe6b6cbc6adcff0af65096f795478cc26dbb0",
+            "identity": [
+              45826,
+              795221,
+              294383616,
+              1789304435836885959
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "24700e5656395ab9122d0ed831bdf72588c8ec71349384338d331463cc9a79a1",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 299266048,
+            "allocated": 299270144,
+            "sha256": "fab6726fd775554168db8090885ba6eaaf727868e615079689d1ac871eb5ce98",
+            "identity": [
+              45826,
+              795227,
+              299266048,
+              1789304456736789777
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795228,
+              0,
+              1789304457012788506
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795226,
+              0,
+              1789304436330390095
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "988ffaf3be077451516c82d3a5f083af7e7d40e8926d92b59c9bedd22885956a",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 294084608,
+            "allocated": 294088704,
+            "sha256": "dfceae64d0764d7fa4d529a446cb789a876de8a4891da9828f79ad66c5425aea",
+            "identity": [
+              45826,
+              795233,
+              294084608,
+              1789304477964692076
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "763a81552f07d9cfb900e2a01ffa453dcb6241a439534a0d5d0090fc6dd7f24d",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29716480,
+            "allocated": 29720576,
+            "sha256": "b6d69bc4e1ce12f1b4cb37e95a87dfc01e07111bcc9c87417ddddf6fb2a175ed",
+            "identity": [
+              45826,
+              795238,
+              29716480,
+              1789304480808678986
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "c7ee101610927472eec387634539d155f1f9b0356e0a7b11490d96808c4ffc89",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29822976,
+            "allocated": 29822976,
+            "sha256": "cdbfd90d37c7d253988197d30a3f4a9dc8f57b4cbae74025453b0fcd88435870",
+            "identity": [
+              45826,
+              795244,
+              29822976,
+              1789304482908669321
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795245,
+              0,
+              1789304482920669266
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795243,
+              0,
+              1789304480885583781
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "b8cdf789cb1453574ccec389ef17acfbfe959cd9d5931774503f1d64bd7c48d7",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 29417472,
+            "allocated": 29421568,
+            "sha256": "ac19b779bc9ff3c032136432f368d7ca37ad6e6035ab2a2af1b0b64e3276d970",
+            "identity": [
+              45826,
+              795250,
+              29417472,
+              1789304485940655365
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "88a9ab0935353b3334973569f9debdc17c3a4ce54b21550a47749e80c33caef4",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 33619968,
+            "allocated": 33619968,
+            "sha256": "bde8cf9ed65714b2eabcdccf57b3df0d8ded4d4d6f530139da5f010de3d880e7",
+            "identity": [
+              45826,
+              795256,
+              33619968,
+              1789304489276640010
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795257,
+              0,
+              1789304489566909563
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795255,
+              0,
+              1789304486365707650
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "6b3e2e9b8ab45a8a223916038e806d772f167ea88c7dcc67638cb1de1e21de67",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 294383616,
+            "allocated": 294387712,
+            "sha256": "3f9d4d3bf1784818e6906c27d4ebe6b6cbc6adcff0af65096f795478cc26dbb0",
+            "identity": [
+              45826,
+              795262,
+              294383616,
+              1789304509228548172
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "4cc29d7f11a57113c3ad2c99e5d76d3c4f308179c27211baefda5b41c65c8560",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 295464960,
+            "allocated": 295469056,
+            "sha256": "f59eef2abb411bddb06456a8d70b3e3e63f51ae87f6d17c309ce959f19e9aee5",
+            "identity": [
+              45826,
+              795268,
+              295464960,
+              1789304528112461243
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795269,
+              0,
+              1789304528124461188
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795267,
+              0,
+              1789304509760545723
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "e66c89a6057b57eb0b2a823fe2877daf85d4352308ce42c3a4538d64ec014848",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 294084608,
+            "allocated": 294088704,
+            "sha256": "dfceae64d0764d7fa4d529a446cb789a876de8a4891da9828f79ad66c5425aea",
+            "identity": [
+              45826,
+              795274,
+              294084608,
+              1789304549432393884
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "ecb5432c325b37bcb47489923db4069fe73f27a05b14bcfe30819329f6561b35",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 299266048,
+            "allocated": 299270144,
+            "sha256": "fab6726fd775554168db8090885ba6eaaf727868e615079689d1ac871eb5ce98",
+            "identity": [
+              45826,
+              795280,
+              299266048,
+              1789304571884553085
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795281,
+              0,
+              1789304572140554844
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795279,
+              0,
+              1789304550300967021
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "14d1f6302f3aa646663f177a76b6fd30eec21934ea926aa39f014d23e66eccd9",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3248128,
+            "allocated": 3248128,
+            "sha256": "752b40ccaaef429ef4d0cf99cdc929f0200e6966c9d6c83bb6f2bb13b63a1ec2",
+            "identity": [
+              45826,
+              795286,
+              3248128,
+              1789304578092595416
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "18bfb8746d3356cf79d3777ffadf197665c6a8a931370ec215c8e40517b2a279",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3256320,
+            "allocated": 3256320,
+            "sha256": "f0a7086f62a3ce1024345cc4bfd05d6f16424e06fc5c02a09f11e743b0498a74",
+            "identity": [
+              45826,
+              795292,
+              3256320,
+              1789304578416597604
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795293,
+              0,
+              1789304578436597739
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795291,
+              0,
+              1789304578120692883
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "517b2cda717f0e17ad6fcfa7010f2c46a8c6c19957012707d2a24e41d49b2210",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3698688,
+            "allocated": 3698688,
+            "sha256": "a57a4dffbdac0e7a1f9fad961f99eeeceb238b9451323a3c30e1421caed2064a",
+            "identity": [
+              45826,
+              795298,
+              3698688,
+              1789304579020601683
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "84c60c3376a1054faf6a7950741ea88afb278d01dc56eb148240c3ecb69eb647",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 3833856,
+            "allocated": 3833856,
+            "sha256": "08b0c37391aa5fd2ce1d820b1ef0ebfa616487ce0f7940d963de01f1fef25885",
+            "identity": [
+              45826,
+              795304,
+              3833856,
+              1789304579716606370
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795305,
+              0,
+              1789304579788606855
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795303,
+              0,
+              1789304579099491992
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "41718cb2d9e4111cda5d542e2a1d84be95939502223ea60217cf5c4dd9bb472a",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 2951909376,
+            "allocated": 2951913472,
+            "sha256": "3522163cdf2e0a40333021ccd1bbaadab6d321d467f29b75abfbc1f3bb36790d",
+            "identity": [
+              45826,
+              795386,
+              2951909376,
+              1789304877933930621
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795387,
+              0,
+              1789304877946575839
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795385,
+              0,
+              1789304686277225594
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "681fc9397ad083820fe752ff1728f16b615273893b99058112f13f0ac6b81eeb",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 2941034496,
+            "allocated": 2941034496,
+            "sha256": "e8f7f872f1b6bf953029be553ddb70c268701b4e9bc9b9ea86dddc69fe1543a8",
+            "identity": [
+              45826,
+              795392,
+              2941034496,
+              1789305164622308004
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "96ba1b3b918ce0cefe39dd44e7b45649ca6688685b0741f7c339f5749c97040f",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 2955706368,
+            "allocated": 2955710464,
+            "sha256": "8daf2f0c0fcbb00504bf1417d1adc7f114dcbf18ec15b5f40074654003fa5ebd",
+            "identity": [
+              45826,
+              795398,
+              2955706368,
+              1789305438322201145
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795399,
+              0,
+              1789305438508884077
+            ]
+          },
+          {
+            "path": "<scratch>",
+            "logical": 0,
+            "allocated": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "identity": [
+              45826,
+              795397,
+              0,
+              1789305256615247566
+            ]
+          }
+        ]
+      },
+      {
+        "path": "<scratch>",
+        "report_sha256": "f59129f0a27bccd58b39c55d916393961952336ad36a2485da4a44c9480f5b6d",
+        "files": [
+          {
+            "path": "<scratch>",
+            "logical": 2940739584,
+            "allocated": 2940739584,
+            "sha256": "312ee70919e654a28d49edd0b140733aa515cdf767ba3ef80719ad02ded1e06a",
+            "identity": [
+              45826,
+              795404,
+              2940739584,
+              1789305792661687064
+            ]
+          }
+        ]
+      }
+    ],
+    "logical_bytes": 14429016064,
+    "allocated_bytes": 14429077504
+  },
+  "total_allocated_bytes_removed": 28920004608,
+  "total_databases_removed": 56,
+  "retained_scaling_databases": 24
+}

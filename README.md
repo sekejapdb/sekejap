@@ -23,6 +23,16 @@ prior context.** Read it top to bottom before touching code.
 
 ## 0. Why e4 exists — the finding that forced it
 
+**Fixed-work scaling / lean law groups (2026-09-14):** the seven laws now map
+to repeatable `lean`, `scale` and `large` profiles. **74 lean tests pass per
+platform; 363 full Mac tests pass.** Eighty scaling/10M arms and eight smoke
+arms have exact matching oracles. The new coverage exposes failures:
+1,000 scattered insertions at 1M take **1.005 s E4 / 0.425 s SQLite on Pi**;
+the 100K scattered case retains **33.620 / 29.450 MB**, **14.16% larger**.
+Local work is approximately stable, but strict **L2-WORK is FAIL** for measured
+scattered growth. The architecture is retained; the public collection API is
+not switched. See [the complete results, test commands and limits](docs/FOUNDATION_SCALING.md).
+
 **Committed foundation / stale-version loop (2026-09-13):** baseline `ee98182`
 and page-WAL v2 `2c56936` are preserved on branch `pagewal-foundation`. Exact
 reproductions show each old-Store failure contains one stale, checksum-valid
