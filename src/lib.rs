@@ -2,6 +2,7 @@ use kernel::spatial::Geom;
 use serde_json::{Map, Value};
 pub mod recovery;
 pub mod collections;
+pub mod pagewal;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Debug, PartialEq)]

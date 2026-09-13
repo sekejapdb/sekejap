@@ -445,8 +445,8 @@ fn main() -> Result<()> {
         _ => return Err("engine".into()),
     };
     let n: u64 = args[3].parse()?;
-    if n == 0 || n % 10000 != 0 {
-        return Err("rows must be a multiple of 10K".into());
+    if n == 0 || n % 1000 != 0 {
+        return Err("rows must be a multiple of 1000".into());
     }
     let times = match args[4].as_str() {
         "on" => true,
@@ -468,6 +468,8 @@ fn main() -> Result<()> {
     if case == "load" && cycles != 0 {
         return Err("load-only requires zero cycles".into());
     }
+    let batch: u64 = std::env::var("COLLECTION_BATCH").unwrap_or_else(|_| "1000".into()).parse()?;
+    if batch == 0 { return Err("batch must be positive".into()); }
     fs::create_dir_all(&root)?;
     let path = root.join(format!("{}-{n}-{}", args[2], args[4]));
     if path.exists() {
@@ -494,7 +496,7 @@ fn main() -> Result<()> {
             } else if i % 10 == 1 && case != "updates" {
                 db.delete(cid, i)?;
                 ops += 1;
-                if ops % 1000 == 0 {
+                if ops % batch == 0 {
                     db.commit()?;
                     db.begin()?;
                 }
@@ -503,7 +505,7 @@ fn main() -> Result<()> {
             } else {
                 continue;
             }
-            if ops % 1000 == 0 {
+            if ops % batch == 0 {
                 db.commit()?;
                 db.begin()?;
             }
@@ -563,6 +565,7 @@ fn main() -> Result<()> {
     assert_eq!(before["crc32c"], after["crc32c"]);
     let report = json!({"case":case,"reader":reader,"reader_release":release,"platform":std::env::consts::OS,"cycles":cycles,"engine":args[2],"rows":n,"timestamps":times,"sqlite_version":rusqlite::version(),"collections":2,"cache_bytes":8<<20,"transaction_operations":1000,"sync":"FULL, platform-native barrier; fullfsync on macOS","vectors":"four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB","sqlite_layout":"WITHOUT ROWID composite primary key and UNIQUE external key; JSONB","peak_semantics":"1ms samples, lower bound, not an enforced cap","empty_logical":empty.0,"empty_allocated":empty.1,"phases":phases,"alter_seconds":alter_seconds,"alter_peak":alter_peak,"alter_final_logical":alter_size.0,"alter_final_allocated":alter_size.1,"reopen_seconds":reopen_seconds,"reopen_verification":after});
     let mut report = report;
+    report["transaction_operations"] = json!(batch);
     report["vector_dim"] = json!(vector_dim());
     report["change_vectors"] = json!(change_vectors());
     report["vectors"] = json!(format!(

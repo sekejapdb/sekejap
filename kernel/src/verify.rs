@@ -566,12 +566,12 @@ fn verify_leaf(
 /// pointer first. Keeping the decoder here extends the independent verifier's
 /// boundary instead of creating a recovery-only parser that can drift.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum DecodedRecord<'a> {
+pub enum DecodedRecord<'a> {
     Leaf { key: &'a [u8], value: &'a [u8], overflow: bool },
     Interior { key: &'a [u8], child: u32 },
 }
 
-pub(crate) fn decode_record(
+pub fn decode_record(
     rec: &[u8],
     page_no: u32,
     kind: PageKind,

@@ -32,6 +32,8 @@ pub struct CandidateReader {
     file: Box<dyn FileIo>,
 }
 impl CandidateReader {
+    /// A read-only logical file supplied by a format owner (for committed WAL overlays).
+    pub fn from_file(file: Box<dyn FileIo>) -> Self { Self { file } }
     pub fn open(source: &Path) -> Result<Self> {
         Ok(Self {
             file: open_recovery_source(&source.join("data"))?,

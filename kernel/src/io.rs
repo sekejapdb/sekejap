@@ -75,6 +75,10 @@ impl IoStats {
 }
 
 pub trait FileIo: Send + Sync {
+    /// Experimental transactional allocator; ordinary files retain pool reuse.
+    fn manages_free_pages(&self) -> bool { false }
+    fn pop_free_page(&self) -> Result<Option<u32>> { Ok(None) }
+    fn push_free_page(&self, _page: u32) -> Result<()> { unreachable!() }
     /// This file's counters, if it keeps any. Defaulted so test doubles need no change.
     fn stats(&self) -> Option<&IoStats> { None }
 

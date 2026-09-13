@@ -195,6 +195,15 @@ impl BufferPool {
     /// `free` field for when it becomes reusable. Never pages 0/1 (meta).
     pub fn free_page(&self, page_no: u32) -> Result<()> {
         if page_no < 2 { return Ok(()); }
+        if self.file.manages_free_pages() {
+            { let mut inner = self.inner.borrow_mut();
+              if let Some(fi) = inner.table.remove(&page_no) {
+                  assert_eq!(inner.frames[fi].pins, 0, "freeing a pinned page");
+                  inner.frames[fi].present=false;inner.frames[fi].dirty=false;
+              }
+            }
+            return self.file.push_free_page(page_no);
+        }
         let mut inner = self.inner.borrow_mut();
         if inner.limits.is_some_and(|l| inner.free_count >= l.tracked_pages as usize) {
             return Err(Error::ResourceLimit("retired-page bookkeeping full"));
@@ -209,6 +218,7 @@ impl BufferPool {
     /// The original generation is read before making its shadow, so a cache
     /// eviction cannot erase this evidence. No extra disk read is required.
     pub(crate) fn free_shadow_page(&self, page_no: u32, birth: u64) -> Result<()> {
+        if self.file.manages_free_pages() { return self.free_page(page_no); }
         self.free_page(page_no)?;
         let mut inner = self.inner.borrow_mut();
         if birth > 0 && birth <= inner.stamp_gen {
@@ -428,6 +438,13 @@ impl BufferPool {
         inner.epoch_allocated_pages = 0;
     }
     pub fn frozen_boundary(&self) -> u32 { self.inner.borrow().frozen_boundary }
+    /// Experimental stable-page pager owns snapshot versions outside the pool.
+    pub fn finish_stable_page_epoch(&self) {
+        let mut inner = self.inner.borrow_mut();
+        assert_eq!(inner.frozen_boundary, 0);
+        inner.thawed.clear();
+        inner.epoch_allocated_pages = 0;
+    }
     pub fn is_frozen(&self, page_no: u32) -> bool {
         let inner = self.inner.borrow();
         page_no >= 2 && page_no < inner.frozen_boundary && !inner.thawed.contains(&page_no)
@@ -592,10 +609,12 @@ impl BufferPool {
     }
 
     pub fn allocate(&self) -> Result<PinnedWrite<'_>> {
+        let managed = self.file.manages_free_pages();
+        let external_free = if managed { self.file.pop_free_page()? } else { None };
         let page_no = { let mut inner = self.inner.borrow_mut();
             Self::admit_allocation(&inner)?;
             inner.epoch_allocated_pages += 1;
-            match Self::pop_free(&mut inner) {
+            match if managed { external_free } else { Self::pop_free(&mut inner) } {
                 Some(p) => {
                     // recycled: its number sits below the frozen boundary but
                     // its content belongs to THIS epoch -- thaw it, and drop
