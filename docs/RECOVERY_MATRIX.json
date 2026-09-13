@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "contract": "RECOVERY_CONTRACT.md",
+  "cases": [
+    {
+      "id": "overflow-byte",
+      "test": "overflow_bad_page_salvages_other_rows",
+      "laws": [
+        3,
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>"
+    },
+    {
+      "id": "overflow-crossed",
+      "test": "overflow_crossed_chain_is_one_known_loss",
+      "laws": [
+        3,
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>"
+    },
+    {
+      "id": "overflow-truncate",
+      "test": "overflow_truncated_tail_is_reported",
+      "laws": [
+        3,
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>"
+    },
+    {
+      "id": "leaf-kind",
+      "test": "damaged_leaf_kind_cannot_hide_loss",
+      "laws": [
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>"
+    },
+    {
+      "id": "cell-length",
+      "test": "malformed_cell_does_not_abort_unrelated_salvage",
+      "laws": [
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>"
+    },
+    {
+      "id": "root-damage",
+      "test": "rootless_repair_does_not_claim_current_membership",
+      "laws": [
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>",
+      "scope": "Verified reachable subset only; rootless cells exported as candidates. Full current-membership reconstruction remains open."
+    },
+    {
+      "id": "delete-stale",
+      "test": "repair_never_resurrects_deleted_rows",
+      "laws": [
+        3,
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>"
+    },
+    {
+      "id": "layout-ancestors",
+      "test": "layouts_recover_without_btree_ancestors",
+      "laws": [
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>",
+      "retained_run": "<scratch>",
+      "scope": "10K/40K, two immutable layouts, three copies each. Rootless candidate export; all-copy loss preserves surviving raw values and reports missing IDs; current membership is not established."
+    },
+    {
+      "id": "layout-all-copies",
+      "test": "missing_layout_preserves_raw_rows_and_names_loss",
+      "laws": [
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>",
+      "retained_run": "<scratch>",
+      "scope": "10K/40K, two immutable layouts, three copies each. Rootless candidate export; all-copy loss preserves surviving raw values and reports missing IDs; current membership is not established."
+    },
+    {
+      "id": "wal-damage",
+      "test": "damaged_wal_keeps_source_and_verified_commits",
+      "laws": [
+        3,
+        5
+      ],
+      "state": "passed",
+      "evidence": "<scratch>"
+    },
+    {
+      "id": "io-failure",
+      "test": "repair_destination_failure_keeps_source",
+      "laws": [
+        3
+      ],
+      "state": "partial",
+      "scope": "Occupied target/aliases/source writer refused and preserved. Per-syscall I/O failures remain pending."
+    },
+    {
+      "id": "recovery-memory",
+      "test": "many_losses_stream_within_budget",
+      "laws": [
+        1,
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": "snapshots",
+      "test": "snapshot_answers_stable_during_churn",
+      "laws": [
+        2,
+        6
+      ],
+      "state": "pending"
+    },
+    {
+      "id": "repair-retry",
+      "test": "interrupted_repair_is_safe_to_retry",
+      "laws": [
+        3,
+        7
+      ],
+      "state": "partial",
+      "scope": "Six injected phase-boundary errors pass kernel unit test; process-kill and every publication syscall remain pending."
+    }
+  ],
+  "additional_tests": [
+    "overflow_cycle_and_wrong_identity_are_contained",
+    "overflow_missing_tail_is_one_known_loss",
+    "repair_rejects_source_aliases_and_active_writers",
+    "committed_wal_delete_and_insert_survive_repair",
+    "damaged_meta_is_membership_uncertain",
+    "concurrent_direct_and_buffered_files_keep_their_own_bytes",
+    "schema_conflicting_ids_never_pick_a_winner",
+    "schema_descriptor_checksum_is_independent_of_page_checksum",
+    "schema_resource_limit_and_archive_validation_preserve_evidence",
+    "schema_codec_policy_is_replaceable"
+  ],
+  "mutation_evidence": "<scratch>"
+}

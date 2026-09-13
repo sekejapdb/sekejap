@@ -1,0 +1,995 @@
+{
+  "platform": "Pi",
+  "layer": "raw KV only",
+  "arms": 18,
+  "three_way_state_comparisons": 42,
+  "aggregate": "median; single-repetition cases are probes",
+  "summary": [
+    {
+      "case": "load-100k",
+      "e4": {
+        "load_seconds": 1.8577522979999999,
+        "mutation_seconds": 0,
+        "mutation_commit_seconds": 0,
+        "mutation_checkpoint_seconds": 0,
+        "final_logical": 29548668,
+        "final_allocated": 29556736,
+        "peak_logical": 29810930,
+        "peak_allocated": 29822976,
+        "expansion": 1.008875594663015,
+        "reopen_seconds": 0.004968702,
+        "repetitions": 1
+      },
+      "pagewal": {
+        "load_seconds": 1.610811861,
+        "mutation_seconds": 0,
+        "mutation_commit_seconds": 0,
+        "mutation_checkpoint_seconds": 0,
+        "final_logical": 29523968,
+        "final_allocated": 29523968,
+        "peak_logical": 33367616,
+        "peak_allocated": 33370112,
+        "expansion": 1.1301873786071033,
+        "reopen_seconds": 0.01078503,
+        "repetitions": 1
+      },
+      "sqlite": {
+        "load_seconds": 1.6344598559999999,
+        "mutation_seconds": 0,
+        "mutation_commit_seconds": 0,
+        "mutation_checkpoint_seconds": 0,
+        "final_logical": 29450240,
+        "final_allocated": 29454336,
+        "peak_logical": 33879272,
+        "peak_allocated": 33890304,
+        "expansion": 1.1503903533553546,
+        "reopen_seconds": 7.4426e-05,
+        "repetitions": 1
+      },
+      "load_seconds_reduction_vs_e4_pct": 13.292430711341252,
+      "load_seconds_ratio_to_sqlite": 0.9855316146718504,
+      "final_size_ratio_to_sqlite": 1.0025034770514603,
+      "size_target": "PASS",
+      "time_target": "PASS",
+      "acceptance_repetitions": "PENDING"
+    },
+    {
+      "case": "mixed-100k",
+      "e4": {
+        "load_seconds": 1.831005211,
+        "mutation_seconds": 6.0501311200000005,
+        "mutation_commit_seconds": 5.325402939999999,
+        "mutation_checkpoint_seconds": 7.22e-07,
+        "final_logical": 34325860,
+        "final_allocated": 34328576,
+        "peak_logical": 34325860,
+        "peak_allocated": 34332672,
+        "expansion": 1.161671991441374,
+        "reopen_seconds": 0.006221864,
+        "repetitions": 3
+      },
+      "pagewal": {
+        "load_seconds": 1.650731247,
+        "mutation_seconds": 5.735901085,
+        "mutation_commit_seconds": 5.01967416,
+        "mutation_checkpoint_seconds": 0.074613214,
+        "final_logical": 32485376,
+        "final_allocated": 32485376,
+        "peak_logical": 37443104,
+        "peak_allocated": 37445632,
+        "expansion": 1.2682273602247502,
+        "reopen_seconds": 0.004452352,
+        "repetitions": 3
+      },
+      "sqlite": {
+        "load_seconds": 1.931244284,
+        "mutation_seconds": 5.822784335,
+        "mutation_commit_seconds": 5.279254212,
+        "mutation_checkpoint_seconds": 0.067088764,
+        "final_logical": 32403456,
+        "final_allocated": 32403456,
+        "peak_logical": 37203336,
+        "peak_allocated": 37203968,
+        "expansion": 1.2632608766515994,
+        "reopen_seconds": 7.9203e-05,
+        "repetitions": 3
+      },
+      "load_seconds_reduction_vs_e4_pct": 9.845628123665673,
+      "load_seconds_ratio_to_sqlite": 0.8547501011011407,
+      "mutation_seconds_reduction_vs_e4_pct": 5.193772312822209,
+      "mutation_seconds_ratio_to_sqlite": 0.9850787449781102,
+      "final_size_ratio_to_sqlite": 1.0025281253950196,
+      "size_target": "PASS",
+      "time_target": "PASS",
+      "acceptance_repetitions": "PASS"
+    },
+    {
+      "case": "resize-1k",
+      "e4": {
+        "load_seconds": 0.119332586,
+        "mutation_seconds": 0.302278393,
+        "mutation_commit_seconds": 0.285262113,
+        "mutation_checkpoint_seconds": 1.5750000000000002e-06,
+        "final_logical": 4126192,
+        "final_allocated": 4128768,
+        "peak_logical": 4908268,
+        "peak_allocated": 4915200,
+        "expansion": 44.34166877461786,
+        "reopen_seconds": 0.004457148,
+        "repetitions": 1
+      },
+      "pagewal": {
+        "load_seconds": 0.052799729,
+        "mutation_seconds": 0.391742417,
+        "mutation_commit_seconds": 0.195558796,
+        "mutation_checkpoint_seconds": 0.18073357599999998,
+        "final_logical": 3289088,
+        "final_allocated": 3289088,
+        "peak_logical": 6620384,
+        "peak_allocated": 6623232,
+        "expansion": 70.2741168478261,
+        "reopen_seconds": 0.004491167,
+        "repetitions": 1
+      },
+      "sqlite": {
+        "load_seconds": 0.046438773,
+        "mutation_seconds": 0.20141995299999998,
+        "mutation_commit_seconds": 0.118103813,
+        "mutation_checkpoint_seconds": 0.07684131599999999,
+        "final_logical": 1867776,
+        "final_allocated": 1867776,
+        "peak_logical": 3725928,
+        "peak_allocated": 3727360,
+        "expansion": 28.42657470703125,
+        "reopen_seconds": 8.1278e-05,
+        "repetitions": 1
+      },
+      "load_seconds_reduction_vs_e4_pct": 55.75413994631777,
+      "load_seconds_ratio_to_sqlite": 1.136975109139942,
+      "mutation_seconds_reduction_vs_e4_pct": -29.596565970892954,
+      "mutation_seconds_ratio_to_sqlite": 1.9449037256006114,
+      "final_size_ratio_to_sqlite": 1.7609649122807018,
+      "size_target": "FAIL",
+      "time_target": "FAIL",
+      "acceptance_repetitions": "PENDING"
+    },
+    {
+      "case": "sustain-400k",
+      "e4": {
+        "load_seconds": 7.635194523,
+        "mutation_seconds": 97.744350245,
+        "mutation_commit_seconds": 87.42576448,
+        "mutation_checkpoint_seconds": 2.5719999999999997e-06,
+        "final_logical": 131749244,
+        "final_allocated": 131751936,
+        "peak_logical": 131749268,
+        "peak_allocated": 131756032,
+        "expansion": 1.1154953468641682,
+        "reopen_seconds": 0.006841083,
+        "repetitions": 1
+      },
+      "pagewal": {
+        "load_seconds": 6.697779775,
+        "mutation_seconds": 72.15366275000001,
+        "mutation_commit_seconds": 63.33833254500002,
+        "mutation_checkpoint_seconds": 0.16442224199999997,
+        "final_logical": 129888256,
+        "final_allocated": 129888256,
+        "peak_logical": 134854240,
+        "peak_allocated": 134860800,
+        "expansion": 1.1421028354494052,
+        "reopen_seconds": 0.004772351,
+        "repetitions": 1
+      },
+      "sqlite": {
+        "load_seconds": 6.749444571,
+        "mutation_seconds": 69.57968720599999,
+        "mutation_commit_seconds": 63.612948689,
+        "mutation_checkpoint_seconds": 0.06771086399999998,
+        "final_logical": 129445888,
+        "final_allocated": 129449984,
+        "peak_logical": 134258128,
+        "peak_allocated": 134262784,
+        "expansion": 1.1409726845325119,
+        "reopen_seconds": 7.7073e-05,
+        "repetitions": 1
+      },
+      "load_seconds_reduction_vs_e4_pct": 12.277548989435228,
+      "load_seconds_ratio_to_sqlite": 0.9923453262773673,
+      "mutation_seconds_reduction_vs_e4_pct": 26.18124467639914,
+      "mutation_seconds_ratio_to_sqlite": 1.0369932037259584,
+      "final_size_ratio_to_sqlite": 1.0034173970825555,
+      "size_target": "PASS",
+      "time_target": "PASS",
+      "acceptance_repetitions": "PENDING"
+    }
+  ],
+  "reports": [
+    {
+      "case": "load-100k",
+      "label": "load-100k",
+      "arm": "e4",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 0,
+      "batch": 1000,
+      "load_seconds": 1.8577522979999999,
+      "mutation_seconds": 0,
+      "mutation_commit_seconds": 0,
+      "mutation_checkpoint_seconds": 0,
+      "create_update_delete_seconds": [
+        0,
+        0,
+        0
+      ],
+      "create_update_delete_counts": [
+        0,
+        0,
+        0
+      ],
+      "loaded_logical": 29548668,
+      "final_logical": 29548668,
+      "final_allocated": 29556736,
+      "peak_logical": 29810930,
+      "peak_allocated": 29822976,
+      "expansion": 1.008875594663015,
+      "final_three_logical": [
+        29548668
+      ],
+      "reopen_seconds": 0.004968702,
+      "report": "<scratch>",
+      "sha256": "5f3082e1dac9646a0602a7f4d6729bc4c7d3dd60bb679e190e050e2204f61c40",
+      "resource_usage": {
+        "elapsed_seconds": 1.9674567019974347,
+        "max_rss_kib_linux": 10960,
+        "user_seconds": 0.223524,
+        "system_seconds": 0.156859,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "load-100k",
+      "label": "load-100k",
+      "arm": "pagewal",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 0,
+      "batch": 1000,
+      "load_seconds": 1.610811861,
+      "mutation_seconds": 0,
+      "mutation_commit_seconds": 0,
+      "mutation_checkpoint_seconds": 0,
+      "create_update_delete_seconds": [
+        0,
+        0,
+        0
+      ],
+      "create_update_delete_counts": [
+        0,
+        0,
+        0
+      ],
+      "loaded_logical": 29523968,
+      "final_logical": 29523968,
+      "final_allocated": 29523968,
+      "peak_logical": 33367616,
+      "peak_allocated": 33370112,
+      "expansion": 1.1301873786071033,
+      "final_three_logical": [
+        29523968
+      ],
+      "reopen_seconds": 0.01078503,
+      "report": "<scratch>",
+      "sha256": "daf7ae97cb160a6a1f72a3c1125038a47e4c965a591dc1845cedddc767a22f35",
+      "resource_usage": {
+        "elapsed_seconds": 1.7617123929958325,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 0.264156,
+        "system_seconds": 0.201262,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "load-100k",
+      "label": "load-100k",
+      "arm": "sqlite",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 0,
+      "batch": 1000,
+      "load_seconds": 1.6344598559999999,
+      "mutation_seconds": 0,
+      "mutation_commit_seconds": 0,
+      "mutation_checkpoint_seconds": 0,
+      "create_update_delete_seconds": [
+        0,
+        0,
+        0
+      ],
+      "create_update_delete_counts": [
+        0,
+        0,
+        0
+      ],
+      "loaded_logical": 29450240,
+      "final_logical": 29450240,
+      "final_allocated": 29454336,
+      "peak_logical": 33879272,
+      "peak_allocated": 33890304,
+      "expansion": 1.1503903533553546,
+      "final_three_logical": [
+        29450240
+      ],
+      "reopen_seconds": 7.4426e-05,
+      "report": "<scratch>",
+      "sha256": "9d15bccead4263f8c969232daeb5022ecc40701c7ee75d39e8d36e93e3810330",
+      "resource_usage": {
+        "elapsed_seconds": 1.77260056900559,
+        "max_rss_kib_linux": 11392,
+        "user_seconds": 0.32620699999999997,
+        "system_seconds": 0.145417,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r1",
+      "arm": "e4",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 1.831005211,
+      "mutation_seconds": 6.58410039,
+      "mutation_commit_seconds": 5.843710532999999,
+      "mutation_checkpoint_seconds": 7.22e-07,
+      "create_update_delete_seconds": [
+        0.07450535699999919,
+        0.38314523299999953,
+        0.2670373930000016
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29548668,
+      "final_logical": 34325860,
+      "final_allocated": 34332672,
+      "peak_logical": 34325860,
+      "peak_allocated": 34332672,
+      "expansion": 1.161671991441374,
+      "final_three_logical": [
+        34325848,
+        34325848,
+        34325860
+      ],
+      "reopen_seconds": 0.006221864,
+      "report": "<scratch>",
+      "sha256": "2dfe6d14c0aa27eddd3c1e906532908be0c442a42c1bd4b1018aaaad577d212b",
+      "resource_usage": {
+        "elapsed_seconds": 8.815492686000653,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 1.286256,
+        "system_seconds": 0.729401,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r1",
+      "arm": "pagewal",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 1.602054683,
+      "mutation_seconds": 5.721231961999999,
+      "mutation_commit_seconds": 5.008643681,
+      "mutation_checkpoint_seconds": 0.07411264399999999,
+      "create_update_delete_seconds": [
+        0.08704026800000068,
+        0.267347527999998,
+        0.2690918110000066
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29523968,
+      "final_logical": 32485376,
+      "final_allocated": 32485376,
+      "peak_logical": 37443104,
+      "peak_allocated": 37445632,
+      "expansion": 1.2682273602247502,
+      "final_three_logical": [
+        32485376,
+        32485376,
+        32485376
+      ],
+      "reopen_seconds": 0.004452352,
+      "report": "<scratch>",
+      "sha256": "86ee8ea0ff04e077a0f9288ca43b4a1d03f25fa48043cc1ca9bea1cf770d7525",
+      "resource_usage": {
+        "elapsed_seconds": 7.6924485199851915,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 1.367918,
+        "system_seconds": 0.8606659999999999,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r1",
+      "arm": "sqlite",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 2.09309324,
+      "mutation_seconds": 5.836447446999999,
+      "mutation_commit_seconds": 5.327317913,
+      "mutation_checkpoint_seconds": 0.06386446300000001,
+      "create_update_delete_seconds": [
+        0.08618106300000057,
+        0.2714507169999972,
+        0.0715937319999988
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29450240,
+      "final_logical": 32403456,
+      "final_allocated": 32403456,
+      "peak_logical": 37203336,
+      "peak_allocated": 37203968,
+      "expansion": 1.2632608766515994,
+      "final_three_logical": [
+        32403456,
+        32403456,
+        32403456
+      ],
+      "reopen_seconds": 7.9203e-05,
+      "report": "<scratch>",
+      "sha256": "9f2743329d4049a353068a32041a160d63ab7fc993e47db3e820ceec6e65e7d7",
+      "resource_usage": {
+        "elapsed_seconds": 8.328262273978908,
+        "max_rss_kib_linux": 11296,
+        "user_seconds": 0.994757,
+        "system_seconds": 0.791827,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r2",
+      "arm": "e4",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 1.8249640230000002,
+      "mutation_seconds": 5.874014783,
+      "mutation_commit_seconds": 5.1394627,
+      "mutation_checkpoint_seconds": 7.040000000000001e-07,
+      "create_update_delete_seconds": [
+        0.07253789399999887,
+        0.3835420069999992,
+        0.26308555400000155
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29548668,
+      "final_logical": 34325860,
+      "final_allocated": 34328576,
+      "peak_logical": 34325860,
+      "peak_allocated": 34332672,
+      "expansion": 1.161671991441374,
+      "final_three_logical": [
+        34325848,
+        34325848,
+        34325860
+      ],
+      "reopen_seconds": 0.004495278,
+      "report": "<scratch>",
+      "sha256": "616ba1f3ccbb0e3185f3a0c46fef44d727b9ace3502e69cc2d8f7fc6463c809e",
+      "resource_usage": {
+        "elapsed_seconds": 8.036130970984232,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 1.18601,
+        "system_seconds": 0.721919,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r2",
+      "arm": "pagewal",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 1.650731247,
+      "mutation_seconds": 5.735901085,
+      "mutation_commit_seconds": 5.01967416,
+      "mutation_checkpoint_seconds": 0.074613214,
+      "create_update_delete_seconds": [
+        0.08941166000000074,
+        0.2663559409999979,
+        0.2709752100000053
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29523968,
+      "final_logical": 32485376,
+      "final_allocated": 32485376,
+      "peak_logical": 37443104,
+      "peak_allocated": 37449728,
+      "expansion": 1.2682273602247502,
+      "final_three_logical": [
+        32485376,
+        32485376,
+        32485376
+      ],
+      "reopen_seconds": 0.004360797,
+      "report": "<scratch>",
+      "sha256": "1f65020664e5f56029e9999b022722efa76343e6a1069a6511ac86ca37cd7c25",
+      "resource_usage": {
+        "elapsed_seconds": 7.778227002010681,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 1.442979,
+        "system_seconds": 0.8988389999999999,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r2",
+      "arm": "sqlite",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 1.931244284,
+      "mutation_seconds": 5.498325503,
+      "mutation_commit_seconds": 4.938310816,
+      "mutation_checkpoint_seconds": 0.067139691,
+      "create_update_delete_seconds": [
+        0.09574723100000053,
+        0.29923179899999586,
+        0.08027247699999916
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29450240,
+      "final_logical": 32403456,
+      "final_allocated": 32403456,
+      "peak_logical": 37203336,
+      "peak_allocated": 37203968,
+      "expansion": 1.2632608766515994,
+      "final_three_logical": [
+        32403456,
+        32403456,
+        32403456
+      ],
+      "reopen_seconds": 7.3982e-05,
+      "report": "<scratch>",
+      "sha256": "d5c1bf5dd66e5bc836dcc16f7f8ef2fede2108a8cc19f614d04a4ad449e453ca",
+      "resource_usage": {
+        "elapsed_seconds": 7.837563630979275,
+        "max_rss_kib_linux": 11808,
+        "user_seconds": 1.012477,
+        "system_seconds": 0.845764,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r3",
+      "arm": "e4",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 1.9226885519999999,
+      "mutation_seconds": 6.0501311200000005,
+      "mutation_commit_seconds": 5.325402939999999,
+      "mutation_checkpoint_seconds": 7.95e-07,
+      "create_update_delete_seconds": [
+        0.07251102999999907,
+        0.377110900000001,
+        0.259905367000002
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29548668,
+      "final_logical": 34325860,
+      "final_allocated": 34328576,
+      "peak_logical": 34325860,
+      "peak_allocated": 34332672,
+      "expansion": 1.161671991441374,
+      "final_three_logical": [
+        34325848,
+        34325848,
+        34325860
+      ],
+      "reopen_seconds": 0.0117116,
+      "report": "<scratch>",
+      "sha256": "f93980f96522c3c9d837c474e66e1ded375085969b2b6c92774c9ab84524e967",
+      "resource_usage": {
+        "elapsed_seconds": 8.340814263006905,
+        "max_rss_kib_linux": 10960,
+        "user_seconds": 1.270624,
+        "system_seconds": 0.670956,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r3",
+      "arm": "pagewal",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 1.671255494,
+      "mutation_seconds": 6.010077904,
+      "mutation_commit_seconds": 5.265516788999999,
+      "mutation_checkpoint_seconds": 0.078020831,
+      "create_update_delete_seconds": [
+        0.09280072800000028,
+        0.27589750899999815,
+        0.2822155820000066
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29523968,
+      "final_logical": 32485376,
+      "final_allocated": 32485376,
+      "peak_logical": 37443104,
+      "peak_allocated": 37445632,
+      "expansion": 1.2682273602247502,
+      "final_three_logical": [
+        32485376,
+        32485376,
+        32485376
+      ],
+      "reopen_seconds": 0.011632786,
+      "report": "<scratch>",
+      "sha256": "37f41abfbc1632ec63e5f6c80327519d603b23451024701c7a5e75188218ebe6",
+      "resource_usage": {
+        "elapsed_seconds": 8.059132669994142,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 1.4159739999999998,
+        "system_seconds": 0.8120419999999999,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "mixed-100k",
+      "label": "mixed-100k-r3",
+      "arm": "sqlite",
+      "rows": 100000,
+      "payload_bytes": 256,
+      "cycles": 4,
+      "batch": 1000,
+      "load_seconds": 1.592457257,
+      "mutation_seconds": 5.822784335,
+      "mutation_commit_seconds": 5.279254212,
+      "mutation_checkpoint_seconds": 0.067088764,
+      "create_update_delete_seconds": [
+        0.09269710800000051,
+        0.2893786239999958,
+        0.07691527799999925
+      ],
+      "create_update_delete_counts": [
+        40000,
+        80000,
+        40000
+      ],
+      "loaded_logical": 29450240,
+      "final_logical": 32403456,
+      "final_allocated": 32403456,
+      "peak_logical": 37203336,
+      "peak_allocated": 37203968,
+      "expansion": 1.2632608766515994,
+      "final_three_logical": [
+        32403456,
+        32403456,
+        32403456
+      ],
+      "reopen_seconds": 9.0611e-05,
+      "report": "<scratch>",
+      "sha256": "5d5a50d4085e0e55bebef67e23f1db419408439a5ee0ab184db312f0b1a9f7ab",
+      "resource_usage": {
+        "elapsed_seconds": 7.837453482992714,
+        "max_rss_kib_linux": 11296,
+        "user_seconds": 1.039337,
+        "system_seconds": 0.8115939999999999,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "resize-1k",
+      "label": "resize-1k",
+      "arm": "e4",
+      "rows": 1000,
+      "payload_bytes": 256,
+      "cycles": 6,
+      "batch": 100,
+      "load_seconds": 0.119332586,
+      "mutation_seconds": 0.302278393,
+      "mutation_commit_seconds": 0.285262113,
+      "mutation_checkpoint_seconds": 1.5750000000000002e-06,
+      "create_update_delete_seconds": [
+        0.0,
+        0.016356623999999997,
+        0.0
+      ],
+      "create_update_delete_counts": [
+        0,
+        1200,
+        0
+      ],
+      "loaded_logical": 110692,
+      "final_logical": 4126192,
+      "final_allocated": 4128768,
+      "peak_logical": 4908268,
+      "peak_allocated": 4915200,
+      "expansion": 44.34166877461786,
+      "final_three_logical": [
+        4126156,
+        4126180,
+        4126192
+      ],
+      "reopen_seconds": 0.004457148,
+      "report": "<scratch>",
+      "sha256": "22915b7eed836d7430d39cb896afd87259ecb5328dee48111d730a0bcf0b62d6",
+      "resource_usage": {
+        "elapsed_seconds": 0.443564076005714,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 0.034623,
+        "system_seconds": 0.029675999999999998,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "resize-1k",
+      "label": "resize-1k",
+      "arm": "pagewal",
+      "rows": 1000,
+      "payload_bytes": 256,
+      "cycles": 6,
+      "batch": 100,
+      "load_seconds": 0.052799729,
+      "mutation_seconds": 0.391742417,
+      "mutation_commit_seconds": 0.195558796,
+      "mutation_checkpoint_seconds": 0.18073357599999998,
+      "create_update_delete_seconds": [
+        0.0,
+        0.014951036000000001,
+        0.0
+      ],
+      "create_update_delete_counts": [
+        0,
+        1200,
+        0
+      ],
+      "loaded_logical": 94208,
+      "final_logical": 3289088,
+      "final_allocated": 3289088,
+      "peak_logical": 6620384,
+      "peak_allocated": 6623232,
+      "expansion": 70.2741168478261,
+      "final_three_logical": [
+        3289088,
+        3289088,
+        3289088
+      ],
+      "reopen_seconds": 0.004491167,
+      "report": "<scratch>",
+      "sha256": "68ce1ecd50e88fead8bbc62555bb2ee6445ae53c5ccf551a1930905b7450234d",
+      "resource_usage": {
+        "elapsed_seconds": 0.46538142999634147,
+        "max_rss_kib_linux": 10960,
+        "user_seconds": 0.031035,
+        "system_seconds": 0.058967,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "resize-1k",
+      "label": "resize-1k",
+      "arm": "sqlite",
+      "rows": 1000,
+      "payload_bytes": 256,
+      "cycles": 6,
+      "batch": 100,
+      "load_seconds": 0.046438773,
+      "mutation_seconds": 0.20141995299999998,
+      "mutation_commit_seconds": 0.118103813,
+      "mutation_checkpoint_seconds": 0.07684131599999999,
+      "create_update_delete_seconds": [
+        0.0,
+        0.006109116000000002,
+        0.0
+      ],
+      "create_update_delete_counts": [
+        0,
+        1200,
+        0
+      ],
+      "loaded_logical": 131072,
+      "final_logical": 1867776,
+      "final_allocated": 1867776,
+      "peak_logical": 3725928,
+      "peak_allocated": 3727360,
+      "expansion": 28.42657470703125,
+      "final_three_logical": [
+        1867776,
+        1867776,
+        1867776
+      ],
+      "reopen_seconds": 8.1278e-05,
+      "report": "<scratch>",
+      "sha256": "31ec53e4d0a5ba7b1f7c09fe63d21a7135beadec667a021390852fb68b1018b8",
+      "resource_usage": {
+        "elapsed_seconds": 0.28423417199519463,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 0.021102,
+        "system_seconds": 0.021102,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "sustain-400k",
+      "label": "sustain-400k",
+      "arm": "e4",
+      "rows": 400000,
+      "payload_bytes": 256,
+      "cycles": 12,
+      "batch": 1000,
+      "load_seconds": 7.635194523,
+      "mutation_seconds": 97.744350245,
+      "mutation_commit_seconds": 87.42576448,
+      "mutation_checkpoint_seconds": 2.5719999999999997e-06,
+      "create_update_delete_seconds": [
+        0.9421829499999894,
+        5.069962682000004,
+        4.106669370999983
+      ],
+      "create_update_delete_counts": [
+        480000,
+        960000,
+        480000
+      ],
+      "loaded_logical": 118108308,
+      "final_logical": 131749244,
+      "final_allocated": 131751936,
+      "peak_logical": 131749268,
+      "peak_allocated": 131756032,
+      "expansion": 1.1154953468641682,
+      "final_three_logical": [
+        131749256,
+        131749256,
+        131749244
+      ],
+      "reopen_seconds": 0.006841083,
+      "report": "<scratch>",
+      "sha256": "670b645f998b4722387a1d558b96cdb941d1a0ae87dfdc16c99119a8d1f3114b",
+      "resource_usage": {
+        "elapsed_seconds": 108.67528673200286,
+        "max_rss_kib_linux": 10960,
+        "user_seconds": 14.174555,
+        "system_seconds": 10.385964,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "sustain-400k",
+      "label": "sustain-400k",
+      "arm": "pagewal",
+      "rows": 400000,
+      "payload_bytes": 256,
+      "cycles": 12,
+      "batch": 1000,
+      "load_seconds": 6.697779775,
+      "mutation_seconds": 72.15366275000001,
+      "mutation_commit_seconds": 63.33833254500002,
+      "mutation_checkpoint_seconds": 0.16442224199999997,
+      "create_update_delete_seconds": [
+        1.2076036670000418,
+        3.326720171000088,
+        3.934408412000147
+      ],
+      "create_update_delete_counts": [
+        480000,
+        960000,
+        480000
+      ],
+      "loaded_logical": 118075392,
+      "final_logical": 129888256,
+      "final_allocated": 129888256,
+      "peak_logical": 134854240,
+      "peak_allocated": 134860800,
+      "expansion": 1.1421028354494052,
+      "final_three_logical": [
+        129888256,
+        129888256,
+        129888256
+      ],
+      "reopen_seconds": 0.004772351,
+      "report": "<scratch>",
+      "sha256": "5a6dde670735668cb43719e85c94c98fc9ae987a7b88ed84c92b98c3ca683d6a",
+      "resource_usage": {
+        "elapsed_seconds": 82.74353023400181,
+        "max_rss_kib_linux": 10976,
+        "user_seconds": 15.222216,
+        "system_seconds": 9.631629,
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "sustain-400k",
+      "label": "sustain-400k",
+      "arm": "sqlite",
+      "rows": 400000,
+      "payload_bytes": 256,
+      "cycles": 12,
+      "batch": 1000,
+      "load_seconds": 6.749444571,
+      "mutation_seconds": 69.57968720599999,
+      "mutation_commit_seconds": 63.612948689,
+      "mutation_checkpoint_seconds": 0.06771086399999998,
+      "create_update_delete_seconds": [
+        1.1057442540000046,
+        3.573193278999907,
+        1.0170962559999932
+      ],
+      "create_update_delete_counts": [
+        480000,
+        960000,
+        480000
+      ],
+      "loaded_logical": 117669888,
+      "final_logical": 129445888,
+      "final_allocated": 129449984,
+      "peak_logical": 134258128,
+      "peak_allocated": 134262784,
+      "expansion": 1.1409726845325119,
+      "final_three_logical": [
+        129445888,
+        129445888,
+        129445888
+      ],
+      "reopen_seconds": 7.7073e-05,
+      "report": "<scratch>",
+      "sha256": "92d01f781db121154dcc916426b9c0f73cccafd699920e3d9f1df502384c2a17",
+      "resource_usage": {
+        "elapsed_seconds": 81.16420764001668,
+        "max_rss_kib_linux": 11296,
+        "user_seconds": 10.694339,
+        "system_seconds": 7.889736,
+        "exit_code": 0
+      }
+    }
+  ]
+}

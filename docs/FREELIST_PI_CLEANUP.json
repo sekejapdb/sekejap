@@ -1,0 +1,152 @@
+{
+  "complete": true,
+  "removed": [
+    {
+      "path": "matrix/batch-1/baseline/e4-1000-off",
+      "files": [
+        {
+          "path": "data",
+          "logical": 503808,
+          "allocated": 503808
+        },
+        {
+          "path": "free",
+          "logical": 172,
+          "allocated": 4096
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "evidence_sha256": "f87415c90ea19b91d294e800106ac0f800e42b87ad04c30fb1e2435fc4d60516"
+    },
+    {
+      "path": "matrix/batch-1/candidate/e4-1000-off",
+      "files": [
+        {
+          "path": "data",
+          "logical": 516096,
+          "allocated": 516096
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "evidence_sha256": "8c4dc26d55b00f12aafd1a43d32fc6683723324588730716d8b1714d0dcd2425"
+    },
+    {
+      "path": "matrix/batch-1/sqlite/sqlite-1000-off",
+      "files": [
+        {
+          "path": "data.sqlite",
+          "logical": 331776,
+          "allocated": 331776
+        }
+      ],
+      "evidence_sha256": "853253bf6ea6b0c6b4747e156626591803e0663c0827101be4339b0a4555ae76"
+    },
+    {
+      "path": "matrix/batch-100/baseline/e4-10000-off",
+      "files": [
+        {
+          "path": "data",
+          "logical": 3911680,
+          "allocated": 3911680
+        },
+        {
+          "path": "free",
+          "logical": 1012,
+          "allocated": 4096
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "evidence_sha256": "0320d27c07eb0be070d7ce7aeea96166a9670745788f354cfff363ef50fe8cbb"
+    },
+    {
+      "path": "matrix/batch-100/candidate/e4-10000-off",
+      "files": [
+        {
+          "path": "data",
+          "logical": 3923968,
+          "allocated": 3923968
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "evidence_sha256": "3f80bbc4567c182b00af1323ef9c65abc2c81bbf148f25a9ec565690d555a113"
+    },
+    {
+      "path": "matrix/batch-100/sqlite/sqlite-10000-off",
+      "files": [
+        {
+          "path": "data.sqlite",
+          "logical": 3084288,
+          "allocated": 3084288
+        }
+      ],
+      "evidence_sha256": "d094610216aa6c20cf2e3f870298572ab3e8dc065b2cfd2d329cc39822f9c51e"
+    },
+    {
+      "path": "matrix/held-100000/baseline/e4-100000-off",
+      "files": [
+        {
+          "path": "data",
+          "logical": 68882432,
+          "allocated": 68886528
+        },
+        {
+          "path": "free",
+          "logical": 100108,
+          "allocated": 102400
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "evidence_sha256": "21ed87c94c9714fc0f46170cde61dff042ef03b992e08e27c96780cb281087d9"
+    },
+    {
+      "path": "matrix/held-100000/candidate/e4-100000-off",
+      "files": [
+        {
+          "path": "data",
+          "logical": 69193728,
+          "allocated": 69193728
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "evidence_sha256": "269de8f7f26839d91856ea66749e925bf264365831036f93f804933038716290"
+    },
+    {
+      "path": "matrix/held-100000/sqlite/sqlite-100000-off",
+      "files": [
+        {
+          "path": "data.sqlite",
+          "logical": 30646272,
+          "allocated": 30650368
+        }
+      ],
+      "evidence_sha256": "9b7234c84b72e99ae94ad98ab4a2473d1c337bdbb2b02bda8de55ab67e7b5de7"
+    }
+  ],
+  "retained": "All three 400K comparison databases, reports, archived candidate, binaries and logs",
+  "logical_bytes": 181095340,
+  "allocated_bytes": 181112832
+}

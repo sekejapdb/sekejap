@@ -1,0 +1,22 @@
+[package]
+name = "kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crc32c = "0.6"
+libc   = "0.2"
+
+[dependencies.tempfile]
+version = "3"
+
+[features]
+default = []
+write-trace = []
+test-support = []
+sqlite-balance = []
+compact-cells = []
+
+[dev-dependencies]
+tempfile = "3"

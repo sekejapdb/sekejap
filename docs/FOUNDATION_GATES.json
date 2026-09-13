@@ -1,0 +1,238 @@
+{
+  "version": "F1",
+  "prototype": "stable-page page-image WAL",
+  "production_promotable": false,
+  "verdict": "Retain v2 architecture candidate; no promotion. Safety coverage expanded; remaining law gates and control scan failure explicit.",
+  "laws": [
+    {
+      "id": "L1-MEM",
+      "law": 1,
+      "status": "PENDING",
+      "passed": "8MiB ordinary cache, 16MiB WAL bound, persisted disk cap and eight-snapshot admission; Pi benchmark arms under 128MiB address-space limit",
+      "remaining": "Aggregate cache/index/allocator accounting; complete record/reader policy and repair-resource admission"
+    },
+    {
+      "id": "L2-WORK",
+      "law": 2,
+      "status": "PENDING",
+      "passed": "Stable-page path, bounded WAL lookup and change-page checkpoint; 10K/40K/100K/400K probes",
+      "remaining": "Fixed-change-count N ladder with I/O counters and exponent gate"
+    },
+    {
+      "id": "L3-ATOMIC",
+      "law": 3,
+      "status": "PENDING",
+      "passed": "356 injected boundary/mode cases, 712 ordinary/simulated-durability reopen checks; four actual checkpoint process exits; torn checkpoint extension defect fixed; source-preserving salvage checks",
+      "remaining": "Full open/create and repair-destination I/O/interruption matrix, wider crash schedules/sector failure model and verified recovery publication"
+    },
+    {
+      "id": "L4-COST",
+      "law": 4,
+      "status": "PASS",
+      "passed": "Explicit source/binaries, layer, timings, peaks, native sync settings, Pi RSS and named limitations",
+      "remaining": "No full-engine qualification implied"
+    },
+    {
+      "id": "L5-DAMAGE",
+      "law": 5,
+      "status": "FAIL",
+      "passed": "Independent read-only scan and committed WAL overlay; current/candidate separation; leaf/overflow/root/meta/free fixtures; exact source preservation and verified 100K repair on Mac/Pi",
+      "remaining": "Corrupt-WAL-region salvage currently refuses; rootless current-membership proof, typed schema dependencies, truncation/unreadable-extent and full mutation/fault corpus remain open"
+    },
+    {
+      "id": "L6-READ",
+      "law": 6,
+      "status": "PENDING",
+      "passed": "Old/new functional snapshots, bounded admission, persisted-cap refusal, short-reader sustained progress under 2x on Mac/Pi",
+      "remaining": "Cross-process readers, zero-coordination/latency/I/O regression gate; surviving reader still prevents replacement writer opening"
+    },
+    {
+      "id": "L7-DEVICE",
+      "law": 7,
+      "status": "PENDING",
+      "passed": "Mac/Pi raw-KV load, live writes, reopen and sustained churn",
+      "remaining": "Complete typed collection integration; bulk and indexed live writes/late indexing remain pending"
+    }
+  ],
+  "workloads": [
+    {
+      "id": "W-LOAD",
+      "status": "PASS",
+      "scope": "Executed raw-KV comparison, not a promise of parity"
+    },
+    {
+      "id": "W-UPDATE",
+      "status": "PASS",
+      "scope": "Executed raw-KV comparison, not a promise of parity"
+    },
+    {
+      "id": "W-RESIZE",
+      "status": "PASS",
+      "scope": "Executed raw-KV comparison, not a promise of parity"
+    },
+    {
+      "id": "W-MIXED",
+      "status": "PASS",
+      "scope": "Executed raw-KV comparison, not a promise of parity"
+    },
+    {
+      "id": "W-SUSTAIN",
+      "status": "PASS",
+      "scope": "Executed raw-KV comparison, not a promise of parity"
+    },
+    {
+      "id": "W-DELETE",
+      "status": "PENDING",
+      "remaining": "Mixed delete timing exists; delete-only matrix pending"
+    },
+    {
+      "id": "W-REINSERT",
+      "status": "PENDING",
+      "remaining": "Mixed fresh-ID reinserts exist; standalone matrix pending"
+    },
+    {
+      "id": "W-READERS",
+      "status": "PENDING",
+      "remaining": "Functional and cap-work progress measured; standalone reader latency/I/O and cross-process matrix pending"
+    },
+    {
+      "id": "W-CAP",
+      "status": "PENDING",
+      "remaining": "Mac/Pi 10K/40K/100K update-only none/held/whole-round/5K-rolling cases measured, 48 arms; full mixed/resize/batch/allocated-space matrix remains pending"
+    },
+    {
+      "id": "W-REPAIR",
+      "status": "PENDING",
+      "remaining": "Eight raw-KV fault cases and 100K verified repair on both platforms; corrupt WAL/rootless proof/typed/destination failure coverage remains pending"
+    }
+  ],
+  "fixtures": {
+    "F-T32": "10K smoke",
+    "F-T256": "40K smoke,100K repeated,400K sustained",
+    "F-T8192": "Overflow within F-TVAR only; standalone pending",
+    "F-TVAR": "1K six-round probe",
+    "F-H4": "PENDING",
+    "F-H1536": "PENDING",
+    "F-SCHEMA": "PENDING"
+  },
+  "evidence": {
+    "Mac": {
+      "arms": 39,
+      "state_comparisons": 76,
+      "tests": "129 kernel + 11 pilot test entries (one subprocess helper)"
+    },
+    "Pi": {
+      "arms": 18,
+      "state_comparisons": 42,
+      "tests": "11 pilot test entries; four deliberate child exits; no full kernel suite this run"
+    }
+  },
+  "parity": {
+    "Mac": [
+      {
+        "case": "load-100k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "Historical v1 pilot reclassified under owner time threshold; not newly measured as standalone v2 workload"
+      },
+      {
+        "case": "mixed-100k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "Page-WAL qualification v2; three rotations; owner accepts time <1.5x SQLite"
+      },
+      {
+        "case": "resize-1k",
+        "time_target": "PASS",
+        "size_target": "FAIL",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "Historical v1 pilot reclassified under owner time threshold; not newly measured as standalone v2 workload"
+      },
+      {
+        "case": "sustain-400k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "Page-WAL qualification v2; three rotations; owner accepts time <1.5x SQLite"
+      },
+      {
+        "case": "text256-40k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "Historical v1 pilot reclassified under owner time threshold; not newly measured as standalone v2 workload"
+      },
+      {
+        "case": "text32-10k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "Historical v1 pilot reclassified under owner time threshold; not newly measured as standalone v2 workload"
+      },
+      {
+        "case": "updates-100k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "Historical v1 pilot reclassified under owner time threshold; not newly measured as standalone v2 workload"
+      }
+    ],
+    "Pi": [
+      {
+        "case": "load-100k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "Historical v1 pilot reclassified under owner time threshold; not newly measured as standalone v2 workload"
+      },
+      {
+        "case": "mixed-100k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "Page-WAL qualification v2; three rotations; owner accepts time <1.5x SQLite"
+      },
+      {
+        "case": "resize-1k",
+        "time_target": "FAIL",
+        "size_target": "FAIL",
+        "acceptance_repetitions": "PENDING",
+        "evidence": "Historical v1 pilot reclassified under owner time threshold; not newly measured as standalone v2 workload"
+      },
+      {
+        "case": "sustain-400k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "evidence": "Page-WAL qualification v2; three rotations; owner accepts time <1.5x SQLite"
+      }
+    ]
+  },
+  "release_blockers": [
+    {
+      "id": "CONTROL-SCAN",
+      "status": "FAIL",
+      "remaining": "Frozen accepted Store control has a persistent round-6 scan/get disagreement. Source-preserving audit and ignored regression retained; cause and its shared-kernel implications unresolved."
+    }
+  ],
+  "qualification_v2": {
+    "source_archive_sha256": "5bb5e4648e8703e4b1122f39eda9606aad4ee910cf467866e70eeec87d6a5b4b",
+    "full_mac_test_entries": 360,
+    "pi_selected_test_entries": 27,
+    "raw_reports": 111,
+    "failed_control_attempts": 1,
+    "ordinary_timing_completed": 47,
+    "contended_timing_excluded": 16,
+    "cap_diagnostics": 48,
+    "report": "docs/PAGEWAL_QUALIFICATION.md",
+    "result": "docs/PAGEWAL_QUALIFICATION_RESULTS.json"
+  },
+  "project_targets": {
+    "sqlite_time_ratio_exclusive": 1.5,
+    "sqlite_final_size_ratio_inclusive": 1.1,
+    "managed_expansion_ratio": 2,
+    "authority": "Owner instruction 2026-09-13: elapsed time <1.5x SQLite is acceptable; seven laws unchanged"
+  }
+}

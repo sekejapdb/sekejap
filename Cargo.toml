@@ -1,0 +1,32 @@
+[workspace]
+members = ["kernel"]
+resolver = "2"
+
+[workspace.package]
+version = "0.17.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[package]
+name = "e4-prototype"
+default-run = "e4-prototype"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+kernel = { path = "kernel" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+crc32c = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+kernel = { path = "kernel", features = ["test-support"] }
+
+[features]
+sqlite-balance = ["kernel/sqlite-balance"]
+compact-cells = ["kernel/compact-cells"]
+
+[profile.release]
+debug = 1

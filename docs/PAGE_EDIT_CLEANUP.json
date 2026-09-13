@@ -1,0 +1,473 @@
+{
+  "status": "complete",
+  "retained": [
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "6ec8c1d5534ef682ea6bc50c2a880f4dc463a8067bf8295393a3037c985c8026",
+      "files": [
+        {
+          "path": "data",
+          "logical": 36876288,
+          "allocated": 37019648
+        },
+        {
+          "path": "free",
+          "logical": 5884,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 36882172,
+      "allocated": 37027840
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "e19a4189e2d1349c10b9ff20475d8f5b944fb5dc6d27bb6f1187cc8dcf292c6b",
+      "files": [
+        {
+          "path": "data",
+          "logical": 36876288,
+          "allocated": 37019648
+        },
+        {
+          "path": "free",
+          "logical": 5884,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 36882172,
+      "allocated": 37027840
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "633381b4b40f8474359f7b761d4416c5cbaaa147d20a1221cf73c7e99fe764ad",
+      "files": [
+        {
+          "path": "data.sqlite",
+          "logical": 30646272,
+          "allocated": 31449088
+        }
+      ],
+      "logical": 30646272,
+      "allocated": 31449088
+    }
+  ],
+  "deleted": [
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "c7d47d7ec384a129bebdf32bac9e121baa0274c21455baa0209fe049a3dd34a6",
+      "files": [
+        {
+          "path": "data",
+          "logical": 36876288,
+          "allocated": 36876288
+        },
+        {
+          "path": "free",
+          "logical": 5884,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 36882172,
+      "allocated": 36884480
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "1146ff026c0e20cea6aef2740be79cfdfb6d9907284040f033618da4ee9ec074",
+      "files": [
+        {
+          "path": "data",
+          "logical": 36876288,
+          "allocated": 37339136
+        },
+        {
+          "path": "free",
+          "logical": 5884,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 36882172,
+      "allocated": 37347328
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "08f205bf31301c83a2f019321e84961fad4826ee35852da29d19ce71b19ce033",
+      "files": [
+        {
+          "path": "data",
+          "logical": 34684928,
+          "allocated": 34922496
+        },
+        {
+          "path": "free",
+          "logical": 7612,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 34692540,
+      "allocated": 34930688
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "453af47bca207f9b50b5b5eefb11692de3570b5406585b9cc7ea59793441279c",
+      "files": [
+        {
+          "path": "data",
+          "logical": 34684928,
+          "allocated": 35241984
+        },
+        {
+          "path": "free",
+          "logical": 7612,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 34692540,
+      "allocated": 35250176
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "ea951204f9f91eb489566254d4fa1a522ba4583742871b661908a15db8258200",
+      "files": [
+        {
+          "path": "data",
+          "logical": 34684928,
+          "allocated": 34922496
+        },
+        {
+          "path": "free",
+          "logical": 7612,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 34692540,
+      "allocated": 34930688
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "968f8dc524a4a7856e3141bfd33d1b7e70dd9016892f2b7c77a9a908c860cd6b",
+      "files": [
+        {
+          "path": "data",
+          "logical": 34684928,
+          "allocated": 34922496
+        },
+        {
+          "path": "free",
+          "logical": 7612,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 34692540,
+      "allocated": 34930688
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "2f75ce5d9e4f29c01fe115126a1ce330216b3de24349c48c2cdd2bed6d9b3bb1",
+      "files": [
+        {
+          "path": "data.sqlite",
+          "logical": 28475392,
+          "allocated": 29351936
+        }
+      ],
+      "logical": 28475392,
+      "allocated": 29351936
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "63970335b870a0745c408964828b790f916124e12926fa45571db1438944c604",
+      "files": [
+        {
+          "path": "data",
+          "logical": 36876288,
+          "allocated": 37019648
+        },
+        {
+          "path": "free",
+          "logical": 5884,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 36882172,
+      "allocated": 37027840
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "d7f597ebac2d37ce3d0f8bbf317c1dac0ebc333e196e3494de7e2b2b1c78e32c",
+      "files": [
+        {
+          "path": "data",
+          "logical": 36876288,
+          "allocated": 37339136
+        },
+        {
+          "path": "free",
+          "logical": 5884,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 36882172,
+      "allocated": 37347328
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "b8b41cbfdb3c38ce062edc082ff1ce52d4c4c66fea5961caef2740c0757833d1",
+      "files": [
+        {
+          "path": "data",
+          "logical": 36876288,
+          "allocated": 37019648
+        },
+        {
+          "path": "free",
+          "logical": 5884,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 36882172,
+      "allocated": 37027840
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "c6f081f5d0cfc28413b057975637a0f95c5b8b4046be9c5f7a8efc7b19e77e43",
+      "files": [
+        {
+          "path": "data",
+          "logical": 36876288,
+          "allocated": 37019648
+        },
+        {
+          "path": "free",
+          "logical": 5884,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 36882172,
+      "allocated": 37027840
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "c7585e972144b755c037d7e7a220563f24632b99623a4facf869e6d93c011fa6",
+      "files": [
+        {
+          "path": "data.sqlite",
+          "logical": 30646272,
+          "allocated": 31449088
+        }
+      ],
+      "logical": 30646272,
+      "allocated": 31449088
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "cc869aaa05a7939eb65a8cdd1aad33c681aae56f0ee352133d1adf80e9788daa",
+      "files": [
+        {
+          "path": "data",
+          "logical": 34684928,
+          "allocated": 35241984
+        },
+        {
+          "path": "free",
+          "logical": 7612,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 34692540,
+      "allocated": 35250176
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "0ef983d999a90219f8c1cf5b33a70c48b1ca002bbd5403115898fbd0e2622f90",
+      "files": [
+        {
+          "path": "data",
+          "logical": 34684928,
+          "allocated": 34922496
+        },
+        {
+          "path": "free",
+          "logical": 7612,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 34692540,
+      "allocated": 34930688
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "51ef46b37772e1d10f9d0f7f45b63d45428f1782472c7d6d4fcfc42be213c380",
+      "files": [
+        {
+          "path": "data",
+          "logical": 34684928,
+          "allocated": 34922496
+        },
+        {
+          "path": "free",
+          "logical": 7612,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 34692540,
+      "allocated": 34930688
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "45dc5e7c2fadf1f6149cfba15f313adb295df752c6e89db4b50d13dbf23e3191",
+      "files": [
+        {
+          "path": "data",
+          "logical": 34684928,
+          "allocated": 35647488
+        },
+        {
+          "path": "free",
+          "logical": 7612,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 34692540,
+      "allocated": 35655680
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "3c191922e89faec0cd5db0cd87c1af1bfb698f8d0af3c1e836b0c9661d9090bb",
+      "files": [
+        {
+          "path": "data.sqlite",
+          "logical": 28475392,
+          "allocated": 29351936
+        }
+      ],
+      "logical": 28475392,
+      "allocated": 29351936
+    },
+    {
+      "path": "<scratch>",
+      "report": "<scratch>",
+      "report_sha256": "965d1a0a4b102576a4298e4ad683c8c91aaeea0368502b4b14327679fbdabd22",
+      "files": [
+        {
+          "path": "data",
+          "logical": 145805312,
+          "allocated": 151154688
+        },
+        {
+          "path": "free",
+          "logical": 5824,
+          "allocated": 8192
+        },
+        {
+          "path": "wal",
+          "logical": 0,
+          "allocated": 0
+        }
+      ],
+      "logical": 145811136,
+      "allocated": 151162880
+    }
+  ],
+  "removed_logical_bytes": 732241544,
+  "removed_allocated_bytes": 744787968
+}

@@ -1,0 +1,1704 @@
+{
+  "arms": 16,
+  "paired_state_checks": 40,
+  "rows_visited_by_exact_oracles": 24000000,
+  "source": "<scratch>",
+  "results": [
+    {
+      "alter_final_allocated": 43081728,
+      "alter_final_logical": 42259872,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 43089920,
+        "sampled_peak_logical": 42265468,
+        "samples": 427
+      },
+      "alter_seconds": 0.032117625,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 122880,
+      "empty_logical": 118896,
+      "engine": "e4",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 32591872,
+          "final_logical": 32199068,
+          "operations": 100000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 32862208,
+            "sampled_peak_logical": 32461799,
+            "samples": 4014
+          },
+          "seconds": 5.549059542,
+          "verification": {
+            "crc32c": 1057123409,
+            "rows": 100000,
+            "verify_seconds": 0.557125792
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 36790272,
+          "final_logical": 36492272,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 37064704,
+            "sampled_peak_logical": 36759574,
+            "samples": 1489
+          },
+          "seconds": 2.055037291,
+          "verification": {
+            "crc32c": 3709675087,
+            "rows": 100000,
+            "verify_seconds": 0.55488475
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 39936000,
+          "final_logical": 39556572,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 39944192,
+            "sampled_peak_logical": 39562168,
+            "samples": 1531
+          },
+          "seconds": 2.110030167,
+          "verification": {
+            "crc32c": 3415477966,
+            "rows": 100000,
+            "verify_seconds": 0.55857425
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 43081728,
+          "final_logical": 42259932,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 43356160,
+            "sampled_peak_logical": 42527726,
+            "samples": 1561
+          },
+          "seconds": 2.149813083,
+          "verification": {
+            "crc32c": 3537247915,
+            "rows": 100000,
+            "verify_seconds": 0.560085125
+          }
+        }
+      ],
+      "reopen_seconds": 0.000667,
+      "reopen_verification": {
+        "crc32c": 3537247915,
+        "rows": 100000,
+        "verify_seconds": 0.560228958
+      },
+      "rows": 100000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": false,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 1,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 31481856,
+      "alter_final_logical": 30679040,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 31494144,
+        "sampled_peak_logical": 30687312,
+        "samples": 423
+      },
+      "alter_seconds": 0.022935708,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 57344,
+      "empty_logical": 57344,
+      "engine": "sqlite",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 25190400,
+          "final_logical": 24412160,
+          "operations": 100000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 30523392,
+            "sampled_peak_logical": 28725832,
+            "samples": 1049
+          },
+          "seconds": 1.442123625,
+          "verification": {
+            "crc32c": 1057123409,
+            "rows": 100000,
+            "verify_seconds": 0.554498708
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 31481856,
+          "final_logical": 30679040,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 36728832,
+            "sampled_peak_logical": 35610712,
+            "samples": 561
+          },
+          "seconds": 0.778056917,
+          "verification": {
+            "crc32c": 3709675087,
+            "rows": 100000,
+            "verify_seconds": 0.560403542
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 31481856,
+          "final_logical": 30679040,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 36728832,
+            "sampled_peak_logical": 35256392,
+            "samples": 545
+          },
+          "seconds": 0.753902625,
+          "verification": {
+            "crc32c": 3415477966,
+            "rows": 100000,
+            "verify_seconds": 0.554675291
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 31481856,
+          "final_logical": 30679040,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 36728832,
+            "sampled_peak_logical": 34881472,
+            "samples": 578
+          },
+          "seconds": 0.799426041,
+          "verification": {
+            "crc32c": 3537247915,
+            "rows": 100000,
+            "verify_seconds": 0.560969667
+          }
+        }
+      ],
+      "reopen_seconds": 0.000655333,
+      "reopen_verification": {
+        "crc32c": 3537247915,
+        "rows": 100000,
+        "verify_seconds": 0.561939375
+      },
+      "rows": 100000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": false,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 1,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 43806720,
+      "alter_final_logical": 43767464,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 43814912,
+        "sampled_peak_logical": 43773324,
+        "samples": 459
+      },
+      "alter_seconds": 0.034209917,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 122880,
+      "empty_logical": 118896,
+      "engine": "e4",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 35414016,
+          "final_logical": 34513320,
+          "operations": 100000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 35684352,
+            "sampled_peak_logical": 34776073,
+            "samples": 3850
+          },
+          "seconds": 5.324949833,
+          "verification": {
+            "crc32c": 798380590,
+            "rows": 100000,
+            "verify_seconds": 0.596127375
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 39612416,
+          "final_logical": 38737216,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 39886848,
+            "sampled_peak_logical": 39004865,
+            "samples": 1489
+          },
+          "seconds": 2.054468625,
+          "verification": {
+            "crc32c": 3829945085,
+            "rows": 100000,
+            "verify_seconds": 0.59439875
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 41709568,
+          "final_logical": 41350884,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 41717760,
+            "sampled_peak_logical": 41356756,
+            "samples": 1541
+          },
+          "seconds": 2.136304334,
+          "verification": {
+            "crc32c": 1446006295,
+            "rows": 100000,
+            "verify_seconds": 0.602523541
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 43806720,
+          "final_logical": 43767524,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 44081152,
+            "sampled_peak_logical": 44035593,
+            "samples": 1586
+          },
+          "seconds": 2.192167542,
+          "verification": {
+            "crc32c": 2108038575,
+            "rows": 100000,
+            "verify_seconds": 0.602880208
+          }
+        }
+      ],
+      "reopen_seconds": 0.000626667,
+      "reopen_verification": {
+        "crc32c": 2108038575,
+        "rows": 100000,
+        "verify_seconds": 0.600567417
+      },
+      "rows": 100000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": true,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 1,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 32038912,
+      "alter_final_logical": 31764480,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 32051200,
+        "sampled_peak_logical": 31772752,
+        "samples": 454
+      },
+      "alter_seconds": 0.023149875,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 57344,
+      "empty_logical": 57344,
+      "engine": "sqlite",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 25747456,
+          "final_logical": 25395200,
+          "operations": 100000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 30175232,
+            "sampled_peak_logical": 29820112,
+            "samples": 1064
+          },
+          "seconds": 1.4726127500000001,
+          "verification": {
+            "crc32c": 798380590,
+            "rows": 100000,
+            "verify_seconds": 0.592037584
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 32038912,
+          "final_logical": 31682560,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 37285888,
+            "sampled_peak_logical": 35963272,
+            "samples": 583
+          },
+          "seconds": 0.809781458,
+          "verification": {
+            "crc32c": 3829945085,
+            "rows": 100000,
+            "verify_seconds": 0.602405375
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 32038912,
+          "final_logical": 31682560,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 37285888,
+            "sampled_peak_logical": 36568912,
+            "samples": 551
+          },
+          "seconds": 0.760761708,
+          "verification": {
+            "crc32c": 1446006295,
+            "rows": 100000,
+            "verify_seconds": 0.593756542
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 32038912,
+          "final_logical": 31764480,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 37285888,
+            "sampled_peak_logical": 36156432,
+            "samples": 588
+          },
+          "seconds": 0.813844667,
+          "verification": {
+            "crc32c": 2108038575,
+            "rows": 100000,
+            "verify_seconds": 0.600225834
+          }
+        }
+      ],
+      "reopen_seconds": 0.000655625,
+      "reopen_verification": {
+        "crc32c": 2108038575,
+        "rows": 100000,
+        "verify_seconds": 0.600216625
+      },
+      "rows": 100000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": true,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 1,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 184958976,
+      "alter_final_logical": 168548032,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 184967168,
+        "sampled_peak_logical": 168553916,
+        "samples": 1711
+      },
+      "alter_seconds": 0.028911,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 122880,
+      "empty_logical": 118896,
+      "engine": "e4",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 134623232,
+          "final_logical": 132837836,
+          "operations": 400000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 134893568,
+            "sampled_peak_logical": 133100632,
+            "samples": 15064
+          },
+          "seconds": 21.3460245,
+          "verification": {
+            "crc32c": 135679484,
+            "rows": 400000,
+            "verify_seconds": 2.6390339579999997
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 151404544,
+          "final_logical": 145622276,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 151678976,
+            "sampled_peak_logical": 145889873,
+            "samples": 5938
+          },
+          "seconds": 8.406639166,
+          "verification": {
+            "crc32c": 359530021,
+            "rows": 400000,
+            "verify_seconds": 2.332728209
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 168181760,
+          "final_logical": 156903200,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 168189952,
+            "sampled_peak_logical": 156909156,
+            "samples": 6068
+          },
+          "seconds": 8.63415475,
+          "verification": {
+            "crc32c": 429553308,
+            "rows": 400000,
+            "verify_seconds": 2.3110204579999998
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 184958976,
+          "final_logical": 168548092,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 185233408,
+            "sampled_peak_logical": 168816193,
+            "samples": 6208
+          },
+          "seconds": 8.8332695,
+          "verification": {
+            "crc32c": 1621833811,
+            "rows": 400000,
+            "verify_seconds": 2.287648541
+          }
+        }
+      ],
+      "reopen_seconds": 0.000947708,
+      "reopen_verification": {
+        "crc32c": 1621833811,
+        "rows": 400000,
+        "verify_seconds": 2.328667833
+      },
+      "rows": 400000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": false,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 1,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 135290880,
+      "alter_final_logical": 122818560,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 135303168,
+        "sampled_peak_logical": 122826832,
+        "samples": 1535
+      },
+      "alter_seconds": 0.024253583,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 57344,
+      "empty_logical": 57344,
+      "engine": "sqlite",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 101736448,
+          "final_logical": 97796096,
+          "operations": 400000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 107069440,
+            "sampled_peak_logical": 102155088,
+            "samples": 4170
+          },
+          "seconds": 5.76851075,
+          "verification": {
+            "crc32c": 135679484,
+            "rows": 400000,
+            "verify_seconds": 2.240464583
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 135290880,
+          "final_logical": 122818560,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140537856,
+            "sampled_peak_logical": 127758472,
+            "samples": 2184
+          },
+          "seconds": 3.021677375,
+          "verification": {
+            "crc32c": 359530021,
+            "rows": 400000,
+            "verify_seconds": 2.275852208
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 135290880,
+          "final_logical": 122818560,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140537856,
+            "sampled_peak_logical": 127564832,
+            "samples": 2064
+          },
+          "seconds": 3.014899417,
+          "verification": {
+            "crc32c": 429553308,
+            "rows": 400000,
+            "verify_seconds": 2.286549167
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 135290880,
+          "final_logical": 122818560,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140537856,
+            "sampled_peak_logical": 127177552,
+            "samples": 2146
+          },
+          "seconds": 3.228340375,
+          "verification": {
+            "crc32c": 1621833811,
+            "rows": 400000,
+            "verify_seconds": 2.317630459
+          }
+        }
+      ],
+      "reopen_seconds": 0.000732417,
+      "reopen_verification": {
+        "crc32c": 1621833811,
+        "rows": 400000,
+        "verify_seconds": 2.273614583
+      },
+      "rows": 400000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": false,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 1,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 185364480,
+      "alter_final_logical": 177899680,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 185372672,
+        "sampled_peak_logical": 177906044,
+        "samples": 1815
+      },
+      "alter_seconds": 0.03311675,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 122880,
+      "empty_logical": 118896,
+      "engine": "e4",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 151805952,
+          "final_logical": 143802840,
+          "operations": 400000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 152076288,
+            "sampled_peak_logical": 144065507,
+            "samples": 15670
+          },
+          "seconds": 21.632112375,
+          "verification": {
+            "crc32c": 537625555,
+            "rows": 400000,
+            "verify_seconds": 2.870196666
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 168587264,
+          "final_logical": 156325628,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 168861696,
+            "sampled_peak_logical": 156594388,
+            "samples": 6049
+          },
+          "seconds": 8.344501166,
+          "verification": {
+            "crc32c": 2509557655,
+            "rows": 400000,
+            "verify_seconds": 2.49381475
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 168587264,
+          "final_logical": 166914244,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 168595456,
+            "sampled_peak_logical": 166920608,
+            "samples": 6218
+          },
+          "seconds": 8.580006666,
+          "verification": {
+            "crc32c": 2043336666,
+            "rows": 400000,
+            "verify_seconds": 2.463323208
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 185364480,
+          "final_logical": 177899740,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 185638912,
+            "sampled_peak_logical": 178168992,
+            "samples": 6400
+          },
+          "seconds": 8.835429874999999,
+          "verification": {
+            "crc32c": 851343186,
+            "rows": 400000,
+            "verify_seconds": 2.473159917
+          }
+        }
+      ],
+      "reopen_seconds": 0.000671042,
+      "reopen_verification": {
+        "crc32c": 851343186,
+        "rows": 400000,
+        "verify_seconds": 2.474698667
+      },
+      "rows": 400000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": true,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 1,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 134799360,
+      "alter_final_logical": 127143936,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 134811648,
+        "sampled_peak_logical": 127152208,
+        "samples": 1759
+      },
+      "alter_seconds": 0.023875583,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 57344,
+      "empty_logical": 57344,
+      "engine": "sqlite",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 118022144,
+          "final_logical": 101732352,
+          "operations": 400000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 123498496,
+            "sampled_peak_logical": 106161384,
+            "samples": 4233
+          },
+          "seconds": 5.849860125,
+          "verification": {
+            "crc32c": 537625555,
+            "rows": 400000,
+            "verify_seconds": 2.478928833
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 134799360,
+          "final_logical": 127143936,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140046336,
+            "sampled_peak_logical": 131453488,
+            "samples": 2265
+          },
+          "seconds": 3.138587333,
+          "verification": {
+            "crc32c": 2509557655,
+            "rows": 400000,
+            "verify_seconds": 2.413075417
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 134799360,
+          "final_logical": 127143936,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140046336,
+            "sampled_peak_logical": 131964368,
+            "samples": 2185
+          },
+          "seconds": 3.022049208,
+          "verification": {
+            "crc32c": 2043336666,
+            "rows": 400000,
+            "verify_seconds": 2.374867208
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 134799360,
+          "final_logical": 127143936,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140046336,
+            "sampled_peak_logical": 131610048,
+            "samples": 2343
+          },
+          "seconds": 3.241377125,
+          "verification": {
+            "crc32c": 851343186,
+            "rows": 400000,
+            "verify_seconds": 2.39546625
+          }
+        }
+      ],
+      "reopen_seconds": 0.000697875,
+      "reopen_verification": {
+        "crc32c": 851343186,
+        "rows": 400000,
+        "verify_seconds": 2.40419525
+      },
+      "rows": 400000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": true,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 1,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 42352640,
+      "alter_final_logical": 42259872,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 42360832,
+        "sampled_peak_logical": 42265468,
+        "samples": 426
+      },
+      "alter_seconds": 0.031873417,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 122880,
+      "empty_logical": 118896,
+      "engine": "e4",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 32911360,
+          "final_logical": 32199068,
+          "operations": 100000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 33181696,
+            "sampled_peak_logical": 32461799,
+            "samples": 4006
+          },
+          "seconds": 5.534506542,
+          "verification": {
+            "crc32c": 1057123409,
+            "rows": 100000,
+            "verify_seconds": 0.551654833
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 37109760,
+          "final_logical": 36492272,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 37384192,
+            "sampled_peak_logical": 36759574,
+            "samples": 1493
+          },
+          "seconds": 2.056946083,
+          "verification": {
+            "crc32c": 3709675087,
+            "rows": 100000,
+            "verify_seconds": 0.550946042
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 40255488,
+          "final_logical": 39556572,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 40263680,
+            "sampled_peak_logical": 39562168,
+            "samples": 1530
+          },
+          "seconds": 2.103665416,
+          "verification": {
+            "crc32c": 3415477966,
+            "rows": 100000,
+            "verify_seconds": 0.553880208
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 42352640,
+          "final_logical": 42259932,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 42627072,
+            "sampled_peak_logical": 42527726,
+            "samples": 1561
+          },
+          "seconds": 2.151768833,
+          "verification": {
+            "crc32c": 3537247915,
+            "rows": 100000,
+            "verify_seconds": 0.554351667
+          }
+        }
+      ],
+      "reopen_seconds": 0.000680459,
+      "reopen_verification": {
+        "crc32c": 3537247915,
+        "rows": 100000,
+        "verify_seconds": 0.552616458
+      },
+      "rows": 100000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": false,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 2,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 31481856,
+      "alter_final_logical": 30679040,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 31494144,
+        "sampled_peak_logical": 30687312,
+        "samples": 423
+      },
+      "alter_seconds": 0.023417291,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 57344,
+      "empty_logical": 57344,
+      "engine": "sqlite",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 25190400,
+          "final_logical": 24412160,
+          "operations": 100000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 30523392,
+            "sampled_peak_logical": 28725832,
+            "samples": 1071
+          },
+          "seconds": 1.4828979580000001,
+          "verification": {
+            "crc32c": 1057123409,
+            "rows": 100000,
+            "verify_seconds": 0.554154416
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 31481856,
+          "final_logical": 30679040,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 36728832,
+            "sampled_peak_logical": 35610712,
+            "samples": 568
+          },
+          "seconds": 0.783451625,
+          "verification": {
+            "crc32c": 3709675087,
+            "rows": 100000,
+            "verify_seconds": 0.557412667
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 31481856,
+          "final_logical": 30679040,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 36728832,
+            "sampled_peak_logical": 35256392,
+            "samples": 540
+          },
+          "seconds": 0.742784,
+          "verification": {
+            "crc32c": 3415477966,
+            "rows": 100000,
+            "verify_seconds": 0.559355
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 31481856,
+          "final_logical": 30679040,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 36728832,
+            "sampled_peak_logical": 34881472,
+            "samples": 586
+          },
+          "seconds": 0.808734875,
+          "verification": {
+            "crc32c": 3537247915,
+            "rows": 100000,
+            "verify_seconds": 0.565284458
+          }
+        }
+      ],
+      "reopen_seconds": 0.000651833,
+      "reopen_verification": {
+        "crc32c": 3537247915,
+        "rows": 100000,
+        "verify_seconds": 0.561386542
+      },
+      "rows": 100000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": false,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 2,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 43806720,
+      "alter_final_logical": 43767464,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 43814912,
+        "sampled_peak_logical": 43773324,
+        "samples": 460
+      },
+      "alter_seconds": 0.030022958,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 122880,
+      "empty_logical": 118896,
+      "engine": "e4",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 35414016,
+          "final_logical": 34513320,
+          "operations": 100000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 35684352,
+            "sampled_peak_logical": 34776073,
+            "samples": 3870
+          },
+          "seconds": 5.343651375,
+          "verification": {
+            "crc32c": 798380590,
+            "rows": 100000,
+            "verify_seconds": 0.599416167
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 39612416,
+          "final_logical": 38737216,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 39886848,
+            "sampled_peak_logical": 39004865,
+            "samples": 1487
+          },
+          "seconds": 2.056028833,
+          "verification": {
+            "crc32c": 3829945085,
+            "rows": 100000,
+            "verify_seconds": 0.60058625
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 41709568,
+          "final_logical": 41350884,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 41717760,
+            "sampled_peak_logical": 41356756,
+            "samples": 1534
+          },
+          "seconds": 2.118166125,
+          "verification": {
+            "crc32c": 1446006295,
+            "rows": 100000,
+            "verify_seconds": 0.606314916
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 43806720,
+          "final_logical": 43767524,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 44081152,
+            "sampled_peak_logical": 44035593,
+            "samples": 1558
+          },
+          "seconds": 2.1408414159999998,
+          "verification": {
+            "crc32c": 2108038575,
+            "rows": 100000,
+            "verify_seconds": 0.605780625
+          }
+        }
+      ],
+      "reopen_seconds": 0.000467916,
+      "reopen_verification": {
+        "crc32c": 2108038575,
+        "rows": 100000,
+        "verify_seconds": 0.6036225
+      },
+      "rows": 100000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": true,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 2,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 32038912,
+      "alter_final_logical": 31764480,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 32051200,
+        "sampled_peak_logical": 31772752,
+        "samples": 450
+      },
+      "alter_seconds": 0.024471667,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 57344,
+      "empty_logical": 57344,
+      "engine": "sqlite",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 25747456,
+          "final_logical": 25395200,
+          "operations": 100000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 30175232,
+            "sampled_peak_logical": 29820112,
+            "samples": 1064
+          },
+          "seconds": 1.464276792,
+          "verification": {
+            "crc32c": 798380590,
+            "rows": 100000,
+            "verify_seconds": 0.592317875
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 32038912,
+          "final_logical": 31682560,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 37285888,
+            "sampled_peak_logical": 35963272,
+            "samples": 568
+          },
+          "seconds": 0.787261167,
+          "verification": {
+            "crc32c": 3829945085,
+            "rows": 100000,
+            "verify_seconds": 0.597738708
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 32038912,
+          "final_logical": 31682560,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 37285888,
+            "sampled_peak_logical": 36568912,
+            "samples": 551
+          },
+          "seconds": 0.755413083,
+          "verification": {
+            "crc32c": 1446006295,
+            "rows": 100000,
+            "verify_seconds": 0.5930695
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 32038912,
+          "final_logical": 31764480,
+          "operations": 40000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 37285888,
+            "sampled_peak_logical": 36156432,
+            "samples": 583
+          },
+          "seconds": 0.807027333,
+          "verification": {
+            "crc32c": 2108038575,
+            "rows": 100000,
+            "verify_seconds": 0.5992205
+          }
+        }
+      ],
+      "reopen_seconds": 0.000646792,
+      "reopen_verification": {
+        "crc32c": 2108038575,
+        "rows": 100000,
+        "verify_seconds": 0.602757666
+      },
+      "rows": 100000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": true,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 2,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 184958976,
+      "alter_final_logical": 168548032,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 184967168,
+        "sampled_peak_logical": 168553916,
+        "samples": 1670
+      },
+      "alter_seconds": 0.0339345,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 122880,
+      "empty_logical": 118896,
+      "engine": "e4",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 134623232,
+          "final_logical": 132837836,
+          "operations": 400000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 134893568,
+            "sampled_peak_logical": 133100632,
+            "samples": 16072
+          },
+          "seconds": 22.206220791,
+          "verification": {
+            "crc32c": 135679484,
+            "rows": 400000,
+            "verify_seconds": 2.261171167
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 151404544,
+          "final_logical": 145622276,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 151678976,
+            "sampled_peak_logical": 145889873,
+            "samples": 5965
+          },
+          "seconds": 8.239304375,
+          "verification": {
+            "crc32c": 359530021,
+            "rows": 400000,
+            "verify_seconds": 2.271540625
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 168181760,
+          "final_logical": 156903200,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 168189952,
+            "sampled_peak_logical": 156909156,
+            "samples": 6117
+          },
+          "seconds": 8.454486583,
+          "verification": {
+            "crc32c": 429553308,
+            "rows": 400000,
+            "verify_seconds": 2.25861925
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 184958976,
+          "final_logical": 168548092,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 185233408,
+            "sampled_peak_logical": 168816193,
+            "samples": 6292
+          },
+          "seconds": 8.682210291,
+          "verification": {
+            "crc32c": 1621833811,
+            "rows": 400000,
+            "verify_seconds": 2.276320084
+          }
+        }
+      ],
+      "reopen_seconds": 0.000542584,
+      "reopen_verification": {
+        "crc32c": 1621833811,
+        "rows": 400000,
+        "verify_seconds": 2.2749432499999998
+      },
+      "rows": 400000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": false,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 2,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 135290880,
+      "alter_final_logical": 122818560,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 135303168,
+        "sampled_peak_logical": 122826832,
+        "samples": 1651
+      },
+      "alter_seconds": 0.021867875,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 57344,
+      "empty_logical": 57344,
+      "engine": "sqlite",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 101736448,
+          "final_logical": 97796096,
+          "operations": 400000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 107069440,
+            "sampled_peak_logical": 102155088,
+            "samples": 4179
+          },
+          "seconds": 5.782681458,
+          "verification": {
+            "crc32c": 135679484,
+            "rows": 400000,
+            "verify_seconds": 2.237399958
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 135290880,
+          "final_logical": 122818560,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140537856,
+            "sampled_peak_logical": 127758472,
+            "samples": 2182
+          },
+          "seconds": 3.018770792,
+          "verification": {
+            "crc32c": 359530021,
+            "rows": 400000,
+            "verify_seconds": 2.262163083
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 135290880,
+          "final_logical": 122818560,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140537856,
+            "sampled_peak_logical": 127564832,
+            "samples": 2167
+          },
+          "seconds": 3.002369084,
+          "verification": {
+            "crc32c": 429553308,
+            "rows": 400000,
+            "verify_seconds": 2.2214310409999998
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 135290880,
+          "final_logical": 122818560,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140537856,
+            "sampled_peak_logical": 127177552,
+            "samples": 2301
+          },
+          "seconds": 3.187772166,
+          "verification": {
+            "crc32c": 1621833811,
+            "rows": 400000,
+            "verify_seconds": 2.257458542
+          }
+        }
+      ],
+      "reopen_seconds": 0.000667333,
+      "reopen_verification": {
+        "crc32c": 1621833811,
+        "rows": 400000,
+        "verify_seconds": 2.252725125
+      },
+      "rows": 400000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": false,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 2,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 185364480,
+      "alter_final_logical": 177899680,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 185372672,
+        "sampled_peak_logical": 177906044,
+        "samples": 1816
+      },
+      "alter_seconds": 0.034314875,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 122880,
+      "empty_logical": 118896,
+      "engine": "e4",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 151805952,
+          "final_logical": 143802840,
+          "operations": 400000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 152076288,
+            "sampled_peak_logical": 144065507,
+            "samples": 15550
+          },
+          "seconds": 21.4662605,
+          "verification": {
+            "crc32c": 537625555,
+            "rows": 400000,
+            "verify_seconds": 2.837663666
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 168587264,
+          "final_logical": 156325628,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 168861696,
+            "sampled_peak_logical": 156594388,
+            "samples": 6077
+          },
+          "seconds": 8.3992495,
+          "verification": {
+            "crc32c": 2509557655,
+            "rows": 400000,
+            "verify_seconds": 2.474730333
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 168587264,
+          "final_logical": 166914244,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 168595456,
+            "sampled_peak_logical": 166920608,
+            "samples": 6242
+          },
+          "seconds": 8.62275125,
+          "verification": {
+            "crc32c": 2043336666,
+            "rows": 400000,
+            "verify_seconds": 2.484663958
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 185364480,
+          "final_logical": 177899740,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 185638912,
+            "sampled_peak_logical": 178168992,
+            "samples": 6458
+          },
+          "seconds": 8.900506959,
+          "verification": {
+            "crc32c": 851343186,
+            "rows": 400000,
+            "verify_seconds": 2.47886725
+          }
+        }
+      ],
+      "reopen_seconds": 0.000729875,
+      "reopen_verification": {
+        "crc32c": 851343186,
+        "rows": 400000,
+        "verify_seconds": 2.481224417
+      },
+      "rows": 400000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": true,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 2,
+      "evidence": "<scratch>"
+    },
+    {
+      "alter_final_allocated": 134799360,
+      "alter_final_logical": 127143936,
+      "alter_peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 134811648,
+        "sampled_peak_logical": 127152208,
+        "samples": 1763
+      },
+      "alter_seconds": 0.023256583,
+      "cache_bytes": 8388608,
+      "collections": 2,
+      "empty_allocated": 57344,
+      "empty_logical": 57344,
+      "engine": "sqlite",
+      "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+      "phases": [
+        {
+          "cycle": 0,
+          "final_allocated": 118022144,
+          "final_logical": 101732352,
+          "operations": 400000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 123498496,
+            "sampled_peak_logical": 106161384,
+            "samples": 4236
+          },
+          "seconds": 5.862488459,
+          "verification": {
+            "crc32c": 537625555,
+            "rows": 400000,
+            "verify_seconds": 2.4651315
+          }
+        },
+        {
+          "cycle": 1,
+          "final_allocated": 134799360,
+          "final_logical": 127143936,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140046336,
+            "sampled_peak_logical": 131453488,
+            "samples": 2256
+          },
+          "seconds": 3.128432875,
+          "verification": {
+            "crc32c": 2509557655,
+            "rows": 400000,
+            "verify_seconds": 2.423730125
+          }
+        },
+        {
+          "cycle": 2,
+          "final_allocated": 134799360,
+          "final_logical": 127143936,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140046336,
+            "sampled_peak_logical": 131964368,
+            "samples": 2039
+          },
+          "seconds": 3.052272583,
+          "verification": {
+            "crc32c": 2043336666,
+            "rows": 400000,
+            "verify_seconds": 2.440110667
+          }
+        },
+        {
+          "cycle": 3,
+          "final_allocated": 134799360,
+          "final_logical": 127143936,
+          "operations": 160000,
+          "peak": {
+            "sample_errors": 0,
+            "sampled_peak_allocated": 140046336,
+            "sampled_peak_logical": 131610048,
+            "samples": 2316
+          },
+          "seconds": 3.257877291,
+          "verification": {
+            "crc32c": 851343186,
+            "rows": 400000,
+            "verify_seconds": 2.411413084
+          }
+        }
+      ],
+      "reopen_seconds": 0.000681708,
+      "reopen_verification": {
+        "crc32c": 851343186,
+        "rows": 400000,
+        "verify_seconds": 2.416159167
+      },
+      "rows": 400000,
+      "sqlite_layout": "WITHOUT ROWID composite primary key and UNIQUE external key; JSONB",
+      "sqlite_version": "3.46.0",
+      "sync": "FULL + fullfsync on macOS",
+      "timestamps": true,
+      "transaction_operations": 1000,
+      "vectors": "four exact f32 lanes; E4 separate keyspace, SQLite inline BLOB",
+      "repeat": 2,
+      "evidence": "<scratch>"
+    }
+  ]
+}

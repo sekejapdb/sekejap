@@ -1,0 +1,1334 @@
+[
+  {
+    "complete": true,
+    "root": "<scratch>",
+    "entries": [
+      {
+        "directory": "baseline-mixed_long-r1/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_long-r1/mixed_long-e4-100000/store/data",
+            "bytes": 186007552,
+            "allocated_bytes": 186007552
+          },
+          {
+            "path": "baseline-mixed_long-r1/mixed_long-e4-100000/store/free",
+            "bytes": 157708,
+            "allocated_bytes": 159744
+          },
+          {
+            "path": "baseline-mixed_long-r1/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-mixed_long-r1/results.json",
+        "result_sha256": "0967d6ec25bfd945ed7b397b1add54d13e121b6a3a820a9d855725820c70950c",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_long-r1/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_long-r1/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33054720
+          }
+        ],
+        "result": "baseline-mixed_long-r1/results.json",
+        "result_sha256": "0967d6ec25bfd945ed7b397b1add54d13e121b6a3a820a9d855725820c70950c",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_long-r2/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_long-r2/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33054720
+          }
+        ],
+        "result": "baseline-mixed_long-r2/results.json",
+        "result_sha256": "5cd29d6593edf41f5d3ebaed1124dadcdff7160d546ed392357d0af8ea46e9fb",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_long-r2/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_long-r2/mixed_long-e4-100000/store/data",
+            "bytes": 186007552,
+            "allocated_bytes": 186007552
+          },
+          {
+            "path": "baseline-mixed_long-r2/mixed_long-e4-100000/store/free",
+            "bytes": 157708,
+            "allocated_bytes": 159744
+          },
+          {
+            "path": "baseline-mixed_long-r2/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-mixed_long-r2/results.json",
+        "result_sha256": "5cd29d6593edf41f5d3ebaed1124dadcdff7160d546ed392357d0af8ea46e9fb",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_long-r3/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_long-r3/mixed_long-e4-100000/store/data",
+            "bytes": 186007552,
+            "allocated_bytes": 186007552
+          },
+          {
+            "path": "baseline-mixed_long-r3/mixed_long-e4-100000/store/free",
+            "bytes": 157708,
+            "allocated_bytes": 159744
+          },
+          {
+            "path": "baseline-mixed_long-r3/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-mixed_long-r3/results.json",
+        "result_sha256": "fa217ec38823ecb0c92d799ca8b6b25294d0eca77c7c9b10d9d019bc95f8c03d",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_long-r3/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_long-r3/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33054720
+          }
+        ],
+        "result": "baseline-mixed_long-r3/results.json",
+        "result_sha256": "fa217ec38823ecb0c92d799ca8b6b25294d0eca77c7c9b10d9d019bc95f8c03d",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_none-r1/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_none-r1/mixed_none-e4-100000/store/data",
+            "bytes": 86130688,
+            "allocated_bytes": 86130688
+          },
+          {
+            "path": "baseline-mixed_none-r1/mixed_none-e4-100000/store/free",
+            "bytes": 60100,
+            "allocated_bytes": 61440
+          },
+          {
+            "path": "baseline-mixed_none-r1/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-mixed_none-r1/results.json",
+        "result_sha256": "caf832b72b226e661f30408bdca26b6ae2e9cc822795ba51416c1706bd43b5b6",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_none-r1/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_none-r1/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33054720
+          }
+        ],
+        "result": "baseline-mixed_none-r1/results.json",
+        "result_sha256": "caf832b72b226e661f30408bdca26b6ae2e9cc822795ba51416c1706bd43b5b6",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_none-r2/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_none-r2/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33857536
+          }
+        ],
+        "result": "baseline-mixed_none-r2/results.json",
+        "result_sha256": "3673bd1e55a0417aa66390e503485e79c54107bfe6ac35e685f5f6c0028ccb86",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_none-r2/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_none-r2/mixed_none-e4-100000/store/data",
+            "bytes": 86130688,
+            "allocated_bytes": 86130688
+          },
+          {
+            "path": "baseline-mixed_none-r2/mixed_none-e4-100000/store/free",
+            "bytes": 60100,
+            "allocated_bytes": 61440
+          },
+          {
+            "path": "baseline-mixed_none-r2/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-mixed_none-r2/results.json",
+        "result_sha256": "3673bd1e55a0417aa66390e503485e79c54107bfe6ac35e685f5f6c0028ccb86",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_none-r3/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_none-r3/mixed_none-e4-100000/store/data",
+            "bytes": 86130688,
+            "allocated_bytes": 86130688
+          },
+          {
+            "path": "baseline-mixed_none-r3/mixed_none-e4-100000/store/free",
+            "bytes": 60100,
+            "allocated_bytes": 61440
+          },
+          {
+            "path": "baseline-mixed_none-r3/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-mixed_none-r3/results.json",
+        "result_sha256": "574a88b4b235ae5d15aa4449a40e9d7ca79d84b4577c16c4c117e9aea5d78111",
+        "removed": true
+      },
+      {
+        "directory": "baseline-mixed_none-r3/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-mixed_none-r3/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33054720
+          }
+        ],
+        "result": "baseline-mixed_none-r3/results.json",
+        "result_sha256": "574a88b4b235ae5d15aa4449a40e9d7ca79d84b4577c16c4c117e9aea5d78111",
+        "removed": true
+      },
+      {
+        "directory": "baseline-updates-r1/updates-e4-100000",
+        "files": [
+          {
+            "path": "baseline-updates-r1/updates-e4-100000/store/data",
+            "bytes": 56500224,
+            "allocated_bytes": 56500224
+          },
+          {
+            "path": "baseline-updates-r1/updates-e4-100000/store/free",
+            "bytes": 36312,
+            "allocated_bytes": 36864
+          },
+          {
+            "path": "baseline-updates-r1/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-updates-r1/results.json",
+        "result_sha256": "ea6b370f8bf7019a9adec7df85a2aa595f7094743dde4492cd3cfa4a7746728b",
+        "removed": true
+      },
+      {
+        "directory": "baseline-updates-r1/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-updates-r1/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 18374656
+          }
+        ],
+        "result": "baseline-updates-r1/results.json",
+        "result_sha256": "ea6b370f8bf7019a9adec7df85a2aa595f7094743dde4492cd3cfa4a7746728b",
+        "removed": true
+      },
+      {
+        "directory": "baseline-updates-r2/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-updates-r2/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 17899520
+          }
+        ],
+        "result": "baseline-updates-r2/results.json",
+        "result_sha256": "71b407026136f545bb4e4452558a148b2c82879adba8cafdc8683df9ae460408",
+        "removed": true
+      },
+      {
+        "directory": "baseline-updates-r2/updates-e4-100000",
+        "files": [
+          {
+            "path": "baseline-updates-r2/updates-e4-100000/store/data",
+            "bytes": 56500224,
+            "allocated_bytes": 56500224
+          },
+          {
+            "path": "baseline-updates-r2/updates-e4-100000/store/free",
+            "bytes": 36312,
+            "allocated_bytes": 36864
+          },
+          {
+            "path": "baseline-updates-r2/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-updates-r2/results.json",
+        "result_sha256": "71b407026136f545bb4e4452558a148b2c82879adba8cafdc8683df9ae460408",
+        "removed": true
+      },
+      {
+        "directory": "baseline-updates-r3/updates-e4-100000",
+        "files": [
+          {
+            "path": "baseline-updates-r3/updates-e4-100000/store/data",
+            "bytes": 56500224,
+            "allocated_bytes": 56500224
+          },
+          {
+            "path": "baseline-updates-r3/updates-e4-100000/store/free",
+            "bytes": 36312,
+            "allocated_bytes": 36864
+          },
+          {
+            "path": "baseline-updates-r3/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "baseline-updates-r3/results.json",
+        "result_sha256": "242f0ee65b90e0d009bfc64e046a4aa6c53b73e492a09ed79449acc683b0a556",
+        "removed": true
+      },
+      {
+        "directory": "baseline-updates-r3/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "baseline-updates-r3/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 18595840
+          }
+        ],
+        "result": "baseline-updates-r3/results.json",
+        "result_sha256": "242f0ee65b90e0d009bfc64e046a4aa6c53b73e492a09ed79449acc683b0a556",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_long-r1/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_long-r1/mixed_long-e4-100000/store/data",
+            "bytes": 68325376,
+            "allocated_bytes": 68325376
+          },
+          {
+            "path": "candidate-mixed_long-r1/mixed_long-e4-100000/store/free",
+            "bytes": 128140,
+            "allocated_bytes": 131072
+          },
+          {
+            "path": "candidate-mixed_long-r1/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-mixed_long-r1/results.json",
+        "result_sha256": "d7146a204a0ed1dfdf6a62f94d7cafb42acb1d9c69fda2db5f195ff596b3920c",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_long-r1/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_long-r1/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33054720
+          }
+        ],
+        "result": "candidate-mixed_long-r1/results.json",
+        "result_sha256": "d7146a204a0ed1dfdf6a62f94d7cafb42acb1d9c69fda2db5f195ff596b3920c",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_long-r2/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_long-r2/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "candidate-mixed_long-r2/results.json",
+        "result_sha256": "424be2d0fbed66822bd4fce5d9af036c94d08d24a303b29dd8e6de29f0a3da47",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_long-r2/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_long-r2/mixed_long-e4-100000/store/data",
+            "bytes": 68325376,
+            "allocated_bytes": 68325376
+          },
+          {
+            "path": "candidate-mixed_long-r2/mixed_long-e4-100000/store/free",
+            "bytes": 128140,
+            "allocated_bytes": 131072
+          },
+          {
+            "path": "candidate-mixed_long-r2/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-mixed_long-r2/results.json",
+        "result_sha256": "424be2d0fbed66822bd4fce5d9af036c94d08d24a303b29dd8e6de29f0a3da47",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_long-r3/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_long-r3/mixed_long-e4-100000/store/data",
+            "bytes": 68325376,
+            "allocated_bytes": 68325376
+          },
+          {
+            "path": "candidate-mixed_long-r3/mixed_long-e4-100000/store/free",
+            "bytes": 128140,
+            "allocated_bytes": 131072
+          },
+          {
+            "path": "candidate-mixed_long-r3/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-mixed_long-r3/results.json",
+        "result_sha256": "820b1e4391873f453599bb72a01bb404d8fdf407fe34ce78c4f1ada51b9ba651",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_long-r3/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_long-r3/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33628160
+          }
+        ],
+        "result": "candidate-mixed_long-r3/results.json",
+        "result_sha256": "820b1e4391873f453599bb72a01bb404d8fdf407fe34ce78c4f1ada51b9ba651",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_none-r1/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_none-r1/mixed_none-e4-100000/store/data",
+            "bytes": 48959488,
+            "allocated_bytes": 48959488
+          },
+          {
+            "path": "candidate-mixed_none-r1/mixed_none-e4-100000/store/free",
+            "bytes": 71344,
+            "allocated_bytes": 73728
+          },
+          {
+            "path": "candidate-mixed_none-r1/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-mixed_none-r1/results.json",
+        "result_sha256": "7663df321e3d3e82b2da38146be69686e1851668dd04c8d35189a30f61c15f7f",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_none-r1/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_none-r1/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "candidate-mixed_none-r1/results.json",
+        "result_sha256": "7663df321e3d3e82b2da38146be69686e1851668dd04c8d35189a30f61c15f7f",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_none-r2/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_none-r2/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33054720
+          }
+        ],
+        "result": "candidate-mixed_none-r2/results.json",
+        "result_sha256": "4f33b137fcd577b17d406354c7bec0b5192792a406ba28f4f02e6e0d8901e43b",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_none-r2/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_none-r2/mixed_none-e4-100000/store/data",
+            "bytes": 48959488,
+            "allocated_bytes": 48959488
+          },
+          {
+            "path": "candidate-mixed_none-r2/mixed_none-e4-100000/store/free",
+            "bytes": 71344,
+            "allocated_bytes": 73728
+          },
+          {
+            "path": "candidate-mixed_none-r2/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-mixed_none-r2/results.json",
+        "result_sha256": "4f33b137fcd577b17d406354c7bec0b5192792a406ba28f4f02e6e0d8901e43b",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_none-r3/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_none-r3/mixed_none-e4-100000/store/data",
+            "bytes": 48959488,
+            "allocated_bytes": 48959488
+          },
+          {
+            "path": "candidate-mixed_none-r3/mixed_none-e4-100000/store/free",
+            "bytes": 71344,
+            "allocated_bytes": 73728
+          },
+          {
+            "path": "candidate-mixed_none-r3/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-mixed_none-r3/results.json",
+        "result_sha256": "6ab93e9bd1db073cb260752a2185382cee6fe7549f6171a27347545d62be8513",
+        "removed": true
+      },
+      {
+        "directory": "candidate-mixed_none-r3/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-mixed_none-r3/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "candidate-mixed_none-r3/results.json",
+        "result_sha256": "6ab93e9bd1db073cb260752a2185382cee6fe7549f6171a27347545d62be8513",
+        "removed": true
+      },
+      {
+        "directory": "candidate-updates-r1/updates-e4-100000",
+        "files": [
+          {
+            "path": "candidate-updates-r1/updates-e4-100000/store/data",
+            "bytes": 35135488,
+            "allocated_bytes": 35135488
+          },
+          {
+            "path": "candidate-updates-r1/updates-e4-100000/store/free",
+            "bytes": 46216,
+            "allocated_bytes": 49152
+          },
+          {
+            "path": "candidate-updates-r1/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-updates-r1/results.json",
+        "result_sha256": "5b43e14323487404317f8f77da93007007a776ef03d58746816d8580e07f3d80",
+        "removed": true
+      },
+      {
+        "directory": "candidate-updates-r1/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-updates-r1/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 18374656
+          }
+        ],
+        "result": "candidate-updates-r1/results.json",
+        "result_sha256": "5b43e14323487404317f8f77da93007007a776ef03d58746816d8580e07f3d80",
+        "removed": true
+      },
+      {
+        "directory": "candidate-updates-r2/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-updates-r2/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 18595840
+          }
+        ],
+        "result": "candidate-updates-r2/results.json",
+        "result_sha256": "a48edb287a649b83ae06e8a63b0e1780aa77cdb162279aa4e9831d4400c6f5f7",
+        "removed": true
+      },
+      {
+        "directory": "candidate-updates-r2/updates-e4-100000",
+        "files": [
+          {
+            "path": "candidate-updates-r2/updates-e4-100000/store/data",
+            "bytes": 35135488,
+            "allocated_bytes": 35135488
+          },
+          {
+            "path": "candidate-updates-r2/updates-e4-100000/store/free",
+            "bytes": 46216,
+            "allocated_bytes": 49152
+          },
+          {
+            "path": "candidate-updates-r2/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-updates-r2/results.json",
+        "result_sha256": "a48edb287a649b83ae06e8a63b0e1780aa77cdb162279aa4e9831d4400c6f5f7",
+        "removed": true
+      },
+      {
+        "directory": "candidate-updates-r3/updates-e4-100000",
+        "files": [
+          {
+            "path": "candidate-updates-r3/updates-e4-100000/store/data",
+            "bytes": 35135488,
+            "allocated_bytes": 35135488
+          },
+          {
+            "path": "candidate-updates-r3/updates-e4-100000/store/free",
+            "bytes": 46216,
+            "allocated_bytes": 49152
+          },
+          {
+            "path": "candidate-updates-r3/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "candidate-updates-r3/results.json",
+        "result_sha256": "2feb26bfdba78df5f9e309e8924b7ae036b56da0320e3e5b81699935622bfc14",
+        "removed": true
+      },
+      {
+        "directory": "candidate-updates-r3/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "candidate-updates-r3/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 18595840
+          }
+        ],
+        "result": "candidate-updates-r3/results.json",
+        "result_sha256": "2feb26bfdba78df5f9e309e8924b7ae036b56da0320e3e5b81699935622bfc14",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_long-r1/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "direct-mixed_long-r1/mixed_long-e4-100000/store/data",
+            "bytes": 68325376,
+            "allocated_bytes": 84742144
+          },
+          {
+            "path": "direct-mixed_long-r1/mixed_long-e4-100000/store/free",
+            "bytes": 128140,
+            "allocated_bytes": 131072
+          },
+          {
+            "path": "direct-mixed_long-r1/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-mixed_long-r1/results.json",
+        "result_sha256": "ba6ef712ada66121e5b33f26f121f1d7925903b9b5dd4819de6fcdc4de3a2866",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_long-r1/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-mixed_long-r1/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "direct-mixed_long-r1/results.json",
+        "result_sha256": "ba6ef712ada66121e5b33f26f121f1d7925903b9b5dd4819de6fcdc4de3a2866",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_long-r2/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-mixed_long-r2/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33054720
+          }
+        ],
+        "result": "direct-mixed_long-r2/results.json",
+        "result_sha256": "9890deaafcd4a89800fdd8eb572336cd6d3de29867fd4fd2dca3c038c1d6c8d5",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_long-r2/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "direct-mixed_long-r2/mixed_long-e4-100000/store/data",
+            "bytes": 68325376,
+            "allocated_bytes": 84742144
+          },
+          {
+            "path": "direct-mixed_long-r2/mixed_long-e4-100000/store/free",
+            "bytes": 128140,
+            "allocated_bytes": 131072
+          },
+          {
+            "path": "direct-mixed_long-r2/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-mixed_long-r2/results.json",
+        "result_sha256": "9890deaafcd4a89800fdd8eb572336cd6d3de29867fd4fd2dca3c038c1d6c8d5",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_long-r3/mixed_long-e4-100000",
+        "files": [
+          {
+            "path": "direct-mixed_long-r3/mixed_long-e4-100000/store/data",
+            "bytes": 68325376,
+            "allocated_bytes": 84742144
+          },
+          {
+            "path": "direct-mixed_long-r3/mixed_long-e4-100000/store/free",
+            "bytes": 128140,
+            "allocated_bytes": 131072
+          },
+          {
+            "path": "direct-mixed_long-r3/mixed_long-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-mixed_long-r3/results.json",
+        "result_sha256": "27b64320622ccc0cc21fac451854b7aca396ad2116ce490397ae8d3afcff3043",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_long-r3/mixed_long-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-mixed_long-r3/mixed_long-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "direct-mixed_long-r3/results.json",
+        "result_sha256": "27b64320622ccc0cc21fac451854b7aca396ad2116ce490397ae8d3afcff3043",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_none-r1/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "direct-mixed_none-r1/mixed_none-e4-100000/store/data",
+            "bytes": 48959488,
+            "allocated_bytes": 49999872
+          },
+          {
+            "path": "direct-mixed_none-r1/mixed_none-e4-100000/store/free",
+            "bytes": 71344,
+            "allocated_bytes": 73728
+          },
+          {
+            "path": "direct-mixed_none-r1/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-mixed_none-r1/results.json",
+        "result_sha256": "1f5208d3564350baa5f657e83697143124b62aa160a168c2e7f2b1c60bcd5ec7",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_none-r1/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-mixed_none-r1/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "direct-mixed_none-r1/results.json",
+        "result_sha256": "1f5208d3564350baa5f657e83697143124b62aa160a168c2e7f2b1c60bcd5ec7",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_none-r2/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-mixed_none-r2/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "direct-mixed_none-r2/results.json",
+        "result_sha256": "53b9529160ab39948f9a61a0602f94323f6ec6f655e10e716c73410a8263d026",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_none-r2/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "direct-mixed_none-r2/mixed_none-e4-100000/store/data",
+            "bytes": 48959488,
+            "allocated_bytes": 49999872
+          },
+          {
+            "path": "direct-mixed_none-r2/mixed_none-e4-100000/store/free",
+            "bytes": 71344,
+            "allocated_bytes": 73728
+          },
+          {
+            "path": "direct-mixed_none-r2/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-mixed_none-r2/results.json",
+        "result_sha256": "53b9529160ab39948f9a61a0602f94323f6ec6f655e10e716c73410a8263d026",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_none-r3/mixed_none-e4-100000",
+        "files": [
+          {
+            "path": "direct-mixed_none-r3/mixed_none-e4-100000/store/data",
+            "bytes": 48959488,
+            "allocated_bytes": 49999872
+          },
+          {
+            "path": "direct-mixed_none-r3/mixed_none-e4-100000/store/free",
+            "bytes": 71344,
+            "allocated_bytes": 73728
+          },
+          {
+            "path": "direct-mixed_none-r3/mixed_none-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-mixed_none-r3/results.json",
+        "result_sha256": "83ef7c2d196b82671cb5cc593b28ca72a7a3be7787b04760fab11de9f2f07f81",
+        "removed": true
+      },
+      {
+        "directory": "direct-mixed_none-r3/mixed_none-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-mixed_none-r3/mixed_none-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33300480
+          }
+        ],
+        "result": "direct-mixed_none-r3/results.json",
+        "result_sha256": "83ef7c2d196b82671cb5cc593b28ca72a7a3be7787b04760fab11de9f2f07f81",
+        "removed": true
+      },
+      {
+        "directory": "direct-smoke/mixed_long-e4-1000",
+        "files": [
+          {
+            "path": "direct-smoke/mixed_long-e4-1000/store/data",
+            "bytes": 872448,
+            "allocated_bytes": 872448
+          },
+          {
+            "path": "direct-smoke/mixed_long-e4-1000/store/free",
+            "bytes": 1792,
+            "allocated_bytes": 4096
+          },
+          {
+            "path": "direct-smoke/mixed_long-e4-1000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-smoke/results.json",
+        "result_sha256": "d9e000991b1436173490df8798a09806e119716678d48f302cea86298e1ebd77",
+        "removed": true
+      },
+      {
+        "directory": "direct-smoke/mixed_long-sqlite-1000",
+        "files": [
+          {
+            "path": "direct-smoke/mixed_long-sqlite-1000/store/data.sqlite",
+            "bytes": 335872,
+            "allocated_bytes": 335872
+          }
+        ],
+        "result": "direct-smoke/results.json",
+        "result_sha256": "d9e000991b1436173490df8798a09806e119716678d48f302cea86298e1ebd77",
+        "removed": true
+      },
+      {
+        "directory": "direct-updates-r1/updates-e4-100000",
+        "files": [
+          {
+            "path": "direct-updates-r1/updates-e4-100000/store/data",
+            "bytes": 35135488,
+            "allocated_bytes": 35295232
+          },
+          {
+            "path": "direct-updates-r1/updates-e4-100000/store/free",
+            "bytes": 46216,
+            "allocated_bytes": 49152
+          },
+          {
+            "path": "direct-updates-r1/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-updates-r1/results.json",
+        "result_sha256": "48c804438947d45d94f8add88869d3e8166fa3ce105bd638ebf626702963af52",
+        "removed": true
+      },
+      {
+        "directory": "direct-updates-r1/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-updates-r1/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 18595840
+          }
+        ],
+        "result": "direct-updates-r1/results.json",
+        "result_sha256": "48c804438947d45d94f8add88869d3e8166fa3ce105bd638ebf626702963af52",
+        "removed": true
+      },
+      {
+        "directory": "direct-updates-r2/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-updates-r2/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 18595840
+          }
+        ],
+        "result": "direct-updates-r2/results.json",
+        "result_sha256": "b9a450da59d1dadc7de8b237664225cd5cee231c61179dafbc56d5a4c340d91a",
+        "removed": true
+      },
+      {
+        "directory": "direct-updates-r2/updates-e4-100000",
+        "files": [
+          {
+            "path": "direct-updates-r2/updates-e4-100000/store/data",
+            "bytes": 35135488,
+            "allocated_bytes": 35319808
+          },
+          {
+            "path": "direct-updates-r2/updates-e4-100000/store/free",
+            "bytes": 46216,
+            "allocated_bytes": 49152
+          },
+          {
+            "path": "direct-updates-r2/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-updates-r2/results.json",
+        "result_sha256": "b9a450da59d1dadc7de8b237664225cd5cee231c61179dafbc56d5a4c340d91a",
+        "removed": true
+      },
+      {
+        "directory": "direct-updates-r3/updates-e4-100000",
+        "files": [
+          {
+            "path": "direct-updates-r3/updates-e4-100000/store/data",
+            "bytes": 35135488,
+            "allocated_bytes": 35295232
+          },
+          {
+            "path": "direct-updates-r3/updates-e4-100000/store/free",
+            "bytes": 46216,
+            "allocated_bytes": 49152
+          },
+          {
+            "path": "direct-updates-r3/updates-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "direct-updates-r3/results.json",
+        "result_sha256": "c8e7359451606ef95c36a79fd605a1a2d183dd6fa84b072ae422a72564f0e192",
+        "removed": true
+      },
+      {
+        "directory": "direct-updates-r3/updates-sqlite-100000",
+        "files": [
+          {
+            "path": "direct-updates-r3/updates-sqlite-100000/store/data.sqlite",
+            "bytes": 17747968,
+            "allocated_bytes": 18595840
+          }
+        ],
+        "result": "direct-updates-r3/results.json",
+        "result_sha256": "c8e7359451606ef95c36a79fd605a1a2d183dd6fa84b072ae422a72564f0e192",
+        "removed": true
+      },
+      {
+        "directory": "gap-smoke/mixed_short_gap-e4-1000",
+        "files": [
+          {
+            "path": "gap-smoke/mixed_short_gap-e4-1000/store/data",
+            "bytes": 925696,
+            "allocated_bytes": 925696
+          },
+          {
+            "path": "gap-smoke/mixed_short_gap-e4-1000/store/free",
+            "bytes": 1948,
+            "allocated_bytes": 4096
+          },
+          {
+            "path": "gap-smoke/mixed_short_gap-e4-1000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "gap-smoke/results.json",
+        "result_sha256": "74e42394f83b9a5a504ef928dd5efca7f3cfc05c540424774033a4e0fe486a93",
+        "removed": true
+      },
+      {
+        "directory": "gap-smoke/mixed_short_gap-sqlite-1000",
+        "files": [
+          {
+            "path": "gap-smoke/mixed_short_gap-sqlite-1000/store/data.sqlite",
+            "bytes": 335872,
+            "allocated_bytes": 335872
+          }
+        ],
+        "result": "gap-smoke/results.json",
+        "result_sha256": "74e42394f83b9a5a504ef928dd5efca7f3cfc05c540424774033a4e0fe486a93",
+        "removed": true
+      },
+      {
+        "directory": "smoke/mixed_long-e4-1000",
+        "files": [
+          {
+            "path": "smoke/mixed_long-e4-1000/store/data",
+            "bytes": 872448,
+            "allocated_bytes": 872448
+          },
+          {
+            "path": "smoke/mixed_long-e4-1000/store/free",
+            "bytes": 632,
+            "allocated_bytes": 4096
+          },
+          {
+            "path": "smoke/mixed_long-e4-1000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "smoke/results.json",
+        "result_sha256": "499bc0d7a2a5f73a0a08b6a17de6d905e5b3c974fd2eab457af6f5a208f7429c",
+        "removed": true
+      },
+      {
+        "directory": "smoke/mixed_long-sqlite-1000",
+        "files": [
+          {
+            "path": "smoke/mixed_long-sqlite-1000/store/data.sqlite",
+            "bytes": 335872,
+            "allocated_bytes": 335872
+          }
+        ],
+        "result": "smoke/results.json",
+        "result_sha256": "499bc0d7a2a5f73a0a08b6a17de6d905e5b3c974fd2eab457af6f5a208f7429c",
+        "removed": true
+      },
+      {
+        "directory": "smoke-final/mixed_long-e4-1000",
+        "files": [
+          {
+            "path": "smoke-final/mixed_long-e4-1000/store/data",
+            "bytes": 872448,
+            "allocated_bytes": 872448
+          },
+          {
+            "path": "smoke-final/mixed_long-e4-1000/store/free",
+            "bytes": 632,
+            "allocated_bytes": 4096
+          },
+          {
+            "path": "smoke-final/mixed_long-e4-1000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "smoke-final/results.json",
+        "result_sha256": "00bc417126347496f10d15cf384374932be1fa08c55bd3464cc1a85475c86711",
+        "removed": true
+      },
+      {
+        "directory": "smoke-final/mixed_long-sqlite-1000",
+        "files": [
+          {
+            "path": "smoke-final/mixed_long-sqlite-1000/store/data.sqlite",
+            "bytes": 335872,
+            "allocated_bytes": 335872
+          }
+        ],
+        "result": "smoke-final/results.json",
+        "result_sha256": "00bc417126347496f10d15cf384374932be1fa08c55bd3464cc1a85475c86711",
+        "removed": true
+      },
+      {
+        "directory": "smoke-v2/mixed_long-e4-1000",
+        "files": [
+          {
+            "path": "smoke-v2/mixed_long-e4-1000/store/data",
+            "bytes": 872448,
+            "allocated_bytes": 872448
+          },
+          {
+            "path": "smoke-v2/mixed_long-e4-1000/store/free",
+            "bytes": 1792,
+            "allocated_bytes": 4096
+          },
+          {
+            "path": "smoke-v2/mixed_long-e4-1000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "smoke-v2/results.json",
+        "result_sha256": "961128dd0d652a5bf1bf85e04cc1b70aa4c40c7aff69f379103a55719fab81c1",
+        "removed": true
+      },
+      {
+        "directory": "smoke-v2/mixed_long-sqlite-1000",
+        "files": [
+          {
+            "path": "smoke-v2/mixed_long-sqlite-1000/store/data.sqlite",
+            "bytes": 335872,
+            "allocated_bytes": 335872
+          }
+        ],
+        "result": "smoke-v2/results.json",
+        "result_sha256": "961128dd0d652a5bf1bf85e04cc1b70aa4c40c7aff69f379103a55719fab81c1",
+        "removed": true
+      }
+    ],
+    "logical_bytes": 2660764444,
+    "allocated_bytes": 2726105088,
+    "note": "Generated arm databases only. Results, event logs, crash evidence, executables and source archives retained. Allocated file blocks are not a claim about APFS volume space recovered."
+  },
+  {
+    "complete": true,
+    "root": "<scratch>",
+    "entries": [
+      {
+        "directory": "matrix-delete_reinsert-r1/delete_reinsert-e4-100000",
+        "files": [
+          {
+            "path": "matrix-delete_reinsert-r1/delete_reinsert-e4-100000/store/data",
+            "bytes": 35913728,
+            "allocated_bytes": 36741120
+          },
+          {
+            "path": "matrix-delete_reinsert-r1/delete_reinsert-e4-100000/store/free",
+            "bytes": 48484,
+            "allocated_bytes": 49152
+          },
+          {
+            "path": "matrix-delete_reinsert-r1/delete_reinsert-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "matrix-delete_reinsert-r1/results.json",
+        "result_sha256": "0dbb7a9994739123058ba43df80e612dcb2317c417b4ef4a62a95d60cf30244f",
+        "removed": true
+      },
+      {
+        "directory": "matrix-delete_reinsert-r1/delete_reinsert-sqlite-100000",
+        "files": [
+          {
+            "path": "matrix-delete_reinsert-r1/delete_reinsert-sqlite-100000/store/data.sqlite",
+            "bytes": 17518592,
+            "allocated_bytes": 17547264
+          }
+        ],
+        "result": "matrix-delete_reinsert-r1/results.json",
+        "result_sha256": "0dbb7a9994739123058ba43df80e612dcb2317c417b4ef4a62a95d60cf30244f",
+        "removed": true
+      },
+      {
+        "directory": "matrix-mixed_short-r1/mixed_short-e4-100000",
+        "files": [
+          {
+            "path": "matrix-mixed_short-r1/mixed_short-e4-100000/store/data",
+            "bytes": 70545408,
+            "allocated_bytes": 84742144
+          },
+          {
+            "path": "matrix-mixed_short-r1/mixed_short-e4-100000/store/free",
+            "bytes": 134968,
+            "allocated_bytes": 135168
+          },
+          {
+            "path": "matrix-mixed_short-r1/mixed_short-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "matrix-mixed_short-r1/results.json",
+        "result_sha256": "01b74604a5e041f5832ea9ca3678b09c6e92b2ef0303ea098642d99e36bd663d",
+        "removed": true
+      },
+      {
+        "directory": "matrix-mixed_short-r1/mixed_short-sqlite-100000",
+        "files": [
+          {
+            "path": "matrix-mixed_short-r1/mixed_short-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "matrix-mixed_short-r1/results.json",
+        "result_sha256": "01b74604a5e041f5832ea9ca3678b09c6e92b2ef0303ea098642d99e36bd663d",
+        "removed": true
+      }
+    ],
+    "logical_bytes": 157064348,
+    "allocated_bytes": 172490752,
+    "note": "Generated arm databases only. Results, event logs, crash evidence, executables and source archives retained. Allocated file blocks are not a claim about APFS volume space recovered."
+  },
+  {
+    "complete": true,
+    "root": "<scratch>",
+    "entries": [
+      {
+        "directory": "matrix-mixed_none-r1/mixed_none-e4-400000",
+        "files": [
+          {
+            "path": "matrix-mixed_none-r1/mixed_none-e4-400000/store/data",
+            "bytes": 160325632,
+            "allocated_bytes": 167886848
+          },
+          {
+            "path": "matrix-mixed_none-r1/mixed_none-e4-400000/store/free",
+            "bytes": 183712,
+            "allocated_bytes": 184320
+          },
+          {
+            "path": "matrix-mixed_none-r1/mixed_none-e4-400000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "matrix-mixed_none-r1/results.json",
+        "result_sha256": "2b874f5a040bb95e7147c5ed483a15e47eb6dd8b0480cf66b2806789a8eceb45",
+        "removed": true
+      },
+      {
+        "directory": "matrix-mixed_none-r1/mixed_none-sqlite-400000",
+        "files": [
+          {
+            "path": "matrix-mixed_none-r1/mixed_none-sqlite-400000/store/data.sqlite",
+            "bytes": 132767744,
+            "allocated_bytes": 134295552
+          }
+        ],
+        "result": "matrix-mixed_none-r1/results.json",
+        "result_sha256": "2b874f5a040bb95e7147c5ed483a15e47eb6dd8b0480cf66b2806789a8eceb45",
+        "removed": true
+      }
+    ],
+    "logical_bytes": 293277088,
+    "allocated_bytes": 302366720,
+    "note": "Generated arm databases only. Results, event logs, crash evidence, executables and source archives retained. Allocated file blocks are not a claim about APFS volume space recovered."
+  },
+  {
+    "complete": true,
+    "root": "<scratch>",
+    "entries": [
+      {
+        "directory": "matrix-mixed_short_gap-r1/mixed_short_gap-e4-100000",
+        "files": [
+          {
+            "path": "matrix-mixed_short_gap-r1/mixed_short_gap-e4-100000/store/data",
+            "bytes": 70545408,
+            "allocated_bytes": 84742144
+          },
+          {
+            "path": "matrix-mixed_short_gap-r1/mixed_short_gap-e4-100000/store/free",
+            "bytes": 134968,
+            "allocated_bytes": 135168
+          },
+          {
+            "path": "matrix-mixed_short_gap-r1/mixed_short_gap-e4-100000/store/wal",
+            "bytes": 0,
+            "allocated_bytes": 0
+          }
+        ],
+        "result": "matrix-mixed_short_gap-r1/results.json",
+        "result_sha256": "23162a93bf8c9c537467f91e90906f560076dc6a4c13dda25b3c3c6d9f2174ee",
+        "removed": true
+      },
+      {
+        "directory": "matrix-mixed_short_gap-r1/mixed_short_gap-sqlite-100000",
+        "files": [
+          {
+            "path": "matrix-mixed_short_gap-r1/mixed_short_gap-sqlite-100000/store/data.sqlite",
+            "bytes": 32903168,
+            "allocated_bytes": 33275904
+          }
+        ],
+        "result": "matrix-mixed_short_gap-r1/results.json",
+        "result_sha256": "23162a93bf8c9c537467f91e90906f560076dc6a4c13dda25b3c3c6d9f2174ee",
+        "removed": true
+      }
+    ],
+    "logical_bytes": 103583544,
+    "allocated_bytes": 118153216,
+    "note": "Generated arm databases only. Results, event logs, crash evidence, executables and source archives retained. Allocated file blocks are not a claim about APFS volume space recovered."
+  }
+]

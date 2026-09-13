@@ -1,0 +1,3189 @@
+{
+  "layer": "raw KV, not full hybrid collections",
+  "platforms": {
+    "Mac": {
+      "timing": {
+        "mixed-100k": {
+          "arms": {
+            "e4": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 2.4770315,
+                  "mutation_seconds": 4.5876361249999995,
+                  "commit_seconds": 4.134145205,
+                  "ending_checkpoint_seconds": 6.249999999999999e-07,
+                  "create_update_delete_seconds": [
+                    0.04310639800000088,
+                    0.2546389019999929,
+                    0.14740030300000298
+                  ],
+                  "final_logical": 34325860,
+                  "final_allocated": 34623488,
+                  "observed_peak_logical": 34325860,
+                  "observed_peak_allocated": 34623488,
+                  "last_three_sizes": [
+                    34325848,
+                    34325848,
+                    34325860
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "e26d941c1e350ba18e7b05d22cec3729131a1d08cf3ae39067d3c66690705b6e"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 2.250397334,
+                  "mutation_seconds": 4.610916709,
+                  "commit_seconds": 4.08680912,
+                  "ending_checkpoint_seconds": 5.41e-07,
+                  "create_update_delete_seconds": [
+                    0.04715623600000095,
+                    0.30780184599999566,
+                    0.16017364700000394
+                  ],
+                  "final_logical": 34325860,
+                  "final_allocated": 34754560,
+                  "observed_peak_logical": 34325860,
+                  "observed_peak_allocated": 34754560,
+                  "last_three_sizes": [
+                    34325848,
+                    34325848,
+                    34325860
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "d3a3babd4af548373d5ba18e9c1892d17322ab63f5729bc9c9879b43df2a37d7"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 2.362386833,
+                  "mutation_seconds": 4.896217833,
+                  "commit_seconds": 4.416872543999999,
+                  "ending_checkpoint_seconds": 1.334e-06,
+                  "create_update_delete_seconds": [
+                    0.04403390700000118,
+                    0.2808035399999926,
+                    0.14599943300000207
+                  ],
+                  "final_logical": 34325860,
+                  "final_allocated": 35213312,
+                  "observed_peak_logical": 34325860,
+                  "observed_peak_allocated": 35213312,
+                  "last_three_sizes": [
+                    34325848,
+                    34325848,
+                    34325860
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "8e5d2926430eec28c332a858bc70a92c3c96cf92a0f08b9791892ce44fc8cf54"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 2.362386833,
+              "median_mutation_seconds": 4.610916709,
+              "median_final_logical": 34325860,
+              "median_final_allocated": 34754560,
+              "median_observed_peak_logical": 34325860,
+              "median_observed_peak_allocated": 34754560,
+              "median_commit_seconds": 4.134145205,
+              "median_ending_checkpoint_seconds": 6.249999999999999e-07,
+              "mutation_range_seconds": [
+                4.5876361249999995,
+                4.896217833
+              ]
+            },
+            "pagewal-v1": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 1.370382,
+                  "mutation_seconds": 3.590071041,
+                  "commit_seconds": 3.026514409,
+                  "ending_checkpoint_seconds": 0.105313459,
+                  "create_update_delete_seconds": [
+                    0.06683878799999841,
+                    0.22561319200000796,
+                    0.15725848299998996
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 33251328,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 38498304,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "6427e7430cbccece09039c609bbde92b98c4ae530b9bd411c91ded9d97d825bf"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 1.427330459,
+                  "mutation_seconds": 3.374044584,
+                  "commit_seconds": 2.893672080999999,
+                  "ending_checkpoint_seconds": 0.068650624,
+                  "create_update_delete_seconds": [
+                    0.061826669999998224,
+                    0.19187063000000903,
+                    0.14959384199999193
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 33251328,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 38498304,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "8659dd04956fec12a10a9d510c72e570f9ac7d9af81ac8c007f2816ea82225c8"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 1.438826291,
+                  "mutation_seconds": 3.374578917,
+                  "commit_seconds": 2.861404631,
+                  "ending_checkpoint_seconds": 0.067430125,
+                  "create_update_delete_seconds": [
+                    0.0678661989999981,
+                    0.20708964700000898,
+                    0.16198030399999166
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 33251328,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 38498304,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "8ffad347164bffd3c1d8ac486818ef719f87981af20f086664129a05bf7bfdd9"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 1.427330459,
+              "median_mutation_seconds": 3.374578917,
+              "median_final_logical": 32485376,
+              "median_final_allocated": 33251328,
+              "median_observed_peak_logical": 37443104,
+              "median_observed_peak_allocated": 38498304,
+              "median_commit_seconds": 2.893672080999999,
+              "median_ending_checkpoint_seconds": 0.068650624,
+              "mutation_range_seconds": [
+                3.374044584,
+                3.590071041
+              ]
+            },
+            "pagewal-v2": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 1.362200125,
+                  "mutation_seconds": 3.496714625,
+                  "commit_seconds": 2.9861706670000006,
+                  "ending_checkpoint_seconds": 0.07094425,
+                  "create_update_delete_seconds": [
+                    0.06813936099999955,
+                    0.20212875000000116,
+                    0.1598411159999911
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 33251328,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 38498304,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "7b8b0469688364da97af6e69c686bf7436174e28b2dcb8458baba2925fe2fae5"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 1.419467542,
+                  "mutation_seconds": 3.5635780830000003,
+                  "commit_seconds": 3.0268207599999997,
+                  "ending_checkpoint_seconds": 0.070088208,
+                  "create_update_delete_seconds": [
+                    0.06977560399999819,
+                    0.2206605430000041,
+                    0.16700395099998988
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 33251328,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 38498304,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "d589dc7197342a093b9df596e8f62a3938f35a3e1d7347d36636d8f82a3128b8"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 1.318638083,
+                  "mutation_seconds": 3.328824625,
+                  "commit_seconds": 2.7976653839999996,
+                  "ending_checkpoint_seconds": 0.073029083,
+                  "create_update_delete_seconds": [
+                    0.07124434299999968,
+                    0.21454157700000287,
+                    0.16347496499999015
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 33251328,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 38498304,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "78ec84109b5d808036a3f00bc7c59d7815cf01312b5fd6c14812c32f9143e2d5"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 1.362200125,
+              "median_mutation_seconds": 3.496714625,
+              "median_final_logical": 32485376,
+              "median_final_allocated": 33251328,
+              "median_observed_peak_logical": 37443104,
+              "median_observed_peak_allocated": 38498304,
+              "median_commit_seconds": 2.9861706670000006,
+              "median_ending_checkpoint_seconds": 0.07094425,
+              "mutation_range_seconds": [
+                3.328824625,
+                3.5635780830000003
+              ]
+            },
+            "sqlite": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 1.21934025,
+                  "mutation_seconds": 2.788455457,
+                  "commit_seconds": 2.4870669640000003,
+                  "ending_checkpoint_seconds": 0.019757291,
+                  "create_update_delete_seconds": [
+                    0.049188914999999514,
+                    0.1774755679999977,
+                    0.03965510500000167
+                  ],
+                  "final_logical": 32403456,
+                  "final_allocated": 32419840,
+                  "observed_peak_logical": 37203336,
+                  "observed_peak_allocated": 37666816,
+                  "last_three_sizes": [
+                    32403456,
+                    32403456,
+                    32403456
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "3ec7b7940bd6843f1b21ba095c9fc333243650116ec58ee4f82bfe91159fab6f"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 1.201722625,
+                  "mutation_seconds": 2.642128124,
+                  "commit_seconds": 2.3715407090000005,
+                  "ending_checkpoint_seconds": 0.016742042,
+                  "create_update_delete_seconds": [
+                    0.03937630600000026,
+                    0.16796345099999915,
+                    0.036518261000000406
+                  ],
+                  "final_logical": 32403456,
+                  "final_allocated": 32419840,
+                  "observed_peak_logical": 37203336,
+                  "observed_peak_allocated": 37666816,
+                  "last_three_sizes": [
+                    32403456,
+                    32403456,
+                    32403456
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "bafe229417fdc34601de84e551920dcf07348a361a8ddab11cb427113c592ae6"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 1.205179375,
+                  "mutation_seconds": 2.8570275,
+                  "commit_seconds": 2.524617621,
+                  "ending_checkpoint_seconds": 0.017366584,
+                  "create_update_delete_seconds": [
+                    0.04354721199999992,
+                    0.21883805000000245,
+                    0.042282318000000645
+                  ],
+                  "final_logical": 32403456,
+                  "final_allocated": 32419840,
+                  "observed_peak_logical": 37203336,
+                  "observed_peak_allocated": 37666816,
+                  "last_three_sizes": [
+                    32403456,
+                    32403456,
+                    32403456
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "29999f90f09bc2f0893abdcbb5ea2394d830e26a550ae2ed10aa9984a9837238"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 1.205179375,
+              "median_mutation_seconds": 2.788455457,
+              "median_final_logical": 32403456,
+              "median_final_allocated": 32419840,
+              "median_observed_peak_logical": 37203336,
+              "median_observed_peak_allocated": 37666816,
+              "median_commit_seconds": 2.4870669640000003,
+              "median_ending_checkpoint_seconds": 0.017366584,
+              "mutation_range_seconds": [
+                2.642128124,
+                2.8570275
+              ]
+            }
+          },
+          "v2_over_sqlite_time": 1.253996945234331,
+          "v2_over_v1_time": 1.0361928735418577,
+          "v2_over_sqlite_size": 1.0025281253950196
+        },
+        "sustain-400k": {
+          "arms": {
+            "e4": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "FAIL",
+                  "evidence": "<scratch>"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 9.0848395,
+                  "mutation_seconds": 64.236272833,
+                  "commit_seconds": 55.00989706699999,
+                  "ending_checkpoint_seconds": 1.8359999999999999e-06,
+                  "create_update_delete_seconds": [
+                    0.6559165749999705,
+                    5.411969880999887,
+                    3.0446348539999475
+                  ],
+                  "final_logical": 131749244,
+                  "final_allocated": 134664192,
+                  "observed_peak_logical": 131749268,
+                  "observed_peak_allocated": 134926336,
+                  "last_three_sizes": [
+                    131749256,
+                    131749256,
+                    131749244
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "d0e2d28afb5becdfecde334c386718ecdb27359dc74c8737f206ede876d98d72"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 9.02134925,
+                  "mutation_seconds": 72.559614668,
+                  "commit_seconds": 56.69094744799999,
+                  "ending_checkpoint_seconds": 2.083e-06,
+                  "create_update_delete_seconds": [
+                    0.8099158029999344,
+                    10.51455533500007,
+                    4.403325963000048
+                  ],
+                  "final_logical": 131749244,
+                  "final_allocated": 134369280,
+                  "observed_peak_logical": 131749268,
+                  "observed_peak_allocated": 134631424,
+                  "last_three_sizes": [
+                    131749256,
+                    131749256,
+                    131749244
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "631ff11d73ace7ee6e374e356653ec9fb76f599a514b53439027c47cea8bc4a1"
+                }
+              ],
+              "correctness": "FAIL",
+              "complete_repetitions": 2,
+              "failed_repetitions": 1,
+              "median_load_seconds": 9.053094375,
+              "median_mutation_seconds": 68.39794375049999,
+              "median_final_logical": 131749244.0,
+              "median_final_allocated": 134516736.0,
+              "median_observed_peak_logical": 131749268.0,
+              "median_observed_peak_allocated": 134778880.0,
+              "median_commit_seconds": 55.850422257499986,
+              "median_ending_checkpoint_seconds": 1.9594999999999996e-06,
+              "mutation_range_seconds": [
+                64.236272833,
+                72.559614668
+              ]
+            },
+            "pagewal-v1": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 5.163763833,
+                  "mutation_seconds": 40.816448165,
+                  "commit_seconds": 35.424091858000004,
+                  "ending_checkpoint_seconds": 0.18632524900000003,
+                  "create_update_delete_seconds": [
+                    0.7618530719998857,
+                    2.18768754000019,
+                    2.1524034230006324
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 134963200,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 140210176,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "c073d7601d5a6f03dc586916807190b371b1fe305aeb4e70d5371e44ce5acad5"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 5.546802208,
+                  "mutation_seconds": 43.621816792,
+                  "commit_seconds": 36.780047211,
+                  "ending_checkpoint_seconds": 0.190298251,
+                  "create_update_delete_seconds": [
+                    1.0823133179999391,
+                    2.9588425330003467,
+                    2.498255303000585
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 134963200,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 140210176,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "55ffafb32c9cfb93713efb4e3f3a67e91c4064ffc461681847b2fe729bb2f892"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 4.856776667,
+                  "mutation_seconds": 48.467422377,
+                  "commit_seconds": 38.89823208800001,
+                  "ending_checkpoint_seconds": 0.18863783499999995,
+                  "create_update_delete_seconds": [
+                    1.672638287000041,
+                    4.236248105000535,
+                    3.328132995000304
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 134963200,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 140210176,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "33696cf72699d9f3a76808f1f5fd81a5511d94bd73ea69fa49961c6249a94171"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 5.163763833,
+              "median_mutation_seconds": 43.621816792,
+              "median_final_logical": 129888256,
+              "median_final_allocated": 134963200,
+              "median_observed_peak_logical": 134854240,
+              "median_observed_peak_allocated": 140210176,
+              "median_commit_seconds": 36.780047211,
+              "median_ending_checkpoint_seconds": 0.18863783499999995,
+              "mutation_range_seconds": [
+                40.816448165,
+                48.467422377
+              ]
+            },
+            "pagewal-v2": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 4.996418166,
+                  "mutation_seconds": 41.92087983300001,
+                  "commit_seconds": 35.190104907,
+                  "ending_checkpoint_seconds": 0.177871416,
+                  "create_update_delete_seconds": [
+                    0.8265676249999334,
+                    3.1028739050000813,
+                    2.5187296800005394
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 134963200,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 140210176,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "3e2124720cde099313eb175537fdfe422713975a83ffa623bed53a2e94beaf12"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 5.24481725,
+                  "mutation_seconds": 41.238676835,
+                  "commit_seconds": 35.940912706999995,
+                  "ending_checkpoint_seconds": 0.18298633100000003,
+                  "create_update_delete_seconds": [
+                    0.728399078999845,
+                    2.1474105200000335,
+                    2.137863571000589
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 134963200,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 140210176,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "0eacf307ccc77bce6c3b97203f305e6a46f4020796adb483320bf53c66b5d33b"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 4.90517525,
+                  "mutation_seconds": 41.290064126000004,
+                  "commit_seconds": 35.173983957000004,
+                  "ending_checkpoint_seconds": 0.17825795700000002,
+                  "create_update_delete_seconds": [
+                    0.9175296729999912,
+                    2.5851470120001174,
+                    2.327935049000695
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 134963200,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 140210176,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "0da744cb3b8a8290e0c9feab25f8c4182df48a1e2ba63b0ae7a578512adda60d"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 4.996418166,
+              "median_mutation_seconds": 41.290064126000004,
+              "median_final_logical": 129888256,
+              "median_final_allocated": 134963200,
+              "median_observed_peak_logical": 134854240,
+              "median_observed_peak_allocated": 140210176,
+              "median_commit_seconds": 35.190104907,
+              "median_ending_checkpoint_seconds": 0.17825795700000002,
+              "mutation_range_seconds": [
+                41.238676835,
+                41.92087983300001
+              ]
+            },
+            "sqlite": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 4.413918333,
+                  "mutation_seconds": 33.958916038999995,
+                  "commit_seconds": 29.434673587,
+                  "ending_checkpoint_seconds": 0.020514456,
+                  "create_update_delete_seconds": [
+                    0.5812310990001377,
+                    3.04569382200088,
+                    0.7430979479998898
+                  ],
+                  "final_logical": 129445888,
+                  "final_allocated": 135180288,
+                  "observed_peak_logical": 134258128,
+                  "observed_peak_allocated": 140427264,
+                  "last_three_sizes": [
+                    129445888,
+                    129445888,
+                    129445888
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "768af67391dd2875dfb317b6097ab21e7d705881e85403868f5adb4c23186bdc"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 4.337773791,
+                  "mutation_seconds": 32.192048584999995,
+                  "commit_seconds": 28.675564504999997,
+                  "ending_checkpoint_seconds": 0.019121041,
+                  "create_update_delete_seconds": [
+                    0.5063636180001251,
+                    2.3295169360009194,
+                    0.5402303669999268
+                  ],
+                  "final_logical": 129445888,
+                  "final_allocated": 135180288,
+                  "observed_peak_logical": 134258128,
+                  "observed_peak_allocated": 140427264,
+                  "last_three_sizes": [
+                    129445888,
+                    129445888,
+                    129445888
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "e74ab9b0569dc7f2d460adceb3e892ef27eca9acff3855730c58ca859ec5e239"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 4.231045083,
+                  "mutation_seconds": 32.422541833000004,
+                  "commit_seconds": 28.189817160999997,
+                  "ending_checkpoint_seconds": 0.020443581999999995,
+                  "create_update_delete_seconds": [
+                    0.517710626000122,
+                    2.8633240590007607,
+                    0.7065361069999031
+                  ],
+                  "final_logical": 129445888,
+                  "final_allocated": 135180288,
+                  "observed_peak_logical": 134258128,
+                  "observed_peak_allocated": 140427264,
+                  "last_three_sizes": [
+                    129445888,
+                    129445888,
+                    129445888
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "d6196e0c2d1e1a1432624ddd100b430140d21681009838af7822e25e79e3ac2a"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 4.337773791,
+              "median_mutation_seconds": 32.422541833000004,
+              "median_final_logical": 129445888,
+              "median_final_allocated": 135180288,
+              "median_observed_peak_logical": 134258128,
+              "median_observed_peak_allocated": 140427264,
+              "median_commit_seconds": 28.675564504999997,
+              "median_ending_checkpoint_seconds": 0.020443581999999995,
+              "mutation_range_seconds": [
+                32.192048584999995,
+                33.958916038999995
+              ]
+            }
+          },
+          "v2_over_sqlite_time": 1.2734986768981371,
+          "v2_over_v1_time": 0.9465461817622501,
+          "v2_over_sqlite_size": 1.0034173970825555
+        }
+      },
+      "cap": [
+        {
+          "batch": 1000,
+          "cap_logical": 5931008,
+          "committed_updates": 9000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.029122542,
+          "engine": "pagewal",
+          "final_logical": 2965504,
+          "load_seconds": 0.133605125,
+          "loaded_logical": 2965504,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.673451459,
+          "mutation_with_ending_checkpoint_seconds": 0.702574001,
+          "observed_peak_logical": 5929408,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.017208917,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5971968,
+          "committed_updates": 10000,
+          "completed": false,
+          "ending_checkpoint_seconds": 5.5583e-05,
+          "engine": "sqlite",
+          "final_logical": 2985984,
+          "load_seconds": 0.126515084,
+          "loaded_logical": 2985984,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.86773275,
+          "mutation_with_ending_checkpoint_seconds": 0.867788333,
+          "observed_peak_logical": 6047176,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.002768833,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5931008,
+          "committed_updates": 120000,
+          "completed": true,
+          "ending_checkpoint_seconds": 5e-07,
+          "engine": "pagewal",
+          "final_logical": 2965504,
+          "load_seconds": 0.137240875,
+          "loaded_logical": 2965504,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 9.924481,
+          "mutation_with_ending_checkpoint_seconds": 9.9244815,
+          "observed_peak_logical": 4203904,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.017764292,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5971968,
+          "committed_updates": 10000,
+          "completed": false,
+          "ending_checkpoint_seconds": 5.1416e-05,
+          "engine": "sqlite",
+          "final_logical": 2985984,
+          "load_seconds": 0.143107875,
+          "loaded_logical": 2985984,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.717008,
+          "mutation_with_ending_checkpoint_seconds": 0.717059416,
+          "observed_peak_logical": 6047176,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.00242625,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5931008,
+          "committed_updates": 9000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.033910041,
+          "engine": "pagewal",
+          "final_logical": 2965504,
+          "load_seconds": 0.123081916,
+          "loaded_logical": 2965504,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.932148083,
+          "mutation_with_ending_checkpoint_seconds": 0.9660581239999999,
+          "observed_peak_logical": 5929408,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.014862708,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5971968,
+          "committed_updates": 120000,
+          "completed": true,
+          "ending_checkpoint_seconds": 3.8333e-05,
+          "engine": "sqlite",
+          "final_logical": 2985984,
+          "load_seconds": 0.136864917,
+          "loaded_logical": 2985984,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 9.293716790000001,
+          "mutation_with_ending_checkpoint_seconds": 9.293755123,
+          "observed_peak_logical": 6047176,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": null,
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.02428046,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 59047936,
+          "committed_updates": 54000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.064133375,
+          "engine": "pagewal",
+          "final_logical": 29523968,
+          "load_seconds": 1.22515225,
+          "loaded_logical": 29523968,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 3.979114084,
+          "mutation_with_ending_checkpoint_seconds": 4.043247459,
+          "observed_peak_logical": 46300160,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.0383185,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 58900480,
+          "committed_updates": 96000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.0001095,
+          "engine": "sqlite",
+          "final_logical": 29450240,
+          "load_seconds": 1.329374,
+          "loaded_logical": 29450240,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 7.279208375,
+          "mutation_with_ending_checkpoint_seconds": 7.279317874999999,
+          "observed_peak_logical": 58945160,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.017903333,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 59047936,
+          "committed_updates": 1200000,
+          "completed": true,
+          "ending_checkpoint_seconds": 0.025402709,
+          "engine": "pagewal",
+          "final_logical": 29523968,
+          "load_seconds": 1.6093166669999999,
+          "loaded_logical": 29523968,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 89.497241625,
+          "mutation_with_ending_checkpoint_seconds": 89.522644334,
+          "observed_peak_logical": 33524000,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.033458292,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 58900480,
+          "committed_updates": 1200000,
+          "completed": true,
+          "ending_checkpoint_seconds": 0.000490125,
+          "engine": "sqlite",
+          "final_logical": 29450240,
+          "load_seconds": 1.294420375,
+          "loaded_logical": 29450240,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 87.79782775,
+          "mutation_with_ending_checkpoint_seconds": 87.798317875,
+          "observed_peak_logical": 33763912,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.023522208,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 59047936,
+          "committed_updates": 54000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.063232583,
+          "engine": "pagewal",
+          "final_logical": 29523968,
+          "load_seconds": 1.34988725,
+          "loaded_logical": 29523968,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 3.992942541,
+          "mutation_with_ending_checkpoint_seconds": 4.056175124,
+          "observed_peak_logical": 46300160,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.039215917,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 58900480,
+          "committed_updates": 96000,
+          "completed": false,
+          "ending_checkpoint_seconds": 8.2667e-05,
+          "engine": "sqlite",
+          "final_logical": 29450240,
+          "load_seconds": 1.202705916,
+          "loaded_logical": 29450240,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 7.371863375,
+          "mutation_with_ending_checkpoint_seconds": 7.371946042,
+          "observed_peak_logical": 58945160,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.017462083,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23642112,
+          "committed_updates": 38000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.058116,
+          "engine": "pagewal",
+          "final_logical": 11821056,
+          "load_seconds": 0.513599666,
+          "loaded_logical": 11821056,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.777995834,
+          "mutation_with_ending_checkpoint_seconds": 2.836111834,
+          "observed_peak_logical": 23639520,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.019356292,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23609344,
+          "committed_updates": 39000,
+          "completed": false,
+          "ending_checkpoint_seconds": 8.1625e-05,
+          "engine": "sqlite",
+          "final_logical": 11804672,
+          "load_seconds": 0.497905167,
+          "loaded_logical": 11804672,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.823442333,
+          "mutation_with_ending_checkpoint_seconds": 2.823523958,
+          "observed_peak_logical": 23777424,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.007318416,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23642112,
+          "committed_updates": 480000,
+          "completed": true,
+          "ending_checkpoint_seconds": 0.020306833,
+          "engine": "pagewal",
+          "final_logical": 11821056,
+          "load_seconds": 0.504721583,
+          "loaded_logical": 11821056,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 36.071349792,
+          "mutation_with_ending_checkpoint_seconds": 36.091656625,
+          "observed_peak_logical": 15821088,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.022594667,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23609344,
+          "committed_updates": 480000,
+          "completed": true,
+          "ending_checkpoint_seconds": 0.0001235,
+          "engine": "sqlite",
+          "final_logical": 11804672,
+          "load_seconds": 0.567582791,
+          "loaded_logical": 11804672,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 34.476190333,
+          "mutation_with_ending_checkpoint_seconds": 34.476313833,
+          "observed_peak_logical": 16114224,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.012595292,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23642112,
+          "committed_updates": 38000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.053986416,
+          "engine": "pagewal",
+          "final_logical": 11821056,
+          "load_seconds": 0.511675958,
+          "loaded_logical": 11821056,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.683052875,
+          "mutation_with_ending_checkpoint_seconds": 2.737039291,
+          "observed_peak_logical": 23639520,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.019778083,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23609344,
+          "committed_updates": 39000,
+          "completed": false,
+          "ending_checkpoint_seconds": 7.95e-05,
+          "engine": "sqlite",
+          "final_logical": 11804672,
+          "load_seconds": 0.736852292,
+          "loaded_logical": 11804672,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.7936579999999998,
+          "mutation_with_ending_checkpoint_seconds": 2.7937374999999998,
+          "observed_peak_logical": 23777424,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.00727625,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5931008,
+          "committed_updates": 120000,
+          "completed": true,
+          "ending_checkpoint_seconds": 6.25e-07,
+          "engine": "pagewal",
+          "final_logical": 2965504,
+          "load_seconds": 0.117024208,
+          "loaded_logical": 2965504,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 11.035763251,
+          "mutation_with_ending_checkpoint_seconds": 11.035763876,
+          "observed_peak_logical": 4513504,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.092397666,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5971968,
+          "committed_updates": 120000,
+          "completed": true,
+          "ending_checkpoint_seconds": 0.000178,
+          "engine": "sqlite",
+          "final_logical": 2985984,
+          "load_seconds": 0.140781083,
+          "loaded_logical": 2985984,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 11.044688129,
+          "mutation_with_ending_checkpoint_seconds": 11.044866129,
+          "observed_peak_logical": 4522776,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.033944454000000006,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 59047936,
+          "committed_updates": 1200000,
+          "completed": true,
+          "ending_checkpoint_seconds": 6.66e-07,
+          "engine": "pagewal",
+          "final_logical": 29523968,
+          "load_seconds": 1.42158075,
+          "loaded_logical": 29523968,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 90.130818543,
+          "mutation_with_ending_checkpoint_seconds": 90.13081920900001,
+          "observed_peak_logical": 31071968,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 4.1644865819999985,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 58900480,
+          "committed_updates": 1200000,
+          "completed": true,
+          "ending_checkpoint_seconds": 0.000107625,
+          "engine": "sqlite",
+          "final_logical": 29450240,
+          "load_seconds": 1.137649458,
+          "loaded_logical": 29450240,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 91.96712517,
+          "mutation_with_ending_checkpoint_seconds": 91.967232795,
+          "observed_peak_logical": 30995272,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 4.953513412999996,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23642112,
+          "committed_updates": 480000,
+          "completed": true,
+          "ending_checkpoint_seconds": 6.25e-07,
+          "engine": "pagewal",
+          "final_logical": 11821056,
+          "load_seconds": 0.5158505,
+          "loaded_logical": 11821056,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 42.408548285,
+          "mutation_with_ending_checkpoint_seconds": 42.40854891,
+          "observed_peak_logical": 13369056,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.761852382,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23609344,
+          "committed_updates": 480000,
+          "completed": true,
+          "ending_checkpoint_seconds": 8.8709e-05,
+          "engine": "sqlite",
+          "final_logical": 11804672,
+          "load_seconds": 0.632371292,
+          "loaded_logical": 11804672,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 41.203551252,
+          "mutation_with_ending_checkpoint_seconds": 41.203639961,
+          "observed_peak_logical": 13349704,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.853001497,
+          "verified": true
+        }
+      ],
+      "repair": {
+        "candidate_rows": 0,
+        "completion": "verified salvage; source not replaced",
+        "current_rows": 100000,
+        "destination": "<scratch>",
+        "format": "page-WAL raw KV",
+        "known_affected_keys": 0,
+        "limitations": "No rootless current-membership reconstruction; corrupt-WAL salvage refuses; no aggregate repair disk cap or typed schema decoding",
+        "malformed_cells": 0,
+        "max_value_bytes": 1048576,
+        "source": "<scratch>",
+        "source_length_crc32c": [
+          [
+            32485376,
+            2752309986
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "source_unchanged": true,
+        "unknown_page_extents": 0,
+        "verified_candidate_rows": 0,
+        "verified_current_rows": 100000,
+        "version": 1,
+        "wal_uncommitted_tail_bytes": 0
+      }
+    },
+    "Pi": {
+      "timing": {
+        "mixed-100k": {
+          "arms": {
+            "e4": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 1.861934503,
+                  "mutation_seconds": 6.097775776000001,
+                  "commit_seconds": 5.354280648000001,
+                  "ending_checkpoint_seconds": 8.149999999999999e-07,
+                  "create_update_delete_seconds": [
+                    0.0744134339999993,
+                    0.3856688620000002,
+                    0.26631980699999924
+                  ],
+                  "final_logical": 34325860,
+                  "final_allocated": 34332672,
+                  "observed_peak_logical": 34325860,
+                  "observed_peak_allocated": 34332672,
+                  "last_three_sizes": [
+                    34325848,
+                    34325848,
+                    34325860
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "d1841b4ecf0e8bb9d5b40a023464b1fbb414842d8dcf84ceb795aedd7a610c43"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 1.8687070700000001,
+                  "mutation_seconds": 6.290962584,
+                  "commit_seconds": 5.540539356000001,
+                  "ending_checkpoint_seconds": 9.99e-07,
+                  "create_update_delete_seconds": [
+                    0.07475164099999908,
+                    0.38913745799999955,
+                    0.27004409799999984
+                  ],
+                  "final_logical": 34325860,
+                  "final_allocated": 34332672,
+                  "observed_peak_logical": 34325860,
+                  "observed_peak_allocated": 34332672,
+                  "last_three_sizes": [
+                    34325848,
+                    34325848,
+                    34325860
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "67e8953660f99c552a2faab08110c804b1f86a749a5117276e3d309631a5dbcf"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 1.86709451,
+                  "mutation_seconds": 6.272004853,
+                  "commit_seconds": 5.525805964,
+                  "ending_checkpoint_seconds": 9.99e-07,
+                  "create_update_delete_seconds": [
+                    0.07489053299999911,
+                    0.38495247700000024,
+                    0.2708362000000005
+                  ],
+                  "final_logical": 34325860,
+                  "final_allocated": 34332672,
+                  "observed_peak_logical": 34325860,
+                  "observed_peak_allocated": 34332672,
+                  "last_three_sizes": [
+                    34325848,
+                    34325848,
+                    34325860
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "95a4c8935a4a24d81957796dfad724ad787e5be6e0efafe9cd8c29b9bf9109bb"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 1.86709451,
+              "median_mutation_seconds": 6.272004853,
+              "median_final_logical": 34325860,
+              "median_final_allocated": 34332672,
+              "median_observed_peak_logical": 34325860,
+              "median_observed_peak_allocated": 34332672,
+              "median_commit_seconds": 5.525805964,
+              "median_ending_checkpoint_seconds": 9.99e-07,
+              "mutation_range_seconds": [
+                6.097775776000001,
+                6.290962584
+              ]
+            },
+            "pagewal-v1": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 1.611528249,
+                  "mutation_seconds": 6.009096149,
+                  "commit_seconds": 5.284389537999999,
+                  "ending_checkpoint_seconds": 0.070008211,
+                  "create_update_delete_seconds": [
+                    0.09158329900000052,
+                    0.2709120419999973,
+                    0.27703689000000775
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 32485376,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 37449728,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "60bd4a84e3c03450b0fb273564ff8868282760d9c3a51a2c7ace26ae075b2d75"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 1.794783111,
+                  "mutation_seconds": 6.350049299,
+                  "commit_seconds": 5.565457873999999,
+                  "ending_checkpoint_seconds": 0.07461383599999999,
+                  "create_update_delete_seconds": [
+                    0.09079290600000203,
+                    0.2923048320000007,
+                    0.31140506900000486
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 32485376,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 37449728,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "76a0ac4e9f5680ebabd83c8b9727d4564abccd83b3478e6fd5766a50c701e158"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 1.821371075,
+                  "mutation_seconds": 6.471807849,
+                  "commit_seconds": 5.733202641999999,
+                  "ending_checkpoint_seconds": 0.074742765,
+                  "create_update_delete_seconds": [
+                    0.0910607180000007,
+                    0.2769406019999968,
+                    0.2803088970000057
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 32485376,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 37449728,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "7b427591af41eeb71d228eda88139e70ed30306b451734ea013a7a5385b148e9"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 1.794783111,
+              "median_mutation_seconds": 6.350049299,
+              "median_final_logical": 32485376,
+              "median_final_allocated": 32485376,
+              "median_observed_peak_logical": 37443104,
+              "median_observed_peak_allocated": 37449728,
+              "median_commit_seconds": 5.565457873999999,
+              "median_ending_checkpoint_seconds": 0.07461383599999999,
+              "mutation_range_seconds": [
+                6.009096149,
+                6.471807849
+              ]
+            },
+            "pagewal-v2": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 1.589745956,
+                  "mutation_seconds": 5.840572969,
+                  "commit_seconds": 5.116273263000001,
+                  "ending_checkpoint_seconds": 0.074671837,
+                  "create_update_delete_seconds": [
+                    0.08955206700000051,
+                    0.2689683549999981,
+                    0.275587276000007
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 32485376,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 37449728,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "09085fc2432a4a57d270383bb72cc83f31d7fb64d4c5d96c3d3a3b4bebf2ca60"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 1.860644629,
+                  "mutation_seconds": 6.248203758,
+                  "commit_seconds": 5.475930354999999,
+                  "ending_checkpoint_seconds": 0.07754549100000001,
+                  "create_update_delete_seconds": [
+                    0.10203238700000068,
+                    0.29621373599999784,
+                    0.2804302180000078
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 32485376,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 37449728,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "18136036fbef4f82ba8e6dbce8cdecb23f9e15ad482ca9fa5a4f0f611e35e82f"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 1.639688053,
+                  "mutation_seconds": 6.059976615,
+                  "commit_seconds": 5.3182546980000005,
+                  "ending_checkpoint_seconds": 0.08047055,
+                  "create_update_delete_seconds": [
+                    0.09158390400000051,
+                    0.2727626879999973,
+                    0.2811644620000062
+                  ],
+                  "final_logical": 32485376,
+                  "final_allocated": 32485376,
+                  "observed_peak_logical": 37443104,
+                  "observed_peak_allocated": 37449728,
+                  "last_three_sizes": [
+                    32485376,
+                    32485376,
+                    32485376
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "1588a4fa353a06879164e8ed0efdfe5d10903bba8881ee06156ee6fe2ee05e1f"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 1.639688053,
+              "median_mutation_seconds": 6.059976615,
+              "median_final_logical": 32485376,
+              "median_final_allocated": 32485376,
+              "median_observed_peak_logical": 37443104,
+              "median_observed_peak_allocated": 37449728,
+              "median_commit_seconds": 5.3182546980000005,
+              "median_ending_checkpoint_seconds": 0.07754549100000001,
+              "mutation_range_seconds": [
+                5.840572969,
+                6.248203758
+              ]
+            },
+            "sqlite": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 1.712835266,
+                  "mutation_seconds": 6.09017451,
+                  "commit_seconds": 5.539436961000001,
+                  "ending_checkpoint_seconds": 0.064092961,
+                  "create_update_delete_seconds": [
+                    0.09365859100000036,
+                    0.29769378599999685,
+                    0.07758787599999896
+                  ],
+                  "final_logical": 32403456,
+                  "final_allocated": 32407552,
+                  "observed_peak_logical": 37203336,
+                  "observed_peak_allocated": 37212160,
+                  "last_three_sizes": [
+                    32403456,
+                    32403456,
+                    32403456
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "401c6e79f6ab45c65189298c29c31859e3b7cb87ba7a11a1ef632e27cf2d163e"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 1.719940311,
+                  "mutation_seconds": 5.674104103,
+                  "commit_seconds": 5.129236558000001,
+                  "ending_checkpoint_seconds": 0.069544806,
+                  "create_update_delete_seconds": [
+                    0.09112216400000045,
+                    0.28760611299999683,
+                    0.07966600299999904
+                  ],
+                  "final_logical": 32403456,
+                  "final_allocated": 32403456,
+                  "observed_peak_logical": 37203336,
+                  "observed_peak_allocated": 37203968,
+                  "last_three_sizes": [
+                    32403456,
+                    32403456,
+                    32403456
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "2f0007fabf284ab86f89887b75532fec18449b1476ee0b6d273934c997c86931"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 1.602484891,
+                  "mutation_seconds": 6.003202809000001,
+                  "commit_seconds": 5.4561705179999995,
+                  "ending_checkpoint_seconds": 0.075206613,
+                  "create_update_delete_seconds": [
+                    0.09161766600000018,
+                    0.2871852049999972,
+                    0.07584003399999906
+                  ],
+                  "final_logical": 32403456,
+                  "final_allocated": 32403456,
+                  "observed_peak_logical": 37203336,
+                  "observed_peak_allocated": 37208064,
+                  "last_three_sizes": [
+                    32403456,
+                    32403456,
+                    32403456
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "9169abbc959c5ef9747e31c173e7935bcb9f445c3b66498939386a37df4dc44e"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 1.712835266,
+              "median_mutation_seconds": 6.003202809000001,
+              "median_final_logical": 32403456,
+              "median_final_allocated": 32403456,
+              "median_observed_peak_logical": 37203336,
+              "median_observed_peak_allocated": 37208064,
+              "median_commit_seconds": 5.4561705179999995,
+              "median_ending_checkpoint_seconds": 0.069544806,
+              "mutation_range_seconds": [
+                5.674104103,
+                6.09017451
+              ]
+            }
+          },
+          "v2_over_sqlite_time": 1.0094572527043204,
+          "v2_over_v1_time": 0.9543196170074333,
+          "v2_over_sqlite_size": 1.0025281253950196
+        },
+        "sustain-400k": {
+          "arms": {
+            "e4": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 7.547141047,
+                  "mutation_seconds": 100.30099571199999,
+                  "commit_seconds": 89.83628024400001,
+                  "ending_checkpoint_seconds": 3.147e-06,
+                  "create_update_delete_seconds": [
+                    0.9549263089999928,
+                    5.182236005000015,
+                    4.125506890999993
+                  ],
+                  "final_logical": 131749244,
+                  "final_allocated": 131756032,
+                  "observed_peak_logical": 131749268,
+                  "observed_peak_allocated": 131756032,
+                  "last_three_sizes": [
+                    131749256,
+                    131749256,
+                    131749244
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "e8fbdcc4d294ad4b01452881d4df6b460fd264a29023cf71886e33a4d86d0475"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 7.980562515,
+                  "mutation_seconds": 107.23186675200002,
+                  "commit_seconds": 95.22919625800002,
+                  "ending_checkpoint_seconds": 3.2230000000000003e-06,
+                  "create_update_delete_seconds": [
+                    1.0710164999999883,
+                    6.0066362359999035,
+                    4.702900271000033
+                  ],
+                  "final_logical": 131749244,
+                  "final_allocated": 131751936,
+                  "observed_peak_logical": 131749268,
+                  "observed_peak_allocated": 131756032,
+                  "last_three_sizes": [
+                    131749256,
+                    131749256,
+                    131749244
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "3e1785a8f16275490db78bb9ca4e99439ebef6ea5953c1fba50047b792f506cf"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 7.113721998,
+                  "mutation_seconds": 97.73782507300001,
+                  "commit_seconds": 87.33118626500003,
+                  "ending_checkpoint_seconds": 3.3300000000000003e-06,
+                  "create_update_delete_seconds": [
+                    0.9544998339999944,
+                    5.091296940999973,
+                    4.159443886000033
+                  ],
+                  "final_logical": 131749244,
+                  "final_allocated": 131751936,
+                  "observed_peak_logical": 131749268,
+                  "observed_peak_allocated": 131751936,
+                  "last_three_sizes": [
+                    131749256,
+                    131749256,
+                    131749244
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "b497b2a62895c31e2a6f10d509aa525e24d61447eaa13b8fa84f1d123f8e746c"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 7.547141047,
+              "median_mutation_seconds": 100.30099571199999,
+              "median_final_logical": 131749244,
+              "median_final_allocated": 131751936,
+              "median_observed_peak_logical": 131749268,
+              "median_observed_peak_allocated": 131756032,
+              "median_commit_seconds": 89.83628024400001,
+              "median_ending_checkpoint_seconds": 3.2230000000000003e-06,
+              "mutation_range_seconds": [
+                97.73782507300001,
+                107.23186675200002
+              ]
+            },
+            "pagewal-v1": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 6.679761491,
+                  "mutation_seconds": 73.23985004,
+                  "commit_seconds": 64.358044982,
+                  "ending_checkpoint_seconds": 0.1273902,
+                  "create_update_delete_seconds": [
+                    1.2299042870000478,
+                    3.3585547860001066,
+                    3.9830554730001437
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 129888256,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 134860800,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "b50895f6470112b0234f7cce1c6adeeec7765e9220725529d5cdc34b435731c5"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 6.627199981,
+                  "mutation_seconds": 73.78753196900001,
+                  "commit_seconds": 64.91278740299998,
+                  "ending_checkpoint_seconds": 0.116209754,
+                  "create_update_delete_seconds": [
+                    1.2224639700000393,
+                    3.373785077000057,
+                    3.9764345220001425
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 129888256,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 134856704,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "e43d9ef7609c3b304f6ebe3f41896e0fabcfab8dd281d0ac924044836a4e2d40"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 6.661556479,
+                  "mutation_seconds": 73.282157244,
+                  "commit_seconds": 64.371691674,
+                  "ending_checkpoint_seconds": 0.11762796899999997,
+                  "create_update_delete_seconds": [
+                    1.2504664279999982,
+                    3.37775585800011,
+                    3.9803719750001836
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 129892352,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 134860800,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "167f472151e70b4391b5599ac4832cad06cc90e644cc25ca47d484baf68315d6"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 6.661556479,
+              "median_mutation_seconds": 73.282157244,
+              "median_final_logical": 129888256,
+              "median_final_allocated": 129888256,
+              "median_observed_peak_logical": 134854240,
+              "median_observed_peak_allocated": 134860800,
+              "median_commit_seconds": 64.371691674,
+              "median_ending_checkpoint_seconds": 0.11762796899999997,
+              "mutation_range_seconds": [
+                73.23985004,
+                73.78753196900001
+              ]
+            },
+            "pagewal-v2": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 6.645946273,
+                  "mutation_seconds": 81.68192124999999,
+                  "commit_seconds": 66.06461309299999,
+                  "ending_checkpoint_seconds": 0.12408636799999999,
+                  "create_update_delete_seconds": [
+                    1.2809979690000421,
+                    9.68824181000012,
+                    4.328782125000105
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 129888256,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 134860800,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "5396d721a155b6b7a50745dd9e088ed88b27e02b42f8b12627b35b6dc4e4ff85"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 6.660458404,
+                  "mutation_seconds": 71.837616369,
+                  "commit_seconds": 63.05096550200002,
+                  "ending_checkpoint_seconds": 0.12271652999999999,
+                  "create_update_delete_seconds": [
+                    1.2098791150000374,
+                    3.300681528000093,
+                    3.967298033000163
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 129888256,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 134856704,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "54100f71c31f10481fcbff96e28d0cbf886f4d36b89d6adc65ddbb4a0d939aeb"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 6.694419979,
+                  "mutation_seconds": 73.66067964599999,
+                  "commit_seconds": 64.75609312399999,
+                  "ending_checkpoint_seconds": 0.125605032,
+                  "create_update_delete_seconds": [
+                    1.226855550000035,
+                    3.3435501930000746,
+                    4.020651220000142
+                  ],
+                  "final_logical": 129888256,
+                  "final_allocated": 129888256,
+                  "observed_peak_logical": 134854240,
+                  "observed_peak_allocated": 134856704,
+                  "last_three_sizes": [
+                    129888256,
+                    129888256,
+                    129888256
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "88023cc72503da11c561bb9773b4ca2f8dad5deff957fdc54b8a063ec57ff574"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 6.660458404,
+              "median_mutation_seconds": 73.66067964599999,
+              "median_final_logical": 129888256,
+              "median_final_allocated": 129888256,
+              "median_observed_peak_logical": 134854240,
+              "median_observed_peak_allocated": 134856704,
+              "median_commit_seconds": 64.75609312399999,
+              "median_ending_checkpoint_seconds": 0.12408636799999999,
+              "mutation_range_seconds": [
+                71.837616369,
+                81.68192124999999
+              ]
+            },
+            "sqlite": {
+              "runs": [
+                {
+                  "rep": 1,
+                  "correctness": "PASS",
+                  "load_seconds": 6.770959406,
+                  "mutation_seconds": 70.534296198,
+                  "commit_seconds": 64.491805404,
+                  "ending_checkpoint_seconds": 0.06687651599999998,
+                  "create_update_delete_seconds": [
+                    1.128756956000018,
+                    3.605157367000018,
+                    1.0357310149999739
+                  ],
+                  "final_logical": 129445888,
+                  "final_allocated": 129445888,
+                  "observed_peak_logical": 134258128,
+                  "observed_peak_allocated": 134262784,
+                  "last_three_sizes": [
+                    129445888,
+                    129445888,
+                    129445888
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "e29a617abf56f4db9bdca6f9018993b92bc029e749faf9d1be8f7e8551f45c4c"
+                },
+                {
+                  "rep": 2,
+                  "correctness": "PASS",
+                  "load_seconds": 6.653097559,
+                  "mutation_seconds": 70.21559295899999,
+                  "commit_seconds": 64.19110285800001,
+                  "ending_checkpoint_seconds": 0.06812338300000001,
+                  "create_update_delete_seconds": [
+                    1.1071454020000049,
+                    3.619799965999928,
+                    1.0242731559999987
+                  ],
+                  "final_logical": 129445888,
+                  "final_allocated": 129449984,
+                  "observed_peak_logical": 134258128,
+                  "observed_peak_allocated": 134262784,
+                  "last_three_sizes": [
+                    129445888,
+                    129445888,
+                    129445888
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "775cdd3c4693b7eb08776339d1c779e5b0b6717dd6ff57336ccc9eba37a781b9"
+                },
+                {
+                  "rep": 3,
+                  "correctness": "PASS",
+                  "load_seconds": 6.711858081,
+                  "mutation_seconds": 70.03409032399999,
+                  "commit_seconds": 64.08306999400001,
+                  "ending_checkpoint_seconds": 0.07428730200000001,
+                  "create_update_delete_seconds": [
+                    1.1013399240000077,
+                    3.539150913999935,
+                    1.0176978459999964
+                  ],
+                  "final_logical": 129445888,
+                  "final_allocated": 129449984,
+                  "observed_peak_logical": 134258128,
+                  "observed_peak_allocated": 134262784,
+                  "last_three_sizes": [
+                    129445888,
+                    129445888,
+                    129445888
+                  ],
+                  "report": "<scratch>",
+                  "sha256": "dcb7cfa8d0d1f1bbb4d74f6eed3d96af09e47e7485111f49717bf9de3c03163d"
+                }
+              ],
+              "correctness": "PASS",
+              "complete_repetitions": 3,
+              "failed_repetitions": 0,
+              "median_load_seconds": 6.711858081,
+              "median_mutation_seconds": 70.21559295899999,
+              "median_final_logical": 129445888,
+              "median_final_allocated": 129449984,
+              "median_observed_peak_logical": 134258128,
+              "median_observed_peak_allocated": 134262784,
+              "median_commit_seconds": 64.19110285800001,
+              "median_ending_checkpoint_seconds": 0.06812338300000001,
+              "mutation_range_seconds": [
+                70.03409032399999,
+                70.534296198
+              ]
+            }
+          },
+          "v2_over_sqlite_time": 1.0490644106503757,
+          "v2_over_v1_time": 1.0051652737342278,
+          "v2_over_sqlite_size": 1.0034173970825555
+        }
+      },
+      "cap": [
+        {
+          "batch": 1000,
+          "cap_logical": 5931008,
+          "committed_updates": 9000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.047899383,
+          "engine": "pagewal",
+          "final_logical": 2965504,
+          "load_seconds": 0.177452972,
+          "loaded_logical": 2965504,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.172094127,
+          "mutation_with_ending_checkpoint_seconds": 0.21999351,
+          "observed_peak_logical": 5929408,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.018742948,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5971968,
+          "committed_updates": 10000,
+          "completed": false,
+          "ending_checkpoint_seconds": 7.5981e-05,
+          "engine": "sqlite",
+          "final_logical": 2985984,
+          "load_seconds": 0.175185816,
+          "loaded_logical": 2985984,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.211533774,
+          "mutation_with_ending_checkpoint_seconds": 0.211609755,
+          "observed_peak_logical": 6047176,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.004087758,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5931008,
+          "committed_updates": 120000,
+          "completed": true,
+          "ending_checkpoint_seconds": 1.296e-06,
+          "engine": "pagewal",
+          "final_logical": 2965504,
+          "load_seconds": 0.162948986,
+          "loaded_logical": 2965504,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.9719018310000003,
+          "mutation_with_ending_checkpoint_seconds": 2.9719031270000005,
+          "observed_peak_logical": 4203904,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.008329054,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5971968,
+          "committed_updates": 10000,
+          "completed": false,
+          "ending_checkpoint_seconds": 7.1036e-05,
+          "engine": "sqlite",
+          "final_logical": 2985984,
+          "load_seconds": 0.182634447,
+          "loaded_logical": 2985984,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.234147666,
+          "mutation_with_ending_checkpoint_seconds": 0.234218702,
+          "observed_peak_logical": 6047176,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.003904518,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5931008,
+          "committed_updates": 9000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.051192757,
+          "engine": "pagewal",
+          "final_logical": 2965504,
+          "load_seconds": 0.163030392,
+          "loaded_logical": 2965504,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.174003303,
+          "mutation_with_ending_checkpoint_seconds": 0.22519606,
+          "observed_peak_logical": 5929408,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.013563917,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5971968,
+          "committed_updates": 120000,
+          "completed": true,
+          "ending_checkpoint_seconds": 4.9296e-05,
+          "engine": "sqlite",
+          "final_logical": 2985984,
+          "load_seconds": 0.172997641,
+          "loaded_logical": 2985984,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.958681308,
+          "mutation_with_ending_checkpoint_seconds": 2.958730604,
+          "observed_peak_logical": 6047176,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": null,
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.035192164,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 59047936,
+          "committed_updates": 54000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.253679338,
+          "engine": "pagewal",
+          "final_logical": 29523968,
+          "load_seconds": 1.55982022,
+          "loaded_logical": 29523968,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 1.043705326,
+          "mutation_with_ending_checkpoint_seconds": 1.297384664,
+          "observed_peak_logical": 46300160,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.054394835,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 58900480,
+          "committed_updates": 96000,
+          "completed": false,
+          "ending_checkpoint_seconds": 4.9351e-05,
+          "engine": "sqlite",
+          "final_logical": 29450240,
+          "load_seconds": 1.524455592,
+          "loaded_logical": 29450240,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.621616519,
+          "mutation_with_ending_checkpoint_seconds": 2.6216658699999997,
+          "observed_peak_logical": 58945160,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.038225783,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 59047936,
+          "committed_updates": 1200000,
+          "completed": true,
+          "ending_checkpoint_seconds": 0.056094382,
+          "engine": "pagewal",
+          "final_logical": 29523968,
+          "load_seconds": 1.837444514,
+          "loaded_logical": 29523968,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 28.873286013,
+          "mutation_with_ending_checkpoint_seconds": 28.929380395000003,
+          "observed_peak_logical": 33524000,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.037573563,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 58900480,
+          "committed_updates": 1200000,
+          "completed": true,
+          "ending_checkpoint_seconds": 5.137e-05,
+          "engine": "sqlite",
+          "final_logical": 29450240,
+          "load_seconds": 1.6486645119999999,
+          "loaded_logical": 29450240,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 27.3682015,
+          "mutation_with_ending_checkpoint_seconds": 27.368252870000003,
+          "observed_peak_logical": 33763912,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.032138219,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 59047936,
+          "committed_updates": 54000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.277938353,
+          "engine": "pagewal",
+          "final_logical": 29523968,
+          "load_seconds": 1.6045928809999999,
+          "loaded_logical": 29523968,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 1.106613642,
+          "mutation_with_ending_checkpoint_seconds": 1.3845519949999998,
+          "observed_peak_logical": 46300160,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.083568809,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 58900480,
+          "committed_updates": 96000,
+          "completed": false,
+          "ending_checkpoint_seconds": 4.9852e-05,
+          "engine": "sqlite",
+          "final_logical": 29450240,
+          "load_seconds": 1.675041642,
+          "loaded_logical": 29450240,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.337413569,
+          "mutation_with_ending_checkpoint_seconds": 2.3374634210000003,
+          "observed_peak_logical": 58945160,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 0.036396254,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23642112,
+          "committed_updates": 38000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.197664266,
+          "engine": "pagewal",
+          "final_logical": 11821056,
+          "load_seconds": 0.647436189,
+          "loaded_logical": 11821056,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.764316802,
+          "mutation_with_ending_checkpoint_seconds": 0.9619810679999999,
+          "observed_peak_logical": 23639520,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.06974691,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23609344,
+          "committed_updates": 39000,
+          "completed": false,
+          "ending_checkpoint_seconds": 6.187e-05,
+          "engine": "sqlite",
+          "final_logical": 11804672,
+          "load_seconds": 0.739067033,
+          "loaded_logical": 11804672,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 1.107038049,
+          "mutation_with_ending_checkpoint_seconds": 1.107099919,
+          "observed_peak_logical": 23777424,
+          "payload_bytes": 256,
+          "reader": "held",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.02095516,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23642112,
+          "committed_updates": 480000,
+          "completed": true,
+          "ending_checkpoint_seconds": 0.025862747,
+          "engine": "pagewal",
+          "final_logical": 11821056,
+          "load_seconds": 0.660305125,
+          "loaded_logical": 11821056,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 11.505510992,
+          "mutation_with_ending_checkpoint_seconds": 11.531373739,
+          "observed_peak_logical": 15821088,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.020533958,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23609344,
+          "committed_updates": 480000,
+          "completed": true,
+          "ending_checkpoint_seconds": 5.2092e-05,
+          "engine": "sqlite",
+          "final_logical": 11804672,
+          "load_seconds": 0.667814887,
+          "loaded_logical": 11804672,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 11.218265016,
+          "mutation_with_ending_checkpoint_seconds": 11.218317108,
+          "observed_peak_logical": 16114224,
+          "payload_bytes": 256,
+          "reader": "none",
+          "refusal": null,
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.013542936,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23642112,
+          "committed_updates": 38000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.220643973,
+          "engine": "pagewal",
+          "final_logical": 11821056,
+          "load_seconds": 0.886396557,
+          "loaded_logical": 11821056,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 0.906531129,
+          "mutation_with_ending_checkpoint_seconds": 1.127175102,
+          "observed_peak_logical": 23639520,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "resource limit: page-WAL managed-byte allowance; reduce the transaction, release old snapshots, or export to a larger store",
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.037762544,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23609344,
+          "committed_updates": 39000,
+          "completed": false,
+          "ending_checkpoint_seconds": 0.000291943,
+          "engine": "sqlite",
+          "final_logical": 11804672,
+          "load_seconds": 0.785810961,
+          "loaded_logical": 11804672,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 1.024686754,
+          "mutation_with_ending_checkpoint_seconds": 1.0249786969999999,
+          "observed_peak_logical": 23777424,
+          "payload_bytes": 256,
+          "reader": "rolling",
+          "refusal": "harness stopped after SQLite crossed 2x; not engine admission",
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 0.027577776,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5931008,
+          "committed_updates": 120000,
+          "completed": true,
+          "ending_checkpoint_seconds": 1.148e-06,
+          "engine": "pagewal",
+          "final_logical": 2965504,
+          "load_seconds": 0.147823647,
+          "loaded_logical": 2965504,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.860570879,
+          "mutation_with_ending_checkpoint_seconds": 2.860572027,
+          "observed_peak_logical": 4513504,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.08044572199999998,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 5971968,
+          "committed_updates": 120000,
+          "completed": true,
+          "ending_checkpoint_seconds": 5.1593e-05,
+          "engine": "sqlite",
+          "final_logical": 2985984,
+          "load_seconds": 0.171601438,
+          "loaded_logical": 2985984,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 2.887621595,
+          "mutation_with_ending_checkpoint_seconds": 2.887673188,
+          "observed_peak_logical": 4522776,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 120000,
+          "rows": 10000,
+          "verification_seconds": 0.067470239,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 59047936,
+          "committed_updates": 1200000,
+          "completed": true,
+          "ending_checkpoint_seconds": 1.037e-06,
+          "engine": "pagewal",
+          "final_logical": 29523968,
+          "load_seconds": 1.68049089,
+          "loaded_logical": 29523968,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 30.073484684,
+          "mutation_with_ending_checkpoint_seconds": 30.073485721,
+          "observed_peak_logical": 31071968,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 7.148763184000003,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 58900480,
+          "committed_updates": 1200000,
+          "completed": true,
+          "ending_checkpoint_seconds": 5.0148e-05,
+          "engine": "sqlite",
+          "final_logical": 29450240,
+          "load_seconds": 1.570043606,
+          "loaded_logical": 29450240,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 34.579411419,
+          "mutation_with_ending_checkpoint_seconds": 34.579461567,
+          "observed_peak_logical": 30995272,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 1200000,
+          "rows": 100000,
+          "verification_seconds": 8.801721847999998,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23642112,
+          "committed_updates": 480000,
+          "completed": true,
+          "ending_checkpoint_seconds": 1.148e-06,
+          "engine": "pagewal",
+          "final_logical": 11821056,
+          "load_seconds": 0.616228058,
+          "loaded_logical": 11821056,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 11.756577021,
+          "mutation_with_ending_checkpoint_seconds": 11.756578169,
+          "observed_peak_logical": 13369056,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 1.1637297770000001,
+          "verified": true
+        },
+        {
+          "batch": 1000,
+          "cap_logical": 23609344,
+          "committed_updates": 480000,
+          "completed": true,
+          "ending_checkpoint_seconds": 5.0555e-05,
+          "engine": "sqlite",
+          "final_logical": 11804672,
+          "load_seconds": 0.658792027,
+          "loaded_logical": 11804672,
+          "measurement": "Logical file sizes checked after each put and commit; transient internal peaks not sampled; metadata overhead is included in both arms; fs stat cost is inside mutation time. E4 enforces cap at every WAL append. SQLite has no total-WAL cap; harness stops AFTER a boundary exceeds 2x. Not a speed acceptance benchmark.",
+          "mutation_seconds": 13.252425576,
+          "mutation_with_ending_checkpoint_seconds": 13.252476131,
+          "observed_peak_logical": 13349704,
+          "payload_bytes": 256,
+          "reader": "short",
+          "refusal": null,
+          "requested_updates": 480000,
+          "rows": 40000,
+          "verification_seconds": 1.4862976040000002,
+          "verified": true
+        }
+      ],
+      "repair": {
+        "candidate_rows": 0,
+        "completion": "verified salvage; source not replaced",
+        "current_rows": 100000,
+        "destination": "<scratch>",
+        "format": "page-WAL raw KV",
+        "known_affected_keys": 0,
+        "limitations": "No rootless current-membership reconstruction; corrupt-WAL salvage refuses; no aggregate repair disk cap or typed schema decoding",
+        "malformed_cells": 0,
+        "max_value_bytes": 1048576,
+        "source": "<scratch>",
+        "source_length_crc32c": [
+          [
+            32485376,
+            2752309986
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "source_unchanged": true,
+        "unknown_page_extents": 0,
+        "verified_candidate_rows": 0,
+        "verified_current_rows": 100000,
+        "version": 1,
+        "wal_uncommitted_tail_bytes": 0
+      }
+    }
+  },
+  "raw_reports": [
+    {
+      "path": "<scratch>",
+      "sha256": "e26d941c1e350ba18e7b05d22cec3729131a1d08cf3ae39067d3c66690705b6e"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "d3a3babd4af548373d5ba18e9c1892d17322ab63f5729bc9c9879b43df2a37d7"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "8e5d2926430eec28c332a858bc70a92c3c96cf92a0f08b9791892ce44fc8cf54"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "6427e7430cbccece09039c609bbde92b98c4ae530b9bd411c91ded9d97d825bf"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "8659dd04956fec12a10a9d510c72e570f9ac7d9af81ac8c007f2816ea82225c8"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "8ffad347164bffd3c1d8ac486818ef719f87981af20f086664129a05bf7bfdd9"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "7b8b0469688364da97af6e69c686bf7436174e28b2dcb8458baba2925fe2fae5"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "d589dc7197342a093b9df596e8f62a3938f35a3e1d7347d36636d8f82a3128b8"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "78ec84109b5d808036a3f00bc7c59d7815cf01312b5fd6c14812c32f9143e2d5"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "3ec7b7940bd6843f1b21ba095c9fc333243650116ec58ee4f82bfe91159fab6f"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "bafe229417fdc34601de84e551920dcf07348a361a8ddab11cb427113c592ae6"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "29999f90f09bc2f0893abdcbb5ea2394d830e26a550ae2ed10aa9984a9837238"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "d0e2d28afb5becdfecde334c386718ecdb27359dc74c8737f206ede876d98d72"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "631ff11d73ace7ee6e374e356653ec9fb76f599a514b53439027c47cea8bc4a1"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "c073d7601d5a6f03dc586916807190b371b1fe305aeb4e70d5371e44ce5acad5"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "55ffafb32c9cfb93713efb4e3f3a67e91c4064ffc461681847b2fe729bb2f892"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "33696cf72699d9f3a76808f1f5fd81a5511d94bd73ea69fa49961c6249a94171"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "3e2124720cde099313eb175537fdfe422713975a83ffa623bed53a2e94beaf12"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "0eacf307ccc77bce6c3b97203f305e6a46f4020796adb483320bf53c66b5d33b"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "0da744cb3b8a8290e0c9feab25f8c4182df48a1e2ba63b0ae7a578512adda60d"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "768af67391dd2875dfb317b6097ab21e7d705881e85403868f5adb4c23186bdc"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "e74ab9b0569dc7f2d460adceb3e892ef27eca9acff3855730c58ca859ec5e239"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "d6196e0c2d1e1a1432624ddd100b430140d21681009838af7822e25e79e3ac2a"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "f020468611088b5995b39270b12a07dd2007a7b488e8ef02ac6f3e6bd101f6e4"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "2ca82608f9ff039fd8dbc677285fcc3c14c497a366a809e535a36a29e22e1164"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "f57fc5cac18886fb4200bab09a7b422dad741c180740c1e60dcf5379e05fadc4"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "01fc196a6118a5091b13809a5ba7cbb480b5f19db04bb5e7342c72dcfa0138d9"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "9204fa46ef54965547ed032990a09033dbaf156bc5a1ccc40a7ad3077c963cf3"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "cb5de1bd73b4d35978446890024776eccb2cf1a775b679915b9fe76f916d3d0d"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "0916cf563de885a36d04840aac18b9fd3909856e84d8f250af5756b82a34647d"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "767a8cffdf394beb6a043dfd79ef808feceb0ffff11fbeea39dfeacecb7e15b7"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "5008f6856fe843687f1a207ddd1a7f9de8e90498b1fb40b5e850a808751c18c6"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "f60920cf8a0fa374014914f3a0279fead5157561520d5dedf1b57f66704c1266"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "89644ad67bce85b96cc6ca2b0e0b9334be1329f7c8473bec9138e7c187d8cbff"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "f209d173155ec5925d0d57612bcab9a598d0bd81b4b0e9188c4a05e13a9fae20"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "c5507d4aef0930c15f17e710b56400e92a3a60e4d4e72e0f1d0232fc1d7c6784"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "555272b94d7d6322fb7d8d32649b09568e0d210ce027866b6e2bb2c7ac2b3917"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "4ed401fd08624c997bcfd9249ff4b4ab303fdb2c15458d2868af67a843ea628b"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "1bca3162dbbce4ad9c360093154518c20833e0c35d02a6fa5ba9426d9ad10d8f"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "e44ba8a25220a08a055152853590bb2f798ee5108cba8e1d3ed284d2921d871e"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "9a28684d408b26b6df15e3b8667519cd90134e058a50261d08f61732c6e6ae86"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "966a2b73deee3e7077aab3c74d2b5bae8ad116c61d6e8d555a02817689aacb90"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "64578885fca4f76cfe5d44d5ca6fa597347f9a6a5ba7824126aa96377213d583"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "3f5b8a2571a4aa282b557a9c95d9cd212d1cb1e47f22b47c4e9c27ab68ecfabb"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "b3f2f2cc09189bd7683b60650fce3f31a0402c2c73e3203963ecd5c83678bc8c"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "63d4badede205f45837d48ec75c3f2d0180c73eae0414180af98614988593499"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "909840e0d5c85d29aeaed2fb0fe9712609d38810b88a0feb701036cc2290397a"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "d1841b4ecf0e8bb9d5b40a023464b1fbb414842d8dcf84ceb795aedd7a610c43"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "67e8953660f99c552a2faab08110c804b1f86a749a5117276e3d309631a5dbcf"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "95a4c8935a4a24d81957796dfad724ad787e5be6e0efafe9cd8c29b9bf9109bb"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "60bd4a84e3c03450b0fb273564ff8868282760d9c3a51a2c7ace26ae075b2d75"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "76a0ac4e9f5680ebabd83c8b9727d4564abccd83b3478e6fd5766a50c701e158"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "7b427591af41eeb71d228eda88139e70ed30306b451734ea013a7a5385b148e9"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "09085fc2432a4a57d270383bb72cc83f31d7fb64d4c5d96c3d3a3b4bebf2ca60"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "18136036fbef4f82ba8e6dbce8cdecb23f9e15ad482ca9fa5a4f0f611e35e82f"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "1588a4fa353a06879164e8ed0efdfe5d10903bba8881ee06156ee6fe2ee05e1f"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "401c6e79f6ab45c65189298c29c31859e3b7cb87ba7a11a1ef632e27cf2d163e"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "2f0007fabf284ab86f89887b75532fec18449b1476ee0b6d273934c997c86931"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "9169abbc959c5ef9747e31c173e7935bcb9f445c3b66498939386a37df4dc44e"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "e8fbdcc4d294ad4b01452881d4df6b460fd264a29023cf71886e33a4d86d0475"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "3e1785a8f16275490db78bb9ca4e99439ebef6ea5953c1fba50047b792f506cf"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "b497b2a62895c31e2a6f10d509aa525e24d61447eaa13b8fa84f1d123f8e746c"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "b50895f6470112b0234f7cce1c6adeeec7765e9220725529d5cdc34b435731c5"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "e43d9ef7609c3b304f6ebe3f41896e0fabcfab8dd281d0ac924044836a4e2d40"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "167f472151e70b4391b5599ac4832cad06cc90e644cc25ca47d484baf68315d6"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "5396d721a155b6b7a50745dd9e088ed88b27e02b42f8b12627b35b6dc4e4ff85"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "54100f71c31f10481fcbff96e28d0cbf886f4d36b89d6adc65ddbb4a0d939aeb"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "88023cc72503da11c561bb9773b4ca2f8dad5deff957fdc54b8a063ec57ff574"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "e29a617abf56f4db9bdca6f9018993b92bc029e749faf9d1be8f7e8551f45c4c"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "775cdd3c4693b7eb08776339d1c779e5b0b6717dd6ff57336ccc9eba37a781b9"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "dcb7cfa8d0d1f1bbb4d74f6eed3d96af09e47e7485111f49717bf9de3c03163d"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "49b6ed662dd2d43743e27a9d54ce87452fc62316dc749be3f638e6174c3122a9"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "c9c6f7e275b44af653e5d54747973ccf328359ed69a9e1176601d42807761639"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "f4df3ec5f58060f6dc79389c4b606a564c0989b418315e20d964a143a8beb093"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "b12fab4cfcb413771b7dd1af822830e9d3eec9ef14f7afa452ae0320d2b18294"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "64f7de674e089bc0f92e085a83d6d38b6beed63e4949801a9d9f4beba30720ea"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "04b844ecee0a6ffd8189d4be44cc61dcc21994e1a0b3cf44f7c37f70c71fdc6a"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "a0450257649a4f1d2520f3bb2bc7402e3cdc8e4fe38bbdfbc21ab461399ea3e3"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "cc88e7ea874b2098af2aab99eabe9708479a8c4df4170756193b1fd3902a88bb"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "b766f21294841dafee39d9d8353475d11075dce80120a9842657ece9424b8ba3"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "738bcf04826b5f3d7d09ebb99fa354dd1de4a5eeca8cd672e0e2278f83bea0ce"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "65545a3eb706625d8ebaf3bc4d4cf0e94be49efd37500b9a22676606edb291c7"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "8d9d7ea657deb4161a914f06b2da60eec23c1e11c262d69498ac68307fb9544f"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "3a88e1b61f0b45c04909e8f638edfb0b9575896523d89ddb8abe380bd59a136c"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "5fac5fe2774bbd7c69f73d132aaa3fcd61cd7517467b1bb891ae6af48bd942a5"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "ec0454a5f9e9b8f71a3b55500d3e8ac6092ab2234c7a82b1733c237d32f712de"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "ee6581e2ed974e30c6bd62c58ed0aa7aad684c39a04fdb4c952607d1fbf1d8e2"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "49bfe9fd792d7c95d57d34b798b9a5d5aee05b5f24951a256f791619f17b007d"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "94f14e05d2a7a1356f7d4d7155d6affdcc79b2a060adf4601e35cdc3b494a850"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "95a093febb53bd7faa0ffea94c6c5dd239c9cec2e2247f029a6916ba6d6fb7ec"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "9213682961351fe070b9df74d0f09fd3251f9232416e9fdba8a09831a98c3b0f"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "d65fb8f8ed255eff5c460f350531dff1b6007bb9035cdac199203dfc9741b1cd"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "f144adf7f5aa7323f8b682393d4cb19a04ef1c3d4d2ec29c5e9b1b06240bd0ee"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "dd30b10f45f430f94c7b70a2b1609b075893bd120d548fc644b2cb94b911aef2"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "d3c0fc7fb4e0ed3823318facb7b4773a51b1372c06c5c53cc44b58709210a0ff"
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "10e8ccf999618a9edfa702908d50614d0ad62ef54dc390c962ad871284907599",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "80305b4ce2947409be56f9820d50f07c3ca87b67894ac347400af4ecaf413df0",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "23e4eb639f7c2891409800713199927ba30b12a3e806ca7428b8ae03a972592a",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "5eda5de368491f6fbabfad3baaa0babe14b6b90d9d6f3fd4249148303df0b359",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "666146e6ea4a1895e044c50980bb64b0b2d2473c75cb708c5c1ae057f3268a0b",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "97cd64ed53ad272c79606aaa465d0a2e40762f45430db77edd7ff6c00ddaaa8a",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "7fb00da5a22825c91b68f91f7c4dd69365610d017306835ba9b2499b13f0ed25",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "8171b80e6639b997a01e9de654ee5ade205e68bf801f58d0da32956938e98ce9",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "04129c836eb73fd21e859999533e61a1ffebc600219650d9d82b0a21d896fa4b",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "86531eeb236eb94f5efc6673835808041cf57cd1d93a0a8d97875f75e86bdf6f",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "579575d82acaafc6af9b33f8e5feaa24caa78bda74f4ffb3c0044e62418615ef",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "681d542b78ff013f81b463087fce1dbc74533f18dc1aa4034ed63f5b9dd2ca08",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "b028903aef064cf559e243c90d2b20731ec9553459826ab2adc52d1145bed80d",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "2cff51741442c5433a597f8642d0e8a042636a588e2647de6c6343b2ffd79c96",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "0d6dc962fb2f00d81459a59ff414a4cf1c7414c7b454dae6106d6933f5bc2a16",
+      "timing_excluded": true
+    },
+    {
+      "path": "<scratch>",
+      "sha256": "17845e095fe3c4d28f37d92086091425151aa27169d0457337cd4a49f6a67c73",
+      "timing_excluded": true
+    }
+  ],
+  "promotion": "Not promoted; remaining F1 law gates and failed accepted control remain explicit",
+  "mac_contended_run": "matrix-contended excluded from timing acceptance",
+  "accepted_production_files_unchanged": 94,
+  "frozen_provenance": {
+    "source_members": {
+      "Cargo.toml": "86624f687eabb6715055a7437a3e6fc0baf5fbef872dcebd2d0577d0fa22d984",
+      "Cargo.lock": "961460c1f9606bd3f0b9e01aab8a2af337d3d285f71db5ede97aea260b13b49d",
+      "src/pagewal_fault_tests.rs": "b161b0a158e2fcd922fdaeb6b1c0171760967695fea0d6ef8bd7e1bb3b163130",
+      "src/recovery.rs": "3a0a74472799e2fe37f9e049e42d29cb30c76f311ab11269dab591c28ba798ba",
+      "src/lib.rs": "c2ddd38538ee1d5e1c07a40eaa0a0a899ff805d0e99ec7d7a42c828460bfe0e6",
+      "src/pagewal.rs": "bae996100c30c2e01b9d03df1bbab92aa3324c3efbe8b484c4b11a13dd953be5",
+      "src/main.rs": "0749bb0aee626a9d2840c8e9ab7178acc4889b1e7ecff0c921495d40cdfc450f",
+      "src/dense_v3.rs": "05463f7ac97399409af9397dd6d537881e5566a861dca982749c951f387474ec",
+      "src/collections.rs": "7c077ba8ed1a43d56f4178102f13db6dbc1650424cce59d53cc6aaeef73b2fa9",
+      "src/bin/pagewal_repair.rs": "67d5201bf9fa66ad7de0d1bda926760e984bd245979c50429863f00c97c2a41e",
+      "src/bin/pagewal_bench.rs": "888fa8f4ce66a58c373a5ae49f0603650feecb84185fd0324eceada27ae4408c",
+      "src/bin/collection_inspect.rs": "a73e3b5e32099356f03be1f227a69d58beff80b79fbe71dbe0fff280e458f51a",
+      "src/bin/recover.rs": "abb500188515022a982efb47847584b4fb01d65f1eee0f4d836a24ca7c4292ca",
+      "src/bin/pagewal_cap.rs": "b94782aeb4b221be3f424171bc714f5b4ec27a73b4db917e2bcd16229f4d11ab",
+      "src/bin/entry.rs": "41e7d0e7fa40c29d8cfb2590ca5d031fbf322a372ee94989e02223a391e3b722",
+      "src/bin/lifecycle.rs": "77447f2204e6fa0727aa09645f8568a7fab36258900a5b68fb4edb007abed3bf",
+      "src/bin/collections.rs": "d9f5e29b00aa79fde28cf758be4d6beaf60d3207cce5c53a490f415e60a19ef9",
+      "src/bin/people.rs": "31a06f2e33ea7cfb4ccea48309ed3fdf70ddda69e3e4061388a61b75b78a11b3",
+      "src/bin/lifecycle/sustained.rs": "09a00af3e47353f9a4d8910cf44f135db245257327b5e7cce327ddde0a0d1663",
+      "src/bin/lifecycle/space.rs": "0b56a34c1f2803d16b344e292183c7114963d5100c99fc227c7d36ff8a6f03c7",
+      "src/pagewal/repair.rs": "68121b4a25074b4a1f9ac911910fd4d9b5b086b09f65c473f4dd8257a5337f1e",
+      "kernel/Cargo.toml": "0b6f4798e464f2e245a832276240204f765e05987b0f9dee17fc9146fbaf182e",
+      "kernel/tests/delete_reinsert.rs": "c1d752c6f6eb47c449fd96f008bd322f568c12c22b33bca736a0f004dd476b25",
+      "kernel/tests/pack_memory.rs": "f162879fc02efcf3e1b2eeb08a7ea5241f4c63ff65968bb8fee33009f9384f0b",
+      "kernel/tests/platform_invariant.rs": "f561b73ac290b7ce6f2792e9855eaab7ec759edda87464a2b9c5b4737d3ae11a",
+      "kernel/tests/props_laws.rs": "c5981b00909a89351d76a82c24f3dacfed7a6276422519b7feca6c3beb76069b",
+      "kernel/tests/overflow.rs": "7e57ba3fb4dd75a0b1f866a64f99c0835645810e959894dba8e7488f2261e01b",
+      "kernel/tests/graph_clustering.rs": "e097116069569513e1f89b317ad0b2aaa2f3962558c7809a5704c562073381d2",
+      "kernel/tests/vector_defects.rs": "1b79c9ec6a06f0aa7496980cae594f9971ff278a93d67687bd3fb47963105add",
+      "kernel/tests/text_laws.rs": "9c0cea288a508bd14d3e36f38117f01dadec9bdec3ff99d2d9127e64f0bab03f",
+      "kernel/tests/hybrid_score.rs": "0efb774de702b4ee8553a22bed479ee1e2d38297736062de01e0f41c59d894bc",
+      "kernel/tests/bulk.rs": "62d061052bd48d6752fbab123c37a907525024159fdf0de557f2a4560b24ded4",
+      "kernel/tests/graph_model.rs": "fcf9d67ade3fa44ad8cdba5b975abb69c3bed129e0a4844a9abcd7bc5bd8badf",
+      "kernel/tests/recovery.rs": "3d447608f74061587cb50917e78313ab7eb4ea99dd2963642452abd131fe1830",
+      "kernel/tests/vector.rs": "d7f70361bcfecbf4488d5bc3ba4451532b638357e7aa64c1bb4c67314651429e",
+      "kernel/tests/graph_law1.rs": "7a4985c724f6ada1a6befe7e021bda79c1fd671791dc779677b7e66a41ef1543",
+      "kernel/tests/seekrepro.rs": "9b0757020e446c7c1d61f1d8232db544ce260d8cf63127bbbe752a2912c0f631",
+      "kernel/tests/overflow_laws.rs": "34b8e30fd833db2bcd6260ceaa8c721b75bcd5fabf82404323bc330772e75b2b",
+      "kernel/tests/persistent_free.rs": "bce39d87cfc6c10bb68eb0a57ad68e2532ad1c5d21d4d77011ada82a980d8813",
+      "kernel/tests/spatial_index.rs": "552a3a69391b7a40141432d9977707cbfddd144ba18253eedb0cdddd3a2e87d7",
+      "kernel/tests/vector_index.rs": "2eae82be84b3c6b21c689a5b265eac1918711ae793e1340337160c5bf30447ef",
+      "kernel/tests/graph_props.rs": "f4132abea134d8300078bb3370e434e34d2da720f1816fcd2a1dc7b3f3038bfd",
+      "kernel/tests/resource_limits.rs": "ddf8447517e1541eff918f4afd450c30f71e26eceb24467f12f8b8a9b5d487b1",
+      "kernel/tests/graph_ctx.rs": "894993cc72bf27eb095c614cfbdad51ade5a9e2293bf9257be7b34d3bf3b53cd",
+      "kernel/tests/demo_parity.rs": "ba8b2a54834af5b16e540db64116cf2e3a35e347d21c1af0447c4984da28445b",
+      "kernel/tests/graph_crash.rs": "201015cc0c41501e5ef9ecbf7c355546ff5edc709da314997cd43f6f4826c4a2",
+      "kernel/tests/vector_laws.rs": "494944490e3d44cc9bfea84edbff7c35a1f0689b6a2595f18681137783a08b4b",
+      "kernel/tests/pack_shape.rs": "fdaacdbe82039a41aa1573eb52799128f19eab54a96b7eb0f3d3779e528ad116",
+      "kernel/tests/text_search.rs": "9c7152eb87940d7fa94c98e3d0a980db2612aaba50680c2b72e8ae0c9f2045d1",
+      "kernel/tests/freelist.rs": "dfae190f5b8a8ec587ec5c6655ed64b1a0d6a4b83aa689c41451aed2599b9d9c",
+      "kernel/tests/snapshot.rs": "93e52a56dcf21b1cd2e1414ff8158a71f3e2d088776e38c70dcd1b9e4321b1de",
+      "kernel/tests/spatial_laws.rs": "4912edcab93860b58c88440bc04ad256479a5c7515b3902ac216ca4400c3a346",
+      "kernel/tests/writer_lock.rs": "b7313751e99f541d81ff08622e18cbded0f7db3b54cfa4e5025de8aee9c3021c",
+      "kernel/tests/graph_law2_reads.rs": "fff1bf5f3d458f9bd7ec050d971fa5fb3a93b75eb65bee117093ebccbf88f4ae",
+      "kernel/tests/law1_heap.rs": "006988e1bc7c53023803908991e4bb6d670a75235538a321e53512e263fe4406",
+      "kernel/tests/law2_shape.rs": "f3610b453eed416b38a0e73b7769b7cf9361a7deeedce9ee2d15e0418048e178",
+      "kernel/tests/score_laws.rs": "49e50d83a0aa1dd59af60988c1285ecec040413f1938323f04c84f4456e39fb9",
+      "kernel/tests/durability.rs": "186f404828ec46a32bbe09ebb139cda21e8037128e721e7a39c6457644fa7808",
+      "kernel/tests/corruption.rs": "e0ee8e9952ad7271684bb89ef3a57c8da183f1e2ec0b0308341f8c819d72d6e3",
+      "kernel/tests/model.rs": "448193edab52a50f91d91b44c519cf611f8ea820bd5e3676bedb4b54c703add0",
+      "kernel/tests/corruption_bounds.rs": "278d02acdbde76c681578021f091fb49d5fd70eb7a9e5e717541f32d8fda736a",
+      "kernel/tests/published_tree_structure.rs": "326d09c44d873714438613f127e30f5044e08d600cece97719cc708153f6022c",
+      "kernel/src/keys.rs": "f80a63317a10ea6c6210f0368f2dbb0a1a582e204943e82e23ecbe08b0ad725e",
+      "kernel/src/page.rs": "fd994bfc7c577f815819c31ef2ce85a61e969baa66005348aea753e85a8f1d82",
+      "kernel/src/vecquant.rs": "a3ae68b71d8b70293e713187967b24b8883181879655aa2ac9c79175f82d31a6",
+      "kernel/src/spatial.rs": "31d9b301b0229d169ea2990c4106a95267ffd6f4631a192a95c304f216b912c7",
+      "kernel/src/wal.rs": "c2dc1ae499511e0f0b0987cae73b566f3d20814616cb5c3d1e6f435b769598c9",
+      "kernel/src/btree.rs": "81b9c6f901088881512b7cf70019de6b07ea1730c63845782b9fa2e24322808f",
+      "kernel/src/budget.rs": "cb9e6ba8bf78575d57c2c553f2f53d5eb468278dab97ddc8e0d5d8b13935232a",
+      "kernel/src/bulk.rs": "eb0d8780ebf20e2b44a296757b829d3ec6cd17af34abd7b1754fce0129907167",
+      "kernel/src/io.rs": "9f976e9daa26d95c71d268fe5e90dcb06ce5e046f9eed228a32177be34141237",
+      "kernel/src/graph.rs": "07f27e65614e94d61edac2d49f6ca9a93a830f6a218b10a31a57f7ec80983769",
+      "kernel/src/readers.rs": "2aba753acf57327b143d3fcadf2e3714c2453dc726dc15f3b6fcb1b547fab193",
+      "kernel/src/lib.rs": "2aca86675b936aa9e6df579e21c227ea602c8f72b83df4e1520556f840352c9a",
+      "kernel/src/limits.rs": "ff24ced7c738752b9f2c8ad147b7b1baf6112b739176b79f107eac7094239159",
+      "kernel/src/store.rs": "5bfe4cb9376ae6655f20d84eebe4a0ae4d8f24dbc1e808a269694ee82bfd6a7a",
+      "kernel/src/test_support.rs": "e4500a44824bd323787450de8d91eb2ebc8881c2854bb18074818e8d00e4d626",
+      "kernel/src/write_stats.rs": "8a274626bf3e73231477bba8cf6053f4a42abb7b958e71fb4fb25c05de93ea71",
+      "kernel/src/meta.rs": "67a868158d72987742d5dbc65b128da152816fc166043d0259b068d5aa2c5485",
+      "kernel/src/geomath.rs": "18cb6413533c3893386e6267ff6e78343f90fa903176c464994135135dfdadbd",
+      "kernel/src/recover.rs": "656aee8c12567bb119ca5bbb556f206daa631381ec51ba6de02455aee293751e",
+      "kernel/src/score.rs": "10a36df051cacc595b68315a632baefe1c6f46910a37470f0ae564100d465e38",
+      "kernel/src/verify.rs": "b9517e382b1d11237dca102e48349aeec17e36e729008abd8675e72456aa500b",
+      "kernel/src/pool.rs": "dd3fbccf7fb1c2f40ee6d54ef634a7a7579b3f7c448eac0e2cce33b3632f0137",
+      "kernel/src/text.rs": "3cfc8d5c0616e782dc3c701d12f722000ef809ad46d40ad585d58555a38aded4",
+      "kernel/src/write_trace.rs": "11a604f5c314c3c6fa5beb802f36d8403472ba59a4487a22a13d779d98366aeb",
+      "kernel/src/nav.rs": "26aba3177c781d0740b8161fb03e01b89f29dc9c7e512e260f47f00274947977",
+      "kernel/src/recover/safe.rs": "f900480c3519e1d1a5457e59a7b9c447d9f8966ee4f3770f942166854c6105da",
+      "kernel/src/recover/reader.rs": "33f17fe6e05336ec2f6dfe9f1c931da5da5abb3e1159990a3139c58b34a4d7a0",
+      "tests/codec_allocations.rs": "d4c31250124b768c9a299147567eb7dee13d93d951851431aac88726f840350f",
+      "tests/pagewal_repair.rs": "9810e924bd6ee840a7660363edec8f67537504a602cb0a35be4c183d31ba5dc5",
+      "tests/byte_checkpoint.rs": "5ef1676d8ae49e517586260da24f631968f4c77f57fb3093370b5e11287198b7",
+      "tests/version_reuse.rs": "7d3def160c4bbc25d9e949bba19bd82da3231e5c7d449e305a4867a8b100b025",
+      "tests/entry_density.rs": "55d29a6339dcfab95067facc3fbf8a3e76430454918f43566287d77e90d29c30",
+      "tests/schema_recovery.rs": "b3df21084bd5c3e6fd870aa464d283a9ebc68c1eae95802934574756a6c02ae6",
+      "tests/overflow_lifecycle.rs": "6020716a497a9e821f98a02a2f500db9841b95363a2480949d1fd14b0641cff3",
+      "tests/recovery_faults.rs": "25223c7a2f6ae8d249e994f6d5e14021098c38f974cb95ca8930906fec9a9385",
+      "tests/pagewal.rs": "113eeb9242cbeffd512d68c44ea2e25205f926c57b64f27e5b08e97b2201b1bd",
+      "tests/codec.rs": "d228a8585b79d5236402a1ba4d5aa1ea1f85d6b9a40d686ed341b6946229bd8c",
+      "tests/write_path.rs": "c08fe545a1ce422451caf0698b7f14ae67de99b1cb79efa3439268134c3de0d0",
+      "tests/delete_packing.rs": "8d62e9d5fd4e8aaccc271624b116a1160c35ab89393fd91792fcc93be9898fdc",
+      "tests/reader_release.rs": "873de388d3c7df28a2ba056d23878fe1dcea06764df3ee9ce107167a63f60335",
+      "tests/collections.rs": "dd0cd9c5604f7bcce4a9b808ed9e21bbca461a0284c00eda8c191722590e5931"
+    },
+    "artifacts": {
+      "source.tar.gz": "5bb5e4648e8703e4b1122f39eda9606aad4ee910cf467866e70eeec87d6a5b4b",
+      "pagewal_bench": "0ae08fb8eef53c66152dd1d4ce9bf78fbc0167f9ab075c3cca8deb02d75fbd22",
+      "pagewal_cap": "d8bdd5b39367d3ec3538cbf92f592d43c13ba7bb1f6b53127312310a577d323e",
+      "pagewal_repair": "27ffa90c1820a7e7181123a4b5ee3fe6442c251ac2f06ac9ac170a96cae7e2ea",
+      "control": "253c7fd45ae4f874d6043c19cad3413559215857170cc0f28488b6e822d3f2b9"
+    }
+  },
+  "short_reader_harness": {
+    "source": "/tmp/e4-pagewal-qualify/src/bin/pagewal_cap.rs",
+    "sha256": "0954238bfeaf53c92573ea10724f55ca88a285611c497575593cce40f27b1d2b",
+    "mac_binary_sha256": "1fd707e66c23a90a9514f39c7d7cd7cadaa2b91822daced1e3babf11800ceadf",
+    "engine_changes": false
+  },
+  "tests": {
+    "mac_distinct_entries": 360,
+    "pi_selected_entries": 27,
+    "includes_subprocess_helpers": true,
+    "io_fault_cases": 356,
+    "ordinary_and_simulated_power_loss_reopens": 712,
+    "repair_fixture_cases": 8,
+    "mac_log_sha256": "f4f57688ca97acef5180789e0a1b819d17d86849266806f4294d92ec032afb75",
+    "pi_log_sha256": "4c6518a392ad589a85c31ef9ed1bd5995c8d8c639a20c0900f70356209ddb416"
+  }
+}

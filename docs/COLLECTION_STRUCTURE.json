@@ -1,0 +1,14 @@
+{
+  "three-cycle": {
+    "nonreachable_nonmeta_pages": 480,
+    "physical_pages": 41148,
+    "reachable_pages": 40666,
+    "records": 1200029
+  },
+  "sustained": {
+    "nonreachable_nonmeta_pages": 483,
+    "physical_pages": 66075,
+    "reachable_pages": 65590,
+    "records": 1200029
+  }
+}
