@@ -23,6 +23,19 @@ prior context.** Read it top to bottom before touching code.
 
 ## 0. Why e4 exists — the finding that forced it
 
+**Linux allocated-space loop (2026-09-15): significant allocation result, no
+runtime change yet.** Independent controls identify XFS reservation beyond EOF
+under the server PVC. Batched explicit reservation around the unchanged E4 binary
+reduces worst sampled server allocation from **263.717 to 126.878 MB**. At 400K
+rows / 1.92M subsequent changes, current E4 / batched E4 / SQLite take
+**102.651 / 107.950 / 118.544 s on Pi** and **58.248 / 58.705 / 49.444 s on server**.
+All 40 database arms verify exactly; logical sizes remain **121.229 MB E4 /
+129.446 MB SQLite**. The per-write allocation variant is rejected for cost.
+The batched diagnostic is not shippable: it reserves 1 MiB for a 4 KiB file in
+a separate test, so reservation must enter the engine's disk-budget accounting.
+The physical-cap gate remains FAIL. See [the allocation investigation, complete
+comparisons and next implementation requirements](docs/ALLOCATION_LOOP.md).
+
 **Linux qualification (2026-09-14): packing retained for density.** Full corrected
 workspace suites pass on Pi and server, plus **162 exact benchmark arms**.
 At 400K rows / 1.92M subsequent changes, Pi baseline E4 / compact E4 / SQLite

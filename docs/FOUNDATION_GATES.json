@@ -556,7 +556,7 @@
     {
       "id": "ALLOC-CAP",
       "status": "FAIL",
-      "remaining": "server overlayfs reports candidate allocated peak 263061504 bytes from 110202880 loaded bytes (2.387x); baseline and SQLite also exceed 2x. Logical admission is not a proven filesystem/physical allocation bound. Pi measured peaks remain about 1.14x. Identify allocation semantics and qualify a genuine disk-full budget before claiming the 2x physical guarantee."
+      "remaining": "server overlayfs reports candidate allocated peak 263061504 bytes from 110202880 loaded bytes (2.387x); baseline and SQLite also exceed 2x. Logical admission is not a proven filesystem/physical allocation bound. Pi measured peaks remain about 1.14x. Identify allocation semantics and qualify a genuine disk-full budget before claiming the 2x physical guarantee. Follow-up controls identify unwritten XFS extents beyond EOF beneath the server OverlayFS PVC. Batched explicit reservation around unchanged E4 cuts fresh worst sampled allocation from 263716864 to 126877696 bytes; its median mutation times remain below 1.5x SQLite on both Linux hosts. This diagnostic does not account reservation against the engine cap: a 4096-byte file receives 1048576 allocated bytes. No runtime change; integrate bounded reservation admission and validate refusal/recovery plus any required filesystem allocation boundary before claiming a physical guarantee. See ALLOCATION_LOOP.md."
     }
   ],
   "qualification_v2": {
@@ -719,5 +719,19 @@
       "baseline": "62688e3946ac26f3d56b9bc24e0946718ff7aa10d43054e9ac51b787140c5ee3",
       "candidate": "190ce364762660d6ae3dfe0fad4f342c5d600e50c804a59edd9357c8638f3a3a"
     }
+  },
+  "allocation_investigation": {
+    "status": "SIGNIFICANT_DIAGNOSTIC_ONLY",
+    "runtime_changed": false,
+    "production_promotable": false,
+    "report": "ALLOCATION_LOOP.md",
+    "raw_results": "ALLOCATION_RESULTS.json",
+    "database_arms": 40,
+    "large_400k_arms": 36,
+    "independent_108mib_controls": 10,
+    "tiny_controls": 4,
+    "per_write_variant": "REJECTED_COST",
+    "batched_variant": "RETAIN_EVIDENCE_FOR_BUDGET_AWARE_PROTOTYPE",
+    "physical_cap": "FAIL"
   }
 }

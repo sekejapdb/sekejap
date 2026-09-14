@@ -1,0 +1,14 @@
+{
+  "talos_node_mount_read": {
+    "command": "talosctl --clusterconfig <home>/ --endpoints 203.0.113.20 --nodes 203.0.113.20 read /proc/mounts",
+    "raw_sha256": "7d658fffdfd389eceb25a1ca9f7245d32bbf9eee228c6f89a9d73f03537f5b56",
+    "relevant_lines": [
+      "/dev/sda5 /var xfs rw,seclabel,relatime,inode64,logbufs=8,logbsize=32k,prjquota 0 0",
+      "none /opt overlay rw,seclabel,relatime,lowerdir=/opt,upperdir=/var/system/overlays/opt-diff,workdir=/var/system/overlays/opt-workdir 0 0"
+    ]
+  },
+  "mounts": {
+    "pi": "TARGET SOURCE         FSTYPE OPTIONS\n/      /dev/mmcblk0p2 ext4   rw,noatime\n",
+    "server": "TARGET      SOURCE                                                                                                          FSTYPE  OPTIONS\n<scratch> none[/local-path-provisioner/pvc-bf257d9f-95f8-45af-8e54-7b020393eae2_sekejap-benchmark_sekejap-benchmark-data] overlay rw,relatime,seclabel,lowerdir=/opt,upperdir=/var/system/overlays/opt-diff,workdir=/var/system/overlays/opt-workdir\n"
+  }
+}

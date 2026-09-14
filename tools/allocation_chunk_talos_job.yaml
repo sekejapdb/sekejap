@@ -1,0 +1,39 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e4-allocation-chunk-20260915
+  namespace: sekejap-benchmark
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400
+  template:
+    spec:
+      restartPolicy: Never
+      nodeName: server
+      priorityClassName: benchmark-low
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: bench
+          image: rust:1-bookworm
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              art=<scratch>
+              mkdir -p "$art"
+              while [ ! -f "$art/chunk-start" ]; do sleep 2; done
+              python3 "$art/allocation_bench.py" "$art" chunk > "$art/chunk-bench.log" 2>&1
+          resources:
+            requests: {cpu: "1", memory: "512Mi"}
+            limits: {cpu: "2", memory: "2Gi"}
+          volumeMounts:
+            - {name: data, mountPath: <scratch>}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: sekejap-benchmark-data
