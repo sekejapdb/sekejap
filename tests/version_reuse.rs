@@ -15,7 +15,9 @@ fn cfg() -> Config {
 }
 fn exercise(reopen_every: u8) {
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>"));
+    assert!(base.starts_with("<scratch>")
+        || base.starts_with("<scratch>")
+        || base.starts_with("<scratch>"));
     let dir = tempfile::tempdir_in(base).unwrap();
     let mut writer = Store::create(dir.path(), cfg()).unwrap();
     for id in 0u32..1024 {
@@ -80,7 +82,9 @@ fn every_reopen_preserves_version_lifetimes() {
 #[test]
 fn corrupt_or_impossible_persisted_lifetimes_never_enable_reuse() {
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>"));
+    assert!(base.starts_with("<scratch>")
+        || base.starts_with("<scratch>")
+        || base.starts_with("<scratch>"));
     let dir = tempfile::tempdir_in(base).unwrap();
     let mut s = Store::create(dir.path(), cfg()).unwrap();
     for version in 0..3u8 {

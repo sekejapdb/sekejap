@@ -82,11 +82,18 @@ fn recovery_prefers_higher_generation_over_higher_page_number() {
         let tid = u16::from_le_bytes(page[8..10].try_into().unwrap());
         if magic != 0x53454B32 || kind != 2 || tid != 1 || no as usize != i || nentries < 10 { continue; }
         let off = u16::from_le_bytes(page[40..42].try_into().unwrap()) as usize;
-        let klen = u16::from_le_bytes(page[off..off + 2].try_into().unwrap()) as usize;
+        let raw = u16::from_le_bytes(page[off..off + 2].try_into().unwrap()) as usize;
+        let compact = cfg!(feature = "compact-cells") && raw & 0xf000 == 0x4000;
+        let klen = if compact { raw & 0x0fff } else { raw };
         let key = page[off + 2..off + 2 + klen].to_vec();
-        let vlen = u16::from_le_bytes(page[off + 2 + klen..off + 4 + klen].try_into().unwrap()) as usize;
+        let (value_at, vlen) = if compact {
+            let slot_len = u16::from_le_bytes(page[42..44].try_into().unwrap()) as usize;
+            (off + 2 + klen, slot_len - 2 - klen)
+        } else {
+            (off + 4 + klen, u16::from_le_bytes(page[off + 2 + klen..off + 4 + klen].try_into().unwrap()) as usize)
+        };
         if vlen != 20 { continue; } // want a plain value record, not a marker
-        found = Some((i, key, off + 4 + klen, vlen));
+        found = Some((i, key, value_at, vlen));
         break;
     }
     let (low, key, val_off, val_len) = found.expect("a decodable leaf");

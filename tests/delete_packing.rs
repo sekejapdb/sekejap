@@ -12,7 +12,10 @@ fn cfg() -> Config {
     }
 }
 fn dir() -> tempfile::TempDir {
-    assert!((std::env::temp_dir().starts_with("<scratch>") || std::env::temp_dir().starts_with("<scratch>")));
+    let tmp = std::env::temp_dir();
+    assert!(tmp.starts_with("<scratch>")
+        || tmp.starts_with("<scratch>")
+        || tmp.starts_with("<scratch>"));
     tempfile::tempdir().unwrap()
 }
 fn key(tag: u8, i: u64) -> Vec<u8> {
@@ -326,7 +329,10 @@ fn damaged_merge_sibling_refuses_publication_and_preserves_healthy_leaf() {
         (0..p.nentries())
             .map(|i| {
                 let rec = p.slot(i);
-                let n = u16::from_le_bytes(rec[..2].try_into().unwrap()) as usize;
+                let raw = u16::from_le_bytes(rec[..2].try_into().unwrap());
+                let n = if cfg!(feature = "compact-cells") && raw & 0xf000 == 0x4000 {
+                    (raw & 0x0fff) as usize
+                } else { raw as usize };
                 rec[2..2 + n].to_vec()
             })
             .collect::<Vec<_>>()

@@ -4,7 +4,7 @@ use kernel::page::{self, PageKind, PAGE_SIZE};
 use kernel::store::{Config, Store};
 use kernel::Error;
 
-fn forge_oversized_value_length(dir: &std::path::Path) {
+fn forge_oversized_record_length(dir: &std::path::Path) {
     let path = dir.join("data");
     let mut bytes = std::fs::read(&path).unwrap();
     let mut forged = false;
@@ -19,8 +19,14 @@ fn forge_oversized_value_length(dir: &std::path::Path) {
         }
         let off = u16::from_le_bytes(page[40..42].try_into().unwrap()) as usize;
         let klen = u16::from_le_bytes(page[off..off + 2].try_into().unwrap()) as usize;
-        let vlen_at = off + 2 + klen;
-        page[vlen_at..vlen_at + 2].copy_from_slice(&((PAGE_SIZE - 1) as u16).to_le_bytes());
+        if cfg!(feature = "compact-cells") && klen & 0xf000 == 0x4000 {
+            // Compact values end at the slot boundary. Forge the remaining
+            // length field (key length) while retaining the compact tag.
+            page[off..off + 2].copy_from_slice(&0x4fffu16.to_le_bytes());
+        } else {
+            let vlen_at = off + 2 + klen;
+            page[vlen_at..vlen_at + 2].copy_from_slice(&((PAGE_SIZE - 1) as u16).to_le_bytes());
+        }
         let generation = u64::from_le_bytes(page[24..32].try_into().unwrap());
         page::seal(page, generation);
         forged = true;
@@ -38,7 +44,7 @@ fn damaged_record_store() -> tempfile::TempDir {
         store.commit().unwrap();
         store.checkpoint().unwrap();
     }
-    forge_oversized_value_length(dir.path());
+    forge_oversized_record_length(dir.path());
     dir
 }
 

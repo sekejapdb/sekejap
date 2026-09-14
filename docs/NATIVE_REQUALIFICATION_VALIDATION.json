@@ -1,0 +1,38 @@
+{
+  "pi": {
+    "baseline": {
+      "reported_executions": 367,
+      "failed": 0,
+      "ignored": 2,
+      "log_sha256": "736cfa1e7f28407b2b43ce27c8d5f1fd2ae7197b03be95dcca75e460f8e23644",
+      "count_note": "Cargo result sums include subprocess helper executions",
+      "features": "sqlite-balance,compact-cells; test-support from workspace dev dependency"
+    },
+    "candidate": {
+      "reported_executions": 371,
+      "failed": 0,
+      "ignored": 2,
+      "log_sha256": "7511fec568e2d39a8edb137f3d94f6247e8852cc353567da1fcf5068ae1e669a",
+      "count_note": "Cargo result sums include subprocess helper executions",
+      "features": "sqlite-balance,compact-cells; test-support from workspace dev dependency"
+    }
+  },
+  "server": {
+    "baseline": {
+      "reported_executions": 367,
+      "failed": 0,
+      "ignored": 2,
+      "log_sha256": "ca0caa08fde44323832fa74688af6178cb75216fd957147ea2660ecc5c86c0c3",
+      "count_note": "Cargo result sums include subprocess helper executions",
+      "features": "sqlite-balance,compact-cells; test-support from workspace dev dependency"
+    },
+    "candidate": {
+      "reported_executions": 371,
+      "failed": 0,
+      "ignored": 2,
+      "log_sha256": "a9d977e638c21015226c740c5a73a82341324b362a7566e77ca94857a5fa75ca",
+      "count_note": "Cargo result sums include subprocess helper executions",
+      "features": "sqlite-balance,compact-cells; test-support from workspace dev dependency"
+    }
+  }
+}

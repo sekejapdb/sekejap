@@ -9,9 +9,13 @@ assert str(base) in ['<scratch>',
     '<scratch>',
     '<scratch>',
     '<scratch>',
+    '<scratch>',
+    '<scratch>',
+    '<scratch>',
+    '<scratch>',
     '<scratch>']
 assert mode in ['probe','qualify','tradeoff'];candidate=sys.argv[3] if len(sys.argv)>3 else 'combined'
-assert candidate in ['compact','packing','combined','pair','compact-pair']
+assert candidate in ['compact','packing','combined','pair','compact-pair','candidate']
 probe_arms=['baseline','pair','compact-pair','sqlite'] if 'pair-packing-20260914' in base.parts else ['baseline','compact','packing','combined','sqlite']
 out=base/mode;out.mkdir();(base/'tmp').mkdir(exist_ok=True)
 env=dict(os.environ,TMPDIR=str(base/'tmp'),SQLITE_TMPDIR=str(base/'tmp'))

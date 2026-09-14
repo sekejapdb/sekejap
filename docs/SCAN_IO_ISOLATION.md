@@ -4,8 +4,9 @@
 scratch stack, without E4 or Rust.** The identical C source passes on the Pi
 and server server. This changes the next action: requalify the frozen packing
 candidate on the native target platforms before attributing the Mac failures
-to its algorithm. Runtime changes remain reverted; foundation promotion and
-the original CONTROL-SCAN investigation remain open.
+to its algorithm. That subsequent [Linux qualification](NATIVE_REQUALIFICATION.md)
+now retains the packing change for density. Foundation promotion and the
+original CONTROL-SCAN investigation remain open.
 
 This is correctness evidence, not a new performance or disk-density benchmark.
 The [previous E4/candidate/SQLite measurements](PAIR_PACKING.md) remain separate.

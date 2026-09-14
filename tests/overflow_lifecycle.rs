@@ -18,6 +18,7 @@ fn key(id: u16) -> [u8; 3] {
 fn run(mode: u8) {
     let base = std::env::temp_dir();
     assert!(base.starts_with("<scratch>")
+        || base.starts_with("<scratch>")
         || base.starts_with("<scratch>"));
     let d = tempfile::tempdir_in(base).unwrap();
     let mut s = Store::create(d.path(), cfg()).unwrap();
@@ -127,6 +128,7 @@ fn corrupt_old_chain_cannot_enter_the_recycling_freelist() {
     for mode in 0..3 {
         let base = std::env::temp_dir();
         assert!(base.starts_with("<scratch>")
+            || base.starts_with("<scratch>")
             || base.starts_with("<scratch>"));
         let d = tempfile::tempdir_in(base).unwrap();
         let mut s = Store::create(d.path(), cfg()).unwrap();

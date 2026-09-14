@@ -390,6 +390,15 @@ pub(crate) fn enc_leaf(key: &[u8], val: &[u8]) -> Vec<u8> {
         let mut r=Vec::with_capacity(1+key.len()+val.len());
         r.push(0xff);r.extend_from_slice(key);r.extend_from_slice(val);return r;
     }
+    #[cfg(feature = "compact-cells")]
+    if key.len() <= 0x0fff {
+        // 0x4xxx cannot be a legal legacy key length in a 4KiB page. The
+        // CRC/bounds-checked slot already provides the value's end, so ordinary
+        // keys need no duplicate u16 value length. Overflow markers stay distinct.
+        let mut r=Vec::with_capacity(2+key.len()+val.len());
+        r.extend_from_slice(&(0x4000|key.len() as u16).to_le_bytes());
+        r.extend_from_slice(key);r.extend_from_slice(val);return r;
+    }
     let mut r = Vec::with_capacity(4 + key.len() + val.len());
     r.extend_from_slice(&(key.len() as u16).to_le_bytes());
     r.extend_from_slice(key);
@@ -407,6 +416,11 @@ fn validated_key(rec: &[u8]) -> &[u8] {
     if rec[0]==0xff && (0x81..=0x88).contains(&rec[1]) {
         return &rec[1..2+(rec[1]-0x80)as usize];
     }
+    #[cfg(feature = "compact-cells")]
+    if rec[1]&0xf0==0x40 {
+        let k=(u16::from_le_bytes([rec[0],rec[1]])&0x0fff) as usize;
+        return &rec[2..2+k];
+    }
     let k = u16::from_le_bytes([rec[0], rec[1]]) as usize;
     &rec[2..2 + k]
 }
@@ -415,6 +429,11 @@ fn validated_key(rec: &[u8]) -> &[u8] {
 fn validated_leaf(rec: &[u8]) -> (&[u8], &[u8], bool) {
     if rec[0]==0xff && (0x81..=0x88).contains(&rec[1]) {
         let end=2+(rec[1]-0x80)as usize;return (&rec[1..end],&rec[end..],false);
+    }
+    #[cfg(feature = "compact-cells")]
+    if rec[1]&0xf0==0x40 {
+        let end=2+(u16::from_le_bytes([rec[0],rec[1]])&0x0fff) as usize;
+        return (&rec[2..end],&rec[end..],false);
     }
     let k = u16::from_le_bytes([rec[0], rec[1]]) as usize;
     let v = u16::from_le_bytes([rec[2 + k], rec[3 + k]]);
@@ -520,6 +539,82 @@ fn upper_bound(p: &PageRef, key: &[u8]) -> Result<usize> {
 /// one record is so large that no arrangement of the rest leaves room. The
 /// caller refuses that insert rather than corrupting a page; the real answer is
 /// overflow pages for large values, which the spec defers.
+#[cfg(feature = "sqlite-balance")]
+fn neighbor_cell_cuts(sizes: &[usize], usable: usize, existing: usize) -> Option<Vec<usize>> {
+    if sizes.is_empty() || sizes.iter().any(|&v| v==0 || v>usable) { return None; }
+    let n=sizes.len();
+    let mut prefix=vec![0usize];
+    for &size in sizes { prefix.push(prefix.last()?.checked_add(size)?); }
+    // Positive, indivisible cells: the longest fitting prefix minimizes the
+    // number of contiguous pages. Compute every suffix's minimum in O(cells).
+    let mut ends=vec![0;n];let mut end=0;
+    for i in 0..n {
+        while end<n && prefix[end+1]-prefix[i]<=usable { end+=1; }
+        ends[i]=end;
+    }
+    let mut needed=vec![0;n+1];
+    for i in (0..n).rev() { needed[i]=1+needed[ends[i]]; }
+    let groups=existing.max(needed[0]);
+    if groups>existing+1 || n<groups { return None; }
+    let mut cuts=vec![0];
+    for group in 0..groups-1 {
+        let begin=*cuts.last()?;let left=groups-group-1;
+        let target=(prefix[n]-prefix[begin])/(left+1);
+        let mut best=None;
+        for end in begin+1..=ends[begin].min(n-left) {
+            if needed[end]>left { continue; }
+            let delta=(prefix[end]-prefix[begin]).abs_diff(target);
+            if best.is_none_or(|(_,old)|delta<old) { best=Some((end,delta)); }
+        }
+        cuts.push(best?.0);
+    }
+    cuts.push(n);Some(cuts)
+}
+
+#[cfg(all(test,feature="sqlite-balance"))]
+mod neighbor_capacity_tests {
+    use super::neighbor_cell_cuts;
+    #[test]
+    fn full_leaf_and_one_sibling_use_at_most_three_pages() {
+        let sizes=vec![272;29];
+        let cuts=neighbor_cell_cuts(&sizes,4056,2).unwrap();
+        assert_eq!(cuts.len(),4);
+        for w in cuts.windows(2) { assert!((w[1]-w[0])*272<=4056); }
+    }
+    #[test]
+    fn forty_three_indivisible_cells_need_four_pages() {
+        let sizes=vec![272;43];
+        assert!(sizes.iter().sum::<usize>()<3*4056);
+        let cuts=neighbor_cell_cuts(&sizes,4056,3).unwrap();
+        assert_eq!(cuts.len(),5);
+        for w in cuts.windows(2) { assert!((w[1]-w[0])*272<=4056); }
+    }
+    #[test]
+    fn bounded_planner_matches_exhaustive_partition_oracle() {
+        fn possible(s:&[usize],pages:usize)->bool {
+            if pages==0 { return s.is_empty(); }
+            let mut sum=0;
+            for end in 1..=s.len() {
+                sum+=s[end-1];if sum>7 { break; }
+                if possible(&s[end..],pages-1) { return true; }
+            }
+            false
+        }
+        for n in 2..=7 {
+            for mut code in 0..3usize.pow(n as u32) {
+                let s:Vec<_>=(0..n).map(|_| {let v=[1,3,5][code%3];code/=3;v}).collect();
+                let expected=(2..=3).find(|&p|possible(&s,p));
+                let result=neighbor_cell_cuts(&s,7,2);
+                assert_eq!(result.as_ref().map(|v|v.len()-1),expected,"{s:?}");
+                if let Some(cuts)=result {
+                    assert_eq!(*cuts.last().unwrap(),n);
+                    for w in cuts.windows(2) {assert!(w[1]>w[0]);assert!(s[w[0]..w[1]].iter().sum::<usize>()<=7);}
+                }
+            }
+        }
+    }
+}
+
 fn split_point(recs: &[Vec<u8>], usable: usize) -> Option<usize> {
     let sizes: Vec<usize> = recs.iter().map(|r| r.len() + 4).collect();
     let total: usize = sizes.iter().sum();
@@ -1175,7 +1270,7 @@ impl<'p> BTree<'p> {
         };
         recs.insert(at, rec);
         // SQLite's balance_nonroot uses neighboring child pages before growing
-        // the tree. P1 keeps this optional and bounds the neighborhood to three leaves.
+        // the tree. Reuse capacity in at most three existing leaves before splitting.
         #[cfg(feature = "sqlite-balance")]
         if old_next != 0 || at + 1 != recs.len() {
             if self.redistribute_neighbors(&mut w, &path, &recs, old_next)? {
@@ -1279,8 +1374,9 @@ impl<'p> BTree<'p> {
         self.insert_separator(&mut path, sep, right_no)
     }
 
-    /// SQLite-style bounded neighbor redistribution: up to three existing
-    /// leaves, growing to four when their combined capacity is exhausted.
+    /// Reuse neighboring capacity without adding a leaf to the window. If all
+    /// neighbors are full, use the ordinary one-to-two split instead. This
+    /// avoids rewriting unrelated full siblings merely to allocate a new leaf.
     /// New images are built before edits; frozen siblings are shadowed before
     /// changing their records. Only this parent and its children participate.
     #[cfg(feature = "sqlite-balance")]
@@ -1308,24 +1404,10 @@ impl<'p> BTree<'p> {
                     if p.kind()!=PageKind::Leaf || p.tree_id()!=self.tree_id{return Err(Error::Corrupt{page_no:no,why:"redistribution sibling identity"});}
                     all.extend((0..p.nentries()).map(|i|p.slot(i).to_vec()));next=p.next_leaf();}
             }
-            let total:usize=all.iter().map(|r|r.len()+4).sum();
-            let groups=if total>usable*count{count+1}else{count};
-            if total>usable*groups || all.len()<groups{continue;}
-            // Choose near-equal byte boundaries. Both sides must fit; a large
-            // indivisible record may reject a window and use ordinary splitting.
-            let mut cuts=vec![0];let mut remaining=total;let mut possible=true;
-            for group in 0..groups-1{
-                let begin=*cuts.last().unwrap();let target=remaining/(groups-group);
-                let mut bytes=0;let mut best=None;
-                for end in begin+1..=all.len()-(groups-group-1){
-                    bytes+=all[end-1].len()+4;if bytes>usable{break;}
-                    if remaining-bytes>usable*(groups-group-1){continue;}
-                    let delta=bytes.abs_diff(target);
-                    if best.is_none_or(|(_,_,old)|delta<old){best=Some((end,bytes,delta));}
-                }
-                if let Some((end,bytes,_))=best{cuts.push(end);remaining-=bytes;}else{possible=false;break;}
-            }
-            if !possible || remaining>usable{continue;}cuts.push(all.len());
+            let sizes:Vec<usize>=all.iter().map(|r|r.len()+4).collect();
+            let Some(cuts)=neighbor_cell_cuts(&sizes,usable,count) else { continue; };
+            let groups=cuts.len()-1;
+            if groups>count { continue; }
             let mut ids=child_ids.clone();
             let mut pr=parent_recs.clone();
             if groups>count{ids.insert(start+count,0);pr.insert(start+count-1,enc_interior(validated_key(&all[cuts[count]]),0));}

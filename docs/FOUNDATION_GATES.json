@@ -2,7 +2,7 @@
   "version": "F1",
   "prototype": "stable-page page-image WAL",
   "production_promotable": false,
-  "verdict": "Keep the page-WAL baseline and executable lean suite. The bounded redistribution follow-up removes prior transaction refusals and improves measured density/time, but is rejected and reverted after incorrect shuffled Store scans. A matching-feature 800K fixture and successful source-preserving reopen audit are retained; reopening changes the copied data file, so the root cause remains open. See PAIR_PACKING.md and SCATTERED_PACKING.md. Strict flat latency, baseline scattered density, recovery/reader/typed integration remain unqualified.",
+  "verdict": "Retain optional compact ordinary cells and bounded existing-neighbor redistribution for repeatable density improvement after full Pi/server suites and 162 exact benchmark arms pass. Fresh 400K mixed speed improvements are 4.1% Pi and 7.0% server, not the earlier 17%/10% claim. The 100K scattered size case is now within 1.10x SQLite; scattered latency, resize, reader progress, repair and typed page-WAL integration remain open. server allocated-space sampling reaches 2.387x loaded size for compact E4 despite logical peaks near 1.14x: physical allocation admission is not proven. No whole-engine promotion. See NATIVE_REQUALIFICATION.md.",
   "laws": [
     {
       "id": "L1-MEM",
@@ -325,13 +325,238 @@
         "acceptance_repetitions": "PENDING",
         "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
       }
+    ],
+    "Pi native requalification": [
+      {
+        "case": "fixed-10000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 0.854376198145664,
+          "insert_seconds": 0.7459674526615443,
+          "update_seconds": 0.7958815896459406,
+          "delete_seconds": 1.0864844084600307
+        },
+        "final_size_ratio": 0.9275905118601748,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-10000-scattered",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 1.211894789299223,
+          "insert_seconds": 0.7955092575099605,
+          "update_seconds": 0.8102289799622447,
+          "delete_seconds": 0.8220013720294881
+        },
+        "final_size_ratio": 0.986827661909989,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-100000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 1.205151534927512,
+          "insert_seconds": 0.6813704826219551,
+          "update_seconds": 1.0485951118358527,
+          "delete_seconds": 0.872598752317737
+        },
+        "final_size_ratio": 0.9357015007572629,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-100000-scattered",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 0.8677181605450027,
+          "insert_seconds": 0.9708730972668225,
+          "update_seconds": 0.4364068671678583,
+          "delete_seconds": 0.47359915448043094
+        },
+        "final_size_ratio": 1.074826147426982,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-1000000-local",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 1.0292397578501056,
+          "insert_seconds": 1.127151672880917,
+          "update_seconds": 1.692127317151637,
+          "delete_seconds": 1.8017229734173519
+        },
+        "final_size_ratio": 0.9366713504639742,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-1000000-scattered",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 0.8566028244586569,
+          "insert_seconds": 2.513339264501066,
+          "update_seconds": 0.7059828945990997,
+          "delete_seconds": 0.5734547146316974
+        },
+        "final_size_ratio": 0.9506030136757374,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "mixed-400k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 1.131575842191801,
+          "mutation_seconds": 0.8606604938410811
+        },
+        "final_size_ratio": 0.9365250134480904,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "resize-1k",
+        "time_target": "FAIL",
+        "size_target": "FAIL",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 1.2910438582901398,
+          "mutation_seconds": 1.9404671666987983
+        },
+        "final_size_ratio": 1.7609649122807018,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      }
+    ],
+    "server native requalification": [
+      {
+        "case": "fixed-10000-local",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 1.114962960461229,
+          "insert_seconds": 1.3403323115695576,
+          "update_seconds": 1.7325763929757076,
+          "delete_seconds": 1.2412021902389567
+        },
+        "final_size_ratio": 0.9275905118601748,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-10000-scattered",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 1.0474714916311965,
+          "insert_seconds": 0.8994335110502371,
+          "update_seconds": 1.6874290347596719,
+          "delete_seconds": 1.591762773649632
+        },
+        "final_size_ratio": 0.986827661909989,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-100000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 1.023348096292547,
+          "insert_seconds": 0.5409421862582996,
+          "update_seconds": 0.7656814535821881,
+          "delete_seconds": 1.3148809269516093
+        },
+        "final_size_ratio": 0.9357015007572629,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-100000-scattered",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 0.40843716690715803,
+          "insert_seconds": 2.4357475545208134,
+          "update_seconds": 1.5546301803309848,
+          "delete_seconds": 1.3531327648242117
+        },
+        "final_size_ratio": 1.074826147426982,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-1000000-local",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 0.7474324215576454,
+          "insert_seconds": 0.9163002478082061,
+          "update_seconds": 1.1594862385159832,
+          "delete_seconds": 1.2692973140912542
+        },
+        "final_size_ratio": 0.9366713504639742,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "fixed-1000000-scattered",
+        "time_target": "FAIL",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 0.9816642186369344,
+          "insert_seconds": 3.0271967358865512,
+          "update_seconds": 0.6732438441513531,
+          "delete_seconds": 0.6978584132142959
+        },
+        "final_size_ratio": 0.9506030136757374,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "mixed-400k",
+        "time_target": "PASS",
+        "size_target": "PASS",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 0.891958581526955,
+          "mutation_seconds": 1.15944053018957
+        },
+        "final_size_ratio": 0.9365250134480904,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      },
+      {
+        "case": "resize-1k",
+        "time_target": "FAIL",
+        "size_target": "FAIL",
+        "acceptance_repetitions": "PASS",
+        "time_ratios": {
+          "load_seconds": 2.4491168127160594,
+          "mutation_seconds": 2.439243890923645
+        },
+        "final_size_ratio": 1.7609649122807018,
+        "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
+      }
     ]
   },
   "release_blockers": [
     {
       "id": "CONTROL-SCAN",
       "status": "FAIL",
-      "remaining": "Unresolved; earlier failed endpoints differ by one stale checksum-valid page with matching parent pointers. A follow-up independently reproduces stale buffered I/O on Mac/scratch using C without E4; identical Pi/server C controls pass. Concurrent instrumented E4 also catches read-versus-last-write mismatches. This establishes an external I/O failure class, not the exact cause of every historical failure. Requalify the frozen candidate on native storage; do not declare the older Store fixed. See SCAN_IO_ISOLATION.md."
+      "remaining": "Unresolved; earlier failed endpoints differ by one stale checksum-valid page with matching parent pointers. A follow-up independently reproduces stale buffered I/O on Mac/scratch using C without E4; identical Pi/server C controls pass. Concurrent instrumented E4 also catches read-versus-last-write mismatches. This establishes an external I/O failure class, not the exact cause of every historical failure. Requalify the frozen candidate on native storage; do not declare the older Store fixed. See SCAN_IO_ISOLATION.md. Full corrected baseline/candidate workspace suites and 200K/800K exact shuffled oracles now pass on both Linux hosts. Historical Mac causality and post-reboot Mac I/O qualification remain separate; do not infer that every old failure is resolved."
+    },
+    {
+      "id": "ALLOC-CAP",
+      "status": "FAIL",
+      "remaining": "server overlayfs reports candidate allocated peak 263061504 bytes from 110202880 loaded bytes (2.387x); baseline and SQLite also exceed 2x. Logical admission is not a proven filesystem/physical allocation bound. Pi measured peaks remain about 1.14x. Identify allocation semantics and qualify a genuine disk-full budget before claiming the 2x physical guarantee."
     }
   ],
   "qualification_v2": {
@@ -477,5 +702,22 @@
     "smoke_arms_per_platform": 4,
     "law2": "FAIL",
     "production_promotable": false
+  },
+  "native_requalification": {
+    "decision": "RETAIN for density; no universal speedup or production promotion",
+    "report": "docs/NATIVE_REQUALIFICATION.md",
+    "results": "docs/NATIVE_REQUALIFICATION_RESULTS.json",
+    "validation": "docs/NATIVE_REQUALIFICATION_VALIDATION.json",
+    "benchmark_arms": 162,
+    "tests_per_host": {
+      "baseline_reported_executions": 367,
+      "candidate_reported_executions": 371,
+      "ignored_each": 2
+    },
+    "mac_policy": "No Mac database tests until owner reboot and independent I/O control",
+    "source_manifest_sha256": {
+      "baseline": "62688e3946ac26f3d56b9bc24e0946718ff7aa10d43054e9ac51b787140c5ee3",
+      "candidate": "190ce364762660d6ae3dfe0fad4f342c5d600e50c804a59edd9357c8638f3a3a"
+    }
   }
 }

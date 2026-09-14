@@ -61,8 +61,14 @@ fn peaks(rows: u64) -> (f64, f64, f64) {
     let mut previous: Option<[u8; 8]> = None;
     let mut disorder = 0;
     for (i, r) in s.scan(&[]).unwrap().enumerate() {
-        let (key, _) = r.unwrap();
+        let (key, value) = r.unwrap();
         let key: [u8; 8] = key.try_into().unwrap();
+        // Inverse of the fixture multiplier modulo 2^64. Strict ordering,
+        // exactly `rows` entries and membership in this `rows`-key domain
+        // prove the complete set, without retaining an O(rows) oracle map.
+        let input_index = u64::from_be_bytes(key).wrapping_mul(0xf1de_83e1_9937_733d);
+        assert!(input_index < rows, "unexpected key {key:?}, fixture {}", fixture.display());
+        assert_eq!(value, v, "wrong value for key {key:?}, fixture {}", fixture.display());
         if previous.is_some_and(|old| old >= key) { disorder += 1; }
         previous = Some(key);
         n += 1;

@@ -88,6 +88,9 @@ fn cells(page: &[u8], no: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
             if r[0] == 255 {
                 let n = (r[1] - 128) as usize;
                 (r[1..2 + n].to_vec(), r[2 + n..].to_vec())
+            } else if cfg!(feature = "compact-cells") && r[1] & 0xf0 == 0x40 {
+                let n = (u16::from_le_bytes(r[..2].try_into().unwrap()) & 0x0fff) as usize;
+                (r[2..2 + n].to_vec(), r[2 + n..].to_vec())
             } else {
                 let n = u16::from_le_bytes(r[..2].try_into().unwrap()) as usize;
                 (r[2..2 + n].to_vec(), r[4 + n..].to_vec())

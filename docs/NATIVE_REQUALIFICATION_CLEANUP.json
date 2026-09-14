@@ -1,0 +1,896 @@
+{
+  "pi": {
+    "removed": [
+      {
+        "path": "<scratch>",
+        "logical": 3256320,
+        "allocated": 3256320
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3043328,
+        "allocated": 3043328
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3248128,
+        "allocated": 3248128
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3833856,
+        "allocated": 3833856
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3682304,
+        "allocated": 3682304
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3698688,
+        "allocated": 3698688
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29822976,
+        "allocated": 29822976
+      },
+      {
+        "path": "<scratch>",
+        "logical": 27836416,
+        "allocated": 27836416
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29716480,
+        "allocated": 29720576
+      },
+      {
+        "path": "<scratch>",
+        "logical": 33619968,
+        "allocated": 33619968
+      },
+      {
+        "path": "<scratch>",
+        "logical": 31653888,
+        "allocated": 31653888
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29417472,
+        "allocated": 29417472
+      },
+      {
+        "path": "<scratch>",
+        "logical": 295464960,
+        "allocated": 295469056
+      },
+      {
+        "path": "<scratch>",
+        "logical": 275771392,
+        "allocated": 275775488
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294383616,
+        "allocated": 294387712
+      },
+      {
+        "path": "<scratch>",
+        "logical": 299266048,
+        "allocated": 299270144
+      },
+      {
+        "path": "<scratch>",
+        "logical": 279588864,
+        "allocated": 279592960
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294084608,
+        "allocated": 294088704
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129888256,
+        "allocated": 129892352
+      },
+      {
+        "path": "<scratch>",
+        "logical": 121229312,
+        "allocated": 121233408
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129413120,
+        "allocated": 129413120
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 1835008,
+        "allocated": 1835008
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3043328,
+        "allocated": 3043328
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3248128,
+        "allocated": 3248128
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3256320,
+        "allocated": 3256320
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3682304,
+        "allocated": 3682304
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3698688,
+        "allocated": 3698688
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3833856,
+        "allocated": 3833856
+      },
+      {
+        "path": "<scratch>",
+        "logical": 27836416,
+        "allocated": 27836416
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29716480,
+        "allocated": 29720576
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29822976,
+        "allocated": 29822976
+      },
+      {
+        "path": "<scratch>",
+        "logical": 31653888,
+        "allocated": 31653888
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29417472,
+        "allocated": 29421568
+      },
+      {
+        "path": "<scratch>",
+        "logical": 33619968,
+        "allocated": 33619968
+      },
+      {
+        "path": "<scratch>",
+        "logical": 275771392,
+        "allocated": 275775488
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294383616,
+        "allocated": 294387712
+      },
+      {
+        "path": "<scratch>",
+        "logical": 295464960,
+        "allocated": 295469056
+      },
+      {
+        "path": "<scratch>",
+        "logical": 279588864,
+        "allocated": 279592960
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294084608,
+        "allocated": 294088704
+      },
+      {
+        "path": "<scratch>",
+        "logical": 299266048,
+        "allocated": 299270144
+      },
+      {
+        "path": "<scratch>",
+        "logical": 121229312,
+        "allocated": 121229312
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129413120,
+        "allocated": 129417216
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129888256,
+        "allocated": 129892352
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 1835008,
+        "allocated": 1839104
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3248128,
+        "allocated": 3248128
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3256320,
+        "allocated": 3256320
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3043328,
+        "allocated": 3043328
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3698688,
+        "allocated": 3698688
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3833856,
+        "allocated": 3833856
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3682304,
+        "allocated": 3682304
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29716480,
+        "allocated": 29720576
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29822976,
+        "allocated": 29822976
+      },
+      {
+        "path": "<scratch>",
+        "logical": 27836416,
+        "allocated": 27840512
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29417472,
+        "allocated": 29421568
+      },
+      {
+        "path": "<scratch>",
+        "logical": 33619968,
+        "allocated": 33624064
+      },
+      {
+        "path": "<scratch>",
+        "logical": 31653888,
+        "allocated": 31653888
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294383616,
+        "allocated": 294387712
+      },
+      {
+        "path": "<scratch>",
+        "logical": 295464960,
+        "allocated": 295469056
+      },
+      {
+        "path": "<scratch>",
+        "logical": 275771392,
+        "allocated": 275775488
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294084608,
+        "allocated": 294088704
+      },
+      {
+        "path": "<scratch>",
+        "logical": 299266048,
+        "allocated": 299270144
+      },
+      {
+        "path": "<scratch>",
+        "logical": 279588864,
+        "allocated": 279592960
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129413120,
+        "allocated": 129417216
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129888256,
+        "allocated": 129888256
+      },
+      {
+        "path": "<scratch>",
+        "logical": 121229312,
+        "allocated": 121233408
+      },
+      {
+        "path": "<scratch>",
+        "logical": 1835008,
+        "allocated": 1835008
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3293184
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2965504,
+        "allocated": 2965504
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2764800,
+        "allocated": 2764800
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2953216,
+        "allocated": 2953216
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2965504,
+        "allocated": 2965504
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2764800,
+        "allocated": 2764800
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2953216,
+        "allocated": 2953216
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2965504,
+        "allocated": 2965504
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2764800,
+        "allocated": 2764800
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2953216,
+        "allocated": 2953216
+      },
+      {
+        "path": "<scratch>",
+        "logical": 391015956,
+        "allocated": 391024640
+      },
+      {
+        "path": "<scratch>",
+        "logical": 98219924,
+        "allocated": 98222080
+      },
+      {
+        "path": "<scratch>",
+        "logical": 391106068,
+        "allocated": 391114752
+      },
+      {
+        "path": "<scratch>",
+        "logical": 98199444,
+        "allocated": 98197504
+      },
+      {
+        "path": "<scratch>",
+        "logical": 391106068,
+        "allocated": 391110656
+      },
+      {
+        "path": "<scratch>",
+        "logical": 98199444,
+        "allocated": 98201600
+      }
+    ],
+    "allocated_reclaimed": 8485056512,
+    "archive_sha256": "efb77f785d13a6f85910f5b47be8f9f7c4811efcffca68609db591e65d96ef07",
+    "preserved": "All logs, source archives, binaries, reports and earlier failure evidence; no other loop directories touched."
+  },
+  "server": {
+    "removed": [
+      {
+        "path": "<scratch>",
+        "logical": 3256320,
+        "allocated": 3256320
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3043328,
+        "allocated": 3043328
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3248128,
+        "allocated": 3248128
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3833856,
+        "allocated": 3833856
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3682304,
+        "allocated": 3682304
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3698688,
+        "allocated": 3698688
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29822976,
+        "allocated": 29822976
+      },
+      {
+        "path": "<scratch>",
+        "logical": 27836416,
+        "allocated": 27836416
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29716480,
+        "allocated": 29716480
+      },
+      {
+        "path": "<scratch>",
+        "logical": 33619968,
+        "allocated": 33619968
+      },
+      {
+        "path": "<scratch>",
+        "logical": 31653888,
+        "allocated": 31653888
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29417472,
+        "allocated": 29417472
+      },
+      {
+        "path": "<scratch>",
+        "logical": 295464960,
+        "allocated": 295464960
+      },
+      {
+        "path": "<scratch>",
+        "logical": 275771392,
+        "allocated": 275771392
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294383616,
+        "allocated": 294383616
+      },
+      {
+        "path": "<scratch>",
+        "logical": 299266048,
+        "allocated": 299266048
+      },
+      {
+        "path": "<scratch>",
+        "logical": 279588864,
+        "allocated": 279588864
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294084608,
+        "allocated": 294084608
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129888256,
+        "allocated": 129888256
+      },
+      {
+        "path": "<scratch>",
+        "logical": 121229312,
+        "allocated": 121229312
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129413120,
+        "allocated": 129413120
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 1835008,
+        "allocated": 1835008
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3043328,
+        "allocated": 3043328
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3248128,
+        "allocated": 3248128
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3256320,
+        "allocated": 3256320
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3682304,
+        "allocated": 3682304
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3698688,
+        "allocated": 3698688
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3833856,
+        "allocated": 3833856
+      },
+      {
+        "path": "<scratch>",
+        "logical": 27836416,
+        "allocated": 27836416
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29716480,
+        "allocated": 29716480
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29822976,
+        "allocated": 29822976
+      },
+      {
+        "path": "<scratch>",
+        "logical": 31653888,
+        "allocated": 31653888
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29417472,
+        "allocated": 29417472
+      },
+      {
+        "path": "<scratch>",
+        "logical": 33619968,
+        "allocated": 33619968
+      },
+      {
+        "path": "<scratch>",
+        "logical": 275771392,
+        "allocated": 275771392
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294383616,
+        "allocated": 294383616
+      },
+      {
+        "path": "<scratch>",
+        "logical": 295464960,
+        "allocated": 295464960
+      },
+      {
+        "path": "<scratch>",
+        "logical": 279588864,
+        "allocated": 279588864
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294084608,
+        "allocated": 294084608
+      },
+      {
+        "path": "<scratch>",
+        "logical": 299266048,
+        "allocated": 299266048
+      },
+      {
+        "path": "<scratch>",
+        "logical": 121229312,
+        "allocated": 121229312
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129413120,
+        "allocated": 129413120
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129888256,
+        "allocated": 129888256
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 1835008,
+        "allocated": 1835008
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3248128,
+        "allocated": 3248128
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3256320,
+        "allocated": 3256320
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3043328,
+        "allocated": 3043328
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3698688,
+        "allocated": 3698688
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3833856,
+        "allocated": 3833856
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3682304,
+        "allocated": 3682304
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29716480,
+        "allocated": 29716480
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29822976,
+        "allocated": 29822976
+      },
+      {
+        "path": "<scratch>",
+        "logical": 27836416,
+        "allocated": 27836416
+      },
+      {
+        "path": "<scratch>",
+        "logical": 29417472,
+        "allocated": 29417472
+      },
+      {
+        "path": "<scratch>",
+        "logical": 33619968,
+        "allocated": 33619968
+      },
+      {
+        "path": "<scratch>",
+        "logical": 31653888,
+        "allocated": 31653888
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294383616,
+        "allocated": 294383616
+      },
+      {
+        "path": "<scratch>",
+        "logical": 295464960,
+        "allocated": 295464960
+      },
+      {
+        "path": "<scratch>",
+        "logical": 275771392,
+        "allocated": 275771392
+      },
+      {
+        "path": "<scratch>",
+        "logical": 294084608,
+        "allocated": 294084608
+      },
+      {
+        "path": "<scratch>",
+        "logical": 299266048,
+        "allocated": 299266048
+      },
+      {
+        "path": "<scratch>",
+        "logical": 279588864,
+        "allocated": 279588864
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129413120,
+        "allocated": 129413120
+      },
+      {
+        "path": "<scratch>",
+        "logical": 129888256,
+        "allocated": 129888256
+      },
+      {
+        "path": "<scratch>",
+        "logical": 121229312,
+        "allocated": 121229312
+      },
+      {
+        "path": "<scratch>",
+        "logical": 1835008,
+        "allocated": 1835008
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 3289088,
+        "allocated": 3289088
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2965504,
+        "allocated": 2965504
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2764800,
+        "allocated": 2764800
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2953216,
+        "allocated": 2953216
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2965504,
+        "allocated": 2965504
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2764800,
+        "allocated": 2764800
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2953216,
+        "allocated": 2953216
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2965504,
+        "allocated": 2965504
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2764800,
+        "allocated": 2764800
+      },
+      {
+        "path": "<scratch>",
+        "logical": 2953216,
+        "allocated": 2953216
+      },
+      {
+        "path": "<scratch>",
+        "logical": 98219924,
+        "allocated": 98230272
+      },
+      {
+        "path": "<scratch>",
+        "logical": 391015956,
+        "allocated": 391024640
+      },
+      {
+        "path": "<scratch>",
+        "logical": 98199444,
+        "allocated": 98209792
+      },
+      {
+        "path": "<scratch>",
+        "logical": 391106068,
+        "allocated": 391114752
+      },
+      {
+        "path": "<scratch>",
+        "logical": 98219924,
+        "allocated": 98226176
+      },
+      {
+        "path": "<scratch>",
+        "logical": 391015956,
+        "allocated": 391020544
+      },
+      {
+        "path": "<scratch>",
+        "logical": 98199444,
+        "allocated": 98209792
+      },
+      {
+        "path": "<scratch>",
+        "logical": 391106068,
+        "allocated": 391114752
+      }
+    ],
+    "allocated_reclaimed": 8974200832,
+    "archive_sha256": "40207e28e4dcd92bbe9b20c9586cc04248712c798cbac45c7cfec8b6514cd202",
+    "preserved": "All logs, source archives, binaries, reports and earlier failure evidence; no other loop directories touched."
+  }
+}

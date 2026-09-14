@@ -14,6 +14,7 @@ fn cfg() -> Config {
 fn temp() -> tempfile::TempDir {
     let p = std::env::temp_dir();
     assert!(p.starts_with("<scratch>")
+        || p.starts_with("<scratch>")
         || p.starts_with("<scratch>"));
     tempfile::tempdir_in(p).unwrap()
 }

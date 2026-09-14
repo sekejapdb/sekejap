@@ -12,7 +12,9 @@ fn cfg() -> Config {
 #[test]
 fn wal_and_page_triggers_have_distinct_effects_and_snapshots_remain_exact() {
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>"));
+    assert!(base.starts_with("<scratch>")
+        || base.starts_with("<scratch>")
+        || base.starts_with("<scratch>"));
     let d = tempfile::tempdir_in(base).unwrap();
     let mut s = Store::create(d.path(), cfg()).unwrap();
     s.put(b"a", b"initial").unwrap();

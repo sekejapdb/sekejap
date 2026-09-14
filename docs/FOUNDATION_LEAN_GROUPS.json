@@ -1,18 +1,133 @@
 {
-  "version": "F1-lean-1",
+  "version": "F1-lean-2",
   "purpose": "Fast regression coverage; never a substitute for seven-law release qualification",
   "commands": {
-    "pager": ["--lib", "--test", "pagewal", "--test", "pagewal_repair", "--test", "btree_reuse", "--test", "pagewal_transaction_capacity"],
-    "typed": ["--test", "codec", "--test", "schema_recovery", "--test", "collections"],
-    "kernel": ["-p", "kernel", "--features", "test-support", "--test", "law1_heap", "--test", "law2_shape", "--test", "corruption_bounds", "--test", "durability", "--test", "platform_invariant"]
+    "pager": [
+      "--lib",
+      "--test",
+      "pagewal",
+      "--test",
+      "pagewal_repair",
+      "--test",
+      "btree_reuse",
+      "--test",
+      "pagewal_transaction_capacity"
+    ],
+    "typed": [
+      "--test",
+      "codec",
+      "--test",
+      "schema_recovery",
+      "--test",
+      "collections"
+    ],
+    "kernel": [
+      "-p",
+      "kernel",
+      "--features",
+      "test-support",
+      "--test",
+      "law1_heap",
+      "--test",
+      "law2_shape",
+      "--test",
+      "corruption_bounds",
+      "--test",
+      "durability",
+      "--test",
+      "platform_invariant",
+      "--test",
+      "compact_cell_bounds"
+    ],
+    "packing": [
+      "-p",
+      "kernel",
+      "--features",
+      "test-support",
+      "--lib",
+      "neighbor_capacity_tests"
+    ],
+    "io": [
+      "-p",
+      "kernel",
+      "--features",
+      "test-support",
+      "--lib",
+      "io::tests"
+    ]
   },
   "groups": [
-    {"law": 1, "id": "memory", "commands": ["pager", "kernel"], "coverage": "Small-cache operation, resource refusal, bounded snapshot admission and inherited heap regressions", "remaining": "Aggregate pager/repair memory accounting; large-data process-budget confirmation"},
-    {"law": 2, "id": "work", "commands": ["pager", "kernel"], "coverage": "Generated reuse and inherited operation-shape regressions; separate scale profile measures fixed CRUD work", "remaining": "Flat-latency qualification is separate from a passing correctness test"},
-    {"law": 3, "id": "atomicity", "commands": ["pager", "kernel"], "coverage": "Commit/checkpoint I/O fault matrix, deliberate process exits and lost-write preservation", "remaining": "Full create/open/repair-destination failure and publication matrix"},
-    {"law": 4, "id": "cost", "commands": [], "coverage": "Every profile records source, elapsed time, scope and results; paired benchmark records bytes and maintenance", "remaining": "Lean timing is diagnostic; phase-boundary sizes are not peak/cap evidence"},
-    {"law": 5, "id": "damage", "commands": ["pager", "typed", "kernel"], "coverage": "CRC/bounds, stale frame, independent raw repair and schema-replica regressions", "remaining": "Corrupt-WAL salvage and rootless current-membership proof remain open"},
-    {"law": 6, "id": "readers", "commands": ["pager"], "coverage": "Old/new snapshots, uncommitted invisibility, admission and writer ownership", "remaining": "Cross-process readers, restart beside a survivor and zero-degradation gate"},
-    {"law": 7, "id": "device-and-values", "commands": ["pager", "typed", "kernel"], "coverage": "Typed round trips, opt-in timestamps, reopen and platform isolation; runnable on Pi", "remaining": "Typed tests use the older collection Store; page-WAL integration, bulk/late indexing/indexed live writes remain pending"}
+    {
+      "law": 1,
+      "id": "memory",
+      "commands": [
+        "pager",
+        "kernel"
+      ],
+      "coverage": "Small-cache operation, resource refusal, bounded snapshot admission and inherited heap regressions",
+      "remaining": "Aggregate pager/repair memory accounting; large-data process-budget confirmation"
+    },
+    {
+      "law": 2,
+      "id": "work",
+      "commands": [
+        "pager",
+        "kernel",
+        "packing"
+      ],
+      "coverage": "Generated reuse and inherited operation-shape regressions; separate scale profile measures fixed CRUD work; exhaustive bounded whole-cell partition oracle",
+      "remaining": "Flat-latency qualification is separate from a passing correctness test"
+    },
+    {
+      "law": 3,
+      "id": "atomicity",
+      "commands": [
+        "pager",
+        "kernel",
+        "io"
+      ],
+      "coverage": "Commit/checkpoint I/O fault matrix, deliberate process exits and lost-write preservation",
+      "remaining": "Full create/open/repair-destination failure and publication matrix"
+    },
+    {
+      "law": 4,
+      "id": "cost",
+      "commands": [],
+      "coverage": "Every profile records source, elapsed time, scope and results; paired benchmark records bytes and maintenance",
+      "remaining": "Lean timing is diagnostic; phase-boundary sizes are not peak/cap evidence; allocated-block sampling may exceed logical file size and does not prove underlying physical admission"
+    },
+    {
+      "law": 5,
+      "id": "damage",
+      "commands": [
+        "pager",
+        "typed",
+        "kernel",
+        "io"
+      ],
+      "coverage": "CRC/bounds, stale frame, independent raw repair and schema-replica regressions; compact-cell slot bounds and aligned concurrent Direct/Buffered file isolation",
+      "remaining": "Corrupt-WAL salvage and rootless current-membership proof remain open"
+    },
+    {
+      "law": 6,
+      "id": "readers",
+      "commands": [
+        "pager"
+      ],
+      "coverage": "Old/new snapshots, uncommitted invisibility, admission and writer ownership",
+      "remaining": "Cross-process readers, restart beside a survivor and zero-degradation gate"
+    },
+    {
+      "law": 7,
+      "id": "device-and-values",
+      "commands": [
+        "pager",
+        "typed",
+        "kernel",
+        "io"
+      ],
+      "coverage": "Typed round trips, opt-in timestamps, reopen and platform isolation; runnable on Pi",
+      "remaining": "Typed tests use the older collection Store; page-WAL integration, bulk/late indexing/indexed live writes remain pending"
+    }
   ]
 }

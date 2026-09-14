@@ -5,7 +5,9 @@ use serde_json::json;
 #[test]
 fn unchanged_embeddings_complete_under_two_times_loaded_allowance_with_reader() {
     let tmp = std::env::temp_dir();
-    assert!(tmp.starts_with("<scratch>") || tmp.starts_with("<scratch>"));
+    assert!(tmp.starts_with("<scratch>")
+        || tmp.starts_with("<scratch>")
+        || tmp.starts_with("<scratch>"));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let config = Config { budget_bytes: 1<<20, io: IoMode::Buffered, sync: SyncMode::Full };

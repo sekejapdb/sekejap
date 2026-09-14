@@ -1,0 +1,122 @@
+--- a/kernel/tests/pack_shape.rs
++++ b/kernel/tests/pack_shape.rs
+@@ -2,6 +2,8 @@
+ //! through a scratch file instead of holding them in a `Vec` must change
+ //! nothing a reader can observe -- not one byte of one page -- and must leave
+ //! no scratch behind, on the failure path as much as the success one.
++//! Compact ordinary cells intentionally change the file format: their golden
++//! fingerprints are separate and backed by exact independent cell-byte checks.
+ 
+ use std::cell::Cell;
+ use std::sync::Arc;
+@@ -106,7 +108,7 @@
+ 
+ /// usable = `((4096 - 40) as f32 * 0.9) as usize` = 3650. A 40-byte key with a
+ /// 2-byte value makes the LEAF record need exactly 50 bytes (2 + 40 + 2 + 2 + 4)
+-/// and the SEPARATOR record need exactly 50 too (2 + 40 + 4 + 4) -- and
++/// (four value bytes with compact framing) and the SEPARATOR record need exactly 50 too (2 + 40 + 4 + 4) -- and
+ /// 3650 = 73 x 50, so both fill loops land on `used + need == usable` exactly,
+ /// on every page, by construction rather than by chance.
+ ///
+@@ -120,7 +122,7 @@
+     (0..n).map(|i| {
+         let mut k = i.to_be_bytes().to_vec();
+         k.resize(40, b'e');
+-        Ok((k, vec![b'v'; 2], false))
++        Ok((k, vec![b'v'; if cfg!(feature = "compact-cells") { 4 } else { 2 }], false))
+     })
+ }
+ 
+@@ -164,7 +166,49 @@
+     let d = tempfile::tempdir().unwrap();
+     let pool = pool_in(d.path(), 64);
+     let _ = pool.allocate().unwrap(); // page 0 is the superblock; reserve it
+-    let root = kernel::bulk::pack_tree(&pool, 1, it, 0.9, &d.path().join("scratch")).unwrap();
++    // This fixed-size format fixture intentionally retains its input oracle;
++    // it is not a bounded-memory benchmark. Do not use engine encoders to
++    // derive the expected ordinary cell bytes.
++    let expected: Vec<_> = it.map(Result::unwrap).collect();
++    let root = kernel::bulk::pack_tree(&pool, 1,
++        expected.iter().cloned().map(Ok), 0.9, &d.path().join("scratch")).unwrap();
++    let (last, hits, tries) = (Cell::new(None), Cell::new(0), Cell::new(0));
++    let tree = kernel::btree::BTree::open(&pool, 1, root, &last, &hits, &tries);
++    let mut scan = tree.range(&[]).unwrap();
++    for (key, value, marker) in &expected {
++        assert!(!marker);
++        assert_eq!(tree.get(key).unwrap().as_deref(), Some(value.as_slice()));
++        assert_eq!(scan.next().unwrap().unwrap(), (key.clone(), value.clone()));
++    }
++    assert!(scan.next().is_none());
++    drop(scan);
++    pool.flush_all(kernel::io::Barrier::None).unwrap();
++    kernel::verify::verify_published_tree(&d.path().join("data"), IoMode::Buffered, root, 1).unwrap();
++    let leaf_ids = levels(&pool, root).pop().unwrap();
++    let mut input = expected.iter().peekable();
++    for (index, no) in leaf_ids.iter().enumerate() {
++        let page = pool.get(*no).unwrap();
++        let page = PageRef::open(&page[..], *no).unwrap();
++        assert_eq!(page.next_leaf(), leaf_ids.get(index + 1).copied().unwrap_or(0));
++        let mut used = 0;
++        for slot in 0..page.nentries() {
++            let (key, value, _) = input.next().unwrap();
++            let mut bytes = Vec::new();
++            let header = key.len() as u16 | if cfg!(feature = "compact-cells") { 0x4000 } else { 0 };
++            bytes.extend(header.to_le_bytes());
++            bytes.extend(key);
++            if !cfg!(feature = "compact-cells") { bytes.extend((value.len() as u16).to_le_bytes()); }
++            bytes.extend(value);
++            assert_eq!(page.slot(slot), bytes, "independent cell encoding for {key:?}");
++            used += bytes.len() + 4;
++        }
++        assert!(used <= 3650);
++        if let Some((key, value, _)) = input.peek() {
++            let next_size = key.len() + value.len() + if cfg!(feature = "compact-cells") { 6 } else { 8 };
++            assert!(used + next_size > 3650, "premature leaf boundary");
++        }
++    }
++    assert!(input.next().is_none());
+     observe(&pool, root)
+ }
+ 
+@@ -197,19 +241,28 @@
+     // began stamping the publishing generation into the formerly-always-0
+     // lsn field -- every page's bytes change by design, so the chained
+     // page-checksum digest must move with them.
++    #[cfg(not(feature = "compact-cells"))]
+     let want: [(u32, usize, u32, u32, u64, u32, u32); 3] = [
+         (278,  3, 1, 275, 50_000, 279,  1320246642),
+         (835,  3, 1, 822, 60_000, 836,  2156132941),
+         (1006, 3, 1, 994, 60_000, 1007, 1305404169),
+     ];
++    // Native capture after all cell bytes, point lookups, scans, page fill and
++    // published-tree structure were independently checked above. Compact framing
++    // removes two bytes per ordinary cell; this intentionally changes density.
++    #[cfg(feature = "compact-cells")]
++    let want: [(u32, usize, u32, u32, u64, u32, u32); 3] = [
++        (251, 3, 1, 248, 50_000, 252, 944332828),
++        (835, 3, 1, 822, 60_000, 836, 800627646),
++        (973, 3, 1, 961, 60_000, 974, 522263165),
++    ];
+     for (i, ((name, got), want)) in cases.iter().zip(want.iter()).enumerate() {
+         assert_eq!(
+             got, want,
+-            "case {i} ({name}): the packed tree is no longer byte-identical to the \
+-             pre-streaming one. Fields are (root, height, first_leaf, leaves, entries, \
++            "case {i} ({name}): the packed tree changed its feature-specific format fingerprint. Fields are (root, height, first_leaf, leaves, entries, \
+              pages, digest); the digest chains the crate's own page checksum over every \
+              page in the store, so contents, page order and page count are all in it. \
+-             Snapshot taken from the Vec-accumulating pack at e4add4b."
++             Legacy constants originate at e4add4b; compact constants follow the independently checked format revision."
+         );
+     }
+ }
+@@ -263,7 +316,8 @@
+     let d = tempfile::tempdir().unwrap();
+     let pool = pool_in(d.path(), 64);
+     let _ = pool.allocate().unwrap();
+-    let n = 30_857u64;
++    // Keep the same 203 full leaves plus one final child in both formats.
++    let n = if cfg!(feature = "compact-cells") { 33_496u64 } else { 30_857u64 };
+     let it = (0..n).map(|i| {
+         Ok((i.to_be_bytes().to_vec(), i.to_le_bytes().to_vec(), false))
+     });

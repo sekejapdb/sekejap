@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e4-native-requal-r2-20260914
+  namespace: sekejap-benchmark
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 10800
+  template:
+    spec:
+      restartPolicy: Never
+      nodeName: server
+      priorityClassName: benchmark-low
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: bench
+          image: rust:1-bookworm
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              art=<scratch>
+              mkdir -p "$art"
+              while [ ! -f "$art/source-ready" ]; do sleep 2; done
+              bash "$art/native_requal.sh" "$art" > "$art/runner.log" 2>&1
+              while [ ! -f "$art/complete" ]; do sleep 2; done
+          resources:
+            requests: {cpu: "1", memory: "512Mi"}
+            limits: {cpu: "2", memory: "2Gi"}
+          volumeMounts:
+            - {name: data, mountPath: <scratch>}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: sekejap-benchmark-data

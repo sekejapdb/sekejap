@@ -9,7 +9,9 @@ use kernel::{
 )]
 fn shuffled_entries_use_neighbor_capacity() {
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>"));
+    assert!(base.starts_with("<scratch>")
+        || base.starts_with("<scratch>")
+        || base.starts_with("<scratch>"));
     let d = tempfile::tempdir_in(base).unwrap();
     let c = Config {
         budget_bytes: 8 << 20,
@@ -37,7 +39,9 @@ fn shuffled_entries_use_neighbor_capacity() {
 #[test]
 fn neighbor_changes_preserve_snapshot_and_wal_reopen() {
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>"));
+    assert!(base.starts_with("<scratch>")
+        || base.starts_with("<scratch>")
+        || base.starts_with("<scratch>"));
     let d = tempfile::tempdir_in(base).unwrap();
     let c = Config {
         budget_bytes: 8 << 20,
@@ -94,7 +98,9 @@ fn neighbor_changes_preserve_snapshot_and_wal_reopen() {
 #[test]
 fn compact_keys_overflow_updates_bulk_and_recovery() {
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>"));
+    assert!(base.starts_with("<scratch>")
+        || base.starts_with("<scratch>")
+        || base.starts_with("<scratch>"));
     let d = tempfile::tempdir_in(base).unwrap();
     let c = Config {
         budget_bytes: 8 << 20,
@@ -162,7 +168,9 @@ fn compact_keys_overflow_updates_bulk_and_recovery() {
 #[test]
 fn recovery_refuses_damaged_overflow_without_replacing_source() {
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>"));
+    assert!(base.starts_with("<scratch>")
+        || base.starts_with("<scratch>")
+        || base.starts_with("<scratch>"));
     let d = tempfile::tempdir_in(base).unwrap();
     let c = Config {
         budget_bytes: 8 << 20,

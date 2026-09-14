@@ -583,6 +583,12 @@ pub fn decode_record(
         let key=rec.get(1..end).ok_or_else(||bad(page_no,"compact integer key crosses its slot"))?;
         return Ok(DecodedRecord::Leaf{key,value:&rec[end..],overflow:false});
     }
+    #[cfg(feature="compact-cells")]
+    if kind==PageKind::Leaf && rec.get(1).is_some_and(|b|b&0xf0==0x40) {
+        let end=2+(u16::from_le_bytes([rec[0],rec[1]])&0x0fff) as usize;
+        let key=rec.get(2..end).ok_or_else(||bad(page_no,"compact key crosses its slot"))?;
+        return Ok(DecodedRecord::Leaf{key,value:&rec[end..],overflow:false});
+    }
     let klen_bytes = rec
         .get(..2)
         .ok_or_else(|| bad(page_no, "record has no key length"))?;

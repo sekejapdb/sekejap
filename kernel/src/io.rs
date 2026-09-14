@@ -480,6 +480,11 @@ mod tests {
     use super::*;
     use crate::page::PAGE_SIZE;
 
+    // A Direct request can succeed on Linux. Ordinary Vec allocations do not
+    // satisfy its buffer-address alignment contract, even at page-sized length.
+    #[repr(align(4096))]
+    struct TestPage([u8; PAGE_SIZE]);
+
     #[test]
     fn pages_round_trip_through_the_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -525,12 +530,12 @@ mod tests {
         assert_eq!(got, IoMode::Buffered, "unproven uncached mode must stay disabled");
 
         // Usable either way.
-        let w = vec![0u8; PAGE_SIZE];
-        f.write_at(&w, 0).unwrap();
+        let w = TestPage([0u8; PAGE_SIZE]);
+        f.write_at(&w.0, 0).unwrap();
         f.sync_data().unwrap();
-        let mut r = vec![0u8; PAGE_SIZE];
-        f.read_at(&mut r, 0).unwrap();
-        assert_eq!(r, w);
+        let mut r = TestPage([0u8; PAGE_SIZE]);
+        f.read_at(&mut r.0, 0).unwrap();
+        assert_eq!(r.0, w.0);
     }
 
     #[test]
@@ -545,18 +550,18 @@ mod tests {
                         let dir = tempfile::tempdir().unwrap();
                         let mode = if worker % 2 == 0 { IoMode::Direct } else { IoMode::Buffered };
                         let (f, _) = open_file(&dir.path().join("roundtrip"), mode).unwrap();
-                        let mut w = vec![0u8; PAGE_SIZE];
+                        let mut w = TestPage([0u8; PAGE_SIZE]);
                         if round % 2 != 0 {
-                            for (i, byte) in w.iter_mut().enumerate() { *byte = worker.wrapping_add(round).wrapping_add(i as u8); }
+                            for (i, byte) in w.0.iter_mut().enumerate() { *byte = worker.wrapping_add(round).wrapping_add(i as u8); }
                         }
-                        f.write_at(&w, 0).unwrap();
+                        f.write_at(&w.0, 0).unwrap();
                         f.sync_data().unwrap();
-                        let mut r = vec![0u8; PAGE_SIZE];
-                        f.read_at(&mut r, 0).unwrap();
-                        if r != w {
+                        let mut r = TestPage([0u8; PAGE_SIZE]);
+                        f.read_at(&mut r.0, 0).unwrap();
+                        if r.0 != w.0 {
                             let retained = dir.keep();
-                            std::fs::write(retained.join("expected"), &w).unwrap();
-                            std::fs::write(retained.join("observed"), &r).unwrap();
+                            std::fs::write(retained.join("expected"), &w.0).unwrap();
+                            std::fs::write(retained.join("observed"), &r.0).unwrap();
                             panic!("I/O isolation failed: worker {worker}, round {round}, evidence {}", retained.display());
                         }
                     }

@@ -764,8 +764,10 @@ mod storage_tests {
     fn directory() -> tempfile::TempDir {
         let p = std::env::temp_dir();
         assert!(
-            p.starts_with("<scratch>"),
-            "Set TMPDIR under <scratch> for storage tests"
+            p.starts_with("<scratch>")
+                || p.starts_with("<scratch>")
+                || p.starts_with("<scratch>"),
+            "Set TMPDIR under an authorized E4 artifact directory for storage tests"
         );
         tempfile::tempdir_in(p).unwrap()
     }

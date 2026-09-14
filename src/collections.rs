@@ -1221,11 +1221,9 @@ mod tests {
             }
             for i in 0..p.nentries() {
                 let cell = p.slot(i);
-                if cell[0] == 255 {
-                    continue;
-                }
-                let n = u16::from_le_bytes(cell[..2].try_into().unwrap()) as usize;
-                let k = &cell[2..2 + n];
+                let kernel::verify::DecodedRecord::Leaf { key: k, .. } =
+                    kernel::verify::decode_record(cell, no as u32, PageKind::Leaf).unwrap()
+                else { panic!("leaf cell decoded as interior") };
                 if k.starts_with(&[0, 0]) {
                     metadata_pages.entry(0).or_default().insert(no);
                 }

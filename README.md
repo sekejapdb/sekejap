@@ -23,24 +23,38 @@ prior context.** Read it top to bottom before touching code.
 
 ## 0. Why e4 exists — the finding that forced it
 
+**Linux qualification (2026-09-14): packing retained for density.** Full corrected
+workspace suites pass on Pi and server, plus **162 exact benchmark arms**.
+At 400K rows / 1.92M subsequent changes, Pi baseline E4 / compact E4 / SQLite
+take **104.451 / 100.169 / 116.386 s**; final logical sizes are
+**129.888 / 121.229 / 129.446 MB** on both hosts. Fresh E4 speed gains are
+4.1% Pi / 7.0% server, below the earlier claim; the repeatable 6.67% size saving
+and newly passing 100K scattered density case justify retaining the optional
+change. Scattered latency, resize and wider F1 gates remain open. server sampled
+allocated space reaches **2.387× loaded size**, so logical admission does not
+prove the physical 2× cap. **17.459 GB** of verified redundant data was removed.
+Mac database tests wait for the owner's reboot and an independent I/O control.
+See [results, test fixes and limits](docs/NATIVE_REQUALIFICATION.md).
+
 **Buffered I/O isolation (2026-09-14):** an independent C program, with no
 E4/Rust or uncached flags, reproduces stale 4 KiB reads on Mac/scratch in two
 runs. The identical control passes 1.6 million reads on each of Pi and server.
 Three concurrent instrumented E4 runs also catch reads differing from the
 last successful write. Three native Pi diagnostic runs pass. This establishes
 an external I/O failure class, while the exact history of older failures and
-the responsible OS/filesystem/device component remain unresolved. Packing
-stays reverted pending full native requalification. See the
+the responsible OS/filesystem/device component remain unresolved. Subsequent
+Linux packing qualification is reported above. See the
 [reproducer, preserved evidence and limits](docs/SCAN_IO_ISOLATION.md).
 
-**Bounded redistribution loop (2026-09-14): rejected on correctness.** The
+**Initial bounded redistribution decision (2026-09-14): rejected on correctness.** The
 final policy completes the previously refused transactions and improves Pi
 400K / 1.92M-mutation medians to **87.386 s**, versus retained E4 **105.241 s**
 and SQLite **112.014 s**. It saves 6.67% final space. However, the shared Store
 returns an incorrect 800K scan; a matching-feature reproduction preserves
 800,000 rows with two ordering violations. Reopening a copy recovers all
 800,000 point lookups, but changes the data file, so the cause remains open.
-All runtime changes are reverted. A transaction-capacity regression, stricter
+At that stage all runtime changes were reverted; the later Linux qualification
+above supersedes that candidate decision. A transaction-capacity regression, stricter
 ordering oracle and matching lean-test features are retained. See the
 [complete comparison and failure evidence](docs/PAIR_PACKING.md).
 

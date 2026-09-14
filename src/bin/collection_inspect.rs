@@ -28,6 +28,9 @@ fn occupancy(
             let r = p.slot(i);
             let k = if r[0] == 255 && (0x81..=0x88).contains(&r[1]) {
                 &r[1..2 + (r[1] - 0x80) as usize]
+            } else if cfg!(feature = "compact-cells") && r[1] & 0xf0 == 0x40 {
+                let n = (u16::from_le_bytes(r[..2].try_into()?) & 0x0fff) as usize;
+                r.get(2..2 + n).ok_or("compact key crosses slot")?
             } else {
                 let n = u16::from_le_bytes(r[..2].try_into()?) as usize;
                 &r[2..2 + n]
