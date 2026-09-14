@@ -936,6 +936,8 @@ mod tests {
         assert!(
             (std::env::temp_dir().starts_with("<scratch>")
                 || std::env::temp_dir()
+                    .starts_with("<scratch>")
+                || std::env::temp_dir()
                     .starts_with("<scratch>"))
         );
         let t = tempfile::tempdir().unwrap();

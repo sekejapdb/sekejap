@@ -2,7 +2,7 @@
   "version": "F1",
   "prototype": "stable-page page-image WAL",
   "production_promotable": false,
-  "verdict": "Keep the page-WAL candidate and executable lean suite; fixed-work scaling falsifies strict flat latency on Mac/Pi, and 100K scattered final size fails. Recovery/reader/typed integration gates remain open.",
+  "verdict": "Keep the page-WAL baseline and executable lean suite. The compact-cell / whole-cell-packing ablation was rejected and reverted: all candidates hit the 16 MiB WAL limit on 1000 scattered inserts at 100K/1M on Pi and server; committed state survives all twelve refusals. See SCATTERED_PACKING.md. Fixed-work scaling still falsifies strict flat latency, 100K scattered final size fails, and recovery/reader/typed integration gates remain open.",
   "laws": [
     {
       "id": "L1-MEM",

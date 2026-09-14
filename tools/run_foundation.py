@@ -15,6 +15,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 MAC = Path('<scratch>')
 PI = Path('<scratch>')
+server = Path('<scratch>')
 
 
 def sha(path):
@@ -32,12 +33,12 @@ def main():
     p.add_argument('--binary', type=Path)
     a = p.parse_args()
     out = a.output.resolve()
-    if not any(out.is_relative_to(base) and out != base for base in [MAC, PI]):
+    if not any(out.is_relative_to(base) and out != base for base in [MAC, PI, server]):
         p.error('output must be a new subdirectory of the authorized artifact area')
     out.mkdir(parents=True, exist_ok=False)
     tmp = out / 'tmp'; tmp.mkdir()
     env = dict(os.environ, TMPDIR=str(tmp), SQLITE_TMPDIR=str(tmp))
-    pi = out.is_relative_to(PI)
+    pi = out.is_relative_to(PI) or out.is_relative_to(server)
     groups = json.loads((ROOT / 'docs/FOUNDATION_LEAN_GROUPS.json').read_text())
     source = {}
     for folder in ['src', 'kernel/src', 'tests', 'kernel/tests', 'tools']:

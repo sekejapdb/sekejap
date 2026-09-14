@@ -139,6 +139,7 @@ fn case_dir(case: &str, n: u16) -> (PathBuf, Option<tempfile::TempDir>) {
     if let Ok(base) = std::env::var("E4_SCHEMA_ARTIFACTS") {
         let p = PathBuf::from(base).join(format!("{case}-{n}"));
         assert!(p.starts_with("<scratch>")
+            || p.starts_with("<scratch>")
             || p.starts_with("<scratch>"));
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::create_dir(&p).unwrap();
@@ -146,6 +147,7 @@ fn case_dir(case: &str, n: u16) -> (PathBuf, Option<tempfile::TempDir>) {
     } else {
         let tmp = std::env::temp_dir();
         assert!(tmp.starts_with("<scratch>")
+            || tmp.starts_with("<scratch>")
             || tmp.starts_with("<scratch>"));
         let t = tempfile::tempdir().unwrap();
         (t.path().to_path_buf(), Some(t))

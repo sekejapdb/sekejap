@@ -23,6 +23,18 @@ prior context.** Read it top to bottom before touching code.
 
 ## 0. Why e4 exists — the finding that forced it
 
+**Scattered-packing ablation (2026-09-14): rejected and reverted.** Compact
+ordinary cells and whole-cell neighbor planning save space in some workloads,
+but all three candidate combinations hit the 16 MiB WAL limit during 1,000
+scattered inserts at 100K and 1M on both Pi and server. Baseline E4 and SQLite
+complete those transactions. All twelve refused cases preserve their exact
+committed population. Pi 400K / 1.92M-change single trials take **75.168 s
+baseline E4 / 72.462 s combined / 78.309 s SQLite**, with final sizes
+**129.888 / 121.229 / 129.446 MB**. Smaller files do not justify the transaction
+regression. Storage code is restored to `bcd6448`; strict Law 2, scattered
+density, resize and wider release gates remain open. See the
+[native comparison, source analysis and rejection](docs/SCATTERED_PACKING.md).
+
 **Fixed-work scaling / lean law groups (2026-09-14):** the seven laws now map
 to repeatable `lean`, `scale` and `large` profiles. **74 lean tests pass per
 platform; 363 full Mac tests pass.** Eighty scaling/10M arms and eight smoke
