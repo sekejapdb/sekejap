@@ -2,7 +2,7 @@
   "version": "F1",
   "prototype": "stable-page page-image WAL",
   "production_promotable": false,
-  "verdict": "Keep the page-WAL baseline and executable lean suite. The compact-cell / whole-cell-packing ablation was rejected and reverted: all candidates hit the 16 MiB WAL limit on 1000 scattered inserts at 100K/1M on Pi and server; committed state survives all twelve refusals. See SCATTERED_PACKING.md. Fixed-work scaling still falsifies strict flat latency, 100K scattered final size fails, and recovery/reader/typed integration gates remain open.",
+  "verdict": "Keep the page-WAL baseline and executable lean suite. The bounded redistribution follow-up removes prior transaction refusals and improves measured density/time, but is rejected and reverted after incorrect shuffled Store scans. A matching-feature 800K fixture and successful source-preserving reopen audit are retained; reopening changes the copied data file, so the root cause remains open. See PAIR_PACKING.md and SCATTERED_PACKING.md. Strict flat latency, baseline scattered density, recovery/reader/typed integration remain unqualified.",
   "laws": [
     {
       "id": "L1-MEM",

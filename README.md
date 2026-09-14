@@ -23,6 +23,17 @@ prior context.** Read it top to bottom before touching code.
 
 ## 0. Why e4 exists — the finding that forced it
 
+**Bounded redistribution loop (2026-09-14): rejected on correctness.** The
+final policy completes the previously refused transactions and improves Pi
+400K / 1.92M-mutation medians to **87.386 s**, versus retained E4 **105.241 s**
+and SQLite **112.014 s**. It saves 6.67% final space. However, the shared Store
+returns an incorrect 800K scan; a matching-feature reproduction preserves
+800,000 rows with two ordering violations. Reopening a copy recovers all
+800,000 point lookups, but changes the data file, so the cause remains open.
+All runtime changes are reverted. A transaction-capacity regression, stricter
+ordering oracle and matching lean-test features are retained. See the
+[complete comparison and failure evidence](docs/PAIR_PACKING.md).
+
 **Scattered-packing ablation (2026-09-14): rejected and reverted.** Compact
 ordinary cells and whole-cell neighbor planning save space in some workloads,
 but all three candidate combinations hit the 16 MiB WAL limit during 1,000

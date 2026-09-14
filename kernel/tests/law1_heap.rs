@@ -35,9 +35,19 @@ fn mib(b: usize) -> f64 { b as f64 / (1 << 20) as f64 }
 
 fn peaks(rows: u64) -> (f64, f64, f64) {
     let d = tempfile::TempDir::new().unwrap();
+    let fixture = if let Ok(root) = std::env::var("E4_LAW1_ARTIFACTS") {
+        let root = std::path::PathBuf::from(root);
+        assert!(root.starts_with("<scratch>")
+            || root.starts_with("<scratch>")
+            || root.starts_with("<scratch>"));
+        let path = root.join(format!("rows-{rows}"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        path
+    } else { d.path().to_path_buf() };
     // pool far smaller than the biggest store, so it must do its job
     let cfg = Config { budget_bytes: 16 << 20, io: IoMode::Buffered, sync: SyncMode::Off };
-    let mut s = Store::create(d.path(), cfg).unwrap();
+    let mut s = Store::create(&fixture, cfg).unwrap();
     let base = LIVE.load(Relaxed);
     let v = vec![b'x'; 200];
     let mut pw = 0usize;
@@ -48,11 +58,17 @@ fn peaks(rows: u64) -> (f64, f64, f64) {
     s.commit().unwrap();
     let mut pr = 0usize;
     let mut n = 0u64;
+    let mut previous: Option<[u8; 8]> = None;
+    let mut disorder = 0;
     for (i, r) in s.scan(&[]).unwrap().enumerate() {
-        r.unwrap(); n += 1;
+        let (key, _) = r.unwrap();
+        let key: [u8; 8] = key.try_into().unwrap();
+        if previous.is_some_and(|old| old >= key) { disorder += 1; }
+        previous = Some(key);
+        n += 1;
         if i % 4096 == 0 { pr = pr.max(LIVE.load(Relaxed).saturating_sub(base)); }
     }
-    assert_eq!(n, rows);
+    assert_eq!((n, disorder), (rows, 0), "fixture {}", fixture.display());
     (mib(pw), mib(pr), mib(LIVE.load(Relaxed)))
 }
 

@@ -3,9 +3,16 @@ import hashlib,json,os,subprocess,sys
 from pathlib import Path
 base=Path(sys.argv[1]).resolve();mode=sys.argv[2]
 assert str(base) in ['<scratch>',
+    '<scratch>',
+    '<scratch>',
+    '<scratch>',
+    '<scratch>',
+    '<scratch>',
+    '<scratch>',
     '<scratch>']
 assert mode in ['probe','qualify','tradeoff'];candidate=sys.argv[3] if len(sys.argv)>3 else 'combined'
-assert candidate in ['compact','packing','combined']
+assert candidate in ['compact','packing','combined','pair','compact-pair']
+probe_arms=['baseline','pair','compact-pair','sqlite'] if 'pair-packing-20260914' in base.parts else ['baseline','compact','packing','combined','sqlite']
 out=base/mode;out.mkdir();(base/'tmp').mkdir(exist_ok=True)
 env=dict(os.environ,TMPDIR=str(base/'tmp'),SQLITE_TMPDIR=str(base/'tmp'))
 records=[];failures=[]
@@ -32,7 +39,7 @@ cases=([(f'fixed-{n}-scattered','foundation_scale',[n,'scattered',1000]) for n i
 if mode=='tradeoff': cases=[c for c in cases if c[1]=='pagewal_bench']
 for rep in range(3 if mode=='qualify' else 1):
     for case,kind,args in cases:
-        arms=['baseline','compact','packing','combined','sqlite'] if mode!='qualify' else ['baseline',candidate,'sqlite']
+        arms=probe_arms if mode!='qualify' else ['baseline',candidate,'sqlite']
         arms=arms[rep:]+arms[:rep];pair=[]
         for arm in arms:
             r=run(case,rep,arm,kind,args)
@@ -45,7 +52,7 @@ for rep in range(3 if mode=='qualify' else 1):
         assert all(v==pair[0] for v in pair),'oracle mismatch'
 if mode in ['qualify','tradeoff']:
     for reader in ['none','held','rolling']:
-        for arm in (['baseline',candidate,'sqlite'] if mode=='qualify' else ['baseline','compact','packing','combined','sqlite']):
+        for arm in (['baseline',candidate,'sqlite'] if mode=='qualify' else probe_arms):
             r=run('cap-10k-'+reader,0,arm,'pagewal_cap',[10000,reader])
             if r is not None:
                 assert r['verified']
