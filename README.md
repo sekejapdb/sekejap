@@ -23,6 +23,16 @@ prior context.** Read it top to bottom before touching code.
 
 ## 0. Why e4 exists — the finding that forced it
 
+**Buffered I/O isolation (2026-09-14):** an independent C program, with no
+E4/Rust or uncached flags, reproduces stale 4 KiB reads on Mac/scratch in two
+runs. The identical control passes 1.6 million reads on each of Pi and server.
+Three concurrent instrumented E4 runs also catch reads differing from the
+last successful write. Three native Pi diagnostic runs pass. This establishes
+an external I/O failure class, while the exact history of older failures and
+the responsible OS/filesystem/device component remain unresolved. Packing
+stays reverted pending full native requalification. See the
+[reproducer, preserved evidence and limits](docs/SCAN_IO_ISOLATION.md).
+
 **Bounded redistribution loop (2026-09-14): rejected on correctness.** The
 final policy completes the previously refused transactions and improves Pi
 400K / 1.92M-mutation medians to **87.386 s**, versus retained E4 **105.241 s**

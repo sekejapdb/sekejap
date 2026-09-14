@@ -1,5 +1,11 @@
 # Bounded redistribution loop — 2026-09-14
 
+**Later evidence:** the [buffered I/O investigation](SCAN_IO_ISOLATION.md)
+reproduces stale reads independently of E4 on Mac/scratch; Pi and server controls
+pass. The decision below records this loop's outcome. Runtime remains reverted
+while the frozen candidate awaits full native requalification; the Mac failures
+alone do not establish a packing algorithm defect.
+
 **Rejected and reverted.** The final candidate fixes the previous 1,000-insert
 WAL-capacity regression, reduces file sizes and improves repeated mixed-workload
 timings, but fails a broader shuffled-write correctness test. Runtime storage

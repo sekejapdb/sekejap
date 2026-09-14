@@ -1,0 +1,453 @@
+{
+  "runtime_decision": "No engine changes; packing remains reverted pending native requalification",
+  "mac_logs": {
+    "audited-v3-r2.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.51s\n\n",
+      "sha256": "50500faef8eef63ff0bc9754f7a5c0513f597e8632cb30127fc6fe6da6191b8c"
+    },
+    "audited-v3-r3.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.50s\n\n",
+      "sha256": "698832399f95e3ce9d6e128b9b0d3f770e802a0ad8a33583f6d0f0012c03ace0"
+    },
+    "audited-v3-r4.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.66s\n\n",
+      "sha256": "dd36e489907ebadcec5a67e7e84493c284187582aa7db5028fae360382a0127c"
+    },
+    "audited-v3-r5.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.17s\n\n",
+      "sha256": "c7b1a608bf6a23caa09876f31b9bf2003be80bab5a97b09cf7eaf7ce00a1fe67"
+    },
+    "audited-v3-r6.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.19s\n\n",
+      "sha256": "264f2e01cb45fa8cd8aab1bbd64f9e13ea732d6d217d6022b8ebc1910b2e18ec"
+    },
+    "audited-v3.log": {
+      "text": "   Compiling kernel v0.17.0 (/tmp/e4-scan-trace/kernel)\nwarning: field `table` is never read\n  --> kernel/src/vecquant.rs:94:5\n   |\n87 | pub struct Encoder {\n   |            ------- field in this struct\n...\n94 |     table: [f32; MAX_LEVELS],\n   |     ^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: field `reader_slot` is never read\n   --> kernel/src/store.rs:220:5\n    |\n206 | pub struct Store {\n    |            ----- field in this struct\n...\n220 |     reader_slot: Option<crate::readers::ReaderSlot>,\n    |     ^^^^^^^^^^^\n\nwarning: `kernel` (lib) generated 2 warnings\n    Finished `release` profile [optimized + debuginfo] target(s) in 8.83s\n     Running tests/law1_heap.rs (/tmp/e4-scan-trace-target/release/deps/law1_heap-6fe3b446bd5d8488)\n\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.82s\n\n",
+      "sha256": "5c6b56e070b762f452e1daf60eda62aff2bed55e850c7c5411ee4fa5201f0bd9"
+    },
+    "c-buffered-r2.log": {
+      "text": "MISMATCH worker=0 step=17020 check=1 page=12364 generation=1 word=0 want=10304c0000000200 got=10304c0000000000\nPASS worker=3 writes=216384 reads=400000\nPASS worker=1 writes=216384 reads=400000\nPASS worker=2 writes=216384 reads=400000\n",
+      "sha256": "76c83244120f04dc38bdfcd36ff8da6dc58a64c96aaf63939ee44c1ef6f79444"
+    },
+    "c-buffered.log": {
+      "text": "MISMATCH worker=3 step=19262 check=1 page=514 generation=1 word=0 want=4002020000000200 got=4002020000000000\nMISMATCH worker=1 step=26305 check=1 page=2984 generation=2 word=0 want=200ba80000000400 got=200ba80000000200\nPASS worker=2 writes=216384 reads=400000\nPASS worker=0 writes=216384 reads=400000\n",
+      "sha256": "9c5b012b3ace2203f5a29a3abbf9f888ec63f90433f132fc852eebd6c2770fdb"
+    },
+    "concurrent-0-0.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\n\nthread 'heap_does_not_grow_with_the_store' (5654864) panicked at kernel/src/io.rs:165:17:\nassertion `left == right` failed: READ DIFFERS FROM LAST SUCCESSFUL WRITE: offset 107143168\n  left: 2176647561\n right: 4134327027\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    heap_does_not_grow_with_the_store\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.28s\n\n",
+      "sha256": "95b0b40affef095d2a646bbb67751df503899654ceded4b12071d4d673831145"
+    },
+    "concurrent-0-1.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.85s\n\n",
+      "sha256": "921d8673801c8ef5407d0c9be54648ca12eb1ff62405750a4dddb11e97225eaf"
+    },
+    "concurrent-0-2.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\n\nthread 'heap_does_not_grow_with_the_store' (5654867) panicked at kernel/src/io.rs:165:17:\nassertion `left == right` failed: READ DIFFERS FROM LAST SUCCESSFUL WRITE: offset 71798784\n  left: 2719374204\n right: 3312108135\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    heap_does_not_grow_with_the_store\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.49s\n\n",
+      "sha256": "ec69b8f227409b1cfe43fe2a7e24014eafa4f8707cd1a88cabdbbb028f11e348"
+    },
+    "concurrent-0-3.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\n\nthread 'heap_does_not_grow_with_the_store' (5654866) panicked at kernel/src/io.rs:165:17:\nassertion `left == right` failed: READ DIFFERS FROM LAST SUCCESSFUL WRITE: offset 15400960\n  left: 4258522496\n right: 2011997261\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    heap_does_not_grow_with_the_store\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.56s\n\n",
+      "sha256": "0a4b57fafbee8b61e513c348186430982d89a5748982a079e10876d56c080182"
+    },
+    "uninstrumented-v3.log": {
+      "text": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... 200k: write 0.3 read 0.3 abs 11.4 MiB\n800k: write 0.3 read 0.3 abs 11.4 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.50s\n\n",
+      "sha256": "f469ac4a884e93f5591ee483b1b13b92477b6633a8efd2161f0fcf5493c5145a"
+    }
+  },
+  "physical_audits": {
+    "original_v3": {
+      "bad_immediate_routes": 1,
+      "duplicate_physical_keys": 7,
+      "expected": 800000,
+      "invalid_pages": 0,
+      "invalid_rows": 0,
+      "issues": [
+        {
+          "index": 44430,
+          "issue": "duplicate physical key",
+          "page": 26984,
+          "slot": 14
+        },
+        {
+          "index": 558659,
+          "issue": "duplicate physical key",
+          "page": 26984,
+          "slot": 15
+        },
+        {
+          "index": 240848,
+          "issue": "duplicate physical key",
+          "page": 26984,
+          "slot": 16
+        },
+        {
+          "index": 437266,
+          "issue": "duplicate physical key",
+          "page": 26984,
+          "slot": 17
+        },
+        {
+          "index": 137166,
+          "issue": "duplicate physical key",
+          "page": 39769,
+          "slot": 15
+        },
+        {
+          "index": 258559,
+          "issue": "duplicate physical key",
+          "page": 39769,
+          "slot": 16
+        },
+        {
+          "index": 454977,
+          "issue": "duplicate physical key",
+          "page": 39769,
+          "slot": 17
+        },
+        {
+          "issue": "within-page ordering",
+          "kind": 2,
+          "left": 4613546706024250342,
+          "page": 39769,
+          "right": 4613478747947949547
+        },
+        {
+          "child": 26984,
+          "issue": "child outside parent interval",
+          "lower": 4613546706024250342,
+          "max": 4613986539932276090,
+          "min": 4613546706024250342,
+          "parent": 456,
+          "upper": 4613902539130864806
+        }
+      ],
+      "missing_examples": [
+        {
+          "index": 5999,
+          "key": 10807919878559871003
+        },
+        {
+          "index": 118314,
+          "key": 1352975615072289138
+        },
+        {
+          "index": 314732,
+          "key": 1353017615472994780
+        },
+        {
+          "index": 436125,
+          "key": 1352949657396693985
+        },
+        {
+          "index": 520228,
+          "key": 10807935921284981492
+        },
+        {
+          "index": 632543,
+          "key": 1352991657797399627
+        },
+        {
+          "index": 651395,
+          "key": 4613562748749360831
+        }
+      ],
+      "missing_physical_keys": 7,
+      "page_errors": [],
+      "path": "<scratch>",
+      "physical_pages": 50562,
+      "physical_rows": 800000,
+      "scope": "physical pages only; cache not flushed; no committed-membership claim",
+      "unreferenced_interiors": [
+        30011
+      ],
+      "within_page_disorder": 1
+    },
+    "baseline": {
+      "bad_immediate_routes": 0,
+      "duplicate_physical_keys": 0,
+      "expected": 800000,
+      "invalid_pages": 0,
+      "invalid_rows": 0,
+      "issues": [],
+      "missing_physical_keys": 0,
+      "page_errors": [],
+      "path": "<scratch>",
+      "physical_pages": 50541,
+      "physical_rows": 800000,
+      "scope": "physical pages only; cache not flushed; no committed-membership claim",
+      "unreferenced_interiors": [
+        30081
+      ],
+      "within_page_disorder": 0
+    },
+    "instrumented_v3": {
+      "bad_immediate_routes": 0,
+      "duplicate_physical_keys": 0,
+      "expected": 800000,
+      "invalid_pages": 0,
+      "invalid_rows": 0,
+      "issues": [],
+      "missing_physical_keys": 0,
+      "page_errors": [],
+      "path": "<scratch>",
+      "physical_pages": 50563,
+      "physical_rows": 800000,
+      "scope": "physical pages only; cache not flushed; no committed-membership claim",
+      "unreferenced_interiors": [
+        30011
+      ],
+      "within_page_disorder": 0
+    }
+  },
+  "native": {
+    "pi": {
+      "evidence_archive_sha256": "310ad03d81c131dfd46ade080ded1ddfdeb3f12ef52e5ef28549abc6b1d652fa",
+      "files": {
+        "interrupted-process-status.txt": "Name:\tlaw1_heap-eda64\nUmask:\t0002\nState:\tS (sleeping)\nTgid:\t173526\nNgid:\t0\nPid:\t173526\nPPid:\t173219\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t256\nGroups:\t4 20 24 27 29 44 46 60 100 102 108 986 988 989 992 996 1000 \nNStgid:\t173526\nNSpid:\t173526\nNSpgid:\t173219\nNSsid:\t173219\nKthread:\t0\nVmPeak:\t  131072 kB\nVmSize:\t  120352 kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t  118448 kB\nVmRSS:\t  116320 kB\nRssAnon:\t  114000 kB\nRssFile:\t    2320 kB\nRssShmem:\t       0 kB\nVmData:\t  116272 kB\nVmStk:\t     144 kB\nVmExe:\t     960 kB\nVmLib:\t    2528 kB\nVmPTE:\t     160 kB\nVmSwap:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t0\nuntag_mask:\t0xffffffffffffff\nThreads:\t2\nSigQ:\t0/16019\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000001000\nSigCgt:\t0000000100000440\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tthread vulnerable\nSpeculationIndirectBranch:\tunknown\nCpus_allowed:\tf\nCpus_allowed_list:\t0-3\nMems_allowed:\t000f\nMems_allowed_list:\t0-3\nvoluntary_ctxt_switches:\t3\nnonvoluntary_ctxt_switches:\t0\n",
+        "platform.txt": "Linux device 6.18.34+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.18.34-1+rpt1 (2026-06-09) aarch64 GNU/Linux\n<scratch>: ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, BuildID[sha1]=d9666491090f4f61fd5f1fd6758d5fa9204e2ba5, for GNU/Linux 3.7.0, with debug_info, not stripped\n",
+        "binary.sha256": "1bfa0bc62a604f2be53439d54693d243934238730c205558ee6a4512acee3dd9  <scratch>\n",
+        "source.sha256": "a42d44418cb75e40432e41c9c812009016eb8b83eb12029e6b8364fa89cfcc05  <scratch>\n",
+        "buffered_rewrite_probe.c": "// Independent positional-I/O oracle: no E4, Rust, CRC library, or uncached flags.\n// Four isolated processes/files. Expected words derive from page/owner/version.\n// Successful pwrite must be visible to subsequent pread without an fsync.\n#include <errno.h>\n#include <fcntl.h>\n#include <inttypes.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/stat.h>\n#include <sys/types.h>\n#include <sys/wait.h>\n#include <unistd.h>\n#define PAGES 16384\n#define STEPS 200000\nstatic uint64_t pattern(unsigned worker,unsigned page,uint32_t gen,unsigned word) {\n    return ((uint64_t)(worker+1)<<60)^((uint64_t)page<<40)^((uint64_t)gen<<9)^word;\n}\nstatic void transfer(int fd,void *buf,off_t offset,int writing) {\n    size_t done=0;\n    while(done<4096) {\n        ssize_t n=writing?pwrite(fd,(char*)buf+done,4096-done,offset+done):pread(fd,(char*)buf+done,4096-done,offset+done);\n        if(n<0 && errno==EINTR)continue;\n        if(n<=0){perror(writing?\"pwrite\":\"pread\");exit(3);}done+=(size_t)n;\n    }\n}\nstatic int run(const char *root,unsigned worker) {\n    char path[1024];snprintf(path,sizeof path,\"%s/worker-%u.data\",root,worker);\n    int fd=open(path,O_RDWR|O_CREAT|O_EXCL,0600);if(fd<0){perror(\"open\");return 3;}\n    uint32_t *versions=calloc(PAGES,sizeof *versions);if(!versions)return 3;\n    uint64_t *writebuf=NULL,*readbuf=NULL;\n    if(posix_memalign((void**)&writebuf,4096,4096)||posix_memalign((void**)&readbuf,4096,4096))return 3;\n    for(unsigned p=0;p<PAGES;p++) {\n        for(unsigned w=0;w<512;w++)writebuf[w]=pattern(worker,p,0,w);\n        transfer(fd,writebuf,(off_t)p*4096,1);\n    }\n    uint64_t random=0x9e3779b97f4a7c15ULL+worker;\n    for(unsigned step=0;step<STEPS;step++) {\n        random^=random<<13;random^=random>>7;random^=random<<17;\n        unsigned p=(unsigned)(random%PAGES);uint32_t gen=++versions[p];\n        for(unsigned w=0;w<512;w++)writebuf[w]=pattern(worker,p,gen,w);\n        transfer(fd,writebuf,(off_t)p*4096,1);\n        memset(writebuf,0xa5,4096); // Buffer is reusable after pwrite returns.\n        // Check both the just-written page and a previously written page.\n        for(unsigned check=0;check<2;check++) {\n            unsigned q=check?(unsigned)((random>>32)%PAGES):p;\n            transfer(fd,readbuf,(off_t)q*4096,0);\n            for(unsigned w=0;w<512;w++)if(readbuf[w]!=pattern(worker,q,versions[q],w)) {\n                fprintf(stderr,\"MISMATCH worker=%u step=%u check=%u page=%u generation=%u word=%u want=%016\" PRIx64 \" got=%016\" PRIx64 \"\\n\",worker,step,check,q,versions[q],w,pattern(worker,q,versions[q],w),readbuf[w]);\n                snprintf(path,sizeof path,\"%s/worker-%u-observed.bin\",root,worker);\n                int evidence=open(path,O_WRONLY|O_CREAT|O_EXCL,0600);if(evidence<0)return 3;transfer(evidence,readbuf,0,1);close(evidence);\n                for(unsigned i=0;i<512;i++)writebuf[i]=pattern(worker,q,versions[q],i);\n                snprintf(path,sizeof path,\"%s/worker-%u-expected.bin\",root,worker);\n                evidence=open(path,O_WRONLY|O_CREAT|O_EXCL,0600);if(evidence<0)return 3;transfer(evidence,writebuf,0,1);close(evidence);\n                close(fd);return 1;\n            }\n        }\n    }\n    printf(\"PASS worker=%u writes=%u reads=%u\\n\",worker,PAGES+STEPS,STEPS*2);fflush(stdout);close(fd);free(versions);free(writebuf);free(readbuf);return 0;\n}\nint main(int argc,char **argv) {\n    if(argc!=2)return 2;\n    if(mkdir(argv[1],0700)){perror(\"mkdir fresh artifact root\");return 2;}\n    for(unsigned i=0;i<4;i++){pid_t p=fork();if(p<0)return 3;if(p==0)exit(run(argv[1],i));}\n    int failed=0,status;while(wait(&status)>0)if(!WIFEXITED(status)||WEXITSTATUS(status))failed=1;\n    return failed;\n}\n",
+        "run-1.log": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\n",
+        "one-arena-1.log": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.51s\n\n",
+        "c-buffered.log": "PASS worker=3 writes=216384 reads=400000\nPASS worker=0 writes=216384 reads=400000\nPASS worker=1 writes=216384 reads=400000\nPASS worker=2 writes=216384 reads=400000\n",
+        "one-arena-3.log": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 34.01s\n\n",
+        "one-arena-2.log": "\nrunning 1 test\ntest heap_does_not_grow_with_the_store ... committed rows 200000 root 232\ncommitted rows 800000 root 30011\n200k: write 0.8 read 0.8 abs 11.9 MiB\n800k: write 2.6 read 2.6 abs 13.7 MiB\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.59s\n\n",
+        "interrupted-process-io.txt": "rchar: 2700159527\nwchar: 2731967790\nsyscr: 659229\nsyscw: 638293\nread_bytes: 0\nwrite_bytes: 1331773440\ncancelled_write_bytes: 0\n",
+        "build.log": "   Compiling semver v1.0.28\n   Compiling libc v0.2.189\n   Compiling rustc_version v0.4.1\n   Compiling rustix v1.1.4\n   Compiling getrandom v0.4.3\n   Compiling crc32c v0.6.8\n   Compiling bitflags v2.13.1\n   Compiling cfg-if v1.0.4\n   Compiling linux-raw-sys v0.12.1\n   Compiling fastrand v2.5.0\n   Compiling once_cell v1.21.4\n   Compiling tempfile v3.27.0\n   Compiling kernel v0.17.0 (<scratch>)\nwarning: field `table` is never read\n  --> kernel/src/vecquant.rs:94:5\n   |\n87 | pub struct Encoder {\n   |            ------- field in this struct\n...\n94 |     table: [f32; MAX_LEVELS],\n   |     ^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: field `reader_slot` is never read\n   --> kernel/src/store.rs:220:5\n    |\n206 | pub struct Store {\n    |            ----- field in this struct\n...\n220 |     reader_slot: Option<crate::readers::ReaderSlot>,\n    |     ^^^^^^^^^^^\n\nwarning: `kernel` (lib) generated 2 warnings\n    Finished `release` profile [optimized + debuginfo] target(s) in 51.97s\n  Executable tests/law1_heap.rs (<scratch>)\n"
+      },
+      "c_source_sha256": "f1db3b2500bc743a43398819cd285793154d0aa53979a725865bb6736896daad",
+      "c_binary_sha256": "21b3131c78c6f8384773d8455f2030bf84443b4e90b5faf03f830861e319ec29",
+      "c_compiler": "cc (Debian 14.2.0-19) 14.2.0\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+    },
+    "server": {
+      "evidence_archive_sha256": "64e9cfc40133b6331e54251711f413f1f6e4b014fc08d1fa93a3c787922d27e2",
+      "files": {
+        "platform.txt": "Linux e4-scan-io-20260914-9qgq4 6.18.1-server #1 SMP Wed Dec 17 10:07:33 UTC 2025 x86_64 GNU/Linux\ncc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+        "buffered_rewrite_probe.c": "// Independent positional-I/O oracle: no E4, Rust, CRC library, or uncached flags.\n// Four isolated processes/files. Expected words derive from page/owner/version.\n// Successful pwrite must be visible to subsequent pread without an fsync.\n#include <errno.h>\n#include <fcntl.h>\n#include <inttypes.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/stat.h>\n#include <sys/types.h>\n#include <sys/wait.h>\n#include <unistd.h>\n#define PAGES 16384\n#define STEPS 200000\nstatic uint64_t pattern(unsigned worker,unsigned page,uint32_t gen,unsigned word) {\n    return ((uint64_t)(worker+1)<<60)^((uint64_t)page<<40)^((uint64_t)gen<<9)^word;\n}\nstatic void transfer(int fd,void *buf,off_t offset,int writing) {\n    size_t done=0;\n    while(done<4096) {\n        ssize_t n=writing?pwrite(fd,(char*)buf+done,4096-done,offset+done):pread(fd,(char*)buf+done,4096-done,offset+done);\n        if(n<0 && errno==EINTR)continue;\n        if(n<=0){perror(writing?\"pwrite\":\"pread\");exit(3);}done+=(size_t)n;\n    }\n}\nstatic int run(const char *root,unsigned worker) {\n    char path[1024];snprintf(path,sizeof path,\"%s/worker-%u.data\",root,worker);\n    int fd=open(path,O_RDWR|O_CREAT|O_EXCL,0600);if(fd<0){perror(\"open\");return 3;}\n    uint32_t *versions=calloc(PAGES,sizeof *versions);if(!versions)return 3;\n    uint64_t *writebuf=NULL,*readbuf=NULL;\n    if(posix_memalign((void**)&writebuf,4096,4096)||posix_memalign((void**)&readbuf,4096,4096))return 3;\n    for(unsigned p=0;p<PAGES;p++) {\n        for(unsigned w=0;w<512;w++)writebuf[w]=pattern(worker,p,0,w);\n        transfer(fd,writebuf,(off_t)p*4096,1);\n    }\n    uint64_t random=0x9e3779b97f4a7c15ULL+worker;\n    for(unsigned step=0;step<STEPS;step++) {\n        random^=random<<13;random^=random>>7;random^=random<<17;\n        unsigned p=(unsigned)(random%PAGES);uint32_t gen=++versions[p];\n        for(unsigned w=0;w<512;w++)writebuf[w]=pattern(worker,p,gen,w);\n        transfer(fd,writebuf,(off_t)p*4096,1);\n        memset(writebuf,0xa5,4096); // Buffer is reusable after pwrite returns.\n        // Check both the just-written page and a previously written page.\n        for(unsigned check=0;check<2;check++) {\n            unsigned q=check?(unsigned)((random>>32)%PAGES):p;\n            transfer(fd,readbuf,(off_t)q*4096,0);\n            for(unsigned w=0;w<512;w++)if(readbuf[w]!=pattern(worker,q,versions[q],w)) {\n                fprintf(stderr,\"MISMATCH worker=%u step=%u check=%u page=%u generation=%u word=%u want=%016\" PRIx64 \" got=%016\" PRIx64 \"\\n\",worker,step,check,q,versions[q],w,pattern(worker,q,versions[q],w),readbuf[w]);\n                snprintf(path,sizeof path,\"%s/worker-%u-observed.bin\",root,worker);\n                int evidence=open(path,O_WRONLY|O_CREAT|O_EXCL,0600);if(evidence<0)return 3;transfer(evidence,readbuf,0,1);close(evidence);\n                for(unsigned i=0;i<512;i++)writebuf[i]=pattern(worker,q,versions[q],i);\n                snprintf(path,sizeof path,\"%s/worker-%u-expected.bin\",root,worker);\n                evidence=open(path,O_WRONLY|O_CREAT|O_EXCL,0600);if(evidence<0)return 3;transfer(evidence,writebuf,0,1);close(evidence);\n                close(fd);return 1;\n            }\n        }\n    }\n    printf(\"PASS worker=%u writes=%u reads=%u\\n\",worker,PAGES+STEPS,STEPS*2);fflush(stdout);close(fd);free(versions);free(writebuf);free(readbuf);return 0;\n}\nint main(int argc,char **argv) {\n    if(argc!=2)return 2;\n    if(mkdir(argv[1],0700)){perror(\"mkdir fresh artifact root\");return 2;}\n    for(unsigned i=0;i<4;i++){pid_t p=fork();if(p<0)return 3;if(p==0)exit(run(argv[1],i));}\n    int failed=0,status;while(wait(&status)>0)if(!WIFEXITED(status)||WEXITSTATUS(status))failed=1;\n    return failed;\n}\n",
+        "c-buffered.log": "PASS worker=0 writes=216384 reads=400000\nPASS worker=2 writes=216384 reads=400000\nPASS worker=1 writes=216384 reads=400000\nPASS worker=3 writes=216384 reads=400000\n",
+        "hashes.txt": "f1db3b2500bc743a43398819cd285793154d0aa53979a725865bb6736896daad  buffered_rewrite_probe.c\nfe6f1deb2b7fc8a6603898f25eb965c278ddad9d9222e9e4dfb07f613d5396d0  buffered-rewrite-probe\n"
+      },
+      "c_source_sha256": "f1db3b2500bc743a43398819cd285793154d0aa53979a725865bb6736896daad",
+      "c_binary_sha256": "fe6f1deb2b7fc8a6603898f25eb965c278ddad9d9222e9e4dfb07f613d5396d0",
+      "c_compiler": "cc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+    }
+  },
+  "c_stale_page_evidence": [
+    {
+      "worker": 3,
+      "step": 19262,
+      "check": 1,
+      "page": 514,
+      "generation": 1,
+      "word": 0,
+      "want": 4612251167404065280,
+      "got": 4612251167404064768,
+      "run": "c-buffered",
+      "expected_sha256": "fa30e4b549bbe0fc255ba2dd902d0c5a8bf372910019e8b150fde065eb42033f",
+      "observed_sha256": "f43618cd6790c9457e3f580560d5d11d2b7d458406f8e843df2cc97e30673795",
+      "later_sha256": "fa30e4b549bbe0fc255ba2dd902d0c5a8bf372910019e8b150fde065eb42033f",
+      "later_matches_expected": true,
+      "later_matches_observed": false,
+      "mismatching_words": 512
+    },
+    {
+      "worker": 1,
+      "step": 26305,
+      "check": 1,
+      "page": 2984,
+      "generation": 2,
+      "word": 0,
+      "want": 2309123951910978560,
+      "got": 2309123951910978048,
+      "run": "c-buffered",
+      "expected_sha256": "634a9befb1d452fb3b8a0d9836bc516d260f69d59733d2cbc7bc2876df40f9d8",
+      "observed_sha256": "d5d056553fa9f7a2326355a71c63fe2af5f845f4bc01a068be1206f9cf362ed5",
+      "later_sha256": "d5d056553fa9f7a2326355a71c63fe2af5f845f4bc01a068be1206f9cf362ed5",
+      "later_matches_expected": false,
+      "later_matches_observed": true,
+      "mismatching_words": 512
+    },
+    {
+      "worker": 0,
+      "step": 17020,
+      "check": 1,
+      "page": 12364,
+      "generation": 1,
+      "word": 0,
+      "want": 1166515866372669952,
+      "got": 1166515866372669440,
+      "run": "c-buffered-r2",
+      "expected_sha256": "039dc06a90b33495e2ff202aa4a480b8f6df13a2930106ffddbd43359a856ef8",
+      "observed_sha256": "849e32c26a849b1bd66230a2875dd37ff03550fa08460a47dad0f30c50c5876d",
+      "later_sha256": "849e32c26a849b1bd66230a2875dd37ff03550fa08460a47dad0f30c50c5876d",
+      "later_matches_expected": false,
+      "later_matches_observed": true,
+      "mismatching_words": 512
+    }
+  ],
+  "mac_compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin\n",
+  "mac_c_binary_sha256": "634861a0e235e147a8edeef8fae0acd8f996971303f1fa446f0a7036edfb9c99",
+  "mac_instrumented_binary_sha256": "372a871b87ce57d32776599744a3300dfe390d903591a87f7ec76c3c059fcd69",
+  "mac_original_binary_sha256": "b5c0294e99c38eb8a84d9e203f8881b12ace7150753558ebf84298f71d7223da",
+  "instrumented_source_archive_sha256": "a42d44418cb75e40432e41c9c812009016eb8b83eb12029e6b8364fa89cfcc05",
+  "talos_failure_backup": {
+    "archive_sha256": "651621bf4a166c7ee62701133a8f0b155ad30b953422e97e2e2d662407bb81b6",
+    "verified_files": 25,
+    "logical_bytes": 1469709036
+  },
+  "failure_manifest": {
+    "files": {
+      "original-v3/rows-200000/data": {
+        "sha256": "baf1d1e97aa0c493b55922c6f7e72d189d4de90c3f39df5697c7336c290753cb",
+        "logical": 52199424
+      },
+      "original-v3/rows-200000/wal": {
+        "sha256": "20cb6f6e973b6a9e97b93a0a382c28bb6c0e772c47a92217620bd7bc556a4dc1",
+        "logical": 46000020
+      },
+      "original-v3/rows-800000/data": {
+        "sha256": "eafd86c55bfd574adf376f1890d8c60f9e30a87ed53fca78a298de430e9a1b7f",
+        "logical": 207101952
+      },
+      "original-v3/rows-800000/wal": {
+        "sha256": "480843760a1b59e89d067775dd1a4a1d18916ec67264b17fa91c82949df4d16c",
+        "logical": 184000020
+      },
+      "concurrent-0-0/rows-200000/data": {
+        "sha256": "baf1d1e97aa0c493b55922c6f7e72d189d4de90c3f39df5697c7336c290753cb",
+        "logical": 52199424
+      },
+      "concurrent-0-0/rows-200000/wal": {
+        "sha256": "20cb6f6e973b6a9e97b93a0a382c28bb6c0e772c47a92217620bd7bc556a4dc1",
+        "logical": 46000020
+      },
+      "concurrent-0-0/rows-800000/data": {
+        "sha256": "31aeb9b4875b2709623accc092b9b425b5eaca75ccf4db81245935b6797ce13f",
+        "logical": 117805056
+      },
+      "concurrent-0-0/rows-800000/wal": {
+        "sha256": "3995d89243d589eeda7339e9f1189aaa55a8d06e98abcb7a63217fc70a4f27c8",
+        "logical": 105142200
+      },
+      "concurrent-0-2/rows-200000/data": {
+        "sha256": "baf1d1e97aa0c493b55922c6f7e72d189d4de90c3f39df5697c7336c290753cb",
+        "logical": 52199424
+      },
+      "concurrent-0-2/rows-200000/wal": {
+        "sha256": "20cb6f6e973b6a9e97b93a0a382c28bb6c0e772c47a92217620bd7bc556a4dc1",
+        "logical": 46000020
+      },
+      "concurrent-0-2/rows-800000/data": {
+        "sha256": "e668bd9a0ad2166dd18d93765f1b4ce23fa5ed2a2e3392506b2786dbda7b489c",
+        "logical": 112967680
+      },
+      "concurrent-0-2/rows-800000/wal": {
+        "sha256": "07c60c338e31eceb9700ef303ca4369716e748a8f58095f169ebedc968f29fda",
+        "logical": 100684800
+      },
+      "concurrent-0-3/rows-200000/data": {
+        "sha256": "baf1d1e97aa0c493b55922c6f7e72d189d4de90c3f39df5697c7336c290753cb",
+        "logical": 52199424
+      },
+      "concurrent-0-3/rows-200000/wal": {
+        "sha256": "20cb6f6e973b6a9e97b93a0a382c28bb6c0e772c47a92217620bd7bc556a4dc1",
+        "logical": 46000020
+      },
+      "concurrent-0-3/rows-800000/data": {
+        "sha256": "8d20b0d7ae0714c01d0890c86dddfc94880c11d1c20e2b28f87f10b73c82179d",
+        "logical": 25309184
+      },
+      "concurrent-0-3/rows-800000/wal": {
+        "sha256": "3806756b951867e3573c2b3655e6ee01f35106ce34a16d6fb6d35441faf76ef0",
+        "logical": 22549200
+      },
+      "c-buffered/worker-1-expected.bin": {
+        "sha256": "634a9befb1d452fb3b8a0d9836bc516d260f69d59733d2cbc7bc2876df40f9d8",
+        "logical": 4096
+      },
+      "c-buffered/worker-1-observed.bin": {
+        "sha256": "d5d056553fa9f7a2326355a71c63fe2af5f845f4bc01a068be1206f9cf362ed5",
+        "logical": 4096
+      },
+      "c-buffered/worker-1.data": {
+        "sha256": "c471724da0f3b233be94f4f7122a29d5ff8d982f4930ff27683855a2ad04ceba",
+        "logical": 67108864
+      },
+      "c-buffered/worker-3-expected.bin": {
+        "sha256": "fa30e4b549bbe0fc255ba2dd902d0c5a8bf372910019e8b150fde065eb42033f",
+        "logical": 4096
+      },
+      "c-buffered/worker-3-observed.bin": {
+        "sha256": "f43618cd6790c9457e3f580560d5d11d2b7d458406f8e843df2cc97e30673795",
+        "logical": 4096
+      },
+      "c-buffered/worker-3.data": {
+        "sha256": "c39a592fff9e26f5631aa009de5d5078fe2e1fe7976eba11075a41b65a6ddba8",
+        "logical": 67108864
+      },
+      "c-buffered-r2/worker-0-expected.bin": {
+        "sha256": "039dc06a90b33495e2ff202aa4a480b8f6df13a2930106ffddbd43359a856ef8",
+        "logical": 4096
+      },
+      "c-buffered-r2/worker-0-observed.bin": {
+        "sha256": "849e32c26a849b1bd66230a2875dd37ff03550fa08460a47dad0f30c50c5876d",
+        "logical": 4096
+      },
+      "c-buffered-r2/worker-0.data": {
+        "sha256": "a65531e681fd56a930e04ced3ddc7a524b2bf590e3c48da7bd8bd085958f8242",
+        "logical": 67108864
+      }
+    },
+    "archive_sha256": "651621bf4a166c7ee62701133a8f0b155ad30b953422e97e2e2d662407bb81b6"
+  },
+  "limits": "Remembered-write digest map is forensic O(written pages) metadata; not a production Law-1 proof. C control is visibility, not crash durability. Exact original failure causality and OS/filesystem/device component remain unproven.",
+  "foundation_gate": {
+    "exit_code": 1,
+    "result": {
+      "promotable": false,
+      "blockers": [
+        "L1-MEM: PENDING",
+        "L2-WORK: FAIL",
+        "L3-ATOMIC: PENDING",
+        "L5-DAMAGE: FAIL",
+        "L6-READ: PENDING",
+        "L7-DEVICE: PENDING",
+        "W-DELETE: PENDING",
+        "W-REINSERT: PENDING",
+        "W-READERS: PENDING",
+        "W-CAP: PENDING",
+        "W-REPAIR: PENDING",
+        "CONTROL-SCAN: FAIL",
+        "F-T8192: Overflow within F-TVAR only; standalone pending",
+        "F-H4: PENDING",
+        "F-H1536: PENDING",
+        "F-SCHEMA: PENDING",
+        "Mac/resize-1k/size_target: FAIL",
+        "Mac/resize-1k/acceptance_repetitions: PENDING",
+        "Mac/text256-40k/acceptance_repetitions: PENDING",
+        "Mac/text32-10k/acceptance_repetitions: PENDING",
+        "Mac/fixed-10000-local/time_target: FAIL",
+        "Mac/fixed-100000-scattered/time_target: FAIL",
+        "Mac/fixed-100000-scattered/size_target: FAIL",
+        "Mac/fixed-10000000-local/time_target: FAIL",
+        "Mac/fixed-10000000-local/acceptance_repetitions: PENDING",
+        "Mac/fixed-10000000-scattered/acceptance_repetitions: PENDING",
+        "Pi/load-100k/acceptance_repetitions: PENDING",
+        "Pi/resize-1k/time_target: FAIL",
+        "Pi/resize-1k/size_target: FAIL",
+        "Pi/resize-1k/acceptance_repetitions: PENDING",
+        "Pi/fixed-100000-scattered/size_target: FAIL",
+        "Pi/fixed-1000000-local/time_target: FAIL",
+        "Pi/fixed-1000000-scattered/time_target: FAIL",
+        "Pi/fixed-10000000-local/acceptance_repetitions: PENDING",
+        "Pi/fixed-10000000-scattered/acceptance_repetitions: PENDING"
+      ]
+    }
+  },
+  "talos_job": {
+    "name": "e4-scan-io-20260914",
+    "namespace": "sekejap-benchmark",
+    "succeeded": 1
+  }
+}

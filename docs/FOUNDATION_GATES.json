@@ -331,7 +331,7 @@
     {
       "id": "CONTROL-SCAN",
       "status": "FAIL",
-      "remaining": "Unresolved; each failed endpoint differs from a successful endpoint by one stale checksum-valid data page. Parent pointers match. Original failed files and exact successful endpoints preserved. The related page-WAL stale-version reader defect is fixed; the native old-Store failure is not declared fixed."
+      "remaining": "Unresolved; earlier failed endpoints differ by one stale checksum-valid page with matching parent pointers. A follow-up independently reproduces stale buffered I/O on Mac/scratch using C without E4; identical Pi/server C controls pass. Concurrent instrumented E4 also catches read-versus-last-write mismatches. This establishes an external I/O failure class, not the exact cause of every historical failure. Requalify the frozen candidate on native storage; do not declare the older Store fixed. See SCAN_IO_ISOLATION.md."
     }
   ],
   "qualification_v2": {
