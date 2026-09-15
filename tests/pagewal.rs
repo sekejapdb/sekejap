@@ -76,7 +76,7 @@ fn crash_child(){
 }
 #[test]
 fn checkpoint_process_death_preserves_acknowledged_rows(){
-    let d=dir();for stage in 1..=4{
+    let d=dir();for stage in 1..=6{
         let p=d.path().join(format!("crash-{stage}"));
         let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","crash_child","--nocapture"])
             .env("E4_PAGEWAL_CRASH_PATH",&p).env("E4_PAGEWAL_CRASH_STAGE",stage.to_string()).status().unwrap();

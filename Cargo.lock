@@ -50,6 +50,7 @@ name = "e4-prototype"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "getrandom",
  "kernel",
  "rusqlite",
  "serde_json",

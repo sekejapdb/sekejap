@@ -19,6 +19,7 @@ kernel = { path = "kernel" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 crc32c = "0.6"
+getrandom = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

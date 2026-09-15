@@ -76,7 +76,7 @@ fn io_failure_at_each_commit_and_checkpoint_boundary(){
     let mut cases=0;
     for checkpoint in [false,true]{
         let control=temp.path().join(format!("control-{checkpoint}"));fs::create_dir(&control).unwrap();
-        for name in ["data","wal"]{fs::copy(base.join(name),control.join(name)).unwrap();}
+        for name in ["data","wal","writer.lock"]{fs::copy(base.join(name),control.join(name)).unwrap();}
         let plan=Arc::new(Mutex::new(Plan::default()));let mut s=hooked(&control,plan.clone());
         if checkpoint{mutate(&mut s).unwrap();}
         *plan.lock().unwrap()=Plan::default();
@@ -84,7 +84,7 @@ fn io_failure_at_each_commit_and_checkpoint_boundary(){
         let trace=plan.lock().unwrap().trace.clone();drop(s);
         for nth in 1..=trace.len(){for mode in 0..4{
             let p=temp.path().join(format!("case-{checkpoint}-{nth}-{mode}"));fs::create_dir(&p).unwrap();
-            for name in ["data","wal"]{fs::copy(base.join(name),p.join(name)).unwrap();}
+            for name in ["data","wal","writer.lock"]{fs::copy(base.join(name),p.join(name)).unwrap();}
             let plan=Arc::new(Mutex::new(Plan::default()));let mut s=hooked(&p,plan.clone());
             if checkpoint{mutate(&mut s).unwrap();}
             *plan.lock().unwrap()=Plan{nth,mode,..Plan::default()};
@@ -138,12 +138,13 @@ fn checksum_valid_stale_wal_frame_cannot_serve_a_snapshot_or_checkpoint(){
     s.put(&1u64.to_be_bytes(),&value(1,2)).unwrap();s.commit().unwrap();
     let good=fs::read(p.join("wal")).unwrap();
     let (off,no)=good.chunks_exact(FRAME).enumerate().find_map(|(i,b)|{
-        if u32at(b,8)!=1{return None;}let no=u32at(b,12);let page=PageRef::open(&b[32..],no).ok()?;
+        if u32at(b,8)!=1{return None;}let no=u32at(b,12);let page=PageRef::open(&b[32..32+PAGE],no).ok()?;
         (page.kind()==PageKind::Leaf).then_some((i*FRAME,no))
     }).unwrap();
     let old:[u8;PAGE]=original_data[no as usize*PAGE..(no as usize+1)*PAGE].try_into().unwrap();
-    let stale=frame(1,no,u64at(&good[off..],16),0,&old);
-    assert_ne!(stale,&good[off..off+FRAME]);PageRef::open(&stale[32..],no).unwrap();
+    let identity=good[off+32+PAGE..off+FRAME].try_into().unwrap();
+    let stale=frame(1,no,u64at(&good[off..],16),0,&old,&identity);
+    assert_ne!(stale,&good[off..off+FRAME]);PageRef::open(&stale[32..32+PAGE],no).unwrap();
     let snapshot=s.snapshot().unwrap();
     let (wal,_)=io::open_file(&p.join("wal"),IoMode::Buffered).unwrap();wal.write_at(&stale,off as u64).unwrap();wal.sync_full().unwrap();
     assert!(snapshot.get(&1u64.to_be_bytes()).is_err(),"valid old bytes are not the published page version");
@@ -156,4 +157,35 @@ fn checksum_valid_stale_wal_frame_cannot_serve_a_snapshot_or_checkpoint(){
     wal.write_at(&good[off..off+FRAME],off as u64).unwrap();wal.sync_full().unwrap();
     let recovered=PageWalStore::open(&p,false,32<<10).unwrap();
     assert_eq!(recovered.get(&1u64.to_be_bytes()).unwrap(),Some(value(1,2)));
+}
+
+#[test]
+fn checkpoint_preserves_a_valid_header_when_the_other_copy_starts_damaged(){
+    let temp=tempfile::tempdir().unwrap();
+    let mut cases=0;
+    for damaged in 0..2usize {
+        let base=temp.path().join(format!("base-{damaged}"));seed(&base);
+        let mut data=fs::read(base.join("data")).unwrap();
+        data[damaged*PAGE+100]^=1;fs::write(base.join("data"),data).unwrap();
+
+        let control=temp.path().join(format!("control-{damaged}"));fs::create_dir(&control).unwrap();
+        for name in ["data","wal","writer.lock"]{fs::copy(base.join(name),control.join(name)).unwrap();}
+        let plan=Arc::new(Mutex::new(Plan::default()));let mut s=hooked(&control,plan.clone());
+        mutate(&mut s).unwrap();*plan.lock().unwrap()=Plan::default();s.checkpoint().unwrap();
+        let trace=plan.lock().unwrap().trace.clone();drop(s);
+
+        for nth in 1..=trace.len() { for mode in 0..4 {
+            let p=temp.path().join(format!("case-{damaged}-{nth}-{mode}"));fs::create_dir(&p).unwrap();
+            for name in ["data","wal","writer.lock"]{fs::copy(base.join(name),p.join(name)).unwrap();}
+            let plan=Arc::new(Mutex::new(Plan::default()));let mut s=hooked(&p,plan.clone());
+            mutate(&mut s).unwrap();*plan.lock().unwrap()=Plan{nth,mode,..Plan::default()};
+            let r=s.checkpoint();assert!(plan.lock().unwrap().fired,"unreached {damaged}/{nth}/{mode}");
+            assert!(r.is_err(),"swallowed {}",trace[nth-1]);drop(s);
+            verify(&p,Some(2));
+            for name in ["data","wal"]{fs::copy(p.join(name).with_extension("durable"),p.join(name)).unwrap();}
+            verify(&p,Some(2));
+            cases+=1;
+        }}
+    }
+    println!("DAMAGED_HEADER_CASES={cases}; REOPEN_CHECKS={}",cases*2);
 }

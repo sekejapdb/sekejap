@@ -13,7 +13,7 @@ impl FileIo for Source {
         if b.len()!=PAGE||off%PAGE as u64!=0||off/PAGE as u64>=self.pages as u64{return Err(bad("repair page bounds"));}
         // Let CandidateReader classify a damaged data page after this raw read.
         let p=(off/PAGE as u64) as u32;
-        if let Some(at)=self.index.get(&p){let f=read_indexed_frame(&*self.wal,*at)?;if u32at(&f,12)!=p{return Err(bad("repair WAL identity"));}b.copy_from_slice(&f[32..]);Ok(())}
+        if let Some(at)=self.index.get(&p){let f=read_indexed_frame(&*self.wal,*at)?;if u32at(&f,12)!=p{return Err(bad("repair WAL identity"));}b.copy_from_slice(&f[32..32+PAGE]);Ok(())}
         else{self.data.read_at(b,off)}
     }
     fn write_at(&self,_:&[u8],_:u64)->Result<()>{Err(Error::ReadOnly)}
@@ -29,9 +29,9 @@ fn fingerprint(f:&dyn FileIo)->Result<(u64,u32)>{
 }
 fn page(source:&Source,no:u32)->Result<[u8;PAGE]>{let mut b=[0;PAGE];source.read_at(&mut b,no as u64*PAGE as u64)?;PageRef::open(&b,no)?;Ok(b)}
 fn root(source:&Source)->Result<u32>{
-    let b=page(source,0)?;let p=PageRef::open(&b,0)?;
-    if p.kind()!=PageKind::Meta||p.nentries()!=1||!matches!(p.slot(0).len(),16|24)||&p.slot(0)[..8]!=MAGIC{return Err(bad("repair meta"));}
-    let root=u32at(p.slot(0),8);if root<2||root>=source.pages{return Err(bad("repair root bounds"));}Ok(root)
+    let h=if source.index.contains_key(&0){Header::decode(&page(source,0)?,0)?}
+        else{disk_header(&*source.data)?.ok_or_else(||bad("repair metadata unavailable"))?};
+    h.validate_extent(source.pages)?;Ok(h.root)
 }
 // Bound descent to 64 pages. Validate all separators/keys before routing;
 // a leaf independently scanned elsewhere is current only if this path names it.

@@ -5,7 +5,7 @@ fn payload(i:u64)->Vec<u8>{let mut v=vec![7;if i==17{8192}else{256}];v[..8].copy
 #[test]
 fn source_preserving_repair_contains_damage_and_never_resurrects_deletes(){
     let t=tempfile::tempdir().unwrap();
-    for fault in ["none","wal-delete","leaf","overflow","root","meta","free","wal-bad"]{
+    for fault in ["none","wal-delete","leaf","overflow","root","meta","meta-single","free","wal-bad"]{
         let p=t.path().join(fault);let mut s=PageWalStore::open(&p,true,64<<10).unwrap();
         for i in 0..1000u64{s.put(&i.to_be_bytes(),&payload(i)).unwrap();}s.commit().unwrap();s.checkpoint().unwrap();
         for i in (0..1000u64).step_by(10){s.delete(&i.to_be_bytes()).unwrap();}s.commit().unwrap();
@@ -20,7 +20,11 @@ fn source_preserving_repair_contains_damage_and_never_resurrects_deletes(){
         }else if fault=="root" {
             let p=PageRef::open(&bytes[..4096],0).unwrap();let root=u32::from_le_bytes(p.slot(0)[8..12].try_into().unwrap()) as usize;
             bytes[root*4096+100]^=1;fs::write(&data,&bytes).unwrap();
-        }else if fault=="meta"{bytes[100]^=1;fs::write(&data,&bytes).unwrap();}
+        }else if fault=="meta"||fault=="meta-single"{
+            bytes[100]^=1;
+            if fault=="meta"{bytes[4096+100]^=1;}
+            fs::write(&data,&bytes).unwrap();
+        }
         if fault=="wal-bad"{let mut b=fs::read(p.join("wal")).unwrap();b[100]^=1;fs::write(p.join("wal"),b).unwrap();}
         let before=[fs::read(&data).unwrap(),fs::read(p.join("wal")).unwrap()];
         let dest=t.path().join(format!("repair-{fault}"));let r=recover_to(&p,&dest,1<<20);
@@ -30,7 +34,7 @@ fn source_preserving_repair_contains_damage_and_never_resurrects_deletes(){
         db.scan(|k,v|{let i=u64::from_be_bytes(k.try_into().unwrap());assert!(i<1000&&i%10!=0);assert_eq!(v,payload(i));rows+=1;true}).unwrap();
         assert_eq!(report["current_rows"],rows);
         match fault {
-            "none"|"wal-delete"|"free"=>assert_eq!(rows,900),
+            "none"|"wal-delete"|"free"|"meta-single"=>assert_eq!(rows,900),
             "overflow"=>{assert_eq!(rows,899);assert_eq!(report["known_affected_keys"],1);},
             "leaf"=>assert!(rows>800&&rows<900),
             "root"|"meta"=>{assert_eq!(rows,0);assert_eq!(report["candidate_rows"],900);},_=>unreachable!(),
