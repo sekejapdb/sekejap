@@ -23,17 +23,20 @@ prior context.** Read it top to bottom before touching code.
 
 ## 0. Why e4 exists — the finding that forced it
 
-**Phase 1 storage candidate qualified (2026-09-16):** the integration candidate
-now reads/writes both supported cell encodings independently of build flags,
-refuses intact unsupported metadata before modification, and requires immutable
-compatibility fixtures with exact entity and identity oracles. Full server Linux
-workspace suites pass in default, compact/balance and retained-feature modes:
-**422 / 427 / 427 passed, zero failures, two existing ignored tests per mode**.
-No disk encoding changed in the refusal fixes. Retain this shape and proceed
-to interfaces; capture the first public release's binary and corpus before
-promising released-file compatibility. This is not a production deployment or
-all-eight-law qualification. See [results and limits](docs/PHASE1_QUALIFICATION.md)
-and the [current format contract](docs/FORMAT_V1.md).
+**Phase 1 disk format stabilized (2026-09-16):** `e4-format-v1` is the named
+V2 entity-storage baseline at engine commit `59d1cbc`. Its source, Linux binaries
+and permanent databases are preserved. Full Linux suites passed **422 / 427 /
+427 tests**, with zero failures and two existing ignores per mode. The expanded
+mandatory fixture suite passed **7/7 in all three modes**, covering both old and
+new corpora. **20 cross-build upgrade/rollback cases** passed, including pending
+WAL; the recovery CLI smoke preserved every source file. These are builds of
+the same frozen engine revision; later versions must run against the preserved
+baseline. No runtime encoding changed in the completion loop. Interface work
+can proceed within this format contract. Public packaging and complete
+multimodel/eight-law product qualification remain separate. See
+[baseline, evidence and future gate](docs/FORMAT_BASELINE.md),
+[format specification](docs/FORMAT_V1.md) and
+[recovery runbook](docs/PHASE1_RECOVERY_RUNBOOK.md).
 
 **Law 8 adopted (2026-09-15): compatibility is permanent.** New E4 releases
 must read and write earlier released E4 formats, including persisted indexes.

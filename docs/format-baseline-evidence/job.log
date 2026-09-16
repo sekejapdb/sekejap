@@ -1,0 +1,86 @@
+<scratch>: OK
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+19bc2d0d0c9c2ac13ac1b096826ae3ec62da394d07ca85e875bb4ff78252eee2  <scratch>
+6bd933a1a63c6f2c2c3af0ac6f6e4d62c29c011a5ccdcbf66d32835fdb88ec26  <scratch>
+BASELINE_CORPUS_READY
+<scratch>: OK
+STAGE=build-baseline
+    | ----------------- associated function in this implementation
+...
+621 |     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
+    |        ^^^^^^^^^
+
+warning: `e4-prototype` (lib) generated 2 warnings
+   Compiling e4-prototype v0.1.0 (<scratch>)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3.39s
+STAGE=build-compact
+    | ----------------- associated function in this implementation
+...
+621 |     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
+    |        ^^^^^^^^^
+
+warning: `e4-prototype` (lib) generated 2 warnings
+warning: `kernel` (lib) generated 2 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 44.27s
+STAGE=build-retained
+    | ----------------- associated function in this implementation
+...
+621 |     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
+    |        ^^^^^^^^^
+
+warning: `e4-prototype` (lib) generated 2 warnings
+warning: `kernel` (lib) generated 2 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 38.06s
+STAGE=compat-compact
+{"fixture": "compact-off-wal-pending", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "compact-on-checkpointed", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "compact-on-checkpointed", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "compact-on-wal-pending", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "compact-on-wal-pending", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "limited-checkpointed", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "limited-checkpointed", "handoff": "wal-pending", "result": "PASS"}
+{"arms": 10, "report": "<scratch>", "result": "PASS"}
+STAGE=compat-retained
+{"fixture": "compact-off-wal-pending", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "compact-on-checkpointed", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "compact-on-checkpointed", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "compact-on-wal-pending", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "compact-on-wal-pending", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "limited-checkpointed", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "limited-checkpointed", "handoff": "wal-pending", "result": "PASS"}
+{"arms": 10, "report": "<scratch>", "result": "PASS"}
+REPAIR_CLI_PASS
+READY_FOR_PINNED_TESTS
+STAGE=fixtures-default
+test a_writer_update_insert_delete_commit_checkpoint_reopen_preserves_declared_feature_bits ... ok
+test an_unknown_physical_page_version_is_refused_without_changing_any_file ... ok
+test an_unknown_required_feature_bit_is_refused_and_leaves_all_files_unchanged ... ok
+test every_fixture_file_matches_its_manifest_sha256 ... ok
+test missing_preserved_fixtures_fail_qualification - should panic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+
+STAGE=fixtures-compact
+test a_writer_update_insert_delete_commit_checkpoint_reopen_preserves_declared_feature_bits ... ok
+test an_unknown_physical_page_version_is_refused_without_changing_any_file ... ok
+test an_unknown_required_feature_bit_is_refused_and_leaves_all_files_unchanged ... ok
+test every_fixture_file_matches_its_manifest_sha256 ... ok
+test missing_preserved_fixtures_fail_qualification - should panic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.27s
+
+STAGE=fixtures-retained
+test a_writer_update_insert_delete_commit_checkpoint_reopen_preserves_declared_feature_bits ... ok
+test an_unknown_physical_page_version_is_refused_without_changing_any_file ... ok
+test an_unknown_required_feature_bit_is_refused_and_leaves_all_files_unchanged ... ok
+test every_fixture_file_matches_its_manifest_sha256 ... ok
+test missing_preserved_fixtures_fail_qualification - should panic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.58s
+
+253a8baa88ba9a770d36dec44ce8bb8ca86a731e351183028e9666aabea23a9f  <scratch>
+a0e5930c10b7e08122560ebb543341a6f241b7320ee63433ef77030f845f53d8  <scratch>
+REFERENCE_QUALIFIED
+REFERENCE_EXIT=0
+

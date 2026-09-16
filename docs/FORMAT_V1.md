@@ -1,12 +1,15 @@
 # Format v1
 
-Candidate name: **e4-format-v1** for the V2/page-WAL storage line. This is
-not an owner-declared release format yet. Phase 1 candidate qualification **passed on Linux**; [PHASE1_STATE.md](PHASE1_STATE.md) records the current work and
-Linux evidence and remaining release requirements. Law 8 in [CONTRACT.md](../CONTRACT.md) is the
-policy authority (the adopted text comes from the main worktree). Neither
-same-build round trips nor prototype fixtures establish released compatibility.
+Declared storage baseline: **e4-format-v1**, engine commit
+`59d1cbc770284f160ffda53cc1ee545167733d11`, for V2 typed collections over
+page-WAL. Its existing byte meanings are frozen: future engines must retain
+read/write support under Law 8. This names the storage baseline; it does not
+publish a product release or freeze nonexistent multimodel index encodings.
+[FORMAT_BASELINE.md](FORMAT_BASELINE.md) records preserved binaries, permanent
+fixtures, upgrade/rollback checks and the commands required for future changes.
+[CONTRACT.md](../CONTRACT.md) remains the policy authority.
 
-## Actual candidate envelope
+## Frozen storage envelope
 
 The typed collection path selects `PageWalStore` in
 [src/collection_backend.rs](../src/collection_backend.rs). Its physical page
@@ -64,7 +67,7 @@ remain readable **and writable** by newer releases under Law 8. Phase 1 defines
 this extension policy; it neither implements those indexes nor claims their
 compatibility has been tested. Add immutable fixtures when each family ships.
 
-## Generator provenance
+## Original candidate generator provenance
 
 Written by `src/bin/format_fixture.rs` through the public `collections::Database` API over `PageWalStore` (not the old KV-projection helper).
 
@@ -93,9 +96,9 @@ The five existing fixtures are immutable **codec-only candidate-build
 evidence**, preserved alongside their original manifests and provenance.
 Never regenerate or replace them in place, including when the owner selects a
 release binary. Capture that binary's fixtures in a **new** versioned corpus
-and retain both sets. The generator deletes its output directory first; use it
-only against a fresh, explicitly chosen artifact directory, never the
-preserved corpus. Ordinary tests must not invoke it.
+and retain both sets. The legacy generator deletes its output directory first. The explicit capture
+mode in `tools/format_reference_compat.py` wraps it with fresh staging and
+refuses an existing destination. Ordinary tests never invoke either generator.
 
 [tests/format_v1_compat.rs](../tests/format_v1_compat.rs) requires the corpus;
 missing fixtures fail qualification. It pins INDEX's SHA-256, checks each
@@ -112,8 +115,10 @@ insertion order: people 1–200 with reinserted slot 7 at ID 201, events 1–80,
 blobs 1–4, and the compatibility writer's new person at ID 202. Get, numeric
 get, scan, update and reopened writer checks enforce those identities, including
 absence of deleted/retired IDs. This is candidate-corpus evidence, not a
-released-binary upgrade proof. No persisted index-family or released-binary
-rollback corpus exists yet. Full Linux workspace and feature-mode qualification is recorded separately
+released-binary upgrade proof. The separately captured `docs/format-v1-baseline/` corpus and preserved
+binaries now establish the permanent baseline and cross-build rollback gate;
+see [FORMAT_BASELINE.md](FORMAT_BASELINE.md). No persisted secondary-index
+family or later public-release binary exists yet. Full Linux workspace and feature-mode qualification is recorded separately
 in [PHASE1_STATE.md](PHASE1_STATE.md); the three default, compact/balance and retained-feature runs passed
 with their pre-existing ignored tests explicitly recorded.
 
@@ -133,3 +138,13 @@ and independent I/O-control requirement. Its scratch path must be under
 ## Inherited kernel Store
 
 `kernel/src/meta.rs` `FORMAT_VERSION` was build-dependent (`compact-cells` → 2, else 1) and a checkpoint restamped the superblock with the build's version. It now accepts versions 1 and 2 in every build and writes the file's own version. That Store is not the typed-collection release path (`src/collection_backend.rs` selects `PageWalStore` only).
+
+## Permanent baseline corpus
+
+`docs/format-v1-baseline/` contains five newly captured databases from the clean
+committed baseline, independently of the original prototype fixtures above.
+INDEX SHA-256: `6bd933a1a63c6f2c2c3af0ac6f6e4d62c29c011a5ccdcbf66d32835fdb88ec26`.
+The ordinary seven-test compatibility suite requires and verifies **both**
+corpora, exercising ten databases; absence or modification fails. Neither
+corpus may be replaced to make a future engine pass. New release evidence is
+additive. Preserved baseline binaries are used for unchanged-feature rollback.

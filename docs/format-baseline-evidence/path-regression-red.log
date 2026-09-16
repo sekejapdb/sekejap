@@ -1,0 +1,63 @@
+test_dotdot_alias_rejected_without_creation (__main__.ArtifactPathTests) ... FAIL
+test_nested_new_parent_rejected_without_creation (__main__.ArtifactPathTests) ... FAIL
+test_symlink_parent_rejected_without_creation (__main__.ArtifactPathTests) ... FAIL
+
+======================================================================
+FAIL: test_dotdot_alias_rejected_without_creation (__main__.ArtifactPathTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<home>/", line 56, in test_dotdot_alias_rejected_without_creation
+    def test_dotdot_alias_rejected_without_creation(self): self.check_refusal('dotdot')
+  File "<home>/", line 50, in check_refusal
+    self.assertEqual(after, before, f'{spelling}: source inventory changed')
+AssertionError: Lists differ: ['sentinel.txt', 'work', 'work/REPORT.json'] != ['sentinel.txt']
+
+First list contains 2 additional elements.
+First extra element 1:
+'work'
+
+- ['sentinel.txt', 'work', 'work/REPORT.json']
++ ['sentinel.txt'] : dotdot: source inventory changed
+
+======================================================================
+FAIL: test_nested_new_parent_rejected_without_creation (__main__.ArtifactPathTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<home>/", line 55, in test_nested_new_parent_rejected_without_creation
+    def test_nested_new_parent_rejected_without_creation(self): self.check_refusal('nested')
+  File "<home>/", line 50, in check_refusal
+    self.assertEqual(after, before, f'{spelling}: source inventory changed')
+AssertionError: Lists differ: ['new-parent', 'sentinel.txt'] != ['sentinel.txt']
+
+First differing element 0:
+'new-parent'
+'sentinel.txt'
+
+First list contains 1 additional elements.
+First extra element 1:
+'sentinel.txt'
+
+- ['new-parent', 'sentinel.txt']
++ ['sentinel.txt'] : nested: source inventory changed
+
+======================================================================
+FAIL: test_symlink_parent_rejected_without_creation (__main__.ArtifactPathTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<home>/", line 57, in test_symlink_parent_rejected_without_creation
+    def test_symlink_parent_rejected_without_creation(self): self.check_refusal('symlink')
+  File "<home>/", line 50, in check_refusal
+    self.assertEqual(after, before, f'{spelling}: source inventory changed')
+AssertionError: Lists differ: ['sentinel.txt', 'work', 'work/REPORT.json'] != ['sentinel.txt']
+
+First list contains 2 additional elements.
+First extra element 1:
+'work'
+
+- ['sentinel.txt', 'work', 'work/REPORT.json']
++ ['sentinel.txt'] : symlink: source inventory changed
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.020s
+
+FAILED (failures=3)

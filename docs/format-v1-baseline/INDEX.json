@@ -1,0 +1,56 @@
+{
+  "fixtures": [
+    {
+      "bytes": 249952,
+      "checkpointed": true,
+      "compact_cells": false,
+      "entities": 283,
+      "limited": false,
+      "manifest_sha256": "c9fabdbc0f13ae52ffea5eacaa86485cf1bbad5bc58a5171e70fec367df28f9b",
+      "name": "compact-off-checkpointed"
+    },
+    {
+      "bytes": 522144,
+      "checkpointed": false,
+      "compact_cells": false,
+      "entities": 283,
+      "limited": false,
+      "manifest_sha256": "d76ac17f912a3229d7fd68621b2c7895726e9582e3cfa01fab0f27e3c5c5f0af",
+      "name": "compact-off-wal-pending"
+    },
+    {
+      "bytes": 249952,
+      "checkpointed": true,
+      "compact_cells": true,
+      "entities": 283,
+      "limited": false,
+      "manifest_sha256": "3950e26a481fb03ee6106ba7d0084bf67c47bebc81c6642d5fd93b863f89b1fc",
+      "name": "compact-on-checkpointed"
+    },
+    {
+      "bytes": 522144,
+      "checkpointed": false,
+      "compact_cells": true,
+      "entities": 283,
+      "limited": false,
+      "manifest_sha256": "29190903f68dce15ed1af6d767f98d102efedcce3cb087286110c53f939e6501",
+      "name": "compact-on-wal-pending"
+    },
+    {
+      "bytes": 249952,
+      "checkpointed": true,
+      "compact_cells": false,
+      "entities": 283,
+      "limited": true,
+      "manifest_sha256": "f9f74ed784b3dd223a145201540182bd2cf0578f625fd0cbee32abd08e18edf7",
+      "name": "limited-checkpointed"
+    }
+  ],
+  "format": "e4-format-v1",
+  "generator": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "git_head": "59d1cbc770284f160ffda53cc1ee545167733d11",
+    "source": "src/bin/format_fixture.rs"
+  },
+  "header_magic": "E4PWAL02"
+}

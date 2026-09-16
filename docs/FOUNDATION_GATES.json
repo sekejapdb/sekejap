@@ -57,13 +57,15 @@
       "id": "L8-COMPAT",
       "law": 8,
       "status": "PENDING",
-      "passed": "Phase 1 immutable candidate fixture read/write/reopen/identity and source-preserving refusal checks passed. Full Linux default/compact/retained workspace: 422/427/427 pass, zero failures, two existing ignored per mode. Three prior-code negative regressions caught. See PHASE1_QUALIFICATION.md; this does not declare released-file compatibility.",
-      "remaining": "Declare and capture the first released binary/corpus; preserve candidate and release corpora independently. Add permanent read/write/query fixtures for each future shipped index and interface. No public release or all-eight-laws claim.",
+      "passed": "e4-format-v1 baseline declared at59d1cbc; binary/source and independently expected corpus preserved. 20 cross-binary unchanged-feature update/delete/insert rollback arms passed, including pending WAL, with immutable source files. Original Linux workspace qualification422/427/427passed. FORMAT_BASELINE.md records exact scope.",
+      "remaining": "First public product release packaging and future shipped interface/index compatibility fixtures. Baseline entity format is fixed; these product obligations do not reopen its byte meanings. Full eight-law product qualification remains separate.",
       "evidence": [
         "CONTRACT.md#law-8--release-compatibility-contract",
         "docs/FORMAT_FREEZE.md",
         "docs/DISK_FORMAT_AUDIT.md",
-        "docs/FORMAT_AUDIT_RESULTS.json"
+        "docs/FORMAT_AUDIT_RESULTS.json",
+        "docs/FORMAT_BASELINE.md",
+        "docs/PHASE1_RECOVERY_RUNBOOK.md"
       ]
     }
   ],

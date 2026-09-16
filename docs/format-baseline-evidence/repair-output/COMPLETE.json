@@ -1,0 +1,28 @@
+{
+  "candidate_rows": 0,
+  "completion": "verified salvage; source not replaced",
+  "current_rows": 606,
+  "destination": "<scratch>",
+  "format": "page-WAL raw KV",
+  "known_affected_keys": 0,
+  "limitations": "No rootless current-membership reconstruction; corrupt-WAL salvage refuses; no aggregate repair disk cap or typed schema decoding",
+  "malformed_cells": 0,
+  "max_value_bytes": 16777216,
+  "source": "<scratch>",
+  "source_length_crc32c": [
+    [
+      8192,
+      1466578547
+    ],
+    [
+      513856,
+      3689889163
+    ]
+  ],
+  "source_unchanged": true,
+  "unknown_page_extents": 0,
+  "verified_candidate_rows": 0,
+  "verified_current_rows": 606,
+  "version": 1,
+  "wal_uncommitted_tail_bytes": 0
+}

@@ -1,0 +1,116 @@
+# e4-format-v1 storage baseline
+
+The V2 storage baseline is **e4-format-v1**, engine commit
+`59d1cbc770284f160ffda53cc1ee545167733d11`. Existing byte meanings and read/write
+support are now a compatibility obligation. This declaration covers today's
+entity storage, layouts, identities, binary JSON, points, vectors, timestamp
+policy, resource metadata, both cell encodings and page-WAL protocol. Future
+secondary indexes add explicitly versioned namespaces and their own fixtures;
+they cannot silently change existing data or invalidate this baseline.
+
+This is a storage milestone, not a public product release. SQL, multimodel
+query/index implementations, EXPORT/IMPORT, adapters and release packaging
+remain product work. The first public release will add its own artifacts; it
+must preserve this baseline rather than replacing its evidence.
+
+## Preserved artifacts and provenance
+
+- New immutable corpus: [format-v1-baseline](format-v1-baseline/INDEX.json),
+  five databases / 283 live entities each / 66 files. Its INDEX is pinned in
+  `tests/format_v1_compat.rs` alongside the unchanged earlier prototype corpus.
+- Exact baseline source with actual shallow Git history:
+  `format-baseline-evidence/baseline-source.tar.gz`. Capture checks actual HEAD
+  and clean tracked/untracked status before compiling or generating data.
+  Mac archive metadata is excluded and ownership normalized when extracting
+  on Linux; committed source bytes are unchanged.
+- Preserved Linux x86_64 executables and duplicate corpus:
+  `format-baseline-evidence/reference-artifacts.tar.gz`. Includes generator,
+  repair CLI, default baseline compatibility writer and two feature-build
+  compatibility writers. **Keep these binaries**, not just rebuild recipes.
+- Raw build/test logs, both complete cross-binary reports and repair report:
+  `format-baseline-evidence/reference-evidence.tar.gz`, also extracted there.
+- Toolchain, corpus inventory and hashes: [PROVENANCE.json](format-baseline-evidence/PROVENANCE.json).
+  [SHA256SUMS](format-baseline-evidence/SHA256SUMS) covers retained artifacts.
+
+Captured on isolated server Linux, Rust/Cargo 1.97.1, release profile, 2 CPU / 2Gi
+limits and 0.5 CPU request. No production workload or Pi service was changed.
+Generator feature set is default (no optional features); it explicitly creates
+both cell families. The baseline compatibility harness is added as untracked
+source to the frozen checkout; the engine/Cargo sources remain byte-identical.
+The two comparison builds use compact/balance and compact/balance/append/split.
+Full commands are preserved in `capture-linux.sh` and `qualify-linux.sh`.
+The final Python driver additionally resolves output paths and checks corpus
+containment before creating directories. Symlink, dot-dot and nested-parent
+negative controls fail against its prior code and pass the fix; all20Linux
+cases pass again with the final driver. See `final-driver-evidence.tar.gz`
+and the three permanent tests in `tools/test_format_reference_paths.py`.
+
+## Qualification
+
+Each cross-binary arm verifies all documents, numeric/external identities,
+collection/layout metadata, resource policy and declared feature bits. It then:
+
+1. Uses the comparison binary to update, insert and delete, then commit.
+2. Hands the files to the frozen baseline binary, which verifies all changed
+   values, writes another update/insert/delete and commits.
+3. Hands the files back to the comparison binary for exact snapshot and writer
+   reopen checks. No source fixture is opened for writing.
+
+Five fixtures × two handoff boundaries (checkpointed / committed WAL pending)
+× two comparison builds = **20 passing arms**. The pending-WAL writer pins a
+snapshot through commit and verifies that old reader's full contents. The next
+binary is the first to open the new committed state. Both writers preserve
+features. All 66 baseline source files are rehashed after every arm.
+
+These are distinct executable builds of the **same engine revision**; this is
+cross-build qualification and a preserved baseline for later version tests,
+not a fabricated historical released-version upgrade. The driver rejects
+identical executable hashes. Every future engine release must repeat this
+cycle using its new binary and the actual preserved baseline binary.
+
+The original full Linux qualification remains 422 / 427 / 427 passing test
+executions (two pre-existing ignored tests per mode), with no runtime changes
+in this completion loop. The expanded seven-test compatibility suite now
+requires both corpora and passed **7/7 in all three modes**; its final results are in
+`format-baseline-evidence/logs/fixtures-*.log`.
+
+The retained repair CLI recovered and verified 606 raw KV entries from the
+clean pending-WAL smoke fixture, with no candidate rows/known losses/unknown
+extents and unchanged source SHA-256 inventory. This is operational command
+coverage; the earlier corruption matrix qualifies the underlying repair API.
+[PHASE1_RECOVERY_RUNBOOK.md](PHASE1_RECOVERY_RUNBOOK.md) states its limits.
+
+## Required checks for later engine changes
+
+On Linux, from the repository, choose a fresh authorized artifact directory
+`RUN` under `<scratch>/` (or the authorized Pi area):
+
+```sh
+(cd docs/format-baseline-evidence && sha256sum -c SHA256SUMS)
+mkdir "$RUN"
+tar -xzf docs/format-baseline-evidence/reference-artifacts.tar.gz -C "$RUN"
+E4_COMPAT_ENGINE_REVISION="$(git rev-parse HEAD)" cargo build --release --locked --bin format_compat --features compact-cells,sqlite-balance,keyspace-append,slotref-split
+python3 tools/format_reference_compat.py \
+  --corpus docs/format-v1-baseline \
+  --index-sha256 6bd933a1a63c6f2c2c3af0ac6f6e4d62c29c011a5ccdcbf66d32835fdb88ec26 \
+  --baseline-bin "$RUN/bin/format_compat-baseline" \
+  --current-bin target/release/format_compat \
+  --work "$RUN/compat"
+cargo test --release --locked --test format_v1_compat --test format_replica_refusal -- --test-threads=1
+```
+
+Set `TMPDIR` to an existing isolated artifact directory before tests. Repeat
+with the required build modes and retain exact current source/binary hashes.
+If `CARGO_TARGET_DIR` is set, use its executable path. These captured executables
+are Linux x86_64; other architectures need separately captured native binaries
+and the same portable corpus. Never regenerate a preserved corpus to pass.
+
+## Execution notes
+
+The first source-transfer guard stopped before compilation because upload was
+incomplete. The next two attempts stopped on Git ownership and Mac archive
+metadata; a fourth pod was rejected for insufficient CPU request capacity.
+The verified source archive was reused, extraction corrected and request
+reduced; these were infrastructure failures, not failed database results. The
+successful job is `e4-phase1-reference-r5-20260916`, artifact root
+`<scratch>`.

@@ -1,0 +1,5 @@
+{
+  "src/bin/format_compat.rs": "209a85362d9b179fd09dbfff76fd1e4f4102461ff25e79e27157cb5ce12fc15e",
+  "src/bin/format_compat/oracle.rs": "a8d93b206576bf2c88215c990e376e659924b80dfb5f185d93bbd4715e2940f2",
+  "tools/format_reference_compat.py": "fd24f56beab3ed30ceb4b0a0db6a8918cd0ee696df9716fba30e5d6080eec4cb"
+}

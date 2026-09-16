@@ -4,6 +4,11 @@ Status: **qualified storage candidate; retain the changes**. This report disting
 candidate from a public release and from completion of the multimodel product.
 Live continuation: [PHASE1_STATE.md](PHASE1_STATE.md).
 
+**Subsequent completion work:** the named `e4-format-v1` baseline and preserved
+source/binaries/corpus are recorded in [FORMAT_BASELINE.md](FORMAT_BASELINE.md).
+The remaining-release-artifact statements below describe this earlier candidate
+qualification. Its full-workspace results remain valid for the unchanged engine.
+
 ## Scope
 
 The current storage shape is `E4PWAL02`, 4096-byte physical version-1 pages,

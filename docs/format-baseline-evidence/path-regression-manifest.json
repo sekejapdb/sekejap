@@ -1,0 +1,10 @@
+{
+  "description": "Three path-only source-preservation regressions: red3fail / green3pass; no database or executable execution; Linux policy simulated with unittest.mock.",
+  "files": {
+    "tools/format_reference_compat.py": "336ad99ad4c4a32b8a7263698a9aaf88d4e44de3e8abc9b9af790624b37a6984",
+    "tools/test_format_reference_paths.py": "f20fa1b7a4d8445aedec9b1fe057dc984f2187c2a816f6429371d032670a0de4",
+    "docs/format-baseline-evidence/driver-before-pathfix.py": "fd24f56beab3ed30ceb4b0a0db6a8918cd0ee696df9716fba30e5d6080eec4cb",
+    "docs/format-baseline-evidence/path-regression-red.log": "a8248d0f71a47ed64bbf0891cf37c26ff91573e165bde6ce4077151e37fd3c1a",
+    "docs/format-baseline-evidence/path-regression-green.log": "e9d57a94ce49dead8efd6232f99d42f94510aab346834120460c7338779899a1"
+  }
+}

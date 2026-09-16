@@ -150,9 +150,9 @@
       "commands": [
         "compatibility"
       ],
-      "status": "QUALIFIED_CANDIDATE",
-      "coverage": "Required immutable reference-candidate fixtures: cross-codec read/write/reopen, full independent entity oracles, source preservation and unsupported physical/logical versions/features. Intact unsupported metadata replicas must not be masked by supported siblings.",
-      "remaining": "First public release binary/provenance/corpus and future shipped index/interface fixtures remain required. Full Linux candidate qualification passed; see PHASE1_QUALIFICATION.md."
+      "status": "BASELINE_QUALIFIED",
+      "coverage": "Mandatory immutable prototype plus59d1cbc baseline corpora (10databases): full document/numericidentity read/write/reopen, both codecs, declared features, and source-preserving unknown-format refusal. Preserved executable cross-build upgrade/rollback20arms passed; command in FORMAT_BASELINE.md.",
+      "remaining": "Repeat the preserved-binary rollback gate for every later engine release; add immutable fixtures for each future shipped index/interface. Public product qualification is separate."
     }
   ]
 }

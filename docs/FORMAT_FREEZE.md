@@ -2,35 +2,31 @@
 
 ## Current boundary — 2026-09-16 (supersedes historical status below)
 
-**Phase 1 storage candidate is qualified; no public release is declared.**
-[PHASE1_STATE.md](PHASE1_STATE.md) owns the current qualification scope and
-completed Linux evidence. The selected candidate collection path is
-`collections::Database` → `PageWalStore`; [FORMAT_V1.md](FORMAT_V1.md) specifies
-its actual `E4PWAL02` envelope, 4144-byte WAL frames, physical version 1,
-required features, typed metadata and extension policy from source.
+The named storage baseline is **e4-format-v1**, engine commit `59d1cbc`.
+Existing byte meanings are frozen under Law 8. [FORMAT_BASELINE.md](FORMAT_BASELINE.md)
+records its immutable source/binaries/corpus, cross-build read/write rollback
+checks and future release gate. [FORMAT_V1.md](FORMAT_V1.md) defines the actual
+`E4PWAL02` envelope, typed layouts/identities, feature policy and extension rules.
 
-Law 8 in [CONTRACT.md](../CONTRACT.md), adopted from the main worktree, governs:
-newer releases keep reading **and writing** every earlier released format.
-Ordinary updates preserve required features and never mandate migration or
-index rebuilding. Safe refusal must precede mutation for unsupported formats.
-Phase 1 fixes and tests concrete refusal/compatibility gaps; the final integrated candidate passed full Linux workspace qualification
-in default, compact/balance and retained-feature modes. See
-[PHASE1_QUALIFICATION.md](PHASE1_QUALIFICATION.md) for counts and ignored tests.
+The three-mode full Linux qualification passed; the original fixtures are
+unchanged. A second, committed-reference corpus is separately pinned and
+mandatory. The preserved default engine binary and compact/retained builds
+passed20unchanged-feature upgrade/rollback arms, including pending WAL.
+This is an honest cross-build baseline; later public versions do not yet exist.
+Every later release must test against these retained bytes and executables.
 
-The existing five codec-only-build fixtures are mandatory, checksummed and
-immutable. Missing fixtures fail the compatibility gate. Keep them alongside
-future, separately captured release-binary fixtures; never overwrite them by
-regeneration. Current fixtures are candidate evidence, not released-binary
-upgrade or downgrade proof.
+The [recovery runbook](PHASE1_RECOVERY_RUNBOOK.md) identifies supported salvage,
+current-versus-candidate evidence, source preservation and explicit limits.
+Its actual PageWal repair CLI also passed a clean committed-WAL smoke.
 
-Reserved physical page bytes remain zero with their current meaning; the
-existing generation field is already meaningful. Future meanings require
-explicit version/feature rules. Coordination files are derived state but
-participate in locking and publication: they cannot be deleted/replaced while
-live merely because they can be reconstructed. Future persisted indexes need
-new noncolliding tags, explicit encoding/catalog versions and required feature
-handling, while preserving all shipped encodings. Phase 1 does not implement
-or claim qualification of nonexistent index families.
+The final evidence is verified and Phase1 storage-shape stabilization is complete;
+[PHASE1_STATE.md](PHASE1_STATE.md) records execution status. It does not claim
+all-eight-law product qualification or a public deployment. SQL, EXPORT/IMPORT,
+multimodel indexes/adapters and release packaging remain product work. New
+index families require noncolliding namespaces, explicit encoding/catalog
+versions/features and immutable compatibility fixtures before they ship.
+They must preserve the frozen entity representation. Coordination files remain
+part of the locking/publication protocol and cannot be unlinked while live.
 
 ## Historical direction and evidence — 2026-09-15
 

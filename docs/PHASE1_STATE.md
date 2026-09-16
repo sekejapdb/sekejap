@@ -1,68 +1,73 @@
-# Phase 1 continuation — 2026-09-16
+# Phase 1 complete — 2026-09-16
 
-**Current result: qualified storage candidate; retain.** Final report:
-[PHASE1_QUALIFICATION.md](PHASE1_QUALIFICATION.md). Format contract:
-[FORMAT_V1.md](FORMAT_V1.md). tracker owns live status at
-`sekejap-e4/phase1-format-qualification`.
+**Disk-format stabilization is complete.** The declared entity-storage baseline
+is **e4-format-v1**, frozen engine `59d1cbc770284f160ffda53cc1ee545167733d11`.
+Read [FORMAT_BASELINE.md](FORMAT_BASELINE.md) for artifacts and future upgrade
+commands, [FORMAT_V1.md](FORMAT_V1.md) for byte/extension rules, and
+[PHASE1_COMPLETION_AUDIT.md](PHASE1_COMPLETION_AUDIT.md) for acceptance evidence.
+tracker task: `sekejap-e4/phase1-format-qualification`.
 
-## Where to resume
+## Accepted result
 
-Integration checkout: `<home>/`, branch
-`l2-integration`, based on `d789fc2`. Main checkout `sekejap-e4` is separate
-and its unrelated dirty work is preserved. This candidate incorporates the
-owner's already-adopted eight-law policy from the main checkout. See the
-current branch log for the scoped qualification commit. No production release
-or deployment was performed.
+- Typed collections use PageWalStore, with both cell encodings readable and
+  writable in every build. Existing database features remain unchanged.
+- Unsupported intact metadata is refused before mutation; CRC-damaged replicas
+  can fall back. Logical version admission precedes version-specific parsing.
+- Frozen source, actual Linux binaries, five independently specified baseline
+  databases and provenance are retained. The earlier five prototype databases
+  remain unchanged. Ordinary tests require both corpora (132 total files).
+- Cross-binary read/update/insert/delete/commit/rollback checks cover all five
+  baseline fixtures at checkpointed and committed-WAL boundaries, using the
+  default preserved binary and compact/retained builds:20cases passed, then
+  all20passed again after a source-preserving path guard was hardened.
+- Full Linux workspace qualification remains422/427/427pass, zero failures,
+  two pre-existing ignored tests per build. Expanded fixture tests7/7pass in
+  each of the three modes. Three path regressions fail old driver/pass final.
+- Recovery CLI smoke verifies606raw KV entries for283entities with unchanged
+  source SHA-256 inventory. [The runbook](PHASE1_RECOVERY_RUNBOOK.md) explains
+  raw/current/candidate distinctions and incomplete typed/rootless recovery.
 
-The owner authorized Codex to lead Phase 1. The storage shape is established
-enough to proceed to interfaces; do not restart general insertion optimization.
-The first public release still needs its selected binary and independently
-specified immutable release corpus captured. Preserve the existing codec-only
-candidate corpus alongside it. Future index families need explicit namespace
-allocation, encoding versions/features and their own permanent fixtures.
+The comparison binaries use the same frozen engine source with different build
+features. This is cross-build qualification and the permanent baseline for
+future versions; no later public-release binary is invented. Every later
+engine release must be tested against the preserved baseline binaries/bytes.
 
-## What was retained
+## Repository and evidence
 
-- Per-database codec selection; every build supports both declared families.
-- Safe refusal of intact unsupported typed and inherited metadata replicas.
-- Version admission before inherited version-dependent payload parsing.
-- Mandatory checksummed fixtures, full document/numeric-ID/scan/write/reopen
-  oracles, and whole-file source-preserving refusal checks.
-- Previous measured append/slot-reference split improvements, with test
-  coverage respecting enabled algorithms. No new speed hypothesis.
-- Existing WAL cap unchanged; the limit test now pins a reader so automatic
-  checkpointing cannot legitimately free its committed prefix.
+Main checkout `<home>/`, branch
+`pagewal-foundation`, incorporates the qualified59d1cbc engine. The completion
+commit adds fixtures/harness/docs only, with no engine encoding change. See
+branch history for its commit. The integration worktree is `sekejap-e4-int`,
+branch `l2-integration`. Main's268pre-existing untracked research files were
+verified unchanged during initial integration. Original tracked policy edits
+were already adopted by59d1cbc and remain backed up in the named Phase1 stash.
 
-Do not import unfinished `sekejap-e4-l24` or Grok no-clone experiments.
-Current changes add no disk field or encoding. Timestamps remain opt-in.
+Prior full-suite evidence: `docs/phase1-evidence/`.
+Baseline/rollback/CLI evidence: `docs/format-baseline-evidence/`, including exact
+source archive, immutable binaries, raw logs/reports, provenance and SHA256SUMS.
+Final Linux reference Job `e4-phase1-reference-r5-20260916`, root
+`<scratch>`; markers
+`REFERENCE_QUALIFIED`, `REFERENCE_EXIT=0`, follow-up `FINAL_DRIVER_EXIT=0`.
 
-## Final evidence
+## Next boundary
 
-server isolated Job `e4-phase1-r2-20260916`, root
-`<scratch>`, Rust 1.97.1, release profile,
-2 CPU/2Gi limit, serial tests. Final marker `PHASE1_R2_EXIT=0`.
-Full workspace default: 422 pass / 0 fail / 2 ignored; compact/balance:
-427/0/2; retained features: 427/0/2. Existing ignores are listed in the report.
-Focused refusal4, fixture/identity7, reader-cap1 and corrected limits1 passed.
-Three deliberately broken previous-code regressions failed as intended.
+Proceed to interfaces and multimodel implementation on this storage contract.
+Do not restart general insertion optimization or import unfinished l24/Grok
+no-clone experiments. Timestamps stay off by default and explicitly opt-in.
+Future graph/spatial/fulltext/vector-navigation indexes need noncolliding
+namespaces, explicit version/features and permanent fixtures before shipping;
+new versions must preserve read/write support for the baseline.
 
-Source SHA256:
-`0fc052d05f55ec48eb3c45ca129319a8a97cb2d0ff15de2901131dbd12a71075`.
-Verified exported evidence archive SHA256:
-`93b1d2ad381a5db8d657939e0445a1f2603a31390974fb4a80d66665d9b79e73`.
-Portable logs/source archive/manifest/counts: `docs/phase1-evidence/`.
-All 66 original fixture-corpus files remain unchanged. The r1 failures and
-corrections are retained; they are not hidden as green qualification.
+Public product packaging, EXPORT/IMPORT, published API compatibility and wider
+eight-law qualification remain product work. Historical resource, strict
+scaling and broad recovery gates are not silently changed to PASS. No public
+release or production deployment has occurred. Pi-specific research can wait.
 
-## Access and scope
+## Access
 
-Kubeconfig `<home>/`, namespace
-`sekejap-benchmark`, PVC `sekejap-benchmark-data` mounted `<scratch>`.
-The reusable approval is saved for the command prefix:
+server kubeconfig `<home>/`, namespace
+`sekejap-benchmark`, PVC `sekejap-benchmark-data` at `<scratch>`. Reusable prefix:
 `kubectl --kubeconfig <home>/ -n sekejap-benchmark`.
-Keep this ordering. Do not alter production workloads.
-
-tracker: `http://127.0.0.1:5156/`; use curl. Notes cap at 8000 characters;
-GET after writing. Existing older handoffs now point here. Both agents
-(format_review and compat_gate) completed their tasks. No agent is still
-editing the candidate. Local database execution was not used as acceptance.
+Use curl for tracker `http://127.0.0.1:5156/`; notes cap8000characters, GET after
+writing. Mac database execution still requires the independent I/O control;
+this loop's acceptance ran on Linux. No agent remains assigned to engine edits.

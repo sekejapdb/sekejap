@@ -1,0 +1,1220 @@
+{
+  "arms": [
+    {
+      "final_files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "65c7ae9fc3aae1a3e0eac9fd242411deb413991e204ed5545fa5c67d001b7036"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "ebef2c99390afb265f73c9d1d1760e2627681de2ae4cc69bd2731f6452f5e9c5"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-off-checkpointed",
+      "handoff": "checkpointed",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "d79332777c34fae28995880e6d1c1edf8eeaff83519995e400463766f60044c5"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "2ef7375b8bf4a842d12b863260aff755b2e15cbc3d45663f712beeea61cc19c9"
+        },
+        "wal": {
+          "bytes": 74592,
+          "sha256": "18a02ae88c29971c05f4351c6c80436814ccf2cff8a7ce0a607f1730308e9bef"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-off-checkpointed",
+      "handoff": "wal-pending",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "765e685a9460f01831c04f6d9b6f4d668f3ad9f7a963d2f10ab5762bbb2a36b0"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "7ac5ae5a1afd852ffa2fad80cdf8da82bebe003c9649eac1509e906749ba7776"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-off-wal-pending",
+      "handoff": "checkpointed",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 8192,
+          "sha256": "ef294d95f97e1431f92e5355aa878e18cd7fd713ed78e46db0d37d24c3cd5980"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "2abb05ce7bd6e26eded23b11cc9e535ac6df6de39672468764882af0bd4bd975"
+        },
+        "wal": {
+          "bytes": 588448,
+          "sha256": "7c2f1348fe72e87ab2bc730d98c00392ed787dbb1f5758ec85c91ca320fe5fb9"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-off-wal-pending",
+      "handoff": "wal-pending",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "61fb84fec27781d4f1117c56f98aef985edbffbf8cf1c6530e22690f9d843613"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "251a3b2389c91f8242f9aedcdee0e96e1a05f1714165cc5c7d1a94efb504ce49"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-on-checkpointed",
+      "handoff": "checkpointed",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "d012611c15c9046459d9f3d1b755b3dd19f50a59527d974223c879b25c2c5318"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "a24528d5c4bccffcac9778cbb2546c1d53ec6a98733f76a4f667a5378942fba6"
+        },
+        "wal": {
+          "bytes": 82880,
+          "sha256": "aec9be78eed3e8fd79031ad7375bfd66d4ebefadf0d38fff24fdddcdfeea737b"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-on-checkpointed",
+      "handoff": "wal-pending",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "370789c5d4b3e0990bf433e3bafe633b5e0e7836874a5edc3824042704a05c1d"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "b7fa29cf3d2b4cf43d0b5dd742bb87b1dd18b9be612ed35f4ac3d6e459181270"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-on-wal-pending",
+      "handoff": "checkpointed",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 8192,
+          "sha256": "a075747206f769ea17dc2315f738b561ccffbfcdeef19672721fe10b9df087e1"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "ef9463eebd41b9510f0d3ca590d912b3d4f5ffeec290be989435c85635c3d1cb"
+        },
+        "wal": {
+          "bytes": 596736,
+          "sha256": "e725b33888f87f086c8c3dcca04af6b6564193c1f2c9d0611cd8eea7934352a2"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-on-wal-pending",
+      "handoff": "wal-pending",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "82bc447c5c12d291a48b5171902452e76ab575cd2b351b013f9fb71a5c8118af"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "483f187ae74bc1baf3a3e77c5267fa865c8c14e55f6cc6e6d8be3364ee1ee346"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "limited-checkpointed",
+      "handoff": "checkpointed",
+      "result": "PASS"
+    },
+    {
+      "final_files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "d4cfbaa826095c146ea84fa67a0e4f3f01695fe429e691cb70bdce6bdef524f3"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "b8298cd87e29f497a9ef7f09758ac0f820eebb9c981b4bc3a4c69ef696882367"
+        },
+        "wal": {
+          "bytes": 74592,
+          "sha256": "a42f7f37ed1072e029d0b80e04d03f2b03f0cfe583fea02a320d3c57169151b1"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "limited-checkpointed",
+      "handoff": "wal-pending",
+      "result": "PASS"
+    }
+  ],
+  "binary_sha256": {
+    "baseline": "18d251f43f744c0bbf4cd22a1b35b7a037c9b94ef76d1d17f3547457bfe57aff",
+    "current": "642ec995d8c675bdd9a0db5bbdb4f6927b037953e99700c4026b7c710afcd3e7"
+  },
+  "commands": [
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"compact_cells\":false,\"engine_revision\":\"59d1cbc770284f160ffda53cc1ee545167733d11\",\"harness\":\"format_compat-v1\",\"keyspace_append\":false,\"slotref_split\":false,\"sqlite_balance\":false}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"compact_cells\":true,\"engine_revision\":\"59d1cbc770284f160ffda53cc1ee545167733d11\",\"harness\":\"format_compat-v1\",\"keyspace_append\":true,\"slotref_split\":true,\"sqlite_balance\":true}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "upgrade",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgrade\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"upgraded\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "mutate",
+        "<scratch>",
+        "<scratch>",
+        "rollback",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"mutate\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "rollback"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"rollback\"}\n"
+    }
+  ],
+  "corpus": "<scratch>",
+  "index_sha256": "6bd933a1a63c6f2c2c3af0ac6f6e4d62c29c011a5ccdcbf66d32835fdb88ec26",
+  "result": "PASS",
+  "source_unchanged": true,
+  "versions": {
+    "baseline": {
+      "compact_cells": false,
+      "engine_revision": "59d1cbc770284f160ffda53cc1ee545167733d11",
+      "harness": "format_compat-v1",
+      "keyspace_append": false,
+      "slotref_split": false,
+      "sqlite_balance": false
+    },
+    "current": {
+      "compact_cells": true,
+      "engine_revision": "59d1cbc770284f160ffda53cc1ee545167733d11",
+      "harness": "format_compat-v1",
+      "keyspace_append": true,
+      "slotref_split": true,
+      "sqlite_balance": true
+    }
+  }
+}
