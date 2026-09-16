@@ -1,10 +1,17 @@
-# Typed collection boundary — 2026-09-11
+# Typed collection boundary — 2026-09-11, backend switched 2026-09-16
 
 The internal Rust API is `e4_prototype::collections::Database`. It layers a
-persistent catalog, external-key index and typed CRUD over the existing pager.
-This is the boundary for adapting E3 interfaces. It does not implement SQL,
-HTTP, scalar indexes, graph adjacency or a deployment package. The seven laws
-in CONTRACT.md are unchanged; this slice is not a claim that all have passed.
+persistent catalog, external-key index and typed CRUD over the V2 page-WAL
+store (`pagewal::PageWalStore`, `E4PWAL02`; selected in
+`src/collection_backend.rs`, contract in
+[V2_COLLECTION_INTEGRATION.md](V2_COLLECTION_INTEGRATION.md)). The inherited
+kernel `Store` is no longer a collection backend. Statements below that name
+the old engine's behaviour were rewritten in the 2026-09-16 pass; the key,
+record, layout and catalog encodings are unchanged. This is the boundary for
+adapting E3 interfaces. It does not implement SQL, HTTP, scalar indexes, graph
+adjacency or a deployment package. The eight laws in CONTRACT.md are
+unchanged; this slice is not a claim that all have passed, and the backend
+switch is unvalidated until the parent's Linux run.
 
 ## API example
 
@@ -49,10 +56,15 @@ for entity in db.scan(people, None)? {
 ```
 
 `open`, `open_snapshot`, `create_limited`, `collection`, `collection_info`,
-`alter_collection`, `get_by_id`, `delete`, `rollback` and an exclusive scan
-cursor complete the current surface. Database paths must not already contain a
-store when creating. A collection must exist before writing it. A single
-writer owns the handle; snapshots use independent read-only handles.
+`alter_collection`, `get_by_id`, `delete`, `rollback`, `checkpoint`,
+`limits`, `storage_bytes`, `tracked_pages` and an exclusive scan cursor
+complete the current surface. Database paths must not already contain a
+store when creating; `open` refuses a missing path. `Config` must request
+`IoMode::Buffered`, `SyncMode::Full` and at least a 64 KiB budget — anything
+else is refused (`Error::Unsupported`) before any file is touched, so every
+run is FULL-barrier by declaration. A collection must exist before writing
+it. A single writer owns the handle; snapshots are independent read-only
+handles that may be opened by path in this or another process.
 
 ## Identity and document semantics
 
@@ -90,23 +102,44 @@ this is an adapter boundary, not source compatibility with every E3 method.
 
 Creation initializes and commits the database format. Collection creation,
 layout changes and entity changes then share an explicit transaction. A
-successful `commit()` checkpoints and publishes one durable root, making it
-visible to snapshots opened afterward. A previously opened snapshot keeps its
-original generation. Every collection commit currently pays publication cost;
-there is no separate WAL-only public commit in this layer.
+successful `commit()` writes the transaction's page images to the page-WAL,
+issues a FULL barrier, then publishes it through the two-copy hint in
+`readers.lock`; only then is it visible to snapshots opened afterward. A
+previously opened snapshot keeps its exact published prefix for its whole
+life. `checkpoint()` folds the published WAL into the data file and resets
+the WAL; it runs automatically at 4 MiB of WAL (or half an allowance) and
+returns `false`, deferring, while any reader in any process holds a slot.
+One transaction's page images must fit the WAL bound (16 MiB, or the
+policy's `wal_bytes`); a larger one refuses and fails the handle.
 
 Validation and encoding happen before mutation. Input/type/oversize validation
 errors leave the handle usable. Once a mutation or commit starts, an error
 marks the collection handle failed: reads, scans, writes and further commits
-refuse until rollback or reopen. `rollback()` discards the working tree and
-reopens the last durable root, clearing metadata caches and the sequence
-buffer. If reopening or validating the header fails, the handle stays failed.
-An I/O failure during publication may have an uncertain commit outcome: reopen
-and inspect; do not assume the failed call proves an abort. Dropping an
-uncommitted handle does not acknowledge its changes.
+refuse until rollback or reopen. `rollback()` discards the working tree in
+place: it re-inspects the durable files exactly as a reopen would, truncates
+only bytes past the last complete commit, barriers and republishes that
+prefix, and clears metadata caches and the sequence buffer. Live snapshots
+are unaffected. If validating the header fails afterwards, the handle stays
+failed. An I/O failure during publication may have an uncertain commit
+outcome, but always a coherent one: if the barrier or the first hint copy
+failed, nobody sees the transaction until `rollback()` or reopen republish
+the complete durable frame; if the first hint copy landed and the second
+failed, every reader and the writer's own bookkeeping already see it and only
+the failed `commit()` call is left to resolve. The failed call is not proof
+of an abort. Dropping an uncommitted handle does not acknowledge its changes.
 
-`create_limited` uses the existing persistent kernel limits. This does not turn
-caller-owned documents, codec scratch space or filesystem allocation into a
+`create_limited` persists the exact `ResourceLimits` (kernel `E4LIMIT1`
+record) in the collection header and enforces every field on the page-WAL
+path: `data_bytes` and `wal_bytes` before each page write/append (their sum
+is also the persisted page-WAL cap), `tracked_pages` at every distinct
+addition to the WAL index between checkpoints, `record_bytes` before
+mutation, `readers` by reader slot index across processes, and
+`recovery_bytes` by never being written into. `wal_bytes > 16 MiB` and
+`readers > 8` are refused before the directory exists. Runtime allowances
+are reinstalled at every open and after rollback. The 96 logical bytes of
+`readers.lock` are charged against the policy's freelist allowance; the slot
+files are zero bytes (inode cost only). This does not turn caller-owned
+documents, codec scratch space or filesystem allocation into a
 whole-process/whole-device quota. The benchmark below uses ordinary stores;
 its sampled peaks are observations, not enforced limits.
 
@@ -136,7 +169,7 @@ in the same B-tree, not separate databases or per-feature files:
 
 | Key | Value |
 |---|---|
-| `[00,00,copy]` | Global next collection/layout IDs |
+| `[00,00,copy]` | Global next collection/layout IDs (8-byte payload; `create_limited` databases append the 56-byte `E4LIMIT1` policy; any other length is refused as unsupported before any write) |
 | `[00,F0] + BE64(layout_id * 3 + copy)` | Immutable dense-v3 layout descriptor |
 | `[01,copy] + ordered(collection)` | Collection ID, name, active layout, timestamp policy |
 | `[02,copy] + ordered(collection)` | Next sequence |
@@ -186,9 +219,13 @@ verified leaves without those ancestors:
 recover_typed_candidates(source, destination, &CollectionRecovery, options)?;
 ```
 
-The existing R2 exporter with `CollectionRecovery` decodes scalar rows into a
-candidate envelope containing numeric collection ID, sequence, external key
-and document. It preserves exact entity bytes in `records.raw` when a layout
+The existing R2 exporter with `CollectionRecovery` reads the page-WAL source
+through `pagewal::candidate_reader`, which overlays the committed WAL on the
+data file read-only (rows acknowledged but not yet checkpointed are
+candidates too; an uninterpretable WAL falls back to the bare data file and
+is recorded in `issues.jsonl`). It decodes scalar rows into a candidate
+envelope containing numeric collection ID, sequence, external key and
+document. It preserves exact entity bytes in `records.raw` when a layout
 is unavailable or a decode fails, and never modifies the source. Exports are
 candidates: obsolete rows can coexist, and committed membership is not inferred.
 Collection names/policy/current catalog generation are separate evidence in the

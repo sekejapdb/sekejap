@@ -1,0 +1,33 @@
+COMMAND: <scratch> <scratch> 1000000 on
+RUN <scratch>
+=== e4 arm: n=1000000 timestamps=true dim=8 batch=1000 ===
+phase 0 250000 ops 13.4s
+phase 0 500000 ops 26.6s
+phase 0 750000 ops 38.2s
+phase 0 1000000 ops 50.2s
+e4 phase load done: 50.220s (+0.025s checkpoint, completed=true) creates=1000000 updates=0 deletes=0 population=1000000 bytes=296153184
+e4 phase update_round_1 done: 9.169s (+0.005s checkpoint, completed=true) creates=0 updates=200000 deletes=0 population=1000000 bytes=296153184
+e4 phase update_round_2 done: 9.528s (+0.005s checkpoint, completed=true) creates=0 updates=200000 deletes=0 population=1000000 bytes=296153184
+e4 phase delete_only done: 7.726s (+0.009s checkpoint, completed=true) creates=0 updates=0 deletes=100000 population=900000 bytes=296153184
+e4 phase replacement_reinsert done: 4.708s (+0.014s checkpoint, completed=true) creates=100000 updates=0 deletes=0 population=1000000 bytes=328335456
+phase 5 250000 ops 14.9s
+e4 phase mixed_round_1 done: 23.139s (+0.042s checkpoint, completed=true) creates=100000 updates=200000 deletes=100000 population=1000000 bytes=362782816
+phase 6 250000 ops 14.1s
+e4 phase mixed_round_2 done: 21.759s (+0.009s checkpoint, completed=true) creates=100000 updates=200000 deletes=100000 population=1000000 bytes=393150560
+e4 COMPLETE total_seconds=126.378
+=== sqlite arm: n=1000000 timestamps=true dim=8 batch=1000 ===
+phase 0 250000 ops 4.8s
+phase 0 500000 ops 9.3s
+phase 0 750000 ops 15.4s
+phase 0 1000000 ops 19.9s
+sqlite phase load done: 19.915s (+0.015s checkpoint, completed=true) creates=1000000 updates=0 deletes=0 population=1000000 bytes=271269888
+sqlite phase update_round_1 done: 6.769s (+0.002s checkpoint, completed=true) creates=0 updates=200000 deletes=0 population=1000000 bytes=271269888
+sqlite phase update_round_2 done: 5.728s (+0.001s checkpoint, completed=true) creates=0 updates=200000 deletes=0 population=1000000 bytes=271269888
+sqlite phase delete_only done: 3.621s (+0.001s checkpoint, completed=true) creates=0 updates=0 deletes=100000 population=900000 bytes=271269888
+sqlite phase replacement_reinsert done: 1.894s (+0.021s checkpoint, completed=true) creates=100000 updates=0 deletes=0 population=1000000 bytes=299442176
+phase 5 250000 ops 5.8s
+sqlite phase mixed_round_1 done: 9.714s (+0.022s checkpoint, completed=true) creates=100000 updates=200000 deletes=100000 population=1000000 bytes=327393280
+phase 6 250000 ops 5.3s
+sqlite phase mixed_round_2 done: 10.150s (+0.042s checkpoint, completed=true) creates=100000 updates=200000 deletes=100000 population=1000000 bytes=355344384
+sqlite COMPLETE total_seconds=57.898
+COMPLETE <scratch>

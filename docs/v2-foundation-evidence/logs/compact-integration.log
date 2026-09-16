@@ -1,0 +1,181 @@
+COMMAND: cargo test --locked --offline --features compact-cells,sqlite-balance --test collections --test collection_pagewal --test schema_recovery --test pagewal --test pagewal_repair --test pagewal_recovery_identity --test pagewal_transaction_capacity --test recovery_faults -- --test-threads=1
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `reader_slot` is never read
+   --> kernel/src/store.rs:220:5
+    |
+206 | pub struct Store {
+    |            ----- field in this struct
+...
+220 |     reader_slot: Option<crate::readers::ReaderSlot>,
+    |     ^^^^^^^^^^^
+
+warning: `kernel` (lib) generated 2 warnings
+   Compiling e4-prototype v0.1.0 (<scratch>)
+warning: field `path` is never read
+   --> src/collections.rs:123:5
+    |
+121 | pub struct Database {
+    |            -------- field in this struct
+122 |     store: Backend,
+123 |     path: PathBuf,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `open_with` is never used
+   --> src/pagewal.rs:606:8
+    |
+594 | impl PageWalStore {
+    | ----------------- associated function in this implementation
+...
+606 |     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
+    |        ^^^^^^^^^
+
+warning: `e4-prototype` (lib) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 51.09s
+     Running tests/collection_pagewal.rs (<scratch>)
+
+running 15 tests
+test coordination_files_are_advisory_and_recreated_by_a_writer_or_a_validated_quiescent_reader ... ok
+test delete_then_reinsert_allocates_a_fresh_identity_and_never_reuses_after_reopen ... ok
+test metadata_transaction_cost_is_measured_and_a_policy_below_it_refuses_explicitly ... ok
+test mixed_records_roundtrip_through_page_wal_commit_and_reopen ... ok
+test reader_child ... ok
+test reader_in_another_process_excludes_checkpoint_and_stays_stable ... 
+running 1 test
+test reader_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.04s
+
+ok
+test reopen_recovers_committed_wal_before_any_checkpoint ... ok
+test resource_policy_is_persisted_as_e4limit1_enforced_per_field_and_refused_when_unsupported ... ok
+test rollback_discards_uncommitted_work_beside_a_live_snapshot ... ok
+test schema_change_keeps_old_rows_decodable_and_new_layout_active ... ok
+test snapshots_serve_published_state_defer_checkpoint_and_are_bounded ... ok
+test timestamps_default_off_and_explicit_on_persist_across_reopen ... ok
+test unsupported_sources_are_refused_before_any_byte_changes ... ok
+test writer_child ... ok
+test writer_restart_in_another_process_beside_a_pinned_reader ... 
+running 1 test
+test writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.01s
+
+ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+     Running tests/collections.rs (<scratch>)
+
+running 7 tests
+test deterministic_model_covers_commits_rollbacks_and_collection_switches ... ok
+test identity_upsert_delete_and_collection_isolation_follow_e3_contracts ... ok
+test immutable_layout_dispatch_and_vector_sidecars_survive_updates ... ok
+test published_snapshots_rollback_and_streaming_cursor_are_consistent ... ok
+test resource_refusal_cannot_publish_a_partial_entity_or_key_mapping ... ok
+test timestamps_are_explicit_persistent_monotonic_and_managed_on_every_write ... ok
+test undeclared_fields_roundtrip_through_collection_and_reopen ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.47s
+
+     Running tests/pagewal.rs (<scratch>)
+
+running 13 tests
+test cap_refusal_preserves_published_snapshot_and_reopen ... ok
+test checkpoint_process_death_preserves_acknowledged_rows ... 
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+ok
+test commit_reopen_and_overflow_resize ... ok
+test corrupt_wal_refuses_without_modifying_evidence ... ok
+test crash_child ... ok
+test delete_reinsert_and_snapshot_versions ... ok
+test free_new_overflow_before_its_first_flush ... ok
+test managed_disk_cap_survives_reopen ... ok
+test new_snapshot_during_uncommitted_changes_sees_latest_commit ... ok
+test repeated_small_transactions_complete_under_twice_loaded_size ... ok
+test snapshot_admission_is_bounded_and_released_on_drop ... ok
+test surviving_snapshot_keeps_wal_reset_ownership ... ok
+test uncommitted_evictions_never_become_visible_after_reopen ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+
+     Running tests/pagewal_recovery_identity.rs (<scratch>)
+
+running 6 tests
+test foreign_valid_wal_refuses_before_mutation ... ok
+test interrupted_reset_can_reopen_write_and_reopen_again ... ok
+test invalid_root_is_refused_before_tail_cleanup ... ok
+test one_damaged_checkpoint_header_can_reopen_and_continue_writing ... ok
+test stale_valid_wal_cannot_roll_back_a_later_checkpoint ... ok
+test unsupported_metadata_or_features_preserve_tail_and_both_headers ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+     Running tests/pagewal_repair.rs (<scratch>)
+
+running 1 test
+test source_preserving_repair_contains_damage_and_never_resurrects_deletes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.19s
+
+     Running tests/pagewal_transaction_capacity.rs (<scratch>)
+
+running 1 test
+test scattered_thousand_insert_transaction_preserves_old_reader_and_reopens ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.78s
+
+     Running tests/recovery_faults.rs (<scratch>)
+
+running 14 tests
+test committed_wal_delete_and_insert_survive_repair ... ok
+test damaged_leaf_kind_cannot_hide_loss ... ok
+test damaged_meta_is_membership_uncertain ... ok
+test damaged_wal_keeps_source_and_verified_commits ... ok
+test malformed_cell_does_not_abort_unrelated_salvage ... ok
+test overflow_bad_page_salvages_other_rows ... ok
+test overflow_crossed_chain_is_one_known_loss ... ok
+test overflow_cycle_and_wrong_identity_are_contained ... ok
+test overflow_missing_tail_is_one_known_loss ... ok
+test overflow_truncated_tail_is_reported ... ok
+test repair_destination_failure_keeps_source ... ok
+test repair_never_resurrects_deleted_rows ... ok
+test repair_rejects_source_aliases_and_active_writers ... ok
+test rootless_repair_does_not_claim_current_membership ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.51s
+
+     Running tests/schema_recovery.rs (<scratch>)
+
+running 7 tests
+test layouts_recover_without_btree_ancestors ... ok
+test missing_layout_preserves_raw_rows_and_names_loss ... ok
+test schema_codec_policy_is_replaceable ... ok
+test schema_conflicting_ids_never_pick_a_winner ... ok
+test schema_descriptor_checksum_is_independent_of_page_checksum ... ok
+test schema_resource_limit_and_archive_validation_preserve_evidence ... ok
+test surviving_layout_replicas_decode_exact_values ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 42.20s
+

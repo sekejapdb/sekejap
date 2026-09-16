@@ -1,0 +1,6 @@
+COMMAND: <scratch> verify-and-update <scratch> --confirm-copy
+checkpointed: baseline scenario verified (5 entities, 2 deletions)
+checkpointed: verify-and-update passed (update+insert+delete, commit, reopen)
+wal_pending: baseline scenario verified (5 entities, 2 deletions)
+wal_pending: verify-and-update passed (update+insert+delete, commit, reopen)
+verify-and-update: all targets verified and advanced

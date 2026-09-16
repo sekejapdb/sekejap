@@ -1,11 +1,10 @@
-//! Typed collections over the existing pager. No JSON text is persisted.
-//! Keys and immutable layouts are documented in docs/COLLECTIONS.md.
+//! Typed collections on the V2 page-WAL store. No JSON text is persisted.
+//! Keys and immutable layouts are documented in docs/COLLECTIONS.md; the
+//! storage path, its limits and its deviations in docs/V2_COLLECTION_INTEGRATION.md.
+use crate::collection_backend::{check_config, check_limits, Backend};
+use crate::pagewal::PageWalStore;
 use crate::{decode_dense_v3, encode_dense_v3, Kind, Layout};
-use kernel::{
-    btree::RangeIter,
-    limits::ResourceLimits,
-    store::{Config, Store},
-};
+use kernel::{btree::RangeIter, limits::ResourceLimits, store::Config};
 use serde_json::Value;
 use std::{
     cell::RefCell,
@@ -23,6 +22,9 @@ pub enum Error {
     ReadOnly,
     Failed,
     Corrupt(String),
+    /// A format, policy or configuration this binary does not implement.
+    /// Raised before any byte of the source changes.
+    Unsupported(String),
     Kernel(kernel::Error),
 }
 impl fmt::Display for Error {
@@ -50,6 +52,12 @@ const PAD: usize = 2081;
 const HEADER_MAGIC: &[u8; 8] = b"E4COLL1\0";
 const CATALOG_MAGIC: &[u8; 8] = b"E4CAT01\0";
 const COUNTER_MAGIC: &[u8; 8] = b"E4SEQ01\0";
+/// Header payload: next collection, next layout (8 bytes, every ordinary
+/// database, byte-identical to the inherited encoding), optionally followed
+/// by the kernel's 56-byte `E4LIMIT1` policy record (only databases created
+/// through `create_limited`). Other lengths are refused before any write.
+const HEADER_PLAIN: usize = 8;
+const HEADER_LIMITED: usize = 8 + 56;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CollectionId(pub u32);
@@ -98,6 +106,12 @@ struct Catalog {
     layout: u32,
     timestamps: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeaderInfo {
+    next_collection: u32,
+    next_layout: u32,
+    limits: Option<ResourceLimits>,
+}
 // E3 db.rs MembershipBatch uses the same fixed one-collection accumulator:
 // switching collections flushes it; memory never grows with collection count.
 struct Sequence {
@@ -105,15 +119,15 @@ struct Sequence {
     next: u64,
 }
 pub struct Database {
-    store: Option<Store>,
+    store: Backend,
     path: PathBuf,
-    config: Config,
     read_only: bool,
     failed: bool,
     sequence: Option<Sequence>,
     catalog_cache: RefCell<Option<Catalog>>,
     layout_cache: RefCell<Option<Arc<Layout>>>,
     clock: Arc<dyn Clock>,
+    limits: Option<ResourceLimits>,
 }
 
 fn ordered(n: u64) -> Vec<u8> {
@@ -242,11 +256,105 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         timestamps: b[8] == 1,
     })
 }
+/// The kernel's own `E4LIMIT1` record: a damaged one is corruption, a valid
+/// one this page-WAL release cannot honour (e.g. more readers than slots) is
+/// refused as unsupported, not silently narrowed.
+fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
+    let l = ResourceLimits::decode(b)
+        .map_err(|e| corrupt(format!("persisted resource policy: {e:?}")))?;
+    check_limits(l).map_err(|e| Error::Unsupported(format!("persisted resource policy: {e:?}")))
+}
+fn header_bytes(h: HeaderInfo) -> Result<Vec<u8>> {
+    let mut payload = h.next_collection.to_be_bytes().to_vec();
+    payload.extend_from_slice(&h.next_layout.to_be_bytes());
+    if let Some(l) = h.limits {
+        payload.extend(l.encode());
+    }
+    packet(HEADER_MAGIC, &payload)
+}
+fn parse_header(b: &[u8]) -> Result<HeaderInfo> {
+    if b.len() == PAD && b.starts_with(b"E4COLL") && &b[..8] != HEADER_MAGIC {
+        return Err(Error::Unsupported(format!(
+            "typed-collection header version {:?} is newer than this binary",
+            String::from_utf8_lossy(&b[..7])
+        )));
+    }
+    let b = unpack(b, HEADER_MAGIC)?;
+    if b.len() != HEADER_PLAIN && b.len() != HEADER_LIMITED {
+        return Err(Error::Unsupported(format!(
+            "typed-collection header payload of {} bytes is not implemented by this binary",
+            b.len()
+        )));
+    }
+    let a = u32::from_be_bytes(b[..4].try_into().unwrap());
+    let z = u32::from_be_bytes(b[4..8].try_into().unwrap());
+    if a == 0 || z == 0 {
+        return Err(corrupt("header counters"));
+    }
+    Ok(HeaderInfo {
+        next_collection: a,
+        next_layout: z,
+        limits: (b.len() == HEADER_LIMITED)
+            .then(|| decode_limits(&b[8..]))
+            .transpose()?,
+    })
+}
+/// Agreeing intact copies win; a damaged page or descriptor loses one copy,
+/// not all metadata. Conflicting valid copies are an error, never a vote. An
+/// unsupported-but-intact copy is reported as such rather than as damage.
+fn replicas<T: PartialEq>(
+    get: impl Fn(&[u8]) -> Result<Option<Vec<u8>>>,
+    keys: impl Fn(u8) -> Vec<u8>,
+    parse: impl Fn(&[u8]) -> Result<T>,
+) -> Result<T> {
+    let mut good = None;
+    let mut unsupported = None;
+    for copy in 0..3 {
+        match get(&keys(copy)) {
+            Ok(Some(b)) => match parse(&b) {
+                Ok(value) => {
+                    if good.as_ref().is_some_and(|old| old != &value) {
+                        return Err(corrupt("conflicting metadata copies"));
+                    }
+                    good = Some(value);
+                }
+                Err(e @ Error::Unsupported(_)) => unsupported = Some(e),
+                Err(_) => {}
+            },
+            Ok(None) | Err(Error::Kernel(kernel::Error::Corrupt { .. })) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    good.ok_or_else(|| {
+        unsupported.unwrap_or_else(|| corrupt("all metadata copies missing or damaged"))
+    })
+}
+fn read_header(s: &PageWalStore) -> Result<HeaderInfo> {
+    replicas(|k| s.get(k).map_err(Error::from), |i| vec![0, 0, i], parse_header)
+}
+/// The typed refusal the page-WAL runs before it normalizes or creates
+/// anything. The precise collection error is kept in `detail`; the kernel
+/// sees an opaque refusal.
+fn typed_check(s: &PageWalStore, detail: &RefCell<Option<Error>>) -> kernel::Result<()> {
+    match read_header(s) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            *detail.borrow_mut() = Some(e);
+            Err(kernel::Error::Corrupt {
+                page_no: 0,
+                why: "typed-collection catalog refused before open",
+            })
+        }
+    }
+}
 
 impl Database {
     pub fn create(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         Self::create_inner(path.as_ref(), config, None)
     }
+    /// Create with a persisted resource policy. Every field is enforced on
+    /// this path or the policy is refused before the directory exists; see
+    /// `collection_backend::check_limits`.
     pub fn create_limited(
         path: impl AsRef<Path>,
         config: Config,
@@ -255,51 +363,110 @@ impl Database {
         Self::create_inner(path.as_ref(), config, Some(limits))
     }
     fn create_inner(path: &Path, config: Config, limits: Option<ResourceLimits>) -> Result<Self> {
-        let store = if let Some(l) = limits {
-            Store::create_limited(path, config, l)?
-        } else {
-            Store::create(path, config)?
-        };
-        let mut db = Self::wrap(store, config, false);
+        let cache = check_config(&config).map_err(Error::Unsupported)?;
+        let limits = limits.map(check_limits).transpose()?;
+        let store = Backend::create(path, cache, limits)?;
+        let mut db = Self::wrap(store, false, limits);
         db.write_header(1, 1)?;
         db.commit()?;
         Ok(db)
     }
+    /// Open the single writer. The catalog header is validated before the
+    /// page-WAL normalizes anything: an unsupported or damaged catalog, an
+    /// unknown storage feature, or a non-page-WAL directory is refused with
+    /// the source byte-for-byte untouched.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        let db = Self::wrap(Store::open(path.as_ref(), config)?, config, false);
-        db.header()?;
+        let path = path.as_ref();
+        let cache = check_config(&config).map_err(Error::Unsupported)?;
+        if path.join("data").exists() && !path.join("writer.lock").exists() {
+            return Err(Error::Unsupported(
+                "not a V2 page-WAL typed-collection database (no writer.lock)".into(),
+            ));
+        }
+        let detail = RefCell::new(None);
+        let store = Backend::open(path, cache, |s| typed_check(s, &detail));
+        let store = match store {
+            Ok(s) => s,
+            Err(k) => return Err(detail.into_inner().unwrap_or(Error::Kernel(k))),
+        };
+        let h = read_header(store.store())?;
+        let mut db = Self::wrap(store, false, h.limits);
+        if let Some(l) = h.limits {
+            db.store.install_limits(l)?;
+        }
         Ok(db)
     }
+    /// Read-only view of the newest PUBLISHED transaction, beside a writer in
+    /// this or another process, or of the committed files when no writer is
+    /// alive. The typed catalog check runs inside admission, before any
+    /// coordination file is created. Holds a reader slot for its life, which
+    /// defers (never blocks) the writer's checkpoint; a persisted `readers`
+    /// bound is enforced by the slot index.
     pub fn open_snapshot(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        let db = Self::wrap(Store::open_snapshot(path.as_ref(), config)?, config, true);
-        db.header()?;
-        Ok(db)
+        let cache = check_config(&config).map_err(Error::Unsupported)?;
+        let detail = RefCell::new(None);
+        let limits = std::cell::Cell::new(None);
+        // The typed check also hands the persisted reader bound to the
+        // page-WAL, which enforces it on the slot this handle holds.
+        let store = Backend::open_snapshot(path.as_ref(), cache, |s| match read_header(s) {
+            Ok(h) => {
+                limits.set(h.limits);
+                Ok(h.limits.map(|l| l.readers as usize))
+            }
+            Err(e) => {
+                *detail.borrow_mut() = Some(e);
+                Err(kernel::Error::Corrupt {
+                    page_no: 0,
+                    why: "typed-collection catalog refused before open",
+                })
+            }
+        });
+        let store = match store {
+            Ok(s) => s,
+            Err(k) => return Err(detail.into_inner().unwrap_or(Error::Kernel(k))),
+        };
+        Ok(Self::wrap(store, true, limits.get()))
     }
-    fn wrap(store: Store, config: Config, read_only: bool) -> Self {
+    fn wrap(store: Backend, read_only: bool, limits: Option<ResourceLimits>) -> Self {
         Self {
             path: store.dir().to_owned(),
-            store: Some(store),
-            config,
+            store,
             read_only,
             failed: false,
             sequence: None,
             catalog_cache: RefCell::new(None),
             layout_cache: RefCell::new(None),
             clock: Arc::new(SystemClock),
+            limits,
         }
     }
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
         self.clock = clock;
     }
-    fn store(&self) -> Result<&Store> {
+    /// The persisted resource policy, if the database was created with one.
+    pub fn limits(&self) -> Option<ResourceLimits> {
+        self.limits
+    }
+    /// Current (data extent, WAL) bytes of the underlying page-WAL store.
+    /// The 96-byte publication hint (`readers.lock`) is not included.
+    pub fn storage_bytes(&self) -> Result<(u64, u64)> {
+        let s = self.store()?;
+        Ok((s.data_bytes(), s.wal_bytes()))
+    }
+    /// Distinct pages held by the WAL index since the last checkpoint: what a
+    /// persisted `tracked_pages` policy bounds. `None` for snapshots.
+    pub fn tracked_pages(&self) -> Result<Option<usize>> {
+        Ok(self.store()?.tracked_pages())
+    }
+    fn store(&self) -> Result<&Backend> {
         if self.failed {
             return Err(Error::Failed);
         }
-        self.store.as_ref().ok_or(Error::Failed)
+        Ok(&self.store)
     }
-    fn writer(&mut self) -> Result<&mut Store> {
+    fn writer(&mut self) -> Result<&mut Backend> {
         self.ready_write()?;
-        self.store.as_mut().ok_or(Error::Failed)
+        Ok(&mut self.store)
     }
     fn ready_write(&self) -> Result<()> {
         self.store()?;
@@ -321,45 +488,18 @@ impl Database {
         parse: impl Fn(&[u8]) -> Result<T>,
     ) -> Result<T> {
         let store = self.store()?;
-        let mut good = None;
-        for copy in 0..3 {
-            // A damaged page/descriptor may lose a copy, not all metadata.
-            match store.get(&keys(copy)) {
-                Ok(Some(b)) => {
-                    if let Ok(value) = parse(&b) {
-                        if good.as_ref().is_some_and(|old| old != &value) {
-                            return Err(corrupt("conflicting metadata copies"));
-                        }
-                        good = Some(value);
-                    }
-                }
-                Ok(None) | Err(kernel::Error::Corrupt { .. }) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        good.ok_or_else(|| corrupt("all metadata copies missing or damaged"))
+        replicas(|k| store.get(k).map_err(Error::from), keys, parse)
     }
     fn header(&self) -> Result<(u32, u32)> {
-        self.replicas(
-            |i| vec![0, 0, i],
-            |b| {
-                let b = unpack(b, HEADER_MAGIC)?;
-                if b.len() != 8 {
-                    return Err(corrupt("header fields"));
-                }
-                let a = u32::from_be_bytes(b[..4].try_into().unwrap());
-                let z = u32::from_be_bytes(b[4..].try_into().unwrap());
-                if a == 0 || z == 0 {
-                    return Err(corrupt("header counters"));
-                }
-                Ok((a, z))
-            },
-        )
+        let h = self.replicas(|i| vec![0, 0, i], parse_header)?;
+        Ok((h.next_collection, h.next_layout))
     }
     fn write_header(&mut self, collection: u32, layout: u32) -> Result<()> {
-        let mut payload = collection.to_be_bytes().to_vec();
-        payload.extend_from_slice(&layout.to_be_bytes());
-        let b = packet(HEADER_MAGIC, &payload)?;
+        let b = header_bytes(HeaderInfo {
+            next_collection: collection,
+            next_layout: layout,
+            limits: self.limits,
+        })?;
         for i in 0..3 {
             self.writer()?.put(&[0, 0, i], &b)?;
         }
@@ -634,7 +774,7 @@ impl Database {
         }
         doc[KEY_FIELD] = Value::from(key);
         let encoded = encode_dense_v3(&layout, &doc).map_err(invalid)?;
-        if let Some(l) = self.store()?.resource_limits() {
+        if let Some(l) = self.limits {
             if encoded.row.len() + 32 > l.record_bytes as usize
                 || encoded
                     .vectors
@@ -787,34 +927,52 @@ impl Database {
         let start = after.map(row_key).unwrap_or_else(|| prefix(0x40, c));
         Ok(Scan {
             db: self,
-            inner: self.store()?.scan(&start)?,
+            inner: self.store()?.range(&start)?,
             prefix: prefix(0x40, c),
             after,
             done: false,
         })
     }
-    /// One atomic transaction; a successful commit also publishes to snapshots.
+    /// One atomic transaction, durable with a FULL barrier and published to
+    /// every snapshot opened afterwards. The committed WAL is folded into the
+    /// data file by `checkpoint`, automatically once it reaches 4 MiB (or half
+    /// the remaining allowance) and no reader holds a slot.
     pub fn commit(&mut self) -> Result<()> {
         self.ready_write()?;
         let r = (|| {
             self.flush_sequence()?;
-            self.writer()?.checkpoint()?;
+            self.writer()?.commit()?;
             Ok(())
         })();
         self.finish(r)
     }
-    /// Discard the uncommitted working tree by reopening the last durable root.
-    /// After an I/O error, publication may be uncertain; inspect the reopened data.
+    /// Fold committed pages into the data file and reset the WAL. Requires a
+    /// committed handle. `Ok(false)` means a live reader (any process) holds a
+    /// slot and the fold is deferred; committed data is unaffected either way.
+    pub fn checkpoint(&mut self) -> Result<bool> {
+        self.ready_write()?;
+        if self.sequence.is_some() || self.store.is_dirty() {
+            return Err(invalid("checkpoint requires commit"));
+        }
+        let r = self.writer()?.checkpoint();
+        self.finish(r.map_err(Error::from))
+    }
+    /// Discard the uncommitted working tree in place by re-inspecting the
+    /// durable files, exactly as a reopen would. Live snapshots are untouched.
+    /// After an I/O error, publication may be uncertain: a commit frame that
+    /// became durable before its barrier failed is reported as committed.
     pub fn rollback(&mut self) -> Result<()> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
-        drop(self.store.take());
         self.sequence = None;
         *self.catalog_cache.borrow_mut() = None;
         *self.layout_cache.borrow_mut() = None;
         self.failed = true;
-        self.store = Some(Store::open(&self.path, self.config)?);
+        self.store.rollback()?;
+        if let Some(l) = self.limits {
+            self.store.install_limits(l)?;
+        }
         self.failed = false;
         let validation = self.header().map(|_| ());
         self.finish(validation)
@@ -922,7 +1080,7 @@ mod tests {
     use kernel::{
         io::IoMode,
         page::{PageKind, PageRef},
-        store::{SyncMode, TestFaultKind},
+        store::SyncMode,
     };
     use serde_json::json;
     fn cfg() -> Config {
@@ -938,7 +1096,8 @@ mod tests {
                 || std::env::temp_dir()
                     .starts_with("<scratch>")
                 || std::env::temp_dir()
-                    .starts_with("<scratch>"))
+                    .starts_with("<scratch>")
+                || std::env::temp_dir().starts_with("<scratch>"))
         );
         let t = tempfile::tempdir().unwrap();
         let mut db = Database::create(t.path().join("db"), cfg()).unwrap();
@@ -953,21 +1112,24 @@ mod tests {
     fn scalar_update_spends_only_one_store_write() {
         let (t, mut db, c, id) = setup();
         let old = Database::open_snapshot(t.path().join("db"), cfg()).unwrap();
-        db.store()
-            .unwrap()
-            .test_fault_injector()
-            .arm(TestFaultKind::Write, 1);
+        db.store().unwrap().arm_write_fault(1);
         assert_eq!(db.update(c, "base", &json!({"n":2})).unwrap(), id);
         db.commit().unwrap();
         assert_eq!(
             old.get_by_id(id).unwrap().unwrap().document,
             json!({"v":[1.0,2.0],"n":1})
         );
+        // The path-based reader holds only its slot: the writer can be closed
+        // and reopened beside it, and it keeps serving its committed state.
         drop(db);
         let db = Database::open(t.path().join("db"), cfg()).unwrap();
         assert_eq!(
             db.get_by_id(id).unwrap().unwrap().document,
             json!({"v":[1.0,2.0],"n":2})
+        );
+        assert_eq!(
+            old.get_by_id(id).unwrap().unwrap().document,
+            json!({"v":[1.0,2.0],"n":1})
         );
     }
     #[test]
@@ -1029,6 +1191,10 @@ mod tests {
         drop(db);
         let db = Database::open(t.path().join("db"), cfg()).unwrap();
         assert_eq!(db.get_by_id(id).unwrap().unwrap().document, json!({"n":3}));
+        assert_eq!(
+            old.get_by_id(id).unwrap().unwrap().document,
+            json!({"w":[3.0,4.0],"v":[1.0,2.0]})
+        );
     }
     #[test]
     fn missing_vector_cannot_be_hidden_by_replacement() {
@@ -1081,10 +1247,7 @@ mod tests {
                 if operation == "sequence-commit" {
                     db.put(c, "new", &json!({"v":[3.0,4.0]})).unwrap();
                 }
-                db.store()
-                    .unwrap()
-                    .test_fault_injector()
-                    .arm(TestFaultKind::Write, fail_at);
+                db.store().unwrap().arm_write_fault(fail_at);
                 let r = match operation {
                     "insert" => db.put(c, "new", &json!({"v":[3.0,4.0]})).map(|_| ()),
                     "replace" => db.put(c, "base", &json!({"v":[3.0,4.0]})).map(|_| ()),
@@ -1103,7 +1266,8 @@ mod tests {
                     old.get_by_id(id).unwrap().unwrap().document,
                     json!({"v":[1.0,2.0],"n":1})
                 );
-                drop(old);
+                // In-place rollback beside a live reader: the reader's frames
+                // are all below the last commit and stay byte-stable.
                 db.rollback().unwrap();
                 assert_eq!(db.scan(c, None).unwrap().count(), 1);
                 assert!(db.collection("new").unwrap().is_none());
@@ -1113,6 +1277,8 @@ mod tests {
                 );
                 db.put(c, "usable", &json!({})).unwrap();
                 db.commit().unwrap();
+                assert_eq!(old.scan(c, None).unwrap().count(), 1);
+                drop(old);
             }
         }
     }
@@ -1123,7 +1289,7 @@ mod tests {
                 let (t, db, c, _) = setup();
                 let path = db.path.clone();
                 drop(db);
-                let mut s = Store::open(&path, cfg()).unwrap();
+                let mut s = PageWalStore::open(&path, false, 1 << 20).unwrap();
                 for copy in 0..losses {
                     let k = match family {
                         0 => vec![0, 0, copy],
@@ -1135,7 +1301,7 @@ mod tests {
                     b[PAD - 1] ^= 1;
                     s.put(&k, &b).unwrap();
                 }
-                s.checkpoint().unwrap();
+                s.commit().unwrap();
                 drop(s);
                 let result = (|| -> Result<()> {
                     let mut db = Database::open(&path, cfg())?;
@@ -1156,10 +1322,10 @@ mod tests {
         let mut cat = db.catalog(c).unwrap();
         drop(db);
         cat.name = "conflict".into();
-        let mut s = Store::open(&path, cfg()).unwrap();
+        let mut s = PageWalStore::open(&path, false, 1 << 20).unwrap();
         s.put(&replica_key(1, c.0, 1), &catalog_bytes(&cat).unwrap())
             .unwrap();
-        s.checkpoint().unwrap();
+        s.commit().unwrap();
         drop(s);
         assert!(Database::open(&path, cfg())
             .unwrap()
@@ -1194,15 +1360,36 @@ mod tests {
         for i in 0..3 {
             db.writer().unwrap().put(&[0, 0, i], b"broken").unwrap();
         }
-        db.writer().unwrap().checkpoint().unwrap();
+        db.writer().unwrap().commit().unwrap();
         assert!(db.rollback().is_err());
         assert!(matches!(db.get_by_id(id), Err(Error::Failed)));
         assert!(db.put(c, "bad", &json!({})).is_err());
     }
     #[test]
+    fn plain_header_payload_is_the_eight_byte_form_and_future_versions_refuse() {
+        let (_t, db, _, _) = setup();
+        let raw = db.store().unwrap().get(&[0, 0, 0]).unwrap().unwrap();
+        let payload = unpack(&raw, HEADER_MAGIC).unwrap();
+        assert_eq!(payload.len(), HEADER_PLAIN);
+        let mut future = raw.clone();
+        future[6] = b'9';
+        let crc = crc32c::crc32c(&future[..PAD - 4]).to_le_bytes();
+        future[PAD - 4..].copy_from_slice(&crc);
+        assert!(matches!(parse_header(&future), Err(Error::Unsupported(_))));
+        let mut longer = packet(HEADER_MAGIC, &[1; 20]).unwrap();
+        assert!(matches!(parse_header(&longer), Err(Error::Unsupported(_))));
+        longer[PAD - 1] ^= 1;
+        assert!(matches!(parse_header(&longer), Err(Error::Corrupt(_))));
+    }
+    #[test]
     fn rootless_collection_recovery_preserves_source_and_reports_vector_limit() {
         let (t, mut db, c, _) = setup();
         db.put(c, "scalar", &json!({"n":2})).unwrap();
+        db.commit().unwrap();
+        assert!(db.checkpoint().unwrap());
+        // Committed after the checkpoint: this row exists only in the WAL and
+        // must still be exported through the committed-WAL overlay.
+        db.put(c, "tail", &json!({"n":3})).unwrap();
         db.commit().unwrap();
         let path = db.path.clone();
         drop(db);
@@ -1242,8 +1429,8 @@ mod tests {
             );
         }
         std::fs::write(&file, &bytes).unwrap();
-        let before =
-            ["data", "wal", "free"].map(|name| std::fs::read(path.join(name)).unwrap_or_default());
+        let before = ["data", "wal", "writer.lock"]
+            .map(|name| std::fs::read(path.join(name)).unwrap_or_default());
         let out = t.path().join("recovered");
         let r = crate::recovery::recover_typed_candidates(
             &path,
@@ -1253,23 +1440,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.decoded_records + r.unresolved_records, r.raw_records);
-        assert!(r.decoded_records >= 1);
+        assert!(r.decoded_records >= 2);
         assert!(r.unresolved_records >= 1);
-        for name in ["data", "wal", "free"].into_iter().enumerate() {
+        for name in ["data", "wal", "writer.lock"].into_iter().enumerate() {
             assert_eq!(
                 std::fs::read(path.join(name.1)).unwrap_or_default(),
                 before[name.0]
             );
         }
         let lines = std::fs::read_to_string(out.join("decoded.jsonl")).unwrap();
+        let mut keys = std::collections::BTreeSet::new();
         for line in lines.lines() {
             let v: Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["membership"], "candidate");
-            assert_eq!(v["document"]["key"], "scalar");
-            assert_eq!(v["document"]["document"], json!({"n":2}));
+            let key = v["document"]["key"].as_str().unwrap().to_owned();
+            let n = if key == "scalar" { 2 } else { 3 };
+            assert_eq!(v["document"]["document"], json!({"n":n}));
+            keys.insert(key);
         }
-        assert!(std::fs::read_to_string(out.join("issues.jsonl"))
-            .unwrap()
-            .contains("candidate vector sidecar not resolved"));
+        assert_eq!(keys, ["scalar", "tail"].map(str::to_owned).into());
+        let issues = std::fs::read_to_string(out.join("issues.jsonl")).unwrap();
+        assert!(issues.contains("candidate vector sidecar not resolved"));
+        assert!(!issues.contains("committed_wal_overlay_skipped"));
     }
 }

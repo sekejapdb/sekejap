@@ -5,7 +5,14 @@ use serde_json::{json,Value};
 use std::{fs,io::Write};
 
 #[derive(Clone)]
-struct Source {data:Arc<dyn FileIo>,wal:Arc<dyn FileIo>,index:Arc<Index>,pages:u32}
+pub(super) struct Source {pub(super) data:Arc<dyn FileIo>,pub(super) wal:Arc<dyn FileIo>,pub(super) index:Arc<Index>,pub(super) pages:u32}
+impl Source {
+    /// The bare data file with no committed-WAL overlay (typed recovery fallback).
+    pub(super) fn plain(data:Arc<dyn FileIo>)->Result<Self>{
+        let pages=u32::try_from(data.len()?/PAGE as u64).map_err(|_|Error::TooLarge)?;
+        Ok(Self{wal:data.clone(),data,index:Arc::new(Index::new()),pages})
+    }
+}
 impl FileIo for Source {
     fn requires_alignment(&self)->bool{false}
     fn len(&self)->Result<u64>{Ok(self.pages as u64*PAGE as u64)}

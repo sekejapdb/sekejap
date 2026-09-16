@@ -586,3 +586,21 @@ pub fn try_lock_exclusive(f: &std::fs::File) -> std::io::Result<bool> {
         Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
+
+/// Shared counterpart of `try_lock_exclusive`: Ok(false) when an exclusive
+/// holder is alive. Read-only handles suffice on every supported platform.
+/// Used by the page-WAL reader admission (ownership probe, admission gate).
+pub fn try_lock_shared(f: &std::fs::File) -> std::io::Result<bool> {
+    match f.try_lock_shared() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Blocking shared lock: waits only for an exclusive holder's critical
+/// section (the page-WAL writer's tail truncation or checkpoint).
+pub fn lock_shared(f: &std::fs::File) -> std::io::Result<()> { f.lock_shared() }
+
+/// Blocking exclusive lock: waits only for admissions in flight.
+pub fn lock_exclusive(f: &std::fs::File) -> std::io::Result<()> { f.lock() }

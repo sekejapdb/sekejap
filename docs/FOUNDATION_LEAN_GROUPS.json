@@ -11,7 +11,9 @@
       "--test",
       "btree_reuse",
       "--test",
-      "pagewal_transaction_capacity"
+      "pagewal_transaction_capacity",
+      "--test",
+      "pagewal_recovery_identity"
     ],
     "typed": [
       "--test",
@@ -19,7 +21,9 @@
       "--test",
       "schema_recovery",
       "--test",
-      "collections"
+      "collections",
+      "--test",
+      "collection_pagewal"
     ],
     "kernel": [
       "-p",
@@ -86,7 +90,7 @@
         "kernel",
         "io"
       ],
-      "coverage": "Commit/checkpoint I/O fault matrix, deliberate process exits and lost-write preservation",
+      "coverage": "Commit/checkpoint I/O fault matrix, deliberate process exits, lost-write preservation, and page-WAL identity-bound refusal of a foreign or stale WAL with continued recovery after a damaged checkpoint header (pagewal_recovery_identity)",
       "remaining": "Full create/open/repair-destination failure and publication matrix"
     },
     {
@@ -105,17 +109,18 @@
         "kernel",
         "io"
       ],
-      "coverage": "CRC/bounds, stale frame, independent raw repair and schema-replica regressions; compact-cell slot bounds and aligned concurrent Direct/Buffered file isolation",
-      "remaining": "Corrupt-WAL salvage and rootless current-membership proof remain open"
+      "coverage": "CRC/bounds, stale frame, independent raw repair and schema-replica regressions; compact-cell slot bounds and aligned concurrent Direct/Buffered file isolation; identity-bound refusal of a foreign/stale WAL and of a damaged checkpoint header (pagewal_recovery_identity); the integrated typed collection over the page-WAL store covers rollback beside a live snapshot, reopen recovering committed WAL before any checkpoint, and unsupported-source refusal before any byte changes (collection_pagewal)",
+      "remaining": "Corrupt-WAL-region salvage and rootless current-membership proof remain open; no released-format compatibility fixture yet (see law 8)"
     },
     {
       "law": 6,
       "id": "readers",
       "commands": [
-        "pager"
+        "pager",
+        "typed"
       ],
-      "coverage": "Old/new snapshots, uncommitted invisibility, admission and writer ownership",
-      "remaining": "Cross-process readers, restart beside a survivor and zero-degradation gate"
+      "coverage": "Old/new snapshots, uncommitted invisibility, admission and writer ownership; the integrated typed path (`typed` group, collection_pagewal) additionally covers a real cross-process reader that excludes a concurrent checkpoint and stays stable, and a cross-process writer restarting beside a pinned reader",
+      "remaining": "Sustained-load restart beside a survivor, resource/scale cross-process concurrency and the zero-degradation latency/I-O regression gate remain open"
     },
     {
       "law": 7,
@@ -126,8 +131,8 @@
         "kernel",
         "io"
       ],
-      "coverage": "Typed round trips, opt-in timestamps, reopen and platform isolation; runnable on Pi",
-      "remaining": "Typed tests use the older collection Store; page-WAL integration, bulk/late indexing/indexed live writes remain pending"
+      "coverage": "Typed round trips, opt-in timestamps, reopen and platform isolation; runnable on Pi; typed collection tests now exercise the integrated page-WAL store rather than the inherited kernel Store (collection_pagewal), including resource-policy (E4LIMIT1) enforcement and schema-layout evolution",
+      "remaining": "Bulk import, late indexing and indexed live writes remain pending; device (Pi/app-scale) qualification of the integrated path is untested in this lean group"
     }
   ]
 }

@@ -1,0 +1,296 @@
+{
+  "batch": 1000,
+  "cache_bytes": 8388608,
+  "cumulative_checkpoint_seconds": 0.10279759499999999,
+  "cumulative_seconds_ops_only": 0.36001776599999996,
+  "cumulative_verify_seconds_excluded_from_total": 0.926340811,
+  "empty_allocated_bytes": 53248,
+  "empty_logical_bytes": 49256,
+  "engine": "sqlite",
+  "final_allocated_bytes": 3424256,
+  "final_checkpoint": {
+    "busy": 0,
+    "checkpointed_frames": 0,
+    "completed": true,
+    "wal_frames": 0
+  },
+  "final_checkpoint_completed": true,
+  "final_checkpoint_seconds": 0.000061805,
+  "final_logical_bytes": 3424256,
+  "final_peak": {
+    "sample_errors": 0,
+    "sampled_peak_allocated": 3424256,
+    "sampled_peak_logical": 3424256,
+    "samples": 1
+  },
+  "initial_policy": {
+    "engine": "sqlite",
+    "explicit_checkpoint_per_phase": "PRAGMA wal_checkpoint(TRUNCATE)",
+    "journal_mode": "wal",
+    "synchronous": 2,
+    "wal_autocheckpoint_pages": 1000
+  },
+  "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+  "phases": [
+    {
+      "checkpoint": {
+        "busy": 0,
+        "checkpointed_frames": 0,
+        "completed": true,
+        "wal_frames": 0
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.013331837,
+      "creates": 10000,
+      "cumulative_checkpoint_seconds": 0.013331837,
+      "cumulative_engine_seconds": 0.14495657,
+      "cumulative_operations": 10000,
+      "cumulative_seconds": 0.131624733,
+      "deletes": 0,
+      "final_allocated_bytes": 2613248,
+      "final_logical_bytes": 2613248,
+      "live_population": 10000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 8421376,
+        "sampled_peak_logical": 5476680,
+        "samples": 106
+      },
+      "phase": "load",
+      "phase_index": 0,
+      "seconds": 0.131624733,
+      "updates": 0,
+      "verification": {
+        "crc32c": 982734848,
+        "rows": 10000,
+        "verify_seconds": 0.126160034
+      }
+    },
+    {
+      "checkpoint": {
+        "busy": 0,
+        "checkpointed_frames": 0,
+        "completed": true,
+        "wal_frames": 0
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.012274643,
+      "creates": 0,
+      "cumulative_checkpoint_seconds": 0.02560648,
+      "cumulative_engine_seconds": 0.19243330999999997,
+      "cumulative_operations": 12000,
+      "cumulative_seconds": 0.16682682999999998,
+      "deletes": 0,
+      "final_allocated_bytes": 2613248,
+      "final_logical_bytes": 2613248,
+      "live_population": 10000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 6807552,
+        "sampled_peak_logical": 4908120,
+        "samples": 39
+      },
+      "phase": "update_round_1",
+      "phase_index": 1,
+      "seconds": 0.035202097,
+      "updates": 2000,
+      "verification": {
+        "crc32c": 3764194548,
+        "rows": 10000,
+        "verify_seconds": 0.125344279
+      }
+    },
+    {
+      "checkpoint": {
+        "busy": 0,
+        "checkpointed_frames": 0,
+        "completed": true,
+        "wal_frames": 0
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.013793581,
+      "creates": 0,
+      "cumulative_checkpoint_seconds": 0.039400061,
+      "cumulative_engine_seconds": 0.24142725599999998,
+      "cumulative_operations": 14000,
+      "cumulative_seconds": 0.202027195,
+      "deletes": 0,
+      "final_allocated_bytes": 2613248,
+      "final_logical_bytes": 2613248,
+      "live_population": 10000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 6807552,
+        "sampled_peak_logical": 4908120,
+        "samples": 38
+      },
+      "phase": "update_round_2",
+      "phase_index": 2,
+      "seconds": 0.035200365,
+      "updates": 2000,
+      "verification": {
+        "crc32c": 3229826714,
+        "rows": 10000,
+        "verify_seconds": 0.130554193
+      }
+    },
+    {
+      "checkpoint": {
+        "busy": 0,
+        "checkpointed_frames": 0,
+        "completed": true,
+        "wal_frames": 0
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.015237858,
+      "creates": 0,
+      "cumulative_checkpoint_seconds": 0.054637919,
+      "cumulative_engine_seconds": 0.28031309499999996,
+      "cumulative_operations": 15000,
+      "cumulative_seconds": 0.22567517599999998,
+      "deletes": 1000,
+      "final_allocated_bytes": 2613248,
+      "final_logical_bytes": 2613248,
+      "live_population": 9000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 6807552,
+        "sampled_peak_logical": 5192400,
+        "samples": 19
+      },
+      "phase": "delete_only",
+      "phase_index": 3,
+      "seconds": 0.023647981,
+      "updates": 0,
+      "verification": {
+        "crc32c": 552256851,
+        "rows": 9000,
+        "verify_seconds": 0.111566789
+      }
+    },
+    {
+      "checkpoint": {
+        "busy": 0,
+        "checkpointed_frames": 0,
+        "completed": true,
+        "wal_frames": 0
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.005002767,
+      "creates": 1000,
+      "cumulative_checkpoint_seconds": 0.059640686,
+      "cumulative_engine_seconds": 0.300036033,
+      "cumulative_operations": 16000,
+      "cumulative_seconds": 0.24039534699999998,
+      "deletes": 0,
+      "final_allocated_bytes": 2895872,
+      "final_logical_bytes": 2895872,
+      "live_population": 10000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 7307264,
+        "sampled_peak_logical": 3209024,
+        "samples": 16
+      },
+      "phase": "replacement_reinsert",
+      "phase_index": 4,
+      "seconds": 0.014720171,
+      "updates": 0,
+      "verification": {
+        "crc32c": 1371126963,
+        "rows": 10000,
+        "verify_seconds": 0.146723712
+      }
+    },
+    {
+      "checkpoint": {
+        "busy": 0,
+        "checkpointed_frames": 0,
+        "completed": true,
+        "wal_frames": 0
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.028162485,
+      "creates": 1000,
+      "cumulative_checkpoint_seconds": 0.087803171,
+      "cumulative_engine_seconds": 0.393795472,
+      "cumulative_operations": 20000,
+      "cumulative_seconds": 0.30599230099999997,
+      "deletes": 1000,
+      "final_allocated_bytes": 3158016,
+      "final_logical_bytes": 3158016,
+      "live_population": 10000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 11239424,
+        "sampled_peak_logical": 6140928,
+        "samples": 63
+      },
+      "phase": "mixed_round_1",
+      "phase_index": 5,
+      "seconds": 0.065596954,
+      "updates": 2000,
+      "verification": {
+        "crc32c": 1977917918,
+        "rows": 10000,
+        "verify_seconds": 0.150529201
+      }
+    },
+    {
+      "checkpoint": {
+        "busy": 0,
+        "checkpointed_frames": 0,
+        "completed": true,
+        "wal_frames": 0
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.014994424,
+      "creates": 1000,
+      "cumulative_checkpoint_seconds": 0.10279759499999999,
+      "cumulative_engine_seconds": 0.462815361,
+      "cumulative_operations": 24000,
+      "cumulative_seconds": 0.36001776599999996,
+      "deletes": 1000,
+      "final_allocated_bytes": 3424256,
+      "final_logical_bytes": 3424256,
+      "live_population": 10000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 7831552,
+        "sampled_peak_logical": 6407168,
+        "samples": 53
+      },
+      "phase": "mixed_round_2",
+      "phase_index": 6,
+      "seconds": 0.054025465,
+      "updates": 2000,
+      "verification": {
+        "crc32c": 134616944,
+        "rows": 10000,
+        "verify_seconds": 0.135462603
+      }
+    }
+  ],
+  "reopen_seconds": 0.002486686,
+  "reopen_verification": {
+    "crc32c": 134616944,
+    "rows": 10000,
+    "verify_seconds": 0.136913795
+  },
+  "reopen_verify_seconds_excluded_from_total": 0.136913795,
+  "reopened_policy": {
+    "engine": "sqlite",
+    "explicit_checkpoint_per_phase": "PRAGMA wal_checkpoint(TRUNCATE)",
+    "journal_mode": "wal",
+    "synchronous": 2,
+    "wal_autocheckpoint_pages": 1000
+  },
+  "rows": 10000,
+  "sqlite_version": "3.46.0",
+  "sync": "FULL; fullfsync/checkpoint_fullfsync requested (inert off macOS)",
+  "timestamps": false,
+  "total_operations": 24000,
+  "total_seconds": 0.465363852,
+  "total_seconds_definition": "sum of per-phase op seconds (which include this benchmark's own cheap, pure content generation, run inline with each write, identically for both engines) + per-phase explicit checkpoint seconds + final checkpoint seconds + reopen seconds; excludes oracle verification time only, reported separately below and never folded in",
+  "vector_dim": 8
+}

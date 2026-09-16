@@ -1,0 +1,68 @@
+{
+  "apiVersion": "batch/v1",
+  "kind": "Job",
+  "metadata": {
+    "name": "v2-r3-lean-evidence-20260916",
+    "namespace": "sekejap-benchmark"
+  },
+  "spec": {
+    "backoffLimit": 0,
+    "activeDeadlineSeconds": 1200,
+    "template": {
+      "metadata": {
+        "labels": {
+          "job": "v2-r3-lean-evidence-20260916"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "nodeName": "server",
+        "priorityClassName": "benchmark-low",
+        "restartPolicy": "Never",
+        "tolerations": [
+          {
+            "key": "node-role.kubernetes.io/control-plane",
+            "operator": "Exists",
+            "effect": "NoSchedule"
+          }
+        ],
+        "containers": [
+          {
+            "name": "test",
+            "image": "rust:1-bookworm",
+            "imagePullPolicy": "IfNotPresent",
+            "command": [
+              "sh",
+              "-lc",
+              "set -eu\nROOT=<scratch>\nROOTOLD=<scratch>\ngrep -q '^FINAL_EXIT=0$' \"$ROOT/logs/summary.log\"\nexport PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nexport CARGO_HOME=<scratch> CARGO_TARGET_DIR=\"$ROOT/target\" CARGO_BUILD_JOBS=2 TMPDIR=<scratch>\ncd \"$ROOT/source\"\nstatus=0\nrun() { name=$1; shift; echo \"COMMAND: $*\" > \"$ROOT/logs/$name.log\"; if \"$@\" >> \"$ROOT/logs/$name.log\" 2>&1; then rc=0; else rc=$?; fi; echo \"SUITE=$name EXIT=$rc\"; if [ \"$rc\" -ne 0 ]; then tail -n 100 \"$ROOT/logs/$name.log\"; status=$rc; else grep 'test result:' \"$ROOT/logs/$name.log\" || true; fi; }\nrun lean-typed-default cargo test --locked --offline --test codec --test btree_reuse -- --test-threads=1\nrun lean-kernel-default cargo test --locked --offline -p kernel --features test-support --test law1_heap --test law2_shape --test corruption_bounds --test durability --test platform_invariant --test compact_cell_bounds -- --test-threads=1\nrun lean-io-default cargo test --locked --offline -p kernel --features test-support --lib io::tests -- --test-threads=1\nrun lean-packing-default cargo test --locked --offline -p kernel --features test-support --lib neighbor_capacity_tests -- --test-threads=1\nrun lean-typed-compact cargo test --locked --offline --features compact-cells,sqlite-balance --test codec --test btree_reuse -- --test-threads=1\nrun lean-kernel-compact cargo test --locked --offline -p kernel --features test-support,compact-cells,sqlite-balance --test law1_heap --test law2_shape --test corruption_bounds --test durability --test platform_invariant --test compact_cell_bounds -- --test-threads=1\nrun lean-io-compact cargo test --locked --offline -p kernel --features test-support,compact-cells,sqlite-balance --lib io::tests -- --test-threads=1\nrun lean-packing-compact cargo test --locked --offline -p kernel --features test-support,compact-cells,sqlite-balance --lib neighbor_capacity_tests -- --test-threads=1\nprintf 'LEAN_EXIT=%s\\n' \"$status\" | tee \"$ROOT/logs/lean-summary.log\"\ncd \"$ROOT\"\nfind source -type f -print0 | sort -z | xargs -0 sha256sum > logs/all-source-sha256.log\ncp \"$ROOTOLD/logs/fixture-sha256.log\" logs/old-fixture-sha256.log\ncp \"$ROOTOLD/logs/archive-sha256.log\" logs/old-fixture-archive-sha256.log\ncp \"$ROOTOLD/logs/binary-sha256.log\" logs/old-helper-binary-sha256.log\nfind logs -type f -print > evidence-files.txt\nfind smoke-off smoke-on bench-1m-off bench-1m-on -type f \\( -name results.json -o -name REPORT.md -o -name e4.json -o -name sqlite.json \\) -print >> evidence-files.txt\nsha256sum source.tar.gz > logs/source-archive-sha256.log\necho logs/source-archive-sha256.log >> evidence-files.txt\ntar -czf evidence.tar.gz -T evidence-files.txt\nsha256sum evidence.tar.gz > evidence-sha256.txt\ncat evidence-sha256.txt\necho EVIDENCE_READY\nexit \"$status\"\n"
+            ],
+            "resources": {
+              "requests": {
+                "cpu": "1",
+                "memory": "512Mi"
+              },
+              "limits": {
+                "cpu": "2",
+                "memory": "2Gi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "data",
+                "mountPath": "<scratch>"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "data",
+            "persistentVolumeClaim": {
+              "claimName": "sekejap-benchmark-data"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

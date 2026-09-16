@@ -1,0 +1,266 @@
+{
+  "batch": 1000,
+  "cache_bytes": 8388608,
+  "cumulative_checkpoint_seconds": 0.132037091,
+  "cumulative_seconds_ops_only": 121.18444006600001,
+  "cumulative_verify_seconds_excluded_from_total": 93.25529627200001,
+  "empty_allocated_bytes": 143360,
+  "empty_logical_bytes": 107744,
+  "engine": "e4",
+  "final_allocated_bytes": 380420096,
+  "final_checkpoint": {
+    "completed": true
+  },
+  "final_checkpoint_completed": true,
+  "final_checkpoint_seconds": 0.000211035,
+  "final_logical_bytes": 380416096,
+  "final_peak": {
+    "sample_errors": 0,
+    "sampled_peak_allocated": 380420096,
+    "sampled_peak_logical": 380416096,
+    "samples": 1
+  },
+  "initial_policy": {
+    "checkpoint_policy": "page-WAL automatic fold near its internal allowance (see src/pagewal.rs); explicit Database::checkpoint() also called every phase",
+    "engine": "e4"
+  },
+  "peak_semantics": "1ms samples, lower bound, not an enforced cap",
+  "phases": [
+    {
+      "checkpoint": {
+        "completed": true
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.017700258,
+      "creates": 1000000,
+      "cumulative_checkpoint_seconds": 0.017700258,
+      "cumulative_engine_seconds": 50.018960639999996,
+      "cumulative_operations": 1000000,
+      "cumulative_seconds": 50.001260382,
+      "deletes": 0,
+      "final_allocated_bytes": 285302784,
+      "final_logical_bytes": 285298784,
+      "live_population": 1000000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 485560320,
+        "sampled_peak_logical": 288382928,
+        "samples": 30437
+      },
+      "phase": "load",
+      "phase_index": 0,
+      "seconds": 50.001260382,
+      "updates": 0,
+      "verification": {
+        "crc32c": 892705159,
+        "rows": 1000000,
+        "verify_seconds": 14.094040647
+      }
+    },
+    {
+      "checkpoint": {
+        "completed": true
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.030401438,
+      "creates": 0,
+      "cumulative_checkpoint_seconds": 0.048101696,
+      "cumulative_engine_seconds": 62.217547176000004,
+      "cumulative_operations": 1200000,
+      "cumulative_seconds": 62.16944548,
+      "deletes": 0,
+      "final_allocated_bytes": 285302784,
+      "final_logical_bytes": 285298784,
+      "live_population": 1000000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 293625856,
+        "sampled_peak_logical": 290540944,
+        "samples": 6629
+      },
+      "phase": "update_round_1",
+      "phase_index": 1,
+      "seconds": 12.168185098,
+      "updates": 200000,
+      "verification": {
+        "crc32c": 3326596202,
+        "rows": 1000000,
+        "verify_seconds": 14.288390279
+      }
+    },
+    {
+      "checkpoint": {
+        "completed": true
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.008168962,
+      "creates": 0,
+      "cumulative_checkpoint_seconds": 0.056270658,
+      "cumulative_engine_seconds": 71.91915278500001,
+      "cumulative_operations": 1400000,
+      "cumulative_seconds": 71.862882127,
+      "deletes": 0,
+      "final_allocated_bytes": 285302784,
+      "final_logical_bytes": 285298784,
+      "live_population": 1000000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 293625856,
+        "sampled_peak_logical": 290540944,
+        "samples": 6321
+      },
+      "phase": "update_round_2",
+      "phase_index": 2,
+      "seconds": 9.693436647,
+      "updates": 200000,
+      "verification": {
+        "crc32c": 3188676815,
+        "rows": 1000000,
+        "verify_seconds": 13.56776627
+      }
+    },
+    {
+      "checkpoint": {
+        "completed": true
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.007844195,
+      "creates": 0,
+      "cumulative_checkpoint_seconds": 0.064114853,
+      "cumulative_engine_seconds": 79.07705349200002,
+      "cumulative_operations": 1500000,
+      "cumulative_seconds": 79.01293863900001,
+      "deletes": 100000,
+      "final_allocated_bytes": 285302784,
+      "final_logical_bytes": 285298784,
+      "live_population": 900000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 293625856,
+        "sampled_peak_logical": 291067232,
+        "samples": 4421
+      },
+      "phase": "delete_only",
+      "phase_index": 3,
+      "seconds": 7.150056512,
+      "updates": 0,
+      "verification": {
+        "crc32c": 1173857140,
+        "rows": 900000,
+        "verify_seconds": 11.624334541
+      }
+    },
+    {
+      "checkpoint": {
+        "completed": true
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.054349912,
+      "creates": 100000,
+      "cumulative_checkpoint_seconds": 0.118464765,
+      "cumulative_engine_seconds": 84.77885018900001,
+      "cumulative_operations": 1600000,
+      "cumulative_seconds": 84.66038542400001,
+      "deletes": 0,
+      "final_allocated_bytes": 316383232,
+      "final_logical_bytes": 316379232,
+      "live_population": 1000000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 452399104,
+        "sampled_peak_logical": 320216576,
+        "samples": 3163
+      },
+      "phase": "replacement_reinsert",
+      "phase_index": 4,
+      "seconds": 5.647446785,
+      "updates": 0,
+      "verification": {
+        "crc32c": 2003065136,
+        "rows": 1000000,
+        "verify_seconds": 12.815632961
+      }
+    },
+    {
+      "checkpoint": {
+        "completed": true
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.007337478,
+      "creates": 100000,
+      "cumulative_checkpoint_seconds": 0.125802243,
+      "cumulative_engine_seconds": 102.24685899800001,
+      "cumulative_operations": 2000000,
+      "cumulative_seconds": 102.12105675500001,
+      "deletes": 100000,
+      "final_allocated_bytes": 350040064,
+      "final_logical_bytes": 350036064,
+      "live_population": 1000000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 620040192,
+        "sampled_peak_logical": 354412128,
+        "samples": 12031
+      },
+      "phase": "mixed_round_1",
+      "phase_index": 5,
+      "seconds": 17.460671331,
+      "updates": 200000,
+      "verification": {
+        "crc32c": 1427891245,
+        "rows": 1000000,
+        "verify_seconds": 13.086011909
+      }
+    },
+    {
+      "checkpoint": {
+        "completed": true
+      },
+      "checkpoint_completed": true,
+      "checkpoint_seconds": 0.006234848,
+      "creates": 100000,
+      "cumulative_checkpoint_seconds": 0.132037091,
+      "cumulative_engine_seconds": 121.31647715700001,
+      "cumulative_operations": 2400000,
+      "cumulative_seconds": 121.18444006600001,
+      "deletes": 100000,
+      "final_allocated_bytes": 380420096,
+      "final_logical_bytes": 380416096,
+      "live_population": 1000000,
+      "peak": {
+        "sample_errors": 0,
+        "sampled_peak_allocated": 455479296,
+        "sampled_peak_logical": 384738288,
+        "samples": 12183
+      },
+      "phase": "mixed_round_2",
+      "phase_index": 6,
+      "seconds": 19.063383311,
+      "updates": 200000,
+      "verification": {
+        "crc32c": 191289254,
+        "rows": 1000000,
+        "verify_seconds": 13.779119665
+      }
+    }
+  ],
+  "reopen_seconds": 0.019050237,
+  "reopen_verification": {
+    "crc32c": 191289254,
+    "rows": 1000000,
+    "verify_seconds": 13.459586948
+  },
+  "reopen_verify_seconds_excluded_from_total": 13.459586948,
+  "reopened_policy": {
+    "checkpoint_policy": "page-WAL automatic fold near its internal allowance (see src/pagewal.rs); explicit Database::checkpoint() also called every phase",
+    "engine": "e4"
+  },
+  "rows": 1000000,
+  "sqlite_version": "3.46.0",
+  "sync": "FULL; fullfsync/checkpoint_fullfsync requested (inert off macOS)",
+  "timestamps": false,
+  "total_operations": 2400000,
+  "total_seconds": 121.33573842900002,
+  "total_seconds_definition": "sum of per-phase op seconds (which include this benchmark's own cheap, pure content generation, run inline with each write, identically for both engines) + per-phase explicit checkpoint seconds + final checkpoint seconds + reopen seconds; excludes oracle verification time only, reported separately below and never folded in",
+  "vector_dim": 8
+}

@@ -1,7 +1,7 @@
 //! Extensible typed recovery above the kernel. Rootless output is candidate
 //! evidence, never a published database or a claim of current membership.
 use crate::{Layout, Result};
-use kernel::recover::{CandidateReader, LeafCandidate, LeafEvent};
+use kernel::recover::{LeafCandidate, LeafEvent};
 use serde_json::json;
 use serde_json::Value;
 use std::{
@@ -104,7 +104,10 @@ pub fn recover_typed_candidates(
     if source.starts_with(&destination) || destination.starts_with(&source) {
         return Err("source and destination must not overlap".into());
     }
-    let reader = CandidateReader::open(&source)?;
+    // Page-WAL sources overlay their committed WAL frames read-only, so rows
+    // acknowledged but not yet checkpointed are candidates too. A source whose
+    // WAL cannot be interpreted falls back to the bare data file, recorded.
+    let (reader, overlay_skipped) = crate::pagewal::candidate_reader(&source)?;
     fs::create_dir(&destination)?;
     kernel::io::sync_directory(&parent)?;
     let mut catalog = Catalog::new(destination.join("layouts"), options.layout_cache_entries)?;
@@ -120,6 +123,9 @@ pub fn recover_typed_candidates(
         damaged_pages: 0,
     };
     let mut issues = output(&destination.join("issues.jsonl"))?;
+    if let Some(reason) = &overlay_skipped {
+        line(&mut issues, &json!({"kind":"committed_wal_overlay_skipped","reason":reason}))?;
+    }
     // Discover the entire schema evidence set before decoding any row. Conflicting
     // immutable IDs must not acquire a first-copy-wins interpretation.
     reader.scan::<Box<dyn std::error::Error>>(1, |event| {
@@ -240,6 +246,7 @@ pub fn recover_typed_candidates(
         "missing_layout_records":report.missing_layout_records,"unresolved_records":report.unresolved_records,"unresolved_values":unresolved_values,
         "damaged_pages":report.damaged_pages,"malformed_cells":scan.malformed_cells,"truncated_tail_bytes":scan.truncated_tail_bytes,
         "max_value_bytes":options.max_value_bytes,"layout_cache_entries":options.layout_cache_entries,
+        "committed_wal_overlay":overlay_skipped.is_none(),
         "elapsed_seconds":started.elapsed().as_secs_f64(),"schema_evidence":"verified leaf cells and descriptor CRC; immutable IDs; conflicts quarantined",
         "scope":"candidate export only; WAL and current membership not reconstructed; JSONL is an export, not database storage"});
     let mut out = output(&destination.join("report.json"))?;

@@ -1,0 +1,101 @@
+{
+  "apiVersion": "batch/v1",
+  "kind": "Job",
+  "metadata": {
+    "name": "v2-candidate-r3-test-20260916",
+    "namespace": "sekejap-benchmark"
+  },
+  "spec": {
+    "backoffLimit": 0,
+    "activeDeadlineSeconds": 3600,
+    "template": {
+      "metadata": {
+        "labels": {
+          "job": "v2-candidate-r3-test-20260916"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "nodeName": "server",
+        "priorityClassName": "benchmark-low",
+        "restartPolicy": "Never",
+        "tolerations": [
+          {
+            "key": "node-role.kubernetes.io/control-plane",
+            "operator": "Exists",
+            "effect": "NoSchedule"
+          }
+        ],
+        "containers": [
+          {
+            "name": "test",
+            "image": "rust:1-bookworm",
+            "imagePullPolicy": "IfNotPresent",
+            "command": [
+              "sh",
+              "-lc",
+              "set -eu\nROOT=<scratch>\nTESTTMP=<scratch>\nmkdir -p \"$ROOT/logs\" \"$ROOT/target\" \"$TESTTMP\"\ntest ! -e \"$ROOT/source\"\ncat /chunks/0/chunk /chunks/1/chunk /chunks/2/chunk > \"$ROOT/source.tar.gz\"\necho 'ee3ae0196ae832de72d67e9c73218d071288f52578df5e07c5b8bce5652feaf1  '\"$ROOT/source.tar.gz\" | sha256sum -c -\nmkdir \"$ROOT/source\"\ntar -xzf \"$ROOT/source.tar.gz\" -C \"$ROOT/source\" 2> \"$ROOT/logs/extract.log\"\nexport PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nexport CARGO_HOME=<scratch> CARGO_TARGET_DIR=\"$ROOT/target\" CARGO_BUILD_JOBS=2 TMPDIR=\"$TESTTMP\" SQLITE_TMPDIR=\"$TESTTMP\"\ncd \"$ROOT/source\"\nrustc --version\nstatus=0\nrun() { name=$1; shift; echo \"COMMAND: $*\" > \"$ROOT/logs/$name.log\"; if \"$@\" >> \"$ROOT/logs/$name.log\" 2>&1; then rc=0; else rc=$?; fi; echo \"SUITE=$name EXIT=$rc\"; if [ \"$rc\" -ne 0 ]; then tail -n 120 \"$ROOT/logs/$name.log\"; status=$rc; else grep 'test result:' \"$ROOT/logs/$name.log\" || true; fi; }\nrun default-lib cargo test --locked --offline  --lib -- --test-threads=1\nrun default-integration cargo test --locked --offline  --test collections --test collection_pagewal --test schema_recovery --test pagewal --test pagewal_repair --test pagewal_recovery_identity --test pagewal_transaction_capacity --test recovery_faults -- --test-threads=1\nrun compact-lib cargo test --locked --offline --features compact-cells,sqlite-balance --lib -- --test-threads=1\nrun compact-integration cargo test --locked --offline --features compact-cells,sqlite-balance --test collections --test collection_pagewal --test schema_recovery --test pagewal --test pagewal_repair --test pagewal_recovery_identity --test pagewal_transaction_capacity --test recovery_faults -- --test-threads=1\nrun release-build cargo build --locked --offline --release --features compact-cells,sqlite-balance --bin v2_foundation_bench --bin v2_compat_fixture\nif [ \"$status\" -eq 0 ]; then\n  sha256sum \"$ROOT/target/release/v2_foundation_bench\" \"$ROOT/target/release/v2_compat_fixture\" | tee \"$ROOT/logs/binary-sha256.log\"\n  run smoke-off \"$ROOT/target/release/v2_foundation_bench\" \"$ROOT/smoke-off\" 10000 off\n  run smoke-on \"$ROOT/target/release/v2_foundation_bench\" \"$ROOT/smoke-on\" 10000 on\nfi\nif [ \"$status\" -eq 0 ]; then\n  OLDROOT=<scratch>\n  test ! -e \"$ROOT/compat-copy\"\n  cp -a \"$OLDROOT/fixtures\" \"$ROOT/compat-copy\"\n  run compat-new \"$ROOT/target/release/v2_compat_fixture\" verify-and-update \"$ROOT/compat-copy\" --confirm-copy\n  run compat-old-raw \"$OLDROOT/target/release/v2_compat_fixture\" verify-raw \"$ROOT/compat-copy\"\n  mkdir -p \"$ROOT/legacy-replay\"\n  run compat-old-typed \"$OLDROOT/target/release/v2_compat_fixture\" legacy-replay \"$ROOT/compat-copy/projected/checkpointed\" \"$ROOT/legacy-replay/checkpointed\" --explicit-test-mode\n  run compat-old-typed-wal \"$OLDROOT/target/release/v2_compat_fixture\" legacy-replay \"$ROOT/compat-copy/projected/wal-pending\" \"$ROOT/legacy-replay/wal-pending\" --explicit-test-mode\n  (cd \"$OLDROOT/fixtures\" && sha256sum -c \"$OLDROOT/logs/fixture-sha256.log\") > \"$ROOT/logs/original-fixture-preserved.log\"\n  echo ORIGINAL_REFERENCE_HASHES=UNCHANGED\nfi\nif [ \"$status\" -eq 0 ]; then\n  uname -a | tee \"$ROOT/logs/benchmark-host.log\"\n  df -B1 <scratch> | tee -a \"$ROOT/logs/benchmark-host.log\"\n  run bench-1m-off \"$ROOT/target/release/v2_foundation_bench\" \"$ROOT/bench-1m-off\" 1000000 off\n  if [ \"$status\" -eq 0 ]; then\n    cat \"$ROOT\"/bench-1m-off/v2-foundation-1000000-*/REPORT.md\n    run bench-1m-on \"$ROOT/target/release/v2_foundation_bench\" \"$ROOT/bench-1m-on\" 1000000 on\n    if [ \"$status\" -eq 0 ]; then cat \"$ROOT\"/bench-1m-on/v2-foundation-1000000-*/REPORT.md; fi\n  fi\nfi\necho \"FINAL_EXIT=$status\" | tee \"$ROOT/logs/summary.log\"\nexit \"$status\"\n"
+            ],
+            "resources": {
+              "requests": {
+                "cpu": "1",
+                "memory": "512Mi"
+              },
+              "limits": {
+                "cpu": "2",
+                "memory": "2Gi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "data",
+                "mountPath": "<scratch>"
+              },
+              {
+                "name": "chunk0",
+                "mountPath": "/chunks/0",
+                "readOnly": true
+              },
+              {
+                "name": "chunk1",
+                "mountPath": "/chunks/1",
+                "readOnly": true
+              },
+              {
+                "name": "chunk2",
+                "mountPath": "/chunks/2",
+                "readOnly": true
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "data",
+            "persistentVolumeClaim": {
+              "claimName": "sekejap-benchmark-data"
+            }
+          },
+          {
+            "name": "chunk0",
+            "configMap": {
+              "name": "v2-candidate-r3-src-0-20260916"
+            }
+          },
+          {
+            "name": "chunk1",
+            "configMap": {
+              "name": "v2-candidate-r3-src-1-20260916"
+            }
+          },
+          {
+            "name": "chunk2",
+            "configMap": {
+              "name": "v2-candidate-r3-src-2-20260916"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

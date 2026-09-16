@@ -1,0 +1,10 @@
+./manifest.json: OK
+./old-source/data: OK
+./old-source/free: OK
+./old-source/wal: OK
+./projected/checkpointed/data: OK
+./projected/checkpointed/wal: OK
+./projected/checkpointed/writer.lock: OK
+./projected/wal-pending/data: OK
+./projected/wal-pending/wal: OK
+./projected/wal-pending/writer.lock: OK

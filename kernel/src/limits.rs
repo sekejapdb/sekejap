@@ -46,7 +46,10 @@ impl ResourceLimits {
             .and_then(|n| n.checked_add(self.recovery_bytes))
             .ok_or(Error::ResourceLimit("total byte limit overflow"))
     }
-    pub(crate) fn encode(self) -> Vec<u8> {
+    /// The 56-byte `E4LIMIT1` policy record. Public so a format owner above
+    /// the kernel (typed collections on the page-WAL) persists the identical
+    /// bytes instead of a second encoding of the same six fields.
+    pub fn encode(self) -> Vec<u8> {
         let mut b = b"E4LIMIT1".to_vec();
         for n in [
             self.data_bytes,
@@ -60,7 +63,7 @@ impl ResourceLimits {
         }
         b
     }
-    pub(crate) fn decode(b: &[u8]) -> Result<Self> {
+    pub fn decode(b: &[u8]) -> Result<Self> {
         if b.len() != 56 || &b[..8] != b"E4LIMIT1" {
             return Err(Error::ResourceLimit(
                 "damaged resource policy; use source-preserving recovery",
