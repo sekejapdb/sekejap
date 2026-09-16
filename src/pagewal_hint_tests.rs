@@ -333,12 +333,26 @@ fn runtime_limits_refuse_before_framing_and_survive_rollback() {
     s.put(b"big", &vec![1; 8192]).unwrap();
     assert!(s.commit().is_err(), "limits survive rollback");
     s.rollback().unwrap();
-    // wal_bytes: refused at the append, independent of the persisted cap.
-    s.set_runtime_limits(u64::MAX, committed + FRAME as u64, usize::MAX).unwrap();
-    s.put(b"a", b"v3").unwrap();
-    assert!(matches!(s.commit(), Err(Error::ResourceLimit(_))));
-    s.rollback().unwrap();
-    assert_eq!(a(&s), b"v2");
+    // wal_bytes: hold the committed prefix with a reader. Without a reader,
+    // the next clean transaction may legitimately auto-fold the old WAL and
+    // fit under this unchanged cap. Here only one frame of headroom remains,
+    // so the multi-frame transaction must refuse at append, not cross the cap.
+    let reader = PageWalStore::open_snapshot(&p, CACHE).unwrap();
+    let wal_limit = committed + FRAME as u64;
+    s.set_runtime_limits(u64::MAX, wal_limit, usize::MAX).unwrap();
+    for value in [b"v3", b"v3-again".as_slice()] {
+        s.put(b"a", value).unwrap();
+        assert!(matches!(s.commit(), Err(Error::ResourceLimit("page-WAL wal_bytes allowance"))));
+        assert!(fs::metadata(p.join("wal")).unwrap().len() <= wal_limit,
+            "a refused append must not cross wal_bytes");
+        assert_eq!(a(&reader), b"v2", "failed commit must preserve the pinned snapshot");
+        s.rollback().unwrap();
+        assert_eq!(fs::metadata(p.join("wal")).unwrap().len(), committed);
+        assert_eq!(a(&s), b"v2");
+        assert!(s.get(b"big").unwrap().is_none());
+        assert_eq!(a(&reader), b"v2", "rollback must preserve the pinned snapshot");
+    }
+    drop(reader);
     // data_bytes: extent growth refused before the page is framed.
     let pages = s.data_bytes();
     s.set_runtime_limits(pages, u64::MAX, usize::MAX).unwrap();

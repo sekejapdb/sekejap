@@ -2,8 +2,33 @@
 use super::*;
 
 pub(super) const HEADER_BYTES: usize = 56;
-const COMPACT_CELLS: u64 = 1;
-pub(super) const WRITE_FEATURES: u64 = if cfg!(feature = "compact-cells") { COMPACT_CELLS } else { 0 };
+pub(super) const COMPACT_CELLS: u64 = 1;
+
+/// Every required-feature bit this release implements. A database declaring
+/// only these opens, reads and writes in EVERY build of this release, whatever
+/// cargo features that build was compiled with (Law 8). A bit outside this set
+/// is a database this binary does not understand, and is refused before any
+/// byte of it is changed.
+pub(super) const SUPPORTED_FEATURES: u64 = COMPACT_CELLS;
+
+/// What a build stamps into a database it CREATES. This is the only thing the
+/// `compact-cells` cargo feature still decides; it does not decide what this
+/// build can open. `set_create_features` lets a caller (and the compatibility
+/// tests) create a database of the other supported family without a second
+/// build of the binary.
+const DEFAULT_CREATE_FEATURES: u64 = if cfg!(feature = "compact-cells") { COMPACT_CELLS } else { 0 };
+static CREATE_FEATURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_CREATE_FEATURES);
+
+pub(super) fn create_features() -> u64 {
+    CREATE_FEATURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub(super) fn set_create_features(features: u64) -> Result<u64> {
+    if features & !SUPPORTED_FEATURES != 0 {
+        return Err(bad("cannot create a database with an unimplemented feature"));
+    }
+    Ok(CREATE_FEATURES.swap(features, std::sync::atomic::Ordering::Relaxed))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Header {
@@ -37,7 +62,10 @@ impl Header {
             return Err(bad("unsupported page-WAL header format"));
         }
         let features = u64at(b, 48);
-        if features & !WRITE_FEATURES != 0 {
+        // Judged against what this RELEASE implements, never against what this
+        // BUILD would have chosen for a new database: a compact-cells database
+        // must open in a plain build and the other way round.
+        if features & !SUPPORTED_FEATURES != 0 {
             return Err(bad("unsupported required page-WAL features"));
         }
         let identity: [u8; 16] = b[24..40].try_into().unwrap();

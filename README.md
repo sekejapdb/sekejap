@@ -2,7 +2,7 @@
 
 **One line:** sekejap at SQLite storage density — entities stored as typed,
 schema-keyed records on a disk-first B-tree kernel, with the graph / vector /
-spatial / text multi-model and the 7 laws.
+spatial / text multi-model and the 8 laws.
 
 **e4 is pure.** It stores **no JSON text, ever.** JSON is only a wire format at
 the API boundary (input parsing, output rendering). On disk, a row is always a
@@ -22,6 +22,51 @@ prior context.** Read it top to bottom before touching code.
 ---
 
 ## 0. Why e4 exists — the finding that forced it
+
+**Phase 1 storage candidate qualified (2026-09-16):** the integration candidate
+now reads/writes both supported cell encodings independently of build flags,
+refuses intact unsupported metadata before modification, and requires immutable
+compatibility fixtures with exact entity and identity oracles. Full server Linux
+workspace suites pass in default, compact/balance and retained-feature modes:
+**422 / 427 / 427 passed, zero failures, two existing ignored tests per mode**.
+No disk encoding changed in the refusal fixes. Retain this shape and proceed
+to interfaces; capture the first public release's binary and corpus before
+promising released-file compatibility. This is not a production deployment or
+all-eight-law qualification. See [results and limits](docs/PHASE1_QUALIFICATION.md)
+and the [current format contract](docs/FORMAT_V1.md).
+
+**Law 8 adopted (2026-09-15): compatibility is permanent.** New E4 releases
+must read and write earlier released E4 formats, including persisted indexes.
+Automatic minor/patch updates require no migration or forced index rebuild;
+unsupported formats are refused before files change. The first seven laws
+retain their wording. This is a contract, not a claim of current compliance:
+`L8-COMPAT` remains pending. See [Law 8 and its release rules](CONTRACT.md#law-8--release-compatibility-contract).
+
+**Clarified release target (2026-09-15): app/app, stable data and index
+formats, and the full E1/E3 interface direction.** Pi research can wait.
+Multimodel SELECT performance is the product objective; roughly 1.75× SQLite
+write time can be acceptable when measured query benefits justify it. The
+earlier 1.5× write threshold is no longer an unconditional release veto.
+Include explicit EXPORT/IMPORT and compatible normal upgrades. See
+[the recorded requirements](docs/FORMAT_FREEZE.md) and the new Law 8 above.
+
+**Owner release direction (2026-09-15): prioritize disk-format stability.**
+The storage shape exists, but upgrade compatibility is not yet qualified:
+typed collections still use the inherited Store, and compact decoding depends
+on build features. Finish the current reservation evaluation, then focus on
+one explicit release format, format-affecting recovery decisions, collection
+integration and frozen-file upgrade tests. Performance improvements that keep
+the format can follow alongside interfaces; all seven laws remain unchanged.
+See [the bounded format-freeze work and compatibility promise](docs/FORMAT_FREEZE.md).
+
+**Format audit / reservation decision (2026-09-15):** Pi and server reproduce
+foreign-WAL acceptance, stale-WAL rollback of a newer checkpoint, and mutation
+of the WAL before refusing an unknown data header. These are explicit
+pre-freeze format issues; see [the byte-layout audit and negative fixtures](docs/DISK_FORMAT_AUDIT.md).
+The integrated reservation candidate passes 96 correctness benchmark arms but
+is **rejected and reverted**: server mixed changes take **60.663 s versus SQLite
+34.604 s (1.753×)**, despite reducing measured allocated peak by 51.9%.
+Accepted runtime is restored. See [the complete comparison](docs/RESERVATION_LOOP.md).
 
 **Linux allocated-space loop (2026-09-15): significant allocation result, no
 runtime change yet.** Independent controls identify XFS reservation beyond EOF
@@ -472,7 +517,8 @@ kernel. If you are rewriting the B-tree, stop — that is not the task.
 
 ## 5. The laws and the north star (non-negotiable)
 
-The 7 laws (copied into [CONTRACT.md](CONTRACT.md)):
+The 8 laws (defined in [CONTRACT.md](CONTRACT.md)):
+
 1. **Disk-first, bounded RAM** — data ≫ RAM on the device; never load the DB to
    answer a query.
 2. **Cost ∝ change, not size** — writes and schema changes cost in proportion to
@@ -486,6 +532,9 @@ The 7 laws (copied into [CONTRACT.md](CONTRACT.md)):
    radius of one bad byte.
 6. **Write never blocks read** — snapshot reads.
 7. **Ingest usable on device** — bulk load within the device budget.
+8. **Compatibility is permanent** — newer releases read/write earlier released
+   E4 data and indexes; minor/patch updates require no migration or forced
+   rebuild; unknown formats are refused before modification.
 
 Audiences (why disk-first): embedded/embodied AI, mobile, games, science,
 resource-constrained servers; ~70% of usage is one user per instance. Where
@@ -563,6 +612,6 @@ typed decode; do not assume).
 - Do **not** store vectors inline — keep the vector keyspace.
 - Do **not** rewrite every row on a schema change — version the layout.
 - Do **not** widen a test limit or delete an index to manufacture a size win.
-- Do **not** break the 7 laws to win bytes; if a law must bend, name the
+- Do **not** break the 8 laws to win bytes; if a law must bend, name the
   sacrifice and get sign-off.
 - Ship nothing until the gates pass and the owner says otherwise.

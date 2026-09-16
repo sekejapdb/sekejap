@@ -656,8 +656,8 @@ impl Iterator for MergeIter {
     }
 }
 
-fn enc_leaf(key: &[u8], val: &[u8]) -> Vec<u8> {
-    crate::btree::enc_leaf(key,val)
+fn enc_leaf(key: &[u8], val: &[u8], compact: bool) -> Vec<u8> {
+    crate::btree::enc_leaf(key,val,compact)
 }
 
 fn enc_interior(key: &[u8], child: u32) -> Vec<u8> {
@@ -1004,7 +1004,7 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
             })?;
             crate::btree::enc_leaf_marker(&k, &m)
         } else {
-            enc_leaf(&k, &v)
+            enc_leaf(&k, &v, pool.compact_cells())
         };
         let need = rec.len() + 4;
         // A record that cannot fit an empty page at all can never be packed,

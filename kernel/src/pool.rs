@@ -112,6 +112,17 @@ pub struct BufferPool {
     file: Arc<dyn FileIo>,
     region: AlignedRegion,
     inner: RefCell<Inner>,
+    /// Which leaf-cell encoding new cells are written in for THIS database.
+    ///
+    /// The encoding is a property of the stored file, declared in its own
+    /// header, not of the build that opens it (Law 8: a release must read AND
+    /// write every database an earlier release wrote, whatever cargo features
+    /// that build had). Every build decodes both families unconditionally;
+    /// this flag only decides what a WRITE produces, and the owner installs it
+    /// from the database's declared features right after opening the pool.
+    /// The `compact-cells` cargo feature survives only as the default for
+    /// databases this build CREATES, which is what seeds the initial value.
+    compact_cells: std::cell::Cell<bool>,
     _res: Reservation,
 }
 
@@ -155,9 +166,17 @@ impl BufferPool {
                 thawed: std::collections::HashSet::new(),
                 live_pins: 0,
             }),
+            compact_cells: std::cell::Cell::new(cfg!(feature = "compact-cells")),
             _res: res,
         })
     }
+
+    /// The cell encoding new cells on this pool are written in.
+    pub fn compact_cells(&self) -> bool { self.compact_cells.get() }
+    /// Install the encoding the DATABASE declares. Called once per open, by
+    /// the owner that read the header; never derived from build flags after
+    /// creation, and never changed while a tree is being written.
+    pub fn set_compact_cells(&self, on: bool) { self.compact_cells.set(on); }
 
     pub fn resource_limits(&self) -> Option<crate::limits::ResourceLimits> { self.inner.borrow().limits }
     pub(crate) fn set_resource_limits(&self, limits: crate::limits::ResourceLimits) -> Result<()> {

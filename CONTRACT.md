@@ -1,6 +1,6 @@
-# sekejap-e3
+# sekejap-e4
 
-## North Star — the 7 laws
+## North Star — the 8 laws
 
 1. **Disk-first** — no operation holds RAM ∝ database. RAM ∝ change is fine.
 2. **Cost ∝ change, not size** — N units of change costs O(N), not O(database). Latency must not grow with the store.
@@ -17,6 +17,53 @@
    matters: a person opening their data on a phone waits, and a load they will
    not sit through is a failure however correct it is. State the per-row cost,
    and state it against the device class this is for — not against a server.
+8. **Compatibility is permanent** — newer E4 releases must read and write
+   databases from earlier released E4 formats, including their schemas,
+   identities, relationships, typed values and persisted indexes. A minor or
+   patch update must not require migration, export/import, or an index rebuild
+   merely to keep using an existing database. Improvements must preserve the
+   meaning of existing bytes; unsupported formats must be refused before any
+   file is modified. Compatibility is proved with preserved release fixtures,
+   not inferred from a version number.
+
+### Law 8 — release compatibility contract
+
+Added by the owner on 2026-09-15. Laws 1–7 retain their existing wording.
+The model is SQLite's [backward-compatibility policy](https://www.sqlite.org/formatchng.html):
+new engines keep reading and writing old databases while new storage features
+may require newer engines.
+
+- **Scope starts at the first declared stable E4 format.** Name that baseline
+  before release and retain support for it in subsequent E4 releases. This is
+  not an E1/E3 data-migration requirement, nor a claim that prototype formats
+  are already stable. A major version number does not excuse dropping support
+  for an earlier released E4 format.
+- **Data and indexes share the promise.** Version pages, records, catalog and
+  index encodings explicitly. Existing index formats remain readable and
+  writable; faster algorithms can use them without forcing a rebuild. New
+  incompatible representations require explicit feature/index creation or an
+  explicitly selected conversion, never an automatic minor-update side effect.
+- **An automatic update preserves the existing feature set.** Merely opening
+  or normally writing a database must not silently raise its minimum reader
+  version. Older binaries may refuse explicitly enabled newer features, but
+  must recognize unsupported versions before recovery, truncation or writes.
+  File compatibility does not promise mixed-version concurrent writers.
+- **Published interfaces also remain compatible across minor/patch releases.**
+  Preserve documented API, query and wire contracts used by applications.
+  Correcting behavior to the documented contract is not a promise to preserve
+  a bug; release notes must identify observable corrections.
+- **EXPORT / IMPORT complements compatibility.** Provide explicit portability
+  and recovery commands; they are not a substitute for opening an existing
+  database after a normal update.
+- **Evidence is mandatory.** Keep immutable, checksummed fixtures and expected
+  results from released binaries. Test newer readers and writers, committed
+  WAL recovery, typed/indexed queries and reopen. Test minor-version rollback
+  within the unchanged feature set, and source-preserving refusal of unknown
+  features. Same-build round trips do not establish release compatibility.
+
+The law is adopted; current implementation compliance is **not yet qualified**.
+Track it as `L8-COMPAT` in `docs/FOUNDATION_GATES.json`. Historical evidence
+below was seeded from E3 and does not establish E4 compliance with this law.
 
 ## Architectural decisions
 

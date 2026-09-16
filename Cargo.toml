@@ -28,6 +28,8 @@ kernel = { path = "kernel", features = ["test-support"] }
 [features]
 sqlite-balance = ["kernel/sqlite-balance"]
 compact-cells = ["kernel/compact-cells"]
+keyspace-append = ["kernel/keyspace-append"]
+slotref-split = ["kernel/slotref-split"]
 
 [profile.release]
 debug = 1

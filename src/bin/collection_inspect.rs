@@ -30,7 +30,11 @@ fn occupancy(
             let r = p.slot(i);
             let k = if r[0] == 255 && (0x81..=0x88).contains(&r[1]) {
                 &r[1..2 + (r[1] - 0x80) as usize]
-            } else if cfg!(feature = "compact-cells") && r[1] & 0xf0 == 0x40 {
+            } else if r[1] & 0xf0 == 0x40 {
+                // Self-describing: 0x4xxx is never a valid ordinary key length on a
+                // 4 KiB page, so this tool reads compact cells whatever cargo
+                // features it was built with — the database it is pointed at
+                // decides the encoding, not this binary.
                 let n = (u16::from_le_bytes(r[..2].try_into()?) & 0x0fff) as usize;
                 r.get(2..2 + n).ok_or("compact key crosses slot")?
             } else {

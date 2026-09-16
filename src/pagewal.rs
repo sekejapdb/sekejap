@@ -27,7 +27,7 @@ pub const HINT_FILE_BYTES: u64 = 2 * HINT_BYTES as u64;
 const HINT_BYTES: usize = 48;
 const HINT_MAGIC: &[u8; 8] = b"E4PWHNT1";
 mod format;
-use format::{disk_header, metadata_write_order, Header, WRITE_FEATURES};
+use format::{create_features, disk_header, metadata_write_order, Header, COMPACT_CELLS};
 // WAL is capped at 16 MiB, so a 32-bit offset leaves room for the expected
 // frame checksum in the same eight bytes previously used by a u64 offset.
 // A valid checksum alone cannot distinguish an older image of the same page.
@@ -187,7 +187,7 @@ impl Pager {
     fn initialize(dir: &Path) -> Result<()> {
         let mut identity = [0;16];
         getrandom::fill(&mut identity).map_err(|e| std::io::Error::other(e.to_string()))?;
-        let h = Header { root:0, free:0, cap:u64::MAX, identity, tx:0, features:WRITE_FEATURES };
+        let h = Header { root:0, free:0, cap:u64::MAX, identity, tx:0, features:create_features() };
         let (data,_) = io::open_file(&dir.join("data"), IoMode::Buffered)?;
         let (wal,_) = io::open_file(&dir.join("wal"), IoMode::Buffered)?;
         if data.len()? != 0 || wal.len()? != 0 { return Err(bad("initialize found existing bytes")); }
@@ -260,7 +260,7 @@ impl Pager {
         let mut committed=Index::new();let mut pending=Index::new();let mut pages=data_pages;
         let floor = disk.map_or(0, |h| h.tx);
         let identity = disk.map_or([0;16], |h| h.identity);
-        let features = disk.map_or(WRITE_FEATURES, |h| h.features);
+        let features = disk.map_or_else(create_features, |h| h.features);
         let mut at=0;let mut last=0;let mut tx=floor.checked_add(1).ok_or(Error::TooLarge)?;let mut crc=0;
         let mut first_tx = None;
         let mut committed_header = None;
@@ -586,6 +586,21 @@ pub fn candidate_reader(source:&Path)->Result<(CandidateReader,Option<String>)>{
         Err(e)=>Ok((CandidateReader::from_file(Box::new(repair::Source::plain(data)?)),Some(format!("committed WAL not interpretable: {e:?}")))),
     }
 }
+/// Whether a database CREATED from now on declares compact cell encodings.
+///
+/// Seeded from the `compact-cells` cargo feature, which is all that feature
+/// still decides: every build of this release reads AND writes both cell
+/// families, and an existing database's own header — never the build — chooses
+/// the encoding its new cells are written in.
+pub fn create_compact_cells()->bool{ create_features() & COMPACT_CELLS != 0 }
+
+/// Choose the cell encoding for databases created from now on, returning the
+/// previous setting. Existing databases are unaffected: opening one never
+/// changes its declared features.
+pub fn set_create_compact_cells(on:bool)->Result<bool>{
+    Ok(format::set_create_features(if on {COMPACT_CELLS} else {0})? & COMPACT_CELLS != 0)
+}
+
 pub struct PageWalStore {
     pager:Option<Arc<Pager>>,pool:BufferPool,root:u32,last:Cell<Option<u32>>,hits:Cell<u64>,attempts:Cell<u64>,
     poisoned:bool,dirty:bool,_lock:Option<Arc<File>>,dir:PathBuf,cache:usize,slot:Option<ReaderSlot>,
@@ -611,6 +626,11 @@ impl PageWalStore {
         if writer {pool.set_stamp_gen(1);pool.set_reuse_limit(u64::MAX);}
         Ok(pool)
     }
+    /// Install the cell encoding the DATABASE declares, so new cells match the
+    /// file rather than this build's cargo features. Snapshot readers never
+    /// encode, but decode both families unconditionally, so this is only
+    /// meaningful on a writer's pool.
+    fn install_codec(pool:&BufferPool,features:u64){ pool.set_compact_cells(features & COMPACT_CELLS != 0); }
     fn open_inner(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>,
         check:impl FnOnce(&Self)->Result<()>)->Result<Self>{
         if create {std::fs::create_dir(dir)?;}
@@ -630,10 +650,13 @@ impl PageWalStore {
         if !io::try_lock_exclusive(&lock)?{return Err(Error::WriterLocked);}
         if create { Pager::initialize(dir)?; }
         let pager=opener(dir)?;let file:Arc<dyn FileIo>=pager.clone();
-        if pager.state.lock().unwrap().features != WRITE_FEATURES {
-            return Err(bad("writer build cannot preserve the database feature set"));
-        }
+        // Every SUPPORTED feature set is writable by every build of this
+        // release; `Header::decode_slot` already refused anything outside it.
+        // The writer adopts the database's declared encoding instead of
+        // demanding its own, and never rewrites those bits (Law 8).
+        let features=pager.state.lock().unwrap().features;
         let pool=Self::new_pool(file,cache,true)?;
+        Self::install_codec(&pool,features);
         let mut s=Self{pager:Some(pager),pool,root:0,last:Cell::new(None),hits:Cell::new(0),attempts:Cell::new(0),
             poisoned:false,dirty:false,_lock:Some(Arc::new(lock)),dir:dir.into(),cache,slot:None,
             limits:(u64::MAX,u64::MAX,usize::MAX),reader_files:None};
@@ -708,6 +731,7 @@ impl PageWalStore {
          *s=fresh;}
         pager.finish_open(&self.dir,None)?;
         self.pool=Self::new_pool(pager.clone(),self.cache,true)?;
+        Self::install_codec(&self.pool,pager.state.lock().unwrap().features);
         self.root=0;self.last.set(None);self.poisoned=true;self.dirty=false;
         self.load_header()?;self.poisoned=false;Ok(())
     }
@@ -729,13 +753,32 @@ impl PageWalStore {
         }Ok(())
     }
     pub fn get(&self,k:&[u8])->Result<Option<Vec<u8>>>{self.ready()?;self.tree().get(k)}
+    // Fold committed WAL before the first frame of a new transaction when the
+    // next append would miss wal_bytes, or a reader-deferred checkpoint is due.
+    // Admission holds `state` and has no exclusion gate, so this lives here.
+    // Safe: !dirty and end==last_commit, so only published frames are folded.
+    fn fold_committed_wal_if_at_cap(&mut self) -> Result<()> {
+        if self.dirty { return Ok(()); }
+        let Some(pager) = self.pager.as_ref() else { return Ok(()); };
+        let due = pager.checkpoint_due();
+        {
+            let s = pager.state.lock().unwrap();
+            let next_misses = s.end.saturating_add(FRAME as u64) > s.wal_limit;
+            if !due && !next_misses { return Ok(()); }
+            if s.end != s.last_commit { return Ok(()); }
+        }
+        match self.checkpoint_guarded(0) {
+            Ok(_) => Ok(()),
+            Err(e) => { self.poisoned = true; Err(e) }
+        }
+    }
     pub fn put(&mut self,k:&[u8],v:&[u8])->Result<()> {
-        self.writable()?;self.dirty=true;
+        self.writable()?;self.fold_committed_wal_if_at_cap()?;self.dirty=true;
         let r={let mut t=self.tree();t.insert(k,v).map(|_|t.root())};
         match r {Ok(root)=>{self.root=root;Ok(())},Err(e)=>{self.poisoned=true;Err(e)}}
     }
     pub fn delete(&mut self,k:&[u8])->Result<bool>{
-        self.writable()?;self.dirty=true;
+        self.writable()?;self.fold_committed_wal_if_at_cap()?;self.dirty=true;
         let r={let mut t=self.tree();t.delete(k).map(|yes|(yes,t.root()))};
         match r {Ok((yes,root))=>{self.root=root;Ok(yes)},Err(e)=>{self.poisoned=true;Err(e)}}
     }

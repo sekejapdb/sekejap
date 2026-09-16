@@ -259,6 +259,10 @@ pub struct Store {
     /// a random-order workload pays for one wasted probe and then stops --
     /// not one wasted probe per row forever.
     fast_path_attempts: Cell<u64>,
+    /// Superblock logical version this file declared (1 = plain cells, 2 =
+    /// compact cells). Independent of this build's `compact-cells` feature;
+    /// checkpoint writes this value, never the compile-time default.
+    format_version: u16,
     #[cfg(test)]
     trace: Vec<&'static str>,
     #[cfg(test)]
@@ -325,12 +329,13 @@ impl Store {
         let fast_path_hits = Cell::new(0);
         let fast_path_attempts = Cell::new(0);
 
-        let (root, generation) = if fresh {
+        let (root, generation, format_version) = if fresh {
             let _meta_page = pool.allocate()?;     // page 0 is the superblock
             drop(_meta_page);
             let _slot_b = pool.allocate()?;        // page 1 is meta slot B (2f)
             drop(_slot_b);
             Meta::init_slot_b(&pool)?;
+            pool.set_compact_cells(crate::meta::FORMAT_VERSION == 2);
             let t = BTree::create(&pool, 1, &last_leaf, &fast_path_hits, &fast_path_attempts)?;
             let r = t.root();
             Meta { format_version: crate::meta::FORMAT_VERSION, roots: [r, 0, 0, 0, 0, 0, 0, 0], next_lsn: wal.next_lsn(),
@@ -342,7 +347,7 @@ impl Store {
             // later commit can be acknowledged. This is unconditional because
             // even SyncMode::Off does not ask for files to vanish by name.
             pool.sync_dir()?;
-            (r, 0)
+            (r, 0, crate::meta::FORMAT_VERSION)
         } else {
             // Re-supply the LSN high-water mark BEFORE anything else touches
             // the log: `Wal::open` above has already derived `next_lsn` from
@@ -351,12 +356,14 @@ impl Store {
             // if the log turned out to know a higher number already (i.e. no
             // rotation happened since the last checkpoint).
             let meta = Meta::read_latest(&pool)?;
+            let format_version = meta.format_version & !crate::meta::LIMITED;
+            pool.set_compact_cells(format_version == 2);
             wal.set_lsn_floor(meta.next_lsn);
             // Opening can recreate a missing WAL. Publish that filename once
             // before any later acknowledgement, rather than relying on a
             // recurring ordinary-checkpoint directory barrier.
             pool.sync_dir()?;
-            (meta.roots[0], meta.generation)
+            (meta.roots[0], meta.generation, format_version)
         };
         // 2f: everything on disk up to here is the published state a snapshot
         // reader may be standing on. Freeze it BEFORE recovery replays the
@@ -388,6 +395,7 @@ impl Store {
         let mut s = Store { pool, wal: Some(wal), root, generation, reader_slot: None, dir: dir_owned, tree_id: 1, sync: cfg.sync, io_mode,
                             #[cfg(feature = "test-support")] test_faults: Arc::new(TestFaultInjector::default()),
                             poisoned: false, last_leaf, fast_path_hits, fast_path_attempts,
+                            format_version,
                             #[cfg(test)] trace: Vec::new(),
                             #[cfg(test)] barriers: Vec::new() };
         if !fresh {
@@ -432,6 +440,8 @@ impl Store {
         let budget = Arc::new(MemoryBudget::new(cfg.budget_bytes));
         let pool = BufferPool::new(file.into(), budget, frames.max(16))?;
         let meta = Meta::read_latest(&pool)?;
+        let format_version = meta.format_version & !crate::meta::LIMITED;
+        pool.set_compact_cells(format_version == 2);
         if let Some(l) = Meta::read_limits(&pool)? { pool.set_resource_limits(l)?; }
         after_meta(meta.generation)?;
         slot.set_generation(meta.generation)?;
@@ -445,6 +455,7 @@ impl Store {
             poisoned: false,
             last_leaf: Cell::new(None),
             fast_path_hits: Cell::new(0), fast_path_attempts: Cell::new(0),
+            format_version,
             #[cfg(test)] trace: Vec::new(),
             #[cfg(test)] barriers: Vec::new(),
         };
@@ -1002,7 +1013,7 @@ impl Store {
         // standing and the WAL tail replayable -- exactly a missed
         // checkpoint, never a torn one.
         Meta {
-            format_version: crate::meta::FORMAT_VERSION,
+            format_version: self.format_version,
             roots: [self.root, 0, 0, 0, 0, 0, 0, 0],
             next_lsn: self.wal.as_ref().ok_or(crate::Error::ReadOnly)?.next_lsn(),
             generation: gen,
@@ -1552,6 +1563,44 @@ mod tests {
     use super::*;
 
     fn cfg() -> Config { Config { budget_bytes: 32 << 20, io: IoMode::Buffered, sync: SyncMode::Full } }
+
+    /// The inherited kernel Store superblock still stamps `FORMAT_VERSION` from
+    /// the `compact-cells` cargo feature. A release must accept both supported
+    /// versions and write the file's own on checkpoint, not the build's.
+    /// (This path is not the typed-collection release backend — that is
+    /// PageWalStore with per-database feature bits — but the same defect.)
+    #[test]
+    fn a_store_checkpoint_preserves_the_file_own_format_version() {
+        let d = tempfile::tempdir().unwrap();
+        let other = if crate::meta::FORMAT_VERSION == 2 { 1 } else { 2 };
+        {
+            let s = Store::create(d.path(), cfg()).unwrap();
+            let meta = Meta::read_latest(&s.pool).unwrap();
+            Meta {
+                format_version: other,
+                roots: meta.roots,
+                next_lsn: meta.next_lsn,
+                generation: meta.generation,
+            }
+            .write(&s.pool)
+            .unwrap();
+            s.pool.flush_all(crate::io::Barrier::Data).unwrap();
+        }
+        let mut s = Store::open(d.path(), cfg()).unwrap_or_else(|e| {
+            panic!("supported superblock version {other} must open in this build: {e}")
+        });
+        s.put(b"k", b"v").unwrap();
+        s.commit().unwrap();
+        s.checkpoint().unwrap();
+        drop(s);
+        let s = Store::open(d.path(), cfg()).unwrap();
+        let got = Meta::read_latest(&s.pool).unwrap().format_version & !crate::meta::LIMITED;
+        assert_eq!(
+            got, other,
+            "checkpoint must write the file's format version, not the build's FORMAT_VERSION"
+        );
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
 
     #[test]
     fn byte_policy_publishes_exact_rows_without_a_redundant_wal_barrier() {

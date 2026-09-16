@@ -17,6 +17,15 @@ write-trace = []
 test-support = []
 sqlite-balance = []
 compact-cells = []
+# D9 per-keyspace append: fire the rightmost-append split when the new key is
+# the largest of ITS OWN key tag, not only of the whole tree. Default OFF so a
+# paired benchmark builds control and candidate from one source tree.
+keyspace-append = []
+# L2.3-2 allocation-free split: move leaf/sibling records as SlotRefs into
+# pinned page images plus one reusable scratch, instead of a Vec<u8> per
+# record. Page images and split decisions are byte-identical either way.
+# Default OFF so one source tree builds control and candidate.
+slotref-split = []
 
 [dev-dependencies]
 tempfile = "3"

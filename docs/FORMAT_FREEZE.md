@@ -1,5 +1,43 @@
 # Disk format freeze — release direction, 2026-09-15
 
+## Current boundary — 2026-09-16 (supersedes historical status below)
+
+**Phase 1 storage candidate is qualified; no public release is declared.**
+[PHASE1_STATE.md](PHASE1_STATE.md) owns the current qualification scope and
+completed Linux evidence. The selected candidate collection path is
+`collections::Database` → `PageWalStore`; [FORMAT_V1.md](FORMAT_V1.md) specifies
+its actual `E4PWAL02` envelope, 4144-byte WAL frames, physical version 1,
+required features, typed metadata and extension policy from source.
+
+Law 8 in [CONTRACT.md](../CONTRACT.md), adopted from the main worktree, governs:
+newer releases keep reading **and writing** every earlier released format.
+Ordinary updates preserve required features and never mandate migration or
+index rebuilding. Safe refusal must precede mutation for unsupported formats.
+Phase 1 fixes and tests concrete refusal/compatibility gaps; the final integrated candidate passed full Linux workspace qualification
+in default, compact/balance and retained-feature modes. See
+[PHASE1_QUALIFICATION.md](PHASE1_QUALIFICATION.md) for counts and ignored tests.
+
+The existing five codec-only-build fixtures are mandatory, checksummed and
+immutable. Missing fixtures fail the compatibility gate. Keep them alongside
+future, separately captured release-binary fixtures; never overwrite them by
+regeneration. Current fixtures are candidate evidence, not released-binary
+upgrade or downgrade proof.
+
+Reserved physical page bytes remain zero with their current meaning; the
+existing generation field is already meaningful. Future meanings require
+explicit version/feature rules. Coordination files are derived state but
+participate in locking and publication: they cannot be deleted/replaced while
+live merely because they can be reconstructed. Future persisted indexes need
+new noncolliding tags, explicit encoding/catalog versions and required feature
+handling, while preserving all shipped encodings. Phase 1 does not implement
+or claim qualification of nonexistent index families.
+
+## Historical direction and evidence — 2026-09-15
+
+The remainder retains the earlier decisions and measured evidence for their
+named source revisions. Historical status and proposed release sequencing do
+not supersede the current boundary above or the adopted Law 8 contract.
+
 The owner's priority is now a durable disk-format contract that lets users
 upgrade E4 without exporting and reimporting their databases. Do not make
 every performance target a prerequisite for starting interface work. The
@@ -43,7 +81,7 @@ E4's current collection tags overlap E3 meanings (for example E4 collection
 name tag `0x10` versus E3 geometry tag `0x10`). Reuse algorithms/interfaces
 through an explicit namespace mapping, never copy these persistent tags blindly.
 
-## Existing shape and the actual boundary
+## Historical shape and candidate-r3 boundary
 
 - The kernel uses 4096-byte checksummed, identity-checked slotted pages,
   B-tree leaves/interiors, free pages and overflow pages.
@@ -96,12 +134,16 @@ through an explicit namespace mapping, never copy these persistent tags blindly.
   Allocated and logical peaks are both recorded, and `ResourceLimits`
   still does not guarantee a hard allocated-block reservation.
 - `E4PWAL02` persists required feature bits, including compact cells.
-  Unsupported bits are refused during header validation, and writers
-  require their feature set to match the existing database; opening does
-  not silently convert its encoding. These checks prevent unsafe format
-  mixing. They do not yet prove release compatibility across different
-  build feature selections; the named stable baseline still needs a
-  supported codec policy and preserved released-file fixtures.
+  Since the loop-2 codec change (2026-09-16) the cell encoding is a
+  property of the database, not of the build: every build decodes both
+  cell families, a writer encodes new cells in the family the header
+  declares, and opening never changes the declared bits. The
+  `compact-cells` cargo feature only selects the default for databases
+  created by that build. Header validation refuses any required bit
+  outside the set this release implements before any byte is changed.
+  The reference-candidate fixture set and its lean test are described in
+  `FORMAT_V1.md`. Preserve that candidate corpus unchanged; when the owner
+  names a release, capture a separate corpus from that binary and retain both.
 - A reference-fixture pass (archive
   `b54d8f8e3a5fc71da6c667145153560bd82075a0713c1f253891127977aeb4d9`) built a
   small database with the accepted `64b6663` `Database` (old typed encoder
@@ -119,7 +161,7 @@ through an explicit namespace mapping, never copy these persistent tags blindly.
 These pieces must become one selected release format and collection path
 before promising that a released database survives an ordinary binary upgrade.
 
-## Bounded work before promising compatibility
+## Historical work outline before promising compatibility
 
 1. Specify the chosen release format from the actual code: file/header
    identification, supported versions/features, page/cell/overflow encoding,
@@ -155,7 +197,7 @@ After these pass, declare a named format version and enforce compatibility in
 the lean suite. Interface development can then proceed while performance work
 continues. Production readiness still needs its separate safety evidence.
 
-## What can improve afterward
+## Format-neutral improvements and compatibility direction
 
 Cache policy, syscall batching, disk reservation, page placement, split/merge
 policy and packing within existing supported cell encodings can improve without
@@ -164,13 +206,15 @@ key tags and catalog descriptors rather than changing entity encodings.
 This is an architectural allowance, not proof that every future optimization
 or recovery solution is format-neutral.
 
-The upgrade promise should be: a newer supported E4 release can open databases
-from earlier supported releases without a mandatory full rewrite. New binary
-versions need not imply new disk versions. If an optional future encoding is
-introduced, preserve old-format reading and define any upgrade explicitly.
-Downgrading to older binaries is a separate promise and is not implied.
+The adopted upgrade promise is permanent read/write compatibility with earlier
+released E4 formats, without a mandatory full rewrite. New binary versions
+need not imply new disk versions. Optional new encodings require explicit
+feature creation/conversion while preserving support for old encodings. Law 8
+also requires minor-version rollback tests within an unchanged feature set;
+older binaries may refuse explicitly enabled newer features. Released-binary
+rollback evidence remains pending.
 
-## Current evaluation
+## Historical reservation evaluation
 
 The reservation evaluation finished: 96 comparison arms verified, and the
 candidate was reverted under the former timing criterion. Its source patch and

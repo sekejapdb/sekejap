@@ -3,7 +3,7 @@ import json,sys
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 d=json.loads((root/'docs/FOUNDATION_GATES.json').read_text())
-assert d['version']=='F1' and [v['law'] for v in d['laws']]==list(range(1,8))
+assert d['version']=='F1' and [v['law'] for v in d['laws']]==list(range(1,9))
 blocked=[v['id']+': '+v['status'] for v in d['laws'] if v['status']!='PASS']
 blocked += [v['id']+': '+v['status'] for v in d['workloads'] if v['status']!='PASS']
 blocked += [v['id']+': '+v['status'] for v in d.get('release_blockers',[]) if v['status']!='PASS']

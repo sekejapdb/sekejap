@@ -1,7 +1,8 @@
 # Foundation test standard F1 — 2026-09-13
 
-This is an executable-evidence contract, not an eighth law. CONTRACT.md keeps
-exactly seven laws. A fast prototype is not a seven-law-qualified engine.
+This is an executable-evidence contract for the eight laws in CONTRACT.md.
+The owner added Law 8 (release compatibility) on 2026-09-15; the test standard
+itself is not an additional law. A fast prototype is not a law-qualified engine.
 Each category is reported as PASS, FAIL, PENDING or NOT APPLICABLE, with the
 exact tested scope. Pending safety/device/interface gates prevent promotion.
 
@@ -52,7 +53,7 @@ Transactions: 1, 100 and 1000 operations as distinct cases; no changes to batch
 size or durability within an A/B comparison. Report final checkpoint time and
 include it in total job time; never hide maintenance after stopping the timer.
 
-## Seven-law acceptance categories
+## Eight-law acceptance categories
 
 | Law | Category | Required falsifiable evidence |
 |---|---|---|
@@ -63,6 +64,15 @@ include it in total job time; never hide maintenance after stopping the timer.
 | 5 Recoverability | L5-DAMAGE | CRC/identity/bounds on every unit; torn versus corrupt WAL; corrupt root/leaf/overflow/schema/free metadata; independent salvage with no stale resurrection; all-replica loss explicitly reported |
 | 6 Readers | L6-READ | New readers see latest acknowledged commit; old readers remain byte-stable; concurrent writer/checkpoint; no writer lock on reads; coordination and latency/I/O effects explicitly audited, including processes |
 | 7 Target usability | L7-DEVICE | Mac + authorized Pi load/live-write/reopen evidence; bulk import, late-indexing and actual indexed live-write gates remain PENDING until those features exist |
+| 8 Release compatibility | L8-COMPAT | Immutable fixtures from released binaries: newer read/write/reopen and committed-WAL recovery; exact typed, schema, relationship and index-query results; minor rollback with unchanged features; unknown-format refusal leaves source files unchanged; no mandatory migration/index rebuild on update |
+
+L8 fixtures must identify their writer release, enabled persistent features,
+source/binary/file hashes and independent expected results. Cover each released
+encoding and index family, both checkpointed and committed-WAL states. Preserve
+original fixtures and mutate only working copies. Add public API/query/wire
+compatibility cases as interfaces return. The current negative format probes
+identify blockers; they are not a passing cross-release fixture suite. Until a
+stable baseline and this suite exist, L8 remains PENDING.
 
 Correctness uses an independent deterministic operation history and streams
 expected records. Count alone is insufficient: compare every key/value, exact
@@ -101,8 +111,10 @@ one-page/metadata rounding allowance. Rebuild/VACUUM is a separate measured arm.
 
 ### Repeatable lean groups and fixed-work scaling
 
-`docs/FOUNDATION_LEAN_GROUPS.json` maps all seven laws to shared executable
-test groups and explicitly lists missing coverage. Each shared command runs
+`docs/FOUNDATION_LEAN_GROUPS.json` lists all eight laws, maps implemented
+coverage to shared executable test groups, and explicitly lists missing
+coverage. L8 currently has no executable compatibility group and remains
+PENDING; an empty command list is not a pass. Each shared command runs
 once. This is fast regression feedback, not a claim that all laws pass.
 
 Run from the project root, using a fresh artifact directory each time:

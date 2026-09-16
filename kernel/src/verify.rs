@@ -576,14 +576,17 @@ pub fn decode_record(
     page_no: u32,
     kind: PageKind,
 ) -> Result<DecodedRecord<'_>> {
-    #[cfg(feature="compact-cells")]
+    // Both compact families decode unconditionally. The encoding belongs to
+    // the stored database, not to the build: gating these here made a binary
+    // compiled without `compact-cells` refuse pages written by one compiled
+    // with it, and disagree with the fast validated helpers in `btree.rs`,
+    // which never gated the integer family at all.
     if kind==PageKind::Leaf && rec.first()==Some(&0xff)
         && rec.get(1).is_some_and(|b|(0x81..=0x88).contains(b)) {
         let end=2+(rec[1]-0x80)as usize;
         let key=rec.get(1..end).ok_or_else(||bad(page_no,"compact integer key crosses its slot"))?;
         return Ok(DecodedRecord::Leaf{key,value:&rec[end..],overflow:false});
     }
-    #[cfg(feature="compact-cells")]
     if kind==PageKind::Leaf && rec.get(1).is_some_and(|b|b&0xf0==0x40) {
         let end=2+(u16::from_le_bytes([rec[0],rec[1]])&0x0fff) as usize;
         let key=rec.get(2..end).ok_or_else(||bad(page_no,"compact key crosses its slot"))?;

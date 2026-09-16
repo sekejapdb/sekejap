@@ -13,12 +13,17 @@ pub const META_PAGE: u32 = 0;
 /// unlike LMDB every slot is protected by the ordinary page checksum.)
 pub const META_PAGE_B: u32 = 1;
 pub const MAX_TREES: usize = 8;
-/// The logical on-disk format this engine reads and writes. The page header's
-/// own version (byte 4) guards the physical page layout; THIS guards the
-/// meaning of what the pages contain — key encodings, payload format, keyspace
-/// tags. A database stamped with a different value is refused on open, never
-/// guessed at: reading v2 data with v1 eyes is silent corruption, the one
-/// failure the format contract exists to forbid.
+/// Highest logical superblock version this engine reads. Versions 1 (plain
+/// cells) and 2 (compact cells) are both supported in every build. The page
+/// header's own version (byte 4) guards the physical page layout; THIS guards
+/// the meaning of what the pages contain — key encodings, payload format,
+/// keyspace tags. A database stamped with a newer value is refused on open,
+/// never guessed at.
+pub const SUPPORTED_FORMAT_VERSION: u16 = 2;
+const FUTURE_FORMAT: &str = "database format version 3+ is newer than this engine reads; open it with the engine version that created it";
+const ZERO_FORMAT: &str = "database format version 0 is not one this engine writes";
+/// Version a newly created store is stamped with. The `compact-cells` cargo
+/// feature still decides only this default; opening never restamps it.
 pub const FORMAT_VERSION: u16 = if cfg!(feature="compact-cells") {2}else{1};
 /// Optional second meta-page slot, never a user-tree row. Covered by the page
 /// checksum. A normal checkpoint reinitializes the slot without this marker.
@@ -133,10 +138,25 @@ impl Meta {
         if p.nentries() == 0 {
             return Err(Error::Corrupt { page_no: p.page_no(), why: "meta page has no slots" });
         }
+        let rec = p.slot(0);
+        if rec.len() < 2 {
+            return Err(Error::Corrupt { page_no: p.page_no(), why: "meta record too short for format_version" });
+        }
+        let format_version = u16::from_le_bytes([rec[0], rec[1]]);
+        let base_version = format_version & !LIMITED;
+        // The version prefix belongs to the admission envelope. A future
+        // version may change roots, record length or extensions, so reject it
+        // before applying any supported-version payload rules. Otherwise an
+        // intact future slot could be mistaken for damage and lose to a sibling.
+        if base_version == 0 || base_version > SUPPORTED_FORMAT_VERSION {
+            return Err(Error::Corrupt {
+                page_no: p.page_no(),
+                why: if base_version == 0 { ZERO_FORMAT } else { FUTURE_FORMAT },
+            });
+        }
         if p.nentries() > 1 && (p.nentries() != 2 || (p.slot(1) != SALVAGED && crate::limits::ResourceLimits::decode(p.slot(1)).is_err())) {
             return Err(Error::Corrupt { page_no: p.page_no(), why: "invalid meta extension" });
         }
-        let rec = p.slot(0);
         let base = 2 + MAX_TREES * 4;
         if rec.len() < base {
             return Err(Error::Corrupt {
@@ -154,29 +174,12 @@ impl Meta {
         let generation = if rec.len() >= base + 16 {
             u64::from_le_bytes(rec[base + 8..base + 16].try_into().unwrap())
         } else { 0 };
-        let format_version = u16::from_le_bytes([rec[0], rec[1]]);
         if format_version & LIMITED != 0 {
             if p.nentries() != 2 { return Err(Error::Corrupt { page_no: p.page_no(), why: "missing resource policy" }); }
             crate::limits::ResourceLimits::decode(p.slot(1))?;
         }
         if format_version & LIMITED == 0 && p.nentries() == 2 && p.slot(1) != SALVAGED {
             return Err(Error::Corrupt { page_no: p.page_no(), why: "resource policy without required format flag" });
-        }
-        let base_version = format_version & !LIMITED;
-        // v1 golden kernel fixtures remain readable. A v1-only build refuses
-        // the new compact-cell format at OPEN, before attempting any row.
-        if base_version == 0 || base_version > FORMAT_VERSION {
-            return Err(Error::Corrupt {
-                page_no: p.page_no(),
-                why: if format_version > FORMAT_VERSION && FORMAT_VERSION==2 {
-                    "database format version 3+ is newer than this engine reads; open it with the engine version that created it"
-                } else if format_version > FORMAT_VERSION {
-                    "database format version 2+ is newer than this engine reads; \
-                     open it with the engine version that created it"
-                } else {
-                    "database format version 0 is not one this engine writes"
-                },
-            });
         }
         Ok(Meta { format_version, roots, next_lsn, generation })
     }
@@ -197,14 +200,28 @@ impl Meta {
     }
 
     /// 2f: read BOTH slots, adopt the newest valid one. A slot that fails
-    /// its page checksum, is not a Meta page, or does not parse is simply
-    /// the loser -- a torn flip leaves the previous publication standing.
+    /// its page checksum or does not parse is normally the loser -- a torn
+    /// flip leaves the previous publication standing. An intact unsupported
+    /// logical version must refuse instead of falling back to stale metadata.
     /// A page-1 slot that is a valid page of any OTHER kind is a pre-2f
     /// file and is refused outright: silently adopting slot 0 would let the
     /// next checkpoint overwrite a live tree page.
     pub fn read_latest(pool: &BufferPool) -> Result<Meta> {
         let read_slot = |page: u32| -> Result<Meta> {
-            let r = pool.get(page)?;
+            let r = match pool.get(page) {
+                // PageRef checks the physical version before its checksum.
+                // Distinguish an intact unsupported page from a damaged copy
+                // before deciding whether the sibling may be used instead.
+                Err(Error::Corrupt { why: "unknown format version", .. }) => {
+                    let mut bytes = [0; crate::page::PAGE_SIZE];
+                    pool.file_ref().read_at(&mut bytes, u64::from(page) * crate::page::PAGE_SIZE as u64)?;
+                    let why = if crate::page::checksum(&bytes) == u32::from_le_bytes(bytes[36..40].try_into().unwrap()) {
+                        "unknown format version"
+                    } else { "checksum mismatch" };
+                    return Err(Error::Corrupt { page_no: page, why });
+                }
+                other => other?,
+            };
             let p = PageRef::open_resident(&r, page)?;
             if p.kind() != PageKind::Meta {
                 return Err(Error::Corrupt { page_no: page, why: "slot is not a meta page" });
@@ -213,6 +230,13 @@ impl Meta {
         };
         let a = read_slot(META_PAGE);
         let b = read_slot(META_PAGE_B);
+        for result in [&a, &b] {
+            if let Err(Error::Corrupt { page_no, why }) = result {
+                if *why == FUTURE_FORMAT || *why == ZERO_FORMAT || *why == "unknown format version" {
+                    return Err(Error::Corrupt { page_no: *page_no, why });
+                }
+            }
+        }
         if let Err(Error::Corrupt { why: "slot is not a meta page", .. }) = &b {
             return Err(Error::Corrupt {
                 page_no: META_PAGE_B,
@@ -251,12 +275,13 @@ mod tests {
     #[test]
     fn a_future_format_version_is_refused_not_misread() {
         let (pool, _d) = scratch_pool(8);
-        let m = Meta { format_version: FORMAT_VERSION+1, roots: [7, 0, 0, 0, 0, 0, 0, 0], next_lsn: 1, generation: 0 };
+        let future = SUPPORTED_FORMAT_VERSION + 1;
+        let m = Meta { format_version: future, roots: [7, 0, 0, 0, 0, 0, 0, 0], next_lsn: 1, generation: 0 };
         m.write(&pool).unwrap();
         pool.flush_all(crate::io::Barrier::Data).unwrap();
         let err = Meta::read(&pool).expect_err("a future format must not open");
         let text = err.to_string();
-        assert!(text.contains(&format!("format version {}",FORMAT_VERSION+1)),
+        assert!(text.contains(&format!("format version {future}")),
             "the refusal must name the file's version: {text}");
     }
 

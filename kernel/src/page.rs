@@ -300,6 +300,17 @@ impl<'a> PageRef<'a> {
         free_ptr.saturating_sub(HEADER_LEN + self.nentries() * SLOT_LEN)
     }
 
+    /// Entry `i`'s slot-directory pair, verbatim: (offset, length) into this
+    /// page image. `slot()` is these two numbers already applied; a caller
+    /// that wants to REMEMBER where a record lives -- rather than copy it out
+    /// -- needs the numbers themselves. Valid for the same reason `slot` is:
+    /// `open`/`open_resident` bounds-checked every pair before handing the
+    /// page over.
+    pub fn slot_bounds(&self, i: usize) -> (u16, u16) {
+        let base = HEADER_LEN + i * SLOT_LEN;
+        (rd_u16(self.b, base), rd_u16(self.b, base + 2))
+    }
+
     pub fn slot(&self, i: usize) -> &'a [u8] {
         let off = rd_u16(self.b, HEADER_LEN + i * SLOT_LEN) as usize;
         let len = rd_u16(self.b, HEADER_LEN + i * SLOT_LEN + 2) as usize;

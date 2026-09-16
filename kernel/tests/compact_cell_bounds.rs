@@ -1,4 +1,6 @@
-#![cfg(feature = "compact-cells")]
+//! Bounds and distinctness of the compact cell families. These hold in EVERY
+//! build: the encoding belongs to the stored database, so a build that would
+//! not choose compact cells for a NEW database must still decode them exactly.
 use kernel::{page::PageKind, verify::{decode_record, DecodedRecord}};
 
 #[test]

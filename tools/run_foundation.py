@@ -1,7 +1,7 @@
 """One command for lean regressions, repeated fixed-work scaling, or 10M confirmation.
 
 Writes fixtures only to authorized artifact roots. A successful run means its
-tests/oracles passed, not that L2 latency or the seven-law release gate passed.
+tests/oracles passed, not that L2 latency or the eight-law release gate passed.
 """
 import argparse
 import hashlib

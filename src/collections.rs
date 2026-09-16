@@ -274,6 +274,9 @@ fn header_bytes(h: HeaderInfo) -> Result<Vec<u8>> {
 }
 fn parse_header(b: &[u8]) -> Result<HeaderInfo> {
     if b.len() == PAD && b.starts_with(b"E4COLL") && &b[..8] != HEADER_MAGIC {
+        // An unknown version is authoritative only inside an intact packet.
+        // A damaged magic byte must still allow an independent replica to win.
+        unpack(b, b[..8].try_into().unwrap())?;
         return Err(Error::Unsupported(format!(
             "typed-collection header version {:?} is newer than this binary",
             String::from_utf8_lossy(&b[..7])
@@ -308,7 +311,6 @@ fn replicas<T: PartialEq>(
     parse: impl Fn(&[u8]) -> Result<T>,
 ) -> Result<T> {
     let mut good = None;
-    let mut unsupported = None;
     for copy in 0..3 {
         match get(&keys(copy)) {
             Ok(Some(b)) => match parse(&b) {
@@ -318,16 +320,14 @@ fn replicas<T: PartialEq>(
                     }
                     good = Some(value);
                 }
-                Err(e @ Error::Unsupported(_)) => unsupported = Some(e),
+                Err(e @ Error::Unsupported(_)) => return Err(e),
                 Err(_) => {}
             },
             Ok(None) | Err(Error::Kernel(kernel::Error::Corrupt { .. })) => {}
             Err(e) => return Err(e),
         }
     }
-    good.ok_or_else(|| {
-        unsupported.unwrap_or_else(|| corrupt("all metadata copies missing or damaged"))
-    })
+    good.ok_or_else(|| corrupt("all metadata copies missing or damaged"))
 }
 fn read_header(s: &PageWalStore) -> Result<HeaderInfo> {
     replicas(|k| s.get(k).map_err(Error::from), |i| vec![0, 0, i], parse_header)

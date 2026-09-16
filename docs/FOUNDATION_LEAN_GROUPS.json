@@ -1,6 +1,6 @@
 {
-  "version": "F1-lean-2",
-  "purpose": "Fast regression coverage; never a substitute for seven-law release qualification",
+  "version": "F1-lean-4",
+  "purpose": "Fast regression coverage; never a substitute for eight-law release qualification",
   "commands": {
     "pager": [
       "--lib",
@@ -58,6 +58,16 @@
       "test-support",
       "--lib",
       "io::tests"
+    ],
+    "compatibility": [
+      "--test",
+      "format_v1_compat",
+      "--test",
+      "format_replica_refusal",
+      "--test",
+      "pagewal_cell_codec",
+      "--test",
+      "pagewal_create_codec"
     ]
   },
   "groups": [
@@ -133,6 +143,16 @@
       ],
       "coverage": "Typed round trips, opt-in timestamps, reopen and platform isolation; runnable on Pi; typed collection tests now exercise the integrated page-WAL store rather than the inherited kernel Store (collection_pagewal), including resource-policy (E4LIMIT1) enforcement and schema-layout evolution",
       "remaining": "Bulk import, late indexing and indexed live writes remain pending; device (Pi/app-scale) qualification of the integrated path is untested in this lean group"
+    },
+    {
+      "law": 8,
+      "id": "compatibility",
+      "commands": [
+        "compatibility"
+      ],
+      "status": "QUALIFIED_CANDIDATE",
+      "coverage": "Required immutable reference-candidate fixtures: cross-codec read/write/reopen, full independent entity oracles, source preservation and unsupported physical/logical versions/features. Intact unsupported metadata replicas must not be masked by supported siblings.",
+      "remaining": "First public release binary/provenance/corpus and future shipped index/interface fixtures remain required. Full Linux candidate qualification passed; see PHASE1_QUALIFICATION.md."
     }
   ]
 }

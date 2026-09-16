@@ -21,6 +21,61 @@ pub mod nav;
 pub mod store;
 #[cfg(test)]
 mod test_support;
+/// Counting allocator for unit tests only.
+///
+/// `tests/codec_allocations.rs` in the root crate proves a claim about
+/// allocation by counting it rather than by reasoning about it; the kernel had
+/// no such allocator, so the same thread-local pattern is repeated here. It is
+/// `cfg(test)`: nothing that ships is wrapped, and when `TRACK` is off the
+/// wrapper is one thread-local read.
+#[cfg(test)]
+pub(crate) mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    thread_local! {
+        static TRACK: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+        static BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+    pub struct Counting;
+    // SAFETY: every method forwards to `System` unchanged; the counters are
+    // thread-local side effects that never touch the returned pointer.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            note(l.size());
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) { unsafe { System.dealloc(p, l) } }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            note(n);
+            unsafe { System.realloc(p, l, n) }
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            note(l.size());
+            unsafe { System.alloc_zeroed(l) }
+        }
+    }
+    fn note(size: usize) {
+        TRACK.try_with(|t| {
+            if t.get() {
+                COUNT.with(|c| c.set(c.get() + 1));
+                BYTES.with(|b| b.set(b.get() + size));
+            }
+        }).ok();
+    }
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+
+    /// Run `f` with allocation counting on. Returns (value, allocations, bytes).
+    pub fn measured<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
+        COUNT.with(|c| c.set(0));
+        BYTES.with(|b| b.set(0));
+        TRACK.with(|t| t.set(true));
+        let v = f();
+        TRACK.with(|t| t.set(false));
+        (v, COUNT.with(Cell::get), BYTES.with(Cell::get))
+    }
+}
 pub mod wal;
 #[doc(hidden)]
 pub mod write_stats;
