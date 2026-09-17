@@ -306,3 +306,63 @@ fn a_reopened_handle_proves_nothing_about_rows_it_did_not_allocate() {
     .unwrap();
     db.commit().unwrap();
 }
+
+/// K1: WHERE THE TWO PUTS GO. Every edge row is an append inside its own key
+/// tag -- forward keys ascend with the source, reverse keys with the
+/// destination -- yet both tags sit behind the row and mapping keyspaces in
+/// the same tree, so `fast_path_leaf`'s "rightmost leaf of the TREE" test
+/// could never fire for either. Measured before the per-keyspace hint, on the
+/// 200K-row relationship load: 4.40 page accesses for the forward put and
+/// 4.35 for the reverse, a full root-to-leaf descent each.
+///
+/// This is the same claim at test scale: a run of edges over ascending sources
+/// must reach its leaves through the hint, not through a descent. The sources
+/// are DISJOINT from the warm-up's, so every put is a new record -- replacing
+/// an existing edge is not an append and is not what this measures.
+#[test]
+fn an_ascending_edge_run_reaches_its_leaves_without_descending() {
+    const EDGES: u64 = 2_000;
+    let (_dir, mut db, people, knows) = population(20_000);
+    // Warm the tree to its final height and arm the hints.
+    pages_per_edge(&mut db, people, knows, 500);
+    let (hits0, attempts0, misses0) = db.tag_hint_stats().unwrap();
+    let before = db.pool_accesses().unwrap();
+    for i in 1_000..(1_000 + EDGES) {
+        db.put_edge(
+            GraphContextId::BASE,
+            entity(people, i + 1),
+            knows,
+            entity(people, i + 2),
+            &json!({}),
+        )
+        .unwrap();
+    }
+    db.commit().unwrap();
+    let pages = (db.pool_accesses().unwrap() - before) as f64 / EDGES as f64;
+    let (hits, attempts, misses) = db.tag_hint_stats().unwrap();
+    let served = hits - hits0;
+    eprintln!(
+        "{pages:.3} page accesses per edge; the per-keyspace hint served {served} of \
+         {} attempts over {} edge-row puts, and {} puts found no slot",
+        attempts - attempts0,
+        EDGES * 2,
+        misses - misses0
+    );
+    // Not all of them, and the gap is a named one. An edge run's top leaf is
+    // the KEYSPACE BOUNDARY leaf -- it holds the last forward-edge rows and
+    // the first reverse-edge rows -- so its fills go through
+    // `redistribute_neighbors`, which moves separators between siblings and
+    // has to forget their fences. D9 exempts the same leaf from its append
+    // split for the same reason. Measured: 88.7% of the 200K load's
+    // forward-edge puts served, 1.75 page accesses against 4.40.
+    assert!(
+        served >= EDGES * 2 * 8 / 10,
+        "the per-keyspace hint served only {served} of the {} edge-row puts",
+        EDGES * 2
+    );
+    assert!(
+        pages <= 3.0,
+        "an edge over two ascending runs took {pages:.2} page accesses; two hinted \
+         appends are two, and before the hint two descents were about 8.7"
+    );
+}

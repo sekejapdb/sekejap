@@ -124,3 +124,97 @@ fn a_rollback_forgets_every_trees_append_hint() {
     );
     set_create_index_trees(previous);
 }
+
+/// The same property for the PRIMARY tree's per-keyspace hints (K1).
+///
+/// `PageWalStore::rollback` cleared the whole-tree hint and the eight per-tree
+/// slots. The per-keyspace hints are a third table and they carry more than a
+/// page number: each one also caches the FENCES its arming descent walked. A
+/// survivor of a discarded transaction is therefore two kinds of wrong at once
+/// -- it can name a page that only ever existed as a WAL frame the rollback
+/// truncated away (an `Io(UnexpectedEof)` on the read that re-checks it), and
+/// it can describe an interval of a tree shape that no longer exists.
+///
+/// Relationship rows are what make this reachable from the primary tree: their
+/// forward keys ascend behind the row and mapping keyspaces, which is exactly
+/// the run the per-keyspace hint exists to serve.
+#[test]
+fn a_rollback_forgets_the_per_keyspace_hints_of_the_primary_tree() {
+    use e4_prototype::collections::{EntityId, GraphContextId};
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("db");
+    let mut db = Database::create(&path, cfg()).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![("age".into(), Kind::Int)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.enable_graph().unwrap();
+    let knows = db.create_edge_type("knows").unwrap();
+    db.commit().unwrap();
+    for i in 0..4_000u64 {
+        db.put(people, &format!("p{i:06}"), &person(i)).unwrap();
+    }
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    let entity = |i: u64| EntityId {
+        collection: people,
+        sequence: i,
+    };
+
+    // A discarded transaction whose forward-edge keys ascend, so the hint for
+    // the 0x71 keyspace parks on a leaf this transaction allocated -- and then
+    // the file is rewound past it.
+    for i in 1..3_000u64 {
+        db.put_edge(GraphContextId::BASE, entity(i), knows, entity(i + 1), &json!({}))
+            .unwrap();
+    }
+    db.rollback().unwrap();
+
+    // THE PROPERTY. The same handle, a new transaction, and an ascending run
+    // that starts INSIDE the interval the discarded transaction's hint claims
+    // -- the first edge here is the one a survivor would answer for. A
+    // survivor either reads past the end of the data file or appends a row
+    // below its own fence.
+    for i in 2_900..3_400u64 {
+        db.put_edge(GraphContextId::BASE, entity(i), knows, entity(i + 2), &json!({}))
+            .unwrap();
+    }
+    db.commit().unwrap();
+    assert!(
+        db.neighbors(e4_prototype::collections::NeighborRequest {
+            entity: entity(1),
+            direction: e4_prototype::collections::Direction::Outgoing,
+            context: GraphContextId::BASE,
+            edge_type: Some(knows),
+            limit: 16,
+        })
+        .unwrap()
+        .is_empty(),
+        "an edge from the discarded transaction survived the rollback"
+    );
+
+    // And the graph answers for what was written, not for what was discarded.
+    for i in [2_900u64, 3_111, 3_399] {
+        let out = db
+            .neighbors(e4_prototype::collections::NeighborRequest {
+                entity: entity(i),
+                direction: e4_prototype::collections::Direction::Outgoing,
+                context: GraphContextId::BASE,
+                edge_type: Some(knows),
+                limit: 16,
+            })
+            .unwrap();
+        let seen: Vec<u64> = out.iter().map(|e| e.key.destination.sequence).collect();
+        assert_eq!(seen, vec![i + 2], "row {i} does not have exactly the edge written after the rollback");
+    }
+    drop(db);
+    let report = verify_indexed_source(&path, VerificationLimits::default(), |_| {}).unwrap();
+    assert!(
+        report.complete && report.clean,
+        "the database written after a rollback does not verify clean"
+    );
+}

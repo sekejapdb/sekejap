@@ -802,6 +802,11 @@ impl Database {
     pub fn pool_accesses(&self) -> Result<u64> {
         Ok(self.store()?.store().pool_accesses())
     }
+    /// Diagnostic only: (hits, attempts) of the per-keyspace append hints.
+    #[doc(hidden)]
+    pub fn tag_hint_stats(&self) -> Result<(u64, u64, u64)> {
+        Ok(self.store()?.store().tag_hint_stats())
+    }
     /// Diagnostic only: monotonic page-WAL I/O counters (frames, fsyncs, bytes).
     #[doc(hidden)]
     pub fn io_counters(&self) -> Result<crate::pagewal::IoCounters> {

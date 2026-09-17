@@ -663,7 +663,7 @@ fn snapshot_store(pager:&Arc<Pager>,lock:Option<Arc<File>>,dir:&Path,cache:usize
     let mut out=PageWalStore{pager:None,pool,root:0,last:Cell::new(None),hits:Cell::new(0),attempts:Cell::new(0),
         poisoned:false,dirty:false,_lock:lock,dir:dir.into(),cache,slot,limits:(u64::MAX,u64::MAX,usize::MAX),
         reader_files:Some((pager.data.clone(),pager.wal.clone())),
-        hints:std::array::from_fn(|_|(Cell::new(0),Cell::new(None))),hint_turn:Cell::new(0)};
+        hints:std::array::from_fn(|_|(Cell::new(0),Cell::new(None))),hint_turn:Cell::new(0),tags:Default::default()};
     out.load_header()?;Ok(out)
 }
 // A persisted reader bound is enforced on the slot index once the slot is
@@ -763,6 +763,14 @@ pub struct PageWalStore {
     poisoned:bool,dirty:bool,_lock:Option<Arc<File>>,dir:PathBuf,cache:usize,slot:Option<ReaderSlot>,
     limits:(u64,u64,usize),reader_files:Option<(Arc<dyn FileIo>,Arc<dyn FileIo>)>,
     hints:[(Cell<u16>,Cell<Option<u32>>);TREE_HINTS],hint_turn:Cell<usize>,
+    /// Per-KEYSPACE append hints, shared by every tree this handle opens.
+    /// `hints` above remembers one leaf per TREE -- the rightmost, the only
+    /// one `fast_path_leaf` can use. This remembers one leaf per (tree, key
+    /// tag) with the fences that let a key be appended to a leaf that is
+    /// rightmost only of its own run: the collection's rows, its external-key
+    /// mappings, and the forward and reverse edge rows all live in tree 1
+    /// behind one another, so at most one of them could ever use `hints`.
+    tags:kernel::btree::TagHints,
 }
 impl PageWalStore {
     pub fn open(dir:&Path,create:bool,cache:usize)->Result<Self>{
@@ -827,7 +835,7 @@ impl PageWalStore {
         let mut s=Self{pager:Some(pager),pool,root:0,last:Cell::new(None),hits:Cell::new(0),attempts:Cell::new(0),
             poisoned:false,dirty:false,_lock:Some(Arc::new(lock)),dir:dir.into(),cache,slot:None,
             limits:(u64::MAX,u64::MAX,usize::MAX),reader_files:None,
-            hints:std::array::from_fn(|_|(Cell::new(0),Cell::new(None))),hint_turn:Cell::new(0)};
+            hints:std::array::from_fn(|_|(Cell::new(0),Cell::new(None))),hint_turn:Cell::new(0),tags:Default::default()};
         if create {
             if s.pool.page_count()!=2{return Err(bad("create found unexpected pages"));}
             // Creation: coordination files and hint first, then the empty
@@ -883,6 +891,12 @@ impl PageWalStore {
     pub fn page_count(&self)->u32{self.pool.page_count()}
     /// Diagnostic only: buffer-pool page accesses since open.
     pub fn pool_accesses(&self)->u64{let s=self.pool.stats();s.hits+s.misses}
+    /// Diagnostic only: (hits, attempts) of the per-keyspace append hints.
+    pub fn tag_hint_stats(&self)->(u64,u64,u64){(self.tags.hits(),self.tags.attempts(),self.tags.misses())}
+    /// Turn the per-keyspace append hints off (or back on) for this handle.
+    /// Placement does not depend on them -- the kernel's byte-equivalence
+    /// oracle proves it -- so this only changes how a write reaches its leaf.
+    pub fn set_tag_hints_enabled(&self,on:bool){self.tags.set_enabled(on);}
     pub fn page_bytes(&self,no:u32)->Result<Vec<u8>>{self.ready()?;let r=self.pool.get(no)?;Ok(r[..].to_vec())}
     /// Discard every uncommitted change in place: the files are re-inspected
     /// exactly as a reopen would, the uncommitted tail is truncated, the
@@ -910,6 +924,10 @@ impl PageWalStore {
         // one wasted descent: the fast path READS the hinted leaf in order to
         // re-check its shape, so the read comes first and fails outright.
         for (id,hint) in &self.hints {id.set(0);hint.set(None);}
+        // And the per-keyspace hints, for the same reason and one more: they
+        // carry a cached fence as well as a page number, so a survivor could
+        // describe an interval of a tree shape this rollback has just undone.
+        self.tags.clear();
         self.poisoned=true;self.dirty=false;
         self.load_header()?;self.poisoned=false;Ok(())
     }
@@ -921,7 +939,7 @@ impl PageWalStore {
     /// A descending ORDER BY is one walk of one tree, not a full materialise
     /// followed by a sort, and this is the cursor that walk rides on.
     pub fn range_reverse(&self,to:&[u8])->Result<ReverseRangeIter<'_>>{self.ready()?;self.tree().range_reverse(to)}
-    fn tree(&self)->BTree<'_>{BTree::open(&self.pool,1,self.root,&self.last,&self.hits,&self.attempts)}
+    fn tree(&self)->BTree<'_>{BTree::open(&self.pool,1,self.root,&self.last,&self.hits,&self.attempts).with_tags(&self.tags)}
     /// The append hint for a tree other than the primary one. A miss claims a
     /// slot round-robin and starts that tree with no hint, which is exactly
     /// the state a freshly opened handle is in.
@@ -933,12 +951,13 @@ impl PageWalStore {
         let (id,hint)=&self.hints[at];id.set(tree_id);hint.set(None);hint
     }
     fn other(&self,tree_id:u16,root:u32)->BTree<'_>{
-        BTree::open(&self.pool,tree_id,root,self.tree_hint(tree_id),&self.hits,&self.attempts)
+        BTree::open(&self.pool,tree_id,root,self.tree_hint(tree_id),&self.hits,&self.attempts).with_tags(&self.tags)
     }
     /// Create an empty tree and return its root. Ordinary pooled page, so the
     /// new root is published by the caller's commit like any other write.
     pub fn tree_create(&mut self,tree_id:u16)->Result<u32>{
         self.writable()?;self.fold_committed_wal_if_at_cap()?;self.dirty=true;
+        self.tags.clear();
         let r=BTree::create(&self.pool,tree_id,self.tree_hint(tree_id),&self.hits,&self.attempts).map(|t|t.root());
         match r {Ok(root)=>Ok(root),Err(e)=>{self.poisoned=true;Err(e)}}
     }
@@ -987,6 +1006,7 @@ impl PageWalStore {
         let r=self.pool.free_page(root);
         if r.is_err() {self.poisoned=true;}
         for (id,hint) in &self.hints { if id.get()==tree_id {id.set(0);hint.set(None);} }
+        self.tags.clear_tree(tree_id);
         r.map_err(Error::from)
     }
     /// Pack a sorted stream into a fresh, EMPTY tree bottom-up, through the
@@ -995,6 +1015,7 @@ impl PageWalStore {
     pub fn tree_pack<I>(&mut self,tree_id:u16,sorted:I,fill:f32,scratch:&Path)->Result<(u32,u64)>
     where I:Iterator<Item=kernel::Result<(Vec<u8>,Vec<u8>,bool)>> {
         self.writable()?;self.fold_committed_wal_if_at_cap()?;self.dirty=true;
+        self.tags.clear();
         let r=kernel::bulk::pack_tree_pooled(&self.pool,tree_id,sorted,fill,scratch);
         match r {Ok(out)=>Ok(out),Err(e)=>{self.poisoned=true;Err(e.into())}}
     }

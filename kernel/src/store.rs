@@ -259,6 +259,13 @@ pub struct Store {
     /// a random-order workload pays for one wasted probe and then stops --
     /// not one wasted probe per row forever.
     fast_path_attempts: Cell<u64>,
+    /// The per-keyspace append hints (`TagHints`), owned here for exactly the
+    /// reason `last_leaf` is: every `Store` operation builds a transient
+    /// `BTree` and drops it, so a cache living on the tree would be empty on
+    /// arrival every time. Every `BTree` this `Store` opens gets it -- the
+    /// ones that write, so they can use it, and the ones that delete or graft,
+    /// so they can clear it.
+    tag_hints: crate::btree::TagHints,
     /// Superblock logical version this file declared (1 = plain cells, 2 =
     /// compact cells). Independent of this build's `compact-cells` feature;
     /// checkpoint writes this value, never the compile-time default.
@@ -328,6 +335,7 @@ impl Store {
         let last_leaf = Cell::new(None);
         let fast_path_hits = Cell::new(0);
         let fast_path_attempts = Cell::new(0);
+        let tag_hints = crate::btree::TagHints::default();
 
         let (root, generation, format_version) = if fresh {
             let _meta_page = pool.allocate()?;     // page 0 is the superblock
@@ -395,6 +403,7 @@ impl Store {
         let mut s = Store { pool, wal: Some(wal), root, generation, reader_slot: None, dir: dir_owned, tree_id: 1, sync: cfg.sync, io_mode,
                             #[cfg(feature = "test-support")] test_faults: Arc::new(TestFaultInjector::default()),
                             poisoned: false, last_leaf, fast_path_hits, fast_path_attempts,
+                            tag_hints,
                             format_version,
                             #[cfg(test)] trace: Vec::new(),
                             #[cfg(test)] barriers: Vec::new() };
@@ -455,6 +464,7 @@ impl Store {
             poisoned: false,
             last_leaf: Cell::new(None),
             fast_path_hits: Cell::new(0), fast_path_attempts: Cell::new(0),
+            tag_hints: crate::btree::TagHints::default(),
             format_version,
             #[cfg(test)] trace: Vec::new(),
             #[cfg(test)] barriers: Vec::new(),
@@ -544,7 +554,7 @@ impl Store {
                 if self.generation == 0 && crate::keys::is_field_aggregate_key(key) {
                     if Meta::is_salvaged(&self.pool)? { return Ok(()); }
                 }
-                let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts);
+                let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
                 t.insert(key, val)?;
                 self.root = t.root();
             }
@@ -583,7 +593,7 @@ impl Store {
                 }
 
                 let mut t = BTree::open(&self.pool, self.tree_id, self.root,
-                    &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts);
+                    &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
                 at = 2;
                 for _ in 0..count {
                     let key_len = u16::from_le_bytes([payload[at], payload[at + 1]]) as usize;
@@ -602,7 +612,7 @@ impl Store {
                 if key_end != payload.len() {
                     return Err(corrupt("delete key length does not match its WAL payload"));
                 }
-                let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts);
+                let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
                 t.delete(&payload[2..key_end])?;
                 self.root = t.root();
             }
@@ -610,7 +620,7 @@ impl Store {
                 if payload.is_empty() {
                     return Err(corrupt("delete-prefix WAL payload is empty"));
                 }
-                let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts);
+                let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
                 t.delete_prefix(payload)?;
                 self.root = t.root();
             }
@@ -688,7 +698,7 @@ impl Store {
             self.poisoned = true;
             return Err(e);
         }
-        let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts);
+        let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
         #[cfg(feature = "write-trace")]
         let btree_started = crate::write_trace::active().then(std::time::Instant::now);
         let inserted = t.insert(k, v);
@@ -746,7 +756,7 @@ impl Store {
             return Err(e);
         }
         let mut t = BTree::open(&self.pool, self.tree_id, self.root,
-            &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts);
+            &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
         let inserted = keys.iter().try_for_each(|key| t.insert(key, &[]));
         let root = t.root();
         drop(t);
@@ -779,7 +789,7 @@ impl Store {
             self.poisoned = true;
             return Err(e);
         }
-        let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts);
+        let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
         let deleted = t.delete(k);
         let root = t.root();
         drop(t);
@@ -809,7 +819,7 @@ impl Store {
             self.poisoned = true;
             return Err(e);
         }
-        let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts);
+        let mut t = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
         let deleted = t.delete_prefix(prefix);
         let root = t.root();
         drop(t);
@@ -830,14 +840,14 @@ impl Store {
         }
         #[cfg(feature = "test-support")]
         self.test_faults.check(TestFaultKind::Read)?;
-        BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).get(k)
+        BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints).get(k)
     }
 
     pub fn scan(&self, from: &[u8]) -> Result<RangeIter<'_>> {
         if self.poisoned && self.resource_limits().is_some() {
             return Err(crate::Error::StorePoisoned);
         }
-        BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).range(from)
+        BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf, &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints).range(from)
     }
 
     /// Descending scan of keys strictly below `to`.
@@ -846,7 +856,7 @@ impl Store {
             return Err(crate::Error::StorePoisoned);
         }
         BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf,
-                    &self.fast_path_hits, &self.fast_path_attempts).range_reverse(to)
+                    &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints).range_reverse(to)
     }
 
     /// `SyncMode` is a promise about what reached the medium, so the three modes
@@ -947,6 +957,9 @@ impl Store {
     /// that reads it can live in `kernel/tests/durability.rs` like any other
     /// public-API test.
     pub fn pool_stats(&self) -> crate::pool::PoolStats { self.pool.stats() }
+    /// The per-keyspace append hints, for diagnostics and for the oracle that
+    /// runs one workload with them and once without.
+    pub fn tag_hints(&self) -> &crate::btree::TagHints { &self.tag_hints }
     /// Data-file counters only; the WAL keeps its own.
     pub fn io_stats(&self) -> Option<&crate::io::IoStats> { self.pool.io_stats() }
     pub fn sweep_steps(&self) -> u64 { self.pool.sweep_steps() }
@@ -1172,6 +1185,7 @@ impl Store {
         // has no reason to survive `bulk_load`, so it is cleared rather than
         // left to be caught.
         self.last_leaf.set(None);
+        self.tag_hints.clear();
         self.checkpoint()
     }
 
@@ -1313,7 +1327,7 @@ impl Store {
             if key <= max { return Err(Error::RangeNotEmpty); }
         }
         let tree = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf,
-            &self.fast_path_hits, &self.fast_path_attempts);
+            &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
         let boundary = tree.plan_graft(&min)?;
         drop(tree);
         let last_next = boundary.right_page.unwrap_or(boundary.old_next);
@@ -1325,7 +1339,7 @@ impl Store {
                 why: "prepared range disagrees with its sorted-stream manifest" });
         }
         let tree = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf,
-            &self.fast_path_hits, &self.fast_path_attempts);
+            &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
         let candidate = tree.build_graft_candidate(&boundary, &packed)?;
         drop(tree);
         if let Err(error) = self.pool.flush_all(Barrier::None) {
@@ -1394,13 +1408,14 @@ impl Store {
             if key <= prepared.inserted_max { return Err(Error::RangeNotEmpty); }
         }
         let mut tree = BTree::open(&self.pool, self.tree_id, self.root, &self.last_leaf,
-            &self.fast_path_hits, &self.fast_path_attempts);
+            &self.fast_path_hits, &self.fast_path_attempts).with_tags(&self.tag_hints);
         let boundary = tree.plan_existing_graft(&prepared.inserted_min)?;
         let retired = tree.install_graft(&boundary, prepared.root, &prepared.min)?;
         self.root = tree.root();
         drop(tree);
         for page in retired { self.pool.free_page(page)?; }
         self.last_leaf.set(None);
+        self.tag_hints.clear();
         self.checkpoint()
     }
 
@@ -1447,7 +1462,7 @@ impl Store {
             &self.last_leaf,
             &self.fast_path_hits,
             &self.fast_path_attempts,
-        );
+        ).with_tags(&self.tag_hints);
         let boundary = tree.plan_graft(&min)?;
         drop(tree);
         let last_next = boundary.right_page.unwrap_or(boundary.old_next);
@@ -1487,7 +1502,7 @@ impl Store {
             &self.last_leaf,
             &self.fast_path_hits,
             &self.fast_path_attempts,
-        );
+        ).with_tags(&self.tag_hints);
         let candidate = tree.build_graft_candidate(&boundary, &packed)?;
         drop(tree);
 
@@ -1528,12 +1543,13 @@ impl Store {
             &self.last_leaf,
             &self.fast_path_hits,
             &self.fast_path_attempts,
-        );
+        ).with_tags(&self.tag_hints);
         let retired = tree.install_graft(&boundary, candidate.root, &candidate.min)?;
         self.root = tree.root();
         drop(tree);
         for page in retired { self.pool.free_page(page)?; }
         self.last_leaf.set(None);
+        self.tag_hints.clear();
         let install =
             install_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
         let publish_started = trace.then(std::time::Instant::now);
@@ -1928,6 +1944,23 @@ mod tests {
 
     // -- Task 16: the append hint lives on `Store`, not on a throwaway `BTree` --
 
+    /// Inserts that reached their leaf without a descent, across BOTH append
+    /// caches, and the same for attempts.
+    ///
+    /// K1 added the per-keyspace cache, and the whole-tree hint these tests
+    /// were written for is now one case of it: a leaf that is rightmost of the
+    /// tree is also rightmost of its own tag. Whichever cache owns a key is
+    /// the only one that probes it -- probing both would make two interleaved
+    /// ascending runs knock each other's hint out -- so an ascending run's
+    /// hits move between the two as splits move which leaf is the tree's last.
+    /// The PROPERTY these tests pin is unchanged and is about the sum: an
+    /// unbroken ascending run pays no descent, an out-of-order key disarms,
+    /// and the cache comes back on its own.
+    fn armed(s: &Store) -> (u64, u64) {
+        (s.fast_path_hits.get() + s.tag_hints.hits(),
+         s.fast_path_attempts.get() + s.tag_hints.attempts())
+    }
+
     /// The test Task 15 needed but did not get. Task 15's own fast-path test
     /// (`btree::tests::insert_ascending_uses_fast_path`) holds one long-lived
     /// `BTree` for its whole run and passes -- but that is not what
@@ -1950,7 +1983,7 @@ mod tests {
         let n = 100u64;
         for i in 0..n { s.put(&i.to_be_bytes(), b"v").unwrap(); }
         assert_eq!(
-            s.fast_path_hits.get(), n - 1,
+            armed(&s).0, n - 1,
             "every Store::put but the first must hit the append fast path"
         );
     }
@@ -2055,6 +2088,19 @@ mod tests {
         // the non-redistributing path still has its exact historical count.
         #[cfg(feature = "sqlite-balance")]
         assert!(s.fast_path_attempts.get() <= 117);
+        // And the per-keyspace cache must be bounded the same way. It arms
+        // only when a record lands at the END of its leaf, which a scattered
+        // key does about once per leaf-full, so this is bounded by leaf
+        // capacity and the number of leaves -- not by n. An implementation
+        // that re-armed on every descent would read one extra page per insert
+        // here, 20,000 of them, which is precisely the pre-Task-18 defect in
+        // a new place.
+        assert!(
+            s.tag_hints.attempts() <= 2_000,
+            "a scattered workload attempted the per-keyspace fast path {} times in {n} \
+             inserts; arming belongs to appends, not to every descent",
+            s.tag_hints.attempts()
+        );
         #[cfg(not(feature = "sqlite-balance"))]
         assert_eq!(
             s.fast_path_attempts.get(), 117,
@@ -2080,7 +2126,7 @@ mod tests {
         let n = 100u64;
         for i in 0..n { s.put(&i.to_be_bytes(), b"v").unwrap(); }
         assert_eq!(
-            s.fast_path_hits.get(), n - 1,
+            armed(&s).0, n - 1,
             "an unbroken ascending run must still hit the fast path on every insert but the first"
         );
     }
@@ -2125,31 +2171,40 @@ mod tests {
         let k = 30u64;
 
         for i in 1..=m { s.put(&i.to_be_bytes(), b"v").unwrap(); }
-        assert_eq!(s.fast_path_attempts.get(), m - 1, "one attempt per insert but the first");
+        assert_eq!(armed(&s).1, m - 1, "one attempt per insert but the first");
         assert_eq!(
-            s.fast_path_hits.get(), m - 2,
+            armed(&s).0, m - 2,
             "one miss expected: the insert that fills the leaf and forces the one split \
              this run crosses"
         );
 
         s.put(&0u64.to_be_bytes(), b"v").unwrap();
-        assert_eq!(s.fast_path_attempts.get(), m, "the out-of-order key is one more attempt");
-        assert_eq!(s.fast_path_hits.get(), m - 2, "the out-of-order key must not hit");
+        assert_eq!(armed(&s).1, m, "the out-of-order key is one more attempt");
+        assert_eq!(armed(&s).0, m - 2, "the out-of-order key must not hit");
         assert_eq!(
             s.last_leaf.get(), None,
             "landing on a non-rightmost leaf must leave the hint disarmed, not re-armed \
              to the wrong leaf"
         );
 
+        let (hits, attempts) = armed(&s);
         for i in (m + 1)..(m + 1 + k) { s.put(&i.to_be_bytes(), b"v").unwrap(); }
+        let (hits, attempts) = (armed(&s).0 - hits, armed(&s).1 - attempts);
         assert_eq!(
-            s.fast_path_attempts.get(), m + k - 1,
-            "k - 1 more attempts: the first post-disarm insert pays for a descent instead"
+            attempts, hits,
+            "an unbroken ascending run must hit every probe it makes"
         );
-        assert_eq!(
-            s.fast_path_hits.get(), m + k - 3,
-            "the fast path must come back: every ascending insert after the one that \
-             re-arms it must hit again (m - 2 from the first run, plus k - 1 more here)"
+        // AT MOST ONE descent in the whole run: the fast path must come back
+        // on its own. Exactly which insert pays it depends on how the build
+        // splits. Without `sqlite-balance` the split re-arms the per-keyspace
+        // hint on the page it left the record in, so the run is never
+        // interrupted at all and k of k hit. With it, the leaf fill goes
+        // through `redistribute_neighbors`, which has to forget the fences of
+        // every page in its window, and the insert after it descends once.
+        assert!(
+            k - hits <= 1,
+            "{} of the {k} ascending inserts after the disarm paid a descent",
+            k - hits
         );
     }
 

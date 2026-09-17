@@ -137,6 +137,318 @@ fn patch_child(pool: &BufferPool, page: u32, i: usize, new_child: u32) -> Result
     Ok(())
 }
 
+/// How many leaves the per-keyspace append hint remembers at once.
+///
+/// Bounded and constant (Law 1): the cache never grows with the store, and a
+/// slot it cannot spare costs one ordinary descent, never an answer. Sixteen
+/// is chosen from the shape of the write, not from taste: the multimodel load
+/// writes at most a handful of tags per document (mapping, row, vector,
+/// forward edge, reverse edge, field index) and the reverse-edge tag alone
+/// needs two -- a near-ascending run over people and a second, far lower run
+/// over the hundred organizations -- so the working set is single digits with
+/// room left for the indexes a collection adds.
+pub const TAG_HINTS: usize = 16;
+
+/// The longest fence a hint will hold, inline.
+///
+/// INLINE, not a `Vec`, and that is a measured requirement rather than a
+/// preference: `tests/edge_write_budget.rs` counts the allocations one
+/// relationship is allowed, and two owned fences per armed leaf pushed a
+/// two-put edge from 8 allocations to 10. Fences are cached on the descending
+/// path, which is the path that is supposed to be getting cheaper.
+///
+/// 48 bytes holds every key this cache is for: an edge row is at most 41 bytes
+/// (tag, two entities, context, type), a data row about 12, a mapping its
+/// external key. A separator longer than this simply does not arm a hint --
+/// the run keeps descending, which is what it did before.
+const FENCE_MAX: usize = 48;
+
+/// One fence, inline. `len` is meaningful only when `present`.
+#[derive(Clone, Copy)]
+struct Fence { present: bool, len: u8, bytes: [u8; FENCE_MAX] }
+
+impl Fence {
+    const ABSENT: Fence = Fence { present: false, len: 0, bytes: [0; FENCE_MAX] };
+    /// `None` when the key does not fit, so the caller can decline to arm
+    /// rather than remember a truncated fence -- a truncated upper fence is
+    /// LOWER than the real one, which would only ever refuse keys, but a
+    /// truncated LOWER fence is lower too, which would accept them.
+    fn of(key: &[u8]) -> Option<Fence> {
+        if key.len() > FENCE_MAX { return None; }
+        let mut f = Fence { present: true, len: key.len() as u8, bytes: [0; FENCE_MAX] };
+        f.bytes[..key.len()].copy_from_slice(key);
+        Some(f)
+    }
+    fn get(&self) -> Option<&[u8]> {
+        if self.present { Some(&self.bytes[..self.len as usize]) } else { None }
+    }
+}
+
+/// The fences of one leaf, as a descent found them. `armable` is false when a
+/// separator was too long to hold inline.
+#[derive(Clone, Copy)]
+pub(crate) struct LeafFences { lower: Fence, upper: Fence, armable: bool }
+
+impl LeafFences {
+    const NONE: LeafFences = LeafFences { lower: Fence::ABSENT, upper: Fence::ABSENT, armable: true };
+    fn narrow_lower(&mut self, key: &[u8]) {
+        match Fence::of(key) { Some(f) => self.lower = f, None => self.armable = false }
+    }
+    fn narrow_upper(&mut self, key: &[u8]) {
+        match Fence::of(key) { Some(f) => self.upper = f, None => self.armable = false }
+    }
+    /// The half of this interval below `sep`, which is what the LEFT page of a
+    /// split at `sep` inherits.
+    fn below(mut self, sep: &[u8]) -> Self { self.narrow_upper(sep); self }
+    /// The half at or above `sep` -- the RIGHT page's interval. Both halves
+    /// are SUBintervals of this one, which is why arming either is sound: a
+    /// narrower interval can only refuse keys, never misplace one.
+    fn above(mut self, sep: &[u8]) -> Self { self.narrow_lower(sep); self }
+}
+
+/// One remembered leaf, and the exact interval of keys that may be appended
+/// to it without descending.
+///
+/// The fences are the SEPARATORS the arming descent walked through, not the
+/// leaf's own first and last keys: they are the fences the tree itself would
+/// use to route a key to this leaf.
+#[derive(Clone, Copy)]
+struct TagHint {
+    /// 0 marks a free slot; tree ids start at 1.
+    tree: u16,
+    /// The leading byte of the keys this slot serves -- the keyspace tag (D4).
+    tag: u8,
+    leaf: u32,
+    /// The leaf's `next_leaf` when the hint was armed. A split of THIS leaf
+    /// relinks it to the new right page, so comparing one `u32` tells the
+    /// subdivision of this interval -- the one case a cached fence cannot
+    /// survive -- from the ordinary appends that leave the chain alone. It
+    /// doubles as identity: a recycled page number would have to be relinked
+    /// identically to pass.
+    next: u32,
+    /// Lower fence: the separator below this leaf, absent for the leftmost.
+    /// SELECTION ONLY. Nothing is placed on the strength of it; it exists so
+    /// two ascending runs under the SAME tag (the reverse-edge rows of people
+    /// and of organizations) can hold two slots and each find its own.
+    lower: Fence,
+    /// THE FENCE. Absent means this leaf is the tree's rightmost and has no
+    /// separator above it; otherwise a key may be appended here only if it is
+    /// STRICTLY below this. A key equal to the separator belongs to the next
+    /// leaf: `upper_bound` routes it there, so appending it here would make it
+    /// reachable by a scan and invisible to `get`.
+    upper: Fence,
+    /// When this slot was last used or armed, on the cache's own counter.
+    /// The victim of an eviction is the smallest of these.
+    used: u64,
+}
+
+impl TagHint {
+    const FREE: TagHint = TagHint {
+        tree: 0, tag: 0, leaf: 0, next: 0, lower: Fence::ABSENT, upper: Fence::ABSENT, used: 0,
+    };
+    /// Does this slot claim `key`? Lower fence inclusive, upper exclusive.
+    ///
+    /// `relaxed` makes the upper fence inclusive, which is WRONG -- see
+    /// `fast_path_tag_leaf`. It exists only so the byte-equivalence oracle has
+    /// a negative control: a test that proves two files identical proves
+    /// nothing unless a deliberately different placement makes them differ.
+    /// It is settable under `cfg(test)` alone and is a constant `false`
+    /// everywhere else.
+    fn claims(&self, tree: u16, tag: u8, key: &[u8], relaxed: bool) -> bool {
+        self.tree == tree
+            && self.tag == tag
+            && self.lower.get().is_none_or(|l| key >= l)
+            && self.upper.get().is_none_or(|u| if relaxed { key <= u } else { key < u })
+    }
+}
+
+/// The per-keyspace append hints for one handle.
+///
+/// D9 widened the append SPLIT from "rightmost leaf of the tree" to "rightmost
+/// leaf of the key's own tag". This widens the append HINT the same way, which
+/// is the other half: the split policy was already right for a tag that is not
+/// the tree's last, but every one of those inserts still paid a full
+/// root-to-leaf descent to reach the leaf the policy then acted on.
+///
+/// WHY A CACHED FENCE IS SAFE. `fast_path_leaf`'s `next_leaf() == 0` test is
+/// self-validating -- it reads the truth off the page every time -- and a
+/// cached separator is not. It is exact only while the tree's shape is the one
+/// the arming descent walked, so every way that shape can move is answered:
+///   * a split of the hinted leaf subdivides its interval -- the cached
+///     `next_leaf` changes, so the page-side check catches it, and the split
+///     path forgets the slot as well;
+///   * a neighbour redistribution moves separators BETWEEN siblings without
+///     touching the chain, so it forgets the slots of every page in its
+///     window itself;
+///   * a delete, a graft, a bulk pack, a rollback and a checkpoint can merge
+///     leaves, collapse the root or hand a page back to the allocator, and
+///     each of those clears the whole cache.
+///
+/// SACRIFICE (Law 4): about 1.5 KB of fixed state per handle, and a linear
+/// scan of sixteen slots per insert. Bought: an ascending run that is not the
+/// tree's rightmost -- which is every run but one, in a store where D4 makes
+/// every feature a tag in the same tree -- inserts with one page access
+/// instead of the tree's full height.
+pub struct TagHints {
+    slots: [Cell<TagHint>; TAG_HINTS],
+    /// Monotonic use counter. Evicting the LEAST RECENTLY USED slot, rather
+    /// than the next one round-robin, is what lets a few hot runs share the
+    /// cache with many cold ones: the relationship load writes two ascending
+    /// runs (forward rows, reverse rows over people) beside a HUNDRED cold
+    /// ones (reverse rows, one run per organization), and round-robin handed
+    /// a cold organization the hot forward-edge slot every sixteenth write.
+    clock: Cell<u64>,
+    hits: Cell<u64>,
+    attempts: Cell<u64>,
+    /// Inserts for which no slot claimed the key at all. Separate from a
+    /// refused probe because the two have different costs and different cures:
+    /// a miss here costs nothing but the descent it was going to pay anyway,
+    /// while a refused probe costs one page read on top of it.
+    misses: Cell<u64>,
+    /// Off means the handle descends for every insert, exactly as it did
+    /// before this cache existed. Not a cargo feature: one build has to be
+    /// able to run a workload BOTH ways and compare the files it produced,
+    /// which is the only evidence that a hint changes where a write descends
+    /// from and not where it lands.
+    enabled: Cell<bool>,
+    #[cfg(test)]
+    relaxed_upper: Cell<bool>,
+}
+
+impl Default for TagHints {
+    fn default() -> Self {
+        TagHints {
+            slots: std::array::from_fn(|_| Cell::new(TagHint::FREE)),
+            clock: Cell::new(0),
+            hits: Cell::new(0),
+            attempts: Cell::new(0),
+            misses: Cell::new(0),
+            enabled: Cell::new(true),
+            #[cfg(test)]
+            relaxed_upper: Cell::new(false),
+        }
+    }
+}
+
+impl TagHints {
+    /// The leaf that may hold `key` without a descent, and the `next_leaf` it
+    /// had when armed. Pure memory: the fences are compared here so that a
+    /// miss never costs a page read, and only the winner is opened.
+    fn find(&self, tree: u16, key: &[u8]) -> Option<(u32, u32)> {
+        if !self.enabled.get() { return None; }
+        let &tag = key.first()?;
+        let relaxed = self.relaxed();
+        for slot in &self.slots {
+            let mut h = slot.get();
+            if h.claims(tree, tag, key, relaxed) {
+                h.used = self.tick();
+                slot.set(h);
+                return Some((h.leaf, h.next));
+            }
+        }
+        None
+    }
+
+    fn tick(&self) -> u64 {
+        let now = self.clock.get() + 1;
+        self.clock.set(now);
+        now
+    }
+
+    /// Remember `leaf` for `key`'s tag between the fences a descent found.
+    /// Any slot naming the same leaf, or covering an overlapping interval of
+    /// the same tag, is replaced rather than duplicated: two slots that both
+    /// claim one key would make which leaf gets tried depend on scan order.
+    fn arm(&self, tree: u16, key: &[u8], leaf: u32, next: u32, fences: LeafFences) {
+        if !self.enabled.get() { return; }
+        let Some(&tag) = key.first() else { return };
+        if !fences.armable { return; }
+        let overlaps = |h: &TagHint| {
+            h.tree == tree
+                && (h.leaf == leaf
+                    || (h.tag == tag
+                        && fences.upper.get().is_none_or(|u| h.lower.get().is_none_or(|l| l < u))
+                        && h.upper.get().is_none_or(|u| fences.lower.get().is_none_or(|l| l < u))))
+        };
+        let mut at = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            if overlaps(&slot.get()) {
+                slot.set(TagHint::FREE);
+                if at.is_none() { at = Some(i); }
+            }
+        }
+        let at = at
+            .or_else(|| self.slots.iter().position(|s| s.get().tree == 0))
+            .unwrap_or_else(|| {
+                let mut victim = 0;
+                let mut oldest = u64::MAX;
+                for (i, slot) in self.slots.iter().enumerate() {
+                    let used = slot.get().used;
+                    if used < oldest { oldest = used; victim = i; }
+                }
+                victim
+            });
+        self.slots[at].set(TagHint {
+            tree, tag, leaf, next, lower: fences.lower, upper: fences.upper, used: self.tick(),
+        });
+    }
+
+    /// Forget one slot after its leaf refused the record. PostgreSQL's
+    /// `_bt_search_insert` disarms on any rejection; this disarms only the
+    /// slot that was wrong, because the other fifteen describe other runs.
+    fn forget_leaf(&self, tree: u16, leaf: u32) {
+        for slot in &self.slots {
+            let h = slot.get();
+            if h.tree == tree && h.leaf == leaf { slot.set(TagHint::FREE); }
+        }
+    }
+
+    /// Forget everything. The answer to every structural change this cache
+    /// does not track page by page.
+    pub fn clear(&self) {
+        for slot in &self.slots { slot.set(TagHint::FREE); }
+    }
+
+    /// Forget one tree's slots, for a tree whose root is being freed or whose
+    /// handle slot is being recycled.
+    pub fn clear_tree(&self, tree: u16) {
+        for slot in &self.slots {
+            if slot.get().tree == tree { slot.set(TagHint::FREE); }
+        }
+    }
+
+    /// Diagnostics: inserts that found a slot, and inserts that then landed on
+    /// its leaf. Counted, not reasoned about -- the budget tests read these.
+    pub fn attempts(&self) -> u64 { self.attempts.get() }
+    pub fn hits(&self) -> u64 { self.hits.get() }
+    /// Inserts no slot claimed.
+    pub fn misses(&self) -> u64 { self.misses.get() }
+
+    /// A cache that is off. Every insert descends, as it did before K1.
+    pub fn disabled() -> Self {
+        let t = TagHints::default();
+        t.set_enabled(false);
+        t
+    }
+
+    /// Turn the cache on or off for this handle. Turning it off forgets
+    /// everything it held, so a handle cannot come back to a stale fence.
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.set(on);
+        if !on { self.clear(); }
+    }
+
+    pub fn enabled(&self) -> bool { self.enabled.get() }
+
+    /// Negative control for the byte-equivalence oracle; see `TagHint::claims`.
+    #[cfg(test)]
+    pub(crate) fn set_relaxed_upper_fence(&self, on: bool) { self.relaxed_upper.set(on); }
+    #[cfg(test)]
+    fn relaxed(&self) -> bool { self.relaxed_upper.get() }
+    #[cfg(not(test))]
+    fn relaxed(&self) -> bool { false }
+}
+
 pub struct BTree<'p> {
     pool: &'p BufferPool,
     tree_id: u16,
@@ -167,6 +479,13 @@ pub struct BTree<'p> {
     /// hint stops trying after the first rejection instead of retrying
     /// forever on a workload it can never satisfy.
     fast_path_attempts: &'p Cell<u64>,
+    /// The per-keyspace append hints, borrowed from the owning handle for the
+    /// same reason `last_leaf` is: `Store` and `PageWalStore` build a fresh
+    /// `BTree` for every single operation, so a cache owned here would be
+    /// empty on arrival every time. `None` is a tree opened without them --
+    /// every path that can invalidate a hint clears through this same borrow,
+    /// so a handle either passes it everywhere or nowhere.
+    tags: Option<&'p TagHints>,
 }
 
 /// Immutable plan for replacing exactly one live boundary leaf with a
@@ -966,7 +1285,7 @@ impl<'p> BTree<'p> {
         let mut p = PageMut::init(w.bytes_mut(), PageKind::Leaf, tree_id, no);
         p.finalise(0);
         drop(w);
-        Ok(BTree { pool, tree_id, root: no, last_leaf, fast_path_hits, fast_path_attempts })
+        Ok(BTree { pool, tree_id, root: no, last_leaf, fast_path_hits, fast_path_attempts, tags: None })
     }
 
     pub fn open(
@@ -977,10 +1296,41 @@ impl<'p> BTree<'p> {
         fast_path_hits: &'p Cell<u64>,
         fast_path_attempts: &'p Cell<u64>,
     ) -> Self {
-        BTree { pool, tree_id, root, last_leaf, fast_path_hits, fast_path_attempts }
+        BTree { pool, tree_id, root, last_leaf, fast_path_hits, fast_path_attempts, tags: None }
     }
 
+    /// Attach the owning handle's per-keyspace append hints. A handle must do
+    /// this on EVERY tree it opens, not only the ones it means to speed up:
+    /// the clearing a split or a delete performs happens through this borrow,
+    /// so a mutation that arrives on an unattached `BTree` would leave a hint
+    /// standing over a tree whose shape it no longer describes.
+    pub fn with_tags(mut self, tags: &'p TagHints) -> Self { self.tags = Some(tags); self }
+
     pub fn root(&self) -> u32 { self.root }
+
+    /// Drop every per-keyspace hint. Called wherever a separator can move or a
+    /// page can be recycled.
+    fn forget_tag_hints(&self) { if let Some(t) = self.tags { t.clear(); } }
+
+    /// Re-arm the per-keyspace hint on the page a SPLIT left the record in.
+    ///
+    /// Without this a leaf fill costs the run two descents, not one: the probe
+    /// is refused for want of room and disarms the slot, the descent splits,
+    /// and then the NEXT key of that run finds no slot and descends again.
+    /// Measured on the 200K relationship load, forward-edge rows: 6,383 of
+    /// 99,840 puts found no slot and each paid about 7.4 page accesses --
+    /// 1.774 accesses per put against 1.36 with this.
+    ///
+    /// Sound because a split's halves are SUBintervals of the interval the
+    /// descent walked: the left page keeps everything below the new separator
+    /// and the right page everything at or above it, so naming one of them is
+    /// a narrowing of what was already exact.
+    fn arm_after_split(&self, key: &[u8], fences: Option<LeafFences>, page: u32, next: u32,
+        side: impl FnOnce(LeafFences) -> LeafFences) {
+        if let (Some(tags), Some(f)) = (self.tags, fences) {
+            tags.arm(self.tree_id, key, page, next, side(f));
+        }
+    }
 
     /// Choose the leaf immediately to the left of `min` (or the leftmost leaf
     /// when no predecessor exists), copy its encoded records, and allocate the
@@ -1276,6 +1626,7 @@ impl<'p> BTree<'p> {
         // recycled leaf of the SAME tree could pass all five. The hint has no
         // reason to survive a graft; drop it rather than rely on those checks.
         self.last_leaf.set(None);
+        self.forget_tag_hints();
         Ok(retired)
     }
 
@@ -1383,6 +1734,26 @@ impl<'p> BTree<'p> {
     /// three separate acquisitions the old `descend` + re-`get`/`get_mut`
     /// shape required — each of which made the page evictable in between.
     fn descend_for_write(&mut self, key: &[u8]) -> Result<(PinnedWrite<'p>, Vec<u32>)> {
+        let (w, path, _) = self.descend_for_write_fenced(key)?;
+        Ok((w, path))
+    }
+
+    /// The same descent, also reporting the leaf's FENCES: the separators
+    /// immediately below and above the leaf it lands on.
+    ///
+    /// They are free here. `upper_bound` already chose a child index at every
+    /// interior page; the separator at that index is the first key of the
+    /// subtree to the right, and the one before it is the first key of this
+    /// subtree. The innermost level where the chosen child was not the last
+    /// gives the tightest upper fence; where it WAS the last, the fence is
+    /// inherited from further up, and a path that was last-child the whole way
+    /// down ends at the tree's rightmost leaf, which has no upper fence at all.
+    ///
+    /// This is exactly the interval `upper_bound` will route to this leaf, so a
+    /// key inside it needs no descent to find its page -- which is what
+    /// `TagHints` remembers.
+    fn descend_for_write_fenced(&mut self, key: &[u8])
+        -> Result<(PinnedWrite<'p>, Vec<u32>, LeafFences)> {
         // 2f: this is THE shadowed descent. Every page on the write path is
         // relocated to a fresh number if it belongs to the published epoch,
         // top-down, so by the time any mutation below runs -- the leaf edit,
@@ -1394,6 +1765,7 @@ impl<'p> BTree<'p> {
         }
         let mut path = Vec::new();
         let mut cur = self.root;
+        let mut fences = LeafFences::NONE;
         loop {
             let (is_leaf, frozen_child) = {
                 let r = self.pool.get(cur)?;
@@ -1405,6 +1777,11 @@ impl<'p> BTree<'p> {
                     (true, None)
                 } else {
                     let i = upper_bound(&p, key)?;
+                    // Narrow the fences by this level's separators before
+                    // stepping down. Child `i` holds the keys between slot
+                    // `i - 1` (inclusive) and slot `i` (exclusive).
+                    if i > 0 { fences.narrow_lower(validated_key(p.slot(i - 1))); }
+                    if i < p.nentries() { fences.narrow_upper(validated_key(p.slot(i))); }
                     let child = child_at(self.pool, &p, i)?;
                     if self.pool.is_frozen(child) {
                         (false, Some((i, child)))
@@ -1424,9 +1801,81 @@ impl<'p> BTree<'p> {
             }
             if is_leaf {
                 let w = self.pool.get_mut(cur)?;
-                return Ok((w, path));
+                return Ok((w, path, fences));
             }
         }
+    }
+
+    /// Try to append `rec` to a leaf a `TagHints` slot named, skipping the
+    /// descent. The caller has already established, IN MEMORY, that `key` sits
+    /// inside the fences recorded when the slot was armed; this establishes the
+    /// rest against the page itself.
+    ///
+    /// THE FENCE RULE, in full. `key` may go into this leaf without a descent
+    /// when all of these hold:
+    ///   * ROUTING, established by the caller in memory from the cached
+    ///     fences: lower fence <= `key` < upper fence, the lower inclusive and
+    ///     the upper STRICTLY exclusive. Strictly, because `upper_bound`
+    ///     routes a key equal to a separator to the child on its RIGHT: a
+    ///     record placed here instead stays visible to a scan and disappears
+    ///     from every `get`. An absent upper fence means the tree's rightmost
+    ///     leaf, which has no separator above it.
+    ///   * IDENTITY: a live (unfrozen) leaf page of THIS tree whose
+    ///     `next_leaf` is still the one the hint recorded. The link is what
+    ///     makes a split of this very leaf -- the one event that subdivides
+    ///     the cached interval -- visible without re-descending, and it is
+    ///     also the evidence that the page number was not recycled underneath
+    ///     the hint.
+    ///   * ROOM for the record and its slot, and the leaf is not empty: an
+    ///     empty leaf is no evidence a key belongs to it, the trap
+    ///     `fast_path_leaf`'s check 5 documents.
+    ///   * `key` IS NOT ALREADY THERE. A replacement has to retire the old
+    ///     record's overflow pages and reclaim its payload bytes, which is
+    ///     `insert_into_leaf`'s work, not this one's.
+    ///
+    /// AND NOTHING ABOUT POSITION. The record goes in at `lower_bound`'s slot,
+    /// wherever that is, because the fences alone already say the key belongs
+    /// to this leaf and nowhere else. Two earlier versions of this check asked
+    /// for more and both were wrong to:
+    ///   * "after the leaf's LAST record" never fires on a boundary leaf. One
+    ///     leaf per keyspace boundary holds the end of one tag and the start
+    ///     of the next, and for the tag below, that leaf is exactly where its
+    ///     run ends -- its appends land BEFORE the higher tag's records. The
+    ///     tag that most needs this hint (0x71 forward edges, with 0x72
+    ///     reverse edges above them) armed nothing at all: measured 0 hits in
+    ///     200,000 edge puts, 4.40 page accesses each.
+    ///   * "after the last record OF ITS OWN TAG" fires on a boundary leaf but
+    ///     not on a near-ascending run. The reverse-edge rows go to
+    ///     destinations (i+1) and (i+7): the second is the tag's new maximum,
+    ///     the first is six keys below it, so two puts in three landed before
+    ///     a record of their own tag and refused a leaf they belonged in.
+    ///     Measured: 4.357 page accesses per reverse row, unchanged.
+    ///
+    /// Returns the slot to insert at.
+    fn fast_path_tag_leaf(&self, hint: u32, next: u32, key: &[u8], rec: &[u8])
+        -> Result<Option<(PinnedWrite<'p>, usize)>> {
+        if self.pool.is_frozen(hint) { return Ok(None); }
+        let w = self.pool.get_mut(hint)?;
+        let at = {
+            let p = PageRef::open_resident(w.bytes(), hint)?;
+            validate_records(&p)?;
+            if p.kind() != PageKind::Leaf
+                || p.tree_id() != self.tree_id
+                || p.next_leaf() != next
+                || p.free_space() < rec.len() + 4
+                || p.nentries() == 0
+            {
+                None
+            } else {
+                // `lower_bound` puts `at` at the first record >= `key`, so
+                // inserting there keeps the leaf sorted, and everything before
+                // it is already strictly below.
+                let at = lower_bound(&p, key)?;
+                let fresh = at == p.nentries() || validated_key(p.slot(at)) != key;
+                fresh.then_some(at)
+            }
+        };
+        Ok(at.map(|at| (w, at)))
     }
 
     /// Try to insert directly into the cached last-written leaf, skipping
@@ -1514,6 +1963,38 @@ impl<'p> BTree<'p> {
         // root-to-leaf descent (PostgreSQL's `RelationGetTargetBlock`).
         #[cfg(feature = "write-trace")]
         let descent_started = crate::write_trace::active().then(std::time::Instant::now);
+        // The per-keyspace hint goes first, and when it claims this key the
+        // whole-tree hint is not probed at all. Probing both would be worse
+        // than probing neither: `last_leaf` names the rightmost leaf of the
+        // TREE, so every insert under a lower tag would fail it, disarm it,
+        // and force the next insert under the top tag to re-descend -- two
+        // interleaved ascending runs would knock each other's hint out
+        // forever. Whichever hint owns the key owns the probe.
+        if let Some(tags) = self.tags {
+            let claimed = tags.find(self.tree_id, key);
+            if claimed.is_none() { tags.misses.set(tags.misses.get() + 1); }
+            if let Some((hint, next)) = claimed {
+                tags.attempts.set(tags.attempts.get() + 1);
+                if let Some((w, at)) = self.fast_path_tag_leaf(hint, next, key, &rec)? {
+                    tags.hits.set(tags.hits.get() + 1);
+                    #[cfg(feature = "write-trace")]
+                    if let Some(started) = descent_started {
+                        crate::write_trace::add(crate::write_trace::Field::Descent, started.elapsed());
+                    }
+                    return self.insert_tag_fast(w, at, rec);
+                }
+                // Only THIS slot was wrong (the leaf filled, or a key arrived
+                // out of order inside its own run). The other fifteen describe
+                // other runs and stay; the descent below re-arms this one.
+                tags.forget_leaf(self.tree_id, hint);
+                let (w, path, fence) = self.descend_for_write_fenced(key)?;
+                #[cfg(feature = "write-trace")]
+                if let Some(started) = descent_started {
+                    crate::write_trace::add(crate::write_trace::Field::Descent, started.elapsed());
+                }
+                return self.insert_into_leaf(w, path, key, rec, Some(fence));
+            }
+        }
         if let Some(hint) = self.last_leaf.get() {
             self.fast_path_attempts.set(self.fast_path_attempts.get() + 1);
             if let Some(w) = self.fast_path_leaf(hint, key, &rec)? {
@@ -1541,19 +2022,39 @@ impl<'p> BTree<'p> {
             self.last_leaf.set(None);
         }
 
-        let (w, path) = self.descend_for_write(key)?;
+        let (w, path, fence) = self.descend_for_write_fenced(key)?;
         #[cfg(feature = "write-trace")]
         if let Some(started) = descent_started {
             crate::write_trace::add(crate::write_trace::Field::Descent, started.elapsed());
         }
-        self.insert_into_leaf(w, path, key, rec)
+        self.insert_into_leaf(w, path, key, rec, Some(fence))
     }
 
-    fn insert_into_leaf(&mut self, mut w: PinnedWrite<'p>, path: Vec<u32>, key: &[u8], rec: Vec<u8>) -> Result<()> {
+    /// Place a record in a leaf a tag hint named, at the slot the probe
+    /// found. The slot already describes this leaf, so nothing is re-armed;
+    /// unlike `insert_fast` this must NOT touch `last_leaf`, because the leaf
+    /// is rightmost of its own tag, not of the tree.
+    fn insert_tag_fast(&mut self, mut w: PinnedWrite<'p>, at: usize, rec: Vec<u8>) -> Result<()> {
+        #[cfg(feature = "write-trace")]
+        let trace_started = crate::write_trace::active().then(std::time::Instant::now);
+        let mut p = PageMut::reopen(w.bytes_mut());
+        p.insert_slot(at, &rec)?;
+        #[cfg(feature = "write-trace")]
+        if trace_started.is_some() { crate::write_trace::value_copy(); }
+        p.finalise(0);
+        #[cfg(feature = "write-trace")]
+        if let Some(started) = trace_started {
+            crate::write_trace::add(crate::write_trace::Field::LeafInsert, started.elapsed());
+        }
+        Ok(())
+    }
+
+    fn insert_into_leaf(&mut self, mut w: PinnedWrite<'p>, path: Vec<u32>, key: &[u8], rec: Vec<u8>,
+        fences: Option<LeafFences>) -> Result<()> {
         let leaf = w.page_no();
         #[cfg(feature = "write-trace")]
         let search_started = crate::write_trace::active().then(std::time::Instant::now);
-        let (i, exists, is_rightmost, retired) = {
+        let (i, exists, is_rightmost, is_next, retired) = {
             // Not "just written": this guard came straight from
             // `descend_for_write`'s `get_mut`, which never verifies a CRC.
             // This is the one read that must.
@@ -1571,9 +2072,11 @@ impl<'p> BTree<'p> {
             // mutates the page: neither `remove_slot`/`compact` nor
             // `insert_slot` ever touch this field, so it stays valid for the
             // whole function.
-            let is_rightmost = p.next_leaf() == 0;
+            let is_next = p.next_leaf();
+            let is_rightmost = is_next == 0;
+
             let retired = if exists { replaced_overflow_pages(self.pool, p.slot(i))? } else { Vec::new() };
-            (i, exists, is_rightmost, retired)
+            (i, exists, is_rightmost, is_next, retired)
         };
         #[cfg(feature = "write-trace")]
         if let Some(started) = search_started {
@@ -1637,6 +2140,18 @@ impl<'p> BTree<'p> {
             if is_rightmost {
                 self.last_leaf.set(Some(leaf));
             }
+            // Arm the per-keyspace hint whether or not this leaf is the
+            // tree's rightmost -- that is the whole point -- and wherever in
+            // the leaf the record landed. The hint says "this tag's writes
+            // are currently in this leaf, between these two separators",
+            // which is true of any insert that did not split; the next key of
+            // the tag is probed against the FENCES, so a hint armed from a
+            // mid-leaf insert is not a worse guess than one armed from an
+            // append. It is only not armed when the insert split, because a
+            // split moves the separator this leaf sits under.
+            if let (Some(tags), Some(fences)) = (self.tags, fences) {
+                tags.arm(self.tree_id, key, leaf, is_next, fences);
+            }
             #[cfg(feature = "write-trace")]
             if let Some(started) = insert_started {
                 crate::write_trace::add(crate::write_trace::Field::LeafInsert, started.elapsed());
@@ -1645,7 +2160,7 @@ impl<'p> BTree<'p> {
         }
         #[cfg(feature = "write-trace")]
         let split_started = crate::write_trace::active().then(std::time::Instant::now);
-        let result = self.split_leaf_and_insert(w, path, i, rec);
+        let result = self.split_leaf_and_insert(w, path, i, rec, key, fences);
         #[cfg(feature = "write-trace")]
         if let Some(started) = split_started {
             crate::write_trace::add(crate::write_trace::Field::Split, started.elapsed());
@@ -1659,15 +2174,28 @@ impl<'p> BTree<'p> {
     /// copies every record into its own `Vec<u8>`, `_ref` points at them in
     /// place). Both are compiled under `cfg(test)` so the byte-equivalence
     /// oracle can run one against the other in a single build.
-    fn split_leaf_and_insert(&mut self, w: PinnedWrite<'p>, path: Vec<u32>, at: usize, rec: Vec<u8>) -> Result<()> {
+    fn split_leaf_and_insert(&mut self, w: PinnedWrite<'p>, path: Vec<u32>, at: usize, rec: Vec<u8>,
+        key: &[u8], fences: Option<LeafFences>) -> Result<()> {
+        // ONLY this leaf's fences. A split subdivides the interval of the leaf
+        // it splits and inserts the new separator inside it; every other
+        // leaf's interval is untouched, and a root split merely adds a level
+        // above separators that do not move. Clearing the whole cache here
+        // instead was measured at 1.410 page accesses per forward-edge insert
+        // against 1.037 for this: a 0x40 leaf fills every fifteen documents,
+        // and each of those splits was knocking out the edge run's hint.
+        // (The neighbour redistribution inside DOES move other leaves'
+        // separators, and clears their slots itself.)
+        if let Some(t) = self.tags { t.forget_leaf(self.tree_id, w.page_no()); }
         #[cfg(not(feature = "slotref-split"))]
-        { self.split_leaf_and_insert_vec(w, path, at, rec) }
+        { self.split_leaf_and_insert_vec(w, path, at, rec, key, fences) }
         #[cfg(feature = "slotref-split")]
-        { self.split_leaf_and_insert_ref(w, path, at, rec) }
+        { self.split_leaf_and_insert_ref(w, path, at, rec, key, fences) }
     }
 
     #[cfg(any(test, not(feature = "slotref-split")))]
-    fn split_leaf_and_insert_vec(&mut self, mut w: PinnedWrite<'p>, mut path: Vec<u32>, at: usize, rec: Vec<u8>) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn split_leaf_and_insert_vec(&mut self, mut w: PinnedWrite<'p>, mut path: Vec<u32>, at: usize,
+        rec: Vec<u8>, key: &[u8], fences: Option<LeafFences>) -> Result<()> {
         #[cfg(feature = "write-trace")]
         if crate::write_trace::active() { crate::write_trace::leaf_split(); }
         let leaf = w.page_no();
@@ -1761,6 +2289,10 @@ impl<'p> BTree<'p> {
             let (guard,mut new_path)=self.descend_for_write(&right_sep)?;drop(guard);
             self.insert_separator(&mut new_path,&right_sep,right_no)?;
             if old_next==0 {self.last_leaf.set(Some(right_no));}
+            if at<cuts[1] {self.arm_after_split(key,fences,leaf,mid_no,|f|f.below(&mid_sep));}
+            else if at<cuts[2] {self.arm_after_split(key,fences,mid_no,right_no,
+                |f|f.above(&mid_sep).below(&right_sep));}
+            else {self.arm_after_split(key,fences,right_no,old_next,|f|f.above(&right_sep));}
             return Ok(());
         };
         let right_recs = recs.split_off(sp);
@@ -1793,7 +2325,13 @@ impl<'p> BTree<'p> {
             self.last_leaf.set(Some(right_no));
         }
 
-        self.insert_separator(&mut path, &sep, right_no)
+        self.insert_separator(&mut path, &sep, right_no)?;
+        if at < sp {
+            self.arm_after_split(key, fences, leaf, right_no, |f| f.below(&sep));
+        } else {
+            self.arm_after_split(key, fences, right_no, old_next, |f| f.above(&sep));
+        }
+        Ok(())
     }
 
     /// L2.3-2: the same split, with every record left where it already is.
@@ -1804,7 +2342,9 @@ impl<'p> BTree<'p> {
     /// records are named by `SlotRef`s into one 4 KiB copy of the page image
     /// instead of being copied into one `Vec<u8>` each.
     #[cfg(any(test, feature = "slotref-split"))]
-    fn split_leaf_and_insert_ref(&mut self, w: PinnedWrite<'p>, path: Vec<u32>, at: usize, rec: Vec<u8>) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn split_leaf_and_insert_ref(&mut self, w: PinnedWrite<'p>, path: Vec<u32>, at: usize,
+        rec: Vec<u8>, key: &[u8], fences: Option<LeafFences>) -> Result<()> {
         // Re-entrancy: nothing `split_core` can reach -- `insert_separator`,
         // `descend_for_write`, `shadow_page`, `redistribute_neighbors_ref` --
         // splits a LEAF, so these three borrows cannot nest. That is what lets
@@ -1813,7 +2353,7 @@ impl<'p> BTree<'p> {
             let mut leaf_img = li.borrow_mut();
             let mut slots = sl.borrow_mut();
             let mut sc = ss.borrow_mut();
-            self.split_core(w, path, at, &rec, &mut leaf_img, &mut slots, &mut sc)
+            self.split_core(w, path, at, &rec, key, fences, &mut leaf_img, &mut slots, &mut sc)
         })))
     }
 
@@ -1825,6 +2365,8 @@ impl<'p> BTree<'p> {
         mut path: Vec<u32>,
         at: usize,
         rec: &[u8],
+        key: &[u8],
+        fences: Option<LeafFences>,
         leaf_img: &mut [u8],
         slots: &mut Vec<SlotRef>,
         sc: &mut SplitScratch,
@@ -1910,6 +2452,10 @@ impl<'p> BTree<'p> {
             drop(guard);
             self.insert_separator(&mut new_path, right_sep, right_no)?;
             if old_next == 0 { self.last_leaf.set(Some(right_no)); }
+            if at < cuts[1] { self.arm_after_split(key, fences, leaf, mid_no, |f| f.below(mid_sep)); }
+            else if at < cuts[2] { self.arm_after_split(key, fences, mid_no, right_no,
+                |f| f.above(mid_sep).below(right_sep)); }
+            else { self.arm_after_split(key, fences, right_no, old_next, |f| f.above(right_sep)); }
             return Ok(());
         };
 
@@ -1929,7 +2475,13 @@ impl<'p> BTree<'p> {
         w.bytes_mut().copy_from_slice(&sc.out[0..P]);
         drop(w);
         if old_next == 0 { self.last_leaf.set(Some(right_no)); }
-        self.insert_separator(&mut path, sep, right_no)
+        self.insert_separator(&mut path, sep, right_no)?;
+        if at < sp {
+            self.arm_after_split(key, fences, leaf, right_no, |f| f.below(sep));
+        } else {
+            self.arm_after_split(key, fences, right_no, old_next, |f| f.above(sep));
+        }
+        Ok(())
     }
 
     /// L2.3-2: `redistribute_neighbors` over borrowed records.
@@ -2117,6 +2669,14 @@ impl<'p> BTree<'p> {
             w.bytes_mut().copy_from_slice(&out[me * P..(me + 1) * P]);
             pw.bytes_mut().copy_from_slice(&out[3 * P..4 * P]);
             self.last_leaf.set(None);
+            // Redistribution rewrote the separators BETWEEN these siblings, so
+            // a hint on any of them describes an interval that has moved --
+            // and unlike a split it can leave the sibling chain intact, so the
+            // page-side check would not notice. Only the window is affected;
+            // the rest of the cache is still exact.
+            if let Some(t) = self.tags {
+                for j in 0..groups { t.forget_leaf(self.tree_id, newids[start + j]); }
+            }
             return Ok(true);
         }
         Ok(false)
@@ -2268,7 +2828,10 @@ impl<'p> BTree<'p> {
             let mut pw=self.pool.get_mut(parent)?;
             for (j,guard) in &mut guards{guard.bytes_mut().copy_from_slice(&images[*j]);}
             w.bytes_mut().copy_from_slice(&images[pos-start]);pw.bytes_mut().copy_from_slice(&parent_image);
-            self.last_leaf.set(None);return Ok(true);
+            self.last_leaf.set(None);
+            // See `redistribute_neighbors_ref`: the window's separators moved.
+            if let Some(t)=self.tags {for j in 0..groups {t.forget_leaf(self.tree_id,ids[start+j]);}}
+            return Ok(true);
         }
         Ok(false)
     }
@@ -2359,6 +2922,11 @@ impl<'p> BTree<'p> {
     /// Scratch is bounded by two children plus their parent; published pages
     /// remain protected by the ordinary copy-on-write retirement protocol.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        // A delete can empty a leaf, merge two, collapse the root, or free a
+        // page that a later allocation hands to another leaf of this same
+        // tree. The hinted fences survive none of that, and the page-identity
+        // checks cannot tell a recycled leaf from the one that was armed.
+        self.forget_tag_hints();
         // Read-only presence probe first, so a miss never shadows anything.
         let (leaf, _) = self.descend(key)?;
         let retired = {
@@ -2544,6 +3112,7 @@ impl<'p> BTree<'p> {
     /// O(matching rows) tree operations. Emptied leaves stay allocated
     /// (the documented delete posture).
     pub fn delete_prefix(&mut self, prefix: &[u8]) -> Result<u64> {
+        self.forget_tag_hints();
         let mut removed = 0u64;
         let mut cursor: Vec<u8> = prefix.to_vec();
         // 2n: the last leaf KEPT in the chain. Fully-cleared leaves after it
@@ -4037,6 +4606,10 @@ mod tests {
 
     /// Buffer-pool page accesses per insert for one interleaved load.
     ///
+    /// No `TagHints` attached, deliberately: this is D9's own measurement and
+    /// the number below is its control. K1's per-keyspace HINT is measured
+    /// separately, by `accesses_for_tag`, on a tree that has one.
+    ///
     /// Page accesses are what this repo measures cost in (D14's 1.1 reads per
     /// hop, D13's 4.2 vs 90.3 reads per trace query). They are exact, they are
     /// already instrumented, and they do not move with the machine.
@@ -4137,6 +4710,506 @@ mod tests {
             "{} leaves for a {floor}-leaf payload",
             all.len()
         );
+    }
+
+    // ------------------------------------------------ K1 per-keyspace append HINT
+    //
+    // D9 widened the append SPLIT to a key's own tag. The HINT stayed narrow:
+    // `fast_path_leaf` believes a leaf only when `next_leaf() == 0`, the
+    // rightmost leaf of the whole TREE, so a run behind a higher tag paid a
+    // full root-to-leaf descent for every single row. Measured on the
+    // relationship load (200K rows, 99,840 edges): 4.40 page accesses to write
+    // one forward edge row and 4.35 to write its reverse, 95% of what was left
+    // of the per-edge write once the endpoint and preflight reads were gone.
+    //
+    // `TagHints` remembers the leaf per (tree, tag) together with the FENCES
+    // the arming descent walked, so the same append lands with one access.
+
+    /// A tree that keeps per-keyspace hints, and the state they borrow.
+    /// The `Cell`s must outlive the tree, so the caller owns them.
+    struct Hinted {
+        last_leaf: Cell<Option<u32>>,
+        hits: Cell<u64>,
+        attempts: Cell<u64>,
+        tags: TagHints,
+    }
+    impl Hinted {
+        fn new() -> Self {
+            Hinted { last_leaf: Cell::new(None), hits: Cell::new(0), attempts: Cell::new(0),
+                     tags: TagHints::default() }
+        }
+        fn tree<'p>(&'p self, pool: &'p BufferPool) -> BTree<'p> {
+            BTree::create(pool, 1, &self.last_leaf, &self.hits, &self.attempts)
+                .unwrap()
+                .with_tags(&self.tags)
+        }
+    }
+
+    /// Page accesses per insert for the run under `measured`, with the other
+    /// tags interleaved between them, counted only after `warm` documents so
+    /// the tree has its final height and the hint has been armed at least once.
+    fn accesses_for_tag(tags: &[u8], measured: u8, docs: u64, warm: u64) -> f64 {
+        let (pool, _d) = scratch_pool(512);
+        let h = Hinted::new();
+        let mut t = h.tree(&pool);
+        let at = |p: &BufferPool| { let s = p.stats(); s.hits + s.misses };
+        let (mut spent, mut counted) = (0u64, 0u64);
+        for i in 0..docs {
+            for tag in tags {
+                let before = at(&pool);
+                t.insert(&tagged(*tag, i), &tagged_value(*tag, i)).unwrap();
+                if *tag == measured && i >= warm {
+                    spent += at(&pool) - before;
+                    counted += 1;
+                }
+            }
+        }
+        spent as f64 / counted.max(1) as f64
+    }
+
+    /// THE BUDGET. An ascending run under a tag that is NOT the tree's last
+    /// must reach its leaf without descending.
+    ///
+    /// 0x71 is the forward-edge tag; 0x40 (rows) and 0x60 (vectors) are written
+    /// between its keys exactly as the multimodel load writes them, and 0x71
+    /// sorts after both, so nothing about it is the tree's rightmost leaf.
+    ///
+    /// One page access is the floor: the leaf itself has to be read. Splits
+    /// happen about once per leaf-full of rows and cost a descent each, so the
+    /// bound is a little above the floor rather than at it.
+    #[test]
+    fn an_ascending_run_behind_other_keyspaces_reaches_its_leaf_without_descending() {
+        const DOCS: u64 = 1_000;
+        let edges = accesses_for_tag(&[0x40, 0x60, 0x71], 0x71, DOCS, DOCS / 5);
+        eprintln!("tag 0x71 behind 0x40 and 0x60: {edges:.3} page accesses per insert");
+        assert!(
+            edges <= 1.20,
+            "an ascending run behind two other keyspaces costs {edges:.3} page accesses per \
+             insert; before the per-keyspace hint it was the tree's full height"
+        );
+    }
+
+    /// THE PLACEMENT PROPERTY. A key that does NOT fall inside the hinted
+    /// leaf's fences must still land where a descent would put it.
+    ///
+    /// The tree is loaded with three ascending runs so every tag holds a live
+    /// hint, then written scattered over the SAME tags -- every one of those
+    /// keys finds a hint armed and almost none of them belongs to its leaf. A
+    /// `BTreeMap` is the oracle: the full scan must equal it exactly, and every
+    /// key must also be reachable by `get`, which is the half a wrong fence
+    /// breaks first. A record appended past its separator stays visible to the
+    /// scan and disappears from the descent.
+    #[test]
+    fn a_key_outside_the_hinted_leaf_still_lands_where_a_descent_would_put_it() {
+        const ASCENDING: u64 = 1_500;
+        const SCATTERED: u64 = 1_500;
+        let (pool, _d) = scratch_pool(16);
+        let h = Hinted::new();
+        let mut t = h.tree(&pool);
+        let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+        let value = |tag: u8, i: u64| {
+            let mut v = tagged_value(tag, i);
+            v.extend_from_slice(format!("|{tag:#04x}/{i}").as_bytes());
+            v
+        };
+        let tags = [0x20u8, 0x40, 0x60, 0x71, 0x72];
+        for i in 0..ASCENDING {
+            for tag in tags {
+                let (k, v) = (tagged(tag, i), value(tag, i));
+                t.insert(&k, &v).unwrap();
+                model.insert(k, v);
+            }
+        }
+        // Scattered, but INSIDE the range the ascending runs already cover, so
+        // the hinted leaf is a plausible-looking neighbour rather than an
+        // obvious miss -- and every third key is deliberately aimed just above
+        // whatever leaf the hint currently names.
+        for j in 0..SCATTERED {
+            let i = j.wrapping_mul(0x9E37_79B9_7F4A_7C15) % ASCENDING;
+            for tag in tags {
+                let (k, v) = (tagged(tag, i), value(tag, i + 1));
+                t.insert(&k, &v).unwrap();
+                model.insert(k, v);
+            }
+        }
+        let seen: Vec<(Vec<u8>, Vec<u8>)> = t.range(&[]).unwrap().map(|r| r.unwrap()).collect();
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+        assert_eq!(seen.len(), expect.len(), "the scan returned a different number of keys");
+        assert_eq!(seen, expect, "the scan is not every key exactly once in byte order");
+        for (k, v) in &expect {
+            assert_eq!(
+                t.get(k).unwrap().as_deref(), Some(&v[..]),
+                "a key the scan can see is not reachable by a descent: {k:?}"
+            );
+        }
+    }
+
+    /// THE SHAPE PROPERTY. Splitting under the hint must leave an ordinary
+    /// tree: every leaf reachable through its parents, every leaf non-empty,
+    /// keys strictly ascending across the whole walk, and the sibling chain
+    /// agreeing with the parent walk. `insert_tag_fast` never splits -- it is
+    /// the fallback descent that does -- so this is the guard that the hint
+    /// does not quietly push records onto a page the split policy then
+    /// mis-cuts.
+    #[test]
+    fn splitting_under_the_per_keyspace_hint_leaves_an_ordinary_tree() {
+        const DOCS: u64 = 4_000;
+        let (pool, _d) = scratch_pool(64);
+        let h = Hinted::new();
+        let mut t = h.tree(&pool);
+        for i in 0..DOCS {
+            for tag in [0x40u8, 0x60, 0x71] {
+                t.insert(&tagged(tag, i), &tagged_value(tag, i)).unwrap();
+            }
+        }
+        let mut all = Vec::new();
+        leaves(&pool, t.root, &mut all);
+        assert!(all.len() > 8, "the fixture did not split enough to test anything");
+
+        // The parent walk and the sibling chain must describe the same tree.
+        let scanned: Vec<Vec<u8>> = t.range(&[]).unwrap().map(|r| r.unwrap().0).collect();
+        assert_eq!(scanned.len() as u64, DOCS * 3, "the walk lost or duplicated keys");
+        for w in scanned.windows(2) {
+            assert!(w[0] < w[1], "the walk is not strictly ascending at {:?}", w[0]);
+        }
+        for k in &scanned {
+            assert!(t.get(k).unwrap().is_some(), "a walked key is not reachable by a descent");
+        }
+    }
+
+    /// Every leaf of the tree, through its parents, as
+    /// (page, first key, last key, `next_leaf`, free space).
+    fn leaf_details(pool: &BufferPool, page_no: u32,
+        out: &mut Vec<(u32, Vec<u8>, Vec<u8>, u32, usize)>) {
+        let kids = {
+            let r = pool.get(page_no).unwrap();
+            let p = PageRef::open_resident(&r, page_no).unwrap();
+            match p.kind() {
+                PageKind::Leaf => {
+                    if p.nentries() > 0 {
+                        out.push((page_no,
+                            validated_key(p.slot(0)).to_vec(),
+                            validated_key(p.slot(p.nentries() - 1)).to_vec(),
+                            p.next_leaf(), p.free_space()));
+                    }
+                    return;
+                }
+                PageKind::Interior => {
+                    let mut kids = vec![p.child0()];
+                    kids.extend((0..p.nentries()).map(|i| validated_child(p.slot(i))));
+                    kids
+                }
+                other => panic!("unexpected page kind in the tree: {other:?}"),
+            }
+        };
+        for k in kids { leaf_details(pool, k, out); }
+    }
+
+    /// THE FENCE IS EXCLUSIVE AT THE TOP. A key EQUAL to the separator above
+    /// the hinted leaf belongs to the NEXT leaf, and the hint must refuse it.
+    ///
+    /// This is the one boundary a cached fence can get wrong in the silent
+    /// direction. `upper_bound` routes a key equal to a separator to the child
+    /// on its RIGHT, so a separator key is always the first key of the leaf to
+    /// the right -- it already exists there. Accepting it on the hinted leaf
+    /// appends a SECOND copy: the scan returns the key twice, and `get` keeps
+    /// answering with the old value forever. Relaxing the comparison in
+    /// `TagHints::find` from `key < upper` to `key <= upper` fails this test
+    /// with "the key is in the tree twice".
+    ///
+    /// The hint is forced onto a chosen leaf the way the stale-hint tests above
+    /// force `last_leaf`: a real workload reaches this state rarely, and a test
+    /// that waits for it to happen by chance is testing nothing.
+    #[test]
+    fn a_key_equal_to_the_fence_belongs_to_the_next_leaf() {
+        const DOCS: u64 = 3_000;
+        let (pool, _d) = scratch_pool(64);
+        let h = Hinted::new();
+        let mut t = h.tree(&pool);
+        // The 0x71 run is written SCATTERED here on purpose: an append split
+        // closes each left page nearly full, and this test needs a leaf with
+        // room in it. The hint is armed by hand below, so the write order of
+        // the fixture decides nothing else.
+        for i in 0..DOCS {
+            let scattered = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % DOCS;
+            t.insert(&tagged(0x40, i), &tagged_value(0x40, i)).unwrap();
+            t.insert(&tagged(0x71, scattered), &tagged_value(0x71, scattered)).unwrap();
+        }
+        let mut all = Vec::new();
+        leaf_details(&pool, t.root, &mut all);
+
+        // A 0x71 leaf with room, whose right neighbour is also a 0x71 leaf.
+        let by_page: std::collections::HashMap<u32, usize> =
+            all.iter().enumerate().map(|(i, l)| (l.0, i)).collect();
+        let chosen = all.iter().find(|l| {
+            l.1[0] == 0x71 && l.2[0] == 0x71 && l.4 >= 64
+                && by_page.get(&l.3).is_some_and(|&j| all[j].1[0] == 0x71)
+        }).expect("the fixture has no 0x71 leaf with room beside another");
+        let right = &all[by_page[&chosen.3]];
+        let separator = right.1.clone();
+        assert!(separator > chosen.2, "the fixture's leaves are not in order");
+
+        // Arm the hint exactly as the arming descent would have, then hand it
+        // the separator key.
+        let mut fences = LeafFences::NONE;
+        fences.narrow_lower(&chosen.1);
+        fences.narrow_upper(&separator);
+        assert!(fences.armable, "the fixture's separators must fit the inline fence");
+        h.tags.arm(1, &chosen.2, chosen.0, chosen.3, fences);
+        t.insert(&separator, b"replaced").unwrap();
+
+        let seen: Vec<Vec<u8>> = t.range(&[]).unwrap().map(|r| r.unwrap().0).collect();
+        assert_eq!(
+            seen.iter().filter(|k| **k == separator).count(), 1,
+            "the key is in the tree twice: the hint appended it below its own fence"
+        );
+        for w in seen.windows(2) {
+            assert!(w[0] < w[1], "the scan is not strictly ascending at {:?}", w[0]);
+        }
+        assert_eq!(
+            t.get(&separator).unwrap().as_deref(), Some(&b"replaced"[..]),
+            "the descent still answers with the old value, so the new record went elsewhere"
+        );
+    }
+
+    /// THE INVALIDATION PROPERTY. A delete can merge leaves, collapse the root
+    /// and hand a freed page straight back to the allocator, so the fences a
+    /// hint cached describe a shape that no longer exists. Writing the same
+    /// ascending run again afterwards must place every key correctly.
+    #[test]
+    fn a_delete_forgets_the_fences_it_invalidated() {
+        const DOCS: u64 = 1_200;
+        let (pool, _d) = scratch_pool(16);
+        let h = Hinted::new();
+        let mut t = h.tree(&pool);
+        let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+        for i in 0..DOCS {
+            for tag in [0x40u8, 0x71] {
+                let (k, v) = (tagged(tag, i), tagged_value(tag, i));
+                t.insert(&k, &v).unwrap();
+                model.insert(k, v);
+            }
+        }
+        // Empty most of the forward-edge run, which is where the hint sits.
+        for i in 0..DOCS * 3 / 4 {
+            let k = tagged(0x71, i);
+            assert!(t.delete(&k).unwrap());
+            model.remove(&k);
+        }
+        // And write it straight back, ascending, through whatever the delete
+        // left behind.
+        for i in 0..DOCS * 3 / 4 {
+            let (k, v) = (tagged(0x71, i), tagged_value(0x71, i + 7));
+            t.insert(&k, &v).unwrap();
+            model.insert(k, v);
+        }
+        let seen: Vec<(Vec<u8>, Vec<u8>)> = t.range(&[]).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(seen, model.into_iter().collect::<Vec<_>>(),
+            "the tree written after a delete is not the tree the model describes");
+        for (k, v) in &seen {
+            assert_eq!(t.get(k).unwrap().as_deref(), Some(&v[..]),
+                "a key is in the scan but not reachable by a descent: {k:?}");
+        }
+    }
+
+    // ------------------------------- K1 byte-equivalence: placement is unchanged
+    //
+    // Phase 1's rule for a speed change in the split/append path is that the
+    // page IMAGES do not move (`split_byte_equivalence` below). The same rule
+    // applies here, and more sharply: this cache decides which leaf a write
+    // reaches WITHOUT descending, so if it ever reaches a different one than
+    // the descent would, the file says so.
+    //
+    // The claim under test: the per-keyspace hint changes where a write
+    // descends FROM, never where it lands. Run one deterministic multimodel
+    // workload twice into two stores -- once with the cache, once with it
+    // switched off -- and the two data files must be equal byte for byte,
+    // every page image, after the final checkpoint.
+
+    use crate::store::{Config, Store, SyncMode};
+    use crate::io::IoMode;
+
+    fn cfg() -> Config {
+        Config { budget_bytes: 32 << 20, io: IoMode::Buffered, sync: SyncMode::Off }
+    }
+
+    /// `[tag][collection][sequence]` -- a data row, `src/collections.rs`'s shape.
+    fn row_key(i: u64) -> Vec<u8> {
+        let mut k = vec![0x40u8, 1];
+        k.extend_from_slice(&i.to_be_bytes());
+        k
+    }
+    /// `[tag][collection][sequence][field]` -- an embedding row.
+    fn vec_key(i: u64) -> Vec<u8> {
+        let mut k = vec![0x60u8, 1];
+        k.extend_from_slice(&i.to_be_bytes());
+        k.push(0);
+        k
+    }
+    /// `[tag][first collection][first seq][ctx][type][last collection][last seq]`
+    /// -- `src/graph_collections.rs`'s edge key, narrowed to one byte per
+    /// small identity. 0x71 is the forward row (first = source), 0x72 the
+    /// reverse (first = destination). Organizations live in collection 2, so
+    /// their rows sort ABOVE every person's, exactly as in the bench.
+    fn edge_key(tag: u8, a: (u8, u64), ty: u8, b: (u8, u64)) -> Vec<u8> {
+        let mut k = vec![tag, a.0];
+        k.extend_from_slice(&a.1.to_be_bytes());
+        k.extend_from_slice(&[0, ty, b.0]);
+        k.extend_from_slice(&b.1.to_be_bytes());
+        k
+    }
+
+    /// THE WORKLOAD. Deterministic, no randomness, no timing: per document it
+    /// writes a row, an embedding, three forward-edge rows and their three
+    /// reverse rows, and every so often deletes one of each. The destinations
+    /// reproduce the relationship load's shape -- `(i+1)` and `(i+7)` make two
+    /// near-ascending reverse runs six keys apart, and `i % 100` makes a
+    /// hundred hot organizations whose reverse rows are a hundred separate
+    /// cold runs. 5,000 documents is 40,000 puts, far past the volume at which
+    /// every tag's run splits and redistributes across the keyspace boundary
+    /// it shares with the tag above it.
+    fn multimodel_workload(s: &mut Store, docs: u64) {
+        for i in 0..docs {
+            s.put(&row_key(i), &vec![b'd'; 200 + (i % 97) as usize * 2]).unwrap();
+            s.put(&vec_key(i), &vec![b'f'; 32]).unwrap();
+            let people = [(1u8, (i + 1) % docs), (1, (i + 7) % docs)];
+            for (n, dst) in people.iter().enumerate() {
+                s.put(&edge_key(0x71, (1, i), 1, *dst), &[b'e', n as u8]).unwrap();
+                s.put(&edge_key(0x72, *dst, 1, (1, i)), &[]).unwrap();
+            }
+            let org = (2u8, i % 100 + 1);
+            s.put(&edge_key(0x71, (1, i), 2, org), b"m").unwrap();
+            s.put(&edge_key(0x72, org, 2, (1, i)), &[]).unwrap();
+
+            // Interleaved deletes: a merge, a freed page and a collapsed root
+            // are what a cached fence cannot survive, so the oracle has to
+            // contain them or it is not testing the invalidation at all.
+            if i % 37 == 36 && i > 40 {
+                s.delete(&row_key(i - 20)).unwrap();
+                s.delete(&edge_key(0x71, (1, i - 13), 1, (1, (i - 12) % docs))).unwrap();
+                s.delete(&edge_key(0x72, (1, (i - 12) % docs), 1, (1, i - 13))).unwrap();
+            }
+            if i % 256 == 255 { s.commit().unwrap(); }
+            if i % 1024 == 1023 { s.checkpoint().unwrap(); }
+        }
+        s.commit().unwrap();
+        s.checkpoint().unwrap();
+
+        // THE UPDATE SWEEP, and it is here for the negative control. A key
+        // EQUAL to a hinted leaf's upper fence is the one placement error a
+        // cached fence can make silently, and it only ever arrives as a
+        // REWRITE: the separator key already lives in the leaf to the right.
+        // Rewriting every key in ascending order walks the cache onto each
+        // leaf in turn and then hands it exactly that leaf's separator, at
+        // every boundary in the tree. The values are shorter than the
+        // originals so the leaf has the room a wrong placement would need --
+        // a control that cannot fit its record proves nothing either.
+        for i in 0..docs {
+            s.put(&row_key(i), &vec![b'u'; 48]).unwrap();
+            s.put(&vec_key(i), b"u").unwrap();
+            s.put(&edge_key(0x71, (1, i), 1, (1, (i + 1) % docs)), b"U").unwrap();
+            s.put(&edge_key(0x72, (1, (i + 1) % docs), 1, (1, i)), &[]).unwrap();
+            if i % 256 == 255 { s.commit().unwrap(); }
+        }
+        s.commit().unwrap();
+        s.checkpoint().unwrap();
+    }
+
+    /// Run the workload into a fresh store and return its data file, page by
+    /// page, plus the rows a full scan sees.
+    fn workload_file(docs: u64, hints: bool, relaxed: bool)
+        -> (Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>, u64) {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::create(&d.path().join("s"), cfg()).unwrap();
+        s.tag_hints().set_enabled(hints);
+        s.tag_hints().set_relaxed_upper_fence(relaxed);
+        multimodel_workload(&mut s, docs);
+        let mut rows = Vec::new();
+        s.scan(&[]).unwrap()
+            .for_each_ref(|k, v| { rows.push((k.to_vec(), v.to_vec())); true })
+            .unwrap();
+        let served = s.tag_hints().hits();
+        drop(s);
+        let bytes = std::fs::read(d.path().join("s").join("data")).unwrap();
+        (bytes.chunks(PAGE_SIZE).map(<[u8]>::to_vec).collect(), rows, served)
+    }
+
+    /// Report the first page and SLOT at which two files disagree, in the
+    /// terms a placement bug is stated in: which leaf, which slot, which key,
+    /// and how the two sides differ there.
+    fn first_difference(a: &[Vec<u8>], b: &[Vec<u8>]) -> Option<String> {
+        if a.len() != b.len() {
+            return Some(format!("page COUNT differs: {} pages with the hint, {} without",
+                a.len(), b.len()));
+        }
+        let records = |page: &[u8], no: u32| -> std::result::Result<Vec<Vec<u8>>, String> {
+            let p = PageRef::open(page, no).map_err(|e| format!("unreadable: {e:?}"))?;
+            Ok((0..p.nentries()).map(|i| p.slot(i).to_vec()).collect())
+        };
+        for (no, (pa, pb)) in a.iter().zip(b).enumerate() {
+            if pa == pb { continue; }
+            let no = no as u32;
+            let (ra, rb) = match (records(pa, no), records(pb, no)) {
+                (Ok(x), Ok(y)) => (x, y),
+                (x, y) => return Some(format!("page {no}: {x:?} vs {y:?}")),
+            };
+            let header = pa[..crate::page::HEADER_LEN] != pb[..crate::page::HEADER_LEN];
+            if ra == rb {
+                return Some(format!(
+                    "page {no} holds the same {} records but differs in its bytes \
+                     (header differs: {header}) -- a difference that is NOT placement",
+                    ra.len()));
+            }
+            let slot = (0..ra.len().max(rb.len()))
+                .find(|&i| ra.get(i) != rb.get(i)).unwrap_or(0);
+            let show = |r: Option<&Vec<u8>>| match r {
+                Some(rec) => format!("key {:02x?} ({} bytes)", validated_key(rec), rec.len()),
+                None => "no record".into(),
+            };
+            return Some(format!(
+                "page {no} (a {:?}) first differs at SLOT {slot}: {} records with the hint, \
+                 {} without\n  with the hint: {}\n  without:      {}",
+                PageRef::open(pa, no).map(|p| p.kind()).unwrap(),
+                ra.len(), rb.len(), show(ra.get(slot)), show(rb.get(slot))));
+        }
+        None
+    }
+
+    /// THE PROOF. Two stores, one workload, one difference: whether the
+    /// per-keyspace cache was on. A hinted placement has to land in the same
+    /// leaf AND the same slot a descent would have chosen, and a split that
+    /// re-arms the cache afterwards must not change which half a record went
+    /// to -- either would move a byte, and every byte is compared.
+    #[test]
+    fn the_hint_changes_where_a_write_descends_from_not_where_it_lands() {
+        const DOCS: u64 = 5_000;   // 40,000 puts
+        let (hinted, hinted_rows, served) = workload_file(DOCS, true, false);
+        let (plain, plain_rows, none) = workload_file(DOCS, false, false);
+        eprintln!("{} pages with the hint and {} without; the cache served {served} writes \
+                   with it on and {none} with it off", hinted.len(), plain.len());
+        // Neither arm may be vacuous: the control must really have the cache
+        // off, and the candidate must really be using it.
+        assert_eq!(none, 0, "the switch did not turn the cache off");
+        assert!(served > DOCS * 4, "the cache served only {served} of this workload's writes");
+        assert_eq!(hinted_rows, plain_rows, "the two stores do not hold the same rows");
+        if let Some(why) = first_difference(&hinted, &plain) {
+            panic!("the per-keyspace hint moved a record:\n{why}");
+        }
+
+        // THE NEGATIVE CONTROL. Without this the assertion above could pass
+        // because the workload never armed a hint at all. Relaxing the upper
+        // fence from `key < separator` to `key <= separator` is the smallest
+        // real placement error this cache can make: the separator key already
+        // lives in the NEXT leaf, so the relaxed rule appends a second copy
+        // here. It must make the files differ.
+        let (relaxed, relaxed_rows, _) = workload_file(DOCS, true, true);
+        let moved = first_difference(&hinted, &relaxed);
+        assert!(
+            moved.is_some() || relaxed_rows != hinted_rows,
+            "relaxing the upper fence changed nothing, so this workload never \
+             exercised the fence and the comparison above is vacuous"
+        );
+        eprintln!("negative control: {}", moved.unwrap_or_else(|| "rows differ".into()));
     }
 
     /// The ordering oracle that rejected pair-packing and scattered-packing
@@ -4272,8 +5345,8 @@ mod split_byte_equivalence {
             lower_bound(&p, k).unwrap()
         };
         match which {
-            Impl::Vec => t.split_leaf_and_insert_vec(w, path, at, rec).unwrap(),
-            Impl::Ref => t.split_leaf_and_insert_ref(w, path, at, rec).unwrap(),
+            Impl::Vec => t.split_leaf_and_insert_vec(w, path, at, rec, k, None).unwrap(),
+            Impl::Ref => t.split_leaf_and_insert_ref(w, path, at, rec, k, None).unwrap(),
         }
 
         let root = t.root();
@@ -4522,8 +5595,8 @@ mod split_allocations {
                 lower_bound(&p, k).unwrap()
             };
             let run = |t: &mut BTree<'p>| {
-                if slotref { t.split_leaf_and_insert_ref(w, path, at, rec) }
-                else { t.split_leaf_and_insert_vec(w, path, at, rec) }.unwrap()
+                if slotref { t.split_leaf_and_insert_ref(w, path, at, rec, k, None) }
+                else { t.split_leaf_and_insert_vec(w, path, at, rec, k, None) }.unwrap()
             };
             if measure {
                 let (_, count, bytes) = measured(|| run(t));
