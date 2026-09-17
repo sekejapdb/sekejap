@@ -657,3 +657,78 @@ documented behaviour, not a defect.
 
 Native Linux qualification is pending, as part of the final Phase 2 job
 described above.
+
+## Graph traversal read-path fix — 2026-09-17
+
+A new bench group measures graph traversal directly: 50,000 people, 150,000
+edges, 100 spread seeds, warm cache, on the Mac; each seed's answer is
+asserted against the generator's own oracle, and SQLite's recursive-CTE plan
+is pinned to its indexes with the plan itself asserted. Ratio below is E4
+wall time ÷ SQLite wall time (lower favors E4); bench is the same
+`phase2_multimodel_bench.rs` family as the CRUD table in
+`PHASE2_INDEX_BUILD_RESULTS.md`.
+
+Before the fix: outgoing 1-hop 3.10 (11.9 vs 3.8 microseconds, median),
+incoming 1-hop 1.42, 3-hop BFS 1.74 (65 vs 38 microseconds), and a
+members-of-organization fan-in over 500 edges 13.2 (488 vs 38 microseconds).
+
+Cause: for every edge visited, the read path did a point lookup into that
+edge's opposite-direction copy, then decoded its JSON properties and
+discarded the result. Both directions of an edge are written in the same
+transaction, so a committed snapshot can never hold half a pair; the
+explicit read-only verifier already reports both damage cases (a missing
+primary or a missing reverse row) independently of traversal. The lookup
+was therefore redundant work, not a correctness need — see the corrected
+sentence in `PHASE2_GRAPH_FORMAT.md`.
+
+After the fix (staged, uncommitted): members-of-organization fan-in 2.59
+(98 microseconds), outgoing 1-hop 1.57 (7.0 microseconds), 3-hop BFS 0.79
+(31 microseconds — E4 faster than SQLite here), incoming 1-hop 1.72 (6.6
+microseconds; this is a 2-row read and the change is within noise of the
+before number). Page accesses: a BFS touching 300 incoming edges fell from
+924 to 24; a neighbours call over 200 outgoing edges fell from 1,226 to 26.
+
+A further pass — an allocation-free range walk, tracked as item H2 — is in
+progress. Until it lands, treat the members-of-organization fan-in case as
+still above the 2.0x acceptance gate.
+
+Separately: the pre-existing single-shot combined-query timings
+(`scalar_active_age`, `members_active_spatial_vector`, `text_active_vector`,
+`combined_graph_active_bbox_vector`) are each one cold execution, including
+query planning and first page touches — SQLite recorded 11,995 cache misses
+during that one stage. They measure first-execution latency only and must
+not be used to rank the two engines against each other.
+
+## Linux final qualification status — 2026-09-17
+
+server job `e4-phase2-final-20260917`. Attempt 1, on `dbdbd71`, failed only on
+packaging: the macOS `tar` shipped AppleDouble `._` files alongside the
+frozen fixtures; the archive step now strips them before packaging. Attempt
+2, on `dbdbd71`: stage 1 (default build, full workspace) PASS; stage 2
+(retained build, full workspace) PASS; stage 4 (lifecycle replay) failed on
+a harness mismatch only — the fixture binaries hardcoded feature mask 63
+against the engine's `0xff`, and the tarball builds carried no engine
+revision. Attempt 3, on `f538d4d`, is running now.
+
+Attempt 3 result: in progress — record the outcome here once it completes.
+
+## Known limits, stated rather than fixed
+
+Beyond the structural limits already listed under "Format and limits"
+above: a held reader lets the WAL grow to its fixed allowance, after which
+writes are refused with committed state verified (matching SQLite's
+behavior under a long-held reader) — snapshot lifetime is a product limit,
+not a defect. The text head-to-segment fold is not implemented (design in
+`PHASE2_TEXT_DESIGN.md`). Packed text entries stay tombstoned until an
+explicit rebuild. Quantized-vector recall has only been shown on synthetic
+data. Each index created consumes tree-id space from a `u16` range.
+
+## Remaining before acceptance, 2026-09-17
+
+- The Linux qualification attempt 3 result (above).
+- Item H2, the allocation-free range walk for graph traversal.
+- One larger matched run, 1,000,000 rows, on Linux, for the converged
+  CRUD/build table (`PHASE2_INDEX_BUILD_RESULTS.md`).
+- The two-arm lean bench (a port of e3's `bench/three_ways`), in progress,
+  as the post-change smoke check.
+- The owner's commit.

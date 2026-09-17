@@ -40,9 +40,22 @@ the requested workload completed. Snapshot lifetime remains a product limit.
 R4 graph timings and its redundant SQLite edge schema are superseded by R7.
 No-reader R7 medians are 13.916 seconds E4 atomic / 6.526 seconds SQLite for
 three complete CRUD rounds, and 8.664 / 6.723 MiB after-close logical size.
-The selected graph-filtered and spatial queries favor E4; text late build and
-text-plus-vector remain slower. Larger-size evidence and an explicit product
-tradeoff assessment remain necessary; correctness alone is not a speed win.
+This R7 number is at 10K rows and is kept for the record, not deleted; it is
+superseded for tracking progress by the converged 50K-row CRUD/build table
+dated 2026-09-17 in `PHASE2_INDEX_BUILD_RESULTS.md`, which is the current
+reference. The selected graph-filtered and spatial queries favor E4; text
+late build and text-plus-vector remain slower. Larger-size evidence and an
+explicit product tradeoff assessment remain necessary; correctness alone is
+not a speed win.
+
+A dedicated graph-traversal bench (50K people / 150K edges, Mac, 2026-09-17)
+found the traversal read path doing one unnecessary point lookup and a
+discarded JSON decode per edge, against the opposite-direction copy; a
+staged, uncommitted fix removes it. Full before/after numbers, cause, and
+the remaining allocation-free range-walk pass (item H2) are recorded in
+`PHASE2_STATE.md` under "Graph traversal read-path fix". The
+members-of-organization fan-in case stays above the 2.0x E4-versus-SQLite
+wall-time acceptance gate until H2 lands.
 
 Sampled no-reader median logical peaks are 13.308 / 12.231 MiB. The largest
 allocated peak across completed no-reader/batch runs is 24.566 MiB E4 versus
@@ -55,6 +68,26 @@ Linux run at the fixed WAL allowance, during late index build. A
 grouped-commit build driver closes that refusal class at 50K and 200K rows
 on the Mac; see [late-build results](PHASE2_INDEX_BUILD_RESULTS.md). Linux
 confirmation at 1M has not run yet.
+
+Linux final qualification (server job `e4-phase2-final-20260917`) is now on
+its third attempt. Attempt 1 on `dbdbd71` failed only on packaging (an
+archiver fix, now applied); attempt 2 on `dbdbd71` passed both full-workspace
+build stages and failed only on a lifecycle-replay harness mismatch (stale
+feature mask in fixture binaries, not an engine defect); attempt 3, on
+`f538d4d`, is running now and its result belongs in `PHASE2_STATE.md` under
+"Linux final qualification status" once it completes. Remaining before
+acceptance: that result, item H2 above, a matched 1,000,000-row run on Linux
+for the converged CRUD/build table, and the in-progress two-arm lean bench
+as a post-change smoke check.
+
+Known limits that are stated rather than fixed: a held reader lets the WAL
+grow to its fixed allowance and then writes are refused with committed state
+verified, matching SQLite's behavior under a long-held reader; the text
+head-to-segment fold is not implemented; packed text entries stay tombstoned
+until an explicit rebuild; quantized-vector recall has only been measured on
+synthetic data; each index created consumes tree-id space from a `u16`
+range. See `PHASE2_STATE.md`, "Known limits, stated rather than fixed", for
+the same list alongside the structural format limits.
 
 The reusable [test-group map](PHASE2_TEST_GROUPS.md) distinguishes lean,
 full-workspace, preserved compatibility, interruption and scale evidence.

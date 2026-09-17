@@ -64,8 +64,10 @@ commit occurs. Published snapshots retain their earlier rows and relationships.
 
 Admission validates bounded name catalogs and all replica versions before any
 source modification. Missing feature flags with graph metadata or edge entries
-are refused. Whole-edge consistency is checked when accessed, not by an O(edges)
-open scan. The explicit read-only verifier checks primary/reverse agreement, and
+are refused, not by an O(edges) open scan. Both directions of an edge are
+written in the same transaction, so a committed snapshot cannot hold half a
+pair; traversal does not re-verify the opposite-direction copy per edge. The
+explicit read-only verifier checks primary/reverse agreement instead, and
 the source-preserving rebuild recreates reverse markers from surviving primary
 edges in a separate destination. A reverse marker never recovers primary edge
 properties. If both members of an edge pair are deleted consistently, no

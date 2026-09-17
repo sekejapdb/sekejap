@@ -132,3 +132,83 @@ workspace re-run was in progress at capture time.
 - `.insert-loop/p2final/multimodel-r7-1000000-partial-9arms.json`: the
   9-arm partial 1M Linux report against the pre-fix engine, showing the
   atomic refusals.
+
+## Converged CRUD/build table, 2026-09-17
+
+Later loop iterations continued past the fixes above. This table is the
+converged state of the same benchmark: Mac, 50,000 rows, retained-feature
+build (`compact-cells,sqlite-balance,keyspace-append,slotref-split`), matched
+durability (SQLite `PRAGMA synchronous=FULL` plus `fullfsync=ON`, versus E4
+`F_FULLFSYNC`). Bench `src/bin/phase2_multimodel_bench.rs`, runner pattern
+`/tmp/e4-mm50k-fair.sh`. Ratio is E4 atomic-arm wall time ÷ SQLite wall time
+(the "Wall clock, 50,000 rows" table above is an earlier point in the same
+loop and is superseded by this one for the atomic arm).
+
+| Stage | E4 atomic ÷ SQLite | Notes |
+|---|---:|---|
+| Spatial index build | 0.54 | E4 faster |
+| Load entities | 0.92 | E4 faster |
+| Load relationships | 0.95 | E4 faster |
+| Updates, three rounds | 1.04 | |
+| Deletes, three rounds | 1.06 | |
+| Final file size | 1.12 | 37.8 MiB E4 vs 33.9 MiB SQLite |
+| Reinsert + edges, three rounds | 1.29 | |
+| Scalar index build | 1.67 | |
+| Text index build | 1.92 | 0.17 s absolute for E4; small absolute time, noisy |
+| Post-CRUD query, spatial | 0.45 | E4 faster |
+| Post-CRUD query, text | 0.82 | E4 faster |
+| Post-CRUD query, vector | 0.93 | E4 faster |
+| Post-CRUD query, scalar | 1.17 | |
+
+Any older single-number quote for these same stages elsewhere in the docs
+(for example the R7 10K no-reader CRUD medians in
+`PHASE2_ACCEPTANCE_REVIEW.md`) is superseded by this table for the converged
+50K state; it is kept in place and labeled, not deleted, because it reflects
+a different row count and an earlier point in the loop.
+
+### Loop history (commits on `pagewal-foundation`, leading to this table)
+
+- `06b16ee` — Phase 2 baseline for this loop.
+- `e142091` — vector scan and edge probes.
+- `76aa411` — sorted scalar/spatial builds.
+- `f394bc8` — I/O counters, a 3-sync checkpoint, and a lost-truncate fault
+  test.
+- `c92ed3e` — checkpoint reduced to 2 syncs.
+- `dbdbd71` — loop 4: text segment tier tags (`0x7A`/`0x7B`) under feature
+  bit `0x40`; per-index B-trees for scalar and spatial under feature bit
+  `0x80` (descriptor v2, `tree_id` plus root); zero-allocation vector scan;
+  a range-graft kernel primitive plus two latent defect fixes it uncovered;
+  a per-handle layout switch. Wall-time ratio (E4 ÷ SQLite) at this point in
+  the loop: text build 19x to 1.4x, scalar build 5x to 1.7x, spatial 0.5x,
+  vector top-10 0.9x, updates 0.9x.
+- `39d52fc` — rollback now clears all per-tree append hints. Defect found by
+  the rejected item F (below): after rolling back an ascending-key write
+  into a per-index tree, the stale hint read past end of file.
+- `a39dc8f` — the accepted index feature mask is named once, as
+  `collections::SUPPORTED_LOGICAL_FEATURES` (`0xff`); the engine revision is
+  recorded in the final Linux job.
+- `f538d4d` — bench driver fix, not an engine change: the edge-restore loop
+  had been committing every 256 edges (about every 86 people), while SQLite
+  committed every 256 people; E4 now commits once per reinsert cycle at
+  SQLite's rate (40 commits, down from 79). Reinsert+edges wall-time ratio
+  moved from 2.05x to 1.29x (E4 ÷ SQLite) as a result.
+
+### Rejected, not kept
+
+Preserved under `.insert-loop/loop3/`, not merged: insert-probe, text sorted
+build, encode-once, quantized candidate planner, range-graft into the shared
+tree, and item F (graph edges in their own per-index trees). Item F cut pool
+accesses 22.7% but left wall time, frame count and fsync count unchanged, so
+it was not kept — per the loop-retrospection rule, a change that does not
+move the target number is reverted unless it earns a named non-speed good.
+
+### Root causes, established by measurement
+
+- The update gap tracks checkpoint fsync count (4 syncs down to 2), not page
+  volume and not allocation count.
+- The build gaps trace to per-posting and per-term read-modify-write, and to
+  one shared B-tree defeating append/pack locality — this is what fixes A/B/C
+  above and the `dbdbd71` per-index trees address.
+- The reinsert gap was a benchmark commit-batching mismatch, not an engine
+  cost: E4 79 commits vs SQLite 40 per cycle, 7,355 vs 4,620 frames, 92 vs 40
+  fsyncs, closed by `f538d4d`.
