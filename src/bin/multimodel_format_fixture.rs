@@ -8,7 +8,7 @@ use e4_prototype::{
         ApproxVectorMethod, BfsRequest, CollectionId, CollectionOptions, Database, Direction,
         EdgeTypeId, EntityId, GraphContextId, IndexFamily, IndexId, IndexState,
         QuantizedVectorCandidates, ScalarPredicate, SpatialCandidates, TextCandidates, TextMatch,
-        VectorCandidates, VectorMetric,
+        VectorCandidates, VectorMetric, SUPPORTED_LOGICAL_FEATURES,
     },
     pagewal::{create_compact_cells, PageWalStore},
     spatial_math::{Bounds, Point},
@@ -1140,7 +1140,7 @@ fn main() {
                 "status":"candidate-not-released-or-frozen",
                 "engine_revision":option_env!("E4_COMPAT_ENGINE_REVISION").unwrap_or("unrecorded"),
                 "create_compact_cells":create_compact_cells(),
-                "supported_logical_features":63,
+                "supported_logical_features":SUPPORTED_LOGICAL_FEATURES,
                 "compile_features":{
                     "compact-cells":cfg!(feature="compact-cells"),
                     "sqlite-balance":cfg!(feature="sqlite-balance"),

@@ -176,7 +176,9 @@ def main():
             version = json.loads(run(binary, "--version").stdout)
             assert version["harness"] == "phase2-lifecycle-fixture-v1"
             assert version["status"] == "candidate-not-released-or-frozen"
-            assert version["supported_logical_features"] == 63
+            # 255 = 0xff: loop 4 added 0x40 (packed text posting segments) and
+            # 0x80 (per-index B-trees) to the five-family mask, which was 63.
+            assert version["supported_logical_features"] == 255
             assert version["graph_enabled"] is False
             report["binaries"][label]["version"] = version
         assert report["binaries"]["default"]["version"]["create_compact_cells"] is False

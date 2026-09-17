@@ -8,7 +8,8 @@ use e4_prototype::{
     collections::{
         ApproxVectorMethod, CollectionId, CollectionOptions, Database, EntityId, Error,
         IndexFamily, IndexId, IndexState, QuantizedVectorCandidates, ScalarPredicate,
-        SpatialCandidates, TextCandidates, TextMatch, VectorCandidates, VectorMetric,
+        SpatialCandidates, SUPPORTED_LOGICAL_FEATURES, TextCandidates, TextMatch,
+        VectorCandidates, VectorMetric,
     },
     pagewal::{PageWalStore, create_compact_cells},
     spatial_math::Bounds,
@@ -1298,7 +1299,7 @@ fn main() {
                 "engine_revision":option_env!("E4_COMPAT_ENGINE_REVISION").unwrap_or("unrecorded"),
                 "rollback_cycle_version":1,
                 "create_compact_cells":create_compact_cells(),
-                "supported_logical_features":63,
+                "supported_logical_features":SUPPORTED_LOGICAL_FEATURES,
                 "graph_enabled":false,
                 "compile_features":{
                     "compact-cells":cfg!(feature="compact-cells"),

@@ -351,6 +351,24 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
         .map_err(|e| corrupt(format!("persisted resource policy: {e:?}")))?;
     check_limits(l).map_err(|e| Error::Unsupported(format!("persisted resource policy: {e:?}")))
 }
+/// Every logical index feature bit this binary implements, in one place.
+///
+/// The collection header carries the set of logical index features the file
+/// actually uses. This binary opens a file only when that set is a subset of
+/// this mask; a file that declares anything outside it is refused whole,
+/// before a byte of it is read (Law 8). Bit 0 is the always-set "typed indexes
+/// exist" marker; the rest are one bit per index family. It is `pub` because
+/// the compatibility fixture binaries report it in their `--version` JSON, and
+/// the fixtures must never be able to disagree with the engine about what this
+/// build accepts.
+pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
+    | graph_collections::GRAPH_FEATURE
+    | vector_indexes::VECTOR_FEATURE
+    | spatial_indexes::SPATIAL_FEATURE
+    | text_indexes::TEXT_FEATURE
+    | text_indexes::segments::SEGMENT_FEATURE
+    | quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE
+    | indexes::INDEX_TREE_FEATURE;
 fn header_bytes(h: HeaderInfo) -> Result<Vec<u8>> {
     let mut payload = h.next_collection.to_be_bytes().to_vec();
     payload.extend_from_slice(&h.next_layout.to_be_bytes());
@@ -414,18 +432,7 @@ fn parse_header(b: &[u8]) -> Result<HeaderInfo> {
             .transpose()?,
         indexes: if indexed {
             let features = u64::from_be_bytes(b[8..16].try_into().unwrap());
-            if features & 1 == 0
-                || features
-                    & !(1
-                        | graph_collections::GRAPH_FEATURE
-                        | vector_indexes::VECTOR_FEATURE
-                        | spatial_indexes::SPATIAL_FEATURE
-                        | text_indexes::TEXT_FEATURE
-                        | text_indexes::segments::SEGMENT_FEATURE
-                        | quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE
-                        | indexes::INDEX_TREE_FEATURE)
-                    != 0
-            {
+            if features & 1 == 0 || features & !SUPPORTED_LOGICAL_FEATURES != 0 {
                 return Err(Error::Unsupported(format!(
                     "logical index features {features:#x}"
                 )));
@@ -1810,5 +1817,43 @@ mod tests {
         let issues = std::fs::read_to_string(out.join("issues.jsonl")).unwrap();
         assert!(issues.contains("candidate vector sidecar not resolved"));
         assert!(!issues.contains("committed_wal_overlay_skipped"));
+    }
+    /// The one number the fixture binaries and the compatibility driver both
+    /// quote. Bits 0x40 (packed text posting segments) and 0x80 (per-index
+    /// B-trees) were added after the mask had stood at 63 for five families,
+    /// and the fixtures kept reporting 63 until the replay caught it. Naming
+    /// the mask once and asserting its value here is what stops that drift:
+    /// a new family bit fails this test until every reporter is updated.
+    #[test]
+    fn supported_logical_feature_mask_is_the_only_definition() {
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0xff);
+        let header = |features| {
+            header_bytes(HeaderInfo {
+                next_collection: 1,
+                next_layout: 1,
+                limits: None,
+                indexes: Some(IndexHeader {
+                    features,
+                    next: 1,
+                    count: 0,
+                }),
+            })
+            .unwrap()
+        };
+        // A file that declares exactly what this binary implements opens.
+        assert_eq!(
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES))
+                .unwrap()
+                .indexes
+                .unwrap()
+                .features,
+            0xff
+        );
+        // One bit past the mask is a future family: refused whole, and as
+        // Unsupported rather than corruption, because the bytes are intact.
+        assert!(matches!(
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x100)),
+            Err(Error::Unsupported(m)) if m.contains("0x1ff")
+        ));
     }
 }

@@ -136,7 +136,9 @@ def main():
             version = json.loads(run(binary, "--version").stdout)
             assert version["harness"] == "multimodel-format-fixture-v2"
             assert version["status"] == "candidate-not-released-or-frozen"
-            assert version["supported_logical_features"] == 63
+            # 255 = 0xff: loop 4 added 0x40 (packed text posting segments) and
+            # 0x80 (per-index B-trees) to the five-family mask, which was 63.
+            assert version["supported_logical_features"] == 255
             report["binaries"][label]["version"] = version
         for probe, recorded in zip(probes, report["older_probes"]):
             version = json.loads(run(probe["path"], "--version").stdout)
