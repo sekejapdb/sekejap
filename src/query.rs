@@ -1344,6 +1344,10 @@ struct Candidate {
 struct EntityCursor<'a> {
     inner: RangeIter<'a>,
     prefix: Vec<u8>,
+    /// Copy the primary row out of the leaf, or read its key only. The bytes
+    /// are worth an allocation only when a filter or the ranking will decode
+    /// them; a key-only scan used to allocate one per row and drop it.
+    wants_row: bool,
     done: bool,
 }
 
@@ -1352,7 +1356,22 @@ struct ScalarCursor<'a> {
     prefix: Vec<u8>,
     info: IndexInfo,
     predicate: EncodedScalarFilter,
+    /// The filter position this cursor's own walk already proves, if any --
+    /// see `DriverCursor::new`.
+    certifies: Option<usize>,
+    /// Copy the posting's value key out of the leaf, or read the sequence
+    /// only. Only a scalar ranking over this same index reads it.
+    wants_scalar: bool,
     done: bool,
+}
+
+/// What one page needs from each candidate, decided once per page instead of
+/// per row. Each field is something a driver can hand over for free when it is
+/// wanted and must allocate for when it is not.
+#[derive(Clone, Copy)]
+struct CursorNeeds {
+    row: bool,
+    scalar_key: bool,
 }
 
 struct VectorCursor<'a> {
@@ -1421,6 +1440,29 @@ fn scalar_lower(predicate: &EncodedScalarFilter) -> Option<&[u8]> {
     }
 }
 
+/// The posting key a resumed scalar walk should open at: the exact entry the
+/// previous page stopped on. Both shapes of rank key that a scalar driver can
+/// produce in its own walk order are covered -- a scalar ranking carries the
+/// value key, and an id ranking over an equality driver has one value for the
+/// whole range. Anything else returns `None` and the cursor opens where it
+/// always did.
+fn resume_scalar_key(
+    info: &IndexInfo,
+    predicate: &EncodedScalarFilter,
+    after: &RankKey,
+) -> Option<Vec<u8>> {
+    let value = match (&after.value, predicate) {
+        (RankValue::Scalar(key), _) => key.as_slice(),
+        (RankValue::Entity, EncodedScalarFilter::Eq(value)) => value.as_slice(),
+        _ => return None,
+    };
+    Some(super::indexes::skey(info, value, after.id.sequence))
+}
+
+/// The nullish scalar key. A NULL field and a MISSING one share it, so a
+/// posting carrying it proves neither.
+const NULLISH_SCALAR_KEY: &[u8] = &[0];
+
 fn scalar_key_position(predicate: &EncodedScalarFilter, key: &[u8]) -> Ordering {
     match predicate {
         EncodedScalarFilter::Empty => Ordering::Greater,
@@ -1450,28 +1492,47 @@ fn scalar_key_position(predicate: &EncodedScalarFilter, key: &[u8]) -> Ordering 
 }
 
 impl<'a> DriverCursor<'a> {
+    /// Open the candidate stream for one page.
+    ///
+    /// `resume` is the previous page's last rank key, and is passed ONLY when
+    /// the caller has established that this driver walks in the query's rank
+    /// order (`PreparedQuery::driver_walks_in_rank_order`). Then the cursor
+    /// opens at that key instead of at the start of the collection or posting
+    /// range, so page k+1 costs what it emits rather than everything emitted
+    /// so far. The resumed row is yielded once more and dropped by the
+    /// `after` comparison in `next_page`: one candidate per page, where
+    /// re-opening from the start costs one whole pass per page.
     fn new(
         db: &'a Database,
         collection: CollectionId,
         plan: &DriverPlan,
         graph: &[Option<BTreeSet<EntityId>>],
+        needs: CursorNeeds,
+        resume: Option<&RankKey>,
     ) -> QueryResult<Self> {
         match plan {
             DriverPlan::Entities => {
                 let prefix = prefix(0x40, collection);
+                let start = match resume {
+                    Some(after) => row_key(after.id),
+                    None => prefix.clone(),
+                };
                 let inner = db
                     .store()?
-                    .range(&prefix)
+                    .range(&start)
                     .map_err(Error::from)
                     .map_err(QueryError::from)?;
                 Ok(Self::Entities(EntityCursor {
                     inner,
                     prefix,
+                    wants_row: needs.row,
                     done: false,
                 }))
             }
             DriverPlan::Scalar {
-                info, predicate, ..
+                info,
+                predicate,
+                position,
             } => {
                 let prefix = scalar_prefix(info.id);
                 let inner = if matches!(predicate, EncodedScalarFilter::Empty) {
@@ -1481,14 +1542,36 @@ impl<'a> DriverCursor<'a> {
                     if let Some(lower) = scalar_lower(predicate) {
                         start.extend_from_slice(lower);
                     }
+                    if let Some(key) = resume.and_then(|after| resume_scalar_key(info, predicate, after))
+                    {
+                        start = key;
+                    }
                     db.index_range(info, &start)
                         .map_err(QueryError::from)?
+                };
+                // A posting key IS the predicate's proof: the walk yields an
+                // entry only when `scalar_key_position` puts its value inside
+                // the predicate, so re-reading the row to ask the same
+                // question again costs a primary point-get per matched row and
+                // can only give the same answer. The one value that does not
+                // prove itself is the nullish sentinel, which a NULL and a
+                // MISSING field share -- `scalar_filter_matches` tells those
+                // apart and the index cannot -- so that key is left uncertified
+                // per candidate below.
+                let certifies = match (position, predicate) {
+                    (
+                        Some(position),
+                        EncodedScalarFilter::Eq(_) | EncodedScalarFilter::Range { .. },
+                    ) => Some(*position),
+                    _ => None,
                 };
                 Ok(Self::Scalar(ScalarCursor {
                     inner,
                     prefix,
                     info: info.clone(),
                     predicate: predicate.clone(),
+                    certifies,
+                    wants_scalar: needs.scalar_key,
                     done: false,
                 }))
             }
@@ -1598,19 +1681,36 @@ impl EntityCursor<'_> {
             return Ok(None);
         }
         meter.charge(WorkResource::PrimaryReads, 1)?;
-        let Some(row) = self.inner.next() else {
-            self.done = true;
-            return Ok(None);
+        // Borrow the record out of the pinned leaf rather than draining a key
+        // `Vec` and a value `Vec` per row out of it. The pinned-leaf borrow
+        // ends with this block so the cursor can step.
+        let (id, row) = {
+            let Some((key, value)) = self
+                .inner
+                .peek_ref()
+                .map_err(Error::from)
+                .map_err(QueryError::from)?
+            else {
+                self.done = true;
+                return Ok(None);
+            };
+            if !key.starts_with(&self.prefix) {
+                self.done = true;
+                return Ok(None);
+            }
+            (
+                row_id(key)?,
+                if self.wants_row {
+                    Some(value.to_vec())
+                } else {
+                    None
+                },
+            )
         };
-        let (key, value) = row.map_err(Error::from).map_err(QueryError::from)?;
-        if !key.starts_with(&self.prefix) {
-            self.done = true;
-            return Ok(None);
-        }
-        let id = row_id(&key)?;
+        self.inner.step();
         Ok(Some(Candidate {
             id,
-            row: Some(value),
+            row,
             scalar: None,
             vector: None,
             quantized: None,
@@ -1633,43 +1733,65 @@ impl ScalarCursor<'_> {
         };
         loop {
             meter.charge(WorkResource::ScalarPostings, 1)?;
-            let Some(row) = inner.next() else {
-                self.done = true;
-                return Ok(None);
-            };
-            let (key, value) = row.map_err(Error::from).map_err(QueryError::from)?;
-            if !key.starts_with(&self.prefix) {
-                self.done = true;
-                return Ok(None);
-            }
-            let suffix = &key[self.prefix.len()..];
-            let (_, value_len) = scalar_key::decode(&self.info.kind, suffix)?;
-            let encoded = suffix
-                .get(..value_len)
-                .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
-            match scalar_key_position(&self.predicate, encoded) {
-                Ordering::Less => continue,
-                Ordering::Greater => {
+            // Same pull-cursor shape as the entity walk: peek into the pinned
+            // leaf, decide, then step. The key and the (always empty) value of
+            // a posting were a `Vec` each before.
+            let decoded = {
+                let Some((key, value)) = inner
+                    .peek_ref()
+                    .map_err(Error::from)
+                    .map_err(QueryError::from)?
+                else {
+                    self.done = true;
+                    return Ok(None);
+                };
+                if !key.starts_with(&self.prefix) {
                     self.done = true;
                     return Ok(None);
                 }
-                Ordering::Equal => {}
-            }
-            let mut at = self.prefix.len() + value_len;
-            let sequence = read_ordered(&key, &mut at)?;
-            if at != key.len() || sequence == 0 || !value.is_empty() {
-                return Err(corrupt_query("scalar index entry"));
-            }
+                let suffix = &key[self.prefix.len()..];
+                let (_, value_len) = scalar_key::decode(&self.info.kind, suffix)?;
+                let encoded = suffix
+                    .get(..value_len)
+                    .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
+                match scalar_key_position(&self.predicate, encoded) {
+                    Ordering::Less => None,
+                    Ordering::Greater => {
+                        self.done = true;
+                        return Ok(None);
+                    }
+                    Ordering::Equal => {
+                        let mut at = self.prefix.len() + value_len;
+                        let sequence = read_ordered(key, &mut at)?;
+                        if at != key.len() || sequence == 0 || !value.is_empty() {
+                            return Err(corrupt_query("scalar index entry"));
+                        }
+                        Some((
+                            sequence,
+                            if self.wants_scalar {
+                                Some(encoded.to_vec())
+                            } else {
+                                None
+                            },
+                            encoded != NULLISH_SCALAR_KEY,
+                        ))
+                    }
+                }
+            };
+            inner.step();
+            let Some((sequence, encoded, proves_predicate)) = decoded else {
+                continue;
+            };
             return Ok(Some(Candidate {
                 id: EntityId {
                     collection: self.info.collection,
                     sequence,
                 },
                 row: None,
-                scalar: Some((self.info.id, encoded.to_vec())),
+                scalar: encoded.map(|key| (self.info.id, key)),
                 vector: None,
                 quantized: None,
-                satisfied_filter: None,
+                satisfied_filter: self.certifies.filter(|_| proves_predicate),
             }));
         }
     }
@@ -2639,6 +2761,96 @@ fn checked_output_size(row: &QueryRow) -> QueryResult<u64> {
 }
 
 impl PreparedQuery<'_> {
+    /// True when the driver's own walk hands candidates over in exactly the
+    /// order this query ranks them by. Two things follow, and only under this
+    /// condition:
+    ///
+    ///   * a page may STOP the moment its heap is full -- nothing later in the
+    ///     walk can outrank what is already there -- which is what turns a
+    ///     LIMIT from a filter over N rows into a stop condition;
+    ///   * the next page may RESUME at this page's last key instead of
+    ///     re-walking everything already emitted.
+    ///
+    /// The cases are the ones where the key the tree is sorted by and the key
+    /// the query sorts by are the same key. The entity cursor walks the
+    /// primary tree in id order and `EntityId` ranks by id. An EQUALITY
+    /// posting range holds one value for all its entries, so it is ordered by
+    /// sequence alone -- also id order. An ascending scalar order driven by
+    /// that same index walks `value || sequence`, which is `(value, id)`.
+    ///
+    /// Everything else is excluded on purpose: a descending order walks
+    /// against its ranking, a ranked order (BM25, vector distance) has no
+    /// relation to any tree's order and must see every candidate before it
+    /// knows its top k, and a range or nullish driver under an id order walks
+    /// by value while ranking by id.
+    fn driver_walks_in_rank_order(&self) -> bool {
+        match (&self.driver, &self.order) {
+            (DriverPlan::Entities, CompiledOrder::EntityId) => true,
+            (
+                DriverPlan::Scalar {
+                    predicate: EncodedScalarFilter::Eq(_),
+                    ..
+                },
+                CompiledOrder::EntityId,
+            ) => true,
+            (
+                DriverPlan::Scalar { info, .. },
+                CompiledOrder::Scalar {
+                    info: order,
+                    direction: SortDirection::Ascending,
+                },
+            ) => info.id == order.id,
+            _ => false,
+        }
+    }
+
+    /// What the page will actually read off each candidate. A driver holding
+    /// borrowed bytes copies them only for something that will be read.
+    fn cursor_needs(&self) -> CursorNeeds {
+        CursorNeeds {
+            // The entity cursor's row bytes save `ensure_row` a point-get, but
+            // only if something decodes them. With no filters and an id
+            // ranking, nothing does.
+            row: !self.filters.is_empty() || !matches!(self.order, CompiledOrder::EntityId),
+            // The posting's value key is read only by a scalar ranking over
+            // the very index that produced it.
+            scalar_key: match (&self.driver, &self.order) {
+                (DriverPlan::Scalar { info, .. }, CompiledOrder::Scalar { info: order, .. }) => {
+                    info.id == order.id
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// Whether a winner's identity is already established without going back
+    /// to the primary tree.
+    ///
+    /// SQLite answers a key-only query out of a covering index and never
+    /// touches the row table. The same holds here when the projection is empty
+    /// AND the driver's own stream is the authority for the row: the entity
+    /// cursor read the primary record itself, and an equality posting is the
+    /// membership record this engine already trusts elsewhere --
+    /// `scalar_eq_posting_matches` answers a non-driving equality filter from
+    /// the posting alone, without a row.
+    ///
+    /// Every other driver stays as it was. A range or order scalar walk, graph
+    /// ids, a text posting, a spatial cell, a vector locator can each name a
+    /// row that is no longer there, and those still fetch it and still refuse
+    /// an orphan.
+    fn winner_needs_no_row(&self) -> bool {
+        self.projection.is_empty()
+            && match &self.driver {
+                DriverPlan::Entities => true,
+                DriverPlan::Scalar {
+                    predicate: EncodedScalarFilter::Eq(_),
+                    position: Some(_),
+                    ..
+                } => true,
+                _ => false,
+            }
+    }
+
     pub fn next_page<C: FnMut() -> bool>(
         &mut self,
         page_size: usize,
@@ -2677,7 +2889,15 @@ impl PreparedQuery<'_> {
         // it 255 times out of 256; one that does not simply re-decodes.
         let mut norms = super::text_indexes::NormCache::default();
         let graph = execute_graph_filters(self.db, &self.filters, &mut meter)?;
-        let mut driver = DriverCursor::new(self.db, self.collection, &self.driver, &graph)?;
+        let in_rank_order = self.driver_walks_in_rank_order();
+        let mut driver = DriverCursor::new(
+            self.db,
+            self.collection,
+            &self.driver,
+            &graph,
+            self.cursor_needs(),
+            self.after.as_ref().filter(|_| in_rank_order),
+        )?;
         let mut heap = BinaryHeap::with_capacity(capacity);
         let approximation =
             if let CompiledOrder::ApproximateVector {
@@ -2820,6 +3040,14 @@ impl PreparedQuery<'_> {
                         heap.pop();
                         heap.push(entry);
                     }
+                    // The page is full and the walk is already in rank order,
+                    // so every candidate still ahead ranks after everything
+                    // held. Without this, `LIMIT 10` reads the whole
+                    // collection to answer with ten rows, and a page of a scan
+                    // reads to the end of the collection to fill 8,192 rows.
+                    if in_rank_order && heap.len() >= capacity {
+                        break;
+                    }
                 }
                 None
             };
@@ -2828,6 +3056,7 @@ impl PreparedQuery<'_> {
         winners.sort_by(|left, right| compare_rank(&left.key, &right.key, descending));
         let has_more = winners.len() > wanted;
         winners.truncate(wanted);
+        let winner_needs_no_row = self.winner_needs_no_row();
         let mut rows = Vec::with_capacity(winners.len());
         for winner in &winners {
             let order = match (&self.order, &winner.key.value) {
@@ -2848,24 +3077,30 @@ impl PreparedQuery<'_> {
             };
             // Every returned ID must still have an authoritative primary row.
             // This remains winner-only so native index scans do not pay a
-            // primary point-get for every rejected candidate.
-            meter.charge(WorkResource::PrimaryReads, 1)?;
-            let bytes = self
-                .db
-                .store()?
-                .get(&row_key(winner.key.id))
-                .map_err(Error::from)
-                .map_err(QueryError::from)?
-                .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
+            // primary point-get for every rejected candidate -- and it is
+            // skipped entirely when the driver is already that authority and
+            // no field is projected (`winner_needs_no_row`), because then the
+            // fetch decodes nothing and only re-proves what the candidate
+            // stream proved.
             let mut projected = Vec::with_capacity(self.projection.len());
-            if !self.projection.is_empty() {
-                let row = decode_row(self.db, bytes)?;
-                for field in &self.projection {
-                    meter.check_cancelled()?;
-                    projected.push((
-                        field.clone(),
-                        project_field(self.db, winner.key.id, &row, field, &mut meter)?,
-                    ));
+            if !winner_needs_no_row {
+                meter.charge(WorkResource::PrimaryReads, 1)?;
+                let bytes = self
+                    .db
+                    .store()?
+                    .get(&row_key(winner.key.id))
+                    .map_err(Error::from)
+                    .map_err(QueryError::from)?
+                    .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
+                if !self.projection.is_empty() {
+                    let row = decode_row(self.db, bytes)?;
+                    for field in &self.projection {
+                        meter.check_cancelled()?;
+                        projected.push((
+                            field.clone(),
+                            project_field(self.db, winner.key.id, &row, field, &mut meter)?,
+                        ));
+                    }
                 }
             }
             let row = QueryRow {

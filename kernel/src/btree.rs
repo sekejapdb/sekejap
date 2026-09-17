@@ -2884,6 +2884,30 @@ impl RangeIter<'_> {
         self.current_ref()
     }
 
+    /// The record the cursor is parked on, borrowed from the pinned leaf, with
+    /// no seek and no allocation. Paired with [`RangeIter::step`] this makes a
+    /// PULL cursor -- peek, use, step, peek -- that costs what `for_each_ref`
+    /// costs while still letting the caller stop and resume. A query executor
+    /// needs exactly that: it has to interleave the walk with a heap, a work
+    /// meter and a cancellation check, none of which fit inside a callback.
+    ///
+    /// The empty target is below every key, so this is `peek_at_or_after`
+    /// standing still: same leaf pin, same overflow-marker resolution.
+    pub fn peek_ref(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.position_at_or_after(&[])?;
+        self.current_ref()
+    }
+
+    /// Step past the record the last peek returned, without materialising it.
+    /// Crossing a leaf boundary is left to the next peek, which already climbs
+    /// the parent path when the slot index runs past the end of the leaf.
+    pub fn step(&mut self) {
+        if self.buf.pop_front().is_some() {
+            return;
+        }
+        self.idx += 1;
+    }
+
     fn position_at_or_after(&mut self, target: &[u8]) -> Result<()> {
         loop {
             let skip_buf = matches!(self.buf.front(), Some((k, _, _)) if k.as_slice() < target);

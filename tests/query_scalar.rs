@@ -348,9 +348,12 @@ fn scalar_driver_streams_and_pages_more_than_65536_matches_completely() {
         })
         .unwrap();
     let mut actual = Vec::with_capacity(ROWS);
+    let mut postings = 0u64;
+    let mut pages = 0u64;
     loop {
         let page = query.next_page(8192, generous(), || false).unwrap();
-        assert!(page.work.scalar_postings >= ROWS as u64);
+        postings += page.work.scalar_postings;
+        pages += 1;
         actual.extend(page.rows.iter().map(|row| row.id));
         if page.done {
             break;
@@ -359,6 +362,17 @@ fn scalar_driver_streams_and_pages_more_than_65536_matches_completely() {
     inserted.reverse(); // rank was written in strictly descending ID order.
     assert_eq!(actual, inserted);
     assert_eq!(actual.len(), ROWS);
+    // The whole posting range is streamed -- there is no 65,536 result cap --
+    // but ONCE, not once per page: every page resumes at the previous page's
+    // last key. This assertion read `>= ROWS` per page, which is the
+    // re-walk-from-the-start cost it was written under.
+    assert!(
+        postings >= ROWS as u64 && postings <= ROWS as u64 + pages * 4,
+        "{pages} pages streamed {postings} postings for {ROWS} rows; one pass \
+         plus a resumed row per page is <= {}, one pass per page is {}",
+        ROWS as u64 + pages * 4,
+        ROWS as u64 * pages
+    );
 }
 
 #[test]
@@ -470,7 +484,11 @@ fn snapshot_cursor_retries_after_cancel_and_budget_errors_then_reopens_current_s
     ));
 
     let first = query.next_page(5, generous(), || false).unwrap();
-    assert_eq!(first.work.scalar_postings, 13); // 12 rows + terminal probe.
+    // 5 rows + the one lookahead that answers `done`. The posting range walks
+    // in the order this query ranks by, so the page stops as soon as its heap
+    // is full. It used to read all 12 rows plus a terminal probe to hand back
+    // 5 -- the whole range, once per page.
+    assert_eq!(first.work.scalar_postings, 6);
     assert_eq!(
         first.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
         old_ids[..5]
