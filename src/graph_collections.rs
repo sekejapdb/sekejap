@@ -225,9 +225,14 @@ pub(super) fn read_name(
 }
 
 fn append_entity(key: &mut Vec<u8>, id: EntityId) {
-    key.extend(ordered(id.collection.0.into()));
-    key.extend(ordered(id.sequence));
+    ordered_into(key, id.collection.0.into());
+    ordered_into(key, id.sequence);
 }
+
+/// Room for the widest edge key: a tag, two identities at their widest, and
+/// the context and type identities. Sized once so building a key is one
+/// allocation rather than one per integer in it plus a regrow per component.
+const EDGE_KEY_BYTES: usize = 1 + 2 * (2 + 9) + 9 + 9;
 
 fn read_entity(key: &[u8], at: &mut usize) -> Result<EntityId> {
     let collection = u32::try_from(read_ordered(key, at)?).map_err(corrupt)?;
@@ -241,18 +246,77 @@ fn read_entity(key: &[u8], at: &mut usize) -> Result<EntityId> {
     })
 }
 
+/// DIAGNOSTIC: per-stage cost of writing one relationship, in nanoseconds and
+/// in buffer-pool page accesses, accumulated over a run of
+/// `Database::put_edge_measured`. Nothing on the shipping write path touches
+/// it; `src/bin/g2_budget.rs` is its only caller.
+#[doc(hidden)]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct EdgeBudget {
+    pub edges: u64,
+    /// Endpoints (of 2 per edge) whose row existence was already known.
+    pub fast_endpoints: u64,
+    /// Edges whose forward/reverse probe was provably pointless.
+    pub fast_preflight: u64,
+    pub header_ns: u64,
+    pub header_pages: u64,
+    pub endpoints_ns: u64,
+    pub endpoint_pages: u64,
+    pub encode_ns: u64,
+    pub encode_pages: u64,
+    pub preflight_ns: u64,
+    pub preflight_pages: u64,
+    pub keybuild_ns: u64,
+    pub keybuild_pages: u64,
+    pub put_primary_ns: u64,
+    pub put_primary_pages: u64,
+    pub put_reverse_ns: u64,
+    pub put_reverse_pages: u64,
+    pub finish_ns: u64,
+    pub finish_pages: u64,
+}
+
+impl EdgeBudget {
+    /// `(label, nanoseconds, page accesses)` for every stage, in the order
+    /// `put_edge` runs them.
+    pub fn stages(&self) -> [(&'static str, u64, u64); 8] {
+        [
+            ("header+ids", self.header_ns, self.header_pages),
+            ("endpoints", self.endpoints_ns, self.endpoint_pages),
+            ("encode props", self.encode_ns, self.encode_pages),
+            ("preflight", self.preflight_ns, self.preflight_pages),
+            ("key build", self.keybuild_ns, self.keybuild_pages),
+            ("put 0x71", self.put_primary_ns, self.put_primary_pages),
+            ("put 0x72", self.put_reverse_ns, self.put_reverse_pages),
+            ("finish", self.finish_ns, self.finish_pages),
+        ]
+    }
+    pub fn total_ns(&self) -> u64 {
+        self.stages().iter().map(|s| s.1).sum()
+    }
+    pub fn total_pages(&self) -> u64 {
+        self.stages().iter().map(|s| s.2).sum()
+    }
+}
+
 pub(super) fn edge_key(tag: u8, edge: EdgeKey) -> Vec<u8> {
-    let mut key = vec![tag];
+    let mut key = Vec::with_capacity(EDGE_KEY_BYTES);
+    edge_key_into(&mut key, tag, edge);
+    key
+}
+
+/// The same frozen encoding, appended to a buffer the caller owns.
+pub(super) fn edge_key_into(key: &mut Vec<u8>, tag: u8, edge: EdgeKey) {
+    key.push(tag);
     let (first, last) = if tag == PRIMARY_EDGE {
         (edge.source, edge.destination)
     } else {
         (edge.destination, edge.source)
     };
-    append_entity(&mut key, first);
-    key.extend(ordered(edge.context.0));
-    key.extend(ordered(edge.edge_type.0));
-    append_entity(&mut key, last);
-    key
+    append_entity(key, first);
+    ordered_into(key, edge.context.0);
+    ordered_into(key, edge.edge_type.0);
+    append_entity(key, last);
 }
 
 pub(super) fn edge_prefix(
@@ -388,8 +452,23 @@ pub(super) fn adjacent_from_tail(
 const EMPTY_PROPERTIES: &[u8] = &[1, 8, 0];
 
 fn encode_properties(value: &Value) -> Result<Vec<u8>> {
-    if !value.is_object() {
+    let Some(object) = value.as_object() else {
         return Err(invalid("edge properties must be an object"));
+    };
+    // The overwhelmingly common edge carries no properties at all. Running the
+    // binary-JSON writer over an empty map to rediscover three frozen bytes is
+    // two allocations for a constant; `decode_properties` already short-cuts
+    // the same three, and the debug assertion below keeps the pair honest.
+    if object.is_empty() {
+        debug_assert!(
+            crate::binary_json(value).is_ok_and(|b| {
+                let mut written = vec![1u8];
+                written.extend(b);
+                written == EMPTY_PROPERTIES
+            }),
+            "the empty-object encoding moved out from under this shortcut"
+        );
+        return Ok(EMPTY_PROPERTIES.to_vec());
     }
     let binary = crate::binary_json(value).map_err(invalid)?;
     if binary.len() + 1 > MAX_EDGE_PROPERTY_BYTES {
@@ -812,8 +891,12 @@ impl Database {
     }
 
     fn preflight_edge_pair(&self, key: EdgeKey) -> Result<()> {
-        let primary = self.store()?.get(&edge_key(PRIMARY_EDGE, key))?;
-        let reverse = self.store()?.get(&edge_key(REVERSE_EDGE, key))?;
+        let mut scratch = Vec::with_capacity(EDGE_KEY_BYTES);
+        edge_key_into(&mut scratch, PRIMARY_EDGE, key);
+        let primary = self.store()?.get(&scratch)?;
+        scratch.clear();
+        edge_key_into(&mut scratch, REVERSE_EDGE, key);
+        let reverse = self.store()?.get(&scratch)?;
         match (primary, reverse) {
             (Some(value), Some(marker)) => {
                 decode_properties(&value)?;
@@ -852,10 +935,14 @@ impl Database {
     /// So the edge family stays immediate, and the read side is what got
     /// cheaper instead -- see `preflight_unless_provably_absent`.
     fn write_edge_pair(&mut self, key: EdgeKey, properties: &[u8]) -> Result<()> {
-        self.writer()?
-            .put(&edge_key(PRIMARY_EDGE, key), properties)?;
-        self.writer()?.put(&edge_key(REVERSE_EDGE, key), &[])?;
-        self.note_edge_written(key);
+        // One buffer for both halves. They are the same integers in a
+        // different order and neither outlives the put that reads it.
+        let mut scratch = Vec::with_capacity(EDGE_KEY_BYTES);
+        edge_key_into(&mut scratch, PRIMARY_EDGE, key);
+        self.writer()?.put(&scratch, properties)?;
+        scratch.clear();
+        edge_key_into(&mut scratch, REVERSE_EDGE, key);
+        self.writer()?.put(&scratch, &[])?;
         Ok(())
     }
 
@@ -909,6 +996,77 @@ impl Database {
         self.preflight_unless_provably_absent(key)?;
         let result = self.write_edge_pair(key, &bytes).map(|()| key);
         self.finish(result)
+    }
+
+    /// DIAGNOSTIC TWIN of `put_edge`, used only by `src/bin/g2_budget.rs`.
+    ///
+    /// It performs the same sequence of steps in the same order and times each
+    /// one, in nanoseconds and in buffer-pool page accesses. It is a separate
+    /// body so the shipping path carries no timer and no branch: the stages it
+    /// names are the stages `put_edge` above runs, and a change to one is a
+    /// change to both.
+    #[doc(hidden)]
+    pub fn put_edge_measured(
+        &mut self,
+        context: GraphContextId,
+        source: EntityId,
+        edge_type: EdgeTypeId,
+        destination: EntityId,
+        properties: &Value,
+        budget: &mut EdgeBudget,
+    ) -> Result<EdgeKey> {
+        use std::time::Instant;
+        let mut at = Instant::now();
+        let mut pool = self.store()?.store().pool_accesses();
+        macro_rules! lap {
+            ($ns:ident, $pa:ident) => {{
+                let now = Instant::now();
+                budget.$ns += now.duration_since(at).as_nanos() as u64;
+                at = now;
+                let p = self.store()?.store().pool_accesses();
+                budget.$pa += p - pool;
+                pool = p;
+            }};
+        }
+        let key = EdgeKey {
+            source,
+            context,
+            edge_type,
+            destination,
+        };
+        // Which fast paths this edge is ELIGIBLE for.
+        budget.fast_endpoints += u64::from(self.endpoint_known_live(source))
+            + u64::from(self.endpoint_known_live(destination));
+        budget.fast_preflight += u64::from(self.edge_provably_absent(key));
+        at = Instant::now();
+        pool = self.store()?.store().pool_accesses();
+        self.ready_write()?;
+        let h = self.graph_header()?;
+        self.validate_edge_ids(h, key)?;
+        lap!(header_ns, header_pages);
+        self.validate_endpoints(source, destination)?;
+        lap!(endpoints_ns, endpoint_pages);
+        let bytes = encode_properties(properties)?;
+        if self
+            .limits
+            .is_some_and(|l| bytes.len() + 64 > l.record_bytes as usize)
+        {
+            return Err(invalid("encoded edge exceeds configured record limit"));
+        }
+        lap!(encode_ns, encode_pages);
+        self.preflight_unless_provably_absent(key)?;
+        lap!(preflight_ns, preflight_pages);
+        let primary = edge_key(PRIMARY_EDGE, key);
+        let reverse = edge_key(REVERSE_EDGE, key);
+        lap!(keybuild_ns, keybuild_pages);
+        self.writer()?.put(&primary, &bytes)?;
+        lap!(put_primary_ns, put_primary_pages);
+        self.writer()?.put(&reverse, &[])?;
+        lap!(put_reverse_ns, put_reverse_pages);
+        let out = self.finish(Ok(key));
+        lap!(finish_ns, finish_pages);
+        budget.edges += 1;
+        out
     }
 
     /// String convenience call. Unknown exact names are allocated in this

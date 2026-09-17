@@ -729,6 +729,16 @@ fn e4_io_delta(db: &Database, prev: &mut IoCounters) -> R<Value> {
     Ok(io_json(&d))
 }
 
+/// Buffer-pool page accesses since the last call. Exact, and it does not move
+/// with what else the machine is doing, which is what a wall clock on a busy
+/// laptop cannot say.
+fn e4_pool_delta(db: &Database, prev: &mut u64) -> R<u64> {
+    let now = db.pool_accesses()?;
+    let d = now.saturating_sub(*prev);
+    *prev = now;
+    Ok(d)
+}
+
 #[derive(Clone, Copy, Default)]
 struct SqliteIoAcc {
     commits: u64,
@@ -822,6 +832,8 @@ fn run_e4(
     );
     let mut io = serde_json::Map::new();
     let mut io_prev = db.io_counters()?;
+    let mut pool_prev = db.pool_accesses()?;
+    let mut pool = serde_json::Map::new();
 
     progress.stage = "entity_load";
     let start = Instant::now();
@@ -854,6 +866,7 @@ fn run_e4(
     let entity_load = time_json(start, json!({"commits":n.div_ceil(BATCH)+1}));
     progress.complete("entity_load", &entity_load);
     io.insert("entity_load".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("entity_load".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
 
     progress.stage = "graph_load";
     let start = Instant::now();
@@ -897,6 +910,7 @@ fn run_e4(
     progress.complete("graph_load", &graph_load);
     db.checkpoint()?;
     io.insert("graph_load".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("graph_load".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
     let loaded = sizes(root);
     progress
         .completed
@@ -953,6 +967,7 @@ fn run_e4(
     builds.insert("scalar".into(), scalar_build.clone());
     progress.complete("build_scalar", &scalar_build);
     io.insert("build_scalar".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("build_scalar".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
     progress.stage = "late_build";
     progress.stage_progress = json!({"index":"embedding_exact","steps":0,"publication_commits":0});
     let start = Instant::now();
@@ -974,6 +989,7 @@ fn run_e4(
     builds.insert("vector".into(), vector_build.clone());
     progress.complete("build_vector", &vector_build);
     io.insert("build_vector".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("build_vector".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
     progress.stage = "late_build";
     progress.stage_progress = json!({"index":"position_point","steps":0,"publication_commits":0});
     let start = Instant::now();
@@ -995,6 +1011,7 @@ fn run_e4(
     builds.insert("spatial".into(), spatial_build.clone());
     progress.complete("build_spatial", &spatial_build);
     io.insert("build_spatial".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("build_spatial".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
     progress.stage = "late_build";
     progress.stage_progress = json!({"index":"body_text","steps":0,"publication_commits":0});
     let start = Instant::now();
@@ -1016,9 +1033,11 @@ fn run_e4(
     builds.insert("text".into(), text_build.clone());
     progress.complete("build_text", &text_build);
     io.insert("build_text".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("build_text".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
     db.checkpoint()?;
     sample(root, &mut peak);
     io.insert("checkpoint_after_builds".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("checkpoint_after_builds".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
 
     progress.stage = "pre_crud_queries";
     let query_vector = vector(17 % n, dimension);
@@ -1438,6 +1457,7 @@ fn run_e4(
 
     progress.complete("pre_crud_queries", &Value::Object(queries.clone()));
     io.insert("pre_crud_queries".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("pre_crud_queries".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
 
     let held = matches!(readers, ReaderMode::Held)
         .then(|| Database::open_snapshot(root, cfg()))
@@ -1523,6 +1543,7 @@ fn run_e4(
         let update_s = start.elapsed().as_secs_f64();
         progress.complete_crud_stage(cycle, "update", json!({"seconds":update_s,"updated":n}));
         io.insert(format!("crud_cycle_{cycle}_update"), e4_io_delta(&db, &mut io_prev)?);
+        pool.insert(format!("crud_cycle_{cycle}_update"), e4_pool_delta(&db, &mut pool_prev)?.into());
         progress.stage = "crud_delete";
         progress.stage_progress = json!({"cycle":cycle,"people":0});
         let start = Instant::now();
@@ -1548,6 +1569,7 @@ fn run_e4(
             json!({"seconds":delete_s,"deleted":deleted}),
         );
         io.insert(format!("crud_cycle_{cycle}_delete"), e4_io_delta(&db, &mut io_prev)?);
+        pool.insert(format!("crud_cycle_{cycle}_delete"), e4_pool_delta(&db, &mut pool_prev)?.into());
         progress.stage = "crud_reinsert";
         progress.stage_progress = json!({"cycle":cycle,"people":0});
         let start = Instant::now();
@@ -1626,6 +1648,7 @@ fn run_e4(
             json!({"seconds":insert_s,"reinserted":inserted,"relationships_restored":restored_sources*3}),
         );
         io.insert(format!("crud_cycle_{cycle}_reinsert"), e4_io_delta(&db, &mut io_prev)?);
+        pool.insert(format!("crud_cycle_{cycle}_reinsert"), e4_pool_delta(&db, &mut pool_prev)?.into());
         assert_eq!(
             db.get(people, &person_key(1))?.unwrap().document,
             updated_document(1, n, dimension, cycle)
@@ -1760,6 +1783,7 @@ fn run_e4(
         &Value::Object(post_crud_queries.clone()),
     );
     io.insert("post_crud_queries".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("post_crud_queries".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
     progress.stage = "held_reader_oracle";
     if let Some(snapshot) = held.as_ref() {
         assert_eq!(snapshot.scan(people, None)?.count(), n);
@@ -1784,6 +1808,7 @@ fn run_e4(
     progress.stage = "checkpoint_reopen";
     db.checkpoint()?;
     io.insert("final_checkpoint".into(), e4_io_delta(&db, &mut io_prev)?);
+    pool.insert("final_checkpoint".into(), e4_pool_delta(&db, &mut pool_prev)?.into());
     let final_size = sizes(root);
     drop(db);
     let start = Instant::now();
@@ -1852,7 +1877,7 @@ fn run_e4(
     );
     progress.stage = "complete";
     Ok(
-        json!({"engine":"e4","entity_load":entity_load,"graph_load":graph_load,"builds":builds,"queries":queries,"crud":crud,"post_crud_queries":post_crud_queries,"io":io,"loaded_bytes":loaded,"final_bytes":final_size,"sampled_peak_bytes":peak,"reopen_seconds":reopen_s,"reader_mode":readers.name(),"reader_scope":readers.scope(),"publication_policy":policy,"rss_hwm":hwm()}),
+        json!({"engine":"e4","entity_load":entity_load,"graph_load":graph_load,"builds":builds,"queries":queries,"crud":crud,"post_crud_queries":post_crud_queries,"io":io,"pool_accesses":pool,"loaded_bytes":loaded,"final_bytes":final_size,"sampled_peak_bytes":peak,"reopen_seconds":reopen_s,"reader_mode":readers.name(),"reader_scope":readers.scope(),"publication_policy":policy,"rss_hwm":hwm()}),
     )
 }
 

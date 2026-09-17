@@ -8,7 +8,7 @@ use kernel::{btree::RangeIter, limits::ResourceLimits, store::Config};
 use serde_json::Value;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -75,7 +75,7 @@ mod vector_indexes;
 #[path = "index_verifier.rs"]
 pub mod verification;
 pub use graph_collections::{
-    BfsRequest, Direction, Edge, EdgeKey, EdgeTypeId, GraphContextId, NeighborRequest,
+    BfsRequest, Direction, Edge, EdgeBudget, EdgeKey, EdgeTypeId, GraphContextId, NeighborRequest,
     TraversalNode, TraversalResult,
 };
 pub use indexes::{
@@ -204,16 +204,20 @@ pub struct Database {
     /// held exclusively, which is the same argument `graph_header_cache`
     /// above rests on.
     index_cache: RefCell<Vec<(indexes::IndexId, indexes::IndexInfo)>>,
-    /// Identities this handle allocated since it opened, with the edges it has
-    /// since written naming them. Sequences are dense, monotonic and never
-    /// reused (D13), and the allocator counter rides the commit, so anything
-    /// handed out after open did not exist in any committed state -- the only
-    /// edges that can name it are the ones listed here. That makes the
-    /// forward/reverse existence probe before writing any OTHER edge on such
-    /// an endpoint provably pointless, which is the read-before-write D10
+    /// Identities this handle allocated since it opened, one entry per
+    /// collection. Sequences are dense, monotonic and never reused (D13) and
+    /// the allocator counter rides the commit, so a sequence handed out after
+    /// open did not exist in any committed state: its row was written here,
+    /// and no edge on disk can name it. That makes both the endpoint
+    /// existence read and the forward/reverse probe before writing an edge on
+    /// such an endpoint provably pointless -- the read-before-write D10
     /// forbids.
-    fresh: BTreeMap<EntityId, Vec<EdgeKey>>,
-    fresh_order: VecDeque<EntityId>,
+    ///
+    /// This is a RANGE per collection, not a list of identities. A list has a
+    /// bound, and past that bound the proof lapses and every write pays the
+    /// four descents again -- a per-edge cost that grows with how much was
+    /// loaded first, which is the shape the 1M multimodel run was paying.
+    allocated: BTreeMap<CollectionId, Allocated>,
     /// Whether scalar and spatial indexes created through this handle get
     /// their own B-tree. Copied from the process-wide default at open/create.
     create_index_trees: bool,
@@ -245,15 +249,33 @@ pub struct Database {
     user_writes_pending: bool,
 }
 
-/// Identities remembered at once, and edges remembered per identity. Both are
-/// caps on RAM, not on correctness: forgetting an entry only sends the next
-/// edge down the probing path it used to always take.
+/// One collection's worth of identities this handle handed out.
 ///
-/// SACRIFICE (Law 4): a writer that inserts without ever linking still carries
-/// this map, ~4 MiB at the bound. It is RAM proportional to change with a
-/// ceiling, never to the store, and it is never read back from disk.
-const FRESH_IDENTITIES: usize = 1 << 16;
-const FRESH_EDGES_EACH: usize = 8;
+/// `live_from..next` is the range it allocated and has not given up on;
+/// `deleted` names the ones inside that range it has since removed. A row is
+/// provably live when it is in the range and not in that set.
+struct Allocated {
+    /// Lowest sequence still provable. It only ever rises, and only when
+    /// `deleted` runs out of room.
+    live_from: u64,
+    /// One past the highest sequence handed out. An identity at or above this
+    /// was never allocated, so the range says nothing about it.
+    next: u64,
+    /// Handle-allocated identities deleted since, named one by one while they
+    /// fit.
+    deleted: BTreeSet<u64>,
+}
+
+/// Deleted identities named individually, per collection.
+///
+/// SACRIFICE (Law 4): past this many deletes in one collection the handle
+/// stops naming them and raises `live_from` above the highest instead, which
+/// costs every older row the cheap path. It is the cost this code used to pay
+/// unconditionally, so the fallback is never worse than the behaviour it
+/// replaces, and it is what keeps the structure's RAM bounded (~3 MiB at the
+/// bound, against ~4 MiB for the identity list it replaces) and proportional
+/// to change rather than to the store.
+const DELETED_IDENTITIES: usize = 1 << 17;
 
 fn ordered(n: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(9);
@@ -288,14 +310,18 @@ fn read_ordered(b: &[u8], at: &mut usize) -> Result<u64> {
     *at += width;
     Ok(u64::from_be_bytes(out))
 }
+/// Room for a tag and two widest integers, so a keyed lookup is one
+/// allocation rather than one per component plus a regrow between them.
+const TAGGED_PAIR_BYTES: usize = 1 + 9 + 9;
 fn prefix(tag: u8, c: CollectionId) -> Vec<u8> {
-    let mut k = vec![tag];
-    k.extend(ordered(c.0 as u64));
+    let mut k = Vec::with_capacity(TAGGED_PAIR_BYTES);
+    k.push(tag);
+    ordered_into(&mut k, c.0 as u64);
     k
 }
 fn row_key(id: EntityId) -> Vec<u8> {
     let mut k = prefix(0x40, id.collection);
-    k.extend(ordered(id.sequence));
+    ordered_into(&mut k, id.sequence);
     k
 }
 fn row_id(k: &[u8]) -> Result<EntityId> {
@@ -659,8 +685,7 @@ impl Database {
             index_header,
             graph_header_cache: Cell::new(None),
             index_cache: RefCell::new(Vec::new()),
-            fresh: BTreeMap::new(),
-            fresh_order: VecDeque::new(),
+            allocated: BTreeMap::new(),
             create_index_trees: indexes::create_index_trees(),
             user_writes_pending: false,
         }
@@ -1071,61 +1096,70 @@ impl Database {
             collection: c,
             sequence,
         };
-        self.remember_fresh(id);
+        self.note_allocated(id);
         Ok(id)
     }
-    /// Record a just-allocated identity as provably edge-free, evicting the
-    /// oldest when the bound is reached.
-    fn remember_fresh(&mut self, id: EntityId) {
-        if self.fresh.insert(id, Vec::new()).is_none() {
-            self.fresh_order.push_back(id);
-        }
-        while self.fresh_order.len() > FRESH_IDENTITIES {
-            if let Some(old) = self.fresh_order.pop_front() {
-                self.fresh.remove(&old);
-            }
-        }
+    /// Extend this collection's allocated range to cover a just-handed-out
+    /// identity. `allocate` is the only place sequences are handed out and it
+    /// hands them out in order, so the range never needs to grow downwards.
+    fn note_allocated(&mut self, id: EntityId) {
+        let e = self.allocated.entry(id.collection).or_insert(Allocated {
+            live_from: id.sequence,
+            next: id.sequence,
+            deleted: BTreeSet::new(),
+        });
+        e.next = e.next.max(id.sequence.saturating_add(1));
     }
-    /// Drop an identity from the fresh map. This is the ONLY row-delete site
-    /// in the engine, and forgetting here is what lets `endpoint_known_live`
-    /// read membership as "the row is there".
-    fn forget_fresh(&mut self, id: EntityId) {
-        self.fresh.remove(&id);
+    /// Take a deleted row out of the provable set. This is the ONLY row-delete
+    /// site in the engine, and forgetting here is what lets
+    /// `endpoint_known_live` read the range as "the row is there".
+    fn note_deleted(&mut self, id: EntityId) {
+        let Some(e) = self.allocated.get_mut(&id.collection) else {
+            return;
+        };
+        if id.sequence < e.live_from || id.sequence >= e.next {
+            return;
+        }
+        e.deleted.insert(id.sequence);
+        if e.deleted.len() > DELETED_IDENTITIES {
+            let highest = e.deleted.iter().next_back().copied().unwrap_or(e.live_from);
+            e.live_from = highest.saturating_add(1);
+            e.deleted.clear();
+        }
     }
     /// True when this handle wrote the endpoint's row and has not deleted it.
     /// `allocate` records the identity, `write_entity` writes its row in the
-    /// same poisoned-on-error closure, `delete` forgets it, and a rollback
-    /// clears the map -- so membership means the row is on the tree and a
-    /// `get` to confirm it is a read that already knows its own answer.
+    /// same poisoned-on-error closure, `delete` records the removal, and a
+    /// rollback clears the map -- so a sequence inside the live range means
+    /// the row is on the tree and a `get` to confirm it is a read that already
+    /// knows its own answer.
+    ///
+    /// The upper bound is not decoration. A sequence at or above `next` was
+    /// never handed out, so nothing wrote its row, and reading the range
+    /// without it would report a row that is not there as live.
     pub(super) fn endpoint_known_live(&self, id: EntityId) -> bool {
-        self.fresh.contains_key(&id)
+        self.allocated.get(&id.collection).is_some_and(|e| {
+            (e.live_from..e.next).contains(&id.sequence)
+                // A handle that has deleted nothing asks nothing. The probe is
+                // for the exceptions, and most writers have none.
+                && (e.deleted.is_empty() || !e.deleted.contains(&id.sequence))
+        })
     }
-    /// True when no edge with this exact key can exist yet, because one of its
-    /// endpoints is an identity this handle allocated and no edge with this
-    /// key has been written on it since.
+    /// True when the forward/reverse probe before writing this edge cannot
+    /// report anything, because one of its endpoints is a row this handle
+    /// allocated.
+    ///
+    /// SACRIFICE (Law 4), widened from "and no edge with this key written on
+    /// it since": the probe's whole product is a corruption report about a
+    /// pair this call is on its way to overwrite, and on a handle-allocated
+    /// endpoint the only bytes it could read are ones this same handle wrote
+    /// in this session, already checksummed on the way in (Law 5). Tracking
+    /// which keys those were cost a list per identity and a bound on how many
+    /// identities could be tracked at all; the report it bought back is one
+    /// `index_verifier` still produces. What is lost is an early warning on
+    /// this engine's own fresh writes, not a repair and not a refusal.
     pub(super) fn edge_provably_absent(&self, key: EdgeKey) -> bool {
-        [key.source, key.destination]
-            .iter()
-            .any(|end| self.fresh.get(end).is_some_and(|seen| !seen.contains(&key)))
-    }
-    /// Record an edge against whichever endpoints are still tracked. An
-    /// identity that outgrows its edge list is forgotten instead, which costs
-    /// it the fast path and never an incorrect answer.
-    pub(super) fn note_edge_written(&mut self, key: EdgeKey) {
-        for end in [key.source, key.destination] {
-            let drop = match self.fresh.get_mut(&end) {
-                Some(seen) => {
-                    if !seen.contains(&key) {
-                        seen.push(key);
-                    }
-                    seen.len() > FRESH_EDGES_EACH
-                }
-                None => false,
-            };
-            if drop {
-                self.fresh.remove(&end);
-            }
-        }
+        self.endpoint_known_live(key.source) || self.endpoint_known_live(key.destination)
     }
     fn validate_document(&self, c: &Catalog, key: &str, doc: &Value) -> Result<()> {
         if key.is_empty() || key.len() > 1024 {
@@ -1338,7 +1372,7 @@ impl Database {
             }
             self.writer()?.delete(&row_key(e.entity.id))?;
             self.writer()?.delete(&mapping_key(c, key))?;
-            self.forget_fresh(e.entity.id);
+            self.note_deleted(e.entity.id);
             Ok(true)
         })();
         self.finish(result)
@@ -1399,8 +1433,7 @@ impl Database {
         // A rollback rewinds the allocator, so a sequence handed out before it
         // can be handed out again. Everything the map claims about those ids
         // was learned in the discarded transaction; drop the lot.
-        self.fresh.clear();
-        self.fresh_order.clear();
+        self.allocated.clear();
         self.user_writes_pending = false;
         self.failed = true;
         self.store.rollback()?;
