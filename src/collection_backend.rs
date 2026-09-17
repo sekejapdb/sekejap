@@ -6,7 +6,7 @@
 //! actually enforces and refuses, explicitly, everything it cannot honour.
 use crate::pagewal::{PageWalStore, HINT_FILE_BYTES, READER_SLOTS};
 use kernel::{
-    btree::RangeIter,
+    btree::{RangeIter, ReverseRangeIter},
     io::IoMode,
     limits::ResourceLimits,
     store::{Config, SyncMode},
@@ -135,6 +135,10 @@ impl Backend {
     pub fn range(&self, from: &[u8]) -> Result<RangeIter<'_>> {
         self.store.range(from)
     }
+    /// Descending records strictly below `to`.
+    pub fn range_reverse(&self, to: &[u8]) -> Result<ReverseRangeIter<'_>> {
+        self.store.range_reverse(to)
+    }
     pub fn put(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
         self.write_fault()?;
         self.store.put(k, v)
@@ -156,6 +160,14 @@ impl Backend {
     }
     pub fn tree_range(&self, tree_id: u16, root: u32, from: &[u8]) -> Result<Option<RangeIter<'_>>> {
         self.store.tree_range(tree_id, root, from)
+    }
+    pub fn tree_range_reverse(
+        &self,
+        tree_id: u16,
+        root: u32,
+        to: &[u8],
+    ) -> Result<Option<ReverseRangeIter<'_>>> {
+        self.store.tree_range_reverse(tree_id, root, to)
     }
     pub fn tree_put(&mut self, tree_id: u16, root: u32, k: &[u8], v: &[u8]) -> Result<u32> {
         self.write_fault()?;

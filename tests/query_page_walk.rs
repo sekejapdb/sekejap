@@ -103,6 +103,7 @@ struct Fixture {
     v: CollectionId,
     cat: IndexId,
     rating: IndexId,
+    price: IndexId,
 }
 
 /// `rows` entities whose sequence is their insertion index, one equality
@@ -110,10 +111,22 @@ struct Fixture {
 /// exactly one eighth of the collection) and one ordered index over a real.
 fn fixture(path: &Path, rows: u64) -> Fixture {
     let mut db = Database::create(path, cfg()).unwrap();
+    // Both index layouts have to answer these questions at the same cost. A
+    // version-2 scalar index walks its OWN tree and a version-1 one walks the
+    // primary tree; the cursors here -- forward and reverse -- reach them
+    // through the same two entry points. `E4_INDEX_TREES=0` runs the whole
+    // file against the version-1 layout.
+    if std::env::var("E4_INDEX_TREES").is_ok_and(|mode| mode == "0") {
+        db.set_create_index_trees(false);
+    }
     let v = db
         .create_collection(
             "v",
-            vec![("cat".into(), Kind::Text), ("rating".into(), Kind::Real)],
+            vec![
+                ("cat".into(), Kind::Text),
+                ("rating".into(), Kind::Real),
+                ("price".into(), Kind::Real),
+            ],
             CollectionOptions::default(),
         )
         .unwrap();
@@ -123,7 +136,11 @@ fn fixture(path: &Path, rows: u64) -> Fixture {
             .put(
                 v,
                 &format!("k{i:08}"),
-                &json!({"cat": CATS[(i % 8) as usize], "rating": (i % 1000) as f64 / 4.0}),
+                &json!({
+                    "cat": CATS[(i % 8) as usize],
+                    "rating": (i % 1000) as f64 / 4.0,
+                    "price": (i % 617) as f64,
+                }),
             )
             .unwrap();
         assert_eq!(id.sequence, i, "the fixture rests on sequence == insertion index");
@@ -136,16 +153,26 @@ fn fixture(path: &Path, rows: u64) -> Fixture {
     db.build_index_to_ready(cat, 255).unwrap();
     let rating = db.create_scalar_index(v, "rating_idx", "rating", false).unwrap();
     db.build_index_to_ready(rating, 255).unwrap();
+    let price = db.create_scalar_index(v, "price_idx", "price", false).unwrap();
+    db.build_index_to_ready(price, 255).unwrap();
     db.commit().unwrap();
     db.checkpoint().unwrap();
-    Fixture { db, v, cat, rating }
+    Fixture {
+        db,
+        v,
+        cat,
+        rating,
+        price,
+    }
 }
 
 struct PageCost {
     ids: Vec<u64>,
+    projected: usize,
     candidates: u64,
     primary_reads: u64,
     scalar_postings: u64,
+    row_decodes: u64,
 }
 
 /// Drain a whole query, summing the work every page reports.
@@ -171,9 +198,11 @@ fn drain(
         .unwrap();
     let mut cost = PageCost {
         ids: Vec::new(),
+        projected: 0,
         candidates: 0,
         primary_reads: 0,
         scalar_postings: 0,
+        row_decodes: 0,
     };
     loop {
         let page = prepared
@@ -182,8 +211,10 @@ fn drain(
         cost.candidates += page.work.candidates;
         cost.primary_reads += page.work.primary_reads;
         cost.scalar_postings += page.work.scalar_postings;
+        cost.row_decodes += page.work.row_decodes;
         for row in &page.rows {
             cost.ids.push(row.id.sequence);
+            cost.projected += row.projected.len();
         }
         if page.done || page.rows.is_empty() {
             break;
@@ -405,5 +436,267 @@ fn a_key_only_scan_does_not_allocate_per_candidate() {
          needs a few dozen; a key and a value `Vec` per candidate is ~2 per \
          row and the allocating range iterator measured ~8 per row (16,349 \
          for 2,000 rows) before this fix",
+    );
+}
+
+// ── loop-5 residuals: the four costs item Q left standing ──────────────────
+
+/// The rank order a DESC scalar query asks for: value descending, entity id
+/// ascending inside a tie. Computed from the fixture's own generator so the
+/// assertion names the answer rather than trusting the engine for it.
+fn descending_rating_order(rows: u64) -> Vec<u64> {
+    let mut all: Vec<(u64, u64)> = (1..=rows).map(|i| (i % 1000, i)).collect();
+    all.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    all.into_iter().map(|(_, id)| id).collect()
+}
+
+/// A DESCENDING scalar order is as much a walk order as an ascending one: the
+/// same posting range read backwards. So the same two properties must hold --
+/// a LIMIT stops the walk, and page k+1 resumes where page k stopped.
+#[test]
+fn a_descending_scalar_order_stops_at_its_limit_and_pages_by_continuation() {
+    let temp = tempfile::tempdir().unwrap();
+    let rows = 5_000u64;
+    let Fixture { db, v, rating, .. } = fixture(&temp.path().join("db"), rows);
+    let expected = descending_rating_order(rows);
+
+    let top = drain(
+        &db,
+        v,
+        &[],
+        QueryOrder::Scalar {
+            index: rating,
+            direction: SortDirection::Descending,
+        },
+        Projection::Ids,
+        Some(50),
+        CandidateDriver::Order,
+        8192,
+    );
+    assert_eq!(top.ids, expected[..50], "the fifty highest-rated ids");
+    assert!(
+        top.candidates <= 56,
+        "DESC + LIMIT 50 over {rows} rows examined {} candidates; a reverse \
+         posting cursor walking in rank order stops at the limit (<= 56), \
+         collecting the whole index and sorting it is {rows}",
+        top.candidates
+    );
+
+    // Paged, small pages, so continuation is exercised rather than a single
+    // page that happens to cover everything.
+    let pages = 5u64;
+    let walk = drain(
+        &db,
+        v,
+        &[],
+        QueryOrder::Scalar {
+            index: rating,
+            direction: SortDirection::Descending,
+        },
+        Projection::Ids,
+        None,
+        CandidateDriver::Order,
+        1_000,
+    );
+    assert_eq!(walk.ids, expected, "pages are disjoint, complete and in order");
+    assert!(
+        walk.scalar_postings <= rows + pages * 16,
+        "a {pages}-page DESC scan of {rows} rows read {} scalar postings; one \
+         reverse pass plus a re-walk of each page's boundary tie group is \
+         {rows} + a little (<= {}), re-walking the posting range per page is \
+         {}",
+        walk.scalar_postings,
+        rows + pages * 16,
+        rows * pages
+    );
+}
+
+/// An equality filter plus an order on a DIFFERENT ready index: walking the
+/// ORDER index puts the walk in rank order, so the LIMIT stops it, and the
+/// equality filter is answered from its own posting as a membership test.
+/// Nothing reads a row to find out what the order field says.
+#[test]
+fn an_equality_filter_ordered_by_another_index_walks_the_order_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let rows = 5_000u64;
+    let Fixture { db, v, cat, rating, .. } = fixture(&temp.path().join("db"), rows);
+    // `cafe` is CATS[0]: exactly the sequences divisible by 8.
+    let matches = rows / 8;
+    let expected: Vec<u64> = descending_rating_order(rows)
+        .into_iter()
+        .filter(|id| id % 8 == 0)
+        .take(10)
+        .collect();
+
+    let filters = [QueryFilter::Scalar {
+        index: cat,
+        predicate: ScalarFilter::Eq(ScalarValue::Text("cafe")),
+    }];
+    let cost = drain(
+        &db,
+        v,
+        &filters,
+        QueryOrder::Scalar {
+            index: rating,
+            direction: SortDirection::Descending,
+        },
+        Projection::Ids,
+        Some(10),
+        CandidateDriver::Auto,
+        8192,
+    );
+    assert_eq!(cost.ids, expected, "the ten highest-rated `cafe` ids");
+    assert!(
+        cost.candidates <= 256,
+        "`cat = 'cafe' ORDER BY rating DESC LIMIT 10` over {rows} rows \
+         ({matches} matches) examined {} candidates. One in eight rows is \
+         accepted, so ten accepted rows are about eighty walked (<= 256); \
+         driving from the equality posting examines every one of the \
+         {matches} matches and sorts them",
+        cost.candidates
+    );
+    assert!(
+        cost.primary_reads == 0,
+        "the same query read {} primary rows. The order key comes out of the \
+         posting the walk is already on and the equality filter is answered \
+         from -- and proved by -- its own posting, so nothing needs a row at \
+         all; reading the order field out of each match was {matches}",
+        cost.primary_reads
+    );
+    assert_eq!(
+        cost.row_decodes, 0,
+        "the same query walked {} dense-v3 rows; neither the order key nor \
+         the membership test needs one",
+        cost.row_decodes
+    );
+}
+
+/// A non-driving RANGE filter on a second index cannot be answered from a
+/// posting: the index is keyed value-first, and the candidate's value is
+/// exactly what is unknown, so there is no key to probe. It is answered from
+/// the row -- but each candidate's row must be read ONCE and walked ONCE, and
+/// a winner must not pay for it a second time.
+#[test]
+fn a_second_range_filter_reads_and_decodes_each_candidate_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let rows = 5_000u64;
+    let Fixture { db, v, rating, price, .. } = fixture(&temp.path().join("db"), rows);
+
+    let filters = [
+        QueryFilter::Scalar {
+            index: price,
+            predicate: ScalarFilter::Range {
+                lower: std::ops::Bound::Included(ScalarValue::F64(100.0)),
+                upper: std::ops::Bound::Unbounded,
+            },
+        },
+        QueryFilter::Scalar {
+            index: rating,
+            predicate: ScalarFilter::Range {
+                lower: std::ops::Bound::Unbounded,
+                upper: std::ops::Bound::Included(ScalarValue::F64(125.0)),
+            },
+        },
+    ];
+    let cost = drain(
+        &db,
+        v,
+        &filters,
+        QueryOrder::EntityId,
+        Projection::Ids,
+        None,
+        CandidateDriver::Auto,
+        8192,
+    );
+    let expected: Vec<u64> = (1..=rows)
+        .filter(|i| (i % 617) as f64 >= 100.0 && (i % 1000) as f64 / 4.0 <= 125.0)
+        .collect();
+    assert_eq!(cost.ids, expected, "both ranges, intersected");
+    let winners = cost.ids.len() as u64;
+    assert!(
+        cost.primary_reads <= cost.candidates + 4,
+        "two ranges over {rows} rows examined {} candidates and read {} \
+         primary rows. The second range needs one row per candidate (<= {}); \
+         re-fetching each of the {winners} winners afterwards costs that again",
+        cost.candidates,
+        cost.primary_reads,
+        cost.candidates + 4,
+    );
+    assert!(
+        cost.row_decodes <= cost.candidates + 4,
+        "the same query walked {} dense-v3 rows for {} candidates; one field \
+         from one walk per candidate is <= {}",
+        cost.row_decodes,
+        cost.candidates,
+        cost.candidates + 4,
+    );
+}
+
+/// Projection. The entity cursor has already read the row out of the primary
+/// tree, so a projected scan must not go back for it; and however many columns
+/// are asked for, the row is one dense-v3 record and must be walked once.
+#[test]
+fn a_projected_scan_reuses_the_walked_row_and_decodes_it_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let rows = 5_000u64;
+    let Fixture { db, v, .. } = fixture(&temp.path().join("db"), rows);
+
+    let (one, allocs) = measured(|| {
+        drain(
+            &db,
+            v,
+            &[],
+            QueryOrder::EntityId,
+            Projection::Fields(&["rating"]),
+            None,
+            CandidateDriver::Entities,
+            8192,
+        )
+    });
+    assert_eq!(one.ids.len(), rows as usize, "the whole collection");
+    assert_eq!(one.projected, rows as usize, "one column per row");
+    assert!(
+        one.primary_reads <= rows + 4,
+        "projecting one column over {rows} rows read {} primary rows. The \
+         entity cursor already read every one of them (<= {}); fetching each \
+         winner again is {}",
+        one.primary_reads,
+        rows + 4,
+        rows * 2
+    );
+    assert!(
+        one.row_decodes <= rows + 4,
+        "projecting one column over {rows} rows walked {} dense-v3 rows; one \
+         walk materialising one field is <= {}",
+        one.row_decodes,
+        rows + 4
+    );
+    assert!(
+        allocs <= rows as usize * 8 + 512,
+        "projecting one column over {rows} rows made {allocs} allocations. \
+         The result is one name and one value per row; the bound is \
+         {} (eight per emitted row plus the page's fixed cost)",
+        rows as usize * 8 + 512
+    );
+
+    let five = drain(
+        &db,
+        v,
+        &[],
+        QueryOrder::EntityId,
+        Projection::Fields(&["cat", "rating", "price"]),
+        None,
+        CandidateDriver::Entities,
+        8192,
+    );
+    assert_eq!(five.projected, rows as usize * 3, "three columns per row");
+    assert!(
+        five.row_decodes <= rows + 4,
+        "projecting three columns over {rows} rows walked {} dense-v3 rows; \
+         the row is ONE record and three fields come out of one walk (<= {}), \
+         one walk per projected field is {}",
+        five.row_decodes,
+        rows + 4,
+        rows * 3
     );
 }

@@ -938,6 +938,14 @@ pub struct ReverseRangeIter<'p> {
     path: Vec<(u32, usize)>,
     leaves: u32,
     max_leaves: u32,
+    /// Live pin of `page` for [`ReverseRangeIter::peek_ref`], held across
+    /// successive peeks into the same leaf exactly as the forward cursor holds
+    /// its own. `for_each_ref` never sets it and is unaffected.
+    pin: Option<PinnedRead<'p>>,
+    /// An overflow record resolved out of its chain. It cannot be borrowed
+    /// from the pinned leaf, so it is parked here and served from here; the
+    /// slot index has already stepped past it when it lands.
+    pending: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl<'p> BTree<'p> {
@@ -2687,6 +2695,7 @@ impl<'p> BTree<'p> {
         Ok(ReverseRangeIter {
             pool: self.pool, tree_id: self.tree_id, page: leaf, idx,
             done: false, leaves: 1, max_leaves: self.pool.page_count(), path,
+            pin: None, pending: None,
         })
     }
 }
@@ -2725,10 +2734,114 @@ impl ReverseRangeIter<'_> {
         Ok(true)
     }
 
+    /// The descending record the cursor is parked on, borrowed from the pinned
+    /// leaf, with no allocation. Paired with [`ReverseRangeIter::step`] this is
+    /// the PULL cursor the forward iterator already has: peek, use, step, peek.
+    ///
+    /// A query executor cannot live inside `for_each_ref`'s callback -- it has
+    /// to interleave the walk with a heap, a work meter and a cancellation
+    /// check -- and until this existed, every descending order had to
+    /// materialise its whole range before it could rank it. Same leaf pin,
+    /// same tree-id and cycle checks, same overflow resolution as the
+    /// callback form.
+    pub fn peek_ref(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.position()?;
+        self.current_ref()
+    }
+
+    /// Step past the record the last peek returned. Crossing into the leaf to
+    /// the LEFT is left to the next peek, which retreats through the saved
+    /// parent path when the slot index reaches the start of the leaf.
+    pub fn step(&mut self) {
+        if self.pending.take().is_some() {
+            return;
+        }
+        self.idx = self.idx.saturating_sub(1);
+    }
+
+    fn position(&mut self) -> Result<()> {
+        loop {
+            if self.pending.is_some() || self.done {
+                return Ok(());
+            }
+            if self.pin.is_none() {
+                self.pin = Some(self.pool.get(self.page)?);
+            }
+            enum Step {
+                Stay,
+                Overflow { key: Vec<u8>, marker: Vec<u8> },
+                PreviousLeaf,
+                Corrupt,
+            }
+            let step = {
+                let pin = self.pin.as_ref().unwrap();
+                let p = open_cached(pin, self.page)?;
+                if p.tree_id() != self.tree_id {
+                    Step::Corrupt
+                } else if self.idx > 0 {
+                    let (key, value, is_marker) = validated_leaf(p.slot(self.idx - 1));
+                    if is_marker {
+                        Step::Overflow { key: key.to_vec(), marker: value.to_vec() }
+                    } else {
+                        Step::Stay
+                    }
+                } else {
+                    Step::PreviousLeaf
+                }
+            };
+            match step {
+                Step::Corrupt => {
+                    self.pin = None;
+                    self.done = true;
+                    return Err(Error::Corrupt {
+                        page_no: self.page, why: "reverse-scan page belongs to another tree" });
+                }
+                Step::Stay => return Ok(()),
+                Step::Overflow { key, marker } => {
+                    // Step past it here: `step()` then only drops `pending`.
+                    self.idx -= 1;
+                    self.pin = None;
+                    let value = read_overflow(self.pool, &marker)?;
+                    self.pending = Some((key, value));
+                    return Ok(());
+                }
+                Step::PreviousLeaf => {
+                    self.pin = None;
+                    if !self.retreat()? {
+                        self.done = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn current_ref(&self) -> Result<Option<(&[u8], &[u8])>> {
+        if let Some((key, value)) = self.pending.as_ref() {
+            return Ok(Some((key.as_slice(), value.as_slice())));
+        }
+        if self.done {
+            return Ok(None);
+        }
+        let Some(pin) = self.pin.as_ref() else {
+            return Ok(None);
+        };
+        let p = open_cached(pin, self.page)?;
+        if self.idx == 0 {
+            return Ok(None);
+        }
+        let (key, value, is_marker) = validated_leaf(p.slot(self.idx - 1));
+        debug_assert!(!is_marker, "peek parks overflow markers in `pending`");
+        Ok(Some((key, value)))
+    }
+
     /// Visit descending records as borrows into one pinned leaf. The cursor is
     /// bounded by the buffer pool; a caller stopping after `k` entries pays for
     /// only the pages containing those entries.
     pub fn for_each_ref(mut self, mut f: impl FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
+        self.pin = None;
+        if let Some((key, value)) = self.pending.take() {
+            if !f(&key, &value) { return Ok(()) }
+        }
         loop {
             if self.done { return Ok(()) }
             let r = self.pool.get(self.page)?;

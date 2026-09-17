@@ -6,7 +6,7 @@ use crate::spatial_math::{
     Bounds, MAX_HILBERT_VALUE, Point, bounds_hilbert_ranges, radius_candidate_bounds, within_radius,
 };
 use crate::{dense_v3, scalar_key};
-use kernel::btree::RangeIter;
+use kernel::btree::{RangeIter, ReverseRangeIter};
 use serde_json::Value;
 use std::{
     cmp::Ordering,
@@ -248,6 +248,14 @@ impl QueryBudget {
 pub struct QueryWork {
     pub candidates: u64,
     pub primary_reads: u64,
+    /// Complete dense-v3 row traversals. A row is one record whose fields are
+    /// length-prefixed, so reaching field k means stepping over fields 0..k:
+    /// there is no offset to jump to. This counts how many times a page paid
+    /// that walk, which is the projection and row-filter cost a point-get
+    /// count cannot see. Diagnostic only -- it has no budget, because
+    /// refusing a query part-way through materialising its answer helps
+    /// nobody.
+    pub row_decodes: u64,
     pub scalar_postings: u64,
     pub graph_edges: u64,
     pub graph_visited: u64,
@@ -342,6 +350,12 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
         } else {
             Ok(())
         }
+    }
+
+    /// Note one complete dense-v3 row traversal. Unbudgeted on purpose: see
+    /// [`QueryWork::row_decodes`].
+    pub(super) fn note_row_decode(&mut self) {
+        self.used.row_decodes = self.used.row_decodes.saturating_add(1);
     }
 
     pub(super) fn charge(&mut self, resource: WorkResource, amount: u64) -> QueryResult<()> {
@@ -584,11 +598,43 @@ struct RankKey {
     id: EntityId,
 }
 
-#[derive(Clone, Debug, Eq)]
+/// How much of the query's rank order the driver's own walk already provides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RankWalk {
+    /// None of it: the walk order and the rank order are unrelated.
+    No,
+    /// All of it, key for key. A page may stop the moment its heap is full,
+    /// and the next page may resume at this page's last key.
+    Exact,
+    /// The VALUE half only, and monotonically. A descending scalar order is
+    /// ranked (value descending, entity id ASCENDING) while the reverse walk
+    /// hands a tie group over id descending, so a full heap is not yet an
+    /// answer: the walk has to finish the boundary value's tie group before
+    /// anything later can be ruled out. It still stops long before the end,
+    /// and it still resumes rather than restarting.
+    ByValue,
+}
+
+/// One ranked candidate the page is still holding, and -- when the page is
+/// going to project fields out of it -- the primary row the walk already read.
+///
+/// Carrying the bytes is what stops a projected scan reading every row twice:
+/// once to walk it and once to fetch the winner back. Bounded by the heap's
+/// capacity, so it is the page's own bound, not the collection's.
 struct HeapEntry {
     key: RankKey,
     descending: bool,
+    /// Boxed on purpose. Every query pays this struct's size on every heap
+    /// push, pop and sift -- a key-only scan of 20,000 rows sifts an 8,192
+    /// entry heap -- so the pointer stays here and the row lives off to one
+    /// side. Inlining `RowData` here cost a measured 25-30% on `scan/full_keys`
+    /// and `filter/eq_indexed_many`, which carry no rows at all.
+    row: Option<Box<RowData>>,
 }
+
+/// The carried row plays no part in the ordering, so equality is the rank
+/// comparison and nothing else.
+impl Eq for HeapEntry {}
 
 impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
@@ -637,8 +683,18 @@ impl Ord for ApproxHeapEntry {
     }
 }
 
+#[inline]
 fn compare_rank(a: &RankKey, b: &RankKey, descending: bool) -> Ordering {
-    let value = match (&a.value, &b.value) {
+    compare_rank_value(&a.value, &b.value, descending).then_with(|| a.id.cmp(&b.id))
+}
+
+/// The VALUE half of the rank comparison, without the entity-id tie-break.
+/// A descending walk is monotone in this and not in the whole key, so this is
+/// what decides whether anything still ahead of the cursor can outrank what
+/// the page already holds.
+#[inline]
+fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool) -> Ordering {
+    match (a, b) {
         (RankValue::Entity, RankValue::Entity) => Ordering::Equal,
         (RankValue::Scalar(a), RankValue::Scalar(b)) => {
             if descending {
@@ -657,8 +713,7 @@ fn compare_rank(a: &RankKey, b: &RankKey, descending: bool) -> Ordering {
             }
         }
         _ => unreachable!("prepared order creates one rank-key kind"),
-    };
-    value.then_with(|| a.id.cmp(&b.id))
+    }
 }
 
 pub struct PreparedQuery<'db> {
@@ -1127,7 +1182,38 @@ impl Database {
                         }
                     )
                 }) {
-                    filter_driver(position)?
+                    // An equality filter is the default driver -- unless the
+                    // query also names a scalar order on ANOTHER ready index
+                    // and the filter is broad enough that walking that index
+                    // in rank order is the cheaper plan. See
+                    // `order_index_drives_better`.
+                    let ordered_elsewhere = match (&order, filters.get(position)) {
+                        (
+                            CompiledOrder::Scalar {
+                                info: ranked,
+                                direction,
+                            },
+                            Some(CompiledFilter::Scalar {
+                                info,
+                                predicate: EncodedScalarFilter::Eq(value),
+                                ..
+                            }),
+                        ) if ranked.id != info.id && request.total_limit.is_some() => {
+                            order_index_drives_better(
+                                self,
+                                ranked,
+                                matches!(direction, SortDirection::Descending),
+                                info,
+                                value,
+                            )?
+                        }
+                        _ => false,
+                    };
+                    if ordered_elsewhere {
+                        order_driver()?
+                    } else {
+                        filter_driver(position)?
+                    }
                 } else if let Some(position) = filters
                     .iter()
                     .position(|filter| matches!(filter, CompiledFilter::Text(_)))
@@ -1214,6 +1300,103 @@ impl Database {
             after: None,
         })
     }
+}
+
+/// How many postings of the ORDER index the planner walks before deciding.
+const ORDER_DRIVE_PROBE: u64 = 64;
+/// The density the probe must find: one accepted row per this many walked.
+/// It is the crossover of the two plans -- see [`order_index_drives_better`].
+const ORDER_DRIVE_MIN_DENSITY: u64 = 16;
+
+/// Should an equality filter plus a scalar order on a DIFFERENT index, under a
+/// LIMIT, be driven from the ORDER index rather than from the filter?
+///
+/// Driving from the equality posting hands candidates over in entity-id order,
+/// which is not the order asked for. Every match then has to give up its order
+/// value, and that value is not in the posting being walked -- it is in the
+/// primary row, one point-get and one dense-v3 walk per match -- and the whole
+/// set has to be sorted before the first row can be returned.
+///
+/// Driving from the ORDER index inverts that. The walk is already in rank
+/// order, so the LIMIT becomes a stop condition, the order key falls out of the
+/// posting the cursor is standing on, and the equality filter is answered from
+/// ITS posting as a membership probe -- no row at all, which is the same
+/// authority `scalar_eq_posting_matches` already carries.
+///
+/// The price is walking over the rows the filter rejects, `1/density` of them
+/// per accepted row, each costing a sequential posting step plus a membership
+/// probe. Against the other plan's random primary point-get plus row walk per
+/// match, the two meet around one accepted row in sixteen. A LIMIT is required:
+/// without one the order walk crosses the whole index and pays a membership
+/// probe on every row of it, which is strictly more work than the equality plan
+/// ever does.
+///
+/// WHICH density, though, is the whole question. An earlier version of this
+/// sampled the equality posting's own sequence spread -- how thinly its matches
+/// are scattered through the collection -- and it was WRONG, measurably: with
+/// `cat` and `rating` correlated, the highest-rated 3,500 rows of the
+/// benchmark's collection contain no `cafe` at all, the equality filter looks
+/// perfectly broad in sequence space, and the order walk still crosses
+/// thousands of rejected rows before its first hit. The query got 1.5x SLOWER.
+///
+/// So the probe walks the ORDER index itself, in the direction the real walk
+/// would take, for a bounded prefix, and counts how many of those postings the
+/// equality filter accepts. That is the statistic the plan actually depends on,
+/// and correlation cannot hide from it. It costs [`ORDER_DRIVE_PROBE`] posting
+/// steps and the same number of membership probes, once per prepared query.
+fn order_index_drives_better(
+    db: &Database,
+    order: &IndexInfo,
+    descending: bool,
+    filter: &IndexInfo,
+    expected: &[u8],
+) -> QueryResult<bool> {
+    let prefix = scalar_prefix(order.id);
+    let mut walk = if descending {
+        match db
+            .index_range_reverse(order, &prefix_successor(&prefix))
+            .map_err(QueryError::from)?
+        {
+            Some(iter) => ScalarWalk::Reverse(iter),
+            None => return Ok(false),
+        }
+    } else {
+        match db.index_range(order, &prefix).map_err(QueryError::from)? {
+            Some(iter) => ScalarWalk::Forward(iter),
+            None => return Ok(false),
+        }
+    };
+    let mut probed = 0u64;
+    let mut accepted = 0u64;
+    while probed < ORDER_DRIVE_PROBE {
+        let sequence = {
+            let Some((key, _)) = walk.peek().map_err(Error::from).map_err(QueryError::from)? else {
+                break;
+            };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let suffix = &key[prefix.len()..];
+            let (_, value_len) = scalar_key::decode(&order.kind, suffix)?;
+            let mut at = prefix.len() + value_len;
+            read_ordered(key, &mut at)?
+        };
+        walk.step();
+        probed += 1;
+        if db
+            .index_get(filter, &super::indexes::skey(filter, expected, sequence))
+            .map_err(QueryError::from)?
+            .is_some()
+        {
+            accepted += 1;
+        }
+    }
+    // A short index is walked end to end either way; only a real prefix says
+    // anything about the rest.
+    if probed < ORDER_DRIVE_PROBE {
+        return Ok(false);
+    }
+    Ok(accepted.saturating_mul(ORDER_DRIVE_MIN_DENSITY) >= probed)
 }
 
 fn validate_graph_request(db: &Database, request: BfsRequest) -> QueryResult<()> {
@@ -1443,8 +1626,43 @@ struct EntityCursor<'a> {
     done: bool,
 }
 
+/// One posting range, walked in one direction. The two cursors are the same
+/// tree read the two ways round: ascending from the predicate's lower bound,
+/// descending from one key past its upper bound.
+enum ScalarWalk<'a> {
+    /// Nothing can match -- the `Empty` predicate, or an index whose tree has
+    /// never been written.
+    Nothing,
+    Forward(RangeIter<'a>),
+    Reverse(ReverseRangeIter<'a>),
+}
+
+impl ScalarWalk<'_> {
+    fn peek(&mut self) -> kernel::Result<Option<(&[u8], &[u8])>> {
+        match self {
+            Self::Nothing => Ok(None),
+            Self::Forward(iter) => iter.peek_ref(),
+            Self::Reverse(iter) => iter.peek_ref(),
+        }
+    }
+
+    fn step(&mut self) {
+        match self {
+            Self::Nothing => {}
+            Self::Forward(iter) => iter.step(),
+            Self::Reverse(iter) => iter.step(),
+        }
+    }
+
+    /// True when the walk runs from high keys to low ones, which inverts what
+    /// "before the predicate" and "past the predicate" mean.
+    fn descending(&self) -> bool {
+        matches!(self, Self::Reverse(_))
+    }
+}
+
 struct ScalarCursor<'a> {
-    inner: Option<RangeIter<'a>>,
+    walk: ScalarWalk<'a>,
     prefix: Vec<u8>,
     info: IndexInfo,
     predicate: EncodedScalarFilter,
@@ -1542,6 +1760,79 @@ fn scalar_lower(predicate: &EncodedScalarFilter) -> Option<&[u8]> {
     }
 }
 
+/// The successor of a prefix: the shortest key above every key that starts
+/// with it. A scalar prefix begins with the family tag `0x70`, so the loop
+/// always finds a byte to raise.
+fn prefix_successor(prefix: &[u8]) -> Vec<u8> {
+    let mut key = prefix.to_vec();
+    while let Some(last) = key.last_mut() {
+        if *last == u8::MAX {
+            key.pop();
+        } else {
+            *last += 1;
+            return key;
+        }
+    }
+    vec![u8::MAX; 64]
+}
+
+/// One key past every posting of `value`. Postings are
+/// `prefix || value || ordered(sequence)`, so the widest of them is the one
+/// with the maximum sequence, and one byte beyond that sits above the whole
+/// group and below the next value.
+fn past_scalar_value(info: &IndexInfo, value: &[u8]) -> Vec<u8> {
+    let mut key = super::indexes::skey(info, value, u64::MAX);
+    key.push(0);
+    key
+}
+
+/// Where a DESCENDING walk of this predicate opens. `range_reverse` yields
+/// keys strictly below its argument, so this is the exclusive upper edge of
+/// the predicate's range rather than its last member.
+fn scalar_reverse_start(
+    info: &IndexInfo,
+    prefix: &[u8],
+    predicate: &EncodedScalarFilter,
+) -> Option<Vec<u8>> {
+    match predicate {
+        EncodedScalarFilter::Empty => None,
+        EncodedScalarFilter::Eq(value) => Some(past_scalar_value(info, value)),
+        EncodedScalarFilter::IsNull | EncodedScalarFilter::IsMissing => {
+            Some(past_scalar_value(info, NULLISH_SCALAR_KEY))
+        }
+        EncodedScalarFilter::Range { upper, .. } => Some(match upper {
+            EncodedBound::Included(value) => past_scalar_value(info, value),
+            // Every posting of `value` sorts after the bare `prefix || value`,
+            // so opening there excludes the whole group, which is what an
+            // exclusive upper bound means.
+            EncodedBound::Excluded(value) => {
+                let mut key = prefix.to_vec();
+                key.extend_from_slice(value);
+                key
+            }
+            EncodedBound::Unbounded => prefix_successor(prefix),
+        }),
+    }
+}
+
+/// Where a resumed DESCENDING walk opens.
+///
+/// A descending query ranks by (value descending, entity id ASCENDING) -- the
+/// id half never flips -- while the reverse walk hands a tie group over id
+/// DESCENDING. So the previous page's last key is NOT a point the walk can
+/// resume from: the rows still owed inside that tie group lie *earlier* in
+/// the walk, not later. Resuming at the top of the boundary value's group
+/// re-walks that one group and lets `next_page`'s `after` comparison drop the
+/// members it already emitted. The re-walk is bounded by one value's tie
+/// group per page; opening at the start of the index is bounded by everything
+/// emitted so far.
+fn resume_scalar_reverse_key(info: &IndexInfo, after: &RankKey) -> Option<Vec<u8>> {
+    match &after.value {
+        RankValue::Scalar(value) => Some(past_scalar_value(info, value)),
+        _ => None,
+    }
+}
+
 /// The posting key a resumed scalar walk should open at: the exact entry the
 /// previous page stopped on. Both shapes of rank key that a scalar driver can
 /// produce in its own walk order are covered -- a scalar ranking carries the
@@ -1611,6 +1902,7 @@ impl<'a> DriverCursor<'a> {
         graph: &[Option<BTreeSet<EntityId>>],
         needs: CursorNeeds,
         resume: Option<&RankKey>,
+        descending: bool,
     ) -> QueryResult<Self> {
         match plan {
             DriverPlan::Entities => {
@@ -1637,8 +1929,23 @@ impl<'a> DriverCursor<'a> {
                 position,
             } => {
                 let prefix = scalar_prefix(info.id);
-                let inner = if matches!(predicate, EncodedScalarFilter::Empty) {
-                    None
+                let walk = if descending {
+                    match scalar_reverse_start(info, &prefix, predicate) {
+                        None => ScalarWalk::Nothing,
+                        Some(mut start) => {
+                            if let Some(key) =
+                                resume.and_then(|after| resume_scalar_reverse_key(info, after))
+                            {
+                                start = key;
+                            }
+                            match db.index_range_reverse(info, &start).map_err(QueryError::from)? {
+                                Some(iter) => ScalarWalk::Reverse(iter),
+                                None => ScalarWalk::Nothing,
+                            }
+                        }
+                    }
+                } else if matches!(predicate, EncodedScalarFilter::Empty) {
+                    ScalarWalk::Nothing
                 } else {
                     let mut start = prefix.clone();
                     if let Some(lower) = scalar_lower(predicate) {
@@ -1648,8 +1955,10 @@ impl<'a> DriverCursor<'a> {
                     {
                         start = key;
                     }
-                    db.index_range(info, &start)
-                        .map_err(QueryError::from)?
+                    match db.index_range(info, &start).map_err(QueryError::from)? {
+                        Some(iter) => ScalarWalk::Forward(iter),
+                        None => ScalarWalk::Nothing,
+                    }
                 };
                 // A posting key IS the predicate's proof: the walk yields an
                 // entry only when `scalar_key_position` puts its value inside
@@ -1668,7 +1977,7 @@ impl<'a> DriverCursor<'a> {
                     _ => None,
                 };
                 Ok(Self::Scalar(ScalarCursor {
-                    inner,
+                    walk,
                     prefix,
                     info: info.clone(),
                     predicate: predicate.clone(),
@@ -1838,9 +2147,13 @@ impl ScalarCursor<'_> {
         if self.done {
             return Ok(None);
         }
-        let Some(inner) = self.inner.as_mut() else {
-            self.done = true;
-            return Ok(None);
+        // Which side of the predicate the walk has NOT reached yet, and which
+        // side means it is finished. An ascending walk approaches from below;
+        // a descending one approaches from above.
+        let past = if self.walk.descending() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
         };
         loop {
             meter.charge(WorkResource::ScalarPostings, 1)?;
@@ -1848,8 +2161,9 @@ impl ScalarCursor<'_> {
             // leaf, decide, then step. The key and the (always empty) value of
             // a posting were a `Vec` each before.
             let decoded = {
-                let Some((key, value)) = inner
-                    .peek_ref()
+                let Some((key, value)) = self
+                    .walk
+                    .peek()
                     .map_err(Error::from)
                     .map_err(QueryError::from)?
                 else {
@@ -1865,12 +2179,12 @@ impl ScalarCursor<'_> {
                 let encoded = suffix
                     .get(..value_len)
                     .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
-                match scalar_key_position(&self.predicate, encoded) {
-                    Ordering::Less => None,
-                    Ordering::Greater => {
-                        self.done = true;
-                        return Ok(None);
-                    }
+                let position = scalar_key_position(&self.predicate, encoded);
+                if position == past {
+                    self.done = true;
+                    return Ok(None);
+                }
+                match position {
                     Ordering::Equal => {
                         let mut at = self.prefix.len() + value_len;
                         let sequence = read_ordered(key, &mut at)?;
@@ -1887,9 +2201,11 @@ impl ScalarCursor<'_> {
                             encoded != NULLISH_SCALAR_KEY,
                         ))
                     }
+                    // Not yet inside the predicate: keep walking.
+                    _ => None,
                 }
             };
-            inner.step();
+            self.walk.step();
             let Some((sequence, encoded, proves_predicate)) = decoded else {
                 continue;
             };
@@ -2211,6 +2527,129 @@ fn decode_row(db: &Database, bytes: Vec<u8>) -> QueryResult<RowData> {
         layout: db.layout(id)?,
         bytes,
     })
+}
+
+/// How far ahead the lockstep cursor will walk before it descends again.
+///
+/// `peek_at_or_after` reaches a key past its pinned leaf by stepping to the
+/// next leaf, one at a time -- cheap for the next row, ruinous for a row a
+/// hundred leaves away. A page whose winners are SPARSE in the primary tree (a
+/// nine-row spatial answer, a one-row graph hop) would walk the whole
+/// collection's leaves to collect them, and it did: `win/spatial_tiny` went
+/// 30 -> 109 us and `graph/hop1_project` 11 -> 47 us before this bound. Beyond
+/// the bound the cursor is re-opened AT the target, which is one descent --
+/// exactly what the point-get it replaces costs, so a sparse page is never
+/// worse off and a dense one still pays one descent per page.
+const LOCKSTEP_REACH: u64 = 32;
+
+/// How a page reads primary rows.
+///
+/// When rows are asked for in ascending entity id -- an equality posting is
+/// ordered by sequence, a graph result is a `BTreeSet`, the entity walk is the
+/// primary tree, and an id ranking returns winners in that order too -- the
+/// keys are ascending primary keys. One forward cursor can then step through
+/// them, paying one pinned leaf for every row that lives on it, instead of
+/// descending the tree from the root for each. Any other order keeps the
+/// point-get it always did, and the cursor is opened only when something
+/// actually reads a row.
+struct PrimaryRows<'a> {
+    db: &'a Database,
+    ascending: bool,
+    cursor: Option<RangeIter<'a>>,
+    last: u64,
+}
+
+impl<'a> PrimaryRows<'a> {
+    fn new(db: &'a Database, ascending: bool) -> Self {
+        Self {
+            db,
+            ascending,
+            cursor: None,
+            last: 0,
+        }
+    }
+
+    fn read(&mut self, id: EntityId) -> QueryResult<Option<Vec<u8>>> {
+        let db = self.db;
+        let key = row_key(id);
+        if !self.ascending {
+            return db
+                .store()?
+                .get(&key)
+                .map_err(Error::from)
+                .map_err(QueryError::from);
+        }
+        if self.cursor.is_some() && id.sequence <= self.last {
+            // The cursor only moves forward. A target behind it would make
+            // `peek_at_or_after` return the record the cursor is parked on,
+            // whose key does not match, and a present row would be reported
+            // missing. Callers ascend by construction; this is the guard that
+            // makes that a property of the reader rather than of every caller.
+            return db
+                .store()?
+                .get(&key)
+                .map_err(Error::from)
+                .map_err(QueryError::from);
+        }
+        if self.cursor.is_some() && id.sequence.saturating_sub(self.last) > LOCKSTEP_REACH {
+            // The rows this page wants are SPARSE in the primary tree, so the
+            // cursor is not paying for itself: reaching each one costs a
+            // re-descent anyway, and a cursor re-descent builds cursor state a
+            // point-get does not. Give the rest of the page back to the
+            // point-get. One page decides this once, from the first gap it
+            // sees, and the next page decides again.
+            self.ascending = false;
+            self.cursor = None;
+            return db
+                .store()?
+                .get(&key)
+                .map_err(Error::from)
+                .map_err(QueryError::from);
+        }
+        if self.cursor.is_none() {
+            self.cursor = Some(
+                db.store()?
+                    .range(&key)
+                    .map_err(Error::from)
+                    .map_err(QueryError::from)?,
+            );
+        }
+        self.last = id.sequence;
+        let cursor = self.cursor.as_mut().expect("the cursor was just opened");
+        Ok(
+            match cursor
+                .peek_at_or_after(&key)
+                .map_err(Error::from)
+                .map_err(QueryError::from)?
+            {
+                Some((found, value)) if found == key.as_slice() => Some(value.to_vec()),
+                _ => None,
+            },
+        )
+    }
+}
+
+/// [`ensure_row`] through the page's own primary reader.
+fn ensure_row_seq<'a, C: FnMut() -> bool>(
+    db: &'a Database,
+    rows: &mut PrimaryRows<'a>,
+    id: EntityId,
+    row: &mut Option<RowData>,
+    encoded: &mut Option<Vec<u8>>,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<()> {
+    if row.is_some() {
+        return Ok(());
+    }
+    let bytes = if let Some(bytes) = encoded.take() {
+        bytes
+    } else {
+        meter.charge(WorkResource::PrimaryReads, 1)?;
+        rows.read(id)?
+            .ok_or_else(|| corrupt_query("query candidate points to a missing entity"))?
+    };
+    *row = Some(decode_row(db, bytes)?);
+    Ok(())
 }
 
 fn ensure_row<C: FnMut() -> bool>(
@@ -2704,8 +3143,9 @@ fn rerank_quantized_vector<C: FnMut() -> bool>(
     .map_err(QueryError::from)
 }
 
-fn filters_match<C: FnMut() -> bool>(
-    db: &Database,
+fn filters_match<'a, C: FnMut() -> bool>(
+    db: &'a Database,
+    rows: &mut PrimaryRows<'a>,
     filters: &[CompiledFilter],
     candidate: &Candidate,
     row: &mut Option<RowData>,
@@ -2734,14 +3174,16 @@ fn filters_match<C: FnMut() -> bool>(
                     scalar_eq_posting_matches(db, info, expected, id, meter)?
                 }
                 _ => {
-                    ensure_row(db, id, row, encoded, meter)?;
+                    ensure_row_seq(db, rows, id, row, encoded, meter)?;
                     let row = row.as_ref().unwrap();
+                    meter.note_row_decode();
                     scalar_filter_matches(info, predicate, selected_field(row, &info.field)?)?
                 }
             },
             CompiledFilter::JsonEq { field, value } => {
-                ensure_row(db, id, row, encoded, meter)?;
+                ensure_row_seq(db, rows, id, row, encoded, meter)?;
                 let row = row.as_ref().unwrap();
+                meter.note_row_decode();
                 json_filter_matches(selected_field(row, field)?, value)?
             }
             CompiledFilter::Graph { position, .. } => graph
@@ -2749,9 +3191,10 @@ fn filters_match<C: FnMut() -> bool>(
                 .and_then(Option::as_ref)
                 .is_some_and(|ids| ids.contains(&id)),
             CompiledFilter::Point { info, predicate } => {
-                ensure_row(db, id, row, encoded, meter)?;
+                ensure_row_seq(db, rows, id, row, encoded, meter)?;
                 let row = row.as_ref().unwrap();
                 meter.charge(WorkResource::SpatialPostings, 1)?;
+                meter.note_row_decode();
                 let Some(point) = point_from_field(selected_field(row, &info.field)?)? else {
                     return Ok(false);
                 };
@@ -2782,8 +3225,9 @@ fn filters_match<C: FnMut() -> bool>(
     Ok(true)
 }
 
-fn rank_candidate<C: FnMut() -> bool>(
-    db: &Database,
+fn rank_candidate<'a, C: FnMut() -> bool>(
+    db: &'a Database,
+    rows: &mut PrimaryRows<'a>,
     order: &CompiledOrder,
     candidate: &Candidate,
     row: &mut Option<RowData>,
@@ -2802,7 +3246,8 @@ fn rank_candidate<C: FnMut() -> bool>(
             let key = match key {
                 Some(key) => key,
                 None => {
-                    ensure_row(db, candidate.id, row, encoded, meter)?;
+                    ensure_row_seq(db, rows, candidate.id, row, encoded, meter)?;
+                    meter.note_row_decode();
                     persisted_scalar_key(info, selected_field(row.as_ref().unwrap(), &info.field)?)?
                         .ok_or_else(|| corrupt_query("missing scalar order key"))?
                 }
@@ -2877,14 +3322,69 @@ fn project_value(value: dense_v3::FieldValue) -> QueryResult<ProjectedValue> {
     }
 }
 
-fn project_field<C: FnMut() -> bool>(
+/// Materialise every projected field of one winner in ONE dense-v3 walk.
+///
+/// A row is a single record; the number of columns asked for changes what
+/// comes out of the walk, not how many walks there are.
+fn project_fields<C: FnMut() -> bool>(
     db: &Database,
     id: EntityId,
     row: &RowData,
-    field: &str,
+    projection: &[String],
+    scratch: &mut ProjectionScratch,
+    out: &mut Vec<(String, ProjectedValue)>,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<()> {
+    if projection.is_empty() {
+        return Ok(());
+    }
+    meter.note_row_decode();
+    scratch
+        .ensure_plan(&row.layout, projection)
+        .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))?;
+    let ProjectionScratch { plan, values } = scratch;
+    let plan = &plan.as_ref().expect("the plan was just built").1;
+    dense_v3::read_fields(&row.layout, &row.bytes, projection, plan, values)
+        .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))?;
+    for (field, value) in projection.iter().zip(values.drain(..)) {
+        meter.check_cancelled()?;
+        out.push((field.clone(), project_value_or_sidecar(db, id, value, meter)?));
+    }
+    Ok(())
+}
+
+/// The two buffers a projected page reuses across its rows: the ordinal map
+/// for the layout it is on, and the vector the decoder fills. Rows of one
+/// collection share a layout in the ordinary case, and the map is rebuilt only
+/// where they do not.
+#[derive(Default)]
+struct ProjectionScratch {
+    plan: Option<(u64, dense_v3::FieldPlan)>,
+    values: Vec<dense_v3::FieldValue>,
+}
+
+impl ProjectionScratch {
+    fn ensure_plan(
+        &mut self,
+        layout: &Layout,
+        projection: &[String],
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        if !self.plan.as_ref().is_some_and(|(id, _)| *id == layout.id) {
+            self.plan = Some((layout.id, dense_v3::FieldPlan::new(layout, projection)?));
+        }
+        Ok(())
+    }
+}
+
+/// A projected value, fetching the authoritative vector sidecar when the field
+/// is a historical vector.
+fn project_value_or_sidecar<C: FnMut() -> bool>(
+    db: &Database,
+    id: EntityId,
+    value: dense_v3::FieldValue,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<ProjectedValue> {
-    match selected_field(row, field)? {
+    match value {
         dense_v3::FieldValue::Vector { ordinal, dimension } => {
             meter.charge(WorkResource::VectorSidecars, 1)?;
             meter.charge(
@@ -2902,6 +3402,33 @@ fn project_field<C: FnMut() -> bool>(
         }
         value => project_value(value),
     }
+}
+
+/// A `Write` that keeps the length and throws the bytes away.
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// How many bytes one projected value would serialise to.
+///
+/// This is charged against the output budget for every projected value of
+/// every returned row, and it used to be measured by serialising the value
+/// into a fresh `Vec` and reading `len()` -- a heap allocation and a full
+/// serialisation per value, whose only product was an integer. A five-column
+/// page of 8,192 rows did that 40,960 times and threw all of it away.
+fn json_size(value: &Value) -> QueryResult<u64> {
+    let mut count = ByteCount(0);
+    serde_json::to_writer(&mut count, value).map_err(invalid_query)?;
+    Ok(count.0)
 }
 
 fn checked_output_size(row: &QueryRow) -> QueryResult<u64> {
@@ -2935,10 +3462,7 @@ fn checked_output_size(row: &QueryRow) -> QueryResult<u64> {
             .ok_or_else(|| invalid_query("query output size overflow"))?;
         let bytes = match value {
             ProjectedValue::Missing | ProjectedValue::Null => 0,
-            ProjectedValue::Value(value) => {
-                u64::try_from(serde_json::to_vec(value).map_err(invalid_query)?.len())
-                    .map_err(invalid_query)?
-            }
+            ProjectedValue::Value(value) => json_size(value)?,
         };
         size = size
             .checked_add(bytes)
@@ -2970,25 +3494,34 @@ impl PreparedQuery<'_> {
     /// relation to any tree's order and must see every candidate before it
     /// knows its top k, and a range or nullish driver under an id order walks
     /// by value while ranking by id.
-    fn driver_walks_in_rank_order(&self) -> bool {
+    fn driver_walks_in_rank_order(&self) -> RankWalk {
         match (&self.driver, &self.order) {
-            (DriverPlan::Entities, CompiledOrder::EntityId) => true,
+            (DriverPlan::Entities, CompiledOrder::EntityId) => RankWalk::Exact,
             (
                 DriverPlan::Scalar {
                     predicate: EncodedScalarFilter::Eq(_),
                     ..
                 },
                 CompiledOrder::EntityId,
-            ) => true,
+            ) => RankWalk::Exact,
             (
                 DriverPlan::Scalar { info, .. },
                 CompiledOrder::Scalar {
                     info: order,
-                    direction: SortDirection::Ascending,
+                    direction,
                 },
-            ) => info.id == order.id,
-            _ => false,
+            ) if info.id == order.id => match direction {
+                SortDirection::Ascending => RankWalk::Exact,
+                SortDirection::Descending => RankWalk::ByValue,
+            },
+            _ => RankWalk::No,
         }
+    }
+
+    /// True when the scalar driver has to be walked backwards: the order is
+    /// descending and it is that order's own index doing the driving.
+    fn scalar_driver_descends(&self) -> bool {
+        matches!(self.driver_walks_in_rank_order(), RankWalk::ByValue)
     }
 
     /// What the page will actually read off each candidate. A driver holding
@@ -2998,7 +3531,17 @@ impl PreparedQuery<'_> {
             // The entity cursor's row bytes save `ensure_row` a point-get, but
             // only if something decodes them. With no filters and an id
             // ranking, nothing does.
-            row: !self.filters.is_empty() || !matches!(self.order, CompiledOrder::EntityId),
+            // A text filter that is not a phrase, and a BM25 ranking, are
+            // answered from the postings and the norm blocks; only a phrase
+            // has to re-read the authoritative text. Copying the row for
+            // them cost one row per scored candidate for nothing.
+            row: self.filters.iter().any(|filter| {
+                !matches!(filter, CompiledFilter::Text(prepared) if prepared.phrase.is_none())
+            }) || !matches!(self.order, CompiledOrder::EntityId | CompiledOrder::Bm25(_))
+                // A projection reads the row as surely as a filter does, and
+                // the cursor is standing on it: copying it here costs one
+                // allocation, fetching it back costs a whole point-get.
+                || !self.projection.is_empty(),
             // The posting's value key is read only by a scalar ranking over
             // the very index that produced it.
             scalar_key: match (&self.driver, &self.order) {
@@ -3026,16 +3569,90 @@ impl PreparedQuery<'_> {
     /// row that is no longer there, and those still fetch it and still refuse
     /// an orphan.
     fn winner_needs_no_row(&self) -> bool {
-        self.projection.is_empty()
-            && match &self.driver {
-                DriverPlan::Entities => true,
-                DriverPlan::Scalar {
+        if !self.projection.is_empty() {
+            return false;
+        }
+        match &self.driver {
+            DriverPlan::Entities => true,
+            DriverPlan::Scalar {
+                predicate: EncodedScalarFilter::Eq(_),
+                position: Some(_),
+                ..
+            } => true,
+            // The ORDER index driving the walk is not itself an authority on
+            // membership -- a posting can outlive its row and an orphan must
+            // still be refused. But when this plan was chosen precisely
+            // BECAUSE an equality filter is riding along as a posting
+            // membership probe (`order_index_drives_better`), that probe is
+            // the same record the equality DRIVER is trusted for one arm up,
+            // and a candidate reached the heap only by passing it. Narrow on
+            // purpose: every other driver, and this one without such a filter,
+            // still goes back for the row.
+            DriverPlan::Scalar { position: None, .. } => self.filters.iter().any(|filter| {
+                matches!(
+                    filter,
+                    CompiledFilter::Scalar {
+                        posting_membership: true,
+                        ..
+                    }
+                )
+            }),
+            _ => false,
+        }
+    }
+
+    /// True when the driver hands candidates over in ascending entity id, so
+    /// the rows they ask for are ascending primary keys and one forward cursor
+    /// can serve the whole page. An equality posting is `value || sequence` for
+    /// one value, so it IS sequence order; a graph result comes out of a
+    /// `BTreeSet`; the entity walk is the primary tree. A range or order walk
+    /// is in value order and a spatial or vector walk in neither, so those keep
+    /// the point-get.
+    fn driver_walks_ids_ascending(&self) -> bool {
+        matches!(
+            self.driver,
+            DriverPlan::Entities
+                | DriverPlan::Graph { .. }
+                | DriverPlan::Scalar {
                     predicate: EncodedScalarFilter::Eq(_),
-                    position: Some(_),
                     ..
-                } => true,
-                _ => false,
-            }
+                }
+        )
+    }
+
+    /// True when EVERY candidate that survives to the heap has already had its
+    /// primary record read, so the winner stage's existence re-fetch is asking
+    /// a question the walk has answered.
+    ///
+    /// It is a property of the plan, not of the candidate: a candidate reaches
+    /// the heap only by passing every filter, so if any filter is one that has
+    /// to read the row, every heap candidate's row was read. The entity cursor
+    /// is the other case -- it walks the primary tree itself, so a key it
+    /// yielded is a record that is there.
+    ///
+    /// The filter the DRIVER certifies is excluded: that one is skipped
+    /// outright and reads nothing.
+    fn walk_reads_every_row(&self) -> bool {
+        if matches!(self.driver, DriverPlan::Entities) {
+            return true;
+        }
+        let driving = match &self.driver {
+            DriverPlan::Scalar { position, .. } | DriverPlan::Text { position, .. } => *position,
+            DriverPlan::Spatial { position, .. } | DriverPlan::Graph { position } => Some(*position),
+            _ => None,
+        };
+        self.filters.iter().enumerate().any(|(position, filter)| {
+            Some(position) != driving
+                && match filter {
+                    // A non-driving equality answered from its posting reads no
+                    // row; every other scalar predicate does.
+                    CompiledFilter::Scalar {
+                        posting_membership, ..
+                    } => !*posting_membership,
+                    CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
+                    _ => false,
+                }
+        })
     }
 
     pub fn next_page<C: FnMut() -> bool>(
@@ -3083,8 +3700,15 @@ impl PreparedQuery<'_> {
             &self.driver,
             &graph,
             self.cursor_needs(),
-            self.after.as_ref().filter(|_| in_rank_order),
+            self.after
+                .as_ref()
+                .filter(|_| in_rank_order != RankWalk::No),
+            self.scalar_driver_descends(),
         )?;
+        // Whether a kept candidate should carry its row into the heap.
+        let wants_rows = !self.projection.is_empty();
+        let db = self.db;
+        let mut rows = PrimaryRows::new(db, self.driver_walks_ids_ascending());
         let mut heap = BinaryHeap::with_capacity(capacity);
         let approximation =
             if let CompiledOrder::ApproximateVector {
@@ -3105,7 +3729,8 @@ impl PreparedQuery<'_> {
                     let mut encoded = candidate.row.take();
                     let mut row = None;
                     if !filters_match(
-                        self.db,
+                        db,
+                        &mut rows,
                         &self.filters,
                         &candidate,
                         &mut row,
@@ -3163,6 +3788,7 @@ impl PreparedQuery<'_> {
                     let entry = HeapEntry {
                         key,
                         descending: false,
+                        row: None,
                     };
                     if heap.len() < capacity {
                         heap.push(entry);
@@ -3189,7 +3815,8 @@ impl PreparedQuery<'_> {
                     let mut encoded = candidate.row.take();
                     let mut row = None;
                     if !filters_match(
-                        self.db,
+                        db,
+                        &mut rows,
                         &self.filters,
                         &candidate,
                         &mut row,
@@ -3201,7 +3828,8 @@ impl PreparedQuery<'_> {
                         continue;
                     }
                     let Some(key) = rank_candidate(
-                        self.db,
+                        db,
+                        &mut rows,
                         &self.order,
                         &candidate,
                         &mut row,
@@ -3217,14 +3845,57 @@ impl PreparedQuery<'_> {
                     }) {
                         continue;
                     }
-                    let entry = HeapEntry { key, descending };
+                    // A walk that is only VALUE-monotone (a descending scalar
+                    // order, whose reverse walk hands each tie group over id
+                    // descending while the rank wants id ascending) cannot
+                    // stop on a full heap: the rest of the boundary value's
+                    // tie group still outranks what is held. It CAN stop the
+                    // moment a candidate's value falls strictly past the worst
+                    // held one, because the walk never comes back up.
+                    if in_rank_order == RankWalk::ByValue
+                        && heap.len() >= capacity
+                        && heap.peek().is_some_and(|worst| {
+                            compare_rank_value(&key.value, &worst.key.value, descending)
+                                == Ordering::Greater
+                        })
+                    {
+                        break;
+                    }
+                    let mut entry = HeapEntry {
+                        key,
+                        descending,
+                        row: None,
+                    };
+                    // The bytes this candidate's row was read from are still
+                    // in hand -- the entity cursor copied them out of the leaf
+                    // it was standing on, or a filter fetched them. Hand them
+                    // to the heap ONLY if the page will project something and
+                    // ONLY if the entry is being kept, so a losing candidate
+                    // costs nothing and a key-only page carries nothing.
+                    let keep = |entry: &mut HeapEntry,
+                                    row: &mut Option<RowData>,
+                                    encoded: &mut Option<Vec<u8>>|
+                     -> QueryResult<()> {
+                        if wants_rows {
+                            entry.row = match row.take() {
+                                Some(row) => Some(Box::new(row)),
+                                None => match encoded.take() {
+                                    Some(bytes) => Some(Box::new(decode_row(self.db, bytes)?)),
+                                    None => None,
+                                },
+                            };
+                        }
+                        Ok(())
+                    };
                     if heap.len() < capacity {
+                        keep(&mut entry, &mut row, &mut encoded)?;
                         heap.push(entry);
                     } else if heap
                         .peek()
                         .is_some_and(|worst| entry.cmp(worst) == Ordering::Less)
                     {
                         heap.pop();
+                        keep(&mut entry, &mut row, &mut encoded)?;
                         heap.push(entry);
                     }
                     // The page is full and the walk is already in rank order,
@@ -3232,7 +3903,7 @@ impl PreparedQuery<'_> {
                     // held. Without this, `LIMIT 10` reads the whole
                     // collection to answer with ten rows, and a page of a scan
                     // reads to the end of the collection to fill 8,192 rows.
-                    if in_rank_order && heap.len() >= capacity {
+                    if in_rank_order == RankWalk::Exact && heap.len() >= capacity {
                         break;
                     }
                 }
@@ -3244,8 +3915,47 @@ impl PreparedQuery<'_> {
         let has_more = winners.len() > wanted;
         winners.truncate(wanted);
         let winner_needs_no_row = self.winner_needs_no_row();
+        let walk_reads_every_row = self.walk_reads_every_row();
+        let mut scratch = ProjectionScratch::default();
+        // An id ranking returns winners in ascending primary-key order, so the
+        // rows they still need can be lifted out by one forward cursor. Any
+        // other ranking hands them over in an order the primary tree knows
+        // nothing about, and each one is a fresh descent as before.
+        let mut winner_rows =
+            PrimaryRows::new(db, matches!(self.order, CompiledOrder::EntityId));
+        // A RANKED page hands its winners over in score order; the primary
+        // tree is in id order. Reading them as they are ranked descends from
+        // the root once per returned row -- a BM25 page over 900 matching
+        // documents paid 900 descents and 900 buffers, where the very same
+        // page ranked by id paid one cursor. So a ranked page lifts its rows
+        // out FIRST, in the tree's order, and hands them back to the ranked
+        // winners by index. Nothing about the answer or its order changes,
+        // only the order the rows are read in; an id ranking already ascends
+        // and keeps streaming them one at a time, holding none.
+        let ranked_rows_read = !winner_needs_no_row
+            && !walk_reads_every_row
+            && !matches!(self.order, CompiledOrder::EntityId);
+        if ranked_rows_read {
+            let mut by_id: Vec<usize> = (0..winners.len())
+                .filter(|at| winners[*at].row.is_none())
+                .collect();
+            by_id.sort_unstable_by_key(|at| winners[*at].key.id);
+            let mut ascending = PrimaryRows::new(db, true);
+            for at in by_id {
+                meter.charge(WorkResource::PrimaryReads, 1)?;
+                let bytes = ascending
+                    .read(winners[at].key.id)?
+                    .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
+                // Only a projection needs the bytes kept; a key-only page
+                // wanted the read for the proof that the entity is still
+                // there, and has it.
+                if wants_rows {
+                    winners[at].row = Some(Box::new(decode_row(db, bytes)?));
+                }
+            }
+        }
         let mut rows = Vec::with_capacity(winners.len());
-        for winner in &winners {
+        for winner in &mut winners {
             let order = match (&self.order, &winner.key.value) {
                 (CompiledOrder::EntityId, RankValue::Entity) => OrderValue::EntityId,
                 (CompiledOrder::Scalar { info, .. }, RankValue::Scalar(key)) => {
@@ -3270,25 +3980,36 @@ impl PreparedQuery<'_> {
             // fetch decodes nothing and only re-proves what the candidate
             // stream proved.
             let mut projected = Vec::with_capacity(self.projection.len());
-            if !winner_needs_no_row {
+            // The row the candidate walk already had, if it kept one.
+            let carried = winner.row.take();
+            if carried.is_none() && !winner_needs_no_row && !walk_reads_every_row && !ranked_rows_read
+            {
                 meter.charge(WorkResource::PrimaryReads, 1)?;
-                let bytes = self
-                    .db
-                    .store()?
-                    .get(&row_key(winner.key.id))
-                    .map_err(Error::from)
-                    .map_err(QueryError::from)?
+                let bytes = winner_rows
+                    .read(winner.key.id)?
                     .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
                 if !self.projection.is_empty() {
                     let row = decode_row(self.db, bytes)?;
-                    for field in &self.projection {
-                        meter.check_cancelled()?;
-                        projected.push((
-                            field.clone(),
-                            project_field(self.db, winner.key.id, &row, field, &mut meter)?,
-                        ));
-                    }
+                    project_fields(
+                        self.db,
+                        winner.key.id,
+                        &row,
+                        &self.projection,
+                        &mut scratch,
+                        &mut projected,
+                        &mut meter,
+                    )?;
                 }
+            } else if let Some(row) = carried {
+                project_fields(
+                    self.db,
+                    winner.key.id,
+                    &row,
+                    &self.projection,
+                    &mut scratch,
+                    &mut projected,
+                    &mut meter,
+                )?;
             }
             let row = QueryRow {
                 id: winner.key.id,

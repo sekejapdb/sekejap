@@ -656,6 +656,22 @@ impl Database {
             Some(t) => self.store()?.tree_range(t.id, t.root, from).map_err(Error::from),
         }
     }
+    /// Descending entries of one index, strictly below `to`. The mirror of
+    /// [`Database::index_range`], and the same two layouts: a version-1 index
+    /// walks the primary tree backwards, a version-2 index walks its own.
+    pub(super) fn index_range_reverse(
+        &self,
+        i: &IndexInfo,
+        to: &[u8],
+    ) -> Result<Option<kernel::btree::ReverseRangeIter<'_>>> {
+        match i.tree {
+            None => self.store()?.range_reverse(to).map(Some).map_err(Error::from),
+            Some(t) => self
+                .store()?
+                .tree_range_reverse(t.id, t.root, to)
+                .map_err(Error::from),
+        }
+    }
     /// One entry of one index.
     pub(super) fn index_get(&self, i: &IndexInfo, k: &[u8]) -> Result<Option<Vec<u8>>> {
         match i.tree {

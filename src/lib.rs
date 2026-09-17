@@ -625,17 +625,34 @@ pub fn decode(
     Ok(v)
 }
 impl Layout {
+    /// The same three checks as ever, without a heap allocation for a typical
+    /// layout.
+    ///
+    /// This runs on the row-read path -- every single-field decode validates
+    /// the layout first -- and the duplicate-name check used to build a
+    /// `BTreeSet` of the names to do it, which is one tree-node allocation per
+    /// column per row read. A layout of a handful of columns is compared
+    /// pairwise instead: no allocation, and fewer comparisons than the set
+    /// costs. The set is kept for a wide layout, where the quadratic scan
+    /// would be the worse of the two.
     pub fn validate(&self) -> Result<()> {
         if self.fields.len() > 256 {
             return Err("P0 max 256 columns".into());
         }
-        let mut names = std::collections::BTreeSet::new();
-        for (name, kind) in &self.fields {
-            if !names.insert(name) {
-                return Err("duplicate field".into());
-            }
+        for (i, (name, kind)) in self.fields.iter().enumerate() {
             if matches!(kind,Kind::Vector(n) if *n==0 || *n>16384) {
                 return Err("vector dimension limit".into());
+            }
+            if self.fields.len() <= 32 && self.fields[..i].iter().any(|(old, _)| old == name) {
+                return Err("duplicate field".into());
+            }
+        }
+        if self.fields.len() > 32 {
+            let mut names = std::collections::BTreeSet::new();
+            for (name, _) in &self.fields {
+                if !names.insert(name) {
+                    return Err("duplicate field".into());
+                }
             }
         }
         Ok(())

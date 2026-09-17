@@ -189,8 +189,10 @@ fn scalar_json_filters_keep_exact_numbers_null_missing_and_page_order() {
 
         // Null and missing share one persisted scalar key, so a non-driving
         // predicate must still read the authoritative rows to distinguish
-        // them. The rank index drives three rows plus its terminal probe;
-        // the three candidate rows and one winner are primary reads.
+        // them. The rank index drives three rows plus its terminal probe, and
+        // each of the three candidates is read once. The winner is NOT read a
+        // fourth time: the walk already read that row, which is the existence
+        // the re-fetch was asking about.
         let fallback = db
             .prepare_query(QueryRequest {
                 collection,
@@ -211,7 +213,7 @@ fn scalar_json_filters_keep_exact_numbers_null_missing_and_page_order() {
             [expected]
         );
         assert_eq!(fallback.work.scalar_postings, 4);
-        assert_eq!(fallback.work.primary_reads, 4);
+        assert_eq!(fallback.work.primary_reads, 3);
     }
 
     let rounded_max = json!({

@@ -11,7 +11,7 @@
 //! gate and every slot, so no reader's page image is rewritten or its WAL
 //! frames reset underneath it. Frame, header and page formats are the
 //! accepted `E4PWAL02` layout and are unchanged by this integration.
-use kernel::{btree::{BTree, RangeIter}, budget::MemoryBudget, io::{self, FileIo, IoMode, Barrier},
+use kernel::{btree::{BTree, RangeIter, ReverseRangeIter}, budget::MemoryBudget, io::{self, FileIo, IoMode, Barrier},
     page::{PageMut, PageRef, PageKind}, pool::BufferPool, recover::CandidateReader, Error, Result};
 use std::{cell::Cell, collections::BTreeMap, fs::File, path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering}}};
@@ -900,6 +900,10 @@ impl PageWalStore {
     /// life. Snapshot readers scan their published index; a writer scans its
     /// working tree.
     pub fn range(&self,from:&[u8])->Result<RangeIter<'_>>{self.ready()?;self.tree().range(from)}
+    /// Descending records strictly below `to`, the mirror of [`Self::range`].
+    /// A descending ORDER BY is one walk of one tree, not a full materialise
+    /// followed by a sort, and this is the cursor that walk rides on.
+    pub fn range_reverse(&self,to:&[u8])->Result<ReverseRangeIter<'_>>{self.ready()?;self.tree().range_reverse(to)}
     fn tree(&self)->BTree<'_>{BTree::open(&self.pool,1,self.root,&self.last,&self.hits,&self.attempts)}
     /// The append hint for a tree other than the primary one. A miss claims a
     /// slot round-robin and starts that tree with no hint, which is exactly
@@ -932,6 +936,11 @@ impl PageWalStore {
     pub fn tree_range(&self,tree_id:u16,root:u32,from:&[u8])->Result<Option<RangeIter<'_>>>{
         self.ready()?;if root==0 {return Ok(None);}
         self.other(tree_id,root).range(from).map(Some)
+    }
+    /// Descending records of a named tree, strictly below `to`.
+    pub fn tree_range_reverse(&self,tree_id:u16,root:u32,to:&[u8])->Result<Option<ReverseRangeIter<'_>>>{
+        self.ready()?;if root==0 {return Ok(None);}
+        self.other(tree_id,root).range_reverse(to).map(Some)
     }
     /// Insert into a named tree; returns the tree's root AFTER the insert. The
     /// root changes when the height grows, and the caller must persist the new

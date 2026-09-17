@@ -125,6 +125,198 @@ pub(crate) enum FieldValue {
     Vector { ordinal: usize, dimension: usize },
 }
 
+/// Which layout ordinal feeds which requested slot. Built once per layout and
+/// reused for every row of it: working it out per row cost one heap allocation
+/// per row, which is the sort of constant a projected scan of a million rows
+/// notices and a unit test does not.
+pub(crate) struct FieldPlan {
+    /// ordinal -> the requested slot that wants it. Duplicate projection
+    /// fields are refused before a query is prepared, so the first match is
+    /// the only one.
+    wanted: Vec<Option<usize>>,
+    /// Some requested field is not in this layout, so the extras object has to
+    /// be searched for it.
+    undeclared: bool,
+}
+
+impl FieldPlan {
+    /// Validating the layout belongs HERE, not in the per-row decode. A layout
+    /// is immutable and shared behind an `Arc`; `Layout::validate` builds a
+    /// `BTreeSet` of its field names, so calling it per row put a handful of
+    /// tree-node allocations on every projected row for an answer that cannot
+    /// change between them. A row can only be decoded through a plan, and a
+    /// plan can only exist for a layout that passed.
+    pub(crate) fn new(layout: &Layout, fields: &[String]) -> Result<Self> {
+        layout.validate()?;
+        let mut wanted = vec![None; layout.fields.len()];
+        let mut undeclared = false;
+        for (slot, field) in fields.iter().enumerate() {
+            match layout.fields.iter().position(|(name, _)| name == field) {
+                Some(ordinal) => wanted[ordinal] = Some(slot),
+                None => undeclared = true,
+            }
+        }
+        Ok(Self { wanted, undeclared })
+    }
+}
+
+/// Validate the complete row while materializing SEVERAL named fields, in one
+/// pass.
+///
+/// A dense-v3 row is positional but not addressable: text is length-prefixed,
+/// integers are variable width and JSON is nested, so reaching field k means
+/// stepping over fields 0..k. There is no offset table to jump into. That
+/// makes the walk itself the cost, and a five-column projection that called
+/// [`read_field`] five times paid it five times over for one record. This
+/// walks once and fills every requested slot on the way past.
+///
+/// `fields` may name undeclared keys; those are answered from the extras
+/// object exactly as the single-field reader answers them.
+pub(crate) fn read_fields(
+    layout: &Layout,
+    bytes: &[u8],
+    fields: &[String],
+    plan: &FieldPlan,
+    out: &mut Vec<FieldValue>,
+) -> Result<()> {
+    // The layout was validated when this plan was built for it, and the length
+    // check below is what ties the two together.
+    if plan.wanted.len() != layout.fields.len() {
+        return Err("projection plan does not match this layout".into());
+    }
+    let wanted = &plan.wanted;
+    let undeclared = plan.undeclared;
+    out.clear();
+    out.resize(fields.len(), FieldValue::Missing);
+    let mut r = Read { b: bytes, p: 0 };
+    let h = r.uv()?;
+    if h >> 2 > u32::MAX as u64 {
+        return Err("layout ID domain".into());
+    }
+    if h >> 2 != layout.id {
+        return Err("wrong layout".into());
+    }
+    let states = if h & 1 != 0 {
+        Some(r.take(layout.fields.len().div_ceil(4))?)
+    } else {
+        None
+    };
+    let integers = layout
+        .fields
+        .iter()
+        .filter(|(_, kind)| matches!(kind, Kind::Int))
+        .count();
+    let widths = r.take((integers * 3).div_ceil(8))?;
+    let mut integer_index = 0;
+    for (ordinal, (_, kind)) in layout.fields.iter().enumerate() {
+        let width_index = integer_index;
+        if matches!(kind, Kind::Int) {
+            integer_index += 1;
+        }
+        let state = states.map_or(2, |states| (states[ordinal / 4] >> ((ordinal % 4) * 2)) & 3);
+        let slot = wanted[ordinal];
+        match state {
+            0 => continue,
+            1 => {
+                if let Some(slot) = slot {
+                    out[slot] = FieldValue::Null;
+                }
+                continue;
+            }
+            2 => {}
+            _ => return Err("invalid field state".into()),
+        }
+        match kind {
+            Kind::Text => {
+                let value = std::str::from_utf8(r.blob()?)?;
+                if let Some(slot) = slot {
+                    out[slot] = FieldValue::Inline(Value::String(value.to_owned()));
+                }
+            }
+            Kind::Int => {
+                let n = (width_get(widths, width_index) + 1) as usize;
+                let bytes = r.take(n)?;
+                if let Some(slot) = slot {
+                    let mut full = [if bytes[0] & 128 == 0 { 0 } else { 255 }; 8];
+                    full[8 - n..].copy_from_slice(bytes);
+                    out[slot] = FieldValue::Inline(Value::from(i64::from_be_bytes(full)));
+                }
+            }
+            Kind::Real => {
+                let value = r.float()?;
+                if let Some(slot) = slot {
+                    out[slot] = FieldValue::Inline(Value::from(value));
+                }
+            }
+            Kind::Bool => {
+                let value = match r.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("boolean encoding".into()),
+                };
+                if let Some(slot) = slot {
+                    out[slot] = FieldValue::Inline(Value::Bool(value));
+                }
+            }
+            Kind::Json => match slot {
+                Some(slot) => out[slot] = FieldValue::Inline(json_read(&mut r, 0)?),
+                None => json_skip(&mut r, 0)?,
+            },
+            Kind::Geo => {
+                let geometry = Geom::decode(r.blob()?).ok_or("invalid binary geometry")?;
+                if let Some(slot) = slot {
+                    out[slot] = FieldValue::Inline(geo_json(geometry));
+                }
+            }
+            Kind::Point => {
+                let point = Geom::Point(r.float()?, r.float()?);
+                if let Some(slot) = slot {
+                    out[slot] = FieldValue::Inline(geo_json(point));
+                }
+            }
+            Kind::Vector(dimension) => {
+                if let Some(slot) = slot {
+                    out[slot] = FieldValue::Vector {
+                        ordinal,
+                        dimension: *dimension,
+                    };
+                }
+            }
+        }
+    }
+    if h & 2 != 0 {
+        if r.byte()? != 8 {
+            return Err("extras must be object".into());
+        }
+        let n = r.count()?;
+        let mut previous: Option<&str> = None;
+        for _ in 0..n {
+            let key = std::str::from_utf8(r.blob()?)?;
+            if previous.is_some_and(|old| old >= key) {
+                return Err("unordered/duplicate object key".into());
+            }
+            if layout.fields.iter().any(|(name, _)| name == key) {
+                return Err("declared key in extras".into());
+            }
+            previous = Some(key);
+            let slot = undeclared.then(|| fields.iter().position(|field| field == key)).flatten();
+            match slot {
+                Some(slot) => {
+                    let value = json_read(&mut r, 1)?;
+                    out[slot] = if value.is_null() {
+                        FieldValue::Null
+                    } else {
+                        FieldValue::Inline(value)
+                    };
+                }
+                None => json_skip(&mut r, 1)?,
+            }
+        }
+    }
+    r.done()?;
+    Ok(())
+}
+
 /// Validate the complete row while materializing only `field`. A field absent
 /// from this immutable layout may still be present in its extras object; such a
 /// numeric JSON array remains ordinary JSON rather than becoming a vector.
