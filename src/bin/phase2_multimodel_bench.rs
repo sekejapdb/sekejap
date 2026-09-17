@@ -505,6 +505,78 @@ fn independent_members_active_spatial_vector(
     })
 }
 
+/// Traversal-group size and seed spread. Seed j is person (j*7919)%n, so the
+/// hundred seeds land all over the key space instead of in one hot page range.
+const GRAPH_SEEDS: usize = 100;
+const GRAPH_BFS_DEPTH: usize = 3;
+
+fn graph_seed(j: usize, n: usize) -> usize {
+    (j * 7919) % n
+}
+
+/// Outgoing `knows` destinations of a seed, straight from the generator formula.
+fn independent_knows_out(n: usize, seed: usize) -> BTreeSet<u64> {
+    [(seed + 1) % n, (seed + 7) % n]
+        .into_iter()
+        .map(|i| i as u64 + 1)
+        .collect()
+}
+
+/// Incoming `knows` sources of a seed: the two people whose formula points at it.
+fn independent_knows_in(n: usize, seed: usize) -> BTreeSet<u64> {
+    [(seed + n - 1) % n, (seed + n - 7) % n]
+        .into_iter()
+        .map(|i| i as u64 + 1)
+        .collect()
+}
+
+/// People wired to organization `org` (1-based) by the `member_of` formula.
+fn independent_org_member_count(n: usize, org: u64) -> usize {
+    (0..n).filter(|i| i % 100 == org as usize - 1).count()
+}
+
+/// Distinct entities within `max_depth` `knows` hops of a seed, both directions,
+/// counted the way the engine counts `visited`: the seed included.
+fn independent_bfs_visited(n: usize, seed: usize, max_depth: usize) -> usize {
+    let mut seen = BTreeSet::from([seed]);
+    let mut frontier = BTreeSet::from([seed]);
+    for _ in 0..max_depth {
+        let mut next = BTreeSet::new();
+        for source in frontier {
+            for adjacent in [
+                (source + 1) % n,
+                (source + 7) % n,
+                (source + n - 1) % n,
+                (source + n - 7) % n,
+            ] {
+                if !seen.contains(&adjacent) {
+                    next.insert(adjacent);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        seen.extend(next.iter().copied());
+        frontier = next;
+    }
+    seen.len()
+}
+
+/// One traversal item: total wall time over every seed plus the per-seed median,
+/// because a single traversal is too short to read off a single-shot timer.
+fn graph_timing_json(mut micros: Vec<f64>, rows: usize, detail: Value) -> Value {
+    let total = micros.iter().sum::<f64>() / 1e6;
+    micros.sort_by(|a, b| a.total_cmp(b));
+    let median = micros[micros.len() / 2];
+    let mut value = detail;
+    value["seconds"] = json!(total);
+    value["median_micros"] = json!(median);
+    value["seeds"] = json!(micros.len());
+    value["rows"] = json!(rows);
+    value
+}
+
 fn final_vector_oracle(
     n: usize,
     dimension: usize,
@@ -1190,6 +1262,142 @@ fn run_e4(
             .collect::<Vec<_>>(),
         member_oracle.iter().map(|hit| hit.id).collect::<Vec<_>>()
     );
+    // Dedicated graph traversal group. The graph is this database's speciality and
+    // nothing here timed a plain traversal: every earlier graph number was an edge
+    // load, a CRUD cascade, or a combined query measured once. One traversal is far
+    // too short for a single-shot timer, so each item runs over the same hundred
+    // spread seeds, each seed timed on its own, after one untimed warm-up seed.
+    let graph_seeds = (0..GRAPH_SEEDS).map(|j| graph_seed(j, n)).collect::<Vec<_>>();
+    let warm_seed = graph_seed(0, n);
+    let out_request = |seed: usize| NeighborRequest {
+        entity: entity(seed),
+        direction: Direction::Outgoing,
+        context: GraphContextId::BASE,
+        edge_type: Some(knows),
+        limit: 8,
+    };
+    let in_request = |seed: usize| NeighborRequest {
+        entity: entity(seed),
+        direction: Direction::Incoming,
+        context: GraphContextId::BASE,
+        edge_type: Some(knows),
+        limit: 8,
+    };
+    let bfs_request = |seed: usize| BfsRequest {
+        seed: entity(seed),
+        direction: Direction::Both,
+        context: GraphContextId::BASE,
+        edge_type: Some(knows),
+        min_depth: 1,
+        max_depth: GRAPH_BFS_DEPTH,
+        include_seed: false,
+        max_visited: 1000,
+        max_edges: 100_000,
+        result_limit: 1000,
+    };
+    let org_request = |seed: usize| BfsRequest {
+        seed: EntityId {
+            collection: organizations,
+            sequence: (seed % 100) as u64 + 1,
+        },
+        direction: Direction::Incoming,
+        context: GraphContextId::BASE,
+        edge_type: Some(member),
+        min_depth: 1,
+        max_depth: 1,
+        include_seed: false,
+        max_visited: member_limit + 1,
+        max_edges: member_limit + 1,
+        result_limit: member_limit,
+    };
+
+    db.neighbors(out_request(warm_seed))?;
+    let mut out_micros = Vec::with_capacity(GRAPH_SEEDS);
+    let mut out_rows = 0usize;
+    for &seed in &graph_seeds {
+        let start = Instant::now();
+        let found = db
+            .neighbors(out_request(seed))?
+            .into_iter()
+            .map(|edge| edge.key.destination.sequence)
+            .collect::<BTreeSet<_>>();
+        out_micros.push(start.elapsed().as_secs_f64() * 1e6);
+        assert_eq!(found, independent_knows_out(n, seed));
+        out_rows += found.len();
+    }
+    queries.insert(
+        "graph_out_1hop".into(),
+        graph_timing_json(
+            out_micros,
+            out_rows,
+            json!({"work":"outgoing knows neighbours, complete-or-error limit 8"}),
+        ),
+    );
+
+    db.neighbors(in_request(warm_seed))?;
+    let mut in_micros = Vec::with_capacity(GRAPH_SEEDS);
+    let mut in_rows = 0usize;
+    for &seed in &graph_seeds {
+        let start = Instant::now();
+        let found = db
+            .neighbors(in_request(seed))?
+            .into_iter()
+            .map(|edge| edge.key.source.sequence)
+            .collect::<BTreeSet<_>>();
+        in_micros.push(start.elapsed().as_secs_f64() * 1e6);
+        assert_eq!(found, independent_knows_in(n, seed));
+        in_rows += found.len();
+    }
+    queries.insert(
+        "graph_in_1hop".into(),
+        graph_timing_json(
+            in_micros,
+            in_rows,
+            json!({"work":"incoming knows neighbours through the reverse edge index"}),
+        ),
+    );
+
+    db.traverse_bfs(bfs_request(warm_seed))?;
+    let mut bfs_micros = Vec::with_capacity(GRAPH_SEEDS);
+    let mut bfs_rows = 0usize;
+    for &seed in &graph_seeds {
+        let start = Instant::now();
+        let visited = db.traverse_bfs(bfs_request(seed))?.visited;
+        bfs_micros.push(start.elapsed().as_secs_f64() * 1e6);
+        assert_eq!(visited, independent_bfs_visited(n, seed, GRAPH_BFS_DEPTH));
+        bfs_rows += visited;
+    }
+    queries.insert(
+        "graph_bfs_3hop".into(),
+        graph_timing_json(
+            bfs_micros,
+            bfs_rows,
+            json!({"work":"distinct-entity BFS over knows, both directions, depth 1..=3, visited counted with the seed"}),
+        ),
+    );
+
+    db.traverse_bfs(org_request(warm_seed))?;
+    let mut org_micros = Vec::with_capacity(GRAPH_SEEDS);
+    let mut org_rows = 0usize;
+    for &seed in &graph_seeds {
+        let start = Instant::now();
+        let members = db.traverse_bfs(org_request(seed))?.nodes.len();
+        org_micros.push(start.elapsed().as_secs_f64() * 1e6);
+        assert_eq!(
+            members,
+            independent_org_member_count(n, (seed % 100) as u64 + 1)
+        );
+        org_rows += members;
+    }
+    queries.insert(
+        "graph_members_of_org".into(),
+        graph_timing_json(
+            org_micros,
+            org_rows,
+            json!({"work":"every person with a member_of edge to organization (seed%100)+1, through the reverse edge index"}),
+        ),
+    );
+
     progress.complete("pre_crud_queries", &Value::Object(queries.clone()));
     io.insert("pre_crud_queries".into(), e4_io_delta(&db, &mut io_prev)?);
 
@@ -2585,6 +2793,169 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
         member_vector.iter().map(|hit| hit.id).collect::<Vec<_>>(),
         member_oracle.iter().map(|hit| hit.id).collect::<Vec<_>>()
     );
+    // The same four traversals, the same hundred seeds, the same counts checked
+    // against the same independent formulas -- see the E4 arm for why this group
+    // exists. Statements are prepared once; only execution and row draining count.
+    const SQLITE_OUT_1HOP_SQL: &str = "SELECT destination_id FROM edges WHERE context=0 AND source_collection=1 AND source_id=?1 AND edge_type=1 AND destination_collection=1";
+    const SQLITE_IN_1HOP_SQL: &str = "SELECT source_id FROM edges WHERE context=0 AND destination_collection=1 AND destination_id=?1 AND edge_type=1 AND source_collection=1";
+    const SQLITE_MEMBERS_OF_ORG_SQL: &str = "SELECT source_id FROM edges WHERE context=0 AND destination_collection=2 AND destination_id=?1 AND edge_type=2 AND source_collection=1";
+    // CROSS JOIN + INDEXED BY, like the combined graph query above: left to itself
+    // the planner drives the recursive step from a broad edge_in range scan instead
+    // of probing one source at a time, which is a plan SQLite should not be judged on.
+    const SQLITE_BFS_3HOP_SQL: &str = "WITH RECURSIVE reach(id,depth) AS (SELECT ?1,0 UNION SELECT e.destination_id,r.depth+1 FROM reach r CROSS JOIN edges AS e INDEXED BY sqlite_autoindex_edges_1 WHERE e.context=0 AND e.source_collection=1 AND e.source_id=r.id AND e.edge_type=1 AND e.destination_collection=1 AND r.depth<3 UNION SELECT e.source_id,r.depth+1 FROM reach r CROSS JOIN edges AS e INDEXED BY edge_in WHERE e.context=0 AND e.destination_collection=1 AND e.destination_id=r.id AND e.edge_type=1 AND e.source_collection=1 AND r.depth<3) SELECT DISTINCT id FROM reach LIMIT 1000";
+
+    // EXPLAIN QUERY PLAN needs a bound statement, so plan the literal-seed spelling.
+    let out_1hop_plan = sqlite_plan(&db, &SQLITE_OUT_1HOP_SQL.replace("?1", "1"))?;
+    assert_indexed_plan("outgoing 1-hop", &out_1hop_plan, &["PRIMARY KEY"]);
+    let in_1hop_plan = sqlite_plan(&db, &SQLITE_IN_1HOP_SQL.replace("?1", "1"))?;
+    assert_indexed_plan("incoming 1-hop", &in_1hop_plan, &["edge_in"]);
+    let members_of_org_plan = sqlite_plan(&db, &SQLITE_MEMBERS_OF_ORG_SQL.replace("?1", "1"))?;
+    assert_indexed_plan("members of organization", &members_of_org_plan, &["edge_in"]);
+    let bfs_3hop_plan = sqlite_plan(&db, &SQLITE_BFS_3HOP_SQL.replace("?1", "1"))?;
+    assert!(
+        bfs_3hop_plan.iter().any(|detail| detail.contains("SEARCH e USING PRIMARY KEY")
+            && detail.contains("source_id=?")),
+        "3-hop BFS forward step is not a point probe: {bfs_3hop_plan:?}"
+    );
+    assert!(
+        bfs_3hop_plan.iter().any(|detail| detail.contains("SEARCH e USING COVERING INDEX edge_in")
+            && detail.contains("destination_id=?")),
+        "3-hop BFS reverse step is not a point probe: {bfs_3hop_plan:?}"
+    );
+    assert!(
+        !bfs_3hop_plan.iter().any(|detail| detail.contains("SCAN edges")),
+        "3-hop BFS scanned edges: {bfs_3hop_plan:?}"
+    );
+
+    // Record the traversal plans next to the others, as the fairness evidence.
+    let mut sqlite_query_plans = sqlite_query_plans;
+    sqlite_query_plans["traversal_out_1hop"] = json!(out_1hop_plan);
+    sqlite_query_plans["traversal_in_1hop"] = json!(in_1hop_plan);
+    sqlite_query_plans["traversal_members_of_org"] = json!(members_of_org_plan);
+    sqlite_query_plans["traversal_bfs_3hop"] = json!(bfs_3hop_plan);
+
+    let graph_seeds = (0..GRAPH_SEEDS).map(|j| graph_seed(j, n)).collect::<Vec<_>>();
+    let warm_seed = graph_seed(0, n);
+
+    let mut out_micros = Vec::with_capacity(GRAPH_SEEDS);
+    let mut out_rows = 0usize;
+    {
+        let mut statement = db.prepare(SQLITE_OUT_1HOP_SQL)?;
+        statement
+            .query_map(params![warm_seed as i64 + 1], |row| row.get::<_, u64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for &seed in &graph_seeds {
+            let start = Instant::now();
+            let mut found = BTreeSet::new();
+            let mut rows = statement.query(params![seed as i64 + 1])?;
+            while let Some(row) = rows.next()? {
+                found.insert(row.get::<_, u64>(0)?);
+            }
+            out_micros.push(start.elapsed().as_secs_f64() * 1e6);
+            assert_eq!(found, independent_knows_out(n, seed));
+            out_rows += found.len();
+        }
+    }
+    queries.insert(
+        "graph_out_1hop".into(),
+        graph_timing_json(
+            out_micros,
+            out_rows,
+            json!({"work":"outgoing knows neighbours through the edges primary key"}),
+        ),
+    );
+
+    let mut in_micros = Vec::with_capacity(GRAPH_SEEDS);
+    let mut in_rows = 0usize;
+    {
+        let mut statement = db.prepare(SQLITE_IN_1HOP_SQL)?;
+        statement
+            .query_map(params![warm_seed as i64 + 1], |row| row.get::<_, u64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for &seed in &graph_seeds {
+            let start = Instant::now();
+            let mut found = BTreeSet::new();
+            let mut rows = statement.query(params![seed as i64 + 1])?;
+            while let Some(row) = rows.next()? {
+                found.insert(row.get::<_, u64>(0)?);
+            }
+            in_micros.push(start.elapsed().as_secs_f64() * 1e6);
+            assert_eq!(found, independent_knows_in(n, seed));
+            in_rows += found.len();
+        }
+    }
+    queries.insert(
+        "graph_in_1hop".into(),
+        graph_timing_json(
+            in_micros,
+            in_rows,
+            json!({"work":"incoming knows neighbours through the edge_in reverse index"}),
+        ),
+    );
+
+    let mut bfs_micros = Vec::with_capacity(GRAPH_SEEDS);
+    let mut bfs_rows = 0usize;
+    {
+        let mut statement = db.prepare(SQLITE_BFS_3HOP_SQL)?;
+        statement
+            .query_map(params![warm_seed as i64 + 1], |row| row.get::<_, u64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for &seed in &graph_seeds {
+            let start = Instant::now();
+            let mut visited = 0usize;
+            let mut rows = statement.query(params![seed as i64 + 1])?;
+            while let Some(row) = rows.next()? {
+                let _: u64 = row.get(0)?;
+                visited += 1;
+            }
+            bfs_micros.push(start.elapsed().as_secs_f64() * 1e6);
+            assert_eq!(visited, independent_bfs_visited(n, seed, GRAPH_BFS_DEPTH));
+            bfs_rows += visited;
+        }
+    }
+    queries.insert(
+        "graph_bfs_3hop".into(),
+        graph_timing_json(
+            bfs_micros,
+            bfs_rows,
+            json!({"work":"WITH RECURSIVE over edges, forward and reverse, depth<=3, DISTINCT visited set including the seed, LIMIT 1000"}),
+        ),
+    );
+
+    let mut org_micros = Vec::with_capacity(GRAPH_SEEDS);
+    let mut org_rows = 0usize;
+    {
+        let mut statement = db.prepare(SQLITE_MEMBERS_OF_ORG_SQL)?;
+        statement
+            .query_map(params![(warm_seed % 100) as i64 + 1], |row| {
+                row.get::<_, u64>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for &seed in &graph_seeds {
+            let start = Instant::now();
+            let mut members = 0usize;
+            let mut rows = statement.query(params![(seed % 100) as i64 + 1])?;
+            while let Some(row) = rows.next()? {
+                let _: u64 = row.get(0)?;
+                members += 1;
+            }
+            org_micros.push(start.elapsed().as_secs_f64() * 1e6);
+            assert_eq!(
+                members,
+                independent_org_member_count(n, (seed % 100) as u64 + 1)
+            );
+            org_rows += members;
+        }
+    }
+    queries.insert(
+        "graph_members_of_org".into(),
+        graph_timing_json(
+            org_micros,
+            org_rows,
+            json!({"work":"every person with a member_of edge to organization (seed%100)+1, through the edge_in reverse index"}),
+        ),
+    );
+
     io.insert("pre_crud_queries".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     let held = matches!(readers, ReaderMode::Held)
         .then(|| Connection::open(&path))
