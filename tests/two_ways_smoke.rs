@@ -4,28 +4,27 @@
 //! the disagreement set, and that every case family reached the report (a
 //! family that silently vanished would take its disagreements with it).
 //!
-//! THE DISAGREEMENT SET IS NOT EMPTY, and that is the first thing the port
-//! found. Six text cases disagree because of an engine defect, not a harness
-//! defect:
+//! THE DISAGREEMENT SET IS EMPTY, and keeping it empty is the whole point.
+//! It was not empty when the port landed: six text cases disagreed because of
+//! one engine defect, now fixed.
 //!
-//!   `collections::query::text_score` (src/query.rs) reads a document's text
+//!   `collections::query::text_score` (src/query.rs) read a document's text
 //!   norm from the HEAD row only — `store().get(norm_key(index, sequence))` —
-//!   and gives up when it is absent. A late, clean-slate text build takes the
+//!   and gave up when it was absent. A late, clean-slate text build takes the
 //!   packed path, which writes norms ONLY as segment blocks
 //!   (`segments::norm_block_key`, src/text_indexes.rs) and never writes a head
 //!   row. `text_indexes::read_norm_cached` knows this and probes head row then
-//!   packed block; `text_score` does not. So after a packed text build every
-//!   BM25 ranking drops every candidate, every text filter that is NOT the
-//!   candidate driver matches nothing, and every phrase match (which always
-//!   refines through `text_score`) returns nothing. A text filter that DRIVES
-//!   with Any/All still works, because the cursor marks it satisfied and
-//!   `text_score` is never called — which is why `text/match_all` agrees and
-//!   `text/bm25_one_term` does not.
+//!   packed block; `text_score` did not. So after a packed text build every
+//!   BM25 ranking dropped every candidate, every text filter that was NOT the
+//!   candidate driver matched nothing, and every phrase match (which always
+//!   refines through `text_score`) returned nothing. A text filter that DRIVES
+//!   with Any/All still worked, because the cursor marks it satisfied and
+//!   `text_score` is never called — which is why `text/match_all` agreed while
+//!   `text/bm25_one_term` did not. `text_score` now uses `read_norm_cached`.
 //!
-//! The active test therefore asserts the disagreement set is EXACTLY that
-//! known set: a new disagreement fails, and so does fixing the defect without
-//! updating this list. `two_arms_agree_everywhere` is the same test with an
-//! empty set — the defect-dashboard entry, ignored until the engine earns it.
+//! Both tests below are active. One asserts the set is empty; the other
+//! asserts it is exactly the (now empty) known-defect list, so a NEW
+//! disagreement names itself instead of merely failing a count.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
@@ -51,16 +50,9 @@ const MUST_RUN: [&str; 9] = [
     "filter", "project", "order", "limit", "text", "graph", "win", "mixed", "scan",
 ];
 
-/// The cases that disagree today, every one of them for the single packed-norm
-/// defect described at the top of this file.
-const KNOWN_DISAGREEMENTS: [&str; 6] = [
-    "bm25_common",
-    "bm25_one_term",
-    "bm25_rare",
-    "bm25_two_terms",
-    "filter_then_text",
-    "match_phrase",
-];
+/// The cases that disagree today. The packed-norm defect that filled this list
+/// is fixed, so it is empty — and must stay empty.
+const KNOWN_DISAGREEMENTS: [&str; 0] = [];
 
 struct Run {
     stdout: String,
@@ -156,8 +148,8 @@ fn the_two_arms_disagree_only_where_the_engine_is_known_to_be_wrong() {
         expected,
         run.disagreeing,
         "the disagreement set moved. A NEW name means the two arms stopped asking the same \
-         question; a MISSING name means the packed text-norm defect is fixed and this list \
-         (and the ignored dashboard test below) must be updated.\n{}",
+         question — the benchmark is comparing answers to different questions and its numbers \
+         mean nothing until that is explained.\n{}",
         run.stdout
             .lines()
             .filter(|line| line.contains("DISAGREE"))
@@ -167,11 +159,9 @@ fn the_two_arms_disagree_only_where_the_engine_is_known_to_be_wrong() {
     assert_every_family_reported(&run);
 }
 
-/// The defect dashboard: what this file will assert once `text_score` reads
-/// packed norms. Remove the `#[ignore]` with the fix.
+/// The property in its plainest form: no case, anywhere, answers differently
+/// in the two arms.
 #[test]
-#[ignore = "engine defect: query::text_score reads head text norms only, so a packed text build \
-            silently scores nothing"]
 fn two_arms_agree_everywhere() {
     let run = two_ways("2000");
     assert!(

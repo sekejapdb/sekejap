@@ -2158,20 +2158,22 @@ fn text_score<C: FnMut() -> bool>(
     id: EntityId,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
+    norms: &mut super::text_indexes::NormCache,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<f64>> {
     if prepared.terms.is_empty() {
         return Ok(None);
     }
     meter.charge(WorkResource::TextPostings, 1)?;
-    let Some(norm) = db.store()?.get(&super::text_indexes::norm_key(
-        prepared.info.id,
-        id.sequence,
-    ))?
+    // Head row first, then the packed `0x7B` block -- the same lookup, and the
+    // same decoding of the EMPTY head value, that every other norm reader
+    // performs. A text index built after its corpus writes NO head row at all,
+    // so reading `norm_key` alone drops every document it scores.
+    let Some(length) =
+        super::text_indexes::read_norm_cached(db, prepared.info.id, id.sequence, norms)?.length
     else {
         return Ok(None);
     };
-    let length = super::text_indexes::decode_u32(&norm, "text document length")?;
     let mut frequencies = Vec::with_capacity(prepared.terms.len());
     let mut dfs = Vec::with_capacity(prepared.terms.len());
     let segments_on = super::text_indexes::segments_enabled(db);
@@ -2409,6 +2411,7 @@ fn filters_match<C: FnMut() -> bool>(
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
     graph: &[Option<BTreeSet<EntityId>>],
+    norms: &mut super::text_indexes::NormCache,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<bool> {
     for (position, filter) in filters.iter().enumerate() {
@@ -2461,7 +2464,7 @@ fn filters_match<C: FnMut() -> bool>(
                 }
             }
             CompiledFilter::Text(prepared) => {
-                text_score(db, prepared, id, row, encoded, meter)?.is_some()
+                text_score(db, prepared, id, row, encoded, norms, meter)?.is_some()
             }
         };
         if !matches {
@@ -2477,6 +2480,7 @@ fn rank_candidate<C: FnMut() -> bool>(
     candidate: &Candidate,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
+    norms: &mut super::text_indexes::NormCache,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<RankKey>> {
     let value = match order {
@@ -2520,6 +2524,7 @@ fn rank_candidate<C: FnMut() -> bool>(
                 candidate.id,
                 row,
                 encoded,
+                norms,
                 meter,
             )? else {
                 return Ok(None);
@@ -2667,6 +2672,10 @@ impl PreparedQuery<'_> {
         );
         let mut meter = WorkMeter::new(budget, &mut cancelled);
         meter.check_cancelled()?;
+        // One decoded `0x7B` norm block held for the page. Candidates that
+        // arrive in ascending sequence -- the text and entity cursors -- reuse
+        // it 255 times out of 256; one that does not simply re-decodes.
+        let mut norms = super::text_indexes::NormCache::default();
         let graph = execute_graph_filters(self.db, &self.filters, &mut meter)?;
         let mut driver = DriverCursor::new(self.db, self.collection, &self.driver, &graph)?;
         let mut heap = BinaryHeap::with_capacity(capacity);
@@ -2695,6 +2704,7 @@ impl PreparedQuery<'_> {
                         &mut row,
                         &mut encoded,
                         &graph,
+                        &mut norms,
                         &mut meter,
                     )? {
                         continue;
@@ -2778,6 +2788,7 @@ impl PreparedQuery<'_> {
                         &mut row,
                         &mut encoded,
                         &graph,
+                        &mut norms,
                         &mut meter,
                     )? {
                         continue;
@@ -2788,6 +2799,7 @@ impl PreparedQuery<'_> {
                         &candidate,
                         &mut row,
                         &mut encoded,
+                        &mut norms,
                         &mut meter,
                     )?
                     else {

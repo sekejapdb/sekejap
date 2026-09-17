@@ -2002,3 +2002,326 @@ fn text_and_spatial_drivers_page_more_than_65536_matches_without_a_result_cap() 
     }
     assert_eq!(actual, expected);
 }
+
+// ---------------------------------------------------------------------------
+// The packed norm tier, seen from the query executor.
+//
+// A text index built AFTER its corpus packs its document lengths into `0x7B`
+// blocks (256 documents per block) and writes no `0x76` head row. Every reader
+// of a document length therefore has to look at the head row first and fall
+// back to the block. `text_indexes::read_norm_cached` does. The executor's own
+// scorer has to as well, or every scored document silently vanishes: BM25
+// ranks nothing, a text filter that is not the candidate driver matches
+// nothing, and a phrase never matches. Only a DRIVING `Any`/`All` text filter
+// escapes, because the cursor answers it without scoring.
+// ---------------------------------------------------------------------------
+
+/// Deterministic prose, ASCII only, so the oracle below can tokenize it with
+/// the same rule the analyzer uses: runs of alphanumerics, lowercased.
+fn packed_doc(i: u64) -> String {
+    let subject = ["harbour", "mill", "terrace", "orchard", "quarry"][(i % 5) as usize];
+    let verb = ["flooded", "settled", "burned", "drained"][(i % 4) as usize];
+    let rare = if i % 97 == 0 { " comet" } else { "" };
+    format!("the {subject} river {verb} again in the year {i}{rare}")
+}
+
+fn packed_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            token.push(ch.to_ascii_lowercase());
+        } else if !token.is_empty() {
+            out.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        out.push(token);
+    }
+    out
+}
+
+fn packed_features(path: &Path) -> u64 {
+    let raw = PageWalStore::open_snapshot(path, 1 << 20).unwrap();
+    let header = raw.get(&[0, 0, 0]).unwrap().unwrap();
+    assert_eq!(&header[..8], b"E4COLL2\0");
+    u64::from_be_bytes(header[10 + 8..10 + 16].try_into().unwrap())
+}
+
+/// Does any `0x7B` norm block exist for this index?
+fn packed_norm_blocks(path: &Path, index: IndexId) -> usize {
+    let raw = PageWalStore::open_snapshot(path, 1 << 20).unwrap();
+    let mut prefix = vec![0x7b_u8];
+    prefix.extend(ordered(index.0));
+    let mut count = 0;
+    for row in raw.range(&prefix).unwrap() {
+        let (key, _) = row.unwrap();
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn packed_norm_head_rows(path: &Path, index: IndexId) -> usize {
+    let raw = PageWalStore::open_snapshot(path, 1 << 20).unwrap();
+    let mut prefix = vec![0x76_u8];
+    prefix.extend(ordered(index.0));
+    let mut count = 0;
+    for row in raw.range(&prefix).unwrap() {
+        let (key, _) = row.unwrap();
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn packed_budget() -> QueryBudget {
+    QueryBudget {
+        candidates: 1 << 22,
+        primary_reads: 1 << 22,
+        scalar_postings: 1 << 22,
+        graph_edges: 1 << 22,
+        graph_visited: 1 << 22,
+        spatial_postings: 1 << 22,
+        text_postings: 1 << 22,
+        text_tokens: 1 << 22,
+        vector_locators: 1 << 22,
+        vector_sidecars: 1 << 22,
+        vector_lanes: 1 << 22,
+        output_bytes: 1 << 24,
+    }
+}
+
+/// An in-memory BM25, written from the published constants rather than from
+/// the engine's own scorer: K1 = 1.2, B = 0.75, and the Robertson/Lucene idf.
+fn packed_bm25_oracle(corpus: &[Vec<String>], doc: usize, terms: &[&str]) -> Option<f64> {
+    let n = corpus.len() as f64;
+    let total: f64 = corpus.iter().map(|tokens| tokens.len() as f64).sum();
+    let average = total / n;
+    let length = corpus[doc].len() as f64;
+    let mut score = 0.0;
+    let mut hit = false;
+    for term in terms {
+        let tf = corpus[doc].iter().filter(|token| *token == term).count() as f64;
+        if tf == 0.0 {
+            continue;
+        }
+        hit = true;
+        let df = corpus
+            .iter()
+            .filter(|tokens| tokens.iter().any(|token| token == term))
+            .count() as f64;
+        let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+        score += idf * (tf * 2.2) / (tf + 1.2 * (0.25 + 0.75 * length / average));
+    }
+    hit.then_some(score)
+}
+
+const PACKED_ROWS: u64 = 700;
+
+#[test]
+fn a_packed_norm_tier_still_scores_text_in_the_query_executor() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("packed_norms");
+
+    // Corpus first, text index afterwards: the late build takes the packed
+    // path and writes norms as `0x7B` blocks only.
+    let (collection, bucket_index, text_index, ids) = {
+        let mut db = Database::create(&path, cfg()).unwrap();
+        let docs = db
+            .create_collection(
+                "docs",
+                vec![("body".into(), Kind::Text), ("bucket".into(), Kind::Int)],
+                CollectionOptions::default(),
+            )
+            .unwrap();
+        let bucket = db
+            .create_scalar_index(docs, "bucket", "bucket", false)
+            .unwrap();
+        db.commit().unwrap();
+        db.build_index_to_ready(bucket, 256).unwrap();
+        db.commit().unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..PACKED_ROWS {
+            ids.push(
+                db.put(
+                    docs,
+                    &format!("d{i:05}"),
+                    &json!({ "body": packed_doc(i), "bucket": (i % 4) as i64 }),
+                )
+                .unwrap(),
+            );
+            if i % 256 == 255 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+
+        let text = db.create_text_index(docs, "body", "body").unwrap();
+        db.commit().unwrap();
+        db.build_index_to_ready(text, 256).unwrap();
+        db.commit().unwrap();
+        db.checkpoint().unwrap();
+        (docs, bucket, text, ids)
+    };
+
+    // The fixture proves nothing unless the build really packed.
+    assert_eq!(
+        packed_features(&path) & 0x40,
+        0x40,
+        "the late text build did not set the packed feature bit"
+    );
+    assert!(
+        packed_norm_blocks(&path, text_index) >= 3,
+        "fewer than three 0x7B norm blocks: {}",
+        packed_norm_blocks(&path, text_index)
+    );
+    assert_eq!(
+        packed_norm_head_rows(&path, text_index),
+        0,
+        "a packed build must not also write 0x76 norm head rows"
+    );
+
+    let db = Database::open(&path, cfg()).unwrap();
+    let corpus: Vec<Vec<String>> = (0..PACKED_ROWS)
+        .map(|i| packed_tokens(&packed_doc(i)))
+        .collect();
+    let bucket_one = |i: u64| i % 4 == 1;
+
+    // (a) BM25 order behind a scalar driver. The cursor is the scalar index,
+    //     so the executor has to score every candidate itself.
+    let scalar_one = [QueryFilter::Scalar {
+        index: bucket_index,
+        predicate: ScalarFilter::Eq(ScalarValue::I64(1)),
+    }];
+    let mut bm25 = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &scalar_one,
+            order: QueryOrder::Bm25 {
+                index: text_index,
+                query: "harbour comet",
+                matching: TextMatch::Any,
+            },
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Filter(0),
+        })
+        .unwrap();
+    let page = bm25.next_page(256, packed_budget(), || false).unwrap();
+    assert_eq!(page.driver, QueryDriver::Scalar(bucket_index));
+    let mut scored: BTreeMap<EntityId, f64> = BTreeMap::new();
+    for row in &page.rows {
+        let OrderValue::Bm25(score) = row.order else {
+            panic!("BM25 order value");
+        };
+        scored.insert(row.id, score);
+    }
+    let mut expected_bm25: BTreeMap<EntityId, f64> = BTreeMap::new();
+    for i in 0..PACKED_ROWS {
+        if !bucket_one(i) {
+            continue;
+        }
+        if let Some(score) = packed_bm25_oracle(&corpus, i as usize, &["harbour", "comet"]) {
+            expected_bm25.insert(ids[i as usize], score);
+        }
+    }
+    assert_eq!(
+        scored.keys().copied().collect::<Vec<_>>(),
+        expected_bm25.keys().copied().collect::<Vec<_>>(),
+        "BM25 behind a scalar driver lost documents"
+    );
+    for (id, expected) in &expected_bm25 {
+        let actual = scored[id];
+        assert!(
+            (actual - expected).abs() <= 1e-12,
+            "BM25 score for {id:?}: {actual} vs oracle {expected}"
+        );
+    }
+
+    // (b) A text filter that is NOT the candidate driver.
+    let scalar_then_text = [
+        QueryFilter::Scalar {
+            index: bucket_index,
+            predicate: ScalarFilter::Eq(ScalarValue::I64(1)),
+        },
+        QueryFilter::Text {
+            index: text_index,
+            query: "comet",
+            matching: TextMatch::Any,
+        },
+    ];
+    let mut passenger = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &scalar_then_text,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Filter(0),
+        })
+        .unwrap();
+    let page = passenger.next_page(256, packed_budget(), || false).unwrap();
+    assert_eq!(page.driver, QueryDriver::Scalar(bucket_index));
+    let expected_passenger: Vec<EntityId> = (0..PACKED_ROWS)
+        .filter(|i| bucket_one(*i) && corpus[*i as usize].iter().any(|token| token == "comet"))
+        .map(|i| ids[i as usize])
+        .collect();
+    assert!(
+        expected_passenger.len() >= 2,
+        "the oracle expected too few rows to prove anything"
+    );
+    assert_eq!(
+        page.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        expected_passenger,
+        "a non-driving text filter lost documents"
+    );
+
+    // (c) A phrase. Phrase refinement always scores, driver or not.
+    let phrase = [QueryFilter::Text {
+        index: text_index,
+        query: "river flooded again",
+        matching: TextMatch::Phrase,
+    }];
+    let mut phrases = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &phrase,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Filter(0),
+        })
+        .unwrap();
+    let mut actual_phrase = Vec::new();
+    loop {
+        let page = phrases.next_page(256, packed_budget(), || false).unwrap();
+        let done = page.done;
+        actual_phrase.extend(page.rows.into_iter().map(|row| row.id));
+        if done {
+            break;
+        }
+    }
+    let wanted = ["river", "flooded", "again"];
+    let expected_phrase: Vec<EntityId> = (0..PACKED_ROWS)
+        .filter(|i| {
+            corpus[*i as usize]
+                .windows(3)
+                .any(|window| window.iter().zip(wanted).all(|(token, term)| token == term))
+        })
+        .map(|i| ids[i as usize])
+        .collect();
+    assert!(
+        expected_phrase.len() >= 100,
+        "the oracle expected too few phrase rows to prove anything"
+    );
+    assert_eq!(
+        actual_phrase, expected_phrase,
+        "a phrase query lost documents"
+    );
+}
