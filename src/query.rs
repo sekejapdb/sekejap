@@ -4080,10 +4080,36 @@ impl PreparedQuery<'_> {
     /// Every other driver stays as it was. A range or order scalar walk, graph
     /// ids, a text posting, a spatial cell, a vector locator can each name a
     /// row that is no longer there, and those still fetch it and still refuse
-    /// an orphan.
+    /// an orphan -- unless the RANKING already proved the winner present,
+    /// which is the BM25 case below.
     fn winner_needs_no_row(&self) -> bool {
         if !self.projection.is_empty() {
             return false;
+        }
+        // A BM25 page has no orphan left to refuse. Every candidate it ranks
+        // goes through `text_score`, and the FIRST thing `text_score` does is
+        // read the document's `0x76` norm: a document that is not in the text
+        // index has no length there, the score is `None`, and the candidate is
+        // dropped before it can reach the heap.
+        //
+        // That lookup is a liveness proof because text maintenance retires a
+        // document in the SAME transaction as its row. The head tier deletes
+        // the norm row outright; the packed tier cannot cut one document out
+        // of a `0x7B` block, so the delete writes the EMPTY head value, which
+        // overrides the block and decodes as "not in the index"
+        // (`text_indexes::apply_transition`, `decode_norm`). Either way a
+        // deleted document scores `None`, so a winner of a ranked text page
+        // has already been proved present -- and probing the primary tree for
+        // it again was a whole root-to-leaf reach, or a cursor step and a key
+        // comparison, per RETURNED row.
+        //
+        // Named sacrifice (Law 4): a store-level orphan -- a primary row
+        // removed behind the index's back, which no supported write can do --
+        // is no longer refused by a BM25 page; it is refused by the norm, and
+        // `verify_index` still refuses it outright. Every other page shape
+        // keeps the probe.
+        if matches!(self.order, CompiledOrder::Bm25(_)) {
+            return true;
         }
         match &self.driver {
             DriverPlan::Entities => true,

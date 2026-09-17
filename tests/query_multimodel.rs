@@ -2459,3 +2459,225 @@ fn a_packed_norm_tier_still_scores_text_in_the_query_executor() {
         );
     }
 }
+
+// ── the guarantee that stands in for the winner-stage existence probe ───────
+
+const TOMBSTONE_ROWS: u64 = 1_000;
+const TOMBSTONE_TERM: &str = "pipeline";
+
+/// Nine documents in ten carry the term, so its whole posting list is one
+/// packed `0x7A` segment and a delete cannot cheaply cut one document out of
+/// it.
+fn tombstone_body(i: u64) -> String {
+    if i % 10 == 0 {
+        return format!("the aqueduct carried water in the year {i}");
+    }
+    format!("the {TOMBSTONE_TERM} carried water in the year {i}")
+}
+
+fn text_prefix(tag: u8, index: IndexId, term: Option<&str>) -> Vec<u8> {
+    let mut key = vec![tag];
+    key.extend(ordered(index.0));
+    if let Some(term) = term {
+        key.extend(term.as_bytes());
+        key.push(0);
+    }
+    key
+}
+
+fn raw_rows(path: &Path, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let raw = PageWalStore::open_snapshot(path, 1 << 20).unwrap();
+    let mut out = Vec::new();
+    for row in raw.range(prefix).unwrap() {
+        let (key, value) = row.unwrap();
+        if !key.starts_with(prefix) {
+            break;
+        }
+        out.push((key, value));
+    }
+    out
+}
+
+fn text_ids(
+    db: &Database,
+    collection: CollectionId,
+    index: IndexId,
+    query: &str,
+    matching: TextMatch,
+    order: QueryOrder,
+) -> Vec<EntityId> {
+    let filters = [QueryFilter::Text {
+        index,
+        query,
+        matching,
+    }];
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &filters,
+            order,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let mut ids = Vec::new();
+    loop {
+        let page = prepared.next_page(4096, generous(), || false).unwrap();
+        ids.extend(page.rows.iter().map(|row| row.id));
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    ids
+}
+
+/// A deleted document whose posting is still inside a packed segment is never
+/// returned by any text-driven page.
+///
+/// The packed tier (`0x7A`, loop 4) does not remove a deleted document's
+/// posting -- a delete will not rewrite a block -- so it records the
+/// retirement at the head instead: `tf = 0` for the posting, the EMPTY value
+/// for the `0x76` norm. Two readers make that record binding, and this pins
+/// both:
+///
+/// * the merge cursor cancels a segment posting against its `tf = 0` head row,
+///   so a deleted document is never even a candidate; and
+/// * the scorer reads the document's norm before it scores it, and the EMPTY
+///   head norm decodes as "not in the index", so `text_score` returns `None`
+///   and the candidate is dropped before it can be a winner.
+///
+/// The second of those is why a BM25-ranked key-only page no longer goes back
+/// to the primary tree to prove each winner present: the norm lookup already
+/// did. This test is that proof, and it must hold before and after the probe
+/// is removed.
+#[test]
+fn a_deleted_document_with_a_packed_posting_is_never_returned_by_a_text_page() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("packed-delete");
+    let mut db = Database::create(&path, cfg()).unwrap();
+    let docs = db
+        .create_collection(
+            "docs",
+            vec![("body".into(), Kind::Text)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    let mut ids = Vec::new();
+    for i in 0..TOMBSTONE_ROWS {
+        ids.push(
+            db.put(docs, &format!("d{i:05}"), &json!({ "body": tombstone_body(i) }))
+                .unwrap(),
+        );
+        if i % 256 == 255 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    // Corpus first, index afterwards: the late build packs.
+    let index = db.create_text_index(docs, "body_idx", "body").unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(index, 256).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+
+    let segments = raw_rows(&path, &text_prefix(0x7a, index, Some(TOMBSTONE_TERM))).len();
+    assert!(
+        segments > 0,
+        "the late build wrote no packed segment, so this test proves nothing"
+    );
+    assert_eq!(
+        raw_rows(&path, &text_prefix(0x75, index, None)).len(),
+        0,
+        "a packed build must leave the head posting tier empty"
+    );
+
+    let victim = 501u64;
+    assert_ne!(victim % 10, 0, "the deleted document must carry the term");
+    let deleted = ids[victim as usize];
+    let mut db = Database::open(&path, cfg()).unwrap();
+    db.delete(docs, &format!("d{victim:05}")).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+
+    // The delete did NOT touch the packed posting: it is still there, naming a
+    // document that no longer exists.
+    assert_eq!(
+        raw_rows(&path, &text_prefix(0x7a, index, Some(TOMBSTONE_TERM))).len(),
+        segments,
+        "the delete rewrote a packed segment; the tombstone path is what is under test"
+    );
+    let mut posting_key = text_prefix(0x75, index, Some(TOMBSTONE_TERM));
+    posting_key.extend(ordered(deleted.sequence));
+    let posting = raw_rows(&path, &posting_key);
+    assert_eq!(
+        posting.len(),
+        1,
+        "the delete left no head posting row over the packed one"
+    );
+    assert_eq!(
+        posting[0].1,
+        0u32.to_be_bytes().to_vec(),
+        "the head posting row is not the `tf = 0` tombstone"
+    );
+    let mut norm_key = text_prefix(0x76, index, None);
+    norm_key.extend(ordered(deleted.sequence));
+    let norm = raw_rows(&path, &norm_key);
+    assert_eq!(norm.len(), 1, "the delete left no head norm row");
+    assert!(
+        norm[0].1.is_empty(),
+        "the head norm row is not the EMPTY tombstone: {:?}",
+        norm[0].1
+    );
+
+    // And the primary row really is gone, so nothing below is answered by it.
+    let db = Database::open_snapshot(&path, cfg()).unwrap();
+    assert!(raw_rows(&path, &primary_key(deleted)).is_empty());
+
+    let live = (0..TOMBSTONE_ROWS).filter(|i| i % 10 != 0).count() - 1;
+
+    // (1) A BM25-ranked page: every winner passed through the scorer.
+    let ranked = text_ids(
+        &db,
+        docs,
+        index,
+        TOMBSTONE_TERM,
+        TextMatch::Any,
+        QueryOrder::Bm25 {
+            index,
+            query: TOMBSTONE_TERM,
+            matching: TextMatch::Any,
+        },
+    );
+    assert_eq!(ranked.len(), live, "bm25 page returned the wrong count");
+    assert!(
+        !ranked.contains(&deleted),
+        "a bm25 page returned a deleted document"
+    );
+
+    // (2) An EntityId-ordered text-driven page, and the Any / All / Phrase
+    //     filter shapes: the merge cursor is what refuses the document here.
+    for (query, matching) in [
+        (TOMBSTONE_TERM, TextMatch::Any),
+        ("pipeline carried", TextMatch::All),
+        ("pipeline carried", TextMatch::Phrase),
+    ] {
+        let ids = text_ids(&db, docs, index, query, matching, QueryOrder::EntityId);
+        assert_eq!(
+            ids.len(),
+            live,
+            "{matching:?} `{query}` returned the wrong count"
+        );
+        assert!(
+            !ids.contains(&deleted),
+            "{matching:?} `{query}` returned a deleted document"
+        );
+        assert!(
+            ids.windows(2).all(|pair| pair[0].sequence < pair[1].sequence),
+            "{matching:?} `{query}` is not in entity order"
+        );
+    }
+}

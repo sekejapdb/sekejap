@@ -476,3 +476,86 @@ fn a_driver_that_hands_out_documents_out_of_order_still_scores_them_correctly() 
         "BM25 behind a scalar range driver disagreed with the oracle"
     );
 }
+
+/// A BM25 page proves its winners from the norm it already read, not from one
+/// primary probe each.
+///
+/// The winner stage exists to refuse an orphan: a posting can outlive the
+/// record it names, so a key-only page went back to the primary tree once per
+/// RETURNED row and threw the bytes away. A BM25 page has no orphan to refuse.
+/// Every candidate it ranks went through `text_score`, which reads the
+/// document's `0x76` norm first, and a deleted document's head norm is the
+/// EMPTY tombstone -- it decodes as "not in the index", the score is `None`,
+/// and the candidate never reaches the heap. The probe re-proves what the
+/// ranking already proved.
+///
+/// This counts the whole page, scoring and winner stage together, against the
+/// pages the answer genuinely has to touch: the term's segments, the norm
+/// blocks, and a per-page constant. `primary_reads` is the exact number the
+/// removal is worth -- one per returned row, which is `MATCHING`.
+#[test]
+fn a_bm25_page_proves_its_winners_without_one_primary_probe_each() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bm25_winners");
+    let fixture = build(&path);
+    let segments = tagged_rows(&path, 0x7a, fixture.text, Some(TERM));
+    let norm_blocks = tagged_rows(&path, 0x7b, fixture.text, None);
+    let db = Database::open(&path, cfg()).unwrap();
+
+    let filters = [QueryFilter::Text {
+        index: fixture.text,
+        query: TERM,
+        matching: TextMatch::Any,
+    }];
+    let page = |order: QueryOrder| {
+        let mut query = db
+            .prepare_query(QueryRequest {
+                collection: fixture.collection,
+                filters: &filters,
+                order,
+                projection: Projection::Ids,
+                total_limit: None,
+                driver: CandidateDriver::Auto,
+            })
+            .unwrap();
+        let before = db.pool_accesses().unwrap();
+        let page = query.next_page(ROWS as usize, budget(), || false).unwrap();
+        let accesses = db.pool_accesses().unwrap() - before;
+        (page, accesses)
+    };
+    // Warm every cache a first execution fills, so what is counted is the
+    // steady state and not first touch.
+    page(bm25(&fixture));
+    let (ranked, accesses) = page(bm25(&fixture));
+    assert_eq!(ranked.rows.len(), MATCHING);
+
+    // The page ranked by ENTITY ID over the same documents keeps its probe --
+    // its candidates never passed through the scorer -- so it is the control
+    // that says the number below is the probe and not the fixture.
+    let (plain, _) = page(QueryOrder::EntityId);
+    assert_eq!(plain.rows.len(), MATCHING);
+    assert_eq!(
+        plain.work.primary_reads, MATCHING as u64,
+        "the id-ordered control stopped probing its winners"
+    );
+
+    println!(
+        "bm25 page over {MATCHING} documents: {accesses} pool accesses, \
+         {} primary reads ({segments} segment, {norm_blocks} norm blocks)",
+        ranked.work.primary_reads
+    );
+    assert_eq!(
+        ranked.work.primary_reads, 0,
+        "a bm25 page still read {} primary rows for {MATCHING} winners it had \
+         already scored",
+        ranked.work.primary_reads
+    );
+    // Segments, norm blocks, and a page constant: no term of this ceiling is a
+    // multiple of `MATCHING`.
+    let ceiling = (segments + norm_blocks) as u64 * 4 + 64;
+    assert!(
+        accesses <= ceiling,
+        "a bm25 page over {MATCHING} documents spent {accesses} pool accesses, \
+         budget {ceiling}"
+    );
+}
