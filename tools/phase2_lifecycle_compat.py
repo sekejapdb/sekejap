@@ -16,13 +16,20 @@ import sys
 from format_reference_compat import digest, inventory, new_artifact_path
 
 
+# The logical feature mask a generated fixture of each family REQUIRES of its
+# reader, as the fixture writes it into the manifest. Loop 4 gave scalar and
+# spatial indexes a B-tree each, announced by 0x80, so a fixture of either
+# family now requires its family bit plus 128: 1 -> 129 and 9 -> 137.
 FAMILIES = {
-    "scalar": 1,
+    "scalar": 129,
     "exact-vector": 5,
-    "spatial": 9,
+    "spatial": 137,
     "text": 17,
     "quantized": 33,
 }
+# What the preserved five-family candidate implements. Every mask with a bit
+# outside this is refused whole by it, which is the admission evidence.
+OLD_FIVE_MASK = 31
 LIFECYCLES = ("ready", "building", "dropping", "post-drop")
 BOUNDARIES = ("checkpointed", "wal-pending")
 MANIFEST = "PHASE2_LIFECYCLE_FIXTURE.json"
@@ -91,7 +98,7 @@ def main():
                 "supported_logical_features": supported,
             }
         )
-    old_five = [probe for probe in probes if probe["supported_logical_features"] == 31]
+    old_five = [probe for probe in probes if probe["supported_logical_features"] == OLD_FIVE_MASK]
     assert old_five, (
         "provide the preserved five-family candidate as "
         "--older-probe LABEL BINARY 31"
@@ -435,35 +442,53 @@ def main():
             for arm in report["admission_arms"]
             if arm["probe"] in old_five_labels
         ]
-        supported = [arm for arm in old_five_arms if arm["required_logical_features"] != 33]
-        quantized = [arm for arm in old_five_arms if arm["required_logical_features"] == 33]
-        post_drop_quantized = [
-            arm for arm in quantized if arm["lifecycle"] == "post-drop"
+        # Which families the preserved candidate can read is arithmetic over
+        # the masks the fixtures actually declare, not a fixed list: loop 4
+        # moved scalar and spatial out of its reach alongside quantized, and
+        # writing the partition this way keeps the gate honest the next time a
+        # family gains a bit.
+        accepted_masks = sorted({m for m in FAMILIES.values() if m & ~OLD_FIVE_MASK == 0})
+        refused_masks = sorted({m for m in FAMILIES.values() if m & ~OLD_FIVE_MASK != 0})
+        assert accepted_masks and refused_masks, (
+            "the mask-31 gate proves nothing unless the corpus has both an "
+            "admissible and an inadmissible family"
+        )
+        supported = [
+            arm for arm in old_five_arms
+            if arm["required_logical_features"] in accepted_masks
         ]
-        per_probe_supported = 2 * 4 * len(LIFECYCLES) * len(BOUNDARIES) * 2
-        per_probe_quantized = 2 * len(LIFECYCLES) * len(BOUNDARIES) * 2
-        per_probe_post_drop = 2 * len(BOUNDARIES) * 2
+        refused = [
+            arm for arm in old_five_arms
+            if arm["required_logical_features"] in refused_masks
+        ]
+        post_drop_refused = [arm for arm in refused if arm["lifecycle"] == "post-drop"]
+        arms_each = len(LIFECYCLES) * len(BOUNDARIES) * 2
+        per_probe_supported = 2 * len(accepted_masks) * arms_each
+        per_probe_refused = 2 * len(refused_masks) * arms_each
+        per_probe_post_drop = 2 * len(refused_masks) * len(BOUNDARIES) * 2
+        assert len(supported) + len(refused) == len(old_five_arms)
         assert len(supported) == len(old_five) * per_probe_supported
-        assert len(quantized) == len(old_five) * per_probe_quantized
-        assert len(post_drop_quantized) == len(old_five) * per_probe_post_drop
+        assert len(refused) == len(old_five) * per_probe_refused
+        assert len(post_drop_refused) == len(old_five) * per_probe_post_drop
         assert all(arm["expectation"] == "accept" and arm["exit_code"] == 0 for arm in supported)
         assert all(
             arm["expectation"] == "refuse"
             and arm["exit_code"] == 42
             and arm["byte_preserving"]
             and arm["source_unchanged"]
-            for arm in quantized
+            for arm in refused
         )
-        assert all(arm["byte_preserving"] for arm in post_drop_quantized)
+        assert all(arm["byte_preserving"] for arm in post_drop_refused)
         report["old_five_mask31_gate"] = {
-            "supported_logical_features": 31,
+            "supported_logical_features": OLD_FIVE_MASK,
             "probes": sorted(old_five_labels),
-            "accepted_masks": [1, 5, 9, 17],
+            "accepted_masks": accepted_masks,
+            "refused_masks": refused_masks,
             "supported_snapshot_and_writer_acceptances": len(supported),
-            "quantized_mask33_snapshot_and_writer_refusals": len(quantized),
-            "post_drop_quantized_refusals": len(post_drop_quantized),
+            "unsupported_snapshot_and_writer_refusals": len(refused),
+            "post_drop_refusals": len(post_drop_refused),
             "post_drop_feature_bit_remained_required": True,
-            "all_quantized_refusals_byte_preserving": True,
+            "all_refusals_byte_preserving": True,
             "result": "PASS",
         }
 

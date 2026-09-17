@@ -756,3 +756,127 @@ fn prepared_query_drivers_read_the_index_tree() {
         .unwrap();
     assert_eq!(a, b);
 }
+
+/// (h) The layout an UNCONFIGURED handle creates.
+///
+/// Every test above sets the per-index-tree switch itself, so all of them keep
+/// passing whatever the default is. The default is not a private detail: a
+/// tool that never touches the switch -- the Phase 2 lifecycle compatibility
+/// fixture is one -- writes whatever it produces into a corpus, declares the
+/// resulting feature mask in its manifest, and the Linux qualification driver
+/// computes its family table and its mask-31 admission gate over that number.
+///
+/// When loop 4 turned per-index trees on by default it moved all three of
+/// those numbers at once -- a scalar index's header mask from 1 to 129, a
+/// spatial one's from 9 to 137, and both descriptors from version 1 to 2 --
+/// and no test said so, because no test asked what an unconfigured handle
+/// creates. Stage 4 of the final qualification found it instead.
+///
+/// So this pins the published contract, through a build long enough to split
+/// the index's tree and move its root more than once, across the commit and
+/// checkpoint and reopen that a fixture performs: what the catalog reports,
+/// what the header declares, and that the entries really are in the index's
+/// own tree with none left behind in the primary one.
+#[test]
+fn an_unconfigured_handle_creates_the_layout_the_compat_corpus_declares() {
+    /// The mask a scalar-only collection must require of a reader: the base
+    /// logical bit plus the per-index-tree bit.
+    const SCALAR_REQUIRES: u64 = 1 | 0x80;
+    /// The same for a collection that also carries a spatial index.
+    const SCALAR_AND_SPATIAL_REQUIRE: u64 = 1 | 8 | 0x80;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("default");
+
+    // No set_create_index_trees here, deliberately: this is the handle an
+    // ordinary tool gets.
+    let mut db = Database::create(&path, cfg()).unwrap();
+    let collection = db
+        .create_collection(
+            "people",
+            vec![("age".into(), Kind::Int), ("home".into(), Kind::Point)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    for i in 0..ROWS {
+        db.put(collection, &format!("p{i}"), &person(i)).unwrap();
+    }
+    db.commit().unwrap();
+    let age = db
+        .create_scalar_index(collection, "age_idx", "age", false)
+        .unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(age, 256).unwrap();
+    db.commit().unwrap();
+
+    // One index, one catalog entry, and the catalog agrees with itself.
+    let before = db.list_indexes(collection).unwrap();
+    assert_eq!(before.len(), 1, "one created index is one catalog entry");
+    assert_eq!(db.index_info(age).unwrap(), before[0]);
+    assert_eq!(before[0].encoding_version, 2);
+    assert_eq!(before[0].state, IndexState::Ready);
+    let tree = db.index_tree(age).unwrap().expect("an owned tree");
+    assert!(tree.0 >= 2, "tree ids 0 and 1 are reserved");
+    assert_ne!(tree.1, 0, "a built index's tree has a root");
+
+    // 600 rows do not fit one leaf, so the build moved the root and rewrote
+    // the descriptor at least twice. Take the entries as the oracle.
+    let mut entries = Vec::new();
+    db.index_for_each(age, &[0x70], &mut |k, v| {
+        entries.push((k.to_vec(), v.to_vec()))
+    })
+    .unwrap();
+    assert_eq!(entries.len() as u64, ROWS);
+
+    assert!(db.checkpoint().unwrap());
+    drop(db);
+    assert_eq!(header_features(&path), SCALAR_REQUIRES);
+
+    let mut db = Database::open(&path, cfg()).unwrap();
+    let after = db.list_indexes(collection).unwrap();
+    assert_eq!(after, before, "reopening changed the catalog");
+    assert_eq!(db.index_info(age).unwrap(), after[0]);
+    assert_eq!(db.index_tree(age).unwrap(), Some(tree));
+    let mut reopened = Vec::new();
+    db.index_for_each(age, &[0x70], &mut |k, v| {
+        reopened.push((k.to_vec(), v.to_vec()))
+    })
+    .unwrap();
+    assert_eq!(reopened, entries, "the root the descriptor kept is the wrong one");
+
+    // A second owned-tree family on the same collection adds its own bit and
+    // nothing else; the mask is the sum of what the file actually contains.
+    let home = db.create_point_index(collection, "home_idx", "home").unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(home, 256).unwrap();
+    db.commit().unwrap();
+    assert_eq!(db.index_info(home).unwrap().encoding_version, 2);
+    assert_eq!(db.list_indexes(collection).unwrap().len(), 2);
+    assert!(db.checkpoint().unwrap());
+    drop(db);
+    assert_eq!(header_features(&path), SCALAR_AND_SPATIAL_REQUIRE);
+
+    // An external inventory -- which is all the fixture is -- must look in the
+    // index's tree. Nothing of either family is left in the primary tree, so a
+    // tool that scans only the primary tree sees an empty index, not a partial
+    // one.
+    let raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
+    for tag in [0x70u8, 0x74] {
+        assert!(
+            raw.range(&[tag])
+                .unwrap()
+                .next()
+                .is_none_or(|row| row.unwrap().0[0] != tag),
+            "tag {tag:#x} entries were left in the primary tree"
+        );
+    }
+    let (id, root) = tree;
+    let mut in_own_tree = 0u64;
+    for row in raw.tree_range(id, root, &[0x70]).unwrap().unwrap() {
+        if row.unwrap().0[0] != 0x70 {
+            break;
+        }
+        in_own_tree += 1;
+    }
+    assert_eq!(in_own_tree, ROWS, "the index's own tree lost entries");
+}

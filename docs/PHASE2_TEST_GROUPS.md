@@ -163,9 +163,12 @@ immutable fixtures and binaries from the first declared released format.
 
 ### Graph-independent lifecycle fixtures
 
-The separate `phase2_lifecycle_fixture` helper captures masks 1/5/9/17/33
+The separate `phase2_lifecycle_fixture` helper captures masks 129/5/137/17/33
 without enabling graph storage, including Ready, nonzero-cursor Building,
-partially Dropping and post-drop states. Build both codecs with an explicit
+partially Dropping and post-drop states. Scalar and spatial fixtures carry the
+per-index-tree bit (0x80) on top of their family bit because an unconfigured
+handle creates those two families with a B-tree each, so the mask-31 probe now
+refuses three of the five families instead of one. Build both codecs with an explicit
 `E4_COMPAT_ENGINE_REVISION`; use the preserved mask-31 admission probe:
 
 ```sh

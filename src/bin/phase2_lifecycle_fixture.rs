@@ -7,9 +7,9 @@ use e4_prototype::{
     Kind,
     collections::{
         ApproxVectorMethod, CollectionId, CollectionOptions, Database, EntityId, Error,
-        IndexFamily, IndexId, IndexState, QuantizedVectorCandidates, ScalarPredicate,
-        SpatialCandidates, SUPPORTED_LOGICAL_FEATURES, TextCandidates, TextMatch,
-        VectorCandidates, VectorMetric,
+        create_index_trees, IndexFamily, IndexId, IndexState, IndexTree,
+        QuantizedVectorCandidates, ScalarPredicate, SpatialCandidates,
+        SUPPORTED_LOGICAL_FEATURES, TextCandidates, TextMatch, VectorCandidates, VectorMetric,
     },
     pagewal::{PageWalStore, create_compact_cells},
     spatial_math::Bounds,
@@ -34,6 +34,13 @@ const MANIFEST: &str = "PHASE2_LIFECYCLE_FIXTURE.json";
 const FORMAT: &str = "e4-phase2-index-lifecycle-candidate-v1";
 const PHYSICAL_FEATURES_OFFSET: usize = 48;
 const ROWS: usize = 10;
+/// The collection-header bit that says this database holds at least one index
+/// with its OWN B-tree. Scalar and spatial indexes are created that way while
+/// the handle's create-index-trees switch is on, so the corpus they generate
+/// requires this bit on top of its family bit, and a binary that predates
+/// per-index trees must refuse the file whole rather than read past a
+/// descriptor it cannot parse.
+const INDEX_TREE_FEATURE: u64 = 0x80;
 const INDEX: IndexId = IndexId(1);
 const PEOPLE: CollectionId = CollectionId(1);
 
@@ -68,13 +75,38 @@ impl Family {
         }
     }
 
+    /// The two families whose indexes get a B-tree of their own when the
+    /// handle's create-index-trees switch is on. Every other family keeps its
+    /// entries in the primary tree at descriptor version 1, whatever the
+    /// switch says.
+    fn owns_tree(self) -> bool {
+        matches!(self, Self::Scalar | Self::Spatial)
+    }
+
+    /// The descriptor version an index of this family is CREATED at, under the
+    /// switch this binary creates databases with. The fixture asserts what it
+    /// actually wrote, so this is read from the engine's create-time default
+    /// rather than pinned to either layout.
+    fn encoding_version(self) -> u16 {
+        if self.owns_tree() && create_index_trees() {
+            2
+        } else {
+            1
+        }
+    }
+
     fn logical_features(self) -> u64 {
-        1 | match self {
+        let family = 1 | match self {
             Self::Scalar => 0,
             Self::ExactVector => 4,
             Self::Spatial => 8,
             Self::Text => 16,
             Self::Quantized => 32,
+        };
+        if self.encoding_version() == 2 {
+            family | INDEX_TREE_FEATURE
+        } else {
+            family
         }
     }
 
@@ -337,7 +369,8 @@ fn check_catalog(db: &Database, family: Family, lifecycle: Lifecycle, upgraded: 
         assert_eq!(index.kind, family.kind());
         assert!(!index.unique);
         assert_eq!(index.state, state);
-        assert_eq!(index.encoding_version, 1);
+        assert_eq!(index.encoding_version, family.encoding_version());
+        assert_eq!(index.tree.is_some(), index.encoding_version == 2);
         assert_eq!(db.index_info(INDEX).unwrap(), *index);
     } else {
         assert!(indexes.is_empty());
@@ -544,13 +577,57 @@ fn derived_entry_count(dir: &Path, family: Family) -> usize {
     derived_namespace(dir, family).len()
 }
 
+/// The B-tree this fixture's index keeps its entries in, or `None` when the
+/// entries are records of the primary tree -- a version-1 descriptor, a family
+/// that never owns a tree, or an index already dropped. The descriptor's own
+/// bytes are checked elsewhere (`check_catalog`, `assert_catalog_presence`);
+/// what is wanted here is only which tree to walk, so it is read through the
+/// catalog rather than by re-deriving the tail offset of every family's
+/// descriptor inside the fixture.
+fn index_tree(dir: &Path, family: Family) -> Option<IndexTree> {
+    if family.encoding_version() != 2 {
+        return None;
+    }
+    let db = Database::open_snapshot(dir, cfg()).unwrap();
+    let tree = match db.index_info(INDEX) {
+        Ok(info) => {
+            assert_eq!(info.encoding_version, 2);
+            info.tree
+        }
+        Err(Error::NotFound("index")) => None,
+        Err(error) => panic!("index descriptor: {error:?}"),
+    };
+    assert!(tree.is_none_or(|t| t.id >= 2), "per-index tree id 0/1 is reserved");
+    tree
+}
+
 fn derived_namespace(dir: &Path, family: Family) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let tree = index_tree(dir, family);
     let store = PageWalStore::open_snapshot(dir, CACHE_BYTES).unwrap();
     let mut entries = BTreeMap::new();
     for &tag in family.derived_tags() {
         let mut prefix = vec![tag];
         prefix.extend(ordered(INDEX.0));
-        for row in store.range(&prefix).unwrap() {
+        // An index that owns a tree keeps its entries there and NOTHING under
+        // these tags in the primary tree; one that does not owns nothing but
+        // the primary tree. Both halves are checked, so a build that wrote to
+        // the wrong tree fails here rather than passing by counting twice.
+        let rows = match tree {
+            Some(t) => {
+                assert!(
+                    store
+                        .range(&prefix)
+                        .unwrap()
+                        .next()
+                        .is_none_or(|row| !row.unwrap().0.starts_with(&prefix)),
+                    "entries of an owned index tree leaked into the primary tree"
+                );
+                store.tree_range(t.id, t.root, &prefix).unwrap()
+            }
+            None => Some(store.range(&prefix).unwrap()),
+        };
+        let Some(rows) = rows else { continue };
+        for row in rows {
             let (key, value) = row.unwrap();
             if !key.starts_with(&prefix) {
                 break;
