@@ -214,6 +214,10 @@ impl Backend {
     pub fn wal_bytes(&self) -> u64 {
         self.store.wal_bytes()
     }
+    /// The managed-byte allowance one transaction may occupy.
+    pub fn wal_allowance(&self) -> u64 {
+        self.store.wal_allowance()
+    }
     pub fn data_bytes(&self) -> u64 {
         self.store.data_bytes()
     }

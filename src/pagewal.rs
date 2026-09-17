@@ -198,6 +198,13 @@ pub struct IoCounters {
     pub wal_bytes_written: u64,
     pub data_bytes_written: u64,
     pub dirty_pages_flushed: u64,
+    /// High-water mark, in frames, of the largest SINGLE transaction this
+    /// handle has published (its page frames plus its commit frame). A
+    /// transaction is refused whole once it passes the managed-byte
+    /// allowance, so a build that must complete at any size has to choose its
+    /// transaction size rather than discover it; this is the number that says
+    /// whether it did. Watermark, not a rate: it never decreases.
+    pub max_transaction_frames: u64,
 }
 impl IoCounters {
     pub fn wal_fsyncs(self) -> u64 {
@@ -226,6 +233,9 @@ impl IoCounters {
             wal_bytes_written: self.wal_bytes_written.saturating_sub(prev.wal_bytes_written),
             data_bytes_written: self.data_bytes_written.saturating_sub(prev.data_bytes_written),
             dirty_pages_flushed: self.dirty_pages_flushed.saturating_sub(prev.dirty_pages_flushed),
+            // A watermark has no difference to take: the larger of two
+            // readings IS the reading for the interval that ends later.
+            max_transaction_frames: self.max_transaction_frames,
         }
     }
 }
@@ -241,6 +251,7 @@ struct IoAcc {
     metadata_fsyncs: AtomicU64,
     wal_bytes_written: AtomicU64,
     data_bytes_written: AtomicU64,
+    max_transaction_frames: AtomicU64,
 }
 impl IoAcc {
     fn new() -> Self {
@@ -256,6 +267,7 @@ impl IoAcc {
             metadata_fsyncs: AtomicU64::new(0),
             wal_bytes_written: AtomicU64::new(0),
             data_bytes_written: AtomicU64::new(0),
+            max_transaction_frames: AtomicU64::new(0),
         }
     }
     fn add(a: &AtomicU64, n: u64) { a.fetch_add(n, Ordering::Relaxed); }
@@ -274,6 +286,7 @@ impl IoAcc {
             wal_bytes_written: g(&self.wal_bytes_written),
             data_bytes_written: g(&self.data_bytes_written),
             dirty_pages_flushed: 0,
+            max_transaction_frames: g(&self.max_transaction_frames),
         }
     }
 }
@@ -467,6 +480,10 @@ impl Pager {
         let mut s=self.state.lock().unwrap();let mut body=[0;PAGE];body[..4].copy_from_slice(&s.tx_crc.to_le_bytes());
         let next = s.tx.checked_add(1).ok_or(Error::TooLarge)?;
         let b=frame(2,u32::MAX,s.tx,s.pages,&body,&s.identity);self.append(&mut s,&b)?;IoAcc::add(&self.io.commit_frames,1);
+        // Every frame since the last publication belongs to THIS transaction,
+        // and the allowance is checked against their sum, so this is the
+        // number a caller sizing its own transactions has to stay under.
+        self.io.max_transaction_frames.fetch_max((s.end-s.last_commit)/FRAME as u64,Ordering::Relaxed);
         self.wal.sync_full()?;IoAcc::add(&self.io.wal_fsyncs_commit,1);
         let (tx,end)=(s.tx,s.end);
         let r=self.write_hint(&mut s,tx,end);
@@ -1070,6 +1087,11 @@ impl PageWalStore {
         snapshot_store(p,self._lock.clone(),&self.dir,self.cache,Some(slot))
     }
     pub fn wal_bytes(&self)->u64 {self.pager.as_ref().map_or(0,|p|p.state.lock().unwrap().end)}
+    /// Bytes of WAL one transaction may ever occupy: the fixed managed-byte
+    /// allowance (`WAL_CAP`), or the smaller `wal_bytes` policy when one is
+    /// installed. `append` refuses past either, so a caller that must finish
+    /// at any size sizes its transactions against this number.
+    pub fn wal_allowance(&self)->u64 {WAL_CAP.min(self.limits.1)}
     /// Diagnostic: monotonic page-WAL and pool I/O counters since this handle opened.
     pub fn io_counters(&self)->IoCounters {
         let mut c=self.pager.as_ref().map(|p|p.io.snapshot()).unwrap_or_default();

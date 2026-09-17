@@ -220,7 +220,22 @@ struct Seeded {
 }
 
 fn seed(path: &std::path::Path) -> (Database, Seeded) {
-    let mut db = Database::create(path, cfg()).unwrap();
+    seed_with(path, None, 256)
+}
+
+/// The same corpus, optionally under a resource policy and with a chosen
+/// commit cadence. Neither changes a single persisted index byte -- the rows
+/// are identical and the digests below are content, not layout -- so a test
+/// that needs a small `wal_bytes` still checks against the same pins.
+fn seed_with(
+    path: &std::path::Path,
+    limits: Option<kernel::limits::ResourceLimits>,
+    commit_every: u64,
+) -> (Database, Seeded) {
+    let mut db = match limits {
+        None => Database::create(path, cfg()).unwrap(),
+        Some(l) => Database::create_limited(path, cfg(), l).unwrap(),
+    };
     let people = db
         .create_collection(
             "people",
@@ -243,13 +258,13 @@ fn seed(path: &std::path::Path) -> (Database, Seeded) {
         .unwrap();
     for i in 0..PEOPLE {
         db.put(people, &format!("p{i:05}"), &person(i)).unwrap();
-        if i % 256 == 255 {
+        if i % commit_every == commit_every - 1 {
             db.commit().unwrap();
         }
     }
     for i in 0..ORGS {
         db.put(orgs, &format!("o{i:04}"), &org(i)).unwrap();
-        if i % 256 == 255 {
+        if i % commit_every == commit_every - 1 {
             db.commit().unwrap();
         }
     }
@@ -687,4 +702,168 @@ fn a_sorted_build_resumes_after_committed_groups_and_keeps_the_oracle() {
     let mut db = Database::open(&path, cfg()).unwrap();
     db.build_index_to_ready(home, 16).unwrap();
     assert_eq!(digest(&db, "spatial", home).0, SPATIAL_HOME);
+}
+
+// ------------------------------------------- bounded runs (loop 5, item B1)
+
+/// A logged page and its frame header: `FRAME` in `src/pagewal.rs`.
+const WAL_FRAME_BYTES: u64 = 4096 + 48;
+
+/// Walk one per-index tree and return `(leaf depths, live cell bytes, leaves)`.
+///
+/// Reads raw pages the way `src/bin/collection_inspect.rs` does rather than
+/// through the engine, so the shape it reports is the shape on disk and not
+/// the shape the builder believes it wrote.
+fn leaf_shape(store: &e4_prototype::pagewal::PageWalStore, tree: u16, no: u32, depth: usize,
+              depths: &mut Vec<usize>, used: &mut u64, leaves: &mut u64) {
+    use kernel::page::{PageKind, PageRef};
+    let bytes = store.page_bytes(no).unwrap();
+    let p = PageRef::open(&bytes, no).unwrap();
+    assert_eq!(p.tree_id(), tree, "page {no} belongs to another tree");
+    assert!(depth < 64, "tree deeper than the format allows");
+    match p.kind() {
+        PageKind::Leaf => {
+            depths.push(depth);
+            *leaves += 1;
+            for i in 0..p.nentries() {
+                *used += p.slot(i).len() as u64 + 4;
+            }
+        }
+        PageKind::Interior => {
+            for i in 0..=p.nentries() {
+                let child = if i == 0 {
+                    p.child0()
+                } else {
+                    let r = p.slot(i - 1);
+                    u32::from_le_bytes(r[r.len() - 4..].try_into().unwrap())
+                };
+                leaf_shape(store, tree, child, depth + 1, depths, used, leaves);
+            }
+        }
+        _ => panic!("non-tree page {no} in a per-index tree"),
+    }
+}
+
+/// An index build must complete at ANY size under the FIXED WAL allowance,
+/// and completing must not change a byte of what it persists.
+///
+/// The old builder handed the whole index to one `tree_pack`, which is one
+/// transaction, which the page-WAL refuses past its managed-byte allowance --
+/// at 1,000,000 scalar rows under the fixed 16 MiB, by construction. The
+/// builder now sizes its own transactions (`Database::sorted_run_budget`):
+/// the first run is packed, the rest appends at the right edge of the same
+/// tree, each run its own commit.
+///
+/// This forces at least three of those runs by shrinking the allowance instead
+/// of growing the corpus, and then checks the four things that could have gone
+/// wrong: the persisted ENTRY SET moved (pinned digests), the tree stopped
+/// being uniformly deep (which a graft would have caused), the pages came out
+/// sparse (occupancy), or some single transaction was still large enough to be
+/// refused on a real database (the frame watermark).
+#[test]
+fn a_bounded_run_build_finishes_under_a_small_allowance_and_keeps_the_pinned_digests() {
+    use e4_prototype::collections::verification::{verify_indexed_source, VerificationLimits};
+    use e4_prototype::pagewal::PageWalStore;
+    use kernel::limits::ResourceLimits;
+
+    const WAL_BYTES: u64 = 256 << 10;
+    let limits = ResourceLimits {
+        data_bytes: 32 << 20,
+        wal_bytes: WAL_BYTES,
+        tracked_pages: 4096,
+        readers: 4,
+        record_bytes: 16384,
+        recovery_bytes: 256 << 10,
+    };
+    // The bound the engine computes, restated here from the allowance alone so
+    // the test does not read it back from the code it is checking: a quarter
+    // of the allowance, in 4144-byte frames.
+    let bound = WAL_BYTES / 4 / WAL_FRAME_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut db, s) = seed_with(&path, Some(limits), 64);
+    db.checkpoint().unwrap();
+    drop(db);
+    // Reopen so the I/O counters below describe the BUILDS and not the
+    // seeding: they are monotonic from the moment a handle opens.
+    let mut db = Database::open(&path, cfg()).unwrap();
+
+    let before = db.io_counters().unwrap();
+    let age = db
+        .create_scalar_index(s.people, "age_idx", "age", false)
+        .unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(age, 256).unwrap();
+    let after = db.io_counters().unwrap();
+    let runs = after.commit_frames - before.commit_frames;
+    eprintln!(
+        "BOUNDED wal_bytes={WAL_BYTES} bound={bound} frames runs={runs} \
+         max_transaction_frames={}",
+        after.max_transaction_frames
+    );
+    assert!(
+        runs >= 3,
+        "the allowance was meant to force at least three runs, it took {runs}"
+    );
+    assert!(
+        after.max_transaction_frames <= bound,
+        "a single transaction of the build wrote {} frames, over the {bound}-frame run bound",
+        after.max_transaction_frames
+    );
+
+    let active = db
+        .create_scalar_index(s.people, "active_idx", "active", false)
+        .unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(active, 256).unwrap();
+    let bio = db.create_text_index(s.people, "bio_idx", "bio").unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(bio, 256).unwrap();
+    let home = db.create_point_index(s.people, "home_idx", "home").unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(home, 256).unwrap();
+
+    // The entry SET is what may not move. Only the page shape may.
+    assert_eq!(digest(&db, "scalar", age).0, SCALAR_AGE);
+    assert_eq!(digest(&db, "scalar", active).0, SCALAR_ACTIVE);
+    assert_eq!(digest(&db, "spatial", home).0, SPATIAL_HOME);
+    assert_eq!(digest(&db, "text", bio).0, TEXT_BIO_SEGMENTS);
+    assert_eq!(digest(&db, "scalar", age).1, PEOPLE);
+
+    let trees = db.index_trees().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+
+    // Clean, by the engine's own two-way verifier.
+    let report = verify_indexed_source(&path, VerificationLimits::default(), |_| {}).unwrap();
+    assert!(
+        report.clean && report.complete,
+        "the verifier is not clean after a bounded-run build: {report:?}"
+    );
+
+    // Uniformly deep, and dense. A right-edge GRAFT would fail the first of
+    // these: it enters as one separator, so its subtree's height is its own.
+    let store = PageWalStore::open(&path, false, 1 << 20).unwrap();
+    for (tree, root) in trees {
+        let (mut depths, mut used, mut leaves) = (Vec::new(), 0u64, 0u64);
+        leaf_shape(&store, tree, root, 0, &mut depths, &mut used, &mut leaves);
+        let occupancy = used as f64 / (leaves * (4096 - 40)) as f64;
+        eprintln!(
+            "BOUNDED tree {tree}: {leaves} leaves depths {:?}..{:?} occupancy {occupancy:.3}",
+            depths.iter().min(),
+            depths.iter().max()
+        );
+        assert_eq!(
+            depths.iter().min(),
+            depths.iter().max(),
+            "tree {tree} is not uniformly deep"
+        );
+        if leaves > 2 {
+            assert!(
+                occupancy >= 0.85,
+                "tree {tree} packs {occupancy:.3} of its leaves, under the 0.85 floor"
+            );
+        }
+    }
 }

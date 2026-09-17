@@ -1190,6 +1190,54 @@ impl Database {
         let (_, n) = scalar_key::decode(&i.kind, &key[p.len()..])?;
         Ok(&key[p.len()..p.len() + n])
     }
+    /// Entry bytes one transaction of a sorted build may carry.
+    ///
+    /// The page-WAL logs one 4144-byte FRAME per page a transaction touches
+    /// and refuses the transaction WHOLE once those frames pass the managed
+    /// allowance -- a fixed 16 MiB, or a smaller installed `wal_bytes`. A
+    /// build that must finish at any size therefore has to pick its own
+    /// transaction size. Packing a whole index in one transaction picks it by
+    /// accident, and past roughly half a million scalar rows the accident is a
+    /// refusal.
+    ///
+    /// The arithmetic, for an allowance A:
+    ///
+    /// ```text
+    ///   budget  = A / 4                      bytes one transaction may spend
+    ///   frames  = budget / 4144              pages those bytes carry
+    ///   leaves  = frames * 3/4 - 4           pages for LEAF content
+    ///   entries = leaves * (4096 - 40) * 0.9 entry bytes those leaves hold
+    /// ```
+    ///
+    /// A QUARTER of the allowance, not all of it, because the WAL is only
+    /// folded BETWEEN transactions: `fold_committed_wal_if_at_cap` runs at the
+    /// first write of a transaction and checkpoints once the WAL has reached
+    /// `min(4 MiB, wal_bytes/2)`. So at most one un-folded transaction can
+    /// still be standing when the next one starts, and a quarter keeps the two
+    /// of them together inside A whichever of those thresholds applies. (At
+    /// the unlimited 16 MiB the two numbers coincide exactly: a quarter of the
+    /// allowance IS the 4 MiB fold threshold.)
+    ///
+    /// THREE QUARTERS of the frames for leaves, less four, because a
+    /// transaction logs more than leaf content: the pack's own interior levels
+    /// (far smaller -- a 4 KiB interior page holds many more separators than a
+    /// leaf holds entries, so the real share is nearer one page in a hundred),
+    /// the collection header page, the index descriptor's three replicas and
+    /// the commit frame. The flat four covers the fixed pages at small
+    /// allowances, where a fraction alone would not.
+    ///
+    /// The estimate does not have to be right, only conservative: a refusal
+    /// still rolls back, halves the group and carries on. Being conservative
+    /// is what stops that from being the normal path.
+    fn sorted_run_budget(&self) -> Result<u64> {
+        /// A logged page and its frame header, `FRAME` in `src/pagewal.rs`.
+        const WAL_FRAME_BYTES: u64 = 4096 + 48;
+        /// What a leaf packed at 0.9 holds: `(PAGE_SIZE - HEADER_LEN) * fill`.
+        const PACKED_LEAF_BYTES: u64 = ((4096 - 40) * 9) / 10;
+        let frames = self.store()?.wal_allowance() / 4 / WAL_FRAME_BYTES;
+        let leaves = (frames * 3 / 4).saturating_sub(4).max(1);
+        Ok(leaves * PACKED_LEAF_BYTES)
+    }
     /// Drive a late build to READY in bounded transactions, committing each
     /// chunk while the descriptor still says BUILDING.
     ///
@@ -1248,6 +1296,49 @@ impl Database {
         const SORTED_GROUP: usize = SORTED_GROUP_FIRST;
         fn allowance(e: &Error) -> bool {
             matches!(e, Error::Kernel(kernel::Error::ResourceLimit(_)))
+        }
+        // A BUILD MAY NOT START ON UNCOMMITTED WORK OF THE CALLER'S.
+        //
+        // Finding the transaction size the allowance admits is part of how
+        // this driver works: a refusal rolls back and tries a smaller one. But
+        // `rollback` discards the WHOLE open transaction, not the build's
+        // share of it, so anything else pending goes with it. When what was
+        // pending was the index's own CREATE, the registry row went too and
+        // the retry asked about an index that no longer existed --
+        // `NotFound("index")` out of a call that was only ever refused for
+        // want of allowance, and an index lost by a build that was supposed to
+        // be resumable. That is the failure this closes.
+        //
+        // The question is not "is the handle dirty" but WHOSE work is sitting
+        // in the transaction, because a build leaves its own READY flip there
+        // for the caller's commit:
+        //
+        //     create A; build A; create B; build B; commit
+        //
+        // is a reasonable thing to write, and by the second build the handle
+        // is dirty with A's publication and B's creation -- the engine's own
+        // work, both of them. Committing that is safe: an index that is finished
+        // or empty is not a decision anyone can object to, and it is exactly
+        // what stops a later refusal from rolling the create away. So it is
+        // committed here.
+        //
+        // USER writes -- rows, edges, collections, graph names -- are a
+        // different matter. Committing them decides something that is not the
+        // engine's to decide, and discarding them is worse. Those are refused,
+        // with the sentence that fixes it. `Database::user_writes_pending`
+        // tells the two apart; every public write entry point sets it.
+        //
+        // The flag is set on ENTRY to a write, before that write can be
+        // refused for a bad field, and it stays set until the next commit or
+        // rollback. So a caller whose `put` was rejected is asked to commit
+        // before building, and committing an empty transaction costs one
+        // barrier and clears it. Conservative in the direction that cannot
+        // lose anything, and the remedy is the one the message names.
+        if self.user_writes_pending {
+            return Err(invalid("commit pending writes before building an index"));
+        }
+        if self.store.is_dirty() || self.sequence.is_some() {
+            self.commit()?;
         }
         let family = self.index_info(id)?.family;
         let sorted = match family {
@@ -1373,8 +1464,38 @@ impl Database {
         // EMPTY, single-family tree every insert is an append at the right
         // edge, which is the kernel's cheapest split. It is slower than the
         // pack and it is never wrong.
+        //
+        // BOUNDED RUNS. The pack is no longer offered the whole index. It is
+        // offered the FIRST RUN: as many entries as `sorted_run_budget` says
+        // one transaction can afford. If the sorted stream ends inside that
+        // budget -- which is every index this engine was measured on below
+        // roughly half a million rows -- nothing else happens and the build is
+        // the single pack it always was. If it does not, the packed run is
+        // committed with its root, and the remainder appends at the right edge
+        // of that same tree through the ascending path below, committing on
+        // the same budget. So the build completes at ANY size under a fixed
+        // allowance, and a database large enough to refuse the whole-index
+        // pack no longer discovers that by being refused.
+        //
+        // WHY NOT GRAFT THE LATER RUNS. `BTree::graft_sorted_range` packs a
+        // run and splices it in as one subtree, which is what the later runs
+        // want. It enters the standing tree as a single separator, so the
+        // grafted subtree's height is independent of the tree's and the tree
+        // stops being uniformly deep -- and at the right edge, EVERY run would
+        // graft there, adding a level each time until the format's depth bound
+        // refused the build. A right-edge graft is an append only in key
+        // order, not in shape. The ascending put costs a descent per key and
+        // keeps one uniformly deep tree, and because a per-keyspace append
+        // splits at the right edge rather than down the middle, its leaves
+        // come out essentially full -- denser than the 0.9 the pack targets.
+        // Measured leaf occupancy is asserted in tests/index_build_equivalence.rs.
+        let mut carry: Option<(Vec<u8>, Vec<u8>)> = None;
+        let mut packed_tail: Option<Vec<u8>> = None;
         if let Some(t) = i.tree {
             if t.root == 0 && group == SORTED_GROUP_FIRST && max_commits.is_none() {
+                let budget = self.sorted_run_budget()?;
+                let mut used = 0u64;
+                let mut cut: Option<(Vec<u8>, Vec<u8>)> = None;
                 let unique = i.family == IndexFamily::Scalar && i.unique;
                 let kind = i.kind.clone();
                 let head = ikey(SCALAR, i.id).len();
@@ -1384,6 +1505,17 @@ impl Database {
                 let mut failed = None;
                 let stream = std::iter::from_fn(|| match merge.next_entry() {
                     Ok(Some((key, value))) => {
+                        // What this entry costs a packed leaf: its record plus
+                        // its slot. `enc_leaf` frames a record in at most four
+                        // bytes and a slot is four more, so key + value + 8 is
+                        // never an under-estimate, whichever cell encoding the
+                        // build was compiled for.
+                        let need = (key.len() + value.len() + 8) as u64;
+                        if used > 0 && used + need > budget {
+                            cut = Some((key, value));
+                            return None;
+                        }
+                        used += need;
                         if unique {
                             match scalar_key::decode(&kind, &key[head..]) {
                                 Ok((_, n)) => {
@@ -1420,17 +1552,35 @@ impl Database {
                 }
                 let (root, _rows) = packed?;
                 i.tree = Some(IndexTree { id: t.id, root });
-                i.state = IndexState::Ready;
+                if cut.is_none() {
+                    i.state = IndexState::Ready;
+                    self.save_index(&i)?;
+                    self.commit()?;
+                    return Ok((max_seq as usize).div_ceil(chunk_rows).max(1));
+                }
+                // More to come. The root is durable in the SAME transaction as
+                // the pages it names, and the descriptor still says BUILDING,
+                // so a crash here leaves a partial index nothing reads and the
+                // next call re-sorts and resumes over it.
                 self.save_index(&i)?;
                 self.commit()?;
-                return Ok((max_seq as usize).div_ceil(chunk_rows).max(1));
+                // The unique check compares each value against the one before
+                // it, and the run boundary is a pair like any other: hand the
+                // last packed value to the loop below so the seam is checked.
+                packed_tail = prev;
+                carry = cut;
             }
         }
+        let run_budget = self.sorted_run_budget()?;
+        let mut run_bytes = 0u64;
         let mut pending = 0usize;
         let mut groups = 0usize;
         let mut commits = 0usize;
-        let mut prev_value: Option<Vec<u8>> = None;
-        while let Some((key, value)) = merge.next_entry()? {
+        let mut prev_value: Option<Vec<u8>> = packed_tail;
+        while let Some((key, value)) = match carry.take() {
+            Some(entry) => Some(entry),
+            None => merge.next_entry()?,
+        } {
             if i.family == IndexFamily::Scalar && i.unique {
                 let v = self.scalar_value_bytes(&i, &key)?;
                 if v != [0] {
@@ -1442,12 +1592,19 @@ impl Database {
                     prev_value = None;
                 }
             }
+            run_bytes += (key.len() + value.len() + 8) as u64;
             self.index_put(&mut i, &key, &value)?;
             pending += 1;
             if pending >= chunk_rows {
                 groups += 1;
                 pending = 0;
-                if groups % group == 0 {
+                // Two reasons to commit, and the group count is the weaker
+                // one: it bounds how long the transaction stays open, the
+                // budget bounds how large it gets. A group of 64 chunks of
+                // small scalar keys is well inside the allowance; one of
+                // spatial entries with their payloads need not be.
+                if groups % group == 0 || run_bytes >= run_budget {
+                    run_bytes = 0;
                     self.commit()?;
                     commits += 1;
                     if max_commits.is_some_and(|n| commits >= n) {

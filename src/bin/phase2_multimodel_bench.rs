@@ -907,9 +907,19 @@ fn run_e4(
     progress.stage_progress = json!({"index":"age_idx","steps":0,"publication_commits":0});
     let start = Instant::now();
     let age_index = db.create_scalar_index(people, "age_idx", "age", false)?;
+    // Commit the CREATE before driving the build, exactly as every engine
+    // test does. A build may roll back to find the transaction size the WAL
+    // allowance admits, and a rollback discards whatever is uncommitted --
+    // which, with no commit here, included the index's own registry row.
+    // That is how the 1,000,000-row atomic arm turned an allowance refusal
+    // into `NotFound("index")` and lost the index. The engine now commits a
+    // lone create itself rather than lose it; the bench still writes the
+    // commit, because the bench is also the worked example.
+    db.commit()?;
     let (active_index, steps, commits) = if policy == "atomic" {
         let steps = db.build_index_to_ready(age_index, BATCH)?;
         let active = db.create_scalar_index(people, "active_idx", "active", false)?;
+        db.commit()?;
         let steps = steps + db.build_index_to_ready(active, BATCH)?;
         progress.index_committed("age_idx", age_index, true, 0);
         progress.index_committed("active_idx", active, true, 0);
@@ -924,6 +934,7 @@ fn run_e4(
             &mut db, age_index, "age_idx", policy, root, &mut peak, progress,
         )?;
         let active = db.create_scalar_index(people, "active_idx", "active", false)?;
+        db.commit()?;
         let (active_steps, active_commits) = finish_build(
             &mut db,
             active,
@@ -946,6 +957,7 @@ fn run_e4(
     progress.stage_progress = json!({"index":"embedding_exact","steps":0,"publication_commits":0});
     let start = Instant::now();
     let vector_index = db.create_exact_vector_index(people, "embedding_exact", "embedding")?;
+    db.commit()?;
     let (steps, commits) = finish_build(
         &mut db,
         vector_index,
@@ -966,6 +978,7 @@ fn run_e4(
     progress.stage_progress = json!({"index":"position_point","steps":0,"publication_commits":0});
     let start = Instant::now();
     let spatial_index = db.create_point_index(people, "position_point", "position")?;
+    db.commit()?;
     let (steps, commits) = finish_build(
         &mut db,
         spatial_index,
@@ -986,6 +999,7 @@ fn run_e4(
     progress.stage_progress = json!({"index":"body_text","steps":0,"publication_commits":0});
     let start = Instant::now();
     let text_index = db.create_text_index(people, "body_text", "body")?;
+    db.commit()?;
     let (steps, commits) = finish_build(
         &mut db,
         text_index,

@@ -198,6 +198,32 @@ pub struct Database {
     /// Whether scalar and spatial indexes created through this handle get
     /// their own B-tree. Copied from the process-wide default at open/create.
     create_index_trees: bool,
+    /// Whether the open transaction holds work the CALLER asked for, as
+    /// opposed to work the engine did on the caller's behalf.
+    ///
+    /// A late build may have to roll back -- an allowance refusal is how it
+    /// finds the transaction size the page-WAL admits -- and `rollback`
+    /// discards everything uncommitted, not the build's share of it. Two
+    /// different things can be sitting in that transaction:
+    ///
+    /// * INDEX CATALOG work: this index's own CREATE, or the READY flip of a
+    ///   build the caller ran a moment ago and has not committed yet. Rolling
+    ///   that away is how a refused build used to LOSE the index it was
+    ///   building (`index_info` then answered `NotFound("index")`). The build
+    ///   commits it before it starts -- it is the engine's own work, and
+    ///   committing a finished index or a fresh empty one changes nothing a
+    ///   reader can object to.
+    /// * USER writes: rows, edges, collections, graph metadata. Committing
+    ///   those decides something that is not the engine's to decide, and
+    ///   discarding them is worse. The build refuses instead and says so.
+    ///
+    /// This flag is what tells the two apart. It is set by every public write
+    /// entry point and cleared by `commit` and `rollback`; the engine's own
+    /// index create/build/drop steps deliberately do not set it, which is what
+    /// lets `create A, build A, create B, build B, commit` work -- a
+    /// reasonable caller pattern that a plain "is the handle dirty" test
+    /// refuses on the second build.
+    user_writes_pending: bool,
 }
 
 /// Identities remembered at once, and edges remembered per identity. Both are
@@ -616,6 +642,7 @@ impl Database {
             fresh: BTreeMap::new(),
             fresh_order: VecDeque::new(),
             create_index_trees: indexes::create_index_trees(),
+            user_writes_pending: false,
         }
     }
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
@@ -868,7 +895,7 @@ impl Database {
         fields: Vec<(String, Kind)>,
         options: CollectionOptions,
     ) -> Result<CollectionId> {
-        self.ready_write()?;
+        self.user_write()?;
         if name.is_empty() || name.len() > 255 {
             return Err(invalid("collection name must contain 1..255 UTF-8 bytes"));
         }
@@ -1061,14 +1088,14 @@ impl Database {
         Ok(())
     }
     pub fn put(&mut self, c: CollectionId, key: &str, doc: &Value) -> Result<EntityId> {
-        self.ready_write()?;
+        self.user_write()?;
         let catalog = self.catalog(c)?;
         self.validate_document(&catalog, key, doc)?;
         let old = self.load_entity(c, key, true, false)?;
         self.write_entity(&catalog, key, doc.clone(), old)
     }
     pub fn update(&mut self, c: CollectionId, key: &str, patch: &Value) -> Result<EntityId> {
-        self.ready_write()?;
+        self.user_write()?;
         let catalog = self.catalog(c)?;
         self.validate_document(&catalog, key, patch)?;
         let old = self
@@ -1244,7 +1271,7 @@ impl Database {
         })
     }
     pub fn delete(&mut self, c: CollectionId, key: &str) -> Result<bool> {
-        self.ready_write()?;
+        self.user_write()?;
         let Some(e) = self.load_entity(c, key, true, false)? else {
             return Ok(false);
         };
@@ -1282,6 +1309,7 @@ impl Database {
     /// the remaining allowance) and no reader holds a slot.
     pub fn commit(&mut self) -> Result<()> {
         self.ready_write()?;
+        self.user_writes_pending = false;
         let r = (|| {
             self.flush_sequence()?;
             self.writer()?.commit()?;
@@ -1317,6 +1345,7 @@ impl Database {
         // was learned in the discarded transaction; drop the lot.
         self.fresh.clear();
         self.fresh_order.clear();
+        self.user_writes_pending = false;
         self.failed = true;
         self.store.rollback()?;
         if let Some(l) = self.limits {

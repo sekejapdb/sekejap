@@ -679,7 +679,7 @@ impl Database {
 
     /// Explicit logical-format opt-in. The caller publishes it with `commit`.
     pub fn enable_graph(&mut self) -> Result<()> {
-        self.ready_write()?;
+        self.user_write()?;
         if self
             .index_header
             .is_some_and(|header| header.features & GRAPH_FEATURE != 0)
@@ -725,7 +725,9 @@ impl Database {
     }
 
     fn create_graph_name(&mut self, kind: u8, name: &str) -> Result<u64> {
-        self.ready_write()?;
+        // Reached only through `create_edge_type` / `create_graph_context`,
+        // both public: naming an edge type is the caller's decision.
+        self.user_write()?;
         validate_name_input(
             name,
             if kind == 0 {
@@ -919,7 +921,7 @@ impl Database {
         context: &str,
         properties: &Value,
     ) -> Result<EdgeKey> {
-        self.ready_write()?;
+        self.user_write()?;
         validate_name_input(edge_type, "edge type name")?;
         if !context.is_empty() {
             validate_name_input(context, "graph context name")?;
@@ -999,7 +1001,7 @@ impl Database {
     }
 
     pub fn delete_edge(&mut self, key: EdgeKey) -> Result<bool> {
-        self.ready_write()?;
+        self.user_write()?;
         let h = self.graph_header()?;
         self.validate_edge_ids(h, key)?;
         let primary_key = edge_key(PRIMARY_EDGE, key);
@@ -1032,7 +1034,7 @@ impl Database {
         destination: EntityId,
         context: &str,
     ) -> Result<bool> {
-        self.ready_write()?;
+        self.user_write()?;
         validate_name_input(edge_type, "edge type name")?;
         if !context.is_empty() {
             validate_name_input(context, "graph context name")?;
