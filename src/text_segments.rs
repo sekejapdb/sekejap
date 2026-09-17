@@ -170,7 +170,12 @@ impl Default for Packer {
 impl Packer {
     pub(in crate::collections) fn new() -> Self {
         Self {
-            body: Vec::with_capacity(MAX_SEGMENT_BYTES),
+            // Grows on demand: the late build keeps one packer per distinct
+            // term alive at once, and reserving the full segment up front cost
+            // 3,600 bytes per term before a single posting arrived (9.8 MB for
+            // a 93 KB corpus). The segment split point depends on the bytes
+            // written, never on the capacity, so the output is unchanged.
+            body: Vec::new(),
             count: 0,
             previous: 0,
             last: 0,
