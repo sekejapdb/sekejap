@@ -143,6 +143,45 @@ impl Backend {
         self.write_fault()?;
         self.store.delete(k)
     }
+    /// Per-index tree access. The store keeps no catalog of trees: the caller
+    /// (the index descriptor) names `(tree_id, root)` on every call and owns
+    /// the durable copy of the root, which is why a root change must be saved
+    /// into the same transaction that produced it.
+    pub fn tree_create(&mut self, tree_id: u16) -> Result<u32> {
+        self.write_fault()?;
+        self.store.tree_create(tree_id)
+    }
+    pub fn tree_get(&self, tree_id: u16, root: u32, k: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.store.tree_get(tree_id, root, k)
+    }
+    pub fn tree_range(&self, tree_id: u16, root: u32, from: &[u8]) -> Result<Option<RangeIter<'_>>> {
+        self.store.tree_range(tree_id, root, from)
+    }
+    pub fn tree_put(&mut self, tree_id: u16, root: u32, k: &[u8], v: &[u8]) -> Result<u32> {
+        self.write_fault()?;
+        self.store.tree_put(tree_id, root, k, v)
+    }
+    pub fn tree_delete(&mut self, tree_id: u16, root: u32, k: &[u8]) -> Result<(bool, u32)> {
+        self.write_fault()?;
+        self.store.tree_delete(tree_id, root, k)
+    }
+    pub fn tree_free_root(&mut self, tree_id: u16, root: u32) -> Result<()> {
+        self.write_fault()?;
+        self.store.tree_free_root(tree_id, root)
+    }
+    pub fn tree_pack<I>(
+        &mut self,
+        tree_id: u16,
+        sorted: I,
+        fill: f32,
+        scratch: &Path,
+    ) -> Result<(u32, u64)>
+    where
+        I: Iterator<Item = kernel::Result<(Vec<u8>, Vec<u8>, bool)>>,
+    {
+        self.write_fault()?;
+        self.store.tree_pack(tree_id, sorted, fill, scratch)
+    }
     /// Durable (FULL barrier) and published through the hint: visible to
     /// every snapshot admitted afterwards.
     pub fn commit(&mut self) -> Result<()> {

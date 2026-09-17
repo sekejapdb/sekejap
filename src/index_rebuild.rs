@@ -575,6 +575,17 @@ fn seed_metadata(destination: &mut Destination, metadata: &Metadata) -> Result<(
     for index in &metadata.indexes {
         let mut building = index.clone();
         building.state = IndexState::Building { after: 0 };
+        // A per-index tree's root is a page NUMBER, and page numbers are local
+        // to a database. The destination is fresh, so the rebuilt index starts
+        // with an empty tree (root 0) and the build packs a new one there; the
+        // tree id is kept so the two databases name the same index the same
+        // way. Carrying the source root over would have pointed the
+        // destination's index at whatever page happened to occupy that number
+        // -- caught as "page belongs to another tree", which is the check
+        // doing its job, not a near miss.
+        if let Some(t) = building.tree {
+            building.tree = Some(indexes::IndexTree { id: t.id, root: 0 });
+        }
         let bytes = indexes::encode(&building)?;
         put_replicas(destination, |copy| indexes::dkey(index.id, copy), &bytes)?;
         destination.put(
@@ -651,6 +662,8 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
                 | 0x77
                 | 0x78
                 | 0x79
+                | 0x7a
+                | 0x7b
         ) {
             return Err(Error::Unsupported(format!(
                 "index rebuild does not understand key tag {tag:#x}"
@@ -936,13 +949,10 @@ fn compare_authoritative(source: &SourceView, destination: &CurrentSourceReader)
 fn build_indexes(path: &Path, indexes: &[IndexInfo], limits: RebuildLimits) -> Result<()> {
     let mut database = Database::open(path, config(limits.cache_bytes))?;
     for index in indexes {
-        loop {
-            let complete = database.build_index_step(index.id, limits.batch)?;
-            database.commit()?;
-            if complete {
-                break;
-            }
-        }
+        // The same entry point a late `CREATE INDEX` uses, so a rebuilt text
+        // index is packed into segments exactly as the original build packed
+        // it -- byte for byte -- instead of being re-materialized as head rows.
+        database.build_index_to_ready(index.id, limits.batch)?;
     }
     drop(database);
     Ok(())

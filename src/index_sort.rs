@@ -100,6 +100,19 @@ impl ExternalSorter {
         self.spills
     }
 
+    /// Push borrowed bytes. The sorter still owns a copy -- that is its
+    /// storage -- but the caller keeps one scratch buffer instead of building
+    /// a fresh `Vec` per entry.
+    pub(super) fn push_ref(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let add = record_bytes(key, value);
+        if !self.current.is_empty() && self.current_bytes.saturating_add(add) > self.budget {
+            self.spill()?;
+        }
+        self.current_bytes = self.current_bytes.saturating_add(add);
+        self.current.push((key.to_vec(), value.to_vec()));
+        Ok(())
+    }
+
     pub(super) fn push(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let add = record_bytes(&key, &value);
         if !self.current.is_empty() && self.current_bytes.saturating_add(add) > self.budget {

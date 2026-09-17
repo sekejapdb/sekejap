@@ -107,6 +107,36 @@ fn tail_without_coordination(path: &Path) {
     }
 }
 
+/// The tree one index's postings live in, or `None` for the shared layout.
+fn index_tree(path: &Path, index: IndexId) -> Option<(u16, u32)> {
+    let db = Database::open(path, cfg()).unwrap();
+    let tree = db.index_tree(index).unwrap();
+    drop(db);
+    tree
+}
+fn raw_get(raw: &PageWalStore, at: Option<(u16, u32)>, key: &[u8]) -> Option<Vec<u8>> {
+    match at {
+        None => raw.get(key).unwrap(),
+        Some((id, root)) => raw.tree_get(id, root, key).unwrap(),
+    }
+}
+fn raw_put(raw: &mut PageWalStore, at: Option<(u16, u32)>, key: &[u8], value: &[u8]) {
+    match at {
+        None => raw.put(key, value).unwrap(),
+        Some((id, root)) => assert_eq!(raw.tree_put(id, root, key, value).unwrap(), root),
+    }
+}
+fn raw_delete(raw: &mut PageWalStore, at: Option<(u16, u32)>, key: &[u8]) -> bool {
+    match at {
+        None => raw.delete(key).unwrap(),
+        Some((id, root)) => {
+            let (found, after) = raw.tree_delete(id, root, key).unwrap();
+            assert_eq!(after, root);
+            found
+        }
+    }
+}
+
 fn assert_unsupported_unchanged(path: &Path) {
     let before = files(path);
     for snapshot in [false, true] {
@@ -137,7 +167,9 @@ fn intact_future_spatial_family_version_or_options_refuse_without_mutation() {
         assert_eq!(&descriptor[..8], b"E4IDX01\0");
         match damage {
             0 => descriptor[10 + 12] = 0x7f,
-            1 => descriptor[10 + 13..10 + 15].copy_from_slice(&2u16.to_be_bytes()),
+            // Version 2 is the per-index-tree spatial layout this binary
+            // writes; the unknown-version probe moved up to 3.
+            1 => descriptor[10 + 13..10 + 15].copy_from_slice(&3u16.to_be_bytes()),
             2 => descriptor[10 + 18] = 1,
             _ => unreachable!(),
         }
@@ -220,32 +252,33 @@ fn malformed_coordinates_and_hilbert_are_corrupt_at_exact_access() {
         let path = temp.path().join(format!("spatial-damage-{damage}"));
         let (index, entity, point) = fixture(&path);
         let original_key = posting_key(index, entity, point);
+        let at = index_tree(&path, index);
         let mut raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
-        let original_value = raw.get(&original_key).unwrap().unwrap();
+        let original_value = raw_get(&raw, at, &original_key).unwrap();
         match damage {
-            0 => raw.put(&original_key, &[0; 15]).unwrap(),
+            0 => raw_put(&mut raw, at, &original_key, &[0; 15]),
             1 => {
                 let mut value = original_value.clone();
                 value[..8].copy_from_slice(&f64::NAN.to_le_bytes());
-                raw.put(&original_key, &value).unwrap();
+                raw_put(&mut raw, at, &original_key, &value);
             }
             2 => {
                 let mut value = original_value.clone();
                 value[..8].copy_from_slice(&181.0f64.to_le_bytes());
-                raw.put(&original_key, &value).unwrap();
+                raw_put(&mut raw, at, &original_key, &value);
             }
             3 => {
                 let mut value = original_value.clone();
                 value[..8].copy_from_slice(&0.0f64.to_le_bytes());
                 value[8..].copy_from_slice(&0.0f64.to_le_bytes());
-                raw.put(&original_key, &value).unwrap();
+                raw_put(&mut raw, at, &original_key, &value);
             }
             4 => {
-                assert!(raw.delete(&original_key).unwrap());
+                assert!(raw_delete(&mut raw, at, &original_key));
                 let mut wrong_key = original_key.clone();
                 let hilbert_at = 1 + ordered(index.0).len();
                 wrong_key[hilbert_at + 3] ^= 1;
-                raw.put(&wrong_key, &original_value).unwrap();
+                raw_put(&mut raw, at, &wrong_key, &original_value);
             }
             _ => unreachable!(),
         }
@@ -286,8 +319,13 @@ fn missing_posting_is_detected_when_primary_candidates_are_supplied() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("missing-posting");
     let (index, entity, point) = fixture(&path);
+    let at = index_tree(&path, index);
     let mut raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
-    assert!(raw.delete(&posting_key(index, entity, point)).unwrap());
+    assert!(raw_delete(
+        &mut raw,
+        at,
+        &posting_key(index, entity, point)
+    ));
     raw.commit().unwrap();
     drop(raw);
 

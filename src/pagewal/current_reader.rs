@@ -323,8 +323,18 @@ impl CurrentSourceReader {
     /// Point lookup in the latest committed tree.  Every page on the routed
     /// root path is CRC/identity checked and all its cells are validated.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_in(TREE_ID, self.root, key)
+    }
+
+    /// The same point lookup in a tree the caller names -- a per-index tree,
+    /// reached through the root its descriptor holds. `root == 0` is an empty
+    /// tree. Identical page checks: every page must carry the tree id asked
+    /// for, so a descriptor root that names a page of some OTHER tree (or a
+    /// free page) is refused rather than read.
+    pub fn get_in(&self, tree_id: u16, root: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if root == 0 { return Ok(None); }
         let mut work = Work::default();
-        let mut page_no = self.root;
+        let mut page_no = root;
         let mut lower: Option<Vec<u8>> = None;
         let mut upper: Option<Vec<u8>> = None;
         let mut path = Vec::with_capacity(self.limits.max_depth);
@@ -338,7 +348,7 @@ impl CurrentSourceReader {
             path.push(page_no);
             let bytes = self.page(page_no, &mut work)?;
             let page = PageRef::open(&bytes, page_no)?;
-            if page.tree_id() != TREE_ID {
+            if page.tree_id() != tree_id {
                 return Err(tree_bad(
                     page_no,
                     "current-reader page belongs to another tree",
@@ -463,8 +473,21 @@ impl CurrentSourceReader {
         &self,
         start: &[u8],
         end: Option<&[u8]>,
+        visitor: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<u64> {
+        self.visit_tree_range(TREE_ID, self.root, start, end, visitor)
+    }
+
+    /// The same streamed range over a tree the caller names.
+    pub fn visit_tree_range(
+        &self,
+        tree_id: u16,
+        root: u32,
+        start: &[u8],
+        end: Option<&[u8]>,
         mut visitor: impl FnMut(&[u8], &[u8]) -> Result<()>,
     ) -> Result<u64> {
+        if root == 0 { return Ok(0); }
         if end.is_some_and(|bound| bound < start) {
             return Err(Error::ResourceLimit(
                 "current-reader range bounds are reversed",
@@ -478,6 +501,7 @@ impl CurrentSourceReader {
         let mut last = None;
         let mut count = 0u64;
         let mut state = VisitState {
+            tree_id,
             start,
             end,
             visitor: &mut visitor,
@@ -486,7 +510,7 @@ impl CurrentSourceReader {
             last: &mut last,
             count: &mut count,
         };
-        self.visit_page(self.root, None, None, 1, &mut state)?;
+        self.visit_page(root, None, None, 1, &mut state)?;
         Ok(count)
     }
 
@@ -512,7 +536,7 @@ impl CurrentSourceReader {
         let result = (|| {
             let bytes = self.page(page_no, state.work)?;
             let page = PageRef::open(&bytes, page_no)?;
-            if page.tree_id() != TREE_ID {
+            if page.tree_id() != state.tree_id {
                 return Err(tree_bad(
                     page_no,
                     "current-reader page belongs to another tree",
@@ -627,6 +651,7 @@ impl CurrentSourceReader {
 }
 
 struct VisitState<'a, F> {
+    tree_id: u16,
     start: &'a [u8],
     end: Option<&'a [u8]>,
     visitor: &'a mut F,

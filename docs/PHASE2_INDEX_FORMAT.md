@@ -28,7 +28,7 @@ bytes, including `b"E4COLL2\0"`, `b"E4IDX01\0"`, `b"E4GRF01\0"` and
 `b"E4GNM01\0"`. COLL2 payload is:
 `next_collection:u32be | next_layout:u32be | required_features:u64be |
 next_index:u64be | live_index_count:u32be | optional E4LIMIT1 policy:56bytes`.
-Only payload lengths 28/84 are admitted. The supported feature mask is `0x3f`:
+Only payload lengths 28/84 are admitted. The supported feature mask is `0xff`:
 
 | Bit | Mask | Meaning |
 |---:|---:|---|
@@ -38,6 +38,8 @@ Only payload lengths 28/84 are admitted. The supported feature mask is `0x3f`:
 | 3 | `0x08` | WGS84 point family 3 |
 | 4 | `0x10` | analyzer-v1 text family 4 |
 | 5 | `0x20` | symmetric-int8 vector family 5 |
+| 6 | `0x40` | packed text posting segments and norm blocks v1 (family 4, tags `0x7a`/`0x7b`) |
+| 7 | `0x80` | per-index B-trees: at least one scalar/spatial index owns a tree (descriptor version 2) |
 
 Every secondary-index family requires bit0 as well as its family bit. Graph
 enablement produces at least mask3. Feature bits are monotone after commit:
@@ -75,6 +77,86 @@ never reused after commit. Failed/uncommitted allocations can be rolled back.
 | 77 | index ID, UTF8 term, NUL | document frequency:u64be |
 | 78 | index ID | document count:u64be, total token count:u64be |
 | 79 | index ID, entity sequence | locator:6 bytes, scale:f64le, dimension signed-i8 lanes |
+| 7a | index ID, UTF8 term, NUL, ordered last entity sequence | packed posting segment (see below) |
+| 7b | index ID, ordered (entity sequence / 256) | packed document-length block (see below) |
+
+## Per-index B-trees (bit 7, descriptor version 2)
+
+A scalar (family 1) or spatial (family 3) index can keep its entries in a
+B-tree of its own instead of sharing the primary tree with rows, metadata and
+every other index. The KEY ENCODINGS ARE IDENTICAL in both layouts -- the
+family tag is still the first byte of every entry key -- so the only difference
+is which tree the cursor walks.
+
+The branch is the DESCRIPTOR VERSION, not the header bit. A version-2 scalar or
+spatial descriptor appends six bytes after its lifecycle cursor and before its
+name/field strings:
+
+`... | state:u8 | cursor:u64be | tree_id:u16be | root:u32be | name | field`
+
+`tree_id` is at least 2: tree 1 is the primary tree and is never handed out.
+`root == 0` is an empty tree, which allocates no page; every read answers it
+without touching one. Tree ids come from the same monotone counter as index
+identities (`next_index`), one above the index's own id, so they are never
+reused after commit and creation is refused once the u16 space is gone.
+
+The root moves whenever the tree grows or loses a level, and the descriptor is
+the only durable copy of it. It is therefore rewritten in the SAME transaction
+as the page split that moved it: both are frames of one commit, so no crash can
+expose a committed tree whose committed descriptor names a different root.
+
+Bit 7 is set only by a CREATE that allocates a tree. Opening a database and
+ordinary writes never set it, so a database whose indexes all live in the
+primary tree keeps the older mask and stays fully readable and writable by
+every binary that predates this work (Law 8); a database that does contain a
+per-index tree is refused whole by such a binary, before a byte is touched,
+because bit 7 is outside the mask it implements. A version-2 descriptor in a
+database whose header does not declare bit 7 is corruption and is refused at
+admission.
+
+SCOPE. Only families 1 and 3 can own a tree. Text (family 4, tags `0x75`-`0x78`
+and the packed `0x7a`/`0x7b` tier), exact vectors (family 2), quantized vectors
+(family 5), graph edges (`0x71`/`0x72`), rows (`0x40`), vector sidecars
+(`0x60`), the name and collection mappings and every metadata replica all stay
+in the primary tree, and their descriptors stay at version 1.
+
+Bit 6 is set only by a late text build that actually writes a segment or a
+norm block; opening a database, an ordinary write and `build_index_step` never
+set it. A reader whose supported mask predates it refuses the whole file before
+normalization, which is what makes the packed tier an explicitly created
+feature rather than a reinterpretation of existing bytes (Law 8). `0x75` gains
+one new value under this bit and only under it: `0` means the posting named by
+the key does not exist, which is how a delete or an update retires a posting
+that is packed inside a `0x7a` value. `0x76` gains one new value under the same
+bit: the EMPTY value, meaning the document named by the key is not in the
+index, which is how a delete retires a length that is packed inside a `0x7b`
+value. `0` could not be used for that, because a four-byte `0` already means a
+present document with zero tokens. A head entry always overrides a packed entry
+for the same `(term, document)` and for the same document.
+
+Norm block value: `format:u8=1 | presence:32 bytes | count x length:varint`.
+The block named by key `s / 256` covers sequences `256 * (s / 256) ..= 256 *
+(s / 256) + 255`; bit `i` of the bitmap (byte `i / 8`, mask `1 << (i % 8)`) is
+set when slot `i` holds a document, and the varints are the lengths of the set
+slots in ascending slot order. Sequences are not dense, so a hole costs one bit
+rather than one byte, and `length = 0` stays distinct from "no document". The
+bitmap population count must equal the number of varints decoded, and the value
+must end exactly where the last varint ends. A full block of ordinary prose is
+1 + 32 + 256 = 289 bytes; a fixed-width `u32` table for the same documents is
+1057, which is why the lengths are varints. Worst case 1 + 32 + 5 * 256 = 1313
+bytes, inline in one leaf record with no overflow chain. Blast radius of one
+bad byte: that one block of at most 256 documents.
+
+Segment value: `format:u8=1 | count:varint | last sequence:varint |
+count x (delta:varint, term frequency:varint)`. Varints are minimal LEB128;
+deltas are strictly positive, so sequences ascend within a segment, and
+segments of one term are disjoint ascending ranges. The writer caps a value at
+3,600 bytes, which keeps every segment inside one 4,052-byte leaf record with
+no overflow chain; a term with more postings continues in the next segment key.
+Decoding re-derives the count and the last sequence from the entries and
+refuses a value with trailing bytes, a zero delta, a zero frequency or a
+declared count larger than the bytes present. Blast radius of one bad byte:
+that one term's one segment.
 
 Tags are hexadecimal; integer identities in keys use the ordered codec described
 above. Graph identities and the edge property codec are specified in

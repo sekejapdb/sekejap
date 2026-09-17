@@ -9,6 +9,50 @@ pub(super) const COLLECTION_INDEX: u8 = 5;
 pub(super) const INDEX_NAME: u8 = 0x11;
 pub(super) const SCALAR: u8 = 0x70;
 pub(super) const MAX_INDEXES: usize = 64;
+/// First (largest) commit group a sorted build tries. A version-2 index packs
+/// its whole tree in one transaction at this group and only at this group.
+pub(super) const SORTED_GROUP_FIRST: usize = 64;
+/// The collection header bit that says this database contains at least one
+/// index with its OWN B-tree. Monotone and set only by a CREATE that allocates
+/// a tree; opening or writing never sets it, so a database of shared-tree
+/// indexes stays readable and writable by every binary that predates this
+/// work, and one that does contain a per-index tree is refused whole by such a
+/// binary before a byte of it is touched (Law 8).
+pub(super) const INDEX_TREE_FEATURE: u64 = 0x80;
+/// Default for new `Database` handles: whether an index CREATED through that
+/// handle gets its own tree. Like the cell-encoding create switch, it decides
+/// what is created, never what can be opened. Both layouts are read and
+/// written by this binary. Creation itself reads the handle, never this.
+static CREATE_INDEX_TREES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Read the per-index-tree creation default copied onto new handles.
+pub fn create_index_trees() -> bool {
+    CREATE_INDEX_TREES.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Set the default copied onto handles created from now on, returning the
+/// previous default. Existing handles and existing indexes are unaffected.
+pub fn set_create_index_trees(on: bool) -> bool {
+    CREATE_INDEX_TREES.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+/// Which families this handle gives their own tree when its create-index-trees
+/// setting is on. Text, vector, quantized-vector, graph, rows, the name and
+/// collection mappings and the vector sidecars all stay in the primary tree:
+/// they are out of scope for this change and their descriptors stay at version 1.
+fn own_tree(family: IndexFamily, on: bool) -> bool {
+    on && matches!(family, IndexFamily::Scalar | IndexFamily::SpatialPoint)
+}
+/// A scalar or spatial index's own B-tree: the kernel tree id its pages are
+/// stamped with, and the root page that tree is reached through.
+///
+/// `root == 0` is an empty tree -- no page allocated yet. The root moves
+/// whenever the tree's height grows, and the descriptor holding it is written
+/// in the same commit as the pages that moved it, so the two can never
+/// disagree across a crash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexTree {
+    pub id: u16,
+    pub root: u32,
+}
 pub(super) const MAX_BATCH: usize = 256;
 pub(super) const MAX_RESULTS: usize = 65536;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,6 +82,9 @@ pub struct IndexInfo {
     pub unique: bool,
     pub state: IndexState,
     pub encoding_version: u16,
+    /// `Some` only for a version-2 scalar or spatial descriptor: every other
+    /// family, and every version-1 descriptor, lives in the primary tree.
+    pub tree: Option<IndexTree>,
 }
 #[derive(Clone, Debug)]
 pub enum ScalarPredicate {
@@ -83,7 +130,31 @@ fn kind_byte(k: &Kind) -> Result<u8> {
         _ => Err(invalid("scalar index requires bool/int/real/text")),
     }
 }
+/// The version-2 tail. Only the two families that own trees carry it, and a
+/// descriptor's version and its `tree` field must agree in both directions:
+/// version 1 with a tree, or version 2 without one, is a caller bug, not a
+/// file this binary should write.
+fn encode_tree(b: &mut Vec<u8>, i: &IndexInfo) -> Result<()> {
+    match (i.encoding_version, i.tree) {
+        (1, None) => Ok(()),
+        (2, Some(t)) => {
+            if t.id < 2 {
+                return Err(invalid("per-index tree id 0/1 is reserved"));
+            }
+            b.extend(t.id.to_be_bytes());
+            b.extend(t.root.to_be_bytes());
+            Ok(())
+        }
+        _ => Err(invalid("index descriptor version does not match its tree")),
+    }
+}
 pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
+    if i.tree.is_some() && !matches!(i.family, IndexFamily::Scalar | IndexFamily::SpatialPoint) {
+        return Err(invalid("only scalar and spatial indexes own a tree"));
+    }
+    if i.tree.is_none() && i.encoding_version != 1 {
+        return Err(invalid("index descriptor version does not match its tree"));
+    }
     let mut b = i.id.0.to_be_bytes().to_vec();
     b.extend(i.collection.0.to_be_bytes());
     let (st, cursor) = match i.state {
@@ -93,13 +164,17 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
     };
     match i.family {
         IndexFamily::Scalar => {
-            // This branch is the frozen scalar descriptor byte layout.
+            // This branch is the frozen scalar descriptor byte layout. Version
+            // 2 appends `tree_id:u16be | root:u32be` after the cursor and
+            // changes nothing before it, so the two versions share every key
+            // encoding and differ only in which tree the keys live in.
             b.push(1);
             b.extend(i.encoding_version.to_be_bytes());
             b.push(kind_byte(&i.kind)?);
             b.push(u8::from(i.unique));
             b.push(st);
             b.extend(cursor.to_be_bytes());
+            encode_tree(&mut b, i)?;
         }
         IndexFamily::ExactVector => {
             let Kind::Vector(dimension) = i.kind else {
@@ -129,6 +204,7 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
             b.push(0); // reserved spatial options
             b.push(st);
             b.extend(cursor.to_be_bytes());
+            encode_tree(&mut b, i)?;
         }
         IndexFamily::Text => {
             if i.kind != Kind::Text || i.unique {
@@ -179,9 +255,9 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
     let collection = CollectionId(u32::from_be_bytes(b[8..12].try_into().unwrap()));
     let version = u16::from_be_bytes(b[13..15].try_into().unwrap());
     let family = match (b[12], version) {
-        (1, 1) => IndexFamily::Scalar,
+        (1, 1 | 2) => IndexFamily::Scalar,
         (2, 1) => IndexFamily::ExactVector,
-        (3, 1) => IndexFamily::SpatialPoint,
+        (3, 1 | 2) => IndexFamily::SpatialPoint,
         (4, 1) => IndexFamily::Text,
         (5, 1) => IndexFamily::QuantizedVector,
         _ => {
@@ -274,6 +350,22 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
             (Kind::Vector(dimension), false, 21, 22, 30)
         }
     };
+    let tree = if version == 2 {
+        let tail = b
+            .get(at..at + 6)
+            .ok_or_else(|| corrupt("short per-index tree descriptor tail"))?;
+        at += 6;
+        let id = u16::from_be_bytes(tail[..2].try_into().unwrap());
+        if id < 2 {
+            return Err(corrupt("per-index tree id 0/1 is reserved"));
+        }
+        Some(IndexTree {
+            id,
+            root: u32::from_be_bytes(tail[2..].try_into().unwrap()),
+        })
+    } else {
+        None
+    };
     let cursor = u64::from_be_bytes(b[cursor_at..cursor_at + 8].try_into().unwrap());
     let state = match b[state_at] {
         0 => IndexState::Building { after: cursor },
@@ -311,6 +403,7 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
         unique,
         state,
         encoding_version: version,
+        tree,
     })
 }
 pub(super) fn read_index(
@@ -365,6 +458,11 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
         {
             return Err(corrupt(
                 "quantized vector descriptor without feature admission",
+            ));
+        }
+        if i.tree.is_some() && h.features & INDEX_TREE_FEATURE == 0 {
+            return Err(corrupt(
+                "per-index tree descriptor without feature admission",
             ));
         }
         if v != i.collection.0.to_be_bytes() {
@@ -507,6 +605,21 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
         }
     }
     if !h.is_some_and(|header| {
+        header.features & super::text_indexes::segments::SEGMENT_FEATURE != 0
+    }) {
+        for tag in [
+            super::text_indexes::segments::SEGMENT,
+            super::text_indexes::segments::NORM_BLOCK,
+        ] {
+            if let Some(row) = s.range(&[tag])?.next() {
+                let (key, _) = row?;
+                if key.first() == Some(&tag) {
+                    return Err(corrupt("text segments without feature admission"));
+                }
+            }
+        }
+    }
+    if !h.is_some_and(|header| {
         header.features & super::quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE != 0
     }) {
         if let Some(row) = s
@@ -524,6 +637,70 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
     Ok(())
 }
 impl Database {
+    /// Ascending entries of one index from `from`.
+    ///
+    /// A version-1 index's entries are records of the primary tree and this is
+    /// the ordinary scan the code has always done. A version-2 index's entries
+    /// are records of ITS tree, reached through the root its descriptor holds.
+    /// Key encodings are identical in both layouts -- the family tag is still
+    /// the first byte -- so every caller's prefix test, decode and stop
+    /// condition is unchanged; only the tree the cursor walks differs.
+    /// `None` is an index whose tree is still empty.
+    pub(super) fn index_range(
+        &self,
+        i: &IndexInfo,
+        from: &[u8],
+    ) -> Result<Option<kernel::btree::RangeIter<'_>>> {
+        match i.tree {
+            None => self.store()?.range(from).map(Some).map_err(Error::from),
+            Some(t) => self.store()?.tree_range(t.id, t.root, from).map_err(Error::from),
+        }
+    }
+    /// One entry of one index.
+    pub(super) fn index_get(&self, i: &IndexInfo, k: &[u8]) -> Result<Option<Vec<u8>>> {
+        match i.tree {
+            None => self.store()?.get(k).map_err(Error::from),
+            Some(t) => self.store()?.tree_get(t.id, t.root, k).map_err(Error::from),
+        }
+    }
+    /// Write one entry of one index.
+    ///
+    /// The root of a per-index tree moves when the tree grows a level, and the
+    /// only durable copy of that root is the descriptor. So the descriptor is
+    /// rewritten HERE, in the same transaction as the page split that moved
+    /// it: both are frames of one commit, and there is no window in which a
+    /// crash could leave a committed tree whose committed descriptor points
+    /// somewhere else. `i` is updated in place so a caller writing several
+    /// entries does not re-read it.
+    pub(super) fn index_put(&mut self, i: &mut IndexInfo, k: &[u8], v: &[u8]) -> Result<()> {
+        let Some(t) = i.tree else {
+            return self.writer()?.put(k, v).map_err(Error::from);
+        };
+        let root = if t.root == 0 {
+            self.writer()?.tree_create(t.id)?
+        } else {
+            t.root
+        };
+        let after = self.writer()?.tree_put(t.id, root, k, v)?;
+        if after != t.root {
+            i.tree = Some(IndexTree { id: t.id, root: after });
+            self.save_index(i)?;
+        }
+        Ok(())
+    }
+    /// Remove one entry of one index, rewriting the descriptor in the same
+    /// transaction if the delete collapsed a level.
+    pub(super) fn index_delete(&mut self, i: &mut IndexInfo, k: &[u8]) -> Result<bool> {
+        let Some(t) = i.tree else {
+            return self.writer()?.delete(k).map_err(Error::from);
+        };
+        let (found, after) = self.writer()?.tree_delete(t.id, t.root, k)?;
+        if after != t.root {
+            i.tree = Some(IndexTree { id: t.id, root: after });
+            self.save_index(i)?;
+        }
+        Ok(found)
+    }
     pub fn index_info(&self, id: IndexId) -> Result<IndexInfo> {
         let s = self.store()?;
         if s.get(&ikey(REGISTRY, id))?.is_none() {
@@ -556,7 +733,7 @@ impl Database {
         }
         Ok(out)
     }
-    fn save_index(&mut self, i: &IndexInfo) -> Result<()> {
+    pub(super) fn save_index(&mut self, i: &IndexInfo) -> Result<()> {
         let b = encode(i)?;
         for copy in 0..3 {
             self.writer()?.put(&dkey(i.id, copy), &b)?;
@@ -598,6 +775,37 @@ impl Database {
         family: IndexFamily,
         feature: u64,
     ) -> Result<IndexId> {
+        self.create_index_with_tree(
+            c,
+            name,
+            field,
+            kind,
+            unique,
+            family,
+            feature,
+            own_tree(family, self.create_index_trees),
+        )
+    }
+    /// Tree ids are drawn from the SAME monotone counter as index identities
+    /// (`header.next`), one above the index's own id, so tree 1 -- the primary
+    /// tree -- is never handed out and a tree id is never reused: an index id
+    /// is not reused either, and a dropped index's tree pages return to the
+    /// freelist under a number nothing will claim again. That costs the u16
+    /// space at the rate indexes are CREATED over a database's life, not at
+    /// the rate they are held; creation past 65534 is refused rather than
+    /// wrapped (SACRIFICE, Law 4).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_index_with_tree(
+        &mut self,
+        c: CollectionId,
+        name: &str,
+        field: &str,
+        kind: Kind,
+        unique: bool,
+        family: IndexFamily,
+        feature: u64,
+        with_tree: bool,
+    ) -> Result<IndexId> {
         if name.is_empty() || name.len() > 128 || field.is_empty() || field.len() > 128 {
             return Err(invalid("index name and field require 1..128 UTF-8 bytes"));
         }
@@ -614,6 +822,14 @@ impl Database {
         });
         header.features |= feature;
         let id = IndexId(header.next);
+        let tree = if with_tree {
+            let tree_id = u16::try_from(id.0 + 1)
+                .map_err(|_| invalid("per-index tree identities exhausted"))?;
+            header.features |= INDEX_TREE_FEATURE;
+            Some(IndexTree { id: tree_id, root: 0 })
+        } else {
+            None
+        };
         header.next = header
             .next
             .checked_add(1)
@@ -631,7 +847,8 @@ impl Database {
             kind,
             unique,
             state: IndexState::Building { after: 0 },
-            encoding_version: 1,
+            encoding_version: if tree.is_some() { 2 } else { 1 },
+            tree,
         };
         let (nc, nl) = self.header()?;
         let result = (|| {
@@ -645,6 +862,22 @@ impl Database {
             Ok(id)
         })();
         self.finish(result)
+    }
+    /// Turn on one logical feature bit in the collection header. Monotone:
+    /// the bit is only ever set, never cleared, and only by an explicit
+    /// creation or a build that actually writes the new representation --
+    /// never by opening or by an ordinary write (Law 8).
+    pub(super) fn enable_index_feature(&mut self, feature: u64) -> Result<()> {
+        let mut header = self
+            .index_header
+            .ok_or_else(|| corrupt("missing index header"))?;
+        if header.features & feature == feature {
+            return Ok(());
+        }
+        header.features |= feature;
+        let (nc, nl) = self.header()?;
+        self.index_header = Some(header);
+        self.write_header(nc, nl)
     }
     pub(super) fn validate_indexed_layout(&self, c: CollectionId, l: &Layout) -> Result<()> {
         for i in self.list_indexes(c)? {
@@ -662,7 +895,7 @@ impl Database {
         }
         let mut p = ikey(SCALAR, i.id);
         p.extend(value);
-        for row in self.store()?.range(&p)? {
+        for row in self.index_range(i, &p)?.into_iter().flatten() {
             let (k, v) = row?;
             if !k.starts_with(&p) {
                 break;
@@ -685,7 +918,7 @@ impl Database {
         new: Option<&Value>,
         new_vectors: Option<(&Layout, &VectorCells)>,
     ) -> Result<()> {
-        for i in self.list_indexes(id.collection)? {
+        for mut i in self.list_indexes(id.collection)? {
             if i.state == IndexState::Dropping {
                 continue;
             }
@@ -698,7 +931,7 @@ impl Database {
                 continue;
             }
             if i.family == IndexFamily::SpatialPoint {
-                super::spatial_indexes::maintain_point(self, &i, id, old, new)?;
+                super::spatial_indexes::maintain_point(self, &mut i, id, old, new)?;
                 continue;
             }
             if i.family == IndexFamily::Text {
@@ -718,10 +951,12 @@ impl Database {
                 self.check_unique(&i, v, id.sequence)?;
             }
             if let Some(v) = a {
-                self.writer()?.delete(&skey(&i, &v, id.sequence))?;
+                let k = skey(&i, &v, id.sequence);
+                self.index_delete(&mut i, &k)?;
             }
             if let Some(v) = b {
-                self.writer()?.put(&skey(&i, &v, id.sequence), &[])?;
+                let k = skey(&i, &v, id.sequence);
+                self.index_put(&mut i, &k, &[])?;
             }
         }
         Ok(())
@@ -857,7 +1092,8 @@ impl Database {
                 match entry {
                     BuiltEntry::Scalar(v) => {
                         self.check_unique(&i, &v, seq)?;
-                        self.writer()?.put(&skey(&i, &v, seq), &[])?;
+                        let k = skey(&i, &v, seq);
+                        self.index_put(&mut i, &k, &[])?;
                     }
                     BuiltEntry::ExactVector(Some(locator)) => self
                         .writer()?
@@ -869,7 +1105,7 @@ impl Database {
                     )?,
                     BuiltEntry::QuantizedVector(None) => {}
                     BuiltEntry::SpatialPoint(Some(point)) => {
-                        self.writer()?.put(&point.key, &point.value)?
+                        self.index_put(&mut i, &point.key, &point.value)?
                     }
                     BuiltEntry::SpatialPoint(None) => {}
                     // Text is written above, one whole chunk at a time.
@@ -886,28 +1122,47 @@ impl Database {
         })();
         self.finish(result)
     }
-    fn sort_scratch(&self) -> std::path::PathBuf {
+    pub(super) fn sort_scratch(&self) -> std::path::PathBuf {
         // Spill under TMPDIR (tests pin it) in a per-database subdirectory.
         let mut dir = std::env::temp_dir();
         dir.push("e4-index-sort");
         dir.push(self.path.file_name().unwrap_or_default());
         dir
     }
-    fn scan_collection_rows(
+    pub(super) fn scan_collection_rows(
         &self,
         collection: CollectionId,
         mut f: impl FnMut(EntityId, &[u8]) -> Result<()>,
     ) -> Result<u64> {
         let p = prefix(0x40, collection);
         let mut last = 0u64;
-        for row in self.store()?.range(&p)? {
-            let (key, value) = row?;
+        // `for_each_ref` hands the callback borrows into the pinned leaf. The
+        // allocating iterator built a `Vec` for the key and a `Vec` for the
+        // whole row -- two per document, the row one as large as the document
+        // -- to hand a builder bytes it only reads. Every other scan in this
+        // file already takes the borrowed form; the primary-row scan every
+        // late build starts from was the one that did not.
+        let mut failure: Option<Error> = None;
+        self.store()?.range(&p)?.for_each_ref(|key, value| {
             if !key.starts_with(&p) {
-                break;
+                return false;
             }
-            let eid = row_id(&key)?;
-            f(eid, &value)?;
-            last = eid.sequence;
+            match row_id(key).and_then(|eid| {
+                f(eid, value)?;
+                Ok(eid.sequence)
+            }) {
+                Ok(sequence) => {
+                    last = sequence;
+                    true
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            }
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(last)
     }
@@ -974,12 +1229,20 @@ impl Database {
         const GROUP: usize = 16;
         // Sorted runs pack into the WAL more densely than a random chunk, so
         // start with a larger group. Allowance refusal still halves it.
-        const SORTED_GROUP: usize = 64;
+        const SORTED_GROUP: usize = SORTED_GROUP_FIRST;
         fn allowance(e: &Error) -> bool {
             matches!(e, Error::Kernel(kernel::Error::ResourceLimit(_)))
         }
         let family = self.index_info(id)?.family;
-        let sorted = matches!(family, IndexFamily::Scalar | IndexFamily::SpatialPoint);
+        let sorted = match family {
+            IndexFamily::Scalar | IndexFamily::SpatialPoint => true,
+            // A text index can only be packed from a clean slate; otherwise
+            // the chunked head-row builder finishes it.
+            IndexFamily::Text => {
+                super::text_indexes::sorted_build_possible(self, &self.index_info(id)?)?
+            }
+            _ => false,
+        };
         if !sorted {
             let mut group = GROUP;
             let mut chunks = 0;
@@ -1048,6 +1311,9 @@ impl Database {
             IndexState::Dropping => return Err(invalid("index is dropping")),
             IndexState::Building { .. } => {}
         }
+        if i.family == IndexFamily::Text {
+            return super::text_indexes::build_sorted(self, &mut i, chunk_rows, group, max_commits);
+        }
         let mut sorter = super::index_sort::ExternalSorter::new(
             &self.sort_scratch(),
             super::index_sort::DEFAULT_BUDGET,
@@ -1070,6 +1336,80 @@ impl Database {
             Ok(())
         })?;
         let mut merge = sorter.finish()?;
+        // A version-2 index owns an EMPTY tree, and the sorted stream is
+        // exactly the tree's final contents in order. That is the one shape a
+        // bottom-up pack is for: leaves filled to 90% and written once, the
+        // interior levels built from the separators those leaves produced, and
+        // no descent at all -- the cost is the pages the index occupies, not
+        // the keys it holds.
+        //
+        // Every page is an ordinary pooled page, so this is one logged
+        // transaction like any other write: no root swap, no skipped WAL, and
+        // a crash before the commit leaves nothing (the descriptor still says
+        // BUILDING with root 0, and the next call re-sorts and re-packs).
+        //
+        // PACK vs ASCENDING PUT. The pack is tried once, on the first attempt
+        // at the largest group. If it is refused for want of WAL allowance --
+        // the whole index is one transaction, and a bounded database may not
+        // have room for it -- the outer loop halves the group and comes back
+        // here, and every later attempt takes the ascending-put path below.
+        // That path is resumable in committed groups, and into a FRESH,
+        // EMPTY, single-family tree every insert is an append at the right
+        // edge, which is the kernel's cheapest split. It is slower than the
+        // pack and it is never wrong.
+        if let Some(t) = i.tree {
+            if t.root == 0 && group == SORTED_GROUP_FIRST && max_commits.is_none() {
+                let unique = i.family == IndexFamily::Scalar && i.unique;
+                let kind = i.kind.clone();
+                let head = ikey(SCALAR, i.id).len();
+                let scratch = self.sort_scratch();
+                let mut duplicate = false;
+                let mut prev: Option<Vec<u8>> = None;
+                let mut failed = None;
+                let stream = std::iter::from_fn(|| match merge.next_entry() {
+                    Ok(Some((key, value))) => {
+                        if unique {
+                            match scalar_key::decode(&kind, &key[head..]) {
+                                Ok((_, n)) => {
+                                    let v = &key[head..head + n];
+                                    if v == [0] {
+                                        prev = None;
+                                    } else if prev.as_deref() == Some(v) {
+                                        duplicate = true;
+                                        return None;
+                                    } else {
+                                        prev = Some(v.to_vec());
+                                    }
+                                }
+                                Err(e) => {
+                                    failed = Some(e);
+                                    return None;
+                                }
+                            }
+                        }
+                        Some(Ok((key, value, false)))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        failed = Some(e);
+                        None
+                    }
+                });
+                let packed = self.writer()?.tree_pack(t.id, stream, 0.9, &scratch);
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                if duplicate {
+                    return Err(Error::AlreadyExists);
+                }
+                let (root, _rows) = packed?;
+                i.tree = Some(IndexTree { id: t.id, root });
+                i.state = IndexState::Ready;
+                self.save_index(&i)?;
+                self.commit()?;
+                return Ok((max_seq as usize).div_ceil(chunk_rows).max(1));
+            }
+        }
         let mut pending = 0usize;
         let mut groups = 0usize;
         let mut commits = 0usize;
@@ -1086,7 +1426,7 @@ impl Database {
                     prev_value = None;
                 }
             }
-            self.writer()?.put(&key, &value)?;
+            self.index_put(&mut i, &key, &value)?;
             pending += 1;
             if pending >= chunk_rows {
                 groups += 1;
@@ -1122,7 +1462,7 @@ impl Database {
         if !(1..=MAX_BATCH).contains(&batch) {
             return Err(invalid("index batch must be 1..256"));
         }
-        let i = self.index_info(id)?;
+        let mut i = self.index_info(id)?;
         if i.state != IndexState::Dropping {
             return Err(invalid("call begin_drop_index first"));
         }
@@ -1138,7 +1478,7 @@ impl Database {
             };
             let mut keys = Vec::new();
             let mut end = true;
-            for row in self.store()?.range(&p)? {
+            for row in self.index_range(&i, &p)?.into_iter().flatten() {
                 let (k, _) = row?;
                 if !k.starts_with(&p) {
                     break;
@@ -1153,9 +1493,16 @@ impl Database {
         };
         let result = (|| {
             for k in keys {
-                self.writer()?.delete(&k)?;
+                self.index_delete(&mut i, &k)?;
             }
             if end {
+                // The tree's leaves and interiors were freed as the deletes
+                // emptied them; the root of an emptied tree is the one page
+                // nothing above it can unlink, so the drop returns it here,
+                // in the same bounded step that removes the descriptor.
+                if let Some(t) = i.tree {
+                    self.writer()?.tree_free_root(t.id, t.root)?;
+                }
                 for copy in 0..3 {
                     self.writer()?.delete(&dkey(id, copy))?;
                 }
@@ -1221,7 +1568,7 @@ impl Database {
             start.extend(k);
         }
         let mut out = Vec::new();
-        for row in self.store()?.range(&start)? {
+        for row in self.index_range(&i, &start)?.into_iter().flatten() {
             let (key, value) = row?;
             if !key.starts_with(&p) {
                 break;
@@ -1266,6 +1613,7 @@ mod codec_tests {
             unique: true,
             state: IndexState::Building { after: 42 },
             encoding_version: 1,
+            tree: None,
         };
         let mut payload = 9u64.to_be_bytes().to_vec();
         payload.extend(7u32.to_be_bytes());
@@ -1295,6 +1643,7 @@ mod codec_tests {
             unique: false,
             state: IndexState::Ready,
             encoding_version: 1,
+            tree: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);
@@ -1318,6 +1667,7 @@ mod codec_tests {
             unique: false,
             state: IndexState::Building { after: 19 },
             encoding_version: 1,
+            tree: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);
@@ -1341,6 +1691,7 @@ mod codec_tests {
             unique: false,
             state: IndexState::Building { after: 91 },
             encoding_version: 1,
+            tree: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);

@@ -1723,7 +1723,8 @@ mod tests {
                     churned_rx.recv().unwrap();
                     Ok(())
                 })?;
-                snapshot.scan(&[])?.collect::<Result<Vec<_>>>()
+                let iter = snapshot.scan(&[])?;
+                iter.collect::<Result<Vec<_>>>()
             });
             let writer_thread = scope.spawn(move || {
                 assert_eq!(selected_rx.recv().unwrap(), 1, "fixture must stop after selecting generation 1");

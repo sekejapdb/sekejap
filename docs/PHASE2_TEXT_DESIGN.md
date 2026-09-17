@@ -66,6 +66,8 @@ Family3 and tag `0x74` belong to spatial.
 | `0x76` | ordered entity sequence | document length, u32 BE |
 | `0x77` | UTF-8 term, NUL | document frequency, u64 BE |
 | `0x78` | none | document count and total token count, two u64 BE |
+| `0x7a` | UTF-8 term, NUL, ordered last entity sequence | packed posting segment, feature bit `0x40` |
+| `0x7b` | ordered entity sequence / 256 | packed document-length block, feature bit `0x40` |
 
 Analyzer terms contain no NUL. Validate UTF-8, nonempty bounded length,
 termination, nonzero IDs/frequencies, counter bounds and exact value length.
@@ -95,6 +97,57 @@ only candidate IDs. Both paths enforce examined-work and cancellation budgets,
 returning an error rather than silently incomplete exact answers. Query memory
 must not hold the matching corpus. Queries allow at most64 distinct analyzer-v1
 terms; this is separate from the document's 4,096-distinct-term allowance.
+
+## Two tiers
+
+`0x75` and `0x76` are the HEAD tier: one posting entry per `(term, document)`
+and one length entry per document, written by every live insert, update and
+delete, and by `build_index_step`. `0x7a` and `0x7b` are the PACKED tier: one
+value per term per segment and one value per 256 consecutive document
+sequences, written only by the sorted late build (`build_index_to_ready`) and
+behind feature bit `0x40`.
+
+A term's live posting list is the merge of the two, with the head overriding
+the segment for the same document. `tf = 0` at the head is the tombstone a
+delete or an update writes when the posting it retires is packed; it exists
+only where bit `0x40` is set. Because a tombstone cancels its packed posting
+at the moment the merge passes over it, the document frequency still equals
+the number of postings the merge yields, and nothing has to consult the norm
+row to decide whether a posting is alive.
+
+A document's length is read the same way: the `0x76` head row first, then the
+`0x7b` block. The head row's EMPTY value is the norm tombstone, and it is what
+a delete of a folded document writes; a four-byte `0` is NOT available for that
+job, because an explicitly empty or punctuation-only string is a present
+document whose length is zero. The test on delete is whether a block holds the
+document, not whether a head row exists: an earlier update may have left a head
+row over a block entry, and removing that row would uncover the stale packed
+length. The tombstone is what keeps "a norm exists exactly when the document is
+in the index" true, which the live-write transition, the filtered query path
+and the verifier all rely on; the scorer alone would not need it, because a
+document whose postings are all retired is never reached through the merge.
+
+The packed build runs only from a clean slate: if any norm row or norm block
+exists, some document has already contributed and the chunked head builder
+finishes the job instead. Norms are written last, so an interrupted packed
+build has published nothing and its segments are deleted and redone on the next
+attempt.
+A packed build interrupted after its norms were committed is refused rather
+than resumed; cancel the index with `begin_drop_index` and create it again.
+
+Named costs of the packed tier: a deleted or updated folded posting leaves its
+packed bytes on disk behind a tombstone until an explicit rebuild, and so does
+a deleted folded length; a live write no longer re-verifies a folded posting
+against the primary text it replaces (the verifier still does); verification
+pays one point read per packed posting to recount document frequencies across
+both tiers, and one per packed length to learn whether a head row overrides it;
+a lookup of a folded document's length costs two point reads instead of one;
+and the verifier re-derives the token count of a SAMPLE of packed lengths from
+the primary text -- the first and last entry of every block plus every
+sequence that is a multiple of 64 -- rather than all of them, because the
+packed posting pass has already re-analyzed the same text. The corpus counters
+are still reconstructed from every entry, so a wholesale rewrite of a block
+cannot hide between the samples.
 
 ## Costs and required evidence
 

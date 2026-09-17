@@ -41,6 +41,67 @@ fn build(db: &mut Database, id: e4_prototype::collections::IndexId) {
     db.commit().unwrap()
 }
 
+/// Every tree a derived entry can live in: the primary tree, then one per
+/// index that owns one. A version-1 database returns just the primary tree, so
+/// these damage helpers read the same either way.
+fn trees(path: &Path) -> Vec<Option<(u16, u32)>> {
+    let db = Database::open(path, config()).unwrap();
+    let mut out = vec![None];
+    out.extend(db.index_trees().unwrap().into_iter().map(Some));
+    out
+}
+/// Collect every key the predicate accepts, from whichever tree holds it.
+fn keys_in(
+    raw: &PageWalStore,
+    trees: &[Option<(u16, u32)>],
+    mut want: impl FnMut(&[u8]) -> bool,
+) -> Vec<(Option<(u16, u32)>, Vec<u8>)> {
+    let mut out = Vec::new();
+    for tree in trees {
+        match tree {
+            None => raw
+                .scan(|k, _| {
+                    if want(k) {
+                        out.push((None, k.to_vec()));
+                    }
+                    true
+                })
+                .unwrap(),
+            Some((id, root)) => {
+                for row in raw.tree_range(*id, *root, &[]).unwrap().into_iter().flatten() {
+                    let (k, _) = row.unwrap();
+                    if want(&k) {
+                        out.push((*tree, k));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+/// Delete one entry where it actually lives. The fixtures here hold two rows,
+/// so no index tree changes height and no descriptor root moves; the assert
+/// keeps that assumption honest rather than silently writing a stale root.
+fn delete_in(raw: &mut PageWalStore, at: Option<(u16, u32)>, key: &[u8]) -> bool {
+    match at {
+        None => raw.delete(key).unwrap(),
+        Some((id, root)) => {
+            let (found, after) = raw.tree_delete(id, root, key).unwrap();
+            assert_eq!(after, root, "damage moved a per-index tree root");
+            found
+        }
+    }
+}
+fn put_in(raw: &mut PageWalStore, at: Option<(u16, u32)>, key: &[u8], value: &[u8]) {
+    match at {
+        None => raw.put(key, value).unwrap(),
+        Some((id, root)) => {
+            let after = raw.tree_put(id, root, key, value).unwrap();
+            assert_eq!(after, root, "damage moved a per-index tree root");
+        }
+    }
+}
+
 fn fixture(path: &Path) {
     let mut db = Database::create(path, config()).unwrap();
     let c = db
@@ -111,21 +172,17 @@ fn two_way_damage_classifies_derived_and_authoritative_loss_without_writes() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     fixture(&path);
+    let trees = trees(&path);
     let mut raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
-    let mut tagged = Vec::new();
-    raw.scan(|k, _| {
-        if matches!(k.first(), Some(0x60 | 0x70 | 0x71 | 0x77)) {
-            tagged.push(k.to_vec())
-        }
-        true
-    })
-    .unwrap();
+    let tagged = keys_in(&raw, &trees, |k| {
+        matches!(k.first(), Some(0x60 | 0x70 | 0x71 | 0x77))
+    });
     for tag in [0x60, 0x70, 0x71] {
-        let key = tagged.iter().find(|k| k[0] == tag).unwrap();
-        assert!(raw.delete(key).unwrap());
+        let (at, key) = tagged.iter().find(|(_, k)| k[0] == tag).unwrap().clone();
+        assert!(delete_in(&mut raw, at, &key));
     }
-    let stat = tagged.iter().find(|k| k[0] == 0x77).unwrap();
-    raw.put(stat, &999u64.to_be_bytes()).unwrap();
+    let (at, stat) = tagged.iter().find(|(_, k)| k[0] == 0x77).unwrap().clone();
+    put_in(&mut raw, at, &stat, &999u64.to_be_bytes());
     raw.commit().unwrap();
     drop(raw);
     let before = inventory(&path);
@@ -217,21 +274,17 @@ fn missing_each_derived_family_entry_and_graph_reverse_is_reported() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     fixture(&path);
+    let trees = trees(&path);
     let mut raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
-    let mut keys = Vec::new();
-    raw.scan(|key, _| {
-        if matches!(
+    let keys = keys_in(&raw, &trees, |key| {
+        matches!(
             key.first(),
             Some(0x73 | 0x74 | 0x75 | 0x76 | 0x78 | 0x79 | 0x72)
-        ) {
-            keys.push(key.to_vec());
-        }
-        true
-    })
-    .unwrap();
+        )
+    });
     for tag in [0x73, 0x74, 0x75, 0x76, 0x78, 0x79, 0x72] {
-        let key = keys.iter().find(|key| key[0] == tag).unwrap();
-        assert!(raw.delete(key).unwrap());
+        let (at, key) = keys.iter().find(|(_, key)| key[0] == tag).unwrap().clone();
+        assert!(delete_in(&mut raw, at, &key));
     }
     raw.commit().unwrap();
     drop(raw);
@@ -291,23 +344,17 @@ fn duplicate_unique_scalar_value_is_detected_by_ordered_adjacency() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("db");
     fixture(&path);
+    let trees = trees(&path);
     let mut raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
-    let mut scalar = Vec::new();
-    raw.scan(|key, _| {
-        if key.first() == Some(&0x70) {
-            scalar.push(key.to_vec());
-        }
-        true
-    })
-    .unwrap();
+    let mut scalar = keys_in(&raw, &trees, |key| key.first() == Some(&0x70));
     assert_eq!(scalar.len(), 2);
-    let second = scalar.pop().unwrap();
-    let first = scalar.pop().unwrap();
+    let (at, second) = scalar.pop().unwrap();
+    let (_, first) = scalar.pop().unwrap();
     assert_eq!(first.len(), second.len());
     let mut duplicate = first[..first.len() - 2].to_vec();
     duplicate.extend_from_slice(&second[second.len() - 2..]);
-    assert!(raw.delete(&second).unwrap());
-    raw.put(&duplicate, &[]).unwrap();
+    assert!(delete_in(&mut raw, at, &second));
+    put_in(&mut raw, at, &duplicate, &[]);
     raw.commit().unwrap();
     drop(raw);
     let before = inventory(&path);

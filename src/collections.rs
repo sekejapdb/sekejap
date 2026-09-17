@@ -78,7 +78,10 @@ pub use graph_collections::{
     BfsRequest, Direction, Edge, EdgeKey, EdgeTypeId, GraphContextId, NeighborRequest,
     TraversalNode, TraversalResult,
 };
-pub use indexes::{IndexFamily, IndexId, IndexInfo, IndexState, ScalarPredicate};
+pub use indexes::{
+    create_index_trees, set_create_index_trees, IndexFamily, IndexId, IndexInfo, IndexState,
+    IndexTree, ScalarPredicate,
+};
 pub use quantized_vector_indexes::{
     ApproxVectorMethod, ApproxVectorResult, QuantizedVectorCandidates,
 };
@@ -192,6 +195,9 @@ pub struct Database {
     /// forbids.
     fresh: BTreeMap<EntityId, Vec<EdgeKey>>,
     fresh_order: VecDeque<EntityId>,
+    /// Whether scalar and spatial indexes created through this handle get
+    /// their own B-tree. Copied from the process-wide default at open/create.
+    create_index_trees: bool,
 }
 
 /// Identities remembered at once, and edges remembered per identity. Both are
@@ -205,11 +211,18 @@ const FRESH_IDENTITIES: usize = 1 << 16;
 const FRESH_EDGES_EACH: usize = 8;
 
 fn ordered(n: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9);
+    ordered_into(&mut key, n);
+    key
+}
+/// The same frozen encoding, appended to a buffer the caller reuses. A late
+/// build writes one of these per posting; allocating a `Vec` for each is a
+/// per-row cost with nothing to show for it.
+fn ordered_into(out: &mut Vec<u8>, n: u64) {
     let bytes = n.to_be_bytes();
     let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
-    let mut key = vec![0x80 + (8 - start) as u8];
-    key.extend_from_slice(&bytes[start..]);
-    key
+    out.push(0x80 + (8 - start) as u8);
+    out.extend_from_slice(&bytes[start..]);
 }
 fn read_ordered(b: &[u8], at: &mut usize) -> Result<u64> {
     let width = usize::from(*b.get(*at).ok_or_else(|| corrupt("truncated integer key"))?)
@@ -408,7 +421,9 @@ fn parse_header(b: &[u8]) -> Result<HeaderInfo> {
                         | vector_indexes::VECTOR_FEATURE
                         | spatial_indexes::SPATIAL_FEATURE
                         | text_indexes::TEXT_FEATURE
-                        | quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE)
+                        | text_indexes::segments::SEGMENT_FEATURE
+                        | quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE
+                        | indexes::INDEX_TREE_FEATURE)
                     != 0
             {
                 return Err(Error::Unsupported(format!(
@@ -593,10 +608,21 @@ impl Database {
             graph_header_cache: Cell::new(None),
             fresh: BTreeMap::new(),
             fresh_order: VecDeque::new(),
+            create_index_trees: indexes::create_index_trees(),
         }
     }
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
         self.clock = clock;
+    }
+    /// Whether scalar and spatial indexes created through this handle get
+    /// their own B-tree.
+    pub fn create_index_trees(&self) -> bool {
+        self.create_index_trees
+    }
+    /// Choose whether scalar and spatial indexes created from now on through
+    /// this handle own a tree. Existing indexes are unaffected.
+    pub fn set_create_index_trees(&mut self, on: bool) {
+        self.create_index_trees = on;
     }
     /// The persisted resource policy, if the database was created with one.
     pub fn limits(&self) -> Option<ResourceLimits> {
@@ -629,6 +655,66 @@ impl Database {
             seen += 1;
         }
         Ok(seen)
+    }
+    /// Diagnostic only: every entry of ONE index under `prefix`, wherever that
+    /// index keeps them.
+    ///
+    /// `raw_for_each` walks the primary tree, which is where a version-1 index
+    /// lives. A version-2 index's entries are the same keys and the same
+    /// values in its own tree, so this resolves the descriptor and scans
+    /// there. It exists so a test can compare the two layouts' ENTRY SETS
+    /// directly: same digest, different tree.
+    #[doc(hidden)]
+    pub fn index_for_each(
+        &self,
+        id: indexes::IndexId,
+        prefix: &[u8],
+        f: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> Result<u64> {
+        let i = match self.index_info(id) {
+            Ok(i) => i,
+            Err(Error::NotFound(_)) => return self.raw_for_each(prefix, f),
+            Err(e) => return Err(e),
+        };
+        let mut seen = 0;
+        for row in self.index_range(&i, prefix)?.into_iter().flatten() {
+            let (k, v) = row?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            f(&k, &v);
+            seen += 1;
+        }
+        Ok(seen)
+    }
+    /// Diagnostic only: the tree id and root page of an index that owns a
+    /// tree, or `None` when its entries live in the primary tree.
+    #[doc(hidden)]
+    pub fn index_tree(&self, id: indexes::IndexId) -> Result<Option<(u16, u32)>> {
+        Ok(self.index_info(id)?.tree.map(|t| (t.id, t.root)))
+    }
+    /// Diagnostic only: `(tree_id, root)` for every index in this database
+    /// that owns a tree. Empty on a database whose indexes all live in the
+    /// primary tree, which is every database written before this format.
+    #[doc(hidden)]
+    pub fn index_trees(&self) -> Result<Vec<(u16, u32)>> {
+        let mut out = Vec::new();
+        let store = self.store()?;
+        let mut ids = Vec::new();
+        for row in store.range(&[indexes::REGISTRY])? {
+            let (k, _) = row?;
+            if k.first() != Some(&indexes::REGISTRY) {
+                break;
+            }
+            let mut at = 1;
+            ids.push(indexes::IndexId(read_ordered(&k, &mut at)?));
+        }
+        for id in ids {
+            if let Some(t) = self.index_info(id)?.tree {
+                out.push((t.id, t.root));
+            }
+        }
+        Ok(out)
     }
     /// Diagnostic only: buffer-pool page accesses (hits + misses) since this
     /// handle opened. This is the unit the repo measures write cost in; it is

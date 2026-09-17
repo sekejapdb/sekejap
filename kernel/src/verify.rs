@@ -225,6 +225,38 @@ pub(crate) fn verify_range_file_generation(
     )
 }
 
+/// Verify a packed graft candidate in the LIVE pool, before anything points
+/// at it.
+///
+/// `verify_range_file` reopens the data file through a second handle because
+/// the pages it checks were written straight to the medium, outside the log:
+/// there, the reopen is what makes the check independent of the writer that
+/// produced the bytes. A page-WAL graft's pages are ordinary logged pages that
+/// have not reached the data file at all yet, so there is nothing to reopen —
+/// the same walk runs over the pool.
+///
+/// SACRIFICE (Law 4): this walk trusts the pool's page images rather than a
+/// second read of the medium, so it cannot catch a fault introduced between
+/// the pool and the disk. It is not asked to: the graft publishes through the
+/// ordinary commit, so those bytes cross the medium boundary as WAL frames
+/// with their own checksums and are verified on the way back like every other
+/// page (Law 5 unchanged). What this catches is the class the packer itself
+/// can produce — a short separator level, an unreachable subtree, a key
+/// outside its separator's interval, a broken leaf chain — before a single
+/// page of the standing tree is rewritten.
+pub(crate) fn verify_range_pool(
+    pool: &BufferPool,
+    root: u32,
+    tree_id: u16,
+    expected_rows: u64,
+    expected_min: &[u8],
+    expected_max: &[u8],
+    expected_next: u32,
+) -> Result<VerifiedTree> {
+    verify_tree_generation(pool, root, tree_id, expected_rows, Some(expected_min),
+        Some(expected_max), expected_next, None)
+}
+
 pub(crate) fn verify_rebuild(
     path: &Path,
     mode: IoMode,

@@ -118,6 +118,22 @@ impl<F: FnMut(&VerificationIssue)> Run<F> {
         }
         self.reader.get(key).map_err(Error::from)
     }
+    /// The same budgeted point read, in the tree that actually holds this
+    /// index's entries. A version-1 index is the primary tree, unchanged.
+    fn read_index(&mut self, i: &IndexInfo, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(t) = i.tree else { return self.read(key) };
+        self.report.point_reads = self
+            .report
+            .point_reads
+            .checked_add(1)
+            .ok_or_else(|| corrupt("verifier read count"))?;
+        if self.report.point_reads > self.limits.max_point_reads {
+            return Err(Error::Kernel(kernel::Error::ResourceLimit(
+                "index verifier point-read budget exceeded",
+            )));
+        }
+        self.reader.get_in(t.id, t.root, key).map_err(Error::from)
+    }
     fn row(&mut self, derived: bool) -> Result<()> {
         let n = if derived {
             &mut self.report.derived_rows
@@ -174,6 +190,34 @@ fn visit(
 ) -> Result<u64> {
     let mut detail = None;
     let raw = reader.visit_range(start, end, |k, v| match f(k, v) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            detail = Some(e);
+            Err(kernel::Error::Corrupt {
+                page_no: 0,
+                why: "typed verifier callback refused",
+            })
+        }
+    });
+    if let Some(e) = detail {
+        return Err(e);
+    }
+    raw.map_err(Error::from)
+}
+/// Walk one index's entries wherever they live. Every page of a per-index
+/// tree must carry that index's tree id, so a descriptor root pointing at a
+/// page of another tree -- or at a free page -- is refused here, which is the
+/// check that makes a wrong root visible instead of silently empty.
+fn visit_index(
+    reader: &CurrentSourceReader,
+    i: &IndexInfo,
+    start: &[u8],
+    end: Option<&[u8]>,
+    mut f: impl FnMut(&[u8], &[u8]) -> Result<()>,
+) -> Result<u64> {
+    let Some(t) = i.tree else { return visit(reader, start, end, f) };
+    let mut detail = None;
+    let raw = reader.visit_tree_range(t.id, t.root, start, end, |k, v| match f(k, v) {
         Ok(()) => Ok(()),
         Err(e) => {
             detail = Some(e);
@@ -810,6 +854,8 @@ pub fn verify_indexed_source(
                     | 0x77
                     | 0x78
                     | 0x79
+                    | 0x7a
+                    | 0x7b
             )
         );
         if !known {
@@ -818,7 +864,7 @@ pub fn verify_indexed_source(
                 key.first()
             )));
         }
-        let Some(tag @ (0x70 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79)) =
+        let Some(tag @ (0x70 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7b)) =
             key.first().copied()
         else {
             return Ok(());
@@ -1156,7 +1202,7 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
             };
             let encoded = crate::scalar_key::encode(&i.kind, value)?;
             let key = indexes::skey(i, &encoded, id.sequence);
-            let actual = run.read(&key)?;
+            let actual = run.read_index(i, &key)?;
             run.mismatch(
                 IssueClass::Derived,
                 &key,
@@ -1229,7 +1275,7 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
                 doc.insert(i.field.clone(), v);
                 if let Some(p) = spatial_indexes::selected_point(&Value::Object(doc), &i.field)? {
                     let e = spatial_indexes::point_entry(i, id, p);
-                    let a = run.read(&e.key)?;
+                    let a = run.read_index(i, &e.key)?;
                     run.mismatch(
                         IssueClass::Derived,
                         &e.key,
@@ -1248,7 +1294,15 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
                 let a = crate::text_analyzer::analyze(&text).map_err(invalid)?;
                 for (term, tf) in &a.terms {
                     let key = text_indexes::posting_key(i.id, term, id.sequence);
-                    let actual = run.read(&key)?;
+                    let mut actual = run.read(&key)?;
+                    // No head row: the posting may be packed inside a segment.
+                    // A head row that IS present overrides the segment, so it
+                    // is compared as it stands -- including the `tf = 0`
+                    // tombstone, which reads as a missing posting.
+                    if actual.is_none() {
+                        actual = segment_tf(run, i, term, id.sequence)?
+                            .map(|packed| packed.to_be_bytes().to_vec());
+                    }
                     run.mismatch(
                         IssueClass::Derived,
                         &key,
@@ -1260,7 +1314,16 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
                     )?;
                 }
                 let key = text_indexes::norm_key(i.id, id.sequence);
-                let actual = run.read(&key)?;
+                let mut actual = run.read(&key)?;
+                // No head row: the length may be packed inside a `0x7B`
+                // block. A head row that IS present overrides the block and
+                // is compared as it stands -- including the EMPTY value, the
+                // tombstone a delete of a folded document leaves, which reads
+                // here as a missing norm for text that still exists.
+                if actual.is_none() {
+                    actual = packed_norm(run, i, id.sequence)?
+                        .map(|length| length.to_be_bytes().to_vec());
+                }
                 run.mismatch(
                     IssueClass::Derived,
                     &key,
@@ -1340,7 +1403,7 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
             let end = prefix_end(&p);
             let source = run.reader.clone();
             let mut last_unique_value: Option<Vec<u8>> = None;
-            visit(&source, &p, end.as_deref(), |key, value| {
+            visit_index(&source, i, &p, end.as_deref(), |key, value| {
                 run.row(true)?;
                 let (_, n) = match crate::scalar_key::decode(&i.kind, &key[p.len()..]) {
                     Ok(decoded) => decoded,
@@ -1545,7 +1608,7 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
             let p = spatial_indexes::posting_prefix(i.id);
             let end = prefix_end(&p);
             let source = run.reader.clone();
-            visit(&source, &p, end.as_deref(), |key, value| {
+            visit_index(&source, i, &p, end.as_deref(), |key, value| {
                 run.row(true)?;
                 let (_, seq, _) = match spatial_indexes::decode_posting(&p, key, value) {
                     Ok(decoded) => decoded,
@@ -1603,25 +1666,420 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+
+/// The packed term frequency of one `(term, document)` pair, or `None`.
+///
+/// Segments of a term are keyed by the LAST sequence they hold, so the first
+/// key at or after `prefix ++ ordered(sequence)` is the only segment that can
+/// contain this document; the rest of the range is walked but not read.
+fn segment_tf<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    i: &IndexInfo,
+    term: &str,
+    sequence: u64,
+) -> Result<Option<u32>> {
+    let prefix = text_indexes::segments::segment_prefix(i.id, term);
+    let mut start = prefix.clone();
+    start.extend(ordered(sequence));
+    let end = prefix_end(&prefix);
+    let source = run.reader.clone();
+    let mut found = None;
+    let mut first = true;
+    visit(&source, &start, end.as_deref(), |_, value| {
+        if !first {
+            return Ok(());
+        }
+        first = false;
+        if let Ok(postings) = text_indexes::segments::decode(value) {
+            found = postings
+                .into_iter()
+                .find(|(candidate, _)| *candidate == sequence)
+                .map(|(_, frequency)| frequency);
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+/// Structural pass over the packed norm tier (`0x7B`).
+///
+/// Every block key must name its block; every value must decode (Law 5 lives
+/// in `text_segments::decode_norm_block`); every entry must land in the block
+/// its key names; and no two blocks may claim the same document. Returns the
+/// `(documents, tokens)` the packed tier contributes to the corpus counters --
+/// entries a head `0x76` row overrides are left to the head pass, including
+/// the tombstone, which counts for neither.
+///
+/// Sacrifice (Law 4), the same one the packed posting pass already names: one
+/// point read per packed norm to learn whether a head row overrides it. The
+/// cross-check against the authoritative primary text is a SAMPLE -- the first
+/// and last entry of every block, plus every entry whose sequence is a
+/// multiple of 64 -- because the packed posting pass already re-analyzes the
+/// primary text of every folded posting, and a second full pass would double
+/// the verifier's read cost to re-derive the token count of text it has just
+/// tokenized. A block whose lengths were rewritten wholesale still fails at
+/// its samples and at the corpus counters, which are reconstructed from EVERY
+/// entry, not from the sample.
+fn verify_text_norm_blocks<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    i: &IndexInfo,
+) -> Result<(u64, u64)> {
+    let p = text_indexes::index_prefix(text_indexes::segments::NORM_BLOCK, i.id);
+    let end = prefix_end(&p);
+    let source = run.reader.clone();
+    let mut previous: Option<u64> = None;
+    let mut entries: Vec<(u64, u32, bool)> = Vec::new();
+    let mut decoded = Vec::new();
+    visit(&source, &p, end.as_deref(), |key, value| {
+        run.row(true)?;
+        let mut at = p.len();
+        let block = match read_ordered(key, &mut at) {
+            Ok(block) if at == key.len() => block,
+            _ => {
+                return malformed(
+                    run,
+                    IssueClass::Derived,
+                    key,
+                    Some(i.id),
+                    None,
+                    "text norm block key is malformed",
+                );
+            }
+        };
+        if previous.is_some_and(|previous| previous >= block) {
+            return malformed(
+                run,
+                IssueClass::Derived,
+                key,
+                Some(i.id),
+                None,
+                "text norm blocks do not ascend",
+            );
+        }
+        previous = Some(block);
+        if text_indexes::segments::decode_norm_block(value, &mut decoded).is_err() {
+            return malformed(
+                run,
+                IssueClass::Derived,
+                key,
+                Some(i.id),
+                None,
+                "text norm block value is malformed",
+            );
+        }
+        let base = block
+            .checked_mul(text_indexes::segments::NORM_BLOCK_SPAN)
+            .ok_or_else(|| corrupt("text norm block base"))?;
+        let last = decoded.len().saturating_sub(1);
+        for (at, (slot, length)) in decoded.iter().enumerate() {
+            let sequence = base
+                .checked_add(*slot as u64)
+                .ok_or_else(|| corrupt("text norm block sequence"))?;
+            if sequence == 0 {
+                return malformed(
+                    run,
+                    IssueClass::Derived,
+                    key,
+                    Some(i.id),
+                    None,
+                    "text norm block names document zero",
+                );
+            }
+            let sampled = at == 0 || at == last || sequence % 64 == 0;
+            entries.push((sequence, *length, sampled));
+        }
+        Ok(())
+    })?;
+
+    let (mut documents, mut tokens) = (0u64, 0u64);
+    for (sequence, length, sampled) in entries {
+        let head = run.read(&text_indexes::norm_key(i.id, sequence))?;
+        if head.is_some() {
+            // A head row overrides this packed length; the head pass owns it,
+            // and an empty head row says the document is gone.
+            continue;
+        }
+        documents = documents
+            .checked_add(1)
+            .ok_or_else(|| corrupt("text corpus documents"))?;
+        tokens = tokens
+            .checked_add(u64::from(length))
+            .ok_or_else(|| corrupt("text corpus tokens"))?;
+        if !sampled {
+            continue;
+        }
+        if let Some((id, layout, row)) = primary_field(run, i, sequence)? {
+            let expected = match field(&layout, &row, &i.field)? {
+                crate::dense_v3::FieldValue::Inline(Value::String(text)) => {
+                    Some(crate::text_analyzer::analyze(&text).map_err(invalid)?.length)
+                }
+                _ => None,
+            };
+            run.mismatch(
+                IssueClass::Derived,
+                &text_indexes::segments::norm_block_key(
+                    i.id,
+                    text_indexes::segments::norm_block_of(sequence),
+                ),
+                Some(i.id),
+                Some(id),
+                Some(&length.to_be_bytes()),
+                expected
+                    .as_ref()
+                    .map(|n| n.to_be_bytes())
+                    .as_ref()
+                    .map(|b| b.as_slice()),
+                "extra/mismatched packed text norm",
+            )?;
+        }
+    }
+    Ok((documents, tokens))
+}
+
+/// The length a `0x7B` block holds for one document, if any.
+fn packed_norm<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    i: &IndexInfo,
+    sequence: u64,
+) -> Result<Option<u32>> {
+    let key = text_indexes::segments::norm_block_key(
+        i.id,
+        text_indexes::segments::norm_block_of(sequence),
+    );
+    let Some(value) = run.read(&key)? else {
+        return Ok(None);
+    };
+    Ok(text_indexes::segments::norm_in_block(&value, sequence).unwrap_or(None))
+}
+
+fn index_has_norm_blocks<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    i: &IndexInfo,
+) -> Result<bool> {
+    let prefix = text_indexes::index_prefix(text_indexes::segments::NORM_BLOCK, i.id);
+    let end = prefix_end(&prefix);
+    let source = run.reader.clone();
+    let mut any = false;
+    visit(&source, &prefix, end.as_deref(), |_, _| {
+        any = true;
+        Ok(())
+    })?;
+    Ok(any)
+}
+
+fn index_has_segments<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    i: &IndexInfo,
+) -> Result<bool> {
+    let prefix = text_indexes::index_prefix(text_indexes::segments::SEGMENT, i.id);
+    let end = prefix_end(&prefix);
+    let source = run.reader.clone();
+    let mut any = false;
+    visit(&source, &prefix, end.as_deref(), |_, _| {
+        any = true;
+        Ok(())
+    })?;
+    Ok(any)
+}
+
+/// Document frequency as the two tiers actually spell it: every head row with
+/// a nonzero frequency, plus every packed posting no head row overrides.
+///
+/// Sacrifice (Law 4): this recount costs one point read per packed posting on
+/// top of the pass that produced it. Verification is an explicit, budgeted,
+/// offline operation and the alternative -- believing the stored count -- is
+/// not verification.
+fn merged_df<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    i: &IndexInfo,
+    term: &str,
+) -> Result<u64> {
+    let mut count = 0u64;
+    let head = text_indexes::posting_prefix(i.id, term);
+    let head_end = prefix_end(&head);
+    let source = run.reader.clone();
+    visit(&source, &head, head_end.as_deref(), |_, value| {
+        if text_indexes::decode_u32(value, "text posting").is_ok_and(|tf| tf != 0) {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| corrupt("text df overflow"))?;
+        }
+        Ok(())
+    })?;
+    let segments = text_indexes::segments::segment_prefix(i.id, term);
+    let segments_end = prefix_end(&segments);
+    let source = run.reader.clone();
+    let mut decoded = Vec::new();
+    let mut sequences = Vec::new();
+    visit(&source, &segments, segments_end.as_deref(), |_, value| {
+        if text_indexes::segments::decode_into(value, &mut decoded).is_ok() {
+            sequences.extend(decoded.iter().map(|(sequence, _)| *sequence));
+        }
+        Ok(())
+    })?;
+    for sequence in sequences {
+        if run
+            .read(&text_indexes::posting_key(i.id, term, sequence))?
+            .is_none()
+        {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| corrupt("text df overflow"))?;
+        }
+    }
+    Ok(count)
+}
+
+/// Structural pass over the packed tier.
+///
+/// Every segment key must name a term and the last sequence its value holds;
+/// every value must decode (Law 5 lives in `text_segments::decode`); segments
+/// of one term must be disjoint and ascending; and every packed posting no
+/// head row overrides must agree with the authoritative primary text.
+fn verify_text_segments<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    i: &IndexInfo,
+) -> Result<()> {
+    let p = text_indexes::index_prefix(text_indexes::segments::SEGMENT, i.id);
+    let end = prefix_end(&p);
+    let source = run.reader.clone();
+    let mut term = String::new();
+    let mut previous: Option<u64> = None;
+    let mut checks: Vec<(String, u64, u32)> = Vec::new();
+    visit(&source, &p, end.as_deref(), |key, value| {
+        run.row(true)?;
+        let tail = &key[p.len()..];
+        let Some(zero) = tail.iter().position(|b| *b == 0) else {
+            return malformed(
+                run,
+                IssueClass::Derived,
+                key,
+                Some(i.id),
+                None,
+                "text segment term terminator is malformed",
+            );
+        };
+        let Ok(t) = std::str::from_utf8(&tail[..zero]) else {
+            return malformed(
+                run,
+                IssueClass::Derived,
+                key,
+                Some(i.id),
+                None,
+                "text segment term is not UTF-8",
+            );
+        };
+        let mut at = p.len() + zero + 1;
+        let last = match read_ordered(key, &mut at) {
+            Ok(last) if at == key.len() && last != 0 => last,
+            _ => {
+                return malformed(
+                    run,
+                    IssueClass::Derived,
+                    key,
+                    Some(i.id),
+                    None,
+                    "text segment identity is malformed",
+                );
+            }
+        };
+        if t != term {
+            term = t.into();
+            previous = None;
+        }
+        let postings = match text_indexes::segments::decode(value) {
+            Ok(postings) => postings,
+            Err(_) => {
+                return malformed(
+                    run,
+                    IssueClass::Derived,
+                    key,
+                    Some(i.id),
+                    None,
+                    "text segment value is malformed",
+                );
+            }
+        };
+        if postings.last().map(|(sequence, _)| *sequence) != Some(last)
+            || previous.is_some_and(|previous| {
+                postings.first().is_none_or(|(first, _)| previous >= *first)
+            })
+        {
+            return malformed(
+                run,
+                IssueClass::Derived,
+                key,
+                Some(i.id),
+                None,
+                "text segments overlap or disagree with their keys",
+            );
+        }
+        previous = Some(last);
+        for (sequence, frequency) in postings {
+            checks.push((t.to_owned(), sequence, frequency));
+        }
+        Ok(())
+    })?;
+    for (term, sequence, frequency) in checks {
+        let key = text_indexes::posting_key(i.id, &term, sequence);
+        if run.read(&key)?.is_some() {
+            // A head row overrides this packed posting; the head pass owns it.
+            continue;
+        }
+        if let Some((id, layout, row)) = primary_field(run, i, sequence)? {
+            let expected = match field(&layout, &row, &i.field)? {
+                crate::dense_v3::FieldValue::Inline(Value::String(text)) => {
+                    crate::text_analyzer::analyze(&text)
+                        .map_err(invalid)?
+                        .terms
+                        .get(&term)
+                        .copied()
+                }
+                _ => None,
+            };
+            run.mismatch(
+                IssueClass::Derived,
+                &text_indexes::segments::segment_key(i.id, &term, sequence),
+                Some(i.id),
+                Some(id),
+                Some(&frequency.to_be_bytes()),
+                expected
+                    .as_ref()
+                    .map(|n| n.to_be_bytes())
+                    .as_ref()
+                    .map(|b| b.as_slice()),
+                "extra/mismatched packed text posting",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) -> Result<()> {
     let p = text_indexes::index_prefix(text_indexes::POSTING, i.id);
     let end = prefix_end(&p);
     let source = run.reader.clone();
+    let segments = index_has_segments(run, i)?;
     let mut term = String::new();
-    let mut df = 0u64;
-    let finish = |run: &mut Run<F>, term: &str, df: u64| -> Result<()> {
+    let finish = |run: &mut Run<F>, term: &str| -> Result<()> {
         if term.is_empty() {
             return Ok(());
         }
+        // Counted across both tiers: head rows that are not tombstones, plus
+        // packed postings no head row overrides.
+        let df = merged_df(run, i, term)?;
         let key = text_indexes::term_stats_key(i.id, term);
         let actual = run.read(&key)?;
+        // A term whose last live posting is gone has no statistic at all:
+        // the head rows left behind are tombstones, which are not postings.
+        let expected = (df != 0).then(|| df.to_be_bytes());
         run.mismatch(
             IssueClass::Derived,
             &key,
             Some(i.id),
             None,
             actual.as_deref(),
-            Some(&df.to_be_bytes()),
+            expected.as_ref().map(|b| b.as_slice()),
             "text document frequency",
         )
     };
@@ -1665,28 +2123,38 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
                 return Ok(());
             }
         };
-        if text_indexes::decode_tf(value).is_err() {
-            malformed(
-                run,
-                IssueClass::Derived,
-                key,
-                Some(i.id),
-                Some(EntityId {
-                    collection: i.collection,
-                    sequence: seq,
-                }),
-                "text posting frequency is malformed",
-            )?;
+        // `tf = 0` is the tombstone a delete or an update writes when the
+        // posting it retires is packed inside a segment. It is a posting-shaped
+        // statement that there is NO posting, and it exists only where the
+        // packed tier does.
+        let frequency = match text_indexes::decode_u32(value, "text posting") {
+            Ok(frequency) if frequency != 0 || segments => frequency,
+            _ => {
+                malformed(
+                    run,
+                    IssueClass::Derived,
+                    key,
+                    Some(i.id),
+                    Some(EntityId {
+                        collection: i.collection,
+                        sequence: seq,
+                    }),
+                    "text posting frequency is malformed",
+                )?;
+                return Ok(());
+            }
+        };
+        if t != term {
+            finish(run, &term)?;
+            term = t.into();
+        }
+        if frequency == 0 {
+            // A tombstone asserts that there is NO posting here. It outlives
+            // the document it retired, so it must not be read as a derived
+            // entry pointing at a primary row. The expected-side pass is what
+            // catches a tombstone over text that does still contain the term.
             return Ok(());
         }
-        if t != term {
-            finish(run, &term, df)?;
-            term = t.into();
-            df = 0;
-        }
-        df = df
-            .checked_add(1)
-            .ok_or_else(|| corrupt("text df overflow"))?;
         if let Some((id, l, row)) = primary_field(run, i, seq)? {
             let expected = match field(&l, &row, &i.field)? {
                 crate::dense_v3::FieldValue::Inline(Value::String(s)) => {
@@ -1714,7 +2182,8 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
         }
         Ok(())
     })?;
-    finish(run, &term, df)?;
+    finish(run, &term)?;
+    verify_text_segments(run, i)?;
 
     // The posting pass finds missing/mismatched statistics. This independent
     // statistics pass also finds a checksum-valid statistic with no postings.
@@ -1771,17 +2240,7 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
             )?;
             return Ok(());
         }
-        let postings = text_indexes::posting_prefix(i.id, term);
-        let postings_end = prefix_end(&postings);
-        let nested = run.reader.clone();
-        let mut count = 0u64;
-        visit(&nested, &postings, postings_end.as_deref(), |_, _| {
-            run.row(true)?;
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| corrupt("text df overflow"))?;
-            Ok(())
-        })?;
+        let count = merged_df(run, i, term)?;
         run.mismatch(
             IssueClass::Derived,
             key,
@@ -1796,6 +2255,7 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
     let p = text_indexes::index_prefix(text_indexes::NORM, i.id);
     let end = prefix_end(&p);
     let source = run.reader.clone();
+    let packed_norms = index_has_norm_blocks(run, i)?;
     let (mut documents, mut tokens) = (0u64, 0u64);
     visit(&source, &p, end.as_deref(), |key, value| {
         run.row(true)?;
@@ -1814,6 +2274,15 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
                 return Ok(());
             }
         };
+        // The EMPTY value is the norm tombstone: a norm-shaped statement that
+        // this document is NOT in the index, written when a delete retires a
+        // length that is packed inside a block it cannot cheaply rewrite. Like
+        // the `tf = 0` posting tombstone it outlives the document it retired,
+        // so it is neither counted into the corpus nor read as a derived entry
+        // pointing at a primary row. It exists only where a block does.
+        if value.is_empty() && packed_norms {
+            return Ok(());
+        }
         let len = match text_indexes::decode_u32(value, "text norm") {
             Ok(len) => len,
             Err(_) => {
@@ -1858,6 +2327,13 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
         }
         Ok(())
     })?;
+    let (block_documents, block_tokens) = verify_text_norm_blocks(run, i)?;
+    documents = documents
+        .checked_add(block_documents)
+        .ok_or_else(|| corrupt("text corpus documents"))?;
+    tokens = tokens
+        .checked_add(block_tokens)
+        .ok_or_else(|| corrupt("text corpus tokens"))?;
     let key = text_indexes::corpus_key(i.id);
     let actual = run.read(&key)?;
     let mut expected = [0; 16];

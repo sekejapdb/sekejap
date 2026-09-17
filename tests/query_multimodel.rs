@@ -1364,13 +1364,18 @@ fn text_driven_scalar_membership_rejects_nonempty_posting_values() {
         indexes,
         ..
     } = create_fixture(&path);
+    // The posting is damaged where it actually lives: a version-2 scalar index
+    // keeps its entries in its own tree, and the key is byte-identical there.
+    let tree = db.index_tree(indexes.active).unwrap();
     drop(db);
     let mut raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
-    raw.put(
-        &scalar_bool_posting_key(indexes.active, true, ids["p0"]),
-        &[1],
-    )
-    .unwrap();
+    let key = scalar_bool_posting_key(indexes.active, true, ids["p0"]);
+    match tree {
+        None => raw.put(&key, &[1]).unwrap(),
+        Some((id, root)) => {
+            assert_eq!(raw.tree_put(id, root, &key, &[1]).unwrap(), root);
+        }
+    }
     raw.commit().unwrap();
     drop(raw);
 

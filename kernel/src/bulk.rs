@@ -744,6 +744,83 @@ impl<'a> PackedPageWriter<'a> {
     }
 }
 
+/// Where a packed page goes, and therefore which durability rule it obeys.
+///
+/// `Direct` reserves an unpooled page number and writes the finished, sealed
+/// page straight into the data file. Those pages are unreachable until the
+/// root swap publishes them, which is what lets `Store::graft_range` skip the
+/// record WAL for them entirely (D11).
+///
+/// `Pooled` allocates ordinary pool pages instead. A page-WAL database then
+/// logs every packed page as a normal frame and publishes the whole graft
+/// with the ordinary commit, so there is no root swap, no skipped log and no
+/// second durability rule to reason about: Law 3 and Law 5 hold exactly as
+/// they do for a single `insert`. The price is one WAL frame per packed page
+/// -- the same frame an ordinary insert would have paid for that leaf anyway,
+/// but paid once instead of once per commit the leaf is dirty in.
+///
+/// A page is RESERVED before it is filled, because a leaf's `next_leaf`
+/// pointer is only known once the following leaf has a number. The pooled
+/// sink therefore holds the write guard between `reserve` and `push` (at most
+/// two at a time: the leaf being finished and the leaf that follows it),
+/// which keeps every packed page a single pooled write with no read-back.
+pub(crate) enum PageSink<'a> {
+    Direct(PackedPageWriter<'a>),
+    Pooled { pool: &'a BufferPool, held: Vec<crate::pool::PinnedWrite<'a>> },
+}
+
+impl<'a> PageSink<'a> {
+    pub(crate) fn direct(pool: &'a BufferPool) -> Result<Self> {
+        Ok(PageSink::Direct(PackedPageWriter::new(pool)?))
+    }
+
+    pub(crate) fn pooled(pool: &'a BufferPool) -> Self {
+        PageSink::Pooled { pool, held: Vec::new() }
+    }
+
+    fn reserve(&mut self) -> Result<u32> {
+        match self {
+            PageSink::Direct(writer) => writer.pool.allocate_unpooled(),
+            PageSink::Pooled { pool, held } => {
+                let guard = pool.allocate()?;
+                let page_no = guard.page_no();
+                held.push(guard);
+                Ok(page_no)
+            }
+        }
+    }
+
+    fn push(&mut self, page_no: u32, scratch: &[u8]) -> Result<()> {
+        match self {
+            PageSink::Direct(writer) => writer.push(page_no, scratch),
+            PageSink::Pooled { held, .. } => {
+                if scratch.len() != PAGE_SIZE { return Err(Error::TooLarge); }
+                // A push for a number this sink never reserved would write a
+                // page the allocator still considers free: refuse instead of
+                // guessing, the same way the direct writer refuses a run that
+                // exceeds its allocation.
+                let at = held.iter().position(|guard| guard.page_no() == page_no)
+                    .ok_or(Error::Corrupt { page_no, why: "packed page was never reserved" })?;
+                let mut guard = held.remove(at);
+                guard.bytes_mut().copy_from_slice(scratch);
+                Ok(())
+            }
+        }
+    }
+
+    /// No page may stay pinned past the pack: `flush_all` asserts that a
+    /// dirty frame has no live guard, so a guard held across the caller's
+    /// commit would be a panic, not a slow path. Guards still held here
+    /// belong to reserved-but-unfilled pages on an error path; dropping them
+    /// leaves each as the valid empty Free page `allocate` initialised.
+    fn finish(&mut self) -> Result<()> {
+        match self {
+            PageSink::Direct(writer) => writer.flush(),
+            PageSink::Pooled { held, .. } => { held.clear(); Ok(()) }
+        }
+    }
+}
+
 /// One level's separators, on disk instead of in RAM.
 ///
 /// `pack_tree` builds a level of pages and needs, for each page, the pair
@@ -936,6 +1013,40 @@ pub(crate) fn pack_range<I>(
     last_next: u32,
 ) -> Result<PackedRange>
 where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
+    let mut sink = PageSink::direct(pool)?;
+    pack_range_into(pool, tree_id, sorted, fill, scratch_dir, last_next, &mut sink)
+}
+
+/// The same pack, with every page allocated and written through the ordinary
+/// buffer pool. A page-WAL store uses this so a graft is an ordinary logged
+/// transaction; see [`PageSink`].
+pub(crate) fn pack_range_pooled<I>(
+    pool: &BufferPool,
+    tree_id: u16,
+    sorted: I,
+    fill: f32,
+    scratch_dir: &Path,
+    last_next: u32,
+) -> Result<PackedRange>
+where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
+    let mut sink = PageSink::pooled(pool);
+    let packed = pack_range_into(pool, tree_id, sorted, fill, scratch_dir, last_next, &mut sink);
+    // Drop any guard a failed pack still holds before the error reaches a
+    // caller that may roll back or commit.
+    sink.finish()?;
+    packed
+}
+
+fn pack_range_into<I>(
+    pool: &BufferPool,
+    tree_id: u16,
+    sorted: I,
+    fill: f32,
+    scratch_dir: &Path,
+    last_next: u32,
+    sink: &mut PageSink<'_>,
+) -> Result<PackedRange>
+where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
     let usable = ((PAGE_SIZE - HEADER_LEN) as f32 * fill) as usize;
     let capacity = PAGE_SIZE - HEADER_LEN;
 
@@ -946,7 +1057,6 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
     static PACK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let pack = PACK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut seq = 0u64;
-    let mut page_writer = PackedPageWriter::new(pool)?;
 
     // Level 0: leaves. Their (first_key, page_no) pairs are spilled, not held.
     let mut level = Separators::create(scratch_dir, pack, &mut seq)?;
@@ -960,7 +1070,7 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
     let flush_leaf = |cur: &mut Option<(u32, Vec<Vec<u8>>, Vec<u8>, usize)>,
                           level: &mut Separators,
                           next_leaf: u32,
-                          page_writer: &mut PackedPageWriter<'_>| -> Result<()> {
+                          sink: &mut PageSink<'_>| -> Result<()> {
         if let Some((no, recs, first, _)) = cur.take() {
             let mut scratch = build_scratch(PageKind::Leaf, tree_id, no, &recs)?;
             {
@@ -968,7 +1078,7 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
                 page.set_next_leaf(next_leaf);
                 page.finalise(0);
             }
-            page_writer.push(no, &scratch)?;
+            sink.push(no, &scratch)?;
             level.push(&first, no)?;
         }
         Ok(())
@@ -1017,22 +1127,22 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
         }
         let fits = matches!(&cur, Some((_, _, _, used)) if used + need <= usable);
         if !fits {
-            let no = pool.allocate_unpooled()?;
-            flush_leaf(&mut cur, &mut level, no, &mut page_writer)?;
+            let no = sink.reserve()?;
+            flush_leaf(&mut cur, &mut level, no, sink)?;
             if first_leaf.is_none() { first_leaf = Some(no); }
             last_leaf = Some(no);
             cur = Some((no, Vec::new(), k.clone(), 0));
         }
         if let Some((_, recs, _, used)) = cur.as_mut() { recs.push(rec); *used += need; }
     }
-    flush_leaf(&mut cur, &mut level, last_next, &mut page_writer)?;
+    flush_leaf(&mut cur, &mut level, last_next, sink)?;
     level.seal()?;
 
     if level.count == 0 {
-        let no = pool.allocate_unpooled()?;
+        let no = sink.reserve()?;
         let scratch = build_scratch(PageKind::Leaf, tree_id, no, &[])?;
-        page_writer.push(no, &scratch)?;
-        page_writer.flush()?;
+        sink.push(no, &scratch)?;
+        sink.finish()?;
         return Ok(PackedRange {
             root: no,
             first_leaf: no,
@@ -1066,7 +1176,7 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
                 pending.push_back(first);
             }
             while let Some((first, child0)) = pending.pop_front() {
-                let no = pool.allocate_unpooled()?;
+                let no = sink.reserve()?;
                 // Keep the separator beside its encoded form until this page
                 // is sealed. If the very last child would strand itself on a
                 // one-child page, we may have to move this page's final
@@ -1128,7 +1238,7 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
                     p.set_child0(child0);
                     p.finalise(0);
                 }
-                page_writer.push(no, &scratch)?;
+                sink.push(no, &scratch)?;
                 up.push(&first, no)?;
             }
             // The outer loop only ends on `pending == None`, which only
@@ -1159,7 +1269,7 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
     // The root is about to become readable through the ordinary pool and,
     // after graft publication, reachable from committed metadata. Do not let
     // either happen while any candidate pages remain only in this buffer.
-    page_writer.flush()?;
+    sink.finish()?;
     Ok(PackedRange {
         root,
         first_leaf: first_leaf.expect("a non-empty level has a first leaf"),
@@ -1176,4 +1286,27 @@ where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
 pub fn pack_tree<I>(pool: &BufferPool, tree_id: u16, sorted: I, fill: f32, scratch_dir: &Path) -> Result<u32>
 where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
     Ok(pack_range(pool, tree_id, sorted, fill, scratch_dir, 0)?.root)
+}
+
+/// Pack a complete sorted tree through the ORDINARY buffer pool.
+///
+/// Same bottom-up pack as [`pack_tree`], but every page is an ordinary pooled
+/// page, so a page-WAL database logs each one as a normal frame and publishes
+/// the whole tree with the caller's commit (`PageSink::Pooled`). There is no
+/// root swap, no skipped log and no second durability rule: Law 3 and Law 5
+/// hold exactly as they do for a single `insert`, and a crash before the
+/// caller's commit leaves nothing reachable.
+///
+/// This is what a per-index tree is built with: the tree is EMPTY, so there is
+/// no standing content to graft beside and no boundary to plan -- the packed
+/// root simply becomes the index descriptor's root in the same transaction.
+/// Returns `(root, rows)`; an empty stream returns `(0, 0)`, the descriptor's
+/// encoding of an empty tree.
+pub fn pack_tree_pooled<I>(pool: &BufferPool, tree_id: u16, sorted: I, fill: f32, scratch_dir: &Path)
+    -> Result<(u32, u64)>
+where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
+    let mut peek = sorted.peekable();
+    if peek.peek().is_none() { return Ok((0, 0)); }
+    let packed = pack_range_pooled(pool, tree_id, peek, fill, scratch_dir, 0)?;
+    Ok((packed.root, packed.rows))
 }

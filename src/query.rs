@@ -1363,11 +1363,7 @@ struct QuantizedVectorCursor<'a> {
 }
 
 struct TextPostingCursor<'a> {
-    inner: RangeIter<'a>,
-    prefix: Vec<u8>,
-    expected: u64,
-    seen: u64,
-    previous: Option<u64>,
+    inner: super::text_indexes::TermPostings<'a>,
     head: Option<u64>,
     done: bool,
 }
@@ -1478,12 +1474,8 @@ impl<'a> DriverCursor<'a> {
                     if let Some(lower) = scalar_lower(predicate) {
                         start.extend_from_slice(lower);
                     }
-                    Some(
-                        db.store()?
-                            .range(&start)
-                            .map_err(Error::from)
-                            .map_err(QueryError::from)?,
-                    )
+                    db.index_range(info, &start)
+                        .map_err(QueryError::from)?
                 };
                 Ok(Self::Scalar(ScalarCursor {
                     inner,
@@ -1524,14 +1516,13 @@ impl<'a> DriverCursor<'a> {
             DriverPlan::Text { prepared, position } => {
                 let mut streams = Vec::with_capacity(prepared.terms.len());
                 for (term, expected) in prepared.terms.iter().zip(&prepared.dfs) {
-                    let prefix = super::text_indexes::posting_prefix(prepared.info.id, term);
-                    let inner = db.store()?.range(&prefix).map_err(Error::from)?;
                     streams.push(TextPostingCursor {
-                        inner,
-                        prefix,
-                        expected: *expected,
-                        seen: 0,
-                        previous: None,
+                        inner: super::text_indexes::TermPostings::open(
+                            db,
+                            prepared.info.id,
+                            term,
+                            *expected,
+                        )?,
                         head: None,
                         done: false,
                     });
@@ -1682,43 +1673,15 @@ impl TextPostingCursor<'_> {
         if self.done {
             return Ok(());
         }
-        meter.charge(WorkResource::TextPostings, 1)?;
-        let Some(row) = self.inner.next() else {
-            if self.seen != self.expected {
-                return Err(corrupt_query(
-                    "text posting count disagrees with term statistics",
-                ));
-            }
-            self.head = None;
+        // One stream over both tiers: the packed segments a late build wrote
+        // and the head rows written since, with head rows overriding.
+        self.head = self
+            .inner
+            .next(&mut || meter.charge(WorkResource::TextPostings, 1))?
+            .map(|(sequence, _)| sequence);
+        if self.head.is_none() {
             self.done = true;
-            return Ok(());
-        };
-        let (key, value) = row.map_err(Error::from)?;
-        if !key.starts_with(&self.prefix) {
-            if self.seen != self.expected {
-                return Err(corrupt_query(
-                    "text posting count disagrees with term statistics",
-                ));
-            }
-            self.head = None;
-            self.done = true;
-            return Ok(());
         }
-        if self.seen == self.expected {
-            return Err(corrupt_query("text posting count exceeds term statistics"));
-        }
-        let mut at = self.prefix.len();
-        let sequence = read_ordered(&key, &mut at)?;
-        if at != key.len()
-            || sequence == 0
-            || self.previous.is_some_and(|previous| previous >= sequence)
-        {
-            return Err(corrupt_query("text posting identity/order"));
-        }
-        super::text_indexes::decode_tf(&value)?;
-        self.seen += 1;
-        self.previous = Some(sequence);
-        self.head = Some(sequence);
         Ok(())
     }
 }
@@ -1833,7 +1796,13 @@ impl SpatialCursor<'_> {
             if self.inner.is_none() {
                 let mut start = self.prefix.clone();
                 start.extend((lo as u32).to_be_bytes());
-                self.inner = Some(self.db.store()?.range(&start).map_err(Error::from)?);
+                // An index whose tree is still empty has no postings at all,
+                // in any range: finish rather than walk the remaining ranges.
+                let Some(iter) = self.db.index_range(&self.info, &start)? else {
+                    self.done = true;
+                    return Ok(None);
+                };
+                self.inner = Some(iter);
             }
             meter.charge(WorkResource::SpatialPostings, 1)?;
             let Some(row) = self.inner.as_mut().unwrap().next() else {
@@ -2059,9 +2028,7 @@ fn scalar_eq_posting_matches<C: FnMut() -> bool>(
 ) -> QueryResult<bool> {
     meter.charge(WorkResource::ScalarPostings, 1)?;
     let value = db
-        .store()?
-        .get(&super::indexes::skey(info, expected, id.sequence))
-        .map_err(Error::from)
+        .index_get(info, &super::indexes::skey(info, expected, id.sequence))
         .map_err(QueryError::from)?;
     match value {
         None => Ok(false),
@@ -2200,14 +2167,17 @@ fn text_score<C: FnMut() -> bool>(
     let length = super::text_indexes::decode_u32(&norm, "text document length")?;
     let mut frequencies = Vec::with_capacity(prepared.terms.len());
     let mut dfs = Vec::with_capacity(prepared.terms.len());
+    let segments_on = super::text_indexes::segments_enabled(db);
     for (term, &df) in prepared.terms.iter().zip(&prepared.dfs) {
         meter.charge(WorkResource::TextPostings, 1)?;
-        if let Some(value) = db.store()?.get(&super::text_indexes::posting_key(
+        if let Some(frequency) = super::text_indexes::point_posting(
+            db,
             prepared.info.id,
             term,
             id.sequence,
-        ))? {
-            frequencies.push(super::text_indexes::decode_tf(&value)?);
+            segments_on,
+        )? {
+            frequencies.push(frequency);
             dfs.push(df);
         }
     }

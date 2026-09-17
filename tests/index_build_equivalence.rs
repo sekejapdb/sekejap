@@ -143,12 +143,14 @@ fn index_prefix(tag: u8, id: IndexId) -> Vec<u8> {
 }
 
 /// Every persisted tag a family owns. 0x70 scalar posting, 0x74 spatial
-/// posting, 0x75/0x76/0x77/0x78 text posting / norm / term stats / corpus.
+/// posting, 0x75/0x76/0x77/0x78 text posting / norm / term stats / corpus,
+/// 0x7a the packed posting segment the sorted builder writes instead of the
+/// per-document head rows.
 fn family_tags(family: &str) -> &'static [u8] {
     match family {
         "scalar" => &[0x70],
         "spatial" => &[0x74],
-        "text" => &[0x75, 0x76, 0x77, 0x78],
+        "text" => &[0x75, 0x76, 0x77, 0x78, 0x7a, 0x7b],
         _ => unreachable!(),
     }
 }
@@ -161,7 +163,7 @@ fn digest(db: &Database, family: &str, id: IndexId) -> (String, u64) {
     for tag in family_tags(family) {
         let p = index_prefix(*tag, id);
         entries += db
-            .raw_for_each(&p, &mut |k, v| {
+            .index_for_each(id, &p, &mut |k, v| {
                 h.update(&(k.len() as u64).to_be_bytes());
                 h.update(k);
                 h.update(&(v.len() as u64).to_be_bytes());
@@ -273,7 +275,18 @@ fn build_sorted(db: &mut Database, id: IndexId) -> u64 {
 /// Pinned by a run of the unchanged builder; see the module note.
 const SCALAR_AGE: &str = "6b7205dc65d3fc47285914b3e86cc0d8224722aa478d05a561c650e0b0bbdb63";
 const SCALAR_ACTIVE: &str = "5349a3713fc8216b9d04df511d8397fe09b5669bcbd8e78bfbc2a3c043770d09";
+/// The stepped builder (`build_index_step`) still writes the head tier, one
+/// entry per `(term, document)`, and its digest is unchanged.
 const TEXT_BIO: &str = "e1b15c14f345ba66dc8a2cd0e954e38de8200ecd7e8f73c2adb0d15904475dc1";
+/// The sorted builder packs the same postings into per-term segments, so the
+/// persisted SET is different by design and needs its own pin. The two are
+/// proved to answer identically in `tests/index_text.rs`; this constant only
+/// pins that the packed bytes do not drift.
+///
+/// Repinned when norms moved from one `0x76` row per document to one `0x7B`
+/// block per 256 documents. The stepped builder's `TEXT_BIO` above is
+/// deliberately untouched: the head tier's bytes did not change.
+const TEXT_BIO_SEGMENTS: &str = "481deca7533220ec312574b03d400d334c21d0d830c923802132cd56f0fd8fef";
 const SPATIAL_HOME: &str = "195919c4b0c7dfdbbcad2c117a6a3d861135d374b45445f72210554b1b19c863";
 
 #[test]
@@ -623,7 +636,9 @@ fn a_sorted_late_build_keeps_the_pinned_digests() {
     db.build_index_to_ready(home, 256).unwrap();
     assert_eq!(digest(&db, "scalar", age).0, SCALAR_AGE);
     assert_eq!(digest(&db, "scalar", active).0, SCALAR_ACTIVE);
-    assert_eq!(digest(&db, "text", bio).0, TEXT_BIO);
+    let (text, entries) = digest(&db, "text", bio);
+    eprintln!("ORACLE text bio segments: {entries} entries {text}");
+    assert_eq!(text, TEXT_BIO_SEGMENTS);
     assert_eq!(digest(&db, "spatial", home).0, SPATIAL_HOME);
 }
 

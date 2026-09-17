@@ -112,7 +112,6 @@ pub(super) fn sidecar_prefix(c: CollectionId) -> Vec<u8> {
 struct SidecarCursor<'a> {
     prefix: Vec<u8>,
     iter: kernel::btree::RangeIter<'a>,
-    head: Option<(Vec<u8>, Vec<u8>)>,
     done: bool,
 }
 
@@ -123,39 +122,44 @@ impl<'a> SidecarCursor<'a> {
         Ok(Self {
             prefix,
             iter,
-            head: None,
             done: false,
         })
     }
 
     /// Advance to `target` and return its stored bytes, or `None` when the
-    /// cursor is already beyond it.
+    /// cursor is already beyond it. Slices are borrowed from the pinned leaf.
     fn seek(&mut self, target: &[u8]) -> Result<Option<&[u8]>> {
-        while !self.done {
-            if self.head.is_none() {
-                match self.iter.next().transpose()? {
-                    Some((key, value)) if key.starts_with(&self.prefix) => {
-                        self.head = Some((key, value));
-                    }
-                    _ => self.done = true,
-                }
-                continue;
-            }
-            if self
-                .head
-                .as_ref()
-                .is_some_and(|(key, _)| key.as_slice() < target)
-            {
-                self.head = None;
-            } else {
-                break;
+        if self.done {
+            return Ok(None);
+        }
+        match self.iter.peek_at_or_after(target)? {
+            Some((key, value)) if key.starts_with(&self.prefix) && key == target => Ok(Some(value)),
+            Some((key, _)) if key.starts_with(&self.prefix) => Ok(None),
+            _ => {
+                self.done = true;
+                Ok(None)
             }
         }
-        Ok(match &self.head {
-            Some((key, value)) if key.as_slice() == target => Some(value.as_slice()),
-            _ => None,
-        })
     }
+}
+
+fn write_ordered(dst: &mut [u8], n: u64) -> usize {
+    let bytes = n.to_be_bytes();
+    let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
+    dst[0] = 0x80 + (8 - start) as u8;
+    let width = 8 - start;
+    dst[1..1 + width].copy_from_slice(&bytes[start..]);
+    1 + width
+}
+
+/// Sidecar key `0x60 || collection || sequence || field` in a stack buffer.
+fn write_vector_key(buf: &mut [u8; 32], id: EntityId, field: usize) -> &[u8] {
+    buf[0] = 0x60;
+    let mut n = 1;
+    n += write_ordered(&mut buf[n..], u64::from(id.collection.0));
+    n += write_ordered(&mut buf[n..], id.sequence);
+    n += write_ordered(&mut buf[n..], field as u64);
+    &buf[..n]
 }
 
 /// Score one already-loaded sidecar. Shared by the scanned and the
@@ -197,11 +201,17 @@ fn score_vector_bytes(
 }
 
 fn admit(heap: &mut BinaryHeap<HeapHit>, k: usize, hit: Option<VectorHit>) {
-    if let Some(hit) = hit {
-        heap.push(HeapHit(hit));
-        if heap.len() > k {
-            heap.pop();
-        }
+    let Some(hit) = hit else {
+        return;
+    };
+    let candidate = HeapHit(hit);
+    if heap.len() < k {
+        heap.push(candidate);
+        return;
+    }
+    if candidate < *heap.peek().unwrap() {
+        heap.pop();
+        heap.push(candidate);
     }
 }
 
@@ -414,40 +424,51 @@ impl Database {
                 let prefix = locator_prefix(id);
                 let store = self.store()?;
                 let mut sidecars = SidecarCursor::new(store, index.collection)?;
-                for row in store.range(&prefix)? {
-                    let (key, value) = row?;
+                let mut failure = None;
+                store.range(&prefix)?.for_each_ref(|key, value| {
                     if !key.starts_with(&prefix) {
-                        break;
+                        return false;
                     }
-                    spend()?;
-                    let mut at = prefix.len();
-                    let sequence = read_ordered(&key, &mut at)?;
-                    if at != key.len() || sequence == 0 {
-                        return Err(corrupt("exact vector locator key"));
-                    }
-                    let entity = EntityId {
-                        collection: index.collection,
-                        sequence,
-                    };
-                    let ordinal = self.locator_ordinal(&index, &value, dimension)?;
-                    let hit = match sidecars.seek(&vector_key(entity, ordinal))? {
-                        Some(bytes) => score_vector_bytes(
-                            entity,
-                            bytes,
-                            dimension,
-                            query,
-                            query_norm,
-                            metric,
-                            &mut || false,
-                        )?,
-                        // Not where the scan is: the sidecar is absent or
-                        // damaged. Pay the descent for this one row and let
-                        // the point-read path produce its diagnosis.
-                        None => {
-                            self.score_locator(&index, entity, &value, query, query_norm, metric)?
+                    if let Err(e) = (|| -> Result<()> {
+                        spend()?;
+                        let mut at = prefix.len();
+                        let sequence = read_ordered(key, &mut at)?;
+                        if at != key.len() || sequence == 0 {
+                            return Err(corrupt("exact vector locator key"));
                         }
-                    };
-                    admit(&mut heap, k, hit);
+                        let entity = EntityId {
+                            collection: index.collection,
+                            sequence,
+                        };
+                        let ordinal = self.locator_ordinal(&index, value, dimension)?;
+                        let mut target_buf = [0u8; 32];
+                        let target = write_vector_key(&mut target_buf, entity, ordinal);
+                        let hit = match sidecars.seek(target)? {
+                            Some(bytes) => score_vector_bytes(
+                                entity,
+                                bytes,
+                                dimension,
+                                query,
+                                query_norm,
+                                metric,
+                                &mut || false,
+                            )?,
+                            // Not where the scan is: the sidecar is absent or
+                            // damaged. Pay the descent for this one row and let
+                            // the point-read path produce its diagnosis.
+                            None => self
+                                .score_locator(&index, entity, value, query, query_norm, metric)?,
+                        };
+                        admit(&mut heap, k, hit);
+                        Ok(())
+                    })() {
+                        failure = Some(e);
+                        return false;
+                    }
+                    true
+                })?;
+                if let Some(e) = failure {
+                    return Err(e);
                 }
             }
             VectorCandidates::SortedUnique(ids) => {

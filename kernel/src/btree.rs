@@ -9,7 +9,7 @@
 //! that already exists, so adding one row never rewrites the store.
 
 use crate::page::{PageKind, PageMut, PageRef, PAGE_SIZE};
-use crate::pool::{BufferPool, PinnedWrite};
+use crate::pool::{BufferPool, PinnedRead, PinnedWrite};
 use crate::verify::decode_record;
 use crate::{Error, Result};
 use std::cell::Cell;
@@ -918,6 +918,12 @@ pub struct RangeIter<'p> {
     /// more leaves than the file has pages, so exceeding it means it cycles.
     leaves: u32,
     max_leaves: u32,
+    /// Live pin of `page` for [`RangeIter::peek_at_or_after`]. Held across
+    /// successive peeks into the same leaf so a lockstep cursor pays one
+    /// `pool.get` per leaf, not per row. Dropped before `advance()` and
+    /// before overflow-chain walks. `next()` / `for_each_ref` drop it on
+    /// entry so their existing pin accounting is unchanged.
+    pin: Option<PinnedRead<'p>>,
 }
 
 /// A descending range cursor. Unlike reversing a forward [`RangeIter`], this
@@ -1149,6 +1155,119 @@ impl<'p> BTree<'p> {
             retired.push(parent);
         }
         self.root = replacement;
+        Ok(retired)
+    }
+
+    /// Pack a sorted run into full pages and splice it into an EMPTY key
+    /// interval of this tree, instead of inserting its keys one at a time.
+    ///
+    /// This is the shape a `CREATE INDEX` has: every key of a new index shares
+    /// one contiguous keyspace (`[tag][index id]...`) that holds nothing yet,
+    /// so the run has no existing neighbours to interleave with. SQLite builds
+    /// the same run into a separate, empty index B-tree with a sorter and
+    /// `OP_IdxInsert`; E4 has one tree per database (D1), so the equivalent is
+    /// to pack the pages and graft them in.
+    ///
+    /// The four steps:
+    ///
+    /// 1. **Refuse a non-empty interval.** One seek to `min` and one key
+    ///    comparison. A key in `[min, max]` means the caller's assumption is
+    ///    wrong, and the graft is refused with `RangeNotEmpty` before anything
+    ///    is allocated or written.
+    /// 2. **Plan the boundary.** `plan_graft` descends to the leaf whose
+    ///    interval owns `min` and splits it at the insertion point: records
+    ///    below `min` become the copied left fragment, records above it the
+    ///    copied right fragment. Both are fresh pages; the standing leaf is
+    ///    read only.
+    /// 3. **Pack.** `pack_range_pooled` fills leaves to 90% and builds the
+    ///    run's OWN interior levels bottom-up, allocating every page through
+    ///    the ordinary buffer pool. The right continuation is known before the
+    ///    last leaf is written, so the leaf chain is correct on the first and
+    ///    only write of each page.
+    /// 4. **Verify, then splice.** The packed subtree is walked
+    ///    (`verify_range_pool`) before any standing page is touched. Then one
+    ///    two-or-three-child wrapper joins {left fragment, packed root, right
+    ///    fragment} and `install_graft` copies the O(height) parent path,
+    ///    replacing exactly one child pointer. The retired page numbers are
+    ///    returned for the caller to free.
+    ///
+    /// **Interior strategy.** The run brings its own interior levels and
+    /// enters the standing tree as ONE separator. Inserting one separator per
+    /// packed leaf was the alternative, and it is O(leaves) interior inserts
+    /// with their own splits -- the cost this call exists to remove -- so the
+    /// subtree is grafted whole. The cost is that the grafted subtree's height
+    /// is independent of the standing tree's, so the tree is no longer
+    /// uniformly deep; `descend_with_path` already reserves for that.
+    ///
+    /// **Page LAYOUT is not preserved, the ENTRY SET is.** Which key sits on
+    /// which page differs from the one-at-a-time insert path (packed leaves
+    /// are 90% full; split-built leaves are not), and so do page numbers and
+    /// tree height. Every persisted key and value is identical, which is what
+    /// `tests/index_build_equivalence.rs` digests.
+    ///
+    /// Nothing here bypasses the log or swaps a root: every page is an
+    /// ordinary pooled page, so a page-WAL store logs each one as a normal
+    /// frame and publishes the whole graft with the caller's commit. A crash
+    /// before that commit leaves the standing tree exactly as it was.
+    pub fn graft_sorted_range<I>(
+        &mut self,
+        sorted: I,
+        expected_rows: u64,
+        min: &[u8],
+        max: &[u8],
+        scratch_dir: &std::path::Path,
+    ) -> Result<Vec<u32>>
+    where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>, bool)>> {
+        if expected_rows == 0 { return Ok(Vec::new()); }
+        if min > max { return Err(Error::TooLarge); }
+        // The bounded probe. `range` seeks once; the first key it returns is
+        // the smallest at or above `min`, so one comparison settles the whole
+        // interval.
+        if let Some(row) = self.range(min)?.next() {
+            let (key, _) = row?;
+            if key.as_slice() <= max { return Err(Error::RangeNotEmpty); }
+        }
+        let boundary = self.plan_graft(min)?;
+        let last_next = boundary.right_page.unwrap_or(boundary.old_next);
+        // Fill factor 1.0, not the whole-tree load's 0.9.
+        //
+        // The path this replaces is the per-keyspace APPEND split (D9), which
+        // leaves each completed leaf of an ascending run essentially full. A
+        // 90% pack would therefore cost about one leaf in ten MORE than
+        // inserting the same run key by key, and in a page-WAL store every
+        // extra page is another logged frame and another page folded at the
+        // next checkpoint -- measured as a 26% frame increase over the insert
+        // path at 0.9, which moved a whole checkpoint into the next build
+        // stage. SQLite's `CREATE INDEX` fills its index pages the same way.
+        //
+        // SACRIFICE (Law 4): a packed leaf has no slack, so the first live
+        // write that lands inside one splits it. That is the ordinary split
+        // path, once per leaf, and the run was just built from data that was
+        // already there; the alternative was paying the extra page for every
+        // leaf up front, whether or not anything ever writes to it.
+        let packed = crate::bulk::pack_range_pooled(
+            self.pool, self.tree_id, sorted, 1.0, scratch_dir, last_next)?;
+        // The stream is the caller's; `pack_range_pooled` recomputes all three
+        // of these from the bytes it actually packed, and a disagreement means
+        // the interval that was proved empty is not the interval that was
+        // packed.
+        if packed.rows != expected_rows
+            || packed.min.as_deref() != Some(min)
+            || packed.max.as_deref() != Some(max) {
+            return Err(Error::Corrupt { page_no: packed.root,
+                why: "packed range disagrees with its sorted-stream manifest" });
+        }
+        crate::verify::verify_range_pool(self.pool, packed.root, self.tree_id,
+            packed.rows, min, max, last_next)?;
+        let candidate = self.build_graft_candidate(&boundary, &packed)?;
+        let candidate_min = candidate.min.clone();
+        let retired = self.install_graft(&boundary, candidate.root, &candidate_min)?;
+        // The append hint names a leaf this graft may have just retired, and a
+        // retired page number can be handed straight back out by the allocator.
+        // `fast_path_leaf`'s checks are about shape, not identity, so a
+        // recycled leaf of the SAME tree could pass all five. The hint has no
+        // reason to survive a graft; drop it rather than rely on those checks.
+        self.last_leaf.set(None);
         Ok(retired)
     }
 
@@ -1841,7 +1960,7 @@ impl<'p> BTree<'p> {
         if pos > 0 { windows[nw] = (pos - 1, 2); nw += 1; }
         let usable = P - crate::page::HEADER_LEN;
 
-        for &(start, count) in &windows[..nw] {
+        'windows: for &(start, count) in &windows[..nw] {
             // Gather the window. One sibling pinned at a time; its image is
             // copied into scratch before the pin is dropped.
             win.clear();
@@ -1856,8 +1975,20 @@ impl<'p> BTree<'p> {
                 }
                 let r = self.pool.get(no)?;
                 let p = open_cached(&r, no)?;
-                if p.kind() != PageKind::Leaf || p.tree_id() != self.tree_id {
+                if p.tree_id() != self.tree_id {
                     return Err(Error::Corrupt { page_no: no, why: "redistribution sibling identity" });
+                }
+                if p.kind() != PageKind::Leaf {
+                // A grafted run enters the tree as a SUBTREE under a single
+                // separator, so a leaf's sibling under the same parent can be
+                // an interior page: a tree with a graft in it is no longer
+                // uniformly deep. Redistribution moves leaf CELLS between
+                // neighbours and has nothing to say about a subtree, so skip
+                // this window and let the ordinary split run -- it never
+                // needed the neighbours. Refusing here turned an ordinary
+                // insert next to a bulk-built index into `Corrupt`, with
+                // nothing actually corrupt (kernel/tests/range_graft.rs).
+                    continue 'windows;
                 }
                 let idx = if nsib == 0 { frame::SIB0 } else { frame::SIB1 };
                 sib[nsib * P..nsib * P + P].copy_from_slice(&r[..]);
@@ -2058,12 +2189,25 @@ impl<'p> BTree<'p> {
         if pos+1<child_ids.len(){windows.push((pos,2));}
         if pos>0{windows.push((pos-1,2));}
         let usable=PAGE_SIZE-crate::page::HEADER_LEN;
-        for (start,count) in windows{
+        'windows: for (start,count) in windows{
             let mut all=Vec::new();let mut next=0;
             for &no in &child_ids[start..start+count]{
                 if no==leaf{all.extend(current.iter().cloned());next=current_next;}
                 else{let r=self.pool.get(no)?;let p=open_cached(&r,no)?;
-                    if p.kind()!=PageKind::Leaf || p.tree_id()!=self.tree_id{return Err(Error::Corrupt{page_no:no,why:"redistribution sibling identity"});}
+                    if p.tree_id()!=self.tree_id{return Err(Error::Corrupt{page_no:no,why:"redistribution sibling identity"});}
+                    if p.kind()!=PageKind::Leaf{
+                    // A grafted run enters the tree as a SUBTREE under a
+                    // single separator, so a leaf's sibling under the same
+                    // parent can be an interior page: a tree with a graft in
+                    // it is no longer uniformly deep. Redistribution moves
+                    // leaf CELLS between neighbours and has nothing to say
+                    // about a subtree, so skip this window and let the
+                    // ordinary split run -- it never needed the neighbours.
+                    // Refusing here turned an ordinary insert next to a
+                    // bulk-built index into `Corrupt`, with nothing actually
+                    // corrupt (kernel/tests/range_graft.rs).
+                        continue 'windows;
+                    }
                     all.extend((0..p.nentries()).map(|i|p.slot(i).to_vec()));next=p.next_leaf();}
             }
             let sizes:Vec<usize>=all.iter().map(|r|r.len()+4).collect();
@@ -2261,14 +2405,27 @@ impl<'p> BTree<'p> {
             'attempt: for merge_only in [true,false] {
                 for &start in &starts {
                     let left=ids[start];let right=ids[start+1];
+                    // A grafted run enters the tree as a SUBTREE under one
+                    // separator, so two children of the same parent need not
+                    // be the same kind any more: an underfull leaf can sit
+                    // beside a bulk-built subtree root. Merging or
+                    // redistributing across that boundary is not defined --
+                    // their records are not the same shape and they are not
+                    // the same height -- so this PAIR is declined and the next
+                    // candidate tried. Refusing outright failed an ordinary
+                    // delete next to a bulk-built index with `Corrupt` and
+                    // nothing corrupt; a declined pair only leaves a node
+                    // underfull, which `!changed` already tolerates.
                     let (mut all, left_link) = {
                         let r=self.pool.get(left)?;let p=open_cached(&r,left)?;
-                        if p.kind()!=kind || p.tree_id()!=self.tree_id {return Err(Error::Corrupt {page_no:left,why:"delete left sibling identity"});}
+                        if p.tree_id()!=self.tree_id {return Err(Error::Corrupt {page_no:left,why:"delete left sibling identity"});}
+                        if p.kind()!=kind {continue;}
                         ((0..p.nentries()).map(|i|p.slot(i).to_vec()).collect::<Vec<_>>(),p.next_leaf())
                     };
                     let (right_link, right_birth) = {
                         let r=self.pool.get(right)?;let p=open_cached(&r,right)?;
-                        if p.kind()!=kind || p.tree_id()!=self.tree_id {return Err(Error::Corrupt {page_no:right,why:"delete right sibling identity"});}
+                        if p.tree_id()!=self.tree_id {return Err(Error::Corrupt {page_no:right,why:"delete right sibling identity"});}
+                        if p.kind()!=kind {continue;}
                         if kind==PageKind::Interior {all.push(enc_interior(validated_key(&parent_recs[start]),p.child0()));}
                         all.extend((0..p.nentries()).map(|i|p.slot(i).to_vec()));(p.next_leaf(),p.lsn())
                     };
@@ -2496,6 +2653,7 @@ impl<'p> BTree<'p> {
             buf: std::collections::VecDeque::new(),
             served: 0,
             path,
+            pin: None,
         })
     }
 
@@ -2646,6 +2804,7 @@ impl RangeIter<'_> {
     /// count-only queries. One pin and one validation per leaf, zero allocs,
     /// same sibling-chain, cycle and tree-id checks as `next()`.
     pub fn for_each_ref(mut self, mut f: impl FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
+        self.pin = None;
         // Drain anything already buffered by earlier `next()` calls first.
         while let Some((k, v, is_marker)) = self.buf.pop_front() {
             if is_marker {
@@ -2686,11 +2845,137 @@ impl RangeIter<'_> {
             if !self.advance()? { return Ok(()); }
         }
     }
+
+    /// Advance to the first remaining key >= `target` and return borrowed
+    /// slices into the pinned leaf (or into a resolved overflow buffer).
+    /// The iterator stays on that record so a later, still-greater target
+    /// can resume without skipping it. `Ok(None)` means the range is empty
+    /// or every remaining key is below `target`.
+    ///
+    /// Does not drain in-leaf records into `Vec`s. Overflow values still
+    /// allocate, because they do not live in the pinned leaf. Reuses
+    /// `advance()` and the validated-bit `open_cached` path that
+    /// `for_each_ref` uses.
+    pub fn peek_at_or_after(&mut self, target: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.position_at_or_after(target)?;
+        self.current_ref()
+    }
+
+    fn position_at_or_after(&mut self, target: &[u8]) -> Result<()> {
+        loop {
+            let skip_buf = matches!(self.buf.front(), Some((k, _, _)) if k.as_slice() < target);
+            if skip_buf {
+                self.buf.pop_front();
+                continue;
+            }
+            break;
+        }
+        if matches!(self.buf.front(), Some((k, _, _)) if k.as_slice() >= target) {
+            if let Some((_, v, true)) = self.buf.front() {
+                let marker = v.clone();
+                let (k, _, _) = self.buf.pop_front().unwrap();
+                let val = read_overflow(self.pool, &marker)?;
+                self.buf.push_front((k, val, false));
+            }
+            return Ok(());
+        }
+
+        loop {
+            if self.done {
+                self.pin = None;
+                return Ok(());
+            }
+            if self.pin.is_none() {
+                self.pin = Some(self.pool.get(self.page)?);
+            }
+
+            enum Step {
+                Stay(usize),
+                Overflow { idx: usize, key: Vec<u8>, marker: Vec<u8> },
+                NextLeaf,
+                Corrupt,
+            }
+            let step = {
+                let pin = self.pin.as_ref().unwrap();
+                let p = open_cached(pin, self.page)?;
+                if p.tree_id() != self.tree_id {
+                    Step::Corrupt
+                } else {
+                    let n = p.nentries();
+                    let mut idx = self.idx;
+                    if idx < n {
+                        let (key0, _, _) = validated_leaf(p.slot(idx));
+                        if key0 < target {
+                            idx = lower_bound(&p, target)?.max(idx);
+                        }
+                    }
+                    if idx < n {
+                        let (key, value, is_marker) = validated_leaf(p.slot(idx));
+                        if is_marker {
+                            Step::Overflow { idx, key: key.to_vec(), marker: value.to_vec() }
+                        } else {
+                            Step::Stay(idx)
+                        }
+                    } else {
+                        Step::NextLeaf
+                    }
+                }
+            };
+            match step {
+                Step::Corrupt => {
+                    self.pin = None;
+                    self.done = true;
+                    return Err(Error::Corrupt {
+                        page_no: self.page,
+                        why: "sibling page belongs to another tree",
+                    });
+                }
+                Step::Stay(idx) => {
+                    self.idx = idx;
+                    return Ok(());
+                }
+                Step::Overflow { idx, key, marker } => {
+                    self.idx = idx + 1;
+                    self.pin = None;
+                    let val = read_overflow(self.pool, &marker)?;
+                    self.buf.push_front((key, val, false));
+                    return Ok(());
+                }
+                Step::NextLeaf => {
+                    self.pin = None;
+                    if !self.advance()? {
+                        self.done = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn current_ref(&self) -> Result<Option<(&[u8], &[u8])>> {
+        if let Some((k, v, is_marker)) = self.buf.front() {
+            debug_assert!(!*is_marker, "peek resolves overflow markers before yielding");
+            return Ok(Some((k.as_slice(), v.as_slice())));
+        }
+        if self.done {
+            return Ok(None);
+        }
+        let Some(pin) = self.pin.as_ref() else {
+            return Ok(None);
+        };
+        let p = open_cached(pin, self.page)?;
+        if self.idx >= p.nentries() {
+            return Ok(None);
+        }
+        let (key, value, is_marker) = validated_leaf(p.slot(self.idx));
+        debug_assert!(!is_marker, "in-leaf overflow must have been parked in buf");
+        Ok(Some((key, value)))
+    }
 }
 
 impl Iterator for RangeIter<'_> {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
     fn next(&mut self) -> Option<Self::Item> {
+        self.pin = None;
         loop {
             if let Some((k, v, is_marker)) = self.buf.pop_front() {
                 if is_marker {
@@ -3024,6 +3309,174 @@ mod tests {
         let t = BTree::create(&pool, 1, &last_leaf, &fast_path_hits, &fast_path_attempts).unwrap();
         assert_eq!(t.range(&[]).unwrap().count(), 0);
         assert_eq!(t.range(&42u64.to_be_bytes()).unwrap().count(), 0);
+    }
+
+    fn peek_owned(iter: &mut RangeIter<'_>, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        iter.peek_at_or_after(target)
+            .unwrap()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+    }
+
+    fn collect_next(t: &BTree<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        t.range(&[]).unwrap().collect::<Result<Vec<_>>>().unwrap()
+    }
+
+    /// `peek_at_or_after` on a sequence of ascending targets must return the
+    /// same key/value as the first allocating `next()` record with key >= target.
+    #[test]
+    fn peek_at_or_after_matches_allocating_iterator_on_random_trees() {
+        let (pool, _d) = scratch_pool(32);
+        let last_leaf = Cell::new(None);
+        let hits = Cell::new(0);
+        let tries = Cell::new(0);
+        let mut t = BTree::create(&pool, 1, &last_leaf, &hits, &tries).unwrap();
+        let n = 800u64;
+        let scatter = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes().to_vec();
+        for i in 0..n {
+            t.insert(&scatter(i), &i.to_le_bytes()).unwrap();
+        }
+        let all = collect_next(&t);
+        assert_eq!(all.len(), n as usize);
+
+        let mut targets: Vec<Vec<u8>> = Vec::new();
+        targets.push(Vec::new());
+        for (i, (k, _)) in all.iter().enumerate() {
+            targets.push(k.clone());
+            if i + 1 < all.len() {
+                let mut mid = k.clone();
+                if let Some(last) = mid.last_mut() {
+                    *last = last.saturating_add(1);
+                }
+                if mid.as_slice() < all[i + 1].0.as_slice() {
+                    targets.push(mid);
+                }
+            }
+        }
+        targets.push(vec![0xff; 16]);
+        targets.sort();
+        targets.dedup();
+
+        let mut peek = t.range(&[]).unwrap();
+        for target in &targets {
+            let expected = all
+                .iter()
+                .find(|(k, _)| k.as_slice() >= target.as_slice())
+                .cloned();
+            assert_eq!(peek_owned(&mut peek, target), expected, "target {target:?}");
+        }
+    }
+
+    #[test]
+    fn peek_at_or_after_crosses_leaf_boundaries() {
+        let (pool, _d) = scratch_pool(16);
+        let last_leaf = Cell::new(None);
+        let hits = Cell::new(0);
+        let tries = Cell::new(0);
+        let mut t = BTree::create(&pool, 1, &last_leaf, &hits, &tries).unwrap();
+        let n = 2_000u64;
+        for i in 0..n {
+            t.insert(&i.to_be_bytes(), &i.to_le_bytes()).unwrap();
+        }
+        let all = collect_next(&t);
+        assert_eq!(all.len(), n as usize);
+
+        let mut peek = t.range(&[]).unwrap();
+        for (k, v) in &all {
+            assert_eq!(peek_owned(&mut peek, k).as_ref(), Some(&(k.clone(), v.clone())));
+        }
+        // Jumping onto a key that is not first in its leaf, then walking to the end.
+        let mid = &all[all.len() / 2].0;
+        let mut peek = t.range(&[]).unwrap();
+        let got = peek_owned(&mut peek, mid);
+        assert_eq!(got.as_ref(), Some(&all[all.len() / 2]));
+        let last = &all[all.len() - 1].0;
+        assert_eq!(peek_owned(&mut peek, last).as_ref(), Some(&all[all.len() - 1]));
+    }
+
+    #[test]
+    fn peek_at_or_after_target_beyond_the_end_is_none() {
+        let (pool, _d) = scratch_pool(8);
+        let last_leaf = Cell::new(None);
+        let hits = Cell::new(0);
+        let tries = Cell::new(0);
+        let mut t = BTree::create(&pool, 1, &last_leaf, &hits, &tries).unwrap();
+        for i in 0..200u64 {
+            t.insert(&i.to_be_bytes(), b"v").unwrap();
+        }
+        let mut peek = t.range(&[]).unwrap();
+        assert!(peek_owned(&mut peek, &u64::MAX.to_be_bytes()).is_none());
+        assert!(peek_owned(&mut peek, &u64::MAX.to_be_bytes()).is_none());
+        let mut peek = t.range(&500u64.to_be_bytes()).unwrap();
+        assert!(peek_owned(&mut peek, &u64::MAX.to_be_bytes()).is_none());
+    }
+
+    #[test]
+    fn peek_at_or_after_on_an_empty_range_is_none() {
+        let (pool, _d) = scratch_pool(8);
+        let last_leaf = Cell::new(None);
+        let hits = Cell::new(0);
+        let tries = Cell::new(0);
+        let t = BTree::create(&pool, 1, &last_leaf, &hits, &tries).unwrap();
+        let mut peek = t.range(&[]).unwrap();
+        assert!(peek_owned(&mut peek, b"").is_none());
+        assert!(peek_owned(&mut peek, b"z").is_none());
+        let mut peek = t.range(b"mid").unwrap();
+        assert!(peek_owned(&mut peek, b"mid").is_none());
+    }
+
+    /// Sequential peeks of every key must pin each leaf once, not once per row.
+    #[test]
+    fn peek_at_or_after_pool_gets_are_per_leaf_not_per_row() {
+        let (pool, _d) = scratch_pool(32);
+        let last_leaf = Cell::new(None);
+        let hits = Cell::new(0);
+        let tries = Cell::new(0);
+        let mut t = BTree::create(&pool, 1, &last_leaf, &hits, &tries).unwrap();
+        let n = 3_000u64;
+        for i in 0..n {
+            t.insert(&i.to_be_bytes(), &i.to_le_bytes()).unwrap();
+        }
+        let keys: Vec<_> = collect_next(&t).into_iter().map(|(k, _)| k).collect();
+        let before = pool.stats();
+        let mut peek = t.range(&[]).unwrap();
+        for k in &keys {
+            assert!(peek_owned(&mut peek, k).is_some());
+        }
+        let after = pool.stats();
+        let gets = (after.hits + after.misses) - (before.hits + before.misses);
+        println!("peek_at_or_after over {n} rows: {gets} pool gets");
+        assert!(
+            gets < n / 8,
+            "peek over {n} rows charged {gets} pool gets; expected O(leaves)"
+        );
+    }
+
+    #[test]
+    fn peek_at_or_after_does_not_allocate_per_row() {
+        let (pool, _d) = scratch_pool(32);
+        let last_leaf = Cell::new(None);
+        let hits = Cell::new(0);
+        let tries = Cell::new(0);
+        let mut t = BTree::create(&pool, 1, &last_leaf, &hits, &tries).unwrap();
+        let n = 2_000u64;
+        for i in 0..n {
+            t.insert(&i.to_be_bytes(), &i.to_le_bytes()).unwrap();
+        }
+        let (_, allocs, bytes) = crate::test_alloc::measured(|| {
+            let mut peek = t.range(&[]).unwrap();
+            for i in 0..n {
+                let key = i.to_be_bytes();
+                let hit = peek.peek_at_or_after(&key).unwrap();
+                let (k, v) = hit.expect("key present");
+                assert_eq!(k, key);
+                assert_eq!(v, i.to_le_bytes());
+            }
+        });
+        println!("peek_at_or_after over {n} rows: {allocs} allocations, {bytes} bytes");
+        assert!(
+            allocs < 32,
+            "peek over {n} in-leaf rows allocated {allocs} times; expected O(1)"
+        );
     }
 
     #[test]

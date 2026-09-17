@@ -93,7 +93,7 @@ pub(super) fn descriptor(i: &IndexInfo) -> Result<()> {
     if i.family != IndexFamily::SpatialPoint
         || i.kind != Kind::Point
         || i.unique
-        || i.encoding_version != 1
+        || !matches!((i.encoding_version, i.tree), (1, None) | (2, Some(_)))
     {
         return Err(corrupt("spatial point descriptor family/options"));
     }
@@ -159,7 +159,7 @@ pub(super) fn build_point_entry(
 /// new coordinates are rejected before the primary row is published.
 pub(super) fn maintain_point(
     db: &mut Database,
-    i: &IndexInfo,
+    i: &mut IndexInfo,
     id: EntityId,
     old: Option<&Value>,
     new: Option<&Value>,
@@ -180,14 +180,14 @@ pub(super) fn maintain_point(
     }
     match (old, new) {
         (Some(old), Some(new)) if old.key == new.key => {
-            db.writer()?.put(&new.key, &new.value)?;
+            db.index_put(i, &new.key, &new.value)?;
         }
         (old, new) => {
             if let Some(old) = old {
-                db.writer()?.delete(&old.key)?;
+                db.index_delete(i, &old.key)?;
             }
             if let Some(new) = new {
-                db.writer()?.put(&new.key, &new.value)?;
+                db.index_put(i, &new.key, &new.value)?;
             }
         }
     }
@@ -451,7 +451,7 @@ impl Database {
                     for &(lo, hi) in ranges {
                         let mut start = prefix.clone();
                         start.extend((lo as u32).to_be_bytes());
-                        for row in self.store()?.range(&start)? {
+                        for row in self.index_range(index, &start)?.into_iter().flatten() {
                             let (key, value) = row?;
                             if !key.starts_with(&prefix) {
                                 break;
@@ -475,7 +475,7 @@ impl Database {
                         }
                     }
                 } else {
-                    for row in self.store()?.range(&prefix)? {
+                    for row in self.index_range(index, &prefix)?.into_iter().flatten() {
                         let (key, value) = row?;
                         if !key.starts_with(&prefix) {
                             break;
@@ -502,8 +502,7 @@ impl Database {
                         continue;
                     };
                     let stored = self
-                        .store()?
-                        .get(&entry.key)?
+                        .index_get(index, &entry.key)?
                         .ok_or_else(|| corrupt("ready spatial point posting is missing"))?;
                     if stored.as_slice() != entry.value {
                         return Err(corrupt("ready spatial point posting differs from primary"));

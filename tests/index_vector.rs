@@ -12,7 +12,55 @@ use kernel::{
     store::{Config, SyncMode},
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::{
+    alloc::{GlobalAlloc, Layout as AllocationLayout, System},
+    cell::Cell,
+    collections::BTreeMap,
+};
+
+thread_local! {
+    static TRACK: Cell<bool> = const { Cell::new(false) };
+    static COUNT: Cell<usize> = const { Cell::new(0) };
+    static BYTES: Cell<usize> = const { Cell::new(0) };
+}
+struct Alloc;
+unsafe impl GlobalAlloc for Alloc {
+    unsafe fn alloc(&self, l: AllocationLayout) -> *mut u8 {
+        TRACK
+            .try_with(|t| {
+                if t.get() {
+                    COUNT.with(|n| n.set(n.get() + 1));
+                    BYTES.with(|n| n.set(n.get() + l.size()));
+                }
+            })
+            .ok();
+        System.alloc(l)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: AllocationLayout) {
+        System.dealloc(p, l)
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: AllocationLayout, n: usize) -> *mut u8 {
+        TRACK
+            .try_with(|t| {
+                if t.get() {
+                    COUNT.with(|c| c.set(c.get() + 1));
+                    BYTES.with(|b| b.set(b.get() + n));
+                }
+            })
+            .ok();
+        System.realloc(p, l, n)
+    }
+}
+#[global_allocator]
+static ALLOC: Alloc = Alloc;
+fn measured<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
+    COUNT.with(|c| c.set(0));
+    BYTES.with(|b| b.set(0));
+    TRACK.with(|t| t.set(true));
+    let v = f();
+    TRACK.with(|t| t.set(false));
+    (v, COUNT.with(Cell::get), BYTES.with(Cell::get))
+}
 
 fn cfg() -> Config {
     Config {
@@ -616,8 +664,75 @@ fn all_candidate_top_k_costs_one_pass_not_a_descent_per_row() {
     println!("all-candidate top-k over {N} rows: {spent} pool accesses");
     assert_hits(&hits, &oracle(&rows, &q, VectorMetric::Cosine, None, 10));
     assert!(
-        spent <= (N as f64 * 1.2) as u64,
-        "top-k over {N} rows charged {spent} pool accesses; a scan must stay under 1.2 per row"
+        spent <= N / 8,
+        "top-k over {N} rows charged {spent} pool accesses; expected O(leaves), not O(rows)"
+    );
+}
+
+/// An all-rows top-k must not allocate a key/value Vec per candidate. After the
+/// zero-alloc peek conversion the count is O(1) + O(k) (heap + result), not
+/// O(rows). The thread-local counter is the same pattern as codec_allocations.
+#[test]
+fn all_candidate_top_k_allocations_are_independent_of_row_count() {
+    let t = tempfile::tempdir().unwrap();
+    let mut db = Database::create(t.path().join("db"), cfg()).unwrap();
+    let c = db
+        .create_collection(
+            "c",
+            vec![("v".into(), Kind::Vector(4))],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    const N: u64 = 2000;
+    let mut rows = BTreeMap::new();
+    for i in 0..N {
+        let x = i as f32;
+        let vector = [x, x * 0.5, 1.0 - x, (i % 7) as f32];
+        let id = db
+            .put(c, &format!("k{i:05}"), &json!({ "v": vector }))
+            .unwrap();
+        rows.insert(id, vector.to_vec());
+        if i % 256 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let index = db.create_exact_vector_index(c, "v", "v").unwrap();
+    while !db.build_index_step(index, 255).unwrap() {
+        db.commit().unwrap();
+    }
+    db.commit().unwrap();
+
+    let q = [1.0f32, 0.0, 0.0, 0.0];
+    query(
+        &db,
+        index,
+        &q,
+        VectorMetric::Cosine,
+        10,
+        VectorCandidates::All,
+        N as usize,
+    )
+    .unwrap();
+
+    let k = 10usize;
+    let (hits, allocs, bytes) = measured(|| {
+        query(
+            &db,
+            index,
+            &q,
+            VectorMetric::Cosine,
+            k,
+            VectorCandidates::All,
+            N as usize,
+        )
+        .unwrap()
+    });
+    println!("all-candidate top-k over {N} rows: {allocs} allocations, {bytes} bytes");
+    assert_hits(&hits, &oracle(&rows, &q, VectorMetric::Cosine, None, k));
+    assert!(
+        allocs < 64 + 16 * k,
+        "top-k over {N} rows allocated {allocs} times; expected O(1)+O(k), not O(rows)"
     );
 }
 
@@ -717,7 +832,7 @@ fn ordinal_moved_mid_collection_is_exact_and_still_one_pass() {
     let spent = db.pool_accesses().unwrap() - before;
     println!("mixed-ordinal top-k over {n} rows: {spent} pool accesses");
     assert!(
-        spent <= (n as f64 * 1.2) as u64,
-        "mixed-ordinal top-k over {n} rows charged {spent} pool accesses"
+        spent <= n / 8,
+        "mixed-ordinal top-k over {n} rows charged {spent} pool accesses; expected O(leaves)"
     );
 }

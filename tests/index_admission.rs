@@ -112,7 +112,9 @@ fn one_intact_future_index_encoding_replica_refuses_before_mutation() {
         let mut descriptor = raw.get(&key).unwrap().unwrap();
         assert_eq!(&descriptor[..8], b"E4IDX01\0");
         // Packet header is ten bytes; encoding version follows id/u32/family.
-        descriptor[23..25].copy_from_slice(&2u16.to_be_bytes());
+        // Version 2 is the per-index-tree scalar/spatial layout THIS binary
+        // writes, so the unknown-version probe moved up to 3.
+        descriptor[23..25].copy_from_slice(&3u16.to_be_bytes());
         reseal(&mut descriptor);
         raw.put(&key, &descriptor).unwrap();
         raw.commit().unwrap();

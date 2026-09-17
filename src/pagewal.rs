@@ -645,7 +645,8 @@ fn snapshot_store(pager:&Arc<Pager>,lock:Option<Arc<File>>,dir:&Path,cache:usize
     let pool=PageWalStore::new_pool(view,cache,false)?;
     let mut out=PageWalStore{pager:None,pool,root:0,last:Cell::new(None),hits:Cell::new(0),attempts:Cell::new(0),
         poisoned:false,dirty:false,_lock:lock,dir:dir.into(),cache,slot,limits:(u64::MAX,u64::MAX,usize::MAX),
-        reader_files:Some((pager.data.clone(),pager.wal.clone()))};
+        reader_files:Some((pager.data.clone(),pager.wal.clone())),
+        hints:std::array::from_fn(|_|(Cell::new(0),Cell::new(None))),hint_turn:Cell::new(0)};
     out.load_header()?;Ok(out)
 }
 // A persisted reader bound is enforced on the slot index once the slot is
@@ -731,10 +732,20 @@ pub fn set_create_compact_cells(on:bool)->Result<bool>{
     Ok(format::set_create_features(if on {COMPACT_CELLS} else {0})? & COMPACT_CELLS != 0)
 }
 
+/// Append hints for trees other than the primary one, one slot per tree the
+/// handle has touched recently. A hint is pure speed -- `fast_path_leaf`
+/// re-checks the leaf's shape before believing it -- so evicting a slot costs
+/// one ordinary descent and can never cost an answer. Eight slots: the catalog
+/// admits 64 indexes per collection, but a write touches at most a handful of
+/// them, and the array keeps `tree_hint` a borrow of `self` rather than a map
+/// lookup that would have to hand out a reference into a `RefCell`.
+const TREE_HINTS: usize = 8;
+
 pub struct PageWalStore {
     pager:Option<Arc<Pager>>,pool:BufferPool,root:u32,last:Cell<Option<u32>>,hits:Cell<u64>,attempts:Cell<u64>,
     poisoned:bool,dirty:bool,_lock:Option<Arc<File>>,dir:PathBuf,cache:usize,slot:Option<ReaderSlot>,
     limits:(u64,u64,usize),reader_files:Option<(Arc<dyn FileIo>,Arc<dyn FileIo>)>,
+    hints:[(Cell<u16>,Cell<Option<u32>>);TREE_HINTS],hint_turn:Cell<usize>,
 }
 impl PageWalStore {
     pub fn open(dir:&Path,create:bool,cache:usize)->Result<Self>{
@@ -798,7 +809,8 @@ impl PageWalStore {
         Self::install_codec(&pool,features);
         let mut s=Self{pager:Some(pager),pool,root:0,last:Cell::new(None),hits:Cell::new(0),attempts:Cell::new(0),
             poisoned:false,dirty:false,_lock:Some(Arc::new(lock)),dir:dir.into(),cache,slot:None,
-            limits:(u64::MAX,u64::MAX,usize::MAX),reader_files:None};
+            limits:(u64::MAX,u64::MAX,usize::MAX),reader_files:None,
+            hints:std::array::from_fn(|_|(Cell::new(0),Cell::new(None))),hint_turn:Cell::new(0)};
         if create {
             if s.pool.page_count()!=2{return Err(bad("create found unexpected pages"));}
             // Creation: coordination files and hint first, then the empty
@@ -881,6 +893,77 @@ impl PageWalStore {
     /// working tree.
     pub fn range(&self,from:&[u8])->Result<RangeIter<'_>>{self.ready()?;self.tree().range(from)}
     fn tree(&self)->BTree<'_>{BTree::open(&self.pool,1,self.root,&self.last,&self.hits,&self.attempts)}
+    /// The append hint for a tree other than the primary one. A miss claims a
+    /// slot round-robin and starts that tree with no hint, which is exactly
+    /// the state a freshly opened handle is in.
+    fn tree_hint(&self,tree_id:u16)->&Cell<Option<u32>>{
+        debug_assert_ne!(tree_id,1,"tree 1 keeps its own dedicated hint");
+        for (id,hint) in &self.hints { if id.get()==tree_id {return hint;} }
+        for (id,hint) in &self.hints { if id.get()==0 {id.set(tree_id);hint.set(None);return hint;} }
+        let at=self.hint_turn.get()%TREE_HINTS;self.hint_turn.set(at+1);
+        let (id,hint)=&self.hints[at];id.set(tree_id);hint.set(None);hint
+    }
+    fn other(&self,tree_id:u16,root:u32)->BTree<'_>{
+        BTree::open(&self.pool,tree_id,root,self.tree_hint(tree_id),&self.hits,&self.attempts)
+    }
+    /// Create an empty tree and return its root. Ordinary pooled page, so the
+    /// new root is published by the caller's commit like any other write.
+    pub fn tree_create(&mut self,tree_id:u16)->Result<u32>{
+        self.writable()?;self.fold_committed_wal_if_at_cap()?;self.dirty=true;
+        let r=BTree::create(&self.pool,tree_id,self.tree_hint(tree_id),&self.hits,&self.attempts).map(|t|t.root());
+        match r {Ok(root)=>Ok(root),Err(e)=>{self.poisoned=true;Err(e)}}
+    }
+    /// Read one key from a tree the caller names. `root == 0` is an empty
+    /// tree, which every read answers without touching a page.
+    pub fn tree_get(&self,tree_id:u16,root:u32,k:&[u8])->Result<Option<Vec<u8>>>{
+        self.ready()?;if root==0 {return Ok(None);}
+        self.other(tree_id,root).get(k)
+    }
+    /// Ascending records of a named tree from `from`. An empty tree yields an
+    /// empty iterator, built over the primary root's empty-range contract.
+    pub fn tree_range(&self,tree_id:u16,root:u32,from:&[u8])->Result<Option<RangeIter<'_>>>{
+        self.ready()?;if root==0 {return Ok(None);}
+        self.other(tree_id,root).range(from).map(Some)
+    }
+    /// Insert into a named tree; returns the tree's root AFTER the insert. The
+    /// root changes when the height grows, and the caller must persist the new
+    /// value in the SAME transaction -- for an index that is its descriptor,
+    /// which is another record of this same commit.
+    pub fn tree_put(&mut self,tree_id:u16,root:u32,k:&[u8],v:&[u8])->Result<u32>{
+        self.writable()?;self.fold_committed_wal_if_at_cap()?;self.dirty=true;
+        let r={let mut t=self.other(tree_id,root);t.insert(k,v).map(|_|t.root())};
+        match r {Ok(root)=>Ok(root),Err(e)=>{self.poisoned=true;Err(e)}}
+    }
+    /// Delete from a named tree; returns (found, root after the delete).
+    pub fn tree_delete(&mut self,tree_id:u16,root:u32,k:&[u8])->Result<(bool,u32)>{
+        self.writable()?;if root==0 {return Ok((false,0));}
+        self.fold_committed_wal_if_at_cap()?;self.dirty=true;
+        let r={let mut t=self.other(tree_id,root);t.delete(k).map(|yes|(yes,t.root()))};
+        match r {Ok(out)=>Ok(out),Err(e)=>{self.poisoned=true;Err(e)}}
+    }
+    /// Return an emptied tree's last page to the freelist. Refused unless the
+    /// root really is an empty leaf, so a mis-sequenced drop cannot hand a
+    /// live page back to the allocator.
+    pub fn tree_free_root(&mut self,tree_id:u16,root:u32)->Result<()>{
+        self.writable()?;if root==0 {return Ok(());}
+        let empty={let r=self.pool.get(root)?;let p=PageRef::open_resident(&r,root)?;
+            p.kind()==PageKind::Leaf && p.tree_id()==tree_id && p.nentries()==0};
+        if !empty {return Err(bad("freeing a per-index tree root that is not an empty leaf"));}
+        self.dirty=true;
+        let r=self.pool.free_page(root);
+        if r.is_err() {self.poisoned=true;}
+        for (id,hint) in &self.hints { if id.get()==tree_id {id.set(0);hint.set(None);} }
+        r.map_err(Error::from)
+    }
+    /// Pack a sorted stream into a fresh, EMPTY tree bottom-up, through the
+    /// ordinary pool. Returns `(root, rows)`; publication is the caller's
+    /// commit, exactly as for `tree_put`.
+    pub fn tree_pack<I>(&mut self,tree_id:u16,sorted:I,fill:f32,scratch:&Path)->Result<(u32,u64)>
+    where I:Iterator<Item=kernel::Result<(Vec<u8>,Vec<u8>,bool)>> {
+        self.writable()?;self.fold_committed_wal_if_at_cap()?;self.dirty=true;
+        let r=kernel::bulk::pack_tree_pooled(&self.pool,tree_id,sorted,fill,scratch);
+        match r {Ok(out)=>Ok(out),Err(e)=>{self.poisoned=true;Err(e.into())}}
+    }
     fn ready(&self)->Result<()>{if self.poisoned {Err(Error::StorePoisoned)}else{Ok(())}}
     fn writable(&self)->Result<()>{self.ready()?;if self.pager.is_none(){Err(Error::ReadOnly)}else{Ok(())}}
     fn load_header(&mut self)->Result<()> {
