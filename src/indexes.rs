@@ -886,6 +886,39 @@ impl Database {
         })();
         self.finish(result)
     }
+    fn sort_scratch(&self) -> std::path::PathBuf {
+        // Spill under TMPDIR (tests pin it) in a per-database subdirectory.
+        let mut dir = std::env::temp_dir();
+        dir.push("e4-index-sort");
+        dir.push(self.path.file_name().unwrap_or_default());
+        dir
+    }
+    fn scan_collection_rows(
+        &self,
+        collection: CollectionId,
+        mut f: impl FnMut(EntityId, &[u8]) -> Result<()>,
+    ) -> Result<u64> {
+        let p = prefix(0x40, collection);
+        let mut last = 0u64;
+        for row in self.store()?.range(&p)? {
+            let (key, value) = row?;
+            if !key.starts_with(&p) {
+                break;
+            }
+            let eid = row_id(&key)?;
+            f(eid, &value)?;
+            last = eid.sequence;
+        }
+        Ok(last)
+    }
+    fn scalar_value_bytes<'a>(&self, i: &IndexInfo, key: &'a [u8]) -> Result<&'a [u8]> {
+        let p = ikey(SCALAR, i.id);
+        if !key.starts_with(&p) {
+            return Err(corrupt("sorted scalar key prefix"));
+        }
+        let (_, n) = scalar_key::decode(&i.kind, &key[p.len()..])?;
+        Ok(&key[p.len()..p.len() + n])
+    }
     /// Drive a late build to READY in bounded transactions, committing each
     /// chunk while the descriptor still says BUILDING.
     ///
@@ -910,6 +943,19 @@ impl Database {
     /// resumable policy already accepts; the difference was never visible to a
     /// reader, only to the WAL.
     pub fn build_index_to_ready(&mut self, id: IndexId, chunk_rows: usize) -> Result<usize> {
+        self.build_index_to_ready_capped(id, chunk_rows, None)
+    }
+    /// Same as `build_index_to_ready`, but stop after `max_commits` committed
+    /// insert groups and leave the descriptor BUILDING. Sort restarts from
+    /// scratch on the next call; already-written keys are overwritten or
+    /// skipped. Test hook for crash/resume, not part of the public contract.
+    #[doc(hidden)]
+    pub fn build_index_to_ready_capped(
+        &mut self,
+        id: IndexId,
+        chunk_rows: usize,
+        max_commits: Option<usize>,
+    ) -> Result<usize> {
         // A commit is a FULL barrier, and a barrier per 256 rows is the late
         // build's real constant. Measured at 200,000 rows on the reference Mac,
         // for byte-identical indexes: the two scalar builds took 20.8s
@@ -926,41 +972,141 @@ impl Database {
         // format admits; a refusal there is a genuinely too-small allowance and
         // is returned to the caller.
         const GROUP: usize = 16;
+        // Sorted runs pack into the WAL more densely than a random chunk, so
+        // start with a larger group. Allowance refusal still halves it.
+        const SORTED_GROUP: usize = 64;
         fn allowance(e: &Error) -> bool {
             matches!(e, Error::Kernel(kernel::Error::ResourceLimit(_)))
         }
-        let mut group = GROUP;
-        let mut chunks = 0;
-        loop {
-            let mut pending = 0;
-            let outcome = loop {
-                let ready = match self.build_index_step(id, chunk_rows) {
-                    Ok(ready) => ready,
-                    Err(e) if allowance(&e) && group > 1 => break Err(e),
-                    Err(e) => return Err(e),
-                };
-                chunks += 1;
-                pending += 1;
-                if ready || pending >= group {
-                    match self.commit() {
-                        Ok(()) => pending = 0,
+        let family = self.index_info(id)?.family;
+        let sorted = matches!(family, IndexFamily::Scalar | IndexFamily::SpatialPoint);
+        if !sorted {
+            let mut group = GROUP;
+            let mut chunks = 0;
+            loop {
+                let mut pending = 0;
+                let outcome = loop {
+                    let ready = match self.build_index_step(id, chunk_rows) {
+                        Ok(ready) => ready,
                         Err(e) if allowance(&e) && group > 1 => break Err(e),
                         Err(e) => return Err(e),
+                    };
+                    chunks += 1;
+                    pending += 1;
+                    if ready || pending >= group {
+                        match self.commit() {
+                            Ok(()) => pending = 0,
+                            Err(e) if allowance(&e) && group > 1 => break Err(e),
+                            Err(e) => return Err(e),
+                        }
                     }
-                }
-                if ready {
-                    break Ok(chunks);
-                }
-            };
-            match outcome {
-                Ok(chunks) => return Ok(chunks),
-                Err(_) => {
-                    self.rollback()?;
-                    chunks -= pending;
-                    group /= 2;
+                    if ready {
+                        break Ok(chunks);
+                    }
+                };
+                match outcome {
+                    Ok(chunks) => return Ok(chunks),
+                    Err(_) => {
+                        self.rollback()?;
+                        chunks -= pending;
+                        group /= 2;
+                    }
                 }
             }
         }
+        let mut group = SORTED_GROUP;
+        loop {
+            match self.build_sorted_once(id, chunk_rows, group, max_commits) {
+                Ok(chunks) => return Ok(chunks),
+                Err(e) if allowance(&e) && group > 1 => {
+                    self.rollback()?;
+                    group /= 2;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    /// Sort every derived key, then insert in ascending order. The sort is not
+    /// resumable (spill files die with the process); the insert is, by
+    /// skipping keys already committed. Cursor after a committed insert group
+    /// is the last entity sequence scanned — the whole collection — so a
+    /// crash restarts the sort and continues the insert.
+    fn build_sorted_once(
+        &mut self,
+        id: IndexId,
+        chunk_rows: usize,
+        group: usize,
+        max_commits: Option<usize>,
+    ) -> Result<usize> {
+        self.ready_write()?;
+        if !(1..=MAX_BATCH).contains(&chunk_rows) {
+            return Err(invalid("index batch must be 1..256"));
+        }
+        let mut i = self.index_info(id)?;
+        match i.state {
+            IndexState::Ready => return Ok(0),
+            IndexState::Dropping => return Err(invalid("index is dropping")),
+            IndexState::Building { .. } => {}
+        }
+        let mut sorter = super::index_sort::ExternalSorter::new(
+            &self.sort_scratch(),
+            super::index_sort::DEFAULT_BUDGET,
+        )?;
+        let max_seq = self.scan_collection_rows(i.collection, |eid, row| {
+            match i.family {
+                IndexFamily::Scalar => {
+                    let value = self.scalar_build_key(&i, row)?;
+                    sorter.push(skey(&i, &value, eid.sequence), Vec::new())?;
+                }
+                IndexFamily::SpatialPoint => {
+                    if let Some(point) =
+                        super::spatial_indexes::build_point_entry(self, &i, eid, row)?
+                    {
+                        sorter.push(point.key, point.value.to_vec())?;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        })?;
+        let mut merge = sorter.finish()?;
+        let mut pending = 0usize;
+        let mut groups = 0usize;
+        let mut commits = 0usize;
+        let mut prev_value: Option<Vec<u8>> = None;
+        while let Some((key, value)) = merge.next_entry()? {
+            if i.family == IndexFamily::Scalar && i.unique {
+                let v = self.scalar_value_bytes(&i, &key)?;
+                if v != [0] {
+                    if prev_value.as_deref() == Some(v) {
+                        return Err(Error::AlreadyExists);
+                    }
+                    prev_value = Some(v.to_vec());
+                } else {
+                    prev_value = None;
+                }
+            }
+            self.writer()?.put(&key, &value)?;
+            pending += 1;
+            if pending >= chunk_rows {
+                groups += 1;
+                pending = 0;
+                if groups % group == 0 {
+                    self.commit()?;
+                    commits += 1;
+                    if max_commits.is_some_and(|n| commits >= n) {
+                        i.state = IndexState::Building { after: max_seq };
+                        self.save_index(&i)?;
+                        self.commit()?;
+                        return Ok((max_seq as usize).div_ceil(chunk_rows).max(1));
+                    }
+                }
+            }
+        }
+        i.state = IndexState::Ready;
+        self.save_index(&i)?;
+        self.commit()?;
+        Ok((max_seq as usize).div_ceil(chunk_rows).max(1))
     }
     pub fn begin_drop_index(&mut self, id: IndexId) -> Result<()> {
         self.ready_write()?;

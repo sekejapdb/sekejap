@@ -56,6 +56,8 @@ const HEADER_MAGIC: &[u8; 8] = b"E4COLL1\0";
 const INDEX_HEADER_MAGIC: &[u8; 8] = b"E4COLL2\0";
 #[path = "graph_collections.rs"]
 mod graph_collections;
+#[path = "index_sort.rs"]
+mod index_sort;
 #[path = "indexes.rs"]
 mod indexes;
 #[path = "quantized_vector_indexes.rs"]

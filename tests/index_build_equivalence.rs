@@ -17,7 +17,7 @@
 //! engine: an oracle that shares code with the thing it checks is not one.
 
 use e4_prototype::{
-    collections::{CollectionOptions, Database, EntityId, IndexId, ScalarPredicate},
+    collections::{CollectionOptions, Database, EntityId, IndexId, IndexState, ScalarPredicate},
     Kind,
 };
 use kernel::{
@@ -264,6 +264,12 @@ fn build(db: &mut Database, id: IndexId) -> u64 {
     db.pool_accesses().unwrap() - before
 }
 
+fn build_sorted(db: &mut Database, id: IndexId) -> u64 {
+    let before = db.pool_accesses().unwrap();
+    db.build_index_to_ready(id, 256).unwrap();
+    db.pool_accesses().unwrap() - before
+}
+
 /// Pinned by a run of the unchanged builder; see the module note.
 const SCALAR_AGE: &str = "6b7205dc65d3fc47285914b3e86cc0d8224722aa478d05a561c650e0b0bbdb63";
 const SCALAR_ACTIVE: &str = "5349a3713fc8216b9d04df511d8397fe09b5669bcbd8e78bfbc2a3c043770d09";
@@ -292,15 +298,17 @@ fn a_late_build_persists_the_same_bytes_however_it_is_scheduled() {
     db.commit().unwrap();
     let text_accesses = build(&mut db, bio);
 
-    let home = db
-        .create_point_index(s.people, "home_idx", "home")
-        .unwrap();
+    let home = db.create_point_index(s.people, "home_idx", "home").unwrap();
     db.commit().unwrap();
     let spatial_accesses = build(&mut db, home);
 
     let found = [
         ("scalar age", digest(&db, "scalar", age), SCALAR_AGE),
-        ("scalar active", digest(&db, "scalar", active), SCALAR_ACTIVE),
+        (
+            "scalar active",
+            digest(&db, "scalar", active),
+            SCALAR_ACTIVE,
+        ),
         ("text bio", digest(&db, "text", bio), TEXT_BIO),
         ("spatial home", digest(&db, "spatial", home), SPATIAL_HOME),
     ];
@@ -497,7 +505,10 @@ fn chunk_commits_publish_nothing_until_the_ready_flip() {
     let hits = after
         .query_scalar(age, ScalarPredicate::Eq(json!(0i64)), 65_536)
         .unwrap();
-    assert_eq!(hits.len(), (0..PEOPLE).filter(|i| (i * 37) % 95 == 0).count());
+    assert_eq!(
+        hits.len(),
+        (0..PEOPLE).filter(|i| (i * 37) % 95 == 0).count()
+    );
 }
 
 // ------------------------------------------- the cost property (fixes A and B)
@@ -549,11 +560,11 @@ fn a_scalar_late_build_does_not_pay_for_the_lanes_it_never_reads() {
         .create_scalar_index(people, "age_idx", "age", false)
         .unwrap();
     db.commit().unwrap();
-    let accesses = build(&mut db, age) as f64 / PEOPLE as f64;
+    let accesses = build_sorted(&mut db, age) as f64 / PEOPLE as f64;
     eprintln!("COST scalar build {accesses:.3} page accesses per indexed row");
     assert!(
-        accesses <= 5.0,
-        "a scalar build costs {accesses:.3} page accesses per row, against 6.689 before fix A"
+        accesses <= 3.2,
+        "a scalar build costs {accesses:.3} page accesses per row, against 3.349 after chunk sort and 6.689 before fix A"
     );
 }
 
@@ -585,4 +596,80 @@ fn a_text_late_build_pays_the_corpus_row_once_per_chunk() {
         accesses <= 75.0,
         "a text build costs {accesses:.3} page accesses per row, against 106.608 before fix B"
     );
+}
+
+/// The sorted driver must persist the same bytes as the step driver. The
+/// oracle constants above were pinned against the unchanged builder.
+#[test]
+fn a_sorted_late_build_keeps_the_pinned_digests() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut db, s) = seed(&path);
+    let age = db
+        .create_scalar_index(s.people, "age_idx", "age", false)
+        .unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(age, 256).unwrap();
+    let active = db
+        .create_scalar_index(s.people, "active_idx", "active", false)
+        .unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(active, 256).unwrap();
+    let bio = db.create_text_index(s.people, "bio_idx", "bio").unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(bio, 256).unwrap();
+    let home = db.create_point_index(s.people, "home_idx", "home").unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(home, 256).unwrap();
+    assert_eq!(digest(&db, "scalar", age).0, SCALAR_AGE);
+    assert_eq!(digest(&db, "scalar", active).0, SCALAR_ACTIVE);
+    assert_eq!(digest(&db, "text", bio).0, TEXT_BIO);
+    assert_eq!(digest(&db, "spatial", home).0, SPATIAL_HOME);
+}
+
+/// Sort restarts; insert resumes from already-committed keys. Killing the
+/// writer after one committed group, reopening, and finishing must leave
+/// the oracle bytes unchanged.
+#[test]
+fn a_sorted_build_resumes_after_committed_groups_and_keeps_the_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut db, s) = seed(&path);
+    let age = db
+        .create_scalar_index(s.people, "age_idx", "age", false)
+        .unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready_capped(age, 16, Some(1)).unwrap();
+    assert!(matches!(
+        db.index_info(age).unwrap().state,
+        IndexState::Building { .. }
+    ));
+    drop(db);
+    let mut db = Database::open(&path, cfg()).unwrap();
+    assert!(matches!(
+        db.index_info(age).unwrap().state,
+        IndexState::Building { .. }
+    ));
+    db.build_index_to_ready(age, 16).unwrap();
+    assert_eq!(db.index_info(age).unwrap().state, IndexState::Ready);
+    assert_eq!(digest(&db, "scalar", age).0, SCALAR_AGE);
+
+    // Spatial oracle keys include the index identity (4 after age/active/bio).
+    let _ = db
+        .create_scalar_index(s.people, "active_idx", "active", false)
+        .unwrap();
+    db.commit().unwrap();
+    let _ = db.create_text_index(s.people, "bio_idx", "bio").unwrap();
+    db.commit().unwrap();
+    let home = db.create_point_index(s.people, "home_idx", "home").unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready_capped(home, 16, Some(1)).unwrap();
+    assert!(matches!(
+        db.index_info(home).unwrap().state,
+        IndexState::Building { .. }
+    ));
+    drop(db);
+    let mut db = Database::open(&path, cfg()).unwrap();
+    db.build_index_to_ready(home, 16).unwrap();
+    assert_eq!(digest(&db, "spatial", home).0, SPATIAL_HOME);
 }
