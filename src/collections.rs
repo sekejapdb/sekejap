@@ -7,7 +7,8 @@ use crate::{decode_dense_v3, encode_dense_v3, Kind, Layout};
 use kernel::{btree::RangeIter, limits::ResourceLimits, store::Config};
 use serde_json::Value;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, VecDeque},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -174,7 +175,32 @@ pub struct Database {
     clock: Arc<dyn Clock>,
     limits: Option<ResourceLimits>,
     index_header: Option<IndexHeader>,
+    /// The graph dictionary header, cached. It is three replica reads, it is
+    /// read once per relationship written, and this handle is the only thing
+    /// that can change it, so re-reading it per edge is three descents bought
+    /// for nothing.
+    graph_header_cache: Cell<Option<graph_collections::GraphHeader>>,
+    /// Identities this handle allocated since it opened, with the edges it has
+    /// since written naming them. Sequences are dense, monotonic and never
+    /// reused (D13), and the allocator counter rides the commit, so anything
+    /// handed out after open did not exist in any committed state -- the only
+    /// edges that can name it are the ones listed here. That makes the
+    /// forward/reverse existence probe before writing any OTHER edge on such
+    /// an endpoint provably pointless, which is the read-before-write D10
+    /// forbids.
+    fresh: BTreeMap<EntityId, Vec<EdgeKey>>,
+    fresh_order: VecDeque<EntityId>,
 }
+
+/// Identities remembered at once, and edges remembered per identity. Both are
+/// caps on RAM, not on correctness: forgetting an entry only sends the next
+/// edge down the probing path it used to always take.
+///
+/// SACRIFICE (Law 4): a writer that inserts without ever linking still carries
+/// this map, ~4 MiB at the bound. It is RAM proportional to change with a
+/// ceiling, never to the store, and it is never read back from disk.
+const FRESH_IDENTITIES: usize = 1 << 16;
+const FRESH_EDGES_EACH: usize = 8;
 
 fn ordered(n: u64) -> Vec<u8> {
     let bytes = n.to_be_bytes();
@@ -562,6 +588,9 @@ impl Database {
             clock: Arc::new(SystemClock),
             limits,
             index_header,
+            graph_header_cache: Cell::new(None),
+            fresh: BTreeMap::new(),
+            fresh_order: VecDeque::new(),
         }
     }
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
@@ -856,10 +885,65 @@ impl Database {
         s.next = sequence
             .checked_add(1)
             .ok_or_else(|| invalid("entity sequence exhausted"))?;
-        Ok(EntityId {
+        let id = EntityId {
             collection: c,
             sequence,
-        })
+        };
+        self.remember_fresh(id);
+        Ok(id)
+    }
+    /// Record a just-allocated identity as provably edge-free, evicting the
+    /// oldest when the bound is reached.
+    fn remember_fresh(&mut self, id: EntityId) {
+        if self.fresh.insert(id, Vec::new()).is_none() {
+            self.fresh_order.push_back(id);
+        }
+        while self.fresh_order.len() > FRESH_IDENTITIES {
+            if let Some(old) = self.fresh_order.pop_front() {
+                self.fresh.remove(&old);
+            }
+        }
+    }
+    /// Drop an identity from the fresh map. This is the ONLY row-delete site
+    /// in the engine, and forgetting here is what lets `endpoint_known_live`
+    /// read membership as "the row is there".
+    fn forget_fresh(&mut self, id: EntityId) {
+        self.fresh.remove(&id);
+    }
+    /// True when this handle wrote the endpoint's row and has not deleted it.
+    /// `allocate` records the identity, `write_entity` writes its row in the
+    /// same poisoned-on-error closure, `delete` forgets it, and a rollback
+    /// clears the map -- so membership means the row is on the tree and a
+    /// `get` to confirm it is a read that already knows its own answer.
+    pub(super) fn endpoint_known_live(&self, id: EntityId) -> bool {
+        self.fresh.contains_key(&id)
+    }
+    /// True when no edge with this exact key can exist yet, because one of its
+    /// endpoints is an identity this handle allocated and no edge with this
+    /// key has been written on it since.
+    pub(super) fn edge_provably_absent(&self, key: EdgeKey) -> bool {
+        [key.source, key.destination]
+            .iter()
+            .any(|end| self.fresh.get(end).is_some_and(|seen| !seen.contains(&key)))
+    }
+    /// Record an edge against whichever endpoints are still tracked. An
+    /// identity that outgrows its edge list is forgotten instead, which costs
+    /// it the fast path and never an incorrect answer.
+    pub(super) fn note_edge_written(&mut self, key: EdgeKey) {
+        for end in [key.source, key.destination] {
+            let drop = match self.fresh.get_mut(&end) {
+                Some(seen) => {
+                    if !seen.contains(&key) {
+                        seen.push(key);
+                    }
+                    seen.len() > FRESH_EDGES_EACH
+                }
+                None => false,
+            };
+            if drop {
+                self.fresh.remove(&end);
+            }
+        }
     }
     fn validate_document(&self, c: &Catalog, key: &str, doc: &Value) -> Result<()> {
         if key.is_empty() || key.len() > 1024 {
@@ -1072,6 +1156,7 @@ impl Database {
             }
             self.writer()?.delete(&row_key(e.entity.id))?;
             self.writer()?.delete(&mapping_key(c, key))?;
+            self.forget_fresh(e.entity.id);
             Ok(true)
         })();
         self.finish(result)
@@ -1126,6 +1211,12 @@ impl Database {
         self.sequence = None;
         *self.catalog_cache.borrow_mut() = None;
         *self.layout_cache.borrow_mut() = None;
+        self.graph_header_cache.set(None);
+        // A rollback rewinds the allocator, so a sequence handed out before it
+        // can be handed out again. Everything the map claims about those ids
+        // was learned in the discarded transaction; drop the lot.
+        self.fresh.clear();
+        self.fresh_order.clear();
         self.failed = true;
         self.store.rollback()?;
         if let Some(l) = self.limits {
@@ -1572,7 +1663,9 @@ mod tests {
                 let cell = p.slot(i);
                 let kernel::verify::DecodedRecord::Leaf { key: k, .. } =
                     kernel::verify::decode_record(cell, no as u32, PageKind::Leaf).unwrap()
-                else { panic!("leaf cell decoded as interior") };
+                else {
+                    panic!("leaf cell decoded as interior")
+                };
                 if k.starts_with(&[0, 0]) {
                     metadata_pages.entry(0).or_default().insert(no);
                 }

@@ -365,3 +365,218 @@ fn entity_delete_refuses_degree_257_before_any_published_change() {
     let db = Database::open(path, cfg()).unwrap();
     assert!(db.get_by_id(hub).unwrap().is_some());
 }
+
+/// The bench shape: delete a person, reinsert it under a fresh identity, then
+/// restore its three relationships. Every relationship the engine writes costs
+/// two tree writes; everything else it charges is a read it took before
+/// writing. This pins the total so a read-before-write creeping back in is a
+/// test failure, not a benchmark regression noticed weeks later.
+#[test]
+fn reinsert_with_three_relationships_pays_for_its_writes_not_its_probes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![("name".into(), Kind::Text)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    let orgs = db
+        .create_collection(
+            "orgs",
+            vec![("name".into(), Kind::Text)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.enable_graph().unwrap();
+    let knows = db.create_edge_type("knows").unwrap();
+    let member = db.create_edge_type("member_of").unwrap();
+    let mut ids = Vec::new();
+    for i in 0..600 {
+        ids.push(
+            db.put(people, &format!("p{i:05}"), &json!({"name":"x"}))
+                .unwrap(),
+        );
+    }
+    let org = db.put(orgs, "org", &json!({"name":"o"})).unwrap();
+    db.commit().unwrap();
+    for i in 0..600usize {
+        db.put_edge(
+            GraphContextId::BASE,
+            ids[i],
+            knows,
+            ids[(i + 1) % 600],
+            &json!({"slot":1}),
+        )
+        .unwrap();
+        db.put_edge(
+            GraphContextId::BASE,
+            ids[i],
+            knows,
+            ids[(i + 7) % 600],
+            &json!({"slot":7}),
+        )
+        .unwrap();
+        db.put_edge(GraphContextId::BASE, ids[i], member, org, &json!({}))
+            .unwrap();
+    }
+    db.commit().unwrap();
+
+    // Round two: the measured shape. Fresh identities, three edges each.
+    const ROUND: usize = 300;
+    for i in 0..ROUND {
+        assert!(db.delete(people, &format!("p{i:05}")).unwrap());
+    }
+    db.commit().unwrap();
+    let before = db.pool_accesses().unwrap();
+    for i in 0..ROUND {
+        ids[i] = db
+            .put(people, &format!("p{i:05}"), &json!({"name":"y"}))
+            .unwrap();
+    }
+    db.commit().unwrap();
+    let rows_spent = db.pool_accesses().unwrap() - before;
+    for i in 0..ROUND {
+        db.put_edge(
+            GraphContextId::BASE,
+            ids[i],
+            knows,
+            ids[(i + 1) % 600],
+            &json!({"slot":1}),
+        )
+        .unwrap();
+        db.put_edge(
+            GraphContextId::BASE,
+            ids[i],
+            knows,
+            ids[(i + 7) % 600],
+            &json!({"slot":7}),
+        )
+        .unwrap();
+        db.put_edge(GraphContextId::BASE, ids[i], member, org, &json!({}))
+            .unwrap();
+    }
+    db.commit().unwrap();
+    let spent = db.pool_accesses().unwrap() - before;
+    let per_person = spent as f64 / ROUND as f64;
+    println!(
+        "reinsert+3 relationships: {spent} pool accesses over {ROUND} people ({per_person:.1}/person); rows {rows_spent} ({:.1}/person), edges {:.1}/edge",
+        rows_spent as f64 / ROUND as f64,
+        (spent - rows_spent) as f64 / (3 * ROUND) as f64
+    );
+
+    // The edges themselves must still be exactly what was asked for.
+    let out = db
+        .neighbors(NeighborRequest {
+            entity: ids[5],
+            direction: Direction::Outgoing,
+            edge_type: Some(knows),
+            context: GraphContextId::BASE,
+            limit: 16,
+        })
+        .unwrap();
+    assert_eq!(out.len(), 2);
+    assert!(
+        per_person <= 60.0,
+        "reinsert of one person with three relationships charged {per_person:.1} pool accesses"
+    );
+}
+
+/// The skipped reads are skipped because their answer is already known, not
+/// because the guarantee was dropped. A freshly allocated identity that is
+/// then deleted must still be refused as an endpoint, and a rolled-back
+/// transaction must leave nothing "known" behind.
+#[test]
+fn fresh_endpoint_fast_path_keeps_every_guarantee_it_skips_a_read_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![("name".into(), Kind::Text)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.enable_graph().unwrap();
+    let knows = db.create_edge_type("knows").unwrap();
+
+    let a = db.put(people, "a", &json!({"name":"a"})).unwrap();
+    let b = db.put(people, "b", &json!({"name":"b"})).unwrap();
+    let doomed = db.put(people, "doomed", &json!({"name":"d"})).unwrap();
+    db.commit().unwrap();
+    assert!(db.delete(people, "doomed").unwrap());
+    db.commit().unwrap();
+    // Allocated by this handle, and gone. The fast path must not vouch for it.
+    assert!(matches!(
+        db.put_edge(GraphContextId::BASE, a, knows, doomed, &json!({})),
+        Err(Error::NotFound("graph endpoint"))
+    ));
+    assert!(matches!(
+        db.put_edge(GraphContextId::BASE, doomed, knows, a, &json!({})),
+        Err(Error::NotFound("graph endpoint"))
+    ));
+    // An identity the allocator has never issued is refused the same way.
+    let never = e4_prototype::collections::EntityId {
+        collection: a.collection,
+        sequence: 9_999_999,
+    };
+    assert!(matches!(
+        db.put_edge(GraphContextId::BASE, a, knows, never, &json!({})),
+        Err(Error::NotFound("graph endpoint"))
+    ));
+
+    // Rewriting the same edge on a fresh endpoint replaces its properties
+    // rather than duplicating or losing the reverse marker.
+    let key = db
+        .put_edge(GraphContextId::BASE, a, knows, b, &json!({"v":1}))
+        .unwrap();
+    db.put_edge(GraphContextId::BASE, a, knows, b, &json!({"v":2}))
+        .unwrap();
+    db.commit().unwrap();
+    let out = db
+        .neighbors(NeighborRequest {
+            entity: a,
+            direction: Direction::Outgoing,
+            edge_type: Some(knows),
+            context: GraphContextId::BASE,
+            limit: 16,
+        })
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].key, key);
+    assert_eq!(out[0].properties, json!({"v":2}));
+    let incoming = db
+        .neighbors(NeighborRequest {
+            entity: b,
+            direction: Direction::Incoming,
+            edge_type: Some(knows),
+            context: GraphContextId::BASE,
+            limit: 16,
+        })
+        .unwrap();
+    assert_eq!(incoming.len(), 1);
+
+    // A rolled-back transaction rewinds the allocator, so nothing it taught
+    // the fast path may survive it.
+    let ghost = db.put(people, "ghost", &json!({"name":"g"})).unwrap();
+    db.rollback().unwrap();
+    assert!(matches!(
+        db.put_edge(GraphContextId::BASE, a, knows, ghost, &json!({})),
+        Err(Error::NotFound("graph endpoint"))
+    ));
+
+    drop(db);
+    let db = Database::open(dir.path().join("db"), cfg()).unwrap();
+    let out = db
+        .neighbors(NeighborRequest {
+            entity: a,
+            direction: Direction::Outgoing,
+            edge_type: Some(knows),
+            context: GraphContextId::BASE,
+            limit: 16,
+        })
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].properties, json!({"v":2}));
+}

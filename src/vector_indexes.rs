@@ -82,6 +82,129 @@ pub(super) fn decode_locator(value: &[u8]) -> Result<(u32, usize)> {
     Ok((layout, ordinal))
 }
 
+/// Every sidecar of one collection, in `(sequence, ordinal)` order.
+pub(super) fn sidecar_prefix(c: CollectionId) -> Vec<u8> {
+    prefix(0x60, c)
+}
+
+/// A one-way cursor over a collection's `0x60` sidecar range.
+///
+/// Sidecars sort by `(sequence, ordinal)` and `All`-candidate search walks
+/// locators in ascending sequence, one locator per sequence per index, so the
+/// sidecar keys it asks for are strictly ascending WHATEVER ordinal each row's
+/// layout puts the field at. That is what makes a single forward scan enough:
+/// the cursor is dragged forward to each requested key instead of paying a
+/// fresh root-to-leaf descent per row, and a population split across two
+/// layouts is walked, not re-descended.
+///
+/// The cursor still reports a miss for any key it did not land on -- a sidecar
+/// that is absent, or a caller asking out of order -- and the caller falls
+/// back to a point read, so the answer never depends on the argument above
+/// holding. It is a speed claim with a correct slow path underneath it, not a
+/// correctness claim.
+///
+/// SACRIFICE (Law 4): the cursor walks EVERY vector field of the collection,
+/// not just the indexed one, so a collection with several vector fields pays
+/// a longer walk than the locators strictly need. It is still one sequential
+/// pass over pages the file already has to hold, against one root-to-leaf
+/// descent per candidate row before. It holds one sidecar in RAM at a time --
+/// RAM proportional to a single vector, not to the collection.
+struct SidecarCursor<'a> {
+    prefix: Vec<u8>,
+    iter: kernel::btree::RangeIter<'a>,
+    head: Option<(Vec<u8>, Vec<u8>)>,
+    done: bool,
+}
+
+impl<'a> SidecarCursor<'a> {
+    fn new(store: &'a Backend, c: CollectionId) -> Result<Self> {
+        let prefix = sidecar_prefix(c);
+        let iter = store.range(&prefix)?;
+        Ok(Self {
+            prefix,
+            iter,
+            head: None,
+            done: false,
+        })
+    }
+
+    /// Advance to `target` and return its stored bytes, or `None` when the
+    /// cursor is already beyond it.
+    fn seek(&mut self, target: &[u8]) -> Result<Option<&[u8]>> {
+        while !self.done {
+            if self.head.is_none() {
+                match self.iter.next().transpose()? {
+                    Some((key, value)) if key.starts_with(&self.prefix) => {
+                        self.head = Some((key, value));
+                    }
+                    _ => self.done = true,
+                }
+                continue;
+            }
+            if self
+                .head
+                .as_ref()
+                .is_some_and(|(key, _)| key.as_slice() < target)
+            {
+                self.head = None;
+            } else {
+                break;
+            }
+        }
+        Ok(match &self.head {
+            Some((key, value)) if key.as_slice() == target => Some(value.as_slice()),
+            _ => None,
+        })
+    }
+}
+
+/// Score one already-loaded sidecar. Shared by the scanned and the
+/// point-read paths so both produce identical f64 arithmetic.
+fn score_vector_bytes(
+    id: EntityId,
+    bytes: &[u8],
+    dimension: usize,
+    query: &[f32],
+    query_norm: f64,
+    metric: VectorMetric,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<VectorHit>> {
+    validate_vector(bytes, dimension)?;
+    let mut dot = 0.0f64;
+    let mut stored_norm = 0.0f64;
+    let mut squared_l2 = 0.0f64;
+    for (at, (lane, query_lane)) in bytes.chunks_exact(4).zip(query.iter()).enumerate() {
+        if at % 256 == 0 && cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let stored = f64::from(f32::from_le_bytes(lane.try_into().unwrap()));
+        let query_lane = f64::from(*query_lane);
+        dot += stored * query_lane;
+        stored_norm += stored * stored;
+        let delta = stored - query_lane;
+        squared_l2 += delta * delta;
+    }
+    let mut distance = match metric {
+        VectorMetric::SquaredL2 => squared_l2,
+        VectorMetric::NegativeDot => -dot,
+        VectorMetric::Cosine if stored_norm == 0.0 => return Ok(None),
+        VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
+    };
+    if distance == 0.0 {
+        distance = 0.0;
+    }
+    Ok(Some(VectorHit { id, distance }))
+}
+
+fn admit(heap: &mut BinaryHeap<HeapHit>, k: usize, hit: Option<VectorHit>) {
+    if let Some(hit) = hit {
+        heap.push(HeapHit(hit));
+        if heap.len() > k {
+            heap.pop();
+        }
+    }
+}
+
 pub(super) fn dimension(i: &IndexInfo) -> Result<usize> {
     match (&i.family, &i.kind) {
         (IndexFamily::ExactVector, Kind::Vector(d)) if (1..=MAX_DIM).contains(d) => Ok(*d),
@@ -266,26 +389,6 @@ impl Database {
 
         let mut examined = 0usize;
         let mut heap = BinaryHeap::with_capacity(k.min(1024));
-        let mut probe = |sequence: u64, locator: &[u8]| -> Result<()> {
-            let hit = self.score_locator(
-                &index,
-                EntityId {
-                    collection: index.collection,
-                    sequence,
-                },
-                locator,
-                query,
-                query_norm,
-                metric,
-            )?;
-            if let Some(hit) = hit {
-                heap.push(HeapHit(hit));
-                if heap.len() > k {
-                    heap.pop();
-                }
-            }
-            Ok(())
-        };
         let mut spend = || -> Result<()> {
             if cancelled() {
                 return Err(Error::Cancelled);
@@ -301,8 +404,17 @@ impl Database {
 
         match candidates {
             VectorCandidates::All => {
+                // Two cursors, not one cursor and N descents. The locator scan
+                // still decides WHICH rows are candidates and which ordinal
+                // each one's vector lives at -- that is the authoritative set
+                // and it is unchanged -- but the sidecar bytes now arrive from
+                // a second forward scan running in the same key order, so a
+                // whole-collection top-k costs two range scans instead of one
+                // range scan plus a root-to-leaf descent per row.
                 let prefix = locator_prefix(id);
-                for row in self.store()?.range(&prefix)? {
+                let store = self.store()?;
+                let mut sidecars = SidecarCursor::new(store, index.collection)?;
+                for row in store.range(&prefix)? {
                     let (key, value) = row?;
                     if !key.starts_with(&prefix) {
                         break;
@@ -313,7 +425,29 @@ impl Database {
                     if at != key.len() || sequence == 0 {
                         return Err(corrupt("exact vector locator key"));
                     }
-                    probe(sequence, &value)?;
+                    let entity = EntityId {
+                        collection: index.collection,
+                        sequence,
+                    };
+                    let ordinal = self.locator_ordinal(&index, &value, dimension)?;
+                    let hit = match sidecars.seek(&vector_key(entity, ordinal))? {
+                        Some(bytes) => score_vector_bytes(
+                            entity,
+                            bytes,
+                            dimension,
+                            query,
+                            query_norm,
+                            metric,
+                            &mut || false,
+                        )?,
+                        // Not where the scan is: the sidecar is absent or
+                        // damaged. Pay the descent for this one row and let
+                        // the point-read path produce its diagnosis.
+                        None => {
+                            self.score_locator(&index, entity, &value, query, query_norm, metric)?
+                        }
+                    };
+                    admit(&mut heap, k, hit);
                 }
             }
             VectorCandidates::SortedUnique(ids) => {
@@ -322,7 +456,13 @@ impl Database {
                     if let Some(locator) =
                         self.store()?.get(&locator_key(id, candidate.sequence))?
                     {
-                        probe(candidate.sequence, &locator)?;
+                        let entity = EntityId {
+                            collection: index.collection,
+                            sequence: candidate.sequence,
+                        };
+                        let hit = self
+                            .score_locator(&index, entity, &locator, query, query_norm, metric)?;
+                        admit(&mut heap, k, hit);
                     }
                 }
             }
@@ -360,6 +500,23 @@ impl Database {
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<Option<VectorHit>> {
         let dimension = dimension(index)?;
+        let ordinal = self.locator_ordinal(index, locator, dimension)?;
+        let bytes = self
+            .store()?
+            .get(&vector_key(id, ordinal))?
+            .ok_or_else(|| corrupt("exact vector locator points to missing sidecar"))?;
+        score_vector_bytes(id, &bytes, dimension, query, query_norm, metric, cancelled)
+    }
+
+    /// Validate a locator against the layout it names and return the physical
+    /// sidecar ordinal it points at. Split out of `score_locator_cancelled` so
+    /// the scanned path performs exactly the same check before believing a row.
+    fn locator_ordinal(
+        &self,
+        index: &IndexInfo,
+        locator: &[u8],
+        dimension: usize,
+    ) -> Result<usize> {
         let (layout_id, ordinal) = decode_locator(locator)?;
         let layout = self.layout(layout_id)?;
         let field_matches = matches!(
@@ -369,35 +526,7 @@ impl Database {
         if layout.id != u64::from(layout_id) || !field_matches {
             return Err(corrupt("exact vector locator field/layout mismatch"));
         }
-        let bytes = self
-            .store()?
-            .get(&vector_key(id, ordinal))?
-            .ok_or_else(|| corrupt("exact vector locator points to missing sidecar"))?;
-        validate_vector(&bytes, dimension)?;
-        let mut dot = 0.0f64;
-        let mut stored_norm = 0.0f64;
-        let mut squared_l2 = 0.0f64;
-        for (at, (lane, query_lane)) in bytes.chunks_exact(4).zip(query.iter()).enumerate() {
-            if at % 256 == 0 && cancelled() {
-                return Err(Error::Cancelled);
-            }
-            let stored = f64::from(f32::from_le_bytes(lane.try_into().unwrap()));
-            let query_lane = f64::from(*query_lane);
-            dot += stored * query_lane;
-            stored_norm += stored * stored;
-            let delta = stored - query_lane;
-            squared_l2 += delta * delta;
-        }
-        let mut distance = match metric {
-            VectorMetric::SquaredL2 => squared_l2,
-            VectorMetric::NegativeDot => -dot,
-            VectorMetric::Cosine if stored_norm == 0.0 => return Ok(None),
-            VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
-        };
-        if distance == 0.0 {
-            distance = 0.0;
-        }
-        Ok(Some(VectorHit { id, distance }))
+        Ok(ordinal)
     }
 }
 

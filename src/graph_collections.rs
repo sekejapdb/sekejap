@@ -453,14 +453,23 @@ impl Database {
         if !enabled {
             return Err(invalid("graph feature is not enabled"));
         }
-        read_graph_header(|key| self.store()?.get(key).map_err(Error::from))
+        if let Some(cached) = self.graph_header_cache.get() {
+            return Ok(cached);
+        }
+        let h = read_graph_header(|key| self.store()?.get(key).map_err(Error::from))?;
+        self.graph_header_cache.set(Some(h));
+        Ok(h)
     }
 
     fn save_graph_header(&mut self, h: GraphHeader) -> Result<()> {
         let bytes = encode_graph_header(h)?;
+        // Publish the cache only once all three replicas are on their way, so
+        // a failed write leaves the cache empty rather than ahead of the file.
+        self.graph_header_cache.set(None);
         for copy in 0..3 {
             self.writer()?.put(&graph_header_key(copy), &bytes)?;
         }
+        self.graph_header_cache.set(Some(h));
         Ok(())
     }
 
@@ -606,10 +615,17 @@ impl Database {
 
     fn validate_endpoints(&self, source: EntityId, destination: EntityId) -> Result<()> {
         for id in [source, destination] {
-            if id.collection.0 == 0
-                || id.sequence == 0
-                || self.store()?.get(&row_key(id))?.is_none()
-            {
+            if id.collection.0 == 0 || id.sequence == 0 {
+                return Err(Error::NotFound("graph endpoint"));
+            }
+            // The existence check stays -- an edge to a row that is not there
+            // is the dangling reference this guard exists to refuse. It is the
+            // DESCENT that goes away, and only for a row this handle wrote and
+            // has not deleted, where the answer is already known.
+            if self.endpoint_known_live(id) {
+                continue;
+            }
+            if self.store()?.get(&row_key(id))?.is_none() {
                 return Err(Error::NotFound("graph endpoint"));
             }
         }
@@ -632,11 +648,56 @@ impl Database {
         Ok(())
     }
 
+    /// Both halves of an edge, written immediately.
+    ///
+    /// DEFERRED, with the reason recorded so it is not re-proposed blind:
+    /// buffering the derived halves of a batch and flushing each tag as one
+    /// ascending run at commit. Two findings stop it.
+    ///
+    /// * It would not arm the append fast path. `fast_path_leaf`
+    ///   (kernel/src/btree.rs:1293-1316) accepts a hinted leaf only when
+    ///   `next_leaf() == 0` -- rightmost in the WHOLE tree, not in its tag --
+    ///   and there is one tree (kernel/src/store.rs:339). Only the highest tag
+    ///   present can ever satisfy that, so sorting `0x71`/`0x72` into runs
+    ///   still pays a full descent per write. Relaxing that check needs a
+    ///   right-hand bound the hint can trust across a neighbour's growth;
+    ///   getting it wrong appends keys that a scan finds and a `get` does not.
+    /// * Deferred entries would be invisible to same-transaction readers.
+    ///   `preflight_edge_pair`, `delete_edge`, `neighbors`, `bfs` and
+    ///   `remove_node` (here) and the traversal in `src/query.rs` all read the
+    ///   edge keyspace through `&self`, several by range scan, so they cannot
+    ///   flush a buffer and cannot cheaply merge one. Correct writes that a
+    ///   read in the same transaction cannot see are not a trade this engine
+    ///   makes.
+    ///
+    /// So the edge family stays immediate, and the read side is what got
+    /// cheaper instead -- see `preflight_unless_provably_absent`.
     fn write_edge_pair(&mut self, key: EdgeKey, properties: &[u8]) -> Result<()> {
         self.writer()?
             .put(&edge_key(PRIMARY_EDGE, key), properties)?;
         self.writer()?.put(&edge_key(REVERSE_EDGE, key), &[])?;
+        self.note_edge_written(key);
         Ok(())
+    }
+
+    /// The forward/reverse probe, skipped when the pair provably cannot exist.
+    ///
+    /// The probe's whole product is a corruption report about a pair this call
+    /// is on its way to overwrite anyway. When one endpoint is an identity
+    /// this handle allocated (D13: never reused, counter rides the commit) and
+    /// no edge with this key has been written on it since, no such pair is on
+    /// disk to report on, and the two descents buy nothing.
+    ///
+    /// SACRIFICE (Law 4): a corrupt forward/reverse pair on such an endpoint
+    /// is no longer reported by THIS call -- it is overwritten by a correct
+    /// pair instead. Nothing is believed from the damaged bytes, no other
+    /// record depends on them, and `index_verifier` still finds a mismatch it
+    /// can reach. What is lost is an early warning, not a repair.
+    fn preflight_unless_provably_absent(&self, key: EdgeKey) -> Result<()> {
+        if self.edge_provably_absent(key) {
+            return Ok(());
+        }
+        self.preflight_edge_pair(key)
     }
 
     /// Identity-based ingestion path. Resolving names once avoids replicated
@@ -666,7 +727,7 @@ impl Database {
         {
             return Err(invalid("encoded edge exceeds configured record limit"));
         }
-        self.preflight_edge_pair(key)?;
+        self.preflight_unless_provably_absent(key)?;
         let result = self.write_edge_pair(key, &bytes).map(|()| key);
         self.finish(result)
     }
@@ -746,7 +807,7 @@ impl Database {
             edge_type: EdgeTypeId(type_id),
             destination,
         };
-        self.preflight_edge_pair(key)?;
+        self.preflight_unless_provably_absent(key)?;
         let result = (|| {
             for name in &names {
                 self.save_graph_name(name)?;

@@ -550,3 +550,174 @@ fn late_build_refuses_incompatible_historical_same_name_field() {
         IndexState::Building { after: 0 }
     ));
 }
+
+/// One `All`-candidate top-k must cost one pass over the keyspace, not a
+/// root-to-leaf descent per row. The locator scan and the sidecar scan walk
+/// the same `(sequence, ordinal)` order, so the number of buffer-pool page
+/// accesses a whole-collection query charges is bounded by the pages the two
+/// ranges occupy -- it does not grow by a descent per candidate.
+#[test]
+fn all_candidate_top_k_costs_one_pass_not_a_descent_per_row() {
+    let t = tempfile::tempdir().unwrap();
+    let mut db = Database::create(t.path().join("db"), cfg()).unwrap();
+    let c = db
+        .create_collection(
+            "c",
+            vec![("v".into(), Kind::Vector(4))],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    const N: u64 = 2000;
+    let mut rows = BTreeMap::new();
+    for i in 0..N {
+        let x = i as f32;
+        let vector = [x, x * 0.5, 1.0 - x, (i % 7) as f32];
+        let id = db
+            .put(c, &format!("k{i:05}"), &json!({ "v": vector }))
+            .unwrap();
+        rows.insert(id, vector.to_vec());
+        if i % 256 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let index = db.create_exact_vector_index(c, "v", "v").unwrap();
+    while !db.build_index_step(index, 255).unwrap() {
+        db.commit().unwrap();
+    }
+    db.commit().unwrap();
+
+    // Warm every metadata replica the query reads once, so the measurement is
+    // the scan and nothing else.
+    let q = [1.0f32, 0.0, 0.0, 0.0];
+    query(
+        &db,
+        index,
+        &q,
+        VectorMetric::Cosine,
+        10,
+        VectorCandidates::All,
+        N as usize,
+    )
+    .unwrap();
+
+    let before = db.pool_accesses().unwrap();
+    let hits = query(
+        &db,
+        index,
+        &q,
+        VectorMetric::Cosine,
+        10,
+        VectorCandidates::All,
+        N as usize,
+    )
+    .unwrap();
+    let spent = db.pool_accesses().unwrap() - before;
+    println!("all-candidate top-k over {N} rows: {spent} pool accesses");
+    assert_hits(&hits, &oracle(&rows, &q, VectorMetric::Cosine, None, 10));
+    assert!(
+        spent <= (N as f64 * 1.2) as u64,
+        "top-k over {N} rows charged {spent} pool accesses; a scan must stay under 1.2 per row"
+    );
+}
+
+/// A layout change that moves the indexed field to a different ordinal leaves
+/// older rows pointing at the old slot. The scanned path must still return the
+/// independent oracle's answer for a query that spans both, and must still do
+/// it in one pass -- the sidecar order is `(sequence, ordinal)`, so a mixed
+/// population is walked, not re-descended.
+#[test]
+fn ordinal_moved_mid_collection_is_exact_and_still_one_pass() {
+    let t = tempfile::tempdir().unwrap();
+    let mut db = Database::create(t.path().join("db"), cfg()).unwrap();
+    let c = db
+        .create_collection(
+            "c",
+            vec![
+                ("pad".into(), Kind::Vector(2)),
+                ("v".into(), Kind::Vector(2)),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    let mut rows = BTreeMap::new();
+    const HALF: u64 = 400;
+    for i in 0..HALF {
+        let vector = [i as f32, 1.0];
+        let id = db
+            .put(c, &format!("a{i:05}"), &json!({"pad":[0.0,0.0],"v":vector}))
+            .unwrap();
+        rows.insert(id, vector.to_vec());
+    }
+    db.commit().unwrap();
+    // `v` moves from ordinal 2 to ordinal 1; existing rows keep the old slot.
+    db.alter_collection(
+        c,
+        vec![
+            ("v".into(), Kind::Vector(2)),
+            ("pad".into(), Kind::Vector(2)),
+        ],
+    )
+    .unwrap();
+    for i in HALF..2 * HALF {
+        let vector = [i as f32, 1.0];
+        let id = db
+            .put(c, &format!("a{i:05}"), &json!({"pad":[0.0,0.0],"v":vector}))
+            .unwrap();
+        rows.insert(id, vector.to_vec());
+    }
+    db.commit().unwrap();
+    let index = db.create_exact_vector_index(c, "v", "v").unwrap();
+    while !db.build_index_step(index, 255).unwrap() {
+        db.commit().unwrap();
+    }
+    db.commit().unwrap();
+
+    let n = 2 * HALF;
+    for metric in [
+        VectorMetric::Cosine,
+        VectorMetric::SquaredL2,
+        VectorMetric::NegativeDot,
+    ] {
+        let q = [3.0f32, 1.0];
+        let hits = query(
+            &db,
+            index,
+            &q,
+            metric,
+            12,
+            VectorCandidates::All,
+            n as usize,
+        )
+        .unwrap();
+        assert_hits(&hits, &oracle(&rows, &q, metric, None, 12));
+    }
+    let q = [3.0f32, 1.0];
+    query(
+        &db,
+        index,
+        &q,
+        VectorMetric::Cosine,
+        12,
+        VectorCandidates::All,
+        n as usize,
+    )
+    .unwrap();
+    let before = db.pool_accesses().unwrap();
+    query(
+        &db,
+        index,
+        &q,
+        VectorMetric::Cosine,
+        12,
+        VectorCandidates::All,
+        n as usize,
+    )
+    .unwrap();
+    let spent = db.pool_accesses().unwrap() - before;
+    println!("mixed-ordinal top-k over {n} rows: {spent} pool accesses");
+    assert!(
+        spent <= (n as f64 * 1.2) as u64,
+        "mixed-ordinal top-k over {n} rows charged {spent} pool accesses"
+    );
+}
