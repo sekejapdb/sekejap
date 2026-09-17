@@ -509,11 +509,12 @@ impl Pager {
         // crash never leaves zero valid headers. The second copy is written
         // and read back but not synced: a crash may leave it torn or stale,
         // which `disk_header` already accepts by selecting the newer valid
-        // copy (today's window between the two metadata syncs). The WAL
-        // truncate barrier is a different file and does not make copy 1
-        // durable; copy 1 rides the next data-file FULL sync (the following
-        // checkpoint's page copy-back). Syncing it here would be a fourth
-        // barrier. WAL truncate+sync is unchanged (option 3).
+        // copy. Copy 1 rides the next data-file FULL sync (the following
+        // checkpoint's page copy-back). The WAL is truncated without a FULL
+        // sync (option 3): leftover pre-truncate frames are idempotent under
+        // the identity + transaction-floor binding on open, and every open
+        // re-truncates. A checkpoint therefore performs two syncs: data after
+        // copy-in, and metadata copy 0.
         let at = *s.latest.get(&0).ok_or_else(||bad("checkpoint lacks metadata"))?;
         let b = read_indexed_frame(&*self.wal,at)?;
         let header = Header::decode(&b[32..32+PAGE],0)?;
@@ -528,11 +529,10 @@ impl Pager {
             Header::decode(&actual,no)?;
         }
         if fault==3 {std::process::exit(86);}
-        // Fault 7 (option 3): snapshot the committed WAL, run the truncate
-        // (and today's WAL FULL sync), then put the pre-truncate bytes back
-        // so reopen sees case (b) — leftover frames of the just-absorbed
-        // floor, not a stale earlier incarnation. When sync 4 is removed the
-        // restore still runs past set_len(0).
+        // Fault 7 (option 3): snapshot the committed WAL, truncate without a
+        // WAL FULL sync, then put the pre-truncate bytes back so reopen sees
+        // case (b) — leftover frames of the just-absorbed floor, not a stale
+        // earlier incarnation.
         let mut lost_truncate=None;
         if fault==7 {
             let n=self.wal.len()?;let mut b=vec![0;n as usize];
@@ -541,7 +541,6 @@ impl Pager {
         }
         self.wal.set_len(0)?;
         if fault==4 {std::process::exit(86);}
-        self.wal.sync_full()?;IoAcc::add(&self.io.wal_fsyncs_checkpoint,1);
         if fault==7 {
             let b=lost_truncate.unwrap();
             self.wal.set_len(b.len() as u64)?;
