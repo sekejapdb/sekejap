@@ -10,7 +10,7 @@ use kernel::btree::{RangeIter, ReverseRangeIter};
 use serde_json::Value;
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, BinaryHeap},
+    collections::BinaryHeap,
     fmt,
     ops::Bound,
     sync::Arc,
@@ -1399,7 +1399,18 @@ fn order_index_drives_better(
     Ok(accepted.saturating_mul(ORDER_DRIVE_MIN_DENSITY) >= probed)
 }
 
-fn validate_graph_request(db: &Database, request: BfsRequest) -> QueryResult<()> {
+/// Checks the request against the graph's identities and hands the header
+/// back, because the walk needs the same header this read.
+///
+/// The header used to be read from the store TWICE per traversal -- once
+/// here and once at the top of `execute_graph` -- through
+/// `read_graph_header`, which reads three replica keys and verifies them,
+/// while the graph code keeps a decoded copy in `graph_header_cache` for
+/// exactly this question.
+fn validate_graph_request(
+    db: &Database,
+    request: BfsRequest,
+) -> QueryResult<super::graph_collections::GraphHeader> {
     if request.min_depth > request.max_depth
         || request.max_depth > 64
         || request.max_visited == 0
@@ -1410,9 +1421,7 @@ fn validate_graph_request(db: &Database, request: BfsRequest) -> QueryResult<()>
     {
         return Err(invalid_query("invalid BFS depth/work/result bounds"));
     }
-    let header = super::graph_collections::read_graph_header(|key| {
-        db.store()?.get(key).map_err(Error::from)
-    })?;
+    let header = db.graph_header()?;
     if request.context.0 >= header.next_context
         || request
             .edge_type
@@ -1420,7 +1429,7 @@ fn validate_graph_request(db: &Database, request: BfsRequest) -> QueryResult<()>
     {
         return Err(invalid_query("unknown graph context or edge type"));
     }
-    Ok(())
+    Ok(header)
 }
 
 fn visit_graph_direction<C: FnMut() -> bool>(
@@ -1428,44 +1437,52 @@ fn visit_graph_direction<C: FnMut() -> bool>(
     header: super::graph_collections::GraphHeader,
     entity: EntityId,
     direction: Direction,
-    request: BfsRequest,
-    seen: &BTreeSet<EntityId>,
-    next: &mut BTreeSet<EntityId>,
+    request: &BfsRequest,
+    seen: &[EntityId],
+    next: &mut super::graph_collections::Frontier,
     scanned: &mut usize,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<()> {
-    let tag = if direction == Direction::Outgoing {
-        super::graph_collections::PRIMARY_EDGE
-    } else {
+    let incoming = direction == Direction::Incoming;
+    let tag = if incoming {
         super::graph_collections::REVERSE_EDGE
+    } else {
+        super::graph_collections::PRIMARY_EDGE
     };
-    let prefix = super::graph_collections::edge_prefix(
+    // The prefix is built into a stack buffer. It used to be a `Vec` per
+    // direction per entity, which on a wide frontier is one heap allocation
+    // per step of the walk for bytes that never leave this function.
+    let mut buffer = [0u8; super::graph_collections::MAX_EDGE_PREFIX];
+    let at0 = super::graph_collections::edge_prefix_into(
+        &mut buffer,
         tag,
         entity,
         Some(request.context),
         request.edge_type,
     );
+    let prefix = &buffer[..at0];
     // The near entity, the context and (when the caller named one) the type
     // are the prefix itself: `starts_with` proves the row carries exactly the
     // bytes we built, so only the far endpoint has to be read back out.
-    let at0 = prefix.len();
+    //
     // `for_each_ref` hands the callback borrows into the pinned leaf. The
     // allocating cursor built a key `Vec` and a value `Vec` for every edge
     // walked, for a parser that only reads them. The work meter is charged on
     // exactly the old schedule: one unit per turn of the loop, including the
     // turn that found no further row.
+    let (pinned, context, max_edges) = (request.edge_type, request.context, request.max_edges);
     let mut failure: Option<QueryError> = None;
     let mut stopped = false;
     {
         let mut step = |key: &[u8], value: &[u8]| -> QueryResult<bool> {
             meter.charge(WorkResource::GraphEdges, 1)?;
-            if !key.starts_with(&prefix) {
+            if !key.starts_with(prefix) {
                 return Ok(false);
             }
             *scanned = scanned
                 .checked_add(1)
                 .ok_or_else(|| invalid_query("BFS edge work overflow"))?;
-            if *scanned > request.max_edges {
+            if *scanned > max_edges {
                 return Err(invalid_query("BFS edge work limit exceeded"));
             }
             // The SQL traversal returns entities, so it decodes no properties
@@ -1473,27 +1490,25 @@ fn visit_graph_direction<C: FnMut() -> bool>(
             // one transaction, so a committed snapshot cannot hold half a pair,
             // and `verify_indexed_source` is the tool that checks pair
             // consistency.
-            if direction == Direction::Incoming && !value.is_empty() {
+            if incoming && !value.is_empty() {
                 return Err(corrupt_query("nonempty reverse edge marker"));
             }
             let (_, adjacent) = super::graph_collections::adjacent_from_tail(
-                key,
-                at0,
-                request.edge_type,
-                request.context,
-                header,
+                key, at0, pinned, context, header,
             )?;
-            if !seen.contains(&adjacent) && !next.contains(&adjacent) {
-                meter.charge(WorkResource::GraphVisited, 1)?;
-                if seen.len() + next.len() == request.max_visited {
-                    return Err(invalid_query("BFS visited limit exceeded"));
-                }
-                next.insert(adjacent);
+            // The visited set is a SORTED VECTOR and the level being built is
+            // a `Frontier`, the same two structures `traverse_bfs` uses. The
+            // three `BTreeSet`s this walk used to keep -- visited, level and
+            // answer -- allocated a heap cell every few entities to answer a
+            // question a binary search answers for nothing.
+            if seen.binary_search(&adjacent).is_err() {
+                next.offer(adjacent)
+                    .map_err(|_| invalid_query("BFS visited limit exceeded"))?;
             }
             Ok(true)
         };
         db.store()?
-            .range(&prefix)
+            .range(prefix)
             .map_err(Error::from)?
             .for_each_ref(|key, value| match step(key, value) {
                 Ok(true) => true,
@@ -1518,33 +1533,37 @@ fn visit_graph_direction<C: FnMut() -> bool>(
     Ok(())
 }
 
+/// The breadth-first walk behind `QueryFilter::Graph`, answering with the
+/// distinct entities it reached in ascending entity order.
+///
+/// It is the walk `Database::traverse_bfs` runs, built out of the same
+/// pieces: a sorted visited vector merged one level at a time, a `Frontier`
+/// for the level being discovered, prefixes built on the stack, and the graph
+/// header the graph code already has in hand. What it adds is the query
+/// engine's work meter, charged on the same schedule as before -- one unit
+/// per turn of the edge loop, and one per DISTINCT entity a level discovers,
+/// which is what the old per-edge charge added up to.
 fn execute_graph<C: FnMut() -> bool>(
     db: &Database,
     request: BfsRequest,
     meter: &mut WorkMeter<'_, C>,
-) -> QueryResult<BTreeSet<EntityId>> {
-    validate_graph_request(db, request)?;
-    meter.charge(WorkResource::PrimaryReads, 1)?;
-    if db.store()?.get(&row_key(request.seed))?.is_none() {
-        return Err(QueryError::Database(Error::NotFound("graph endpoint")));
-    }
-    let header = super::graph_collections::read_graph_header(|key| {
-        db.store()?.get(key).map_err(Error::from)
-    })?;
+) -> QueryResult<Vec<EntityId>> {
+    let header = validate_graph_request(db, request)?;
     meter.charge(WorkResource::GraphVisited, 1)?;
-    let mut seen = BTreeSet::from([request.seed]);
-    let mut results = BTreeSet::new();
+    let mut seen = vec![request.seed];
+    let mut merged: Vec<EntityId> = Vec::new();
+    let mut results: Vec<EntityId> = Vec::new();
     if request.include_seed && request.min_depth == 0 {
         if request.result_limit == 0 {
             return Err(invalid_query("BFS result limit exceeded"));
         }
-        results.insert(request.seed);
+        results.push(request.seed);
     }
-    let mut frontier = BTreeSet::from([request.seed]);
+    let mut frontier = vec![request.seed];
     let mut scanned = 0usize;
     for depth in 1..=request.max_depth {
         meter.check_cancelled()?;
-        let mut next = BTreeSet::new();
+        let mut next = super::graph_collections::Frontier::new(request.max_visited - seen.len());
         for entity in frontier {
             meter.check_cancelled()?;
             if matches!(request.direction, Direction::Outgoing | Direction::Both) {
@@ -1553,7 +1572,7 @@ fn execute_graph<C: FnMut() -> bool>(
                     header,
                     entity,
                     Direction::Outgoing,
-                    request,
+                    &request,
                     &seen,
                     &mut next,
                     &mut scanned,
@@ -1566,7 +1585,7 @@ fn execute_graph<C: FnMut() -> bool>(
                     header,
                     entity,
                     Direction::Incoming,
-                    request,
+                    &request,
                     &seen,
                     &mut next,
                     &mut scanned,
@@ -1574,7 +1593,12 @@ fn execute_graph<C: FnMut() -> bool>(
                 )?;
             }
         }
-        seen.extend(next.iter().copied());
+        let next = next.into_sorted();
+        meter.charge(WorkResource::GraphVisited, next.len() as u64)?;
+        if seen.len() + next.len() > request.max_visited {
+            return Err(invalid_query("BFS visited limit exceeded"));
+        }
+        super::graph_collections::merge_sorted_disjoint(&mut seen, &next, &mut merged);
         if depth >= request.min_depth {
             if results.len() + next.len() > request.result_limit {
                 return Err(invalid_query("BFS result limit exceeded"));
@@ -1586,6 +1610,22 @@ fn execute_graph<C: FnMut() -> bool>(
         }
         frontier = next;
     }
+    // The seed-existence refusal, paid only when it can still be the answer.
+    // An edge cannot outlive its endpoints -- a write validates both and a
+    // delete cascades -- so an edge already walked is itself the proof that
+    // the seed's row is there. This read used to be paid by every traversal,
+    // before the walk, whether or not anything was going to need it; it is
+    // the same rule `traverse_bfs` and `neighbors` already apply.
+    if scanned == 0 {
+        meter.charge(WorkResource::PrimaryReads, 1)?;
+        if db.store()?.get(&row_key(request.seed))?.is_none() {
+            return Err(QueryError::Database(Error::NotFound("graph endpoint")));
+        }
+    }
+    // Each level is sorted, but the levels were appended in discovery order.
+    // Membership is asked once per candidate and the driver promises
+    // ascending ids, so the answer is sorted once here.
+    results.sort_unstable();
     Ok(results)
 }
 
@@ -1593,7 +1633,7 @@ fn execute_graph_filters<C: FnMut() -> bool>(
     db: &Database,
     filters: &[CompiledFilter],
     meter: &mut WorkMeter<'_, C>,
-) -> QueryResult<Vec<Option<BTreeSet<EntityId>>>> {
+) -> QueryResult<Vec<Option<Vec<EntityId>>>> {
     let mut results = vec![None; filters.len()];
     for filter in filters {
         if let CompiledFilter::Graph { request, position } = filter {
@@ -1899,7 +1939,7 @@ impl<'a> DriverCursor<'a> {
         db: &'a Database,
         collection: CollectionId,
         plan: &DriverPlan,
-        graph: &[Option<BTreeSet<EntityId>>],
+        graph: &[Option<Vec<EntityId>>],
         needs: CursorNeeds,
         resume: Option<&RankKey>,
         descending: bool,
@@ -2545,7 +2585,7 @@ const LOCKSTEP_REACH: u64 = 32;
 /// How a page reads primary rows.
 ///
 /// When rows are asked for in ascending entity id -- an equality posting is
-/// ordered by sequence, a graph result is a `BTreeSet`, the entity walk is the
+/// ordered by sequence, a graph result is sorted, the entity walk is the
 /// primary tree, and an id ranking returns winners in that order too -- the
 /// keys are ascending primary keys. One forward cursor can then step through
 /// them, paying one pinned leaf for every row that lives on it, instead of
@@ -3150,7 +3190,7 @@ fn filters_match<'a, C: FnMut() -> bool>(
     candidate: &Candidate,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
-    graph: &[Option<BTreeSet<EntityId>>],
+    graph: &[Option<Vec<EntityId>>],
     norms: &mut super::text_indexes::TextScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<bool> {
@@ -3189,7 +3229,9 @@ fn filters_match<'a, C: FnMut() -> bool>(
             CompiledFilter::Graph { position, .. } => graph
                 .get(*position)
                 .and_then(Option::as_ref)
-                .is_some_and(|ids| ids.contains(&id)),
+                // Sorted, so membership is a binary search rather than a walk
+                // down a tree whose nodes were allocated to answer this.
+                .is_some_and(|ids| ids.binary_search(&id).is_ok()),
             CompiledFilter::Point { info, predicate } => {
                 ensure_row_seq(db, rows, id, row, encoded, meter)?;
                 let row = row.as_ref().unwrap();
@@ -3604,8 +3646,8 @@ impl PreparedQuery<'_> {
     /// True when the driver hands candidates over in ascending entity id, so
     /// the rows they ask for are ascending primary keys and one forward cursor
     /// can serve the whole page. An equality posting is `value || sequence` for
-    /// one value, so it IS sequence order; a graph result comes out of a
-    /// `BTreeSet`; the entity walk is the primary tree. A range or order walk
+    /// one value, so it IS sequence order; a graph result is sorted before it
+    /// leaves the traversal; the entity walk is the primary tree. A range or order walk
     /// is in value order and a spatial or vector walk in neither, so those keep
     /// the point-get.
     fn driver_walks_ids_ascending(&self) -> bool {

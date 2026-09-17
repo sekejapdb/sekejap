@@ -425,14 +425,14 @@ pub(super) fn decode_properties(bytes: &[u8]) -> Result<Value> {
 /// at before: `offer` sorts and dedups the moment the raw count could exceed
 /// the room the level has left, and a level that is full answers membership
 /// by binary search over the sorted vector.
-struct Frontier {
+pub(super) struct Frontier {
     items: Vec<EntityId>,
     sorted: bool,
     room: usize,
 }
 
 impl Frontier {
-    fn new(room: usize) -> Self {
+    pub(super) fn new(room: usize) -> Self {
         Self {
             items: Vec::new(),
             sorted: true,
@@ -440,7 +440,7 @@ impl Frontier {
         }
     }
 
-    fn offer(&mut self, entity: EntityId) -> Result<()> {
+    pub(super) fn offer(&mut self, entity: EntityId) -> Result<()> {
         if self.sorted && self.items.len() == self.room {
             // Full and normalised: one more distinct entity is one too many.
             return if self.items.binary_search(&entity).is_ok() {
@@ -468,7 +468,7 @@ impl Frontier {
         }
     }
 
-    fn into_sorted(mut self) -> Vec<EntityId> {
+    pub(super) fn into_sorted(mut self) -> Vec<EntityId> {
         self.normalize();
         self.items
     }
@@ -477,7 +477,11 @@ impl Frontier {
 /// Union of two sorted sets with no element in common, in one pass, reusing
 /// the caller's scratch buffer so a deep traversal allocates per LEVEL rather
 /// than per entity.
-fn merge_sorted_disjoint(seen: &mut Vec<EntityId>, next: &[EntityId], scratch: &mut Vec<EntityId>) {
+pub(super) fn merge_sorted_disjoint(
+    seen: &mut Vec<EntityId>,
+    next: &[EntityId],
+    scratch: &mut Vec<EntityId>,
+) {
     if next.is_empty() {
         return;
     }
@@ -619,7 +623,7 @@ pub(super) fn validate_graph(s: &PageWalStore, enabled: bool) -> Result<()> {
 }
 
 impl Database {
-    fn graph_header(&self) -> Result<GraphHeader> {
+    pub(super) fn graph_header(&self) -> Result<GraphHeader> {
         let enabled = self
             .index_header
             .is_some_and(|header| header.features & GRAPH_FEATURE != 0);

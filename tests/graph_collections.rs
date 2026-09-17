@@ -1,6 +1,8 @@
 use e4_prototype::{
     collections::{
-        BfsRequest, CollectionOptions, Database, Direction, Error, GraphContextId, NeighborRequest,
+        BfsRequest, CandidateDriver, CollectionId, CollectionOptions, Database, Direction,
+        EntityId, Error, GraphContextId, NeighborRequest, Projection, QueryBudget, QueryFilter,
+        QueryOrder, QueryRequest,
     },
     Kind,
 };
@@ -1102,4 +1104,331 @@ fn graph_reads_still_refuse_a_seed_that_has_no_row() {
     assert!(db.neighbor_ids(neighbors_of(a)).unwrap().is_empty());
     assert!(db.neighbors(neighbors_of(a)).unwrap().is_empty());
     assert_eq!(db.traverse_bfs(bfs_from(a)).unwrap().visited, 1);
+}
+
+// ── the graph filter inside the query engine ──────────────────────────────
+
+/// One page of a graph-filtered query, as `two_ways`' `hop1_project` asks it.
+fn graph_query(db: &Database, collection: CollectionId, request: BfsRequest) -> Vec<u64> {
+    let filters = [QueryFilter::Graph(request)];
+    page_ids(db, collection, &filters, CandidateDriver::Auto)
+}
+
+/// The same query with no filter at all, stopped at one row: the query
+/// engine's own floor, which the graph filter is measured against rather
+/// than counted as if it were graph work.
+fn floor_query(db: &Database, collection: CollectionId) -> Vec<u64> {
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &[],
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: Some(1),
+            driver: CandidateDriver::Entities,
+        })
+        .unwrap();
+    prepared
+        .next_page(8192, QueryBudget::unlimited(), || false)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|row| row.id.sequence)
+        .collect()
+}
+
+fn page_ids(
+    db: &Database,
+    collection: CollectionId,
+    filters: &[QueryFilter<'_>],
+    driver: CandidateDriver,
+) -> Vec<u64> {
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver,
+        })
+        .unwrap();
+    let mut found = Vec::new();
+    loop {
+        let page = prepared
+            .next_page(8192, QueryBudget::unlimited(), || false)
+            .unwrap();
+        found.extend(page.rows.iter().map(|row| row.id.sequence));
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    found
+}
+
+/// The query engine's graph filter must cost what `traverse_bfs` costs.
+///
+/// The traversal a `QueryFilter::Graph` runs is the same breadth-first walk
+/// `traverse_bfs` runs, so it must not be a second, slower copy of it. The
+/// copy that lived in the query engine read the graph header from the store
+/// TWICE per call -- three replica keys and a verify each time -- ignoring
+/// the decoded copy the graph code keeps for exactly that question; it probed
+/// the seed's authoritative row before it knew whether an edge had already
+/// proved the seed was there; and it kept its visited set, its level and its
+/// answer in three `BTreeSet`s, a heap cell every few entities.
+///
+/// The measurement is the FIXED cost: one hop over one edge, against the same
+/// query engine answering with no filter at all. That is the cost `two_ways`'
+/// `hop1_project` pays, where the seed has a single neighbour, and it is the
+/// cost that must not depend on the graph at all.
+#[test]
+fn graph_filtered_query_allocates_like_the_traversal_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![("name".into(), Kind::Text)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.enable_graph().unwrap();
+    let member = db.create_edge_type("member_of").unwrap();
+
+    const FAN_IN: usize = 200;
+    let mut ids = Vec::new();
+    for i in 0..FAN_IN {
+        ids.push(
+            db.put(people, &format!("p{i:05}"), &json!({"name": "x"}))
+                .unwrap(),
+        );
+    }
+    let hub = db.put(people, "hub", &json!({"name": "h"})).unwrap();
+    let one = db.put(people, "one", &json!({"name": "1"})).unwrap();
+    db.commit().unwrap();
+    for id in &ids {
+        db.put_edge(GraphContextId::BASE, *id, member, hub, &json!({"r": 1}))
+            .unwrap();
+    }
+    // The single-edge seed, which is the shape `hop1_project` measures.
+    db.put_edge(GraphContextId::BASE, one, member, ids[0], &json!({"r": 1}))
+        .unwrap();
+    db.commit().unwrap();
+    drop(db);
+    let db = Database::open(dir.path().join("db"), cfg()).unwrap();
+
+    let hop = |seed, direction| BfsRequest {
+        seed,
+        direction,
+        edge_type: Some(member),
+        context: GraphContextId::BASE,
+        min_depth: 1,
+        max_depth: 1,
+        include_seed: false,
+        max_visited: 4096,
+        max_edges: 4096,
+        result_limit: 4096,
+    };
+    let single = hop(one, Direction::Outgoing);
+    let wide = hop(hub, Direction::Incoming);
+    // Warm the pages and any one-off lazy state, then measure the repeat.
+    for _ in 0..2 {
+        graph_query(&db, people, single);
+        graph_query(&db, people, wide);
+        floor_query(&db, people);
+    }
+    let (floor_rows, floor, _) = measured(|| floor_query(&db, people));
+    let (found, allocations, bytes) = measured(|| graph_query(&db, people, single));
+    let (wide_found, wide_allocations, _) = measured(|| graph_query(&db, people, wide));
+    assert_eq!(found.len(), 1);
+    assert_eq!(floor_rows.len(), 1);
+    assert_eq!(wide_found.len(), FAN_IN);
+    println!(
+        "one-edge graph filter: {allocations} allocations, {bytes} bytes; \
+         the same engine with no filter: {floor}; \
+         the {FAN_IN}-edge fan-in: {wide_allocations}"
+    );
+    // Counted here: 53 allocations against a floor of 13 through the query
+    // engine's own BFS copy -- a share of 40 for ONE edge -- and 30 against
+    // the same floor once that copy used the cached header, the deferred seed
+    // probe and the sorted vectors: a share of 17, which is the answer, the
+    // level and the visited set themselves.
+    //
+    // The wide case barely moves, 1152 to 1038, because what dominates there
+    // is the DRIVER's cost per row it hands over -- about five allocations
+    // each, none of them graph work. That is a separate finding and this
+    // bound does not pretend to cover it.
+    let bound = floor + 24;
+    assert!(
+        allocations <= bound,
+        "a one-hop graph filter over ONE edge allocated {allocations} times; the same \
+         query with no filter costs {floor}, so the filter's own share is {} against a \
+         bound of 24. Two uncached header reads allocate three replica buffers each, \
+         the eager seed probe allocates the seed's whole row, and a BTreeSet frontier \
+         allocates a heap cell of its own.",
+        allocations.saturating_sub(floor)
+    );
+}
+
+/// The filter and the traversal must answer with the same entities.
+///
+/// The query engine's graph filter is a `traverse_bfs` whose result is turned
+/// into candidates, so every shape of request must produce exactly the node
+/// set the traversal produces -- both directions, one hop and two, and a
+/// filter that matches nothing.
+#[test]
+fn graph_filter_answers_what_traverse_bfs_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![("name".into(), Kind::Text)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.enable_graph().unwrap();
+    let knows = db.create_edge_type("knows").unwrap();
+
+    // A ring of 40 with a chord every seventh step, so two hops reach more
+    // than one hop and the two directions differ.
+    const N: u64 = 40;
+    let mut ids = Vec::new();
+    for i in 0..N {
+        ids.push(
+            db.put(people, &format!("p{i:05}"), &json!({"name": "x"}))
+                .unwrap(),
+        );
+    }
+    db.commit().unwrap();
+    for i in 0..N {
+        let next = ((i + 1) % N) as usize;
+        db.put_edge(
+            GraphContextId::BASE,
+            ids[i as usize],
+            knows,
+            ids[next],
+            &json!({}),
+        )
+        .unwrap();
+        if i % 7 == 0 {
+            let chord = ((i + 13) % N) as usize;
+            db.put_edge(
+                GraphContextId::BASE,
+                ids[i as usize],
+                knows,
+                ids[chord],
+                &json!({}),
+            )
+            .unwrap();
+        }
+    }
+    db.commit().unwrap();
+
+    for seed in [0usize, 7, 21, 39] {
+        for direction in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
+            for max_depth in 1..=3 {
+                for include_seed in [false, true] {
+                    let request = BfsRequest {
+                        seed: ids[seed],
+                        direction,
+                        edge_type: Some(knows),
+                        context: GraphContextId::BASE,
+                        min_depth: usize::from(!include_seed),
+                        max_depth,
+                        include_seed,
+                        max_visited: 4096,
+                        max_edges: 4096,
+                        result_limit: 4096,
+                    };
+                    let mut traversal = db
+                        .traverse_bfs(request)
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .map(|node| node.entity.sequence)
+                        .collect::<Vec<_>>();
+                    traversal.sort_unstable();
+                    let mut filtered = graph_query(&db, people, request);
+                    filtered.sort_unstable();
+                    assert_eq!(
+                        filtered, traversal,
+                        "seed {seed} {direction:?} depth {max_depth} include_seed {include_seed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A graph filter whose seed is not a row still refuses, and refuses the way
+/// the traversal refuses. Deferring the probe until no edge has been walked
+/// must not turn a missing seed into an empty answer.
+#[test]
+fn graph_filter_refuses_a_seed_that_is_not_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::create(dir.path().join("db"), cfg()).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![("name".into(), Kind::Text)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.enable_graph().unwrap();
+    let knows = db.create_edge_type("knows").unwrap();
+    let a = db.put(people, "a", &json!({"name": "a"})).unwrap();
+    let b = db.put(people, "b", &json!({"name": "b"})).unwrap();
+    db.put_edge(GraphContextId::BASE, a, knows, b, &json!({}))
+        .unwrap();
+    db.commit().unwrap();
+
+    let missing = EntityId {
+        collection: people,
+        sequence: 9_999,
+    };
+    let request = BfsRequest {
+        seed: missing,
+        direction: Direction::Outgoing,
+        edge_type: Some(knows),
+        context: GraphContextId::BASE,
+        min_depth: 1,
+        max_depth: 2,
+        include_seed: false,
+        max_visited: 4096,
+        max_edges: 4096,
+        result_limit: 4096,
+    };
+    assert!(matches!(
+        db.traverse_bfs(request),
+        Err(Error::NotFound("graph endpoint"))
+    ));
+    let filters = [QueryFilter::Graph(request)];
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection: people,
+            filters: &filters,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let error = prepared
+        .next_page(8192, QueryBudget::unlimited(), || false)
+        .unwrap_err();
+    assert!(
+        format!("{error}").contains("graph endpoint"),
+        "a missing seed must refuse, not answer empty: {error}"
+    );
+
+    // A live seed with no edge at all answers empty, as the traversal does.
+    let lonely = db.put(people, "lonely", &json!({"name": "l"})).unwrap();
+    db.commit().unwrap();
+    let request = BfsRequest {
+        seed: lonely,
+        ..request
+    };
+    assert!(db.traverse_bfs(request).unwrap().nodes.is_empty());
+    assert!(graph_query(&db, people, request).is_empty());
 }
