@@ -445,6 +445,9 @@ struct PreparedText {
     info: IndexInfo,
     terms: Vec<String>,
     phrase: Option<Vec<String>>,
+    /// The phrase's KMP failure function. It depends on the phrase alone, and
+    /// the document scanner used to rebuild it per document.
+    phrase_prefix: Vec<usize>,
     matching: TextMatch,
     dfs: Vec<u64>,
     /// The corpus half of every BM25 score this query can produce, and one
@@ -512,6 +515,32 @@ const MAX_TEXT_TERMS: usize = 64;
 struct TextRowScratch {
     frequencies: Vec<u32>,
     idfs: Vec<f64>,
+}
+
+/// Everything one page reuses across its candidates, in one place.
+///
+/// Each of these is a buffer whose contents belong to the row being looked at
+/// and whose CAPACITY belongs to the page. Passing them as one value is what
+/// keeps `filters_match` and `rank_candidate` from growing a parameter every
+/// time another per-row allocation is found.
+#[derive(Default)]
+struct RowScratch {
+    /// One decoded norm block, reused by every candidate that lands in it.
+    norms: super::text_indexes::TextScratch,
+    /// The per-term frequencies and idfs of the document being scored.
+    text: TextRowScratch,
+    /// The encoded scalar key of ONE row value.
+    ///
+    /// A non-driving scalar predicate encodes the row's value to compare it
+    /// against its bound. Through `scalar_key::encode` that was two
+    /// allocations per candidate for nine bytes that are read once and
+    /// dropped.
+    scalar: Vec<u8>,
+    /// The phrase scanner's current token.
+    token: String,
+    /// How often each of the query's terms was seen in the document the phrase
+    /// scanner is on. Positionally by prepared term.
+    seen: Vec<u32>,
 }
 
 /// The per-term frequencies the text merge cursor decoded on its way past this
@@ -923,6 +952,10 @@ fn prepare_text(
     Ok(PreparedText {
         info,
         terms,
+        phrase_prefix: phrase
+            .as_deref()
+            .map(crate::text_analyzer::phrase_prefix)
+            .unwrap_or_default(),
         phrase,
         matching,
         dfs,
@@ -1491,7 +1524,7 @@ fn order_index_drives_better(
                 break;
             }
             let suffix = &key[prefix.len()..];
-            let (_, value_len) = scalar_key::decode(&order.kind, suffix)?;
+            let value_len = scalar_key::width(&order.kind, suffix)?;
             let mut at = prefix.len() + value_len;
             read_ordered(key, &mut at)?
         };
@@ -1779,6 +1812,12 @@ struct Candidate {
     row: Option<Vec<u8>>,
     carried: Option<CarriedKey>,
     satisfied_filter: Option<usize>,
+    /// What the batched row pass already decided about this candidate's
+    /// FILTERS. `Some(true)` means every filter passed and there is nothing
+    /// left to evaluate; `Some(false)` means one refused it. `None` means the
+    /// pass did not settle it -- no batch, or a row it could not reach -- and
+    /// the walk decides as it always did.
+    row_filtered: Option<bool>,
     /// What the text merge cursor already knew about this document. Only the
     /// text driver fills it in; every other driver leaves it `None` and every
     /// scorer that cannot prove the frequencies are its own ignores it.
@@ -1793,6 +1832,7 @@ impl Candidate {
             row: None,
             carried: None,
             satisfied_filter: None,
+            row_filtered: None,
             text: None,
         }
     }
@@ -2364,7 +2404,7 @@ impl ScalarCursor<'_> {
                     return Ok(None);
                 }
                 let suffix = &key[self.prefix.len()..];
-                let (_, value_len) = scalar_key::decode(&self.info.kind, suffix)?;
+                let value_len = scalar_key::width(&self.info.kind, suffix)?;
                 let encoded = suffix
                     .get(..value_len)
                     .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
@@ -2760,10 +2800,16 @@ impl<'a> PrimaryRows<'a> {
     /// Point the reusable key at `id` and say how it will be reached, moving
     /// the cursor's own state along with the decision.
     fn plan(&mut self, id: EntityId) -> Reach {
+        // `ordered` RETURNS a `Vec`, so building the key out of it allocated
+        // twice -- nine bytes each -- for every row any page read, on every
+        // path: the counting allocator put two of `filter/two_ranges`' six
+        // allocations per candidate right here, for a key whose buffer is
+        // already owned and already the right size. `ordered_into` is the same
+        // frozen encoding appended to a buffer the caller keeps.
         self.key.clear();
         self.key.push(0x40);
-        self.key.extend(ordered(u64::from(id.collection.0)));
-        self.key.extend(ordered(id.sequence));
+        ordered_into(&mut self.key, u64::from(id.collection.0));
+        ordered_into(&mut self.key, id.sequence);
         if !self.ascending {
             return Reach::PointGet;
         }
@@ -2787,6 +2833,19 @@ impl<'a> PrimaryRows<'a> {
             return Reach::PointGet;
         }
         Reach::Lockstep
+    }
+
+    /// Point the reader at a fresh ascending run.
+    ///
+    /// The sparse bail-out in `plan` is a decision the reader makes ONCE and
+    /// then keeps: it drops the cursor and never opens another. That is right
+    /// for a page that reads its rows in one pass, and wrong for one that
+    /// reads them in BATCHES -- each batch ascends from its own smallest id,
+    /// so a batch that was sparse says nothing about the next one.
+    fn restart(&mut self, ascending: bool) {
+        self.ascending = ascending;
+        self.cursor = None;
+        self.last = 0;
     }
 
     /// Park the cursor on the first record at or after the planned key.
@@ -2828,6 +2887,41 @@ impl<'a> PrimaryRows<'a> {
         )
     }
 
+    /// Look at one row WITHOUT copying it out of the leaf.
+    ///
+    /// A page that reads a row only to answer a predicate -- `price > 100 AND
+    /// rating < 3.0` reads 15,912 rows to return 7,956 -- copied every one of
+    /// them into a `Vec` that the filter read one field out of and dropped.
+    /// The lockstep cursor is standing on the record, so the bytes can be
+    /// borrowed straight out of the pinned leaf; the point-get path has no
+    /// such borrow to offer and materialises as it always did.
+    fn with_row<R>(
+        &mut self,
+        id: EntityId,
+        f: impl FnOnce(Option<&[u8]>) -> QueryResult<R>,
+    ) -> QueryResult<R> {
+        if self.plan(id) == Reach::PointGet {
+            let bytes = self
+                .db
+                .store()?
+                .get(&self.key)
+                .map_err(Error::from)
+                .map_err(QueryError::from)?;
+            return f(bytes.as_deref());
+        }
+        self.seek(id)?;
+        let key = &self.key;
+        let cursor = self.cursor.as_mut().expect("the cursor was just opened");
+        match cursor
+            .peek_at_or_after(key)
+            .map_err(Error::from)
+            .map_err(QueryError::from)?
+        {
+            Some((found, value)) if found == key.as_slice() => f(Some(value)),
+            _ => f(None),
+        }
+    }
+
     /// Is the row still there? The same reach, without the copy.
     ///
     /// A key-only page asks the primary tree for a winner's row only to refuse
@@ -2858,6 +2952,163 @@ impl<'a> PrimaryRows<'a> {
     }
 }
 
+/// How many candidates one batch of row reads holds.
+///
+/// The batch exists to turn a random point-get per candidate into one forward
+/// pass of the primary tree, so it wants to be large; it holds a row per entry
+/// while it does, so it cannot be unbounded. A page never gathers more than it
+/// could return, and never more than this.
+const ROW_BATCH: usize = 4_096;
+
+/// ... and how many bytes of row those entries may hold.
+///
+/// Rows are whatever the caller stored. The count bound alone would let a
+/// batch of 4,096 megabyte blobs hold four gigabytes, so the read stops
+/// filling at this many bytes and the candidates past it are read one at a
+/// time exactly as before -- slower, and bounded.
+const ROW_BATCH_BYTES: usize = 4 << 20;
+
+/// Read one batch of candidates' rows in ASCENDING ENTITY ORDER.
+///
+/// The candidates arrive in the driver's order, which for a range posting is
+/// `(value, sequence)`: the ids do not ascend, so the page's lockstep reader
+/// gives up on its first gap and every candidate pays a fresh root-to-leaf
+/// descent -- measured at 4.0 pager accesses and 6.0 allocations per candidate
+/// on `filter/two_ranges`. Filters are pure functions of the row, so the ORDER
+/// they are evaluated in cannot change the answer: the batch is sorted by id
+/// here, read through one forward cursor, and handed back to the walk in its
+/// original order with the rows already in hand.
+///
+/// A candidate whose row is absent is left alone rather than refused. A
+/// posting can outlive the record it names, and whether that is an error is a
+/// question for the filter that asked for the row -- not for a reader that is
+/// only moving the read earlier.
+fn read_batch_rows<'a, C: FnMut() -> bool>(
+    db: &'a Database,
+    rows: &mut PrimaryRows<'a>,
+    filters: &[CompiledFilter],
+    keep_rows: bool,
+    batch: &mut [Candidate],
+    order: &mut Vec<(u64, u32)>,
+    scratch: &mut RowScratch,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<()> {
+    order.clear();
+    // The SEQUENCE travels with the index rather than being looked up through
+    // it. Sorting indices alone makes every one of a 4,096-entry sort's ~49,000
+    // comparisons an indirect load into a 64-byte-per-entry array; the
+    // collection is the same for every candidate here (the walk refuses one
+    // that crosses), so what orders them is one `u64` each.
+    for (at, candidate) in batch.iter().enumerate() {
+        if candidate.row.is_none() {
+            order.push((
+                candidate.id.sequence,
+                u32::try_from(at).map_err(|_| invalid_query("query batch overflow"))?,
+            ));
+        }
+    }
+    order.sort_unstable();
+    rows.restart(true);
+    let mut held = 0usize;
+    for (_, at) in order.iter() {
+        meter.check_cancelled()?;
+        let at = *at as usize;
+        meter.charge(WorkResource::PrimaryReads, 1)?;
+        let id = batch[at].id;
+        let satisfied = batch[at].satisfied_filter;
+        // Whether this row has to survive the pass as BYTES. A page that
+        // projects fields, or ranks by a key only the row holds, keeps it; a
+        // key-only page reads it to answer a predicate and then wants nothing
+        // from it, and copying it out of the leaf for that was one allocation
+        // and a row-sized memcpy per candidate.
+        let (verdict, kept) = rows.with_row(id, |bytes| {
+            let Some(bytes) = bytes else {
+                return Ok((None, None));
+            };
+            let verdict = batch_filters_match(db, filters, satisfied, bytes, scratch, meter)?;
+            let kept = if keep_rows && verdict != Some(false) && held < ROW_BATCH_BYTES {
+                Some(bytes.to_vec())
+            } else {
+                None
+            };
+            Ok((verdict, kept))
+        })?;
+        if let Some(bytes) = kept {
+            held = held.saturating_add(bytes.len());
+            batch[at].row = Some(bytes);
+        }
+        batch[at].row_filtered = verdict;
+    }
+    Ok(())
+}
+
+/// Every filter of a BATCHED page, against one borrowed row.
+///
+/// `batches_row_reads` has already established that each of these is a pure
+/// function of the row -- no graph set, no posting probe, no text merge -- so
+/// evaluating them here rather than in driver order changes nothing but the
+/// order the rows are read in. `None` means one of them was not of that kind
+/// after all and the walk must decide; the gate makes that unreachable, and it
+/// is a fallback rather than an assertion because being merely slow is the
+/// right failure for a plan predicate that drifts.
+fn batch_filters_match<C: FnMut() -> bool>(
+    db: &Database,
+    filters: &[CompiledFilter],
+    satisfied: Option<usize>,
+    bytes: &[u8],
+    scratch: &mut RowScratch,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<Option<bool>> {
+    let layout = db.layout(layout_id(bytes)?)?;
+    for (position, filter) in filters.iter().enumerate() {
+        meter.check_cancelled()?;
+        if satisfied == Some(position) {
+            continue;
+        }
+        let matches = match filter {
+            CompiledFilter::Scalar {
+                info,
+                predicate,
+                posting_membership,
+            } => {
+                if *posting_membership && matches!(predicate, EncodedScalarFilter::Eq(_)) {
+                    return Ok(None);
+                }
+                meter.note_row_decode();
+                scalar_filter_matches(
+                    info,
+                    predicate,
+                    selected_field_in(&layout, bytes, &info.field)?,
+                    &mut scratch.scalar,
+                )?
+            }
+            CompiledFilter::JsonEq { field, value } => {
+                meter.note_row_decode();
+                json_filter_matches(selected_field_in(&layout, bytes, field)?, value)?
+            }
+            CompiledFilter::Point { info, predicate } => {
+                meter.charge(WorkResource::SpatialPostings, 1)?;
+                meter.note_row_decode();
+                match point_from_field(selected_field_in(&layout, bytes, &info.field)?)? {
+                    Some(point) => match predicate {
+                        PointFilter::Bbox(bounds) => bounds.contains(point),
+                        PointFilter::Radius {
+                            center,
+                            radius_metres,
+                        } => within_radius(*center, point, *radius_metres).map_err(corrupt_query)?,
+                    },
+                    None => false,
+                }
+            }
+            CompiledFilter::Graph { .. } | CompiledFilter::Text(_) => return Ok(None),
+        };
+        if !matches {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
 /// [`ensure_row`] through the page's own primary reader.
 fn ensure_row_seq<'a, C: FnMut() -> bool>(
     db: &'a Database,
@@ -2881,30 +3132,6 @@ fn ensure_row_seq<'a, C: FnMut() -> bool>(
     Ok(())
 }
 
-fn ensure_row<C: FnMut() -> bool>(
-    db: &Database,
-    id: EntityId,
-    row: &mut Option<RowData>,
-    encoded: &mut Option<Vec<u8>>,
-    meter: &mut WorkMeter<'_, C>,
-) -> QueryResult<()> {
-    if row.is_some() {
-        return Ok(());
-    }
-    let bytes = if let Some(bytes) = encoded.take() {
-        bytes
-    } else {
-        meter.charge(WorkResource::PrimaryReads, 1)?;
-        db.store()?
-            .get(&row_key(id))
-            .map_err(Error::from)
-            .map_err(QueryError::from)?
-            .ok_or_else(|| corrupt_query("query candidate points to a missing entity"))?
-    };
-    *row = Some(decode_row(db, bytes)?);
-    Ok(())
-}
-
 /// One field of one candidate's row.
 ///
 /// The layout is not re-validated here. A `RowData` gets its layout from
@@ -2915,7 +3142,16 @@ fn ensure_row<C: FnMut() -> bool>(
 /// being repaid once per candidate for an answer fixed when the collection was
 /// created.
 fn selected_field(row: &RowData, field: &str) -> QueryResult<dense_v3::FieldValue> {
-    dense_v3::read_field_in(&row.layout, &row.bytes, field)
+    selected_field_in(&row.layout, &row.bytes, field)
+}
+
+/// [`selected_field`] for a row whose bytes are BORROWED.
+fn selected_field_in(
+    layout: &Layout,
+    bytes: &[u8],
+    field: &str,
+) -> QueryResult<dense_v3::FieldValue> {
+    dense_v3::read_field_in(layout, bytes, field)
         .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))
 }
 
@@ -2938,6 +3174,7 @@ fn scalar_filter_matches(
     info: &IndexInfo,
     predicate: &EncodedScalarFilter,
     value: dense_v3::FieldValue,
+    out: &mut Vec<u8>,
 ) -> QueryResult<bool> {
     match predicate {
         EncodedScalarFilter::Empty => Ok(false),
@@ -2945,9 +3182,9 @@ fn scalar_filter_matches(
         EncodedScalarFilter::IsMissing => Ok(matches!(value, dense_v3::FieldValue::Missing)),
         EncodedScalarFilter::Eq(expected) => match value {
             dense_v3::FieldValue::Inline(value) => {
-                let actual = scalar_key::encode(&info.kind, Some(&value))
+                scalar_key::encode_into(&info.kind, Some(&value), out)
                     .map_err(|error| corrupt_query(format!("indexed scalar row value: {error}")))?;
-                Ok(&actual == expected)
+                Ok(out.as_slice() == expected.as_slice())
             }
             dense_v3::FieldValue::Missing | dense_v3::FieldValue::Null => Ok(false),
             dense_v3::FieldValue::Vector { .. } => {
@@ -2956,9 +3193,9 @@ fn scalar_filter_matches(
         },
         EncodedScalarFilter::Range { .. } => match value {
             dense_v3::FieldValue::Inline(value) => {
-                let actual = scalar_key::encode(&info.kind, Some(&value))
+                scalar_key::encode_into(&info.kind, Some(&value), out)
                     .map_err(|error| corrupt_query(format!("indexed scalar row value: {error}")))?;
-                Ok(scalar_key_position(predicate, &actual) == Ordering::Equal)
+                Ok(scalar_key_position(predicate, out) == Ordering::Equal)
             }
             dense_v3::FieldValue::Missing | dense_v3::FieldValue::Null => Ok(false),
             dense_v3::FieldValue::Vector { .. } => {
@@ -3094,15 +3331,15 @@ fn point_from_field(value: dense_v3::FieldValue) -> QueryResult<Option<Point>> {
         .map_err(corrupt_query)
 }
 
-fn text_score<C: FnMut() -> bool>(
-    db: &Database,
+fn text_score<'a, C: FnMut() -> bool>(
+    db: &'a Database,
+    rows: &mut PrimaryRows<'a>,
     prepared: &PreparedText,
     id: EntityId,
     driven: Option<&TextFrequencies>,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
-    norms: &mut super::text_indexes::TextScratch,
-    scratch: &mut TextRowScratch,
+    scratch: &mut RowScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<f64>> {
     if prepared.terms.is_empty() {
@@ -3114,7 +3351,8 @@ fn text_score<C: FnMut() -> bool>(
     // performs. A text index built after its corpus writes NO head row at all,
     // so reading `norm_key` alone drops every document it scores.
     let Some(length) =
-        super::text_indexes::read_norm_cached(db, prepared.info.id, id.sequence, norms)?.length
+        super::text_indexes::read_norm_cached(db, prepared.info.id, id.sequence, &mut scratch.norms)?
+            .length
     else {
         return Ok(None);
     };
@@ -3137,8 +3375,8 @@ fn text_score<C: FnMut() -> bool>(
     if prepared.terms.len() > MAX_TEXT_TERMS {
         return Err(corrupt_query("prepared text query exceeds its term bound"));
     }
-    scratch.frequencies.clear();
-    scratch.idfs.clear();
+    scratch.text.frequencies.clear();
+    scratch.text.idfs.clear();
     let segments_on = super::text_indexes::segments_enabled(db);
     for (position, (term, &idf)) in prepared.terms.iter().zip(&prepared.idfs).enumerate() {
         let frequency = match merged {
@@ -3155,17 +3393,17 @@ fn text_score<C: FnMut() -> bool>(
                     term,
                     id.sequence,
                     segments_on,
-                    norms,
+                    &mut scratch.norms,
                 )?
             }
         };
         if let Some(frequency) = frequency {
-            scratch.frequencies.push(frequency);
-            scratch.idfs.push(idf);
+            scratch.text.frequencies.push(frequency);
+            scratch.text.idfs.push(idf);
         }
     }
-    let frequencies = scratch.frequencies.as_slice();
-    let idfs = scratch.idfs.as_slice();
+    let frequencies = scratch.text.frequencies.as_slice();
+    let idfs = scratch.text.idfs.as_slice();
     let matched = frequencies.len();
     if matched == 0
         || (matches!(prepared.matching, TextMatch::All | TextMatch::Phrase)
@@ -3174,23 +3412,55 @@ fn text_score<C: FnMut() -> bool>(
         return Ok(None);
     }
     if let Some(phrase) = prepared.phrase.as_deref() {
-        ensure_row(db, id, row, encoded, meter)?;
-        let text = match selected_field(row.as_ref().unwrap(), &prepared.info.field)? {
-            dense_v3::FieldValue::Inline(Value::String(text)) => text,
-            dense_v3::FieldValue::Missing | dense_v3::FieldValue::Null => {
+        // Through the PAGE's reader, not a fresh point-get. The text merge
+        // hands documents over in ascending sequence, so the rows a phrase
+        // re-reads ascend with it and one forward cursor serves the page: this
+        // was 8.0 pager accesses per candidate on `text/match_phrase`, most of
+        // them a root-to-leaf descent for a row the cursor was standing near.
+        ensure_row_seq(db, rows, id, row, encoded, meter)?;
+        let held = row.as_ref().expect("the row was just ensured");
+        // Borrowed out of the row, not copied out of it: an owned `String` per
+        // candidate was an allocation and a memcpy of the whole field for text
+        // that is scanned once and dropped.
+        let text = match dense_v3::read_text_field_in(&held.layout, &held.bytes, &prepared.info.field)
+            .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))?
+        {
+            dense_v3::TextFieldRef::Text(text) => text,
+            dense_v3::TextFieldRef::Missing | dense_v3::TextFieldRef::Null => {
                 return Err(corrupt_query(
                     "text posting points to absent authoritative primary text",
                 ));
             }
-            dense_v3::FieldValue::Inline(_) | dense_v3::FieldValue::Vector { .. } => {
-                return Err(corrupt_query(
-                    "text posting points to non-text authoritative primary field",
-                ));
+            // A text index over a field this layout does not declare as Text:
+            // the value is in the extras object, so it is read the general way
+            // and the same three cases decide.
+            dense_v3::TextFieldRef::Elsewhere => {
+                match selected_field(held, &prepared.info.field)? {
+                    dense_v3::FieldValue::Inline(Value::String(_)) => {
+                        return Err(corrupt_query(
+                            "text index field is not a declared text column",
+                        ));
+                    }
+                    dense_v3::FieldValue::Missing | dense_v3::FieldValue::Null => {
+                        return Err(corrupt_query(
+                            "text posting points to absent authoritative primary text",
+                        ));
+                    }
+                    _ => {
+                        return Err(corrupt_query(
+                            "text posting points to non-text authoritative primary field",
+                        ));
+                    }
+                }
             }
         };
-        let scanned = crate::text_analyzer::analyze_phrase_document(
-            &text,
+        let scanned = crate::text_analyzer::scan_phrase_document(
+            text,
             phrase,
+            &prepared.phrase_prefix,
+            &prepared.terms,
+            &mut scratch.seen,
+            &mut scratch.token,
             |event| match event {
                 crate::text_analyzer::PhraseScanEvent::Poll => meter.check_cancelled(),
                 crate::text_analyzer::PhraseScanEvent::Token => {
@@ -3198,7 +3468,7 @@ fn text_score<C: FnMut() -> bool>(
                 }
             },
         );
-        let (analysis, matched) = match scanned {
+        let (scanned_length, matched) = match scanned {
             Ok(result) => result,
             Err(crate::text_analyzer::PhraseScanError::Analysis(error)) => {
                 return Err(corrupt_query(format!(
@@ -3207,13 +3477,21 @@ fn text_score<C: FnMut() -> bool>(
             }
             Err(crate::text_analyzer::PhraseScanError::Callback(error)) => return Err(error),
         };
-        if analysis.length != length {
+        if scanned_length != length {
             return Err(corrupt_query(
                 "text norm disagrees with authoritative primary text",
             ));
         }
-        for (term, frequency) in prepared.terms.iter().zip(frequencies) {
-            if analysis.terms.get(term).copied() != Some(*frequency) {
+        // The same cross-check as before, positionally: `frequencies` holds
+        // the MATCHED terms in prepared order, and a phrase requires every
+        // prepared term to have matched, so the two run in step.
+        if frequencies.len() != prepared.terms.len() || scratch.seen.len() != prepared.terms.len() {
+            return Err(corrupt_query(
+                "text posting frequency disagrees with authoritative primary text",
+            ));
+        }
+        for (at, frequency) in frequencies.iter().enumerate() {
+            if scratch.seen[at] != *frequency {
                 return Err(corrupt_query(
                     "text posting frequency disagrees with authoritative primary text",
                 ));
@@ -3381,8 +3659,7 @@ fn filters_match<'a, C: FnMut() -> bool>(
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
     graph: &[Option<Vec<EntityId>>],
-    norms: &mut super::text_indexes::TextScratch,
-    scratch: &mut TextRowScratch,
+    scratch: &mut RowScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<bool> {
     for (position, filter) in filters.iter().enumerate() {
@@ -3408,7 +3685,12 @@ fn filters_match<'a, C: FnMut() -> bool>(
                     ensure_row_seq(db, rows, id, row, encoded, meter)?;
                     let row = row.as_ref().unwrap();
                     meter.note_row_decode();
-                    scalar_filter_matches(info, predicate, selected_field(row, &info.field)?)?
+                    scalar_filter_matches(
+                        info,
+                        predicate,
+                        selected_field(row, &info.field)?,
+                        &mut scratch.scalar,
+                    )?
                 }
             },
             CompiledFilter::JsonEq { field, value } => {
@@ -3441,12 +3723,12 @@ fn filters_match<'a, C: FnMut() -> bool>(
             }
             CompiledFilter::Text(prepared) => text_score(
                 db,
+                rows,
                 prepared,
                 id,
                 candidate.text.as_ref(),
                 row,
                 encoded,
-                norms,
                 scratch,
                 meter,
             )?
@@ -3466,8 +3748,7 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
     candidate: &Candidate,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
-    norms: &mut super::text_indexes::TextScratch,
-    scratch: &mut TextRowScratch,
+    scratch: &mut RowScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<RankKey>> {
     let value = match order {
@@ -3504,12 +3785,12 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
         CompiledOrder::Bm25(prepared) => {
             let Some(score) = text_score(
                 db,
+                rows,
                 prepared,
                 candidate.id,
                 candidate.text.as_ref(),
                 row,
                 encoded,
-                norms,
                 scratch,
                 meter,
             )? else {
@@ -3845,11 +4126,92 @@ impl PreparedQuery<'_> {
             self.driver,
             DriverPlan::Entities
                 | DriverPlan::Graph { .. }
+                // The text merge emits documents in STRICTLY ascending
+                // sequence and refuses a posting that does not advance -- it
+                // says so, and returns `text merge did not advance` if it ever
+                // stops holding. A phrase re-reads the authoritative text of
+                // every document it scores, and was paying a root-to-leaf
+                // descent for each: 8.0 pager accesses per candidate on
+                // `text/match_phrase`.
+                | DriverPlan::Text { .. }
                 | DriverPlan::Scalar {
                     predicate: EncodedScalarFilter::Eq(_),
                     ..
                 }
         )
+    }
+
+    /// True when the RANKING, not a filter, has to read the row: a scalar
+    /// order whose key the driver's postings do not carry.
+    fn order_needs_the_row(&self) -> bool {
+        match &self.order {
+            CompiledOrder::Scalar { .. } => !self.cursor_needs().scalar_key,
+            CompiledOrder::EntityId
+            | CompiledOrder::ExactVector { .. }
+            | CompiledOrder::ApproximateVector { .. }
+            | CompiledOrder::Bm25(_) => false,
+        }
+    }
+
+    /// True when the page should GATHER its candidates and read their rows in
+    /// tree order rather than one at a time in driver order.
+    ///
+    /// Four things have to hold, and each one is a correctness statement:
+    ///
+    ///   * the walk has no stop condition (`RankWalk::No`), so a batch can
+    ///     never read past the point a stopping walk would have reached. This
+    ///     is the whole of the bound rule: where a page CAN stop early, its
+    ///     driver is already handing candidates over in rank order and the
+    ///     row-reading question is a different one;
+    ///   * the driver does not already ascend by id -- when it does, the
+    ///     lockstep reader serves the page in one pass without gathering
+    ///     anything;
+    ///   * something actually reads a row per candidate, or there is nothing
+    ///     to gather for;
+    ///   * and nothing can REJECT a candidate before that read. A batch reads
+    ///     rows before any filter runs, so a filter that answers from a
+    ///     posting or from a graph set -- and would have rejected the
+    ///     candidate for free -- must not be sitting in front of the one that
+    ///     needs the row.
+    fn batches_row_reads(&self) -> bool {
+        if self.driver_walks_in_rank_order() != RankWalk::No || self.driver_walks_ids_ascending() {
+            return false;
+        }
+        if !(self.walk_reads_every_row() || self.order_needs_the_row()) {
+            return false;
+        }
+        self.filters_are_row_pure()
+    }
+
+    /// True when every filter this page still has to evaluate is a pure
+    /// function of the row -- no posting probe, no graph set, no text merge --
+    /// so the whole decision can be made against BORROWED row bytes and
+    /// nothing has to be copied out of the leaf to make it.
+    ///
+    /// The DRIVING filter is judged like any other. It is usually certified
+    /// by the driver and skipped per candidate, but whether it is certified is
+    /// a property of the CANDIDATE and this is a property of the plan, so
+    /// exempting it here would let a phrase -- whose driver certifies nothing
+    /// -- through, and a phrase decided against borrowed bytes alone is no
+    /// decision at all.
+    fn filters_are_row_pure(&self) -> bool {
+        let driving = match &self.driver {
+            DriverPlan::Scalar { position, .. } | DriverPlan::Text { position, .. } => *position,
+            DriverPlan::Spatial { position, .. } | DriverPlan::Graph { position } => Some(*position),
+            _ => None,
+        };
+        self.filters.iter().all(|filter| match filter {
+            CompiledFilter::Scalar {
+                posting_membership, ..
+            } => !*posting_membership,
+            CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
+            // A text filter rejects from its postings before it looks at a
+            // row, so it is a cheap refusal standing in front of the expensive
+            // one -- and a PHRASE is not a pure function of the row at all: it
+            // needs the merge's frequencies first. A graph filter is a
+            // membership test over a set the traversal already built.
+            CompiledFilter::Text(_) | CompiledFilter::Graph { .. } => false,
+        })
     }
 
     /// True when EVERY candidate that survives to the heap has already had its
@@ -3865,25 +4227,40 @@ impl PreparedQuery<'_> {
     /// The filter the DRIVER certifies is excluded: that one is skipped
     /// outright and reads nothing.
     fn walk_reads_every_row(&self) -> bool {
-        if matches!(self.driver, DriverPlan::Entities) {
-            return true;
-        }
+        // The entity cursor walks the primary tree itself, so a key it yielded
+        // is a record it has already read.
+        matches!(self.driver, DriverPlan::Entities) || self.a_filter_reads_the_row()
+    }
+
+    /// The half of [`walk_reads_every_row`] that is about the FILTERS: does
+    /// one of them have to go to the primary tree for every candidate?
+    ///
+    /// The entity driver makes `walk_reads_every_row` true without any filter
+    /// asking for a row, which is the right answer to "has this candidate's
+    /// record been read" and the wrong one to "is there a read here worth
+    /// moving".
+    fn a_filter_reads_the_row(&self) -> bool {
         let driving = match &self.driver {
             DriverPlan::Scalar { position, .. } | DriverPlan::Text { position, .. } => *position,
             DriverPlan::Spatial { position, .. } | DriverPlan::Graph { position } => Some(*position),
             _ => None,
         };
-        self.filters.iter().enumerate().any(|(position, filter)| {
-            Some(position) != driving
-                && match filter {
-                    // A non-driving equality answered from its posting reads no
-                    // row; every other scalar predicate does.
-                    CompiledFilter::Scalar {
-                        posting_membership, ..
-                    } => !*posting_membership,
-                    CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
-                    _ => false,
-                }
+        self.filters.iter().enumerate().any(|(position, filter)| match filter {
+            // A phrase is the one filter the DRIVER does not certify: its
+            // postings establish all-term candidacy and the ordered adjacency
+            // is settled against the authoritative primary text. So every
+            // candidate that passes it -- driving or not -- has had its row
+            // read, and the winner stage's re-fetch is asking a question this
+            // walk has answered.
+            CompiledFilter::Text(prepared) => prepared.phrase.is_some(),
+            _ if Some(position) == driving => false,
+            // A non-driving equality answered from its posting reads no row;
+            // every other scalar predicate does.
+            CompiledFilter::Scalar {
+                posting_membership, ..
+            } => !*posting_membership,
+            CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
+            CompiledFilter::Graph { .. } => false,
         })
     }
 
@@ -3923,8 +4300,7 @@ impl PreparedQuery<'_> {
         // One decoded `0x7B` norm block held for the page. Candidates that
         // arrive in ascending sequence -- the text and entity cursors -- reuse
         // it 255 times out of 256; one that does not simply re-decodes.
-        let mut norms = super::text_indexes::TextScratch::default();
-        let mut text_scratch = TextRowScratch::default();
+        let mut scratch = RowScratch::default();
         let graph = execute_graph_filters(self.db, &self.filters, &mut meter)?;
         let in_rank_order = self.driver_walks_in_rank_order();
         let mut driver = DriverCursor::new(
@@ -3969,8 +4345,7 @@ impl PreparedQuery<'_> {
                         &mut row,
                         &mut encoded,
                         &graph,
-                        &mut norms,
-                        &mut text_scratch,
+                        &mut scratch,
                         &mut meter,
                     )? {
                         continue;
@@ -4041,26 +4416,111 @@ impl PreparedQuery<'_> {
                     reranked,
                 })
             } else {
-                while let Some(mut candidate) = driver.next(&mut meter)? {
-                    meter.charge(WorkResource::Candidates, 1)?;
-                    if candidate.id.collection != self.collection {
-                        return Err(corrupt_query("query driver crossed collection boundary"));
-                    }
+                // Does this page gather its candidates before reading their
+                // rows? THE BOUND RULE, stated once: a batch is taken only
+                // where the walk has no stop condition at all, and it is never
+                // larger than the page could return. So the rows a batch reads
+                // are rows the row-by-row walk would have read too -- the same
+                // set, in the primary tree's order instead of the driver's.
+                let batched = self.batches_row_reads();
+                let keep_batch_rows = wants_rows || self.order_needs_the_row();
+                // A page whose driver ALREADY ascends gathers nothing -- one
+                // forward cursor serves it in a single pass -- but it was
+                // still copying each row out of the leaf to look at one field
+                // of it and then dropping the copy: the last allocation per
+                // candidate on `filter/and_half_indexed`. It can borrow
+                // instead, on exactly the terms a batch can.
+                let borrowed = !batched
+                    && !keep_batch_rows
+                    && self.a_filter_reads_the_row()
+                    && self.filters_are_row_pure();
+                let batch_bound = capacity.min(ROW_BATCH);
+                let mut batch: Vec<Candidate> = Vec::new();
+                let mut batch_order: Vec<(u64, u32)> = Vec::new();
+                'walk: loop {
+                    let mut candidate = if batched {
+                        if batch.is_empty() {
+                            while batch.len() < batch_bound {
+                                let Some(candidate) = driver.next(&mut meter)? else {
+                                    break;
+                                };
+                                meter.charge(WorkResource::Candidates, 1)?;
+                                if candidate.id.collection != self.collection {
+                                    return Err(corrupt_query(
+                                        "query driver crossed collection boundary",
+                                    ));
+                                }
+                                batch.push(candidate);
+                            }
+                            if batch.is_empty() {
+                                break 'walk;
+                            }
+                            read_batch_rows(
+                                db,
+                                &mut rows,
+                                &self.filters,
+                                keep_batch_rows,
+                                &mut batch,
+                                &mut batch_order,
+                                &mut scratch,
+                                &mut meter,
+                            )?;
+                            // `pop` takes from the end, so reversing hands the
+                            // candidates back in the driver's own order: the
+                            // rows were read in another order, nothing else
+                            // was.
+                            batch.reverse();
+                        }
+                        batch.pop().expect("the batch was just filled")
+                    } else {
+                        let Some(candidate) = driver.next(&mut meter)? else {
+                            break 'walk;
+                        };
+                        meter.charge(WorkResource::Candidates, 1)?;
+                        if candidate.id.collection != self.collection {
+                            return Err(corrupt_query("query driver crossed collection boundary"));
+                        }
+                        candidate
+                    };
                     let mut encoded = candidate.row.take();
                     let mut row = None;
-                    if !filters_match(
-                        db,
-                        &mut rows,
-                        &self.filters,
-                        &candidate,
-                        &mut row,
-                        &mut encoded,
-                        &graph,
-                        &mut norms,
-                        &mut text_scratch,
-                        &mut meter,
-                    )? {
-                        continue;
+                    if borrowed && encoded.is_none() && candidate.row_filtered.is_none() {
+                        meter.charge(WorkResource::PrimaryReads, 1)?;
+                        let id = candidate.id;
+                        let satisfied = candidate.satisfied_filter;
+                        let filters = &self.filters;
+                        let scratch = &mut scratch;
+                        let meter = &mut meter;
+                        candidate.row_filtered = rows.with_row(id, |bytes| match bytes {
+                            Some(bytes) => {
+                                batch_filters_match(db, filters, satisfied, bytes, scratch, meter)
+                            }
+                            None => Err(corrupt_query(
+                                "query candidate points to a missing entity",
+                            )),
+                        })?;
+                    }
+                    match candidate.row_filtered {
+                        // The batched pass read this candidate's row and ran
+                        // every filter against it; there is nothing here to
+                        // repeat.
+                        Some(true) => {}
+                        Some(false) => continue,
+                        None => {
+                            if !filters_match(
+                                db,
+                                &mut rows,
+                                &self.filters,
+                                &candidate,
+                                &mut row,
+                                &mut encoded,
+                                &graph,
+                                &mut scratch,
+                                &mut meter,
+                            )? {
+                                continue;
+                            }
+                        }
                     }
                     let Some(key) = rank_candidate(
                         db,
@@ -4069,8 +4529,7 @@ impl PreparedQuery<'_> {
                         &candidate,
                         &mut row,
                         &mut encoded,
-                        &mut norms,
-                        &mut text_scratch,
+                        &mut scratch,
                         &mut meter,
                     )?
                     else {

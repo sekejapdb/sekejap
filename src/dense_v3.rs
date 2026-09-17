@@ -317,6 +317,128 @@ pub(crate) fn read_fields(
     Ok(())
 }
 
+/// One declared Text column, BORROWED out of the row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TextFieldRef<'b> {
+    Text(&'b str),
+    Null,
+    Missing,
+    /// `field` is not a declared Text column of this layout, so its value
+    /// lives in the extras object or is of another kind. The caller reads it
+    /// the general way.
+    Elsewhere,
+}
+
+/// Read one declared Text column without copying it.
+///
+/// [`read_field_in`] hands back an owned `serde_json::Value`, so a caller that
+/// only wants to LOOK at the text -- the phrase refinement re-reads the
+/// authoritative primary text of every document it scores -- paid an
+/// allocation and a copy of the whole field per row for a string it drops one
+/// line later. The row is still validated end to end: this walks and checks
+/// exactly what `read_field_in` walks and checks, and only the one field it
+/// was asked for comes back, as a borrow into `bytes`.
+pub(crate) fn read_text_field_in<'b>(
+    layout: &Layout,
+    bytes: &'b [u8],
+    field: &str,
+) -> Result<TextFieldRef<'b>> {
+    let declared = layout
+        .fields
+        .iter()
+        .position(|(name, kind)| name == field && matches!(kind, Kind::Text));
+    if declared.is_none() {
+        return Ok(TextFieldRef::Elsewhere);
+    }
+    let mut selected = TextFieldRef::Missing;
+    let mut r = Read { b: bytes, p: 0 };
+    let h = r.uv()?;
+    if h >> 2 > u32::MAX as u64 {
+        return Err("layout ID domain".into());
+    }
+    if h >> 2 != layout.id {
+        return Err("wrong layout".into());
+    }
+    let states = if h & 1 != 0 {
+        Some(r.take(layout.fields.len().div_ceil(4))?)
+    } else {
+        None
+    };
+    let integers = layout
+        .fields
+        .iter()
+        .filter(|(_, kind)| matches!(kind, Kind::Int))
+        .count();
+    let widths = r.take((integers * 3).div_ceil(8))?;
+    let mut integer_index = 0;
+    for (ordinal, (_, kind)) in layout.fields.iter().enumerate() {
+        let width_index = integer_index;
+        if matches!(kind, Kind::Int) {
+            integer_index += 1;
+        }
+        let state = states.map_or(2, |states| (states[ordinal / 4] >> ((ordinal % 4) * 2)) & 3);
+        match state {
+            0 => continue,
+            1 => {
+                if declared == Some(ordinal) {
+                    selected = TextFieldRef::Null;
+                }
+                continue;
+            }
+            2 => {}
+            _ => return Err("invalid field state".into()),
+        }
+        match kind {
+            Kind::Text => {
+                let value = std::str::from_utf8(r.blob()?)?;
+                if declared == Some(ordinal) {
+                    selected = TextFieldRef::Text(value);
+                }
+            }
+            Kind::Int => {
+                let n = (width_get(widths, width_index) + 1) as usize;
+                r.take(n)?;
+            }
+            Kind::Real => {
+                r.float()?;
+            }
+            Kind::Bool => match r.byte()? {
+                0 | 1 => {}
+                _ => return Err("boolean encoding".into()),
+            },
+            Kind::Json => json_skip(&mut r, 0)?,
+            Kind::Geo => {
+                Geom::decode(r.blob()?).ok_or("invalid binary geometry")?;
+            }
+            Kind::Point => {
+                r.float()?;
+                r.float()?;
+            }
+            Kind::Vector(_) => {}
+        }
+    }
+    if h & 2 != 0 {
+        if r.byte()? != 8 {
+            return Err("extras must be object".into());
+        }
+        let n = r.count()?;
+        let mut previous: Option<&str> = None;
+        for _ in 0..n {
+            let key = std::str::from_utf8(r.blob()?)?;
+            if previous.is_some_and(|old| old >= key) {
+                return Err("unordered/duplicate object key".into());
+            }
+            if layout.fields.iter().any(|(name, _)| name == key) {
+                return Err("declared key in extras".into());
+            }
+            previous = Some(key);
+            json_skip(&mut r, 1)?;
+        }
+    }
+    r.done()?;
+    Ok(selected)
+}
+
 /// Validate the complete row while materializing only `field`. A field absent
 /// from this immutable layout may still be present in its extras object; such a
 /// numeric JSON array remains ordinary JSON rather than becoming a vector.

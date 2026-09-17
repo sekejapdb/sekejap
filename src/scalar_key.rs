@@ -25,11 +25,28 @@ fn corrupt(message: &str) -> Error {
 }
 
 pub(crate) fn encode(kind: &Kind, value: Option<&Value>) -> Result<Vec<u8>> {
+    // Nine bytes covers every numeric key and the common short text one, so
+    // the buffer is sized once rather than grown from the one-byte tag.
+    let mut out = Vec::with_capacity(9);
+    encode_into(kind, value, &mut out)?;
+    Ok(out)
+}
+
+/// The same encoding, appended to a buffer the caller reuses.
+///
+/// A row-evaluated scalar predicate encodes the row's value to compare it with
+/// the bound, once per candidate. Through `encode` that was TWO allocations
+/// each -- `vec![tag]` and then the growth to nine bytes -- and the result was
+/// dropped one line later. A page that filters on a non-driving scalar keeps
+/// one buffer instead.
+pub(crate) fn encode_into(kind: &Kind, value: Option<&Value>, out: &mut Vec<u8>) -> Result<()> {
     let tag = tag(kind).ok_or_else(|| invalid("scalar index requires Bool, Int, Real, or Text"))?;
+    out.clear();
     let Some(value) = value.filter(|v| !v.is_null()) else {
-        return Ok(vec![0]);
+        out.push(0);
+        return Ok(());
     };
-    let mut out = vec![tag];
+    out.push(tag);
     match kind {
         Kind::Bool => out.push(u8::from(
             value
@@ -68,7 +85,78 @@ pub(crate) fn encode(kind: &Kind, value: Option<&Value>) -> Result<Vec<u8>> {
         }
         _ => unreachable!("kind checked above"),
     }
-    Ok(out)
+    Ok(())
+}
+
+/// How many bytes one scalar key occupies, without decoding its value.
+///
+/// A scalar cursor steps over a posting key to reach the entity id behind it
+/// and never looks at the value; through `decode` a TEXT key allocated a
+/// `String` for every posting the walk passed, and dropped it unread --
+/// `filter/text_gt` walks 12,500 of them. The validation is the same as
+/// `decode`'s, byte for byte; only the materialisation is gone.
+pub(crate) fn width(kind: &Kind, bytes: &[u8]) -> Result<usize> {
+    let expected = tag(kind).ok_or_else(|| corrupt("unsupported scalar index kind"))?;
+    let actual = *bytes
+        .first()
+        .ok_or_else(|| corrupt("missing scalar key tag"))?;
+    if actual == 0 {
+        return Ok(1);
+    }
+    if actual != expected {
+        return Err(corrupt("scalar key tag does not match declared kind"));
+    }
+    match kind {
+        Kind::Bool => match bytes.get(1) {
+            Some(0 | 1) => Ok(2),
+            _ => Err(corrupt("invalid scalar Bool key")),
+        },
+        Kind::Int => {
+            if bytes.len() < 9 {
+                return Err(corrupt("truncated scalar numeric key"));
+            }
+            Ok(9)
+        }
+        Kind::Real => {
+            // The same canonicality refusal `decode` makes. Skipping a key is
+            // not a reason to start believing one this engine would reject.
+            let encoded = bytes
+                .get(1..9)
+                .ok_or_else(|| corrupt("truncated scalar numeric key"))?;
+            let ordered = u64::from_be_bytes(encoded.try_into().unwrap());
+            let bits = if ordered & SIGN != 0 {
+                ordered ^ SIGN
+            } else {
+                !ordered
+            };
+            if !f64::from_bits(bits).is_finite() || bits == SIGN {
+                return Err(corrupt("noncanonical or nonfinite scalar Real key"));
+            }
+            Ok(9)
+        }
+        Kind::Text => {
+            let mut at = 1;
+            let mut length = 0usize;
+            loop {
+                let b = *bytes
+                    .get(at)
+                    .ok_or_else(|| corrupt("unterminated scalar Text key"))?;
+                at += 1;
+                if b == 0 {
+                    match bytes.get(at) {
+                        Some(0) => return Ok(at + 1),
+                        Some(255) => at += 1,
+                        _ => return Err(corrupt("invalid scalar Text escape")),
+                    }
+                }
+                if length == TEXT_LIMIT {
+                    return Err(corrupt("scalar Text key exceeds 1024 UTF-8 bytes"));
+                }
+                length += 1;
+            }
+        }
+        _ => unreachable!("kind checked above"),
+    }
 }
 
 /// Decode one scalar prefix and return bytes consumed, leaving an entity-ID

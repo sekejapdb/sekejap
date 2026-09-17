@@ -130,6 +130,134 @@ pub(crate) fn analyze_phrase_query(text: &str) -> Result<PhraseAnalysis, &'stati
     Ok(PhraseAnalysis { analysis, sequence })
 }
 
+/// The KMP failure function of a phrase, built ONCE for the query.
+///
+/// It depends on the phrase alone, and `analyze_phrase_document` rebuilt it --
+/// an allocation and a `Vec` of `usize` -- for every document it scanned.
+pub(crate) fn phrase_prefix(phrase: &[String]) -> Vec<usize> {
+    let mut prefix = vec![0usize; phrase.len()];
+    for index in 1..phrase.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && phrase[index] != phrase[matched] {
+            matched = prefix[matched - 1];
+        }
+        if phrase[index] == phrase[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+    prefix
+}
+
+/// Scan authoritative primary text for an ordered contiguous phrase, counting
+/// only what the caller is going to read.
+///
+/// The difference from [`analyze_phrase_document`] is what is NOT built. That
+/// one returns a whole `Analysis`: a `BTreeMap<String, u32>` of every distinct
+/// term in the document, which is a map node and an owned `String` per term,
+/// per document -- and the query then looks up two of them and drops the rest.
+/// Here the caller names the terms it will ask about and gets their counts
+/// back positionally in a buffer it owns, so a document costs no allocation at
+/// all once the buffers have settled.
+///
+/// Returns `(token count, phrase found)`. `seen[i]` is how often `terms[i]`
+/// occurred. `token` is scratch; its contents on return mean nothing.
+///
+/// The distinct-term bound is the one check that cannot survive dropping the
+/// map, and it is the one that cannot fire: `analyze` refuses to INDEX text
+/// over that bound, so a document reaching this scanner is one the index
+/// already accepted. The bounds that guard this scan's own work -- text size,
+/// token count, term size -- are all still here, and the caller still holds
+/// the count and the frequencies against what the index recorded.
+pub(crate) fn scan_phrase_document<E>(
+    text: &str,
+    phrase: &[String],
+    prefix: &[usize],
+    terms: &[String],
+    seen: &mut Vec<u32>,
+    token: &mut String,
+    mut callback: impl FnMut(PhraseScanEvent) -> Result<(), E>,
+) -> Result<(u32, bool), PhraseScanError<E>> {
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(PhraseScanError::Analysis("indexed text exceeds 64 KiB"));
+    }
+    debug_assert_eq!(prefix.len(), phrase.len(), "the phrase and its failure function agree");
+    seen.clear();
+    seen.resize(terms.len(), 0);
+    token.clear();
+    let mut length = 0u32;
+    let mut matched = 0usize;
+    let mut found = false;
+    let mut next_poll = 256usize;
+    fn finish<E>(
+        token: &mut String,
+        length: &mut u32,
+        terms: &[String],
+        seen: &mut [u32],
+        phrase: &[String],
+        prefix: &[usize],
+        matched: &mut usize,
+        found: &mut bool,
+        callback: &mut impl FnMut(PhraseScanEvent) -> Result<(), E>,
+    ) -> Result<(), PhraseScanError<E>> {
+        if token.is_empty() {
+            return Ok(());
+        }
+        callback(PhraseScanEvent::Token).map_err(PhraseScanError::Callback)?;
+        if *length == MAX_TOKENS {
+            return Err(PhraseScanError::Analysis(
+                "indexed text exceeds 16384 tokens",
+            ));
+        }
+        *length += 1;
+        // A text query carries at most 64 terms and usually one or two, so a
+        // linear pass over them beats hashing the token.
+        for (at, term) in terms.iter().enumerate() {
+            if term.as_str() == token.as_str() {
+                seen[at] = seen[at].saturating_add(1);
+                break;
+            }
+        }
+        if !phrase.is_empty() {
+            while *matched > 0 && token != &phrase[*matched] {
+                *matched = prefix[*matched - 1];
+            }
+            if token == &phrase[*matched] {
+                *matched += 1;
+            }
+            if *matched == phrase.len() {
+                *found = true;
+                *matched = prefix[*matched - 1];
+            }
+        }
+        token.clear();
+        Ok(())
+    }
+    for (offset, ch) in text.char_indices() {
+        if offset >= next_poll {
+            callback(PhraseScanEvent::Poll).map_err(PhraseScanError::Callback)?;
+            next_poll = offset.saturating_add(256);
+        }
+        if alphanumeric(ch) {
+            push_lower(ch, token);
+            if token.len() > MAX_TERM_BYTES {
+                return Err(PhraseScanError::Analysis(
+                    "indexed term exceeds 128 UTF-8 bytes",
+                ));
+            }
+        } else {
+            finish(
+                token, &mut length, terms, seen, phrase, prefix, &mut matched, &mut found,
+                &mut callback,
+            )?;
+        }
+    }
+    finish(
+        token, &mut length, terms, seen, phrase, prefix, &mut matched, &mut found, &mut callback,
+    )?;
+    Ok((length, found))
+}
+
 /// Analyze authoritative primary text and test an ordered contiguous phrase
 /// without retaining document positions. `callback(Token)` runs before each
 /// token is counted or compared. `Poll` keeps cancellation responsive during
@@ -142,17 +270,7 @@ pub(crate) fn analyze_phrase_document<E>(
     if text.len() > MAX_TEXT_BYTES {
         return Err(PhraseScanError::Analysis("indexed text exceeds 64 KiB"));
     }
-    let mut prefix = vec![0usize; phrase.len()];
-    for index in 1..phrase.len() {
-        let mut matched = prefix[index - 1];
-        while matched > 0 && phrase[index] != phrase[matched] {
-            matched = prefix[matched - 1];
-        }
-        if phrase[index] == phrase[matched] {
-            matched += 1;
-        }
-        prefix[index] = matched;
-    }
+    let prefix = phrase_prefix(phrase);
 
     let mut result = Analysis {
         length: 0,

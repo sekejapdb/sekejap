@@ -567,3 +567,266 @@ fn a_descending_scalar_page_still_ranks_correctly() {
         }
     }
 }
+
+// ── Q4: the row-needing predicate ─────────────────────────────────────────
+//
+// A page whose driver hands candidates over in an order the primary tree knows
+// nothing about -- a RANGE posting is ordered by (value, sequence) -- and whose
+// second predicate has to read the row paid a full root-to-leaf descent per
+// candidate. These fix the cost of that shape to a number.
+
+const Q4_ROWS: u64 = 5_000;
+
+struct Q4 {
+    db: Database,
+    rows: e4_prototype::collections::CollectionId,
+    price: IndexId,
+    rating: IndexId,
+    note: IndexId,
+}
+
+fn q4_price(i: u64) -> f64 {
+    10.0 + (i % 49) as f64 * 10.0
+}
+fn q4_rating(i: u64) -> f64 {
+    (10 + i % 40) as f64 / 10.0
+}
+/// Every thirteenth row carries the phrase, in that order and adjacent; the
+/// rest carry the same two words but never next to each other in that order.
+fn q4_note(i: u64) -> String {
+    if i % 13 == 0 {
+        format!("railway signal number {i}")
+    } else {
+        format!("signal {} railway number {i}", WORDS[(i % 10) as usize])
+    }
+}
+
+fn q4_fixture(dir: &std::path::Path) -> Q4 {
+    let mut db = Database::create(dir.join("db"), cfg()).unwrap();
+    let rows = db
+        .create_collection(
+            "v",
+            vec![
+                ("price".into(), Kind::Real),
+                ("rating".into(), Kind::Real),
+                ("note".into(), Kind::Text),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    for i in 1..=Q4_ROWS {
+        db.put(
+            rows,
+            &format!("k{i:08}"),
+            &json!({"price": q4_price(i), "rating": q4_rating(i), "note": q4_note(i)}),
+        )
+        .unwrap();
+        if i % 256 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let price = db
+        .create_scalar_index(rows, "price_idx", "price", false)
+        .unwrap();
+    db.build_index_to_ready(price, 256).unwrap();
+    let rating = db
+        .create_scalar_index(rows, "rating_idx", "rating", false)
+        .unwrap();
+    db.build_index_to_ready(rating, 256).unwrap();
+    let note = db.create_text_index(rows, "note_text", "note").unwrap();
+    db.build_index_to_ready(note, 256).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    Q4 {
+        db,
+        rows,
+        price,
+        rating,
+        note,
+    }
+}
+
+/// `price > 250 AND rating < 3.0`: the price posting drives in (value,
+/// sequence) order and the rating predicate has to read the row.
+fn q4_two_ranges(f: &Q4) -> [QueryFilter<'static>; 2] {
+    [
+        QueryFilter::Scalar {
+            index: f.price,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Excluded(ScalarValue::F64(250.0)),
+                upper: Bound::Unbounded,
+            },
+        },
+        QueryFilter::Scalar {
+            index: f.rating,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Excluded(ScalarValue::F64(3.0)),
+            },
+        },
+    ]
+}
+
+/// The answer, computed from the generator alone.
+fn q4_oracle() -> Vec<u64> {
+    (1..=Q4_ROWS)
+        .filter(|i| q4_price(*i) > 250.0 && q4_rating(*i) < 3.0)
+        .collect()
+}
+
+/// Drain a query and report the ids it returned plus what it charged.
+fn q4_drain(
+    f: &Q4,
+    filters: &[QueryFilter<'_>],
+    order: QueryOrder<'_>,
+    page_size: usize,
+    total_limit: Option<usize>,
+) -> (Vec<u64>, u64) {
+    let mut prepared = f
+        .db
+        .prepare_query(QueryRequest {
+            collection: f.rows,
+            filters,
+            order,
+            projection: Projection::Ids,
+            total_limit,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let mut ids = Vec::new();
+    let mut candidates = 0;
+    loop {
+        let page = prepared
+            .next_page(page_size, QueryBudget::unlimited(), || false)
+            .unwrap();
+        candidates += page.work.candidates;
+        for row in &page.rows {
+            ids.push(row.id.sequence);
+        }
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    (ids, candidates)
+}
+
+/// A second predicate that needs the row does not cost a tree descent each.
+///
+/// The price posting is ordered by (value, sequence), so the candidate ids do
+/// NOT ascend and the page's lockstep primary reader gives up on its first
+/// gap: every candidate paid a fresh root-to-leaf descent, measured at 4.0
+/// pager accesses and 6.0 allocations per candidate on the 20,000-row bench.
+/// Gathering the page's candidates, sorting them by id and reading the rows
+/// through one ascending cursor is the same answer for one pass of the tree.
+#[test]
+fn a_row_needing_second_predicate_reads_rows_in_tree_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let f = q4_fixture(temp.path());
+    let filters = q4_two_ranges(&f);
+    let oracle = q4_oracle();
+    assert!(oracle.len() > 800, "the fixture must have a real answer");
+    // Warm every cache the first execution fills.
+    let (ids, candidates) = q4_drain(&f, &filters, QueryOrder::EntityId, PAGE, None);
+    assert_eq!(ids, oracle, "the batched read answers what the walk answers");
+    assert!(
+        (1_500..3_500).contains(&candidates),
+        "the driving posting should offer about 2,000 candidates, offered {candidates}"
+    );
+    let before = f.db.pool_accesses().unwrap();
+    let ((ids, candidates), allocations, _) =
+        counted(|| q4_drain(&f, &filters, QueryOrder::EntityId, PAGE, None));
+    let accesses = f.db.pool_accesses().unwrap() - before;
+    assert_eq!(ids, oracle);
+    assert!(
+        accesses as f64 <= candidates as f64 * 0.5,
+        "{accesses} pager accesses for {candidates} candidates: {:.2} each, and it was 4.0",
+        accesses as f64 / candidates as f64
+    );
+    assert!(
+        allocations as f64 <= candidates as f64 * 1.5,
+        "{allocations} allocations for {candidates} candidates: {:.2} each, and it was 6.0",
+        allocations as f64 / candidates as f64
+    );
+}
+
+/// The batch does not change what a page contains or where the next one starts.
+#[test]
+fn batched_row_reads_keep_pages_disjoint_complete_and_limited() {
+    let temp = tempfile::tempdir().unwrap();
+    let f = q4_fixture(temp.path());
+    let filters = q4_two_ranges(&f);
+    let oracle = q4_oracle();
+    for page_size in [1usize, 7, 64, 500, PAGE] {
+        let (ids, _) = q4_drain(&f, &filters, QueryOrder::EntityId, page_size, None);
+        assert_eq!(ids, oracle, "page size {page_size}");
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            ids.iter().all(|id| seen.insert(*id)),
+            "page size {page_size} returned a row twice"
+        );
+    }
+    for limit in [1usize, 10, 37, 900] {
+        let (ids, _) = q4_drain(&f, &filters, QueryOrder::EntityId, 16, Some(limit));
+        assert_eq!(
+            ids,
+            oracle.iter().copied().take(limit).collect::<Vec<_>>(),
+            "limit {limit}"
+        );
+    }
+}
+
+/// A phrase re-reads the authoritative text; it must not re-descend the tree
+/// for it, and tokenising it must not allocate per token.
+///
+/// The phrase scanner built a `BTreeMap<String, u32>` of every distinct term in
+/// the document and a fresh KMP table for the query, per document: 16.0
+/// allocations and 8.0 pager accesses per candidate on the 20,000-row bench.
+#[test]
+fn a_phrase_scans_the_row_without_a_descent_or_a_term_map() {
+    let temp = tempfile::tempdir().unwrap();
+    let f = q4_fixture(temp.path());
+    let phrase = [QueryFilter::Text {
+        index: f.note,
+        query: "railway signal",
+        matching: TextMatch::Phrase,
+    }];
+    // The very same posting walk, without the authoritative re-read: the
+    // baseline every phrase cost is measured ON TOP of.
+    let all = [QueryFilter::Text {
+        index: f.note,
+        query: "railway signal",
+        matching: TextMatch::All,
+    }];
+    let oracle: Vec<u64> = (1..=Q4_ROWS).filter(|i| i % 13 == 0).collect();
+    assert!(oracle.len() > 300, "the fixture must have a real answer");
+    let (ids, candidates) = q4_drain(&f, &phrase, QueryOrder::EntityId, PAGE, None);
+    assert_eq!(ids, oracle, "the phrase answer");
+    let (all_ids, _) = q4_drain(&f, &all, QueryOrder::EntityId, PAGE, None);
+    assert!(
+        all_ids.len() > ids.len(),
+        "every document holding both words must outnumber the ones holding the phrase"
+    );
+
+    let before = f.db.pool_accesses().unwrap();
+    let (_, base_allocations, _) = counted(|| q4_drain(&f, &all, QueryOrder::EntityId, PAGE, None));
+    let base_accesses = f.db.pool_accesses().unwrap() - before;
+    let before = f.db.pool_accesses().unwrap();
+    let ((ids, candidates2), allocations, _) =
+        counted(|| q4_drain(&f, &phrase, QueryOrder::EntityId, PAGE, None));
+    let accesses = f.db.pool_accesses().unwrap() - before;
+    assert_eq!(ids, oracle);
+    assert_eq!(candidates, candidates2);
+    let extra_accesses = accesses.saturating_sub(base_accesses) as f64 / candidates as f64;
+    let extra_allocations =
+        allocations.saturating_sub(base_allocations) as f64 / candidates as f64;
+    assert!(
+        extra_accesses <= 1.0,
+        "the phrase re-read cost {extra_accesses:.2} pager accesses per candidate beyond its posting walk"
+    );
+    assert!(
+        extra_allocations <= 2.0,
+        "the phrase re-read cost {extra_allocations:.2} allocations per candidate beyond its posting walk"
+    );
+}

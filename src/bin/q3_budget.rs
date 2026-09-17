@@ -67,12 +67,22 @@ unsafe impl GlobalAlloc for Alloc {
         unsafe { System.alloc_zeroed(l) }
     }
 }
+thread_local! {
+    static SIZES: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static HIST: Cell<bool> = const { Cell::new(false) };
+}
 fn note_alloc(size: usize) {
     TRACK
         .try_with(|t| {
             if t.get() {
                 COUNT.with(|c| c.set(c.get() + 1));
                 BYTES.with(|b| b.set(b.get() + size));
+                if HIST.with(Cell::get) {
+                    HIST.with(|h| h.set(false));
+                    SIZES.with(|m| *m.borrow_mut().entry(size).or_insert(0) += 1);
+                    HIST.with(|h| h.set(true));
+                }
             }
         })
         .ok();
@@ -660,6 +670,24 @@ fn main() -> R<()> {
             },
         },
     ];
+    let and_half = [
+        QueryFilter::Scalar {
+            index: c.cat,
+            predicate: ScalarFilter::Eq(ScalarValue::Text("cafe")),
+        },
+        QueryFilter::Scalar {
+            index: c.rating,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Excluded(ScalarValue::F64(3.0)),
+                upper: Bound::Unbounded,
+            },
+        },
+    ];
+    let phrase = [QueryFilter::Text {
+        index: c.note,
+        query: "railway signal",
+        matching: TextMatch::Phrase,
+    }];
     let (tn, tprimary, tcand) =
         run_query(&c, &two_ranges, QueryOrder::EntityId, Projection::Ids, PAGE);
     let two_t = time(iters / 200, || {
@@ -721,21 +749,23 @@ fn main() -> R<()> {
 
     // ── counted, not reasoned about ───────────────────────────────────────
     println!("\n── allocations and pager accesses per execution ──\n");
-    let mut counts: Vec<(String, usize, usize, u64)> = Vec::new();
-    let mut measure = |label: &str, f: &mut dyn FnMut()| {
+    let mut counts: Vec<(String, usize, usize, u64, u64)> = Vec::new();
+    let mut measure = |label: &str, f: &mut dyn FnMut() -> u64| {
+        // Warm once untimed so first touch is not what is counted.
+        let _ = f();
         let before = c.db.pool_accesses().unwrap();
-        let ((), n, bytes) = counted(|| f());
+        let (candidates, n, bytes) = counted(&mut *f);
         let after = c.db.pool_accesses().unwrap();
-        counts.push((label.to_owned(), n, bytes, after - before));
+        counts.push((label.to_owned(), n, bytes, after - before, candidates));
     };
     measure("scan/full_keys", &mut || {
-        run_query(&c, &no_filters, QueryOrder::EntityId, Projection::Ids, PAGE);
+        run_query(&c, &no_filters, QueryOrder::EntityId, Projection::Ids, PAGE).2
     });
     measure("filter/range_open", &mut || {
-        run_query(&c, &range_open, QueryOrder::EntityId, Projection::Ids, PAGE);
+        run_query(&c, &range_open, QueryOrder::EntityId, Projection::Ids, PAGE).2
     });
     measure("filter/eq_indexed_many", &mut || {
-        run_query(&c, &eq_cafe, QueryOrder::EntityId, Projection::Ids, PAGE);
+        run_query(&c, &eq_cafe, QueryOrder::EntityId, Projection::Ids, PAGE).2
     });
     measure("text/bm25_one_term", &mut || {
         run_query(
@@ -752,7 +782,8 @@ fn main() -> R<()> {
             },
             Projection::Ids,
             PAGE,
-        );
+        )
+        .2
     });
     measure("scan/full_one_col", &mut || {
         run_query(
@@ -761,27 +792,111 @@ fn main() -> R<()> {
             QueryOrder::EntityId,
             Projection::Fields(&["cat"]),
             PAGE,
-        );
+        )
+        .2
     });
     measure("filter/two_ranges", &mut || {
-        run_query(&c, &two_ranges, QueryOrder::EntityId, Projection::Ids, PAGE);
+        run_query(&c, &two_ranges, QueryOrder::EntityId, Projection::Ids, PAGE).2
+    });
+    measure("filter/and_half_indexed", &mut || {
+        run_query(&c, &and_half, QueryOrder::EntityId, Projection::Ids, PAGE).2
+    });
+    measure("text/match_phrase", &mut || {
+        run_query(&c, &phrase, QueryOrder::EntityId, Projection::Ids, PAGE).2
+    });
+    measure("scan/full_one_col(rating)", &mut || {
+        run_query(
+            &c,
+            &no_filters,
+            QueryOrder::EntityId,
+            Projection::Fields(&["rating"]),
+            PAGE,
+        )
+        .2
+    });
+    let price_gt_100 = [QueryFilter::Scalar {
+        index: c.price,
+        predicate: ScalarFilter::Range {
+            lower: Bound::Excluded(ScalarValue::F64(100.0)),
+            upper: Bound::Unbounded,
+        },
+    }];
+    let price_and_missing = [
+        QueryFilter::Scalar {
+            index: c.price,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Excluded(ScalarValue::F64(100.0)),
+                upper: Bound::Unbounded,
+            },
+        },
+        QueryFilter::Scalar {
+            index: c.rating,
+            predicate: ScalarFilter::IsMissing,
+        },
+    ];
+    measure("probe/price_gt_100 alone", &mut || {
+        run_query(&c, &price_gt_100, QueryOrder::EntityId, Projection::Ids, PAGE).2
+    });
+    measure("probe/price_gt_100 + rating IS MISSING", &mut || {
+        run_query(&c, &price_and_missing, QueryOrder::EntityId, Projection::Ids, PAGE).2
     });
     measure("filter/eq_no_match", &mut || {
-        run_query(&c, &eq_nowhere, QueryOrder::EntityId, Projection::Ids, PAGE);
+        run_query(&c, &eq_nowhere, QueryOrder::EntityId, Projection::Ids, PAGE).2
     });
     measure("prepare_query only (one scalar index)", &mut || {
-        prepare_only(&c, &eq_nowhere, QueryOrder::EntityId);
+        u64::from(prepare_only(&c, &eq_nowhere, QueryOrder::EntityId))
     });
     measure("prepare_query only (no index)", &mut || {
-        prepare_only(&c, &no_filters, QueryOrder::EntityId);
+        u64::from(prepare_only(&c, &no_filters, QueryOrder::EntityId))
     });
     println!(
-        "{:<44} {:>10} {:>12} {:>14}",
-        "case", "allocs", "bytes", "pool accesses"
+        "{:<44} {:>10} {:>12} {:>14} {:>11} {:>9} {:>9}",
+        "case", "allocs", "bytes", "pool accesses", "candidates", "all/cand", "acc/cand"
     );
-    println!("{}", "-".repeat(84));
-    for (label, n, bytes, pool) in &counts {
-        println!("{label:<44} {n:>10} {bytes:>12} {pool:>14}");
+    println!("{}", "-".repeat(116));
+    for (label, n, bytes, pool, candidates) in &counts {
+        let per = |v: f64| if *candidates == 0 { 0.0 } else { v / *candidates as f64 };
+        println!(
+            "{label:<44} {n:>10} {bytes:>12} {pool:>14} {candidates:>11} {:>9.2} {:>9.2}",
+            per(*n as f64),
+            per(*pool as f64)
+        );
+    }
+    // ── where the per-candidate allocations go, by size ───────────────────
+    for (label, run) in [
+        ("filter/two_ranges", 0usize),
+        ("filter/and_half_indexed", 1),
+        ("text/match_phrase", 2),
+        ("scan/full_one_col(rating)", 3),
+        ("probe/price_gt_100 alone", 4),
+        ("probe/price_gt_100 + rating IS MISSING", 5),
+    ] {
+        SIZES.with(|m| m.borrow_mut().clear());
+        HIST.with(|h| h.set(true));
+        let (_, n, _) = counted(|| match run {
+            0 => run_query(&c, &two_ranges, QueryOrder::EntityId, Projection::Ids, PAGE).2,
+            1 => run_query(&c, &and_half, QueryOrder::EntityId, Projection::Ids, PAGE).2,
+            2 => run_query(&c, &phrase, QueryOrder::EntityId, Projection::Ids, PAGE).2,
+            4 => run_query(&c, &price_gt_100, QueryOrder::EntityId, Projection::Ids, PAGE).2,
+            5 => run_query(&c, &price_and_missing, QueryOrder::EntityId, Projection::Ids, PAGE).2,
+            _ => run_query(
+                &c,
+                &no_filters,
+                QueryOrder::EntityId,
+                Projection::Fields(&["rating"]),
+                PAGE,
+            )
+            .2,
+        });
+        HIST.with(|h| h.set(false));
+        let mut v: Vec<(usize, usize)> =
+            SIZES.with(|m| m.borrow().iter().map(|(k, c)| (*k, *c)).collect());
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(10);
+        println!("\n{label}: {n} allocations, top sizes");
+        for (size, count) in v {
+            println!("    {size:>8} B  x {count}");
+        }
     }
     println!();
     let _ = fs::remove_dir_all(&root);
