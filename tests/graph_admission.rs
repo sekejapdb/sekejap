@@ -2,6 +2,7 @@
 //! authorized Linux paths; local development is compile-only on macOS.
 use e4_prototype::{
     collections::{
+        verification::{verify_indexed_source, VerificationLimits},
         CollectionId, Database, Direction, EdgeKey, EdgeTypeId, EntityId, Error, GraphContextId,
         NeighborRequest,
     },
@@ -237,8 +238,13 @@ fn damaged_graph_metadata_replica_falls_back_without_rewriting_source() {
     }
 }
 
+/// A traversal no longer cross-checks the other direction of every edge it
+/// walks -- that cost one lookup per edge, to guard a state the commit
+/// protocol already excludes, since both directions are written in the same
+/// transaction. Damage that the read actually needs is still refused; a
+/// missing reverse marker is now the verifier's finding, and it is reported.
 #[test]
-fn missing_reverse_or_primary_and_bad_properties_have_distinct_read_failures() {
+fn edge_damage_fails_the_read_that_needs_it_and_the_verifier_reports_the_rest() {
     let temp = tempfile::tempdir().unwrap();
     for damage in 0..3u8 {
         let path = temp.path().join(format!("edge-damage-{damage}"));
@@ -270,6 +276,28 @@ fn missing_reverse_or_primary_and_bad_properties_have_distinct_read_failures() {
             edge_type: Some(edge.edge_type),
             limit: 2,
         };
+        if damage == 0 {
+            // The outgoing read never needed the reverse marker: it answers
+            // from the authoritative row it scanned. The verifier owns this.
+            let found = db.neighbors(request).unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].key.destination, b);
+            drop(db);
+            let mut issues = Vec::new();
+            let report = verify_indexed_source(&path, VerificationLimits::default(), |issue| {
+                issues.push(issue.clone())
+            })
+            .unwrap();
+            assert!(report.complete && !report.clean);
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.message.contains("graph reverse marker missing")),
+                "verifier issues: {:?}",
+                issues.iter().map(|i| i.message.clone()).collect::<Vec<_>>()
+            );
+            continue;
+        }
         assert!(matches!(db.neighbors(request), Err(Error::Corrupt(_))));
     }
 }

@@ -1174,70 +1174,77 @@ fn visit_graph_direction<C: FnMut() -> bool>(
         Some(request.context),
         request.edge_type,
     );
-    let mut cursor = db.store()?.range(&prefix).map_err(Error::from)?;
-    loop {
-        meter.charge(WorkResource::GraphEdges, 1)?;
-        let Some(row) = cursor.next() else {
-            return Ok(());
-        };
-        let (key, value) = row.map_err(Error::from)?;
-        if !key.starts_with(&prefix) {
-            return Ok(());
-        }
-        *scanned = scanned
-            .checked_add(1)
-            .ok_or_else(|| invalid_query("BFS edge work overflow"))?;
-        if *scanned > request.max_edges {
-            return Err(invalid_query("BFS edge work limit exceeded"));
-        }
-        let edge = super::graph_collections::parse_edge_key(&key, tag)?;
-        if edge.context.0 >= header.next_context
-            || edge.edge_type.0 == 0
-            || edge.edge_type.0 >= header.next_type
-        {
-            return Err(corrupt_query(
-                "stored edge has unknown type/context identity",
-            ));
-        }
-        if direction == Direction::Outgoing {
-            super::graph_collections::decode_properties(&value)?;
-            if db
-                .store()?
-                .get(&super::graph_collections::edge_key(
-                    super::graph_collections::REVERSE_EDGE,
-                    edge,
-                ))?
-                .as_deref()
-                != Some(&[])
-            {
-                return Err(corrupt_query("missing/nonempty reverse edge marker"));
+    // The near entity, the context and (when the caller named one) the type
+    // are the prefix itself: `starts_with` proves the row carries exactly the
+    // bytes we built, so only the far endpoint has to be read back out.
+    let at0 = prefix.len();
+    // `for_each_ref` hands the callback borrows into the pinned leaf. The
+    // allocating cursor built a key `Vec` and a value `Vec` for every edge
+    // walked, for a parser that only reads them. The work meter is charged on
+    // exactly the old schedule: one unit per turn of the loop, including the
+    // turn that found no further row.
+    let mut failure: Option<QueryError> = None;
+    let mut stopped = false;
+    {
+        let mut step = |key: &[u8], value: &[u8]| -> QueryResult<bool> {
+            meter.charge(WorkResource::GraphEdges, 1)?;
+            if !key.starts_with(&prefix) {
+                return Ok(false);
             }
-        } else {
-            if !value.is_empty() {
+            *scanned = scanned
+                .checked_add(1)
+                .ok_or_else(|| invalid_query("BFS edge work overflow"))?;
+            if *scanned > request.max_edges {
+                return Err(invalid_query("BFS edge work limit exceeded"));
+            }
+            // The SQL traversal returns entities, so it decodes no properties
+            // and reads nothing across the pair: both directions are written in
+            // one transaction, so a committed snapshot cannot hold half a pair,
+            // and `verify_indexed_source` is the tool that checks pair
+            // consistency.
+            if direction == Direction::Incoming && !value.is_empty() {
                 return Err(corrupt_query("nonempty reverse edge marker"));
             }
-            let primary = db
-                .store()?
-                .get(&super::graph_collections::edge_key(
-                    super::graph_collections::PRIMARY_EDGE,
-                    edge,
-                ))?
-                .ok_or_else(|| corrupt_query("reverse edge without authoritative primary"))?;
-            super::graph_collections::decode_properties(&primary)?;
-        }
-        let adjacent = if direction == Direction::Outgoing {
-            edge.destination
-        } else {
-            edge.source
-        };
-        if !seen.contains(&adjacent) && !next.contains(&adjacent) {
-            meter.charge(WorkResource::GraphVisited, 1)?;
-            if seen.len() + next.len() == request.max_visited {
-                return Err(invalid_query("BFS visited limit exceeded"));
+            let (_, adjacent) = super::graph_collections::adjacent_from_tail(
+                key,
+                at0,
+                request.edge_type,
+                request.context,
+                header,
+            )?;
+            if !seen.contains(&adjacent) && !next.contains(&adjacent) {
+                meter.charge(WorkResource::GraphVisited, 1)?;
+                if seen.len() + next.len() == request.max_visited {
+                    return Err(invalid_query("BFS visited limit exceeded"));
+                }
+                next.insert(adjacent);
             }
-            next.insert(adjacent);
-        }
+            Ok(true)
+        };
+        db.store()?
+            .range(&prefix)
+            .map_err(Error::from)?
+            .for_each_ref(|key, value| match step(key, value) {
+                Ok(true) => true,
+                Ok(false) => {
+                    stopped = true;
+                    false
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    stopped = true;
+                    false
+                }
+            })
+            .map_err(Error::from)?;
     }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if !stopped {
+        meter.charge(WorkResource::GraphEdges, 1)?;
+    }
+    Ok(())
 }
 
 fn execute_graph<C: FnMut() -> bool>(

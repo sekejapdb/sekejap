@@ -1311,49 +1311,73 @@ fn run_e4(
         result_limit: member_limit,
     };
 
-    db.neighbors(out_request(warm_seed))?;
+    // Both arms are asked for the same thing: the adjacent identities. The
+    // SQLite statement is `SELECT destination_id`/`SELECT source_id` -- a
+    // covering index walk that never touches the row -- so E4 is measured on
+    // `neighbor_ids`, its matching keys-only call, rather than on `neighbors`,
+    // which also decodes every edge's properties.
+    db.neighbor_ids(out_request(warm_seed))?;
     let mut out_micros = Vec::with_capacity(GRAPH_SEEDS);
     let mut out_rows = 0usize;
     for &seed in &graph_seeds {
         let start = Instant::now();
         let found = db
-            .neighbors(out_request(seed))?
+            .neighbor_ids(out_request(seed))?
             .into_iter()
-            .map(|edge| edge.key.destination.sequence)
+            .map(|id| id.sequence)
             .collect::<BTreeSet<_>>();
         out_micros.push(start.elapsed().as_secs_f64() * 1e6);
         assert_eq!(found, independent_knows_out(n, seed));
         out_rows += found.len();
+    }
+    // The property-bearing call must still answer the identical adjacency.
+    for &seed in &graph_seeds {
+        assert_eq!(
+            db.neighbors(out_request(seed))?
+                .into_iter()
+                .map(|edge| edge.key.destination.sequence)
+                .collect::<BTreeSet<_>>(),
+            independent_knows_out(n, seed)
+        );
     }
     queries.insert(
         "graph_out_1hop".into(),
         graph_timing_json(
             out_micros,
             out_rows,
-            json!({"work":"outgoing knows neighbours, complete-or-error limit 8"}),
+            json!({"work":"outgoing knows neighbour identities, complete-or-error limit 8"}),
         ),
     );
 
-    db.neighbors(in_request(warm_seed))?;
+    db.neighbor_ids(in_request(warm_seed))?;
     let mut in_micros = Vec::with_capacity(GRAPH_SEEDS);
     let mut in_rows = 0usize;
     for &seed in &graph_seeds {
         let start = Instant::now();
         let found = db
-            .neighbors(in_request(seed))?
+            .neighbor_ids(in_request(seed))?
             .into_iter()
-            .map(|edge| edge.key.source.sequence)
+            .map(|id| id.sequence)
             .collect::<BTreeSet<_>>();
         in_micros.push(start.elapsed().as_secs_f64() * 1e6);
         assert_eq!(found, independent_knows_in(n, seed));
         in_rows += found.len();
+    }
+    for &seed in &graph_seeds {
+        assert_eq!(
+            db.neighbors(in_request(seed))?
+                .into_iter()
+                .map(|edge| edge.key.source.sequence)
+                .collect::<BTreeSet<_>>(),
+            independent_knows_in(n, seed)
+        );
     }
     queries.insert(
         "graph_in_1hop".into(),
         graph_timing_json(
             in_micros,
             in_rows,
-            json!({"work":"incoming knows neighbours through the reverse edge index"}),
+            json!({"work":"incoming knows neighbour identities through the reverse edge index"}),
         ),
     );
 

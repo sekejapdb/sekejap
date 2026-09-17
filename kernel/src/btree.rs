@@ -1302,6 +1302,30 @@ impl<'p> BTree<'p> {
         }
     }
 
+    /// Descend to the leaf for `key` and, while that leaf is still pinned,
+    /// answer where in it the scan starts.
+    ///
+    /// `range` used to take the path from `descend_with_path` and then pin the
+    /// SAME leaf a second time purely to run `lower_bound` on it. Every scan in
+    /// the engine paid that second `pool.get` -- a borrow of the pool's table
+    /// and a hash lookup -- for a page the descent had open one line earlier.
+    fn descend_positioned(&self, key: &[u8]) -> Result<(u32, usize, Vec<(u32, usize)>)> {
+        let mut cur = self.root;
+        let mut path = Vec::with_capacity(8);
+        loop {
+            let r = self.pool.get(cur)?;
+            let p = open_cached(&r, cur)?;
+            if p.tree_id() != self.tree_id {
+                return Err(Error::Corrupt { page_no: cur, why: "page belongs to another tree" });
+            }
+            if p.kind() == PageKind::Leaf { return Ok((cur, lower_bound(&p, key)?, path)); }
+            let i = upper_bound(&p, key)?;
+            let child = child_at(self.pool, &p, i)?;
+            path.push((cur, i));
+            cur = child;
+        }
+    }
+
     /// Descend to the leaf for `key`, recording the path as (interior page,
     /// chosen child index) pairs for the scan cursor's parent-walk advance.
     fn descend_with_path(&self, key: &[u8]) -> Result<(u32, Vec<(u32, usize)>)> {
@@ -2645,8 +2669,7 @@ impl<'p> BTree<'p> {
     }
 
     pub fn range(&self, from: &[u8]) -> Result<RangeIter<'p>> {
-        let (leaf, path) = self.descend_with_path(from)?;
-        let idx = { let r = self.pool.get(leaf)?; lower_bound(&open_cached(&r, leaf)?, from)? };
+        let (leaf, idx, path) = self.descend_positioned(from)?;
         Ok(RangeIter {
             pool: self.pool, tree_id: self.tree_id, page: leaf, idx,
             done: false, leaves: 1, max_leaves: self.pool.page_count(),
