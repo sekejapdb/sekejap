@@ -322,6 +322,21 @@ pub(crate) fn read_fields(
 /// numeric JSON array remains ordinary JSON rather than becoming a vector.
 pub(crate) fn read_field(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
     layout.validate()?;
+    read_field_in(layout, bytes, field)
+}
+
+/// [`read_field`] for a layout that has ALREADY been validated.
+///
+/// Checking the layout belongs where the layout is built, not on the row-read
+/// path -- the same argument [`FieldPlan::new`] makes for the projection.
+/// `Layout::from_descriptor` validates every layout it decodes and
+/// `Layout::descriptor` validates every layout it writes, so a layout that
+/// reached a caller through the database cannot be one that failed. Re-asking
+/// per row compared a seven-column layout's names pairwise twenty-one times to
+/// learn what building it had already established: measured at 147 ns against
+/// 87 ns per field read, on a path a non-driving field predicate walks once
+/// per candidate.
+pub(crate) fn read_field_in(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
     let declared = layout.fields.iter().position(|(name, _)| name == field);
     let mut selected = FieldValue::Missing;
     let mut r = Read { b: bytes, p: 0 };

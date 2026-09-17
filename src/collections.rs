@@ -185,6 +185,25 @@ pub struct Database {
     /// that can change it, so re-reading it per edge is three descents bought
     /// for nothing.
     graph_header_cache: Cell<Option<graph_collections::GraphHeader>>,
+    /// Index descriptors this handle has already read, by id.
+    ///
+    /// `index_info` is four B-tree point-gets -- one registry probe and three
+    /// descriptor replicas -- and a query pays it once per index it names,
+    /// before it has looked at a single row. Measured on the 20,000-row
+    /// fixture: preparing a query with ONE scalar index cost 5.5 us against
+    /// 0.38 us for the same query with no index, so 5.1 us of a 8.1 us
+    /// empty-result query was descriptor reads.
+    ///
+    /// INVALIDATION. The cache is per handle and lives only as long as the
+    /// handle, so it cannot survive a reopen, and a snapshot handle opens its
+    /// own. Within a handle it is emptied by [`Database::writer`] -- the one
+    /// gate every mutation passes through, including the descriptor rewrites
+    /// that an index build, a tree-root move, a create and a drop all perform
+    /// -- and by [`Database::rollback`], which re-reads the durable files.
+    /// Nothing else can change a descriptor under a live handle: the store is
+    /// held exclusively, which is the same argument `graph_header_cache`
+    /// above rests on.
+    index_cache: RefCell<Vec<(indexes::IndexId, indexes::IndexInfo)>>,
     /// Identities this handle allocated since it opened, with the edges it has
     /// since written naming them. Sequences are dense, monotonic and never
     /// reused (D13), and the allocator counter rides the commit, so anything
@@ -639,6 +658,7 @@ impl Database {
             limits,
             index_header,
             graph_header_cache: Cell::new(None),
+            index_cache: RefCell::new(Vec::new()),
             fresh: BTreeMap::new(),
             fresh_order: VecDeque::new(),
             create_index_trees: indexes::create_index_trees(),
@@ -770,7 +790,42 @@ impl Database {
     }
     fn writer(&mut self) -> Result<&mut Backend> {
         self.ready_write()?;
+        // Every mutation this handle makes passes here, and a descriptor
+        // rewrite is one of them. See `index_cache`.
+        self.index_cache.borrow_mut().clear();
         Ok(&mut self.store)
+    }
+    /// [`Database::index_info`] through the per-handle descriptor cache.
+    pub(crate) fn index_info_cached(&self, id: indexes::IndexId) -> Result<indexes::IndexInfo> {
+        if let Some((_, info)) = self
+            .index_cache
+            .borrow()
+            .iter()
+            .find(|(cached, _)| *cached == id)
+        {
+            return Ok(info.clone());
+        }
+        let info = self.index_info(id)?;
+        let mut cache = self.index_cache.borrow_mut();
+        // One collection may hold `MAX_INDEXES`; beyond that a handle is
+        // touching more indexes than one database is allowed to have, so the
+        // cache starts again rather than growing without a bound.
+        if cache.len() >= indexes::MAX_INDEXES {
+            cache.clear();
+        }
+        cache.push((id, info.clone()));
+        Ok(info)
+    }
+    /// A public write entry point: the caller is changing the database, not
+    /// the engine. Everything `ready_write` refuses is still refused; what this
+    /// adds is the record that the transaction now holds work only the caller
+    /// can decide the fate of, which is what stops a late build from
+    /// committing or rolling back someone else's rows. The engine's own index
+    /// create/build/drop steps call `ready_write` and deliberately not this.
+    fn user_write(&mut self) -> Result<()> {
+        self.ready_write()?;
+        self.user_writes_pending = true;
+        Ok(())
     }
     fn ready_write(&self) -> Result<()> {
         self.store()?;
@@ -1340,6 +1395,7 @@ impl Database {
         *self.catalog_cache.borrow_mut() = None;
         *self.layout_cache.borrow_mut() = None;
         self.graph_header_cache.set(None);
+        self.index_cache.borrow_mut().clear();
         // A rollback rewinds the allocator, so a sequence handed out before it
         // can be handed out again. Everything the map claims about those ids
         // was learned in the discarded transaction; drop the lot.

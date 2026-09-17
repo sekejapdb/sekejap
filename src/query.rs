@@ -446,8 +446,13 @@ struct PreparedText {
     terms: Vec<String>,
     phrase: Option<Vec<String>>,
     matching: TextMatch,
-    corpus: super::text_indexes::Corpus,
     dfs: Vec<u64>,
+    /// The corpus half of every BM25 score this query can produce, and one
+    /// inverse document frequency per term. Both are settled the moment the
+    /// query is prepared; both used to be recomputed inside the per-document
+    /// loop, the idf with a natural logarithm.
+    weights: super::text_indexes::Bm25Weights,
+    idfs: Vec<f64>,
     /// Which candidate driver, if any, hands this prepared query the term
     /// frequencies it needs -- see `TextSource`. Filled in once, after the
     /// driver is chosen, by comparing term lists; `None` means this scorer
@@ -494,6 +499,20 @@ const INLINE_TEXT_TERMS: usize = 8;
 /// `prepare_text`. Scoring sizes its per-document buffers from this so it can
 /// keep them on the stack.
 const MAX_TEXT_TERMS: usize = 64;
+
+/// The two buffers the text scorer fills per document: one frequency and one
+/// inverse document frequency per term that actually matched.
+///
+/// They were stack arrays sized to the 64-term bound -- 256 bytes plus 512
+/// bytes, zeroed on every scored document, for a query that usually has one
+/// term. A page builds this once and every document reuses it: `clear` frees
+/// nothing and `push` allocates only until the first document has settled the
+/// capacity.
+#[derive(Default)]
+struct TextRowScratch {
+    frequencies: Vec<u32>,
+    idfs: Vec<f64>,
+}
 
 /// The per-term frequencies the text merge cursor decoded on its way past this
 /// document.
@@ -654,6 +673,88 @@ impl PartialOrd for HeapEntry {
     }
 }
 
+/// The candidates one page is still holding.
+///
+/// A page needs a HEAP only once it is full: until then every candidate is
+/// kept, so the ordering the heap maintains on the way in is thrown away by
+/// the final sort. Pushing 8,192 entries into a max-heap in ASCENDING order --
+/// which is exactly what a key-only scan does -- is the heap's worst case, one
+/// full sift to the root per row; measured at 61.9 ns/row against 3.6 ns/row
+/// for pushing the same entries onto a `Vec`.
+///
+/// So the page fills a `Vec`, and becomes a heap in one `O(n)` heapify the
+/// first time it has to name its WORST held entry -- which can only happen
+/// once it is full and a candidate has to displace something. A page whose
+/// answer fits (every non-ranked case here, and every ranked one under 8,192
+/// hits) never heapifies at all.
+///
+/// The `Vec` also reserves nothing until its first entry. `capacity` is the
+/// page size, not the answer size, so an EMPTY answer used to allocate 8,193
+/// entries -- 459 KB -- and drop them untouched, which was most of what
+/// `filter/eq_no_match` cost.
+enum Winners {
+    Filling(Vec<HeapEntry>),
+    Full(BinaryHeap<HeapEntry>),
+}
+
+impl Winners {
+    fn new() -> Self {
+        Self::Filling(Vec::new())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Filling(kept) => kept.len(),
+            Self::Full(heap) => heap.len(),
+        }
+    }
+
+    /// Keep one more. Only ever called with fewer than `capacity` held, or
+    /// straight after [`Winners::pop_worst`].
+    fn push(&mut self, capacity: usize, entry: HeapEntry) {
+        match self {
+            Self::Filling(kept) => {
+                if kept.capacity() == 0 {
+                    kept.reserve_exact(capacity);
+                }
+                kept.push(entry);
+            }
+            Self::Full(heap) => heap.push(entry),
+        }
+    }
+
+    /// The worst entry held, which is the one a better candidate displaces.
+    /// Asking the question is what turns the page into a heap.
+    fn worst(&mut self) -> Option<&HeapEntry> {
+        if let Self::Filling(kept) = self {
+            *self = Self::Full(BinaryHeap::from(std::mem::take(kept)));
+        }
+        match self {
+            Self::Full(heap) => heap.peek(),
+            Self::Filling(_) => unreachable!("the page was just heapified"),
+        }
+    }
+
+    fn pop_worst(&mut self) {
+        if let Self::Full(heap) = self {
+            heap.pop();
+        }
+    }
+
+    /// True once the page has had to order itself, so its entries are in heap
+    /// order and not in the order the walk handed them over.
+    fn heaped(&self) -> bool {
+        matches!(self, Self::Full(_))
+    }
+
+    fn into_vec(self) -> Vec<HeapEntry> {
+        match self {
+            Self::Filling(kept) => kept,
+            Self::Full(heap) => heap.into_vec(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ApproxHeapEntry {
     distance: f64,
@@ -741,7 +842,7 @@ fn require_scalar_index(
     collection: CollectionId,
     id: IndexId,
 ) -> QueryResult<IndexInfo> {
-    let info = db.index_info(id)?;
+    let info = db.index_info_cached(id)?;
     if info.collection != collection {
         return Err(invalid_query("query index belongs to another collection"));
     }
@@ -761,7 +862,7 @@ fn require_family_index(
     family: IndexFamily,
     label: &str,
 ) -> QueryResult<IndexInfo> {
-    let info = db.index_info(id)?;
+    let info = db.index_info_cached(id)?;
     if info.collection != collection {
         return Err(invalid_query("query index belongs to another collection"));
     }
@@ -807,13 +908,26 @@ fn prepare_text(
         }
         dfs.push(df);
     }
+    let weights = super::text_indexes::bm25_weights(corpus)?;
+    let mut idfs = Vec::with_capacity(terms.len());
+    for &df in &dfs {
+        idfs.push(if df == 0 {
+            // No posting carries this term, so nothing will ever be scored
+            // against it; a document that claims one is refused by
+            // `bm25_scored`'s own bounds and never reaches this weight.
+            0.0
+        } else {
+            super::text_indexes::bm25_idf(corpus, df)?
+        });
+    }
     Ok(PreparedText {
         info,
         terms,
         phrase,
         matching,
-        corpus,
         dfs,
+        weights,
+        idfs,
         driven: None,
     })
 }
@@ -1643,17 +1757,68 @@ fn execute_graph_filters<C: FnMut() -> bool>(
     Ok(results)
 }
 
+/// An index key a driver carried over from the entry it was standing on.
+///
+/// Exactly one driver kind ever fills this in, and each consumer proves the
+/// key is the one IT asked for by matching the index id as well as the
+/// variant. As three separate `Option<(IndexId, Vec<u8>)>` fields this cost 96
+/// bytes on EVERY candidate -- including the 20,000 of a key-only scan, which
+/// carry none of them -- and a candidate is built, moved and dropped once per
+/// row.
+enum CarriedKey {
+    /// A scalar posting's value key, read only by a ranking over that index.
+    Scalar(IndexId, Vec<u8>),
+    /// An exact-vector locator.
+    Vector(IndexId, Vec<u8>),
+    /// A quantized-vector entry.
+    Quantized(IndexId, Vec<u8>),
+}
+
 struct Candidate {
     id: EntityId,
     row: Option<Vec<u8>>,
-    scalar: Option<(IndexId, Vec<u8>)>,
-    vector: Option<(IndexId, Vec<u8>)>,
-    quantized: Option<(IndexId, Vec<u8>)>,
+    carried: Option<CarriedKey>,
     satisfied_filter: Option<usize>,
     /// What the text merge cursor already knew about this document. Only the
     /// text driver fills it in; every other driver leaves it `None` and every
     /// scorer that cannot prove the frequencies are its own ignores it.
     text: Option<TextFrequencies>,
+}
+
+impl Candidate {
+    /// One candidate that carries nothing but its identity.
+    fn bare(id: EntityId) -> Self {
+        Self {
+            id,
+            row: None,
+            carried: None,
+            satisfied_filter: None,
+            text: None,
+        }
+    }
+
+    /// The scalar value key this candidate came in on, if it came in on
+    /// `index`'s postings.
+    fn scalar(&self, index: IndexId) -> Option<&[u8]> {
+        match &self.carried {
+            Some(CarriedKey::Scalar(id, key)) if *id == index => Some(key),
+            _ => None,
+        }
+    }
+
+    fn vector(&self, index: IndexId) -> Option<&[u8]> {
+        match &self.carried {
+            Some(CarriedKey::Vector(id, key)) if *id == index => Some(key),
+            _ => None,
+        }
+    }
+
+    fn quantized(&self, index: IndexId) -> Option<&[u8]> {
+        match &self.carried {
+            Some(CarriedKey::Quantized(id, key)) if *id == index => Some(key),
+            _ => None,
+        }
+    }
 }
 
 struct EntityCursor<'a> {
@@ -2118,15 +2283,7 @@ impl<'a> DriverCursor<'a> {
             Self::Text(cursor) => cursor.next(meter),
             Self::Vector(cursor) => cursor.next(meter),
             Self::QuantizedVector(cursor) => cursor.next(meter),
-            Self::Ids(ids) => Ok(ids.next().map(|id| Candidate {
-                id,
-                row: None,
-                scalar: None,
-                vector: None,
-                quantized: None,
-                satisfied_filter: None,
-                text: None,
-            })),
+            Self::Ids(ids) => Ok(ids.next().map(Candidate::bare)),
         }
     }
 }
@@ -2167,15 +2324,7 @@ impl EntityCursor<'_> {
             )
         };
         self.inner.step();
-        Ok(Some(Candidate {
-            id,
-            row,
-            scalar: None,
-            vector: None,
-            quantized: None,
-            satisfied_filter: None,
-            text: None,
-        }))
+        Ok(Some(Candidate { row, ..Candidate::bare(id) }))
     }
 }
 
@@ -2250,16 +2399,12 @@ impl ScalarCursor<'_> {
                 continue;
             };
             return Ok(Some(Candidate {
-                id: EntityId {
+                carried: encoded.map(|key| CarriedKey::Scalar(self.info.id, key)),
+                satisfied_filter: self.certifies.filter(|_| proves_predicate),
+                ..Candidate::bare(EntityId {
                     collection: self.info.collection,
                     sequence,
-                },
-                row: None,
-                scalar: encoded.map(|key| (self.info.id, key)),
-                vector: None,
-                quantized: None,
-                satisfied_filter: self.certifies.filter(|_| proves_predicate),
-                text: None,
+                })
             }));
         }
     }
@@ -2380,14 +2525,6 @@ impl TextCursor<'_> {
         }
         self.previous = Some(sequence);
         Ok(Some(Candidate {
-            id: EntityId {
-                collection: self.collection,
-                sequence,
-            },
-            row: None,
-            scalar: None,
-            vector: None,
-            quantized: None,
             // Phrase postings establish only distinct all-term candidacy. The
             // filter remains pending until authoritative primary refinement.
             satisfied_filter: if self.matching == TextMatch::Phrase {
@@ -2400,6 +2537,10 @@ impl TextCursor<'_> {
                 len: self.streams.len() as u8,
                 slots,
             }),
+            ..Candidate::bare(EntityId {
+                collection: self.collection,
+                sequence,
+            })
         }))
     }
 }
@@ -2463,16 +2604,11 @@ impl SpatialCursor<'_> {
                 continue;
             }
             return Ok(Some(Candidate {
-                id: EntityId {
+                satisfied_filter: Some(self.position),
+                ..Candidate::bare(EntityId {
                     collection: self.info.collection,
                     sequence,
-                },
-                row: None,
-                scalar: None,
-                vector: None,
-                quantized: None,
-                satisfied_filter: Some(self.position),
-                text: None,
+                })
             }));
         }
     }
@@ -2502,16 +2638,11 @@ impl VectorCursor<'_> {
             return Err(corrupt_query("exact vector locator key"));
         }
         Ok(Some(Candidate {
-            id: EntityId {
+            carried: Some(CarriedKey::Vector(self.info.id, value)),
+            ..Candidate::bare(EntityId {
                 collection: self.info.collection,
                 sequence,
-            },
-            row: None,
-            scalar: None,
-            vector: Some((self.info.id, value)),
-            quantized: None,
-            satisfied_filter: None,
-            text: None,
+            })
         }))
     }
 }
@@ -2542,16 +2673,11 @@ impl QuantizedVectorCursor<'_> {
             return Err(corrupt_query("quantized vector entry key"));
         }
         Ok(Some(Candidate {
-            id: EntityId {
+            carried: Some(CarriedKey::Quantized(self.info.id, value)),
+            ..Candidate::bare(EntityId {
                 collection: self.info.collection,
                 sequence,
-            },
-            row: None,
-            scalar: None,
-            vector: None,
-            quantized: Some((self.info.id, value)),
-            satisfied_filter: None,
-            text: None,
+            })
         }))
     }
 }
@@ -2569,18 +2695,27 @@ fn decode_row(db: &Database, bytes: Vec<u8>) -> QueryResult<RowData> {
     })
 }
 
-/// How far ahead the lockstep cursor will walk before it descends again.
+/// How far ahead the lockstep cursor will walk before it gives up on itself.
 ///
-/// `peek_at_or_after` reaches a key past its pinned leaf by stepping to the
-/// next leaf, one at a time -- cheap for the next row, ruinous for a row a
-/// hundred leaves away. A page whose winners are SPARSE in the primary tree (a
-/// nine-row spatial answer, a one-row graph hop) would walk the whole
-/// collection's leaves to collect them, and it did: `win/spatial_tiny` went
-/// 30 -> 109 us and `graph/hop1_project` 11 -> 47 us before this bound. Beyond
-/// the bound the cursor is re-opened AT the target, which is one descent --
-/// exactly what the point-get it replaces costs, so a sparse page is never
-/// worse off and a dense one still pays one descent per page.
-const LOCKSTEP_REACH: u64 = 32;
+/// `peek_at_or_after` reaches a key past its pinned leaf by binary-searching
+/// the leaf it is on and then stepping to the next leaf, one at a time --
+/// cheap for a row a few slots away, ruinous for a row a hundred leaves away.
+/// A page whose winners are SPARSE in the primary tree (a nine-row spatial
+/// answer, a one-row graph hop) would walk the whole collection's leaves to
+/// collect them, and it did: `win/spatial_tiny` went 30 -> 109 us and
+/// `graph/hop1_project` 11 -> 47 us before this bound.
+///
+/// The bound is a number of ROWS but the thing it is protecting against is
+/// LEAVES, and a primary leaf of this collection holds on the order of a
+/// hundred rows. At 32 it was a quarter of one leaf, so a walk that is dense
+/// in runs and sparse between them -- `price > 400` matches nine rows out of
+/// every forty-nine, so it steps 1,1,...,1,40 -- gave the whole page back to
+/// the point-get at its FIRST gap, and then paid a full root-to-leaf descent
+/// per winner: measured at 4.0 pager accesses and 6 allocations per row on
+/// `filter/range_open`. At 256 a gap of that shape stays inside the leaf the
+/// cursor is standing on or crosses one, which is cheaper than the descent it
+/// replaces, while a genuinely sparse page still bails on its first gap.
+const LOCKSTEP_REACH: u64 = 256;
 
 /// How a page reads primary rows.
 ///
@@ -2597,6 +2732,18 @@ struct PrimaryRows<'a> {
     ascending: bool,
     cursor: Option<RangeIter<'a>>,
     last: u64,
+    /// The seek key, rebuilt in place. One `Vec` for the page rather than one
+    /// per row read.
+    key: Vec<u8>,
+}
+
+/// Which way one row is going to be reached.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Forward from where the cursor is parked.
+    Lockstep,
+    /// A fresh descent from the root.
+    PointGet,
 }
 
 impl<'a> PrimaryRows<'a> {
@@ -2606,18 +2753,19 @@ impl<'a> PrimaryRows<'a> {
             ascending,
             cursor: None,
             last: 0,
+            key: Vec::new(),
         }
     }
 
-    fn read(&mut self, id: EntityId) -> QueryResult<Option<Vec<u8>>> {
-        let db = self.db;
-        let key = row_key(id);
+    /// Point the reusable key at `id` and say how it will be reached, moving
+    /// the cursor's own state along with the decision.
+    fn plan(&mut self, id: EntityId) -> Reach {
+        self.key.clear();
+        self.key.push(0x40);
+        self.key.extend(ordered(u64::from(id.collection.0)));
+        self.key.extend(ordered(id.sequence));
         if !self.ascending {
-            return db
-                .store()?
-                .get(&key)
-                .map_err(Error::from)
-                .map_err(QueryError::from);
+            return Reach::PointGet;
         }
         if self.cursor.is_some() && id.sequence <= self.last {
             // The cursor only moves forward. A target behind it would make
@@ -2625,11 +2773,7 @@ impl<'a> PrimaryRows<'a> {
             // whose key does not match, and a present row would be reported
             // missing. Callers ascend by construction; this is the guard that
             // makes that a property of the reader rather than of every caller.
-            return db
-                .store()?
-                .get(&key)
-                .map_err(Error::from)
-                .map_err(QueryError::from);
+            return Reach::PointGet;
         }
         if self.cursor.is_some() && id.sequence.saturating_sub(self.last) > LOCKSTEP_REACH {
             // The rows this page wants are SPARSE in the primary tree, so the
@@ -2640,25 +2784,41 @@ impl<'a> PrimaryRows<'a> {
             // sees, and the next page decides again.
             self.ascending = false;
             self.cursor = None;
-            return db
-                .store()?
-                .get(&key)
-                .map_err(Error::from)
-                .map_err(QueryError::from);
+            return Reach::PointGet;
         }
+        Reach::Lockstep
+    }
+
+    /// Park the cursor on the first record at or after the planned key.
+    fn seek(&mut self, id: EntityId) -> QueryResult<()> {
         if self.cursor.is_none() {
             self.cursor = Some(
-                db.store()?
-                    .range(&key)
+                self.db
+                    .store()?
+                    .range(&self.key)
                     .map_err(Error::from)
                     .map_err(QueryError::from)?,
             );
         }
         self.last = id.sequence;
+        Ok(())
+    }
+
+    fn read(&mut self, id: EntityId) -> QueryResult<Option<Vec<u8>>> {
+        if self.plan(id) == Reach::PointGet {
+            return self
+                .db
+                .store()?
+                .get(&self.key)
+                .map_err(Error::from)
+                .map_err(QueryError::from);
+        }
+        self.seek(id)?;
+        let key = &self.key;
         let cursor = self.cursor.as_mut().expect("the cursor was just opened");
         Ok(
             match cursor
-                .peek_at_or_after(&key)
+                .peek_at_or_after(key)
                 .map_err(Error::from)
                 .map_err(QueryError::from)?
             {
@@ -2666,6 +2826,35 @@ impl<'a> PrimaryRows<'a> {
                 _ => None,
             },
         )
+    }
+
+    /// Is the row still there? The same reach, without the copy.
+    ///
+    /// A key-only page asks the primary tree for a winner's row only to refuse
+    /// an orphan -- a posting can outlive the record it names. It then decodes
+    /// nothing and drops the bytes, so copying a whole row out of the pinned
+    /// leaf to answer a yes/no was one allocation and one row-sized memcpy per
+    /// returned row, on every page that projects no field.
+    fn exists(&mut self, id: EntityId) -> QueryResult<bool> {
+        if self.plan(id) == Reach::PointGet {
+            return Ok(self
+                .db
+                .store()?
+                .get(&self.key)
+                .map_err(Error::from)
+                .map_err(QueryError::from)?
+                .is_some());
+        }
+        self.seek(id)?;
+        let key = &self.key;
+        let cursor = self.cursor.as_mut().expect("the cursor was just opened");
+        Ok(matches!(
+            cursor
+                .peek_at_or_after(key)
+                .map_err(Error::from)
+                .map_err(QueryError::from)?,
+            Some((found, _)) if found == key.as_slice()
+        ))
     }
 }
 
@@ -2716,8 +2905,17 @@ fn ensure_row<C: FnMut() -> bool>(
     Ok(())
 }
 
+/// One field of one candidate's row.
+///
+/// The layout is not re-validated here. A `RowData` gets its layout from
+/// `Database::layout`, which produces one only through
+/// `Layout::from_descriptor` or from a layout this handle itself wrote, and
+/// both of those validate -- see [`dense_v3::read_field_in`]. This is the
+/// per-candidate path of every non-driving field predicate, so the check was
+/// being repaid once per candidate for an answer fixed when the collection was
+/// created.
 fn selected_field(row: &RowData, field: &str) -> QueryResult<dense_v3::FieldValue> {
-    dense_v3::read_field(&row.layout, &row.bytes, field)
+    dense_v3::read_field_in(&row.layout, &row.bytes, field)
         .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))
 }
 
@@ -2904,6 +3102,7 @@ fn text_score<C: FnMut() -> bool>(
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
     norms: &mut super::text_indexes::TextScratch,
+    scratch: &mut TextRowScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<f64>> {
     if prepared.terms.is_empty() {
@@ -2931,18 +3130,17 @@ fn text_score<C: FnMut() -> bool>(
             && usize::from(frequencies.len) == prepared.terms.len()
             && usize::from(frequencies.len) <= INLINE_TEXT_TERMS
     });
-    // On the stack, not the heap: a query has at most 64 distinct terms (see
-    // `prepare_text`), and a pair of heap vectors per scored document is one
-    // allocation per document per query -- the same per-document shape this
-    // whole path exists to get rid of.
+    // The page's own buffers, not this document's: a pair of heap vectors per
+    // scored document would be one allocation per document per query, and a
+    // pair of 64-slot stack arrays -- which is what this was -- is 768 bytes
+    // zeroed per document to hold, usually, one term.
     if prepared.terms.len() > MAX_TEXT_TERMS {
         return Err(corrupt_query("prepared text query exceeds its term bound"));
     }
-    let mut frequencies = [0u32; MAX_TEXT_TERMS];
-    let mut dfs = [0u64; MAX_TEXT_TERMS];
-    let mut matched = 0usize;
+    scratch.frequencies.clear();
+    scratch.idfs.clear();
     let segments_on = super::text_indexes::segments_enabled(db);
-    for (position, (term, &df)) in prepared.terms.iter().zip(&prepared.dfs).enumerate() {
+    for (position, (term, &idf)) in prepared.terms.iter().zip(&prepared.idfs).enumerate() {
         let frequency = match merged {
             // Already charged to `TextPostings` by the merge that decoded it.
             Some(merged) => {
@@ -2962,13 +3160,13 @@ fn text_score<C: FnMut() -> bool>(
             }
         };
         if let Some(frequency) = frequency {
-            frequencies[matched] = frequency;
-            dfs[matched] = df;
-            matched += 1;
+            scratch.frequencies.push(frequency);
+            scratch.idfs.push(idf);
         }
     }
-    let frequencies = &frequencies[..matched];
-    let dfs = &dfs[..matched];
+    let frequencies = scratch.frequencies.as_slice();
+    let idfs = scratch.idfs.as_slice();
+    let matched = frequencies.len();
     if matched == 0
         || (matches!(prepared.matching, TextMatch::All | TextMatch::Phrase)
             && matched != prepared.terms.len())
@@ -3025,7 +3223,7 @@ fn text_score<C: FnMut() -> bool>(
             return Ok(None);
         }
     }
-    super::text_indexes::bm25(prepared.corpus, length, frequencies, dfs)
+    super::text_indexes::bm25_scored(prepared.weights, length, frequencies, idfs)
         .map(Some)
         .map_err(QueryError::from)
 }
@@ -3039,11 +3237,7 @@ fn vector_score<C: FnMut() -> bool>(
     metric: VectorMetric,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<f64>> {
-    let locator = candidate
-        .vector
-        .as_ref()
-        .filter(|(index, _)| *index == info.id)
-        .map(|(_, locator)| locator.clone());
+    let locator = candidate.vector(info.id).map(<[u8]>::to_vec);
     let locator = match locator {
         Some(locator) => locator,
         None => {
@@ -3092,11 +3286,7 @@ fn approximate_vector_score<C: FnMut() -> bool>(
     metric: VectorMetric,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<(f64, [u8; 6])>> {
-    let value = candidate
-        .quantized
-        .as_ref()
-        .filter(|(index, _)| *index == info.id)
-        .map(|(_, value)| value.clone());
+    let value = candidate.quantized(info.id).map(<[u8]>::to_vec);
     let value = match value {
         Some(value) => value,
         None => {
@@ -3192,6 +3382,7 @@ fn filters_match<'a, C: FnMut() -> bool>(
     encoded: &mut Option<Vec<u8>>,
     graph: &[Option<Vec<EntityId>>],
     norms: &mut super::text_indexes::TextScratch,
+    scratch: &mut TextRowScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<bool> {
     for (position, filter) in filters.iter().enumerate() {
@@ -3256,6 +3447,7 @@ fn filters_match<'a, C: FnMut() -> bool>(
                 row,
                 encoded,
                 norms,
+                scratch,
                 meter,
             )?
             .is_some(),
@@ -3275,16 +3467,13 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
     norms: &mut super::text_indexes::TextScratch,
+    scratch: &mut TextRowScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<RankKey>> {
     let value = match order {
         CompiledOrder::EntityId => RankValue::Entity,
         CompiledOrder::Scalar { info, .. } => {
-            let key = candidate
-                .scalar
-                .as_ref()
-                .filter(|(index, _)| *index == info.id)
-                .map(|(_, key)| key.clone());
+            let key = candidate.scalar(info.id).map(<[u8]>::to_vec);
             let key = match key {
                 Some(key) => key,
                 None => {
@@ -3321,6 +3510,7 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
                 row,
                 encoded,
                 norms,
+                scratch,
                 meter,
             )? else {
                 return Ok(None);
@@ -3734,6 +3924,7 @@ impl PreparedQuery<'_> {
         // arrive in ascending sequence -- the text and entity cursors -- reuse
         // it 255 times out of 256; one that does not simply re-decodes.
         let mut norms = super::text_indexes::TextScratch::default();
+        let mut text_scratch = TextRowScratch::default();
         let graph = execute_graph_filters(self.db, &self.filters, &mut meter)?;
         let in_rank_order = self.driver_walks_in_rank_order();
         let mut driver = DriverCursor::new(
@@ -3751,7 +3942,7 @@ impl PreparedQuery<'_> {
         let wants_rows = !self.projection.is_empty();
         let db = self.db;
         let mut rows = PrimaryRows::new(db, self.driver_walks_ids_ascending());
-        let mut heap = BinaryHeap::with_capacity(capacity);
+        let mut winners = Winners::new();
         let approximation =
             if let CompiledOrder::ApproximateVector {
                 info,
@@ -3779,6 +3970,7 @@ impl PreparedQuery<'_> {
                         &mut encoded,
                         &graph,
                         &mut norms,
+                        &mut text_scratch,
                         &mut meter,
                     )? {
                         continue;
@@ -3832,14 +4024,14 @@ impl PreparedQuery<'_> {
                         descending: false,
                         row: None,
                     };
-                    if heap.len() < capacity {
-                        heap.push(entry);
-                    } else if heap
-                        .peek()
+                    if winners.len() < capacity {
+                        winners.push(capacity, entry);
+                    } else if winners
+                        .worst()
                         .is_some_and(|worst| entry.cmp(worst) == Ordering::Less)
                     {
-                        heap.pop();
-                        heap.push(entry);
+                        winners.pop_worst();
+                        winners.push(capacity, entry);
                     }
                 }
                 Some(ApproximationDiagnostics {
@@ -3865,6 +4057,7 @@ impl PreparedQuery<'_> {
                         &mut encoded,
                         &graph,
                         &mut norms,
+                        &mut text_scratch,
                         &mut meter,
                     )? {
                         continue;
@@ -3877,6 +4070,7 @@ impl PreparedQuery<'_> {
                         &mut row,
                         &mut encoded,
                         &mut norms,
+                        &mut text_scratch,
                         &mut meter,
                     )?
                     else {
@@ -3895,8 +4089,8 @@ impl PreparedQuery<'_> {
                     // moment a candidate's value falls strictly past the worst
                     // held one, because the walk never comes back up.
                     if in_rank_order == RankWalk::ByValue
-                        && heap.len() >= capacity
-                        && heap.peek().is_some_and(|worst| {
+                        && winners.len() >= capacity
+                        && winners.worst().is_some_and(|worst| {
                             compare_rank_value(&key.value, &worst.key.value, descending)
                                 == Ordering::Greater
                         })
@@ -3929,31 +4123,49 @@ impl PreparedQuery<'_> {
                         }
                         Ok(())
                     };
-                    if heap.len() < capacity {
+                    if winners.len() < capacity {
                         keep(&mut entry, &mut row, &mut encoded)?;
-                        heap.push(entry);
-                    } else if heap
-                        .peek()
+                        winners.push(capacity, entry);
+                    } else if winners
+                        .worst()
                         .is_some_and(|worst| entry.cmp(worst) == Ordering::Less)
                     {
-                        heap.pop();
+                        winners.pop_worst();
                         keep(&mut entry, &mut row, &mut encoded)?;
-                        heap.push(entry);
+                        winners.push(capacity, entry);
                     }
                     // The page is full and the walk is already in rank order,
                     // so every candidate still ahead ranks after everything
                     // held. Without this, `LIMIT 10` reads the whole
                     // collection to answer with ten rows, and a page of a scan
                     // reads to the end of the collection to fill 8,192 rows.
-                    if in_rank_order == RankWalk::Exact && heap.len() >= capacity {
+                    if in_rank_order == RankWalk::Exact && winners.len() >= capacity {
                         break;
                     }
                 }
                 None
             };
 
-        let mut winners = heap.into_vec();
-        winners.sort_by(|left, right| compare_rank(&left.key, &right.key, descending));
+        // A page that never had to name its worst entry is still in the order
+        // the walk handed it over, and an EXACT walk hands it over in rank
+        // order. That page is already sorted and sorting it again is 8,192
+        // comparisons over 459 KB for an answer that cannot change.
+        let ordered = in_rank_order == RankWalk::Exact && !winners.heaped();
+        let mut winners = winners.into_vec();
+        if !ordered {
+            // A rank key ends in the entity id, so no two entries compare
+            // equal and a stable sort is ordering something that cannot be
+            // observed -- while allocating a scratch buffer the size of the
+            // page to do it.
+            winners.sort_unstable_by(|left, right| compare_rank(&left.key, &right.key, descending));
+        }
+        debug_assert!(
+            winners
+                .windows(2)
+                .all(|pair| compare_rank(&pair[0].key, &pair[1].key, descending)
+                    != Ordering::Greater),
+            "a page returns its winners in rank order"
+        );
         let has_more = winners.len() > wanted;
         winners.truncate(wanted);
         let winner_needs_no_row = self.winner_needs_no_row();
@@ -3978,21 +4190,40 @@ impl PreparedQuery<'_> {
             && !walk_reads_every_row
             && !matches!(self.order, CompiledOrder::EntityId);
         if ranked_rows_read {
-            let mut by_id: Vec<usize> = (0..winners.len())
-                .filter(|at| winners[*at].row.is_none())
-                .collect();
-            by_id.sort_unstable_by_key(|at| winners[*at].key.id);
             let mut ascending = PrimaryRows::new(db, true);
-            for at in by_id {
-                meter.charge(WorkResource::PrimaryReads, 1)?;
-                let bytes = ascending
-                    .read(winners[at].key.id)?
-                    .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
-                // Only a projection needs the bytes kept; a key-only page
-                // wanted the read for the proof that the entity is still
-                // there, and has it.
-                if wants_rows {
+            if wants_rows {
+                let mut by_id: Vec<usize> = (0..winners.len())
+                    .filter(|at| winners[*at].row.is_none())
+                    .collect();
+                by_id.sort_unstable_by_key(|at| winners[*at].key.id);
+                for at in by_id {
+                    meter.charge(WorkResource::PrimaryReads, 1)?;
+                    let bytes = ascending
+                        .read(winners[at].key.id)?
+                        .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
                     winners[at].row = Some(Box::new(decode_row(db, bytes)?));
+                }
+            } else {
+                // A key-only page wanted this read for one thing: the proof
+                // that the entity is still there. It keeps nothing, so it
+                // sorts the SEQUENCES and not indices into the winners --
+                // every comparison of `sort_unstable_by_key(|at|
+                // winners[*at]...)` is an indirect load into a
+                // 56-byte-per-entry array, and a 3,716-document BM25 page
+                // makes about 44,000 of them. The collection is the same for
+                // every candidate (the walk refuses one that crosses), so what
+                // is sorted is one `u64` each.
+                let mut sequences: Vec<u64> =
+                    winners.iter().map(|winner| winner.key.id.sequence).collect();
+                sequences.sort_unstable();
+                for sequence in sequences {
+                    meter.charge(WorkResource::PrimaryReads, 1)?;
+                    if !ascending.exists(EntityId {
+                        collection: self.collection,
+                        sequence,
+                    })? {
+                        return Err(corrupt_query("query winner is missing its entity"));
+                    }
                 }
             }
         }
@@ -4027,10 +4258,17 @@ impl PreparedQuery<'_> {
             if carried.is_none() && !winner_needs_no_row && !walk_reads_every_row && !ranked_rows_read
             {
                 meter.charge(WorkResource::PrimaryReads, 1)?;
-                let bytes = winner_rows
-                    .read(winner.key.id)?
-                    .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
-                if !self.projection.is_empty() {
+                if self.projection.is_empty() {
+                    // Nothing is decoded from these bytes -- the read is here
+                    // to refuse an orphan -- so do not copy them out of the
+                    // leaf.
+                    if !winner_rows.exists(winner.key.id)? {
+                        return Err(corrupt_query("query winner is missing its entity"));
+                    }
+                } else {
+                    let bytes = winner_rows
+                        .read(winner.key.id)?
+                        .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
                     let row = decode_row(self.db, bytes)?;
                     project_fields(
                         self.db,

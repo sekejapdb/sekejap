@@ -240,7 +240,17 @@ impl TextScratch {
             self.block = Some(block);
         }
         let slot = segments::norm_slot_of(sequence);
-        // `decode_norm_block` yields ascending slots.
+        // `decode_norm_block` yields ascending slots, so the binary search is
+        // correct for any block. A block that lists EVERY document it covers
+        // -- which is what a folded index of a collection with no deletes
+        // produces -- has the slot at its own index, and one bounds-checked
+        // load answers what eight probing iterations answered before, once per
+        // scored document.
+        if let Some((found, length)) = self.entries.get(slot) {
+            if *found == slot {
+                return Ok(Some(*length));
+            }
+        }
         Ok(self
             .entries
             .binary_search_by_key(&slot, |(slot, _)| *slot)
@@ -1526,6 +1536,67 @@ fn spend(
     Ok(())
 }
 
+/// The corpus half of a BM25 score, settled before the query sees a document.
+///
+/// Only the AVERAGE document length lives here, and the arithmetic below is
+/// written exactly as it always was. Folding the length normalisation into
+/// `flat + per_token * length` is algebraically the same number and is NOT the
+/// same float: `text_score_cost` compares scores with the definition bit for
+/// bit, and it caught the rewrite. A rounding change is a behaviour change,
+/// and this loop had no business making one.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Bm25Weights {
+    average: f64,
+}
+
+/// The corpus half of the score, once per query.
+pub(super) fn bm25_weights(corpus: Corpus) -> Result<Bm25Weights> {
+    if corpus.documents == 0 || corpus.tokens == 0 {
+        return Err(corrupt("text corpus statistics cannot score postings"));
+    }
+    Ok(Bm25Weights {
+        average: corpus.tokens as f64 / corpus.documents as f64,
+    })
+}
+
+/// One term's inverse document frequency, once per query TERM.
+///
+/// This is a natural logarithm, and it was taken once per term PER DOCUMENT --
+/// `text/bm25_common` scores 20,000 documents, so 20,000 logs whose arguments
+/// were all the same number.
+pub(super) fn bm25_idf(corpus: Corpus, df: u64) -> Result<f64> {
+    if corpus.documents == 0 || df > corpus.documents {
+        return Err(corrupt("text document frequency exceeds the corpus"));
+    }
+    let n = corpus.documents as f64;
+    Ok((1.0 + (n - df as f64 + 0.5) / (df as f64 + 0.5)).ln())
+}
+
+/// The per-document half: one multiply-add and one divide per matching term.
+pub(super) fn bm25_scored(
+    weights: Bm25Weights,
+    length: u32,
+    frequencies: &[u32],
+    idfs: &[f64],
+) -> Result<f64> {
+    if frequencies.len() != idfs.len() {
+        return Err(corrupt("text corpus statistics cannot score postings"));
+    }
+    let normalised = K1 * (1.0 - B + B * f64::from(length) / weights.average);
+    let mut score = 0.0;
+    for (&frequency, &idf) in frequencies.iter().zip(idfs) {
+        if frequency == 0 || frequency > length {
+            return Err(corrupt("text posting/statistics scoring bounds"));
+        }
+        let tf = f64::from(frequency);
+        score += idf * (tf * (K1 + 1.0)) / (tf + normalised);
+    }
+    if !score.is_finite() || score <= 0.0 {
+        return Err(corrupt("non-finite text score"));
+    }
+    Ok(score)
+}
+
 pub(super) fn bm25(
     corpus: Corpus,
     length: u32,
@@ -1535,22 +1606,15 @@ pub(super) fn bm25(
     if corpus.documents == 0 || corpus.tokens == 0 || frequencies.len() != dfs.len() {
         return Err(corrupt("text corpus statistics cannot score postings"));
     }
-    let n = corpus.documents as f64;
-    let average = corpus.tokens as f64 / n;
-    let mut score = 0.0;
-    for (&frequency, &df) in frequencies.iter().zip(dfs) {
-        if frequency == 0 || df == 0 || df > corpus.documents || frequency > length {
+    let weights = bm25_weights(corpus)?;
+    let mut idfs = Vec::with_capacity(dfs.len());
+    for &df in dfs {
+        if df == 0 || df > corpus.documents {
             return Err(corrupt("text posting/statistics scoring bounds"));
         }
-        let tf = f64::from(frequency);
-        let idf = (1.0 + (n - df as f64 + 0.5) / (df as f64 + 0.5)).ln();
-        let denominator = tf + K1 * (1.0 - B + B * f64::from(length) / average);
-        score += idf * (tf * (K1 + 1.0)) / denominator;
+        idfs.push(bm25_idf(corpus, df)?);
     }
-    if !score.is_finite() || score <= 0.0 {
-        return Err(corrupt("non-finite text score"));
-    }
-    Ok(score)
+    bm25_scored(weights, length, frequencies, &idfs)
 }
 
 fn push_hit(heap: &mut BinaryHeap<HeapHit>, k: usize, hit: TextHit) {
