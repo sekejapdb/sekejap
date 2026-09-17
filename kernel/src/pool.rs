@@ -55,6 +55,8 @@ pub struct PoolStats {
     /// could not still make the test pass.
     pub sync_data_calls: u64,
     pub sync_full_calls: u64,
+    /// Dirty frames written by `flush_all` (monotonic since pool construction).
+    pub dirty_pages_flushed: u64,
 }
 
 struct Frame {
@@ -752,6 +754,7 @@ impl BufferPool {
                     crate::write_stats::Phase::FinalPages,
                     PAGE_SIZE as u64,
                 );
+                inner.stats.dirty_pages_flushed += 1;
                 inner.frames[i].dirty = false;
             }
         }

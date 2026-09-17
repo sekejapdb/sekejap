@@ -9,7 +9,7 @@ use e4_prototype::{
         ScalarPredicate, ScalarValue, SpatialCandidates, TextCandidates, TextMatch,
         VectorCandidates, VectorMetric,
     },
-    pagewal::{create_compact_cells, PageWalStore},
+    pagewal::{create_compact_cells, IoCounters, PageWalStore},
     spatial_math::Bounds,
     Kind,
 };
@@ -629,6 +629,89 @@ fn time_json(start: Instant, extra: Value) -> Value {
     value
 }
 
+fn io_json(c: &IoCounters) -> Value {
+    json!({
+        "frames": c.wal_frames_appended,
+        "commit_frames": c.commit_frames,
+        "dirty_pages_flushed": c.dirty_pages_flushed,
+        "data_pages_written_at_checkpoint": c.data_pages_written_at_checkpoint,
+        "pages_written": c.pages_written(),
+        "wal_fsyncs": c.wal_fsyncs(),
+        "wal_fsyncs_commit": c.wal_fsyncs_commit,
+        "wal_fsyncs_checkpoint": c.wal_fsyncs_checkpoint,
+        "wal_fsyncs_open": c.wal_fsyncs_open,
+        "data_fsyncs": c.data_fsyncs_checkpoint,
+        "metadata_fsyncs": c.metadata_fsyncs,
+        "fsyncs": c.fsyncs(),
+        "checkpoint_count": c.checkpoint_count,
+        "wal_bytes_written": c.wal_bytes_written,
+        "data_bytes_written": c.data_bytes_written,
+        "bytes_written": c.bytes_written()
+    })
+}
+
+fn e4_io_delta(db: &Database, prev: &mut IoCounters) -> R<Value> {
+    let now = db.io_counters()?;
+    let d = now.saturating_sub(*prev);
+    *prev = now;
+    Ok(io_json(&d))
+}
+
+#[derive(Clone, Copy, Default)]
+struct SqliteIoAcc {
+    commits: u64,
+    explicit_checkpoints: u64,
+    checkpointed_pages: i64,
+}
+
+fn sqlite_db_status(conn: &Connection, op: i32) -> R<i64> {
+    let (mut current, mut high) = (0i32, 0i32);
+    let rc = unsafe { rusqlite::ffi::sqlite3_db_status(conn.handle(), op, &mut current, &mut high, 0) };
+    if rc != rusqlite::ffi::SQLITE_OK {
+        return Err("sqlite db_status failed".into());
+    }
+    Ok(i64::from(current))
+}
+
+fn sqlite_io_delta(conn: &Connection, acc: &SqliteIoAcc, prev: &mut (i64, i64, i64, i64, SqliteIoAcc)) -> R<Value> {
+    let writes = sqlite_db_status(conn, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE)?;
+    let hits = sqlite_db_status(conn, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT)?;
+    let misses = sqlite_db_status(conn, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS)?;
+    let spill = sqlite_db_status(conn, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL)?;
+    let d_writes = (writes - prev.0).max(0);
+    let d_hits = (hits - prev.1).max(0);
+    let d_misses = (misses - prev.2).max(0);
+    let d_spill = (spill - prev.3).max(0);
+    let d_commits = acc.commits.saturating_sub(prev.4.commits);
+    let d_ckpt = acc.explicit_checkpoints.saturating_sub(prev.4.explicit_checkpoints);
+    let d_ckpt_pages = (acc.checkpointed_pages - prev.4.checkpointed_pages).max(0);
+    *prev = (writes, hits, misses, spill, *acc);
+    Ok(json!({
+        "frames": d_writes,
+        "pages_written": d_writes,
+        "cache_writes": d_writes,
+        "cache_hits": d_hits,
+        "cache_misses": d_misses,
+        "cache_spill": d_spill,
+        "commits": d_commits,
+        "explicit_checkpoints": d_ckpt,
+        "checkpointed_pages": d_ckpt_pages,
+        "derived_wal_fsyncs": d_commits,
+        "derived_checkpoint_fsyncs": d_ckpt * 2,
+        "fsyncs": d_commits + d_ckpt * 2,
+        "bytes_written": d_writes * 4096,
+        "fsync_basis": "derived: 1 WAL fsync per COMMIT (synchronous=FULL, fullfsync=ON) + 2 fsyncs per explicit TRUNCATE checkpoint (db+wal); auto-checkpoint fsyncs are not observed (no VFS hook)"
+    }))
+}
+
+fn sqlite_truncate(conn: &Connection, acc: &mut SqliteIoAcc) -> R<()> {
+    let (_busy, _log, checkpointed): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    acc.explicit_checkpoints += 1;
+    acc.checkpointed_pages += checkpointed;
+    Ok(())
+}
+
 fn run_e4(
     n: usize,
     dimension: usize,
@@ -665,6 +748,8 @@ fn run_e4(
         "create_schema",
         json!({"people_collection":people.0,"organizations_collection":organizations.0,"knows":knows.0,"member_of":member.0}),
     );
+    let mut io = serde_json::Map::new();
+    let mut io_prev = db.io_counters()?;
 
     progress.stage = "entity_load";
     let start = Instant::now();
@@ -696,6 +781,7 @@ fn run_e4(
     progress.committed("entity_load", json!({"people":n,"organizations":100}));
     let entity_load = time_json(start, json!({"commits":n.div_ceil(BATCH)+1}));
     progress.complete("entity_load", &entity_load);
+    io.insert("entity_load".into(), e4_io_delta(&db, &mut io_prev)?);
 
     progress.stage = "graph_load";
     let start = Instant::now();
@@ -738,6 +824,7 @@ fn run_e4(
     );
     progress.complete("graph_load", &graph_load);
     db.checkpoint()?;
+    io.insert("graph_load".into(), e4_io_delta(&db, &mut io_prev)?);
     let loaded = sizes(root);
     progress
         .completed
@@ -782,6 +869,7 @@ fn run_e4(
     );
     builds.insert("scalar".into(), scalar_build.clone());
     progress.complete("build_scalar", &scalar_build);
+    io.insert("build_scalar".into(), e4_io_delta(&db, &mut io_prev)?);
     progress.stage = "late_build";
     progress.stage_progress = json!({"index":"embedding_exact","steps":0,"publication_commits":0});
     let start = Instant::now();
@@ -801,6 +889,7 @@ fn run_e4(
     );
     builds.insert("vector".into(), vector_build.clone());
     progress.complete("build_vector", &vector_build);
+    io.insert("build_vector".into(), e4_io_delta(&db, &mut io_prev)?);
     progress.stage = "late_build";
     progress.stage_progress = json!({"index":"position_point","steps":0,"publication_commits":0});
     let start = Instant::now();
@@ -820,6 +909,7 @@ fn run_e4(
     );
     builds.insert("spatial".into(), spatial_build.clone());
     progress.complete("build_spatial", &spatial_build);
+    io.insert("build_spatial".into(), e4_io_delta(&db, &mut io_prev)?);
     progress.stage = "late_build";
     progress.stage_progress = json!({"index":"body_text","steps":0,"publication_commits":0});
     let start = Instant::now();
@@ -839,8 +929,10 @@ fn run_e4(
     );
     builds.insert("text".into(), text_build.clone());
     progress.complete("build_text", &text_build);
+    io.insert("build_text".into(), e4_io_delta(&db, &mut io_prev)?);
     db.checkpoint()?;
     sample(root, &mut peak);
+    io.insert("checkpoint_after_builds".into(), e4_io_delta(&db, &mut io_prev)?);
 
     progress.stage = "pre_crud_queries";
     let query_vector = vector(17 % n, dimension);
@@ -1099,6 +1191,7 @@ fn run_e4(
         member_oracle.iter().map(|hit| hit.id).collect::<Vec<_>>()
     );
     progress.complete("pre_crud_queries", &Value::Object(queries.clone()));
+    io.insert("pre_crud_queries".into(), e4_io_delta(&db, &mut io_prev)?);
 
     let held = matches!(readers, ReaderMode::Held)
         .then(|| Database::open_snapshot(root, cfg()))
@@ -1183,6 +1276,7 @@ fn run_e4(
         }
         let update_s = start.elapsed().as_secs_f64();
         progress.complete_crud_stage(cycle, "update", json!({"seconds":update_s,"updated":n}));
+        io.insert(format!("crud_cycle_{cycle}_update"), e4_io_delta(&db, &mut io_prev)?);
         progress.stage = "crud_delete";
         progress.stage_progress = json!({"cycle":cycle,"people":0});
         let start = Instant::now();
@@ -1207,6 +1301,7 @@ fn run_e4(
             "delete",
             json!({"seconds":delete_s,"deleted":deleted}),
         );
+        io.insert(format!("crud_cycle_{cycle}_delete"), e4_io_delta(&db, &mut io_prev)?);
         progress.stage = "crud_reinsert";
         progress.stage_progress = json!({"cycle":cycle,"people":0});
         let start = Instant::now();
@@ -1283,6 +1378,7 @@ fn run_e4(
             "reinsert_edges",
             json!({"seconds":insert_s,"reinserted":inserted,"relationships_restored":restored_sources*3}),
         );
+        io.insert(format!("crud_cycle_{cycle}_reinsert"), e4_io_delta(&db, &mut io_prev)?);
         assert_eq!(
             db.get(people, &person_key(1))?.unwrap().document,
             updated_document(1, n, dimension, cycle)
@@ -1416,6 +1512,7 @@ fn run_e4(
         "post_crud_queries",
         &Value::Object(post_crud_queries.clone()),
     );
+    io.insert("post_crud_queries".into(), e4_io_delta(&db, &mut io_prev)?);
     progress.stage = "held_reader_oracle";
     if let Some(snapshot) = held.as_ref() {
         assert_eq!(snapshot.scan(people, None)?.count(), n);
@@ -1439,6 +1536,7 @@ fn run_e4(
     drop(held);
     progress.stage = "checkpoint_reopen";
     db.checkpoint()?;
+    io.insert("final_checkpoint".into(), e4_io_delta(&db, &mut io_prev)?);
     let final_size = sizes(root);
     drop(db);
     let start = Instant::now();
@@ -1507,7 +1605,7 @@ fn run_e4(
     );
     progress.stage = "complete";
     Ok(
-        json!({"engine":"e4","entity_load":entity_load,"graph_load":graph_load,"builds":builds,"queries":queries,"crud":crud,"post_crud_queries":post_crud_queries,"loaded_bytes":loaded,"final_bytes":final_size,"sampled_peak_bytes":peak,"reopen_seconds":reopen_s,"reader_mode":readers.name(),"reader_scope":readers.scope(),"publication_policy":policy,"rss_hwm":hwm()}),
+        json!({"engine":"e4","entity_load":entity_load,"graph_load":graph_load,"builds":builds,"queries":queries,"crud":crud,"post_crud_queries":post_crud_queries,"io":io,"loaded_bytes":loaded,"final_bytes":final_size,"sampled_peak_bytes":peak,"reopen_seconds":reopen_s,"reader_mode":readers.name(),"reader_scope":readers.scope(),"publication_policy":policy,"rss_hwm":hwm()}),
     )
 }
 
@@ -2047,11 +2145,13 @@ fn assert_sqlite_snapshot_person(
 
 fn sqlite_tx(
     connection: &mut Connection,
+    acc: &mut SqliteIoAcc,
     operation: impl FnOnce(&rusqlite::Transaction<'_>) -> R<()>,
 ) -> R<()> {
     let transaction = connection.transaction()?;
     operation(&transaction)?;
     transaction.commit()?;
+    acc.commits += 1;
     Ok(())
 }
 
@@ -2137,9 +2237,28 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
     let path = root.join("database.sqlite");
     let mut db = Connection::open(&path)?;
     sqlite_setup(&db)?;
+    let mut sio = SqliteIoAcc::default();
+    let mut io = serde_json::Map::new();
+    let wal_autocheckpoint: i64 = db.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?;
+    let page_size: i64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    io.insert("_meta".into(), json!({
+        "page_size": page_size,
+        "wal_autocheckpoint": wal_autocheckpoint,
+        "synchronous": "FULL",
+        "fullfsync": "ON",
+        "journal_mode": "WAL",
+        "fsync_basis": "derived: 1 WAL fsync per COMMIT (synchronous=FULL, fullfsync=ON) + 2 fsyncs per explicit TRUNCATE checkpoint (db+wal); auto-checkpoint fsyncs are not observed (no VFS hook)"
+    }));
+    let mut io_prev = (
+        sqlite_db_status(&db, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE)?,
+        sqlite_db_status(&db, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT)?,
+        sqlite_db_status(&db, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS)?,
+        sqlite_db_status(&db, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL)?,
+        sio,
+    );
     let mut peak = (0, 0);
     let start = Instant::now();
-    sqlite_tx(&mut db, |tx| {
+    sqlite_tx(&mut db, &mut sio, |tx| {
         for i in 0..100 {
             tx.execute(
                 "INSERT INTO organizations(id,external_key,name) VALUES(?1,?2,?3)",
@@ -2149,7 +2268,7 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
         Ok(())
     })?;
     for base in (0..n).step_by(BATCH) {
-        sqlite_tx(&mut db, |tx| {
+        sqlite_tx(&mut db, &mut sio, |tx| {
             for i in base..(base + BATCH).min(n) {
                 let (x, y) = point(i);
                 tx.execute("INSERT INTO people(id,external_key,age,name,active,body,embedding,longitude,latitude,profile) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![i+1,person_key(i),age(i),format!("Person {i:08}"),active(i),body(i),vector_blob(&vector(i,dimension)),x,y,profile().to_string()])?;
@@ -2159,9 +2278,10 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
         sample(root, &mut peak);
     }
     let entity_load = time_json(start, json!({"commits":n.div_ceil(BATCH)+1}));
+    io.insert("entity_load".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     let start = Instant::now();
     for base in (0..n).step_by(BATCH) {
-        sqlite_tx(&mut db, |tx| {
+        sqlite_tx(&mut db, &mut sio, |tx| {
             for i in base..(base + BATCH).min(n) {
                 for d in [(i + 1) % n, (i + 7) % n] {
                     tx.execute(
@@ -2182,11 +2302,13 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
         start,
         json!({"relationships":3*n,"forward_primary_key_and_reverse_index_maintained":true,"edge_table":"WITHOUT ROWID"}),
     );
-    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    sqlite_truncate(&db, &mut sio)?;
+    io.insert("graph_load".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     let loaded = sizes(root);
     let mut builds = serde_json::Map::new();
     let start = Instant::now();
     db.execute_batch("BEGIN; CREATE INDEX people_age ON people(age,id); CREATE INDEX people_active_age ON people(active,age,id); COMMIT;")?;
+    sio.commits += 1;
     builds.insert(
         "scalar".into(),
         time_json(
@@ -2194,9 +2316,12 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
             json!({"publication_commits":1,"policy":"SQLite atomic DDL"}),
         ),
     );
+    io.insert("build_scalar".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     builds.insert("vector".into(),json!({"seconds":0.0,"publication_commits":0,"policy":"no native vector index; exact f32 blobs already loaded"}));
+    io.insert("build_vector".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     let start = Instant::now();
     db.execute_batch("BEGIN; CREATE VIRTUAL TABLE people_rtree USING rtree(id,min_lon,max_lon,min_lat,max_lat); INSERT INTO people_rtree SELECT id,longitude,longitude,latitude,latitude FROM people; COMMIT;")?;
+    sio.commits += 1;
     builds.insert(
         "spatial".into(),
         time_json(
@@ -2204,8 +2329,10 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
             json!({"publication_commits":1,"policy":"SQLite atomic DDL+population"}),
         ),
     );
+    io.insert("build_spatial".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     let start = Instant::now();
     db.execute_batch("BEGIN; CREATE VIRTUAL TABLE people_fts USING fts5(body,content='people',content_rowid='id',tokenize='unicode61 remove_diacritics 0'); INSERT INTO people_fts(people_fts) VALUES('rebuild'); CREATE VIRTUAL TABLE people_fts_vocab USING fts5vocab(people_fts,'row'); CREATE TABLE phase2_text_meta(documents INTEGER NOT NULL,tokens INTEGER NOT NULL); INSERT INTO phase2_text_meta SELECT count(*),coalesce(sum(length(body)-length(replace(body,' ',''))+1),0) FROM people; CREATE TRIGGER people_ai AFTER INSERT ON people BEGIN INSERT INTO people_rtree VALUES(new.id,new.longitude,new.longitude,new.latitude,new.latitude); INSERT INTO people_fts(rowid,body) VALUES(new.id,new.body); UPDATE phase2_text_meta SET documents=documents+1,tokens=tokens+(length(new.body)-length(replace(new.body,' ',''))+1); END; CREATE TRIGGER people_ad AFTER DELETE ON people BEGIN DELETE FROM people_rtree WHERE id=old.id; INSERT INTO people_fts(people_fts,rowid,body) VALUES('delete',old.id,old.body); UPDATE phase2_text_meta SET documents=documents-1,tokens=tokens-(length(old.body)-length(replace(old.body,' ',''))+1); END; CREATE TRIGGER people_au AFTER UPDATE ON people BEGIN DELETE FROM people_rtree WHERE id=old.id; INSERT INTO people_rtree VALUES(new.id,new.longitude,new.longitude,new.latitude,new.latitude); INSERT INTO people_fts(people_fts,rowid,body) VALUES('delete',old.id,old.body); INSERT INTO people_fts(rowid,body) VALUES(new.id,new.body); UPDATE phase2_text_meta SET tokens=tokens-(length(old.body)-length(replace(old.body,' ',''))+1)+(length(new.body)-length(replace(new.body,' ',''))+1); END; COMMIT;")?;
+    sio.commits += 1;
     builds.insert(
         "text".into(),
         time_json(
@@ -2213,6 +2340,7 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
             json!({"publication_commits":1,"policy":"SQLite atomic DDL+FTS rebuild"}),
         ),
     );
+    io.insert("build_text".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     sample(root, &mut peak);
     let delete_out_plan = sqlite_plan(
         &db,
@@ -2456,6 +2584,7 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
         member_vector.iter().map(|hit| hit.id).collect::<Vec<_>>(),
         member_oracle.iter().map(|hit| hit.id).collect::<Vec<_>>()
     );
+    io.insert("pre_crud_queries".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     let held = matches!(readers, ReaderMode::Held)
         .then(|| Connection::open(&path))
         .transpose()?;
@@ -2484,7 +2613,7 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
         };
         let start = Instant::now();
         for base in (0..n).step_by(BATCH) {
-            sqlite_tx(&mut db, |tx| {
+            sqlite_tx(&mut db, &mut sio, |tx| {
                 for i in base..(base + BATCH).min(n) {
                     let (x, y) = point(i);
                     tx.execute("UPDATE people SET age=?2,body=?3,embedding=?4,longitude=?5,latitude=?6 WHERE id=?1",params![current_ids[i],age(i)+cycle as i64+1,format!("{} cycle{cycle}",body(i)),vector_blob(&vector((i+cycle+1)%n,dimension)),x+0.00001,y])?;
@@ -2523,10 +2652,11 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
             }
         }
         let update_s = start.elapsed().as_secs_f64();
+        io.insert(format!("crud_cycle_{cycle}_update"), sqlite_io_delta(&db, &sio, &mut io_prev)?);
         let deleted_indices = (0..n).step_by(10).collect::<Vec<_>>();
         let start = Instant::now();
         for chunk in deleted_indices.chunks(BATCH) {
-            sqlite_tx(&mut db, |tx| {
+            sqlite_tx(&mut db, &mut sio, |tx| {
                 for &i in chunk {
                     tx.execute("DELETE FROM edges WHERE context=0 AND source_collection=1 AND source_id=?1",params![current_ids[i]])?;
                     tx.execute("DELETE FROM edges WHERE context=0 AND destination_collection=1 AND destination_id=?1",params![current_ids[i]])?;
@@ -2537,9 +2667,10 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
             sample(root, &mut peak);
         }
         let delete_s = start.elapsed().as_secs_f64();
+        io.insert(format!("crud_cycle_{cycle}_delete"), sqlite_io_delta(&db, &sio, &mut io_prev)?);
         let start = Instant::now();
         for chunk in deleted_indices.chunks(BATCH) {
-            sqlite_tx(&mut db, |tx| {
+            sqlite_tx(&mut db, &mut sio, |tx| {
                 for &i in chunk {
                     let (x, y) = point(i);
                     tx.execute("INSERT INTO people(external_key,age,name,active,body,embedding,longitude,latitude,profile) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![person_key(i),age(i)+cycle as i64+1,format!("Person {i:08}"),active(i),format!("{} cycle{cycle}",body(i)),vector_blob(&vector((i+cycle+1)%n,dimension)),x+0.00001,y,profile().to_string()])?;
@@ -2550,7 +2681,7 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
             sample(root, &mut peak);
         }
         for chunk in deleted_indices.chunks(BATCH) {
-            sqlite_tx(&mut db, |tx| {
+            sqlite_tx(&mut db, &mut sio, |tx| {
                 for &i in chunk {
                     tx.execute(
                         "INSERT INTO edges VALUES(0,1,?1,1,1,?2,?3)",
@@ -2582,6 +2713,7 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
             sample(root, &mut peak);
         }
         let insert_s = start.elapsed().as_secs_f64();
+        io.insert(format!("crud_cycle_{cycle}_reinsert"), sqlite_io_delta(&db, &sio, &mut io_prev)?);
         let observed_age: i64 = db.query_row(
             "SELECT age FROM people WHERE external_key=?1",
             params![person_key(1)],
@@ -2745,6 +2877,7 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
     for (actual, expected) in text_hits.iter().zip(&final_text) {
         assert!((actual.1 - expected.1).abs() < 1e-12);
     }
+    io.insert("post_crud_queries".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     if let Some(reader) = held.as_ref() {
         let count: i64 = reader.query_row("SELECT count(*) FROM people", [], |r| r.get(0))?;
         assert_eq!(count, n as i64);
@@ -2762,7 +2895,8 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
         reader.execute_batch("COMMIT")?;
     }
     drop(held);
-    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    sqlite_truncate(&db, &mut sio)?;
+    io.insert("final_checkpoint".into(), sqlite_io_delta(&db, &sio, &mut io_prev)?);
     let final_size = sizes(root);
     drop(db);
     let start = Instant::now();
@@ -2827,7 +2961,7 @@ fn run_sqlite(n: usize, dimension: usize, root: &Path, readers: ReaderMode) -> R
     )?;
     assert!(fts_count > 0);
     Ok(
-        json!({"engine":"sqlite","entity_load":entity_load,"graph_load":graph_load,"builds":builds,"queries":queries,"crud":crud,"post_crud_queries":post_crud_queries,"sqlite_query_plans":sqlite_query_plans,"loaded_bytes":loaded,"final_bytes":final_size,"sampled_peak_bytes":peak,"reopen_seconds":reopen_s,"reader_mode":readers.name(),"reader_scope":readers.scope(),"publication_policy":"native SQLite atomic DDL","rss_hwm":hwm(),"sqlite_version":rusqlite::version(),"runtime_settings":{"journal_mode":"WAL","synchronous":"FULL","fullfsync":"ON (macOS parity with E4 F_FULLFSYNC)","cache_bytes":CACHE,"temp_store":"FILE","vector":"identical Rust exact f32 math over blobs","fts":"FTS5 unicode61 remove_diacritics=0"}}),
+        json!({"engine":"sqlite","entity_load":entity_load,"graph_load":graph_load,"builds":builds,"queries":queries,"crud":crud,"post_crud_queries":post_crud_queries,"io":io,"sqlite_query_plans":sqlite_query_plans,"loaded_bytes":loaded,"final_bytes":final_size,"sampled_peak_bytes":peak,"reopen_seconds":reopen_s,"reader_mode":readers.name(),"reader_scope":readers.scope(),"publication_policy":"native SQLite atomic DDL","rss_hwm":hwm(),"sqlite_version":rusqlite::version(),"runtime_settings":{"journal_mode":"WAL","synchronous":"FULL","fullfsync":"ON (macOS parity with E4 F_FULLFSYNC)","cache_bytes":CACHE,"temp_store":"FILE","vector":"identical Rust exact f32 math over blobs","fts":"FTS5 unicode61 remove_diacritics=0"}}),
     )
 }
 

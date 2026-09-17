@@ -189,3 +189,46 @@ fn checkpoint_preserves_a_valid_header_when_the_other_copy_starts_damaged(){
     }
     println!("DAMAGED_HEADER_CASES={cases}; REOPEN_CHECKS={}",cases*2);
 }
+
+#[test]
+fn lost_truncate_child() {
+    let Ok(p)=std::env::var("E4_PAGEWAL_LOST_TRUNCATE") else { return; };
+    let p=std::path::Path::new(&p);
+    seed(p);
+    let mut s=PageWalStore::open(p,false,32<<10).unwrap();
+    mutate(&mut s).unwrap();
+    s.test_checkpoint_crash(7).unwrap();
+    panic!("fault 7 did not terminate child");
+}
+
+#[test]
+fn lost_wal_truncate_keeps_checkpoint_floor_and_refuses_foreign_identity() {
+    let temp=tempfile::tempdir().unwrap();let p=temp.path().join("db");
+    let result=std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact","pagewal::fault_tests::lost_truncate_child","--nocapture"])
+        .env("E4_PAGEWAL_LOST_TRUNCATE",&p).status().unwrap();
+    assert_eq!(result.code(),Some(86));
+    let mut s=PageWalStore::open(&p,false,32<<10).unwrap();
+    for i in 0..120u64{
+        let key=if i%3==0{i+1000}else{i};
+        assert_eq!(s.get(&key.to_be_bytes()).unwrap(),Some(value(i,2)));
+        if i%3==0{assert!(s.get(&i.to_be_bytes()).unwrap().is_none());}
+    }
+    let snap=s.snapshot().unwrap();
+    for i in 0..120u64{
+        let key=if i%3==0{i+1000}else{i};
+        assert_eq!(snap.get(&key.to_be_bytes()).unwrap(),Some(value(i,2)));
+    }
+    drop(snap);
+    for i in 0..120u64{s.put(&i.to_be_bytes(),&value(i,3)).unwrap();}s.commit().unwrap();drop(s);
+    let s=PageWalStore::open(&p,false,32<<10).unwrap();
+    for i in 0..120u64{assert_eq!(s.get(&i.to_be_bytes()).unwrap(),Some(value(i,3)));}
+    drop(s);
+    let foreign=temp.path().join("foreign");
+    let mut other=PageWalStore::open(&foreign,true,32<<10).unwrap();
+    other.put(b"x",b"y").unwrap();other.commit().unwrap();drop(other);
+    fs::copy(foreign.join("wal"),p.join("wal")).unwrap();
+    let before=[fs::read(p.join("data")).unwrap(),fs::read(p.join("wal")).unwrap(),fs::read(p.join("writer.lock")).unwrap()];
+    assert!(PageWalStore::open(&p,false,32<<10).is_err(),"foreign identity WAL must refuse (64b6663)");
+    assert_eq!(before,[fs::read(p.join("data")).unwrap(),fs::read(p.join("wal")).unwrap(),fs::read(p.join("writer.lock")).unwrap()]);
+}

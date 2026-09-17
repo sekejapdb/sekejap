@@ -76,12 +76,31 @@ fn crash_child(){
 }
 #[test]
 fn checkpoint_process_death_preserves_acknowledged_rows(){
-    let d=dir();for stage in 1..=6{
+    let d=dir();for stage in 1..=7{
         let p=d.path().join(format!("crash-{stage}"));
         let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","crash_child","--nocapture"])
             .env("E4_PAGEWAL_CRASH_PATH",&p).env("E4_PAGEWAL_CRASH_STAGE",stage.to_string()).status().unwrap();
         assert_eq!(result.code(),Some(86));let s=PageWalStore::open(&p,false,64<<10).unwrap();check(&s,200,2,256);
     }
+}
+#[test]
+fn lost_wal_truncate_keeps_checkpoint_floor_and_refuses_foreign_identity(){
+    let d=dir();let p=d.path().join("lost-truncate");
+    let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","crash_child","--nocapture"])
+        .env("E4_PAGEWAL_CRASH_PATH",&p).env("E4_PAGEWAL_CRASH_STAGE","7").status().unwrap();
+    assert_eq!(result.code(),Some(86));
+    let mut s=PageWalStore::open(&p,false,64<<10).unwrap();
+    check(&s,200,2,256);
+    let snap=s.snapshot().unwrap();check(&snap,200,2,256);drop(snap);
+    for i in 0..200u64{s.put(&i.to_be_bytes(),&val(i,3,256)).unwrap();}s.commit().unwrap();drop(s);
+    let s=PageWalStore::open(&p,false,64<<10).unwrap();check(&s,200,3,256);drop(s);
+    let foreign=d.path().join("foreign");
+    let mut other=PageWalStore::open(&foreign,true,64<<10).unwrap();
+    other.put(b"x",b"y").unwrap();other.commit().unwrap();drop(other);
+    fs::copy(foreign.join("wal"),p.join("wal")).unwrap();
+    let before=[fs::read(p.join("data")).unwrap(),fs::read(p.join("wal")).unwrap(),fs::read(p.join("writer.lock")).unwrap()];
+    assert!(PageWalStore::open(&p,false,64<<10).is_err());
+    assert_eq!(before,[fs::read(p.join("data")).unwrap(),fs::read(p.join("wal")).unwrap(),fs::read(p.join("writer.lock")).unwrap()]);
 }
 #[test]
 fn repeated_small_transactions_complete_under_twice_loaded_size(){

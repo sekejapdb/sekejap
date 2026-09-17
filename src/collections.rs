@@ -637,6 +637,11 @@ impl Database {
     pub fn pool_accesses(&self) -> Result<u64> {
         Ok(self.store()?.store().pool_accesses())
     }
+    /// Diagnostic only: monotonic page-WAL I/O counters (frames, fsyncs, bytes).
+    #[doc(hidden)]
+    pub fn io_counters(&self) -> Result<crate::pagewal::IoCounters> {
+        Ok(self.store()?.store().io_counters())
+    }
     fn store(&self) -> Result<&Backend> {
         if self.failed {
             return Err(Error::Failed);

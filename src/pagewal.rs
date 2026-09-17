@@ -14,7 +14,7 @@
 use kernel::{btree::{BTree, RangeIter}, budget::MemoryBudget, io::{self, FileIo, IoMode, Barrier},
     page::{PageMut, PageRef, PageKind}, pool::BufferPool, recover::CandidateReader, Error, Result};
 use std::{cell::Cell, collections::BTreeMap, fs::File, path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}};
+    sync::{Arc, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering}}};
 
 const PAGE: usize = 4096;
 const FRAME: usize = PAGE + 48;
@@ -181,12 +181,110 @@ struct State {
     // header). Independent of the persisted total cap; never written to disk here.
     data_limit: u64, wal_limit: u64, tracked_limit: usize,
 }
+
+/// Monotonic page-WAL I/O counters. Relaxed atomics / pool Cells: the writer
+/// is single-threaded. Diagnostic; not on the per-key path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IoCounters {
+    pub wal_frames_appended: u64,
+    pub commit_frames: u64,
+    pub wal_fsyncs_commit: u64,
+    pub wal_fsyncs_checkpoint: u64,
+    pub wal_fsyncs_open: u64,
+    pub checkpoint_count: u64,
+    pub data_pages_written_at_checkpoint: u64,
+    pub data_fsyncs_checkpoint: u64,
+    pub metadata_fsyncs: u64,
+    pub wal_bytes_written: u64,
+    pub data_bytes_written: u64,
+    pub dirty_pages_flushed: u64,
+}
+impl IoCounters {
+    pub fn wal_fsyncs(self) -> u64 {
+        self.wal_fsyncs_commit.saturating_add(self.wal_fsyncs_checkpoint).saturating_add(self.wal_fsyncs_open)
+    }
+    pub fn fsyncs(self) -> u64 {
+        self.wal_fsyncs().saturating_add(self.data_fsyncs_checkpoint).saturating_add(self.metadata_fsyncs)
+    }
+    pub fn pages_written(self) -> u64 {
+        self.wal_frames_appended.saturating_add(self.data_pages_written_at_checkpoint)
+    }
+    pub fn bytes_written(self) -> u64 {
+        self.wal_bytes_written.saturating_add(self.data_bytes_written)
+    }
+    pub fn saturating_sub(self, prev: Self) -> Self {
+        Self {
+            wal_frames_appended: self.wal_frames_appended.saturating_sub(prev.wal_frames_appended),
+            commit_frames: self.commit_frames.saturating_sub(prev.commit_frames),
+            wal_fsyncs_commit: self.wal_fsyncs_commit.saturating_sub(prev.wal_fsyncs_commit),
+            wal_fsyncs_checkpoint: self.wal_fsyncs_checkpoint.saturating_sub(prev.wal_fsyncs_checkpoint),
+            wal_fsyncs_open: self.wal_fsyncs_open.saturating_sub(prev.wal_fsyncs_open),
+            checkpoint_count: self.checkpoint_count.saturating_sub(prev.checkpoint_count),
+            data_pages_written_at_checkpoint: self.data_pages_written_at_checkpoint.saturating_sub(prev.data_pages_written_at_checkpoint),
+            data_fsyncs_checkpoint: self.data_fsyncs_checkpoint.saturating_sub(prev.data_fsyncs_checkpoint),
+            metadata_fsyncs: self.metadata_fsyncs.saturating_sub(prev.metadata_fsyncs),
+            wal_bytes_written: self.wal_bytes_written.saturating_sub(prev.wal_bytes_written),
+            data_bytes_written: self.data_bytes_written.saturating_sub(prev.data_bytes_written),
+            dirty_pages_flushed: self.dirty_pages_flushed.saturating_sub(prev.dirty_pages_flushed),
+        }
+    }
+}
+struct IoAcc {
+    wal_frames_appended: AtomicU64,
+    commit_frames: AtomicU64,
+    wal_fsyncs_commit: AtomicU64,
+    wal_fsyncs_checkpoint: AtomicU64,
+    wal_fsyncs_open: AtomicU64,
+    checkpoint_count: AtomicU64,
+    data_pages_written_at_checkpoint: AtomicU64,
+    data_fsyncs_checkpoint: AtomicU64,
+    metadata_fsyncs: AtomicU64,
+    wal_bytes_written: AtomicU64,
+    data_bytes_written: AtomicU64,
+}
+impl IoAcc {
+    fn new() -> Self {
+        Self {
+            wal_frames_appended: AtomicU64::new(0),
+            commit_frames: AtomicU64::new(0),
+            wal_fsyncs_commit: AtomicU64::new(0),
+            wal_fsyncs_checkpoint: AtomicU64::new(0),
+            wal_fsyncs_open: AtomicU64::new(0),
+            checkpoint_count: AtomicU64::new(0),
+            data_pages_written_at_checkpoint: AtomicU64::new(0),
+            data_fsyncs_checkpoint: AtomicU64::new(0),
+            metadata_fsyncs: AtomicU64::new(0),
+            wal_bytes_written: AtomicU64::new(0),
+            data_bytes_written: AtomicU64::new(0),
+        }
+    }
+    fn add(a: &AtomicU64, n: u64) { a.fetch_add(n, Ordering::Relaxed); }
+    fn snapshot(&self) -> IoCounters {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        IoCounters {
+            wal_frames_appended: g(&self.wal_frames_appended),
+            commit_frames: g(&self.commit_frames),
+            wal_fsyncs_commit: g(&self.wal_fsyncs_commit),
+            wal_fsyncs_checkpoint: g(&self.wal_fsyncs_checkpoint),
+            wal_fsyncs_open: g(&self.wal_fsyncs_open),
+            checkpoint_count: g(&self.checkpoint_count),
+            data_pages_written_at_checkpoint: g(&self.data_pages_written_at_checkpoint),
+            data_fsyncs_checkpoint: g(&self.data_fsyncs_checkpoint),
+            metadata_fsyncs: g(&self.metadata_fsyncs),
+            wal_bytes_written: g(&self.wal_bytes_written),
+            data_bytes_written: g(&self.data_bytes_written),
+            dirty_pages_flushed: 0,
+        }
+    }
+}
+
 struct Pager {
     data: Arc<dyn FileIo>, wal: Arc<dyn FileIo>, state: Mutex<State>,
     readers: Arc<AtomicUsize>,
     // Read-write handle on `readers.lock` for hint writes; set by the writer's
     // `finish_open`. Lock order: `state` before `hint`.
     hint: Mutex<Option<Arc<dyn FileIo>>>,
+    io: IoAcc,
 }
 impl Pager {
     fn initialize(dir: &Path, features:u64) -> Result<()> {
@@ -214,7 +312,7 @@ impl Pager {
         Ok(Self::with_state(data,wal,state))
     }
     fn with_state(data:Arc<dyn FileIo>, wal:Arc<dyn FileIo>, state:State) -> Arc<Self> {
-        Arc::new(Self{data,wal,state:Mutex::new(state),readers:Arc::new(AtomicUsize::new(0)),hint:Mutex::new(None)})
+        Arc::new(Self{data,wal,state:Mutex::new(state),readers:Arc::new(AtomicUsize::new(0)),hint:Mutex::new(None),io:IoAcc::new()})
     }
     // Only the fully validated writer opener may normalize an uncommitted
     // tail. Under the gate (`held` when the opener took it before claiming
@@ -230,7 +328,7 @@ impl Pager {
         if self.wal.len()? != end { self.wal.set_len(end)?; }
         // A prefix recovered after a failed barrier is made durable before any
         // reader can be pointed at it.
-        self.wal.sync_full()?;
+        self.wal.sync_full()?;IoAcc::add(&self.io.wal_fsyncs_open,1);
         let (hint_io,_)=io::open_file(&dir.join(GATE),IoMode::Buffered)?;
         *self.hint.lock().unwrap()=Some(Arc::from(hint_io));
         let mut s=self.state.lock().unwrap();
@@ -339,7 +437,7 @@ impl Pager {
         let end=s.end.checked_add(b.len() as u64).ok_or(Error::TooLarge)?;
         if end>WAL_CAP || end+s.pages as u64*PAGE as u64>s.cap {return Err(Error::ResourceLimit("page-WAL managed-byte allowance"));}
         if end>s.wal_limit {return Err(Error::ResourceLimit("page-WAL wal_bytes allowance"));}
-        self.wal.write_at(b,s.end)?;s.end=end;Ok(())
+        self.wal.write_at(b,s.end)?;s.end=end;IoAcc::add(&self.io.wal_bytes_written,b.len() as u64);Ok(())
     }
     // Refuse extent growth before the page is framed. `pages` may still rise
     // ahead of a later append failure; rollback restores the committed extent.
@@ -368,8 +466,8 @@ impl Pager {
     fn publish(&self) -> Result<()> {
         let mut s=self.state.lock().unwrap();let mut body=[0;PAGE];body[..4].copy_from_slice(&s.tx_crc.to_le_bytes());
         let next = s.tx.checked_add(1).ok_or(Error::TooLarge)?;
-        let b=frame(2,u32::MAX,s.tx,s.pages,&body,&s.identity);self.append(&mut s,&b)?;
-        self.wal.sync_full()?;
+        let b=frame(2,u32::MAX,s.tx,s.pages,&body,&s.identity);self.append(&mut s,&b)?;IoAcc::add(&self.io.commit_frames,1);
+        self.wal.sync_full()?;IoAcc::add(&self.io.wal_fsyncs_commit,1);
         let (tx,end)=(s.tx,s.end);
         let r=self.write_hint(&mut s,tx,end);
         if s.hint_published {
@@ -392,9 +490,10 @@ impl Pager {
             let b=read_indexed_frame(&*self.wal,off)?;
             if u32at(&b,12)!=p {return Err(bad("WAL lookup identity"));}
             PageRef::open(&b[32..32+PAGE],p)?;self.data.write_at(&b[32..32+PAGE],p as u64*PAGE as u64)?;
+            IoAcc::add(&self.io.data_pages_written_at_checkpoint,1);IoAcc::add(&self.io.data_bytes_written,PAGE as u64);
             if fault==1 {std::process::exit(86);}
         }
-        self.data.set_len(s.pages as u64*PAGE as u64)?;self.data.sync_full()?;
+        self.data.set_len(s.pages as u64*PAGE as u64)?;self.data.sync_full()?;IoAcc::add(&self.io.data_fsyncs_checkpoint,1);
         if fault==2 {std::process::exit(86);}
         // Independent read-back precedes dropping the WAL. Cost is measured.
         for (&p,&off) in &s.latest {
@@ -405,27 +504,54 @@ impl Pager {
             PageRef::open(&data,p)?;
         }
         // Advance the checkpoint floor only after its data is durable and
-        // verified. Either intact metadata copy can anchor interrupted recovery.
+        // verified. `metadata_write_order` replaces the damaged or older copy
+        // first. That copy is FULL-synced before the other is touched, so a
+        // crash never leaves zero valid headers. The second copy is written
+        // and read back but not synced: a crash may leave it torn or stale,
+        // which `disk_header` already accepts by selecting the newer valid
+        // copy (today's window between the two metadata syncs). The WAL
+        // truncate barrier is a different file and does not make copy 1
+        // durable; copy 1 rides the next data-file FULL sync (the following
+        // checkpoint's page copy-back). Syncing it here would be a fourth
+        // barrier. WAL truncate+sync is unchanged (option 3).
         let at = *s.latest.get(&0).ok_or_else(||bad("checkpoint lacks metadata"))?;
         let b = read_indexed_frame(&*self.wal,at)?;
         let header = Header::decode(&b[32..32+PAGE],0)?;
         let order = metadata_write_order(&*self.data)?;
         for (step,no) in order.into_iter().enumerate() {
             let page = header.page(no)?;
-            self.data.write_at(&page,no as u64*PAGE as u64)?;
+            self.data.write_at(&page,no as u64*PAGE as u64)?;IoAcc::add(&self.io.data_bytes_written,PAGE as u64);
             if (fault==5&&step==0)||(fault==6&&step==1) {std::process::exit(86);}
-            self.data.sync_full()?;
+            if step==0 { self.data.sync_full()?;IoAcc::add(&self.io.metadata_fsyncs,1); }
             let mut actual=[0;PAGE];self.data.read_at(&mut actual,no as u64*PAGE as u64)?;
             if actual != page { return Err(bad("checkpoint metadata read-back mismatch")); }
             Header::decode(&actual,no)?;
         }
         if fault==3 {std::process::exit(86);}
+        // Fault 7 (option 3): snapshot the committed WAL, run the truncate
+        // (and today's WAL FULL sync), then put the pre-truncate bytes back
+        // so reopen sees case (b) — leftover frames of the just-absorbed
+        // floor, not a stale earlier incarnation. When sync 4 is removed the
+        // restore still runs past set_len(0).
+        let mut lost_truncate=None;
+        if fault==7 {
+            let n=self.wal.len()?;let mut b=vec![0;n as usize];
+            if n>0 {self.wal.read_at(&mut b,0)?;}
+            lost_truncate=Some(b);
+        }
         self.wal.set_len(0)?;
         if fault==4 {std::process::exit(86);}
-        self.wal.sync_full()?;
+        self.wal.sync_full()?;IoAcc::add(&self.io.wal_fsyncs_checkpoint,1);
+        if fault==7 {
+            let b=lost_truncate.unwrap();
+            self.wal.set_len(b.len() as u64)?;
+            if !b.is_empty() {self.wal.write_at(&b,0)?;}
+            std::process::exit(86);
+        }
         s.latest.clear();s.committed=Arc::new(Index::new());s.end=0;s.last_commit=0;s.tx_crc=0;s.floor=header.tx;
         // Absorbed: the data file alone is transaction `floor`; the hint says so.
         let tx=s.tx-1;self.write_hint(&mut s,tx,0)?;
+        IoAcc::add(&self.io.checkpoint_count,1);
         Ok(true)
     }
     // 4 MiB, or half of whichever allowance (persisted cap, runtime WAL
@@ -459,7 +585,7 @@ impl FileIo for Pager {
         // Mark taken through WAL before returning it. A corrupt cycle cannot
         // reallocate this page even while its replacement is still cached.
         let mut page=PageMut::init(&mut b,PageKind::Free,0,p);page.insert_slot(0,b"taken")?;page.finalise(0);kernel::page::seal(&mut b,1);
-        let f=frame(1,p,s.tx,0,&b,&s.identity);let at=s.end;self.append(&mut s,&f)?;
+        let f=frame(1,p,s.tx,0,&b,&s.identity);let at=s.end;self.append(&mut s,&f)?;IoAcc::add(&self.io.wal_frames_appended,1);
         s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,FrameRef::new(at,&f));s.free_head=next;Ok(Some(p))
     }
     fn push_free_page(&self,p:u32)->Result<()>{
@@ -469,7 +595,7 @@ impl FileIo for Pager {
         Pager::grow(&mut s,p)?;
         let mut b=[0;PAGE];let mut page=PageMut::init(&mut b,PageKind::Free,0,p);
         page.insert_slot(0,&s.free_head.to_le_bytes())?;page.finalise(0);kernel::page::seal(&mut b,1);
-        let f=frame(1,p,s.tx,0,&b,&s.identity);let at=s.end;self.append(&mut s,&f)?;
+        let f=frame(1,p,s.tx,0,&b,&s.identity);let at=s.end;self.append(&mut s,&f)?;IoAcc::add(&self.io.wal_frames_appended,1);
         s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,FrameRef::new(at,&f));s.free_head=p;Ok(())
     }
     fn requires_alignment(&self)->bool{false}
@@ -485,7 +611,7 @@ impl FileIo for Pager {
         let p=u32::try_from(off/PAGE as u64).map_err(|_|Error::TooLarge)?;PageRef::open(b,p)?;
         let mut s=self.state.lock().unwrap();Pager::track(&s,p)?;Pager::grow(&mut s,p)?;
         let f=frame(1,p,s.tx,0,b.try_into().unwrap(),&s.identity);let at=s.end;
-        self.append(&mut s,&f)?;s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,FrameRef::new(at,&f));Ok(())
+        self.append(&mut s,&f)?;IoAcc::add(&self.io.wal_frames_appended,1);s.tx_crc=crc32c::crc32c_append(s.tx_crc,&f);s.latest.insert(p,FrameRef::new(at,&f));Ok(())
     }
     fn sync_data(&self)->Result<()>{Err(bad("use explicit page-WAL publication"))}
     fn sync_full(&self)->Result<()>{Err(bad("use explicit page-WAL publication"))}
@@ -845,6 +971,11 @@ impl PageWalStore {
         snapshot_store(p,self._lock.clone(),&self.dir,self.cache,Some(slot))
     }
     pub fn wal_bytes(&self)->u64 {self.pager.as_ref().map_or(0,|p|p.state.lock().unwrap().end)}
+    /// Diagnostic: monotonic page-WAL and pool I/O counters since this handle opened.
+    pub fn io_counters(&self)->IoCounters {
+        let mut c=self.pager.as_ref().map(|p|p.io.snapshot()).unwrap_or_default();
+        c.dirty_pages_flushed=self.pool.stats().dirty_pages_flushed;c
+    }
     /// Diagnostic snapshot/reset of existing FileIo counters, data then WAL.
     /// Each tuple is (write calls, issued write bytes, read calls). Buffered
     /// calls are not physical-device I/O. Snapshot handles report their own
@@ -857,7 +988,7 @@ impl PageWalStore {
     }
     /// Pilot fault harness only: abruptly exits inside a checkpoint stage.
     pub fn test_checkpoint_crash(&mut self,stage:u8)->Result<bool>{
-        self.writable()?;assert!((1..=6).contains(&stage));assert!(!self.dirty);
+        self.writable()?;assert!((1..=7).contains(&stage));assert!(!self.dirty);
         self.checkpoint_guarded(stage)
     }
     /// Test seam: route publication-hint writes through a caller's `FileIo`.
