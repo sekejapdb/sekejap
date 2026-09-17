@@ -1325,7 +1325,10 @@ fn run_e4(
         progress.committed("crud_reinsert", json!({"cycle":cycle,"people":inserted}));
         progress.stage = "crud_restore_edges";
         progress.stage_progress = json!({"cycle":cycle,"people":0,"relationships":0});
-        let mut restored = 0usize;
+        // Commit by PEOPLE restored, exactly like the SQLite arm's chunks(BATCH)
+        // over deleted_indices and E4's own reinsert loop above. Counting edges
+        // here (+3 per person) committed every 86 people instead of 256, so the
+        // E4 arm did ~2x the commits and fsyncs of the SQLite arm in this stage.
         let mut restored_sources = 0usize;
         for i in (0..n).step_by(10) {
             db.put_edge(
@@ -1352,9 +1355,8 @@ fn run_e4(
                 },
                 &json!({"round":cycle}),
             )?;
-            restored += 3;
             restored_sources += 1;
-            if restored >= BATCH {
+            if restored_sources % BATCH == 0 {
                 db.commit()?;
                 progress.committed.restored[cycle] = restored_sources;
                 progress.committed(
@@ -1362,7 +1364,6 @@ fn run_e4(
                     json!({"cycle":cycle,"people":restored_sources,"relationships":restored_sources*3}),
                 );
                 sample(root, &mut peak);
-                restored = 0;
             }
         }
         db.commit()?;
