@@ -148,22 +148,85 @@ pub(super) struct Norm {
     pub(super) packed: bool,
 }
 
-/// One decoded norm block, held across the documents of one query.
+/// The per-query text scratch: everything one query re-reads about the same
+/// documents, held once instead of once per candidate.
 ///
-/// A block carries 256 lengths behind one key, so reading one document's
-/// length means decoding all 256 varints. Both query paths visit documents in
-/// ascending sequence, so 255 of every 256 lookups want the block the previous
-/// lookup already decoded; without this the scan decodes the same block 256
-/// times and a whole-index text query costs more than the per-row norms it
-/// replaced. Sacrifice (Law 1): one block -- at most 256 `(slot, length)`
-/// pairs -- resident for the life of one query.
+/// Three things live here, and all three exist for the same reason -- a text
+/// query visits documents in ascending sequence, and the on-disk shapes it
+/// reads are all *ranges* keyed by sequence, so the naive "one point read per
+/// document per thing" costs O(range) work O(range) times:
+///
+/// * **One decoded `0x7B` norm block.** A block carries 256 lengths behind one
+///   key, so reading one document's length means decoding all 256 varints.
+///   255 of every 256 lookups want the block the previous lookup decoded.
+/// * **The gap to the next `0x76` norm head row.** A folded index writes NO
+///   head rows at all, so the head probe that overrides the block is a
+///   guaranteed miss for every document -- but it still costs a point read
+///   each time. Remembering *where the next head row actually is* turns those
+///   misses into no read at all until the cursor reaches it.
+/// * **One decoded `0x7A` packed segment per query term.** A term's whole
+///   posting list can be one segment; decoding it to extract one document's
+///   frequency, once per matching document, is the O(df^2) shape this cache
+///   exists to remove. The window records which sequences the decoded segment
+///   is authoritative for, so an ascending walk decodes each segment once.
+///
+/// None of the three assumes ascending order for CORRECTNESS: each lookup
+/// re-checks that the cached range covers the sequence asked for, and reloads
+/// when it does not. A driver that hands out sequences in some other order
+/// (a scalar range cursor, a spatial cursor) therefore still gets the right
+/// answer -- it just pays the reload it would have paid anyway.
+///
+/// Sacrifice (Law 1): one norm block (at most 256 `(slot, length)` pairs), one
+/// pending head-row entry, and one decoded segment per distinct query term
+/// (at most `MAX_QUERY_TERMS`, each at most `MAX_SEGMENT_BYTES` of postings),
+/// resident for the life of one query page.
 #[derive(Default)]
-pub(super) struct NormCache {
+pub(super) struct TextScratch {
     block: Option<u64>,
     entries: Vec<(usize, u32)>,
+    /// No `0x76` head row exists for any sequence in `head_from ..` below
+    /// `head_next`. `head_next` is the first head row at or after `head_from`,
+    /// already decoded (its inner `None` is the EMPTY "not indexed" value).
+    head_from: u64,
+    head_next: Option<(u64, Option<u32>)>,
+    head_scanned: bool,
+    /// One decoded packed segment per `(index, term)` this query has touched.
+    windows: Vec<TermWindow>,
 }
 
-impl NormCache {
+/// What one query knows about one term's postings, across both tiers.
+///
+/// **The packed tier.** `lower` is the sequence whose seek produced the
+/// decoded segment and `upper` is the last sequence that segment holds, so
+/// every sequence in `lower ..= upper` seeks to exactly this segment: inside
+/// the window the answer is a binary search, and a sequence the window does
+/// not list is genuinely absent from the packed tier. An empty `entries` with
+/// `upper = u64::MAX` records the other true answer -- that no segment of this
+/// term reaches `lower` at all.
+///
+/// **The head tier.** Same shape, one row at a time: `head_next` is the first
+/// `0x75` row at or after `head_from`, so every sequence below it is known to
+/// have no head row without a read. A folded index has no head rows at all, so
+/// one seek answers the whole query; an unfolded one pays a seek per head row
+/// it actually walks past, which is what the point read cost anyway.
+struct TermWindow {
+    index: IndexId,
+    term: String,
+    /// `0x75` prefix for this term, kept so a seek does not rebuild it.
+    head_prefix: Vec<u8>,
+    /// `0x7A` prefix for this term.
+    segment_prefix: Vec<u8>,
+    /// Reusable seek key, so an amortized lookup allocates nothing.
+    key: Vec<u8>,
+    head_from: u64,
+    head_next: Option<(u64, u32)>,
+    head_scanned: bool,
+    lower: u64,
+    upper: u64,
+    entries: Vec<(u64, u32)>,
+}
+
+impl TextScratch {
     fn packed(&mut self, db: &Database, id: IndexId, sequence: u64) -> Result<Option<u32>> {
         let block = segments::norm_block_of(sequence);
         if self.block != Some(block) {
@@ -184,20 +247,229 @@ impl NormCache {
             .ok()
             .map(|at| self.entries[at].1))
     }
+
+    /// The `0x76` head row for one document, read through the gap cache.
+    ///
+    /// `Ok(None)` means no head row exists (the block, if any, is
+    /// authoritative); `Ok(Some(value))` is the decoded head row, whose own
+    /// `None` is the EMPTY value meaning "not in the index".
+    fn head_norm(
+        &mut self,
+        db: &Database,
+        id: IndexId,
+        sequence: u64,
+    ) -> Result<Option<Option<u32>>> {
+        let stale = !self.head_scanned
+            || sequence < self.head_from
+            || self.head_next.is_some_and(|(at, _)| at < sequence);
+        if stale {
+            self.seek_head(db, id, sequence)?;
+        }
+        Ok(match self.head_next {
+            Some((at, value)) if at == sequence => Some(value),
+            _ => None,
+        })
+    }
+
+    /// Position the head gap at the first `0x76` row at or after `from`.
+    fn seek_head(&mut self, db: &Database, id: IndexId, from: u64) -> Result<()> {
+        let prefix = index_prefix(NORM, id);
+        let mut start = prefix.clone();
+        start.extend(ordered(from));
+        self.head_from = from;
+        self.head_scanned = true;
+        self.head_next = None;
+        if let Some(row) = db.store()?.range(&start)?.next() {
+            let (key, value) = row?;
+            if key.starts_with(&prefix) {
+                let mut at = prefix.len();
+                let sequence = read_ordered(&key, &mut at)?;
+                if at != key.len() || sequence == 0 {
+                    return Err(corrupt("text norm key identity"));
+                }
+                self.head_next = Some((sequence, decode_norm(&value, true)?));
+            }
+        }
+        Ok(())
+    }
+
+    /// The window for one `(index, term)`, created on first use.
+    fn window(&mut self, id: IndexId, term: &str) -> usize {
+        if let Some(at) = self
+            .windows
+            .iter()
+            .position(|window| window.index == id && window.term == term)
+        {
+            return at;
+        }
+        self.windows.push(TermWindow {
+            index: id,
+            term: term.to_owned(),
+            head_prefix: posting_prefix(id, term),
+            segment_prefix: segments::segment_prefix(id, term),
+            key: Vec::new(),
+            head_from: 0,
+            head_next: None,
+            head_scanned: false,
+            // An empty window: `lower > upper` matches no sequence.
+            lower: 1,
+            upper: 0,
+            entries: Vec::new(),
+        });
+        self.windows.len() - 1
+    }
+
+    /// One document's live frequency for one term, across both tiers, with
+    /// each tier read through the window that the last lookup left behind.
+    ///
+    /// Head row first -- it overrides, and `tf = 0` is the tombstone -- then
+    /// the one segment whose key proves it could hold this document.
+    fn posting(
+        &mut self,
+        db: &Database,
+        id: IndexId,
+        term: &str,
+        sequence: u64,
+    ) -> Result<Option<u32>> {
+        let at = self.window(id, term);
+        let stale = {
+            let window = &self.windows[at];
+            !window.head_scanned
+                || sequence < window.head_from
+                || window.head_next.is_some_and(|(at, _)| at < sequence)
+        };
+        if stale {
+            self.seek_posting_head(db, at, sequence)?;
+        }
+        if let Some((found, frequency)) = self.windows[at].head_next {
+            if found == sequence {
+                return Ok((frequency != 0).then_some(frequency));
+            }
+        }
+        if sequence < self.windows[at].lower || sequence > self.windows[at].upper {
+            self.seek_segment(db, at, sequence)?;
+        }
+        let window = &self.windows[at];
+        // `decode_into` yields strictly ascending sequences.
+        Ok(window
+            .entries
+            .binary_search_by_key(&sequence, |(sequence, _)| *sequence)
+            .ok()
+            .map(|at| window.entries[at].1))
+    }
+
+    /// Position the head gap at the first `0x75` row at or after `from`.
+    fn seek_posting_head(&mut self, db: &Database, at: usize, from: u64) -> Result<()> {
+        let window = &mut self.windows[at];
+        window.key.clear();
+        window.key.extend_from_slice(&window.head_prefix);
+        window.key.extend(ordered(from));
+        window.head_from = from;
+        window.head_scanned = true;
+        window.head_next = None;
+        let prefix_len = window.head_prefix.len();
+        let found = match db.store()?.range(&self.windows[at].key)?.next() {
+            Some(row) => {
+                let (key, value) = row?;
+                if key.starts_with(&self.windows[at].head_prefix) {
+                    let mut cursor = prefix_len;
+                    let sequence = read_ordered(&key, &mut cursor)?;
+                    if cursor != key.len() || sequence == 0 {
+                        return Err(corrupt("text posting identity/order"));
+                    }
+                    Some((sequence, decode_u32(&value, "text posting frequency length")?))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        self.windows[at].head_next = found;
+        Ok(())
+    }
+
+    /// Load the one packed segment that could hold `sequence`.
+    fn seek_segment(&mut self, db: &Database, at: usize, sequence: u64) -> Result<()> {
+        let window = &mut self.windows[at];
+        window.key.clear();
+        window.key.extend_from_slice(&window.segment_prefix);
+        window.key.extend(ordered(sequence));
+        let prefix_len = window.segment_prefix.len();
+        let found = match db.store()?.range(&self.windows[at].key)?.next() {
+            Some(row) => {
+                let (key, value) = row?;
+                if key.starts_with(&self.windows[at].segment_prefix) {
+                    let mut cursor = prefix_len;
+                    let last = read_ordered(&key, &mut cursor)?;
+                    if cursor != key.len() {
+                        return Err(corrupt("text segment key identity"));
+                    }
+                    Some((last, value))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let window = &mut self.windows[at];
+        window.lower = sequence;
+        match found {
+            Some((last, value)) => {
+                segments::decode_into(&value, &mut window.entries)?;
+                if window.entries.last().map(|(sequence, _)| *sequence) != Some(last) {
+                    return Err(corrupt("text segment key disagrees with its postings"));
+                }
+                window.upper = last;
+            }
+            // No segment of this term reaches `sequence`, so none reaches
+            // anything above it either.
+            None => {
+                window.entries.clear();
+                window.upper = u64::MAX;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Head row first, then the packed block.
 ///
 /// One point read for a file that never folded (the block probe is skipped
-/// when the feature bit is clear), two for one that did and whose document is
-/// not at the head -- and the second is served from `cache` for every document
-/// after the first of its block.
+/// when the feature bit is clear). A file that did folded pays neither of the
+/// two point reads per document once the scratch is warm: the head row is
+/// answered from the gap the last seek proved empty, and the block from the
+/// one decode its 256 documents share.
 pub(super) fn read_norm_cached(
     db: &Database,
     id: IndexId,
     sequence: u64,
-    cache: &mut NormCache,
+    cache: &mut TextScratch,
 ) -> Result<Norm> {
+    if !segments_enabled(db) {
+        let head = db.store()?.get(&norm_key(id, sequence))?;
+        return Ok(Norm {
+            length: head
+                .as_deref()
+                .map(|bytes| decode_u32(bytes, "text document length"))
+                .transpose()?,
+            packed: false,
+        });
+    }
+    let head = cache.head_norm(db, id, sequence)?;
+    let packed = cache.packed(db, id, sequence)?;
+    Ok(Norm {
+        length: match head {
+            Some(length) => length,
+            None => packed,
+        },
+        packed: packed.is_some(),
+    })
+}
+
+/// The one-shot read, for the write path. Deliberately NOT the cached reader:
+/// a writer touches one document and then moves on, so a range seek for the
+/// head row would cost it more than the point get it replaces.
+pub(super) fn read_norm(db: &Database, id: IndexId, sequence: u64) -> Result<Norm> {
     let segments_on = segments_enabled(db);
     let head = db.store()?.get(&norm_key(id, sequence))?;
     if !segments_on {
@@ -209,7 +481,7 @@ pub(super) fn read_norm_cached(
             packed: false,
         });
     }
-    let packed = cache.packed(db, id, sequence)?;
+    let packed = TextScratch::default().packed(db, id, sequence)?;
     let length = match head.as_deref() {
         Some(bytes) => decode_norm(bytes, true)?,
         None => packed,
@@ -218,10 +490,6 @@ pub(super) fn read_norm_cached(
         length,
         packed: packed.is_some(),
     })
-}
-
-pub(super) fn read_norm(db: &Database, id: IndexId, sequence: u64) -> Result<Norm> {
-    read_norm_cached(db, id, sequence, &mut NormCache::default())
 }
 
 pub(super) fn term_stats_key(id: IndexId, term: &str) -> Vec<u8> {
@@ -528,32 +796,19 @@ pub(super) fn point_posting(
     term: &str,
     sequence: u64,
     segments_on: bool,
+    scratch: &mut TextScratch,
 ) -> Result<Option<u32>> {
-    if let Some(value) = db.store()?.get(&posting_key(id, term, sequence))? {
-        let frequency = if segments_on {
-            decode_u32(&value, "text posting frequency length")?
-        } else {
-            decode_tf(&value)?
-        };
-        return Ok((frequency != 0).then_some(frequency));
-    }
     if !segments_on {
-        return Ok(None);
+        // One tier, one point read: exactly what this was before segments.
+        let Some(value) = db.store()?.get(&posting_key(id, term, sequence))? else {
+            return Ok(None);
+        };
+        return decode_tf(&value).map(Some);
     }
-    let prefix = segments::segment_prefix(id, term);
-    let mut start = prefix.clone();
-    start.extend(ordered(sequence));
-    let Some(row) = db.store()?.range(&start)?.next() else {
-        return Ok(None);
-    };
-    let (key, value) = row?;
-    if !key.starts_with(&prefix) {
-        return Ok(None);
-    }
-    Ok(segments::decode(&value)?
-        .into_iter()
-        .find(|(candidate, _)| *candidate == sequence)
-        .map(|(_, frequency)| frequency))
+    // Both tiers, through the query's term window. Re-seeking and re-decoding
+    // the whole segment here, once per document, is what made a term of
+    // document frequency `df` cost O(df^2) to score.
+    scratch.posting(db, id, term, sequence)
 }
 
 fn checked_add(value: u64, amount: u64, what: &'static str) -> Result<u64> {
@@ -1395,7 +1650,7 @@ impl Database {
         }
         let mut examined = 0usize;
         let segments_on = segments_enabled(self);
-        let mut norms = NormCache::default();
+        let mut norms = TextScratch::default();
         let mut heap = BinaryHeap::with_capacity(k.min(1024));
         match candidates {
             TextCandidates::SortedUnique(ids) => {
@@ -1411,7 +1666,7 @@ impl Database {
                     for (term, &df) in terms.iter().zip(&dfs) {
                         spend(&mut examined, max_examined, &mut cancelled)?;
                         if let Some(frequency) =
-                            point_posting(self, id, term, entity.sequence, segments_on)?
+                            point_posting(self, id, term, entity.sequence, segments_on, &mut norms)?
                         {
                             frequencies.push(frequency);
                             matched_dfs.push(df);

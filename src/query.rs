@@ -434,6 +434,67 @@ struct PreparedText {
     matching: TextMatch,
     corpus: super::text_indexes::Corpus,
     dfs: Vec<u64>,
+    /// Which candidate driver, if any, hands this prepared query the term
+    /// frequencies it needs -- see `TextSource`. Filled in once, after the
+    /// driver is chosen, by comparing term lists; `None` means this scorer
+    /// must read its own frequencies.
+    driven: Option<TextSource>,
+}
+
+impl PreparedText {
+    /// Would the driver's per-term frequencies answer THIS query's terms?
+    ///
+    /// Same index, same match mode, same terms in the same order. Nothing is
+    /// hashed or assumed: a query may search one term list and rank by
+    /// another (`WHERE SEARCH(body,'comet') ORDER BY BM25(body,'harbour
+    /// comet')`), and taking the driver's frequencies for the wrong term list
+    /// would silently score the wrong documents.
+    fn same_terms(&self, other: &Self) -> bool {
+        self.info.id == other.info.id && self.matching == other.matching && self.terms == other.terms
+    }
+}
+
+/// Which compiled text site produced a candidate, so a scorer can tell whether
+/// the frequencies riding on that candidate are the ones IT asked for.
+///
+/// A text query is compiled at most twice in one request -- once per `WHERE`
+/// text filter, once for a BM25 order -- and the driver is exactly one of
+/// those sites. The candidate carries the site, the scorer knows its own, and
+/// `PreparedText::driven` records (once, at prepare time) which site's
+/// frequencies it may consume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextSource {
+    Filter(usize),
+    Order,
+}
+
+/// How many query terms' frequencies ride on a candidate without allocating.
+///
+/// A text query may have up to 64 distinct terms; carrying 64 slots on every
+/// candidate would cost more than the reads they save. Past this many the
+/// driver stamps nothing and the scorer reads its own frequencies, which is
+/// the behaviour every driver had before.
+const INLINE_TEXT_TERMS: usize = 8;
+
+/// The most distinct terms one text query may have, enforced by
+/// `prepare_text`. Scoring sizes its per-document buffers from this so it can
+/// keep them on the stack.
+const MAX_TEXT_TERMS: usize = 64;
+
+/// The per-term frequencies the text merge cursor decoded on its way past this
+/// document.
+///
+/// The merge already stands on the `(document, frequency)` entry it is
+/// emitting. Keeping it costs one `u32` per query term; throwing it away costs
+/// a re-seek and a whole-segment re-decode per term per document, which is the
+/// O(df^2) that this type removes.
+#[derive(Clone, Copy, Debug)]
+struct TextFrequencies {
+    source: TextSource,
+    len: u8,
+    /// Frequency per query term, positionally. `0` means the term is absent
+    /// from this document, which the posting format never stores.
+    slots: [u32; INLINE_TEXT_TERMS],
 }
 
 #[derive(Clone, Debug)]
@@ -698,6 +759,7 @@ fn prepare_text(
         matching,
         corpus,
         dfs,
+        driven: None,
     })
 }
 
@@ -924,7 +986,7 @@ impl Database {
             });
         }
 
-        let order = match request.order {
+        let mut order = match request.order {
             QueryOrder::EntityId => CompiledOrder::EntityId,
             QueryOrder::Scalar { index, direction } => CompiledOrder::Scalar {
                 info: require_scalar_index(self, request.collection, index)?,
@@ -1111,6 +1173,32 @@ impl Database {
             {
                 *posting_membership = matches!(predicate, EncodedScalarFilter::Eq(_))
                     && scalar_driver_position != Some(position);
+            }
+        }
+
+        // Which scorers may read the frequencies the text driver decodes.
+        //
+        // Decided once, here, by comparing term lists -- not per candidate,
+        // and never by a hash. A text driver produces the frequencies of ITS
+        // terms; a scorer over a different term list on the same index must go
+        // on reading its own, or it would score the wrong words.
+        if let DriverPlan::Text {
+            prepared: driving,
+            position,
+        } = &driver
+        {
+            let source = match position {
+                Some(position) => TextSource::Filter(*position),
+                None => TextSource::Order,
+            };
+            let carries = driving.terms.len() <= INLINE_TEXT_TERMS;
+            for filter in filters.iter_mut() {
+                if let CompiledFilter::Text(prepared) = filter {
+                    prepared.driven = (carries && prepared.same_terms(driving)).then_some(source);
+                }
+            }
+            if let CompiledOrder::Bm25(prepared) = &mut order {
+                prepared.driven = (carries && prepared.same_terms(driving)).then_some(source);
             }
         }
 
@@ -1339,6 +1427,10 @@ struct Candidate {
     vector: Option<(IndexId, Vec<u8>)>,
     quantized: Option<(IndexId, Vec<u8>)>,
     satisfied_filter: Option<usize>,
+    /// What the text merge cursor already knew about this document. Only the
+    /// text driver fills it in; every other driver leaves it `None` and every
+    /// scorer that cannot prove the frequencies are its own ignores it.
+    text: Option<TextFrequencies>,
 }
 
 struct EntityCursor<'a> {
@@ -1390,7 +1482,10 @@ struct QuantizedVectorCursor<'a> {
 
 struct TextPostingCursor<'a> {
     inner: super::text_indexes::TermPostings<'a>,
-    head: Option<u64>,
+    /// The posting the merge is standing on: document AND term frequency.
+    /// `TermPostings::next` decodes both; the frequency used to be dropped
+    /// here and re-read, per document, by the scorer.
+    head: Option<(u64, u32)>,
     done: bool,
 }
 
@@ -1399,6 +1494,13 @@ struct TextCursor<'a> {
     collection: CollectionId,
     matching: TextMatch,
     position: Option<usize>,
+    /// Which compiled text site this cursor is, stamped onto every candidate
+    /// it emits so only the scorer that asked for these terms reads them.
+    source: TextSource,
+    /// Are there few enough query terms to carry their frequencies inline?
+    carries: bool,
+    /// The last document emitted, to prove the merge ascends.
+    previous: Option<u64>,
     initialized: bool,
     done: bool,
 }
@@ -1617,11 +1719,18 @@ impl<'a> DriverCursor<'a> {
                         done: false,
                     });
                 }
+                let carries = streams.len() <= INLINE_TEXT_TERMS;
                 Ok(Self::Text(TextCursor {
                     streams,
                     collection: prepared.info.collection,
                     matching: prepared.matching,
                     position: *position,
+                    source: match position {
+                        Some(position) => TextSource::Filter(*position),
+                        None => TextSource::Order,
+                    },
+                    carries,
+                    previous: None,
                     initialized: false,
                     done: false,
                 }))
@@ -1667,6 +1776,7 @@ impl<'a> DriverCursor<'a> {
                 vector: None,
                 quantized: None,
                 satisfied_filter: None,
+                text: None,
             })),
         }
     }
@@ -1715,6 +1825,7 @@ impl EntityCursor<'_> {
             vector: None,
             quantized: None,
             satisfied_filter: None,
+            text: None,
         }))
     }
 }
@@ -1792,6 +1903,7 @@ impl ScalarCursor<'_> {
                 vector: None,
                 quantized: None,
                 satisfied_filter: self.certifies.filter(|_| proves_predicate),
+                text: None,
             }));
         }
     }
@@ -1806,8 +1918,7 @@ impl TextPostingCursor<'_> {
         // and the head rows written since, with head rows overriding.
         self.head = self
             .inner
-            .next(&mut || meter.charge(WorkResource::TextPostings, 1))?
-            .map(|(sequence, _)| sequence);
+            .next(&mut || meter.charge(WorkResource::TextPostings, 1))?;
         if self.head.is_none() {
             self.done = true;
         }
@@ -1842,15 +1953,25 @@ impl TextCursor<'_> {
             self.done = true;
             return Ok(None);
         }
+        // The frequencies this document's streams are standing on, harvested
+        // before the streams are advanced off them.
+        let mut slots = [0u32; INLINE_TEXT_TERMS];
         let sequence = match self.matching {
             TextMatch::Any => {
-                let Some(sequence) = self.streams.iter().filter_map(|stream| stream.head).min()
+                let Some(sequence) = self
+                    .streams
+                    .iter()
+                    .filter_map(|stream| stream.head.map(|(sequence, _)| sequence))
+                    .min()
                 else {
                     self.done = true;
                     return Ok(None);
                 };
-                for stream in &mut self.streams {
-                    if stream.head == Some(sequence) {
+                for (position, stream) in self.streams.iter_mut().enumerate() {
+                    if stream.head.is_some_and(|(at, _)| at == sequence) {
+                        if let Some(slot) = slots.get_mut(position) {
+                            *slot = stream.head.unwrap().1;
+                        }
                         stream.advance(meter)?;
                     }
                 }
@@ -1865,11 +1986,11 @@ impl TextCursor<'_> {
                 let target = self
                     .streams
                     .iter()
-                    .filter_map(|stream| stream.head)
+                    .filter_map(|stream| stream.head.map(|(sequence, _)| sequence))
                     .max()
                     .ok_or_else(|| corrupt_query("initialized text stream has no head"))?;
                 for stream in &mut self.streams {
-                    while stream.head.is_some_and(|sequence| sequence < target) {
+                    while stream.head.is_some_and(|(sequence, _)| sequence < target) {
                         stream.advance(meter)?;
                     }
                 }
@@ -1879,15 +2000,29 @@ impl TextCursor<'_> {
                 if self
                     .streams
                     .iter()
-                    .all(|stream| stream.head == Some(target))
+                    .all(|stream| stream.head.is_some_and(|(at, _)| at == target))
                 {
-                    for stream in &mut self.streams {
+                    for (position, stream) in self.streams.iter_mut().enumerate() {
+                        if let Some(slot) = slots.get_mut(position) {
+                            *slot = stream.head.unwrap().1;
+                        }
                         stream.advance(meter)?;
                     }
                     break target;
                 }
             },
         };
+        // The merge emits documents in strictly ascending sequence -- every
+        // stream is ascending (`TermPostings` refuses a posting that does not
+        // advance) and each round takes the smallest or the common head and
+        // then steps past it. The scorer's segment and norm windows amortize
+        // against exactly this; if it ever stopped holding, they would go on
+        // answering correctly but at the old per-document cost, so it is
+        // cheaper to state it here than to discover it in a profile.
+        if self.previous.is_some_and(|previous| previous >= sequence) {
+            return Err(corrupt_query("text merge did not advance"));
+        }
+        self.previous = Some(sequence);
         Ok(Some(Candidate {
             id: EntityId {
                 collection: self.collection,
@@ -1904,6 +2039,11 @@ impl TextCursor<'_> {
             } else {
                 self.position
             },
+            text: self.carries.then(|| TextFrequencies {
+                source: self.source,
+                len: self.streams.len() as u8,
+                slots,
+            }),
         }))
     }
 }
@@ -1976,6 +2116,7 @@ impl SpatialCursor<'_> {
                 vector: None,
                 quantized: None,
                 satisfied_filter: Some(self.position),
+                text: None,
             }));
         }
     }
@@ -2014,6 +2155,7 @@ impl VectorCursor<'_> {
             vector: Some((self.info.id, value)),
             quantized: None,
             satisfied_filter: None,
+            text: None,
         }))
     }
 }
@@ -2053,6 +2195,7 @@ impl QuantizedVectorCursor<'_> {
             vector: None,
             quantized: Some((self.info.id, value)),
             satisfied_filter: None,
+            text: None,
         }))
     }
 }
@@ -2278,9 +2421,10 @@ fn text_score<C: FnMut() -> bool>(
     db: &Database,
     prepared: &PreparedText,
     id: EntityId,
+    driven: Option<&TextFrequencies>,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
-    norms: &mut super::text_indexes::NormCache,
+    norms: &mut super::text_indexes::TextScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<f64>> {
     if prepared.terms.is_empty() {
@@ -2296,25 +2440,59 @@ fn text_score<C: FnMut() -> bool>(
     else {
         return Ok(None);
     };
-    let mut frequencies = Vec::with_capacity(prepared.terms.len());
-    let mut dfs = Vec::with_capacity(prepared.terms.len());
+    // Did the candidate driver already decode these very frequencies? It did
+    // whenever the driver is the merge over THIS query's terms: `driven` on
+    // the prepared query names that site, and the candidate carries the site
+    // it came from. Anything else -- a scalar or spatial driver, or a text
+    // driver over different terms -- reads its own, through the per-query
+    // term window so that each segment is decoded once rather than once per
+    // document.
+    let merged = driven.filter(|frequencies| {
+        prepared.driven == Some(frequencies.source)
+            && usize::from(frequencies.len) == prepared.terms.len()
+            && usize::from(frequencies.len) <= INLINE_TEXT_TERMS
+    });
+    // On the stack, not the heap: a query has at most 64 distinct terms (see
+    // `prepare_text`), and a pair of heap vectors per scored document is one
+    // allocation per document per query -- the same per-document shape this
+    // whole path exists to get rid of.
+    if prepared.terms.len() > MAX_TEXT_TERMS {
+        return Err(corrupt_query("prepared text query exceeds its term bound"));
+    }
+    let mut frequencies = [0u32; MAX_TEXT_TERMS];
+    let mut dfs = [0u64; MAX_TEXT_TERMS];
+    let mut matched = 0usize;
     let segments_on = super::text_indexes::segments_enabled(db);
-    for (term, &df) in prepared.terms.iter().zip(&prepared.dfs) {
-        meter.charge(WorkResource::TextPostings, 1)?;
-        if let Some(frequency) = super::text_indexes::point_posting(
-            db,
-            prepared.info.id,
-            term,
-            id.sequence,
-            segments_on,
-        )? {
-            frequencies.push(frequency);
-            dfs.push(df);
+    for (position, (term, &df)) in prepared.terms.iter().zip(&prepared.dfs).enumerate() {
+        let frequency = match merged {
+            // Already charged to `TextPostings` by the merge that decoded it.
+            Some(merged) => {
+                let frequency = merged.slots[position];
+                (frequency != 0).then_some(frequency)
+            }
+            None => {
+                meter.charge(WorkResource::TextPostings, 1)?;
+                super::text_indexes::point_posting(
+                    db,
+                    prepared.info.id,
+                    term,
+                    id.sequence,
+                    segments_on,
+                    norms,
+                )?
+            }
+        };
+        if let Some(frequency) = frequency {
+            frequencies[matched] = frequency;
+            dfs[matched] = df;
+            matched += 1;
         }
     }
-    if frequencies.is_empty()
+    let frequencies = &frequencies[..matched];
+    let dfs = &dfs[..matched];
+    if matched == 0
         || (matches!(prepared.matching, TextMatch::All | TextMatch::Phrase)
-            && frequencies.len() != prepared.terms.len())
+            && matched != prepared.terms.len())
     {
         return Ok(None);
     }
@@ -2357,7 +2535,7 @@ fn text_score<C: FnMut() -> bool>(
                 "text norm disagrees with authoritative primary text",
             ));
         }
-        for (term, frequency) in prepared.terms.iter().zip(&frequencies) {
+        for (term, frequency) in prepared.terms.iter().zip(frequencies) {
             if analysis.terms.get(term).copied() != Some(*frequency) {
                 return Err(corrupt_query(
                     "text posting frequency disagrees with authoritative primary text",
@@ -2368,7 +2546,7 @@ fn text_score<C: FnMut() -> bool>(
             return Ok(None);
         }
     }
-    super::text_indexes::bm25(prepared.corpus, length, &frequencies, &dfs)
+    super::text_indexes::bm25(prepared.corpus, length, frequencies, dfs)
         .map(Some)
         .map_err(QueryError::from)
 }
@@ -2533,7 +2711,7 @@ fn filters_match<C: FnMut() -> bool>(
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
     graph: &[Option<BTreeSet<EntityId>>],
-    norms: &mut super::text_indexes::NormCache,
+    norms: &mut super::text_indexes::TextScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<bool> {
     for (position, filter) in filters.iter().enumerate() {
@@ -2585,9 +2763,17 @@ fn filters_match<C: FnMut() -> bool>(
                     } => within_radius(*center, point, *radius_metres).map_err(corrupt_query)?,
                 }
             }
-            CompiledFilter::Text(prepared) => {
-                text_score(db, prepared, id, row, encoded, norms, meter)?.is_some()
-            }
+            CompiledFilter::Text(prepared) => text_score(
+                db,
+                prepared,
+                id,
+                candidate.text.as_ref(),
+                row,
+                encoded,
+                norms,
+                meter,
+            )?
+            .is_some(),
         };
         if !matches {
             return Ok(false);
@@ -2602,7 +2788,7 @@ fn rank_candidate<C: FnMut() -> bool>(
     candidate: &Candidate,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
-    norms: &mut super::text_indexes::NormCache,
+    norms: &mut super::text_indexes::TextScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<RankKey>> {
     let value = match order {
@@ -2644,6 +2830,7 @@ fn rank_candidate<C: FnMut() -> bool>(
                 db,
                 prepared,
                 candidate.id,
+                candidate.text.as_ref(),
                 row,
                 encoded,
                 norms,
@@ -2887,7 +3074,7 @@ impl PreparedQuery<'_> {
         // One decoded `0x7B` norm block held for the page. Candidates that
         // arrive in ascending sequence -- the text and entity cursors -- reuse
         // it 255 times out of 256; one that does not simply re-decodes.
-        let mut norms = super::text_indexes::NormCache::default();
+        let mut norms = super::text_indexes::TextScratch::default();
         let graph = execute_graph_filters(self.db, &self.filters, &mut meter)?;
         let in_rank_order = self.driver_walks_in_rank_order();
         let mut driver = DriverCursor::new(

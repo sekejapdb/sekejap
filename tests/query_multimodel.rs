@@ -2324,4 +2324,138 @@ fn a_packed_norm_tier_still_scores_text_in_the_query_executor() {
         actual_phrase, expected_phrase,
         "a phrase query lost documents"
     );
+
+    // (d) The SAME BM25, this time driven by the text merge cursor itself.
+    //     The scorer now takes the frequencies the merge decoded instead of
+    //     re-reading them, so this is where that shortcut has to produce
+    //     byte-identical scores -- against the oracle, and against (a), which
+    //     reached them the long way behind a scalar driver.
+    let mut expected_text_driven: Vec<(EntityId, f64)> = (0..PACKED_ROWS)
+        .filter_map(|i| {
+            packed_bm25_oracle(&corpus, i as usize, &["harbour", "comet"])
+                .map(|score| (ids[i as usize], score))
+        })
+        .collect();
+    expected_text_driven.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.sequence.cmp(&right.0.sequence))
+    });
+    assert!(
+        expected_text_driven.len() >= 140,
+        "the oracle expected too few BM25 rows to prove anything"
+    );
+
+    let text_any = [QueryFilter::Text {
+        index: text_index,
+        query: "harbour comet",
+        matching: TextMatch::Any,
+    }];
+    for driver in [CandidateDriver::Auto, CandidateDriver::Filter(0)] {
+        let mut driven = db
+            .prepare_query(QueryRequest {
+                collection,
+                filters: &text_any,
+                order: QueryOrder::Bm25 {
+                    index: text_index,
+                    query: "harbour comet",
+                    matching: TextMatch::Any,
+                },
+                projection: Projection::Ids,
+                total_limit: None,
+                driver,
+            })
+            .unwrap();
+        let page = driven
+            .next_page(PACKED_ROWS as usize, packed_budget(), || false)
+            .unwrap();
+        assert_eq!(page.driver, QueryDriver::Text(text_index));
+        assert!(page.done);
+        let actual: Vec<(EntityId, f64)> = page
+            .rows
+            .iter()
+            .map(|row| {
+                let OrderValue::Bm25(score) = row.order else {
+                    panic!("BM25 order value");
+                };
+                (row.id, score)
+            })
+            .collect();
+        assert_eq!(
+            actual.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected_text_driven
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            "text-driven BM25 order ({driver:?})"
+        );
+        for ((id, score), (_, oracle)) in actual.iter().zip(&expected_text_driven) {
+            assert!(
+                (score - oracle).abs() <= 1e-12,
+                "text-driven BM25 score for {id:?}: {score} vs oracle {oracle}"
+            );
+            // And identical to what the scalar-driven query in (a) produced
+            // for the documents the two queries share.
+            if let Some(scalar_score) = scored.get(id) {
+                assert_eq!(
+                    score.to_bits(),
+                    scalar_score.to_bits(),
+                    "the same document scored differently behind a different driver"
+                );
+            }
+        }
+    }
+
+    // (e) A text driver over DIFFERENT terms from the order it feeds. The
+    //     driver decodes the frequency of "comet"; ranking wants "harbour
+    //     comet". Taking the driver's frequencies here would score the wrong
+    //     words, so the scorer must still read its own.
+    let comet_only = [QueryFilter::Text {
+        index: text_index,
+        query: "comet",
+        matching: TextMatch::Any,
+    }];
+    let mut mixed = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &comet_only,
+            order: QueryOrder::Bm25 {
+                index: text_index,
+                query: "harbour comet",
+                matching: TextMatch::Any,
+            },
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Filter(0),
+        })
+        .unwrap();
+    let page = mixed
+        .next_page(PACKED_ROWS as usize, packed_budget(), || false)
+        .unwrap();
+    assert_eq!(page.driver, QueryDriver::Text(text_index));
+    let mut expected_mixed: Vec<(EntityId, f64)> = (0..PACKED_ROWS)
+        .filter(|i| corpus[*i as usize].iter().any(|token| token == "comet"))
+        .filter_map(|i| {
+            packed_bm25_oracle(&corpus, i as usize, &["harbour", "comet"])
+                .map(|score| (ids[i as usize], score))
+        })
+        .collect();
+    expected_mixed.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.sequence.cmp(&right.0.sequence))
+    });
+    assert!(expected_mixed.len() >= 7);
+    for (row, (id, oracle)) in page.rows.iter().zip(&expected_mixed) {
+        let OrderValue::Bm25(score) = row.order else {
+            panic!("BM25 order value");
+        };
+        assert_eq!(row.id, *id, "mixed-term BM25 order");
+        assert!(
+            (score - oracle).abs() <= 1e-12,
+            "mixed-term BM25 score for {id:?}: {score} vs oracle {oracle}"
+        );
+    }
 }
