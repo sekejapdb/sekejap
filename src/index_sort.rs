@@ -103,6 +103,10 @@ impl ExternalSorter {
     /// Push borrowed bytes. The sorter still owns a copy -- that is its
     /// storage -- but the caller keeps one scratch buffer instead of building
     /// a fresh `Vec` per entry.
+    ///
+    /// Unused since the text build stopped sorting its postings; kept because
+    /// it is the cheaper of the two pushes for any caller with a scratch key.
+    #[allow(dead_code)]
     pub(super) fn push_ref(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let add = record_bytes(key, value);
         if !self.current.is_empty() && self.current_bytes.saturating_add(add) > self.budget {

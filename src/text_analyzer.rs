@@ -102,6 +102,144 @@ pub(crate) fn analyze(text: &str) -> Result<Analysis, &'static str> {
     Ok(result)
 }
 
+/// The build-side analyzer: the same terms, the same term frequencies and the
+/// same token count as [`analyze`], with no per-document allocation at all.
+///
+/// [`analyze`] is shaped for one document in isolation. It builds a fresh
+/// `BTreeMap<String, u32>`, which costs an owned `String` and a tree node the
+/// first time a document mentions a term, and a string-compare descent on
+/// every occurrence including repeats. A late build runs that once per row: at
+/// 200,000 rows and six distinct terms a document, roughly 2.4 million
+/// allocations whose only purpose is to be dropped again a few microseconds
+/// later.
+///
+/// FTS5 does not do that either -- its tokenizer writes straight into the hash
+/// entry the term already has. This is that shape. Terms are interned ONCE for
+/// the whole build; a document is a run of hash lookups into that table and an
+/// increment of a counter the table already owns. The per-document output is
+/// `(term id, term frequency)` in first-appearance order, and the caller keeps
+/// its own state per id -- the build keeps a segment packer there.
+///
+/// Every bound [`analyze`] enforces is enforced here, in the same order and
+/// with the same sentence: text size first, then token count, then term size,
+/// then distinct terms per document. `analyze_oracle_equivalence` in this
+/// module is the proof, over generated bodies and over each bound.
+///
+/// Sacrifice (Law 1): the intern table holds the build's whole vocabulary --
+/// one `Box<str>` and eight bytes per DISTINCT term, not per document and not
+/// per posting.
+pub(crate) struct BuildAnalyzer {
+    ids: std::collections::HashMap<Box<str>, u32>,
+    names: Vec<Box<str>>,
+    /// Current document's frequency per term id. Zero outside a document, so
+    /// a non-zero slot is also "this document has already seen this term".
+    frequency: Vec<u32>,
+    touched: Vec<u32>,
+    document: Vec<(u32, u32)>,
+    token: String,
+    length: u32,
+}
+
+impl Default for BuildAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BuildAnalyzer {
+    pub(crate) fn new() -> Self {
+        Self {
+            ids: std::collections::HashMap::new(),
+            names: Vec::new(),
+            frequency: Vec::new(),
+            touched: Vec::new(),
+            document: Vec::new(),
+            token: String::new(),
+            length: 0,
+        }
+    }
+
+    /// Every term interned so far, indexed by term id.
+    pub(crate) fn names(&self) -> &[Box<str>] {
+        &self.names
+    }
+
+    /// The last analyzed document's `(term id, term frequency)` pairs.
+    pub(crate) fn document(&self) -> &[(u32, u32)] {
+        &self.document
+    }
+
+    /// Analyze one document. Returns its token count; its terms are then in
+    /// [`BuildAnalyzer::document`]. On any error the per-document state is
+    /// drained exactly as on success, so the analyzer stays usable.
+    pub(crate) fn analyze(&mut self, text: &str) -> Result<u32, &'static str> {
+        let outcome = self.run(text);
+        self.document.clear();
+        if outcome.is_ok() {
+            self.document.reserve(self.touched.len());
+        }
+        for at in 0..self.touched.len() {
+            let id = self.touched[at] as usize;
+            if outcome.is_ok() {
+                self.document.push((id as u32, self.frequency[id]));
+            }
+            self.frequency[id] = 0;
+        }
+        self.touched.clear();
+        self.token.clear();
+        outcome
+    }
+
+    fn run(&mut self, text: &str) -> Result<u32, &'static str> {
+        if text.len() > MAX_TEXT_BYTES {
+            return Err("indexed text exceeds 64 KiB");
+        }
+        self.length = 0;
+        for ch in text.chars() {
+            if alphanumeric(ch) {
+                push_lower(ch, &mut self.token);
+                if self.token.len() > MAX_TERM_BYTES {
+                    return Err("indexed term exceeds 128 UTF-8 bytes");
+                }
+            } else {
+                self.finish_token()?;
+            }
+        }
+        self.finish_token()?;
+        Ok(self.length)
+    }
+
+    fn finish_token(&mut self) -> Result<(), &'static str> {
+        if self.token.is_empty() {
+            return Ok(());
+        }
+        if self.length == MAX_TOKENS {
+            return Err("indexed text exceeds 16384 tokens");
+        }
+        self.length += 1;
+        let id = match self.ids.get(self.token.as_str()) {
+            Some(id) => *id as usize,
+            None => {
+                let id = self.names.len();
+                let name: Box<str> = self.token.as_str().into();
+                self.ids.insert(name.clone(), id as u32);
+                self.names.push(name);
+                self.frequency.push(0);
+                id
+            }
+        };
+        if self.frequency[id] == 0 {
+            if self.touched.len() == MAX_TERMS {
+                return Err("indexed text exceeds 4096 distinct terms");
+            }
+            self.touched.push(id as u32);
+        }
+        self.frequency[id] += 1;
+        self.token.clear();
+        Ok(())
+    }
+}
+
 /// Analyze a literal phrase query while preserving its ordered token stream.
 /// The distinct-term bounds are identical to ordinary text queries; the
 /// position-sensitive stream has its own explicit, smaller bound.
@@ -365,6 +503,88 @@ pub(crate) fn analyze_phrase_document<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Generate bodies the way a corpus does: repeated terms, punctuation,
+    /// unicode, empty documents, long runs of separators.
+    fn generated_body(i: u64) -> String {
+        let words = [
+            "flood", "levee", "river", "CAFÉ", "cafe\u{301}", "İstanbul", "ΣΟΣ", "北京", "１２３",
+            "Straße", "rock-and-roll", "silt", "tide", "rail", "flood", "flood",
+        ];
+        if i % 37 == 0 {
+            return String::new();
+        }
+        let mut body = String::new();
+        for j in 0..(1 + i % 11) {
+            if j > 0 {
+                body.push_str(if j % 3 == 0 { ", " } else { "  ---  " });
+            }
+            body.push_str(words[((i * 7 + j * 13) % words.len() as u64) as usize]);
+            if j % 4 == 0 {
+                body.push('.');
+                body.push_str(words[((i + j) % words.len() as u64) as usize]);
+            }
+        }
+        body
+    }
+
+    /// The build analyzer is only allowed to be faster. Term set, term
+    /// frequency, token count and every refusal must be what `analyze` says,
+    /// document by document, with one analyzer reused across all of them.
+    #[test]
+    fn the_build_analyzer_agrees_with_analyze_on_every_document() {
+        let mut build = BuildAnalyzer::new();
+        for i in 0..2_000u64 {
+            let body = generated_body(i);
+            let oracle = analyze(&body).unwrap();
+            let length = build.analyze(&body).unwrap();
+            assert_eq!(length, oracle.length, "token count for {body:?}");
+            let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+            for &(id, frequency) in build.document() {
+                assert!(
+                    seen.insert(build.names()[id as usize].to_string(), frequency)
+                        .is_none(),
+                    "term id {id} repeated in one document"
+                );
+            }
+            assert_eq!(seen, oracle.terms, "terms for {body:?}");
+        }
+    }
+
+    /// Every bound, with the same sentence, and the analyzer still usable
+    /// afterwards -- a refused document must not leave a half-counted one
+    /// behind for the next row of the build.
+    #[test]
+    fn the_build_analyzer_refuses_exactly_what_analyze_refuses() {
+        let cases = [
+            "x".repeat(MAX_TEXT_BYTES + 1),
+            "y".repeat(MAX_TERM_BYTES + 1),
+            (0..MAX_TOKENS as usize + 1)
+                .map(|n| format!("t{n} "))
+                .collect::<String>(),
+            (0..MAX_TERMS + 1)
+                .map(|n| format!("u{n} "))
+                .collect::<String>(),
+        ];
+        let mut build = BuildAnalyzer::new();
+        for case in &cases {
+            let oracle = analyze(case).unwrap_err();
+            let theirs = build.analyze(case).unwrap_err();
+            assert_eq!(theirs, oracle, "refusal sentence");
+            // Still usable, and not carrying the refused document's counts.
+            let length = build.analyze("levee levee river").unwrap();
+            assert_eq!(length, 3);
+            let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+            for &(id, frequency) in build.document() {
+                seen.insert(build.names()[id as usize].to_string(), frequency);
+            }
+            assert_eq!(
+                seen,
+                analyze("levee levee river").unwrap().terms,
+                "state survived a refusal"
+            );
+        }
+    }
     #[test]
     fn fixed_multilingual_tokens_preserve_e3_semantics() {
         let a = analyze(

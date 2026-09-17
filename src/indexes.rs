@@ -1182,6 +1182,65 @@ impl Database {
         }
         Ok(last)
     }
+    /// `scan_collection_rows`, bounded: at most `limit` rows after `after`.
+    ///
+    /// A whole-collection scan hands the callback a borrow of the store, so a
+    /// builder that wants to WRITE what it just read has to buffer everything
+    /// until the scan is over -- RAM proportional to the store. Scanning in
+    /// bounded runs gives the builder a place to stand between runs where the
+    /// store is not borrowed and it can flush. Returns the last sequence
+    /// visited and whether the collection is exhausted.
+    pub(super) fn scan_collection_rows_from(
+        &self,
+        collection: CollectionId,
+        after: u64,
+        limit: usize,
+        mut f: impl FnMut(EntityId, &[u8]) -> Result<()>,
+    ) -> Result<(u64, bool)> {
+        let p = prefix(0x40, collection);
+        let start = if after == 0 {
+            p.clone()
+        } else {
+            row_key(EntityId {
+                collection,
+                sequence: after,
+            })
+        };
+        let mut last = after;
+        let mut seen = 0usize;
+        let mut exhausted = true;
+        let mut failure: Option<Error> = None;
+        self.store()?.range(&start)?.for_each_ref(|key, value| {
+            if !key.starts_with(&p) {
+                return false;
+            }
+            let eid = match row_id(key) {
+                Ok(eid) => eid,
+                Err(error) => {
+                    failure = Some(error);
+                    return false;
+                }
+            };
+            if eid.sequence <= after {
+                return true;
+            }
+            if seen == limit {
+                exhausted = false;
+                return false;
+            }
+            if let Err(error) = f(eid, value) {
+                failure = Some(error);
+                return false;
+            }
+            seen += 1;
+            last = eid.sequence;
+            true
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok((last, exhausted))
+    }
     fn scalar_value_bytes<'a>(&self, i: &IndexInfo, key: &'a [u8]) -> Result<&'a [u8]> {
         let p = ikey(SCALAR, i.id);
         if !key.starts_with(&p) {

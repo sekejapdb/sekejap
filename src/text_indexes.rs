@@ -1227,37 +1227,144 @@ fn clear_unpublished(db: &mut Database, i: &IndexInfo) -> Result<()> {
     Ok(())
 }
 
-fn split_posting_key<'a>(prefix: &[u8], key: &'a [u8]) -> Result<(&'a str, u64)> {
-    let tail = key
-        .get(prefix.len()..)
-        .ok_or_else(|| corrupt("sorted text posting key"))?;
-    let zero = tail
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(|| corrupt("sorted text posting terminator"))?;
-    let term = std::str::from_utf8(&tail[..zero]).map_err(|_| corrupt("sorted text term"))?;
-    let mut at = prefix.len() + zero + 1;
-    let sequence = read_ordered(key, &mut at)?;
-    if at != key.len() || sequence == 0 {
-        return Err(corrupt("sorted text posting identity"));
-    }
-    Ok((term, sequence))
+
+/// One term's state for the whole packed build: the segment it is filling and
+/// how many documents it has been seen in.
+struct TermAccumulator {
+    packer: segments::Packer,
+    documents: u64,
 }
 
-/// The packed late build: sort every `(term, document, frequency)` once, then
-/// write ONE value per term instead of one entry per pair.
+impl TermAccumulator {
+    fn new() -> Self {
+        Self {
+            packer: segments::Packer::new(),
+            documents: 0,
+        }
+    }
+}
+
+/// Entry bytes one write group of the packed build carries. One packed segment
+/// can be 3.6 KiB where a scalar index entry is a few dozen bytes, so
+/// `chunk_rows` segments would be two orders of magnitude more WAL than
+/// `chunk_rows` scalar keys and would exhaust a small allowance before the
+/// grouping ever got a chance to halve itself. Charge one unit per entry plus
+/// one per 64 bytes written.
+const BYTES_PER_UNIT: usize = 64;
+
+/// Rows one scan run visits before the builder is handed the store back to
+/// flush what that run finished.
+const SCAN_RUN_ROWS: usize = 65_536;
+
+/// Unfinished segment bytes the accumulator may hold before it gives up
+/// maximal packing to stay inside a bound. See `build_sorted`'s sacrifices.
+const MAX_HELD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Write one sorted run of derived entries, committing on the group boundary.
+#[allow(clippy::too_many_arguments)]
+fn write_run(
+    db: &mut Database,
+    run: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    chunk_rows: usize,
+    group: usize,
+    pending: &mut usize,
+    groups: &mut usize,
+    commits: &mut usize,
+    enabled: &mut bool,
+) -> Result<()> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    if !*enabled {
+        db.enable_index_feature(segments::SEGMENT_FEATURE)?;
+        *enabled = true;
+    }
+    run.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (key, value) in run.drain(..) {
+        db.writer()?.put(&key, &value)?;
+        *pending += 1 + value.len() / BYTES_PER_UNIT;
+        if *pending >= chunk_rows {
+            *groups += 1;
+            *pending = 0;
+            if *groups % group == 0 {
+                db.commit()?;
+                *commits += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Analyze one immutable row's indexed text field into the build's analyzer.
 ///
-/// This is what FTS5 does and what the head tier cannot: the corpus is turned
-/// into an ascending run by an external sort (RAM is the sorter's budget, not
-/// the store), and the run is consumed in one pass, so each term's document
-/// frequency is written exactly once, each term's postings are written as one
-/// or a few packed values, and the shared corpus row is written once for the
-/// whole build rather than once per chunk.
+/// The same decode and the same kind checks as `analyze_row_bytes`; only the
+/// analyzer differs, and `text_analyzer`'s own oracle test pins the two to the
+/// same terms, frequencies, token count and refusals.
+fn analyze_row_bytes_into(
+    db: &Database,
+    index: &IndexInfo,
+    row: &[u8],
+    analyzer: &mut text_analyzer::BuildAnalyzer,
+) -> Result<Option<u32>> {
+    let layout_id = layout_id(row)?;
+    let layout = db.layout(layout_id)?;
+    if let Some((_, kind)) = layout.fields.iter().find(|(name, _)| name == &index.field) {
+        if kind != &Kind::Text {
+            return Err(invalid("historical indexed text field changed kind"));
+        }
+    }
+    match crate::dense_v3::read_field(&layout, row, &index.field).map_err(corrupt)? {
+        crate::dense_v3::FieldValue::Missing | crate::dense_v3::FieldValue::Null => Ok(None),
+        crate::dense_v3::FieldValue::Inline(Value::String(text)) => {
+            Ok(Some(analyzer.analyze(&text).map_err(invalid)?))
+        }
+        crate::dense_v3::FieldValue::Inline(_) | crate::dense_v3::FieldValue::Vector { .. } => {
+            Err(invalid("historical indexed text field changed kind"))
+        }
+    }
+}
+
+/// The packed late build: accumulate each term's postings as it is scanned and
+/// write ONE value per term per segment instead of one entry per pair.
+///
+/// This is what FTS5 does and what the head tier cannot: a term's postings are
+/// gathered in memory under that term and emitted already packed, so each
+/// term's document frequency is written exactly once, each term's postings are
+/// written as one or a few packed values, and the shared corpus row is written
+/// once for the whole build rather than once per chunk.
+///
+/// WHY THERE IS NO SORT HERE ANY MORE. The first version of this builder sent
+/// every `(term, document, frequency)` triple through `index_sort`, the
+/// external sorter the scalar and spatial builds use -- SQLite's `CREATE INDEX`
+/// shape, an in-memory run spilled at a byte budget and merged k-way, so the
+/// consumer sees one ascending stream. It works, and it cost about 6.9
+/// allocations per posting: a clone of the key and of the value into the
+/// sorter, a spill of ~25 bytes per posting once the corpus passed the 8 MiB
+/// budget, and a re-read of ~86% of the postings back off those spill files
+/// during the merge. Measured at 200,000 rows and 1.2M postings, that sort was
+/// 48% of the build's wall time.
+///
+/// None of it was buying anything. A sort answers "which term does this
+/// posting belong to" -- and the tokenizer already knew, at index time, for
+/// free. Scanning primary rows already visits documents in ascending sequence
+/// order, so a term's postings arrive ascending whether or not anything sorts
+/// them: the packer for a term sees exactly the stream the merge used to hand
+/// it, in exactly the same order, and therefore splits its segments at exactly
+/// the same postings and writes byte-identical values. The pinned digests in
+/// `tests/index_build_equivalence.rs` are the proof of that, not a hope.
 ///
 /// Sacrifices (Law 4):
-/// * Temp spill space proportional to the index being built, for the life of
-///   the sort -- inherited from `index_sort`, which the scalar and spatial
-///   builds already pay.
+/// * One unfinished segment per DISTINCT term is resident for the life of the
+///   build -- at most `MAX_SEGMENT_BYTES` each, and in total no more than the
+///   packed postings themselves, which is roughly two bytes per posting. That
+///   replaces the old sorter's 8 MiB run plus a spill file of about 25 bytes
+///   per posting: less RAM than the sort's own budget at the corpus sizes that
+///   used to spill, and no scratch file at all. Past `MAX_HELD_BYTES` -- which
+///   needs a vocabulary of millions of rare terms -- the builder stops packing
+///   segments maximally and flushes what it holds, so the bound is hard; the
+///   index is the same postings in more, smaller segments, and reads the same.
+/// * Completed segments are buffered until the end of the scan run that
+///   completed them, at most `SCAN_RUN_ROWS` rows' worth.
 /// * Crash atomicity is the same bounded-BUILDING deal every late build makes;
 ///   an interrupted packed build is cancelled and recreated rather than
 ///   resumed in place, because its published-document marker (the norms) is
@@ -1275,126 +1382,154 @@ pub(super) fn build_sorted(
     descriptor(i)?;
     clear_unpublished(db, i)?;
 
-    let mut sorter =
-        super::index_sort::ExternalSorter::new(&db.sort_scratch(), super::index_sort::DEFAULT_BUDGET)?;
+    let mut analyzer = text_analyzer::BuildAnalyzer::new();
+    let mut terms: Vec<TermAccumulator> = Vec::new();
     let mut corpus = Corpus {
         documents: 0,
         tokens: 0,
     };
-    let source: &Database = db;
-    let index = &*i;
-    // Norms do not go through the sorter. `scan_collection_rows` already walks
-    // primary rows in ascending sequence, which is the order the blocks want,
-    // so they are packed straight off the scan: 50,000 sorter pushes (two
-    // allocations and a spill record each) and 50,000 buffered entries become
-    // 196 blocks.
+    // Norms are packed straight off the scan -- `scan_collection_rows_from`
+    // already walks primary rows in ascending sequence, which is the order the
+    // blocks want -- and held until every posting is on disk, because a norm
+    // row is what says a document has contributed.
     let mut norm_packer = segments::NormPacker::new();
     let mut norm_blocks: Vec<(u64, Vec<u8>)> = Vec::new();
-    // One reusable posting key. The sorter still owns a copy per posting --
-    // that is the sort's own storage -- but the scan no longer builds a fresh
-    // `Vec` for the index prefix and the ordered sequence of every posting.
-    let posting_scratch = index_prefix(POSTING, index.id);
-    let mut posting_key_buffer = Vec::with_capacity(posting_scratch.len() + 160);
-    let max_seq = source.scan_collection_rows(index.collection, |eid, row| {
-        let Some(analysis) = analyze_row_bytes(source, index, row)? else {
-            return Ok(());
-        };
-        for (term, frequency) in &analysis.terms {
-            if *frequency == 0 {
-                return Err(corrupt("zero text posting frequency"));
-            }
-            posting_key_buffer.clear();
-            posting_key_buffer.extend_from_slice(&posting_scratch);
-            posting_key_buffer.extend_from_slice(term.as_bytes());
-            posting_key_buffer.push(0);
-            ordered_into(&mut posting_key_buffer, eid.sequence);
-            sorter.push_ref(&posting_key_buffer, &frequency.to_be_bytes())?;
-        }
-        if let Some(block) = norm_packer.push(eid.sequence, analysis.length)? {
-            norm_blocks.push(block);
-        }
-        corpus.documents = checked_add(corpus.documents, 1, "text document count overflow")?;
-        corpus.tokens = checked_add(
-            corpus.tokens,
-            u64::from(analysis.length),
-            "text token count overflow",
-        )?;
-        Ok(())
-    })?;
-    if let Some(block) = norm_packer.finish()? {
-        norm_blocks.push(block);
-    }
+    // Segments this scan run completed, flushed in key order when it ends.
+    let mut run: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut held = 0usize;
 
-    let mut merge = sorter.finish()?;
-    let posting_prefix = index_prefix(POSTING, i.id);
-    let mut packer = segments::Packer::new();
-    let mut term = String::new();
-    let mut df = 0u64;
+    let mut after = 0u64;
     let mut pending = 0usize;
     let mut groups = 0usize;
     let mut commits = 0usize;
     let mut enabled = false;
-    // A chunk is bounded by BYTES as well as by entries. One packed segment
-    // can be 3.6 KiB where a scalar index entry is a few dozen bytes, so
-    // `chunk_rows` segments would be two orders of magnitude more WAL than
-    // `chunk_rows` scalar keys and would exhaust a small allowance before the
-    // grouping ever got a chance to halve itself. Charge one unit per entry
-    // plus one per 64 bytes written.
-    const BYTES_PER_UNIT: usize = 64;
 
-    while let Some((key, value)) = merge.next_entry()? {
-        if !key.starts_with(&posting_prefix) {
-            return Err(corrupt("sorted text build produced a foreign key"));
-        }
-        let (next, sequence) = split_posting_key(&posting_prefix, &key)?;
-        let frequency = decode_tf(&value)?;
-        if next != term {
-            if !term.is_empty() {
-                if let Some((last, packed)) = packer.finish()? {
-                    db.writer()?
-                        .put(&segments::segment_key(i.id, &term, last), &packed)?;
-                    pending += 1 + packed.len() / BYTES_PER_UNIT;
+    loop {
+        let (last, exhausted) = {
+            let source: &Database = db;
+            let index = &*i;
+            let terms = &mut terms;
+            let analyzer = &mut analyzer;
+            let run = &mut run;
+            let held = &mut held;
+            let corpus = &mut corpus;
+            let norm_packer = &mut norm_packer;
+            let norm_blocks = &mut norm_blocks;
+            source.scan_collection_rows_from(
+                index.collection,
+                after,
+                SCAN_RUN_ROWS,
+                |eid, row| {
+                    let Some(length) = analyze_row_bytes_into(source, index, row, analyzer)? else {
+                        return Ok(());
+                    };
+                    if terms.len() < analyzer.names().len() {
+                        terms.resize_with(analyzer.names().len(), TermAccumulator::new);
+                    }
+                    for &(id, frequency) in analyzer.document() {
+                        if frequency == 0 {
+                            return Err(corrupt("zero text posting frequency"));
+                        }
+                        let slot = &mut terms[id as usize];
+                        slot.documents = checked_add(
+                            slot.documents,
+                            1,
+                            "text document frequency overflow",
+                        )?;
+                        let before = slot.packer.held_bytes();
+                        let finished = slot.packer.push(eid.sequence, frequency)?;
+                        *held = *held + slot.packer.held_bytes() - before;
+                        if let Some((last, packed)) = finished {
+                            run.push((
+                                segments::segment_key(
+                                    index.id,
+                                    &analyzer.names()[id as usize],
+                                    last,
+                                ),
+                                packed,
+                            ));
+                        }
+                    }
+                    if let Some(block) = norm_packer.push(eid.sequence, length)? {
+                        norm_blocks.push(block);
+                    }
+                    corpus.documents =
+                        checked_add(corpus.documents, 1, "text document count overflow")?;
+                    corpus.tokens = checked_add(
+                        corpus.tokens,
+                        u64::from(length),
+                        "text token count overflow",
+                    )?;
+                    Ok(())
+                },
+            )?
+        };
+        after = last;
+
+        if held > MAX_HELD_BYTES {
+            for (id, slot) in terms.iter_mut().enumerate() {
+                if let Some((last, packed)) = slot.packer.finish()? {
+                    run.push((segments::segment_key(i.id, &analyzer.names()[id], last), packed));
                 }
-                db.writer()?
-                    .put(&term_stats_key(i.id, &term), &df.to_be_bytes())?;
-                pending += 1;
             }
-            term = next.to_owned();
-            df = 0;
+            held = 0;
         }
-        df = checked_add(df, 1, "text document frequency overflow")?;
-        if !enabled {
-            db.enable_index_feature(segments::SEGMENT_FEATURE)?;
-            enabled = true;
+        write_run(
+            db,
+            &mut run,
+            chunk_rows,
+            group,
+            &mut pending,
+            &mut groups,
+            &mut commits,
+            &mut enabled,
+        )?;
+        if max_commits.is_some_and(|n| commits >= n) {
+            // Nothing is PUBLISHED -- the norms are still unwritten -- so the
+            // cursor stays at zero however far the scan got. The next call
+            // clears the unpublished segments and scans again from the start;
+            // and if a live write has meanwhile made the packed path
+            // impossible, the chunked head-row builder that takes over reads
+            // the cursor literally and must not be told that rows it has
+            // never seen are behind it.
+            i.state = IndexState::Building { after: 0 };
+            db.save_index(i)?;
+            db.commit()?;
+            return Ok((after as usize).div_ceil(chunk_rows).max(1));
         }
-        if let Some((last, packed)) = packer.push(sequence, frequency)? {
-            db.writer()?
-                .put(&segments::segment_key(i.id, &term, last), &packed)?;
-            pending += 1 + packed.len() / BYTES_PER_UNIT;
-        }
-        if pending >= chunk_rows {
-            groups += 1;
-            pending = 0;
-            if groups % group == 0 {
-                db.commit()?;
-                commits += 1;
-                if max_commits.is_some_and(|n| commits >= n) {
-                    i.state = IndexState::Building { after: max_seq };
-                    db.save_index(i)?;
-                    db.commit()?;
-                    return Ok((max_seq as usize).div_ceil(chunk_rows).max(1));
-                }
-            }
+        if exhausted {
+            break;
         }
     }
-    if !term.is_empty() {
-        if let Some((last, packed)) = packer.finish()? {
-            db.writer()?
-                .put(&segments::segment_key(i.id, &term, last), &packed)?;
-        }
-        db.writer()?
-            .put(&term_stats_key(i.id, &term), &df.to_be_bytes())?;
+    if let Some(block) = norm_packer.finish()? {
+        norm_blocks.push(block);
     }
+
+    // Every term's last segment and its document frequency, in key order.
+    for (id, slot) in terms.iter_mut().enumerate() {
+        if slot.documents == 0 {
+            continue;
+        }
+        let term: &str = &analyzer.names()[id];
+        if let Some((last, packed)) = slot.packer.finish()? {
+            run.push((segments::segment_key(i.id, term, last), packed));
+        }
+        run.push((
+            term_stats_key(i.id, term),
+            slot.documents.to_be_bytes().to_vec(),
+        ));
+    }
+    write_run(
+        db,
+        &mut run,
+        chunk_rows,
+        group,
+        &mut pending,
+        &mut groups,
+        &mut commits,
+        &mut enabled,
+    )?;
+
     // Norms last: they are the marker that says a document has contributed,
     // so nothing claims publication until every packed posting is on disk.
     //
@@ -1421,7 +1556,7 @@ pub(super) fn build_sorted(
     i.state = IndexState::Ready;
     db.save_index(i)?;
     db.commit()?;
-    Ok((max_seq as usize).div_ceil(chunk_rows).max(1))
+    Ok((after as usize).div_ceil(chunk_rows).max(1))
 }
 
 pub(super) fn drop_batch(db: &Database, id: IndexId, batch: usize) -> Result<(Vec<Vec<u8>>, bool)> {

@@ -182,6 +182,17 @@ impl Packer {
         self.count == 0
     }
 
+    /// Encoded bytes this packer is holding for the segment it is filling.
+    ///
+    /// The late build keeps one packer per term alive across the whole scan,
+    /// so it needs a cheap, exact answer to "how much RAM are the unfinished
+    /// segments costing" -- the difference across one `push` is what that
+    /// posting added, or, when the push completed a segment, what it gave
+    /// back.
+    pub(in crate::collections) fn held_bytes(&self) -> usize {
+        self.body.len()
+    }
+
     /// Add one posting. Returns a finished `(last sequence, value)` when this
     /// posting did not fit the segment being filled; that segment is complete
     /// and the posting has started the next one.
