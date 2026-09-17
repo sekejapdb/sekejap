@@ -732,3 +732,162 @@ data. Each index created consumes tree-id space from a `u16` range.
 - The two-arm lean bench (a port of e3's `bench/three_ways`), in progress,
   as the post-change smoke check.
 - The owner's commit.
+
+## 2026-09-18 — Linux qualification attempt 4 GREEN; further query and build items landed
+
+Everything below the previous "Remaining before acceptance" list is now
+answered for the committed head; the items that came after are separate,
+staged work the owner will commit tomorrow morning. This section is the
+current status. Older numbers elsewhere in this file that these results
+supersede are left in place and marked superseded, not deleted.
+
+### Linux final qualification: attempt 4, GREEN
+
+server job `e4-phase2-final-20260917`, attempt 4, is on the committed head
+`aeeae13` (eight commits `d0cbc7b`..`aeeae13`, landed the morning of
+2026-09-18). Result: exit 0, all stages passed — stage 1 (default build,
+full workspace) PASS, stage 2 (retained-feature build, full workspace) PASS,
+stage 4 (lifecycle replay) PASS with 404 passing results including guard
+checks, stage 5 (release binaries) PASS. This closes attempt 3, which was
+still running when the previous entry in this file was written, and
+supersedes the earlier lifecycle-replay harness-mismatch failure from
+attempt 2 (that mismatch was in the fixture binaries' hardcoded feature
+mask, not an engine defect, and is not reproduced here).
+
+### Staged, uncommitted items on top of `aeeae13` (owner to commit)
+
+The owner kept the following items from the loop; they are staged in the
+working tree, not yet committed, pending the owner's own commit pass. Each
+ratio below is E4 wall time ÷ SQLite wall time (lower favors E4), matched
+durability, retained-feature build, this Mac unless noted; case names are
+from the lean bench `src/bin/two_ways.rs` at 20,000 rows. Per-item detail
+notes with full numbers live on the tracker nodes and in
+`.insert-loop/loop3/`.
+
+- **Q2 — descending scalar cursor.** Drives an `ORDER BY ... DESC LIMIT`
+  from the order index when a bounded probe of that index says the index
+  path pays, with no winner re-fetch: one dense-v3 walk per projection,
+  lockstep with row reach. `ORDER BY DESC LIMIT 50`: 13.1x to 0.62x.
+  Equality filter plus order, `LIMIT 10`: 4.9x to 0.11x. Full star scan:
+  8.3x to 2.2x.
+- **H4 — graph filter on the shared BFS.** The query engine's graph filter
+  path is rewired onto the shared BFS implementation. 1-hop with
+  projection: 5.7x to 1.11x.
+- **B1 — bounded index build.** The late-build atomic policy no longer
+  packs a whole scalar/vector/text index in one uncommitted transaction: the
+  first sorted run is packed to a quarter of the page-WAL allowance, and the
+  remainder is appended in its own subsequent commits. A refused build no
+  longer loses the index registry entry (see the root-cause note below); the
+  guard refuses only pending USER writes, not the build's own commits. The
+  1,000,000-row build that used to die with `Error: NotFound("index")` now
+  completes. Named sacrifice: the 200K scalar build costs +0.19 s.
+- **Q3 — id-ordered and existence-only paths.** No heap allocation for
+  id-ordered pages, no page reserved for an empty answer, a per-handle
+  descriptor cache, and key-only existence answered by key compare instead
+  of a row fetch. Empty-result queries: 4.3x to 0.8x. Key scan: 2.4x to
+  1.2x. Range: 2.5x to 1.2x. Ascending indexed order: 1.7x to 0.9x.
+- **Q4 — batched row reads.** Row-needing predicates now batch their row
+  reads, work on borrowed leaf bytes, and a phrase query with no term map
+  skips building one. `two_ranges`: 3.07x to 1.55x. `match_phrase`: 4.87x
+  to 2.88x.
+- **G2 — graph write existence window.** The existence-proof window used
+  for a graph write (previously a fixed 65,536-entry window) is replaced by
+  a per-collection allocated range: 25 to 8.75 page accesses per edge, flat
+  in N. 300,000-relationship load: 31.5 s to 24.3 s.
+- **T2 — BM25 winner-probe skip.** The BM25 page path skips a redundant
+  winner-existence probe. `bm25_one_term`: 1.62x to 0.84x. Two terms: 1.47x
+  to 0.79x. `bm25_common`: 3.81x to 2.86x.
+- **Q5 — range posting as existence proof.** A range posting is now
+  trusted as an existence proof the same way an equality posting already
+  was, letting a same-index filter fold. `range_two_sided`: 2.07x to 0.38x.
+  `range_open`: to 0.51x. `range_closed`: to 0.49x. `between`: to 0.81x.
+
+**Pending, not claimed:** item K1 (a kernel per-collection append hint
+intended to cut page accesses per edge write by roughly half, I/O
+byte-identical to the unhinted path) needs a byte-identity proof before it
+can be listed as done. Status: pending.
+
+### Root cause behind B1, for the record
+
+`.insert-loop/loop3/ROOTCAUSE-1m-index-notfound.md` traces the pre-B1
+failure precisely: the atomic build path created an index and drove it
+straight to READY inside the same open transaction as the surrounding
+loads, with no intermediate commit. At 1,000,000 rows the whole-index pack
+exceeded the page-WAL's fixed allowance and was refused; the build driver's
+recovery then rolled back everything uncommitted since the last real
+commit, including the index's own CREATE, so the retry looked up a registry
+row that no longer existed and got `NotFound("index")` — a different error
+type than the `ResourceLimit` the driver's retry logic and the bench's
+refusal handler were both written to catch. 50K and 200K never hit this
+because the whole-index pack fit inside the allowance at those sizes. B1's
+bounded-build design (above) closes this class by committing progress
+inside the build itself.
+
+### Lean bench standing after T2, before Q5 (20,000 rows, Mac)
+
+`src/bin/two_ways.rs`: 29 cases E4-slower, 19 cases E4-faster, 0
+disagreements (row count or key sequence mismatches) — up from the first
+run of this bench, 42 slower / 6 faster. Graph is faster than SQLite on
+every measured case at this point: 2-hop 0.17x, ... 1-hop with projection
+1.06x, 1-hop 0.41x.
+
+Cases still above the 2x acceptance gate, and why, as of this standing
+(after Q5 several of these move further; see
+`PHASE2_INDEX_BUILD_RESULTS.md` for the case-by-case table once posted):
+
+- `bm25_common` 2.86x — the query returns all 20,000 rows; the remaining
+  cost is per-returned-row output, not per-candidate scoring.
+- `scan full_one_col` 3.4x — 4 of the 5 allocations per row are shape
+  required by the public API, not the storage path.
+- `match_phrase` 2.9x — tokenizes per candidate.
+- `three_and` 2.3x and `paginate filter_order_limit` 2.0x — the row decoder
+  validates every field it steps over to reach the one it needs; skipping
+  that validation on a committed-snapshot read is a read-contract decision
+  for the owner, not taken in this loop.
+
+### 1,000,000-row same-machine pair, E4 with B1 vs SQLite
+
+Ratios are E4 ÷ SQLite wall time unless marked otherwise.
+
+Mac, matched pair: load entities 0.99, load relationships 1.27, build
+scalar index 1.47, build spatial index 0.36, build text index 1.82, updates
+(three rounds) 0.93, deletes (three rounds) 0.91, reinsert + edges (three
+rounds) 1.38, final file size 1.15, query scalar 1.40, query spatial 1.52,
+query text 0.99, query vector 0.90.
+
+Linux, SQLite reference only (server, 2 CPU): updates (three rounds) 1,303 s,
+reinsert 97.7 s, final file size 660 MiB. The matching E4 Linux 1M run with
+B1 has not run yet — it is pending the owner's commit of B1, since the
+qualified Linux job runs against committed source only.
+
+### Measured and rejected in this stretch of the loop
+
+- **Per-row field offset table.** Would change the on-disk row format. The
+  field walk this would remove is 15-21% of per-row cost, the change costs
+  +3.6% on-disk size, and no lean-bench case crosses the 2x gate as a
+  result. Not taken.
+- **Per-tree edge tags for 1-hop reads.** `.insert-loop/loop3/DECISION-graph-1hop-parity.md`
+  shows the shared and a dedicated per-collection edge tree have the same
+  B-tree height at both 50K and 1M rows by fan-out arithmetic (fan-out
+  ~170; height-reducing boundaries sit at ~29K and ~4.9M leaves, neither
+  matched size lands on one). A dedicated tree would reduce distinct pages
+  touched per traversal but not descent depth — item F already measured
+  this shape (-22.7% pool accesses, no wall-time change) and was reverted
+  for the same reason. Not taken; 1-hop reads stay at rough SQLite parity,
+  revisit only if a real workload makes 1-hop dominate.
+
+### Owner decisions still pending, unchanged from before
+
+(a) Whether to skip validation of skipped fields on a committed-snapshot
+predicate read (affects `three_and`, `filter_order_limit`, and others
+above). (b) Whether the projected-field-name `String` clone in the public
+API can change. (c) Whether `OFFSET` should be added to `QueryRequest`; it
+is unsupported today.
+
+### Known limits, unchanged
+
+The limits already listed above under "Known limits, stated rather than
+fixed" are unchanged by this stretch of work: snapshot lifetime is bounded
+by the WAL allowance, the text head-to-segment fold is not implemented,
+packed text entries stay tombstoned until an explicit rebuild, and
+quantized-vector recall is measured on synthetic data only.

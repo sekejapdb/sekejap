@@ -212,3 +212,81 @@ move the target number is reverted unless it earns a named non-speed good.
 - The reinsert gap was a benchmark commit-batching mismatch, not an engine
   cost: E4 79 commits vs SQLite 40 per cycle, 7,355 vs 4,620 frames, 92 vs 40
   fsyncs, closed by `f538d4d`.
+
+## 2026-09-18 — B1 closes the 1M atomic-build refusal; committed head qualified Linux GREEN
+
+Head `aeeae13` (the fixes described above, through `f538d4d`) passed Linux
+final qualification attempt 4, exit 0, all stages including stage 5 release
+binaries — see `PHASE2_STATE.md`, "Linux qualification attempt 4 GREEN".
+That closes fix A/B/C above as qualified, not just Mac-measured. The items
+below are staged on top of that head, not yet committed.
+
+### B1: bounded index build closes the 1,000,000-row atomic refusal
+
+Fix C above (grouped commits under a BUILDING flag) reduced the atomic
+build's commit-window size but still packed the index in one pass; at
+1,000,000 rows on Linux that pass still exceeded the page-WAL allowance and
+the build was refused with an error type (`NotFound("index")`, see root
+cause below) that the driver's own refusal-retry logic did not catch, so the
+run exited 1 with no result. B1 changes the build's own structure: the
+first sorted run is packed to a quarter of the page-WAL allowance, and the
+remainder is appended across its own subsequent commits, so a refused build
+never loses the index's registry entry — only pending USER writes are
+refused by the guard, not the build's own progress commits. The
+1,000,000-row build that previously died with `NotFound("index")` now
+completes end to end.
+
+Named sacrifice: the 200,000-row scalar build costs +0.19 s versus the fix
+A/B/C state above, for the bounded-build safety margin.
+
+Root cause, `.insert-loop/loop3/ROOTCAUSE-1m-index-notfound.md`: the
+pre-B1 atomic build created the index and drove it to READY with no commit
+in between; a refusal at scale rolled back the uncommitted CREATE along
+with the failed pack, so the retry looked up a registry row that no longer
+existed. 50K and 200K never exercised this path because the whole-index
+pack fit the allowance at those sizes.
+
+### T2 and Q5: further read-side index-adjacent fixes
+
+- **T2**, the BM25 page path skips a redundant winner-existence probe:
+  `bm25_one_term` 1.62x to 0.84x (E4 ÷ SQLite wall time, matched durability,
+  retained build, Mac, `two_ways` 20K rows), two-term 1.47x to 0.79x,
+  `bm25_common` 3.81x to 2.86x.
+- **Q5**, a range posting is trusted as an existence proof the same way an
+  equality posting already was, letting same-index filters fold:
+  `range_two_sided` 2.07x to 0.38x, `range_open` to 0.51x, `range_closed`
+  to 0.49x, `between` to 0.81x.
+
+Full list of everything staged on top of `aeeae13` — Q2, H4, B1, Q3, Q4,
+G2, T2, Q5, and the pending K1 — is in `PHASE2_STATE.md` under "Staged,
+uncommitted items on top of `aeeae13`"; that is the current source for the
+per-item ratios so they are not duplicated here.
+
+### 1,000,000-row matched pair, E4 with B1, Mac
+
+Ratios are E4 ÷ SQLite wall time. Load entities 0.99, load relationships
+1.27, build scalar index 1.47, build spatial index 0.36, build text index
+1.82, updates (three rounds) 0.93, deletes (three rounds) 0.91, reinsert +
+edges (three rounds) 1.38, final file size 1.15, query scalar 1.40, query
+spatial 1.52, query text 0.99, query vector 0.90.
+
+This supersedes the "No claim about Linux wall-clock cost at 1,000,000
+rows" line under "What this does not claim" above for the Mac side only;
+the Linux 1,000,000-row run with B1 has not happened yet, since the
+qualified Linux job runs from committed source and B1 is still staged. The
+Linux SQLite-only reference from the pre-B1 partial 1M run remains useful as
+a baseline: updates (three rounds) 1,303 s, reinsert 97.7 s, final file size
+660 MiB (server, 2 CPU) — kept for comparison, not combined with the Mac E4
+numbers above, which are a different machine.
+
+### Measured and rejected, this stretch
+
+- Per-row field offset table: would change the on-disk row format; the
+  field walk it would remove is 15-21% of per-row cost against a +3.6%
+  disk-size cost, and no `two_ways` case crosses the 2x gate as a result.
+  Not taken.
+- Per-tree edge tags for 1-hop graph reads: same B-tree height at 50K and
+  1M rows by fan-out arithmetic (`.insert-loop/loop3/DECISION-graph-1hop-parity.md`);
+  would reduce pages touched, not descent depth, matching item F's earlier
+  measurement (-22.7% pool accesses, no wall-time change, reverted). Not
+  taken.

@@ -144,3 +144,91 @@ Tests: `tests/index_text.rs` and `tests/query_multimodel.rs`, including
 qualification is part of the final Phase 2 job and has not yet run. Observed
 cost: phrase refinement meters every token of every all-term candidate, so it
 needs a larger token budget than an equivalent all-term query.
+
+## 2026-09-18 — Linux qualification GREEN on committed head; further items staged
+
+### Linux final qualification: attempt 4, GREEN
+
+The Linux final qualification job (`e4-phase2-final-20260917`) reached a
+GREEN attempt 4 on committed head `aeeae13` (eight commits `d0cbc7b`..
+`aeeae13`, landed the morning of 2026-09-18): stage 1 (default build, full
+workspace) PASS, stage 2 (retained-feature build, full workspace) PASS,
+stage 4 (lifecycle replay) PASS with 404 passing results including guard
+checks, stage 5 (release binaries) PASS, exit 0. This resolves the "attempt
+3 result" line this document previously listed as remaining, and the phrase
+native-Linux-qualification-pending line above — phrase's tests are part of
+this same full-workspace run and are included in the passing stage 1/2
+counts.
+
+This is the first Linux qualification pass to reach stage 5 (release
+binaries). It qualifies the committed head only; the query and build items
+below are staged on top of it and are not part of this qualified result.
+
+### Staged, uncommitted query and build items (owner to commit)
+
+On top of `aeeae13`, the owner is keeping eight further items from the same
+loop: Q2 (descending scalar cursor), H4 (graph filter on the shared BFS),
+B1 (bounded index build, closes the 1,000,000-row atomic-build refusal),
+Q3 (id-ordered and existence-only query paths), Q4 (batched row reads), G2
+(graph write existence window), T2 (BM25 winner-probe skip), and Q5 (range
+posting as existence proof). Full per-item ratios are recorded once in
+`PHASE2_STATE.md` under "Staged, uncommitted items on top of `aeeae13`" and
+are not repeated here. Item K1 (a kernel per-collection append hint) is
+pending a byte-identity proof and is not claimed as done.
+
+Net effect on the lean two-arm bench (`src/bin/two_ways.rs`, 20,000 rows,
+Mac, matched durability): after T2 and before Q5, 29 cases were E4-slower
+and 19 E4-faster with 0 disagreements, up from the first run of this bench
+at 42 slower / 6 faster. Graph reads are faster than SQLite on every
+measured case at that point, 2-hop 0.17x through 1-hop with projection
+1.06x, 1-hop 0.41x. Remaining cases above the 2x acceptance gate and their
+named cause are listed in `PHASE2_STATE.md`; none of them is a graph case.
+
+### 1,000,000-row matched pair with B1, Mac
+
+Ratios are E4 ÷ SQLite wall time (Mac, matched pair, B1 staged): load
+entities 0.99, load relationships 1.27, build scalar index 1.47, build
+spatial index 0.36, build text index 1.82, updates (three rounds) 0.93,
+deletes (three rounds) 0.91, reinsert + edges (three rounds) 1.38, final
+file size 1.15, query scalar 1.40, query spatial 1.52, query text 0.99,
+query vector 0.90. This is a same-machine pair, not the qualified Linux 1M
+matrix; the Linux 1,000,000-row run with B1 has not happened yet, since the
+qualified Linux job runs against committed source only and B1 is still
+staged. It supersedes, for the Mac side only, the earlier "1M has not run
+yet" line under "Remaining before acceptance" above.
+
+### Row updated in the requirement table
+
+For "Fair total cost": the representative-1M line above is now measured on
+the Mac with B1; the qualified Linux 1M run with these staged items remains
+outstanding, alongside the tradeoff assessment already listed.
+
+### Decisions taken this stretch (measured and rejected, not open)
+
+- Per-row field offset table: would change the on-disk row format for a
+  15-21% share of per-row cost, against +3.6% disk size, with no
+  `two_ways` case crossing the 2x gate as a result. Not taken.
+- Per-tree edge tags for 1-hop graph reads: shown to leave B-tree descent
+  depth unchanged at both 50K and 1M rows by fan-out arithmetic
+  (`.insert-loop/loop3/DECISION-graph-1hop-parity.md`); 1-hop stays at
+  rough SQLite parity by design, not oversight.
+
+### Owner decisions still pending
+
+Unchanged from the existing "Known limits" list: (a) whether to skip
+validation of skipped fields on a committed-snapshot predicate read, (b)
+whether the projected-field-name `String` clone in the public API can
+change, (c) whether `OFFSET` is added to `QueryRequest`.
+
+### Remaining before acceptance, updated 2026-09-18
+
+- The owner's commit of the eight staged items above (Q2, H4, B1, Q3, Q4,
+  G2, T2, Q5) on top of the now-qualified `aeeae13`.
+- Item K1's byte-identity proof.
+- A qualified Linux 1,000,000-row run of the converged CRUD/build table
+  once the staged items are committed.
+- The three owner decisions above.
+- The known limits already listed (snapshot lifetime bound by the WAL
+  allowance, text head-to-segment fold not implemented, packed text
+  entries tombstoned until rebuild, quantized-vector recall synthetic
+  only) remain unchanged by this stretch of work.
