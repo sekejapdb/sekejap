@@ -1,0 +1,8 @@
+{
+  "src/lib.rs": "8a67c1600c39d78c14f278a60d75e7a7efd18589e90cad178c74f4fd36a82789",
+  "src/collections.rs": "46ef1c8be3a85ea565575985df57dd9cb5de70e983bb9739540c6db4c05b0a7a",
+  "src/indexes.rs": "50ff703b2a70e6677be210aa138b85b0287e69f231e2b38a961add7369abfa20",
+  "src/spatial_math.rs": "5bd8ec1dd68d5605d5fe8128a7b353d25dd629a3101131af4b4d49746b4bef77",
+  "src/spatial_indexes.rs": "b33f8ffa1bef51ae32126c0e1adbd72f9e80e2351c2d407d9622b0ed414260a2",
+  "tests/index_spatial.rs": "b74332127f9119cd27d768bd5ba953b2dd0ef1bd004717d8f7fa81d960c64440"
+}

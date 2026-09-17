@@ -1,0 +1,6 @@
+{
+  "src/query.rs": "8985154135d3abda6cba7befac006f0343b0a0c53096105dcc835240ce5064e1",
+  "src/vector_indexes.rs": "020e0d77e6eedd8479dde5e67ada95b9024d58c607c60a82ddee799af2ab2128",
+  "tests/query_multimodel.rs": "68c30d5549411acc409146ca9b7a03eddcabc4d7785d838e530d8535ab2de95f",
+  "docs/PHASE2_QUERY_DESIGN.md": "5e25308b4aecc46240fdbf80689727f4cb7c36bb41d3e741802af4d5c2996e9e"
+}

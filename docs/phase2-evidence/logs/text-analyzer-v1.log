@@ -1,0 +1,8 @@
+
+running 3 tests
+test tests::fixed_multilingual_tokens_preserve_e3_semantics ... ok
+test tests::bounds_reject_whole_analysis_without_truncation ... ok
+test tests::table_shape_and_complete_generation_oracle ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+

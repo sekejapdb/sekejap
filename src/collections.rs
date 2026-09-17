@@ -25,6 +25,8 @@ pub enum Error {
     /// A format, policy or configuration this binary does not implement.
     /// Raised before any byte of the source changes.
     Unsupported(String),
+    /// The caller's cancellation callback stopped a bounded exact query.
+    Cancelled,
     Kernel(kernel::Error),
 }
 impl fmt::Display for Error {
@@ -50,6 +52,48 @@ const CREATED: &str = "_created_unix";
 const UPDATED: &str = "_updated_unix";
 const PAD: usize = 2081;
 const HEADER_MAGIC: &[u8; 8] = b"E4COLL1\0";
+const INDEX_HEADER_MAGIC: &[u8; 8] = b"E4COLL2\0";
+#[path = "graph_collections.rs"]
+mod graph_collections;
+#[path = "indexes.rs"]
+mod indexes;
+#[path = "quantized_vector_indexes.rs"]
+mod quantized_vector_indexes;
+#[path = "query.rs"]
+mod query;
+#[path = "index_rebuild.rs"]
+pub mod rebuild;
+#[path = "spatial_indexes.rs"]
+mod spatial_indexes;
+#[path = "text_indexes.rs"]
+mod text_indexes;
+#[path = "vector_indexes.rs"]
+mod vector_indexes;
+#[path = "index_verifier.rs"]
+pub mod verification;
+pub use graph_collections::{
+    BfsRequest, Direction, Edge, EdgeKey, EdgeTypeId, GraphContextId, NeighborRequest,
+    TraversalNode, TraversalResult,
+};
+pub use indexes::{IndexFamily, IndexId, IndexInfo, IndexState, ScalarPredicate};
+pub use quantized_vector_indexes::{
+    ApproxVectorMethod, ApproxVectorResult, QuantizedVectorCandidates,
+};
+pub use query::{
+    ApproximationDiagnostics, CandidateDriver, OrderValue, OwnedScalarValue, PointFilter,
+    PreparedQuery, ProjectedValue, Projection, QueryBudget, QueryDriver, QueryError, QueryFilter,
+    QueryOrder, QueryPage, QueryRequest, QueryResult, QueryRow, QueryWork, ScalarFilter,
+    ScalarValue, SortDirection, WorkResource,
+};
+pub use spatial_indexes::{SpatialCandidates, SpatialHit};
+pub use text_indexes::{TextCandidates, TextHit, TextMatch};
+pub use vector_indexes::{VectorCandidates, VectorHit, VectorMetric};
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IndexHeader {
+    features: u64,
+    next: u64,
+    count: u32,
+}
 const CATALOG_MAGIC: &[u8; 8] = b"E4CAT01\0";
 const COUNTER_MAGIC: &[u8; 8] = b"E4SEQ01\0";
 /// Header payload: next collection, next layout (8 bytes, every ordinary
@@ -111,6 +155,7 @@ struct HeaderInfo {
     next_collection: u32,
     next_layout: u32,
     limits: Option<ResourceLimits>,
+    indexes: Option<IndexHeader>,
 }
 // E3 db.rs MembershipBatch uses the same fixed one-collection accumulator:
 // switching collections flushes it; memory never grows with collection count.
@@ -128,6 +173,7 @@ pub struct Database {
     layout_cache: RefCell<Option<Arc<Layout>>>,
     clock: Arc<dyn Clock>,
     limits: Option<ResourceLimits>,
+    index_header: Option<IndexHeader>,
 }
 
 fn ordered(n: u64) -> Vec<u8> {
@@ -267,13 +313,29 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 fn header_bytes(h: HeaderInfo) -> Result<Vec<u8>> {
     let mut payload = h.next_collection.to_be_bytes().to_vec();
     payload.extend_from_slice(&h.next_layout.to_be_bytes());
+    if let Some(i) = h.indexes {
+        payload.extend_from_slice(&i.features.to_be_bytes());
+        payload.extend_from_slice(&i.next.to_be_bytes());
+        payload.extend_from_slice(&i.count.to_be_bytes());
+    }
     if let Some(l) = h.limits {
         payload.extend(l.encode());
     }
-    packet(HEADER_MAGIC, &payload)
+    packet(
+        if h.indexes.is_some() {
+            INDEX_HEADER_MAGIC
+        } else {
+            HEADER_MAGIC
+        },
+        &payload,
+    )
 }
 fn parse_header(b: &[u8]) -> Result<HeaderInfo> {
-    if b.len() == PAD && b.starts_with(b"E4COLL") && &b[..8] != HEADER_MAGIC {
+    if b.len() == PAD
+        && b.starts_with(b"E4COLL")
+        && &b[..8] != HEADER_MAGIC
+        && &b[..8] != INDEX_HEADER_MAGIC
+    {
         // An unknown version is authoritative only inside an intact packet.
         // A damaged magic byte must still allow an independent replica to win.
         unpack(b, b[..8].try_into().unwrap())?;
@@ -282,8 +344,17 @@ fn parse_header(b: &[u8]) -> Result<HeaderInfo> {
             String::from_utf8_lossy(&b[..7])
         )));
     }
-    let b = unpack(b, HEADER_MAGIC)?;
-    if b.len() != HEADER_PLAIN && b.len() != HEADER_LIMITED {
+    let indexed = b.get(..8) == Some(INDEX_HEADER_MAGIC.as_slice());
+    let b = unpack(
+        b,
+        if indexed {
+            INDEX_HEADER_MAGIC
+        } else {
+            HEADER_MAGIC
+        },
+    )?;
+    let base = if indexed { 28 } else { HEADER_PLAIN };
+    if b.len() != base && b.len() != base + (HEADER_LIMITED - HEADER_PLAIN) {
         return Err(Error::Unsupported(format!(
             "typed-collection header payload of {} bytes is not implemented by this binary",
             b.len()
@@ -297,16 +368,45 @@ fn parse_header(b: &[u8]) -> Result<HeaderInfo> {
     Ok(HeaderInfo {
         next_collection: a,
         next_layout: z,
-        limits: (b.len() == HEADER_LIMITED)
-            .then(|| decode_limits(&b[8..]))
+        limits: (b.len() != base)
+            .then(|| decode_limits(&b[base..]))
             .transpose()?,
+        indexes: if indexed {
+            let features = u64::from_be_bytes(b[8..16].try_into().unwrap());
+            if features & 1 == 0
+                || features
+                    & !(1
+                        | graph_collections::GRAPH_FEATURE
+                        | vector_indexes::VECTOR_FEATURE
+                        | spatial_indexes::SPATIAL_FEATURE
+                        | text_indexes::TEXT_FEATURE
+                        | quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE)
+                    != 0
+            {
+                return Err(Error::Unsupported(format!(
+                    "logical index features {features:#x}"
+                )));
+            }
+            let next = u64::from_be_bytes(b[16..24].try_into().unwrap());
+            let count = u32::from_be_bytes(b[24..28].try_into().unwrap());
+            if next == 0 || u64::from(count) >= next {
+                return Err(corrupt("index allocator/count"));
+            }
+            Some(IndexHeader {
+                features,
+                next,
+                count,
+            })
+        } else {
+            None
+        },
     })
 }
 /// Agreeing intact copies win; a damaged page or descriptor loses one copy,
 /// not all metadata. Conflicting valid copies are an error, never a vote. An
 /// unsupported-but-intact copy is reported as such rather than as damage.
 fn replicas<T: PartialEq>(
-    get: impl Fn(&[u8]) -> Result<Option<Vec<u8>>>,
+    mut get: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>>,
     keys: impl Fn(u8) -> Vec<u8>,
     parse: impl Fn(&[u8]) -> Result<T>,
 ) -> Result<T> {
@@ -330,14 +430,25 @@ fn replicas<T: PartialEq>(
     good.ok_or_else(|| corrupt("all metadata copies missing or damaged"))
 }
 fn read_header(s: &PageWalStore) -> Result<HeaderInfo> {
-    replicas(|k| s.get(k).map_err(Error::from), |i| vec![0, 0, i], parse_header)
+    replicas(
+        |k| s.get(k).map_err(Error::from),
+        |i| vec![0, 0, i],
+        parse_header,
+    )
+}
+fn validate_features(s: &PageWalStore, header: Option<IndexHeader>) -> Result<()> {
+    indexes::validate_catalog(s, header)?;
+    graph_collections::validate_graph(
+        s,
+        header.is_some_and(|h| h.features & graph_collections::GRAPH_FEATURE != 0),
+    )
 }
 /// The typed refusal the page-WAL runs before it normalizes or creates
 /// anything. The precise collection error is kept in `detail`; the kernel
 /// sees an opaque refusal.
 fn typed_check(s: &PageWalStore, detail: &RefCell<Option<Error>>) -> kernel::Result<()> {
-    match read_header(s) {
-        Ok(_) => Ok(()),
+    match read_header(s).and_then(|h| validate_features(s, h.indexes)) {
+        Ok(()) => Ok(()),
         Err(e) => {
             *detail.borrow_mut() = Some(e);
             Err(kernel::Error::Corrupt {
@@ -366,7 +477,7 @@ impl Database {
         let cache = check_config(&config).map_err(Error::Unsupported)?;
         let limits = limits.map(check_limits).transpose()?;
         let store = Backend::create(path, cache, limits)?;
-        let mut db = Self::wrap(store, false, limits);
+        let mut db = Self::wrap(store, false, limits, None);
         db.write_header(1, 1)?;
         db.commit()?;
         Ok(db)
@@ -390,7 +501,7 @@ impl Database {
             Err(k) => return Err(detail.into_inner().unwrap_or(Error::Kernel(k))),
         };
         let h = read_header(store.store())?;
-        let mut db = Self::wrap(store, false, h.limits);
+        let mut db = Self::wrap(store, false, h.limits, h.indexes);
         if let Some(l) = h.limits {
             db.store.install_limits(l)?;
         }
@@ -406,28 +517,40 @@ impl Database {
         let cache = check_config(&config).map_err(Error::Unsupported)?;
         let detail = RefCell::new(None);
         let limits = std::cell::Cell::new(None);
+        let index_header = std::cell::Cell::new(None);
         // The typed check also hands the persisted reader bound to the
         // page-WAL, which enforces it on the slot this handle holds.
-        let store = Backend::open_snapshot(path.as_ref(), cache, |s| match read_header(s) {
-            Ok(h) => {
-                limits.set(h.limits);
-                Ok(h.limits.map(|l| l.readers as usize))
-            }
-            Err(e) => {
-                *detail.borrow_mut() = Some(e);
-                Err(kernel::Error::Corrupt {
-                    page_no: 0,
-                    why: "typed-collection catalog refused before open",
-                })
+        let store = Backend::open_snapshot(path.as_ref(), cache, |s| {
+            match read_header(s).and_then(|h| {
+                validate_features(s, h.indexes)?;
+                Ok(h)
+            }) {
+                Ok(h) => {
+                    index_header.set(h.indexes);
+                    limits.set(h.limits);
+                    Ok(h.limits.map(|l| l.readers as usize))
+                }
+                Err(e) => {
+                    *detail.borrow_mut() = Some(e);
+                    Err(kernel::Error::Corrupt {
+                        page_no: 0,
+                        why: "typed-collection catalog refused before open",
+                    })
+                }
             }
         });
         let store = match store {
             Ok(s) => s,
             Err(k) => return Err(detail.into_inner().unwrap_or(Error::Kernel(k))),
         };
-        Ok(Self::wrap(store, true, limits.get()))
+        Ok(Self::wrap(store, true, limits.get(), index_header.get()))
     }
-    fn wrap(store: Backend, read_only: bool, limits: Option<ResourceLimits>) -> Self {
+    fn wrap(
+        store: Backend,
+        read_only: bool,
+        limits: Option<ResourceLimits>,
+        index_header: Option<IndexHeader>,
+    ) -> Self {
         Self {
             path: store.dir().to_owned(),
             store,
@@ -438,6 +561,7 @@ impl Database {
             layout_cache: RefCell::new(None),
             clock: Arc::new(SystemClock),
             limits,
+            index_header,
         }
     }
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
@@ -457,6 +581,30 @@ impl Database {
     /// persisted `tracked_pages` policy bounds. `None` for snapshots.
     pub fn tracked_pages(&self) -> Result<Option<usize>> {
         Ok(self.store()?.tracked_pages())
+    }
+    /// Diagnostic only. Stream every persisted key/value under `prefix` in key
+    /// order and return how many entries were seen. Derived-index equivalence
+    /// tests need the exact persisted bytes; Law 1 refuses to hand them a `Vec`
+    /// of a whole index, so the caller folds each entry as it arrives.
+    #[doc(hidden)]
+    pub fn raw_for_each(&self, prefix: &[u8], f: &mut dyn FnMut(&[u8], &[u8])) -> Result<u64> {
+        let mut seen = 0;
+        for row in self.store()?.range(prefix)? {
+            let (k, v) = row?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            f(&k, &v);
+            seen += 1;
+        }
+        Ok(seen)
+    }
+    /// Diagnostic only: buffer-pool page accesses (hits + misses) since this
+    /// handle opened. This is the unit the repo measures write cost in; it is
+    /// exact and does not move with the machine.
+    #[doc(hidden)]
+    pub fn pool_accesses(&self) -> Result<u64> {
+        Ok(self.store()?.store().pool_accesses())
     }
     fn store(&self) -> Result<&Backend> {
         if self.failed {
@@ -499,6 +647,7 @@ impl Database {
             next_collection: collection,
             next_layout: layout,
             limits: self.limits,
+            indexes: self.index_header,
         })?;
         for i in 0..3 {
             self.writer()?.put(&[0, 0, i], &b)?;
@@ -654,6 +803,7 @@ impl Database {
         let mut c = self.catalog(id)?;
         let (next_c, next_l) = self.header()?;
         let layout = Self::make_layout(next_l, fields, c.timestamps)?;
+        self.validate_indexed_layout(id, &layout)?;
         let after = next_l
             .checked_add(1)
             .ok_or_else(|| invalid("layout IDs exhausted"))?;
@@ -790,6 +940,12 @@ impl Database {
             } else {
                 self.allocate(c.id)?
             };
+            self.maintain_indexes(
+                id,
+                old.as_ref().map(|e| &e.entity.document),
+                Some(&doc),
+                Some((&layout, &encoded.vectors)),
+            )?;
             // Sidecar identity is the physical field ordinal. Compare exact
             // encoded bytes, including float sign bits, across layout versions.
             // Only removed slots need deletes; replacements are ordinary puts.
@@ -909,6 +1065,8 @@ impl Database {
             return Ok(false);
         };
         let result = (|| {
+            self.cascade_graph_delete(e.entity.id)?;
+            self.maintain_indexes(e.entity.id, Some(&e.entity.document), None, None)?;
             for (field, _) in e.vectors {
                 self.writer()?.delete(&vector_key(e.entity.id, field))?;
             }
@@ -974,7 +1132,11 @@ impl Database {
             self.store.install_limits(l)?;
         }
         self.failed = false;
-        let validation = self.header().map(|_| ());
+        let validation = read_header(self.store.store()).and_then(|h| {
+            validate_features(self.store.store(), h.indexes)?;
+            self.index_header = h.indexes;
+            Ok(())
+        });
         self.finish(validation)
     }
 }

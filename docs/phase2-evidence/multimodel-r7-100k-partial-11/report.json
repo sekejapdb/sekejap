@@ -1,0 +1,2439 @@
+{
+  "arms": [
+    {
+      "command": [
+        "<scratch>",
+        "e4",
+        "100000",
+        "32",
+        "<scratch>",
+        "atomic",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 165613568,
+        "logical_bytes": 95874432,
+        "rss_bytes": 24641536
+      },
+      "driver_samples": 3420,
+      "engine": "e4",
+      "final_tree_bytes": {
+        "allocated": 90284032,
+        "logical": 90280032
+      },
+      "policy": "atomic",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 177.507633173,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "indexes": 2,
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 2.093519032,
+              "steps": 782
+            },
+            "spatial": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 0.862169061,
+              "steps": 391
+            },
+            "text": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 18.79050289,
+              "steps": 391
+            },
+            "vector": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 0.457029326,
+              "steps": 391
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 4.616774634,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.128975974,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 40.148522056,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 3.863590373,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 4.958903914,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 34.315552253999996,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 3.80274704,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.305922399,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 35.565793495,
+              "updated": 100000
+            }
+          ],
+          "engine": "e4",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 4.118328845
+          },
+          "final_bytes": [
+            90280032,
+            90284032
+          ],
+          "graph_load": {
+            "relationships": 300000,
+            "reverse_maintained": true,
+            "seconds": 10.067545971
+          },
+          "loaded_bytes": [
+            46497888,
+            46501888
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.000490627
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.004287933
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.054188235
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.174447231
+            }
+          },
+          "publication_policy": "atomic",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 5,
+              "seconds": 0.0006312,
+              "work": "QueryWork { candidates: 5, primary_reads: 11, scalar_postings: 0, graph_edges: 9, graph_visited: 6, spatial_postings: 5, text_postings: 0, vector_locators: 5, vector_sidecars: 5, vector_lanes: 160, output_bytes: 110 }"
+            },
+            "members_active_spatial_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 10,
+              "seconds": 0.036655285,
+              "work": "QueryWork { candidates: 1000, primary_reads: 1011, scalar_postings: 0, graph_edges: 1001, graph_visited: 1001, spatial_postings: 666, text_postings: 0, vector_locators: 133, vector_sidecars: 133, vector_lanes: 4256, output_bytes: 220 }"
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.026112324
+            },
+            "spatial_bbox": {
+              "driver": "RTree candidate-first CROSS JOIN + exact f64 refinement",
+              "hits": 10100,
+              "seconds": 0.007685982
+            },
+            "text_active_vector": {
+              "driver": "Text(IndexId(5))",
+              "hits": 10,
+              "seconds": 0.228606017,
+              "work": "QueryWork { candidates: 37500, primary_reads: 37510, scalar_postings: 0, graph_edges: 0, graph_visited: 0, spatial_postings: 0, text_postings: 37501, vector_locators: 24999, vector_sidecars: 24999, vector_lanes: 799968, output_bytes: 220 }"
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.058277909,
+              "semantics": "phase2 positive BM25"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.204818989
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.0111102,
+          "rss_hwm": "VmHWM:\t   23584 kB",
+          "sampled_peak_bytes": [
+            94469616,
+            98607104
+          ]
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 0,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 0,
+      "wall_seconds": 177.5110123194754
+    },
+    {
+      "command": [
+        "<scratch>",
+        "sqlite",
+        "100000",
+        "32",
+        "<scratch>",
+        "atomic",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 148144128,
+        "logical_bytes": 81623480,
+        "rss_bytes": 18698240
+      },
+      "driver_samples": 2256,
+      "engine": "sqlite",
+      "final_tree_bytes": {
+        "allocated": 69918720,
+        "logical": 69918720
+      },
+      "policy": "atomic",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 119.536985786,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "policy": "SQLite atomic DDL",
+              "publication_commits": 1,
+              "seconds": 0.204198504
+            },
+            "spatial": {
+              "policy": "SQLite atomic DDL+population",
+              "publication_commits": 1,
+              "seconds": 1.197924301
+            },
+            "text": {
+              "policy": "SQLite atomic DDL+FTS rebuild",
+              "publication_commits": 1,
+              "seconds": 0.313106037
+            },
+            "vector": {
+              "policy": "no native vector index; exact f32 blobs already loaded",
+              "publication_commits": 0,
+              "seconds": 0.0
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 5.8847799179999996,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 2.885637135,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 33.025282086,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 2.80057772,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.912208482,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 30.271407196,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 2.343734763,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.797763824,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 27.745079961,
+              "updated": 100000
+            }
+          ],
+          "engine": "sqlite",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 2.617609143
+          },
+          "final_bytes": [
+            69951488,
+            69951488
+          ],
+          "graph_load": {
+            "edge_table": "WITHOUT ROWID",
+            "forward_primary_key_and_reverse_index_maintained": true,
+            "relationships": 300000,
+            "seconds": 5.033784997
+          },
+          "loaded_bytes": [
+            43085824,
+            43085824
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.000365923
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.014948121
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.099639153
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.085096128
+            }
+          },
+          "publication_policy": "native SQLite atomic DDL",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "recursive edge-index candidates first via CROSS JOIN, then scalar + RTree + exact Rust f32 ranking",
+              "hits": 5,
+              "seconds": 0.00064788
+            },
+            "members_active_spatial_vector": {
+              "driver": "incoming edge-index candidates first via CROSS JOIN, then active + RTree overlap/exact refinement + exact Rust f32 ranking",
+              "hits": 10,
+              "seconds": 0.009457501
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.000238725
+            },
+            "spatial_bbox": {
+              "hits": 10100,
+              "seconds": 0.015552812
+            },
+            "sqlite_native_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.041703607,
+              "semantics": "SQLite FTS5 native rank; not cross-engine BM25"
+            },
+            "text_active_vector": {
+              "driver": "FTS MATCH candidates first via CROSS JOIN, then active refinement + exact Rust f32 ranking",
+              "hits": 10,
+              "seconds": 0.067823224
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.079744238,
+              "semantics": "FTS MATCH candidate-first CROSS JOIN cost plus phase2 positive BM25 scoring"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.075841777
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.001235959,
+          "rss_hwm": "VmHWM:\t   18260 kB",
+          "runtime_settings": {
+            "cache_bytes": 8388608,
+            "fts": "FTS5 unicode61 remove_diacritics=0",
+            "journal_mode": "WAL",
+            "synchronous": "FULL",
+            "temp_store": "FILE",
+            "vector": "identical Rust exact f32 math over blobs"
+          },
+          "sampled_peak_bytes": [
+            81623480,
+            85254144
+          ],
+          "sqlite_query_plans": {
+            "combined_graph": [
+              "CO-ROUTINE reach",
+              "SETUP",
+              "SEARCH edges USING PRIMARY KEY (context=? AND source_collection=? AND source_id=? AND edge_type=? AND destination_collection=?)",
+              "RECURSIVE STEP",
+              "SCAN r",
+              "SEARCH e USING PRIMARY KEY (context=? AND source_collection=? AND source_id=? AND edge_type=? AND destination_collection=?)",
+              "SCAN q",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "SCAN s VIRTUAL TABLE INDEX 1:",
+              "USE TEMP B-TREE FOR DISTINCT"
+            ],
+            "combined_members": [
+              "SEARCH e USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=? AND edge_type=? AND source_collection=?)",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "SCAN r VIRTUAL TABLE INDEX 1:"
+            ],
+            "delete_incoming": [
+              "SEARCH edges USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=?)"
+            ],
+            "delete_outgoing": [
+              "SEARCH edges USING PRIMARY KEY (context=? AND source_collection=? AND source_id=?)"
+            ],
+            "incoming_membership": [
+              "SEARCH e USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=? AND edge_type=? AND source_collection=?)",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            "spatial": [
+              "SCAN r VIRTUAL TABLE INDEX 2:B0D1B2D3",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ],
+            "text_active": [
+              "SCAN f VIRTUAL TABLE INDEX 0:M1",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          },
+          "sqlite_version": "3.46.0"
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 1,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 0,
+      "wall_seconds": 119.5492596924305
+    },
+    {
+      "command": [
+        "<scratch>",
+        "e4",
+        "100000",
+        "32",
+        "<scratch>",
+        "resumable",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 232525824,
+        "logical_bytes": 95874432,
+        "rss_bytes": 24559616
+      },
+      "driver_samples": 3618,
+      "engine": "e4",
+      "final_tree_bytes": {
+        "allocated": 90284032,
+        "logical": 90280032
+      },
+      "policy": "resumable",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 188.048957794,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "indexes": 2,
+              "policy": "resumable",
+              "publication_commits": 782,
+              "seconds": 5.489706077,
+              "steps": 782
+            },
+            "spatial": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 1.794539554,
+              "steps": 391
+            },
+            "text": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 20.553949129,
+              "steps": 391
+            },
+            "vector": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 1.30408747,
+              "steps": 391
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 4.759738542,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.566184792,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 38.695617108,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 3.8435098610000002,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.071962424,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 35.395650913,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 3.773680613,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.210535802,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 38.332962627,
+              "updated": 100000
+            }
+          ],
+          "engine": "e4",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 4.499366917
+          },
+          "final_bytes": [
+            90280032,
+            90284032
+          ],
+          "graph_load": {
+            "relationships": 300000,
+            "reverse_maintained": true,
+            "seconds": 10.386500989
+          },
+          "loaded_bytes": [
+            46497888,
+            46501888
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.00047612
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.005736709
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.05680336
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.150923339
+            }
+          },
+          "publication_policy": "resumable",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 5,
+              "seconds": 0.000524991,
+              "work": "QueryWork { candidates: 5, primary_reads: 11, scalar_postings: 0, graph_edges: 9, graph_visited: 6, spatial_postings: 5, text_postings: 0, vector_locators: 5, vector_sidecars: 5, vector_lanes: 160, output_bytes: 110 }"
+            },
+            "members_active_spatial_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 10,
+              "seconds": 0.025594104,
+              "work": "QueryWork { candidates: 1000, primary_reads: 1011, scalar_postings: 0, graph_edges: 1001, graph_visited: 1001, spatial_postings: 666, text_postings: 0, vector_locators: 133, vector_sidecars: 133, vector_lanes: 4256, output_bytes: 220 }"
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.019378921
+            },
+            "spatial_bbox": {
+              "driver": "RTree candidate-first CROSS JOIN + exact f64 refinement",
+              "hits": 10100,
+              "seconds": 0.005165031
+            },
+            "text_active_vector": {
+              "driver": "Text(IndexId(5))",
+              "hits": 10,
+              "seconds": 0.212608093,
+              "work": "QueryWork { candidates: 37500, primary_reads: 37510, scalar_postings: 0, graph_edges: 0, graph_visited: 0, spatial_postings: 0, text_postings: 37501, vector_locators: 24999, vector_sidecars: 24999, vector_lanes: 799968, output_bytes: 220 }"
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.052092157,
+              "semantics": "phase2 positive BM25"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.166728192
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.010062853,
+          "rss_hwm": "VmHWM:\t   23756 kB",
+          "sampled_peak_bytes": [
+            94469616,
+            98607104
+          ]
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 2,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 0,
+      "wall_seconds": 188.05248951539397
+    },
+    {
+      "command": [
+        "<scratch>",
+        "sqlite",
+        "100000",
+        "32",
+        "<scratch>",
+        "atomic",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 126910464,
+        "logical_bytes": 81623480,
+        "rss_bytes": 18448384
+      },
+      "driver_samples": 2068,
+      "engine": "sqlite",
+      "final_tree_bytes": {
+        "allocated": 69918720,
+        "logical": 69918720
+      },
+      "policy": "atomic",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 107.180991028,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "policy": "SQLite atomic DDL",
+              "publication_commits": 1,
+              "seconds": 0.217715653
+            },
+            "spatial": {
+              "policy": "SQLite atomic DDL+population",
+              "publication_commits": 1,
+              "seconds": 1.251511724
+            },
+            "text": {
+              "policy": "SQLite atomic DDL+FTS rebuild",
+              "publication_commits": 1,
+              "seconds": 0.300378993
+            },
+            "vector": {
+              "policy": "no native vector index; exact f32 blobs already loaded",
+              "publication_commits": 0,
+              "seconds": 0.0
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 4.5634146300000005,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 2.053933081,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 28.14332464,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 2.522447437,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.9920068359999998,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 27.456266664,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 2.1899015569999998,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.752795814,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 25.813071054,
+              "updated": 100000
+            }
+          ],
+          "engine": "sqlite",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 2.468863721
+          },
+          "final_bytes": [
+            69951488,
+            69951488
+          ],
+          "graph_load": {
+            "edge_table": "WITHOUT ROWID",
+            "forward_primary_key_and_reverse_index_maintained": true,
+            "relationships": 300000,
+            "seconds": 5.006592366
+          },
+          "loaded_bytes": [
+            43085824,
+            43085824
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.000387865
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.019476774
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.101664244
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.089084458
+            }
+          },
+          "publication_policy": "native SQLite atomic DDL",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "recursive edge-index candidates first via CROSS JOIN, then scalar + RTree + exact Rust f32 ranking",
+              "hits": 5,
+              "seconds": 0.000479276
+            },
+            "members_active_spatial_vector": {
+              "driver": "incoming edge-index candidates first via CROSS JOIN, then active + RTree overlap/exact refinement + exact Rust f32 ranking",
+              "hits": 10,
+              "seconds": 0.007144771
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.000206926
+            },
+            "spatial_bbox": {
+              "hits": 10100,
+              "seconds": 0.013386563
+            },
+            "sqlite_native_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.040861472,
+              "semantics": "SQLite FTS5 native rank; not cross-engine BM25"
+            },
+            "text_active_vector": {
+              "driver": "FTS MATCH candidates first via CROSS JOIN, then active refinement + exact Rust f32 ranking",
+              "hits": 10,
+              "seconds": 0.06218261
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.076574442,
+              "semantics": "FTS MATCH candidate-first CROSS JOIN cost plus phase2 positive BM25 scoring"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.071854344
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.001035414,
+          "rss_hwm": "VmHWM:\t   18016 kB",
+          "runtime_settings": {
+            "cache_bytes": 8388608,
+            "fts": "FTS5 unicode61 remove_diacritics=0",
+            "journal_mode": "WAL",
+            "synchronous": "FULL",
+            "temp_store": "FILE",
+            "vector": "identical Rust exact f32 math over blobs"
+          },
+          "sampled_peak_bytes": [
+            81623480,
+            86728704
+          ],
+          "sqlite_query_plans": {
+            "combined_graph": [
+              "CO-ROUTINE reach",
+              "SETUP",
+              "SEARCH edges USING PRIMARY KEY (context=? AND source_collection=? AND source_id=? AND edge_type=? AND destination_collection=?)",
+              "RECURSIVE STEP",
+              "SCAN r",
+              "SEARCH e USING PRIMARY KEY (context=? AND source_collection=? AND source_id=? AND edge_type=? AND destination_collection=?)",
+              "SCAN q",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "SCAN s VIRTUAL TABLE INDEX 1:",
+              "USE TEMP B-TREE FOR DISTINCT"
+            ],
+            "combined_members": [
+              "SEARCH e USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=? AND edge_type=? AND source_collection=?)",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "SCAN r VIRTUAL TABLE INDEX 1:"
+            ],
+            "delete_incoming": [
+              "SEARCH edges USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=?)"
+            ],
+            "delete_outgoing": [
+              "SEARCH edges USING PRIMARY KEY (context=? AND source_collection=? AND source_id=?)"
+            ],
+            "incoming_membership": [
+              "SEARCH e USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=? AND edge_type=? AND source_collection=?)",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            "spatial": [
+              "SCAN r VIRTUAL TABLE INDEX 2:B0D1B2D3",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ],
+            "text_active": [
+              "SCAN f VIRTUAL TABLE INDEX 0:M1",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          },
+          "sqlite_version": "3.46.0"
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 3,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 1,
+      "wall_seconds": 107.1876451484859
+    },
+    {
+      "command": [
+        "<scratch>",
+        "e4",
+        "100000",
+        "32",
+        "<scratch>",
+        "atomic",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 124325888,
+        "logical_bytes": 95928304,
+        "rss_bytes": 24350720
+      },
+      "driver_samples": 3463,
+      "engine": "e4",
+      "final_tree_bytes": {
+        "allocated": 90284032,
+        "logical": 90280032
+      },
+      "policy": "atomic",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 181.053802826,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "indexes": 2,
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 2.279611319,
+              "steps": 782
+            },
+            "spatial": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 0.896240553,
+              "steps": 391
+            },
+            "text": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 18.930834613000002,
+              "steps": 391
+            },
+            "vector": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 0.442895519,
+              "steps": 391
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 4.703037041,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.080474637,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 39.123559299,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 3.900786756,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 4.88406811,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 35.893981744,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 4.049826722,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.029442283,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 36.891857763,
+              "updated": 100000
+            }
+          ],
+          "engine": "e4",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 4.189756633
+          },
+          "final_bytes": [
+            90280032,
+            90284032
+          ],
+          "graph_load": {
+            "relationships": 300000,
+            "reverse_maintained": true,
+            "seconds": 11.40227216
+          },
+          "loaded_bytes": [
+            46497888,
+            46501888
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.000514501
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.004122402
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.051514126
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.174280569
+            }
+          },
+          "publication_policy": "atomic",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 5,
+              "seconds": 0.000577259,
+              "work": "QueryWork { candidates: 5, primary_reads: 11, scalar_postings: 0, graph_edges: 9, graph_visited: 6, spatial_postings: 5, text_postings: 0, vector_locators: 5, vector_sidecars: 5, vector_lanes: 160, output_bytes: 110 }"
+            },
+            "members_active_spatial_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 10,
+              "seconds": 0.029743657,
+              "work": "QueryWork { candidates: 1000, primary_reads: 1011, scalar_postings: 0, graph_edges: 1001, graph_visited: 1001, spatial_postings: 666, text_postings: 0, vector_locators: 133, vector_sidecars: 133, vector_lanes: 4256, output_bytes: 220 }"
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.019527718
+            },
+            "spatial_bbox": {
+              "driver": "RTree candidate-first CROSS JOIN + exact f64 refinement",
+              "hits": 10100,
+              "seconds": 0.005519563
+            },
+            "text_active_vector": {
+              "driver": "Text(IndexId(5))",
+              "hits": 10,
+              "seconds": 0.271213213,
+              "work": "QueryWork { candidates: 37500, primary_reads: 37510, scalar_postings: 0, graph_edges: 0, graph_visited: 0, spatial_postings: 0, text_postings: 37501, vector_locators: 24999, vector_sidecars: 24999, vector_lanes: 799968, output_bytes: 220 }"
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.062082854,
+              "semantics": "phase2 positive BM25"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.165632301
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.010105412,
+          "rss_hwm": "VmHWM:\t   23224 kB",
+          "sampled_peak_bytes": [
+            94469616,
+            98607104
+          ]
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 4,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 1,
+      "wall_seconds": 181.05744322761893
+    },
+    {
+      "command": [
+        "<scratch>",
+        "e4",
+        "100000",
+        "32",
+        "<scratch>",
+        "resumable",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 123736064,
+        "logical_bytes": 95928304,
+        "rss_bytes": 24715264
+      },
+      "driver_samples": 3667,
+      "engine": "e4",
+      "final_tree_bytes": {
+        "allocated": 90284032,
+        "logical": 90280032
+      },
+      "policy": "resumable",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 191.383646211,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "indexes": 2,
+              "policy": "resumable",
+              "publication_commits": 782,
+              "seconds": 6.06367279,
+              "steps": 782
+            },
+            "spatial": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 2.209775884,
+              "steps": 391
+            },
+            "text": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 22.210916982,
+              "steps": 391
+            },
+            "vector": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 1.580773474,
+              "steps": 391
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 5.499135373,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.879863452,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 40.774199923,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 4.026763016,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 4.929782081,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 34.962413498,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 3.807647108,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.113661225,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 36.146120521,
+              "updated": 100000
+            }
+          ],
+          "engine": "e4",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 4.306250494
+          },
+          "final_bytes": [
+            90280032,
+            90284032
+          ],
+          "graph_load": {
+            "relationships": 300000,
+            "reverse_maintained": true,
+            "seconds": 10.670572225
+          },
+          "loaded_bytes": [
+            46497888,
+            46501888
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.0004281
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.004144564
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.050340814
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.155837425
+            }
+          },
+          "publication_policy": "resumable",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 5,
+              "seconds": 0.00061057,
+              "work": "QueryWork { candidates: 5, primary_reads: 11, scalar_postings: 0, graph_edges: 9, graph_visited: 6, spatial_postings: 5, text_postings: 0, vector_locators: 5, vector_sidecars: 5, vector_lanes: 160, output_bytes: 110 }"
+            },
+            "members_active_spatial_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 10,
+              "seconds": 0.046043363,
+              "work": "QueryWork { candidates: 1000, primary_reads: 1011, scalar_postings: 0, graph_edges: 1001, graph_visited: 1001, spatial_postings: 666, text_postings: 0, vector_locators: 133, vector_sidecars: 133, vector_lanes: 4256, output_bytes: 220 }"
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.018026082
+            },
+            "spatial_bbox": {
+              "driver": "RTree candidate-first CROSS JOIN + exact f64 refinement",
+              "hits": 10100,
+              "seconds": 0.005682668
+            },
+            "text_active_vector": {
+              "driver": "Text(IndexId(5))",
+              "hits": 10,
+              "seconds": 0.207172188,
+              "work": "QueryWork { candidates: 37500, primary_reads: 37510, scalar_postings: 0, graph_edges: 0, graph_visited: 0, spatial_postings: 0, text_postings: 37501, vector_locators: 24999, vector_sidecars: 24999, vector_lanes: 799968, output_bytes: 220 }"
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.05418728,
+              "semantics": "phase2 positive BM25"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.189166864
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.008437566,
+          "rss_hwm": "VmHWM:\t   23780 kB",
+          "sampled_peak_bytes": [
+            94469616,
+            98607104
+          ]
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 5,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 1,
+      "wall_seconds": 191.3881190866232
+    },
+    {
+      "command": [
+        "<scratch>",
+        "e4",
+        "100000",
+        "32",
+        "<scratch>",
+        "atomic",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 165482496,
+        "logical_bytes": 95928304,
+        "rss_bytes": 24289280
+      },
+      "driver_samples": 3578,
+      "engine": "e4",
+      "final_tree_bytes": {
+        "allocated": 90284032,
+        "logical": 90280032
+      },
+      "policy": "atomic",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 187.850038143,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "indexes": 2,
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 2.23120086,
+              "steps": 782
+            },
+            "spatial": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 0.862497637,
+              "steps": 391
+            },
+            "text": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 18.630520077,
+              "steps": 391
+            },
+            "vector": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 0.447126245,
+              "steps": 391
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 5.047372578,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 6.312393583,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 39.617838421,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 4.910193355,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.290277036,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 37.436709821,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 4.151103649,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.52913245,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 39.700742641,
+              "updated": 100000
+            }
+          ],
+          "engine": "e4",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 4.00861509
+          },
+          "final_bytes": [
+            90280032,
+            90284032
+          ],
+          "graph_load": {
+            "relationships": 300000,
+            "reverse_maintained": true,
+            "seconds": 10.429481342
+          },
+          "loaded_bytes": [
+            46497888,
+            46501888
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.000594752
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.00376768
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.052867805
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.156631999
+            }
+          },
+          "publication_policy": "atomic",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 5,
+              "seconds": 0.00048202,
+              "work": "QueryWork { candidates: 5, primary_reads: 11, scalar_postings: 0, graph_edges: 9, graph_visited: 6, spatial_postings: 5, text_postings: 0, vector_locators: 5, vector_sidecars: 5, vector_lanes: 160, output_bytes: 110 }"
+            },
+            "members_active_spatial_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 10,
+              "seconds": 0.025976878,
+              "work": "QueryWork { candidates: 1000, primary_reads: 1011, scalar_postings: 0, graph_edges: 1001, graph_visited: 1001, spatial_postings: 666, text_postings: 0, vector_locators: 133, vector_sidecars: 133, vector_lanes: 4256, output_bytes: 220 }"
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.016238942
+            },
+            "spatial_bbox": {
+              "driver": "RTree candidate-first CROSS JOIN + exact f64 refinement",
+              "hits": 10100,
+              "seconds": 0.007531192
+            },
+            "text_active_vector": {
+              "driver": "Text(IndexId(5))",
+              "hits": 10,
+              "seconds": 0.20534351,
+              "work": "QueryWork { candidates: 37500, primary_reads: 37510, scalar_postings: 0, graph_edges: 0, graph_visited: 0, spatial_postings: 0, text_postings: 37501, vector_locators: 24999, vector_sidecars: 24999, vector_lanes: 799968, output_bytes: 220 }"
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.052847666,
+              "semantics": "phase2 positive BM25"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.158605327
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.009743727,
+          "rss_hwm": "VmHWM:\t   23048 kB",
+          "sampled_peak_bytes": [
+            94469616,
+            98607104
+          ]
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 6,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 2,
+      "wall_seconds": 187.85632479935884
+    },
+    {
+      "command": [
+        "<scratch>",
+        "sqlite",
+        "100000",
+        "32",
+        "<scratch>",
+        "atomic",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 113016832,
+        "logical_bytes": 81623480,
+        "rss_bytes": 18571264
+      },
+      "driver_samples": 2309,
+      "engine": "sqlite",
+      "final_tree_bytes": {
+        "allocated": 69918720,
+        "logical": 69918720
+      },
+      "policy": "atomic",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 123.69224278,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "policy": "SQLite atomic DDL",
+              "publication_commits": 1,
+              "seconds": 0.219722044
+            },
+            "spatial": {
+              "policy": "SQLite atomic DDL+population",
+              "publication_commits": 1,
+              "seconds": 1.271014383
+            },
+            "text": {
+              "policy": "SQLite atomic DDL+FTS rebuild",
+              "publication_commits": 1,
+              "seconds": 0.330956818
+            },
+            "vector": {
+              "policy": "no native vector index; exact f32 blobs already loaded",
+              "publication_commits": 0,
+              "seconds": 0.0
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 4.173040043,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.96302858,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 29.368105446,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 8.376302332,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.466794264,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 27.666574252,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 2.323952659,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.767982551,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 30.816627023,
+              "updated": 100000
+            }
+          ],
+          "engine": "sqlite",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 3.13613298
+          },
+          "final_bytes": [
+            69951488,
+            69951488
+          ],
+          "graph_load": {
+            "edge_table": "WITHOUT ROWID",
+            "forward_primary_key_and_reverse_index_maintained": true,
+            "relationships": 300000,
+            "seconds": 5.117665557
+          },
+          "loaded_bytes": [
+            43085824,
+            43085824
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.000381062
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.020646519
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.11554177
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.092434555
+            }
+          },
+          "publication_policy": "native SQLite atomic DDL",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "recursive edge-index candidates first via CROSS JOIN, then scalar + RTree + exact Rust f32 ranking",
+              "hits": 5,
+              "seconds": 0.000518249
+            },
+            "members_active_spatial_vector": {
+              "driver": "incoming edge-index candidates first via CROSS JOIN, then active + RTree overlap/exact refinement + exact Rust f32 ranking",
+              "hits": 10,
+              "seconds": 0.00892693
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.000351146
+            },
+            "spatial_bbox": {
+              "hits": 10100,
+              "seconds": 0.016609345
+            },
+            "sqlite_native_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.056844023,
+              "semantics": "SQLite FTS5 native rank; not cross-engine BM25"
+            },
+            "text_active_vector": {
+              "driver": "FTS MATCH candidates first via CROSS JOIN, then active refinement + exact Rust f32 ranking",
+              "hits": 10,
+              "seconds": 0.072097936
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.095994467,
+              "semantics": "FTS MATCH candidate-first CROSS JOIN cost plus phase2 positive BM25 scoring"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.091614443
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.001959341,
+          "rss_hwm": "VmHWM:\t   18136 kB",
+          "runtime_settings": {
+            "cache_bytes": 8388608,
+            "fts": "FTS5 unicode61 remove_diacritics=0",
+            "journal_mode": "WAL",
+            "synchronous": "FULL",
+            "temp_store": "FILE",
+            "vector": "identical Rust exact f32 math over blobs"
+          },
+          "sampled_peak_bytes": [
+            81623480,
+            86728704
+          ],
+          "sqlite_query_plans": {
+            "combined_graph": [
+              "CO-ROUTINE reach",
+              "SETUP",
+              "SEARCH edges USING PRIMARY KEY (context=? AND source_collection=? AND source_id=? AND edge_type=? AND destination_collection=?)",
+              "RECURSIVE STEP",
+              "SCAN r",
+              "SEARCH e USING PRIMARY KEY (context=? AND source_collection=? AND source_id=? AND edge_type=? AND destination_collection=?)",
+              "SCAN q",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "SCAN s VIRTUAL TABLE INDEX 1:",
+              "USE TEMP B-TREE FOR DISTINCT"
+            ],
+            "combined_members": [
+              "SEARCH e USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=? AND edge_type=? AND source_collection=?)",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "SCAN r VIRTUAL TABLE INDEX 1:"
+            ],
+            "delete_incoming": [
+              "SEARCH edges USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=?)"
+            ],
+            "delete_outgoing": [
+              "SEARCH edges USING PRIMARY KEY (context=? AND source_collection=? AND source_id=?)"
+            ],
+            "incoming_membership": [
+              "SEARCH e USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=? AND edge_type=? AND source_collection=?)",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            "spatial": [
+              "SCAN r VIRTUAL TABLE INDEX 2:B0D1B2D3",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ],
+            "text_active": [
+              "SCAN f VIRTUAL TABLE INDEX 0:M1",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          },
+          "sqlite_version": "3.46.0"
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 7,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 2,
+      "wall_seconds": 123.70237438008189
+    },
+    {
+      "command": [
+        "<scratch>",
+        "e4",
+        "100000",
+        "32",
+        "<scratch>",
+        "resumable",
+        "none"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 232722432,
+        "logical_bytes": 95928304,
+        "rss_bytes": 24498176
+      },
+      "driver_samples": 3856,
+      "engine": "e4",
+      "final_tree_bytes": {
+        "allocated": 90284032,
+        "logical": 90280032
+      },
+      "policy": "resumable",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 203.095163826,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "indexes": 2,
+              "policy": "resumable",
+              "publication_commits": 782,
+              "seconds": 6.7041243900000005,
+              "steps": 782
+            },
+            "spatial": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 2.373023377,
+              "steps": 391
+            },
+            "text": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 20.059072613,
+              "steps": 391
+            },
+            "vector": {
+              "policy": "resumable",
+              "publication_commits": 391,
+              "seconds": 1.774623759,
+              "steps": 391
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 4.9738859,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.030502408,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 39.056145211,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 4.906371835,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 6.815162953,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 42.639100927,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 4.552398757,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.424447051,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 37.648067361,
+              "updated": 100000
+            }
+          ],
+          "engine": "e4",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 4.53890024
+          },
+          "final_bytes": [
+            90280032,
+            90284032
+          ],
+          "graph_load": {
+            "relationships": 300000,
+            "reverse_maintained": true,
+            "seconds": 13.118797923
+          },
+          "loaded_bytes": [
+            46497888,
+            46501888
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.00079243
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.004456047
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.056020876
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.178739878
+            }
+          },
+          "publication_policy": "resumable",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 5,
+              "seconds": 0.000528968,
+              "work": "QueryWork { candidates: 5, primary_reads: 11, scalar_postings: 0, graph_edges: 9, graph_visited: 6, spatial_postings: 5, text_postings: 0, vector_locators: 5, vector_sidecars: 5, vector_lanes: 160, output_bytes: 110 }"
+            },
+            "members_active_spatial_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 10,
+              "seconds": 0.029800182,
+              "work": "QueryWork { candidates: 1000, primary_reads: 1011, scalar_postings: 0, graph_edges: 1001, graph_visited: 1001, spatial_postings: 666, text_postings: 0, vector_locators: 133, vector_sidecars: 133, vector_lanes: 4256, output_bytes: 220 }"
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.017189339
+            },
+            "spatial_bbox": {
+              "driver": "RTree candidate-first CROSS JOIN + exact f64 refinement",
+              "hits": 10100,
+              "seconds": 0.003584447
+            },
+            "text_active_vector": {
+              "driver": "Text(IndexId(5))",
+              "hits": 10,
+              "seconds": 0.200406813,
+              "work": "QueryWork { candidates: 37500, primary_reads: 37510, scalar_postings: 0, graph_edges: 0, graph_visited: 0, spatial_postings: 0, text_postings: 37501, vector_locators: 24999, vector_sidecars: 24999, vector_lanes: 799968, output_bytes: 220 }"
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.052818222,
+              "semantics": "phase2 positive BM25"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.15463129
+            }
+          },
+          "reader_mode": "none",
+          "reader_scope": "no concurrent reader",
+          "reopen_seconds": 0.01218676,
+          "rss_hwm": "VmHWM:\t   23352 kB",
+          "sampled_peak_bytes": [
+            94469616,
+            98607104
+          ]
+        },
+        "rows": 100000
+      },
+      "reader_mode": "none",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 8,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 2,
+      "wall_seconds": 203.0984554439783
+    },
+    {
+      "command": [
+        "<scratch>",
+        "e4",
+        "100000",
+        "32",
+        "<scratch>",
+        "atomic",
+        "batch"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 130682880,
+        "logical_bytes": 95874432,
+        "rss_bytes": 24371200
+      },
+      "driver_samples": 3515,
+      "engine": "e4",
+      "final_tree_bytes": {
+        "allocated": 90284032,
+        "logical": 90280032
+      },
+      "policy": "atomic",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 183.510670384,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "indexes": 2,
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 2.188892314,
+              "steps": 782
+            },
+            "spatial": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 0.830916525,
+              "steps": 391
+            },
+            "text": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 18.536277796,
+              "steps": 391
+            },
+            "vector": {
+              "policy": "atomic",
+              "publication_commits": 1,
+              "seconds": 0.451984031,
+              "steps": 391
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 5.067447211,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 6.086177805,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 41.164088299,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 4.309355727,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 4.956072821,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 34.9190932,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 4.392624082,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 5.784863823,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 35.204850327,
+              "updated": 100000
+            }
+          ],
+          "engine": "e4",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 4.59770035
+          },
+          "final_bytes": [
+            90280032,
+            90284032
+          ],
+          "graph_load": {
+            "relationships": 300000,
+            "reverse_maintained": true,
+            "seconds": 11.597139137
+          },
+          "loaded_bytes": [
+            46497888,
+            46501888
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.000541562
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.004188412
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.053752371
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.167286208
+            }
+          },
+          "publication_policy": "atomic",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 5,
+              "seconds": 0.000554967,
+              "work": "QueryWork { candidates: 5, primary_reads: 11, scalar_postings: 0, graph_edges: 9, graph_visited: 6, spatial_postings: 5, text_postings: 0, vector_locators: 5, vector_sidecars: 5, vector_lanes: 160, output_bytes: 110 }"
+            },
+            "members_active_spatial_vector": {
+              "driver": "Graph { filter: 0 }",
+              "hits": 10,
+              "seconds": 0.031985942,
+              "work": "QueryWork { candidates: 1000, primary_reads: 1011, scalar_postings: 0, graph_edges: 1001, graph_visited: 1001, spatial_postings: 666, text_postings: 0, vector_locators: 133, vector_sidecars: 133, vector_lanes: 4256, output_bytes: 220 }"
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.017257838
+            },
+            "spatial_bbox": {
+              "driver": "RTree candidate-first CROSS JOIN + exact f64 refinement",
+              "hits": 10100,
+              "seconds": 0.006291559
+            },
+            "text_active_vector": {
+              "driver": "Text(IndexId(5))",
+              "hits": 10,
+              "seconds": 0.207361628,
+              "work": "QueryWork { candidates: 37500, primary_reads: 37510, scalar_postings: 0, graph_edges: 0, graph_visited: 0, spatial_postings: 0, text_postings: 37501, vector_locators: 24999, vector_sidecars: 24999, vector_lanes: 799968, output_bytes: 220 }"
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.054335809,
+              "semantics": "phase2 positive BM25"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.164620902
+            }
+          },
+          "reader_mode": "batch",
+          "reader_scope": "one snapshot held across the first 256-row update commit of each CRUD round, then released",
+          "reopen_seconds": 0.008554657,
+          "rss_hwm": "VmHWM:\t   23484 kB",
+          "sampled_peak_bytes": [
+            94469616,
+            98607104
+          ]
+        },
+        "rows": 100000
+      },
+      "reader_mode": "batch",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 9,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 0,
+      "wall_seconds": 183.51653896272182
+    },
+    {
+      "command": [
+        "<scratch>",
+        "sqlite",
+        "100000",
+        "32",
+        "<scratch>",
+        "atomic",
+        "batch"
+      ],
+      "dimension": 32,
+      "driver_sample_interval_seconds": 0.05,
+      "driver_sampled_peak": {
+        "allocated_bytes": 109748224,
+        "logical_bytes": 81623480,
+        "rss_bytes": 18448384
+      },
+      "driver_samples": 2128,
+      "engine": "sqlite",
+      "final_tree_bytes": {
+        "allocated": 69918720,
+        "logical": 69918720
+      },
+      "policy": "atomic",
+      "raw": {
+        "cache_bytes": 8388608,
+        "commit_batch": 256,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "dimension": 32,
+        "disk_scope": "all regular files recursively under dedicated root including tmp",
+        "durability": "FULL WAL",
+        "e4_create_compact_cells": true,
+        "elapsed_seconds": 110.890777432,
+        "format": "phase2-multimodel-bench-v1",
+        "generator": "phase2-synthetic-v1",
+        "input_digest": "crc32c:4935e892",
+        "organizations": 100,
+        "peak_sampling": "in-process after commits/stages; discrete lower bound; driver adds timed polling and SQLite unlinked temp remains unobservable",
+        "profile": "scale-full-population-3round",
+        "refusal_accounting": "timed workload retains only compact committed boundaries; the bounded streaming committed-state oracle runs after a typed resource refusal and outside named stage timings",
+        "relationships": 300000,
+        "result": {
+          "builds": {
+            "scalar": {
+              "policy": "SQLite atomic DDL",
+              "publication_commits": 1,
+              "seconds": 0.232546004
+            },
+            "spatial": {
+              "policy": "SQLite atomic DDL+population",
+              "publication_commits": 1,
+              "seconds": 1.312680004
+            },
+            "text": {
+              "policy": "SQLite atomic DDL+FTS rebuild",
+              "publication_commits": 1,
+              "seconds": 0.340518003
+            },
+            "vector": {
+              "policy": "no native vector index; exact f32 blobs already loaded",
+              "publication_commits": 0,
+              "seconds": 0.0
+            }
+          },
+          "crud": [
+            {
+              "cycle": 0,
+              "delete_seconds": 3.986647337,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.6797033319999999,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 26.049086166,
+              "updated": 100000
+            },
+            {
+              "cycle": 1,
+              "delete_seconds": 2.958190132,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.8264536900000001,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 30.013349693,
+              "updated": 100000
+            },
+            {
+              "cycle": 2,
+              "delete_seconds": 2.745096111,
+              "deleted_fraction": 0.1,
+              "deleted_reinserted": 10000,
+              "profile": "scale",
+              "reinsert_edges_seconds": 1.8617430499999998,
+              "relationships_reasserted_during_update": 300000,
+              "update_seconds": 27.810301397,
+              "updated": 100000
+            }
+          ],
+          "engine": "sqlite",
+          "entity_load": {
+            "commits": 392,
+            "seconds": 2.988972811
+          },
+          "final_bytes": [
+            69951488,
+            69951488
+          ],
+          "graph_load": {
+            "edge_table": "WITHOUT ROWID",
+            "forward_primary_key_and_reverse_index_maintained": true,
+            "relationships": 300000,
+            "seconds": 5.341216328
+          },
+          "loaded_bytes": [
+            43085824,
+            43085824
+          ],
+          "post_crud_queries": {
+            "scalar_age": {
+              "hits": 1429,
+              "seconds": 0.000455651
+            },
+            "spatial": {
+              "hits": 10000,
+              "seconds": 0.019602594
+            },
+            "text": {
+              "hits": 10,
+              "seconds": 0.138558973
+            },
+            "vector": {
+              "hits": 10,
+              "seconds": 0.10401376
+            }
+          },
+          "publication_policy": "native SQLite atomic DDL",
+          "queries": {
+            "combined_graph_active_bbox_vector": {
+              "driver": "recursive edge-index candidates first via CROSS JOIN, then scalar + RTree + exact Rust f32 ranking",
+              "hits": 5,
+              "seconds": 0.000523507
+            },
+            "members_active_spatial_vector": {
+              "driver": "incoming edge-index candidates first via CROSS JOIN, then active + RTree overlap/exact refinement + exact Rust f32 ranking",
+              "hits": 10,
+              "seconds": 0.007121391
+            },
+            "scalar_active_age": {
+              "hits": 100,
+              "seconds": 0.00019259
+            },
+            "spatial_bbox": {
+              "hits": 10100,
+              "seconds": 0.015673042
+            },
+            "sqlite_native_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.046504186,
+              "semantics": "SQLite FTS5 native rank; not cross-engine BM25"
+            },
+            "text_active_vector": {
+              "driver": "FTS MATCH candidates first via CROSS JOIN, then active refinement + exact Rust f32 ranking",
+              "hits": 10,
+              "seconds": 0.066088254
+            },
+            "text_positive_bm25_k10": {
+              "hits": 10,
+              "seconds": 0.101186325,
+              "semantics": "FTS MATCH candidate-first CROSS JOIN cost plus phase2 positive BM25 scoring"
+            },
+            "vector_cosine_k10": {
+              "hits": 10,
+              "seconds": 0.085623979
+            }
+          },
+          "reader_mode": "batch",
+          "reader_scope": "one snapshot held across the first 256-row update commit of each CRUD round, then released",
+          "reopen_seconds": 0.001451231,
+          "rss_hwm": "VmHWM:\t   18016 kB",
+          "runtime_settings": {
+            "cache_bytes": 8388608,
+            "fts": "FTS5 unicode61 remove_diacritics=0",
+            "journal_mode": "WAL",
+            "synchronous": "FULL",
+            "temp_store": "FILE",
+            "vector": "identical Rust exact f32 math over blobs"
+          },
+          "sampled_peak_bytes": [
+            81623480,
+            81625088
+          ],
+          "sqlite_query_plans": {
+            "combined_graph": [
+              "CO-ROUTINE reach",
+              "SETUP",
+              "SEARCH edges USING PRIMARY KEY (context=? AND source_collection=? AND source_id=? AND edge_type=? AND destination_collection=?)",
+              "RECURSIVE STEP",
+              "SCAN r",
+              "SEARCH e USING PRIMARY KEY (context=? AND source_collection=? AND source_id=? AND edge_type=? AND destination_collection=?)",
+              "SCAN q",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "SCAN s VIRTUAL TABLE INDEX 1:",
+              "USE TEMP B-TREE FOR DISTINCT"
+            ],
+            "combined_members": [
+              "SEARCH e USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=? AND edge_type=? AND source_collection=?)",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "SCAN r VIRTUAL TABLE INDEX 1:"
+            ],
+            "delete_incoming": [
+              "SEARCH edges USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=?)"
+            ],
+            "delete_outgoing": [
+              "SEARCH edges USING PRIMARY KEY (context=? AND source_collection=? AND source_id=?)"
+            ],
+            "incoming_membership": [
+              "SEARCH e USING COVERING INDEX edge_in (context=? AND destination_collection=? AND destination_id=? AND edge_type=? AND source_collection=?)",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            "spatial": [
+              "SCAN r VIRTUAL TABLE INDEX 2:B0D1B2D3",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ],
+            "text_active": [
+              "SCAN f VIRTUAL TABLE INDEX 0:M1",
+              "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          },
+          "sqlite_version": "3.46.0"
+        },
+        "rows": 100000
+      },
+      "reader_mode": "batch",
+      "returncode": 0,
+      "rows": 100000,
+      "sequence": 10,
+      "stderr": "<scratch>",
+      "stdout": "<scratch>",
+      "trial": 0,
+      "wall_seconds": 110.8951193317771
+    }
+  ],
+  "binary": "<scratch>",
+  "binary_sha256": "5034ad305932ecf60b28a1c9a61be5a08935cd56f2beeb09807ca24addb8e71e",
+  "capture_complete": false,
+  "complete": false,
+  "format": "phase2-multimodel-driver-v2",
+  "peak_limit": "timed polling is discrete; transients between samples and unlinked SQLite temp files can be missed",
+  "poll_seconds": 0.05,
+  "reader_scopes": {
+    "batch": "one snapshot held across the first 256-row update commit of each CRUD round, then released",
+    "held": "one snapshot held across all three CRUD rounds",
+    "none": "no concurrent reader",
+    "short": "one snapshot held across each complete CRUD round"
+  },
+  "status": "candidate-evidence-not-public-acceptance",
+  "workload_complete": false
+}

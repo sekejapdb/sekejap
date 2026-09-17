@@ -1,0 +1,86 @@
+{
+  "cache_bytes": 8388608,
+  "churn": [
+    {
+      "bytes": [
+        7991296,
+        7991296
+      ],
+      "delete_s": 0.426542405,
+      "reinsert_s": 0.294214169,
+      "round": 1,
+      "update_s": 5.503385327,
+      "verified": true
+    },
+    {
+      "bytes": [
+        7999488,
+        7999488
+      ],
+      "delete_s": 0.34173398,
+      "reinsert_s": 0.339353732,
+      "round": 2,
+      "update_s": 4.615566082,
+      "verified": true
+    },
+    {
+      "bytes": [
+        7999488,
+        7999488
+      ],
+      "delete_s": 0.241438208,
+      "reinsert_s": 0.457255201,
+      "round": 3,
+      "update_s": 4.209650602,
+      "verified": true
+    }
+  ],
+  "columns": "external key, age i64, name text, active bool",
+  "commit_batch": 256,
+  "durability": "WAL FULL",
+  "engine": "sqlite",
+  "final_bytes": [
+    7966720,
+    7966720
+  ],
+  "index": "age nonunique, plus unique external key",
+  "indexed_bytes": [
+    7303168,
+    7303168
+  ],
+  "late_index_s": 0.052740676,
+  "load_s": 1.701837007,
+  "loaded_bytes": [
+    6328320,
+    6328320
+  ],
+  "peak_sampling": "after each commit and phase, excludes sub-commit filesystem peaks",
+  "process_peak_rss": "VmHWM:\t   14520 kB",
+  "queries": [
+    {
+      "hits": 1250,
+      "lower": 38,
+      "seconds": 0.000341518,
+      "upper": 38
+    },
+    {
+      "hits": 3750,
+      "lower": 47,
+      "seconds": 0.000489174,
+      "upper": 49
+    },
+    {
+      "hits": 3750,
+      "lower": 90,
+      "seconds": 0.000598738,
+      "upper": 92
+    }
+  ],
+  "reopen_s": 0.000965494,
+  "rows": 100000,
+  "sampled_peak_bytes": [
+    12824040,
+    16388096
+  ],
+  "verified": true
+}

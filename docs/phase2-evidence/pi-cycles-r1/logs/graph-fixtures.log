@@ -1,0 +1,9 @@
+{"fixture": "default-checkpointed", "handoff": "checkpointed", "result": "PASS", "source_unchanged": true}
+{"fixture": "default-checkpointed", "handoff": "wal-pending", "result": "PASS", "source_unchanged": true}
+{"fixture": "default-wal-pending", "handoff": "checkpointed", "result": "PASS", "source_unchanged": true}
+{"fixture": "default-wal-pending", "handoff": "wal-pending", "result": "PASS", "source_unchanged": true}
+{"fixture": "retained-checkpointed", "handoff": "checkpointed", "result": "PASS", "source_unchanged": true}
+{"fixture": "retained-checkpointed", "handoff": "wal-pending", "result": "PASS", "source_unchanged": true}
+{"fixture": "retained-wal-pending", "handoff": "checkpointed", "result": "PASS", "source_unchanged": true}
+{"fixture": "retained-wal-pending", "handoff": "wal-pending", "result": "PASS", "source_unchanged": true}
+{"result": "PASS", "arms": 8, "report": "<scratch>"}

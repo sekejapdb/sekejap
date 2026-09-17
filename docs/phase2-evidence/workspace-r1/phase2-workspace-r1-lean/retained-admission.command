@@ -1,0 +1,1 @@
+cargo test --release --locked --offline --no-fail-fast --features compact-cells\,sqlite-balance\,keyspace-append\,slotref-split --test index_admission --test graph_admission --test vector_admission --test spatial_admission --test text_admission -- --test-threads=1 

@@ -1,0 +1,27 @@
+{
+  "result": "PASS",
+  "scope": "ARM same-revision cross-build candidate preparation, not performance or release acceptance",
+  "families": [
+    {
+      "family": "graph",
+      "sources": 4,
+      "cycles": 16,
+      "report": "<scratch>",
+      "sha256": "a3d9aa8c45ee08cd0ee48a58b00c007e3d31e71aca3669b932f3fdd2c00c7f94"
+    },
+    {
+      "family": "multimodel",
+      "sources": 20,
+      "cycles": 80,
+      "report": "<scratch>",
+      "sha256": "805673dbbf26323854aad9cda3211e2f66306cc08eed09f6670b9677e0fe80fb"
+    },
+    {
+      "family": "lifecycle",
+      "sources": 80,
+      "cycles": 320,
+      "report": "<scratch>",
+      "sha256": "6aa9c53905746e1604f60d21e931bd24019fffa78173bd3da1e4255f33a78f67"
+    }
+  ]
+}

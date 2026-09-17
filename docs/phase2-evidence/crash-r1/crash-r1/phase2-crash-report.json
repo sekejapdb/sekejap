@@ -1,0 +1,5065 @@
+{
+  "builds": {
+    "default": {
+      "arms": [
+        {
+          "boundary": "precommit",
+          "classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "delay_seconds": null,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY"
+          ]
+        },
+        {
+          "boundary": "postcommit",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": null,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING",
+            "COMMIT_RETURNED"
+          ]
+        },
+        {
+          "boundary": "timing",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": 0.0,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING"
+          ]
+        },
+        {
+          "boundary": "timing",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": 0.0001,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING"
+          ]
+        },
+        {
+          "boundary": "timing",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": 0.001,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING"
+          ]
+        },
+        {
+          "boundary": "timing",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": 0.005,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 0 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "build",
+            "observed": "Building { after: 0 }",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": 0.0,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ],
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ],
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": 0.0,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ],
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ],
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 0 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "build",
+            "observed": "Building { after: 0 }",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": 0.0,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ],
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ],
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": 0.0,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ],
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ],
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 0 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "build",
+            "observed": "Building { after: 0 }",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": 0.0,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ],
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ],
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": 0.0,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ],
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ],
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 0 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "788105",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 0 }"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "788105",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "build",
+            "observed": "Building { after: 0 }",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": 0.0,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "788105",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "788105",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "758105636166c3a9008102",
+                "00000001"
+              ],
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "758105636166c3a9008102",
+                "00000001"
+              ],
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": 0.0,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "758105636166c3a9008102",
+                "00000001"
+              ],
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "758105636166c3a9008102",
+                "00000001"
+              ],
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 1
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 2
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 3
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 4
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 5
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 6
+        }
+      ],
+      "binary": "<scratch>",
+      "binary_sha256": "02a56ee5ad87b2755cd51b2f7b73b6f5ab0ab1bc0ca2a844b1bd70e636be13b6",
+      "source_inventory": [
+        {
+          "bytes": 4221,
+          "path": "MULTIMODEL_FIXTURE.json",
+          "sha256": "265f1c0a1561f32819afd310c046ef6fa68f04339eaccb05bd4a51a06bd287f3"
+        },
+        {
+          "bytes": 8192,
+          "path": "data",
+          "sha256": "6613e9d770f13aa4f24674783d26e529e13dc363209401d5afa48a490eff967f"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-0.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-1.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-2.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-3.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-4.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-5.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-6.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-7.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 96,
+          "path": "readers.lock",
+          "sha256": "b5aa4e3cc40261e98f55329cd42c252ae8ece31503da3fc71af302dc0c7a7296"
+        },
+        {
+          "bytes": 368816,
+          "path": "wal",
+          "sha256": "187001c4ef6c335b41020ba229a5f38ee5379170855b2ea9e6154afe169f78d9"
+        },
+        {
+          "bytes": 0,
+          "path": "writer.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "source_unchanged": true,
+      "version": {
+        "commit_stage_hook": false,
+        "compile_features": {
+          "compact-cells": false,
+          "keyspace-append": false,
+          "slotref-split": false,
+          "sqlite-balance": false
+        },
+        "create_compact_cells": false,
+        "deterministic_checkpoint_stages": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "engine_revision": "phase2-query-r1-plus-crash-harness",
+        "harness": "phase2-crash-probe-v1",
+        "write_fault_hook_available_to_binary": false
+      }
+    },
+    "retained": {
+      "arms": [
+        {
+          "boundary": "precommit",
+          "classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "delay_seconds": null,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY"
+          ]
+        },
+        {
+          "boundary": "postcommit",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": null,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING",
+            "COMMIT_RETURNED"
+          ]
+        },
+        {
+          "boundary": "timing",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": 0.0,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING"
+          ]
+        },
+        {
+          "boundary": "timing",
+          "classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "delay_seconds": 0.0001,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING"
+          ]
+        },
+        {
+          "boundary": "timing",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": 0.001,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING"
+          ]
+        },
+        {
+          "boundary": "timing",
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "delay_seconds": 0.005,
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "kind": "commit",
+          "writer_barriers": [
+            "MUTATIONS_READY",
+            "COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 0 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "build",
+            "observed": "Building { after: 0 }",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": 0.0,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ],
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ],
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": 0.0,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ],
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "scalar",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7081050280000000000000148101",
+                ""
+              ],
+              [
+                "70810502800000000000001e8102",
+                ""
+              ],
+              [
+                "7081050280000000000000288103",
+                ""
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "scalar",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 0 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "build",
+            "observed": "Building { after: 0 }",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": 0.0,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ],
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ],
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": 0.0,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ],
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "vector",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "7381058101",
+                "000000010003"
+              ],
+              [
+                "7381058102",
+                "000000010003"
+              ],
+              [
+                "7381058103",
+                "000000010003"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "vector",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 0 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "build",
+            "observed": "Building { after: 0 }",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": 0.0,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ],
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ],
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": 0.0,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ],
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "spatial",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "748105800000008101",
+                "00000000000000000000000000000000"
+              ],
+              [
+                "74810580004f148102",
+                "000000000000f03f0000000000000000"
+              ],
+              [
+                "7481058003befa8103",
+                "00000000000000400000000000000000"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "spatial",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 0 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "788105",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 0 }"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "788105",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "build",
+            "observed": "Building { after: 0 }",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": 0.0,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "788105",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "delay_seconds": null,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Building { after: 1 }",
+          "kind": "lifecycle",
+          "mode": "build",
+          "observed_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000001"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "00000000000000010000000000000004"
+              ]
+            ],
+            "state": "Building { after: 1 }"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "788105",
+                "00000000000000000000000000000000"
+              ]
+            ],
+            "state": "Building { after: 0 }"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "build",
+            "observed": "Building { after: 1 }",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "precommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "758105636166c3a9008102",
+                "00000001"
+              ],
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "758105636166c3a9008102",
+                "00000001"
+              ],
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "old",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "timing",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": 0.0,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "758105636166c3a9008102",
+                "00000001"
+              ],
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING"
+          ]
+        },
+        {
+          "base_classification": {
+            "exact": true,
+            "state": "original"
+          },
+          "boundary": "postcommit",
+          "committed_new_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "delay_seconds": null,
+          "family": "text",
+          "held_snapshot": {
+            "barriers": [
+              "SNAPSHOT_READY",
+              "SNAPSHOT_STILL_EXACT"
+            ],
+            "exact_old_snapshot": true
+          },
+          "initial_lifecycle_after_reopen": "Dropping",
+          "kind": "lifecycle",
+          "mode": "drop",
+          "observed_signature": {
+            "entries": [
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "old_signature": {
+            "entries": [
+              [
+                "758105636166c3a9008102",
+                "00000001"
+              ],
+              [
+                "7581056461746162617365008101",
+                "00000002"
+              ],
+              [
+                "7581056461746162617365008103",
+                "00000001"
+              ],
+              [
+                "75810569cc877374616e62756c008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008101",
+                "00000001"
+              ],
+              [
+                "75810572757374008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008102",
+                "00000001"
+              ],
+              [
+                "758105736561726368008103",
+                "00000001"
+              ],
+              [
+                "758105e58c97e4baac008103",
+                "00000001"
+              ],
+              [
+                "7681058101",
+                "00000004"
+              ],
+              [
+                "7681058102",
+                "00000003"
+              ],
+              [
+                "7681058103",
+                "00000003"
+              ],
+              [
+                "778105636166c3a900",
+                "0000000000000001"
+              ],
+              [
+                "778105646174616261736500",
+                "0000000000000002"
+              ],
+              [
+                "77810569cc877374616e62756c00",
+                "0000000000000001"
+              ],
+              [
+                "7781057275737400",
+                "0000000000000002"
+              ],
+              [
+                "77810573656172636800",
+                "0000000000000002"
+              ],
+              [
+                "778105e58c97e4baac00",
+                "0000000000000001"
+              ],
+              [
+                "788105",
+                "0000000000000003000000000000000a"
+              ]
+            ],
+            "state": "Dropping"
+          },
+          "resume_and_oracle": {
+            "family": "text",
+            "mode": "drop",
+            "observed": "Dropping",
+            "resumed": true
+          },
+          "transition_endpoint": "committed-new",
+          "writer_barriers": [
+            "STEP_READY",
+            "STEP_MUTATED done=false",
+            "STEP_COMMIT_STARTING",
+            "STEP_COMMITTED done=false"
+          ]
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 1
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 2
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 3
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 4
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 5
+        },
+        {
+          "classification": {
+            "exact": true,
+            "state": "updated"
+          },
+          "exit_code": 86,
+          "kind": "deterministic-checkpoint",
+          "stage": 6
+        }
+      ],
+      "binary": "<scratch>",
+      "binary_sha256": "165748ef8562b3b857950226b9fc15274398613bd0c24c05b6d4382bfb4a95c8",
+      "source_inventory": [
+        {
+          "bytes": 4221,
+          "path": "MULTIMODEL_FIXTURE.json",
+          "sha256": "8eb01e5d2a5b38a12f2c2213ba77694fb9e466924e260e9d98623c98bc3d37ff"
+        },
+        {
+          "bytes": 8192,
+          "path": "data",
+          "sha256": "6d5e15db748a71803012f5f521c17b42255129b6bca2bf2b2cd2cecf9d4d24df"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-0.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-1.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-2.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-3.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-4.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-5.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-6.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 0,
+          "path": "reader-7.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "bytes": 96,
+          "path": "readers.lock",
+          "sha256": "0682463c7788c8969982fd417dd69282e4ac8d1c53c85ed551fbc195750be9f4"
+        },
+        {
+          "bytes": 368816,
+          "path": "wal",
+          "sha256": "8b29b29d551cecca091e202be42a5f5b7553e16dc492a237e396baa30f9967f5"
+        },
+        {
+          "bytes": 0,
+          "path": "writer.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "source_unchanged": true,
+      "version": {
+        "commit_stage_hook": false,
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "create_compact_cells": true,
+        "deterministic_checkpoint_stages": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "engine_revision": "phase2-query-r1-plus-crash-harness",
+        "harness": "phase2-crash-probe-v1",
+        "write_fault_hook_available_to_binary": false
+      }
+    }
+  },
+  "complete": true,
+  "finished_unix": 1789574246.916393,
+  "format": "e4-phase2-crash-qualification-v1",
+  "limits": {
+    "checkpoint": "deterministic PageWAL pilot stages 1..6, expected abrupt exit 86",
+    "commit_window": "SIGKILL timing samples; no public deterministic commit-stage hook",
+    "peak_or_randomness_claim": false,
+    "write_faults": "normal binaries cannot arm cfg(test) PageWAL write faults; exhaustive in-crate family fault tests are companion evidence"
+  },
+  "started_unix": 1789574232.5970306,
+  "status": "candidate-evidence-not-public-acceptance"
+}

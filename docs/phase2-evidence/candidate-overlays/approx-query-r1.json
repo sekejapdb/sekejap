@@ -1,0 +1,13 @@
+{
+  "src/pagewal.rs": "b0ad86c0b214b5f1c946063779a580d1218e3c4da7ae339f633868a4aaa2d34c",
+  "src/pagewal/create_feature_tests.rs": "5676ba30af35e1a07618ae779dcac7f46b4776fc92e3b4e4e9de66162bd8c4d2",
+  "src/pagewal/current_reader.rs": "1f139766479768abe8082ebc7d0723328da79a6c4c9958d2fbabd3bf3982c946",
+  "src/index_rebuild.rs": "8c4e23bbb0d5e981cec1105a3d4ca6f797080e434b04967f6bbc78f180bb774b",
+  "tests/index_rebuild.rs": "c3819c7922c30a048dee15b355241b0e8c5621abf4cbac419118e2779dad672d",
+  "src/query.rs": "e640abcecfc378ce3a2d746058230300f5be1ad0739be796b90d2df14cb30d1a",
+  "tests/query_multimodel.rs": "46bf17c7a6350a071789108b307d98adc33c65a938fcc27c7db450a7805a208a",
+  "examples/query_multimodel.rs": "472b4c06f5b59c6619ba020e23c9d1c9081308c2c4ce6b8efbb90d09bbc285d3",
+  "src/collections.rs": "995412f81a71c792555483a72999ab044808d50429f268d85b279e4a371bfffe",
+  "src/quantized_vector_indexes.rs": "045ccc9d3dd82c14da69c20880f6955139c98601a47787c9cd1828563e49eda0",
+  "docs/PHASE2_QUERY_DESIGN.md": "bdd66bbfce70673e1759a6cd1b7f6840dd5bc9680da7ed24c67be36474aa09ef"
+}

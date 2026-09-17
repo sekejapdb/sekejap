@@ -1,0 +1,6 @@
+{
+  "src/collections.rs": "3810f8572ead2e25ee86018683476d7a0f7b31c4a69dfcb2e95d3e61190ac048",
+  "src/indexes.rs": "fded724f8677b1de61d9d6ef350a60cf5aa19ae0972aecde0d5093d0cc07ba3e",
+  "src/query.rs": "c7b271f72aa60f18b0cdac899560c8fb366dd10733d8d9dfa9abaf15cec1f980",
+  "tests/query_scalar.rs": "b24abbd153dd79c81ab5bcf98f771ea9a887808fd584a4711dddc0276162d1c1"
+}

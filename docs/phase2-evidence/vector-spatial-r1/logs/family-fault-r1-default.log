@@ -1,0 +1,229 @@
+   Compiling kernel v0.17.0 (<scratch>)
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `reader_slot` is never read
+   --> kernel/src/store.rs:220:5
+    |
+206 | pub struct Store {
+    |            ----- field in this struct
+...
+220 |     reader_slot: Option<crate::readers::ReaderSlot>,
+    |     ^^^^^^^^^^^
+
+   Compiling e4-prototype v0.1.0 (<scratch>)
+warning: field `path` is never read
+   --> src/collections.rs:148:5
+    |
+146 | pub struct Database {
+    |            -------- field in this struct
+147 |     store: Backend,
+148 |     path: PathBuf,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `open_with` is never used
+   --> src/pagewal.rs:621:8
+    |
+609 | impl PageWalStore {
+    | ----------------- associated function in this implementation
+...
+621 |     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
+    |        ^^^^^^^^^
+
+warning: `e4-prototype` (lib) generated 2 warnings
+warning: `kernel` (lib) generated 2 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 56s
+     Running tests/graph_admission.rs (<scratch>)
+
+running 4 tests
+test graph_rows_cannot_be_hidden_by_clearing_feature_and_metadata ... ok
+test damaged_graph_metadata_replica_falls_back_without_rewriting_source ... ok
+test missing_reverse_or_primary_and_bad_properties_have_distinct_read_failures ... ok
+test intact_future_graph_header_or_name_replica_refuses_before_source_mutation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/graph_collections.rs (<scratch>)
+
+running 6 tests
+test cyclic_bfs_is_shortest_hop_deterministic_and_bounded ... ok
+test directed_typed_context_edges_replace_properties_and_survive_reopen ... ok
+test entity_delete_cascades_both_directions_all_contexts_and_self_edges ... ok
+test neighbor_and_bfs_cancellation_never_return_partial_or_poison_reads ... ok
+test entity_delete_refuses_degree_257_before_any_published_change ... ok
+test snapshots_unlink_missing_endpoints_and_delete_cascade_are_transactional ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/index_admission.rs (<scratch>)
+
+running 6 tests
+test building_unique_index_cannot_become_ready_with_an_unseen_duplicate ... ok
+test limited_policy_survives_index_opt_in_rollback_and_last_drop ... ok
+test damaged_future_descriptor_replica_falls_back_to_intact_siblings ... ok
+test missing_registry_or_intact_orphan_descriptor_is_not_silently_ignored ... ok
+test one_intact_future_index_encoding_replica_refuses_before_mutation ... ok
+test one_intact_unknown_logical_feature_replica_refuses_before_mutation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/index_lifecycle.rs (<scratch>)
+
+running 3 tests
+test drop_and_build_can_resume_after_reopen_without_claiming_ready ... ok
+test late_index_tracks_crud_and_published_snapshots ... ok
+test unique_conflict_and_schema_changes_do_not_leave_partial_indexes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/index_scalar_oracle.rs (<scratch>)
+
+running 1 test
+test scalar_indexes_match_independent_logical_oracle_through_repeated_crud ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/index_spatial.rs (<scratch>)
+
+running 3 tests
+test bbox_radius_nearest_two_fields_and_collections_match_oracles ... ok
+test build_live_crud_snapshot_rollback_drop_and_reopen ... ok
+test validation_work_bounds_cancellation_and_candidate_order_are_explicit ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/index_vector.rs (<scratch>)
+
+running 5 tests
+test late_build_refuses_incompatible_historical_same_name_field ... ok
+test immutable_layout_ordinals_live_crud_snapshots_rollback_and_reopen ... ok
+test tiny_workload_matches_independent_metrics_and_filters_before_top_k ... ok
+test validation_zero_vectors_ties_and_work_bounds_are_explicit ... ok
+test two_collections_build_and_drop_resume_without_touching_payloads ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/spatial_admission.rs (<scratch>)
+
+running 5 tests
+test clearing_spatial_feature_cannot_hide_descriptor_or_postings ... ok
+test malformed_coordinates_and_hilbert_are_corrupt_at_exact_access ... ok
+test missing_posting_is_detected_when_primary_candidates_are_supplied ... ok
+test posting_prefix_without_spatial_feature_is_refused ... ok
+test intact_future_spatial_family_version_or_options_refuse_without_mutation ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/vector_admission.rs (<scratch>)
+
+running 4 tests
+test locator_prefix_without_explicit_vector_feature_is_refused ... ok
+test clearing_vector_feature_cannot_hide_vector_descriptor_or_locators ... ok
+test malformed_locator_or_authoritative_sidecar_is_reported_at_exact_query ... ok
+test one_intact_unknown_vector_family_or_version_refuses_before_mutation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `reader_slot` is never read
+   --> kernel/src/store.rs:220:5
+    |
+206 | pub struct Store {
+    |            ----- field in this struct
+...
+220 |     reader_slot: Option<crate::readers::ReaderSlot>,
+    |     ^^^^^^^^^^^
+
+warning: `kernel` (lib) generated 2 warnings
+   Compiling e4-prototype v0.1.0 (<scratch>)
+    Finished `release` profile [optimized + debuginfo] target(s) in 24.24s
+     Running unittests src/lib.rs (<scratch>)
+
+running 1 test
+test collections::vector_indexes::fault_tests::vector_write_boundaries_preserve_entities_sidecars_indexes_and_readers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 3.00s
+
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `reader_slot` is never read
+   --> kernel/src/store.rs:220:5
+    |
+206 | pub struct Store {
+    |            ----- field in this struct
+...
+220 |     reader_slot: Option<crate::readers::ReaderSlot>,
+    |     ^^^^^^^^^^^
+
+warning: `kernel` (lib) generated 2 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (<scratch>)
+
+running 1 test
+test collections::spatial_indexes::fault_tests::spatial_write_boundaries_preserve_entities_indexes_and_readers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 2.71s
+
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `reader_slot` is never read
+   --> kernel/src/store.rs:220:5
+    |
+206 | pub struct Store {
+    |            ----- field in this struct
+...
+220 |     reader_slot: Option<crate::readers::ReaderSlot>,
+    |     ^^^^^^^^^^^
+
+warning: `kernel` (lib) generated 2 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (<scratch>)
+
+running 6 tests
+test spatial_math::tests::geographiclib_wgs84_distance_goldens ... ok
+test spatial_math::tests::inclusive_boxes_handle_dateline_and_aliases ... ok
+test spatial_math::tests::bbox_covers_every_included_grid_and_random_point ... ok
+test spatial_math::tests::invalid_inputs_are_rejected ... ok
+test spatial_math::tests::zero_and_world_radius_are_conservative_and_exact ... ok
+test spatial_math::tests::radius_envelope_contains_every_exact_grid_and_random_hit ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 40 filtered out; finished in 0.05s
+

@@ -1,0 +1,11 @@
+
+running 6 tests
+test tests::frozen_scale_lanes_and_halfway_rule ... ok
+test tests::malformed_values_and_invalid_inputs_are_rejected ... ok
+test tests::metric_goldens_and_zero_rules ... ok
+test tests::subnormal_and_maximum_f32_keep_finite_nonzero_scales ... ok
+test tests::quantization_error_is_bounded_per_lane ... ok
+test tests::maximal_vector_scoring_checks_cancellation_in_chunks ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

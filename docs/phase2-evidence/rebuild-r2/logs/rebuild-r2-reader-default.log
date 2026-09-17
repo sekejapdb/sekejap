@@ -1,0 +1,36 @@
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `reader_slot` is never read
+   --> kernel/src/store.rs:220:5
+    |
+206 | pub struct Store {
+    |            ----- field in this struct
+...
+220 |     reader_slot: Option<crate::readers::ReaderSlot>,
+    |     ^^^^^^^^^^^
+
+warning: `kernel` (lib) generated 2 warnings
+   Compiling e4-prototype v0.1.0 (<scratch>)
+    Finished `release` profile [optimized + debuginfo] target(s) in 34.81s
+     Running unittests src/lib.rs (<scratch>)
+
+running 7 tests
+test pagewal::current_reader::tests::active_writer_is_refused_without_mutation ... ok
+test pagewal::current_reader::tests::checkpointed_source_is_streamed_without_source_changes ... ok
+test pagewal::current_reader::tests::committed_wal_overlays_checkpoint_and_deleted_rows_stay_absent ... ok
+test pagewal::current_reader::tests::crc_valid_reachable_cycle_is_refused_without_source_changes ... ok
+test pagewal::current_reader::tests::corrupt_reachable_page_and_work_or_value_overflow_refuse ... ok
+test pagewal::current_reader::tests::fingerprint_recheck_detects_inventory_change ... ok
+test pagewal::current_reader::tests::interior_tree_point_range_and_full_visit_match_independent_map ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 66 filtered out; finished in 0.13s
+

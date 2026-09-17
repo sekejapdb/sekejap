@@ -1,0 +1,6 @@
+{
+  "src/text_indexes.rs": "4a4a0beb5a46fcb1e692719e831a6bf38b4b33d838b4f520da893532c322ad22",
+  "src/text_fault_tests.rs": "dad172726db3fd9a2328123f72fab05c6f59dda783f233d39dd2e87a02d8dffd",
+  "tests/index_text.rs": "c5af364c32ce5ee191be6f3aeb775f074deb4cec56467641da0551589670ed9e",
+  "tests/text_admission.rs": "cbad8b0e84b5c60df3d71572ede8513fad4457650a92b06c583200fb377ff541"
+}

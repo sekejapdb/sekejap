@@ -1,0 +1,588 @@
+//! The late-build oracle.
+//!
+//! A late index build is allowed to get cheaper. It is not allowed to persist
+//! different bytes. This file is the guard for that: it seeds a fixed
+//! people + organizations corpus, builds one index of every family that has a
+//! late-build path, and folds every persisted key and value under that index's
+//! key prefix into a SHA-256 digest.
+//!
+//! The digests are pinned constants. They were produced by the **unchanged**
+//! builder on branch `pagewal-foundation` at working tree `a69838c` + the
+//! Phase 2 tree, before the scalar sort, the text chunk accumulator and the
+//! bounded-commit atomic policy were written. If a digest below moves, the
+//! change altered persisted index content and is refused, whatever it did to
+//! the clock.
+//!
+//! SHA-256 is implemented here from FIPS 180-4 rather than taken from the
+//! engine: an oracle that shares code with the thing it checks is not one.
+
+use e4_prototype::{
+    collections::{CollectionOptions, Database, EntityId, IndexId, ScalarPredicate},
+    Kind,
+};
+use kernel::{
+    io::IoMode,
+    store::{Config, SyncMode},
+};
+use serde_json::{json, Value};
+
+// ---------------------------------------------------------------- SHA-256
+
+const K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+struct Sha256 {
+    h: [u32; 8],
+    buf: [u8; 64],
+    n: usize,
+    len: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Sha256 {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: [0; 64],
+            n: 0,
+            len: 0,
+        }
+    }
+    fn block(&mut self) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(self.buf[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut v = self.h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+            let t1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v = [
+                t1.wrapping_add(t2),
+                v[0],
+                v[1],
+                v[2],
+                v[3].wrapping_add(t1),
+                v[4],
+                v[5],
+                v[6],
+            ];
+        }
+        for i in 0..8 {
+            self.h[i] = self.h[i].wrapping_add(v[i]);
+        }
+    }
+    fn update(&mut self, mut b: &[u8]) {
+        self.len += b.len() as u64;
+        while !b.is_empty() {
+            let take = (64 - self.n).min(b.len());
+            self.buf[self.n..self.n + take].copy_from_slice(&b[..take]);
+            self.n += take;
+            b = &b[take..];
+            if self.n == 64 {
+                self.block();
+                self.n = 0;
+            }
+        }
+    }
+    fn hex(mut self) -> String {
+        let bits = self.len * 8;
+        self.update(&[0x80]);
+        while self.n != 56 {
+            self.update(&[0]);
+        }
+        self.len = 0;
+        self.update(&bits.to_be_bytes());
+        self.h.iter().map(|w| format!("{w:08x}")).collect()
+    }
+}
+
+// ------------------------------------------------- key prefixes (from the spec)
+
+/// `PHASE2_INDEX_FORMAT.md`: ordered integers are `0x80 + width` then the
+/// minimal unsigned big-endian bytes. Written out here so the oracle does not
+/// borrow the engine's codec.
+fn ordered(n: u64) -> Vec<u8> {
+    let b = n.to_be_bytes();
+    let start = b.iter().position(|x| *x != 0).unwrap_or(7);
+    let mut k = vec![0x80 + (8 - start) as u8];
+    k.extend_from_slice(&b[start..]);
+    k
+}
+
+fn index_prefix(tag: u8, id: IndexId) -> Vec<u8> {
+    let mut k = vec![tag];
+    k.extend(ordered(id.0));
+    k
+}
+
+/// Every persisted tag a family owns. 0x70 scalar posting, 0x74 spatial
+/// posting, 0x75/0x76/0x77/0x78 text posting / norm / term stats / corpus.
+fn family_tags(family: &str) -> &'static [u8] {
+    match family {
+        "scalar" => &[0x70],
+        "spatial" => &[0x74],
+        "text" => &[0x75, 0x76, 0x77, 0x78],
+        _ => unreachable!(),
+    }
+}
+
+/// Fold every key and value the index owns, in key order, into one digest.
+/// Lengths are folded too, so no pair of entries can be re-split silently.
+fn digest(db: &Database, family: &str, id: IndexId) -> (String, u64) {
+    let mut h = Sha256::new();
+    let mut entries = 0;
+    for tag in family_tags(family) {
+        let p = index_prefix(*tag, id);
+        entries += db
+            .raw_for_each(&p, &mut |k, v| {
+                h.update(&(k.len() as u64).to_be_bytes());
+                h.update(k);
+                h.update(&(v.len() as u64).to_be_bytes());
+                h.update(v);
+            })
+            .unwrap();
+    }
+    (h.hex(), entries)
+}
+
+// ------------------------------------------------------------------ fixture
+
+fn cfg() -> Config {
+    Config {
+        budget_bytes: 1 << 20,
+        io: IoMode::Buffered,
+        sync: SyncMode::Full,
+    }
+}
+
+const PEOPLE: u64 = 2_000;
+const ORGS: u64 = 1_000;
+
+/// Deterministic, no randomness: every value is a closed form of the row index
+/// so the digests below are reproducible on any machine.
+fn person(i: u64) -> Value {
+    let words = [
+        "flood", "levee", "river", "bridge", "survey", "harbour", "silt", "canal", "tide", "rail",
+    ];
+    let mut bio = String::new();
+    for j in 0..(3 + i % 9) {
+        if j > 0 {
+            bio.push(' ');
+        }
+        bio.push_str(words[((i * 7 + j * 3) % 10) as usize]);
+    }
+    json!({
+        "name": format!("person-{i:05}"),
+        "age": ((i * 37) % 95) as i64,
+        "active": i % 3 == 0,
+        "bio": bio,
+        "home": {"type":"Point","coordinates":[
+            -180.0 + ((i * 131) % 3600) as f64 / 10.0,
+            -85.0 + ((i * 97) % 1700) as f64 / 10.0]},
+    })
+}
+
+fn org(i: u64) -> Value {
+    json!({"title": format!("org-{i:04}"), "staff": ((i * 13) % 500) as i64})
+}
+
+struct Seeded {
+    people: e4_prototype::collections::CollectionId,
+}
+
+fn seed(path: &std::path::Path) -> (Database, Seeded) {
+    let mut db = Database::create(path, cfg()).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![
+                ("name".into(), Kind::Text),
+                ("age".into(), Kind::Int),
+                ("active".into(), Kind::Bool),
+                ("bio".into(), Kind::Text),
+                ("home".into(), Kind::Point),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    let orgs = db
+        .create_collection(
+            "organizations",
+            vec![("title".into(), Kind::Text), ("staff".into(), Kind::Int)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    for i in 0..PEOPLE {
+        db.put(people, &format!("p{i:05}"), &person(i)).unwrap();
+        if i % 256 == 255 {
+            db.commit().unwrap();
+        }
+    }
+    for i in 0..ORGS {
+        db.put(orgs, &format!("o{i:04}"), &org(i)).unwrap();
+        if i % 256 == 255 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    (db, Seeded { people })
+}
+
+fn build(db: &mut Database, id: IndexId) -> u64 {
+    let before = db.pool_accesses().unwrap();
+    while !db.build_index_step(id, 256).unwrap() {
+        db.commit().unwrap();
+    }
+    db.commit().unwrap();
+    db.pool_accesses().unwrap() - before
+}
+
+/// Pinned by a run of the unchanged builder; see the module note.
+const SCALAR_AGE: &str = "6b7205dc65d3fc47285914b3e86cc0d8224722aa478d05a561c650e0b0bbdb63";
+const SCALAR_ACTIVE: &str = "5349a3713fc8216b9d04df511d8397fe09b5669bcbd8e78bfbc2a3c043770d09";
+const TEXT_BIO: &str = "e1b15c14f345ba66dc8a2cd0e954e38de8200ecd7e8f73c2adb0d15904475dc1";
+const SPATIAL_HOME: &str = "195919c4b0c7dfdbbcad2c117a6a3d861135d374b45445f72210554b1b19c863";
+
+#[test]
+fn a_late_build_persists_the_same_bytes_however_it_is_scheduled() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut db, s) = seed(&path);
+
+    let age = db
+        .create_scalar_index(s.people, "age_idx", "age", false)
+        .unwrap();
+    db.commit().unwrap();
+    let age_accesses = build(&mut db, age);
+
+    let active = db
+        .create_scalar_index(s.people, "active_idx", "active", false)
+        .unwrap();
+    db.commit().unwrap();
+    let active_accesses = build(&mut db, active);
+
+    let bio = db.create_text_index(s.people, "bio_idx", "bio").unwrap();
+    db.commit().unwrap();
+    let text_accesses = build(&mut db, bio);
+
+    let home = db
+        .create_point_index(s.people, "home_idx", "home")
+        .unwrap();
+    db.commit().unwrap();
+    let spatial_accesses = build(&mut db, home);
+
+    let found = [
+        ("scalar age", digest(&db, "scalar", age), SCALAR_AGE),
+        ("scalar active", digest(&db, "scalar", active), SCALAR_ACTIVE),
+        ("text bio", digest(&db, "text", bio), TEXT_BIO),
+        ("spatial home", digest(&db, "spatial", home), SPATIAL_HOME),
+    ];
+    eprintln!(
+        "ORACLE rows={PEOPLE} accesses/row age={:.3} active={:.3} text={:.3} spatial={:.3}",
+        age_accesses as f64 / PEOPLE as f64,
+        active_accesses as f64 / PEOPLE as f64,
+        text_accesses as f64 / PEOPLE as f64,
+        spatial_accesses as f64 / PEOPLE as f64,
+    );
+    for (what, (hex, entries), _) in &found {
+        eprintln!("ORACLE {what}: {entries} entries {hex}");
+        assert!(*entries > 0, "{what} built nothing");
+    }
+    for (what, (hex, _), pinned) in &found {
+        assert_eq!(hex, pinned, "{what} index content moved");
+    }
+
+    // The same bytes must still be there after the handle is gone: a build that
+    // only agrees inside its own writer proves nothing about what was published.
+    db.checkpoint().unwrap();
+    drop(db);
+    let reopened = Database::open(&path, cfg()).unwrap();
+    for (what, (hex, entries), _) in &found {
+        let (again, n) = digest(
+            &reopened,
+            match *what {
+                "text bio" => "text",
+                "spatial home" => "spatial",
+                _ => "scalar",
+            },
+            match *what {
+                "scalar age" => age,
+                "scalar active" => active,
+                "text bio" => bio,
+                _ => home,
+            },
+        );
+        assert_eq!((&again, n), (hex, *entries), "{what} changed across reopen");
+    }
+
+    // And the index must answer, not merely exist.
+    let hits = reopened
+        .query_scalar(age, ScalarPredicate::Eq(json!(0i64)), 65_536)
+        .unwrap();
+    let expect: Vec<EntityId> = (0..PEOPLE)
+        .filter(|i| (i * 37) % 95 == 0)
+        .map(|i| EntityId {
+            collection: s.people,
+            sequence: i + 1,
+        })
+        .collect();
+    assert_eq!(hits, expect);
+}
+
+/// The oracle checks the engine, so something has to check the oracle. FIPS
+/// 180-4 test vectors plus a multi-block message.
+#[test]
+fn the_oracles_own_digest_is_sha256() {
+    assert_eq!(
+        Sha256::new().hex(),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    let mut h = Sha256::new();
+    h.update(b"abc");
+    assert_eq!(
+        h.hex(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    let mut h = Sha256::new();
+    for _ in 0..1000 {
+        h.update(b"a");
+    }
+    assert_eq!(
+        h.hex(),
+        "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"
+    );
+}
+
+// --------------------------------------------- the publication policy (fix C)
+
+/// "Atomic" was implemented as one transaction, and one transaction is bounded
+/// by the page-WAL. A build big enough to matter is therefore not slow, it is
+/// REFUSED. This pins both halves: the old shape fails on a small allowance,
+/// and the engine's own driver finishes the same build on the same allowance.
+#[test]
+fn an_atomic_late_build_is_bounded_by_chunks_not_by_the_whole_index() {
+    use kernel::limits::ResourceLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let limits = ResourceLimits {
+        data_bytes: 32 << 20,
+        wal_bytes: 256 << 10,
+        tracked_pages: 4096,
+        readers: 4,
+        record_bytes: 16384,
+        recovery_bytes: 256 << 10,
+    };
+    let mut db = Database::create_limited(&path, cfg(), limits).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![("bio".into(), Kind::Text), ("age".into(), Kind::Int)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    const ROWS: u64 = 16_000;
+    for i in 0..ROWS {
+        let doc = person(i);
+        db.put(
+            people,
+            &format!("p{i:05}"),
+            &json!({"bio": doc["bio"], "age": doc["age"]}),
+        )
+        .unwrap();
+        if i % 128 == 127 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    // RED: the old policy, one transaction for the whole build.
+    let first = db.create_text_index(people, "bio_idx", "bio").unwrap();
+    db.commit().unwrap();
+    let refused = loop {
+        match db.build_index_step(first, 256) {
+            Ok(true) => break None,
+            Ok(false) => {}
+            Err(e) => break Some(e),
+        }
+    };
+    let refused = refused.unwrap_or_else(|| {
+        panic!(
+            "a whole-index transaction should exhaust the WAL allowance; it used {:?}",
+            db.storage_bytes()
+        )
+    });
+    assert!(
+        format!("{refused:?}").contains("ResourceLimit"),
+        "expected a WAL allowance refusal, got {refused:?}"
+    );
+    db.rollback().unwrap();
+
+    // GREEN: the same build, same allowance, through the engine's driver.
+    let index = db.create_text_index(people, "bio_idx2", "bio").unwrap();
+    db.commit().unwrap();
+    // The driver groups chunks into one transaction to save FULL barriers, and
+    // a group of 16 does not fit this allowance either: finishing therefore
+    // also proves the group shrank itself and carried on rather than failing.
+    let chunks = db.build_index_to_ready(index, 256).unwrap();
+    assert_eq!(chunks, ROWS.div_ceil(256) as usize);
+    let hits = db
+        .query_text(
+            index,
+            "flood",
+            e4_prototype::collections::TextMatch::Any,
+            5,
+            e4_prototype::collections::TextCandidates::All,
+            usize::MAX,
+            || false,
+        )
+        .unwrap();
+    assert!(!hits.is_empty(), "the finished index must answer");
+}
+
+/// Bounded chunk commits must not publish a half-built index. Visibility is the
+/// descriptor's state, and a snapshot is byte-stable for its whole life.
+#[test]
+fn chunk_commits_publish_nothing_until_the_ready_flip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut db, s) = seed(&path);
+    let age = db
+        .create_scalar_index(s.people, "age_idx", "age", false)
+        .unwrap();
+    db.commit().unwrap();
+
+    // Opened while the descriptor says BUILDING.
+    let before = Database::open_snapshot(&path, cfg()).unwrap();
+    assert!(before
+        .query_scalar(age, ScalarPredicate::Eq(json!(0i64)), 16)
+        .is_err());
+
+    db.build_index_to_ready(age, 256).unwrap();
+
+    // Still refused: this reader's generation never had a READY descriptor.
+    assert!(before
+        .query_scalar(age, ScalarPredicate::Eq(json!(0i64)), 16)
+        .is_err());
+    drop(before);
+
+    let after = Database::open_snapshot(&path, cfg()).unwrap();
+    let hits = after
+        .query_scalar(age, ScalarPredicate::Eq(json!(0i64)), 65_536)
+        .unwrap();
+    assert_eq!(hits.len(), (0..PEOPLE).filter(|i| (i * 37) % 95 == 0).count());
+}
+
+// ------------------------------------------- the cost property (fixes A and B)
+
+/// THE COST PROPERTY for a late scalar build: a row's index work must not
+/// include the vector lanes it never looks at, and a chunk's inserts must not
+/// each be a blind descent into the middle of the scalar key space.
+///
+/// Page accesses, not seconds: they are exact and they do not move with the
+/// machine (`sharing_a_tree_must_not_multiply_an_ascending_runs_page_work` in
+/// kernel/src/btree.rs measures the same quantity for the same reason).
+///
+/// Measured on this fixture, 2,000 rows carrying a 64-lane vector:
+///   builder before fix A    6.689 accesses per indexed row
+///   builder after  fix A    3.349
+/// Most of the difference is the sidecar `get` the scalar key never needed;
+/// the rest is the chunk sort. The bound sits between the two numbers.
+#[test]
+fn a_scalar_late_build_does_not_pay_for_the_lanes_it_never_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut db = Database::create(&path, cfg()).unwrap();
+    let people = db
+        .create_collection(
+            "people",
+            vec![
+                ("age".into(), Kind::Int),
+                ("embed".into(), Kind::Vector(64)),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    for i in 0..PEOPLE {
+        let lanes: Vec<f32> = (0..64).map(|j| (i as f32 + j as f32) / 64.0).collect();
+        db.put(
+            people,
+            &format!("p{i:05}"),
+            &json!({"age": ((i * 37) % 95) as i64, "embed": lanes}),
+        )
+        .unwrap();
+        if i % 256 == 255 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let age = db
+        .create_scalar_index(people, "age_idx", "age", false)
+        .unwrap();
+    db.commit().unwrap();
+    let accesses = build(&mut db, age) as f64 / PEOPLE as f64;
+    eprintln!("COST scalar build {accesses:.3} page accesses per indexed row");
+    assert!(
+        accesses <= 5.0,
+        "a scalar build costs {accesses:.3} page accesses per row, against 6.689 before fix A"
+    );
+}
+
+/// THE COST PROPERTY for a late text build. Document-at-a-time reads and
+/// rewrites the one shared corpus row once per document and each term's
+/// document frequency once per document per term; a chunk accumulator pays each
+/// once per chunk and writes every key in ascending order.
+///
+/// Measured on the oracle fixture, 2,000 documents:
+///   builder before fix B  106.608 accesses per indexed row
+///   builder after  fix B   52.341
+/// (the same build before both fixes, without the analysis carried out of the
+/// scan loop, measured 109.591)
+/// Retained deliberately: the per-posting absence probe, which is the Law 5
+/// check that a document with no norm owns no posting. Dropping it measured
+/// 31.606 -- a further 1.65x that is not taken here, because it buys speed with
+/// a corruption check.
+#[test]
+fn a_text_late_build_pays_the_corpus_row_once_per_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut db, s) = seed(&path);
+    db.checkpoint().unwrap();
+    let bio = db.create_text_index(s.people, "bio_idx", "bio").unwrap();
+    db.commit().unwrap();
+    let accesses = build(&mut db, bio) as f64 / PEOPLE as f64;
+    eprintln!("COST text build {accesses:.3} page accesses per indexed row");
+    assert!(
+        accesses <= 75.0,
+        "a text build costs {accesses:.3} page accesses per row, against 106.608 before fix B"
+    );
+}

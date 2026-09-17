@@ -1,0 +1,2618 @@
+{
+  "arms": [
+    {
+      "comparison": "retained",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "9df4131b7833118e41b8ea7b366528e62fa5725fe6638840bbd6d3dad640acd8"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "cf5607b29868a5450a5ff8da3901c0632e2b4656212b0774eb4a92817e5e679a"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "8aef3c765841bb6672282e89398be0925571145c4794756614dc58a3b2f16814"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "checkpointed",
+      "first_wal_bytes": 0,
+      "fixture": "default-checkpointed",
+      "result": "PASS",
+      "second_handoff": "checkpointed",
+      "second_wal_bytes": 0,
+      "source_generator": "default",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "retained",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "9df4131b7833118e41b8ea7b366528e62fa5725fe6638840bbd6d3dad640acd8"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "de3a9c2781e74bf4cd67ababdd67daa65e627b866665c6fed6fa234ffa559aca"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "9248f7b1ca10a9467b19c471f26b3eec152955a476d36209482cf8b6ac0e463a"
+        },
+        "wal": {
+          "bytes": 24864,
+          "sha256": "e555864387f59311a36f08aeeb046c3981b06568251c4d3c9429d191551c6bb0"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "checkpointed",
+      "first_wal_bytes": 0,
+      "fixture": "default-checkpointed",
+      "result": "PASS",
+      "second_handoff": "wal-pending",
+      "second_wal_bytes": 24864,
+      "source_generator": "default",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "retained",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "9df4131b7833118e41b8ea7b366528e62fa5725fe6638840bbd6d3dad640acd8"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "cf5607b29868a5450a5ff8da3901c0632e2b4656212b0774eb4a92817e5e679a"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "8aef3c765841bb6672282e89398be0925571145c4794756614dc58a3b2f16814"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "wal-pending",
+      "first_wal_bytes": 24864,
+      "fixture": "default-checkpointed",
+      "result": "PASS",
+      "second_handoff": "checkpointed",
+      "second_wal_bytes": 0,
+      "source_generator": "default",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "retained",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "9df4131b7833118e41b8ea7b366528e62fa5725fe6638840bbd6d3dad640acd8"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "6f7e84500024511e5f0c5e586be28cbff4bb001f6d56b3c35bf3d0cdcf849b55"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "1c6f3cb9dd6be31ae1fbe447176ffa365a58ac9b3ce16d2e2f5a31fc059b02d6"
+        },
+        "wal": {
+          "bytes": 49728,
+          "sha256": "b3ec45823bedaead0c566e4f9476cea9095fd8921e9bef7b24d1a77ff21e06b1"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "wal-pending",
+      "first_wal_bytes": 24864,
+      "fixture": "default-checkpointed",
+      "result": "PASS",
+      "second_handoff": "wal-pending",
+      "second_wal_bytes": 49728,
+      "source_generator": "default",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "retained",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "aeedc62f5ac0e902fe67a43889fc9eeeaa61cdc0ba9292c1741aaadfcf8ba166"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "487b5abdaecb5bd6778d4492ec60ea49e1933a6c4cb81028bad621cf22908b97"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "5de887dee62e1541a62dd212cc7a4ab8ae32b2d78505b4a57735ab121366b080"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "checkpointed",
+      "first_wal_bytes": 0,
+      "fixture": "default-wal-pending",
+      "result": "PASS",
+      "second_handoff": "checkpointed",
+      "second_wal_bytes": 0,
+      "source_generator": "default",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "retained",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "aeedc62f5ac0e902fe67a43889fc9eeeaa61cdc0ba9292c1741aaadfcf8ba166"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "3405ed8d2237d1c7cbdff7a9dceb7a56ca16e6597c37c8dfd2ba87bf859862a7"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "7c873fad861f6d8a4b00e0de180a9365fc7f2e7ada706c490bb03da475bee4ff"
+        },
+        "wal": {
+          "bytes": 24864,
+          "sha256": "84245a037a60a97a8faef29e1fe157ab531d890cb2ac9810e1d8d371aff92600"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "checkpointed",
+      "first_wal_bytes": 0,
+      "fixture": "default-wal-pending",
+      "result": "PASS",
+      "second_handoff": "wal-pending",
+      "second_wal_bytes": 24864,
+      "source_generator": "default",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "retained",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "aeedc62f5ac0e902fe67a43889fc9eeeaa61cdc0ba9292c1741aaadfcf8ba166"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "487b5abdaecb5bd6778d4492ec60ea49e1933a6c4cb81028bad621cf22908b97"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "5de887dee62e1541a62dd212cc7a4ab8ae32b2d78505b4a57735ab121366b080"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "wal-pending",
+      "first_wal_bytes": 236208,
+      "fixture": "default-wal-pending",
+      "result": "PASS",
+      "second_handoff": "checkpointed",
+      "second_wal_bytes": 0,
+      "source_generator": "default",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "retained",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "aeedc62f5ac0e902fe67a43889fc9eeeaa61cdc0ba9292c1741aaadfcf8ba166"
+        },
+        "data": {
+          "bytes": 8192,
+          "sha256": "3a67ce994919bf8c31dd037406f885757d7b4f27a0fb36f2102711b0e3981019"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "f73d3ea3de2819dcd83ab8e6a283f3f45c4a49d3b8a05120689c6bde29fc9123"
+        },
+        "wal": {
+          "bytes": 261072,
+          "sha256": "2c6e3f372f641e20718feeb26ca1dc9132c9ac64a27a50436e8c684eb152069a"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "wal-pending",
+      "first_wal_bytes": 236208,
+      "fixture": "default-wal-pending",
+      "result": "PASS",
+      "second_handoff": "wal-pending",
+      "second_wal_bytes": 261072,
+      "source_generator": "default",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "default",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "710924a053a29e39d236d72c69c6434434e00297d7859ec170409698e9f9e3e9"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "8c9af0b814e8bddfde2e88f1840fca8cae38b87c31a899c7e3fbf0c47460ef51"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "c1cff9bf25616a478a2348789e513f41729d4b8a60b84e2f80136db97803fc0c"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "checkpointed",
+      "first_wal_bytes": 0,
+      "fixture": "retained-checkpointed",
+      "result": "PASS",
+      "second_handoff": "checkpointed",
+      "second_wal_bytes": 0,
+      "source_generator": "retained",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "default",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "710924a053a29e39d236d72c69c6434434e00297d7859ec170409698e9f9e3e9"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "f0c8734152656a427ca0f7546cb76c1b641ae56a1103c10b1c739d81960bbbd3"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "811e7ab0b42ea9dea7a01eb8196ea564416f646bc17cfb23a3e3d2a417764785"
+        },
+        "wal": {
+          "bytes": 24864,
+          "sha256": "6e30a7e4a40ae72377d253906607f88853855067f2e540465e2645ccfee60eea"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "checkpointed",
+      "first_wal_bytes": 0,
+      "fixture": "retained-checkpointed",
+      "result": "PASS",
+      "second_handoff": "wal-pending",
+      "second_wal_bytes": 24864,
+      "source_generator": "retained",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "default",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "710924a053a29e39d236d72c69c6434434e00297d7859ec170409698e9f9e3e9"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "8c9af0b814e8bddfde2e88f1840fca8cae38b87c31a899c7e3fbf0c47460ef51"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "c1cff9bf25616a478a2348789e513f41729d4b8a60b84e2f80136db97803fc0c"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "wal-pending",
+      "first_wal_bytes": 24864,
+      "fixture": "retained-checkpointed",
+      "result": "PASS",
+      "second_handoff": "checkpointed",
+      "second_wal_bytes": 0,
+      "source_generator": "retained",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "default",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "710924a053a29e39d236d72c69c6434434e00297d7859ec170409698e9f9e3e9"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "c70e25635adcf5e750640800c799514891c59e87122bd3047712d2d8c5144d75"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "59951d556fc9b950ade1d53864cfc49646a62ccca19c0b020fbe06bd0c49dcce"
+        },
+        "wal": {
+          "bytes": 49728,
+          "sha256": "f396ede0f1c951111b532b3d9d1e484595bc6987a8c54d85081c5fb0d5bdef0c"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "wal-pending",
+      "first_wal_bytes": 24864,
+      "fixture": "retained-checkpointed",
+      "result": "PASS",
+      "second_handoff": "wal-pending",
+      "second_wal_bytes": 49728,
+      "source_generator": "retained",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "default",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "daef2d2128fb8d0dad9ef20d98b8e2e9edbeb945a41c18bf95d5a432496fe473"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "3b177946c87843fce5059eaa993b05d7a8280c170a7f0c693b3850457cd25a09"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "e28b60d79cdbe810aaf9a6e8e830d4ea30c605131f3e589d6d3008245b50f48f"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "checkpointed",
+      "first_wal_bytes": 0,
+      "fixture": "retained-wal-pending",
+      "result": "PASS",
+      "second_handoff": "checkpointed",
+      "second_wal_bytes": 0,
+      "source_generator": "retained",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "default",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "daef2d2128fb8d0dad9ef20d98b8e2e9edbeb945a41c18bf95d5a432496fe473"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "b6cd92992265777dbd76cea4fe5e3ec0b061ba2a86f2fe9b93b932b3c8c860fc"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "f92789f18e0306b6075cd71f2c258eddfa3b9c4f4e521090f099ca85593b3ca9"
+        },
+        "wal": {
+          "bytes": 24864,
+          "sha256": "1d976c6190d0cb2f2b2409241f0116beb035d7b9649e15950dcd703e1d053adf"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "checkpointed",
+      "first_wal_bytes": 0,
+      "fixture": "retained-wal-pending",
+      "result": "PASS",
+      "second_handoff": "wal-pending",
+      "second_wal_bytes": 24864,
+      "source_generator": "retained",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "default",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "daef2d2128fb8d0dad9ef20d98b8e2e9edbeb945a41c18bf95d5a432496fe473"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "3b177946c87843fce5059eaa993b05d7a8280c170a7f0c693b3850457cd25a09"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "e28b60d79cdbe810aaf9a6e8e830d4ea30c605131f3e589d6d3008245b50f48f"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "wal-pending",
+      "first_wal_bytes": 236208,
+      "fixture": "retained-wal-pending",
+      "result": "PASS",
+      "second_handoff": "checkpointed",
+      "second_wal_bytes": 0,
+      "source_generator": "retained",
+      "source_unchanged": true
+    },
+    {
+      "comparison": "default",
+      "final_copy_inventory": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "daef2d2128fb8d0dad9ef20d98b8e2e9edbeb945a41c18bf95d5a432496fe473"
+        },
+        "data": {
+          "bytes": 8192,
+          "sha256": "014ee26e532e9c559210e71ecbc704564bfa77d1538eebf7a85fc3d84b7702e0"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "17f55bf9948aaf529c71303e76eb5aa31adfdddd7288d1ac0db3c7040e5ab8e6"
+        },
+        "wal": {
+          "bytes": 261072,
+          "sha256": "566552d9919e3247c1826330aa86583eefe7971af082e6c0dceef34e6e52ef99"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "first_handoff": "wal-pending",
+      "first_wal_bytes": 236208,
+      "fixture": "retained-wal-pending",
+      "result": "PASS",
+      "second_handoff": "wal-pending",
+      "second_wal_bytes": 261072,
+      "source_generator": "retained",
+      "source_unchanged": true
+    }
+  ],
+  "binary_sha256": {
+    "baseline": {
+      "default": "617940226340b724fa00aee17310d9834975de337a9ab4fb7596253612c48e25",
+      "retained": "bcdd1f7db06bece7fcc797ef5e986fabfd924f4cf288827d174bb05f7e88b992"
+    },
+    "comparison": {
+      "default": "617940226340b724fa00aee17310d9834975de337a9ab4fb7596253612c48e25",
+      "retained": "bcdd1f7db06bece7fcc797ef5e986fabfd924f4cf288827d174bb05f7e88b992"
+    }
+  },
+  "binary_versions": {
+    "baseline": {
+      "default": {
+        "compile_features": {
+          "compact-cells": false,
+          "keyspace-append": false,
+          "slotref-split": false,
+          "sqlite-balance": false
+        },
+        "create_compact_cells": false,
+        "engine_revision": "pi-phase2-query-candidate-rollback-d4a78b1d202dd4647cf7ee9f57d156129134a5f8d82d37d984a6be9ea59626de",
+        "harness": "phase2-format-fixture-v1",
+        "rollback_cycle_version": 1
+      },
+      "retained": {
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "create_compact_cells": true,
+        "engine_revision": "pi-phase2-query-candidate-rollback-d4a78b1d202dd4647cf7ee9f57d156129134a5f8d82d37d984a6be9ea59626de",
+        "harness": "phase2-format-fixture-v1",
+        "rollback_cycle_version": 1
+      }
+    },
+    "comparison": {
+      "default": {
+        "compile_features": {
+          "compact-cells": false,
+          "keyspace-append": false,
+          "slotref-split": false,
+          "sqlite-balance": false
+        },
+        "create_compact_cells": false,
+        "engine_revision": "pi-phase2-query-candidate-rollback-d4a78b1d202dd4647cf7ee9f57d156129134a5f8d82d37d984a6be9ea59626de",
+        "harness": "phase2-format-fixture-v1",
+        "rollback_cycle_version": 1
+      },
+      "retained": {
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "create_compact_cells": true,
+        "engine_revision": "pi-phase2-query-candidate-rollback-d4a78b1d202dd4647cf7ee9f57d156129134a5f8d82d37d984a6be9ea59626de",
+        "harness": "phase2-format-fixture-v1",
+        "rollback_cycle_version": 1
+      }
+    }
+  },
+  "claim": "same copied database: comparison writes, preserved writer continues, comparison verifies and reopens writer",
+  "commands": [
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "purpose": "version:baseline:default",
+      "stderr": "",
+      "stdout": "{\"compile_features\":{\"compact-cells\":false,\"keyspace-append\":false,\"slotref-split\":false,\"sqlite-balance\":false},\"create_compact_cells\":false,\"engine_revision\":\"pi-phase2-query-candidate-rollback-d4a78b1d202dd4647cf7ee9f57d156129134a5f8d82d37d984a6be9ea59626de\",\"harness\":\"phase2-format-fixture-v1\",\"rollback_cycle_version\":1}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "purpose": "version:baseline:retained",
+      "stderr": "",
+      "stdout": "{\"compile_features\":{\"compact-cells\":true,\"keyspace-append\":true,\"slotref-split\":true,\"sqlite-balance\":true},\"create_compact_cells\":true,\"engine_revision\":\"pi-phase2-query-candidate-rollback-d4a78b1d202dd4647cf7ee9f57d156129134a5f8d82d37d984a6be9ea59626de\",\"harness\":\"phase2-format-fixture-v1\",\"rollback_cycle_version\":1}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "purpose": "version:comparison:default",
+      "stderr": "",
+      "stdout": "{\"compile_features\":{\"compact-cells\":false,\"keyspace-append\":false,\"slotref-split\":false,\"sqlite-balance\":false},\"create_compact_cells\":false,\"engine_revision\":\"pi-phase2-query-candidate-rollback-d4a78b1d202dd4647cf7ee9f57d156129134a5f8d82d37d984a6be9ea59626de\",\"harness\":\"phase2-format-fixture-v1\",\"rollback_cycle_version\":1}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "purpose": "version:comparison:retained",
+      "stderr": "",
+      "stdout": "{\"compile_features\":{\"compact-cells\":true,\"keyspace-append\":true,\"slotref-split\":true,\"sqlite-balance\":true},\"create_compact_cells\":true,\"engine_revision\":\"pi-phase2-query-candidate-rollback-d4a78b1d202dd4647cf7ee9f57d156129134a5f8d82d37d984a6be9ea59626de\",\"harness\":\"phase2-format-fixture-v1\",\"rollback_cycle_version\":1}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:default-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:default-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:retained-checkpointed",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-write:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-updated:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "continue-upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "old-write-current-bytes:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"continue-upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "current-read-roundtrip:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify-writer",
+        "<scratch>",
+        "<scratch>",
+        "roundtrip",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "purpose": "current-writer-reopen:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify-writer\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "roundtrip"
+      ],
+      "exit_code": 0,
+      "purpose": "old-read-reopened:retained-wal-pending",
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"roundtrip\"}\n"
+    }
+  ],
+  "comparison_build": null,
+  "comparison_build_sha256": null,
+  "fixture_generation_invoked": false,
+  "format": "phase2-rollback-compat-report-v1",
+  "protected_unchanged": true,
+  "qualification_kind": "cross-build",
+  "qualification_report": "<scratch>",
+  "qualification_report_sha256": "933c0cd3cb1417b76d8935c2ae5387bb21193b749177be16f316e71e0328c09e",
+  "result": "PASS",
+  "source_inventory": {
+    "default-checkpointed/PHASE2_FIXTURE.json": {
+      "bytes": 517,
+      "sha256": "9df4131b7833118e41b8ea7b366528e62fa5725fe6638840bbd6d3dad640acd8"
+    },
+    "default-checkpointed/data": {
+      "bytes": 172032,
+      "sha256": "6f7e84500024511e5f0c5e586be28cbff4bb001f6d56b3c35bf3d0cdcf849b55"
+    },
+    "default-checkpointed/reader-0.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/reader-1.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/reader-2.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/reader-3.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/reader-4.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/reader-5.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/reader-6.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/reader-7.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/readers.lock": {
+      "bytes": 96,
+      "sha256": "4eb63d744f708d3641fc794eed1bec3461ced7e82f59ff156dd09bd74335676f"
+    },
+    "default-checkpointed/wal": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-checkpointed/writer.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/PHASE2_FIXTURE.json": {
+      "bytes": 516,
+      "sha256": "aeedc62f5ac0e902fe67a43889fc9eeeaa61cdc0ba9292c1741aaadfcf8ba166"
+    },
+    "default-wal-pending/data": {
+      "bytes": 8192,
+      "sha256": "3a67ce994919bf8c31dd037406f885757d7b4f27a0fb36f2102711b0e3981019"
+    },
+    "default-wal-pending/reader-0.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/reader-1.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/reader-2.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/reader-3.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/reader-4.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/reader-5.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/reader-6.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/reader-7.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "default-wal-pending/readers.lock": {
+      "bytes": 96,
+      "sha256": "0b962272b304a64955d80068afe46da1e2b7132a25343fce3d4c6d5539b3f715"
+    },
+    "default-wal-pending/wal": {
+      "bytes": 211344,
+      "sha256": "368c74e85db8b821662b8648a38c326a953d7591cf82af23c75817e787c03b23"
+    },
+    "default-wal-pending/writer.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/PHASE2_FIXTURE.json": {
+      "bytes": 517,
+      "sha256": "710924a053a29e39d236d72c69c6434434e00297d7859ec170409698e9f9e3e9"
+    },
+    "retained-checkpointed/data": {
+      "bytes": 172032,
+      "sha256": "c70e25635adcf5e750640800c799514891c59e87122bd3047712d2d8c5144d75"
+    },
+    "retained-checkpointed/reader-0.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/reader-1.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/reader-2.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/reader-3.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/reader-4.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/reader-5.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/reader-6.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/reader-7.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/readers.lock": {
+      "bytes": 96,
+      "sha256": "e3e9632dabae149a340a443f3d88131a83335b91fb41cbc68c007b36ec5b6859"
+    },
+    "retained-checkpointed/wal": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-checkpointed/writer.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/PHASE2_FIXTURE.json": {
+      "bytes": 516,
+      "sha256": "daef2d2128fb8d0dad9ef20d98b8e2e9edbeb945a41c18bf95d5a432496fe473"
+    },
+    "retained-wal-pending/data": {
+      "bytes": 8192,
+      "sha256": "014ee26e532e9c559210e71ecbc704564bfa77d1538eebf7a85fc3d84b7702e0"
+    },
+    "retained-wal-pending/reader-0.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/reader-1.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/reader-2.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/reader-3.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/reader-4.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/reader-5.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/reader-6.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/reader-7.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "retained-wal-pending/readers.lock": {
+      "bytes": 96,
+      "sha256": "419f5beee7e5f5b6c7d42566c87d733eaaa48d4c988325b8b57c130175a8a920"
+    },
+    "retained-wal-pending/wal": {
+      "bytes": 211344,
+      "sha256": "7514a06a0e49a8e04ceff20089c0c1987b0934339b066aaba03a7f38a7656b32"
+    },
+    "retained-wal-pending/writer.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}

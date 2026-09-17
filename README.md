@@ -19,6 +19,16 @@ journey tracks E3. See [AGENTS.md](AGENTS.md) for the working convention.
 This README is the full brief for a fresh engineer (human or Astra) with **no
 prior context.** Read it top to bottom before touching code.
 
+**Phase 2 candidate (2026-09-17):** scalar, graph, exact and explicit approximate
+vector, spatial-point and full-text indexing now have an embedded combined-query
+API, independent correctness tests, compatibility fixtures, and explicit verified
+index rebuilds. Qualification is still in progress; this is not a Phase 2 release
+or format freeze. The [workload contract](docs/PHASE2_WORKLOAD.md) defines the
+scope, the [acceptance review](docs/PHASE2_ACCEPTANCE_REVIEW.md) lists remaining
+evidence, and the [test groups](docs/PHASE2_TEST_GROUPS.md) provide the repeatable
+lean/full commands. Current Linux results and measured limitations are linked
+there. Broad SQL and application adapters remain subsequent product work.
+
 ---
 
 ## 0. Why e4 exists — the finding that forced it

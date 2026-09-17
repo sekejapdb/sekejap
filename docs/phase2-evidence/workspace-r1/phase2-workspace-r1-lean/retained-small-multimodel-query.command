@@ -1,0 +1,1 @@
+cargo test --release --locked --offline --no-fail-fast --features compact-cells\,sqlite-balance\,keyspace-append\,slotref-split --test query_multimodel -- --test-threads=1 --skip text_and_spatial_drivers_page_more_than_65536_matches_without_a_result_cap 

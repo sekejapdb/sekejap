@@ -1,0 +1,13 @@
+{
+  "mode": "sampled summed process RSS; no kernel memory controller",
+  "interval_seconds": 0.25,
+  "limit_bytes": 1610612736,
+  "minimum_available_bytes": 536870912,
+  "peak_rss_bytes": 738312192,
+  "samples": 4254,
+  "stopped_unit": false,
+  "invocation": "5c6fe7f1644d4aac875ea8d30089bebb",
+  "result": "STOPPED_MONITOR_DIFFERENT_INVOCATION",
+  "last_rss_bytes": 20414464,
+  "last_available_bytes": 3395076096
+}

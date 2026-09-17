@@ -40,6 +40,8 @@ impl FrameRef {
     }
 }
 type Index = BTreeMap<u32, FrameRef>;
+mod current_reader;
+pub use current_reader::{CurrentReaderLimits, CurrentSourceReader, SourceFingerprint};
 mod repair;
 pub use repair::recover_to;
 fn bad(why: &'static str) -> Error { Error::CorruptWal { offset: 0, why } }
@@ -62,6 +64,9 @@ mod fault_tests;
 #[cfg(test)]
 #[path = "pagewal_hint_tests.rs"]
 mod hint_tests;
+#[cfg(test)]
+#[path = "pagewal/create_feature_tests.rs"]
+mod create_feature_tests;
 fn read_frame(file: &dyn FileIo, off: u64) -> Result<Vec<u8>> {
     let mut b=vec![0;FRAME];file.read_at(&mut b,off)?;
     let want=u32at(&b,28);b[28..32].fill(0);
@@ -184,10 +189,10 @@ struct Pager {
     hint: Mutex<Option<Arc<dyn FileIo>>>,
 }
 impl Pager {
-    fn initialize(dir: &Path) -> Result<()> {
+    fn initialize(dir: &Path, features:u64) -> Result<()> {
         let mut identity = [0;16];
         getrandom::fill(&mut identity).map_err(|e| std::io::Error::other(e.to_string()))?;
-        let h = Header { root:0, free:0, cap:u64::MAX, identity, tx:0, features:create_features() };
+        let h = Header { root:0, free:0, cap:u64::MAX, identity, tx:0, features };
         let (data,_) = io::open_file(&dir.join("data"), IoMode::Buffered)?;
         let (wal,_) = io::open_file(&dir.join("wal"), IoMode::Buffered)?;
         if data.len()? != 0 || wal.len()? != 0 { return Err(bad("initialize found existing bytes")); }
@@ -608,18 +613,27 @@ pub struct PageWalStore {
 }
 impl PageWalStore {
     pub fn open(dir:&Path,create:bool,cache:usize)->Result<Self>{
-        Self::open_inner(dir,create,cache,Pager::open,|_|Ok(()))
+        Self::open_inner(dir,create,cache,None,Pager::open,|_|Ok(()))
     }
+    /// Explicit new-database codec, without changing the process default.
+    /// Rebuilds preserve their source's codec even beside unrelated creates.
+    pub(crate) fn create_with_compact_cells(dir:&Path,cache:usize,compact:bool)->Result<Self>{
+        Self::open_inner(dir,true,cache,Some(if compact {COMPACT_CELLS} else {0}),Pager::open,|_|Ok(()))
+    }
+    /// Managed bytes sufficient to create an empty tree and persist its cap:
+    /// three pages, root/header/commit frames, then cap-header/commit frames.
+    /// Coordination and caller-owned marker files are additional to this bound.
+    pub(crate) fn creation_cap_headroom()->u64{(3*PAGE+5*FRAME) as u64}
     /// Open a writer, running `check` on the committed state BEFORE the
     /// uncommitted WAL tail is normalized or any coordination file is
     /// created. A layer above (typed collections) refuses an unsupported
     /// catalog here without any byte of the source changing; a refused open
     /// releases the writer lock untouched.
     pub fn open_validated(dir:&Path,create:bool,cache:usize,check:impl FnOnce(&Self)->Result<()>)->Result<Self>{
-        Self::open_inner(dir,create,cache,Pager::open,check)
+        Self::open_inner(dir,create,cache,None,Pager::open,check)
     }
     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
-        Self::open_inner(dir,create,cache,opener,|_|Ok(()))
+        Self::open_inner(dir,create,cache,None,opener,|_|Ok(()))
     }
     fn new_pool(file:Arc<dyn FileIo>,cache:usize,writer:bool)->Result<BufferPool>{
         let pool=BufferPool::new(file,Arc::new(MemoryBudget::new(cache)),cache/PAGE)?;
@@ -631,7 +645,7 @@ impl PageWalStore {
     /// encode, but decode both families unconditionally, so this is only
     /// meaningful on a writer's pool.
     fn install_codec(pool:&BufferPool,features:u64){ pool.set_compact_cells(features & COMPACT_CELLS != 0); }
-    fn open_inner(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>,
+    fn open_inner(dir:&Path,create:bool,cache:usize,create_codec:Option<u64>,opener:impl FnOnce(&Path)->Result<Arc<Pager>>,
         check:impl FnOnce(&Self)->Result<()>)->Result<Self>{
         if create {std::fs::create_dir(dir)?;}
         else { for name in ["data","wal","writer.lock"] { std::fs::metadata(dir.join(name))?; } }
@@ -648,7 +662,7 @@ impl PageWalStore {
         // A quiescent reader admission holds this shared for one bounded
         // scan; a writer arriving in that window is refused, not queued.
         if !io::try_lock_exclusive(&lock)?{return Err(Error::WriterLocked);}
-        if create { Pager::initialize(dir)?; }
+        if create { Pager::initialize(dir,create_codec.unwrap_or_else(create_features))?; }
         let pager=opener(dir)?;let file:Arc<dyn FileIo>=pager.clone();
         // Every SUPPORTED feature set is writable by every build of this
         // release; `Header::decode_slot` already refused anything outside it.
@@ -713,6 +727,8 @@ impl PageWalStore {
     /// one page's bytes as this handle sees them (WAL overlay included).
     pub fn root(&self)->u32{self.root}
     pub fn page_count(&self)->u32{self.pool.page_count()}
+    /// Diagnostic only: buffer-pool page accesses since open.
+    pub fn pool_accesses(&self)->u64{let s=self.pool.stats();s.hits+s.misses}
     pub fn page_bytes(&self,no:u32)->Result<Vec<u8>>{self.ready()?;let r=self.pool.get(no)?;Ok(r[..].to_vec())}
     /// Discard every uncommitted change in place: the files are re-inspected
     /// exactly as a reopen would, the uncommitted tail is truncated, the

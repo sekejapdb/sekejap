@@ -1,0 +1,112 @@
+{
+  "cache_bytes": 8388608,
+  "churn": [
+    {
+      "bytes": [
+        15528032,
+        15532032
+      ],
+      "delete_s": 0.836366978,
+      "reinsert_s": 0.831853844,
+      "round": 1,
+      "update_s": 6.493530273,
+      "verified": true
+    },
+    {
+      "bytes": [
+        15556704,
+        15560704
+      ],
+      "delete_s": 0.694359923,
+      "reinsert_s": 0.786806813,
+      "round": 2,
+      "update_s": 6.602396758,
+      "verified": true
+    },
+    {
+      "bytes": [
+        15556704,
+        15560704
+      ],
+      "delete_s": 0.52326152,
+      "reinsert_s": 0.629718141,
+      "round": 3,
+      "update_s": 6.844865557,
+      "verified": true
+    }
+  ],
+  "columns": "external key, age i64, name text, active bool",
+  "commit_batch": 256,
+  "compile_features": {
+    "compact-cells": false,
+    "keyspace-append": false,
+    "slotref-split": false,
+    "sqlite-balance": false
+  },
+  "disk_scope": "all regular files recursively under the dedicated root",
+  "durability": "WAL FULL",
+  "e4_create_compact_cells": false,
+  "engine": "e4",
+  "final_bytes": [
+    15556704,
+    15560704
+  ],
+  "index": "age nonunique, plus unique external key",
+  "indexed_bytes": [
+    14553184,
+    14557184
+  ],
+  "late_index_build_batch_rows": 256,
+  "late_index_build_steps": 391,
+  "late_index_commit_count": 391,
+  "late_index_mode": "resumable",
+  "late_index_publication_policy": "commit each bounded 256-row build step",
+  "late_index_s": 4.181383114,
+  "late_index_sampled_peak_bytes": [
+    18406080,
+    22028288
+  ],
+  "late_index_setup": "fresh post-load database; no prior age index or drop",
+  "load_s": 2.504612792,
+  "loaded_bytes": [
+    9936992,
+    9940992
+  ],
+  "oracle": "independent generated external keys in exact age then entity-ID order",
+  "peak_sampling": "after each commit and phase; discrete samples and unlinked SQLite temp files remain lower bounds",
+  "process_peak_rss": "VmHWM:\t   11864 kB",
+  "queries": [
+    {
+      "hits": 1250,
+      "lower": 38,
+      "seconds": 0.0003747,
+      "upper": 38
+    },
+    {
+      "hits": 3750,
+      "lower": 47,
+      "seconds": 0.000809011,
+      "upper": 49
+    },
+    {
+      "hits": 3750,
+      "lower": 90,
+      "seconds": 0.000624366,
+      "upper": 92
+    }
+  ],
+  "reopen_s": 0.010638284,
+  "reopen_scope": "open with 8 MiB buffered/FULL config and resolve collection people; row count excluded",
+  "rows": 100000,
+  "runtime_settings": {
+    "cache_budget_bytes": 8388608,
+    "io_mode": "buffered",
+    "journal_mode": "page-WAL",
+    "sync_mode": "FULL"
+  },
+  "sampled_peak_bytes": [
+    19742144,
+    23883776
+  ],
+  "verified": true
+}

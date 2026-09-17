@@ -1,0 +1,7 @@
+result=PASS
+profile=full
+configuration=both
+completed_groups=2
+test_tmpdir=<scratch>
+status_tsv=<scratch>
+exit_code=0

@@ -1,0 +1,15 @@
+repository=<scratch>
+profile=lean
+configuration=both
+tmpdir=<scratch>
+output=<scratch>
+sqlite_tmpdir=<scratch>
+uname=Linux e4-phase2-20260916-c9rp8 6.18.1-server #1 SMP Wed Dec 17 10:07:33 UTC 2025 x86_64 GNU/Linux
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+git_head=unavailable
+retained_features=compact-cells,sqlite-balance,keyspace-append,slotref-split
+started_utc=2026-09-16T17:17:31Z
+source_status_begin
+source_status_end
+finished_utc=2026-09-16T17:29:41Z

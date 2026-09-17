@@ -1,0 +1,199 @@
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `reader_slot` is never read
+   --> kernel/src/store.rs:220:5
+    |
+206 | pub struct Store {
+    |            ----- field in this struct
+...
+220 |     reader_slot: Option<crate::readers::ReaderSlot>,
+    |     ^^^^^^^^^^^
+
+warning: `kernel` (lib) generated 2 warnings
+warning: field `path` is never read
+   --> src/collections.rs:145:5
+    |
+143 | pub struct Database {
+    |            -------- field in this struct
+144 |     store: Backend,
+145 |     path: PathBuf,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `open_with` is never used
+   --> src/pagewal.rs:621:8
+    |
+609 | impl PageWalStore {
+    | ----------------- associated function in this implementation
+...
+621 |     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
+    |        ^^^^^^^^^
+
+warning: `e4-prototype` (lib) generated 2 warnings
+   Compiling e4-prototype v0.1.0 (<scratch>)
+error[E0432]: unresolved imports `e4_prototype::collections::SpatialCandidates`, `e4_prototype::spatial_math`
+ --> tests/index_spatial.rs:6:80
+  |
+6 |         CollectionOptions, Database, EntityId, Error, IndexFamily, IndexState, SpatialCandidates,
+  |                                                                                ^^^^^^^^^^^^^^^^^ no `SpatialCandidates` in `collections`
+7 |     },
+8 |     spatial_math::{Bounds, Point},
+  |     ^^^^^^^^^^^^ could not find `spatial_math` in `e4_prototype`
+
+error[E0599]: no method named `query_point_bbox` found for reference `&Database` in the current scope
+  --> tests/index_spatial.rs:48:8
+   |
+48 |     db.query_point_bbox(index, bounds, limit, candidates, max_examined, || false)
+   |        ^^^^^^^^^^^^^^^^
+   |
+help: there is a method `try_into` with a similar name, but with different arguments
+  --> /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/convert/mod.rs:623:4
+
+error[E0599]: no method named `query_point_radius` found for reference `&Database` in the current scope
+  --> tests/index_spatial.rs:60:8
+   |
+60 |     db.query_point_radius(
+   |     ---^^^^^^^^^^^^^^^^^^ method not found in `&Database`
+
+error[E0599]: no method named `create_point_index` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:145:10
+    |
+144 |       let position = db
+    |  ____________________-
+145 | |         .create_point_index(people, "position", "position")
+    | |_________-^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `create_scalar_index` with a similar name, but with different arguments
+   --> src/indexes.rs:413:4
+
+error[E0599]: no method named `create_point_index` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:147:19
+    |
+147 |     let home = db.create_point_index(people, "home", "home").unwrap();
+    |                   ^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `create_scalar_index` with a similar name, but with different arguments
+   --> src/indexes.rs:413:4
+
+error[E0599]: no method named `create_point_index` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:149:10
+    |
+148 |       let other_position = db
+    |  __________________________-
+149 | |         .create_point_index(places, "position", "position")
+    | |_________-^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `create_scalar_index` with a similar name, but with different arguments
+   --> src/indexes.rs:413:4
+
+error[E0599]: no variant, associated function, or constant named `SpatialPoint` found for enum `IndexFamily` in the current scope
+   --> tests/index_spatial.rs:153:22
+    |
+153 |         IndexFamily::SpatialPoint
+    |                      ^^^^^^^^^^^^ variant, associated function, or constant not found in `IndexFamily`
+
+error[E0599]: no method named `query_point_nearest` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:230:10
+    |
+229 |       assert!(db
+    |  _____________-
+230 | |         .query_point_nearest(
+    | |         -^^^^^^^^^^^^^^^^^^^ method not found in `Database`
+    | |_________|
+    |
+
+error[E0599]: no method named `query_point_nearest` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:255:10
+    |
+254 |       let nearest = db
+    |  ___________________-
+255 | |         .query_point_nearest(position, p(0.0, 0.0), 3, SpatialCandidates::All, 5, || {
+    | |         -^^^^^^^^^^^^^^^^^^^ method not found in `Database`
+    | |_________|
+    |
+
+error[E0599]: no method named `query_point_nearest` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:268:10
+    |
+267 |       let nearest = db
+    |  ___________________-
+268 | |         .query_point_nearest(
+    | |         -^^^^^^^^^^^^^^^^^^^ method not found in `Database`
+    | |_________|
+    |
+
+error[E0599]: no method named `create_point_index` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:322:10
+    |
+321 |       let index = db
+    |  _________________-
+322 | |         .create_point_index(collection, "position", "position")
+    | |_________-^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `create_scalar_index` with a similar name, but with different arguments
+   --> src/indexes.rs:413:4
+
+error[E0599]: no method named `query_point_nearest` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:418:10
+    |
+417 |       assert!(db
+    |  _____________-
+418 | |         .query_point_nearest(
+    | |         -^^^^^^^^^^^^^^^^^^^ method not found in `Database`
+    | |_________|
+    |
+
+error[E0599]: no method named `create_point_index` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:488:16
+    |
+488 |     assert!(db.create_point_index(collection, "bad", "name").is_err());
+    |                ^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `create_scalar_index` with a similar name, but with different arguments
+   --> src/indexes.rs:413:4
+
+error[E0599]: no method named `create_point_index` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:523:10
+    |
+522 |       let index = db
+    |  _________________-
+523 | |         .create_point_index(collection, "position", "position")
+    | |_________-^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `create_scalar_index` with a similar name, but with different arguments
+   --> src/indexes.rs:413:4
+
+error[E0599]: no method named `query_point_nearest` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:542:12
+    |
+542 |         db.query_point_nearest(index, p(0.0, 0.0), 1, SpatialCandidates::All, 3, || false,),
+    |            ^^^^^^^^^^^^^^^^^^^ method not found in `Database`
+
+error[E0599]: no method named `query_point_bbox` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:580:12
+    |
+580 |         db.query_point_bbox(index, world, 4, SpatialCandidates::All, 4, || true,),
+    |            ^^^^^^^^^^^^^^^^
+    |
+help: there is a method `try_into` with a similar name, but with different arguments
+   --> /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/convert/mod.rs:623:4
+
+error[E0599]: no method named `query_point_nearest` found for struct `Database` in the current scope
+   --> tests/index_spatial.rs:585:12
+    |
+585 |         db.query_point_nearest(index, p(0.0, 0.0), 4, SpatialCandidates::All, 4, || {
+    |         ---^^^^^^^^^^^^^^^^^^^ method not found in `Database`
+
+Some errors have detailed explanations: E0432, E0599.
+For more information about an error, try `rustc --explain E0432`.
+error: could not compile `e4-prototype` (test "index_spatial") due to 17 previous errors

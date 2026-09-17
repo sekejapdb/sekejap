@@ -4,6 +4,10 @@ pub mod recovery;
 pub mod collection_backend;
 pub mod collections;
 pub mod pagewal;
+mod scalar_key;
+pub mod spatial_math;
+mod text_analyzer;
+mod vector_quant;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Debug, PartialEq)]

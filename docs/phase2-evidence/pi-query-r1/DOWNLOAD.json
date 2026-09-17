@@ -1,0 +1,12 @@
+{
+  "archive_path": "<scratch>",
+  "archive": "phase2-arm-candidate-r1.tar.gz",
+  "bytes": 55689410,
+  "sha256": "5f2554a6e1a57aafaebd97c39e3bef06a15b6b82be6503f956b6150f69f5891d",
+  "manifest_sha256": "b35ed6879a5cb0f2d30b9173c96805dde879ab99df1b6fc7c73615b98c2fac85",
+  "files": 2029,
+  "originals": 104,
+  "rollback_cycles": 416,
+  "result": "PASS",
+  "scope": "104 original corpora, ARM binaries, 416 cross-build cycles, 22 native query tests"
+}

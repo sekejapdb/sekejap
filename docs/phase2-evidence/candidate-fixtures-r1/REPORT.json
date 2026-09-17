@@ -1,0 +1,1156 @@
+{
+  "arms": [
+    {
+      "fixture": "default-checkpointed",
+      "handoff": "checkpointed",
+      "result": "PASS",
+      "source_unchanged": true,
+      "upgraded_files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "9df4131b7833118e41b8ea7b366528e62fa5725fe6638840bbd6d3dad640acd8"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "cc882cac05e1d8a92d51064946ae0ab47ef8de7c22a72b74cfffffad339b2229"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "98c47f12395b10951cc3ee512877838deea65bafe12cb2c005a0b2ac770d2aff"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    {
+      "fixture": "default-checkpointed",
+      "handoff": "wal-pending",
+      "result": "PASS",
+      "source_unchanged": true,
+      "upgraded_files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "9df4131b7833118e41b8ea7b366528e62fa5725fe6638840bbd6d3dad640acd8"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "2171dfbb93ff8a0f0e3c857018579fa57205b2de317e043b072894348377e417"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "313a259ab25c9e3946911caa5ed4d4768d8e0b8130dc6ec5a5f4fa854be43e56"
+        },
+        "wal": {
+          "bytes": 24864,
+          "sha256": "4a8c06925e2cf275a8e61ba244fbb7102922602cb3279b324ce7541d193c6dfc"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    {
+      "fixture": "default-wal-pending",
+      "handoff": "checkpointed",
+      "result": "PASS",
+      "source_unchanged": true,
+      "upgraded_files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "aeedc62f5ac0e902fe67a43889fc9eeeaa61cdc0ba9292c1741aaadfcf8ba166"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "c6067cea6e01f7b2247509ebcc0f688ebeb7dc12ed0078d8758e55251796a1ce"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "ad1f19ab6853102f4531ec4683a7ccdf1a8f9ac6b4c6e391a49b2dd8b1ace1ef"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    {
+      "fixture": "default-wal-pending",
+      "handoff": "wal-pending",
+      "result": "PASS",
+      "source_unchanged": true,
+      "upgraded_files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "aeedc62f5ac0e902fe67a43889fc9eeeaa61cdc0ba9292c1741aaadfcf8ba166"
+        },
+        "data": {
+          "bytes": 8192,
+          "sha256": "f62e8bb7597042db77096f4c98e5db7fe1d9f83c4cb684ca141cd6d6584726ec"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "89ac7511a4c2b0c7b4bb4b69b2abbaf4631d4f6df34954c3a9b090f52fa2c095"
+        },
+        "wal": {
+          "bytes": 236208,
+          "sha256": "134dc565261ea6dfbd778267988467fcc236abfe2b93789730b13254c34d2441"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    {
+      "fixture": "retained-checkpointed",
+      "handoff": "checkpointed",
+      "result": "PASS",
+      "source_unchanged": true,
+      "upgraded_files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "710924a053a29e39d236d72c69c6434434e00297d7859ec170409698e9f9e3e9"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "1f742846025346fc672575da9ed1a3f88370ba2ece8be48c07a668ff211f1061"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "de1c17b325a4b840fe62b943c0196933d07c1959a527ba952c884832fefb2f08"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    {
+      "fixture": "retained-checkpointed",
+      "handoff": "wal-pending",
+      "result": "PASS",
+      "source_unchanged": true,
+      "upgraded_files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "710924a053a29e39d236d72c69c6434434e00297d7859ec170409698e9f9e3e9"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "d897ffc866d6e00caf7178d7dea53f66562b0497ef933a81ec4f92ff8fcc37c7"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "5ef71e6b816be91f23ac187d14a01690bd363a127dd02dede3a96f144f002fe2"
+        },
+        "wal": {
+          "bytes": 24864,
+          "sha256": "390e3028c9e8d1dfcf78f43778f2e3843ff0185b5dabccb15f12b908d119d073"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    {
+      "fixture": "retained-wal-pending",
+      "handoff": "checkpointed",
+      "result": "PASS",
+      "source_unchanged": true,
+      "upgraded_files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "daef2d2128fb8d0dad9ef20d98b8e2e9edbeb945a41c18bf95d5a432496fe473"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "703cf6e4671d4d915630eb6dd449fe87d56deaa403591257a3164b0e42a43f8f"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "e8e84fc3af36771a5dff11a7cc2286d76a77dc6e29d51e9e280e5be4353301ad"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    {
+      "fixture": "retained-wal-pending",
+      "handoff": "wal-pending",
+      "result": "PASS",
+      "source_unchanged": true,
+      "upgraded_files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "daef2d2128fb8d0dad9ef20d98b8e2e9edbeb945a41c18bf95d5a432496fe473"
+        },
+        "data": {
+          "bytes": 8192,
+          "sha256": "9e4d35082635deffee0ccd70cff40d2843afbafb0ad246fd3fde8f9f23bcc4b8"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "60318469351a4def64de86c9bf452fe75f509f6ff5649edc5c7d4d3475976c16"
+        },
+        "wal": {
+          "bytes": 236208,
+          "sha256": "7605839af402894864ab72c4169d2e32395c757511b666e2d6c68a1f0551ada8"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    }
+  ],
+  "binaries": {
+    "default": {
+      "path": "<scratch>",
+      "sha256": "771f78c4cd95341d59b55d7285a47e839da49e36c97edcc907efff093b829dc1",
+      "version": {
+        "compile_features": {
+          "compact-cells": false,
+          "keyspace-append": false,
+          "slotref-split": false,
+          "sqlite-balance": false
+        },
+        "create_compact_cells": false,
+        "engine_revision": "phase2-graph-candidate-0d41dbf982bd5af8a5a69e8593863ec3ce1bbbe2b36ce908b3bb10bdf684bce4",
+        "harness": "phase2-format-fixture-v1"
+      }
+    },
+    "retained": {
+      "path": "<scratch>",
+      "sha256": "5e2cbcd32761acfc72fbda32fbd35dce2250491b6f977bc7fa6be2c47a4747e9",
+      "version": {
+        "compile_features": {
+          "compact-cells": true,
+          "keyspace-append": true,
+          "slotref-split": true,
+          "sqlite-balance": true
+        },
+        "create_compact_cells": true,
+        "engine_revision": "phase2-graph-candidate-0d41dbf982bd5af8a5a69e8593863ec3ce1bbbe2b36ce908b3bb10bdf684bce4",
+        "harness": "phase2-format-fixture-v1"
+      }
+    }
+  },
+  "commands": [
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"compile_features\":{\"compact-cells\":false,\"keyspace-append\":false,\"slotref-split\":false,\"sqlite-balance\":false},\"create_compact_cells\":false,\"engine_revision\":\"phase2-graph-candidate-0d41dbf982bd5af8a5a69e8593863ec3ce1bbbe2b36ce908b3bb10bdf684bce4\",\"harness\":\"phase2-format-fixture-v1\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"compile_features\":{\"compact-cells\":true,\"keyspace-append\":true,\"slotref-split\":true,\"sqlite-balance\":true},\"create_compact_cells\":true,\"engine_revision\":\"phase2-graph-candidate-0d41dbf982bd5af8a5a69e8593863ec3ce1bbbe2b36ce908b3bb10bdf684bce4\",\"harness\":\"phase2-format-fixture-v1\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "generate",
+        "<scratch>",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"generate\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (22612) panicked at src/bin/phase2_format_fixture.rs:449:5:\nassertion `left != right` failed: refusing to mutate source fixture\n  left: \"<scratch>\"\n right: \"<scratch>\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (22613) panicked at src/bin/phase2_format_fixture.rs:495:13:\nassertion `left == right` failed: copied fixture entry \"writer.lock\" has multiple hard links\n  left: 2\n right: 1\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "generate",
+        "<scratch>",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"generate\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (22620) panicked at src/bin/phase2_format_fixture.rs:449:5:\nassertion `left != right` failed: refusing to mutate source fixture\n  left: \"<scratch>\"\n right: \"<scratch>\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (22621) panicked at src/bin/phase2_format_fixture.rs:495:13:\nassertion `left == right` failed: copied fixture entry \"writer.lock\" has multiple hard links\n  left: 2\n right: 1\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "generate",
+        "<scratch>",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"generate\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (22628) panicked at src/bin/phase2_format_fixture.rs:449:5:\nassertion `left != right` failed: refusing to mutate source fixture\n  left: \"<scratch>\"\n right: \"<scratch>\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (22629) panicked at src/bin/phase2_format_fixture.rs:495:13:\nassertion `left == right` failed: copied fixture entry \"writer.lock\" has multiple hard links\n  left: 2\n right: 1\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "generate",
+        "<scratch>",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"generate\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (22636) panicked at src/bin/phase2_format_fixture.rs:449:5:\nassertion `left != right` failed: refusing to mutate source fixture\n  left: \"<scratch>\"\n right: \"<scratch>\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (22637) panicked at src/bin/phase2_format_fixture.rs:495:13:\nassertion `left == right` failed: copied fixture entry \"writer.lock\" has multiple hard links\n  left: 2\n right: 1\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"checkpointed\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "upgrade",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending",
+        "--confirm-copy"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"boundary\":\"wal-pending\",\"command\":\"upgrade\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "updated"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"state\":\"updated\"}\n"
+    }
+  ],
+  "fixtures": [
+    {
+      "files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "9df4131b7833118e41b8ea7b366528e62fa5725fe6638840bbd6d3dad640acd8"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "2171dfbb93ff8a0f0e3c857018579fa57205b2de317e043b072894348377e417"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "1e45c6a25c68da3827280f6bef15e54ffb6646374a3fe76a57b1331817f3c379"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "generator": "default",
+      "name": "default-checkpointed"
+    },
+    {
+      "files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "aeedc62f5ac0e902fe67a43889fc9eeeaa61cdc0ba9292c1741aaadfcf8ba166"
+        },
+        "data": {
+          "bytes": 8192,
+          "sha256": "f62e8bb7597042db77096f4c98e5db7fe1d9f83c4cb684ca141cd6d6584726ec"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "fbffbd9906486838555e0ce0bc292d415c55b500b4d9176c05ebe6e2d7bda82d"
+        },
+        "wal": {
+          "bytes": 211344,
+          "sha256": "5ba585ce4ac62f7220f1e36ebd1823b3f709e30b0722738f2140fc7e59e35ed2"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "generator": "default",
+      "name": "default-wal-pending"
+    },
+    {
+      "files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 517,
+          "sha256": "710924a053a29e39d236d72c69c6434434e00297d7859ec170409698e9f9e3e9"
+        },
+        "data": {
+          "bytes": 172032,
+          "sha256": "d897ffc866d6e00caf7178d7dea53f66562b0497ef933a81ec4f92ff8fcc37c7"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "5696049b6d9e163f56cfa9b7ed3f7360eacc0cce8a4af6df9f73ceb8fe88e07c"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "generator": "retained",
+      "name": "retained-checkpointed"
+    },
+    {
+      "files": {
+        "PHASE2_FIXTURE.json": {
+          "bytes": 516,
+          "sha256": "daef2d2128fb8d0dad9ef20d98b8e2e9edbeb945a41c18bf95d5a432496fe473"
+        },
+        "data": {
+          "bytes": 8192,
+          "sha256": "9e4d35082635deffee0ccd70cff40d2843afbafb0ad246fd3fde8f9f23bcc4b8"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "e30720f023287db8e14f4bc2bd63e8b08cb42a83e3bb73d9c740c87eae7a77c1"
+        },
+        "wal": {
+          "bytes": 211344,
+          "sha256": "29983fbae18c1bb20412aa85584bd221dca98fd6b32b8077b39821c5ffb915c3"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "generator": "retained",
+      "name": "retained-wal-pending"
+    }
+  ],
+  "result": "PASS",
+  "status": "candidate-not-released-or-frozen"
+}

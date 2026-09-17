@@ -1,0 +1,760 @@
+{
+  "arms": [
+    {
+      "boundary": "checkpointed",
+      "files": {
+        "data": {
+          "bytes": 278528,
+          "sha256": "37b3e0a5ca38251ceea00988c7d4b30326ff0b46dc28c94e4223a3eb95337a59"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "72b8864982f489472b3bfae7d475699bd8c6a2c30841fb7d92acd6e4ce06497d"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-off-checkpointed",
+      "frozen_snapshot_refused": true,
+      "frozen_writer_refused": true,
+      "result": "PASS",
+      "source_unchanged": true
+    },
+    {
+      "boundary": "wal-pending",
+      "files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "d79332777c34fae28995880e6d1c1edf8eeaff83519995e400463766f60044c5"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "fb2b745625771b084996fc990194a10b20c22009c3f1e053b99e7747b533aab8"
+        },
+        "wal": {
+          "bytes": 290080,
+          "sha256": "d07d6b88fe387918af1081f4ac916d3b958c649b45b0808c5d7cab079958972e"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-off-checkpointed",
+      "frozen_snapshot_refused": true,
+      "frozen_writer_refused": true,
+      "result": "PASS",
+      "source_unchanged": true
+    },
+    {
+      "boundary": "checkpointed",
+      "files": {
+        "data": {
+          "bytes": 274432,
+          "sha256": "e4795acddd44493c4e849c8513723d14b486b18d33bebaf2136e97115543dd83"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "2938fddb1e839478264b82e713d57db49f8aaa251c3e1a8a4bcd60307ec53e94"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-on-checkpointed",
+      "frozen_snapshot_refused": true,
+      "frozen_writer_refused": true,
+      "result": "PASS",
+      "source_unchanged": true
+    },
+    {
+      "boundary": "wal-pending",
+      "files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "d012611c15c9046459d9f3d1b755b3dd19f50a59527d974223c879b25c2c5318"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "d008f043c54b17ec155d253edfd88c0edc61f0593fbd58e3cd9e9d402dbe440c"
+        },
+        "wal": {
+          "bytes": 277648,
+          "sha256": "cd8e94bc774c983f4675d5f3e4290dc4b67d732b14a3acab433a19a16b04ea14"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "compact-on-checkpointed",
+      "frozen_snapshot_refused": true,
+      "frozen_writer_refused": true,
+      "result": "PASS",
+      "source_unchanged": true
+    },
+    {
+      "boundary": "checkpointed",
+      "files": {
+        "data": {
+          "bytes": 278528,
+          "sha256": "1184f606a80bff0877e741f9b8ba31f28daa334e136a9281c703017f9c419ea3"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "fda540e13856322aef8053dcc02d8e4ea24bbafd86d12b8bbee4689d84a92d96"
+        },
+        "wal": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "limited-checkpointed",
+      "frozen_snapshot_refused": true,
+      "frozen_writer_refused": true,
+      "result": "PASS",
+      "source_unchanged": true
+    },
+    {
+      "boundary": "wal-pending",
+      "files": {
+        "data": {
+          "bytes": 249856,
+          "sha256": "d4cfbaa826095c146ea84fa67a0e4f3f01695fe429e691cb70bdce6bdef524f3"
+        },
+        "reader-0.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-1.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-2.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-3.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-4.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-5.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-6.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "reader-7.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "readers.lock": {
+          "bytes": 96,
+          "sha256": "79fe4031e939bab92ba18316e176f12d78c2bddb0f468e449e60e2a049eb6258"
+        },
+        "wal": {
+          "bytes": 290080,
+          "sha256": "c7711872a7a27f0cac84968e2f656b2b0abafa65e3fc87681c9fc383a5c172bc"
+        },
+        "writer.lock": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "fixture": "limited-checkpointed",
+      "frozen_snapshot_refused": true,
+      "frozen_writer_refused": true,
+      "result": "PASS",
+      "source_unchanged": true
+    }
+  ],
+  "binary_sha256": {
+    "baseline": "18d251f43f744c0bbf4cd22a1b35b7a037c9b94ef76d1d17f3547457bfe57aff",
+    "baseline_writer_probe": "aad5d3a6fcc212f6d93615006086747d6a3c574293c29e1c612dd906dbb5fc07",
+    "current": "deb9637024b10b3dd63cb86d84cb54b0d2589013e66d0c7d194bdefc15d8f264"
+  },
+  "commands": [
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"compact_cells\":false,\"engine_revision\":\"59d1cbc770284f160ffda53cc1ee545167733d11\",\"harness\":\"format_compat-v1\",\"keyspace_append\":false,\"slotref_split\":false,\"sqlite_balance\":false}\n"
+    },
+    {
+      "argv": [
+        "git",
+        "-c",
+        "safe.directory=<scratch>",
+        "-C",
+        "<scratch>",
+        "rev-parse",
+        "HEAD"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "59d1cbc770284f160ffda53cc1ee545167733d11\n"
+    },
+    {
+      "argv": [
+        "git",
+        "-c",
+        "safe.directory=<scratch>",
+        "-C",
+        "<scratch>",
+        "diff",
+        "HEAD"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "--bin",
+        "index_admission_probe"
+      ],
+      "exit_code": 0,
+      "stderr": "   Compiling cfg-if v1.0.4\n   Compiling version_check v0.9.5\n   Compiling once_cell v1.21.4\n   Compiling zerocopy v0.8.56\n   Compiling ahash v0.8.12\n   Compiling semver v1.0.28\n   Compiling find-msvc-tools v0.1.12\n   Compiling libc v0.2.189\n   Compiling shlex v2.0.1\n   Compiling cc v1.4.5\n   Compiling rustc_version v0.4.1\n   Compiling pkg-config v0.3.34\n   Compiling getrandom v0.4.3\n   Compiling vcpkg v0.2.15\n   Compiling rustix v1.1.4\n   Compiling bitflags v2.13.1\n   Compiling libsqlite3-sys v0.30.1\n   Compiling crc32c v0.6.8\n   Compiling zmij v1.0.23\n   Compiling serde_core v1.0.229\n   Compiling linux-raw-sys v0.12.1\n   Compiling hashbrown v0.14.5\n   Compiling fastrand v2.5.0\n   Compiling serde_json v1.0.151\n   Compiling tempfile v3.27.0\n   Compiling hashlink v0.9.1\n   Compiling itoa v1.0.18\n   Compiling memchr v2.8.3\n   Compiling smallvec v1.16.0\n   Compiling fallible-iterator v0.3.0\n   Compiling fallible-streaming-iterator v0.1.9\n   Compiling kernel v0.17.0 (<scratch>)\nwarning: field `table` is never read\n  --> kernel/src/vecquant.rs:94:5\n   |\n87 | pub struct Encoder {\n   |            ------- field in this struct\n...\n94 |     table: [f32; MAX_LEVELS],\n   |     ^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: field `reader_slot` is never read\n   --> kernel/src/store.rs:220:5\n    |\n206 | pub struct Store {\n    |            ----- field in this struct\n...\n220 |     reader_slot: Option<crate::readers::ReaderSlot>,\n    |     ^^^^^^^^^^^\n\nwarning: `kernel` (lib) generated 2 warnings\n   Compiling rusqlite v0.32.1\n   Compiling e4-prototype v0.1.0 (<scratch>)\nwarning: field `path` is never read\n   --> src/collections.rs:123:5\n    |\n121 | pub struct Database {\n    |            -------- field in this struct\n122 |     store: Backend,\n123 |     path: PathBuf,\n    |     ^^^^\n    |\n    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated function `open_with` is never used\n   --> src/pagewal.rs:621:8\n    |\n609 | impl PageWalStore {\n    | ----------------- associated function in this implementation\n...\n621 |     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{\n    |        ^^^^^^^^^\n\nwarning: `e4-prototype` (lib) generated 2 warnings\n    Finished `release` profile [optimized + debuginfo] target(s) in 3m 23s\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"engine_revision\":\"59d1cbc770284f160ffda53cc1ee545167733d11\",\"harness\":\"index-writer-refusal-v1\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "prepare",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"prepare\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (9524) panicked at src/bin/format_compat.rs:16:54:\nsnapshot open: Unsupported(\"typed-collection header version \\\"E4COLL2\\\" is newer than this binary\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 42,
+      "stderr": "Unsupported: typed-collection header version \"E4COLL2\" is newer than this binary\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "prepare",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"prepare\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (9529) panicked at src/bin/format_compat.rs:16:54:\nsnapshot open: Unsupported(\"typed-collection header version \\\"E4COLL2\\\" is newer than this binary\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 42,
+      "stderr": "Unsupported: typed-collection header version \"E4COLL2\" is newer than this binary\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "prepare",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"prepare\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (9534) panicked at src/bin/format_compat.rs:16:54:\nsnapshot open: Unsupported(\"typed-collection header version \\\"E4COLL2\\\" is newer than this binary\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 42,
+      "stderr": "Unsupported: typed-collection header version \"E4COLL2\" is newer than this binary\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "prepare",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"prepare\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (9539) panicked at src/bin/format_compat.rs:16:54:\nsnapshot open: Unsupported(\"typed-collection header version \\\"E4COLL2\\\" is newer than this binary\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 42,
+      "stderr": "Unsupported: typed-collection header version \"E4COLL2\" is newer than this binary\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "prepare",
+        "<scratch>",
+        "<scratch>",
+        "checkpointed"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"prepare\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (9544) panicked at src/bin/format_compat.rs:16:54:\nsnapshot open: Unsupported(\"typed-collection header version \\\"E4COLL2\\\" is newer than this binary\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 42,
+      "stderr": "Unsupported: typed-collection header version \"E4COLL2\" is newer than this binary\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "original"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\",\"stage\":\"original\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "prepare",
+        "<scratch>",
+        "<scratch>",
+        "wal-pending"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"prepare\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>",
+        "upgraded"
+      ],
+      "exit_code": 101,
+      "stderr": "\nthread 'main' (9549) panicked at src/bin/format_compat.rs:16:54:\nsnapshot open: Unsupported(\"typed-collection header version \\\"E4COLL2\\\" is newer than this binary\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 42,
+      "stderr": "Unsupported: typed-collection header version \"E4COLL2\" is newer than this binary\n",
+      "stdout": ""
+    },
+    {
+      "argv": [
+        "<scratch>",
+        "verify",
+        "<scratch>",
+        "<scratch>"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "{\"command\":\"verify\",\"database\":\"<scratch>\",\"result\":\"PASS\"}\n"
+    }
+  ],
+  "immutable_corpus_unchanged": true,
+  "result": "PASS",
+  "source_corpus": "<scratch>",
+  "source_index_sha256": "6bd933a1a63c6f2c2c3af0ac6f6e4d62c29c011a5ccdcbf66d32835fdb88ec26",
+  "writer_probe_source_sha256": "fd0f6f3075ae87360c07fe9fab2d7f4138c1785fa68825e1e3f5145df4d8305b"
+}

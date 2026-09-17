@@ -1,0 +1,8 @@
+MULTIMODEL_SMOKE_R6_RECORDED e4-atomic-none
+MULTIMODEL_SMOKE_R6_RECORDED sqlite-atomic-none
+MULTIMODEL_SMOKE_R6_RECORDED e4-resumable-short
+MULTIMODEL_SMOKE_R6_RECORDED e4-atomic-held
+multimodel-smoke-r6-e4-atomic-held.log verified refusal
+multimodel-smoke-r6-e4-atomic-none.log completed workload
+multimodel-smoke-r6-e4-resumable-short.log verified refusal
+multimodel-smoke-r6-sqlite-atomic-none.log completed workload

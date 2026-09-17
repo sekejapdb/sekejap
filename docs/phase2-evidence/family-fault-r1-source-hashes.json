@@ -1,0 +1,9 @@
+{
+  "src/vector_indexes.rs": "7f568fab497c062d1dd7e374825cb73e8e087ed2a849c7059c679a8cc44ba0cd",
+  "src/vector_fault_tests.rs": "f6f08847e39ab1ecaf4baf4daa7ef9ba2cd5910c15b5be5a0962b9a84486a7cf",
+  "tests/vector_admission.rs": "55e30ac04dc69dbf9ba3eadb45f3f55797edd4a2900e134fc178c7ce00d7e7d3",
+  "src/spatial_indexes.rs": "e6b880b8ff792181bebf55a0918561a3529e06810aeee55a32001c0d1183df87",
+  "src/spatial_fault_tests.rs": "1ac10b9fc3a6d7eeb71d1f9cea08bd5ca3153fd57594725f2eaf183838a6fee3",
+  "tests/spatial_admission.rs": "eb3f086fc597c81f817bdc6fd0c61188f0fea29cccfd5f90ac41cbe5da35e14b",
+  "tests/index_spatial.rs": "271495559e7e2851f9c450c1dd4367f8b24d8650b48b92817f2be8e6792921a6"
+}

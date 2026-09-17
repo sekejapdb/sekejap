@@ -1,0 +1,1 @@
+cargo test --release --locked --offline --no-fail-fast --features compact-cells\,sqlite-balance\,keyspace-append\,slotref-split --test collections --test index_scalar_oracle --test graph_collections --test index_vector --test index_vector_quantized --test index_spatial --test index_text -- --test-threads=1 

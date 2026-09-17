@@ -1,0 +1,16 @@
+{
+  "files": {
+    "src/query.rs": "0676197e8fe5df94be4943ab2130b53515e9b736ac149c348f9da06575083858",
+    "tests/query_multimodel.rs": "31907f1cea294c5288411075274365fca2e955bd50bed1e8d15d9a676b9ddf9c",
+    "tests/query_scalar.rs": "b7d5c19262a1e6d3aab5a1c61f334d03968a840fe7026f6d706dd0ddf3689a81",
+    "examples/query_multimodel.rs": "5e1e92bdeda7e2b61eac8e31b495de2139da9d6ae0f4427f0c2ffd98151d5958",
+    "docs/PHASE2_QUERY_DESIGN.md": "453568b3d28ededb06e2939b0b8d9093462a0af5e53be3d618084afac3df169e",
+    "src/collections.rs": "8b01c113346a30eba14786dfde2d873c3654902cc7ed1ab5df61c9763b7c0aab",
+    "src/indexes.rs": "11e5381bc82dc03d6e0da1296aa987c71f456a3744613b2a6cf845e126ea0bc6",
+    "src/graph_collections.rs": "904dfc0c190e15f15bbb955773cb15e1070bfa639aaf5ac2562d3819b5aa5ab5",
+    "src/spatial_indexes.rs": "4ebf9692da341dadb85ceaae0bda6f5f87c89cec5bc5e1c5c3818131fe5bbb14",
+    "src/text_indexes.rs": "ad9de42cdf2edae46ff0b1a1cd1bcaf473c7e66a714320eb9466ba3dc90887eb",
+    "src/vector_indexes.rs": "e414c7d5efe3c785eac6cb080541d1d2e741747f2c414886f614ee1eeaf363d0"
+  },
+  "capture_note": "Source snapshot excludes only ongoing collections::verification module hook; verifier not part of mixed-query r1 qualification."
+}

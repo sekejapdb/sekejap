@@ -1,0 +1,11 @@
+{"fixture": "compact-off-checkpointed", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "compact-off-checkpointed", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "compact-off-wal-pending", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "compact-off-wal-pending", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "compact-on-checkpointed", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "compact-on-checkpointed", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "compact-on-wal-pending", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "compact-on-wal-pending", "handoff": "wal-pending", "result": "PASS"}
+{"fixture": "limited-checkpointed", "handoff": "checkpointed", "result": "PASS"}
+{"fixture": "limited-checkpointed", "handoff": "wal-pending", "result": "PASS"}
+{"arms": 10, "report": "<scratch>", "result": "PASS"}

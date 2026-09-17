@@ -1,0 +1,24 @@
+{
+  "archive_sha256": "6235e53505863acbc9a122d3b54747d84f02001074a36398821ef792feb3d765",
+  "members": 27,
+  "reports": [
+    {
+      "family": "graph",
+      "fixture_report_sha256": "933c0cd3cb1417b76d8935c2ae5387bb21193b749177be16f316e71e0328c09e",
+      "cycle_report_sha256": "a3d9aa8c45ee08cd0ee48a58b00c007e3d31e71aca3669b932f3fdd2c00c7f94",
+      "cycles": 16
+    },
+    {
+      "family": "multimodel",
+      "fixture_report_sha256": "922db7ea90458e805004d595f39c370f7a40c02db6e98fb5e67dcabf652b501e",
+      "cycle_report_sha256": "805673dbbf26323854aad9cda3211e2f66306cc08eed09f6670b9677e0fe80fb",
+      "cycles": 80
+    },
+    {
+      "family": "lifecycle",
+      "fixture_report_sha256": "7e84814e64ab0a7c5d17178b1af7f3736be467aeb1f61be0f3ee85c398a39daf",
+      "cycle_report_sha256": "6aa9c53905746e1604f60d21e931bd24019fffa78173bd3da1e4255f33a78f67",
+      "cycles": 320
+    }
+  ]
+}

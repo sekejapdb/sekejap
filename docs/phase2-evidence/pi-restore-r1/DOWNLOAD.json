@@ -1,0 +1,7 @@
+{
+  "archive_sha256": "59a1b331483de15af3b440cdf08ae7cbc0b45728dcd9322d41c19a1425fa2821",
+  "result": "PASS",
+  "reports_verified": 3,
+  "cycles": 416,
+  "note": "Relocation replay of existing candidate; no additional format coverage claimed"
+}

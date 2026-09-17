@@ -1,0 +1,1174 @@
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `reader_slot` is never read
+   --> kernel/src/store.rs:220:5
+    |
+206 | pub struct Store {
+    |            ----- field in this struct
+...
+220 |     reader_slot: Option<crate::readers::ReaderSlot>,
+    |     ^^^^^^^^^^^
+
+warning: `kernel` (lib) generated 2 warnings
+warning: field `path` is never read
+   --> src/collections.rs:140:5
+    |
+138 | pub struct Database {
+    |            -------- field in this struct
+139 |     store: Backend,
+140 |     path: PathBuf,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `open_with` is never used
+   --> src/pagewal.rs:621:8
+    |
+609 | impl PageWalStore {
+    | ----------------- associated function in this implementation
+...
+621 |     fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
+    |        ^^^^^^^^^
+
+warning: `e4-prototype` (lib) generated 2 warnings
+   Compiling e4-prototype v0.1.0 (<scratch>)
+warning: unused variable: `i`
+  --> kernel/tests/overflow.rs:44:9
+   |
+44 |     for i in 0..500u64 {
+   |         ^ help: if this is intentional, prefix it with an underscore: `_i`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `kernel` (test "overflow") generated 1 warning (run `cargo fix --test "overflow" -p kernel` to apply 1 suggestion)
+warning: multiple fields are never read
+   --> kernel/src/btree.rs:728:5
+    |
+725 | pub(crate) struct SplitScratch {
+    |                   ------------ fields in this struct
+...
+728 |     sib: Vec<u8>,
+    |     ^^^
+729 |     /// The parent's page image.
+730 |     parent: Vec<u8>,
+    |     ^^^^^^
+...
+736 |     seps: Vec<u8>,
+    |     ^^^^
+737 |     /// The window's records, in order, across the whole window.
+738 |     win: Vec<SlotRef>,
+    |     ^^^
+739 |     /// The parent's separators as they stand, and as they will stand.
+740 |     pr0: Vec<SlotRef>,
+    |     ^^^
+741 |     pr: Vec<SlotRef>,
+    |     ^^
+742 |     sizes: Vec<usize>,
+    |     ^^^^^
+743 |     prefix: Vec<usize>,
+    |     ^^^^^^
+744 |     ends: Vec<usize>,
+    |     ^^^^
+745 |     needed: Vec<usize>,
+    |     ^^^^^^
+746 |     cuts: Vec<usize>,
+    |     ^^^^
+747 |     /// The parent's children as they stand, and after any shadowing.
+748 |     ids: Vec<u32>,
+    |     ^^^
+749 |     newids: Vec<u32>,
+    |     ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `SIB0` is never used
+   --> kernel/src/btree.rs:702:15
+    |
+702 |     pub const SIB0: u8 = 2;   // first redistribution sibling
+    |               ^^^^
+
+warning: constant `SIB1` is never used
+   --> kernel/src/btree.rs:703:15
+    |
+703 |     pub const SIB1: u8 = 3;   // second redistribution sibling
+    |               ^^^^
+
+warning: constant `PARENT` is never used
+   --> kernel/src/btree.rs:704:15
+    |
+704 |     pub const PARENT: u8 = 4; // the parent's image, copied to scratch
+    |               ^^^^^^
+
+warning: constant `SEPS` is never used
+   --> kernel/src/btree.rs:705:15
+    |
+705 |     pub const SEPS: u8 = 5;   // separators this redistribution had to rebuild
+    |               ^^^^
+
+warning: function `leaves` is never used
+    --> kernel/src/btree.rs:3384:8
+     |
+3384 |     fn leaves(pool: &BufferPool, page_no: u32, out: &mut Vec<(u8, usize, bool)>) {
+     |        ^^^^^^
+
+warning: function `fill_of` is never used
+    --> kernel/src/btree.rs:3414:8
+     |
+3414 |     fn fill_of(all: &[(u8, usize, bool)], tag: u8) -> (f64, usize) {
+     |        ^^^^^^^
+
+warning: field `table` is never read
+  --> kernel/src/vecquant.rs:94:5
+   |
+87 | pub struct Encoder {
+   |            ------- field in this struct
+...
+94 |     table: [f32; MAX_LEVELS],
+   |     ^^^^^
+
+warning: `kernel` (lib test) generated 9 warnings (1 duplicate)
+    Finished `release` profile [optimized + debuginfo] target(s) in 59.73s
+     Running unittests src/lib.rs (<scratch>)
+
+running 32 tests
+test collections::graph_collections::fault_tests::graph_write_boundaries_preserve_edges_scalar_postings_and_readers ... ok
+test collections::indexes::fault_tests::scalar_index_write_boundaries_preserve_committed_state_and_readers ... ok
+test collections::tests::alter_preserves_raw_rows_and_replacement_removes_old_vectors ... ok
+test collections::tests::failed_rollback_validation_keeps_handle_failed ... ok
+test collections::tests::metadata_replica_loss_and_conflict_fail_safely ... ok
+test collections::tests::missing_vector_cannot_be_hidden_by_replacement ... ok
+test collections::tests::mutation_vector_validation_matches_public_reads ... ok
+test collections::tests::plain_header_payload_is_the_eight_byte_form_and_future_versions_refuse ... ok
+test collections::tests::replacement_compares_vector_bits_and_layout_ordinals ... ok
+test collections::tests::rootless_collection_recovery_preserves_source_and_reports_vector_limit ... ok
+test collections::tests::scalar_update_spends_only_one_store_write ... ok
+test collections::tests::write_faults_never_publish_partial_multikey_changes ... ok
+test dense_v3::tests::exact_bytes_vectors_and_malformed_semantics_match_reference ... ok
+test dense_v3::tests::malformed_inline_bytes_never_fetch_external_vectors ... ok
+test pagewal::fault_tests::checkpoint_preserves_a_valid_header_when_the_other_copy_starts_damaged ... ok
+test pagewal::fault_tests::checksum_valid_stale_wal_frame_cannot_serve_a_snapshot_or_checkpoint ... ok
+test pagewal::fault_tests::io_failure_at_each_commit_and_checkpoint_boundary ... ok
+test pagewal::fault_tests::partial_checkpoint_extension_can_reopen_from_committed_wal ... ok
+test pagewal::fault_tests::successful_but_dropped_data_write_preserves_committed_wal ... ok
+test pagewal::hint_tests::barrier_failure_after_the_frame_write_hides_the_transaction_until_rollback ... ok
+test pagewal::hint_tests::damaged_stale_or_foreign_hints_refuse_live_readers_until_the_next_publication ... ok
+test pagewal::hint_tests::hint_write_failure_at_each_copy_boundary_keeps_readers_and_writer_coherent ... ok
+test pagewal::hint_tests::quiescent_readers_derive_state_strictly_and_create_files_only_after_validation ... ok
+test pagewal::hint_tests::reader_bound_is_enforced_on_the_held_slot_in_both_admission_paths ... ok
+test pagewal::hint_tests::runtime_limits_refuse_before_framing_and_survive_rollback ... ok
+test pagewal::hint_tests::writer_recovery_window_never_serves_a_stale_hint_to_a_live_reader ... ok
+test pagewal::hint_tests::writer_restart_rewrites_the_hint_and_keeps_pinned_readers_stable ... ok
+test scalar_key::tests::integers_and_booleans_keep_order_at_boundaries ... ok
+test scalar_key::tests::malformed_keys_do_not_decode_as_valid_values ... ok
+test scalar_key::tests::missing_null_and_strict_type_checks ... ok
+test scalar_key::tests::reals_keep_order_and_normalize_zero ... ok
+test scalar_key::tests::utf8_nuls_prefixes_and_size_boundary ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.88s
+
+     Running unittests src/bin/collection_inspect.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/collections.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/control_tree_audit.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (<scratch>)
+
+running 2 tests
+test storage_tests::descriptor_leaf_damage_recovers_without_reading_damaged_copy ... ok
+test storage_tests::large_json_and_large_external_vector_survive_reopen ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running unittests src/bin/entry.rs (<scratch>)
+
+running 1 test
+test tests::compact_ids_are_ordered_and_roundtrip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/format_compat.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/format_fixture.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/foundation_scale.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/foundation_space.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/index_format_fixture.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/lifecycle.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/pagewal_bench.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/pagewal_cap.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/pagewal_repair.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/people.rs (<scratch>)
+
+running 1 test
+test tests::timestamps_are_typed_and_base_document_roundtrips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase2_scalar_bench.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/recover.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/v2_compat_fixture.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/v2_foundation_bench.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/accepted_control_scan_regression.rs (<scratch>)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/btree_reuse.rs (<scratch>)
+
+running 1 test
+test mixed_reuse_keeps_ordered_rows_equal_to_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+     Running tests/byte_checkpoint.rs (<scratch>)
+
+running 1 test
+test wal_and_page_triggers_have_distinct_effects_and_snapshots_remain_exact ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/codec.rs (<scratch>)
+
+running 14 tests
+test corrupted_lengths_and_tags_never_panic ... ok
+test dense_header_preserves_optional_fields_and_point_contract ... ok
+test descriptors_detect_each_single_byte_change ... ok
+test every_truncated_record_is_rejected ... ok
+test integers_keep_all_bits_and_float_values ... ok
+test json_wire_preserves_promoted_fp32_coordinates ... ok
+test layout_versions_and_general_geometry_roundtrip ... ok
+test missing_null_and_json_null_are_not_empty_objects ... ok
+test packed_integer_widths_preserve_full_range_missing_null_and_extras ... ok
+test projection_matches_document_paths_including_missing_and_null ... ok
+test randomized_optional_and_dynamic_shapes ... ok
+test undeclared_nested_fields_roundtrip_first ... ok
+test vector_is_external_and_point_binary ... ok
+test wrong_layout_and_wrong_types_are_rejected ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/codec_allocations.rs (<scratch>)
+
+running 1 test
+test dense_rows_do_not_rebuild_multiple_intermediate_formats ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/collection_pagewal.rs (<scratch>)
+
+running 15 tests
+test coordination_files_are_advisory_and_recreated_by_a_writer_or_a_validated_quiescent_reader ... ok
+test delete_then_reinsert_allocates_a_fresh_identity_and_never_reuses_after_reopen ... ok
+test metadata_transaction_cost_is_measured_and_a_policy_below_it_refuses_explicitly ... ok
+test mixed_records_roundtrip_through_page_wal_commit_and_reopen ... ok
+test reader_child ... ok
+test reader_in_another_process_excludes_checkpoint_and_stays_stable ... 
+running 1 test
+test reader_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.04s
+
+ok
+test reopen_recovers_committed_wal_before_any_checkpoint ... ok
+test resource_policy_is_persisted_as_e4limit1_enforced_per_field_and_refused_when_unsupported ... ok
+test rollback_discards_uncommitted_work_beside_a_live_snapshot ... ok
+test schema_change_keeps_old_rows_decodable_and_new_layout_active ... ok
+test snapshots_serve_published_state_defer_checkpoint_and_are_bounded ... ok
+test timestamps_default_off_and_explicit_on_persist_across_reopen ... ok
+test unsupported_sources_are_refused_before_any_byte_changes ... ok
+test writer_child ... ok
+test writer_restart_in_another_process_beside_a_pinned_reader ... 
+running 1 test
+test writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.06s
+
+ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.99s
+
+     Running tests/collections.rs (<scratch>)
+
+running 7 tests
+test deterministic_model_covers_commits_rollbacks_and_collection_switches ... ok
+test identity_upsert_delete_and_collection_isolation_follow_e3_contracts ... ok
+test immutable_layout_dispatch_and_vector_sidecars_survive_updates ... ok
+test published_snapshots_rollback_and_streaming_cursor_are_consistent ... ok
+test resource_refusal_cannot_publish_a_partial_entity_or_key_mapping ... ok
+test timestamps_are_explicit_persistent_monotonic_and_managed_on_every_write ... ok
+test undeclared_fields_roundtrip_through_collection_and_reopen ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.82s
+
+     Running tests/delete_packing.rs (<scratch>)
+
+running 8 tests
+test damaged_merge_sibling_refuses_publication_and_preserves_healthy_leaf ... ok
+test deleting_last_rows_collapses_all_interior_levels ... ok
+test fresh_id_churn_reuses_pages_instead_of_extending_forever ... ok
+test killed_merge_writer_reopens_exactly_the_last_published_generation ... ok
+test large_middle_record_splits_into_three_without_losing_either_run ... ok
+test packing_crash_child ... ok
+test sparse_leaves_merge_while_old_snapshot_keeps_all_rows ... ok
+test variable_keys_bidirectional_scans_and_reopen_match_independent_model ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.44s
+
+     Running tests/entry_density.rs (<scratch>)
+
+running 4 tests
+test compact_keys_overflow_updates_bulk_and_recovery ... ok
+test neighbor_changes_preserve_snapshot_and_wal_reopen ... ok
+test recovery_refuses_damaged_overflow_without_replacing_source ... ok
+test shuffled_entries_use_neighbor_capacity ... ignored, P1 shuffled-density defect without sibling redistribution
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.81s
+
+     Running tests/format_replica_refusal.rs (<scratch>)
+
+running 4 tests
+test damaged_future_typed_replica_still_falls_back ... ok
+test one_future_store_superblock_refuses_before_any_open_mutation ... ok
+test one_future_typed_replica_refuses_before_any_open_mutation ... ok
+test store_version_admission_precedes_version_specific_payload_parsing ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/format_v1_compat.rs (<scratch>)
+
+running 7 tests
+test a_foreign_wal_beside_a_data_file_is_refused_and_leaves_all_files_unchanged ... ok
+test a_snapshot_of_a_copied_fixture_serves_every_expected_entity_and_count ... ok
+test a_writer_update_insert_delete_commit_checkpoint_reopen_preserves_declared_feature_bits ... ok
+test an_unknown_physical_page_version_is_refused_without_changing_any_file ... ok
+test an_unknown_required_feature_bit_is_refused_and_leaves_all_files_unchanged ... ok
+test every_fixture_file_matches_its_manifest_sha256 ... ok
+test missing_preserved_fixtures_fail_qualification - should panic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.42s
+
+     Running tests/graph_admission.rs (<scratch>)
+
+running 4 tests
+test damaged_graph_metadata_replica_falls_back_without_rewriting_source ... ok
+test graph_rows_cannot_be_hidden_by_clearing_feature_and_metadata ... ok
+test intact_future_graph_header_or_name_replica_refuses_before_source_mutation ... ok
+test missing_reverse_or_primary_and_bad_properties_have_distinct_read_failures ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+     Running tests/graph_collections.rs (<scratch>)
+
+running 6 tests
+test cyclic_bfs_is_shortest_hop_deterministic_and_bounded ... ok
+test directed_typed_context_edges_replace_properties_and_survive_reopen ... ok
+test entity_delete_cascades_both_directions_all_contexts_and_self_edges ... ok
+test entity_delete_refuses_degree_257_before_any_published_change ... ok
+test neighbor_and_bfs_cancellation_never_return_partial_or_poison_reads ... ok
+test snapshots_unlink_missing_endpoints_and_delete_cascade_are_transactional ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/index_admission.rs (<scratch>)
+
+running 6 tests
+test building_unique_index_cannot_become_ready_with_an_unseen_duplicate ... ok
+test damaged_future_descriptor_replica_falls_back_to_intact_siblings ... ok
+test limited_policy_survives_index_opt_in_rollback_and_last_drop ... ok
+test missing_registry_or_intact_orphan_descriptor_is_not_silently_ignored ... ok
+test one_intact_future_index_encoding_replica_refuses_before_mutation ... ok
+test one_intact_unknown_logical_feature_replica_refuses_before_mutation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+     Running tests/index_lifecycle.rs (<scratch>)
+
+running 3 tests
+test drop_and_build_can_resume_after_reopen_without_claiming_ready ... ok
+test late_index_tracks_crud_and_published_snapshots ... ok
+test unique_conflict_and_schema_changes_do_not_leave_partial_indexes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/index_scalar_oracle.rs (<scratch>)
+
+running 1 test
+test scalar_indexes_match_independent_logical_oracle_through_repeated_crud ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/overflow_lifecycle.rs (<scratch>)
+
+running 5 tests
+test corrupt_old_chain_cannot_enter_the_recycling_freelist ... ok
+test deleted_overflow_pages_are_recycled_after_snapshot_release ... ok
+test partially_trimmed_leaf_retires_only_matching_overflow ... ok
+test prefix_deleted_overflow_pages_are_recycled_after_snapshot_release ... ok
+test replaced_overflow_pages_are_recycled_after_snapshot_release ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+
+     Running tests/pagewal.rs (<scratch>)
+
+running 13 tests
+test cap_refusal_preserves_published_snapshot_and_reopen ... ok
+test checkpoint_process_death_preserves_acknowledged_rows ... 
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+ok
+test commit_reopen_and_overflow_resize ... ok
+test corrupt_wal_refuses_without_modifying_evidence ... ok
+test crash_child ... ok
+test delete_reinsert_and_snapshot_versions ... ok
+test free_new_overflow_before_its_first_flush ... ok
+test managed_disk_cap_survives_reopen ... ok
+test new_snapshot_during_uncommitted_changes_sees_latest_commit ... ok
+test repeated_small_transactions_complete_under_twice_loaded_size ... ok
+test snapshot_admission_is_bounded_and_released_on_drop ... ok
+test surviving_snapshot_keeps_wal_reset_ownership ... ok
+test uncommitted_evictions_never_become_visible_after_reopen ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+
+     Running tests/pagewal_cell_codec.rs (<scratch>)
+
+running 2 tests
+test a_database_declaring_the_other_codec_opens_reads_writes_and_keeps_its_bits ... ok
+test unknown_feature_bits_are_refused_and_supported_bits_are_not ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/pagewal_create_codec.rs (<scratch>)
+
+running 1 test
+test either_created_encoding_round_trips_and_keeps_its_declared_bits ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/pagewal_recovery_identity.rs (<scratch>)
+
+running 6 tests
+test foreign_valid_wal_refuses_before_mutation ... ok
+test interrupted_reset_can_reopen_write_and_reopen_again ... ok
+test invalid_root_is_refused_before_tail_cleanup ... ok
+test one_damaged_checkpoint_header_can_reopen_and_continue_writing ... ok
+test stale_valid_wal_cannot_roll_back_a_later_checkpoint ... ok
+test unsupported_metadata_or_features_preserve_tail_and_both_headers ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+     Running tests/pagewal_repair.rs (<scratch>)
+
+running 1 test
+test source_preserving_repair_contains_damage_and_never_resurrects_deletes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+
+     Running tests/pagewal_transaction_capacity.rs (<scratch>)
+
+running 1 test
+test scattered_thousand_insert_transaction_preserves_old_reader_and_reopens ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.70s
+
+     Running tests/reader_release.rs (<scratch>)
+
+running 2 tests
+test commit_refreshes_reuse_after_reader_release_without_publishing ... ok
+test repeated_root_publication_reuses_two_trees_and_survives_one_lost_meta ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/recovery_faults.rs (<scratch>)
+
+running 14 tests
+test committed_wal_delete_and_insert_survive_repair ... ok
+test damaged_leaf_kind_cannot_hide_loss ... ok
+test damaged_meta_is_membership_uncertain ... ok
+test damaged_wal_keeps_source_and_verified_commits ... ok
+test malformed_cell_does_not_abort_unrelated_salvage ... ok
+test overflow_bad_page_salvages_other_rows ... ok
+test overflow_crossed_chain_is_one_known_loss ... ok
+test overflow_cycle_and_wrong_identity_are_contained ... ok
+test overflow_missing_tail_is_one_known_loss ... ok
+test overflow_truncated_tail_is_reported ... ok
+test repair_destination_failure_keeps_source ... ok
+test repair_never_resurrects_deleted_rows ... ok
+test repair_rejects_source_aliases_and_active_writers ... ok
+test rootless_repair_does_not_claim_current_membership ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.94s
+
+     Running tests/schema_recovery.rs (<scratch>)
+
+running 7 tests
+test layouts_recover_without_btree_ancestors ... ok
+test missing_layout_preserves_raw_rows_and_names_loss ... ok
+test schema_codec_policy_is_replaceable ... ok
+test schema_conflicting_ids_never_pick_a_winner ... ok
+test schema_descriptor_checksum_is_independent_of_page_checksum ... ok
+test schema_resource_limit_and_archive_validation_preserve_evidence ... ok
+test surviving_layout_replicas_decode_exact_values ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.72s
+
+     Running tests/version_reuse.rs (<scratch>)
+
+running 3 tests
+test corrupt_or_impossible_persisted_lifetimes_never_enable_reuse ... ok
+test every_reopen_preserves_version_lifetimes ... ok
+test intermediate_versions_are_reused_with_two_live_snapshots_and_reopen ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.97s
+
+     Running tests/write_path.rs (<scratch>)
+
+running 1 test
+test pinned_reader_grows_wal_until_cap_then_refuses_cleanly_and_recovers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.34s
+
+     Running unittests src/lib.rs (<scratch>)
+
+running 136 tests
+test btree::split_allocations::a_steady_state_split_allocates_a_bounded_constant ... ok
+test btree::split_byte_equivalence::both_split_implementations_write_identical_pages_for_every_corpus_state ... ok
+test btree::split_byte_equivalence::the_oracle_notices_a_one_byte_difference ... ok
+test btree::tests::a_cyclic_sibling_chain_is_inert_because_scans_descend ... ok
+test btree::tests::a_full_scan_pins_one_leaf_at_a_time ... ok
+test btree::tests::a_key_written_is_a_key_found ... ok
+test btree::tests::a_later_write_replaces_an_earlier_one ... ok
+test btree::tests::a_range_scan_from_a_midpoint_starts_there ... ok
+test btree::tests::a_range_scan_returns_keys_in_order_across_leaf_boundaries ... ok
+test btree::tests::a_scan_of_an_empty_tree_yields_nothing ... ok
+test btree::tests::a_scan_starting_past_the_last_key_yields_nothing ... ok
+test btree::tests::a_scan_still_walks_leaves_that_deletion_emptied ... ok
+test btree::tests::a_split_with_one_huge_record_among_many_small_ones_keeps_every_key ... ok
+test btree::tests::a_value_too_large_for_a_page_is_refused_not_panicked ... ok
+test btree::tests::deleted_keys_are_gone_and_their_neighbours_are_not ... ok
+test btree::tests::deleting_a_key_that_is_not_there_reports_so ... ok
+test btree::tests::fast_path_rejects_non_rightmost ... ok
+test btree::tests::fast_path_rejects_wrong_tree ... ok
+test btree::tests::fifty_thousand_scattered_keys_are_all_findable ... ok
+test btree::tests::insert_ascending_uses_fast_path ... ok
+test btree::tests::insert_descending_never_uses_fast_path ... ok
+test btree::tests::interleaved_then_scattered_keeps_every_key_exactly_once_in_order ... ok
+test btree::tests::random_order_matches_sequential ... ok
+test btree::tests::repeated_replacement_of_one_key_does_not_exhaust_its_leaf ... ok
+test btree::tests::replacing_a_value_with_a_longer_one_on_a_full_leaf_keeps_every_key ... ok
+test btree::tests::sharing_a_tree_must_not_multiply_an_ascending_runs_page_work ... ok
+test budget::tests::exhaustion_is_an_error_never_a_panic_and_never_a_kill ... ok
+test budget::tests::reservations_are_returned_when_dropped ... ok
+test geomath::tests::point_in_polygon_in_and_out ... ok
+test geomath::tests::ring_area_and_perimeter_match_postgis ... ok
+test geomath::tests::vincenty_matches_postgis_geography ... ok
+test io::tests::a_read_past_the_end_is_an_error_not_a_short_buffer ... ok
+test io::tests::concurrent_direct_and_buffered_files_keep_their_own_bytes ... ok
+test io::tests::pages_round_trip_through_the_file ... ok
+test io::tests::requesting_direct_degrades_rather_than_failing ... ok
+test keys::tests::adjacency_is_a_contiguous_prefix ... ok
+test keys::tests::byte_order_is_numeric_order_and_tags_never_interleave ... ok
+test meta::tests::a_future_format_version_is_refused_not_misread ... ok
+test meta::tests::a_refused_meta_record_still_leaves_a_checksum_that_matches_the_page ... ok
+test meta::tests::a_superblock_written_before_next_lsn_existed_still_loads ... ok
+test meta::tests::an_empty_but_crc_valid_meta_page_is_refused_not_panicked ... ok
+test meta::tests::the_superblock_round_trips ... ok
+test nav::tests::malformed_navigation_rows_are_errors_not_missing_nodes ... ok
+test nav::tests::robust_prune_alpha_acts_on_true_distances ... ok
+test nav::tests::sortable_orders_floats_across_the_sign_boundary ... ok
+test page::tests::a_corrupt_entry_count_cannot_read_past_the_page ... ok
+test page::tests::a_finalised_page_reads_back_its_identity ... ok
+test page::tests::a_free_pointer_outside_its_page_is_refused ... ok
+test page::tests::a_page_asked_for_by_the_wrong_number_is_refused ... ok
+test page::tests::a_record_larger_than_the_page_is_refused_not_panicked ... ok
+test page::tests::a_single_flipped_byte_anywhere_is_refused ... ok
+test page::tests::child0_round_trips_through_an_interior_page ... ok
+test page::tests::compact_reclaims_a_removed_entrys_payload ... ok
+test page::tests::entries_round_trip_in_slot_order ... ok
+test pool::tests::a_dirty_page_survives_eviction_because_it_was_written_out ... ok
+test pool::tests::a_file_with_a_partial_page_is_refused ... ok
+test pool::tests::a_pinned_page_is_never_evicted ... ok
+test pool::tests::a_pool_smaller_than_the_working_set_still_serves_every_page ... ok
+test pool::tests::flushing_while_a_dirty_page_is_pinned_is_refused - should panic ... ok
+test pool::tests::taking_a_reader_on_a_page_a_writer_holds_is_refused - should panic ... ok
+test pool::tests::taking_a_writer_on_a_page_a_reader_holds_is_refused - should panic ... ok
+test pool::tests::the_budget_refuses_a_pool_it_cannot_fund ... ok
+test readers::tests::a_crashed_readers_file_is_swept_not_trusted ... ok
+test readers::tests::a_dropped_slot_disappears_and_a_live_one_pins ... ok
+test readers::tests::a_flipped_byte_in_a_live_slot_pins_generation_zero ... ok
+test readers::tests::a_writer_sweep_during_creation_cannot_hide_a_live_reader ... ok
+test recover::safe::tests::interrupted_repair_is_safe_to_retry ... ok
+test recover::tests::a_corrupted_rebuild_never_replaces_the_original_data_file ... ok
+test recover::tests::a_damaged_interior_page_costs_nothing ... ok
+test recover::tests::a_duplicate_key_across_two_surviving_generations_keeps_the_newer_one ... ok
+test recover::tests::a_lost_leafs_after_key_comes_from_the_sibling_chain_not_page_order ... ok
+test recover::tests::a_truncated_tail_is_named_not_silently_dropped ... ok
+test recover::tests::an_unreadable_page_is_counted_regardless_of_the_stale_buffer_it_follows ... ok
+test recover::tests::an_unreadable_wal_is_an_error_while_no_wal_is_success ... ok
+test recover::tests::recover_does_not_panic_on_an_empty_but_crc_valid_meta_page ... ok
+test spatial::tests::aligned_squares_are_contiguous_hilbert_runs ... ok
+test spatial::tests::cover_ranges_cover_exactly_against_bruteforce ... ok
+test spatial::tests::hilbert_is_a_bijection_on_an_8x8_grid ... ok
+test spatial::tests::outward_rounding_always_contains_the_double_box ... ok
+test store::reuse_probe::store_churn_audits_last_issued_page_write ... ignored, large forensic probe; explicit scratch TMPDIR required
+test store::tests::a_checkpoint_refuses_when_no_later_page_generation_exists ... ok
+test store::tests::a_checkpoint_rotates_the_log_only_after_the_pages_are_durable ... ok
+test store::tests::a_commit_before_the_first_checkpoint_survives_a_directory_crash ... ok
+test store::tests::a_corrupted_packed_tree_never_becomes_authoritative ... ok
+test store::tests::a_failed_checkpoint_barrier_poisons_every_writer ... ok
+test store::tests::a_maximum_generation_read_from_disk_is_refused_not_wrapped ... ok
+test store::tests::a_partial_tree_mutation_poisons_and_reopen_replays_the_retained_log ... ok
+test store::tests::a_pre_mutation_validation_error_does_not_poison_the_store ... ok
+test store::tests::a_rotation_followed_by_a_reopen_does_not_reissue_lsn_1 ... ok
+test store::tests::a_snapshot_is_registered_before_its_generation_can_be_recycled ... ok
+test store::tests::a_store_checkpoint_preserves_the_file_own_format_version ... ok
+test store::tests::an_oversized_record_never_reaches_the_log ... ok
+test store::tests::ascending_keeps_fast_path_armed ... ok
+test store::tests::bounded_empty_key_batch_replays_as_one_committed_wal_unit ... ok
+test store::tests::byte_policy_keeps_wal_and_old_snapshot_after_data_barrier_failure ... ok
+test store::tests::byte_policy_publishes_exact_rows_without_a_redundant_wal_barrier ... ok
+test store::tests::constrained_commit_data_write_failures_do_not_publish_partial_rows ... ok
+test store::tests::constrained_commit_failure_preserves_published_state_and_snapshot ... ok
+test store::tests::corrupt_packed_range_is_caught_and_never_published ... ok
+test store::tests::deletion_merge_eviction_failures_cannot_publish_partial_changes ... ok
+test store::tests::graft_and_individual_inserts_answer_every_kernel_query_identically ... ok
+test store::tests::graft_crash_boundary_is_old_before_and_durable_after ... ok
+test store::tests::graft_into_an_empty_tree_becomes_the_tree ... ok
+test store::tests::graft_preserves_every_preexisting_key ... ok
+test store::tests::graft_refuses_a_nonempty_range_without_changing_the_tree ... ok
+test store::tests::malformed_wal_payloads_are_bounded_and_do_not_mutate_the_tree ... ok
+test store::tests::mixed_workload_rearms ... ok
+test store::tests::prepared_graft_manifest_and_generation_are_both_enforced ... ok
+test store::tests::prepared_graft_publishes_after_reopen_and_resume_of_resume_is_idempotent ... ok
+test store::tests::random_order_disarms_fast_path ... ok
+test store::tests::recreated_wal_name_survives_a_commit_before_checkpoint ... ok
+test store::tests::reopening_clears_poisoning_and_the_committed_data_is_still_there ... ok
+test store::tests::store_put_ascending_uses_fast_path ... ok
+test store::tests::store_put_survives_bulk_load ... ok
+test store::tests::store_random_order_matches_sequential ... ok
+test store::tests::the_three_durability_modes_issue_different_barriers ... ok
+test text::build_accumulator_tests::forced_spill_is_byte_identical_to_unspilled_posting_blocks ... ok
+test text::merge_interruption_tests::an_interrupted_k_way_merge_leaves_every_old_batch_findable ... ok
+test text::merge_interruption_tests::an_interruption_after_publish_reads_the_verified_replacement ... ok
+test text::parallel_prepare_tests::packed_document_transform_canonicalizes_norm_term_order ... ok
+test text::parallel_prepare_tests::packed_document_transform_is_deterministic ... ok
+test text::parallel_prepare_tests::packed_document_transform_preserves_document_identity_and_length ... ok
+test wal::tests::a_log_payload_larger_than_the_writer_max_is_refused_before_allocation ... ok
+test wal::tests::a_partial_frame_at_the_end_is_an_ending_not_damage ... ok
+test wal::tests::a_torn_tail_stops_replay_at_the_last_good_frame ... ok
+test wal::tests::a_verified_frame_naming_an_unknown_kind_is_damage ... ok
+test wal::tests::a_write_after_a_torn_tail_survives_the_next_open ... ok
+test wal::tests::an_all_zero_extension_is_a_clean_ending_and_is_truncated ... ok
+test wal::tests::an_exhausted_lsn_is_refused_with_checked_arithmetic ... ok
+test wal::tests::an_io_error_on_a_header_read_is_an_error_not_a_clean_end ... ok
+test wal::tests::append_lands_at_the_scanned_end_not_at_physical_eof ... ok
+test wal::tests::damage_with_more_log_behind_it_refuses_the_open_and_keeps_every_byte ... ok
+test wal::tests::non_zero_garbage_shorter_than_a_frame_is_damage_and_is_preserved ... ok
+test wal::tests::records_replay_in_order ... ok
+test wal::tests::replay_refuses_a_byte_changed_after_the_opening_crc_walk ... ok
+test wal::tests::writers_cannot_emit_a_frame_larger_than_max_frame_bytes ... ok
+
+test result: ok. 135 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.68s
+
+     Running tests/bulk.rs (<scratch>)
+
+running 16 tests
+test a_bulk_load_refuses_duplicate_keys ... ok
+test a_bulk_load_survives_a_crash_without_a_later_checkpoint ... ok
+test a_durable_sort_resumes_twice_from_its_last_watermark ... ok
+test a_flipped_scratch_value_is_refused_before_packing ... ok
+test a_merge_needing_more_than_one_merge_down_pass_loses_nothing ... ok
+test a_merge_with_far_more_runs_than_the_fanout_still_completes_in_order ... ok
+test a_missing_run_file_is_an_error_not_a_panic ... ok
+test a_partial_scratch_header_is_truncation_not_end_of_file ... ok
+test a_scratch_length_is_bounded_before_it_allocates ... ok
+test a_sort_dropped_without_finishing_removes_its_scratch ... ok
+test a_sort_far_larger_than_its_arena_comes_out_ordered ... ok
+test bulk_and_split_density_matches_the_balance_policy ... ok
+test bulk_load_and_point_lookup_agree ... ok
+test durable_sort_refuses_a_changed_published_manifest ... ok
+test durable_sort_refuses_stale_generation_and_torn_manifest ... ok
+test truncation_on_a_record_boundary_is_not_a_clean_complete_run ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.63s
+
+     Running tests/cell_codec_families.rs (<scratch>)
+
+running 4 tests
+test a_plain_codec_tree_reads_and_extends_a_compact_page ... ok
+test canonical_decoder_reads_every_cell_family_in_every_build ... ok
+test fast_and_canonical_paths_agree_on_every_cell_family ... ok
+test the_declared_codec_decides_the_written_family_in_both_directions ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/compact_cell_bounds.rs (<scratch>)
+
+running 1 test
+test compact_ordinary_key_is_slot_bounded_and_distinct_from_overflow ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/corruption.rs (<scratch>)
+
+running 1 test
+test no_single_flipped_byte_can_abort_the_process ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.33s
+
+     Running tests/corruption_bounds.rs (<scratch>)
+
+running 8 tests
+test a_malformed_id_counter_refuses_allocation ... ok
+test a_missing_id_counter_cannot_reuse_an_existing_id ... ok
+test a_number_list_with_trailing_bytes_returns_corruption ... ok
+test a_partial_data_page_refuses_store_open ... ok
+test a_short_node_row_returns_corruption ... ok
+test a_short_vector_code_row_returns_corruption_during_scan ... ok
+test an_oversized_record_length_returns_corruption_during_recovery ... ok
+test an_oversized_record_length_returns_corruption_on_normal_read ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+
+     Running tests/delete_reinsert.rs (<scratch>)
+
+running 2 tests
+test delete_prefix_agrees_with_the_model ... ok
+test delete_reinsert_keeps_tree_coherent ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+
+     Running tests/demo_parity.rs (<scratch>)
+
+running 1 test
+test the_demo_tool_layer_maps_onto_the_kernel ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/durability.rs (<scratch>)
+
+running 5 tests
+test a_checkpoint_places_the_barrier_its_mode_calls_for ... ok
+test a_committed_write_is_there_after_reopening ... ok
+test a_rejected_oversized_put_has_no_effect_on_a_commit_right_after_it ... ok
+test an_uncommitted_write_is_not_there_after_reopening ... ok
+test reopening_after_a_checkpoint_finds_everything ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+
+     Running tests/freelist.rs (<scratch>)
+
+running 9 tests
+test a_corrupt_freelist_sidecar_only_leaks ... ok
+test a_corrupt_registered_reader_marker_halts_recycling ... ok
+test a_crash_after_data_publish_cannot_reimport_the_previous_freelist ... ok
+test every_flushed_page_carries_its_publishing_generation ... ok
+test fold_insert_fold_cycles_lose_nothing ... ok
+test overwrite_churn_plateaus_the_file ... ok
+test recovery_does_not_leave_a_freelist_that_claims_live_pages ... ok
+test recovery_prefers_higher_generation_over_higher_page_number ... ok
+test the_freelist_survives_reopen ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.61s
+
+     Running tests/graph_clustering.rs (<scratch>)
+
+running 1 test
+test sequential_ids_beat_hashed_ids_on_trace_queries ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.06s
+
+     Running tests/graph_crash.rs (<scratch>)
+
+running 1 test
+test committed_graph_survives_a_crash_intact ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running tests/graph_ctx.rs (<scratch>)
+
+running 1 test
+test perspectives_share_nodes_but_never_edges ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/graph_law1.rs (<scratch>)
+
+running 1 test
+test graph_heap_does_not_grow_with_the_store ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.83s
+
+     Running tests/graph_law2_reads.rs (<scratch>)
+
+running 1 test
+test a_hop_costs_the_degree_not_the_store ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 79.44s
+
+     Running tests/graph_model.rs (<scratch>)
+
+running 1 test
+test graph_ops_agree_with_a_model ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+     Running tests/graph_props.rs (<scratch>)
+
+running 2 tests
+test encoders_preserve_order ... ok
+test prop_index_agrees_with_a_model ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/hybrid_score.rs (<scratch>)
+
+running 6 tests
+test extern_columns_join_the_expression ... ok
+test missing_rows_are_neutral_or_infinitely_far ... ok
+test scores_match_an_independent_oracle ... ok
+test scoring_survives_a_fold ... ok
+test snapshot_scores_are_immovable_during_churn ... ok
+test weights_change_the_ranking ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+
+     Running tests/law1_heap.rs (<scratch>)
+
+running 1 test
+test heap_does_not_grow_with_the_store ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.18s
+
+     Running tests/law2_shape.rs (<scratch>)
+
+running 1 test
+test write_cost_per_row_is_flat_as_the_store_grows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.53s
+
+     Running tests/model.rs (<scratch>)
+
+running 1 test
+test random_ops_agree_with_btreemap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/overflow.rs (<scratch>)
+
+running 4 tests
+test a_damaged_chain_refuses_one_record_only ... ok
+test bulk_load_spills_and_round_trips ... ok
+test crossed_chains_of_valid_pages_are_refused ... ok
+test mixed_sizes_agree_with_a_model_across_reopen ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/overflow_laws.rs (<scratch>)
+
+running 1 test
+test chained_values_hold_the_laws ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests/pack_memory.rs (<scratch>)
+
+running 1 test
+test pack_tree_memory_is_flat_in_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.43s
+
+     Running tests/pack_shape.rs (<scratch>)
+
+running 7 tests
+test a_damaged_level_file_is_refused_not_packed ... ok
+test an_overflow_marker_must_be_exactly_twelve_bytes ... ok
+test pack_tree_cleans_up_temp_files ... ok
+test pack_tree_multi_level ... ok
+test pack_tree_never_strands_a_single_interior_child ... ok
+test pack_tree_produces_identical_tree ... ok
+test pack_tree_spill_is_a_small_fraction_of_the_tree ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.35s
+
+     Running tests/persistent_free.rs (<scratch>)
+
+running 2 tests
+test interrupted_hint_replacement_preserves_current_and_fallback_rows ... ok
+test repeated_checkpoints_reuse_the_open_freelist_file ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+     Running tests/platform_invariant.rs (<scratch>)
+
+running 1 test
+test platform_specific_code_only_in_io_rs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/props_laws.rs (<scratch>)
+
+running 1 test
+test prop_index_is_disk_first_and_flat ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.59s
+
+     Running tests/published_tree_structure.rs (<scratch>)
+
+running 1 test
+test a_regrafted_range_leaves_the_published_tree_sound ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/recovery.rs (<scratch>)
+
+running 5 tests
+test a_damaged_log_refuses_to_open_and_recover_clears_it ... ok
+test one_flipped_byte_in_a_complete_frame_keeps_later_committed_frames ... ok
+test recovery_keeps_every_intact_leaf_and_names_what_it_lost ... ok
+test recovery_of_an_undamaged_store_loses_nothing ... ok
+test recovery_preserves_committed_but_uncheckpointed_writes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+     Running tests/resource_limits.rs (<scratch>)
+
+running 8 tests
+test concurrent_reader_admission_keeps_the_same_fixed_slot_inodes ... ok
+test constrained_source_can_be_salvaged_without_modifying_its_budgeted_files ... ok
+test duplicate_freelist_pages_are_rejected_before_installing_reuse_state ... ok
+test memory_reservation_overflow_is_a_refusal ... ok
+test policy_survives_one_bad_meta_and_create_cannot_disable_it ... ok
+test readers_are_bounded_and_reusable_and_oversize_input_is_preflighted ... ok
+test refusal_preserves_acknowledged_rows_and_old_reader_with_no_replay_growth ... ok
+test wal_and_bookkeeping_exhaustion_are_separate_safe_refusals ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.45s
+
+     Running tests/score_laws.rs (<scratch>)
+
+running 1 test
+test scoring_holds_no_resident_state_and_peaks_with_candidates ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+
+     Running tests/seekrepro.rs (<scratch>)
+
+running 1 test
+test seek_between_grafted_keys_lands_on_the_next_key ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/snapshot.rs (<scratch>)
+
+running 6 tests
+test a_busy_writer_adds_zero_reads_to_a_snapshot_query ... ok
+test a_new_reader_sees_the_new_publish ... ok
+test a_reader_refuses_every_mutation ... ok
+test a_reader_serves_the_publish_not_the_wal_tail ... ok
+test a_readers_view_is_byte_stable_while_the_writer_churns ... ok
+test a_torn_newest_slot_loses_to_the_standing_generation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+
+     Running tests/spatial_index.rs (<scratch>)
+
+running 6 tests
+test axis_order_is_lat_lon_everywhere ... ok
+test big_geometries_fall_to_coarse_and_still_answer ... ok
+test knn_matches_bruteforce_ranking ... ok
+test polygons_containment_and_update_delete ... ok
+test radius_query_agrees_with_bruteforce ... ok
+test snapshot_readers_see_stable_geo_answers ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/spatial_laws.rs (<scratch>)
+
+running 1 test
+test geo_ingest_heap_is_flat_across_4x ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+     Running tests/text_laws.rs (<scratch>)
+
+running 1 test
+test text_ingest_heap_is_flat_across_4x_corpus ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.02s
+
+     Running tests/text_search.rs (<scratch>)
+
+running 12 tests
+test a_deleted_document_vanishes_from_results ... ok
+test a_fold_bigger_than_one_chunk_stays_exact ... ok
+test bm25_exact_ranked_order_is_pinned ... ok
+test bm25_ranking_matches_the_independent_oracle ... ok
+test deleted_documents_do_not_change_survivor_ranking_or_length_normalisation ... ok
+test folding_preserves_every_answer_and_drops_the_dead ... ok
+test fuzzy_terms_match_bruteforce_edit_distance ... ok
+test incremental_document_stats_equal_a_recount_after_churn_and_reopen ... ok
+test indexing_is_immediate_and_survives_crash ... ok
+test instant_search_prefix_and_typos ... ok
+test leveled_merge_preserves_exact_results_and_bounds_batch_fanout ... ok
+test text_candidates_feed_vector_rescore ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+
+     Running tests/vector.rs (<scratch>)
+
+running 3 tests
+test rescore_matches_brute_force_all_metrics ... ok
+test vectors_round_trip_including_chained ... ok
+test wrong_dimension_is_refused ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/vector_defects.rs (<scratch>)
+
+running 2 tests
+test a_field_stored_at_four_bits_is_decoded_at_four_bits ... ok
+test a_vector_stored_with_a_lower_id_after_a_fold_is_still_found ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running tests/vector_index.rs (<scratch>)
+
+running 8 tests
+test a_deleted_vector_leaves_the_index_too ... ok
+test a_snapshot_reader_searches_vectors_too ... ok
+test fingerprints_are_deterministic_and_survive_reopen ... ok
+test nav_head_merges_with_the_walk ... ok
+test nav_recall_against_bruteforce ... ok
+test nearest_recall_against_exact_bruteforce ... ok
+test nearest_recall_on_hostile_sparse_vectors ... ok
+test parallel_nearest_agrees_with_serial ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.48s
+
+     Running tests/vector_laws.rs (<scratch>)
+
+running 2 tests
+test fold_wal_is_bounded_by_the_checkpoint_interval ... ok
+test vector_ingest_and_rescore_hold_law_1 ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.22s
+
+     Running tests/writer_lock.rs (<scratch>)
+
+running 3 tests
+test dropping_a_writer_releases_the_lock ... ok
+test one_writer_readers_allowed_and_process_death_releases_the_lock ... 
+running 1 test
+ok
+test writer_lock_process_helper ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+   Doc-tests e4_prototype
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests kernel
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

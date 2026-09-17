@@ -1,0 +1,7 @@
+{"fixture": "compact-off-checkpointed", "boundary": "checkpointed", "result": "PASS", "frozen_snapshot_refused": true, "frozen_writer_refused": true, "source_unchanged": true}
+{"fixture": "compact-off-checkpointed", "boundary": "wal-pending", "result": "PASS", "frozen_snapshot_refused": true, "frozen_writer_refused": true, "source_unchanged": true}
+{"fixture": "compact-on-checkpointed", "boundary": "checkpointed", "result": "PASS", "frozen_snapshot_refused": true, "frozen_writer_refused": true, "source_unchanged": true}
+{"fixture": "compact-on-checkpointed", "boundary": "wal-pending", "result": "PASS", "frozen_snapshot_refused": true, "frozen_writer_refused": true, "source_unchanged": true}
+{"fixture": "limited-checkpointed", "boundary": "checkpointed", "result": "PASS", "frozen_snapshot_refused": true, "frozen_writer_refused": true, "source_unchanged": true}
+{"fixture": "limited-checkpointed", "boundary": "wal-pending", "result": "PASS", "frozen_snapshot_refused": true, "frozen_writer_refused": true, "source_unchanged": true}
+{"result": "PASS", "arms": 6, "report": "<scratch>"}

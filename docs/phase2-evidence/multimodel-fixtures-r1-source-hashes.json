@@ -1,0 +1,6 @@
+{
+  "src/bin/multimodel_format_fixture.rs": "7e3819946206e8f2ca0d526b7dc98293c1b53b8e63a17bc3e0bd692451eab125",
+  "src/bin/typed_admission_probe.rs": "870b4d3f9c8a9eca8add780ff11b4519d329e47d00954f7c06ccb13356d8d9b2",
+  "tools/multimodel_format_compat.py": "30ecf36786ab4acc81f5caca0ebe3faed27b89f6abc58f265169cc7165b809b4",
+  "tools/format_reference_compat.py": "336ad99ad4c4a32b8a7263698a9aaf88d4e44de3e8abc9b9af790624b37a6984"
+}

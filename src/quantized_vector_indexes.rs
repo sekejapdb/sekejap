@@ -1,0 +1,748 @@
+//! Opt-in symmetric-int8 approximate scan with authoritative f32 reranking.
+//!
+//! This is a bounded linear scan over compact independently rebuildable
+//! entries. It is not an ANN graph or HNSW, and it never changes the existing
+//! exact-vector family or immutable f32 sidecars.
+use super::*;
+use crate::vector_quant::{self, Metric as QuantMetric};
+use std::{cmp::Ordering, collections::BinaryHeap};
+
+pub(super) const QUANTIZED_VECTOR_FEATURE: u64 = 0x20;
+pub(super) const QUANTIZED_VECTOR_ENTRY: u8 = 0x79;
+pub(super) const QUANTIZER_VERSION: u8 = 1;
+pub(super) const OPTIONS: u8 = 0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApproxVectorMethod {
+    SymmetricInt8ScanV1,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum QuantizedVectorCandidates<'a> {
+    All,
+    /// IDs must belong to the index collection and be strictly sorted.
+    SortedUnique(&'a [EntityId]),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApproxVectorResult {
+    /// Authoritative f32 vectors, accumulated as f64 in lane order.
+    pub hits: Vec<VectorHit>,
+    pub method: ApproxVectorMethod,
+    /// Requested maximum approximate shortlist size.
+    pub ef: usize,
+    /// Quantized index entries or filtered IDs examined.
+    pub examined: usize,
+    /// Authoritative vectors reranked exactly.
+    pub reranked: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ApproxCandidate {
+    id: EntityId,
+    distance: f64,
+    locator: [u8; 6],
+}
+
+impl PartialEq for ApproxCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance.to_bits() == other.distance.to_bits() && self.id == other.id
+    }
+}
+impl Eq for ApproxCandidate {}
+impl PartialOrd for ApproxCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ApproxCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExactHit(VectorHit);
+
+impl PartialEq for ExactHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.distance.to_bits() == other.0.distance.to_bits() && self.0.id == other.0.id
+    }
+}
+impl Eq for ExactHit {}
+impl PartialOrd for ExactHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ExactHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .distance
+            .total_cmp(&other.0.distance)
+            .then_with(|| self.0.id.cmp(&other.0.id))
+    }
+}
+
+pub(super) fn entry_prefix(id: IndexId) -> Vec<u8> {
+    let mut key = vec![QUANTIZED_VECTOR_ENTRY];
+    key.extend(ordered(id.0));
+    key
+}
+
+pub(super) fn entry_key(id: IndexId, sequence: u64) -> Vec<u8> {
+    let mut key = entry_prefix(id);
+    key.extend(ordered(sequence));
+    key
+}
+
+pub(super) fn dimension(index: &IndexInfo) -> Result<usize> {
+    match (&index.family, &index.kind) {
+        (IndexFamily::QuantizedVector, Kind::Vector(dimension))
+            if (1..=vector_quant::MAX_DIMENSION).contains(dimension) =>
+        {
+            Ok(*dimension)
+        }
+        _ => Err(corrupt("quantized vector descriptor family/kind")),
+    }
+}
+
+fn metric(metric: VectorMetric) -> QuantMetric {
+    match metric {
+        VectorMetric::Cosine => QuantMetric::Cosine,
+        VectorMetric::SquaredL2 => QuantMetric::SquaredL2,
+        VectorMetric::NegativeDot => QuantMetric::NegativeDot,
+    }
+}
+
+fn raw_lanes(bytes: &[u8], dimension: usize) -> Result<Vec<f32>> {
+    super::vector_indexes::validate_vector(bytes, dimension)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|lane| f32::from_le_bytes(lane.try_into().unwrap()))
+        .collect())
+}
+
+pub(super) fn encode_entry(locator: [u8; 6], raw: &[u8], dimension: usize) -> Result<Vec<u8>> {
+    let lanes = raw_lanes(raw, dimension)?;
+    let quantized = vector_quant::encode(&lanes)
+        .map_err(|_| corrupt("valid f32 vector could not be quantized"))?;
+    let mut value = Vec::with_capacity(6 + quantized.len());
+    value.extend(locator);
+    value.extend(quantized);
+    Ok(value)
+}
+
+pub(super) fn decode_entry(
+    value: &[u8],
+    dimension: usize,
+) -> Result<([u8; 6], vector_quant::Decoded<'_>)> {
+    if value.len() != 6 + 8 + dimension {
+        return Err(corrupt("quantized vector entry length"));
+    }
+    let locator: [u8; 6] = value[..6].try_into().unwrap();
+    super::vector_indexes::decode_locator(&locator)?;
+    let decoded = vector_quant::decode(&value[6..], dimension)
+        .map_err(|_| corrupt("quantized vector entry codec"))?;
+    Ok((locator, decoded))
+}
+
+pub(super) fn validate_locator(
+    db: &Database,
+    index: &IndexInfo,
+    locator: &[u8; 6],
+) -> Result<usize> {
+    let expected = dimension(index)?;
+    let (layout_id, ordinal) = super::vector_indexes::decode_locator(locator)?;
+    let layout = db.layout(layout_id)?;
+    if layout.id != u64::from(layout_id)
+        || !matches!(
+            layout.fields.get(ordinal),
+            Some((name, Kind::Vector(found))) if name == &index.field && *found == expected
+        )
+    {
+        return Err(corrupt("quantized vector locator field/layout mismatch"));
+    }
+    Ok(ordinal)
+}
+
+fn desired_entry(
+    index: &IndexInfo,
+    layout: &Layout,
+    vectors: &VectorCells,
+) -> Result<Option<Vec<u8>>> {
+    let expected = dimension(index)?;
+    let Some((ordinal, (_, kind))) = layout
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, (name, _))| name == &index.field)
+    else {
+        return Err(corrupt("current indexed vector field is absent"));
+    };
+    if kind != &Kind::Vector(expected) {
+        return Err(corrupt("current indexed vector field changed kind"));
+    }
+    let Some((_, raw)) = vectors.iter().find(|(field, _)| *field == ordinal) else {
+        return Ok(None);
+    };
+    let layout_id = u32::try_from(layout.id).map_err(corrupt)?;
+    let locator = super::vector_indexes::encode_locator(layout_id, ordinal)?;
+    encode_entry(locator, raw, expected).map(Some)
+}
+
+pub(super) fn maintain_entry(
+    db: &mut Database,
+    index: &IndexInfo,
+    id: EntityId,
+    new: Option<(&Layout, &VectorCells)>,
+) -> Result<()> {
+    let key = entry_key(index.id, id.sequence);
+    let desired = new
+        .map(|(layout, vectors)| desired_entry(index, layout, vectors))
+        .transpose()?
+        .flatten();
+    let existing = db.store()?.get(&key)?;
+    match (existing.as_deref(), desired) {
+        (Some(old), Some(value)) if old == value => {}
+        (_, Some(value)) => db.writer()?.put(&key, &value)?,
+        (Some(_), None) => {
+            db.writer()?.delete(&key)?;
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+/// Derive and validate one entry from an immutable row and its authoritative
+/// vector sidecar. Missing/null/historically absent fields emit no entry.
+pub(super) fn build_entry(
+    db: &Database,
+    index: &IndexInfo,
+    id: EntityId,
+    row: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let expected = dimension(index)?;
+    let layout_id = layout_id(row)?;
+    let layout = db.layout(layout_id)?;
+    let ordinal =
+        crate::dense_v3::locate_vector(&layout, row, &index.field, expected).map_err(|error| {
+            let message = error.to_string();
+            if message.contains("historical vector field") {
+                invalid(message)
+            } else {
+                corrupt(message)
+            }
+        })?;
+    let Some(ordinal) = ordinal else {
+        return Ok(None);
+    };
+    let raw = db
+        .store()?
+        .get(&vector_key(id, ordinal))?
+        .ok_or_else(|| corrupt("indexed vector sidecar is missing"))?;
+    let locator = super::vector_indexes::encode_locator(layout_id, ordinal)?;
+    encode_entry(locator, &raw, expected).map(Some)
+}
+
+fn validate_candidates(index: &IndexInfo, candidates: QuantizedVectorCandidates<'_>) -> Result<()> {
+    if let QuantizedVectorCandidates::SortedUnique(ids) = candidates {
+        let mut previous = None;
+        for candidate in ids {
+            if candidate.collection != index.collection
+                || previous.is_some_and(|old| old >= *candidate)
+            {
+                return Err(invalid(
+                    "filtered candidates must be same-collection, sorted and unique",
+                ));
+            }
+            previous = Some(*candidate);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn exact_score(
+    raw: &[u8],
+    dimension: usize,
+    query: &[f32],
+    query_norm: f64,
+    metric: VectorMetric,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<f64>> {
+    super::vector_indexes::validate_vector(raw, dimension)?;
+    let mut dot = 0.0f64;
+    let mut stored_norm = 0.0f64;
+    let mut squared_l2 = 0.0f64;
+    for (at, (lane, query_lane)) in raw.chunks_exact(4).zip(query).enumerate() {
+        if at % 256 == 0 && cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let stored = f64::from(f32::from_le_bytes(lane.try_into().unwrap()));
+        let query_lane = f64::from(*query_lane);
+        dot += stored * query_lane;
+        stored_norm += stored * stored;
+        let difference = stored - query_lane;
+        squared_l2 += difference * difference;
+    }
+    let distance = match metric {
+        VectorMetric::SquaredL2 => squared_l2,
+        VectorMetric::NegativeDot => -dot,
+        VectorMetric::Cosine if stored_norm == 0.0 => return Ok(None),
+        VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
+    };
+    Ok(Some(if distance == 0.0 { 0.0 } else { distance }))
+}
+
+fn spend(
+    examined: &mut usize,
+    max_examined: usize,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if *examined == max_examined {
+        return Err(Error::Kernel(kernel::Error::ResourceLimit(
+            "quantized vector max_examined exceeded",
+        )));
+    }
+    *examined += 1;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_approx(
+    db: &Database,
+    index: &IndexInfo,
+    entity: EntityId,
+    value: &[u8],
+    dimension: usize,
+    query: &[f32],
+    metric_value: VectorMetric,
+    ef: usize,
+    shortlist: &mut BinaryHeap<ApproxCandidate>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    let (locator, decoded) = decode_entry(value, dimension)?;
+    validate_locator(db, index, &locator)?;
+    let distance = match decoded.score(query, metric(metric_value), cancelled) {
+        Ok(Some(distance)) => distance,
+        Ok(None) => return Ok(()),
+        Err(vector_quant::Error::Cancelled) => return Err(Error::Cancelled),
+        Err(vector_quant::Error::Invalid(_)) => {
+            return Err(corrupt("quantized vector approximate scoring"));
+        }
+    };
+    shortlist.push(ApproxCandidate {
+        id: entity,
+        distance,
+        locator,
+    });
+    if shortlist.len() > ef {
+        shortlist.pop();
+    }
+    Ok(())
+}
+
+impl Database {
+    pub fn create_quantized_vector_index(
+        &mut self,
+        collection: CollectionId,
+        name: &str,
+        field: &str,
+    ) -> Result<IndexId> {
+        self.ready_write()?;
+        let info = self.collection_info(collection)?;
+        let kind = info
+            .layout
+            .fields
+            .iter()
+            .find(|(candidate, _)| candidate == field)
+            .map(|(_, kind)| kind.clone())
+            .ok_or_else(|| invalid("index field must be declared"))?;
+        if !matches!(kind, Kind::Vector(d) if (1..=vector_quant::MAX_DIMENSION).contains(&d)) {
+            return Err(invalid("quantized vector index requires a vector field"));
+        }
+        self.create_index(
+            collection,
+            name,
+            field,
+            kind,
+            false,
+            IndexFamily::QuantizedVector,
+            QUANTIZED_VECTOR_FEATURE,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_quantized_vector(
+        &self,
+        id: IndexId,
+        query: &[f32],
+        metric: VectorMetric,
+        k: usize,
+        ef: usize,
+        candidates: QuantizedVectorCandidates<'_>,
+        max_examined: usize,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<ApproxVectorResult> {
+        if k == 0 || k > ef || ef > indexes::MAX_RESULTS {
+            return Err(invalid(
+                "quantized vector search requires 1 <= k <= ef <= 65536",
+            ));
+        }
+        let index = self.index_info(id)?;
+        if index.family != IndexFamily::QuantizedVector {
+            return Err(invalid("index is not a quantized vector index"));
+        }
+        if index.state != IndexState::Ready {
+            return Err(invalid("index is not ready"));
+        }
+        let dimension = dimension(&index)?;
+        if query.len() != dimension || query.iter().any(|lane| !lane.is_finite()) {
+            return Err(invalid(
+                "query vector has wrong dimension or non-finite lane",
+            ));
+        }
+        let query_norm = query.iter().fold(0.0f64, |sum, lane| {
+            sum + f64::from(*lane) * f64::from(*lane)
+        });
+        if metric == VectorMetric::Cosine && query_norm == 0.0 {
+            return Err(invalid("cosine query vector must have nonzero norm"));
+        }
+        validate_candidates(&index, candidates)?;
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+
+        let mut examined = 0usize;
+        let mut shortlist = BinaryHeap::with_capacity(ef.min(1024));
+
+        match candidates {
+            QuantizedVectorCandidates::All => {
+                let prefix = entry_prefix(id);
+                for row in self.store()?.range(&prefix)? {
+                    let (key, value) = row?;
+                    if !key.starts_with(&prefix) {
+                        break;
+                    }
+                    spend(&mut examined, max_examined, &mut cancelled)?;
+                    let mut at = prefix.len();
+                    let sequence = read_ordered(&key, &mut at)?;
+                    if at != key.len() || sequence == 0 {
+                        return Err(corrupt("quantized vector entry key"));
+                    }
+                    probe_approx(
+                        self,
+                        &index,
+                        EntityId {
+                            collection: index.collection,
+                            sequence,
+                        },
+                        &value,
+                        dimension,
+                        query,
+                        metric,
+                        ef,
+                        &mut shortlist,
+                        &mut cancelled,
+                    )?;
+                }
+            }
+            QuantizedVectorCandidates::SortedUnique(ids) => {
+                for entity in ids {
+                    spend(&mut examined, max_examined, &mut cancelled)?;
+                    if let Some(value) = self.store()?.get(&entry_key(id, entity.sequence))? {
+                        probe_approx(
+                            self,
+                            &index,
+                            *entity,
+                            &value,
+                            dimension,
+                            query,
+                            metric,
+                            ef,
+                            &mut shortlist,
+                            &mut cancelled,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let reranked = shortlist.len();
+        let mut exact = BinaryHeap::with_capacity(k.min(1024));
+        for candidate in shortlist {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let ordinal = validate_locator(self, &index, &candidate.locator)?;
+            let raw = self
+                .store()?
+                .get(&vector_key(candidate.id, ordinal))?
+                .ok_or_else(|| corrupt("quantized vector locator points to missing sidecar"))?;
+            let persisted = self
+                .store()?
+                .get(&entry_key(index.id, candidate.id.sequence))?
+                .ok_or_else(|| corrupt("quantized shortlist entry disappeared"))?;
+            if encode_entry(candidate.locator, &raw, dimension)? != persisted {
+                return Err(corrupt(
+                    "quantized vector entry differs from authoritative sidecar",
+                ));
+            }
+            let Some(distance) =
+                exact_score(&raw, dimension, query, query_norm, metric, &mut cancelled)?
+            else {
+                continue;
+            };
+            exact.push(ExactHit(VectorHit {
+                id: candidate.id,
+                distance,
+            }));
+            if exact.len() > k {
+                exact.pop();
+            }
+        }
+        let mut hits: Vec<_> = exact.into_iter().map(|hit| hit.0).collect();
+        hits.sort_by(|left, right| {
+            left.distance
+                .total_cmp(&right.distance)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(ApproxVectorResult {
+            hits,
+            method: ApproxVectorMethod::SymmetricInt8ScanV1,
+            ef,
+            examined,
+            reranked,
+        })
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+    use kernel::{io::IoMode, store::SyncMode};
+    use serde_json::json;
+
+    fn cfg() -> Config {
+        Config {
+            budget_bytes: 1 << 20,
+            io: IoMode::Buffered,
+            sync: SyncMode::Full,
+        }
+    }
+
+    fn rows(db: &Database) -> Vec<(Vec<u8>, Vec<u8>)> {
+        db.store()
+            .unwrap()
+            .range(&[])
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn ids(db: &Database, index: IndexId) -> Vec<EntityId> {
+        db.query_quantized_vector(
+            index,
+            &[0.0, 0.0],
+            VectorMetric::SquaredL2,
+            16,
+            16,
+            QuantizedVectorCandidates::All,
+            16,
+            || false,
+        )
+        .unwrap()
+        .hits
+        .into_iter()
+        .map(|hit| hit.id)
+        .collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Operation {
+        Create,
+        Insert,
+        Update,
+        Delete,
+        BuildProgress,
+        BuildPublish,
+        DropBegin,
+        DropProgress,
+        DropFinish,
+    }
+
+    struct Fixture {
+        collection: CollectionId,
+        a: EntityId,
+        b: EntityId,
+        index: Option<IndexId>,
+    }
+
+    fn fixture(db: &mut Database, operation: Operation) -> Fixture {
+        let collection = db
+            .create_collection(
+                "rows",
+                vec![("v".into(), Kind::Vector(2))],
+                Default::default(),
+            )
+            .unwrap();
+        let a = db.put(collection, "a", &json!({"v":[1.0,0.0]})).unwrap();
+        let b = db.put(collection, "b", &json!({"v":[2.0,0.0]})).unwrap();
+        db.commit().unwrap();
+        if matches!(operation, Operation::Create) {
+            return Fixture {
+                collection,
+                a,
+                b,
+                index: None,
+            };
+        }
+        let index = db
+            .create_quantized_vector_index(collection, "v_int8", "v")
+            .unwrap();
+        if !matches!(
+            operation,
+            Operation::BuildProgress | Operation::BuildPublish
+        ) {
+            assert!(db.build_index_step(index, 16).unwrap());
+        }
+        db.commit().unwrap();
+        Fixture {
+            collection,
+            a,
+            b,
+            index: Some(index),
+        }
+    }
+
+    fn apply(operation: Operation, db: &mut Database, fixture: &Fixture) -> Result<()> {
+        match operation {
+            Operation::Create => db
+                .create_quantized_vector_index(fixture.collection, "v_int8", "v")
+                .map(|_| ()),
+            Operation::Insert => db
+                .put(fixture.collection, "new", &json!({"v":[3.0,0.0]}))
+                .map(|_| ()),
+            Operation::Update => db
+                .update(fixture.collection, "a", &json!({"v":[3.0,0.0]}))
+                .map(|_| ()),
+            Operation::Delete => db
+                .delete(fixture.collection, "a")
+                .map(|deleted| assert!(deleted)),
+            Operation::BuildProgress => db
+                .build_index_step(fixture.index.unwrap(), 1)
+                .map(|done| assert!(!done)),
+            Operation::BuildPublish => db
+                .build_index_step(fixture.index.unwrap(), 16)
+                .map(|done| assert!(done)),
+            Operation::DropBegin => db.begin_drop_index(fixture.index.unwrap()),
+            Operation::DropProgress => db
+                .drop_index_step(fixture.index.unwrap(), 1)
+                .map(|done| assert!(!done)),
+            Operation::DropFinish => db
+                .drop_index_step(fixture.index.unwrap(), 16)
+                .map(|done| assert!(done)),
+        }
+    }
+
+    fn committed_semantics(db: &Database, operation: Operation, fixture: &Fixture) {
+        match operation {
+            Operation::Create => {
+                let indexes = db.list_indexes(fixture.collection).unwrap();
+                assert_eq!(indexes.len(), 1);
+                assert_eq!(indexes[0].family, IndexFamily::QuantizedVector);
+            }
+            Operation::Insert => assert_eq!(ids(db, fixture.index.unwrap()).len(), 3),
+            Operation::Update => {
+                assert_eq!(ids(db, fixture.index.unwrap()), vec![fixture.b, fixture.a]);
+            }
+            Operation::Delete => {
+                assert!(db.get_by_id(fixture.a).unwrap().is_none());
+                assert_eq!(ids(db, fixture.index.unwrap()), vec![fixture.b]);
+            }
+            Operation::BuildProgress => assert!(matches!(
+                db.index_info(fixture.index.unwrap()).unwrap().state,
+                IndexState::Building { after } if after == fixture.a.sequence
+            )),
+            Operation::BuildPublish => {
+                assert_eq!(
+                    db.index_info(fixture.index.unwrap()).unwrap().state,
+                    IndexState::Ready
+                );
+                assert_eq!(ids(db, fixture.index.unwrap()), vec![fixture.a, fixture.b]);
+            }
+            Operation::DropBegin | Operation::DropProgress => assert_eq!(
+                db.index_info(fixture.index.unwrap()).unwrap().state,
+                IndexState::Dropping
+            ),
+            Operation::DropFinish => assert!(matches!(
+                db.index_info(fixture.index.unwrap()),
+                Err(Error::NotFound("index"))
+            )),
+        }
+    }
+
+    #[test]
+    fn quantized_catalog_crud_build_and_drop_are_atomic_at_every_key_write() {
+        for operation in [
+            Operation::Create,
+            Operation::Insert,
+            Operation::Update,
+            Operation::Delete,
+            Operation::BuildProgress,
+            Operation::BuildPublish,
+            Operation::DropBegin,
+            Operation::DropProgress,
+            Operation::DropFinish,
+        ] {
+            let mut reached_success = false;
+            for fail_at in 0..96 {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("db");
+                let mut db = Database::create(&path, cfg()).unwrap();
+                let fixture = fixture(&mut db, operation);
+                if matches!(operation, Operation::DropProgress | Operation::DropFinish) {
+                    db.begin_drop_index(fixture.index.unwrap()).unwrap();
+                    db.commit().unwrap();
+                }
+                let pinned = Database::open_snapshot(&path, cfg()).unwrap();
+                let pinned_rows = rows(&pinned);
+                let baseline = rows(&db);
+                db.store().unwrap().arm_write_fault(fail_at);
+                let result = apply(operation, &mut db, &fixture);
+                if result.is_ok() {
+                    assert!(fail_at > 0, "{operation:?} performed no writes");
+                    assert_eq!(rows(&pinned), pinned_rows);
+                    drop(db);
+                    assert_eq!(rows(&Database::open(&path, cfg()).unwrap()), baseline);
+                    reached_success = true;
+                    break;
+                }
+
+                assert!(db.commit().is_err(), "{operation:?}/{fail_at}");
+                assert_eq!(rows(&pinned), pinned_rows);
+                assert_eq!(
+                    rows(&Database::open_snapshot(&path, cfg()).unwrap()),
+                    baseline,
+                    "partial publication at {operation:?}/{fail_at}"
+                );
+                db.rollback().unwrap();
+                assert_eq!(rows(&db), baseline);
+                apply(operation, &mut db, &fixture).unwrap();
+                db.commit().unwrap();
+                committed_semantics(&db, operation, &fixture);
+                let committed = rows(&db);
+                drop(db);
+                let reopened = Database::open(&path, cfg()).unwrap();
+                assert_eq!(rows(&reopened), committed);
+                committed_semantics(&reopened, operation, &fixture);
+            }
+            assert!(reached_success, "{operation:?} exceeded 96 key writes");
+        }
+    }
+}
