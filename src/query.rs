@@ -2931,16 +2931,37 @@ fn decode_row(db: &Database, bytes: Vec<u8>) -> QueryResult<RowData> {
 /// `graph/hop1_project` 11 -> 47 us before this bound.
 ///
 /// The bound is a number of ROWS but the thing it is protecting against is
-/// LEAVES, and a primary leaf of this collection holds on the order of a
-/// hundred rows. At 32 it was a quarter of one leaf, so a walk that is dense
-/// in runs and sparse between them -- `price > 400` matches nine rows out of
-/// every forty-nine, so it steps 1,1,...,1,40 -- gave the whole page back to
-/// the point-get at its FIRST gap, and then paid a full root-to-leaf descent
-/// per winner: measured at 4.0 pager accesses and 6 allocations per row on
-/// `filter/range_open`. At 256 a gap of that shape stays inside the leaf the
-/// cursor is standing on or crosses one, which is cheaper than the descent it
-/// replaces, while a genuinely sparse page still bails on its first gap.
+/// LEAVES. At 32 it was a fraction of one leaf of a narrow collection, so a
+/// walk that is dense in runs and sparse between them -- `price > 400` matches
+/// nine rows out of every forty-nine, so it steps 1,1,...,1,40 -- gave the
+/// whole page back to the point-get at its FIRST gap, and then paid a full
+/// root-to-leaf descent per winner: measured at 4.0 pager accesses and 6
+/// allocations per row on `filter/range_open`.
+///
+/// How many leaves a row-gap spans is a property of the DATA, not of the plan:
+/// the same gap of a hundred sequences is a fraction of a leaf in a collection
+/// of forty-byte rows and a dozen leaves in one of five-hundred-byte rows. So
+/// this stays a cheap pre-filter -- a gap wider than this cannot be worth
+/// stepping under any row width, and the first reach is what it bounds -- and
+/// what the page actually decides on is [`LOCKSTEP_LEAVES`], which the cursor
+/// measures.
 const LOCKSTEP_REACH: u64 = 256;
+
+/// How many LEAVES one reach may cross before the page gives the rest of
+/// itself back to the point-get.
+///
+/// `RangeIter::advance` climbs the parent path and re-descends the leftmost
+/// spine for every leaf it steps, so a reach across a dozen leaves costs
+/// several times the root-to-leaf descent it was replacing. A reach that stays
+/// inside the pinned leaf costs nothing at all, and one that crosses a leaf or
+/// two is still cheaper than a descent; past that the cursor is not paying for
+/// itself and the reader stops pretending it is.
+///
+/// The cost is only knowable AFTER the reach, so the page pays one expensive
+/// one and then stops -- the same shape as the row pre-filter above, which is
+/// what keeps that pre-filter necessary: it is the bound on how bad that one
+/// reach can be.
+const LOCKSTEP_LEAVES: u32 = 2;
 
 /// How a page reads primary rows.
 ///
@@ -3033,6 +3054,19 @@ impl<'a> PrimaryRows<'a> {
         self.last = 0;
     }
 
+    /// What the reach the cursor just made actually cost, in leaves.
+    ///
+    /// A page that crossed more than [`LOCKSTEP_LEAVES`] to reach one row is
+    /// sparse in the primary tree however close together its SEQUENCES looked,
+    /// so it gives the rest of itself back to the point-get exactly as
+    /// `plan`'s row pre-filter does.
+    fn charge(&mut self, stepped: u32) {
+        if stepped > LOCKSTEP_LEAVES {
+            self.ascending = false;
+            self.cursor = None;
+        }
+    }
+
     /// Park the cursor on the first record at or after the planned key.
     fn seek(&mut self, id: EntityId) -> QueryResult<()> {
         if self.cursor.is_none() {
@@ -3060,16 +3094,18 @@ impl<'a> PrimaryRows<'a> {
         self.seek(id)?;
         let key = &self.key;
         let cursor = self.cursor.as_mut().expect("the cursor was just opened");
-        Ok(
-            match cursor
-                .peek_at_or_after(key)
-                .map_err(Error::from)
-                .map_err(QueryError::from)?
-            {
-                Some((found, value)) if found == key.as_slice() => Some(value.to_vec()),
-                _ => None,
-            },
-        )
+        let before = cursor.leaves_stepped();
+        let found = match cursor
+            .peek_at_or_after(key)
+            .map_err(Error::from)
+            .map_err(QueryError::from)?
+        {
+            Some((found, value)) if found == key.as_slice() => Some(value.to_vec()),
+            _ => None,
+        };
+        let stepped = cursor.leaves_stepped() - before;
+        self.charge(stepped);
+        Ok(found)
     }
 
     /// Look at one row WITHOUT copying it out of the leaf.
@@ -3097,14 +3133,18 @@ impl<'a> PrimaryRows<'a> {
         self.seek(id)?;
         let key = &self.key;
         let cursor = self.cursor.as_mut().expect("the cursor was just opened");
-        match cursor
+        let before = cursor.leaves_stepped();
+        let value = match cursor
             .peek_at_or_after(key)
             .map_err(Error::from)
             .map_err(QueryError::from)?
         {
             Some((found, value)) if found == key.as_slice() => f(Some(value)),
             _ => f(None),
-        }
+        };
+        let stepped = cursor.leaves_stepped() - before;
+        self.charge(stepped);
+        value
     }
 
     /// Is the row still there? The same reach, without the copy.
@@ -3127,13 +3167,17 @@ impl<'a> PrimaryRows<'a> {
         self.seek(id)?;
         let key = &self.key;
         let cursor = self.cursor.as_mut().expect("the cursor was just opened");
-        Ok(matches!(
+        let before = cursor.leaves_stepped();
+        let present = matches!(
             cursor
                 .peek_at_or_after(key)
                 .map_err(Error::from)
                 .map_err(QueryError::from)?,
             Some((found, _)) if found == key.as_slice()
-        ))
+        );
+        let stepped = cursor.leaves_stepped() - before;
+        self.charge(stepped);
+        Ok(present)
     }
 }
 

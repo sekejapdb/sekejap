@@ -830,3 +830,153 @@ fn a_phrase_scans_the_row_without_a_descent_or_a_term_map() {
         "the phrase re-read cost {extra_allocations:.2} allocations per candidate beyond its posting walk"
     );
 }
+
+/// How WIDE the rows of the sparse-page fixture are.
+///
+/// The number is the whole point. A 4 KiB leaf holds only a handful of rows
+/// of this size, so a gap of a hundred SEQUENCES is a gap of tens of LEAVES --
+/// which is what the lockstep reader's reach is really spending, and what a
+/// bound counted in rows cannot see.
+const WIDE_BULK: usize = 384;
+const WIDE_ROWS: u64 = 20_000;
+/// One `pod` value in every hundred rows, so an equality posting hands the
+/// page ascending ids a hundred apart.
+const POD_STRIDE: u64 = 100;
+
+struct Wide {
+    db: Database,
+    rows: e4_prototype::collections::CollectionId,
+    pod: IndexId,
+    price: IndexId,
+}
+
+fn wide_fixture(dir: &std::path::Path) -> Wide {
+    let mut db = Database::create(dir.join("db"), cfg()).unwrap();
+    let rows = db
+        .create_collection(
+            "w",
+            vec![
+                ("pod".into(), Kind::Text),
+                ("price".into(), Kind::Real),
+                ("bulk".into(), Kind::Text),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    let bulk = "x".repeat(WIDE_BULK);
+    for i in 1..=WIDE_ROWS {
+        db.put(
+            rows,
+            &format!("k{i:08}"),
+            &json!({
+                "pod": format!("pod{:03}", i % POD_STRIDE),
+                "price": price(i),
+                "bulk": bulk,
+            }),
+        )
+        .unwrap();
+        if i % 256 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let pod = db.create_scalar_index(rows, "pod_idx", "pod", false).unwrap();
+    db.build_index_to_ready(pod, 256).unwrap();
+    let price = db
+        .create_scalar_index(rows, "price_idx", "price", false)
+        .unwrap();
+    db.build_index_to_ready(price, 256).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    Wide {
+        db,
+        rows,
+        pod,
+        price,
+    }
+}
+
+/// A page whose candidates are SPARSE in the primary tree must not walk the
+/// leaves between them.
+///
+/// The shape is the multimodel bench's `members_active_spatial_vector` in
+/// miniature: an equality posting drives, so the ids ascend and the page reads
+/// its rows through the lockstep cursor, and a second predicate needs the row
+/// of every candidate. The candidates are a hundred sequences apart, and the
+/// rows are wide enough that a hundred sequences is tens of LEAVES.
+///
+/// `peek_at_or_after` reaches a key past its pinned leaf by stepping to the
+/// next leaf, one at a time, and each of those steps climbs and re-descends
+/// the parent path -- so reaching across tens of leaves costs many times what
+/// the root-to-leaf descent it replaced costs. The reader's bail-out is
+/// what is supposed to notice; counted in ROWS it cannot, because how many
+/// leaves a row-gap spans depends on how wide the rows are.
+///
+/// Measured on this fixture: 44.44 pager accesses per candidate with the reach
+/// bounded at 256 ROWS, against 4.24 once the reader bounds it in LEAVES and
+/// gives a sparse page back to the point-get. The ceiling is set between the
+/// two, nearer the bad number, so it fails on the regression and not on a
+/// rounding.
+#[test]
+fn a_sparse_page_over_wide_rows_does_not_walk_the_leaves_between_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = wide_fixture(temp.path());
+    let filters = [
+        QueryFilter::Scalar {
+            index: fixture.pod,
+            predicate: ScalarFilter::Eq(ScalarValue::Text("pod007")),
+        },
+        QueryFilter::Scalar {
+            index: fixture.price,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Excluded(ScalarValue::F64(400.0)),
+                upper: Bound::Unbounded,
+            },
+        },
+    ];
+    // Every row the equality posting names has its row read for the range
+    // predicate; those reads are what this test is about.
+    let candidates = (1..=WIDE_ROWS).filter(|i| i % POD_STRIDE == 7).count() as u64;
+    let expected = (1..=WIDE_ROWS)
+        .filter(|i| i % POD_STRIDE == 7 && price(*i) > 400.0)
+        .count();
+    assert!(candidates > 100, "the fixture must have a real walk");
+    assert!(expected > 10, "the fixture must have a real answer");
+
+    let mut prepared = fixture
+        .db
+        .prepare_query(QueryRequest {
+            collection: fixture.rows,
+            filters: &filters,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let before = fixture.db.pool_accesses().unwrap();
+    let mut found = 0;
+    let mut reads = 0;
+    loop {
+        let page = prepared
+            .next_page(PAGE, QueryBudget::unlimited(), || false)
+            .unwrap();
+        found += page.rows.len();
+        reads += page.work.primary_reads;
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    let accesses = fixture.db.pool_accesses().unwrap() - before;
+    assert_eq!(found, expected);
+    assert_eq!(
+        reads, candidates,
+        "one primary read per candidate is the shape this test measures"
+    );
+    assert!(
+        accesses < candidates * 8,
+        "{accesses} pager accesses for {candidates} candidate rows: {:.2} each, and it was 44.44",
+        accesses as f64 / candidates as f64
+    );
+}

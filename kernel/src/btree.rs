@@ -3444,6 +3444,20 @@ impl ReverseRangeIter<'_> {
 }
 
 impl RangeIter<'_> {
+    /// How many LEAVES this cursor has stepped through since it was opened.
+    ///
+    /// `advance` is the cursor's real unit of cost: it climbs the parent path
+    /// until an ancestor has a child to the right and then re-descends the
+    /// leftmost spine, so one step is one or more pager accesses and a long
+    /// reach is many. A caller choosing between stepping this cursor forward
+    /// and descending the tree afresh is choosing between LEAF STEPS and a
+    /// tree height, and this is the only half of that it cannot work out for
+    /// itself -- how far apart two keys are in leaves depends on how wide the
+    /// records between them are, which is the caller's data and not its plan.
+    pub fn leaves_stepped(&self) -> u32 {
+        self.leaves
+    }
+
     /// 2f: step to the next leaf through the parent path. Climb until an
     /// ancestor has a child to the right, step into it, then take the
     /// leftmost spine down to its first leaf. Returns false when every
