@@ -425,6 +425,17 @@ enum CompiledFilter {
         predicate: EncodedScalarFilter,
         posting_membership: bool,
     },
+    /// A scalar filter whose predicate was folded into `into` -- another
+    /// position naming the SAME index -- by [`fold_same_index_scalars`].
+    ///
+    /// The position survives because positions are user-visible: a caller may
+    /// name any of them as `CandidateDriver::Filter`, and a candidate's
+    /// `satisfied_filter` is a position. What does not survive is the WORK:
+    /// the surviving predicate is the conjunction, so this slot is already
+    /// answered for every candidate that reaches it and it reads nothing.
+    Folded {
+        into: usize,
+    },
     JsonEq {
         field: String,
         value: Value,
@@ -1073,25 +1084,186 @@ fn compile_scalar_filter(
 ) -> QueryResult<EncodedScalarFilter> {
     match predicate {
         ScalarFilter::Eq(value) => Ok(EncodedScalarFilter::Eq(encode_scalar_value(kind, *value)?)),
-        ScalarFilter::Range { lower, upper } => {
-            let lower = encode_bound(kind, lower)?;
-            let upper = encode_bound(kind, upper)?;
-            let empty = match (bound_bytes(&lower), bound_bytes(&upper)) {
-                (Some(lower_value), Some(upper_value)) if lower_value > upper_value => true,
-                (Some(lower_value), Some(upper_value)) if lower_value == upper_value => {
-                    matches!(lower, EncodedBound::Excluded(_))
-                        || matches!(upper, EncodedBound::Excluded(_))
-                }
-                _ => false,
-            };
-            if empty {
-                Ok(EncodedScalarFilter::Empty)
-            } else {
-                Ok(EncodedScalarFilter::Range { lower, upper })
-            }
-        }
+        ScalarFilter::Range { lower, upper } => Ok(range_or_empty(
+            encode_bound(kind, lower)?,
+            encode_bound(kind, upper)?,
+        )),
         ScalarFilter::IsNull => Ok(EncodedScalarFilter::IsNull),
         ScalarFilter::IsMissing => Ok(EncodedScalarFilter::IsMissing),
+    }
+}
+
+/// A pair of bounds as a predicate: `Range` when a value can sit between them,
+/// `Empty` when nothing can. Crossed bounds, and bounds that meet on a value
+/// at least one side excludes, admit nothing.
+fn range_or_empty(lower: EncodedBound, upper: EncodedBound) -> EncodedScalarFilter {
+    let empty = match (bound_bytes(&lower), bound_bytes(&upper)) {
+        (Some(lower_value), Some(upper_value)) if lower_value > upper_value => true,
+        (Some(lower_value), Some(upper_value)) if lower_value == upper_value => {
+            matches!(lower, EncodedBound::Excluded(_)) || matches!(upper, EncodedBound::Excluded(_))
+        }
+        _ => false,
+    };
+    if empty {
+        EncodedScalarFilter::Empty
+    } else {
+        EncodedScalarFilter::Range { lower, upper }
+    }
+}
+
+/// The tighter of two LOWER bounds. Unbounded is the loosest; on the same
+/// value the excluding bound is the tighter one.
+fn tighter_lower(left: EncodedBound, right: EncodedBound) -> EncodedBound {
+    match (bound_bytes(&left), bound_bytes(&right)) {
+        (None, _) => right,
+        (_, None) => left,
+        (Some(a), Some(b)) => match a.cmp(b) {
+            Ordering::Greater => left,
+            Ordering::Less => right,
+            Ordering::Equal => {
+                if matches!(left, EncodedBound::Excluded(_)) {
+                    left
+                } else {
+                    right
+                }
+            }
+        },
+    }
+}
+
+/// The tighter of two UPPER bounds, by the same rule mirrored.
+fn tighter_upper(left: EncodedBound, right: EncodedBound) -> EncodedBound {
+    match (bound_bytes(&left), bound_bytes(&right)) {
+        (None, _) => right,
+        (_, None) => left,
+        (Some(a), Some(b)) => match a.cmp(b) {
+            Ordering::Less => left,
+            Ordering::Greater => right,
+            Ordering::Equal => {
+                if matches!(left, EncodedBound::Excluded(_)) {
+                    left
+                } else {
+                    right
+                }
+            }
+        },
+    }
+}
+
+/// Two predicates on ONE scalar index, as the single predicate they mean.
+///
+/// The whole point is that an index answers a conjunction over itself without
+/// help: a posting key that survives the folded predicate has satisfied both,
+/// so nothing has to open the row to ask the second question. The rules, in
+/// full, with `Empty` absorbing everything:
+///
+/// * `Range ∩ Range` -- the tighter bound on each side. Bounds that cross, or
+///   meet on a value one side excludes, give `Empty`: the answer is empty and
+///   the tree is never touched.
+/// * `Eq ∩ Range` -- `Eq` when the value lies inside the range, otherwise
+///   `Empty`. `Eq` is a subset of any range that contains it.
+/// * `Eq ∩ Eq` -- the same `Eq` when the encodings agree, otherwise `Empty`.
+/// * `IsNull ∩ IsNull`, `IsMissing ∩ IsMissing` -- unchanged. Mixed, `Empty`:
+///   a field is not both absent and present-and-null.
+/// * `IsNull` or `IsMissing` against `Eq` or `Range` -- `Empty`. Null and
+///   missing share the nullish posting key, which sorts below every real
+///   value, and `scalar_filter_matches` refuses both for `Eq` and for `Range`.
+///   So no row is both nullish and inside a value predicate, and folding to
+///   `Empty` says exactly what the per-row evaluation already said.
+fn fold_scalar_predicates(
+    left: &EncodedScalarFilter,
+    right: &EncodedScalarFilter,
+) -> EncodedScalarFilter {
+    use EncodedScalarFilter as F;
+    match (left, right) {
+        (F::Empty, _) | (_, F::Empty) => F::Empty,
+        (F::IsNull, F::IsNull) => F::IsNull,
+        (F::IsMissing, F::IsMissing) => F::IsMissing,
+        (F::IsNull | F::IsMissing, _) | (_, F::IsNull | F::IsMissing) => F::Empty,
+        (F::Eq(a), F::Eq(b)) => {
+            if a == b {
+                F::Eq(a.clone())
+            } else {
+                F::Empty
+            }
+        }
+        (F::Eq(value), range @ F::Range { .. }) | (range @ F::Range { .. }, F::Eq(value)) => {
+            if scalar_key_position(range, value) == Ordering::Equal {
+                F::Eq(value.clone())
+            } else {
+                F::Empty
+            }
+        }
+        (
+            F::Range {
+                lower: left_lower,
+                upper: left_upper,
+            },
+            F::Range {
+                lower: right_lower,
+                upper: right_upper,
+            },
+        ) => range_or_empty(
+            tighter_lower(left_lower.clone(), right_lower.clone()),
+            tighter_upper(left_upper.clone(), right_upper.clone()),
+        ),
+    }
+}
+
+/// Fold every group of scalar filters that name the SAME index into one
+/// predicate, held by one surviving position.
+///
+/// Which position survives is user-visible, so the rule is fixed and narrow:
+///
+/// * if the request names one of the group as its candidate driver
+///   (`CandidateDriver::Filter(position)`), THAT position keeps the folded
+///   predicate, so an explicitly chosen driver still drives;
+/// * otherwise the LOWEST position in the group keeps it.
+///
+/// Every other position in the group becomes [`CompiledFilter::Folded`],
+/// which matches every candidate and reads nothing. The positions themselves
+/// never move: naming a folded position as the driver drives the survivor,
+/// and a candidate the survivor certifies still reports the survivor's
+/// position in `satisfied_filter`.
+fn fold_same_index_scalars(filters: &mut [CompiledFilter], driver: CandidateDriver) {
+    let named = match driver {
+        CandidateDriver::Filter(position) => Some(position),
+        _ => None,
+    };
+    let mut groups: Vec<(IndexId, Vec<usize>)> = Vec::new();
+    for (position, filter) in filters.iter().enumerate() {
+        if let CompiledFilter::Scalar { info, .. } = filter {
+            match groups.iter_mut().find(|(id, _)| *id == info.id) {
+                Some((_, members)) => members.push(position),
+                None => groups.push((info.id, vec![position])),
+            }
+        }
+    }
+    for (_, members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let keeper = named
+            .filter(|position| members.contains(position))
+            .unwrap_or(members[0]);
+        let mut folded = match &filters[members[0]] {
+            CompiledFilter::Scalar { predicate, .. } => predicate.clone(),
+            _ => continue,
+        };
+        for position in members.iter().skip(1) {
+            if let CompiledFilter::Scalar { predicate, .. } = &filters[*position] {
+                folded = fold_scalar_predicates(&folded, predicate);
+            }
+        }
+        for position in &members {
+            if *position == keeper {
+                if let CompiledFilter::Scalar { predicate, .. } = &mut filters[*position] {
+                    *predicate = folded.clone();
+                }
+            } else {
+                filters[*position] = CompiledFilter::Folded { into: keeper };
+            }
+        }
     }
 }
 
@@ -1188,6 +1360,13 @@ impl Database {
             });
         }
 
+        // Two predicates on ONE scalar index are one predicate. Folding them
+        // here, once, is the difference between an index that answers the
+        // conjunction from its own postings and one that answers half of it
+        // and opens the row for the rest -- a primary read per candidate for
+        // a question the posting key had already settled.
+        fold_same_index_scalars(&mut filters, request.driver);
+
         let mut order = match request.order {
             QueryOrder::EntityId => CompiledOrder::EntityId,
             QueryOrder::Scalar { index, direction } => CompiledOrder::Scalar {
@@ -1259,6 +1438,12 @@ impl Database {
         };
 
         let filter_driver = |position: usize| -> QueryResult<DriverPlan> {
+            // A folded position names the survivor that holds its predicate,
+            // so naming either one as the driver drives the same walk.
+            let position = match filters.get(position) {
+                Some(CompiledFilter::Folded { into }) => *into,
+                _ => position,
+            };
             match filters.get(position) {
                 Some(CompiledFilter::Scalar {
                     info, predicate, ..
@@ -3100,6 +3285,8 @@ fn batch_filters_match<C: FnMut() -> bool>(
                     None => false,
                 }
             }
+            // Already answered by the position it folded into.
+            CompiledFilter::Folded { .. } => true,
             CompiledFilter::Graph { .. } | CompiledFilter::Text(_) => return Ok(None),
         };
         if !matches {
@@ -3721,6 +3908,8 @@ fn filters_match<'a, C: FnMut() -> bool>(
                     } => within_radius(*center, point, *radius_metres).map_err(corrupt_query)?,
                 }
             }
+            // Already answered by the position it folded into.
+            CompiledFilter::Folded { .. } => true,
             CompiledFilter::Text(prepared) => text_score(
                 db,
                 rows,
@@ -4072,16 +4261,33 @@ impl PreparedQuery<'_> {
     /// SQLite answers a key-only query out of a covering index and never
     /// touches the row table. The same holds here when the projection is empty
     /// AND the driver's own stream is the authority for the row: the entity
-    /// cursor read the primary record itself, and an equality posting is the
+    /// cursor read the primary record itself, and a scalar posting is the
     /// membership record this engine already trusts elsewhere --
     /// `scalar_eq_posting_matches` answers a non-driving equality filter from
     /// the posting alone, without a row.
     ///
-    /// Every other driver stays as it was. A range or order scalar walk, graph
-    /// ids, a text posting, a spatial cell, a vector locator can each name a
-    /// row that is no longer there, and those still fetch it and still refuse
-    /// an orphan -- unless the RANKING already proved the winner present,
-    /// which is the BM25 case below.
+    /// A RANGE walk over that same index reads the same records. The entry
+    /// `value || sequence` is written and retired by one maintenance path,
+    /// whichever predicate later reads it, so trusting it when the predicate
+    /// is `price = 490` and distrusting it when the predicate is
+    /// `price >= 490 AND price < 500` would be a distinction in the question,
+    /// not in the evidence. The one entry a range walk sees that an equality
+    /// walk cannot is the nullish key, which null and missing share: that
+    /// candidate is never certified, so `filters_match` opens its row and the
+    /// predicate rejects it there. No candidate reaches the heap on a nullish
+    /// posting, and every one that does came from a real value entry.
+    ///
+    /// Every other driver stays as it was. An order scalar walk, graph ids, a
+    /// text posting, a spatial cell, a vector locator can each name a row that
+    /// is no longer there, and those still fetch it and still refuse an orphan
+    /// -- unless the RANKING already proved the winner present, which is the
+    /// BM25 case below.
+    ///
+    /// Named sacrifice (Law 4): a store-level orphan -- a primary row removed
+    /// behind the scalar index's back, which no supported write can do -- is
+    /// no longer refused by a key-only page driven by a range filter, exactly
+    /// as it has not been refused by one driven by an equality filter.
+    /// `verify_index` refuses it outright either way.
     fn winner_needs_no_row(&self) -> bool {
         if !self.projection.is_empty() {
             return false;
@@ -4114,7 +4320,7 @@ impl PreparedQuery<'_> {
         match &self.driver {
             DriverPlan::Entities => true,
             DriverPlan::Scalar {
-                predicate: EncodedScalarFilter::Eq(_),
+                predicate: EncodedScalarFilter::Eq(_) | EncodedScalarFilter::Range { .. },
                 position: Some(_),
                 ..
             } => true,
@@ -4230,7 +4436,9 @@ impl PreparedQuery<'_> {
             CompiledFilter::Scalar {
                 posting_membership, ..
             } => !*posting_membership,
-            CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
+            CompiledFilter::JsonEq { .. }
+            | CompiledFilter::Point { .. }
+            | CompiledFilter::Folded { .. } => true,
             // A text filter rejects from its postings before it looks at a
             // row, so it is a cheap refusal standing in front of the expensive
             // one -- and a PHRASE is not a pure function of the row at all: it
@@ -4286,7 +4494,7 @@ impl PreparedQuery<'_> {
                 posting_membership, ..
             } => !*posting_membership,
             CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
-            CompiledFilter::Graph { .. } => false,
+            CompiledFilter::Graph { .. } | CompiledFilter::Folded { .. } => false,
         })
     }
 

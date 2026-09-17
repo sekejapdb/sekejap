@@ -374,6 +374,29 @@ fn main() -> R<()> {
             upper: Bound::Unbounded,
         },
     }];
+    let range_two_sided = [QueryFilter::Scalar {
+        index: c.price,
+        predicate: ScalarFilter::Range {
+            lower: Bound::Included(ScalarValue::F64(490.0)),
+            upper: Bound::Excluded(ScalarValue::F64(500.0)),
+        },
+    }];
+    let two_filters_one_index = [
+        QueryFilter::Scalar {
+            index: c.price,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Included(ScalarValue::F64(490.0)),
+                upper: Bound::Unbounded,
+            },
+        },
+        QueryFilter::Scalar {
+            index: c.price,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Excluded(ScalarValue::F64(500.0)),
+            },
+        },
+    ];
     let eq_cafe = [QueryFilter::Scalar {
         index: c.cat,
         predicate: ScalarFilter::Eq(ScalarValue::Text("cafe")),
@@ -504,6 +527,44 @@ fn main() -> R<()> {
         format!(
             "{rn} rows, {rcand} candidates, {rprimary} primary reads — {:.1} ns/row",
             range_t * 1000.0 / rn as f64
+        ),
+    ));
+    let (tn, tprimary, tcand) =
+        run_query(&c, &range_two_sided, QueryOrder::EntityId, Projection::Ids, PAGE);
+    let two_sided_t = time(iters / 40, || {
+        run_query(&c, &range_two_sided, QueryOrder::EntityId, Projection::Ids, PAGE).0
+    });
+    out.push((
+        "2a2 filter/range_two_sided (Ids)".into(),
+        two_sided_t,
+        format!(
+            "{tn} rows, {tcand} candidates, {tprimary} primary reads — {:.1} ns/row",
+            two_sided_t * 1000.0 / tn as f64
+        ),
+    ));
+    let (fn2, fprimary2, fcand2) = run_query(
+        &c,
+        &two_filters_one_index,
+        QueryOrder::EntityId,
+        Projection::Ids,
+        PAGE,
+    );
+    let two_filters_t = time(iters / 40, || {
+        run_query(
+            &c,
+            &two_filters_one_index,
+            QueryOrder::EntityId,
+            Projection::Ids,
+            PAGE,
+        )
+        .0
+    });
+    out.push((
+        "2a3   … the same range written as TWO filters".into(),
+        two_filters_t,
+        format!(
+            "{fn2} rows, {fcand2} candidates, {fprimary2} primary reads — {:.1} ns/row",
+            two_filters_t * 1000.0 / fn2 as f64
         ),
     ));
     let (en, eprimary, ecand) = run_query(&c, &eq_cafe, QueryOrder::EntityId, Projection::Ids, PAGE);
