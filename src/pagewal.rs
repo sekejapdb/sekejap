@@ -885,7 +885,15 @@ impl PageWalStore {
         pager.finish_open(&self.dir,None)?;
         self.pool=Self::new_pool(pager.clone(),self.cache,true)?;
         Self::install_codec(&self.pool,pager.state.lock().unwrap().features);
-        self.root=0;self.last.set(None);self.poisoned=true;self.dirty=false;
+        self.root=0;self.last.set(None);
+        // Every OTHER tree's append hint too. A rollback rewinds the file to
+        // its last committed extent, so a hint left over from the discarded
+        // transaction can name a page that only ever existed as a WAL frame
+        // this rollback just truncated away. That is not a stale guess worth
+        // one wasted descent: the fast path READS the hinted leaf in order to
+        // re-check its shape, so the read comes first and fails outright.
+        for (id,hint) in &self.hints {id.set(0);hint.set(None);}
+        self.poisoned=true;self.dirty=false;
         self.load_header()?;self.poisoned=false;Ok(())
     }
     /// Ascending records from `from`, borrowing this handle for the cursor's
