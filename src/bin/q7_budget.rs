@@ -40,6 +40,8 @@ fn centre() -> Point {
 struct Case {
     name: &'static str,
     filters: Vec<QueryFilter<'static>>,
+    /// popsim's LIMIT, when the case has one (`radius_top10`).
+    limit: Option<usize>,
     /// The order popsim asks this case in. It is part of the question: a range
     /// answered in the driving index's own order walks that range once and
     /// resumes, and the same rows in entity order do not. See popsim's
@@ -55,7 +57,7 @@ fn run(db: &Database, person: CollectionId, case: &Case) -> R<()> {
         filters: &case.filters,
         order: case.order,
         projection: Projection::Ids,
-        total_limit: None,
+        total_limit: case.limit,
         driver: CandidateDriver::Auto,
     })?;
     let (mut rows, mut pages) = (0u64, 0u64);
@@ -160,11 +162,13 @@ fn main() -> R<()> {
     let cases = vec![
         Case {
             name: "count_all",
+            limit: None,
             filters: vec![],
             order: QueryOrder::EntityId,
         },
         Case {
             name: "name_fulltext",
+            limit: None,
             filters: vec![QueryFilter::Text {
                 index: fullname,
                 query: "sari",
@@ -174,6 +178,7 @@ fn main() -> R<()> {
         },
         Case {
             name: "name_two_terms",
+            limit: None,
             filters: vec![QueryFilter::Text {
                 index: fullname,
                 query: "sari wati",
@@ -188,6 +193,7 @@ fn main() -> R<()> {
         // matches about one document in 256.
         Case {
             name: "name_wide",
+            limit: None,
             filters: vec![QueryFilter::Text {
                 index: fullname,
                 query: "sari wati budi jaka mala anti kani ribu tija lasa",
@@ -197,6 +203,7 @@ fn main() -> R<()> {
         },
         Case {
             name: "name_and_born",
+            limit: None,
             filters: vec![
                 QueryFilter::Text {
                     index: fullname,
@@ -215,6 +222,7 @@ fn main() -> R<()> {
         },
         Case {
             name: "born_decade",
+            limit: None,
             filters: range(
                 Bound::Included(19_900_101),
                 Bound::Excluded(20_000_101),
@@ -223,11 +231,13 @@ fn main() -> R<()> {
         },
         Case {
             name: "born_ge_open",
+            limit: None,
             filters: range(Bound::Included(20_100_101), Bound::Unbounded),
             order: by_born,
         },
         Case {
             name: "born_one_year",
+            limit: None,
             filters: range(
                 Bound::Included(19_870_101),
                 Bound::Excluded(19_880_101),
@@ -240,6 +250,7 @@ fn main() -> R<()> {
         // program exists to print.
         Case {
             name: "radius_50km",
+            limit: None,
             filters: vec![point(PointFilter::Radius {
                 center: centre(),
                 radius_metres: 50_000.0,
@@ -248,6 +259,7 @@ fn main() -> R<()> {
         },
         Case {
             name: "radius_2km",
+            limit: None,
             filters: vec![point(PointFilter::Radius {
                 center: centre(),
                 radius_metres: 2_000.0,
@@ -255,7 +267,17 @@ fn main() -> R<()> {
             order: QueryOrder::Driver,
         },
         Case {
+            name: "radius_top10",
+            limit: Some(10),
+            filters: vec![point(PointFilter::Radius {
+                center: centre(),
+                radius_metres: 10_000.0,
+            })],
+            order: QueryOrder::Driver,
+        },
+        Case {
             name: "bbox",
+            limit: None,
             filters: vec![point(PointFilter::Bbox(
                 Bounds::new(BOX_WEST, BOX_EAST, BOX_SOUTH, BOX_NORTH).expect("box is valid"),
             ))],
@@ -263,6 +285,7 @@ fn main() -> R<()> {
         },
         Case {
             name: "radius_and_born",
+            limit: None,
             filters: vec![
                 point(PointFilter::Radius {
                     center: centre(),
@@ -282,6 +305,7 @@ fn main() -> R<()> {
     for case in &cases {
         let case = Case {
             name: case.name,
+            limit: case.limit,
             filters: case.filters.clone(),
             order: if entity_order { QueryOrder::EntityId } else { case.order },
         };
