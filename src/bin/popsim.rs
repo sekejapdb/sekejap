@@ -729,6 +729,61 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
     ))
 }
 
+/// Reopen a database `load_e4` built earlier and find its collection and
+/// three indexes by NAME, the way a program that did not build the file has
+/// to. Every stage but `open_s` is `null`: nothing was loaded or built here,
+/// and a zero would read as "instant".
+fn open_e4(root: &Path, rows: u64, cache_bytes: usize) -> R<(E4Ctx, Value)> {
+    let at = Instant::now();
+    let db = Database::open(
+        root,
+        Config {
+            budget_bytes: cache_bytes,
+            io: IoMode::Buffered,
+            sync: SyncMode::Full,
+        },
+    )?;
+    let person = db.collection("person")?.ok_or("--reuse: no `person` collection")?;
+    let (mut fullname, mut born, mut addr) = (None, None, None);
+    for n in 1..=8u64 {
+        let Ok(info) = db.index_info(IndexId(n)) else {
+            continue;
+        };
+        match info.name.as_str() {
+            "fullname_text" => fullname = Some(info.id),
+            "born_idx" => born = Some(info.id),
+            "addr_point" => addr = Some(info.id),
+            _ => {}
+        }
+    }
+    let ctx = E4Ctx {
+        db,
+        person,
+        fullname: fullname.ok_or("--reuse: no fullname_text index")?,
+        born: born.ok_or("--reuse: no born_idx index")?,
+        addr: addr.ok_or("--reuse: no addr_point index")?,
+        rows,
+    };
+    let open_s = at.elapsed().as_secs_f64();
+    eprintln!("[e4] reopened {} in {open_s:.3}s; queries only", root.display());
+    Ok((ctx, reused_stages(open_s)))
+}
+
+/// The stage block of a query-only pass: the open is real, the rest did not
+/// happen.
+fn reused_stages(open_s: f64) -> Value {
+    json!({
+        "open_s": open_s,
+        "load_s": Value::Null,
+        "index_text_s": Value::Null,
+        "index_scalar_s": Value::Null,
+        "index_point_s": Value::Null,
+        "index_total_s": Value::Null,
+        "checkpoint_s": Value::Null,
+        "total_s": Value::Null,
+    })
+}
+
 // ── the SQLite arm ────────────────────────────────────────────────────────
 
 /// Step the statement, materialise every projected column, count the rows and
@@ -846,11 +901,9 @@ fn lite_cases(rows: u64) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Connection, Value)> {
-    fs::create_dir_all(root)?;
-    let overall = Instant::now();
-
-    let at = Instant::now();
+/// Open (or create) the SQLite file with the arm's pragmas and the geodesic
+/// function; the schema is the caller's business.
+fn lite_connect(root: &Path, cache_bytes: usize) -> R<Connection> {
     let connection = Connection::open(root.join("person.db"))?;
     // E4's radius is an exact WGS84 geodesic. SQLite is given the SAME routine
     // rather than a haversine that would disagree at the boundary.
@@ -868,11 +921,39 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
     )?;
     connection.execute_batch(&format!(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;
-         PRAGMA cache_size=-{}; PRAGMA temp_store=FILE;
-         CREATE TABLE person(_key TEXT PRIMARY KEY, fullname TEXT, born INTEGER,
-                             born_year INTEGER, lon REAL, lat REAL);",
+         PRAGMA cache_size=-{}; PRAGMA temp_store=FILE;",
         cache_bytes / 1024
     ))?;
+    Ok(connection)
+}
+
+/// Reopen a file `load_lite` built earlier: queries only, stages `null`.
+fn open_lite(root: &Path, cache_bytes: usize) -> R<(Connection, Value)> {
+    let at = Instant::now();
+    let connection = lite_connect(root, cache_bytes)?;
+    let tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('person','person_fts','person_geo','idx_born')",
+        [],
+        |r| r.get(0),
+    )?;
+    if tables != 4 {
+        return Err(format!("--reuse: {} of the 4 expected SQLite objects present", tables).into());
+    }
+    let open_s = at.elapsed().as_secs_f64();
+    eprintln!("[sqlite] reopened {} in {open_s:.3}s; queries only", root.display());
+    Ok((connection, reused_stages(open_s)))
+}
+
+fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Connection, Value)> {
+    fs::create_dir_all(root)?;
+    let overall = Instant::now();
+
+    let at = Instant::now();
+    let connection = lite_connect(root, cache_bytes)?;
+    connection.execute_batch(
+        "CREATE TABLE person(_key TEXT PRIMARY KEY, fullname TEXT, born INTEGER,
+                             born_year INTEGER, lon REAL, lat REAL);",
+    )?;
     let open_s = at.elapsed().as_secs_f64();
 
     eprintln!("[sqlite] inserting {rows} rows, commit every {batch} …");
@@ -1011,6 +1092,10 @@ pub struct Options {
     pub reps: usize,
     pub case_budget: Duration,
     pub cache_bytes: usize,
+    /// Open the arm's existing database and run only the queries: no wipe, no
+    /// load, no index build. The load and build stages are then reported as
+    /// `null` and `"reused": true`, never as zero.
+    pub reuse: bool,
 }
 
 impl Options {
@@ -1024,6 +1109,7 @@ impl Options {
             reps: 5,
             case_budget: Duration::from_secs(300),
             cache_bytes: CACHE_BYTES,
+            reuse: false,
         }
     }
 }
@@ -1033,9 +1119,17 @@ impl Options {
 pub fn run_arm(options: &Options) -> R<Value> {
     let arm = options.arm.label();
     let db_root = options.root.join(arm);
-    // The arm owns this subdirectory by name; a rerun starts from nothing.
-    let _ = fs::remove_dir_all(&db_root);
-    fs::create_dir_all(&options.root)?;
+    if options.reuse {
+        // A query-only pass over a database an earlier run left behind. The
+        // file is the whole point, so its absence is an error, not a rebuild.
+        if !db_root.is_dir() {
+            return Err(format!("--reuse: no {arm} database at {}", db_root.display()).into());
+        }
+    } else {
+        // The arm owns this subdirectory by name; a rerun starts from nothing.
+        let _ = fs::remove_dir_all(&db_root);
+        fs::create_dir_all(&options.root)?;
+    }
 
     let selected = |name: &str| {
         options
@@ -1048,7 +1142,11 @@ pub fn run_arm(options: &Options) -> R<Value> {
     let stages;
     match options.arm {
         Arm::E4 => {
-            let (ctx, s) = load_e4(&db_root, options.rows, options.batch, options.cache_bytes)?;
+            let (ctx, s) = if options.reuse {
+                open_e4(&db_root, options.rows, options.cache_bytes)?
+            } else {
+                load_e4(&db_root, options.rows, options.batch, options.cache_bytes)?
+            };
             stages = s;
             for (name, run) in e4_cases() {
                 if !selected(name) {
@@ -1066,8 +1164,11 @@ pub fn run_arm(options: &Options) -> R<Value> {
             drop(ctx);
         }
         Arm::Sqlite => {
-            let (connection, s) =
-                load_lite(&db_root, options.rows, options.batch, options.cache_bytes)?;
+            let (connection, s) = if options.reuse {
+                open_lite(&db_root, options.cache_bytes)?
+            } else {
+                load_lite(&db_root, options.rows, options.batch, options.cache_bytes)?
+            };
             stages = s;
             for (name, sql) in lite_cases(options.rows) {
                 if !selected(name) {
@@ -1097,6 +1198,7 @@ pub fn run_arm(options: &Options) -> R<Value> {
         "batch": options.batch,
         "cache_bytes": options.cache_bytes,
         "reps": options.reps,
+        "reused": options.reuse,
         "stages": stages,
         "bytes_on_disk": bytes,
         "bytes_per_row": bytes as f64 / options.rows.max(1) as f64,
@@ -1119,7 +1221,7 @@ pub fn run_arm(options: &Options) -> R<Value> {
 
 fn usage() -> String {
     "usage: popsim e4|sqlite <rows> <fresh-dir> [--batch N] [--only substr] \
-     [--reps N] [--case-budget SECS] [--cache-bytes N]"
+     [--reps N] [--case-budget SECS] [--cache-bytes N] [--reuse]"
         .into()
 }
 
@@ -1139,6 +1241,7 @@ fn parse(args: &[String]) -> R<Options> {
             "--reps" => options.reps = value()?.parse()?,
             "--case-budget" => options.case_budget = Duration::from_secs(value()?.parse()?),
             "--cache-bytes" => options.cache_bytes = value()?.parse()?,
+            "--reuse" => options.reuse = true,
             other => return Err(format!("unknown flag {other}\n{}", usage()).into()),
         }
     }

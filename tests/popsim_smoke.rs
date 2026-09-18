@@ -129,3 +129,45 @@ fn both_arms_answer_the_same_questions() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// `--reuse` opens the database an earlier pass built and runs only the
+/// queries. It must answer every case with the same rows AND the same keys as
+/// the pass that built the file (the reopen found the same collection and
+/// indexes by name), and it must not report a load or build it did not do.
+#[test]
+fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
+    let root = std::env::temp_dir().join(format!("popsim-reuse-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let pass = |which, reuse| {
+        let mut options = Options::new(which, ROWS, &root);
+        options.reps = 2;
+        options.case_budget = Duration::from_secs(30);
+        options.reuse = reuse;
+        run_arm(&options).expect("arm runs")
+    };
+    let answers = |report: &serde_json::Value| {
+        report["queries"]
+            .as_array()
+            .expect("queries")
+            .iter()
+            .map(|q| (q["name"].clone(), q["rows"].clone(), q["keys"].clone()))
+            .collect::<Vec<_>>()
+    };
+    for which in [Arm::E4, Arm::Sqlite] {
+        let built = pass(which, false);
+        let reused = pass(which, true);
+        assert_eq!(answers(&built), answers(&reused), "{which:?}: the reuse pass disagreed");
+        assert_eq!(reused["reused"], serde_json::Value::Bool(true));
+        assert_eq!(built["reused"], serde_json::Value::Bool(false));
+        assert!(reused["stages"]["load_s"].is_null(), "{which:?}: a reuse pass reported a load");
+        assert!(reused["stages"]["index_total_s"].is_null());
+        assert!(reused["stages"]["open_s"].as_f64().is_some());
+        assert!(built["stages"]["load_s"].as_f64().is_some());
+    }
+    // And a reuse pass over nothing is an error, never a silent rebuild.
+    let _ = fs::remove_dir_all(&root);
+    let mut options = Options::new(Arm::E4, ROWS, &root);
+    options.reuse = true;
+    assert!(run_arm(&options).is_err());
+    let _ = fs::remove_dir_all(&root);
+}
