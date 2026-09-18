@@ -475,8 +475,9 @@ fn a_build_that_never_commits_leaves_the_last_committed_root() {
 
     // A build stopped after committed groups: BUILDING, with a root that is
     // the one those groups published.
-    // One committed insert group, then stop: the group is 64 chunks, so a
-    // chunk of one row reaches the cap well inside 200 rows.
+    // One committed insert group, then stop: a CAPPED build ends its run at
+    // the first chunk (the hook exists to produce a group to stop after), so
+    // a chunk of one row reaches the cap immediately.
     db.build_index_to_ready_capped(age, 1, Some(1)).unwrap();
     let mid = db.index_tree(age).unwrap().unwrap().1;
     assert!(matches!(

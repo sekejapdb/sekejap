@@ -867,3 +867,161 @@ fn a_bounded_run_build_finishes_under_a_small_allowance_and_keeps_the_pinned_dig
         }
     }
 }
+
+// ------------------------- ascending-run commit cadence (loop 7, item B3)
+
+/// Restate `Database::sorted_run_budget` from the allowance alone, so this
+/// test does not read its own bound out of the code it is checking: a quarter
+/// of the allowance in 4144-byte frames, three quarters of those frames as
+/// leaves less a four-frame margin, each leaf packed at 0.9.
+fn run_budget_bytes(wal_allowance: u64) -> u64 {
+    const PACKED_LEAF_BYTES: u64 = ((4096 - 40) * 9) / 10;
+    let frames = wal_allowance / 4 / WAL_FRAME_BYTES;
+    let leaves = (frames * 3 / 4).saturating_sub(4).max(1);
+    leaves * PACKED_LEAF_BYTES
+}
+
+/// The default managed page-WAL allowance, `WAL_CAP` in `src/pagewal.rs`. A
+/// database opened without a resource policy gets this one.
+const DEFAULT_WAL_ALLOWANCE: u64 = 16 << 20;
+
+/// Rows enough that the packed first run cannot hold them: one run is about
+/// 115,000 scalar entries at the default allowance, so this is three runs.
+const COUNTED_ROWS: u64 = 300_000;
+
+/// Pinned by a run of the UNCHANGED builder (`SORTED_GROUP_FIRST` still
+/// throttling the ascending commits) over the corpus below. The commit
+/// cadence is a transaction-size decision and may not move a persisted byte.
+const SCALAR_TICK: &str =
+    "fd820af206b48d68b899f572aa7895f30e1c1f759d8885040edff0a5b0ba553a";
+
+fn tick(i: u64) -> Value {
+    // Deterministic and NOT in key order, so the external sort does real work
+    // and the ascending phase really is ascending in index order rather than
+    // in insertion order.
+    json!({ "n": ((i.wrapping_mul(2_654_435_761)) % 1_000_003) as i64 })
+}
+
+fn seed_ticks(path: &std::path::Path) -> (Database, e4_prototype::collections::CollectionId) {
+    let mut db = Database::create(path, cfg()).unwrap();
+    let ticks = db
+        .create_collection(
+            "ticks",
+            vec![("n".into(), Kind::Int)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    for i in 0..COUNTED_ROWS {
+        db.put(ticks, &format!("t{i:09}"), &tick(i)).unwrap();
+        if i % 256 == 255 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    (db, ticks)
+}
+
+/// A sorted scalar build must commit on its BYTE BUDGET, not on a chunk count.
+///
+/// `SORTED_GROUP_FIRST` names the group the first PACK attempt is offered.
+/// The ascending-put loop that finishes the build was reusing the same
+/// constant as its commit throttle, so it committed every
+/// `SORTED_GROUP_FIRST * chunk_rows` = 16,384 rows and the byte budget it is
+/// supposed to fill -- about 115,000 entries -- never fired first. Every
+/// commit is a full barrier, so that is seven times the fsyncs the design
+/// intends, and at 1,000,000 rows it was the majority of the build's wall
+/// clock.
+///
+/// This counts the commits directly. The bound is the number of runs the byte
+/// budget admits, plus two: one for the `CREATE INDEX` commit this window
+/// includes and one for the final READY flip.
+#[test]
+fn a_sorted_build_commits_on_its_byte_budget_not_on_a_chunk_count() {
+    use e4_prototype::collections::verification::{verify_indexed_source, VerificationLimits};
+    use e4_prototype::pagewal::PageWalStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let (mut db, ticks) = seed_ticks(&path);
+    db.checkpoint().unwrap();
+    drop(db);
+    // Reopen: the I/O counters are monotonic from the moment a handle opens,
+    // so this window is the build and nothing else.
+    let mut db = Database::open(&path, cfg()).unwrap();
+
+    let before = db.io_counters().unwrap();
+    let n_idx = db.create_scalar_index(ticks, "n_idx", "n", false).unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(n_idx, 256).unwrap();
+    let after = db.io_counters().unwrap();
+    let commits = after.commit_frames - before.commit_frames;
+
+    // What one entry costs the builder's own accounting: its key, its value
+    // and the eight bytes of leaf framing and slot the run budget charges.
+    let mut entry_bytes = 0u64;
+    let mut entries = 0u64;
+    let p = index_prefix(0x70, n_idx);
+    entries += db
+        .index_for_each(n_idx, &p, &mut |k, v| {
+            entry_bytes += (k.len() + v.len() + 8) as u64;
+        })
+        .unwrap();
+    assert_eq!(entries, COUNTED_ROWS, "the index lost rows");
+
+    let budget = run_budget_bytes(DEFAULT_WAL_ALLOWANCE);
+    let run_rows = budget / (entry_bytes / entries);
+    let bound = COUNTED_ROWS.div_ceil(run_rows) + 2;
+    let frame_bound = DEFAULT_WAL_ALLOWANCE / 4 / WAL_FRAME_BYTES;
+    let persisted = digest(&db, "scalar", n_idx).0;
+    eprintln!(
+        "COUNTED rows={COUNTED_ROWS} entry_bytes={} budget={budget} run_rows={run_rows} \
+         commits={commits} bound={bound} max_transaction_frames={} frame_bound={frame_bound} \
+         digest={persisted}",
+        entry_bytes / entries,
+        after.max_transaction_frames
+    );
+    assert!(
+        commits <= bound,
+        "the build committed {commits} times for {COUNTED_ROWS} rows; its own byte budget \
+         admits runs of {run_rows} rows, so {bound} is the ceiling"
+    );
+    // B1's watermark: no single transaction may outgrow the run bound, or a
+    // bounded database would refuse the build outright.
+    assert!(
+        after.max_transaction_frames <= frame_bound,
+        "a single transaction wrote {} frames, over the {frame_bound}-frame run bound",
+        after.max_transaction_frames
+    );
+
+    // A cadence change may not move a persisted byte.
+    assert_eq!(persisted, SCALAR_TICK);
+
+    let trees = db.index_trees().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+
+    let report = verify_indexed_source(&path, VerificationLimits::default(), |_| {}).unwrap();
+    assert!(
+        report.clean && report.complete,
+        "the verifier is not clean after a byte-budget build: {report:?}"
+    );
+
+    let store = PageWalStore::open(&path, false, 1 << 20).unwrap();
+    for (tree, root) in trees {
+        let (mut depths, mut used, mut leaves) = (Vec::new(), 0u64, 0u64);
+        leaf_shape(&store, tree, root, 0, &mut depths, &mut used, &mut leaves);
+        let occupancy = used as f64 / (leaves * (4096 - 40)) as f64;
+        eprintln!("COUNTED tree {tree}: {leaves} leaves occupancy {occupancy:.3}");
+        assert_eq!(
+            depths.iter().min(),
+            depths.iter().max(),
+            "tree {tree} is not uniformly deep"
+        );
+        if leaves > 2 {
+            assert!(
+                occupancy >= 0.85,
+                "tree {tree} packs {occupancy:.3} of its leaves, under the 0.85 floor"
+            );
+        }
+    }
+}

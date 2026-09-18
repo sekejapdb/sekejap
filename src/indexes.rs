@@ -10,7 +10,13 @@ pub(super) const INDEX_NAME: u8 = 0x11;
 pub(super) const SCALAR: u8 = 0x70;
 pub(super) const MAX_INDEXES: usize = 64;
 /// First (largest) commit group a sorted build tries. A version-2 index packs
-/// its whole tree in one transaction at this group and only at this group.
+/// its first run at this group and only at this group; a later attempt, after
+/// an allowance refusal halved it, takes the ascending-put path instead.
+///
+/// It is NOT the ascending phase's commit cadence. It used to be, and a chunk
+/// count is not a transaction size: see `build_sorted_once`, which ends its
+/// runs on `sorted_run_budget` and scales that budget by the group the
+/// back-off has reached.
 pub(super) const SORTED_GROUP_FIRST: usize = 64;
 /// The collection header bit that says this database contains at least one
 /// index with its OWN B-tree. Monotone and set only by a CREATE that allocates
@@ -116,10 +122,24 @@ pub(super) fn nkey(c: CollectionId, n: &str) -> Vec<u8> {
     k
 }
 pub(super) fn skey(i: &IndexInfo, value: &[u8], seq: u64) -> Vec<u8> {
-    let mut k = ikey(SCALAR, i.id);
-    k.extend(value);
-    k.extend(ordered(seq));
+    let mut k = Vec::new();
+    skey_into(i, value, seq, &mut k);
     k
+}
+/// The same key, written into a buffer the caller reuses.
+///
+/// A late build derives one of these PER ROW and hands it straight to the
+/// external sorter, which takes its own copy. Through `skey` that row paid for
+/// four heap allocations it dropped a line later -- the one-byte `vec![tag]`
+/// and its growth, plus a throwaway `Vec` from each `ordered` -- on top of the
+/// one the sorter genuinely needs. Written into a scratch buffer they are all
+/// gone after the first row.
+pub(super) fn skey_into(i: &IndexInfo, value: &[u8], seq: u64, out: &mut Vec<u8>) {
+    out.clear();
+    out.push(SCALAR);
+    super::ordered_into(out, i.id.0);
+    out.extend_from_slice(value);
+    super::ordered_into(out, seq);
 }
 fn kind_byte(k: &Kind) -> Result<u8> {
     match k {
@@ -993,6 +1013,13 @@ impl Database {
     /// `Some(Null)` on both sides, and the external-key field is refused as a
     /// collection field name (`reserved`), so it can never be the index field.
     fn scalar_build_key(&self, i: &IndexInfo, row: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.scalar_build_key_into(i, row, &mut out)?;
+        Ok(out)
+    }
+    /// The same value, encoded into a buffer the caller reuses. `encode_into`
+    /// clears it; the caller keeps the capacity.
+    fn scalar_build_key_into(&self, i: &IndexInfo, row: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let layout = self.layout(layout_id(row)?)?;
         let value = match crate::dense_v3::read_field(&layout, row, &i.field).map_err(corrupt)? {
             crate::dense_v3::FieldValue::Missing => None,
@@ -1002,7 +1029,7 @@ impl Database {
                 return Err(invalid("historical indexed scalar field changed kind"))
             }
         };
-        scalar_key::encode(&i.kind, value.as_ref())
+        scalar_key::encode_into(&i.kind, value.as_ref(), out)
     }
     /// One transaction's bounded work. No implicit commit; true means READY in
     /// this transaction, visible to other readers only after caller commits.
@@ -1350,8 +1377,11 @@ impl Database {
         // format admits; a refusal there is a genuinely too-small allowance and
         // is returned to the caller.
         const GROUP: usize = 16;
-        // Sorted runs pack into the WAL more densely than a random chunk, so
-        // start with a larger group. Allowance refusal still halves it.
+        // A sorted build does not count chunks: it fills the byte budget
+        // `sorted_run_budget` computes from the allowance. This is the group
+        // it starts at -- the one that admits the first-run pack, and the
+        // scale factor on that budget. Allowance refusal still halves it, and
+        // halves the run with it.
         const SORTED_GROUP: usize = SORTED_GROUP_FIRST;
         fn allowance(e: &Error) -> bool {
             matches!(e, Error::Kernel(kernel::Error::ResourceLimit(_)))
@@ -1484,11 +1514,18 @@ impl Database {
             &self.sort_scratch(),
             super::index_sort::DEFAULT_BUDGET,
         )?;
+        // One scratch pair for the whole scan. See `skey_into`.
+        let mut value_buf = Vec::new();
+        let mut key_buf = Vec::new();
         let max_seq = self.scan_collection_rows(i.collection, |eid, row| {
             match i.family {
                 IndexFamily::Scalar => {
-                    let value = self.scalar_build_key(&i, row)?;
-                    sorter.push(skey(&i, &value, eid.sequence), Vec::new())?;
+                    self.scalar_build_key_into(&i, row, &mut value_buf)?;
+                    skey_into(&i, &value_buf, eid.sequence, &mut key_buf);
+                    // `push_ref`, not `push`: the sorter copies the key into
+                    // its own storage either way, and this way the build does
+                    // not also allocate the key it is copying FROM.
+                    sorter.push_ref(&key_buf, &[])?;
                 }
                 IndexFamily::SpatialPoint => {
                     if let Some(point) =
@@ -1630,10 +1667,37 @@ impl Database {
                 carry = cut;
             }
         }
-        let run_budget = self.sorted_run_budget()?;
+        // WHAT ENDS AN ASCENDING RUN: the byte budget, and only the byte budget.
+        //
+        // `SORTED_GROUP_FIRST` names the group the first PACK attempt is
+        // offered, above. It was ALSO being used down here as a chunk-count
+        // commit throttle, and a chunk count is not a transaction size: 64
+        // chunks of 256 rows ends a run every 16,384 rows, about a seventh of
+        // the ~115,000 entries `sorted_run_budget` says one transaction can
+        // afford, so the budget never got to fire first. Every commit is a
+        // full barrier. Measured at 1,000,000 rows: 54 ascending commits at
+        // ~25 ms each (~47 ms on the one in six that also folds the WAL),
+        // which was the majority of the whole build's wall clock, for runs the
+        // allowance would have taken seven times larger.
+        //
+        // The refusal back-off still has something to halve. `group` now
+        // SCALES the budget instead of counting chunks, so a `ResourceLimit`
+        // comes back here with half the run and the same single trigger, down
+        // to a sixty-fourth of it before the refusal is returned to the caller.
+        //
+        // Sacrifice (Law 4): a crash mid-build discards a larger in-flight
+        // group, so the resume from the committed cursor re-inserts more keys.
+        // Bounded rework, never a wrong answer -- and the sort itself already
+        // restarts from scratch on every call whatever the group size was.
+        let run_budget = match max_commits {
+            // The crash/resume hook exists to produce committed groups to stop
+            // after, so it asks for the smallest run this loop can make: one
+            // chunk. Still the byte trigger, with a budget of one byte.
+            Some(_) => 1,
+            None => (self.sorted_run_budget()? * group as u64 / SORTED_GROUP_FIRST as u64).max(1),
+        };
         let mut run_bytes = 0u64;
         let mut pending = 0usize;
-        let mut groups = 0usize;
         let mut commits = 0usize;
         let mut prev_value: Option<Vec<u8>> = packed_tail;
         while let Some((key, value)) = match carry.take() {
@@ -1655,14 +1719,13 @@ impl Database {
             self.index_put(&mut i, &key, &value)?;
             pending += 1;
             if pending >= chunk_rows {
-                groups += 1;
                 pending = 0;
-                // Two reasons to commit, and the group count is the weaker
-                // one: it bounds how long the transaction stays open, the
-                // budget bounds how large it gets. A group of 64 chunks of
-                // small scalar keys is well inside the allowance; one of
-                // spatial entries with their payloads need not be.
-                if groups % group == 0 || run_bytes >= run_budget {
+                // One reason to commit: the run is as large as the allowance
+                // affords. Rows are the wrong unit for it -- a group of small
+                // scalar keys is well inside the allowance where the same
+                // group of spatial entries with their payloads need not be --
+                // and the chunk boundary is only where the question is asked.
+                if run_bytes >= run_budget {
                     run_bytes = 0;
                     self.commit()?;
                     commits += 1;
