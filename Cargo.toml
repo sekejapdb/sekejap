@@ -21,6 +21,10 @@ rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 crc32c = "0.6"
 getrandom = "0.4"
 geographiclib-rs = { version = "=0.2.7", default-features = false }
+# Synchronous client for the `popsim postgres` arm. Ungated (always available),
+# matching how `rusqlite` is ungated for the `sqlite` arm — this is a bench
+# harness dependency, not a feature the rest of the crate depends on.
+postgres = "0.19"
 
 [dev-dependencies]
 tempfile = "3"

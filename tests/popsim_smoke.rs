@@ -171,3 +171,86 @@ fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
     assert!(run_arm(&options).is_err());
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Same agreement, E4 against the Postgres/PostGIS arm — but this arm needs a
+/// real server, which is not guaranteed to be running wherever this test
+/// suite executes. The test SKIPS (prints a note, returns `Ok`) rather than
+/// failing when nothing answers on the DSN, so `cargo test` stays green on a
+/// machine with no Postgres and still exercises the third arm wherever one is
+/// reachable (`POPSIM_PG_DSN` overrides the default local dev DSN).
+#[test]
+fn postgres_arm_answers_the_same_questions_as_e4() -> Result<(), Box<dyn std::error::Error>> {
+    let dsn = std::env::var("POPSIM_PG_DSN")
+        .unwrap_or_else(|_| "postgres://127.0.0.1:55432/postgres".to_string());
+    if postgres::Client::connect(&dsn, postgres::NoTls).is_err() {
+        eprintln!(
+            "SKIP postgres_arm_answers_the_same_questions_as_e4: no server reachable at {dsn}"
+        );
+        return Ok(());
+    }
+
+    let root = std::env::temp_dir().join(format!("popsim-smoke-pg-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+
+    let arm = |which| {
+        let mut options = Options::new(which, ROWS, &root);
+        options.reps = 3;
+        options.case_budget = Duration::from_secs(30);
+        options.dsn = Some(dsn.clone());
+        run_arm(&options).expect("arm runs")
+    };
+
+    let e4 = arm(Arm::E4);
+    let pg = arm(Arm::Postgres);
+
+    let counts = |report: &serde_json::Value| {
+        report["queries"]
+            .as_array()
+            .expect("queries is an array")
+            .iter()
+            .map(|q| {
+                (
+                    q["name"].as_str().expect("name").to_string(),
+                    q["rows"].as_u64().expect("rows"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let e4_counts = counts(&e4);
+    let pg_counts = counts(&pg);
+    assert_eq!(
+        e4_counts.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        pg_counts.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "the two arms must run the same battery in the same order"
+    );
+    for ((name, e4_rows), (_, pg_rows)) in e4_counts.iter().zip(&pg_counts) {
+        assert_eq!(
+            e4_rows, pg_rows,
+            "{name}: E4 returned {e4_rows} rows, Postgres returned {pg_rows}"
+        );
+    }
+
+    let keys_of = |report: &serde_json::Value, case: &str| {
+        report["queries"]
+            .as_array()
+            .expect("queries is an array")
+            .iter()
+            .find(|q| q["name"] == case)
+            .map(|q| q["keys"].clone())
+            .unwrap_or_else(|| panic!("case {case} ran"))
+    };
+    for case in ["point_lookup", "count_all", "oldest_10", "youngest_10"] {
+        assert_eq!(
+            keys_of(&e4, case),
+            keys_of(&pg, case),
+            "{case}: the two arms returned different keys"
+        );
+    }
+
+    let bytes = pg["bytes_on_disk"].as_u64().expect("bytes_on_disk");
+    assert!(bytes > 0, "postgres reported no bytes on disk");
+
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}

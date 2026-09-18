@@ -187,7 +187,7 @@ pub fn cover_ranges(xmin: f64, xmax: f64, ymin: f64, ymax: f64, bits: u8,
     let mut out: Vec<(u64, u64)> = Vec::new();
     let mut straddling: BinaryHeap<Straddling> = BinaryHeap::new();
     let full = 1u32 << bits;
-    let mut place = |x: u32, y: u32, size: u32, out: &mut Vec<(u64, u64)>,
+    let place = |x: u32, y: u32, size: u32, out: &mut Vec<(u64, u64)>,
                      straddling: &mut BinaryHeap<Straddling>| {
         if let Some(cells) = inside(x, y, size) {
             let total = (size as u64) * (size as u64);

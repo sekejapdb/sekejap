@@ -11,13 +11,50 @@
 //! can be rerun here. Each arm is a separate process, because a 48M run is two
 //! cluster jobs, not one.
 //!
-//!     popsim e4|sqlite <rows> <fresh-dir> [--batch N] [--only substr]
+//!     popsim e4|sqlite|postgres <rows> <fresh-dir> [--batch N] [--only substr]
 //!                                        [--reps N] [--case-budget SECS]
-//!                                        [--cache-bytes N]
+//!                                        [--cache-bytes N] [--dsn URL]
 //!
 //! The arm writes its database under `<fresh-dir>/<arm>` and its results to
 //! `<fresh-dir>/popsim-<arm>.json`. `.insert-loop/p2final/popsim_compare.py`
-//! reads the two JSONs and prints the comparison.
+//! reads the JSONs and prints the comparison (two or three arms).
+//!
+//! THE THIRD ARM: POSTGRES/POSTGIS
+//!
+//!   `postgres` targets a real server (default DSN
+//!   `postgres://127.0.0.1:55432/postgres`, override with
+//!   `--dsn`). `<fresh-dir>` holds only the JSON report; the data lives in a
+//!   FRESH per-run database (`popsim_<rows>_<unix-secs>`), created off the
+//!   `--dsn` connection so repeated runs never see a stale index or a leftover
+//!   row from a previous size. Schema, index set and load cadence mirror the
+//!   other two arms as closely as Postgres's own idiom allows:
+//!
+//!     * `person(k text primary key, fullname text, born bigint,
+//!        born_year int, addr geography(Point,4326))`.
+//!     * Indexes built LATE, same as the other two arms: a GIN index on
+//!       `to_tsvector('simple', fullname)` for text, a btree on `born`, a
+//!       GiST index on `addr` for spatial.
+//!     * Text uses the `simple` search configuration, not `english` —
+//!       `simple` does no stemming, which is the closer match to E4's
+//!       tokenizer (case-fold, alphanumeric-run tokens, no stemming). `Any`
+//!       (OR) queries become `to_tsquery('simple', 'term1 | term2')`; the
+//!       ranked case orders by `ts_rank_cd` (a different formula from E4's
+//!       BM25, so, like the other two arms, it is compared on row count only,
+//!       never on result order).
+//!     * Radius uses `ST_DWithin(addr, point::geography, metres, true)` —
+//!       `use_spheroid => true` explicitly, so Postgres measures the same
+//!       ellipsoidal (not spherical) distance model E4's Karney routine does.
+//!       Boundary rows can still disagree in the last metre; see the report.
+//!     * Bbox uses the GiST `&&` overlap operator as the index-accelerated
+//!       candidate filter, refined by an exact `ST_X`/`ST_Y` closed-interval
+//!       check against the same doubles the other two arms compare against —
+//!       the same candidate-then-refine shape SQLite's R*Tree case uses.
+//!     * Load batches 256 rows into one multi-row `INSERT ... VALUES (...),
+//!       (...), ...` per transaction — the idiomatic shape for this cadence
+//!       from a real Postgres client, not 256 single-row round trips.
+//!       `synchronous_commit` and `fsync` are Postgres's defaults (both ON);
+//!       `synchronous_commit` is also set explicitly so the load pays the
+//!       same per-commit durability barrier the other two arms do.
 //!
 //! WHAT IS THE SAME AS e3
 //!
@@ -125,13 +162,17 @@ use kernel::{
     io::IoMode,
     store::{Config, SyncMode},
 };
+use postgres::{
+    types::{ToSql, Type},
+    Client, NoTls,
+};
 use rusqlite::{functions::FunctionFlags, Connection};
 use serde_json::{json, Value};
 use std::{
     fs,
     ops::Bound,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
@@ -1030,6 +1071,357 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
     Ok((connection, stages))
 }
 
+// ── the postgres arm ──────────────────────────────────────────────────────
+
+const DEFAULT_PG_DSN: &str = "postgres://127.0.0.1:55432/postgres";
+
+/// Swap the trailing `/database` segment of a DSN for a freshly created one.
+fn dsn_with_db(dsn: &str, db: &str) -> String {
+    match dsn.rfind('/') {
+        Some(idx) => format!("{}/{db}", &dsn[..idx]),
+        None => format!("{dsn}/{db}"),
+    }
+}
+
+/// Column 0 is always the key. Extra columns are touched (materialised) the
+/// same way `lite_answer` touches SQLite's, so both arms pay for pulling the
+/// row apart, not just for finding it. The battery only ever selects `TEXT`
+/// or `INT8` beyond column 0, so those are the only types handled.
+fn pg_touch(row: &postgres::Row, idx: usize) -> R<()> {
+    match row.columns()[idx].type_().clone() {
+        Type::TEXT | Type::VARCHAR => {
+            std::hint::black_box(row.try_get::<_, String>(idx)?);
+        }
+        Type::INT8 => {
+            std::hint::black_box(row.try_get::<_, i64>(idx)?);
+        }
+        Type::INT4 => {
+            std::hint::black_box(row.try_get::<_, i32>(idx)?);
+        }
+        other => return Err(format!("pg_touch: unexpected column type {other}").into()),
+    }
+    Ok(())
+}
+
+/// Every case's SQL is a literal-embedded string, same convention `lite_cases`
+/// uses for its radius/bbox constants — the values are fixed Rust constants,
+/// never user input, so binding them as query parameters would add ceremony
+/// without adding safety. `query_raw` with no parameters still gives a
+/// streamed row-by-row iterator, which is what `count_all` needs: this arm
+/// must never spell `SELECT COUNT(*)`, so Postgres cannot answer from an
+/// index-only fast count instead of a real per-row enumeration — see the
+/// `count_all` deviation note the other two arms already carry.
+fn pg_answer(client: &mut Client, sql: &str) -> R<Answer> {
+    use postgres::fallible_iterator::FallibleIterator;
+    let mut answer = Answer::default();
+    let mut rows = client.query_raw(sql, std::iter::empty::<i32>())?;
+    while let Some(row) = rows.next()? {
+        for idx in 1..row.len() {
+            pg_touch(&row, idx)?;
+        }
+        answer.push(row.try_get::<_, String>(0)?);
+    }
+    Ok(answer)
+}
+
+/// The exact WGS84-geodesic candidate: `ST_DWithin` on a `geography` column
+/// with `use_spheroid => true` explicitly passed (it is also the default),
+/// so Postgres measures the same ellipsoidal model E4's Karney routine does,
+/// not the cheaper great-circle sphere model. Boundary rows can still
+/// disagree by the last metre between Karney's convergent series and
+/// PostGIS's own ellipsoidal inverse; see the report for a boundary count.
+fn pg_radius_sql(metres: f64, extra: &str) -> String {
+    format!(
+        "SELECT k FROM person WHERE ST_DWithin(addr, \
+         ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326)::geography, {metres:?}, true){extra}"
+    )
+}
+
+/// The GiST `&&` overlap operator supplies the index-accelerated candidate
+/// set (a bounding-box test, like SQLite's R*Tree join); the `ST_X`/`ST_Y`
+/// clause is the exact refine against the same closed interval
+/// `lite_box_clause` tests (`>=` west/south, `<=` east/north, all four edges
+/// inclusive) — the geography type's own internal box representation is a
+/// float4 approximation, so the refine is not optional here either.
+fn pg_bbox_sql(b: Bounds) -> String {
+    format!(
+        "SELECT k FROM person WHERE addr && ST_MakeEnvelope({:?},{:?},{:?},{:?},4326)::geography \
+         AND ST_X(addr::geometry) BETWEEN {:?} AND {:?} \
+         AND ST_Y(addr::geometry) BETWEEN {:?} AND {:?}",
+        b.west(), b.south(), b.east(), b.north(),
+        b.west(), b.east(), b.south(), b.north()
+    )
+}
+
+/// The same battery, in the same order, as Postgres spells it. Every case not
+/// named in the module doc (the plain `born` ranges, `oldest_10`/
+/// `youngest_10`) is the same predicate/ORDER BY the SQLite arm uses, `_key`
+/// renamed to `k` and nothing else changed.
+fn pg_cases(rows: u64) -> Vec<(&'static str, String)> {
+    let mid = key(rows / 2);
+    vec![
+        (
+            "point_lookup",
+            format!("SELECT k, fullname, born FROM person WHERE k='{mid}'"),
+        ),
+        ("count_all", "SELECT k FROM person".into()),
+        (
+            "name_fulltext",
+            "SELECT k FROM person WHERE to_tsvector('simple', fullname) \
+             @@ to_tsquery('simple', 'sari')"
+                .into(),
+        ),
+        (
+            "name_two_terms",
+            // TextMatch::Any is an OR of terms (E4 merges by taking the min
+            // doc across all term posting streams); `sari | wati` is the
+            // `simple`-config equivalent.
+            "SELECT k FROM person WHERE to_tsvector('simple', fullname) \
+             @@ to_tsquery('simple', 'sari | wati')"
+                .into(),
+        ),
+        (
+            "name_top10",
+            // ts_rank_cd, not BM25 — a different ranking formula, so (like
+            // the other two arms) this case is compared on row count only.
+            "SELECT k FROM person WHERE to_tsvector('simple', fullname) \
+             @@ to_tsquery('simple', 'diwa') \
+             ORDER BY ts_rank_cd(to_tsvector('simple', fullname), to_tsquery('simple', 'diwa')) DESC, \
+             k ASC LIMIT 10"
+                .into(),
+        ),
+        (
+            "born_decade",
+            "SELECT k FROM person WHERE born>=19900101 AND born<20000101".into(),
+        ),
+        (
+            "born_between",
+            "SELECT k FROM person WHERE born BETWEEN 19900101 AND 19991231".into(),
+        ),
+        (
+            "born_ge_open",
+            "SELECT k FROM person WHERE born>=20100101".into(),
+        ),
+        (
+            "born_one_year",
+            "SELECT k FROM person WHERE born>=19870101 AND born<19880101".into(),
+        ),
+        (
+            "born_one_day",
+            "SELECT k FROM person WHERE born>=19870615 AND born<19870616".into(),
+        ),
+        ("radius_2km", pg_radius_sql(2_000.0, "")),
+        ("radius_50km", pg_radius_sql(50_000.0, "")),
+        ("bbox", pg_bbox_sql(query_box())),
+        (
+            "radius_and_born",
+            pg_radius_sql(10_000.0, " AND born>=19900101 AND born<20000101"),
+        ),
+        (
+            "name_and_born",
+            "SELECT k FROM person WHERE to_tsvector('simple', fullname) \
+             @@ to_tsquery('simple', 'sari') AND born>=19800101 AND born<19900101"
+                .into(),
+        ),
+        (
+            "oldest_10",
+            "SELECT k, born FROM person ORDER BY born ASC, k ASC LIMIT 10".into(),
+        ),
+        (
+            "youngest_10",
+            "SELECT k, born FROM person ORDER BY born DESC, k ASC LIMIT 10".into(),
+        ),
+    ]
+}
+
+/// One multi-row `INSERT ... VALUES (...), (...), ...` per batch — the
+/// idiomatic shape a real Postgres client uses at this commit cadence, not
+/// 256 single-row round trips. Bound as real parameters (not literal-embedded
+/// like the read side): `fullname` is generator output, and binding is the
+/// straightforward way to hand a dynamic-length batch to `postgres::Client`
+/// without hand-escaping text.
+fn insert_batch(client: &mut Client, people: &[Person]) -> R<()> {
+    let mut sql = String::from("INSERT INTO person (k, fullname, born, born_year, addr) VALUES ");
+    let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::with_capacity(people.len() * 6);
+    for (i, p) in people.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        let base = i * 6;
+        sql.push_str(&format!(
+            "(${},${},${},${},ST_SetSRID(ST_MakePoint(${},${}),4326)::geography)",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6
+        ));
+        params.push(Box::new(p.key.clone()));
+        params.push(Box::new(p.fullname.clone()));
+        params.push(Box::new(p.born));
+        params.push(Box::new(p.born_year as i32));
+        params.push(Box::new(p.lon));
+        params.push(Box::new(p.lat));
+    }
+    let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
+    // Explicit BEGIN/COMMIT per batch, matching the other two arms' commit
+    // cadence documentation, though a lone multi-row statement would already
+    // be its own implicit transaction under Postgres's autocommit.
+    let mut txn = client.transaction()?;
+    txn.execute(sql.as_str(), &refs)?;
+    txn.commit()?;
+    Ok(())
+}
+
+fn load_pg(
+    root: &Path,
+    rows: u64,
+    batch: u64,
+    dsn_base: &str,
+) -> R<(Client, Value, String, String)> {
+    fs::create_dir_all(root)?;
+    let overall = Instant::now();
+
+    let at = Instant::now();
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let db_name = format!("popsim_{rows}_{stamp}");
+    // A fresh database per run, so a rerun never sees a stale index or a
+    // leftover row from a previous size — the same "start from nothing" rule
+    // `run_arm` already applies to the other two arms' directories.
+    let mut admin = Client::connect(dsn_base, NoTls)?;
+    admin.batch_execute(&format!("CREATE DATABASE \"{db_name}\""))?;
+    drop(admin);
+
+    let dsn = dsn_with_db(dsn_base, &db_name);
+    let mut client = Client::connect(&dsn, NoTls)?;
+    client.batch_execute("CREATE EXTENSION IF NOT EXISTS postgis;")?;
+    // synchronous_commit and fsync are both ON by default on a stock Postgres
+    // server; synchronous_commit is set explicitly anyway so the load pays
+    // the same per-commit durability barrier the other two arms document.
+    client.batch_execute(
+        "SET synchronous_commit = on;
+         CREATE TABLE person (
+             k text primary key,
+             fullname text,
+             born bigint,
+             born_year int,
+             addr geography(Point,4326)
+         );",
+    )?;
+    let open_s = at.elapsed().as_secs_f64();
+
+    eprintln!("[postgres] inserting {rows} rows, commit every {batch} …");
+    let at = Instant::now();
+    let mut pending: Vec<Person> = Vec::with_capacity(batch as usize);
+    for i in 0..rows {
+        pending.push(person(i));
+        if pending.len() as u64 == batch {
+            insert_batch(&mut client, &pending)?;
+            pending.clear();
+        }
+        if (i + 1) % PROGRESS == 0 {
+            eprintln!(
+                "[postgres]   … {} rows in ({:.0}s)",
+                i + 1,
+                at.elapsed().as_secs_f64()
+            );
+        }
+    }
+    if !pending.is_empty() {
+        insert_batch(&mut client, &pending)?;
+    }
+    let load_s = at.elapsed().as_secs_f64();
+    eprintln!("[postgres] {rows} rows in {load_s:.2}s; building three indexes …");
+
+    // Late build, same as the other two arms.
+    let at = Instant::now();
+    client.batch_execute(
+        "CREATE INDEX person_fts_idx ON person USING gin (to_tsvector('simple', fullname));",
+    )?;
+    let index_text_s = at.elapsed().as_secs_f64();
+
+    let at = Instant::now();
+    client.batch_execute("CREATE INDEX person_born_idx ON person (born);")?;
+    let index_scalar_s = at.elapsed().as_secs_f64();
+
+    let at = Instant::now();
+    client.batch_execute("CREATE INDEX person_addr_gix ON person USING gist (addr);")?;
+    let index_point_s = at.elapsed().as_secs_f64();
+
+    // Postgres's analog of the other two arms' checkpoint: ANALYZE so the
+    // planner has fresh stats for the indexes just built, then CHECKPOINT so
+    // dirty buffers are forced to disk — both folded into one timed stage.
+    let at = Instant::now();
+    client.batch_execute("ANALYZE person; CHECKPOINT;")?;
+    let checkpoint_s = at.elapsed().as_secs_f64();
+
+    let stages = json!({
+        "open_s": open_s,
+        "load_s": load_s,
+        "index_text_s": index_text_s,
+        "index_scalar_s": index_scalar_s,
+        "index_point_s": index_point_s,
+        "index_total_s": index_text_s + index_scalar_s + index_point_s,
+        "checkpoint_s": checkpoint_s,
+        "total_s": overall.elapsed().as_secs_f64(),
+    });
+    eprintln!(
+        "[postgres] indexes built in {:.2}s; analyze+checkpoint {checkpoint_s:.2}s",
+        index_text_s + index_scalar_s + index_point_s
+    );
+    Ok((client, stages, dsn, db_name))
+}
+
+/// `pg_total_relation_size` (table + indexes + TOAST + free-space/visibility
+/// maps — confirmed against the Postgres docs) alongside
+/// `pg_database_size(current_database())`. `bytes_on_disk` in the report is
+/// the DATABASE size, for comparability with the other two arms' `dir_bytes`
+/// (which sums an entire directory, not just one collection's own pages);
+/// the relation-only number is kept alongside it, not dropped.
+fn pg_bytes(client: &mut Client) -> R<(u64, u64)> {
+    let row = client.query_one(
+        "SELECT pg_total_relation_size('person'), pg_database_size(current_database())",
+        &[],
+    )?;
+    let relation: i64 = row.try_get(0)?;
+    let database: i64 = row.try_get(1)?;
+    Ok((relation as u64, database as u64))
+}
+
+/// Container memory via `docker stats`, since the server runs in Docker; not
+/// a host-process RSS read from `/proc`. `None` if the container name isn't
+/// running under `docker` on this host (report omits the field, never fakes
+/// it).
+fn pg_container_rss_bytes(container: &str) -> Option<u64> {
+    let output = std::process::Command::new("docker")
+        .args(["stats", "--no-stream", "--format", "{{.MemUsage}}", container])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let used = text.split('/').next()?.trim();
+    parse_docker_mem(used)
+}
+
+fn parse_docker_mem(s: &str) -> Option<u64> {
+    let (num, unit) = s.split_at(s.find(|c: char| c.is_alphabetic())?);
+    let value: f64 = num.trim().parse().ok()?;
+    let mult = match unit.trim() {
+        "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "KB" => 1000.0,
+        "MB" => 1_000_000.0,
+        "GB" => 1_000_000_000.0,
+        _ => return None,
+    };
+    Some((value * mult) as u64)
+}
+
 // ── measurement ───────────────────────────────────────────────────────────
 
 /// Warm once untimed, then time until BOTH the sample floor and a short time
@@ -1064,6 +1456,7 @@ fn bench(
 pub enum Arm {
     E4,
     Sqlite,
+    Postgres,
 }
 
 impl Arm {
@@ -1071,6 +1464,7 @@ impl Arm {
         match s {
             "e4" => Some(Self::E4),
             "sqlite" => Some(Self::Sqlite),
+            "postgres" => Some(Self::Postgres),
             _ => None,
         }
     }
@@ -1078,6 +1472,7 @@ impl Arm {
         match self {
             Self::E4 => "e4",
             Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
         }
     }
 }
@@ -1096,6 +1491,9 @@ pub struct Options {
     /// load, no index build. The load and build stages are then reported as
     /// `null` and `"reused": true`, never as zero.
     pub reuse: bool,
+    /// Postgres arm only: the DSN of the maintenance connection used to
+    /// `CREATE DATABASE` a fresh per-run database. Ignored by the other arms.
+    pub dsn: Option<String>,
 }
 
 impl Options {
@@ -1110,6 +1508,7 @@ impl Options {
             case_budget: Duration::from_secs(300),
             cache_bytes: CACHE_BYTES,
             reuse: false,
+            dsn: None,
         }
     }
 }
@@ -1140,6 +1539,13 @@ pub fn run_arm(options: &Options) -> R<Value> {
 
     let mut measured = Vec::new();
     let stages;
+    // Bytes/files are computed per arm below: the first two are a directory
+    // sum, taken AFTER CLOSE so a WAL only folded away on close is counted;
+    // the postgres arm has no local directory worth summing (the data lives
+    // on the server), so it reports server-side sizes instead.
+    let bytes;
+    let files;
+    let mut extra = serde_json::Map::new();
     match options.arm {
         Arm::E4 => {
             let (ctx, s) = if options.reuse {
@@ -1162,6 +1568,8 @@ pub fn run_arm(options: &Options) -> R<Value> {
                 }));
             }
             drop(ctx);
+            bytes = dir_bytes(&db_root);
+            files = file_map(&db_root);
         }
         Arm::Sqlite => {
             let (connection, s) = if options.reuse {
@@ -1186,13 +1594,56 @@ pub fn run_arm(options: &Options) -> R<Value> {
                 }));
             }
             drop(connection);
+            bytes = dir_bytes(&db_root);
+            files = file_map(&db_root);
+        }
+        Arm::Postgres => {
+            if options.reuse {
+                // The Postgres arm names a fresh database per run; there is no
+                // kept file to reopen yet.
+                return Err("--reuse is not supported for the postgres arm".into());
+            }
+            let dsn_base = options.dsn.as_deref().unwrap_or(DEFAULT_PG_DSN);
+            let (mut client, s, dsn, db_name) =
+                load_pg(&db_root, options.rows, options.batch, dsn_base)?;
+            stages = s;
+            for (name, sql) in pg_cases(options.rows) {
+                if !selected(name) {
+                    continue;
+                }
+                let (micros, samples, answer) =
+                    bench(options.reps, options.case_budget, || pg_answer(&mut client, &sql))
+                        .map_err(|e| format!("case {name}: {e}"))?;
+                eprintln!("[postgres] {name:<16} {micros:>12.1} us  rows={}", answer.rows);
+                measured.push(json!({
+                    "name": name, "micros": micros, "samples": samples,
+                    "rows": answer.rows, "keys": answer.keys,
+                }));
+            }
+            let (relation, database) = pg_bytes(&mut client)?;
+            drop(client);
+            bytes = database;
+            files = json!({
+                "pg_total_relation_size_person": relation,
+                "pg_database_size": database,
+            });
+            extra.insert("dsn".into(), json!(dsn));
+            extra.insert("database".into(), json!(db_name));
+            match pg_container_rss_bytes("e4-pg") {
+                Some(rss) => {
+                    extra.insert("server_rss_bytes".into(), json!(rss));
+                }
+                None => {
+                    extra.insert(
+                        "server_rss_bytes_note".into(),
+                        json!("not obtainable: no 'e4-pg' docker container reachable via `docker stats`"),
+                    );
+                }
+            }
         }
     }
 
-    // Bytes on disk AFTER CLOSE, so a WAL that is only folded away on close is
-    // counted in whichever arm does that.
-    let bytes = dir_bytes(&db_root);
-    let report = json!({
+    let mut report = json!({
         "arm": arm,
         "rows": options.rows,
         "batch": options.batch,
@@ -1202,12 +1653,15 @@ pub fn run_arm(options: &Options) -> R<Value> {
         "stages": stages,
         "bytes_on_disk": bytes,
         "bytes_per_row": bytes as f64 / options.rows.max(1) as f64,
-        "files": file_map(&db_root),
+        "files": files,
         "queries": measured,
         "unsupported": UNSUPPORTED.iter()
             .map(|(name, why)| json!({"name": name, "reason": why}))
             .collect::<Vec<_>>(),
     });
+    if let Value::Object(map) = &mut report {
+        map.extend(extra);
+    }
     let out = options.root.join(format!("popsim-{arm}.json"));
     fs::write(&out, serde_json::to_string_pretty(&report)?)?;
     eprintln!(
@@ -1220,8 +1674,8 @@ pub fn run_arm(options: &Options) -> R<Value> {
 }
 
 fn usage() -> String {
-    "usage: popsim e4|sqlite <rows> <fresh-dir> [--batch N] [--only substr] \
-     [--reps N] [--case-budget SECS] [--cache-bytes N] [--reuse]"
+    "usage: popsim e4|sqlite|postgres <rows> <fresh-dir> [--batch N] [--only substr] \
+     [--reps N] [--case-budget SECS] [--cache-bytes N] [--reuse] [--dsn URL]"
         .into()
 }
 
@@ -1242,6 +1696,7 @@ fn parse(args: &[String]) -> R<Options> {
             "--case-budget" => options.case_budget = Duration::from_secs(value()?.parse()?),
             "--cache-bytes" => options.cache_bytes = value()?.parse()?,
             "--reuse" => options.reuse = true,
+            "--dsn" => options.dsn = Some(value()?),
             other => return Err(format!("unknown flag {other}\n{}", usage()).into()),
         }
     }
