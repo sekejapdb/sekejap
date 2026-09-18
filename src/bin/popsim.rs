@@ -1472,6 +1472,39 @@ fn insert_batch(client: &mut Client, people: &[Person]) -> R<()> {
     Ok(())
 }
 
+/// Reopen the database an earlier `load_pg` pass built. The Postgres arm has
+/// no file of its own to find: the database's name travelled in the report
+/// the build pass wrote under `<root>/popsim-postgres.json`, so that is what
+/// is read back, and the server named by `--dsn` must still hold it with the
+/// table and its three indexes. Stages other than `open_s` are `null`.
+fn open_pg(root: &Path, dsn_base: &str) -> R<(Client, Value, String, String)> {
+    let at = Instant::now();
+    // `run_arm` writes the report beside the arm directories, not inside
+    // this arm's own one.
+    let report_path = root.parent().unwrap_or(root).join("popsim-postgres.json");
+    let report: Value = serde_json::from_str(&fs::read_to_string(&report_path).map_err(|e| {
+        format!("--reuse: no earlier report at {}: {e}", report_path.display())
+    })?)?;
+    let db_name = report["database"]
+        .as_str()
+        .ok_or("--reuse: the earlier report names no database")?
+        .to_string();
+    let dsn = dsn_with_db(dsn_base, &db_name);
+    let mut client = Client::connect(&dsn, NoTls)?;
+    let indexes: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_indexes WHERE tablename = 'person'",
+            &[],
+        )?
+        .get(0);
+    if indexes < 3 {
+        return Err(format!("--reuse: {db_name} has {indexes} indexes on person, expected 3").into());
+    }
+    let open_s = at.elapsed().as_secs_f64();
+    eprintln!("[postgres] reopened {db_name} in {open_s:.3}s; queries only");
+    Ok((client, reused_stages(open_s), dsn, db_name))
+}
+
 fn load_pg(
     root: &Path,
     rows: u64,
@@ -1796,14 +1829,12 @@ pub fn run_arm(options: &Options) -> R<Value> {
             files = file_map(&db_root);
         }
         Arm::Postgres => {
-            if options.reuse {
-                // The Postgres arm names a fresh database per run; there is no
-                // kept file to reopen yet.
-                return Err("--reuse is not supported for the postgres arm".into());
-            }
             let dsn_base = options.dsn.as_deref().unwrap_or(DEFAULT_PG_DSN);
-            let (mut client, s, dsn, db_name) =
-                load_pg(&db_root, options.rows, options.batch, dsn_base)?;
+            let (mut client, s, dsn, db_name) = if options.reuse {
+                open_pg(&db_root, dsn_base)?
+            } else {
+                load_pg(&db_root, options.rows, options.batch, dsn_base)?
+            };
             stages = s;
             for (name, sql) in pg_cases(options.rows) {
                 if !selected(name) {

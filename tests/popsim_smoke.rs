@@ -138,11 +138,15 @@ fn both_arms_answer_the_same_questions() {
 fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
     let root = std::env::temp_dir().join(format!("popsim-reuse-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
+    let dsn = std::env::var("POPSIM_PG_DSN")
+        .unwrap_or_else(|_| "postgres://127.0.0.1:55432/postgres".to_string());
+    let pg_reachable = postgres::Client::connect(&dsn, postgres::NoTls).is_ok();
     let pass = |which, reuse| {
         let mut options = Options::new(which, ROWS, &root);
         options.reps = 2;
         options.case_budget = Duration::from_secs(30);
         options.reuse = reuse;
+        options.dsn = Some(dsn.clone());
         run_arm(&options).expect("arm runs")
     };
     let answers = |report: &serde_json::Value| {
@@ -153,7 +157,15 @@ fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
             .map(|q| (q["name"].clone(), q["rows"].clone(), q["keys"].clone()))
             .collect::<Vec<_>>()
     };
-    for which in [Arm::E4, Arm::Sqlite] {
+    // The Postgres arm reopens the database its build pass named in the
+    // report; it joins the loop only where a server answers.
+    let mut arms = vec![Arm::E4, Arm::Sqlite];
+    if pg_reachable {
+        arms.push(Arm::Postgres);
+    } else {
+        eprintln!("SKIP the postgres reuse pass: no server reachable at {dsn}");
+    }
+    for which in arms {
         let built = pass(which, false);
         let reused = pass(which, true);
         assert_eq!(answers(&built), answers(&reused), "{which:?}: the reuse pass disagreed");
