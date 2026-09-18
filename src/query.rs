@@ -867,6 +867,28 @@ pub struct PreparedQuery<'db> {
     total_limit: Option<usize>,
     emitted: usize,
     after: Option<RankKey>,
+    /// Rows this query has already ranked but has not handed out yet, in rank
+    /// order, LAST FIRST so `pop` takes the next one.
+    ///
+    /// A driver whose walk order is unrelated to the ranking -- a RANGE over a
+    /// value-ordered index, or a text merge, under an entity-id ranking --
+    /// cannot stop early and cannot resume: to know which rows come next it
+    /// has to see every candidate again. So page k+1 re-opened the whole
+    /// candidate stream and discarded everything page 1..k had already
+    /// returned. That is one full pass PER PAGE, and an answer of R rows in
+    /// pages of P costs R^2/P -- invisible while the answer fits one page, and
+    /// the whole of why `popsim`'s `born_decade` took 1,011 s to return 5.58M
+    /// rows at 48M while the same case at 200K took 11 ms.
+    ///
+    /// A page under such a driver walks to the end of the stream whatever it
+    /// does, so the rows past this page are rows it has ALREADY ranked. It
+    /// keeps them here instead of dropping them, and the pages after it are
+    /// served from here without walking at all.
+    run: Vec<HeapEntry>,
+    /// Whether the walk that filled `run` was cut off by [`RUN_ROWS`]. When it
+    /// was, emptying the run is not the end of the answer and the next page
+    /// walks again, from the last row handed out.
+    run_bounded: bool,
 }
 
 fn invalid_query(message: impl fmt::Display) -> QueryError {
@@ -1630,6 +1652,8 @@ impl Database {
             total_limit: request.total_limit,
             emitted: 0,
             after: None,
+            run: Vec::new(),
+            run_bounded: false,
         })
     }
 }
@@ -3187,6 +3211,32 @@ impl<'a> PrimaryRows<'a> {
 /// pass of the primary tree, so it wants to be large; it holds a row per entry
 /// while it does, so it cannot be unbounded. A page never gathers more than it
 /// could return, and never more than this.
+/// How many ranked rows one page may HOLD BACK for the pages after it.
+///
+/// A page whose driver walks in an order unrelated to the ranking reads the
+/// whole candidate stream whatever it does (see [`PreparedQuery::run`]), so
+/// the rows past this page are rows it has already ranked. Keeping them turns
+/// the answer's cost from one pass PER PAGE into one pass per this many rows:
+/// an answer of R rows costs `R / RUN_ROWS` passes instead of `R / page_size`.
+/// At 48M rows `popsim`'s `born_decade` returns 5.58M rows in pages of 8,192 --
+/// 681 passes over a 5.58M-posting range, which is what made it take 1,011 s.
+///
+/// The bound is in BYTES because what is held is a rank key each and the
+/// promise has to mean the same thing whatever a rank key weighs. It is the
+/// same order as the default buffer pool, it is transient -- it lives on the
+/// prepared query and goes when the query does -- and it is only ever reached
+/// by an answer large enough to have paid far more than this in re-walking.
+const RUN_BYTES: usize = 8 << 20;
+
+const RUN_ROWS: usize = {
+    let rows = RUN_BYTES / std::mem::size_of::<HeapEntry>();
+    if rows < MAX_PAGE_SIZE {
+        MAX_PAGE_SIZE
+    } else {
+        rows
+    }
+};
+
 const ROW_BATCH: usize = 4_096;
 
 /// ... and how many bytes of row those entries may hold.
@@ -4542,6 +4592,204 @@ impl PreparedQuery<'_> {
         })
     }
 
+    /// True when this page should HOLD BACK the rows it ranked but could not
+    /// return, instead of dropping them and walking for them again.
+    ///
+    /// Three things have to hold, and each one is a correctness statement:
+    ///
+    ///   * the walk is not in rank order (`RankWalk::No`), so it has neither a
+    ///     stop condition nor a resume: it reads the whole candidate stream
+    ///     whatever it does, and everything past this page is something it has
+    ///     already ranked. A walk that CAN resume holds nothing, exactly as
+    ///     before -- it never ranked those rows in the first place;
+    ///   * the page projects no fields, so what is held is a rank key and
+    ///     nothing else. A projected page can carry a whole primary record per
+    ///     entry, and a bound in rows would not be a bound in bytes. Named
+    ///     sacrifice (Law 4): a PROJECTED answer over a value-ordered walk
+    ///     still re-walks its driver once per page;
+    ///   * the order is not the approximate-vector one, whose `ef` already
+    ///     bounds the entire result set to one shortlist, and whose page
+    ///     reports approximation diagnostics that a held row does not carry.
+    fn keeps_a_run(&self) -> bool {
+        self.projection.is_empty()
+            && self.driver_walks_in_rank_order() == RankWalk::No
+            && !matches!(self.order, CompiledOrder::ApproximateVector { .. })
+    }
+
+    /// The bookkeeping every page ends with, however its winners were found:
+    /// where the next page resumes, how many rows the query has emitted, and
+    /// whether there is anything left.
+    fn finish_page(
+        &mut self,
+        rows: Vec<QueryRow>,
+        winners: &[HeapEntry],
+        has_more: bool,
+        approximation: Option<ApproximationDiagnostics>,
+        work: QueryWork,
+    ) -> QueryResult<QueryPage> {
+        let next_after = winners.last().map(|winner| winner.key.clone());
+        let next_emitted = self
+            .emitted
+            .checked_add(rows.len())
+            .ok_or_else(|| invalid_query("query total output overflow"))?;
+        let hit_total_limit = self.total_limit.is_some_and(|limit| next_emitted >= limit);
+        self.after = next_after.or_else(|| self.after.clone());
+        self.emitted = next_emitted;
+        Ok(QueryPage {
+            rows,
+            done: hit_total_limit || !has_more,
+            driver: self.driver.diagnostic(),
+            work,
+            approximation,
+        })
+    }
+
+    /// Turn a page's ranked winners into its rows: the existence proof a
+    /// driver that is not its own authority still owes, and the projected
+    /// fields. Shared by the page that walked for these winners and the page
+    /// that took them out of the held run.
+    fn emit_rows<C: FnMut() -> bool>(
+        &self,
+        winners: &mut [HeapEntry],
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Vec<QueryRow>> {
+        let db = self.db;
+        // Whether the page will project anything out of the rows it holds.
+        let wants_rows = !self.projection.is_empty();
+        let winner_needs_no_row = self.winner_needs_no_row();
+        let walk_reads_every_row = self.walk_reads_every_row();
+        let mut scratch = ProjectionScratch::default();
+        // An id ranking returns winners in ascending primary-key order, so the
+        // rows they still need can be lifted out by one forward cursor. Any
+        // other ranking hands them over in an order the primary tree knows
+        // nothing about, and each one is a fresh descent as before.
+        let mut winner_rows =
+            PrimaryRows::new(db, matches!(self.order, CompiledOrder::EntityId));
+        // A RANKED page hands its winners over in score order; the primary
+        // tree is in id order. Reading them as they are ranked descends from
+        // the root once per returned row -- a BM25 page over 900 matching
+        // documents paid 900 descents and 900 buffers, where the very same
+        // page ranked by id paid one cursor. So a ranked page lifts its rows
+        // out FIRST, in the tree's order, and hands them back to the ranked
+        // winners by index. Nothing about the answer or its order changes,
+        // only the order the rows are read in; an id ranking already ascends
+        // and keeps streaming them one at a time, holding none.
+        let ranked_rows_read = !winner_needs_no_row
+            && !walk_reads_every_row
+            && !matches!(self.order, CompiledOrder::EntityId);
+        if ranked_rows_read {
+            let mut ascending = PrimaryRows::new(db, true);
+            if wants_rows {
+                let mut by_id: Vec<usize> = (0..winners.len())
+                    .filter(|at| winners[*at].row.is_none())
+                    .collect();
+                by_id.sort_unstable_by_key(|at| winners[*at].key.id);
+                for at in by_id {
+                    meter.charge(WorkResource::PrimaryReads, 1)?;
+                    let bytes = ascending
+                        .read(winners[at].key.id)?
+                        .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
+                    winners[at].row = Some(Box::new(decode_row(db, bytes)?));
+                }
+            } else {
+                // A key-only page wanted this read for one thing: the proof
+                // that the entity is still there. It keeps nothing, so it
+                // sorts the SEQUENCES and not indices into the winners --
+                // every comparison of `sort_unstable_by_key(|at|
+                // winners[*at]...)` is an indirect load into a
+                // 56-byte-per-entry array, and a 3,716-document BM25 page
+                // makes about 44,000 of them. The collection is the same for
+                // every candidate (the walk refuses one that crosses), so what
+                // is sorted is one `u64` each.
+                let mut sequences: Vec<u64> =
+                    winners.iter().map(|winner| winner.key.id.sequence).collect();
+                sequences.sort_unstable();
+                for sequence in sequences {
+                    meter.charge(WorkResource::PrimaryReads, 1)?;
+                    if !ascending.exists(EntityId {
+                        collection: self.collection,
+                        sequence,
+                    })? {
+                        return Err(corrupt_query("query winner is missing its entity"));
+                    }
+                }
+            }
+        }
+        let mut rows = Vec::with_capacity(winners.len());
+        for winner in winners.iter_mut() {
+            let order = match (&self.order, &winner.key.value) {
+                (CompiledOrder::EntityId, RankValue::Entity) => OrderValue::EntityId,
+                (CompiledOrder::Scalar { info, .. }, RankValue::Scalar(key)) => {
+                    OrderValue::Scalar(scalar_order_value(info, key)?)
+                }
+                (CompiledOrder::ExactVector { .. }, RankValue::Score(score)) => {
+                    OrderValue::Distance(f64::from_bits(*score))
+                }
+                (CompiledOrder::ApproximateVector { .. }, RankValue::Score(score)) => {
+                    OrderValue::Distance(f64::from_bits(*score))
+                }
+                (CompiledOrder::Bm25(_), RankValue::Score(score)) => {
+                    OrderValue::Bm25(f64::from_bits(*score))
+                }
+                _ => unreachable!("prepared order and rank key agree"),
+            };
+            // Every returned ID must still have an authoritative primary row.
+            // This remains winner-only so native index scans do not pay a
+            // primary point-get for every rejected candidate -- and it is
+            // skipped entirely when the driver is already that authority and
+            // no field is projected (`winner_needs_no_row`), because then the
+            // fetch decodes nothing and only re-proves what the candidate
+            // stream proved.
+            let mut projected = Vec::with_capacity(self.projection.len());
+            // The row the candidate walk already had, if it kept one.
+            let carried = winner.row.take();
+            if carried.is_none() && !winner_needs_no_row && !walk_reads_every_row && !ranked_rows_read
+            {
+                meter.charge(WorkResource::PrimaryReads, 1)?;
+                if self.projection.is_empty() {
+                    // Nothing is decoded from these bytes -- the read is here
+                    // to refuse an orphan -- so do not copy them out of the
+                    // leaf.
+                    if !winner_rows.exists(winner.key.id)? {
+                        return Err(corrupt_query("query winner is missing its entity"));
+                    }
+                } else {
+                    let bytes = winner_rows
+                        .read(winner.key.id)?
+                        .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
+                    let row = decode_row(self.db, bytes)?;
+                    project_fields(
+                        self.db,
+                        winner.key.id,
+                        &row,
+                        &self.projection,
+                        &mut scratch,
+                        &mut projected,
+                        meter,
+                    )?;
+                }
+            } else if let Some(row) = carried {
+                project_fields(
+                    self.db,
+                    winner.key.id,
+                    &row,
+                    &self.projection,
+                    &mut scratch,
+                    &mut projected,
+                    meter,
+                )?;
+            }
+            let row = QueryRow {
+                id: winner.key.id,
+                order,
+                projected,
+            };
+            meter.charge(WorkResource::OutputBytes, checked_output_size(&row)?)?;
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
     pub fn next_page<C: FnMut() -> bool>(
         &mut self,
         page_size: usize,
@@ -4566,6 +4814,15 @@ impl PreparedQuery<'_> {
         let wanted = page_size.min(remaining);
         let needs_extra = remaining > wanted;
         let capacity = wanted + usize::from(needs_extra);
+        // How many ranked rows this page will hold on to. A page that can
+        // resume holds exactly what it returns; one that cannot holds a whole
+        // run, because the rows past this page are rows it is about to rank
+        // anyway and dropping them is what makes the next page walk again.
+        let held = if self.keeps_a_run() {
+            capacity.max(RUN_ROWS.min(remaining))
+        } else {
+            capacity
+        };
         let descending = matches!(
             self.order,
             CompiledOrder::Scalar {
@@ -4575,6 +4832,20 @@ impl PreparedQuery<'_> {
         );
         let mut meter = WorkMeter::new(budget, &mut cancelled);
         meter.check_cancelled()?;
+        // Rows an earlier page's walk already ranked and could not return.
+        // They are in rank order, last first, so this takes the next ones off
+        // the end -- and the whole walk is skipped, which is the point.
+        if !self.run.is_empty() {
+            let take = wanted.min(self.run.len());
+            let mut winners = Vec::with_capacity(take);
+            for _ in 0..take {
+                winners.push(self.run.pop().expect("the run was just measured"));
+            }
+            let has_more = !self.run.is_empty() || self.run_bounded;
+            let rows = self.emit_rows(&mut winners, &mut meter)?;
+            let work = meter.used;
+            return self.finish_page(rows, &winners, has_more, None, work);
+        }
         // One decoded `0x7B` norm block held for the page. Candidates that
         // arrive in ascending sequence -- the text and entity cursors -- reuse
         // it 255 times out of 256; one that does not simply re-decodes.
@@ -4860,7 +5131,13 @@ impl PreparedQuery<'_> {
                         }
                         Ok(())
                     };
-                    if winners.len() < capacity {
+                    // `held` is the page's own hold, which is the page size
+                    // unless the walk cannot resume -- then it is a whole run,
+                    // and the entries past this page are kept for the pages
+                    // after it instead of being walked for again. `capacity`
+                    // stays the RESERVE: a ten-row answer must not reserve a
+                    // run's worth of entries to hold ten.
+                    if winners.len() < held {
                         keep(&mut entry, &mut row, &mut encoded)?;
                         winners.push(capacity, entry);
                     } else if winners
@@ -4904,153 +5181,20 @@ impl PreparedQuery<'_> {
             "a page returns its winners in rank order"
         );
         let has_more = winners.len() > wanted;
+        // Everything this walk ranked past the page it is returning. It was
+        // ranked; the pages after this one take it from here rather than
+        // opening the whole candidate stream again. `run_bounded` records
+        // whether the walk filled the hold -- if it did, emptying the run is
+        // not the end of the answer and a later page walks once more, from the
+        // last row handed out.
+        if winners.len() > wanted && self.keeps_a_run() {
+            self.run_bounded = winners.len() == held;
+            self.run = winners.split_off(wanted);
+            self.run.reverse();
+        }
         winners.truncate(wanted);
-        let winner_needs_no_row = self.winner_needs_no_row();
-        let walk_reads_every_row = self.walk_reads_every_row();
-        let mut scratch = ProjectionScratch::default();
-        // An id ranking returns winners in ascending primary-key order, so the
-        // rows they still need can be lifted out by one forward cursor. Any
-        // other ranking hands them over in an order the primary tree knows
-        // nothing about, and each one is a fresh descent as before.
-        let mut winner_rows =
-            PrimaryRows::new(db, matches!(self.order, CompiledOrder::EntityId));
-        // A RANKED page hands its winners over in score order; the primary
-        // tree is in id order. Reading them as they are ranked descends from
-        // the root once per returned row -- a BM25 page over 900 matching
-        // documents paid 900 descents and 900 buffers, where the very same
-        // page ranked by id paid one cursor. So a ranked page lifts its rows
-        // out FIRST, in the tree's order, and hands them back to the ranked
-        // winners by index. Nothing about the answer or its order changes,
-        // only the order the rows are read in; an id ranking already ascends
-        // and keeps streaming them one at a time, holding none.
-        let ranked_rows_read = !winner_needs_no_row
-            && !walk_reads_every_row
-            && !matches!(self.order, CompiledOrder::EntityId);
-        if ranked_rows_read {
-            let mut ascending = PrimaryRows::new(db, true);
-            if wants_rows {
-                let mut by_id: Vec<usize> = (0..winners.len())
-                    .filter(|at| winners[*at].row.is_none())
-                    .collect();
-                by_id.sort_unstable_by_key(|at| winners[*at].key.id);
-                for at in by_id {
-                    meter.charge(WorkResource::PrimaryReads, 1)?;
-                    let bytes = ascending
-                        .read(winners[at].key.id)?
-                        .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
-                    winners[at].row = Some(Box::new(decode_row(db, bytes)?));
-                }
-            } else {
-                // A key-only page wanted this read for one thing: the proof
-                // that the entity is still there. It keeps nothing, so it
-                // sorts the SEQUENCES and not indices into the winners --
-                // every comparison of `sort_unstable_by_key(|at|
-                // winners[*at]...)` is an indirect load into a
-                // 56-byte-per-entry array, and a 3,716-document BM25 page
-                // makes about 44,000 of them. The collection is the same for
-                // every candidate (the walk refuses one that crosses), so what
-                // is sorted is one `u64` each.
-                let mut sequences: Vec<u64> =
-                    winners.iter().map(|winner| winner.key.id.sequence).collect();
-                sequences.sort_unstable();
-                for sequence in sequences {
-                    meter.charge(WorkResource::PrimaryReads, 1)?;
-                    if !ascending.exists(EntityId {
-                        collection: self.collection,
-                        sequence,
-                    })? {
-                        return Err(corrupt_query("query winner is missing its entity"));
-                    }
-                }
-            }
-        }
-        let mut rows = Vec::with_capacity(winners.len());
-        for winner in &mut winners {
-            let order = match (&self.order, &winner.key.value) {
-                (CompiledOrder::EntityId, RankValue::Entity) => OrderValue::EntityId,
-                (CompiledOrder::Scalar { info, .. }, RankValue::Scalar(key)) => {
-                    OrderValue::Scalar(scalar_order_value(info, key)?)
-                }
-                (CompiledOrder::ExactVector { .. }, RankValue::Score(score)) => {
-                    OrderValue::Distance(f64::from_bits(*score))
-                }
-                (CompiledOrder::ApproximateVector { .. }, RankValue::Score(score)) => {
-                    OrderValue::Distance(f64::from_bits(*score))
-                }
-                (CompiledOrder::Bm25(_), RankValue::Score(score)) => {
-                    OrderValue::Bm25(f64::from_bits(*score))
-                }
-                _ => unreachable!("prepared order and rank key agree"),
-            };
-            // Every returned ID must still have an authoritative primary row.
-            // This remains winner-only so native index scans do not pay a
-            // primary point-get for every rejected candidate -- and it is
-            // skipped entirely when the driver is already that authority and
-            // no field is projected (`winner_needs_no_row`), because then the
-            // fetch decodes nothing and only re-proves what the candidate
-            // stream proved.
-            let mut projected = Vec::with_capacity(self.projection.len());
-            // The row the candidate walk already had, if it kept one.
-            let carried = winner.row.take();
-            if carried.is_none() && !winner_needs_no_row && !walk_reads_every_row && !ranked_rows_read
-            {
-                meter.charge(WorkResource::PrimaryReads, 1)?;
-                if self.projection.is_empty() {
-                    // Nothing is decoded from these bytes -- the read is here
-                    // to refuse an orphan -- so do not copy them out of the
-                    // leaf.
-                    if !winner_rows.exists(winner.key.id)? {
-                        return Err(corrupt_query("query winner is missing its entity"));
-                    }
-                } else {
-                    let bytes = winner_rows
-                        .read(winner.key.id)?
-                        .ok_or_else(|| corrupt_query("query winner is missing its entity"))?;
-                    let row = decode_row(self.db, bytes)?;
-                    project_fields(
-                        self.db,
-                        winner.key.id,
-                        &row,
-                        &self.projection,
-                        &mut scratch,
-                        &mut projected,
-                        &mut meter,
-                    )?;
-                }
-            } else if let Some(row) = carried {
-                project_fields(
-                    self.db,
-                    winner.key.id,
-                    &row,
-                    &self.projection,
-                    &mut scratch,
-                    &mut projected,
-                    &mut meter,
-                )?;
-            }
-            let row = QueryRow {
-                id: winner.key.id,
-                order,
-                projected,
-            };
-            meter.charge(WorkResource::OutputBytes, checked_output_size(&row)?)?;
-            rows.push(row);
-        }
-
-        let next_after = winners.last().map(|winner| winner.key.clone());
-        let next_emitted = self
-            .emitted
-            .checked_add(rows.len())
-            .ok_or_else(|| invalid_query("query total output overflow"))?;
-        let hit_total_limit = self.total_limit.is_some_and(|limit| next_emitted >= limit);
-        self.after = next_after.or_else(|| self.after.clone());
-        self.emitted = next_emitted;
-        Ok(QueryPage {
-            rows,
-            done: hit_total_limit || !has_more,
-            driver: self.driver.diagnostic(),
-            work: meter.used,
-            approximation,
-        })
+        let rows = self.emit_rows(&mut winners, &mut meter)?;
+        let work = meter.used;
+        self.finish_page(rows, &winners, has_more, approximation, work)
     }
 }

@@ -700,3 +700,125 @@ fn a_projected_scan_reuses_the_walked_row_and_decodes_it_once() {
         rows * 3
     );
 }
+
+// ── loop-7 residual: the page that re-walked its own driver ────────────────
+
+/// Property 2 again, for the drivers it was never true of.
+///
+/// `a_multi_page_scan_walks_the_collection_once_not_once_per_page` proves it
+/// for the two walks whose order IS the ranking -- the primary tree under an
+/// id ranking, and an ordered index under its own ascending order. A RANGE
+/// walked under an entity-id ranking is neither: the postings arrive in value
+/// order and the answer is wanted in id order, so the page cannot stop early
+/// and cannot resume. It therefore re-opened the whole posting range on every
+/// page and threw away everything it had already returned -- N postings per
+/// page, N^2/page for the answer.
+///
+/// The cost is invisible below one page and quadratic above it, which is why
+/// a 200K-row run looked healthy and a 48M-row one did not: `born_decade` at
+/// 48M returned 5.58M rows in 681 pages and spent 1,011 s doing it.
+///
+/// The bound below is the same one the scan test states: ONE pass over the
+/// posting range for the whole answer, whatever the page size.
+#[test]
+fn a_multi_page_range_answer_walks_its_posting_range_once_not_once_per_page() {
+    let temp = tempfile::tempdir().unwrap();
+    let rows = 20_000u64;
+    let Fixture { db, v, rating, .. } = fixture(&temp.path().join("db"), rows);
+
+    // `rating` cycles every 1,000 rows, so this range holds 111 of every
+    // 1,000 ids -- about one row in nine, spread the whole length of the
+    // collection, which is what makes the id ranking a real sort.
+    let filters = [QueryFilter::Scalar {
+        index: rating,
+        predicate: ScalarFilter::Range {
+            lower: std::ops::Bound::Unbounded,
+            upper: std::ops::Bound::Included(ScalarValue::F64(27.5)),
+        },
+    }];
+    let expected: Vec<u64> = (1..=rows).filter(|i| i % 1000 <= 110).collect();
+    let page_size = 256;
+    let pages = expected.len().div_ceil(page_size) as u64;
+
+    let before = db.pool_accesses().unwrap();
+    let cost = drain(
+        &db,
+        v,
+        &filters,
+        QueryOrder::EntityId,
+        Projection::Ids,
+        None,
+        CandidateDriver::Auto,
+        page_size,
+    );
+    let accesses = db.pool_accesses().unwrap() - before;
+    let matched = cost.ids.len() as u64;
+    assert_eq!(cost.ids, expected, "every matching id once, in id order");
+
+    assert!(
+        cost.scalar_postings <= matched + pages * 4,
+        "a {pages}-page range answer of {matched} rows read {} scalar \
+         postings. The range holds {matched} postings and one pass over it is \
+         the whole answer (<= {}); re-opening it per page is {}",
+        cost.scalar_postings,
+        matched + pages * 4,
+        matched * pages
+    );
+    assert!(
+        cost.candidates <= matched + pages * 4,
+        "the same answer examined {} candidates for {matched} rows (<= {}); \
+         one per returned row is the floor, one per row PER PAGE is {}",
+        cost.candidates,
+        matched + pages * 4,
+        matched * pages
+    );
+    assert_eq!(
+        cost.primary_reads, 0,
+        "a key-only range answer read {} primary rows; the driving posting is \
+         the membership record and `Projection::Ids` decodes nothing",
+        cost.primary_reads
+    );
+    assert!(
+        accesses <= matched,
+        "a {pages}-page range answer of {matched} rows made {accesses} \
+         buffer-pool accesses -- more than one per returned row. One pass over \
+         the range's leaves is a small fraction of that; {pages} passes is what \
+         {} would be",
+        matched * pages
+    );
+}
+
+/// The held-back rows must not outlive the limit they are bounded by: a
+/// `total_limit` that stops mid-run still returns exactly that many rows, once
+/// each, and says it is done.
+#[test]
+fn a_limited_range_answer_over_a_value_ordered_walk_stops_at_its_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let rows = 20_000u64;
+    let Fixture { db, v, rating, .. } = fixture(&temp.path().join("db"), rows);
+
+    let filters = [QueryFilter::Scalar {
+        index: rating,
+        predicate: ScalarFilter::Range {
+            lower: std::ops::Bound::Unbounded,
+            upper: std::ops::Bound::Included(ScalarValue::F64(27.5)),
+        },
+    }];
+    let expected: Vec<u64> = (1..=rows).filter(|i| i % 1000 <= 110).take(700).collect();
+    for page_size in [64usize, 256, 8192] {
+        let cost = drain(
+            &db,
+            v,
+            &filters,
+            QueryOrder::EntityId,
+            Projection::Ids,
+            Some(700),
+            CandidateDriver::Auto,
+            page_size,
+        );
+        assert_eq!(
+            cost.ids, expected,
+            "LIMIT 700 in pages of {page_size}: the first 700 matching ids, once each"
+        );
+    }
+}

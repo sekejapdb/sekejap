@@ -1302,7 +1302,12 @@ fn text_driver_uses_strict_scalar_membership_with_retry_pages_and_snapshot() {
     assert!(!first.done);
     let second = query.next_page(1, generous(), || false).unwrap();
     assert_eq!(second.rows[0].id, f.ids["p1"]);
-    assert_eq!(second.work.scalar_postings, 2);
+    // Zero, not two. A text driver under an id ranking cannot stop early and
+    // cannot resume, so the FIRST page walked the merge to its end and ran the
+    // membership probe against every candidate it found. This page was already
+    // ranked on that walk; probing again would be asking the same question
+    // twice. The winner's existence check is still owed and still paid.
+    assert_eq!(second.work.scalar_postings, 0);
     assert_eq!(second.work.primary_reads, 1);
     assert!(second.done);
 
@@ -1953,19 +1958,33 @@ fn text_and_spatial_drivers_page_more_than_65536_matches_without_a_result_cap() 
         })
         .unwrap();
     let mut actual = Vec::with_capacity(ROWS);
+    let mut postings = 0;
+    let mut pages = 0u64;
     loop {
         let mut budget = generous();
         budget.candidates = ROWS as u64 + 1;
         budget.text_postings = ROWS as u64 + 1;
         let page = query.next_page(8192, budget, || false).unwrap();
         assert_eq!(page.driver, QueryDriver::Text(text));
-        assert_eq!(page.work.text_postings, ROWS as u64 + 1);
+        postings += page.work.text_postings;
+        pages += 1;
         actual.extend(page.rows.into_iter().map(|row| row.id));
         if page.done {
             break;
         }
     }
     assert_eq!(actual, expected);
+    // The merge order (ascending sequence) is not the ranking's order as far
+    // as the plan is concerned, so this page can neither stop early nor
+    // resume: it walks the merge to the end whatever it returns. It therefore
+    // keeps what it ranked, and the pages after the first walk nothing at all.
+    assert_eq!(
+        postings,
+        ROWS as u64 + 1,
+        "{pages} pages over {ROWS} matches read {postings} text postings. The          merge is opened ONCE for the whole answer ({}); re-opening it per          page is {}",
+        ROWS as u64 + 1,
+        (ROWS as u64 + 1) * pages
+    );
 
     let filters = [QueryFilter::Point {
         index: spatial,
@@ -1982,6 +2001,8 @@ fn text_and_spatial_drivers_page_more_than_65536_matches_without_a_result_cap() 
         })
         .unwrap();
     let mut actual = Vec::with_capacity(ROWS);
+    let mut postings = 0;
+    let mut pages = 0u64;
     loop {
         let mut budget = generous();
         budget.candidates = ROWS as u64 + 1;
@@ -1994,13 +2015,21 @@ fn text_and_spatial_drivers_page_more_than_65536_matches_without_a_result_cap() 
                 fallback_world: true,
             }
         );
-        assert_eq!(page.work.spatial_postings, ROWS as u64 + 1);
+        postings += page.work.spatial_postings;
+        pages += 1;
         actual.extend(page.rows.into_iter().map(|row| row.id));
         if page.done {
             break;
         }
     }
     assert_eq!(actual, expected);
+    assert_eq!(
+        postings,
+        ROWS as u64 + 1,
+        "{pages} pages over {ROWS} matches read {postings} spatial postings;          the cell walk is opened once for the whole answer ({}), not {} times",
+        ROWS as u64 + 1,
+        pages
+    );
 }
 
 // ---------------------------------------------------------------------------
