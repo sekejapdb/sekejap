@@ -7,6 +7,7 @@ use e4_prototype::{
         Direction, EntityId, Error, GraphContextId, IndexId, OrderValue, PointFilter,
         ProjectedValue, Projection, QueryBudget, QueryDriver, QueryError, QueryFilter, QueryOrder,
         QueryRequest, ScalarFilter, ScalarValue, TextMatch, VectorMetric, WorkResource,
+        verification::{verify_indexed_source, VerificationLimits},
     },
     pagewal::PageWalStore,
     spatial_math::{within_radius, Bounds, Point},
@@ -1298,7 +1299,11 @@ fn text_driver_uses_strict_scalar_membership_with_retry_pages_and_snapshot() {
     assert_eq!(first.driver, QueryDriver::Text(indexes.text));
     assert_eq!(first.rows[0].id, f.ids["p0"]);
     assert_eq!(first.work.scalar_postings, 2);
-    assert_eq!(first.work.primary_reads, 1); // winner existence only
+    // Zero: the text merge only hands over documents whose posting is live,
+    // and a posting retires in the same transaction as its row, so a
+    // text-driven key-only page no longer probes the primary tree per winner
+    // (it was 1, the winner existence probe).
+    assert_eq!(first.work.primary_reads, 0);
     assert!(!first.done);
     let second = query.next_page(1, generous(), || false).unwrap();
     assert_eq!(second.rows[0].id, f.ids["p1"]);
@@ -1311,7 +1316,7 @@ fn text_driver_uses_strict_scalar_membership_with_retry_pages_and_snapshot() {
     // and nothing past this page has been touched. The winner's existence
     // check is still owed and still paid.
     assert_eq!(second.work.scalar_postings, 2);
-    assert_eq!(second.work.primary_reads, 1);
+    assert_eq!(second.work.primary_reads, 0);
     assert!(second.done);
 
     // Entity candidates already carry their primary row. Reuse it for the
@@ -1840,10 +1845,34 @@ fn every_native_driver_refuses_an_orphan_winner_without_full_candidate_rescoring
                 .unwrap()
                 .next_page(1, generous(), || false),
         };
-        assert!(
-            matches!(result, Err(QueryError::Database(Error::Corrupt(_)))),
-            "{case:?}: {result:?}"
-        );
+        match case {
+            // A text merge and a spatial cell walk only hand over postings
+            // that retire in the same transaction as their row, so a key-only
+            // page driven by either no longer probes the primary tree per
+            // winner (item T3). A store-level orphan -- a row removed behind
+            // the index's back, which no supported write can do -- is
+            // therefore not refused by the page; it is the verifier's to
+            // report, and it must.
+            OrphanDriver::Text | OrphanDriver::Spatial => {
+                assert!(result.is_ok(), "{case:?}: {result:?}");
+                drop(db);
+                let mut issues = Vec::new();
+                let report =
+                    verify_indexed_source(&path, VerificationLimits::default(), |issue| {
+                        issues.push(issue.clone())
+                    })
+                    .unwrap();
+                assert!(report.complete && !report.clean, "{case:?}: {report:?}");
+                assert!(
+                    issues.iter().any(|issue| issue.entity == Some(orphan)),
+                    "{case:?}: the verifier did not name the orphan: {issues:?}"
+                );
+            }
+            _ => assert!(
+                matches!(result, Err(QueryError::Database(Error::Corrupt(_)))),
+                "{case:?}: {result:?}"
+            ),
+        }
     }
 }
 
@@ -2713,4 +2742,70 @@ fn a_deleted_document_with_a_packed_posting_is_never_returned_by_a_text_page() {
             "{matching:?} `{query}` is not in entity order"
         );
     }
+}
+
+/// Item T3: a spatial-driven key-only page no longer probes the primary tree
+/// per winner. The guarantee that replaces the probe is that a point's cell
+/// posting retires in the same transaction as its row, so a deleted row can
+/// never be handed over by the cell walk -- under entity order and under the
+/// driver's own cell order alike -- and the verifier stays clean.
+#[test]
+fn a_deleted_point_is_never_returned_by_a_spatial_page_that_no_longer_probes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("db");
+    let mut f = create_fixture(&path);
+    let gone = f.ids["p3"]; // position (2.0, 2.0)
+    f.db.delete(f.people, "p3").unwrap();
+    f.db.commit().unwrap();
+    f.db.checkpoint().unwrap();
+    let people = f.people;
+    let position = f.indexes.position;
+    drop(f);
+
+    let mut issues = Vec::new();
+    let report = verify_indexed_source(&path, VerificationLimits::default(), |issue| {
+        issues.push(issue.clone())
+    })
+    .unwrap();
+    assert!(report.complete && report.clean, "{report:?} {issues:?}");
+
+    let db = Database::open_snapshot(&path, cfg()).unwrap();
+    let filters = [QueryFilter::Point {
+        index: position,
+        predicate: PointFilter::Bbox(Bounds::new(-1.0, 5.0, -1.0, 5.0).unwrap()),
+    }];
+    let mut by_id = db
+        .prepare_query(QueryRequest {
+            collection: people,
+            filters: &filters,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let page = by_id.next_page(100, generous(), || false).unwrap();
+    assert!(page.done);
+    let ids_in_order: Vec<EntityId> = page.rows.iter().map(|row| row.id).collect();
+    assert!(!ids_in_order.contains(&gone), "{ids_in_order:?}");
+    assert!(!ids_in_order.is_empty());
+    // The whole point of T3: the page proved nothing through the primary tree.
+    assert_eq!(page.work.primary_reads, 0, "{:?}", page.work);
+
+    let mut by_cell = db
+        .prepare_query(QueryRequest {
+            collection: people,
+            filters: &filters,
+            order: QueryOrder::Driver,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let page = by_cell.next_page(100, generous(), || false).unwrap();
+    assert!(page.done);
+    let mut ids_by_cell: Vec<EntityId> = page.rows.iter().map(|row| row.id).collect();
+    ids_by_cell.sort();
+    assert_eq!(ids_by_cell, ids_in_order);
+    assert_eq!(page.work.primary_reads, 0, "{:?}", page.work);
 }

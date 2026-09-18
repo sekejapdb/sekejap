@@ -4656,11 +4656,27 @@ impl PreparedQuery<'_> {
     /// predicate rejects it there. No candidate reaches the heap on a nullish
     /// posting, and every one that does came from a real value entry.
     ///
-    /// Every other driver stays as it was. An order scalar walk, graph ids, a
-    /// text posting, a spatial cell, a vector locator can each name a row that
-    /// is no longer there, and those still fetch it and still refuse an orphan
-    /// -- unless the RANKING already proved the winner present, which is the
-    /// BM25 case below.
+    /// Every other driver stays as it was, with two more exceptions below the
+    /// text and spatial ones just described. An order scalar walk, graph ids,
+    /// a vector locator can each name a row that is no longer there, and
+    /// those still fetch it and still refuse an orphan -- unless the RANKING
+    /// already proved the winner present, which is the BM25 case below, or
+    /// the DRIVER's own stream already proved it, which is the text and
+    /// spatial cases below that.
+    ///
+    /// Graph ids stay on the probing side even though an edge cannot outlive
+    /// its endpoints: `Database::delete` cascades every incident edge
+    /// (`cascade_graph_delete`, both primary and reverse markers) before it
+    /// touches the row or the other indexes (`collections.rs:1466-1471`), so
+    /// an edge the traversal still walks in this snapshot does prove its far
+    /// endpoint alive. But `execute_graph` also seeds its result with
+    /// `request.seed` unconditionally when `include_seed && min_depth == 0`
+    /// (`query.rs`, the `include_seed` branch near the top of
+    /// `execute_graph`) -- no edge is walked to reach that entity, so the
+    /// traversal proves nothing about it. A caller can name any entity id as
+    /// a seed; the probe is the only thing standing between that and an
+    /// orphan reaching the page. So graph keeps the probe for every shape,
+    /// not just the ones this function already declined to touch.
     ///
     /// Named sacrifice (Law 4): a store-level orphan -- a primary row removed
     /// behind the scalar index's back, which no supported write can do -- is
@@ -4694,6 +4710,64 @@ impl PreparedQuery<'_> {
         // `verify_index` still refuses it outright. Every other page shape
         // keeps the probe.
         if matches!(self.order, CompiledOrder::Bm25(_)) {
+            return true;
+        }
+        // A text-driven page has no orphan left to refuse either, ranked by
+        // BM25 or not. `TermPostings::next` (text_indexes.rs:850 and 863)
+        // never emits a posting whose live term frequency is `0` -- that is
+        // exactly the tombstone form a delete or an update writes when it
+        // retires a posting that a packed segment will not be rewritten to
+        // drop, and it is written in the SAME transaction as the row: the
+        // text family of `maintain_indexes` (`indexes.rs:973-975`) runs
+        // inside the one `Database::delete` closure that goes on to remove
+        // the row itself (`collections.rs:1467,1471`), committed or failed as
+        // one frame (`collections.rs:1476`). So a document the merge still
+        // hands over in this snapshot is a document whose row was alive when
+        // the snapshot was taken -- the same guarantee the BM25 case above
+        // reaches through the norm, proved one layer down instead, in the
+        // posting stream every matching mode (Any, All, Phrase) reads from.
+        // A phrase filter already carries the row forward for its own
+        // adjacency check, so this arm changes nothing for phrase; it is
+        // Any/All, which certify from the posting alone, that stop paying the
+        // probe.
+        //
+        // Named sacrifice (Law 4): a store-level orphan -- a primary row
+        // removed behind the text index's back, which no supported write can
+        // do -- is no longer refused by a key-only page driven by the text
+        // merge, exactly as it is not refused by a BM25 page. `verify_index`
+        // refuses it outright either way.
+        if matches!(self.driver, DriverPlan::Text { .. }) {
+            return true;
+        }
+        // A spatial-driven page reads the same guarantee off the cell
+        // posting. `maintain_point` retires a point's old cell posting in the
+        // SAME transaction as the row that carried it: on a delete (or a move
+        // to a different cell), `db.index_delete(i, &old.key)`
+        // (spatial_indexes.rs:194) runs inside the one `Database::delete`
+        // closure that also removes the row (`collections.rs:1467,1471`), and
+        // the whole closure commits or fails as one frame
+        // (`collections.rs:1476`, via `self.finish`). So a cell posting the
+        // spatial cursor still walks in this snapshot is a document whose row
+        // was alive when the snapshot was taken.
+        //
+        // That only covers the shapes where nothing ELSE in the page needs
+        // the row either: under `QueryOrder::EntityId` or a driver-ordered
+        // walk (`DriverKey::Cell`), the cell the cursor is standing on is the
+        // whole of the ranking, the same way the entity cursor and the text
+        // merge are the whole of theirs. A spatial driver ranked by anything
+        // else already reads the row for the ranking (`order_needs_the_row`),
+        // and this function's guard for that is unchanged.
+        //
+        // Named sacrifice (Law 4): a store-level orphan -- a primary row
+        // removed behind the spatial index's back, which no supported write
+        // can do -- is no longer refused by a bbox/radius page under those
+        // two orders. `verify_index` refuses it outright either way.
+        if matches!(self.driver, DriverPlan::Spatial { .. })
+            && matches!(
+                self.order,
+                CompiledOrder::EntityId | CompiledOrder::Driver(DriverKey::Cell(_))
+            )
+        {
             return true;
         }
         match &self.driver {
@@ -4809,11 +4883,6 @@ impl PreparedQuery<'_> {
     /// -- through, and a phrase decided against borrowed bytes alone is no
     /// decision at all.
     fn filters_are_row_pure(&self) -> bool {
-        let driving = match &self.driver {
-            DriverPlan::Scalar { position, .. } | DriverPlan::Text { position, .. } => *position,
-            DriverPlan::Spatial { position, .. } | DriverPlan::Graph { position } => Some(*position),
-            _ => None,
-        };
         self.filters.iter().all(|filter| match filter {
             CompiledFilter::Scalar {
                 posting_membership, ..

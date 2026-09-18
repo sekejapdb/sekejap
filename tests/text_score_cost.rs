@@ -529,14 +529,17 @@ fn a_bm25_page_proves_its_winners_without_one_primary_probe_each() {
     let (ranked, accesses) = page(bm25(&fixture));
     assert_eq!(ranked.rows.len(), MATCHING);
 
-    // The page ranked by ENTITY ID over the same documents keeps its probe --
-    // its candidates never passed through the scorer -- so it is the control
-    // that says the number below is the probe and not the fixture.
+    // The page ranked by ENTITY ID over the same documents used to keep its
+    // probe -- its candidates never passed through the scorer. Since item T3
+    // the text driver stands on the same guarantee the scorer did: a term
+    // posting retires in the transaction that deletes its row, so there is no
+    // orphan to refuse and the id-ordered page reads no primary row either.
     let (plain, _) = page(QueryOrder::EntityId);
     assert_eq!(plain.rows.len(), MATCHING);
     assert_eq!(
-        plain.work.primary_reads, MATCHING as u64,
-        "the id-ordered control stopped probing its winners"
+        plain.work.primary_reads, 0,
+        "the id-ordered text page still probes {} winners",
+        plain.work.primary_reads
     );
 
     println!(
