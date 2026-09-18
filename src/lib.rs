@@ -5,6 +5,7 @@ pub mod collection_backend;
 pub mod collections;
 pub mod pagewal;
 mod scalar_key;
+pub mod spatial_geometry;
 pub mod spatial_math;
 mod text_analyzer;
 mod vector_quant;
