@@ -153,7 +153,7 @@ use e4_prototype::{
     collections::{
         CandidateDriver, CollectionId, CollectionOptions, Database, IndexId, PointFilter,
         Projection, QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue,
-        SortDirection, TextMatch,
+        SortDirection, SpatialCandidates, TextMatch,
     },
     spatial_math::{radius_candidate_bounds, wgs84_distance_metres, Bounds, Point},
     Kind,
@@ -430,13 +430,80 @@ fn text(index: IndexId, query: &str, matching: TextMatch) -> QueryFilter<'_> {
 }
 
 fn radius(index: IndexId, metres: f64) -> QueryFilter<'static> {
+    radius_at(index, center(), metres)
+}
+
+fn radius_at(index: IndexId, center: Point, metres: f64) -> QueryFilter<'static> {
     QueryFilter::Point {
         index,
         predicate: PointFilter::Radius {
-            center: center(),
+            center,
             radius_metres: metres,
         },
     }
+}
+
+fn bbox(index: IndexId, bounds: Bounds) -> QueryFilter<'static> {
+    QueryFilter::Point {
+        index,
+        predicate: PointFilter::Bbox(bounds),
+    }
+}
+
+// ── the spatial battery's extra geometry ─────────────────────────────────
+//
+// The population is uniform over BBOX_LON x BBOX_LAT (about 265 x 210 km), so a
+// radius at the centre sees the full density, a radius at the south-west
+// corner sees a quarter circle at the data's edge, and a radius 100 km west of
+// the box sees nothing at all -- the empty answer is where index pruning is
+// the whole cost.
+const CORNER_LON: f64 = 106.45;
+const CORNER_LAT: f64 = -7.75;
+const FAR_LON: f64 = 105.0;
+const FAR_LAT: f64 = -6.9;
+
+fn corner() -> Point {
+    Point::new(CORNER_LON, CORNER_LAT).expect("corner is a valid point")
+}
+
+fn far_away() -> Point {
+    Point::new(FAR_LON, FAR_LAT).expect("far point is valid")
+}
+
+/// About 2 km on a side around the centre: a box smaller than one cover cell
+/// at most levels, so the answer is a handful of postings.
+fn small_box() -> Bounds {
+    Bounds::new(CENTER_LON - 0.009, CENTER_LON + 0.009, CENTER_LAT - 0.009, CENTER_LAT + 0.009)
+        .expect("small box is valid")
+}
+
+/// A strip 0.5 degrees of longitude wide (about 55 km) and 0.01 degrees of
+/// latitude tall (about 1.1 km): the shape a square-cell cover handles worst,
+/// because the box is long and thin and every cell along it is mostly outside.
+fn strip_box() -> Bounds {
+    Bounds::new(CENTER_LON - 0.25, CENTER_LON + 0.25, CENTER_LAT - 0.005, CENTER_LAT + 0.005)
+        .expect("strip box is valid")
+}
+
+/// E4's k nearest: an exhaustive pass over the point index's postings (every
+/// posting carries its coordinates) keeping the k closest. There is no
+/// ordered walk from the centre outward yet, so this costs a full index scan
+/// however small k is -- the case exists to keep that cost visible next to
+/// PostGIS's KNN-GiST walk.
+fn e4_knn(c: &E4Ctx, k: usize) -> R<Answer> {
+    let hits = c.db.query_point_nearest(
+        c.addr,
+        center(),
+        k,
+        SpatialCandidates::All,
+        usize::MAX,
+        || false,
+    )?;
+    let mut answer = Answer::default();
+    for hit in hits {
+        answer.push(key(hit.id.sequence - 1));
+    }
+    Ok(answer)
 }
 
 /// e3's battery, in e3's order, as this engine's API spells it.
@@ -566,6 +633,52 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
                 None,
             )
         }),
+        ("radius_500m", |c| {
+            e4_ids(c, &[radius(c.addr, 500.0)], QueryOrder::Driver, None)
+        }),
+        ("radius_10km", |c| {
+            e4_ids(c, &[radius(c.addr, 10_000.0)], QueryOrder::Driver, None)
+        }),
+        ("radius_corner_10km", |c| {
+            e4_ids(c, &[radius_at(c.addr, corner(), 10_000.0)], QueryOrder::Driver, None)
+        }),
+        ("radius_far_empty", |c| {
+            e4_ids(c, &[radius_at(c.addr, far_away(), 20_000.0)], QueryOrder::Driver, None)
+        }),
+        ("bbox_2km", |c| {
+            e4_ids(c, &[bbox(c.addr, small_box())], QueryOrder::Driver, None)
+        }),
+        ("bbox_strip", |c| {
+            e4_ids(c, &[bbox(c.addr, strip_box())], QueryOrder::Driver, None)
+        }),
+        ("bbox_and_born", |c| {
+            e4_ids(
+                c,
+                &[
+                    bbox(c.addr, query_box()),
+                    born_range(
+                        c.born,
+                        Bound::Included(19_900_101),
+                        Bound::Excluded(20_000_101),
+                    ),
+                ],
+                QueryOrder::Driver,
+                None,
+            )
+        }),
+        ("radius_and_name", |c| {
+            e4_ids(
+                c,
+                &[radius(c.addr, 10_000.0), text(c.fullname, "sari", TextMatch::Any)],
+                QueryOrder::Driver,
+                None,
+            )
+        }),
+        ("radius_top10", |c| {
+            e4_ids(c, &[radius(c.addr, 10_000.0)], QueryOrder::Driver, Some(10))
+        }),
+        ("knn_10", |c| e4_knn(c, 10)),
+        ("knn_100", |c| e4_knn(c, 100)),
         ("radius_and_born", |c| {
             e4_ids(
                 c,
@@ -856,12 +969,25 @@ fn lite_box_clause(b: Bounds) -> String {
 }
 
 fn lite_radius_sql(metres: f64, extra: &str) -> String {
-    let b = radius_candidate_bounds(center(), metres).expect("benchmark radius is valid");
+    lite_radius_sql_at(center(), metres, extra)
+}
+
+fn lite_radius_sql_at(at: Point, metres: f64, extra: &str) -> String {
+    let b = radius_candidate_bounds(at, metres).expect("benchmark radius is valid");
     format!(
         "SELECT p._key FROM person_geo g JOIN person p ON p.rowid=g.id WHERE \
          g.maxlon>={:?} AND g.minlon<={:?} AND g.maxlat>={:?} AND g.minlat<={:?} \
          AND geodist(p.lon,p.lat,{:?},{:?})<={:?}{extra}",
-        b.west(), b.east(), b.south(), b.north(), CENTER_LON, CENTER_LAT, metres
+        b.west(), b.east(), b.south(), b.north(), at.longitude(), at.latitude(), metres
+    )
+}
+
+/// SQLite has no spatial nearest-neighbour operator (the R*Tree module
+/// answers overlap only), so its k nearest is the spelling a SQLite user
+/// would write: order the whole table by the geodesic distance.
+fn lite_knn_sql(k: usize) -> String {
+    format!(
+        "SELECT _key FROM person ORDER BY geodist(lon,lat,{CENTER_LON:?},{CENTER_LAT:?}), _key LIMIT {k}"
     )
 }
 
@@ -921,6 +1047,43 @@ fn lite_cases(rows: u64) -> Vec<(&'static str, String)> {
                 lite_box_clause(query_box())
             ),
         ),
+        ("radius_500m", lite_radius_sql(500.0, "")),
+        ("radius_10km", lite_radius_sql(10_000.0, "")),
+        ("radius_corner_10km", lite_radius_sql_at(corner(), 10_000.0, "")),
+        ("radius_far_empty", lite_radius_sql_at(far_away(), 20_000.0, "")),
+        (
+            "bbox_2km",
+            format!(
+                "SELECT p._key FROM person_geo g JOIN person p ON p.rowid=g.id WHERE {}",
+                lite_box_clause(small_box())
+            ),
+        ),
+        (
+            "bbox_strip",
+            format!(
+                "SELECT p._key FROM person_geo g JOIN person p ON p.rowid=g.id WHERE {}",
+                lite_box_clause(strip_box())
+            ),
+        ),
+        (
+            "bbox_and_born",
+            format!(
+                "SELECT p._key FROM person_geo g JOIN person p ON p.rowid=g.id WHERE {} \
+                 AND p.born>=19900101 AND p.born<20000101",
+                lite_box_clause(query_box())
+            ),
+        ),
+        (
+            "radius_and_name",
+            format!(
+                "SELECT p._key FROM person_geo g JOIN person p ON p.rowid=g.id \
+                 JOIN person_fts ON person_fts.rowid=p.rowid WHERE {} AND person_fts MATCH 'sari'",
+                lite_radius_sql(10_000.0, "").split_once("WHERE ").expect("radius sql has WHERE").1
+            ),
+        ),
+        ("radius_top10", format!("{} LIMIT 10", lite_radius_sql(10_000.0, ""))),
+        ("knn_10", lite_knn_sql(10)),
+        ("knn_100", lite_knn_sql(100)),
         (
             "radius_and_born",
             lite_radius_sql(10_000.0, " AND p.born>=19900101 AND p.born<20000101"),
@@ -1131,9 +1294,24 @@ fn pg_answer(client: &mut Client, sql: &str) -> R<Answer> {
 /// disagree by the last metre between Karney's convergent series and
 /// PostGIS's own ellipsoidal inverse; see the report for a boundary count.
 fn pg_radius_sql(metres: f64, extra: &str) -> String {
+    pg_radius_sql_at(center(), metres, extra)
+}
+
+fn pg_radius_sql_at(at: Point, metres: f64, extra: &str) -> String {
     format!(
         "SELECT k FROM person WHERE ST_DWithin(addr, \
-         ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326)::geography, {metres:?}, true){extra}"
+         ST_SetSRID(ST_MakePoint({:?},{:?}),4326)::geography, {metres:?}, true){extra}",
+        at.longitude(),
+        at.latitude()
+    )
+}
+
+/// PostGIS's k nearest: the KNN-GiST ordered walk (`<->` on geography is the
+/// spheroidal distance in metres), ties broken by key like the other arms.
+fn pg_knn_sql(k: usize) -> String {
+    format!(
+        "SELECT k FROM person ORDER BY addr <-> \
+         ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326)::geography, k LIMIT {k}"
     )
 }
 
@@ -1213,6 +1391,26 @@ fn pg_cases(rows: u64) -> Vec<(&'static str, String)> {
         ("radius_2km", pg_radius_sql(2_000.0, "")),
         ("radius_50km", pg_radius_sql(50_000.0, "")),
         ("bbox", pg_bbox_sql(query_box())),
+        ("radius_500m", pg_radius_sql(500.0, "")),
+        ("radius_10km", pg_radius_sql(10_000.0, "")),
+        ("radius_corner_10km", pg_radius_sql_at(corner(), 10_000.0, "")),
+        ("radius_far_empty", pg_radius_sql_at(far_away(), 20_000.0, "")),
+        ("bbox_2km", pg_bbox_sql(small_box())),
+        ("bbox_strip", pg_bbox_sql(strip_box())),
+        (
+            "bbox_and_born",
+            format!("{} AND born>=19900101 AND born<20000101", pg_bbox_sql(query_box())),
+        ),
+        (
+            "radius_and_name",
+            pg_radius_sql(
+                10_000.0,
+                " AND to_tsvector('simple', fullname) @@ to_tsquery('simple', 'sari')",
+            ),
+        ),
+        ("radius_top10", format!("{} LIMIT 10", pg_radius_sql(10_000.0, ""))),
+        ("knn_10", pg_knn_sql(10)),
+        ("knn_100", pg_knn_sql(100)),
         (
             "radius_and_born",
             pg_radius_sql(10_000.0, " AND born>=19900101 AND born<20000101"),
