@@ -17,6 +17,12 @@
 //!      rows, and its buffer-pool cost per matched row must not grow with the
 //!      size of the collection.
 //!   4. Walking candidates must not allocate per row.
+//!   5. A text-driven page ranked by entity id resumes like any other walk
+//!      that is already in rank order. The merge over the term streams hands
+//!      documents over in strictly ascending sequence, so page k+1 opens the
+//!      streams at the document page k stopped on instead of being served out
+//!      of a held run -- and a text answer bigger than the run stops paying a
+//!      whole pass over the posting range per page.
 //!
 //! Every bound here is a counted number with the measurement that produced it
 //! written into the assertion message, so a future change can see what it
@@ -25,6 +31,7 @@ use e4_prototype::{
     collections::{
         CandidateDriver, CollectionId, CollectionOptions, Database, IndexId, Projection,
         QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue, SortDirection,
+        TextMatch,
     },
     Kind,
 };
@@ -821,4 +828,190 @@ fn a_limited_range_answer_over_a_value_ordered_walk_stops_at_its_limit() {
             "LIMIT 700 in pages of {page_size}: the first 700 matching ids, once each"
         );
     }
+}
+
+
+const WORDS: [&str; 4] = ["holloway", "harriet", "rivet", "cinder"];
+
+struct TextFixture {
+    db: Database,
+    d: CollectionId,
+    body: IndexId,
+}
+
+/// `rows` documents over one ranked text field, with `rivet` in every fourth
+/// one. The index is built LATE, so its postings live in packed segments and
+/// the seek a resumed page performs has to find its way into one.
+fn text_fixture(path: &Path, rows: u64) -> TextFixture {
+    let mut db = Database::create(path, cfg()).unwrap();
+    if std::env::var("E4_INDEX_TREES").is_ok_and(|mode| mode == "0") {
+        db.set_create_index_trees(false);
+    }
+    let d = db
+        .create_collection(
+            "d",
+            vec![("body".into(), Kind::Text)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    for i in 1..=rows {
+        let body = format!(
+            "{} {} {}",
+            WORDS[0],
+            WORDS[1],
+            if i % 4 == 0 { WORDS[2] } else { WORDS[3] }
+        );
+        let id = db.put(d, &format!("k{i:08}"), &json!({ "body": body })).unwrap();
+        assert_eq!(id.sequence, i, "the fixture rests on sequence == insertion index");
+        if i % 512 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let body = db.create_text_index(d, "body_idx", "body").unwrap();
+    db.build_index_to_ready(body, 255).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    TextFixture { db, d, body }
+}
+
+/// One entry per page: what it returned and what its own walk cost.
+struct PageWork {
+    ids: Vec<u64>,
+    candidates: u64,
+    text_postings: u64,
+}
+
+fn text_pages(
+    db: &Database,
+    collection: CollectionId,
+    filters: &[QueryFilter<'_>],
+    total_limit: Option<usize>,
+    driver: CandidateDriver,
+    page_size: usize,
+) -> Vec<PageWork> {
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit,
+            driver,
+        })
+        .unwrap();
+    let mut out = Vec::new();
+    loop {
+        let page = prepared
+            .next_page(page_size, QueryBudget::unlimited(), || false)
+            .unwrap();
+        out.push(PageWork {
+            ids: page.rows.iter().map(|row| row.id.sequence).collect(),
+            candidates: page.work.candidates,
+            text_postings: page.work.text_postings,
+        });
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+/// A text-driven answer ranked by entity id costs ONE pass over its posting
+/// range, however many pages it is returned in.
+///
+/// The three states this file has seen, for a 3,000-row answer in pages of
+/// 256 (twelve pages):
+///
+///   * before the run existed, page k re-opened the term streams at the start
+///     and walked past everything already emitted: about `rows x pages`
+///     postings, 36,000 here;
+///   * with the run, the first page walked once and HELD the other 2,744
+///     ranked rows, so the total came back to about `rows` -- but every page
+///     after the first read zero postings, because it did no walking at all,
+///     and an answer larger than the run (149,796 rows) went back to a pass
+///     per page;
+///   * resumed, each page walks its own slice and nothing is held: the total
+///     is still about `rows`, and page 2 reads about a page of postings
+///     rather than none.
+///
+/// So the bound below is the property, and the page-2 assertion is what tells
+/// the two ways of meeting it apart.
+#[test]
+fn a_text_driven_id_ordered_answer_walks_its_postings_once_across_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let rows = 12_000u64;
+    let TextFixture { db, d, body } = text_fixture(&temp.path().join("db"), rows);
+    let filters = [QueryFilter::Text {
+        index: body,
+        query: WORDS[2],
+        matching: TextMatch::Any,
+    }];
+    let expected: Vec<u64> = (1..=rows).filter(|i| i % 4 == 0).collect();
+    assert_eq!(expected.len(), 3_000, "the fixture matches every fourth document");
+
+    let page_size = 256usize;
+    let pages = text_pages(&db, d, &filters, None, CandidateDriver::Auto, page_size);
+    let returned: Vec<u64> = pages.iter().flat_map(|page| page.ids.iter().copied()).collect();
+    assert_eq!(
+        returned, expected,
+        "the pages of a text answer are disjoint, complete and in id order"
+    );
+    let full = pages.len() as u64;
+    let postings: u64 = pages.iter().map(|page| page.text_postings).sum();
+    assert!(
+        postings <= expected.len() as u64 + 4 * full,
+        "a {full}-page text answer of {} rows read {postings} postings; one \
+         pass plus a few per page is at most {}",
+        expected.len(),
+        expected.len() as u64 + 4 * full
+    );
+
+    // Page 2 did its own walking. A page served out of a held run reads no
+    // postings at all, which is how a run-served answer used to meet the
+    // bound above; a resumed one reads about a page of them and no more.
+    let second = &pages[1];
+    assert_eq!(second.ids.len(), page_size, "page 2 is a full page");
+    assert!(
+        second.text_postings > 0,
+        "page 2 read {} postings -- it was served out of a held run rather \
+         than resuming its own walk",
+        second.text_postings
+    );
+    assert!(
+        second.text_postings <= page_size as u64 + 4,
+        "page 2 returned {page_size} rows off {} postings; a resumed walk \
+         reads its own page and no more",
+        second.text_postings
+    );
+    assert!(
+        second.candidates <= page_size as u64 + 4,
+        "page 2 returned {page_size} rows off {} candidates",
+        second.candidates
+    );
+
+    // A LIMIT is a stop condition here too: 700 rows must not cost 3,000.
+    let limited = text_pages(&db, d, &filters, Some(700), CandidateDriver::Auto, page_size);
+    let ids: Vec<u64> = limited.iter().flat_map(|page| page.ids.iter().copied()).collect();
+    assert_eq!(ids, expected[..700], "LIMIT 700 returns the first 700 matches, once each");
+    let limited_postings: u64 = limited.iter().map(|page| page.text_postings).sum();
+    assert!(
+        limited_postings <= 700 + 4 * limited.len() as u64,
+        "LIMIT 700 over a 3,000-row text answer read {limited_postings} \
+         postings; the answer it returned is worth {}",
+        700 + 4 * limited.len() as u64
+    );
+
+    // And the resumed answer is the answer, whatever the page size and
+    // whichever driver produced it -- including the entity walk, which reads
+    // the same filter off the primary tree.
+    for size in [1usize, 17, 3_000, 8_192] {
+        let other = text_pages(&db, d, &filters, None, CandidateDriver::Auto, size);
+        let ids: Vec<u64> = other.iter().flat_map(|page| page.ids.iter().copied()).collect();
+        assert_eq!(ids, expected, "pages of {size} return the same answer");
+    }
+    let scanned = text_pages(&db, d, &filters, None, CandidateDriver::Entities, page_size);
+    let ids: Vec<u64> = scanned.iter().flat_map(|page| page.ids.iter().copied()).collect();
+    assert_eq!(ids, expected, "the entity walk agrees with the text walk");
 }

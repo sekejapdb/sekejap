@@ -1302,12 +1302,15 @@ fn text_driver_uses_strict_scalar_membership_with_retry_pages_and_snapshot() {
     assert!(!first.done);
     let second = query.next_page(1, generous(), || false).unwrap();
     assert_eq!(second.rows[0].id, f.ids["p1"]);
-    // Zero, not two. A text driver under an id ranking cannot stop early and
-    // cannot resume, so the FIRST page walked the merge to its end and ran the
-    // membership probe against every candidate it found. This page was already
-    // ranked on that walk; probing again would be asking the same question
-    // twice. The winner's existence check is still owed and still paid.
-    assert_eq!(second.work.scalar_postings, 0);
+    // Two, and they are this page's own. The text merge ascends by document
+    // and an id ranking wants exactly that order, so page one STOPPED on a
+    // full heap instead of walking the merge to its end, and page two RESUMES
+    // by seeking every term stream to the document page one ended on. What it
+    // probes is the resumed document -- re-emitted once and dropped by the
+    // continuation key -- and the one it returns. Nothing was ranked twice,
+    // and nothing past this page has been touched. The winner's existence
+    // check is still owed and still paid.
+    assert_eq!(second.work.scalar_postings, 2);
     assert_eq!(second.work.primary_reads, 1);
     assert!(second.done);
 
@@ -1974,15 +1977,16 @@ fn text_and_spatial_drivers_page_more_than_65536_matches_without_a_result_cap() 
         }
     }
     assert_eq!(actual, expected);
-    // The merge order (ascending sequence) is not the ranking's order as far
-    // as the plan is concerned, so this page can neither stop early nor
-    // resume: it walks the merge to the end whatever it returns. It therefore
-    // keeps what it ranked, and the pages after the first walk nothing at all.
-    assert_eq!(
-        postings,
-        ROWS as u64 + 1,
-        "{pages} pages over {ROWS} matches read {postings} text postings. The          merge is opened ONCE for the whole answer ({}); re-opening it per          page is {}",
-        ROWS as u64 + 1,
+    // The merge order (ascending sequence) IS the ranking's order, so each
+    // page walks its own slice and resumes where the last one stopped: one
+    // pass over the posting range for the whole answer, plus the resumed
+    // document each page re-emits and the end-of-tier charge each page pays.
+    assert!(
+        postings <= ROWS as u64 + 4 * pages,
+        "{pages} pages over {ROWS} matches read {postings} text postings. The \
+         posting range is walked ONCE for the whole answer (at most {}); \
+         re-opening it per page is {}",
+        ROWS as u64 + 4 * pages,
         (ROWS as u64 + 1) * pages
     );
 

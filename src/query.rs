@@ -870,10 +870,13 @@ pub struct PreparedQuery<'db> {
     /// Rows this query has already ranked but has not handed out yet, in rank
     /// order, LAST FIRST so `pop` takes the next one.
     ///
-    /// A driver whose walk order is unrelated to the ranking -- a RANGE over a
-    /// value-ordered index, or a text merge, under an entity-id ranking --
-    /// cannot stop early and cannot resume: to know which rows come next it
-    /// has to see every candidate again. So page k+1 re-opened the whole
+    /// A driver whose walk order is unrelated to the ranking -- a spatial cell
+    /// walk under an entity-id ranking -- cannot stop early and cannot resume:
+    /// to know which rows come next it has to see every candidate again. (A
+    /// RANGE over a value-ordered index was in this list until the query asked
+    /// for it in that index's own order, and a text merge until it was
+    /// recognised as already ascending by document; both resume now.) So page
+    /// k+1 re-opened the whole
     /// candidate stream and discarded everything page 1..k had already
     /// returned. That is one full pass PER PAGE, and an answer of R rows in
     /// pages of P costs R^2/P -- invisible while the answer fits one page, and
@@ -2469,15 +2472,31 @@ impl<'a> DriverCursor<'a> {
                 done: false,
             })),
             DriverPlan::Text { prepared, position } => {
+                // The merge hands documents over in strictly ascending
+                // sequence -- it says so and refuses a round that does not
+                // advance -- so under an id ranking the previous page's last
+                // key is a document number every term stream can be opened
+                // at. Each stream seeks to it; nothing walks the postings the
+                // earlier pages already emitted.
+                let from = resume.map(|after| after.id.sequence);
                 let mut streams = Vec::with_capacity(prepared.terms.len());
                 for (term, expected) in prepared.terms.iter().zip(&prepared.dfs) {
                     streams.push(TextPostingCursor {
-                        inner: super::text_indexes::TermPostings::open(
-                            db,
-                            prepared.info.id,
-                            term,
-                            *expected,
-                        )?,
+                        inner: match from {
+                            Some(from) => super::text_indexes::TermPostings::open_from(
+                                db,
+                                prepared.info.id,
+                                term,
+                                *expected,
+                                from,
+                            )?,
+                            None => super::text_indexes::TermPostings::open(
+                                db,
+                                prepared.info.id,
+                                term,
+                                *expected,
+                            )?,
+                        },
                         head: None,
                         done: false,
                     });
@@ -3218,8 +3237,16 @@ impl<'a> PrimaryRows<'a> {
 /// the rows past this page are rows it has already ranked. Keeping them turns
 /// the answer's cost from one pass PER PAGE into one pass per this many rows:
 /// an answer of R rows costs `R / RUN_ROWS` passes instead of `R / page_size`.
-/// At 48M rows `popsim`'s `born_decade` returns 5.58M rows in pages of 8,192 --
-/// 681 passes over a 5.58M-posting range, which is what made it take 1,011 s.
+/// At 48M rows `popsim`'s `born_decade` returned 5.58M rows in pages of 8,192
+/// -- 681 passes over a 5.58M-posting range, which is what made it take
+/// 1,011 s.
+///
+/// What is LEFT here is the walk that genuinely has no resume: a spatial
+/// driver, whose cells are walked in cell order and whose candidates therefore
+/// arrive in no order the ranking knows. `born_decade` itself is no longer one
+/// of them -- it is asked in its own index's order now, which is the order
+/// SQLite answers it in (`popsim` deviation 8) -- and neither is a text-driven
+/// page, whose merge ascends by document.
 ///
 /// The bound is in BYTES because what is held is a rank key each and the
 /// promise has to mean the same thing whatever a rank key weighs. It is the
@@ -4285,6 +4312,10 @@ impl PreparedQuery<'_> {
     /// sequence alone -- also id order. An ascending scalar order driven by
     /// that same index walks `value || sequence`, which is `(value, id)`.
     ///
+    /// The text merge is the same statement about a different structure: its
+    /// term streams ascend by document, so their merge does, and `EntityId`
+    /// ranks by exactly that.
+    ///
     /// Everything else is excluded on purpose: a descending order walks
     /// against its ranking, a ranked order (BM25, vector distance) has no
     /// relation to any tree's order and must see every candidate before it
@@ -4300,6 +4331,16 @@ impl PreparedQuery<'_> {
                 },
                 CompiledOrder::EntityId,
             ) => RankWalk::Exact,
+            // The text merge yields documents in strictly ascending
+            // sequence -- every term stream ascends and each round takes the
+            // smallest or the common head and steps past it, which
+            // `TextCursor::next` asserts and refuses to violate -- and an id
+            // ranking is that same order. So a text-driven page ranked by id
+            // stops on a full heap like any other, and resumes by seeking
+            // every term stream to the document the last page ended on
+            // (`TermPostings::open_from`). Spatial is deliberately NOT here:
+            // its cells are walked in cell order, which is not id order.
+            (DriverPlan::Text { .. }, CompiledOrder::EntityId) => RankWalk::Exact,
             (
                 DriverPlan::Scalar { info, .. },
                 CompiledOrder::Scalar {
