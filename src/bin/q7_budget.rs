@@ -1,7 +1,7 @@
 //! Q7 BUDGET — where a popsim query's time goes, in counted work rather than
 //! seconds.
 //!
-//!     q7_budget <popsim-dir>/e4 [--cache-bytes N]
+//!     q7_budget <popsim-dir>/e4 [--cache-bytes N] [--entity-order]
 //!
 //! Opens a database `popsim` already built and re-runs the cases whose per-row
 //! cost grew with the population, reporting for each one: pages, the summed
@@ -12,7 +12,7 @@
 use e4_prototype::{
     collections::{
         CandidateDriver, CollectionId, Database, IndexId, PointFilter, Projection, QueryBudget,
-        QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue, TextMatch,
+        QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue, SortDirection, TextMatch,
     },
     spatial_math::Point,
 };
@@ -31,6 +31,11 @@ const CENTER_LAT: f64 = -6.9;
 struct Case {
     name: &'static str,
     filters: Vec<QueryFilter<'static>>,
+    /// The order popsim asks this case in. It is part of the question: a range
+    /// answered in the driving index's own order walks that range once and
+    /// resumes, and the same rows in entity order do not. See popsim's
+    /// deviation 8.
+    order: QueryOrder<'static>,
 }
 
 fn run(db: &Database, person: CollectionId, case: &Case) -> R<()> {
@@ -39,7 +44,7 @@ fn run(db: &Database, person: CollectionId, case: &Case) -> R<()> {
     let mut prepared = db.prepare_query(QueryRequest {
         collection: person,
         filters: &case.filters,
-        order: QueryOrder::EntityId,
+        order: case.order,
         projection: Projection::Ids,
         total_limit: None,
         driver: CandidateDriver::Auto,
@@ -84,9 +89,14 @@ fn main() -> R<()> {
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(args.next().ok_or("usage: q7_budget <db-dir> [--cache-bytes N]")?);
     let mut cache = 8usize << 20;
+    let mut entity_order = false;
     while let Some(flag) = args.next() {
-        if flag == "--cache-bytes" {
-            cache = args.next().ok_or("--cache-bytes needs a value")?.parse()?;
+        match flag.as_str() {
+            "--cache-bytes" => {
+                cache = args.next().ok_or("--cache-bytes needs a value")?.parse()?
+            }
+            "--entity-order" => entity_order = true,
+            other => return Err(format!("unknown flag {other}").into()),
         }
     }
     let db = Database::open(
@@ -115,11 +125,30 @@ fn main() -> R<()> {
         born.ok_or("no born_idx index")?,
         addr.ok_or("no addr_point index")?,
     );
-    println!("cache_bytes={cache}");
+    println!("cache_bytes={cache} entity_order={entity_order}");
+    let by_born = QueryOrder::Scalar {
+        index: born,
+        direction: SortDirection::Ascending,
+    };
+    let range = |lower: Bound<i64>, upper: Bound<i64>| {
+        let map = |bound: Bound<i64>| match bound {
+            Bound::Included(v) => Bound::Included(ScalarValue::I64(v)),
+            Bound::Excluded(v) => Bound::Excluded(ScalarValue::I64(v)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        vec![QueryFilter::Scalar {
+            index: born,
+            predicate: ScalarFilter::Range {
+                lower: map(lower),
+                upper: map(upper),
+            },
+        }]
+    };
     let cases = vec![
         Case {
             name: "count_all",
             filters: vec![],
+            order: QueryOrder::EntityId,
         },
         Case {
             name: "name_fulltext",
@@ -128,26 +157,69 @@ fn main() -> R<()> {
                 query: "sari",
                 matching: TextMatch::Any,
             }],
+            order: QueryOrder::EntityId,
+        },
+        Case {
+            name: "name_two_terms",
+            filters: vec![QueryFilter::Text {
+                index: fullname,
+                query: "sari wati",
+                matching: TextMatch::Any,
+            }],
+            order: QueryOrder::EntityId,
+        },
+        // Wide enough that the answer OUTGROWS the held run (8 MiB of rank
+        // keys, 149,796 rows), which is where a text walk that cannot resume
+        // goes back to a pass over the posting range per run's worth of rows.
+        // Ten two-syllable names out of the sixteen-syllable alphabet; each
+        // matches about one document in 256.
+        Case {
+            name: "name_wide",
+            filters: vec![QueryFilter::Text {
+                index: fullname,
+                query: "sari wati budi jaka mala anti kani ribu tija lasa",
+                matching: TextMatch::Any,
+            }],
+            order: QueryOrder::EntityId,
+        },
+        Case {
+            name: "name_and_born",
+            filters: vec![
+                QueryFilter::Text {
+                    index: fullname,
+                    query: "sari",
+                    matching: TextMatch::Any,
+                },
+                QueryFilter::Scalar {
+                    index: born,
+                    predicate: ScalarFilter::Range {
+                        lower: Bound::Included(ScalarValue::I64(19_800_101)),
+                        upper: Bound::Excluded(ScalarValue::I64(19_900_101)),
+                    },
+                },
+            ],
+            order: QueryOrder::EntityId,
         },
         Case {
             name: "born_decade",
-            filters: vec![QueryFilter::Scalar {
-                index: born,
-                predicate: ScalarFilter::Range {
-                    lower: Bound::Included(ScalarValue::I64(19_900_101)),
-                    upper: Bound::Excluded(ScalarValue::I64(20_000_101)),
-                },
-            }],
+            filters: range(
+                Bound::Included(19_900_101),
+                Bound::Excluded(20_000_101),
+            ),
+            order: by_born,
+        },
+        Case {
+            name: "born_ge_open",
+            filters: range(Bound::Included(20_100_101), Bound::Unbounded),
+            order: by_born,
         },
         Case {
             name: "born_one_year",
-            filters: vec![QueryFilter::Scalar {
-                index: born,
-                predicate: ScalarFilter::Range {
-                    lower: Bound::Included(ScalarValue::I64(19_870_101)),
-                    upper: Bound::Excluded(ScalarValue::I64(19_880_101)),
-                },
-            }],
+            filters: range(
+                Bound::Included(19_870_101),
+                Bound::Excluded(19_880_101),
+            ),
+            order: by_born,
         },
         Case {
             name: "radius_50km",
@@ -158,10 +230,16 @@ fn main() -> R<()> {
                     radius_metres: 50_000.0,
                 },
             }],
+            order: QueryOrder::EntityId,
         },
     ];
     for case in &cases {
-        run(&db, person, case)?;
+        let case = Case {
+            name: case.name,
+            filters: case.filters.clone(),
+            order: if entity_order { QueryOrder::EntityId } else { case.order },
+        };
+        run(&db, person, &case)?;
     }
     Ok(())
 }

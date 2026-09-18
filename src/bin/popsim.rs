@@ -71,6 +71,27 @@
 //!      exactly the same points. The R*Tree supplies the candidate box (from
 //!      E4's own `radius_candidate_bounds`, as constants) and the refine call
 //!      is SQLite's per-candidate cost, inside the timed statement.
+//!   8. THE DATE-RANGE CASES ARE ORDERED BY THE DRIVING DATE INDEX, NOT BY
+//!      KEY. `SELECT _key FROM person WHERE born >= ? AND born < ?` returns
+//!      SQLite's index order -- `(born, rowid)` -- and sorts nothing. Asking
+//!      E4 for the same rows in ENTITY order was asking a different question:
+//!      the driving index is walked by value, so the answer has to be
+//!      re-ranked by id, and a paged answer that cannot resume re-walks the
+//!      whole posting range per page. `born_decade`, `born_between`,
+//!      `born_ge_open`, `born_one_year` and `born_one_day` therefore order by
+//!      `born` ascending, which is the order SQLite's plan produces and the
+//!      order the index is already in. The comparison is unaffected: these
+//!      cases are compared on ROW COUNT, never on key order (the compare
+//!      script's `ORDERED` set is the point lookup, the full scan and the two
+//!      ordered limits, and none of these is in it).
+//!
+//!      The text cases keep `EntityId`: the term merge ascends by document,
+//!      so entity order IS the order the driving structure produces, and
+//!      SQLite's FTS5 join returns rowid order, which is the same thing.
+//!      `radius_2km`, `radius_50km`, `bbox` and `radius_and_born` also keep
+//!      `EntityId` -- E4 walks spatial cells in cell order and SQLite walks
+//!      the R*Tree in its own order, so NEITHER arm returns index order that
+//!      the other could match, and both arms pay for the re-rank.
 //!
 //! MEMORY. Generation is streaming: one row exists at a time, and no case
 //! accumulates its answer — rows are counted as they arrive and only the first
@@ -335,6 +356,15 @@ fn born_range(index: IndexId, lower: Bound<i64>, upper: Bound<i64>) -> QueryFilt
     }
 }
 
+/// The order SQLite's plan for a `born` range produces: the index's own,
+/// `(born, rowid)` ascending, with no sort step. See deviation 8.
+fn born_order(index: IndexId) -> QueryOrder<'static> {
+    QueryOrder::Scalar {
+        index,
+        direction: SortDirection::Ascending,
+    }
+}
+
 fn text(index: IndexId, query: &str, matching: TextMatch) -> QueryFilter<'_> {
     QueryFilter::Text {
         index,
@@ -413,7 +443,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
                     Bound::Included(19_900_101),
                     Bound::Excluded(20_000_101),
                 )],
-                QueryOrder::EntityId,
+                born_order(c.born),
                 None,
             )
         }),
@@ -425,7 +455,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
                     Bound::Included(19_900_101),
                     Bound::Included(19_991_231),
                 )],
-                QueryOrder::EntityId,
+                born_order(c.born),
                 None,
             )
         }),
@@ -433,7 +463,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
             e4_ids(
                 c,
                 &[born_range(c.born, Bound::Included(20_100_101), Bound::Unbounded)],
-                QueryOrder::EntityId,
+                born_order(c.born),
                 None,
             )
         }),
@@ -445,7 +475,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
                     Bound::Included(19_870_101),
                     Bound::Excluded(19_880_101),
                 )],
-                QueryOrder::EntityId,
+                born_order(c.born),
                 None,
             )
         }),
@@ -459,7 +489,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
                     Bound::Included(19_870_615),
                     Bound::Excluded(19_870_616),
                 )],
-                QueryOrder::EntityId,
+                born_order(c.born),
                 None,
             )
         }),
