@@ -137,51 +137,78 @@ pub fn cover_cells(xmin: f64, xmax: f64, ymin: f64, ymax: f64, bits: u8, max: us
     Some(out)
 }
 
-/// Decompose a query bbox into Hilbert key RANGES at one level: recursive
-/// quadtree descent over Hilbert quadrants, emitting [lo, hi] index runs
-/// for subtrees fully inside the box and recursing on partial overlaps;
-/// subtrees fully outside are dropped. `max_ranges` caps the output -- on
-/// overflow the deepest partial quadrants are emitted whole (a slightly
-/// larger scan, filtered exactly by the per-posting bbox, never a miss).
+/// Decompose a query bbox into Hilbert key RANGES at one level: a quadtree
+/// refinement over Hilbert quadrants, emitting one [lo, hi] run for every
+/// square fully inside the box, dropping squares fully outside, and
+/// splitting the ones that straddle the box's edge. `max_ranges` caps the
+/// output; the refinement spends that budget where it buys the most.
+///
+/// The budget is spent WASTE-FIRST. Every straddling square carries the
+/// number of its cells that lie outside the box; the square with the most
+/// outside cells is always the next one split, because that split removes
+/// the most cells the scan would otherwise read and throw away. When one
+/// more split could push the count of runs past the budget, every square
+/// still straddling is emitted whole -- a slightly larger scan, filtered
+/// exactly per posting, never a miss. A depth-first descent that checked
+/// its budget against its own stack was the earlier shape of this: three
+/// pending siblings per level ate fifty of sixty-four slots at sixteen
+/// bits, so it stopped refining at the fourth level and read five times the
+/// box for a 50 km radius.
 pub fn cover_ranges(xmin: f64, xmax: f64, ymin: f64, ymax: f64, bits: u8,
                     max_ranges: usize) -> Vec<(u64, u64)>
 {
+    use std::collections::BinaryHeap;
     let (qx0, qy0) = cell_of(xmin, ymin, bits);
     let (qx1, qy1) = cell_of(xmax, ymax, bits);
+    let budget = max_ranges.max(4);
+    // An aligned power-of-two square of side `size` at cell (x, y); its
+    // cells are one contiguous hilbert run starting at the least of its
+    // corners (see `aligned_squares_are_contiguous_hilbert_runs`).
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Straddling { waste: u64, size: u32, x: u32, y: u32 }
+    let run = |x: u32, y: u32, size: u32| -> (u64, u64) {
+        let (x1, y1) = (x + size - 1, y + size - 1);
+        let corners = [
+            cell_hilbert(x, y, bits), cell_hilbert(x1, y, bits),
+            cell_hilbert(x, y1, bits), cell_hilbert(x1, y1, bits),
+        ];
+        let lo = *corners.iter().min().unwrap();
+        (lo, lo + (size as u64) * (size as u64) - 1)
+    };
+    // How many of the square's cells fall inside the box: `None` when
+    // none do, so the square is dropped.
+    let inside = |x: u32, y: u32, size: u32| -> Option<u64> {
+        let (x1, y1) = (x + size - 1, y + size - 1);
+        if x1 < qx0 || x > qx1 || y1 < qy0 || y > qy1 { return None; }
+        let w = (x1.min(qx1) - x.max(qx0) + 1) as u64;
+        let h = (y1.min(qy1) - y.max(qy0) + 1) as u64;
+        Some(w * h)
+    };
     let mut out: Vec<(u64, u64)> = Vec::new();
-    // depth-first over quadrants of the full 32-bit hilbert space, but we
-    // only need `bits` of depth; cell coords are compared at level `bits`.
-    struct Q { x: u32, y: u32, size: u32 } // cell-space square, side=size
+    let mut straddling: BinaryHeap<Straddling> = BinaryHeap::new();
     let full = 1u32 << bits;
-    let mut stack = vec![Q { x: 0, y: 0, size: full }];
-    let mut budgeted = max_ranges.max(4);
-    while let Some(q) = stack.pop() {
-        // classify square vs query cell-rect
-        let (sx0, sy0) = (q.x, q.y);
-        let (sx1, sy1) = (q.x + q.size - 1, q.y + q.size - 1);
-        if sx1 < qx0 || sx0 > qx1 || sy1 < qy0 || sy0 > qy1 { continue; }
-        let inside = sx0 >= qx0 && sx1 <= qx1 && sy0 >= qy0 && sy1 <= qy1;
-        if inside || q.size == 1 || out.len() + stack.len() >= budgeted {
-            // whole square becomes one contiguous hilbert run: a hilbert
-            // quadrant of side S covers S*S consecutive indices starting at
-            // the min over its corners (true for power-of-two aligned
-            // squares on the hilbert curve).
-            let corners = [
-                cell_hilbert(sx0, sy0, bits), cell_hilbert(sx1, sy0, bits),
-                cell_hilbert(sx0, sy1, bits), cell_hilbert(sx1, sy1, bits),
-            ];
-            let lo = *corners.iter().min().unwrap();
-            let n = (q.size as u64) * (q.size as u64);
-            out.push((lo, lo + n - 1));
-            continue;
+    let mut place = |x: u32, y: u32, size: u32, out: &mut Vec<(u64, u64)>,
+                     straddling: &mut BinaryHeap<Straddling>| {
+        if let Some(cells) = inside(x, y, size) {
+            let total = (size as u64) * (size as u64);
+            if cells == total {
+                out.push(run(x, y, size));
+            } else {
+                straddling.push(Straddling { waste: total - cells, size, x, y });
+            }
         }
-        let h = q.size / 2;
-        stack.push(Q { x: q.x, y: q.y, size: h });
-        stack.push(Q { x: q.x + h, y: q.y, size: h });
-        stack.push(Q { x: q.x, y: q.y + h, size: h });
-        stack.push(Q { x: q.x + h, y: q.y + h, size: h });
-        budgeted = budgeted.max(4);
+    };
+    place(0, 0, full, &mut out, &mut straddling);
+    // A split replaces one run by at most four, so it is affordable while
+    // three more runs still fit under the budget.
+    while out.len() + straddling.len() + 3 <= budget {
+        let Some(worst) = straddling.pop() else { break };
+        let half = worst.size / 2;
+        for (dx, dy) in [(0, 0), (half, 0), (0, half), (half, half)] {
+            place(worst.x + dx, worst.y + dy, half, &mut out, &mut straddling);
+        }
     }
+    out.extend(straddling.into_iter().map(|s| run(s.x, s.y, s.size)));
     // merge adjacent/overlapping runs so the scan count stays small
     out.sort_unstable();
     let mut merged: Vec<(u64, u64)> = Vec::new();
@@ -249,6 +276,37 @@ mod tests {
                             (xmin, xmax, ymin, ymax));
                 }
             }
+        }
+    }
+
+    /// The cover's over-fetch is bounded by its RANGE budget, not by how deep
+    /// the recursion happens to be when the budget check first trips. A box
+    /// of 262x262 cells (a 50 km radius at 16 bits) under a budget of 64
+    /// ranges must cover at most 1.5x its own cells, and a box of 47x47
+    /// (10 km) and 9x17 (2 km) the same, with never more ranges than the
+    /// budget. Before this was pinned the 50 km cover spent 5.2x its box and
+    /// only 14 of its 64 ranges: the check counted the DFS stack -- three
+    /// pending siblings per level, fifty of the sixty-four -- and emitted
+    /// whole quadrants far larger than the box.
+    #[test]
+    fn cover_over_fetch_is_bounded_by_the_range_budget() {
+        let bits = 16u8;
+        let (lon, lat) = (107.6f64, -6.9f64);
+        for (half_lon, half_lat, budget, ceiling) in
+            [(0.45, 0.45, 64, 1.5), (0.09, 0.09, 64, 1.5), (0.018, 0.018, 64, 1.6)]
+        {
+            let (xmin, xmax, ymin, ymax) = (lon - half_lon, lon + half_lon, lat - half_lat, lat + half_lat);
+            let ranges = cover_ranges(xmin, xmax, ymin, ymax, bits, budget);
+            assert!(ranges.len() <= budget, "{} ranges over a budget of {budget}", ranges.len());
+            let (qx0, qy0) = cell_of(xmin, ymin, bits);
+            let (qx1, qy1) = cell_of(xmax, ymax, bits);
+            let box_cells = (qx1 - qx0 + 1) as u64 * (qy1 - qy0 + 1) as u64;
+            let covered: u64 = ranges.iter().map(|(lo, hi)| hi - lo + 1).sum();
+            assert!(
+                covered as f64 <= ceiling * box_cells as f64,
+                "a {}x{} box was covered with {covered} cells ({:.2}x) by {} ranges",
+                qx1 - qx0 + 1, qy1 - qy0 + 1, covered as f64 / box_cells as f64, ranges.len()
+            );
         }
     }
 
