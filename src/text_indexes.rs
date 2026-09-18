@@ -615,6 +615,11 @@ pub(super) struct TermPostings<'a> {
     head: HeadSource<'a>,
     expected: u64,
     seen: u64,
+    /// Did this stream open PART WAY IN (`open_from`)? Then the postings
+    /// before that point were never read, so the count invariant below --
+    /// exactly `df` postings come out -- cannot be checked at exhaustion. The
+    /// upper half of it still is: no stream may emit MORE than `df`.
+    resumed: bool,
 }
 
 struct SegmentSource<'a> {
@@ -624,6 +629,11 @@ struct SegmentSource<'a> {
     at: usize,
     previous: Option<u64>,
     done: bool,
+    /// The document this source was opened at. A segment is decoded whole, so
+    /// the FIRST one a resumed stream loads can hold documents below the
+    /// resume point; `at` skips them in memory rather than emitting and
+    /// charging for them.
+    from: u64,
 }
 
 struct HeadSource<'a> {
@@ -648,6 +658,7 @@ impl<'a> TermPostings<'a> {
                 at: 0,
                 previous: None,
                 done: false,
+                from: 0,
             })
         } else {
             None
@@ -666,6 +677,73 @@ impl<'a> TermPostings<'a> {
             },
             expected,
             seen: 0,
+            resumed: false,
+        })
+    }
+
+    /// The same stream, opened at the first live posting whose document is at
+    /// or after `from`.
+    ///
+    /// This is what lets a PAGED text query resume. Both tiers are ordered by
+    /// document and both are reached through a range cursor, so neither has to
+    /// be walked to be positioned: the head rows are keyed
+    /// `prefix || ordered(sequence)`, so opening at `posting_key(.., from)`
+    /// lands on the first row at or after `from`; a segment is keyed by the
+    /// LAST document it packs, so opening at `segment_key(.., from)` lands on
+    /// the first segment that can still reach `from`, and the documents below
+    /// `from` inside that one segment are skipped in the decoded buffer.
+    ///
+    /// The cost is one descent per tier per term, against a walk of every
+    /// posting the earlier pages already emitted.
+    ///
+    /// `from` is INCLUSIVE: the document the previous page stopped on comes
+    /// out once more, and the caller's `after` comparison drops it. One
+    /// candidate per page, which is what every other resumable driver pays.
+    pub(super) fn open_from(
+        db: &'a Database,
+        id: IndexId,
+        term: &str,
+        expected: u64,
+        from: u64,
+    ) -> Result<Self> {
+        // Sequences start at one, so a resume at or below the first possible
+        // document is the whole stream -- and opening it the ordinary way
+        // keeps the exact count invariant, which a seek has to give up.
+        if from <= 1 {
+            return Self::open(db, id, term, expected);
+        }
+        let tombstones = segments_enabled(db);
+        let segments = if tombstones {
+            let prefix = segments::segment_prefix(id, term);
+            let start = segments::segment_key(id, term, from);
+            Some(SegmentSource {
+                inner: db.store()?.range(&start)?,
+                prefix,
+                buffer: Vec::new(),
+                at: 0,
+                previous: None,
+                done: false,
+                from,
+            })
+        } else {
+            None
+        };
+        let prefix = posting_prefix(id, term);
+        let start = posting_key(id, term, from);
+        Ok(Self {
+            segments,
+            head: HeadSource {
+                inner: db.store()?.range(&start)?,
+                prefix,
+                head: None,
+                previous: None,
+                done: false,
+                loaded: false,
+                tombstones,
+            },
+            expected,
+            seen: 0,
+            resumed: true,
         })
     }
 
@@ -698,7 +776,11 @@ impl<'a> TermPostings<'a> {
                 return Err(corrupt("text segments overlap"));
             }
             source.previous = Some(last);
-            source.at = 0;
+            // Ascending, so the documents below the resume point are a prefix
+            // of the buffer. Zero for a stream opened at the start.
+            source.at = source
+                .buffer
+                .partition_point(|(sequence, _)| *sequence < source.from);
         }
         Ok(())
     }
@@ -753,7 +835,7 @@ impl<'a> TermPostings<'a> {
             let head = self.head.head;
             if segment.is_none() && head.is_none() {
                 spend()?;
-                if self.seen != self.expected {
+                if !self.resumed && self.seen != self.expected {
                     return Err(E::from(corrupt(
                         "text posting count disagrees with term statistics",
                     )));
