@@ -588,6 +588,135 @@ pub(crate) fn read_field_in(layout: &Layout, bytes: &[u8], field: &str) -> Resul
     Ok(selected)
 }
 
+/// [`read_field_in`] for a row on a COMMITTED, checksum-valid page, read by a
+/// query predicate: stops at the requested field and steps over the others
+/// without decoding them.
+///
+/// The full reader decodes and validates every field of the row -- UTF-8 of
+/// every text, finiteness of every float, the binary geometry of every geo
+/// field, the extras object, the exact end of the record -- to answer a
+/// predicate that wants one integer. On a page that was validated when it was
+/// written and is covered by the page checksum, that re-proves what the write
+/// proved, once per candidate; measured at about 400 ns of the per-candidate
+/// cost of a row-needing filter at 5M. Here a stepped-over field is advanced
+/// by its length only, and the walk ends the moment the requested field is
+/// decoded, so nothing after it is touched.
+///
+/// What is kept: every length and count is still bounds-checked (`take`,
+/// `count`), so a corrupt offset returns an error and never reads outside the
+/// row; the layout id and field states are still checked; the requested field
+/// itself is decoded exactly as the full reader decodes it; a field the layout
+/// does not declare still goes through the fully validated extras path.
+///
+/// Named sacrifice (Law 4, owner decision 2026-09-19): a row that is corrupt
+/// but still checksum-valid -- which only a writer defect can produce, since
+/// the checksum covers the page -- is no longer refused by a predicate read
+/// when the corruption lies in a field it steps over or after the field it
+/// wants. The write path, recovery, index maintenance and the verifier keep
+/// the full reader, so such a row is still refused everywhere a decision is
+/// durable.
+pub(crate) fn read_field_in_trusted(layout: &Layout, bytes: &[u8], field: &str) -> Result<FieldValue> {
+    let Some(declared) = layout.fields.iter().position(|(name, _)| name == field) else {
+        // Extras carry their own structure; the validated path is the only
+        // way to find a key there.
+        return read_field_in(layout, bytes, field);
+    };
+    let mut r = Read { b: bytes, p: 0 };
+    let h = r.uv()?;
+    if h >> 2 > u32::MAX as u64 {
+        return Err("layout ID domain".into());
+    }
+    if h >> 2 != layout.id {
+        return Err("wrong layout".into());
+    }
+    let states = if h & 1 != 0 {
+        Some(r.take(layout.fields.len().div_ceil(4))?)
+    } else {
+        None
+    };
+    let integers = layout
+        .fields
+        .iter()
+        .filter(|(_, kind)| matches!(kind, Kind::Int))
+        .count();
+    let widths = r.take((integers * 3).div_ceil(8))?;
+    let mut integer_index = 0;
+    for (ordinal, (_, kind)) in layout.fields.iter().enumerate().take(declared + 1) {
+        let width_index = integer_index;
+        if matches!(kind, Kind::Int) {
+            integer_index += 1;
+        }
+        let state = states.map_or(2, |states| (states[ordinal / 4] >> ((ordinal % 4) * 2)) & 3);
+        let requested = ordinal == declared;
+        match state {
+            0 => {
+                if requested {
+                    return Ok(FieldValue::Missing);
+                }
+                continue;
+            }
+            1 => {
+                if requested {
+                    return Ok(FieldValue::Null);
+                }
+                continue;
+            }
+            2 => {}
+            _ => return Err("invalid field state".into()),
+        }
+        if requested {
+            return Ok(match kind {
+                Kind::Text => FieldValue::Inline(Value::String(
+                    std::str::from_utf8(r.blob()?)?.to_owned(),
+                )),
+                Kind::Int => {
+                    let n = (width_get(widths, width_index) + 1) as usize;
+                    let bytes = r.take(n)?;
+                    let mut full = [if bytes[0] & 128 == 0 { 0 } else { 255 }; 8];
+                    full[8 - n..].copy_from_slice(bytes);
+                    FieldValue::Inline(Value::from(i64::from_be_bytes(full)))
+                }
+                Kind::Real => FieldValue::Inline(Value::from(r.float()?)),
+                Kind::Bool => FieldValue::Inline(Value::Bool(match r.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("boolean encoding".into()),
+                })),
+                Kind::Json => FieldValue::Inline(json_read(&mut r, 0)?),
+                Kind::Geo => FieldValue::Inline(geo_json(
+                    Geom::decode(r.blob()?).ok_or("invalid binary geometry")?,
+                )),
+                Kind::Point => FieldValue::Inline(geo_json(Geom::Point(r.float()?, r.float()?))),
+                Kind::Vector(dimension) => FieldValue::Vector {
+                    ordinal,
+                    dimension: *dimension,
+                },
+            });
+        }
+        // Stepped over: advance by length, decode nothing.
+        match kind {
+            Kind::Text | Kind::Geo => {
+                r.blob()?;
+            }
+            Kind::Int => {
+                r.take((width_get(widths, width_index) + 1) as usize)?;
+            }
+            Kind::Real => {
+                r.take(8)?;
+            }
+            Kind::Bool => {
+                r.take(1)?;
+            }
+            Kind::Json => json_skip(&mut r, 0)?,
+            Kind::Point => {
+                r.take(16)?;
+            }
+            Kind::Vector(_) => {}
+        }
+    }
+    unreachable!("the loop returns at the declared ordinal")
+}
+
 /// Validate a complete dense-v3 row and locate one declared vector without
 /// materializing its inline values or touching any external vector sidecar.
 /// The returned ordinal is physical to this immutable layout.
@@ -1376,5 +1505,89 @@ mod tests {
             "invalid inline row fetched vector"
         ))
         .is_err());
+    }
+
+    /// The trusted reader stops at the requested field and steps over the
+    /// rest by length. Pinned from both sides: it agrees with the full reader
+    /// on every field of a valid row, it still refuses a row truncated
+    /// BEFORE the requested field, and -- the named sacrifice -- it no longer
+    /// refuses corruption that lies after the field it wants or inside a field
+    /// it steps over, which the full reader still does.
+    #[test]
+    fn trusted_read_stops_at_the_requested_field_and_skips_the_rest_by_length() {
+        let layout = Layout {
+            id: 91,
+            fields: vec![
+                ("name".into(), Kind::Text),
+                ("born".into(), Kind::Int),
+                ("note".into(), Kind::Json),
+                ("addr".into(), Kind::Point),
+                ("shape".into(), Kind::Geo),
+                ("ok".into(), Kind::Bool),
+            ],
+        };
+        let encoded = encode_direct(
+            &layout,
+            &json!({
+                "name": "Sari Wati",
+                "born": 19870615,
+                "note": {"deep": [1, true, null]},
+                "addr": {"type": "Point", "coordinates": [107.6, -6.9]},
+                "shape": {"type": "Polygon", "coordinates": [[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]]},
+                "ok": true,
+                "extra": {"more": 1}
+            }),
+        )
+        .unwrap();
+        for (field, _) in &layout.fields {
+            assert_eq!(
+                read_field_in_trusted(&layout, &encoded.row, field).unwrap(),
+                read_field(&layout, &encoded.row, field).unwrap(),
+                "{field}"
+            );
+        }
+        // A key only the extras hold takes the validated path unchanged.
+        assert_eq!(
+            read_field_in_trusted(&layout, &encoded.row, "extra").unwrap(),
+            FieldValue::Inline(json!({"more": 1}))
+        );
+
+        // Truncated before `born` is reached: still refused (bounds checks).
+        let born_end = {
+            let mut r = Read { b: &encoded.row, p: 0 };
+            r.uv().unwrap();
+            r.take(1).unwrap(); // integer widths for one Int field
+            r.blob().unwrap(); // name
+            r.p
+        };
+        for end in 0..born_end {
+            assert!(read_field_in_trusted(&layout, &encoded.row[..end], "born").is_err());
+        }
+
+        // The sacrifice: junk after the requested field, and an invalid text
+        // in a field stepped over, are not seen by the trusted reader.
+        let mut trailing = encoded.row.clone();
+        trailing.push(0);
+        assert!(read_field(&layout, &trailing, "born").is_err());
+        assert_eq!(
+            read_field_in_trusted(&layout, &trailing, "born").unwrap(),
+            FieldValue::Inline(json!(19870615))
+        );
+        let mut bad_name = encoded.row.clone();
+        let name_at = {
+            let mut r = Read { b: &encoded.row, p: 0 };
+            r.uv().unwrap();
+            r.take(1).unwrap();
+            r.count().unwrap();
+            r.p
+        };
+        bad_name[name_at] = 0xff; // not UTF-8
+        assert!(read_field(&layout, &bad_name, "born").is_err());
+        assert_eq!(
+            read_field_in_trusted(&layout, &bad_name, "born").unwrap(),
+            FieldValue::Inline(json!(19870615))
+        );
+        // But the requested field itself is decoded in full.
+        assert!(read_field_in_trusted(&layout, &bad_name, "name").is_err());
     }
 }

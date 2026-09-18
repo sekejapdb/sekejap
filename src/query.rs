@@ -3651,7 +3651,10 @@ fn selected_field_in(
     bytes: &[u8],
     field: &str,
 ) -> QueryResult<dense_v3::FieldValue> {
-    dense_v3::read_field_in(layout, bytes, field)
+    // A predicate reads committed, checksum-valid pages: the trusted reader
+    // stops at the field it wants and steps over the rest by length. The
+    // sacrifice is named on `read_field_in_trusted`.
+    dense_v3::read_field_in_trusted(layout, bytes, field)
         .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))
 }
 
