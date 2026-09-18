@@ -45,6 +45,7 @@ pub enum QueryOrder<'a> {
     ApproximateVector { index: IndexId, query: &'a [f32],
                         metric: VectorMetric, ef: usize },
     Bm25 { index: IndexId, query: &'a str, matching: TextMatch },
+    Driver,                                   // the driver's own walk order
 }
 
 pub enum CandidateDriver { Auto, Entities, Filter(usize), Order }
@@ -134,7 +135,26 @@ sort keys are:
 - exact-vector distance: `f64::total_cmp` ascending, then `EntityId`;
 - approximate-vector authoritative rerank distance: `f64::total_cmp`
   ascending, then `EntityId`;
-- BM25: score descending, then `EntityId` ascending.
+- BM25: score descending, then `EntityId` ascending;
+- driver order: the key the chosen driver's own walk is sorted by, then
+  `EntityId` -- the entity id for the primary cursor, the text merge and a
+  graph result, the posting's encoded value for a scalar index, and the
+  Hilbert cell for a spatial index.
+
+`Driver` asks for the rows in the order the candidate driver yields them,
+with no re-ranking: pages are disjoint and complete, a `total_limit` stops
+the walk, and the continuation seeds the driver at its own cursor position.
+It is what SQLite returns for a bare index scan or an R*Tree join, which
+sorts nothing either, and it is the only order in which a SPATIAL answer can
+be paged -- cells are neither id order nor value order, so a spatial page
+ranked by anything else must see every candidate in the envelope before it
+knows its first row, and the page after it must see them all again. The
+order is stable for a fixed driver, which a prepared query has (the driver is
+chosen once, at prepare time); it is not a promise across two separately
+prepared queries that `CandidateDriver::Auto` may plan differently. A driver
+with no walk order of its own -- the approximate-vector shortlist, whose
+entries are in locator order and whose answer is in distance order -- is
+refused with `InvalidInput`.
 
 `ApproximateVector` scans compact symmetric-int8 entries and retains at most
 `ef` approximate candidates only after every graph/scalar/spatial/text/JSON

@@ -117,6 +117,31 @@ pub enum QueryOrder<'a> {
         query: &'a str,
         matching: TextMatch,
     },
+    /// The rows in the order the candidate DRIVER hands them over, with no
+    /// re-ranking at all.
+    ///
+    /// Which order that is depends on which driver the query prepared: the
+    /// entity cursor walks the primary tree, so it is entity-id order; a
+    /// scalar posting range is `value || sequence`, so it is that index's own
+    /// ascending order; the text merge ascends by document, which is id order
+    /// again; a spatial index is walked in CELL order. It is what SQLite
+    /// returns for a bare index scan or an R*Tree join, which sorts nothing
+    /// either.
+    ///
+    /// The point of it is the spatial case. Cells are not id order and not
+    /// value order, so a spatial page ranked by anything else has to see
+    /// every candidate in the envelope before it knows its first row -- and
+    /// the next page has to see them all again. Asked in cell order, the page
+    /// stops when it is full and the one after it opens at the posting this
+    /// one stopped on.
+    ///
+    /// Pages are disjoint and complete, a LIMIT stops the walk, and a
+    /// continuation seeds the driver at its own cursor position. The order is
+    /// stable for a FIXED driver, which is what a prepared query has: the
+    /// driver is chosen once, at prepare time, and every page of that query
+    /// walks the same one. It is NOT a promise across two separately prepared
+    /// queries that `CandidateDriver::Auto` might plan differently.
+    Driver,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +208,10 @@ pub enum OrderValue {
     Scalar(OwnedScalarValue),
     Distance(f64),
     Bm25(f64),
+    /// The query asked for the driver's own walk order, so there is no
+    /// ranking value to report: the row's place in the answer is the place
+    /// the candidate stream gave it.
+    Driver,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -591,6 +620,24 @@ enum CompiledOrder {
         ef: usize,
     },
     Bm25(PreparedText),
+    /// Rank by the driver's own walk key. Which key that is cannot be known
+    /// while the order is being compiled -- the driver is chosen after -- so
+    /// `prepare_query` fills it in once the plan is settled.
+    Driver(DriverKey),
+}
+
+/// The key ONE driver's own walk is sorted by, resolved at prepare time so
+/// the ranking never has to ask the plan again, per row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverKey {
+    /// The entity id and nothing else. The primary cursor walks it, the text
+    /// merge ascends by document, and a graph result is sorted before it
+    /// leaves the traversal.
+    Entity,
+    /// `value || sequence` of one scalar index's postings.
+    Scalar(IndexId),
+    /// `cell || sequence` of one spatial index's postings.
+    Cell(IndexId),
 }
 
 #[derive(Clone, Debug)]
@@ -649,6 +696,11 @@ enum RankValue {
     Entity,
     Scalar(Vec<u8>),
     Score(u64),
+    /// One spatial posting's Hilbert cell. Four bytes in the key, and the
+    /// value they hold rather than the bytes: a spatial answer can be
+    /// millions of rows, and a `Vec` per row to carry a `u32` is an
+    /// allocation per row.
+    Cell(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -844,6 +896,13 @@ fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool) -> Orderin
                 a.cmp(b)
             }
         }
+        (RankValue::Cell(a), RankValue::Cell(b)) => {
+            if descending {
+                b.cmp(a)
+            } else {
+                a.cmp(b)
+            }
+        }
         (RankValue::Score(a), RankValue::Score(b)) => {
             let a = f64::from_bits(*a);
             let b = f64::from_bits(*b);
@@ -873,15 +932,16 @@ pub struct PreparedQuery<'db> {
     /// A driver whose walk order is unrelated to the ranking -- a spatial cell
     /// walk under an entity-id ranking -- cannot stop early and cannot resume:
     /// to know which rows come next it has to see every candidate again. (A
-    /// RANGE over a value-ordered index was in this list until the query asked
-    /// for it in that index's own order, and a text merge until it was
-    /// recognised as already ascending by document; both resume now.) So page
-    /// k+1 re-opened the whole
-    /// candidate stream and discarded everything page 1..k had already
-    /// returned. That is one full pass PER PAGE, and an answer of R rows in
-    /// pages of P costs R^2/P -- invisible while the answer fits one page, and
-    /// the whole of why `popsim`'s `born_decade` took 1,011 s to return 5.58M
-    /// rows at 48M while the same case at 200K took 11 ms.
+    /// RANGE over a value-ordered index was in this list until the query
+    /// asked for it in that index's own order, a SPATIAL walk until
+    /// `QueryOrder::Driver` let a query ask for cell order, and a text merge
+    /// until it was recognised as already ascending by document; all three
+    /// resume now.) So page k+1 re-opened the whole candidate stream and
+    /// discarded everything page 1..k had already returned. That is one full
+    /// pass PER PAGE, and an answer of R rows in pages of P costs R^2/P --
+    /// invisible while the answer fits one page, and the whole of why
+    /// `popsim`'s `born_decade` took 1,011 s to return 5.58M rows at 48M
+    /// while the same case at 200K took 11 ms.
     ///
     /// A page under such a driver walks to the end of the stream whatever it
     /// does, so the rows past this page are rows it has ALREADY ranked. It
@@ -1439,6 +1499,9 @@ impl Database {
                 query,
                 matching,
             )?),
+            // The key is the DRIVER's, and the driver is chosen below. This
+            // stands in until it is; `driver_key` replaces it.
+            QueryOrder::Driver => CompiledOrder::Driver(DriverKey::Entity),
         };
 
         let fields = match request.projection {
@@ -1518,6 +1581,11 @@ impl Database {
                     prepared: prepared.clone(),
                     position: None,
                 }),
+                // Driver order names no index, so there is no order index to
+                // drive: the entity cursor is the candidate stream, and its
+                // own order is the answer's. This is also what a driver-
+                // ordered query with no filter at all lands on.
+                CompiledOrder::Driver(_) => Ok(DriverPlan::Entities),
             }
         };
         let driver = match request.driver {
@@ -1603,6 +1671,12 @@ impl Database {
             }
         };
 
+        // Driver order ranks by the key the chosen driver's own walk is
+        // sorted by, which is knowable only now.
+        if matches!(order, CompiledOrder::Driver(_)) {
+            order = CompiledOrder::Driver(driver_key(&driver)?);
+        }
+
         let scalar_driver_position = match &driver {
             DriverPlan::Scalar { position, .. } => *position,
             _ => None,
@@ -1658,6 +1732,36 @@ impl Database {
             run: Vec::new(),
             run_bounded: false,
         })
+    }
+}
+
+/// The key one driver's own walk is ordered by.
+///
+/// Every driver the planner can choose for a driver-ordered query has one,
+/// and it is a key the walk is already standing on: the primary cursor is in
+/// id order, a scalar posting range is `value || sequence`, the text merge
+/// ascends by document and refuses a posting that does not advance, a
+/// traversal hands its ids over sorted, and a spatial walk ascends by
+/// `(cell, sequence)` across a sorted, merged range list.
+///
+/// A vector driver has none. Its entries are in locator order and its answer
+/// is in distance order, and driver order asked for neither -- an approximate
+/// shortlist is a RANKING wearing a walk's clothes, and returning it as
+/// though its walk were the answer's order would be a page that cannot be
+/// resumed and an order nobody asked for. It is unreachable as the planner
+/// stands (no filter drives a vector index, and `order_driver` hands driver
+/// order the entity cursor), so this is the rule written down where the other
+/// cases are rather than left for a future driver to rediscover.
+fn driver_key(driver: &DriverPlan) -> QueryResult<DriverKey> {
+    match driver {
+        DriverPlan::Entities | DriverPlan::Text { .. } | DriverPlan::Graph { .. } => {
+            Ok(DriverKey::Entity)
+        }
+        DriverPlan::Scalar { info, .. } => Ok(DriverKey::Scalar(info.id)),
+        DriverPlan::Spatial { info, .. } => Ok(DriverKey::Cell(info.id)),
+        DriverPlan::ExactVector { .. } | DriverPlan::QuantizedVector { .. } => Err(invalid_query(
+            "driver order needs a driver that walks in an order of its own",
+        )),
     }
 }
 
@@ -2017,6 +2121,9 @@ enum CarriedKey {
     Vector(IndexId, Vec<u8>),
     /// A quantized-vector entry.
     Quantized(IndexId, Vec<u8>),
+    /// The Hilbert cell a spatial posting is filed under, read only by a
+    /// ranking in that index's own walk order.
+    Cell(IndexId, u32),
 }
 
 struct Candidate {
@@ -2068,6 +2175,15 @@ impl Candidate {
     fn quantized(&self, index: IndexId) -> Option<&[u8]> {
         match &self.carried {
             Some(CarriedKey::Quantized(id, key)) if *id == index => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The spatial cell this candidate came in on, if it came in on
+    /// `index`'s postings.
+    fn cell(&self, index: IndexId) -> Option<u32> {
+        match &self.carried {
+            Some(CarriedKey::Cell(id, cell)) if *id == index => Some(*cell),
             _ => None,
         }
     }
@@ -2188,6 +2304,11 @@ struct SpatialCursor<'a> {
     prefix: Vec<u8>,
     ranges: Vec<(u64, u64)>,
     range: usize,
+    /// Where the FIRST range this cursor opens starts, when the page is
+    /// resuming: the exact posting the previous page stopped on. `None` opens
+    /// at the range's own low cell, which is what an unresumed walk does and
+    /// what every page used to do.
+    start: Option<Vec<u8>>,
     inner: Option<RangeIter<'a>>,
     done: bool,
 }
@@ -2451,6 +2572,13 @@ impl<'a> DriverCursor<'a> {
                     .iter()
                     .copied()
                     .filter(|id| id.collection == collection)
+                    // A traversal hands its result over sorted, so under
+                    // driver order a resumed page opens past the row the last
+                    // one ended on: the same walk with its head cut off.
+                    .filter(|id| match resume {
+                        Some(after) => *id > after.id,
+                        None => true,
+                    })
                     .collect::<Vec<_>>();
                 Ok(Self::Ids(ids.into_iter()))
             }
@@ -2460,17 +2588,59 @@ impl<'a> DriverCursor<'a> {
                 position,
                 ranges,
                 ..
-            } => Ok(Self::Spatial(SpatialCursor {
-                db,
-                info: info.clone(),
-                predicate: *predicate,
-                position: *position,
-                prefix: super::spatial_indexes::posting_prefix(info.id),
-                ranges: ranges.clone(),
-                range: 0,
-                inner: None,
-                done: false,
-            })),
+            } => {
+                // A spatial posting is `prefix || cell || sequence` and the
+                // merged Hilbert ranges are walked low cell to high, so the
+                // walk ascends by `(cell, sequence)` from end to end. Under
+                // driver order that IS the rank key, so the previous page's
+                // last key is a posting key this cursor can open on: the
+                // ranges wholly below it are finished and skipped, and the
+                // one holding it opens at the posting itself. That posting is
+                // yielded once more and dropped by the `after` comparison in
+                // `next_page` -- one candidate per page, where re-opening at
+                // the envelope's first cell costs a whole pass, and a whole
+                // geodesic refine of it, per page.
+                let prefix = super::spatial_indexes::posting_prefix(info.id);
+                let mut range = 0usize;
+                let mut start = None;
+                if let Some(RankKey {
+                    value: RankValue::Cell(cell),
+                    id,
+                }) = resume
+                {
+                    while ranges
+                        .get(range)
+                        .is_some_and(|(_, hi)| *hi < u64::from(*cell))
+                    {
+                        range += 1;
+                    }
+                    // A cell that falls in the GAP between two ranges leaves
+                    // the walk at the next range's own start; only a cell
+                    // inside a range names a posting to open on.
+                    if ranges
+                        .get(range)
+                        .is_some_and(|(lo, _)| *lo <= u64::from(*cell))
+                    {
+                        start = Some(super::spatial_indexes::posting_key_at(
+                            info.id,
+                            *cell,
+                            id.sequence,
+                        ));
+                    }
+                }
+                Ok(Self::Spatial(SpatialCursor {
+                    db,
+                    info: info.clone(),
+                    predicate: *predicate,
+                    position: *position,
+                    prefix,
+                    ranges: ranges.clone(),
+                    range,
+                    start,
+                    inner: None,
+                    done: false,
+                }))
+            }
             DriverPlan::Text { prepared, position } => {
                 // The merge hands documents over in strictly ascending
                 // sequence -- it says so and refuses a round that does not
@@ -2828,8 +2998,16 @@ impl SpatialCursor<'_> {
             }
             let (lo, hi) = self.ranges[self.range];
             if self.inner.is_none() {
-                let mut start = self.prefix.clone();
-                start.extend((lo as u32).to_be_bytes());
+                // `start` is the resumed posting, and only the first range
+                // this cursor opens can have one.
+                let start = match self.start.take() {
+                    Some(key) => key,
+                    None => {
+                        let mut start = self.prefix.clone();
+                        start.extend((lo as u32).to_be_bytes());
+                        start
+                    }
+                };
                 // An index whose tree is still empty has no postings at all,
                 // in any range: finish rather than walk the remaining ranges.
                 let Some(iter) = self.db.index_range(&self.info, &start)? else {
@@ -2850,10 +3028,11 @@ impl SpatialCursor<'_> {
                 self.range += 1;
                 continue;
             }
-            let hilbert = key
+            let cell = key
                 .get(self.prefix.len()..self.prefix.len() + 4)
                 .ok_or_else(|| corrupt_query("spatial point posting key"))?;
-            let hilbert = u64::from(u32::from_be_bytes(hilbert.try_into().unwrap()));
+            let cell = u32::from_be_bytes(cell.try_into().unwrap());
+            let hilbert = u64::from(cell);
             if hilbert > hi {
                 self.inner = None;
                 self.range += 1;
@@ -2873,6 +3052,10 @@ impl SpatialCursor<'_> {
             }
             return Ok(Some(Candidate {
                 satisfied_filter: Some(self.position),
+                // The cell this posting is filed under. A page ranked in the
+                // driver's own order ranks by it; handing it over costs
+                // nothing, because the key it came out of is decoded already.
+                carried: Some(CarriedKey::Cell(self.info.id, cell)),
                 ..Candidate::bare(EntityId {
                     collection: self.info.collection,
                     sequence,
@@ -3241,12 +3424,15 @@ impl<'a> PrimaryRows<'a> {
 /// -- 681 passes over a 5.58M-posting range, which is what made it take
 /// 1,011 s.
 ///
-/// What is LEFT here is the walk that genuinely has no resume: a spatial
-/// driver, whose cells are walked in cell order and whose candidates therefore
-/// arrive in no order the ranking knows. `born_decade` itself is no longer one
-/// of them -- it is asked in its own index's order now, which is the order
-/// SQLite answers it in (`popsim` deviation 8) -- and neither is a text-driven
-/// page, whose merge ascends by document.
+/// What is LEFT here is a walk whose order the RANKING does not share: a
+/// spatial driver under an id or scalar ranking, whose cells arrive in no
+/// order that ranking knows. Each of the big cases has since been asked in
+/// the order its own driver produces instead -- `born_decade` in its index's
+/// ascending order (`popsim` deviation 8), the radius and bbox cases in cell
+/// order (deviation 9, `QueryOrder::Driver`) -- and a text-driven page never
+/// needed the run, because its merge ascends by document. A query that still
+/// asks for a re-ranking it cannot walk in keeps the run, and pays one pass
+/// per this many rows rather than one per page.
 ///
 /// The bound is in BYTES because what is held is a rank key each and the
 /// promise has to mean the same thing whatever a rank key weighs. It is the
@@ -4092,6 +4278,22 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
         CompiledOrder::ApproximateVector { .. } => {
             unreachable!("approximate order uses shortlist then exact rerank")
         }
+        // Driver order takes the key the driver's own walk is sorted by, and
+        // every one of them is already in hand: the candidate's id, the
+        // scalar posting's value key, or the spatial posting's cell. Ranking
+        // a driver-ordered page reads nothing and allocates nothing.
+        CompiledOrder::Driver(DriverKey::Entity) => RankValue::Entity,
+        CompiledOrder::Driver(DriverKey::Scalar(index)) => RankValue::Scalar(
+            candidate
+                .scalar(*index)
+                .ok_or_else(|| corrupt_query("driver order lost its scalar posting key"))?
+                .to_vec(),
+        ),
+        CompiledOrder::Driver(DriverKey::Cell(index)) => RankValue::Cell(
+            candidate
+                .cell(*index)
+                .ok_or_else(|| corrupt_query("driver order lost its spatial cell"))?,
+        ),
         CompiledOrder::Bm25(prepared) => {
             let Some(score) = text_score(
                 db,
@@ -4269,7 +4471,10 @@ fn checked_output_size(row: &QueryRow) -> QueryResult<u64> {
                 .ok_or_else(|| invalid_query("query output size overflow"))?,
         },
         OrderValue::Distance(_) | OrderValue::Bm25(_) => 9,
-        OrderValue::EntityId => 0,
+        // Neither carries a value the caller is charged for: an id-ordered
+        // row's key is its id, and a driver-ordered row's place is the
+        // candidate stream's, not a value in the row.
+        OrderValue::EntityId | OrderValue::Driver => 0,
     };
     if order_bytes != 0 {
         size = size
@@ -4341,6 +4546,23 @@ impl PreparedQuery<'_> {
             // (`TermPostings::open_from`). Spatial is deliberately NOT here:
             // its cells are walked in cell order, which is not id order.
             (DriverPlan::Text { .. }, CompiledOrder::EntityId) => RankWalk::Exact,
+            // Driver order IS the driver's walk order -- that is the whole of
+            // what it means -- so every driver that has one walks in rank
+            // order by construction. The spatial cell walk is the case that
+            // exists for: it ascends by `(cell, sequence)` over a sorted,
+            // merged range list, which is exactly the rank key
+            // `DriverKey::Cell` produces, and `DriverCursor::new` opens it on
+            // the posting the last page stopped on. `driver_key` refused the
+            // drivers that have no order of their own before this could be
+            // asked.
+            (
+                DriverPlan::Entities
+                | DriverPlan::Scalar { .. }
+                | DriverPlan::Spatial { .. }
+                | DriverPlan::Text { .. }
+                | DriverPlan::Graph { .. },
+                CompiledOrder::Driver(_),
+            ) => RankWalk::Exact,
             (
                 DriverPlan::Scalar { info, .. },
                 CompiledOrder::Scalar {
@@ -4374,7 +4596,10 @@ impl PreparedQuery<'_> {
             // them cost one row per scored candidate for nothing.
             row: self.filters.iter().any(|filter| {
                 !matches!(filter, CompiledFilter::Text(prepared) if prepared.phrase.is_none())
-            }) || !matches!(self.order, CompiledOrder::EntityId | CompiledOrder::Bm25(_))
+            }) || !matches!(
+                self.order,
+                CompiledOrder::EntityId | CompiledOrder::Bm25(_) | CompiledOrder::Driver(_)
+            )
                 // A projection reads the row as surely as a filter does, and
                 // the cursor is standing on it: copying it here costs one
                 // allocation, fetching it back costs a whole point-get.
@@ -4384,6 +4609,11 @@ impl PreparedQuery<'_> {
             scalar_key: match (&self.driver, &self.order) {
                 (DriverPlan::Scalar { info, .. }, CompiledOrder::Scalar { info: order, .. }) => {
                     info.id == order.id
+                }
+                // A driver-ordered scalar walk ranks by the very key the
+                // cursor is standing on.
+                (DriverPlan::Scalar { info, .. }, CompiledOrder::Driver(DriverKey::Scalar(order))) => {
+                    info.id == *order
                 }
                 _ => false,
             },
@@ -4516,7 +4746,10 @@ impl PreparedQuery<'_> {
             CompiledOrder::EntityId
             | CompiledOrder::ExactVector { .. }
             | CompiledOrder::ApproximateVector { .. }
-            | CompiledOrder::Bm25(_) => false,
+            | CompiledOrder::Bm25(_)
+            // Every driver-order key is carried by the candidate: its id, the
+            // scalar posting's value, or the spatial posting's cell.
+            | CompiledOrder::Driver(_) => false,
         }
     }
 
@@ -4657,6 +4890,22 @@ impl PreparedQuery<'_> {
             && !matches!(self.order, CompiledOrder::ApproximateVector { .. })
     }
 
+    /// True when this page hands its winners back in ascending entity id, so
+    /// the rows they still owe can be lifted out by one forward cursor rather
+    /// than a root-to-leaf descent each.
+    ///
+    /// An id ranking is the obvious one. Driver order is the other: over the
+    /// entity cursor, the text merge or a traversal its key IS the id, and
+    /// the page is as ascending as an id-ranked one. Over a scalar or spatial
+    /// walk it is not, and those pages lift their rows out in the tree's
+    /// order first, as every other ranked page does.
+    fn winners_ascend_by_id(&self) -> bool {
+        matches!(
+            self.order,
+            CompiledOrder::EntityId | CompiledOrder::Driver(DriverKey::Entity)
+        )
+    }
+
     /// The bookkeeping every page ends with, however its winners were found:
     /// where the next page resumes, how many rows the query has emitted, and
     /// whether there is anything left.
@@ -4704,8 +4953,7 @@ impl PreparedQuery<'_> {
         // rows they still need can be lifted out by one forward cursor. Any
         // other ranking hands them over in an order the primary tree knows
         // nothing about, and each one is a fresh descent as before.
-        let mut winner_rows =
-            PrimaryRows::new(db, matches!(self.order, CompiledOrder::EntityId));
+        let mut winner_rows = PrimaryRows::new(db, self.winners_ascend_by_id());
         // A RANKED page hands its winners over in score order; the primary
         // tree is in id order. Reading them as they are ranked descends from
         // the root once per returned row -- a BM25 page over 900 matching
@@ -4715,9 +4963,8 @@ impl PreparedQuery<'_> {
         // winners by index. Nothing about the answer or its order changes,
         // only the order the rows are read in; an id ranking already ascends
         // and keeps streaming them one at a time, holding none.
-        let ranked_rows_read = !winner_needs_no_row
-            && !walk_reads_every_row
-            && !matches!(self.order, CompiledOrder::EntityId);
+        let ranked_rows_read =
+            !winner_needs_no_row && !walk_reads_every_row && !self.winners_ascend_by_id();
         if ranked_rows_read {
             let mut ascending = PrimaryRows::new(db, true);
             if wants_rows {
@@ -4772,6 +5019,10 @@ impl PreparedQuery<'_> {
                 (CompiledOrder::Bm25(_), RankValue::Score(score)) => {
                     OrderValue::Bm25(f64::from_bits(*score))
                 }
+                // The driver's key is the walk's own bookkeeping, not an
+                // answer about the row: a cell number is not a distance and a
+                // sequence is already `id`.
+                (CompiledOrder::Driver(_), _) => OrderValue::Driver,
                 _ => unreachable!("prepared order and rank key agree"),
             };
             // Every returned ID must still have an authoritative primary row.

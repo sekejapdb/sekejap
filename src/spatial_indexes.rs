@@ -65,8 +65,15 @@ pub(super) fn posting_prefix(id: IndexId) -> Vec<u8> {
 }
 
 pub(super) fn posting_key(id: IndexId, point: Point, sequence: u64) -> Vec<u8> {
+    posting_key_at(id, point_hilbert(point) as u32, sequence)
+}
+
+/// The posting key of one `(cell, sequence)` pair. `posting_key` derives the
+/// cell from a point; a resumed cell walk already holds the cell and has no
+/// point to derive it from again.
+pub(super) fn posting_key_at(id: IndexId, cell: u32, sequence: u64) -> Vec<u8> {
     let mut key = posting_prefix(id);
-    key.extend((point_hilbert(point) as u32).to_be_bytes());
+    key.extend(cell.to_be_bytes());
     key.extend(ordered(sequence));
     key
 }

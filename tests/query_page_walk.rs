@@ -29,10 +29,11 @@
 //! moved.
 use e4_prototype::{
     collections::{
-        CandidateDriver, CollectionId, CollectionOptions, Database, IndexId, Projection,
-        QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue, SortDirection,
-        TextMatch,
+        CandidateDriver, CollectionId, CollectionOptions, Database, IndexId, PointFilter,
+        Projection, QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue,
+        SortDirection, TextMatch,
     },
+    spatial_math::{Bounds, Point},
     Kind,
 };
 use kernel::{
@@ -881,6 +882,7 @@ struct PageWork {
     ids: Vec<u64>,
     candidates: u64,
     text_postings: u64,
+    spatial_postings: u64,
 }
 
 fn text_pages(
@@ -891,11 +893,32 @@ fn text_pages(
     driver: CandidateDriver,
     page_size: usize,
 ) -> Vec<PageWork> {
+    walk_pages(
+        db,
+        collection,
+        filters,
+        QueryOrder::EntityId,
+        total_limit,
+        driver,
+        page_size,
+    )
+}
+
+/// Every page of one query: what it returned and what its own walk cost.
+fn walk_pages(
+    db: &Database,
+    collection: CollectionId,
+    filters: &[QueryFilter<'_>],
+    order: QueryOrder<'_>,
+    total_limit: Option<usize>,
+    driver: CandidateDriver,
+    page_size: usize,
+) -> Vec<PageWork> {
     let mut prepared = db
         .prepare_query(QueryRequest {
             collection,
             filters,
-            order: QueryOrder::EntityId,
+            order,
             projection: Projection::Ids,
             total_limit,
             driver,
@@ -910,6 +933,7 @@ fn text_pages(
             ids: page.rows.iter().map(|row| row.id.sequence).collect(),
             candidates: page.work.candidates,
             text_postings: page.work.text_postings,
+            spatial_postings: page.work.spatial_postings,
         });
         if page.done || page.rows.is_empty() {
             break;
@@ -1014,4 +1038,333 @@ fn a_text_driven_id_ordered_answer_walks_its_postings_once_across_pages() {
     let scanned = text_pages(&db, d, &filters, None, CandidateDriver::Entities, page_size);
     let ids: Vec<u64> = scanned.iter().flat_map(|page| page.ids.iter().copied()).collect();
     assert_eq!(ids, expected, "the entity walk agrees with the text walk");
+}
+
+// ── the driver's own order ────────────────────────────────────────────────
+
+/// A 1.2 degree square around the radius centre, which at this latitude is
+/// about 133 km on a side.
+const SPAN: f64 = 1.2;
+const CENTER_LON: f64 = 107.6;
+const CENTER_LAT: f64 = -6.9;
+
+struct SpatialFixture {
+    db: Database,
+    p: CollectionId,
+    addr: IndexId,
+}
+
+/// Where row `i` lives. Scattered on purpose: a point's CELL must have
+/// nothing to do with its entity id, because that mismatch is the whole
+/// reason a spatial page could not resume.
+fn place(i: u64) -> (f64, f64) {
+    let mut r = i.wrapping_mul(0xA24B_AED4_963E_E407) | 1;
+    let mut next = move || {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        (r % 100_000) as f64 / 100_000.0
+    };
+    let lon = CENTER_LON - SPAN / 2.0 + next() * SPAN;
+    let lat = CENTER_LAT - SPAN / 2.0 + next() * SPAN;
+    // Five decimals, taken numerically, so a boundary comparison sees the
+    // same f64 the fixture wrote.
+    let round = |x: f64| (x * 100_000.0).round() / 100_000.0;
+    (round(lon), round(lat))
+}
+
+/// `rows` points scattered over the square, with one point index built LATE
+/// so its postings sit in the tree the query walks.
+fn spatial_fixture(path: &Path, rows: u64) -> SpatialFixture {
+    let mut db = Database::create(path, cfg()).unwrap();
+    if std::env::var("E4_INDEX_TREES").is_ok_and(|mode| mode == "0") {
+        db.set_create_index_trees(false);
+    }
+    let p = db
+        .create_collection(
+            "p",
+            vec![("addr".into(), Kind::Point)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    for i in 1..=rows {
+        let (lon, lat) = place(i);
+        let id = db
+            .put(
+                p,
+                &format!("k{i:08}"),
+                &json!({ "addr": { "type": "Point", "coordinates": [lon, lat] } }),
+            )
+            .unwrap();
+        assert_eq!(id.sequence, i, "the fixture rests on sequence == insertion index");
+        if i % 512 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let addr = db.create_point_index(p, "addr_point", "addr").unwrap();
+    db.commit().unwrap();
+    db.build_index_to_ready(addr, 255).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    SpatialFixture { db, p, addr }
+}
+
+/// What a spatial answer costs, and that its pages are its own.
+///
+/// `one` is the same question asked in ONE page: the cost of a single pass
+/// over the cells the envelope covers, which is the floor any paged answer
+/// can reach. Everything else is measured against it.
+fn assert_one_pass_over_cells(
+    db: &Database,
+    p: CollectionId,
+    filters: &[QueryFilter<'_>],
+    shape: &str,
+) {
+    let page_size = 256usize;
+    let one = walk_pages(db, p, filters, QueryOrder::Driver, None, CandidateDriver::Auto, 8_192);
+    assert_eq!(one.len(), 1, "{shape}: the whole answer fits in one page");
+    let whole = one[0].ids.clone();
+    let pass = one[0].spatial_postings;
+    assert!(
+        whole.len() >= 3_000,
+        "{shape}: the fixture answers {} rows; the bound below is only \
+         meaningful over a multi-page answer",
+        whole.len()
+    );
+
+    // The oracle: the same rows, ranked by entity id. Driver order is a
+    // different ORDER, never a different answer.
+    let ordered = drain(
+        db,
+        p,
+        filters,
+        QueryOrder::EntityId,
+        Projection::Ids,
+        None,
+        CandidateDriver::Auto,
+        8_192,
+    );
+    let mut sorted = whole.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, ordered.ids, "{shape}: driver order returns the id-ordered answer as a set");
+    assert_ne!(
+        whole, ordered.ids,
+        "{shape}: the fixture must scatter ids across cells, or cell order \
+         and id order are the same order and this proves nothing"
+    );
+
+    let pages = walk_pages(db, p, filters, QueryOrder::Driver, None, CandidateDriver::Auto, page_size);
+    let returned: Vec<u64> = pages.iter().flat_map(|page| page.ids.iter().copied()).collect();
+    assert_eq!(
+        returned, whole,
+        "{shape}: the pages of a driver-ordered answer are disjoint, complete \
+         and in the driver's own order"
+    );
+    let full = pages.len() as u64;
+    let postings: u64 = pages.iter().map(|page| page.spatial_postings).sum();
+    assert!(
+        postings <= pass + 4 * full,
+        "{shape}: a {full}-page answer of {} rows read {postings} spatial \
+         postings; one pass over the same cells is {pass}, so the bound is {}",
+        whole.len(),
+        pass + 4 * full
+    );
+    let candidates: u64 = pages.iter().map(|page| page.candidates).sum();
+    assert!(
+        candidates <= whole.len() as u64 + 2 * full,
+        "{shape}: {} rows cost {candidates} candidates; a resumed walk costs \
+         its rows plus two per page -- the one candidate past the page that \
+         tells it there is more, and the one posting the next page re-opens \
+         on -- so the bound is {}",
+        whole.len(),
+        whole.len() as u64 + 2 * full
+    );
+
+    // Page 2 did its own walking. A page served out of a held run reads no
+    // postings at all -- which is how a spatial answer used to meet the bound
+    // above, at the price of one whole pass per run's worth of rows.
+    let second = &pages[1];
+    assert_eq!(second.ids.len(), page_size, "{shape}: page 2 is a full page");
+    assert!(
+        second.spatial_postings > 0,
+        "{shape}: page 2 read no postings -- it was served out of a held run \
+         rather than resuming its own walk"
+    );
+    assert!(
+        second.candidates <= page_size as u64 + 4,
+        "{shape}: page 2 returned {page_size} rows off {} candidates; a \
+         resumed walk examines its own page and no more",
+        second.candidates
+    );
+
+    // A LIMIT is a stop condition, not a filter over the whole envelope.
+    let limited = walk_pages(
+        db,
+        p,
+        filters,
+        QueryOrder::Driver,
+        Some(700),
+        CandidateDriver::Auto,
+        page_size,
+    );
+    let ids: Vec<u64> = limited.iter().flat_map(|page| page.ids.iter().copied()).collect();
+    assert_eq!(ids, whole[..700], "{shape}: LIMIT 700 returns the first 700 rows of the walk, once each");
+    let limited_postings: u64 = limited.iter().map(|page| page.spatial_postings).sum();
+    assert!(
+        limited_postings * 2 < pass,
+        "{shape}: LIMIT 700 of a {}-row answer read {limited_postings} \
+         postings against a full pass of {pass}; a stop condition must cost \
+         about the rows it returns",
+        whole.len()
+    );
+
+    // And the answer is the answer, whatever the page size.
+    for size in [1usize, 17, 4_000] {
+        let other = walk_pages(db, p, filters, QueryOrder::Driver, None, CandidateDriver::Auto, size);
+        let ids: Vec<u64> = other.iter().flat_map(|page| page.ids.iter().copied()).collect();
+        assert_eq!(ids, whole, "{shape}: pages of {size} return the same answer");
+    }
+}
+
+/// A radius answer walks its cells ONCE, however many pages it is returned
+/// in, once the query asks for it in the order the cells are walked.
+///
+/// The three states, for a 3,000-row answer in pages of 256 (twelve pages):
+///
+///   * before the held run, page k re-opened the cell walk at the start of
+///     the envelope and re-ran the geodesic refine over everything already
+///     emitted: about `rows x pages` postings;
+///   * with the run, the first page walked the envelope once and HELD the
+///     rest -- so a small answer looks free (page 2 reads zero postings) and
+///     an answer larger than the run (149,796 rows) pays one whole pass, and
+///     one whole geodesic refine of the envelope, per run's worth of rows.
+///     At 48M rows popsim's `radius_50km` returned 6,762,672 rows in 1,648 s,
+///     244 us/row, from 46 passes;
+///   * in driver order, each page resumes at the cell posting the last one
+///     stopped on: the total is one pass, and page 2 walks its own slice.
+#[test]
+fn a_spatial_radius_answer_in_driver_order_walks_its_cells_once_across_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let SpatialFixture { db, p, addr } = spatial_fixture(&temp.path().join("db"), 20_000);
+    let filters = [QueryFilter::Point {
+        index: addr,
+        predicate: PointFilter::Radius {
+            center: Point::new(CENTER_LON, CENTER_LAT).unwrap(),
+            radius_metres: 29_000.0,
+        },
+    }];
+    assert_one_pass_over_cells(&db, p, &filters, "radius");
+}
+
+/// The same, for a bbox -- whose cells are walked identically but whose
+/// refine is a rectangle test rather than a geodesic.
+#[test]
+fn a_spatial_bbox_answer_in_driver_order_walks_its_cells_once_across_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let SpatialFixture { db, p, addr } = spatial_fixture(&temp.path().join("db"), 20_000);
+    let filters = [QueryFilter::Point {
+        index: addr,
+        predicate: PointFilter::Bbox(
+            Bounds::new(
+                CENTER_LON - 0.24,
+                CENTER_LON + 0.24,
+                CENTER_LAT - 0.24,
+                CENTER_LAT + 0.24,
+            )
+            .unwrap(),
+        ),
+    }];
+    assert_one_pass_over_cells(&db, p, &filters, "bbox");
+}
+
+/// Driver order is not a new order: for every driver that already had one, it
+/// is that one, row for row.
+///
+/// The entity cursor walks the primary tree, so it is entity-id order. A
+/// scalar posting range is `value || sequence`, so it is that index's own
+/// ascending order. The text merge ascends by document, so it is entity-id
+/// order again. Each is asserted against the oracle that names it.
+#[test]
+fn driver_order_is_each_drivers_own_walk_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let rows = 4_000u64;
+    let Fixture { db, v, price, .. } = fixture(&temp.path().join("db"), rows);
+    let ids = |order, filters: &[QueryFilter<'_>], driver| {
+        drain(&db, v, filters, order, Projection::Ids, None, driver, 256).ids
+    };
+
+    // The entity cursor.
+    let by_id = ids(QueryOrder::EntityId, &[], CandidateDriver::Entities);
+    assert_eq!(by_id.len(), rows as usize, "the scan returns the collection");
+    assert_eq!(
+        ids(QueryOrder::Driver, &[], CandidateDriver::Entities),
+        by_id,
+        "driver order over the entity cursor IS entity-id order"
+    );
+    assert_eq!(
+        ids(QueryOrder::Driver, &[], CandidateDriver::Auto),
+        by_id,
+        "with no filter to drive it, driver order is still the entity walk"
+    );
+
+    // A scalar range driver, whose postings are (value, sequence).
+    let range = [QueryFilter::Scalar {
+        index: price,
+        predicate: ScalarFilter::Range {
+            lower: std::ops::Bound::Included(ScalarValue::F64(100.0)),
+            upper: std::ops::Bound::Excluded(ScalarValue::F64(400.0)),
+        },
+    }];
+    let by_price = ids(
+        QueryOrder::Scalar {
+            index: price,
+            direction: SortDirection::Ascending,
+        },
+        &range,
+        CandidateDriver::Auto,
+    );
+    assert!(by_price.len() > 1_000, "the range matches {} rows", by_price.len());
+    assert_eq!(
+        ids(QueryOrder::Driver, &range, CandidateDriver::Auto),
+        by_price,
+        "driver order over a scalar range IS that index's ascending order"
+    );
+
+    // The text merge.
+    let temp = tempfile::tempdir().unwrap();
+    let TextFixture { db, d, body } = text_fixture(&temp.path().join("db"), 4_000);
+    let filters = [QueryFilter::Text {
+        index: body,
+        query: WORDS[2],
+        matching: TextMatch::Any,
+    }];
+    let by_document = drain(
+        &db,
+        d,
+        &filters,
+        QueryOrder::EntityId,
+        Projection::Ids,
+        None,
+        CandidateDriver::Auto,
+        256,
+    )
+    .ids;
+    assert_eq!(by_document.len(), 1_000, "every fourth document matches");
+    assert_eq!(
+        drain(
+            &db,
+            d,
+            &filters,
+            QueryOrder::Driver,
+            Projection::Ids,
+            None,
+            CandidateDriver::Auto,
+            256,
+        )
+        .ids,
+        by_document,
+        "driver order over the text merge IS entity-id order"
+    );
 }
