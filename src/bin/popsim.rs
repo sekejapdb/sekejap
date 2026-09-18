@@ -88,10 +88,25 @@
 //!      The text cases keep `EntityId`: the term merge ascends by document,
 //!      so entity order IS the order the driving structure produces, and
 //!      SQLite's FTS5 join returns rowid order, which is the same thing.
-//!      `radius_2km`, `radius_50km`, `bbox` and `radius_and_born` also keep
-//!      `EntityId` -- E4 walks spatial cells in cell order and SQLite walks
-//!      the R*Tree in its own order, so NEITHER arm returns index order that
-//!      the other could match, and both arms pay for the re-rank.
+//!
+//!   9. THE SPATIAL CASES ARE ASKED IN THE DRIVING INDEX'S OWN ORDER.
+//!      `SELECT p._key FROM person p JOIN addr_rt ... WHERE geodist(...)<=?`
+//!      returns SQLite's R*Tree join order and sorts nothing. E4 walks its
+//!      point index in HILBERT CELL order, which is neither entity order nor
+//!      any value order -- so asking for the same rows in `EntityId` was
+//!      asking a question with a sort in it that SQLite was never asked to
+//!      pay, and, worse, one that no page could resume: the walk had to see
+//!      every posting in the envelope before it knew its first row, and the
+//!      next page had to see them all again. At 48M rows `radius_50km`
+//!      returned 6,762,672 rows in 1,648 s -- 244 us/row, 46 passes over the
+//!      cells with a geodesic refine on each.
+//!
+//!      `radius_2km`, `radius_50km`, `bbox` and `radius_and_born` therefore
+//!      ask for `QueryOrder::Driver`: the rows in the order the cell walk
+//!      produces them. NEITHER arm returns an order the other could match --
+//!      SQLite's is the R*Tree's, E4's is the Hilbert curve's, and both are
+//!      unsorted -- and these cases are compared on ROW COUNT, never on key
+//!      order (they are not in the compare script's `ORDERED` set).
 //!
 //! MEMORY. Generation is streaming: one row exists at a time, and no case
 //! accumulates its answer — rows are counted as they arrive and only the first
@@ -494,10 +509,10 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
             )
         }),
         ("radius_2km", |c| {
-            e4_ids(c, &[radius(c.addr, 2_000.0)], QueryOrder::EntityId, None)
+            e4_ids(c, &[radius(c.addr, 2_000.0)], QueryOrder::Driver, None)
         }),
         ("radius_50km", |c| {
-            e4_ids(c, &[radius(c.addr, 50_000.0)], QueryOrder::EntityId, None)
+            e4_ids(c, &[radius(c.addr, 50_000.0)], QueryOrder::Driver, None)
         }),
         ("bbox", |c| {
             e4_ids(
@@ -506,7 +521,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
                     index: c.addr,
                     predicate: PointFilter::Bbox(query_box()),
                 }],
-                QueryOrder::EntityId,
+                QueryOrder::Driver,
                 None,
             )
         }),
@@ -521,7 +536,9 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
                         Bound::Excluded(20_000_101),
                     ),
                 ],
-                QueryOrder::EntityId,
+                // The spatial filter drives this one too, so its order is the
+                // cell walk's. See deviation 9.
+                QueryOrder::Driver,
                 None,
             )
         }),

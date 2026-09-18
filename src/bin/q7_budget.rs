@@ -14,7 +14,7 @@ use e4_prototype::{
         CandidateDriver, CollectionId, Database, IndexId, PointFilter, Projection, QueryBudget,
         QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue, SortDirection, TextMatch,
     },
-    spatial_math::Point,
+    spatial_math::{Bounds, Point},
 };
 use kernel::{
     io::IoMode,
@@ -27,6 +27,15 @@ type R<T> = Result<T, Box<dyn std::error::Error>>;
 const PAGE: usize = 8192;
 const CENTER_LON: f64 = 107.6;
 const CENTER_LAT: f64 = -6.9;
+/// popsim's `bbox`, the same 0.2 degree box around the same centre.
+const BOX_WEST: f64 = 107.5;
+const BOX_EAST: f64 = 107.7;
+const BOX_SOUTH: f64 = -7.0;
+const BOX_NORTH: f64 = -6.8;
+
+fn centre() -> Point {
+    Point::new(CENTER_LON, CENTER_LAT).expect("centre is valid")
+}
 
 struct Case {
     name: &'static str,
@@ -34,7 +43,7 @@ struct Case {
     /// The order popsim asks this case in. It is part of the question: a range
     /// answered in the driving index's own order walks that range once and
     /// resumes, and the same rows in entity order do not. See popsim's
-    /// deviation 8.
+    /// deviations 8 (scalar ranges) and 9 (spatial).
     order: QueryOrder<'static>,
 }
 
@@ -126,6 +135,10 @@ fn main() -> R<()> {
         addr.ok_or("no addr_point index")?,
     );
     println!("cache_bytes={cache} entity_order={entity_order}");
+    let point = |predicate: PointFilter| QueryFilter::Point {
+        index: addr,
+        predicate,
+    };
     let by_born = QueryOrder::Scalar {
         index: born,
         direction: SortDirection::Ascending,
@@ -221,16 +234,49 @@ fn main() -> R<()> {
             ),
             order: by_born,
         },
+        // The spatial cases. Their driver walks Hilbert cells, so cell order
+        // is the only order a page of one can resume in; `--entity-order`
+        // asks the same rows the old way, which is the comparison this
+        // program exists to print.
         Case {
             name: "radius_50km",
-            filters: vec![QueryFilter::Point {
-                index: addr,
-                predicate: PointFilter::Radius {
-                    center: Point::new(CENTER_LON, CENTER_LAT).expect("centre is valid"),
-                    radius_metres: 50_000.0,
+            filters: vec![point(PointFilter::Radius {
+                center: centre(),
+                radius_metres: 50_000.0,
+            })],
+            order: QueryOrder::Driver,
+        },
+        Case {
+            name: "radius_2km",
+            filters: vec![point(PointFilter::Radius {
+                center: centre(),
+                radius_metres: 2_000.0,
+            })],
+            order: QueryOrder::Driver,
+        },
+        Case {
+            name: "bbox",
+            filters: vec![point(PointFilter::Bbox(
+                Bounds::new(BOX_WEST, BOX_EAST, BOX_SOUTH, BOX_NORTH).expect("box is valid"),
+            ))],
+            order: QueryOrder::Driver,
+        },
+        Case {
+            name: "radius_and_born",
+            filters: vec![
+                point(PointFilter::Radius {
+                    center: centre(),
+                    radius_metres: 10_000.0,
+                }),
+                QueryFilter::Scalar {
+                    index: born,
+                    predicate: ScalarFilter::Range {
+                        lower: Bound::Included(ScalarValue::I64(19_900_101)),
+                        upper: Bound::Excluded(ScalarValue::I64(20_000_101)),
+                    },
                 },
-            }],
-            order: QueryOrder::EntityId,
+            ],
+            order: QueryOrder::Driver,
         },
     ];
     for case in &cases {
