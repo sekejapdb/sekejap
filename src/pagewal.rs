@@ -891,6 +891,8 @@ impl PageWalStore {
     pub fn page_count(&self)->u32{self.pool.page_count()}
     /// Diagnostic only: buffer-pool page accesses since open.
     pub fn pool_accesses(&self)->u64{let s=self.pool.stats();s.hits+s.misses}
+    /// Diagnostic only: (hits, misses, evictions, clock sweep steps).
+    pub fn pool_counters(&self)->(u64,u64,u64,u64){let s=self.pool.stats();(s.hits,s.misses,s.evictions,self.pool.sweep_steps())}
     /// Diagnostic only: (hits, attempts) of the per-keyspace append hints.
     pub fn tag_hint_stats(&self)->(u64,u64,u64){(self.tags.hits(),self.tags.attempts(),self.tags.misses())}
     /// Turn the per-keyspace append hints off (or back on) for this handle.

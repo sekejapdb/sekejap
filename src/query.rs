@@ -803,6 +803,7 @@ impl Winners {
 
     /// Keep one more. Only ever called with fewer than `capacity` held, or
     /// straight after [`Winners::pop_worst`].
+    #[inline]
     fn push(&mut self, capacity: usize, entry: HeapEntry) {
         match self {
             Self::Filling(kept) => {
@@ -876,7 +877,7 @@ impl Ord for ApproxHeapEntry {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn compare_rank(a: &RankKey, b: &RankKey, descending: bool) -> Ordering {
     compare_rank_value(&a.value, &b.value, descending).then_with(|| a.id.cmp(&b.id))
 }
@@ -885,7 +886,7 @@ fn compare_rank(a: &RankKey, b: &RankKey, descending: bool) -> Ordering {
 /// A descending walk is monotone in this and not in the whole key, so this is
 /// what decides whether anything still ahead of the cursor can outrank what
 /// the page already holds.
-#[inline]
+#[inline(always)]
 fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool) -> Ordering {
     match (a, b) {
         (RankValue::Entity, RankValue::Entity) => Ordering::Equal,
@@ -2192,6 +2193,10 @@ impl Candidate {
 struct EntityCursor<'a> {
     inner: RangeIter<'a>,
     prefix: Vec<u8>,
+    /// The collection the prefix was built from. A key that matched the
+    /// prefix has already proved its collection; carrying it here is what
+    /// lets the id decode read only the sequence.
+    collection: CollectionId,
     /// Copy the primary row out of the leaf, or read its key only. The bytes
     /// are worth an allocation only when a filter or the ranking will decode
     /// them; a key-only scan used to allocate one per row and drop it.
@@ -2497,6 +2502,7 @@ impl<'a> DriverCursor<'a> {
                 Ok(Self::Entities(EntityCursor {
                     inner,
                     prefix,
+                    collection,
                     wants_row: needs.row,
                     done: false,
                 }))
@@ -2748,12 +2754,12 @@ impl EntityCursor<'_> {
                 self.done = true;
                 return Ok(None);
             };
-            if !key.starts_with(&self.prefix) {
+            if !super::has_prefix(key, &self.prefix) {
                 self.done = true;
                 return Ok(None);
             }
             (
-                row_id(key)?,
+                super::row_id_after_prefix(key, self.prefix.len(), self.collection)?,
                 if self.wants_row {
                     Some(value.to_vec())
                 } else {
@@ -4456,7 +4462,15 @@ fn json_size(value: &Value) -> QueryResult<u64> {
     Ok(count.0)
 }
 
+#[inline]
 fn checked_output_size(row: &QueryRow) -> QueryResult<u64> {
+    // The commonest row the engine emits: an id-ordered or driver-ordered row
+    // with nothing projected. Its size is the 12 bytes of identity plus the
+    // one byte every row is charged, and there is no arithmetic that can
+    // overflow on the way to saying so.
+    if row.projected.is_empty() && matches!(row.order, OrderValue::EntityId | OrderValue::Driver) {
+        return Ok(13);
+    }
     let mut size = 12u64; // collection u32 + sequence u64
     size = size.checked_add(1).ok_or_else(|| {
         QueryError::Database(Error::InvalidInput("query output size overflow".into()))
@@ -5347,6 +5361,11 @@ impl PreparedQuery<'_> {
                         // repeat.
                         Some(true) => {}
                         Some(false) => continue,
+                        // `filters_match` over an empty slice can only say
+                        // yes, and saying it costs a nine-argument call per
+                        // row: 5.6% of a key-only enumeration that has no
+                        // filters to evaluate at all.
+                        None if self.filters.is_empty() => {}
                         None => {
                             if !filters_match(
                                 db,

@@ -763,6 +763,28 @@ fn validated_leaf(rec: &[u8]) -> (&[u8], &[u8], bool) {
     let value_len = if v == OVERFLOW_VLEN { 12 } else { v as usize };
     (&rec[2..2 + k], &rec[4 + k..4 + k + value_len], v == OVERFLOW_VLEN)
 }
+/// Does this leaf hold an overflow marker anywhere? Read ONCE per leaf pin so
+/// a pull cursor can serve each row with one page open and one record decode
+/// instead of asking the page again per row. Only the general record encoding
+/// can carry a marker at all -- the two short forms declare their own value
+/// inline -- so the common leaf costs two comparisons per record and stops
+/// there.
+fn leaf_has_marker(page: &PageRef<'_>) -> bool {
+    for i in 0..page.nentries() {
+        let rec = page.slot(i);
+        if rec[0] == 0xff && (0x81..=0x88).contains(&rec[1]) {
+            continue;
+        }
+        if rec[1] & 0xf0 == 0x40 {
+            continue;
+        }
+        let k = u16::from_le_bytes([rec[0], rec[1]]) as usize;
+        if u16::from_le_bytes([rec[2 + k], rec[3 + k]]) == OVERFLOW_VLEN {
+            return true;
+        }
+    }
+    false
+}
 fn enc_interior(key: &[u8], child: u32) -> Vec<u8> {
     let mut r = Vec::with_capacity(6 + key.len());
     r.extend_from_slice(&(key.len() as u16).to_le_bytes());
@@ -1243,6 +1265,19 @@ pub struct RangeIter<'p> {
     /// before overflow-chain walks. `next()` / `for_each_ref` drop it on
     /// entry so their existing pin accounting is unchanged.
     pin: Option<PinnedRead<'p>>,
+    /// The pinned leaf's entry count and whether any of its records is an
+    /// overflow marker, read ONCE when the pin is taken. A pull cursor asks
+    /// "am I still standing on a record of this leaf?" once per ROW, and
+    /// answering it from the page needed a second page open and a second
+    /// record decode every time. Meaningful only while `pin` is `Some`.
+    leaf_entries: usize,
+    leaf_markers: bool,
+    /// Seeks: how many times this cursor has had to ASK where it is, rather
+    /// than read the record it was already standing on. One per leaf is the
+    /// shape a streaming walk should have; one per row is the shape a pull
+    /// cursor had. Diagnostic, so the property can be asserted rather than
+    /// timed.
+    seeks: u64,
 }
 
 /// A descending range cursor. Unlike reversing a forward [`RangeIter`], this
@@ -3254,6 +3289,9 @@ impl<'p> BTree<'p> {
             served: 0,
             path,
             pin: None,
+            leaf_entries: 0,
+            leaf_markers: true,
+            seeks: 0,
         })
     }
 
@@ -3590,8 +3628,37 @@ impl RangeIter<'_> {
     /// The empty target is below every key, so this is `peek_at_or_after`
     /// standing still: same leaf pin, same overflow-marker resolution.
     pub fn peek_ref(&mut self) -> Result<Option<(&[u8], &[u8])>> {
-        self.position_at_or_after(&[])?;
+        // A cursor that is already standing on a record of its pinned leaf
+        // has nothing to seek for: the empty target is below every key, so
+        // `position_at_or_after` would open the page a second time and decode
+        // the record two more times to arrive back where it already is. That
+        // was 2 page opens and 3 record decodes per ROW where the callback
+        // walk pays 1 open per LEAF and 1 decode per row.
+        if !self.parked() {
+            self.position_at_or_after(&[])?;
+        }
         self.current_ref()
+    }
+
+    /// True when `current_ref` alone is the whole answer: nothing parked in
+    /// `buf`, the walk is live, a leaf is pinned, `idx` names a record in it,
+    /// and that leaf holds no overflow marker (a marker's value lives off the
+    /// page and only the seek path can resolve it). Every term is a field
+    /// read, and the two leaf facts were recorded when the pin was taken.
+    fn parked(&self) -> bool {
+        self.buf.is_empty()
+            && !self.done
+            && self.pin.is_some()
+            && !self.leaf_markers
+            && self.idx < self.leaf_entries
+    }
+
+    /// How many times this cursor has had to seek -- ask the tree where it
+    /// is -- rather than read the record it was standing on. A streaming walk
+    /// should seek about once per leaf; seeking once per row is the defect
+    /// this counts.
+    pub fn seeks(&self) -> u64 {
+        self.seeks
     }
 
     /// Step past the record the last peek returned, without materialising it.
@@ -3605,6 +3672,7 @@ impl RangeIter<'_> {
     }
 
     fn position_at_or_after(&mut self, target: &[u8]) -> Result<()> {
+        self.seeks += 1;
         loop {
             let skip_buf = matches!(self.buf.front(), Some((k, _, _)) if k.as_slice() < target);
             if skip_buf {
@@ -3629,7 +3697,18 @@ impl RangeIter<'_> {
                 return Ok(());
             }
             if self.pin.is_none() {
-                self.pin = Some(self.pool.get(self.page)?);
+                // The ONE place this cursor takes a leaf pin, and so the one
+                // place the leaf's own facts are read. `page` cannot change
+                // while the pin is held -- `advance` runs only after the pin
+                // is dropped -- so what is recorded here stays true for as
+                // long as `peek_ref` may believe it.
+                let pin = self.pool.get(self.page)?;
+                {
+                    let p = open_cached(&pin, self.page)?;
+                    self.leaf_entries = p.nentries();
+                    self.leaf_markers = leaf_has_marker(&p);
+                }
+                self.pin = Some(pin);
             }
 
             enum Step {
@@ -3646,7 +3725,12 @@ impl RangeIter<'_> {
                 } else {
                     let n = p.nentries();
                     let mut idx = self.idx;
-                    if idx < n {
+                    // The EMPTY target -- what `peek_ref` asks with -- is below
+                    // every key, so the cursor is never before it and the
+                    // probe that decides whether to seek can only ever answer
+                    // no. Deciding that by decoding the record was 2.6% of a
+                    // key-only enumeration.
+                    if !target.is_empty() && idx < n {
                         let (key0, _, _) = validated_leaf(p.slot(idx));
                         if key0 < target {
                             idx = lower_bound(&p, target)?.max(idx);
@@ -3705,7 +3789,13 @@ impl RangeIter<'_> {
         let Some(pin) = self.pin.as_ref() else {
             return Ok(None);
         };
-        let p = open_cached(pin, self.page)?;
+        // This pin was taken through `open_cached`, which either found the
+        // frame's validated bit set or validated the residency and set it --
+        // and a pinned frame cannot be evicted, so the bit cannot have been
+        // cleared since. Asking the pool for it again costs a `RefCell`
+        // borrow and a frame index PER ROW; `open_cached` is exactly this
+        // call plus that question.
+        let p = PageRef::open_resident_validated(pin, self.page)?;
         if self.idx >= p.nentries() {
             return Ok(None);
         }
@@ -4030,6 +4120,75 @@ mod tests {
         assert_eq!(n, 50_000);
         assert_eq!(after.peak_pins, 1, "a scan must hold exactly one leaf at a time");
         assert!(after.evictions > before.evictions, "50k keys over 8 frames must evict");
+    }
+
+    /// A PULL cursor -- peek, use, step -- is how the query executor walks a
+    /// scan, and it must cost what the callback walk costs. `peek_ref` used
+    /// to run the whole `position_at_or_after` seek EVERY time, which is a
+    /// second page open and two more record decodes per row to arrive back
+    /// at the record the cursor was already standing on. Counted, not timed:
+    /// a walk of 50,000 keys must seek about once per leaf, and there are
+    /// nowhere near 50,000 leaves.
+    #[test]
+    fn a_pull_cursor_seeks_once_per_leaf_not_once_per_row() {
+        let (pool, _d) = scratch_pool(64);
+        let last_leaf = Cell::new(None);
+        let fast_path_hits = Cell::new(0);
+        let fast_path_attempts = Cell::new(0);
+        let mut t = BTree::create(&pool, 1, &last_leaf, &fast_path_hits, &fast_path_attempts).unwrap();
+        for i in 0..50_000u64 {
+            t.insert(&i.to_be_bytes(), b"v").unwrap();
+        }
+        let mut iter = t.range(&[]).unwrap();
+        let mut rows = 0u64;
+        while iter.peek_ref().unwrap().is_some() {
+            iter.step();
+            rows += 1;
+        }
+        assert_eq!(rows, 50_000);
+        let leaves = u64::from(iter.leaves_stepped());
+        assert!(
+            iter.seeks() <= leaves + 2,
+            "a pull walk of {rows} rows over {leaves} leaves seeked {} times;              one seek per leaf (plus the first and the last) is the shape",
+            iter.seeks()
+        );
+    }
+
+    /// The fast path above must never serve an overflow marker's 12-byte
+    /// locator where the value belongs. A leaf holding one is excluded
+    /// wholesale, so every record of it goes the seek way.
+    #[test]
+    fn a_pull_cursor_still_resolves_overflow_values() {
+        let (pool, _d) = scratch_pool(64);
+        let last_leaf = Cell::new(None);
+        let fast_path_hits = Cell::new(0);
+        let fast_path_attempts = Cell::new(0);
+        let mut t = BTree::create(&pool, 1, &last_leaf, &fast_path_hits, &fast_path_attempts).unwrap();
+        let big = vec![7u8; 9_000];
+        for i in 0..64u64 {
+            if i % 8 == 0 {
+                t.insert(&i.to_be_bytes(), &big).unwrap();
+            } else {
+                t.insert(&i.to_be_bytes(), b"v").unwrap();
+            }
+        }
+        let mut iter = t.range(&[]).unwrap();
+        let mut seen = 0u64;
+        loop {
+            let (key, value) = {
+                let Some((key, value)) = iter.peek_ref().unwrap() else { break };
+                (key.to_vec(), value.to_vec())
+            };
+            let i = u64::from_be_bytes(key.as_slice().try_into().unwrap());
+            if i % 8 == 0 {
+                assert_eq!(value, big, "key {i} must read back its overflow value");
+            } else {
+                assert_eq!(value, b"v", "key {i} must read back its inline value");
+            }
+            iter.step();
+            seen += 1;
+        }
+        assert_eq!(seen, 64);
     }
 
     #[test]

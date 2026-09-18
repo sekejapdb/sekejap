@@ -291,6 +291,7 @@ fn ordered_into(out: &mut Vec<u8>, n: u64) {
     out.push(0x80 + (8 - start) as u8);
     out.extend_from_slice(&bytes[start..]);
 }
+#[inline]
 fn read_ordered(b: &[u8], at: &mut usize) -> Result<u64> {
     let width = usize::from(*b.get(*at).ok_or_else(|| corrupt("truncated integer key"))?)
         .checked_sub(0x80)
@@ -305,10 +306,14 @@ fn read_ordered(b: &[u8], at: &mut usize) -> Result<u64> {
     if width > 1 && bytes[0] == 0 {
         return Err(corrupt("noncanonical integer key"));
     }
-    let mut out = [0u8; 8];
-    out[8 - width..].copy_from_slice(bytes);
+    // A `copy_from_slice` of a RUNTIME width compiles to a `memcpy` call, and
+    // the call costs more than the at-most-eight shifts it is standing in for.
+    let mut out = 0u64;
+    for b in bytes {
+        out = (out << 8) | u64::from(*b);
+    }
     *at += width;
-    Ok(u64::from_be_bytes(out))
+    Ok(out)
 }
 /// Room for a tag and two widest integers, so a keyed lookup is one
 /// allocation rather than one per component plus a regrow between them.
@@ -323,6 +328,41 @@ fn row_key(id: EntityId) -> Vec<u8> {
     let mut k = prefix(0x40, id.collection);
     ordered_into(&mut k, id.sequence);
     k
+}
+/// True when `key` begins with `prefix`. The prefixes a scan matches per row
+/// are a tag and one width-tagged integer -- three or four bytes -- and
+/// `starts_with` hands those to the platform's `memcmp`, whose call overhead
+/// is most of what a four-byte comparison costs. Counted on a 5M-row key-only
+/// enumeration it was 4.6% of the whole walk.
+#[inline]
+pub(crate) fn has_prefix(key: &[u8], prefix: &[u8]) -> bool {
+    if key.len() < prefix.len() {
+        return false;
+    }
+    for (a, b) in key.iter().zip(prefix) {
+        if a != b {
+            return false;
+        }
+    }
+    true
+}
+/// The entity id of a primary key whose `0x40 || collection` prefix the caller
+/// has ALREADY matched byte for byte against a prefix built from
+/// `collection`. The collection half is then not a question -- the bytes that
+/// answer it are the bytes that were just compared -- so only the sequence is
+/// decoded. `row_id` re-read the tag, re-decoded the collection width, and
+/// re-checked a range that the prefix match had already settled, once per row.
+#[inline]
+fn row_id_after_prefix(k: &[u8], prefix_len: usize, collection: CollectionId) -> Result<EntityId> {
+    let mut at = prefix_len;
+    let sequence = read_ordered(k, &mut at)?;
+    if at != k.len() || sequence == 0 {
+        return Err(corrupt("entity identity"));
+    }
+    Ok(EntityId {
+        collection,
+        sequence,
+    })
 }
 fn row_id(k: &[u8]) -> Result<EntityId> {
     if k.first() != Some(&0x40) {
@@ -801,6 +841,59 @@ impl Database {
     #[doc(hidden)]
     pub fn pool_accesses(&self) -> Result<u64> {
         Ok(self.store()?.store().pool_accesses())
+    }
+    /// Diagnostic only: buffer-pool (hits, misses, evictions, clock sweep
+    /// steps). `pool_accesses` is their first two summed; a scan budget needs
+    /// them apart, because a MISS is a pread and a checksum and a hit is a
+    /// hash lookup.
+    #[doc(hidden)]
+    pub fn pool_counters(&self) -> Result<(u64, u64, u64, u64)> {
+        Ok(self.store()?.store().pool_counters())
+    }
+    /// Diagnostic only: count the primary rows of one collection through the
+    /// kernel's callback walk -- one pin and one validation per leaf, no
+    /// allocation and no engine work at all. The floor a key-only page is
+    /// measured against.
+    #[doc(hidden)]
+    pub fn diag_scan_for_each_ref(&self, c: CollectionId) -> Result<u64> {
+        let prefix = prefix(0x40, c);
+        let mut seen = 0u64;
+        self.store()?.range(&prefix)?.for_each_ref(|key, _| {
+            if !key.starts_with(&prefix) {
+                return false;
+            }
+            seen += 1;
+            true
+        })?;
+        Ok(seen)
+    }
+    /// Diagnostic only: the same rows through the PULL cursor the entity
+    /// driver uses -- peek, decode the id, step -- with nothing else on top.
+    /// The difference from `diag_scan_for_each_ref` is what the pull shape
+    /// itself costs; the difference from a key-only page is the engine.
+    #[doc(hidden)]
+    pub fn diag_scan_pull(&self, c: CollectionId, decode_id: bool) -> Result<u64> {
+        let prefix = prefix(0x40, c);
+        let mut iter = self.store()?.range(&prefix)?;
+        let mut seen = 0u64;
+        loop {
+            let ok = {
+                let Some((key, _)) = iter.peek_ref()? else { break };
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if decode_id {
+                    row_id(key)?;
+                }
+                true
+            };
+            if !ok {
+                break;
+            }
+            iter.step();
+            seen += 1;
+        }
+        Ok(seen)
     }
     /// Diagnostic only: (hits, attempts) of the per-keyspace append hints.
     #[doc(hidden)]
