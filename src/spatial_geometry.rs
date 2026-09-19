@@ -26,6 +26,38 @@
 //! search along the great-circle arc between the segment's endpoints,
 //! minimizing the exact Karney distance to the query point at each sample —
 //! no bearings, no pole singularity, ellipsoid-accurate at convergence.
+//!
+//! POSTGIS CONFORMANCE, `intersects` (spheroidal). A `geography` edge is the
+//! GEODESIC between its two vertices, which bows off the straight lon/lat
+//! line through them by up to `BULGE_METRES_PER_DEGREE_SQUARED · span²`
+//! metres. `segments_intersect_geodesic` used to test edge crossings on the
+//! flat lon/lat plane, which is the `geometry` edge model, not the
+//! `geography` one — so on the 50,000-row battle50k corpus E4 and PostGIS
+//! disagreed on eleven (query, row) pairs of `plot_intersects`, in both
+//! directions. Seven were planar-disjoint pairs the geodesic closes
+//! (`ST_Relate` `FF2FF1212`, `ST_Distance(geography)` 0 m): q0/p0029206,
+//! q28/p0046799, q35/p0029158, q39/p0007895, q43/p0001572, q43/p0010630,
+//! q45/p0018906. Four were planar slivers (down to 1.05 m²,
+//! `ST_Relate` `212101212`) the geodesic does not cut, with the two
+//! boundaries 0.63 m – 2.18 m apart on the spheroid: q32/p0016989,
+//! q32/p0022998, q42/p0018219, q46/p0007969. PostGIS is right on all
+//! eleven against this module's own documented semantics; the edge test is
+//! now a great-circle arc crossing (`great_circle_arcs_cross`) and all
+//! eleven agree. Fixtures: `tests/spatial_geometry_intersects_edge.rs`.
+//!
+//! Both halves of the test had the same flaw. Fixing only the edge crossing
+//! recovered the seven, and left the four: their sliver is cut by a polygon
+//! VERTEX, and the vertex-in-ring half (`point_in_ring_geodesic`) was
+//! ray-casting over straight lon/lat edges too, placing that vertex inside a
+//! ring it is geodesically outside. The two rings differ only in the lens
+//! between each straight edge and its own geodesic, so the ray cast is now
+//! followed by `ring_lens_parity`, which flips it for each lens the point is
+//! actually in — arithmetic-only for every point that is in none, which is
+//! every point but a handful.
+//!
+//! Verified end to end on the battery: `plot_intersects` returns 35,189 rows
+//! over the fifty query instances, key for key the same set PostGIS returns,
+//! on all fifty; `plot_dwithin_1km` is unchanged at 289, also key for key.
 
 use geographiclib_rs::{Geodesic, InverseGeodesic, PolygonArea, Winding};
 use kernel::spatial::Geom;
@@ -584,29 +616,271 @@ fn wrap180(v: f64) -> f64 {
     w - 180.0
 }
 
+// ── Cheap conservative bounds (the planar stage of the staged predicate) ──
+//
+// Every exact call in this module -- one Karney inverse per point pair, and
+// ~122 of them per point/segment golden-section search -- is now gated by a
+// closed-form bound that can only UNDER-state the true geodesic distance.
+// The exact routine runs when the bound falls inside a band; outside the
+// band the answer is settled by the bound alone. The band is stated at
+// `NEAR_BAND_M` together with why it cannot change an answer.
+
+/// Metres in one degree of latitude at its global WGS84 MINIMUM (the
+/// equator): the meridional radius of curvature there is `a(1-e²)` =
+/// 6,335,439 m, i.e. 110,574 m per degree. Every other latitude is larger,
+/// and one degree of longitude at latitude φ is `N cos φ` per radian with
+/// `N ≥ a`, i.e. at least `111,319 cos φ` > `110,574 cos φ` metres per
+/// degree. So the flat metric `110574 · sqrt(dφ² + cos²φ · dλ²)` (degrees)
+/// is pointwise dominated by the true WGS84 metric, and a straight-line
+/// distance measured in it is a lower bound on any path's true length.
+const MIN_METRES_PER_DEGREE: f64 = 110_574.0;
+
+/// How far a geodesic edge may bulge poleward of the straight lon/lat line
+/// between its own endpoints, in metres per (degree of span)². A great
+/// circle through two points of longitude span `Δλ` reaches
+/// `tan φ_max = tan φ / cos(Δλ/2)`, so the excursion is at most
+/// `(Δλ_rad/2)²/4` radians = `0.001091 · Δλ_deg²` degrees, i.e. under
+/// `122 · Δλ_deg²` metres. Subtracting it keeps the flat bound below the
+/// true distance to the CURVED edge, not merely to its straight chord.
+const BULGE_METRES_PER_DEGREE_SQUARED: f64 = 122.0;
+
+/// The staging band, in metres. Below it the exact spheroidal routine runs;
+/// at or above it the cheap bound answers on its own.
+///
+/// It cannot change an answer because every decision the bound short-circuits
+/// is taken at [`GEODESIC_TOUCH_EPS_M`] = 1e-6 m, a MILLION times smaller:
+/// the bound never over-states the true distance (see
+/// [`MIN_METRES_PER_DEGREE`] and [`BULGE_METRES_PER_DEGREE_SQUARED`]), so a
+/// pair whose true distance is under 1e-6 m always bounds under 1e-6 m, is
+/// always inside the band, and is always settled by the exact routine. The
+/// only thing the band trades is work: a pair between 1e-6 m and 1 m apart
+/// pays for an exact answer it did not strictly need.
+///
+/// `dwithin_m` passes its own radius instead of this constant, for the same
+/// reason and with the same guarantee: the bound is a lower bound, so a pair
+/// the bound puts beyond the radius is beyond it.
+const NEAR_BAND_M: f64 = 1.0;
+
+/// The smallest metres-per-degree-of-longitude factor that can apply
+/// anywhere on a short path between these latitudes: `cos` of the poleward
+/// extreme, with one degree of slack for a geodesic's own poleward bulge.
+/// Clamped at zero, which degrades the bound to its latitude term alone --
+/// still a valid lower bound, never an invalid one.
+fn min_lon_scale(lat_a: f64, lat_b: f64) -> f64 {
+    let poleward = (lat_a.abs().max(lat_b.abs()) + 1.0).min(90.0);
+    poleward.to_radians().cos().max(0.0)
+}
+
+/// A lower bound, in metres, on the true WGS84 geodesic distance between two
+/// lon/lat points. Never above the true distance.
+fn point_pair_lower_bound_m(a: [f64; 2], b: [f64; 2]) -> f64 {
+    let dlat = a[1] - b[1];
+    let dlon = wrap180(a[0] - b[0]) * min_lon_scale(a[1], b[1]);
+    MIN_METRES_PER_DEGREE * dlon.hypot(dlat)
+}
+
+/// The flat point-to-segment distance from `p` to `a → b` in the
+/// conservative scaled frame (never above the true planar distance), and
+/// that edge's own maximum poleward bulge — both in metres.
+fn flat_point_segment_and_bulge_m(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> (f64, f64) {
+    let scale = min_lon_scale(a[1].abs().max(b[1].abs()), p[1]);
+    let px = wrap180(p[0] - a[0]) * scale;
+    let py = p[1] - a[1];
+    let bx = wrap180(b[0] - a[0]) * scale;
+    let by = b[1] - a[1];
+    let len2 = bx * bx + by * by;
+    let (dx, dy) = if len2 <= 0.0 {
+        (px, py)
+    } else {
+        let t = ((px * bx + py * by) / len2).clamp(0.0, 1.0);
+        (px - t * bx, py - t * by)
+    };
+    let span = wrap180(b[0] - a[0]).abs().max((b[1] - a[1]).abs());
+    (
+        MIN_METRES_PER_DEGREE * dx.hypot(dy),
+        BULGE_METRES_PER_DEGREE_SQUARED * span * span,
+    )
+}
+
+/// A lower bound, in metres, on the true WGS84 geodesic distance from `p` to
+/// the geodesic edge `a → b`: the flat point-to-segment distance in the
+/// conservative scaled frame, less the edge's maximum poleward bulge.
+fn point_segment_lower_bound_m(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let (flat, bulge) = flat_point_segment_and_bulge_m(p, a, b);
+    (flat - bulge).max(0.0)
+}
+
+/// [`point_to_segment_geodesic_m`], but only when the cheap bound puts the
+/// pair inside `band`; otherwise the bound itself, which is already enough to
+/// answer "further away than `band`".
+fn point_to_segment_within(p: [f64; 2], a: [f64; 2], b: [f64; 2], band: f64) -> f64 {
+    let bound = point_segment_lower_bound_m(p, a, b);
+    if bound >= band {
+        return bound;
+    }
+    point_to_segment_geodesic_m(p[0], p[1], a[0], a[1], b[0], b[1])
+}
+
+/// [`geodesic_m`], but only when the cheap bound puts the pair inside `band`.
+fn point_pair_within(a: [f64; 2], b: [f64; 2], band: f64) -> f64 {
+    let bound = point_pair_lower_bound_m(a, b);
+    if bound >= band {
+        return bound;
+    }
+    geodesic_m(a[0], a[1], b[0], b[1])
+}
+
+// ── Great-circle edge crossing (3D, no trig per test beyond the vertices) ──
+
+fn cross3(u: [f64; 3], v: [f64; 3]) -> [f64; 3] {
+    [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ]
+}
+
+fn dot3(u: [f64; 3], v: [f64; 3]) -> f64 {
+    u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+}
+
+fn unit3(p: [f64; 2]) -> [f64; 3] {
+    let (x, y, z) = lonlat_to_vec(p[0], p[1]);
+    [x, y, z]
+}
+
+fn normalize3(v: [f64; 3]) -> Option<[f64; 3]> {
+    let n = dot3(v, v).sqrt();
+    if n < 1e-18 {
+        None
+    } else {
+        Some([v[0] / n, v[1] / n, v[2] / n])
+    }
+}
+
+/// Is the unit vector `p` on the minor arc `u1 → u2` whose plane normal is
+/// `n = u1 × u2`? Endpoints count, so a touch is an intersection.
+fn on_minor_arc(p: [f64; 3], u1: [f64; 3], u2: [f64; 3], n: [f64; 3]) -> bool {
+    dot3(cross3(u1, p), n) >= 0.0 && dot3(cross3(p, u2), n) >= 0.0
+}
+
+/// Do the two lon/lat boxes of these edges stay apart even after each edge is
+/// allowed its full poleward bulge? Then no crossing is possible and the 3D
+/// test is skipped. Longitudes are compared in a frame rotated to `a1`, so
+/// the antimeridian needs no special case.
+fn edge_boxes_disjoint(a1: [f64; 2], a2: [f64; 2], b1: [f64; 2], b2: [f64; 2]) -> bool {
+    let rel = |p: [f64; 2]| [wrap180(p[0] - a1[0]), p[1]];
+    let (a1r, a2r, b1r, b2r) = (rel(a1), rel(a2), rel(b1), rel(b2));
+    let pad = |p: [f64; 2], q: [f64; 2]| {
+        let span = (q[0] - p[0]).abs().max((q[1] - p[1]).abs());
+        // `BULGE_METRES_PER_DEGREE_SQUARED / MIN_METRES_PER_DEGREE` degrees
+        // per (degree of span)², rounded up.
+        0.0011 * span * span
+    };
+    let (pa, pb) = (pad(a1r, a2r), pad(b1r, b2r));
+    let (axl, axh) = (a1r[0].min(a2r[0]) - pa, a1r[0].max(a2r[0]) + pa);
+    let (ayl, ayh) = (a1r[1].min(a2r[1]) - pa, a1r[1].max(a2r[1]) + pa);
+    let (bxl, bxh) = (b1r[0].min(b2r[0]) - pb, b1r[0].max(b2r[0]) + pb);
+    let (byl, byh) = (b1r[1].min(b2r[1]) - pb, b1r[1].max(b2r[1]) + pb);
+    axh < bxl || bxh < axl || ayh < byl || byh < ayl
+}
+
+/// Do the two GREAT-CIRCLE arcs `a1→a2` and `b1→b2` cross or touch?
+///
+/// This is the spheroidal edge model PostGIS `geography` uses: an edge
+/// between two vertices is the geodesic between them, not the straight
+/// lon/lat line. Two great circles meet at an antipodal pair; the crossing
+/// exists iff one of that pair lies on both minor arcs. Nearly coplanar
+/// circles (`normalize3` failing, or a degenerate zero-length edge) return
+/// `false` here and are left to the touch-distance tests in
+/// [`geodesic_overlap`], which answer the collinear-overlap case directly.
+/// How many of a ring's LENSES does this point fall inside, in parity?
+///
+/// A ray cast over straight lon/lat edges answers for the wrong ring: a
+/// `geography` ring's edges are geodesics. The two rings enclose exactly the
+/// same area except in the lens between each straight edge and its own
+/// geodesic — a sliver at most `BULGE_METRES_PER_DEGREE_SQUARED · span²`
+/// metres wide, bounded by the two curves and closed at the edge's own
+/// endpoints. A point inside an odd number of those lenses is on the
+/// opposite side of the true ring from the planar answer, and a point inside
+/// none is classified identically by both, so the planar ray cast plus this
+/// parity IS the geodesic answer.
+///
+/// It is the cheap way round: the correction walks the ring once with a flat
+/// distance test that rejects every edge the point is not already within a
+/// few metres of, so a point anywhere but in a lens pays only arithmetic —
+/// where projecting the whole ring gnomonically about the point (the
+/// straightforward exact route) would pay four transcendentals per ring
+/// vertex for every candidate the walk ever looked at.
+///
+/// This is what closed the four remaining `plot_intersects` rows: PostGIS
+/// scored a planar sliver of 1.05 m² as no intersection at all, because the
+/// polygon vertex cutting it lies in the lens of the query ring's edge and
+/// is OUTSIDE the geodesic ring even though it is inside the straight one.
+fn ring_lens_parity(lon: f64, lat: f64, ring: &[[f64; 2]]) -> bool {
+    let p = [lon, lat];
+    let n = ring.len();
+    let mut flipped = false;
+    for i in 0..n {
+        let (a, b) = (ring[i], ring[(i + 1) % n]);
+        let (flat, bulge) = flat_point_segment_and_bulge_m(p, a, b);
+        if flat > bulge {
+            continue;
+        }
+        // Rotated to `a`'s longitude so the antimeridian needs no case.
+        let (ar, br, pr) = (
+            [0.0, a[1]],
+            [wrap180(b[0] - a[0]), b[1]],
+            [wrap180(p[0] - a[0]), p[1]],
+        );
+        let (bx, by) = (br[0] - ar[0], br[1] - ar[1]);
+        let len2 = bx * bx + by * by;
+        if len2 <= 0.0 {
+            continue;
+        }
+        // A lens is closed at its edge's endpoints: past either of them the
+        // straight line and the geodesic have already crossed back, and the
+        // region between their extensions is some OTHER edge's business.
+        let t = ((pr[0] - ar[0]) * bx + (pr[1] - ar[1]) * by) / len2;
+        if !(0.0..=1.0).contains(&t) {
+            continue;
+        }
+        let planar = cross(ar, br, pr);
+        let Some(normal) = normalize3(cross3(unit3(a), unit3(b))) else {
+            continue;
+        };
+        let geodesic = dot3(unit3(p), normal);
+        if planar != 0.0 && geodesic != 0.0 && (planar > 0.0) != (geodesic > 0.0) {
+            flipped = !flipped;
+        }
+    }
+    flipped
+}
+
+fn great_circle_arcs_cross(a1: [f64; 2], a2: [f64; 2], b1: [f64; 2], b2: [f64; 2]) -> bool {
+    let (u1, u2, v1, v2) = (unit3(a1), unit3(a2), unit3(b1), unit3(b2));
+    let (Some(na), Some(nb)) = (normalize3(cross3(u1, u2)), normalize3(cross3(v1, v2))) else {
+        return false;
+    };
+    let Some(p) = normalize3(cross3(na, nb)) else {
+        return false;
+    };
+    let q = [-p[0], -p[1], -p[2]];
+    (on_minor_arc(p, u1, u2, na) && on_minor_arc(p, v1, v2, nb))
+        || (on_minor_arc(q, u1, u2, na) && on_minor_arc(q, v1, v2, nb))
+}
+
 fn point_in_ring_geodesic(lon: f64, lat: f64, ring: &[[f64; 2]], boundary_inclusive: bool) -> bool {
     let n = ring.len();
     if n < 3 {
         return false;
     }
-    // The boundary check uses the TRUE great-circle edge (via
-    // `point_to_segment_geodesic_m`), not a straight lon/lat line: PostGIS
-    // `geography` edges are geodesics, and a point at the arithmetic
-    // lon/lat midpoint of two same-latitude vertices is measurably (here,
-    // ~1.2cm) off the true edge, which bulges toward the pole — verified
-    // live: PostGIS itself reports that pair's distance as ~0.012m, not 0,
-    // and `ST_Intersects(geography)` as `false`. No antimeridian rotation
-    // is needed here since `slerp`/Karney already work in 3D.
-    if boundary_inclusive {
-        for i in 0..n {
-            let j = (i + 1) % n;
-            if point_to_segment_geodesic_m(lon, lat, ring[i][0], ring[i][1], ring[j][0], ring[j][1]) < GEODESIC_TOUCH_EPS_M {
-                return true;
-            }
-        }
-    }
-    // Ray-casting for strict interior still needs the antimeridian-safe
-    // rotated frame (see `wrap180`'s doc).
+    // Ray-casting first, because the result is an OR and this half is pure
+    // arithmetic while the other half was, until this loop was reordered and
+    // gated, ~122 Karney inverses PER RING EDGE for every candidate the walk
+    // ever looked at — paid even by a point sitting a kilometre inside the
+    // ring. Ray-casting still needs the antimeridian-safe rotated frame (see
+    // `wrap180`'s doc).
     let ref_lon = ring[0][0];
     let rel = |x: f64| wrap180(x - ref_lon);
     let px = rel(lon);
@@ -620,7 +894,31 @@ fn point_in_ring_geodesic(lon: f64, lat: f64, ring: &[[f64; 2]], boundary_inclus
         }
         j = i;
     }
-    inside
+    // The ray cast just answered for the STRAIGHT-edged ring; this is the
+    // correction to the geodesic one (see `ring_lens_parity`).
+    if inside != ring_lens_parity(lon, lat, ring) {
+        return true;
+    }
+    if !boundary_inclusive {
+        return false;
+    }
+    // The boundary check uses the TRUE great-circle edge (via
+    // `point_to_segment_geodesic_m`), not a straight lon/lat line: PostGIS
+    // `geography` edges are geodesics, and a point at the arithmetic
+    // lon/lat midpoint of two same-latitude vertices is measurably (here,
+    // ~1.2cm) off the true edge, which bulges toward the pole — verified
+    // live: PostGIS itself reports that pair's distance as ~0.012m, not 0,
+    // and `ST_Intersects(geography)` as `false`. No antimeridian rotation
+    // is needed here since `slerp`/Karney already work in 3D. Every call is
+    // staged behind `NEAR_BAND_M`, which cannot move the 1e-6 m verdict.
+    let point = [lon, lat];
+    for i in 0..n {
+        let j = (i + 1) % n;
+        if point_to_segment_within(point, ring[i], ring[j], NEAR_BAND_M) < GEODESIC_TOUCH_EPS_M {
+            return true;
+        }
+    }
+    false
 }
 
 fn covers_point_polygon_geodesic(rings: &[Vec<[f64; 2]>], lon: f64, lat: f64) -> bool {
@@ -631,13 +929,26 @@ fn covers_point_polygon_geodesic(rings: &[Vec<[f64; 2]>], lon: f64, lat: f64) ->
     !rings[1..].iter().any(|hole| point_in_ring_geodesic(lon, lat, hole, false))
 }
 
-/// Segment intersection, re-expressed relative to `a1`'s longitude first —
-/// locally antimeridian-safe as long as neither segment spans close to 180°
-/// of longitude on its own (true of any realistic polygon/line edge).
+/// Do two `geography` edges meet? The edges are GEODESICS, so this is a
+/// great-circle arc crossing, not a straight-lon/lat-line crossing.
+///
+/// It used to be the latter: `segments_intersect` on the raw lon/lat plane,
+/// rotated to `a1`'s longitude for antimeridian safety. That is the planar
+/// `ST_Intersects(geometry)` edge model, and using it inside a predicate
+/// documented as `ST_Intersects(geography)` is what made E4 disagree with
+/// PostGIS on eleven rows of the 50K corpus — in BOTH directions, since a
+/// geodesic edge bows off the straight lon/lat line by up to
+/// `BULGE_METRES_PER_DEGREE_SQUARED · span²` metres and can therefore either
+/// close a planar gap or open a planar crossing. See this module's
+/// "PostGIS conformance" note for the ten keys.
+///
+/// A cheap lon/lat box test with each edge's own bulge allowance rejects
+/// almost every pair before any 3D work.
 fn segments_intersect_geodesic(a1: [f64; 2], a2: [f64; 2], b1: [f64; 2], b2: [f64; 2]) -> bool {
-    let ref_lon = a1[0];
-    let rel = |p: [f64; 2]| [wrap180(p[0] - ref_lon), p[1]];
-    segments_intersect(rel(a1), rel(a2), rel(b1), rel(b2))
+    if edge_boxes_disjoint(a1, a2, b1, b2) {
+        return false;
+    }
+    great_circle_arcs_cross(a1, a2, b1, b2)
 }
 
 /// Spherical linear interpolation between two `(lon, lat)` points at `t ∈ [0,1]`
@@ -715,6 +1026,12 @@ fn point_to_segment_geodesic_m(plon: f64, plat: f64, alon: f64, alat: f64, blon:
 /// and point-vs-line cases, which have no polygon ring or edge crossing to
 /// detect a touch with).
 fn geodesic_overlap(a: &Geom, b: &Geom) -> bool {
+    // Nothing below can fire across a gap the two bounding boxes already
+    // prove is wider than the touch epsilon, and a box test is four
+    // comparisons against O(n·m) edge work.
+    if boxes_apart_by_more_than(a, b, GEODESIC_TOUCH_EPS_M) {
+        return false;
+    }
     let (ca, cb) = (all_coords(a), all_coords(b));
     for rings in polygon_ring_sets(a) {
         if cb.iter().any(|c| covers_point_polygon_geodesic(rings, c[0], c[1])) {
@@ -730,16 +1047,44 @@ fn geodesic_overlap(a: &Geom, b: &Geom) -> bool {
     if ea.iter().any(|(a1, a2)| eb.iter().any(|(b1, b2)| segments_intersect_geodesic(*a1, *a2, *b1, *b2))) {
         return true;
     }
-    if ca.iter().any(|pa| cb.iter().any(|pb| geodesic_m(pa[0], pa[1], pb[0], pb[1]) < GEODESIC_TOUCH_EPS_M)) {
+    // The three touch tests below decide at `GEODESIC_TOUCH_EPS_M`, so every
+    // exact call is staged behind `NEAR_BAND_M` (a million times wider).
+    if ca.iter().any(|pa| cb.iter().any(|pb| point_pair_within(*pa, *pb, NEAR_BAND_M) < GEODESIC_TOUCH_EPS_M)) {
         return true;
     }
-    if ca.iter().any(|pa| eb.iter().any(|(b1, b2)| point_to_segment_geodesic_m(pa[0], pa[1], b1[0], b1[1], b2[0], b2[1]) < GEODESIC_TOUCH_EPS_M)) {
+    if ca.iter().any(|pa| eb.iter().any(|(b1, b2)| point_to_segment_within(*pa, *b1, *b2, NEAR_BAND_M) < GEODESIC_TOUCH_EPS_M)) {
         return true;
     }
-    if cb.iter().any(|pb| ea.iter().any(|(a1, a2)| point_to_segment_geodesic_m(pb[0], pb[1], a1[0], a1[1], a2[0], a2[1]) < GEODESIC_TOUCH_EPS_M)) {
+    if cb.iter().any(|pb| ea.iter().any(|(a1, a2)| point_to_segment_within(*pb, *a1, *a2, NEAR_BAND_M) < GEODESIC_TOUCH_EPS_M)) {
         return true;
     }
     false
+}
+
+/// Is every point of `a` further than `metres` from every point of `b`, on
+/// the evidence of their lon/lat bounding boxes alone? A conservative lower
+/// bound on the box-to-box separation, so `true` is always sound; `false`
+/// only means the boxes are close enough to need the real test.
+fn boxes_apart_by_more_than(a: &Geom, b: &Geom, metres: f64) -> bool {
+    let (Some(ba), Some(bb)) = (a.bbox(), b.bbox()) else {
+        return false;
+    };
+    let (axl, axh, ayl, ayh) = ba;
+    let (bxl, bxh, byl, byh) = bb;
+    // A box whose raw longitude span exceeds 180° is an antimeridian
+    // artefact, not a real extent; do not reject on it.
+    if axh - axl > 180.0 || bxh - bxl > 180.0 {
+        return false;
+    }
+    let dlat = (byl - ayh).max(ayl - byh).max(0.0);
+    let dlon = (wrap180(bxl - axh)).max(wrap180(axl - bxh)).max(0.0);
+    let scale = min_lon_scale(ayl.abs().max(ayh.abs()), byl.abs().max(byh.abs()));
+    // Each side may bulge poleward by up to this much; the boxes are built
+    // from vertices, so allow both.
+    let span = (axh - axl).max(ayh - ayl).max(bxh - bxl).max(byh - byl);
+    let bulge = BULGE_METRES_PER_DEGREE_SQUARED * span * span;
+    let bound = MIN_METRES_PER_DEGREE * (dlon * scale).hypot(dlat) - bulge;
+    bound > metres
 }
 
 /// `ST_Intersects(a::geography, b::geography)` — spheroidal, antimeridian-aware.
@@ -759,28 +1104,68 @@ pub fn distance_m(a: &Geom, b: &Geom) -> f64 {
     if geodesic_overlap(a, b) {
         return 0.0;
     }
+    nearest_within(a, b, f64::INFINITY).1
+}
+
+/// The shared engine of [`distance_m`] and [`dwithin_m`]: the minimum
+/// vertex/vertex and vertex/edge geodesic distance, with `(answered, value)`
+/// telling the caller whether some pair came in at or under `ceiling`.
+///
+/// Two economies, neither of which can move an answer. Every pair is first
+/// bounded by the closed-form lower bound: one already beyond `ceiling` is
+/// skipped, which is sound because the bound never over-states. And the
+/// vertex/vertex pairs (one Karney inverse each) run before the vertex/edge
+/// pairs (a golden-section search, ~122 inverses each), so a `dwithin`
+/// answered by a vertex never pays for a segment.
+fn nearest_within(a: &Geom, b: &Geom, ceiling: f64) -> (bool, f64) {
     let (ca, cb) = (all_coords(a), all_coords(b));
     let (ea, eb) = (all_edges(a), all_edges(b));
+    // With a finite ceiling the walk may stop at the first pair inside it;
+    // without one it must see every pair, and the running minimum is what
+    // prunes instead.
+    let bounded = ceiling.is_finite();
     let mut best = f64::INFINITY;
     for pa in &ca {
         for pb in &cb {
+            let cutoff = if bounded { ceiling } else { best };
+            if point_pair_lower_bound_m(*pa, *pb) > cutoff {
+                continue;
+            }
             best = best.min(geodesic_m(pa[0], pa[1], pb[0], pb[1]));
-        }
-        for (b1, b2) in &eb {
-            best = best.min(point_to_segment_geodesic_m(pa[0], pa[1], b1[0], b1[1], b2[0], b2[1]));
-        }
-    }
-    for pb in &cb {
-        for (a1, a2) in &ea {
-            best = best.min(point_to_segment_geodesic_m(pb[0], pb[1], a1[0], a1[1], a2[0], a2[1]));
+            if bounded && best <= ceiling {
+                return (true, best);
+            }
         }
     }
-    best
+    for (points, edges) in [(&ca, &eb), (&cb, &ea)] {
+        for p in points.iter() {
+            for (e1, e2) in edges.iter() {
+                let cutoff = if bounded { ceiling } else { best };
+                if point_segment_lower_bound_m(*p, *e1, *e2) > cutoff {
+                    continue;
+                }
+                best = best.min(point_to_segment_geodesic_m(p[0], p[1], e1[0], e1[1], e2[0], e2[1]));
+                if bounded && best <= ceiling {
+                    return (true, best);
+                }
+            }
+        }
+    }
+    (best <= ceiling, best)
 }
 
-/// `ST_DWithin(a::geography, b::geography, radius_metres)`.
+/// `ST_DWithin(a::geography, b::geography, radius_metres)`. Asks only the
+/// question it needs: it stops at the first pair inside the radius instead of
+/// finishing [`distance_m`]'s full minimum, and it never looks at a pair the
+/// cheap bound already places outside.
 pub fn dwithin_m(a: &Geom, b: &Geom, radius_metres: f64) -> bool {
-    distance_m(a, b) <= radius_metres
+    if boxes_apart_by_more_than(a, b, radius_metres) {
+        return false;
+    }
+    if geodesic_overlap(a, b) {
+        return true;
+    }
+    nearest_within(a, b, radius_metres).0
 }
 
 
