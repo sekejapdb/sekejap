@@ -58,6 +58,44 @@
 //! Verified end to end on the battery: `plot_intersects` returns 35,189 rows
 //! over the fifty query instances, key for key the same set PostGIS returns,
 //! on all fifty; `plot_dwithin_1km` is unchanged at 289, also key for key.
+//!
+//! POSTGIS CONFORMANCE, loop 2. A 1,020-pair adversarial fixture
+//! (`tests/spatial_postgis_conformance.rs`, PostGIS 3.6.4) found four more
+//! classes, all outside the city scale the 50K corpus exercises:
+//!
+//! - A point exactly on a ring's straight CHORD had no planar verdict for
+//!   `ring_lens_parity` to correct, so the answer was whatever the
+//!   degenerate ray-cast comparisons gave. The midpoint of a
+//!   constant-latitude edge is exactly that point, and the sign matters in
+//!   both directions: a north edge's geodesic bulges OUT of the ring, so its
+//!   chord midpoint is 2.7 cm INSIDE; a south edge's bulges IN, so its chord
+//!   midpoint is 2.7 cm OUTSIDE. `point_in_ring_geodesic` now answers such a
+//!   point from its side of that edge's own great circle against the ring's
+//!   winding.
+//! - `point_pair_lower_bound_m` was not a lower bound at long range: a
+//!   geodesic 178.8° wide in longitude climbs 78° poleward of its endpoints,
+//!   and a bound built on the endpoints' own cosine OVER-states it, so
+//!   `nearest_within` pruned the nearest vertex pair of an antimeridian
+//!   strip and answered 15,827,449.8 m where PostGIS said 15,744,708.6 m.
+//!   `min_lon_scale` now takes the span and uses [`max_bulge_deg`].
+//! - `BULGE_METRES_PER_DEGREE_SQUARED` is a small-angle series and stops
+//!   bounding the truth near a 30° span (2.45× under at 179.9°), so every
+//!   bulge allowance in the module now goes through [`max_bulge_deg`], which
+//!   is exact above [`EXACT_GEODESIC_SPAN_DEG`].
+//! - A ring with an edge wider than that, or one that encloses a pole, is
+//!   not answerable by a lon/lat ray cast at all. `point_in_ring_geodesic`
+//!   sends those to [`ring_winding_about`], the exact spherical winding,
+//!   which also identifies longitude ±180 with no seam case.
+//!
+//! The one thing loop 2 did NOT change is the edge model. A `geography`
+//! edge is the GREAT CIRCLE through its two vertices, with `(lon, lat)` read
+//! straight onto a sphere — not the WGS84 geodesic — and only distances
+//! between POINTS are spheroidal. `ST_ClosestPoint` on a 117.48°-wide edge
+//! returns a point on the great circle to fourteen decimals of a degree
+//! (`documented_postgis_edges_are_great_circles`), and replacing
+//! [`slerp_lonlat`] with Karney's direct solution moves that answer 39% off
+//! the server. `plot_intersects` still returns 35,189 rows and
+//! `plot_dwithin_1km` 289, key for key.
 
 use geographiclib_rs::{Geodesic, InverseGeodesic, PolygonArea, Winding};
 use kernel::spatial::Geom;
@@ -644,6 +682,59 @@ const MIN_METRES_PER_DEGREE: f64 = 110_574.0;
 /// true distance to the CURVED edge, not merely to its straight chord.
 const BULGE_METRES_PER_DEGREE_SQUARED: f64 = 122.0;
 
+/// Metres in one degree of latitude at its global WGS84 MAXIMUM (a pole):
+/// the meridional radius of curvature there is `a²/b` = 6,399,594 m, i.e.
+/// 111,694 m per degree. Rounded up, so a poleward excursion stated in
+/// degrees is never UNDER-stated once converted to metres — the direction a
+/// bulge allowance has to err in to stay an allowance.
+const MAX_METRES_PER_DEGREE: f64 = 111_700.0;
+
+/// The lon/lat span, in degrees, up to which the quadratic
+/// [`BULGE_METRES_PER_DEGREE_SQUARED`] is still an OVER-estimate of the true
+/// geodesic bulge, and up to which [`min_lon_scale`]'s one degree of slack
+/// still covers that bulge. Above it, both are computed exactly.
+///
+/// The exact maximum poleward excursion of a great circle whose endpoints
+/// are `Δλ` apart in longitude is `atan(1/√c) − atan(√c)` degrees, with
+/// `c = cos(Δλ/2)`: maximising `atan(tan φ / c) − φ` over `φ` gives
+/// `tan φ = √c`. Against the quadratic `0.001091·Δλ²` rad-series form that
+/// is 1.0002× at 5°, 1.0011× at 10°, 1.0114× at 30°, 1.23× at 117°, and
+/// 2.45× at 179.9°, so the series stops bounding the truth near 30° (the
+/// 122 m/deg² constant carries 1.1% of headroom over it). Five degrees is
+/// six-fold margin on that, and is small enough that no ring in a
+/// city-scale corpus ever leaves the cheap path: `plot_intersects`'s
+/// query rings and plot rings span hundredths of a degree.
+const EXACT_GEODESIC_SPAN_DEG: f64 = 5.0;
+
+/// An upper bound, in DEGREES of latitude, on how far a geodesic bows
+/// poleward of the straight lon/lat line between its endpoints, for an edge
+/// whose lon/lat span is `span` degrees. Quadratic below
+/// [`EXACT_GEODESIC_SPAN_DEG`] (and 1.1% over, see there); the exact
+/// great-circle maximum above it, so the value stays an upper bound out to a
+/// 179.9° span instead of under-stating it by 2.45×.
+fn max_bulge_deg(span: f64) -> f64 {
+    if span <= EXACT_GEODESIC_SPAN_DEG {
+        // `BULGE_METRES_PER_DEGREE_SQUARED / MIN_METRES_PER_DEGREE`, up.
+        return 0.0011 * span * span;
+    }
+    let c = (span.min(180.0).to_radians() / 2.0).cos();
+    if c <= 0.0 {
+        return 90.0;
+    }
+    let r = c.sqrt();
+    ((1.0 / r).atan() - r.atan()).to_degrees()
+}
+
+/// [`max_bulge_deg`] in METRES, at the largest metres-per-degree the
+/// ellipsoid has anywhere. Bit-identical to the old `122 · span²` below
+/// [`EXACT_GEODESIC_SPAN_DEG`].
+fn max_bulge_m(span: f64) -> f64 {
+    if span <= EXACT_GEODESIC_SPAN_DEG {
+        return BULGE_METRES_PER_DEGREE_SQUARED * span * span;
+    }
+    MAX_METRES_PER_DEGREE * max_bulge_deg(span)
+}
+
 /// The staging band, in metres. Below it the exact spheroidal routine runs;
 /// at or above it the cheap bound answers on its own.
 ///
@@ -662,12 +753,22 @@ const BULGE_METRES_PER_DEGREE_SQUARED: f64 = 122.0;
 const NEAR_BAND_M: f64 = 1.0;
 
 /// The smallest metres-per-degree-of-longitude factor that can apply
-/// anywhere on a short path between these latitudes: `cos` of the poleward
-/// extreme, with one degree of slack for a geodesic's own poleward bulge.
-/// Clamped at zero, which degrades the bound to its latitude term alone --
-/// still a valid lower bound, never an invalid one.
-fn min_lon_scale(lat_a: f64, lat_b: f64) -> f64 {
-    let poleward = (lat_a.abs().max(lat_b.abs()) + 1.0).min(90.0);
+/// anywhere on a path of lon/lat span `span` between these latitudes: `cos`
+/// of the poleward extreme, with slack for the geodesic's own poleward
+/// bulge -- one degree, or [`max_bulge_deg`] when the span makes that
+/// larger. Clamped at zero, which degrades the bound to its latitude term
+/// alone -- still a valid lower bound, never an invalid one.
+///
+/// The slack is not cosmetic. A geodesic between two points 178.8° apart in
+/// longitude climbs 78° poleward of them, where a degree of longitude is a
+/// fifth of what it is at the endpoints; a "bound" built on the endpoints'
+/// own cosine then OVER-states the true distance and
+/// [`nearest_within`] prunes the genuinely nearest vertex pair. That is the
+/// whole of the 0.5% antimeridian-distance class: E4 reported the distance
+/// to a strip's SOUTH vertices (15,827,449.799 m) because the bound had
+/// discarded its north ones (15,744,708.609 m, PostGIS's answer) as too far.
+fn min_lon_scale(lat_a: f64, lat_b: f64, span: f64) -> f64 {
+    let poleward = (lat_a.abs().max(lat_b.abs()) + max_bulge_deg(span).max(1.0)).min(90.0);
     poleward.to_radians().cos().max(0.0)
 }
 
@@ -675,7 +776,8 @@ fn min_lon_scale(lat_a: f64, lat_b: f64) -> f64 {
 /// lon/lat points. Never above the true distance.
 fn point_pair_lower_bound_m(a: [f64; 2], b: [f64; 2]) -> f64 {
     let dlat = a[1] - b[1];
-    let dlon = wrap180(a[0] - b[0]) * min_lon_scale(a[1], b[1]);
+    let raw = wrap180(a[0] - b[0]);
+    let dlon = raw * min_lon_scale(a[1], b[1], raw.abs().max(dlat.abs()));
     MIN_METRES_PER_DEGREE * dlon.hypot(dlat)
 }
 
@@ -683,10 +785,22 @@ fn point_pair_lower_bound_m(a: [f64; 2], b: [f64; 2]) -> f64 {
 /// conservative scaled frame (never above the true planar distance), and
 /// that edge's own maximum poleward bulge — both in metres.
 fn flat_point_segment_and_bulge_m(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> (f64, f64) {
-    let scale = min_lon_scale(a[1].abs().max(b[1].abs()), p[1]);
-    let px = wrap180(p[0] - a[0]) * scale;
+    // Two `wrap180` calls, both reused below: this is the hottest arithmetic
+    // in the module (`ring_lens_parity` runs it once per ring edge per
+    // candidate) and `wrap180` carries an `%`.
+    let prel = wrap180(p[0] - a[0]);
+    let brel = wrap180(b[0] - a[0]);
+    let edge_span = brel.abs().max((b[1] - a[1]).abs());
+    // The span the SCALE has to survive is the whole configuration's: the
+    // path whose length is bounded runs from `p` to the edge, so a longitude
+    // gap between them bulges exactly as an edge of that span does. `p`'s own
+    // reach plus the edge's covers every point of that path without a third
+    // `wrap180`.
+    let reach = prel.abs().max((p[1] - a[1]).abs()).max((p[1] - b[1]).abs());
+    let scale = min_lon_scale(a[1].abs().max(b[1].abs()), p[1], edge_span + reach);
+    let px = prel * scale;
     let py = p[1] - a[1];
-    let bx = wrap180(b[0] - a[0]) * scale;
+    let bx = brel * scale;
     let by = b[1] - a[1];
     let len2 = bx * bx + by * by;
     let (dx, dy) = if len2 <= 0.0 {
@@ -695,11 +809,7 @@ fn flat_point_segment_and_bulge_m(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> (f64
         let t = ((px * bx + py * by) / len2).clamp(0.0, 1.0);
         (px - t * bx, py - t * by)
     };
-    let span = wrap180(b[0] - a[0]).abs().max((b[1] - a[1]).abs());
-    (
-        MIN_METRES_PER_DEGREE * dx.hypot(dy),
-        BULGE_METRES_PER_DEGREE_SQUARED * span * span,
-    )
+    (MIN_METRES_PER_DEGREE * dx.hypot(dy), max_bulge_m(edge_span))
 }
 
 /// A lower bound, in metres, on the true WGS84 geodesic distance from `p` to
@@ -771,12 +881,7 @@ fn on_minor_arc(p: [f64; 3], u1: [f64; 3], u2: [f64; 3], n: [f64; 3]) -> bool {
 fn edge_boxes_disjoint(a1: [f64; 2], a2: [f64; 2], b1: [f64; 2], b2: [f64; 2]) -> bool {
     let rel = |p: [f64; 2]| [wrap180(p[0] - a1[0]), p[1]];
     let (a1r, a2r, b1r, b2r) = (rel(a1), rel(a2), rel(b1), rel(b2));
-    let pad = |p: [f64; 2], q: [f64; 2]| {
-        let span = (q[0] - p[0]).abs().max((q[1] - p[1]).abs());
-        // `BULGE_METRES_PER_DEGREE_SQUARED / MIN_METRES_PER_DEGREE` degrees
-        // per (degree of span)², rounded up.
-        0.0011 * span * span
-    };
+    let pad = |p: [f64; 2], q: [f64; 2]| max_bulge_deg((q[0] - p[0]).abs().max((q[1] - p[1]).abs()));
     let (pa, pb) = (pad(a1r, a2r), pad(b1r, b2r));
     let (axl, axh) = (a1r[0].min(a2r[0]) - pa, a1r[0].max(a2r[0]) + pa);
     let (ayl, ayh) = (a1r[1].min(a2r[1]) - pa, a1r[1].max(a2r[1]) + pa);
@@ -817,10 +922,22 @@ fn edge_boxes_disjoint(a1: [f64; 2], a2: [f64; 2], b1: [f64; 2], b2: [f64; 2]) -
 /// scored a planar sliver of 1.05 m² as no intersection at all, because the
 /// polygon vertex cutting it lies in the lens of the query ring's edge and
 /// is OUTSIDE the geodesic ring even though it is inside the straight one.
-fn ring_lens_parity(lon: f64, lat: f64, ring: &[[f64; 2]]) -> bool {
+///
+/// The decomposition needs the point to be OFF the straight ring, because
+/// it corrects a planar verdict and a point on the straight boundary has
+/// none: the ray cast's answer there is whatever the degenerate comparisons
+/// happen to give. That is not a corner case — it is every "point at the
+/// arithmetic midpoint of a constant-latitude edge" the fixture asks about.
+/// So the second return value carries the geodesic side of the chord the
+/// point is ON (`dot3(p, n)` for that edge's great circle, positive to the
+/// LEFT of a→b, the same sense as [`cross`]) whenever the point lies exactly
+/// on one, and the caller answers from the ring's own winding instead of
+/// from a parity correction to a verdict that does not exist.
+fn ring_lens_parity(lon: f64, lat: f64, ring: &[[f64; 2]]) -> (bool, Option<f64>) {
     let p = [lon, lat];
     let n = ring.len();
     let mut flipped = false;
+    let mut on_chord: Option<f64> = None;
     for i in 0..n {
         let (a, b) = (ring[i], ring[(i + 1) % n]);
         let (flat, bulge) = flat_point_segment_and_bulge_m(p, a, b);
@@ -850,11 +967,19 @@ fn ring_lens_parity(lon: f64, lat: f64, ring: &[[f64; 2]]) -> bool {
             continue;
         };
         let geodesic = dot3(unit3(p), normal);
-        if planar != 0.0 && geodesic != 0.0 && (planar > 0.0) != (geodesic > 0.0) {
+        if planar == 0.0 {
+            // On the chord. A meridian edge has `geodesic == 0.0` too (a
+            // meridian IS its own geodesic) and needs no correction at all.
+            if geodesic != 0.0 && on_chord.is_none() {
+                on_chord = Some(geodesic);
+            }
+            continue;
+        }
+        if geodesic != 0.0 && (planar > 0.0) != (geodesic > 0.0) {
             flipped = !flipped;
         }
     }
-    flipped
+    (flipped, on_chord)
 }
 
 fn great_circle_arcs_cross(a1: [f64; 2], a2: [f64; 2], b1: [f64; 2], b2: [f64; 2]) -> bool {
@@ -868,6 +993,58 @@ fn great_circle_arcs_cross(a1: [f64; 2], a2: [f64; 2], b1: [f64; 2], b2: [f64; 2
     let q = [-p[0], -p[1], -p[2]];
     (on_minor_arc(p, u1, u2, na) && on_minor_arc(p, v1, v2, nb))
         || (on_minor_arc(q, u1, u2, na) && on_minor_arc(q, v1, v2, nb))
+}
+
+/// Signed winding of `ring` about the point, in radians: the sum of the
+/// signed angles `∠(Vᵢ, P, Vᵢ₊₁)` measured in P's own tangent plane. `0` when
+/// the ring does not enclose P, `±2π` when it does.
+///
+/// This is the exact `geography` answer, and it is exact for the two things
+/// the lon/lat ray cast plus [`ring_lens_parity`] cannot represent at all:
+///
+/// - an edge of large longitude span, whose geodesic leaves the straight
+///   lon/lat line by degrees rather than by the millimetres the lens
+///   correction is scaled for — a 117°-wide edge at latitude 29.5° tops out
+///   at latitude 47.5°, eighteen degrees off its own chord;
+/// - a ring that encloses a POLE, which no lon/lat ray cast can see: the
+///   three vertices of a 120°-spaced triangle at latitude 71° enclose the
+///   north pole on the sphere and enclose nothing on the lon/lat plane.
+///
+/// It also identifies longitude ±180 without a seam case, because both map
+/// to the same unit vector — which is exactly how PostGIS `geography` reads
+/// a GeoJSON rectangle spanning −180..180 as a polar sliver rather than a
+/// world cap.
+///
+/// `None` when a vertex coincides with P or with P's antipode, where the
+/// tangent-plane direction is undefined. The caller then falls back to the
+/// boundary test, which is the right answer for a vertex hit.
+fn ring_winding_about(p: [f64; 2], ring: &[[f64; 2]]) -> Option<f64> {
+    let up = unit3(p);
+    let tangent = |v: [f64; 2]| {
+        let u = unit3(v);
+        let d = dot3(u, up);
+        normalize3([u[0] - d * up[0], u[1] - d * up[1], u[2] - d * up[2]])
+    };
+    let n = ring.len();
+    let mut prev = tangent(ring[n - 1])?;
+    let mut sum = 0.0;
+    for v in ring.iter() {
+        let cur = tangent(*v)?;
+        sum += dot3(up, cross3(prev, cur)).atan2(dot3(prev, cur));
+        prev = cur;
+    }
+    Some(sum)
+}
+
+/// Is the point within [`GEODESIC_TOUCH_EPS_M`] of the ring's own geodesic
+/// boundary? Staged behind [`NEAR_BAND_M`], a million times wider, which
+/// cannot move that verdict.
+fn ring_boundary_touch(lon: f64, lat: f64, ring: &[[f64; 2]]) -> bool {
+    let point = [lon, lat];
+    let n = ring.len();
+    (0..n).any(|i| {
+        point_to_segment_within(point, ring[i], ring[(i + 1) % n], NEAR_BAND_M) < GEODESIC_TOUCH_EPS_M
+    })
 }
 
 fn point_in_ring_geodesic(lon: f64, lat: f64, ring: &[[f64; 2]], boundary_inclusive: bool) -> bool {
@@ -885,18 +1062,58 @@ fn point_in_ring_geodesic(lon: f64, lat: f64, ring: &[[f64; 2]], boundary_inclus
     let rel = |x: f64| wrap180(x - ref_lon);
     let px = rel(lon);
     let mut inside = false;
+    let (mut xlo, mut xhi) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut ylo, mut yhi) = (f64::INFINITY, f64::NEG_INFINITY);
     let mut j = n - 1;
     for i in 0..n {
         let (xi, yi) = (rel(ring[i][0]), ring[i][1]);
         let (xj, yj) = (rel(ring[j][0]), ring[j][1]);
+        xlo = xlo.min(xi);
+        xhi = xhi.max(xi);
+        ylo = ylo.min(yi);
+        yhi = yhi.max(yi);
         if ((yi > lat) != (yj > lat)) && (px < (xj - xi) * (lat - yi) / (yj - yi) + xi) {
             inside = !inside;
         }
         j = i;
     }
+    // Two rings are outside what a lon/lat ray cast plus a lens correction
+    // can answer at all: one with an edge spanning more than
+    // `EXACT_GEODESIC_SPAN_DEG` (past there the lens is degrees wide, not
+    // metres, and `flat > bulge` stops even looking at it), and one that
+    // encloses a POLE, which the plane cannot see. The ring's own extent in
+    // the rotated frame decides both, at four comparisons per vertex and no
+    // extra `wrap180`: no edge can span more than the extent, and a ring
+    // whose longitudes all sit inside a window that narrow has a longitude
+    // turn of exactly zero (the differences telescope), so it encloses no
+    // pole. The test is one-sided — it can send a wide ring of short edges
+    // down the exact path, which is correct, only slower — and every ring in
+    // a city-scale corpus stays on the arithmetic-only path below.
+    if (xhi - xlo).max(yhi - ylo) > EXACT_GEODESIC_SPAN_DEG {
+        if ring_winding_about([lon, lat], ring).is_some_and(|w| w.abs() > std::f64::consts::PI) {
+            return true;
+        }
+        return boundary_inclusive && ring_boundary_touch(lon, lat, ring);
+    }
     // The ray cast just answered for the STRAIGHT-edged ring; this is the
     // correction to the geodesic one (see `ring_lens_parity`).
-    if inside != ring_lens_parity(lon, lat, ring) {
+    let (flipped, on_chord) = ring_lens_parity(lon, lat, ring);
+    if let Some(geodesic_side) = on_chord {
+        // The point is ON one straight edge, so there is no planar verdict to
+        // correct: answer from that edge alone. A ring's interior is to the
+        // LEFT of every directed edge when the ring winds counter-clockwise,
+        // and `geodesic_side` is positive to the left of the edge's own great
+        // circle — so a constant-latitude north edge, whose geodesic bulges
+        // poleward and therefore OUT of the ring, leaves its chord's midpoint
+        // 2.7 cm inside; a south edge's chord midpoint is 2.7 cm outside.
+        // Both verified against PostGIS 3.6 (`docs/SPATIAL_FUNCTIONS.md`).
+        let ccw = ring_centroid_and_signed_area_rel(ring, ref_lon).2 > 0.0;
+        if (geodesic_side > 0.0) == ccw {
+            return true;
+        }
+        return boundary_inclusive && ring_boundary_touch(lon, lat, ring);
+    }
+    if inside != flipped {
         return true;
     }
     if !boundary_inclusive {
@@ -911,14 +1128,7 @@ fn point_in_ring_geodesic(lon: f64, lat: f64, ring: &[[f64; 2]], boundary_inclus
     // and `ST_Intersects(geography)` as `false`. No antimeridian rotation
     // is needed here since `slerp`/Karney already work in 3D. Every call is
     // staged behind `NEAR_BAND_M`, which cannot move the 1e-6 m verdict.
-    let point = [lon, lat];
-    for i in 0..n {
-        let j = (i + 1) % n;
-        if point_to_segment_within(point, ring[i], ring[j], NEAR_BAND_M) < GEODESIC_TOUCH_EPS_M {
-            return true;
-        }
-    }
-    false
+    ring_boundary_touch(lon, lat, ring)
 }
 
 fn covers_point_polygon_geodesic(rings: &[Vec<[f64; 2]>], lon: f64, lat: f64) -> bool {
@@ -989,6 +1199,18 @@ fn slerp_lonlat(a: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
 /// polygon/line edge).
 fn point_to_segment_geodesic_m(plon: f64, plat: f64, alon: f64, alat: f64, blon: f64, blat: f64) -> f64 {
     let (a, b) = ([alon, alat], [blon, blat]);
+    // The sample walks the GREAT CIRCLE, not the ellipsoidal geodesic, and
+    // that is not an approximation: a PostGIS `geography` edge IS the great
+    // circle through its two vertices, with `(lon, lat)` read straight onto
+    // the sphere, and only the distances between POINTS are spheroidal.
+    // Measured, not assumed: for the 117.48°-wide edge at latitude
+    // 29.503844920576796 in `tests/spatial_postgis_conformance.rs`
+    // (`documented_postgis_edges_are_great_circles`), the great circle tops
+    // out at latitude 47.475329 — `ST_ClosestPoint(...::geography)` on this
+    // server returns `POINT(80.86411847825508 47.475329257577954)` — while
+    // the WGS84 geodesic between the same two vertices tops out at
+    // 47.566990, 10.2 km further north. Interpolating along the geodesic
+    // instead moves the answer from PostGIS's 25,246.58 m to 35,223.56 m.
     let f = |t: f64| {
         let q = slerp_lonlat(a, b, t);
         geodesic_m(plon, plat, q[0], q[1])
@@ -1078,12 +1300,17 @@ fn boxes_apart_by_more_than(a: &Geom, b: &Geom, metres: f64) -> bool {
     }
     let dlat = (byl - ayh).max(ayl - byh).max(0.0);
     let dlon = (wrap180(bxl - axh)).max(wrap180(axl - bxh)).max(0.0);
-    let scale = min_lon_scale(ayl.abs().max(ayh.abs()), byl.abs().max(byh.abs()));
     // Each side may bulge poleward by up to this much; the boxes are built
-    // from vertices, so allow both.
-    let span = (axh - axl).max(ayh - ayl).max(bxh - bxl).max(byh - byl);
-    let bulge = BULGE_METRES_PER_DEGREE_SQUARED * span * span;
-    let bound = MIN_METRES_PER_DEGREE * (dlon * scale).hypot(dlat) - bulge;
+    // from vertices, so allow both. `span` also has to reach across the gap:
+    // the path being bounded runs from one box to the other.
+    let span = (axh - axl)
+        .max(ayh - ayl)
+        .max(bxh - bxl)
+        .max(byh - byl)
+        .max(dlon)
+        .max(dlat);
+    let scale = min_lon_scale(ayl.abs().max(ayh.abs()), byl.abs().max(byh.abs()), span);
+    let bound = MIN_METRES_PER_DEGREE * (dlon * scale).hypot(dlat) - max_bulge_m(span);
     bound > metres
 }
 

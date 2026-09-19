@@ -124,10 +124,10 @@ fn dwithin_matches_postgis_at_every_fixture_radius() {
 }
 
 /// `ST_Within`/`ST_Contains`/`ST_Covers`/`ST_Crosses`/`ST_Intersects` (both
-/// forms) must match exactly (boolean, no tolerance) across every pair,
-/// EXCEPT the one documented edge case in
-/// [`geodesic_interior_classification_disagrees_at_the_millimetre_scale`]
-/// below, which explains why and is not silently skipped.
+/// forms) must match exactly (boolean, no tolerance) across every pair. The
+/// `poly_nyc_small` / `p_on_poly_edge` exception this test used to carry is
+/// gone: see
+/// [`geodesic_interior_classification_matches_postgis_at_the_centimetre_scale`].
 #[test]
 fn predicates_match_postgis_exactly() {
     let fx = load();
@@ -138,35 +138,41 @@ fn predicates_match_postgis_exactly() {
         assert_eq!(contains(a, b), p["contains"].as_bool().unwrap(), "{a_id}/{b_id}: contains");
         assert_eq!(covers(a, b), p["covers"].as_bool().unwrap(), "{a_id}/{b_id}: covers");
         assert_eq!(crosses(a, b), p["crosses"].as_bool().unwrap(), "{a_id}/{b_id}: crosses");
-        if (a_id, b_id) != ("poly_nyc_small", "p_on_poly_edge") && (a_id, b_id) != ("p_on_poly_edge", "poly_nyc_small") {
-            assert_eq!(intersects(a, b), p["intersects_geography"].as_bool().unwrap(), "{a_id}/{b_id}: intersects(geography)");
-        }
+        assert_eq!(intersects(a, b), p["intersects_geography"].as_bool().unwrap(), "{a_id}/{b_id}: intersects(geography)");
         assert_eq!(intersects_planar(a, b), p["intersects_geometry"].as_bool().unwrap(), "{a_id}/{b_id}: intersects(geometry)");
     }
 }
 
-/// Documents a real, narrow limitation rather than papering over it: this
-/// module's `intersects`/`distance_m` classify a point's interior-vs-exterior
-/// relationship to a geodesic polygon using a ray-cast over the RAW lon/lat
-/// ring (only the boundary-touch check uses the true great-circle edge, via
-/// [`point_to_segment_geodesic_m`]-style logic). `p_on_poly_edge` sits at the
-/// exact arithmetic lon/lat midpoint of `poly_nyc_small`'s south edge — on
-/// the FLAT edge, but the true geodesic edge between two same-latitude points
-/// bulges slightly poleward, so the true edge is a hair north of this point.
-/// PostGIS's own `ST_Distance(geography)` agrees the point is measurably
-/// (~1.2cm) outside; this module's `intersects`/`distance_m` currently read
-/// it as touching, because the ray-cast interior classification doesn't
-/// account for that bulge. Scale: millimetres to centimetres, only for
-/// points within roughly that distance of an edge that runs along a
-/// constant latitude — see `docs/SPATIAL_FUNCTIONS.md` and the final report.
+/// The former limitation, now closed, kept as the case that proves it.
+///
+/// `p_on_poly_edge` sits at the exact arithmetic lon/lat midpoint of
+/// `poly_nyc_small`'s SOUTH edge — on the flat chord, but the geodesic
+/// between two same-latitude vertices bulges POLEWARD, i.e. northward, i.e.
+/// INTO this ring, so the chord's midpoint is a centimetre OUTSIDE the
+/// geography polygon. PostGIS says 0.01197727 m and `ST_Intersects` false.
+///
+/// This module used to answer "touching": its interior classification was a
+/// ray cast over the raw lon/lat ring corrected by `ring_lens_parity`, and
+/// that correction has no planar verdict to correct for a point sitting
+/// exactly ON the straight ring. It now answers from the point's side of
+/// that edge's own great circle, against the ring's winding
+/// (`point_in_ring_geodesic`, `src/spatial_geometry.rs`), which is the same
+/// arithmetic in both directions: the midpoint of a NORTH edge is a
+/// centimetre INSIDE, and PostGIS 3.6 agrees (see
+/// `tests/spatial_postgis_conformance.rs`,
+/// `documented_constant_latitude_edge_midpoints`).
 #[test]
-fn geodesic_interior_classification_disagrees_at_the_millimetre_scale() {
+fn geodesic_interior_classification_matches_postgis_at_the_centimetre_scale() {
     let fx = load();
     let a = &fx.geoms["poly_nyc_small"];
     let b = &fx.geoms["p_on_poly_edge"];
-    assert_eq!(distance_m(a, b), 0.0, "this module currently reads the point as touching");
     let live_distance_m = 0.01197727; // captured from the live server; see docs/SPATIAL_FUNCTIONS.md
-    assert!(live_distance_m > 0.0 && live_distance_m < 0.02, "PostGIS itself reports a small nonzero distance here");
+    let got = distance_m(a, b);
+    assert!(
+        (got - live_distance_m).abs() <= 1e-3 || (got - live_distance_m).abs() / live_distance_m <= 1e-6,
+        "south-edge chord midpoint: e4 distance_m={got} postgis={live_distance_m}"
+    );
+    assert!(!intersects(a, b), "the chord midpoint of a south edge is outside the geography ring");
 }
 
 /// Centroids: Point/MultiPoint/LineString/MultiLineString use a spherical
