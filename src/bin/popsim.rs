@@ -472,7 +472,8 @@ pub struct E4Ctx {
     fullname: IndexId,
     born: IndexId,
     addr: IndexId,
-    plot: IndexId,
+    /// The plot geometry index, absent when a reused corpus predates it.
+    plot: Option<IndexId>,
     rows: u64,
 }
 
@@ -842,7 +843,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
             e4_ids(
                 c,
                 &[QueryFilter::Geometry {
-                    index: c.plot,
+                    index: c.plot.ok_or("no plot index in this corpus")?,
                     predicate: GeometryFilter::Within(box_polygon()),
                 }],
                 QueryOrder::Driver,
@@ -853,7 +854,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
             e4_ids(
                 c,
                 &[QueryFilter::Geometry {
-                    index: c.plot,
+                    index: c.plot.ok_or("no plot index in this corpus")?,
                     predicate: GeometryFilter::Intersects(radius_poly(10_000.0)),
                 }],
                 QueryOrder::Driver,
@@ -864,7 +865,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
             e4_ids(
                 c,
                 &[QueryFilter::Geometry {
-                    index: c.plot,
+                    index: c.plot.ok_or("no plot index in this corpus")?,
                     predicate: GeometryFilter::Contains(centre_point()),
                 }],
                 QueryOrder::Driver,
@@ -875,7 +876,7 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
             e4_ids(
                 c,
                 &[QueryFilter::Geometry {
-                    index: c.plot,
+                    index: c.plot.ok_or("no plot index in this corpus")?,
                     predicate: GeometryFilter::DWithin {
                         geometry: centre_point(),
                         metres: 2_000.0,
@@ -1060,7 +1061,7 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
             fullname,
             born,
             addr,
-            plot,
+            plot: Some(plot),
             rows,
         },
         stages,
@@ -1101,7 +1102,7 @@ fn open_e4(root: &Path, rows: u64, cache_bytes: usize) -> R<(E4Ctx, Value)> {
         fullname: fullname.ok_or("--reuse: no fullname_text index")?,
         born: born.ok_or("--reuse: no born_idx index")?,
         addr: addr.ok_or("--reuse: no addr_point index")?,
-        plot: plot.ok_or("--reuse: no plot_geo index")?,
+        plot,
         rows,
     };
     let open_s = at.elapsed().as_secs_f64();
@@ -1437,12 +1438,12 @@ fn open_lite(root: &Path, cache_bytes: usize) -> R<(Connection, Value)> {
     let at = Instant::now();
     let connection = lite_connect(root, cache_bytes)?;
     let tables: i64 = connection.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE name IN ('person','person_fts','person_geo','idx_born','person_plot')",
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('person','person_fts','person_geo','idx_born')",
         [],
         |r| r.get(0),
     )?;
-    if tables != 5 {
-        return Err(format!("--reuse: {} of the 5 expected SQLite objects present", tables).into());
+    if tables != 4 {
+        return Err(format!("--reuse: {} of the 4 expected SQLite objects present", tables).into());
     }
     let open_s = at.elapsed().as_secs_f64();
     eprintln!("[sqlite] reopened {} in {open_s:.3}s; queries only", root.display());
@@ -1865,8 +1866,8 @@ fn open_pg(root: &Path, dsn_base: &str) -> R<(Client, Value, String, String)> {
             &[],
         )?
         .get(0);
-    if indexes < 4 {
-        return Err(format!("--reuse: {db_name} has {indexes} indexes on person, expected 4").into());
+    if indexes < 3 {
+        return Err(format!("--reuse: {db_name} has {indexes} indexes on person, expected at least 3").into());
     }
     let open_s = at.elapsed().as_secs_f64();
     eprintln!("[postgres] reopened {db_name} in {open_s:.3}s; queries only");
@@ -2089,6 +2090,9 @@ pub struct Options {
     pub root: PathBuf,
     pub batch: u64,
     pub only: Option<String>,
+    /// Skip every case whose name contains this (a reused corpus that
+    /// predates a field cannot answer the cases over it).
+    pub without: Option<String>,
     pub reps: usize,
     pub case_budget: Duration,
     pub cache_bytes: usize,
@@ -2109,6 +2113,7 @@ impl Options {
             root: root.into(),
             batch: BATCH,
             only: None,
+            without: None,
             reps: 5,
             case_budget: Duration::from_secs(300),
             cache_bytes: CACHE_BYTES,
@@ -2140,6 +2145,10 @@ pub fn run_arm(options: &Options) -> R<Value> {
             .only
             .as_deref()
             .is_none_or(|needle| name.contains(needle))
+            && options
+                .without
+                .as_deref()
+                .is_none_or(|needle| !name.contains(needle))
     };
 
     let mut measured = Vec::new();
@@ -2278,7 +2287,7 @@ pub fn run_arm(options: &Options) -> R<Value> {
 
 fn usage() -> String {
     "usage: popsim e4|sqlite|postgres <rows> <fresh-dir> [--batch N] [--only substr] \
-     [--reps N] [--case-budget SECS] [--cache-bytes N] [--reuse] [--dsn URL]"
+     [--reps N] [--case-budget SECS] [--cache-bytes N] [--reuse] [--without substr] [--dsn URL]"
         .into()
 }
 
@@ -2295,6 +2304,7 @@ fn parse(args: &[String]) -> R<Options> {
         match flag.as_str() {
             "--batch" => options.batch = value()?.parse()?,
             "--only" => options.only = Some(value()?),
+            "--without" => options.without = Some(value()?),
             "--reps" => options.reps = value()?.parse()?,
             "--case-budget" => options.case_budget = Duration::from_secs(value()?.parse()?),
             "--cache-bytes" => options.cache_bytes = value()?.parse()?,
