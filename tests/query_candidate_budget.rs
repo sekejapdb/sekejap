@@ -903,7 +903,7 @@ fn wide_fixture(dir: &std::path::Path) -> Wide {
 ///
 /// The second predicate is JSON equality rather than a scalar range on
 /// purpose: a non-driving scalar RANGE now answers from a posting-built id
-/// set instead of the row (see `ScalarRangeSet`), so it no longer walks the
+/// set instead of the row (see `MembershipSet`), so it no longer walks the
 /// primary tree at all and cannot stand in for "a predicate that needs the
 /// row" any more. JSON equality still can.
 ///
@@ -1271,7 +1271,7 @@ fn a_text_driven_pages_non_driving_range_reads_no_row() {
 ///
 /// The fallback is forced by a `scalar_postings` budget of zero: the walk
 /// that would build the set cannot afford its first posting, so
-/// `ensure_scalar_range_sets` steps back to `ScalarRangeSet::Overflow` and
+/// `ensure_membership_sets` steps back to `MembershipSet::Overflow` and
 /// every candidate reads its row exactly as it did before this file's
 /// changes -- the same budget that a non-driving range never spent then, and
 /// still does not spend now that the walk failed to afford it.

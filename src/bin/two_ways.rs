@@ -55,7 +55,7 @@ use e4_prototype::{
     collections::{
         BfsRequest, CandidateDriver, CollectionId, CollectionOptions, Database, Direction,
         EdgeTypeId, EntityId, GraphContextId, IndexId, NeighborRequest, PointFilter, Projection,
-        QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue,
+        QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue, ScoreExpr,
         SortDirection, TextMatch, VectorMetric,
     },
     spatial_math::Point,
@@ -600,9 +600,32 @@ fn cases() -> Vec<Case> {
         &[text_filter(c.note, "railway", TextMatch::Any)],
         QueryOrder::ExactVector { index: c.emb, query: &[0.5, 0.5, 0.5], metric: VectorMetric::SquaredL2 },
         Projection::Ids, Some(50), CandidateDriver::Filter(0)), None, true),
-    no("win", "hybrid",
-        "QueryOrder ranks by ONE key; there is no score expression combining BM25 and vector distance",
-        None),
+    run("win", "hybrid", |c| {
+        let query = [0.5f32, 0.5, 0.5];
+        let half = ScoreExpr::Lit(0.5);
+        let bm25 = ScoreExpr::Bm25 {
+            index: c.note,
+            query: "railway",
+            matching: TextMatch::Any,
+        };
+        let vec = ScoreExpr::VectorSimilarity {
+            index: c.emb,
+            query: &query,
+            metric: VectorMetric::SquaredL2,
+        };
+        let text_term = ScoreExpr::Mul(&half, &bm25);
+        let vec_term = ScoreExpr::Mul(&half, &vec);
+        let expr = ScoreExpr::Add(&text_term, &vec_term);
+        ids(
+            c,
+            &[],
+            QueryOrder::Score {
+                expr: &expr,
+                direction: SortDirection::Descending,
+            },
+            Some(10),
+        )
+    }, None, true),
 
     // ── mixed: the shapes real applications write ──────────────────────────
     run("mixed", "filter_order_limit", |c| ids(c, &[eq_text(c.cat, "cafe")], order_by(c.rating, false), Some(10)),

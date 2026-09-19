@@ -91,7 +91,7 @@ pub use query::{
     ApproximationDiagnostics, CandidateDriver, Geom, GeometryFilter, OrderValue, OwnedScalarValue,
     PointFilter, PreparedQuery, ProjectedValue, Projection, QueryBudget, QueryDriver, QueryError,
     QueryFilter, QueryOrder, QueryPage, QueryRequest, QueryResult, QueryRow, QueryWork,
-    ScalarFilter, ScalarValue, SortDirection, WorkResource,
+    ScalarFilter, ScalarValue, ScoreExpr, SortDirection, WorkResource,
 };
 pub use spatial_indexes::{SpatialCandidates, SpatialHit};
 pub use text_indexes::{TextCandidates, TextHit, TextMatch};

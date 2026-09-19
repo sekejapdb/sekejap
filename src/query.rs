@@ -21,6 +21,8 @@ use std::{
 pub use kernel::spatial::Geom;
 
 const MAX_FILTERS: usize = 64;
+const MAX_SCORE_DEPTH: usize = 32;
+const MAX_SCORE_LEAVES: usize = 8;
 const MAX_PROJECTION_FIELDS: usize = 64;
 const MAX_PAGE_SIZE: usize = 8192;
 const MAX_FIELD_BYTES: usize = 128;
@@ -183,6 +185,55 @@ pub enum QueryOrder<'a> {
         center: Point,
         direction: SortDirection,
     },
+    /// Rank by a combined arithmetic expression over index leaves.
+    ///
+    /// Filters still choose the candidate set. The expression is evaluated
+    /// per surviving candidate. `ScoreExpr::VectorSimilarity` is higher-is-
+    /// better: Cosine, NegativeDot and SquaredL2 all map the exact-index
+    /// sidecar **distance** to `-distance` (Cosine distance is `1 - cos`;
+    /// NegativeDot distance is `-dot`; SquaredL2 is squared Euclidean).
+    Score {
+        expr: &'a ScoreExpr<'a>,
+        direction: SortDirection,
+    },
+}
+
+/// Arithmetic score expression compiled by Phase-3 SQL `ORDER BY <expr>`.
+///
+/// Index leaves must belong to the request collection and the matching
+/// family. Depth is capped at 32; leaf count (including literals) at 8.
+/// Division by zero yields `NaN`, and `NaN` sorts last under both directions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScoreExpr<'a> {
+    Lit(f64),
+    /// Numeric scalar index value of the candidate. I64 and F64 coerce to
+    /// `f64`; Bool is `0.0`/`1.0`; missing or null is `0.0`. Text scalars are
+    /// refused at prepare.
+    Scalar { index: IndexId },
+    /// BM25 of `query` over `index`. A candidate that does not match scores
+    /// `0.0` rather than dropping out of the ranking.
+    Bm25 {
+        index: IndexId,
+        query: &'a str,
+        matching: TextMatch,
+    },
+    /// Exact-vector similarity. Higher is better: the leaf is `-distance`
+    /// from the authoritative f32 sidecar the ExactVector order already
+    /// reads. A missing locator scores `f64::NEG_INFINITY` (the worst value
+    /// under both directions); a zero-norm stored cosine vector scores `0.0`.
+    VectorSimilarity {
+        index: IndexId,
+        query: &'a [f32],
+        metric: VectorMetric,
+    },
+    /// Geodesic metres from `center` on a point index. A missing point
+    /// scores `f64::INFINITY`.
+    Distance { index: IndexId, center: Point },
+    Add(&'a ScoreExpr<'a>, &'a ScoreExpr<'a>),
+    Sub(&'a ScoreExpr<'a>, &'a ScoreExpr<'a>),
+    Mul(&'a ScoreExpr<'a>, &'a ScoreExpr<'a>),
+    Div(&'a ScoreExpr<'a>, &'a ScoreExpr<'a>),
+    Neg(&'a ScoreExpr<'a>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,6 +319,7 @@ pub enum OrderValue {
     /// ranking value to report: the row's place in the answer is the place
     /// the candidate stream gave it.
     Driver,
+    Score(f64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,9 +500,10 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
         self.used.row_decodes = self.used.row_decodes.saturating_add(1);
     }
 
-    pub(super) fn charge(&mut self, resource: WorkResource, amount: u64) -> QueryResult<()> {
-        self.check_cancelled()?;
-        let (used, limit) = match resource {
+    /// This resource's running total and its ceiling, in one place, so
+    /// "charge me" and "how much is left" cannot drift apart.
+    fn slot(&mut self, resource: WorkResource) -> (&mut u64, u64) {
+        match resource {
             WorkResource::Candidates => (&mut self.used.candidates, self.limit.candidates),
             WorkResource::PrimaryReads => (&mut self.used.primary_reads, self.limit.primary_reads),
             WorkResource::ScalarPostings => {
@@ -472,7 +525,23 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
             WorkResource::VectorLanes => (&mut self.used.vector_lanes, self.limit.vector_lanes),
             WorkResource::KeyPostings => (&mut self.used.key_postings, self.limit.key_postings),
             WorkResource::OutputBytes => (&mut self.used.output_bytes, self.limit.output_bytes),
-        };
+        }
+    }
+
+    /// How much of one resource a walk may still spend.
+    ///
+    /// A scan that is handed this as a record count stops AT the budget
+    /// rather than reading the whole collection and reporting the overrun
+    /// afterwards, which is the difference between a budget that bounds work
+    /// and one that only measures it.
+    pub(super) fn remaining(&mut self, resource: WorkResource) -> u64 {
+        let (used, limit) = self.slot(resource);
+        limit.saturating_sub(*used)
+    }
+
+    pub(super) fn charge(&mut self, resource: WorkResource, amount: u64) -> QueryResult<()> {
+        self.check_cancelled()?;
+        let (used, limit) = self.slot(resource);
         let attempted = used.checked_add(amount).ok_or(QueryError::BudgetExceeded {
             resource,
             limit,
@@ -487,6 +556,69 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
         }
         *used = attempted;
         Ok(())
+    }
+}
+
+/// How many vector records a page-order scan may read, plus one.
+///
+/// The plus one is the whole point. The scan charges what it has read before
+/// it reports its own ceiling, so stopping ONE record past the budget is what
+/// turns "I have read as much as I am allowed" into a `BudgetExceeded` that
+/// names the resource and its limit. A scan that stopped exactly at the
+/// budget would charge exactly the budget and report a bare resource limit.
+fn scan_ceiling<C: FnMut() -> bool>(
+    meter: &mut WorkMeter<'_, C>,
+    lanes_per_record: u64,
+    per_record: WorkResource,
+) -> usize {
+    let mut cap = meter
+        .remaining(WorkResource::Candidates)
+        .min(meter.remaining(per_record));
+    if lanes_per_record > 0 {
+        cap = cap.min(meter.remaining(WorkResource::VectorLanes) / lanes_per_record);
+    }
+    usize::try_from(cap).unwrap_or(usize::MAX).saturating_add(1)
+}
+
+/// The charge hook a page-order vector scan calls every `SCAN_STEP` records.
+///
+/// `per_record` is the second resource one scored record costs beyond a
+/// candidate: a sidecar for the exact scan, a locator for the quantized one,
+/// whose compact entry carries the locator inline.
+///
+/// A budget refusal is stashed WHOLE rather than returned: it names its
+/// resource, its limit and what was attempted, and the scan's error type has
+/// nowhere to put any of that. The scan is stopped with `Cancelled` and the
+/// caller reads the stash back before it looks at the scan's own result.
+fn vector_scan_progress<'a, 'm, C: FnMut() -> bool>(
+    meter: &'a mut WorkMeter<'m, C>,
+    budget: &'a mut Option<QueryError>,
+    lanes_per_record: u64,
+    per_record: WorkResource,
+) -> impl FnMut(super::vector_indexes::ScanStep) -> super::Result<()> + use<'a, 'm, C> {
+    move |step| {
+        let charged = match step {
+            super::vector_indexes::ScanStep::Locators(records) => {
+                meter.charge(WorkResource::VectorLocators, records)
+            }
+            super::vector_indexes::ScanStep::Scored(records) => meter
+                .charge(WorkResource::Candidates, records)
+                .and_then(|()| meter.charge(per_record, records))
+                .and_then(|()| {
+                    meter.charge(
+                        WorkResource::VectorLanes,
+                        records.saturating_mul(lanes_per_record),
+                    )
+                }),
+        };
+        match charged {
+            Ok(()) => Ok(()),
+            Err(QueryError::Cancelled) => Err(Error::Cancelled),
+            Err(other) => {
+                *budget = Some(other);
+                Err(Error::Cancelled)
+            }
+        }
     }
 }
 
@@ -509,50 +641,60 @@ enum EncodedBound {
     Unbounded,
 }
 
-/// One non-driving scalar RANGE filter's posting range, walked ONCE and kept
-/// for the rest of the query's pages.
+/// One non-driving filter's own index walk, done ONCE and kept for the rest
+/// of the query's pages: every entity SEQUENCE that filter's postings prove,
+/// so a candidate afterwards is a membership test instead of a primary read.
 ///
-/// An equality filter already answers a non-driving candidate from its own
-/// posting (`scalar_eq_posting_matches`): the key `value || entity` is known,
-/// so testing it costs one point read. A range predicate cannot do that --
-/// the candidate's value is unknown until something reads it -- so the walk
-/// this holds is the index-side answer Postgres gets from a bitmap AND of two
-/// posting lists: every entity the range's own postings prove, collected
-/// once, so a candidate afterwards is a binary search instead of a primary
-/// read.
+/// Two filter shapes are collected here.
+///
+/// A scalar RANGE. An equality filter already answers a non-driving candidate
+/// from its own posting (`scalar_eq_posting_matches`): the key
+/// `value || entity` is known, so testing it costs one point read. A range
+/// predicate cannot do that -- the candidate's value is unknown until
+/// something reads it -- so what this holds is the index-side answer Postgres
+/// gets from a bitmap AND of two posting lists.
+///
+/// A POINT filter (bbox or radius). Its postings are filed by Hilbert cell
+/// and each one CARRIES the stored coordinates, so the exact predicate is
+/// decided from the posting alone -- the same test, on the same bytes, that
+/// `SpatialCursor::next` makes when the same filter drives. That is why a set
+/// collected here certifies the filter outright (T3's no-row rule): a point
+/// filter used to be the one non-driving filter that went to the primary tree
+/// for EVERY candidate, because its cover ranges were only ever walked when
+/// it was the driver.
 #[derive(Clone, Debug)]
-enum ScalarRangeSet {
-    /// This position is not a candidate for the optimization: not a Range
-    /// predicate, or the position driving the query (whose own walk already
-    /// answers it for free).
+enum MembershipSet {
+    /// This position is not a candidate for the optimization: neither a Range
+    /// predicate nor a point filter, or the position driving the query (whose
+    /// own walk already answers it for free).
     Ineligible,
     /// Eligible, but no page has walked it yet.
     Unbuilt,
-    /// The range's own collection span (every sequence it could ever name) is
-    /// too wide for even a bitmap to fit the budget, or the walk found more
+    /// The filter's own collection span (every sequence it could ever name)
+    /// is too wide for even a bitmap to fit the budget, or the walk found more
     /// entities than the plain-Vec cap allows while a bitmap was not a viable
-    /// fallback either. Named sacrifice (Law 4): a range wide enough to fail
-    /// this budget gets no faster than it already was -- every candidate
+    /// fallback either. Named sacrifice (Law 4): a predicate wide enough to
+    /// fail this budget gets no faster than it already was -- every candidate
     /// still reads its row -- rather than holding an unbounded set in memory.
     Overflow,
-    /// Every entity SEQUENCE the posting range proved, ascending, so
-    /// `binary_search` answers membership. Chosen over a bitmap when the
-    /// range is narrow enough, in a large enough collection, that the Vec is
-    /// the smaller of the two -- e.g. one day out of decades of `born`
-    /// values.
+    /// Every entity SEQUENCE the walk proved, ascending, so `binary_search`
+    /// answers membership. Chosen over a bitmap when the predicate is narrow
+    /// enough, in a large enough collection, that the Vec is the smaller of
+    /// the two -- e.g. one day out of decades of `born` values, or a 1 km
+    /// radius in a world-sized point index.
     Ids(Vec<u64>),
     /// One bit per sequence in `1..=collection_span`, set for every entity
-    /// SEQUENCE the posting range proved. Chosen once the Vec representation
-    /// would be bigger than this: unlike the Vec, setting a bit costs no sort
-    /// and no allocation growth once the bitmap is sized, so a wide range
-    /// (e.g. a whole decade of `born`) is one linear pass, no CPU cost from
-    /// the postings count once past the initial allocation.
+    /// SEQUENCE the walk proved. Chosen once the Vec representation would be
+    /// bigger than this: unlike the Vec, setting a bit costs no sort and no
+    /// allocation growth once the bitmap is sized, so a wide predicate (e.g. a
+    /// whole decade of `born`) is one linear pass, no CPU cost from the
+    /// postings count once past the initial allocation.
     Bitmap(Vec<u8>),
 }
 
-/// How many entity ids one [`ScalarRangeSet`] may hold as a plain `Vec`
-/// before it is either converted to a [`ScalarRangeSet::Bitmap`] (when one
-/// would fit the budget) or abandoned as [`ScalarRangeSet::Overflow`] (when
+/// How many entity ids one [`MembershipSet`] may hold as a plain `Vec`
+/// before it is either converted to a [`MembershipSet::Bitmap`] (when one
+/// would fit the budget) or abandoned as [`MembershipSet::Overflow`] (when
 /// even a bitmap would not), in the same currency [`RUN_BYTES`] already
 /// bounds a held run in: both are memory one page keeps beyond what it
 /// returns this call.
@@ -562,24 +704,24 @@ enum ScalarRangeSet {
 /// same cap the Vec-only design used before bitmaps existed, so a collection
 /// too large even for a bitmap degrades to exactly that prior behaviour
 /// rather than something new.
-const SCALAR_RANGE_SET_CAP: usize = RUN_BYTES / std::mem::size_of::<u64>();
+const MEMBERSHIP_SET_CAP: usize = RUN_BYTES / std::mem::size_of::<u64>();
 
 /// A bitmap large enough to need more than this many bytes is not a viable
-/// [`ScalarRangeSet::Bitmap`]: `RUN_BYTES` is the same per-page memory
+/// [`MembershipSet::Bitmap`]: `RUN_BYTES` is the same per-page memory
 /// currency the Vec cap above is drawn from. One bit per sequence, so a
 /// collection whose span exceeds `8 * RUN_BYTES` sequences (about 67
 /// million entities) never gets a bitmap here, whatever the range's own
 /// selectivity.
-const SCALAR_RANGE_BITMAP_CAP_BYTES: usize = RUN_BYTES;
+const MEMBERSHIP_BITMAP_CAP_BYTES: usize = RUN_BYTES;
 
 /// The number of bytes a bitmap covering sequences `1..=span` would need.
-fn scalar_range_bitmap_bytes(span: u64) -> u64 {
+fn membership_bitmap_bytes(span: u64) -> u64 {
     span.div_ceil(8)
 }
 
 /// Sets the bit for `sequence` (1-based, as every allocated entity sequence
-/// is) in a bitmap sized by [`scalar_range_bitmap_bytes`].
-fn scalar_range_bitmap_set(bits: &mut [u8], sequence: u64) {
+/// is) in a bitmap sized by [`membership_bitmap_bytes`].
+fn membership_bitmap_set(bits: &mut [u8], sequence: u64) {
     let index = (sequence - 1) as usize;
     bits[index / 8] |= 1 << (index % 8);
 }
@@ -587,7 +729,7 @@ fn scalar_range_bitmap_set(bits: &mut [u8], sequence: u64) {
 /// Tests the bit for `sequence` (1-based). A sequence at or past the
 /// bitmap's span was never allocated when the bitmap was built and so was
 /// never set -- `false`, not a panic or an out-of-bounds read.
-fn scalar_range_bitmap_contains(bits: &[u8], sequence: u64) -> bool {
+fn membership_bitmap_contains(bits: &[u8], sequence: u64) -> bool {
     let index = (sequence - 1) as usize;
     bits.get(index / 8).is_some_and(|byte| byte & (1 << (index % 8)) != 0)
 }
@@ -787,6 +929,94 @@ enum CompiledOrder {
         info: IndexInfo,
         center: Point,
     },
+    Score {
+        expr: CompiledScoreExpr,
+        direction: SortDirection,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum CompiledScoreExpr {
+    Lit(f64),
+    Scalar {
+        info: IndexInfo,
+    },
+    Bm25(PreparedText),
+    VectorSimilarity {
+        info: IndexInfo,
+        query: Vec<f32>,
+        query_norm: f64,
+        metric: VectorMetric,
+    },
+    Distance {
+        info: IndexInfo,
+        center: Point,
+    },
+    Add(Box<CompiledScoreExpr>, Box<CompiledScoreExpr>),
+    Sub(Box<CompiledScoreExpr>, Box<CompiledScoreExpr>),
+    Mul(Box<CompiledScoreExpr>, Box<CompiledScoreExpr>),
+    Div(Box<CompiledScoreExpr>, Box<CompiledScoreExpr>),
+    Neg(Box<CompiledScoreExpr>),
+}
+
+impl CompiledScoreExpr {
+    fn vector_similarity_leaf(&self) -> Option<&IndexInfo> {
+        match self {
+            Self::VectorSimilarity { info, .. } => Some(info),
+            _ => None,
+        }
+    }
+
+    fn uses_scalar(&self, index: IndexId) -> bool {
+        match self {
+            Self::Scalar { info } => info.id == index,
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
+                a.uses_scalar(index) || b.uses_scalar(index)
+            }
+            Self::Neg(a) => a.uses_scalar(index),
+            _ => false,
+        }
+    }
+
+    fn needs_row(&self, driver: &DriverPlan) -> bool {
+        match self {
+            Self::Lit(_) | Self::VectorSimilarity { .. } => false,
+            Self::Bm25(prepared) => prepared.phrase.is_some(),
+            Self::Scalar { info } => match driver {
+                DriverPlan::Scalar {
+                    info: driving, ..
+                } if driving.id == info.id => false,
+                _ => true,
+            },
+            Self::Distance { info, .. } => match driver {
+                DriverPlan::Nearest {
+                    info: driving, ..
+                }
+                | DriverPlan::Spatial {
+                    info: driving, ..
+                } if driving.id == info.id => false,
+                _ => true,
+            },
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
+                a.needs_row(driver) || b.needs_row(driver)
+            }
+            Self::Neg(a) => a.needs_row(driver),
+        }
+    }
+
+    fn mark_text_driven(&mut self, driving: &PreparedText, source: TextSource, carries: bool) {
+        match self {
+            Self::Bm25(prepared) => {
+                prepared.driven = (carries && prepared.same_terms(driving)).then_some(source);
+            }
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
+                a.mark_text_driven(driving, source, carries);
+                b.mark_text_driven(driving, source, carries);
+            }
+            Self::Neg(a) => a.mark_text_driven(driving, source, carries),
+            _ => {}
+        }
+    }
 }
 
 /// The key ONE driver's own walk is sorted by, resolved at prepare time so
@@ -1156,10 +1386,20 @@ fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool) -> Orderin
         (RankValue::Score(a), RankValue::Score(b)) => {
             let a = f64::from_bits(*a);
             let b = f64::from_bits(*b);
-            if descending {
-                b.total_cmp(&a)
-            } else {
-                a.total_cmp(&b)
+            match (a.is_nan(), b.is_nan()) {
+                (true, true) => Ordering::Equal,
+                // NaN is last under both directions: it is always worse than
+                // a number, so the heap peeks it first to displace and a
+                // page sort puts it after every finite score.
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => {
+                    if descending {
+                        b.total_cmp(&a)
+                    } else {
+                        a.total_cmp(&b)
+                    }
+                }
             }
         }
         _ => unreachable!("prepared order creates one rank-key kind"),
@@ -1202,9 +1442,9 @@ pub struct PreparedQuery<'db> {
     /// was, emptying the run is not the end of the answer and the next page
     /// walks again, from the last row handed out.
     run_bounded: bool,
-    /// One [`ScalarRangeSet`] per filter position, built at most once and
-    /// reused by every page and by resume -- see `ensure_scalar_range_sets`.
-    scalar_ranges: Vec<ScalarRangeSet>,
+    /// One [`MembershipSet`] per filter position, built at most once and
+    /// reused by every page and by resume -- see `ensure_membership_sets`.
+    membership: Vec<MembershipSet>,
     /// The resumable nearest walk, when the driver is [`DriverPlan::Nearest`].
     /// Kept on the prepared query so page N+1 continues the ring the previous
     /// page stopped in rather than re-walking from the centre: a `PreparedQuery`
@@ -1382,6 +1622,109 @@ fn prepare_approximate_vector(
         return Err(invalid_query("cosine query vector must have nonzero norm"));
     }
     Ok((info, query.to_vec(), norm))
+}
+
+fn compile_score_expr(
+    db: &Database,
+    collection: CollectionId,
+    expr: &ScoreExpr<'_>,
+    depth: usize,
+    leaves: &mut usize,
+) -> QueryResult<CompiledScoreExpr> {
+    if depth > MAX_SCORE_DEPTH {
+        return Err(invalid_query("score expression depth exceeds 32"));
+    }
+    let leaf = |leaves: &mut usize| -> QueryResult<()> {
+        *leaves = leaves.saturating_add(1);
+        if *leaves > MAX_SCORE_LEAVES {
+            Err(invalid_query("score expression has more than 8 leaves"))
+        } else {
+            Ok(())
+        }
+    };
+    match expr {
+        ScoreExpr::Lit(value) => {
+            leaf(leaves)?;
+            Ok(CompiledScoreExpr::Lit(*value))
+        }
+        ScoreExpr::Scalar { index } => {
+            leaf(leaves)?;
+            let info = require_scalar_index(db, collection, *index)?;
+            if !matches!(info.kind, Kind::Int | Kind::Real | Kind::Bool) {
+                return Err(invalid_query(
+                    "score scalar requires an Int, Real or Bool scalar index",
+                ));
+            }
+            Ok(CompiledScoreExpr::Scalar { info })
+        }
+        ScoreExpr::Bm25 {
+            index,
+            query,
+            matching,
+        } => {
+            leaf(leaves)?;
+            Ok(CompiledScoreExpr::Bm25(prepare_text(
+                db, collection, *index, query, *matching,
+            )?))
+        }
+        ScoreExpr::VectorSimilarity {
+            index,
+            query,
+            metric,
+        } => {
+            leaf(leaves)?;
+            let (info, query, query_norm) =
+                prepare_vector(db, collection, *index, query, *metric)?;
+            Ok(CompiledScoreExpr::VectorSimilarity {
+                info,
+                query,
+                query_norm,
+                metric: *metric,
+            })
+        }
+        ScoreExpr::Distance { index, center } => {
+            leaf(leaves)?;
+            let info = require_family_index(
+                db,
+                collection,
+                *index,
+                IndexFamily::SpatialPoint,
+                "spatial-point",
+            )?;
+            super::spatial_indexes::descriptor(&info)?;
+            Ok(CompiledScoreExpr::Distance {
+                info,
+                center: *center,
+            })
+        }
+        ScoreExpr::Add(left, right) => Ok(CompiledScoreExpr::Add(
+            Box::new(compile_score_expr(db, collection, left, depth + 1, leaves)?),
+            Box::new(compile_score_expr(
+                db, collection, right, depth + 1, leaves,
+            )?),
+        )),
+        ScoreExpr::Sub(left, right) => Ok(CompiledScoreExpr::Sub(
+            Box::new(compile_score_expr(db, collection, left, depth + 1, leaves)?),
+            Box::new(compile_score_expr(
+                db, collection, right, depth + 1, leaves,
+            )?),
+        )),
+        ScoreExpr::Mul(left, right) => Ok(CompiledScoreExpr::Mul(
+            Box::new(compile_score_expr(db, collection, left, depth + 1, leaves)?),
+            Box::new(compile_score_expr(
+                db, collection, right, depth + 1, leaves,
+            )?),
+        )),
+        ScoreExpr::Div(left, right) => Ok(CompiledScoreExpr::Div(
+            Box::new(compile_score_expr(db, collection, left, depth + 1, leaves)?),
+            Box::new(compile_score_expr(
+                db, collection, right, depth + 1, leaves,
+            )?),
+        )),
+        ScoreExpr::Neg(inner) => Ok(CompiledScoreExpr::Neg(Box::new(compile_score_expr(
+            db, collection, inner, depth + 1, leaves,
+        )?))),
+    }
 }
 
 fn point_ranges(predicate: PointFilter) -> QueryResult<(Vec<(u64, u64)>, bool)> {
@@ -1978,6 +2321,13 @@ impl Database {
                     center,
                 }
             }
+            QueryOrder::Score { expr, direction } => {
+                let mut leaves = 0usize;
+                CompiledOrder::Score {
+                    expr: compile_score_expr(self, request.collection, expr, 1, &mut leaves)?,
+                    direction,
+                }
+            }
         };
 
         let fields = match request.projection {
@@ -2076,6 +2426,18 @@ impl Database {
                 CompiledOrder::Distance { info, center } => {
                     Ok(nearest_plan(info, *center, &filters))
                 }
+                // Score never drives, except a lone VectorSimilarity leaf with
+                // no filters is the same query as ExactVector, so it reuses
+                // that driver. With filters, Auto still picks from the
+                // filters; CandidateDriver::Order on any other expression is
+                // a full entity scan ranked by the score.
+                CompiledOrder::Score { expr, .. } => {
+                    if let (Some(info), true) = (expr.vector_similarity_leaf(), filters.is_empty()) {
+                        Ok(DriverPlan::ExactVector { info: info.clone() })
+                    } else {
+                        Ok(DriverPlan::Entities)
+                    }
+                }
             }
         };
         // `CandidateDriver::Keys` is not `CandidateDriver::Filter(position)`
@@ -2125,10 +2487,11 @@ impl Database {
                     )
                 }) {
                     // An equality filter is the default driver -- unless the
-                    // query also names a scalar order on ANOTHER ready index
-                    // and the filter is broad enough that walking that index
-                    // in rank order is the cheaper plan. See
-                    // `order_index_drives_better`.
+                    // query also names an ORDER on another ready index and the
+                    // filter is broad enough that walking that index in rank
+                    // order is the cheaper plan: `order_index_drives_better`
+                    // for a scalar order, `nearest_drives_better` for a
+                    // distance one.
                     let ordered_elsewhere = match (&order, filters.get(position)) {
                         (
                             CompiledOrder::Scalar {
@@ -2145,6 +2508,27 @@ impl Database {
                                 self,
                                 ranked,
                                 matches!(direction, SortDirection::Descending),
+                                info,
+                                value,
+                            )?
+                        }
+                        (
+                            CompiledOrder::Distance {
+                                info: ranked,
+                                center,
+                            },
+                            Some(CompiledFilter::Scalar {
+                                info,
+                                predicate: EncodedScalarFilter::Eq(value),
+                                ..
+                            }),
+                        ) if request.total_limit.is_some_and(|limit| limit > 0)
+                            && distance_can_drive(ranked.id, *center, &filters)
+                            && nearest_tests_filters_index_side(&filters) =>
+                        {
+                            nearest_drives_better(
+                                self,
+                                request.total_limit.unwrap_or(0),
                                 info,
                                 value,
                             )?
@@ -2259,17 +2643,42 @@ impl Database {
 
         // A non-driving RANGE filter's candidate's value is unknown until
         // something reads it -- unlike an equality filter, its posting alone
-        // cannot answer one candidate at a time. `ensure_scalar_range_sets`
-        // walks it once instead, on first use, and every position marked here
-        // is what that walk fills in.
-        let mut scalar_ranges = filters.iter().map(|_| ScalarRangeSet::Ineligible).collect::<Vec<_>>();
+        // cannot answer one candidate at a time. A non-driving POINT filter is
+        // worse: nothing but the row carries the coordinates unless its own
+        // cover ranges are walked, so every candidate was a primary read.
+        // `ensure_membership_sets` walks each of them once instead, on first
+        // use, and every position marked here is what that walk fills in.
+        let driving_position = match &driver {
+            DriverPlan::Scalar { position, .. }
+            | DriverPlan::Text { position, .. }
+            | DriverPlan::Keys { position, .. } => *position,
+            DriverPlan::Spatial { position, .. }
+            | DriverPlan::Geometry { position, .. }
+            | DriverPlan::Graph { position } => Some(*position),
+            DriverPlan::Nearest { certifies, .. } => *certifies,
+            DriverPlan::Entities
+            | DriverPlan::ExactVector { .. }
+            | DriverPlan::QuantizedVector { .. } => None,
+        };
+        let mut membership = filters.iter().map(|_| MembershipSet::Ineligible).collect::<Vec<_>>();
         for (position, filter) in filters.iter().enumerate() {
-            if let CompiledFilter::Scalar { predicate, .. } = filter {
-                if matches!(predicate, EncodedScalarFilter::Range { .. })
-                    && scalar_driver_position != Some(position)
-                {
-                    scalar_ranges[position] = ScalarRangeSet::Unbuilt;
+            let eligible = match filter {
+                CompiledFilter::Scalar { predicate, .. } => {
+                    matches!(predicate, EncodedScalarFilter::Range { .. })
+                        && scalar_driver_position != Some(position)
                 }
+                // A world-wide cover is every posting in the index, which is
+                // the whole collection: walking it to build a set that admits
+                // everything buys nothing, so that one is left on the row-read
+                // path it already had.
+                CompiledFilter::Point { predicate, .. } => {
+                    driving_position != Some(position)
+                        && point_ranges(*predicate).is_ok_and(|(_, world)| !world)
+                }
+                _ => false,
+            };
+            if eligible {
+                membership[position] = MembershipSet::Unbuilt;
             }
         }
 
@@ -2296,6 +2705,9 @@ impl Database {
             }
             if let CompiledOrder::Bm25(prepared) = &mut order {
                 prepared.driven = (carries && prepared.same_terms(driving)).then_some(source);
+            }
+            if let CompiledOrder::Score { expr, .. } = &mut order {
+                expr.mark_text_driven(driving, source, carries);
             }
         }
 
@@ -2327,7 +2739,7 @@ impl Database {
             after: None,
             run: Vec::new(),
             run_bounded: false,
-            scalar_ranges,
+            membership,
             nearest,
             geometry_seen: HashSet::new(),
         })
@@ -2409,6 +2821,122 @@ fn nearest_plan(info: &IndexInfo, center: Point, filters: &[CompiledFilter]) -> 
         radius_cap,
         certifies,
     }
+}
+
+/// Can every filter of a `QueryOrder::Distance` query be decided WITHOUT the
+/// primary row once the nearest walk drives?
+///
+/// That is the whole condition for keeping the ordered walk in front. The
+/// walk hands over `(id, point, distance)` and stops at `k`; what it must not
+/// do is turn each of those into a point-get, because then the plan is paying
+/// per candidate what the equality plan pays per match, over more candidates.
+///
+///   * a scalar EQUALITY that is not driving is answered from its own posting
+///     (`scalar_eq_posting_matches`) -- one index key, no row. That is the
+///     same authority `order_index_drives_better` already leans on;
+///   * a POINT filter here is a same-index, same-centre radius and nothing
+///     else, because `distance_can_drive` is checked first, and `nearest_plan`
+///     certifies exactly that filter from the walk's own radius cap.
+///
+/// Every other filter -- a scalar RANGE (whose set may overflow back to row
+/// reads), a JSON equality, a geometry refinement, a text score, a traversal
+/// -- reads or may read the row, so the walk would pay for the rows it
+/// rejects as well as the ones it keeps. Those keep the equality driver.
+fn nearest_tests_filters_index_side(filters: &[CompiledFilter]) -> bool {
+    filters.iter().all(|filter| match filter {
+        CompiledFilter::Scalar { predicate, .. } => {
+            matches!(predicate, EncodedScalarFilter::Eq(_))
+        }
+        CompiledFilter::Point { .. } => true,
+        _ => false,
+    })
+}
+
+/// The ratio the crossover below is priced at: one primary row read against
+/// one examined spatial posting. A row read is a random point-get into the
+/// primary tree plus a dense-v3 walk to the point field; an examined posting
+/// is a sequential step in a leaf the ring cover already positioned, plus one
+/// geodesic distance. Four is the conservative end of what the 50K battery
+/// shows (about 2.9 us against about 0.6 us) -- conservative because a lower
+/// ratio moves the crossover UP, and a crossover that is too high only leaves
+/// the equality driving a query it used to drive anyway.
+const NEAREST_DRIVE_ROW_RATIO: u64 = 4;
+/// Floor and ceiling on how many of the equality's postings the probe reads.
+/// The floor keeps a tiny collection from deciding on three postings; the
+/// ceiling keeps the probe itself from becoming the cost it is measuring.
+const NEAREST_DRIVE_PROBE_FLOOR: u64 = 64;
+const NEAREST_DRIVE_PROBE_CEILING: u64 = 1024;
+
+/// Should an equality filter plus a DISTANCE order under a LIMIT be driven by
+/// the nearest walk rather than by the equality's postings?
+///
+/// Driving from the equality hands candidates over in entity order, which is
+/// not the order asked for, so the distance of every match has to be read out
+/// of its primary row and the whole set sorted before the first row can be
+/// returned: `m` row reads for a `k`-row answer, and `m` is the filter's
+/// cardinality, not `k`. Driving from the spatial index inverts it -- the walk
+/// is already in distance order, the LIMIT becomes a stop condition, the point
+/// falls out of the posting the cursor is standing on, and the equality is a
+/// membership probe against its own posting. The price is walking over the
+/// rows the equality rejects: about `k / acceptance` postings for `k` answers.
+///
+/// So the two plans meet where `m * ratio == k * n / m`, with `n` the
+/// collection's span and `ratio` the row-to-posting price above: `m` around
+/// `sqrt(k * n / ratio)`, which is 353 postings for `k = 10` over 50,000 rows.
+/// Below it the equality is narrow enough that reading its rows beats crossing
+/// the space between them; above it the walk wins, and by a widening margin --
+/// at one row in eight of a 50,000-row collection the equality plan reads
+/// 6,250 rows to answer with ten.
+///
+/// The probe is that crossover, walked. It reads the equality's own postings
+/// and stops the moment it has seen enough of them to decide, so a broad
+/// filter costs a bounded prefix and a narrow one costs its whole (small)
+/// posting list -- the same postings its driver is about to walk anyway.
+/// Counting is exact in the direction that matters: "at least `crossover`
+/// members" is the only claim made, never an estimate of how many more.
+fn nearest_drives_better(
+    db: &Database,
+    limit: usize,
+    filter: &IndexInfo,
+    expected: &[u8],
+) -> QueryResult<bool> {
+    let span = db
+        .collection_span(filter.collection)
+        .map_err(QueryError::from)?;
+    let crossover = (limit as u64)
+        .saturating_mul(span)
+        .saturating_div(NEAREST_DRIVE_ROW_RATIO)
+        .isqrt()
+        .clamp(NEAREST_DRIVE_PROBE_FLOOR, NEAREST_DRIVE_PROBE_CEILING);
+    let prefix = scalar_prefix(filter.id);
+    let mut start = prefix.clone();
+    start.extend_from_slice(expected);
+    let Some(mut walk) = db.index_range(filter, &start).map_err(QueryError::from)? else {
+        return Ok(false);
+    };
+    let mut seen = 0u64;
+    while seen < crossover {
+        {
+            let Some((key, _)) = walk.peek_ref().map_err(Error::from).map_err(QueryError::from)?
+            else {
+                break;
+            };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let suffix = &key[prefix.len()..];
+            let value_len = scalar_key::width(&filter.kind, suffix)?;
+            let value = suffix
+                .get(..value_len)
+                .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
+            if value != expected {
+                break;
+            }
+        }
+        walk.step();
+        seen += 1;
+    }
+    Ok(seen >= crossover)
 }
 
 /// How many postings of the ORDER index the planner walks before deciding.
@@ -3585,6 +4113,18 @@ impl<'a> DriverCursor<'a> {
             Self::Ids(ids) => Ok(ids.next().map(Candidate::bare)),
         }
     }
+
+    /// Report back to the driver whether the candidate it just handed over
+    /// survived the page's filters.
+    ///
+    /// Only the nearest walk has anything to do with the answer: it sizes its
+    /// next ring from it (`NearestWalk::note`). Every other cursor's walk is
+    /// fixed by its predicate and hears nothing.
+    fn note_kept(&mut self, kept: bool) {
+        if let Self::Nearest(cursor) = self {
+            cursor.walk.note(kept);
+        }
+    }
 }
 
 impl EntityCursor<'_> {
@@ -4527,7 +5067,7 @@ fn read_batch_rows<'a, C: FnMut() -> bool>(
     db: &'a Database,
     rows: &mut PrimaryRows<'a>,
     filters: &[CompiledFilter],
-    ranges: &[ScalarRangeSet],
+    ranges: &[MembershipSet],
     keep_rows: bool,
     batch: &mut [Candidate],
     order: &mut Vec<(u64, u32)>,
@@ -4595,7 +5135,7 @@ fn read_batch_rows<'a, C: FnMut() -> bool>(
 fn batch_filters_match<C: FnMut() -> bool>(
     db: &Database,
     filters: &[CompiledFilter],
-    ranges: &[ScalarRangeSet],
+    ranges: &[MembershipSet],
     satisfied: Option<usize>,
     id: EntityId,
     bytes: &[u8],
@@ -4614,8 +5154,8 @@ fn batch_filters_match<C: FnMut() -> bool>(
                 predicate,
                 posting_membership,
             } => match &ranges[position] {
-                ScalarRangeSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
-                ScalarRangeSet::Bitmap(bits) => scalar_range_bitmap_contains(bits, id.sequence),
+                MembershipSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
+                MembershipSet::Bitmap(bits) => membership_bitmap_contains(bits, id.sequence),
                 _ => {
                     if *posting_membership && matches!(predicate, EncodedScalarFilter::Eq(_)) {
                         return Ok(None);
@@ -4633,20 +5173,27 @@ fn batch_filters_match<C: FnMut() -> bool>(
                 meter.note_row_decode();
                 json_filter_matches(selected_field_in(&layout, bytes, field)?, value)?
             }
-            CompiledFilter::Point { info, predicate } => {
-                meter.charge(WorkResource::SpatialPostings, 1)?;
-                meter.note_row_decode();
-                match point_from_field(selected_field_in(&layout, bytes, &info.field)?)? {
-                    Some(point) => match predicate {
-                        PointFilter::Bbox(bounds) => bounds.contains(point),
-                        PointFilter::Radius {
-                            center,
-                            radius_metres,
-                        } => within_radius(*center, point, *radius_metres).map_err(corrupt_query)?,
-                    },
-                    None => false,
+            CompiledFilter::Point { info, predicate } => match &ranges[position] {
+                MembershipSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
+                MembershipSet::Bitmap(bits) => membership_bitmap_contains(bits, id.sequence),
+                _ => {
+                    meter.charge(WorkResource::SpatialPostings, 1)?;
+                    meter.note_row_decode();
+                    match point_from_field(selected_field_in(&layout, bytes, &info.field)?)? {
+                        Some(point) => match predicate {
+                            PointFilter::Bbox(bounds) => bounds.contains(point),
+                            PointFilter::Radius {
+                                center,
+                                radius_metres,
+                            } => {
+                                within_radius(*center, point, *radius_metres)
+                                    .map_err(corrupt_query)?
+                            }
+                        },
+                        None => false,
+                    }
                 }
-            }
+            },
             CompiledFilter::Geometry { info, predicate } => {
                 meter.note_row_decode();
                 match geom_from_field(selected_field_in(&layout, bytes, &info.field)?)? {
@@ -4804,7 +5351,7 @@ fn build_scalar_range_set<C: FnMut() -> bool>(
     info: &IndexInfo,
     predicate: &EncodedScalarFilter,
     meter: &mut WorkMeter<'_, C>,
-) -> QueryResult<ScalarRangeSet> {
+) -> QueryResult<MembershipSet> {
     let prefix = scalar_prefix(info.id);
     let mut start = prefix.clone();
     if let Some(lower) = scalar_lower(predicate) {
@@ -4812,7 +5359,7 @@ fn build_scalar_range_set<C: FnMut() -> bool>(
     }
     let mut walk = match db.index_range(info, &start).map_err(QueryError::from)? {
         Some(iter) => iter,
-        None => return Ok(ScalarRangeSet::Ids(Vec::new())),
+        None => return Ok(MembershipSet::Ids(Vec::new())),
     };
     // The collection's span bounds a bitmap without a scan: every sequence a
     // posting in this walk can name is below it. A Vec is kept only while it
@@ -4822,14 +5369,9 @@ fn build_scalar_range_set<C: FnMut() -> bool>(
     // allocation. When the bitmap itself would not fit the budget, `vec_cap`
     // falls back to the plain per-element cap the Vec-only design used, and
     // the walk is abandoned exactly as it was before bitmaps existed.
-    let span = db.collection_span(info.collection).map_err(QueryError::from)?;
-    let bitmap_bytes = scalar_range_bitmap_bytes(span);
-    let bitmap_viable = bitmap_bytes <= SCALAR_RANGE_BITMAP_CAP_BYTES as u64;
-    let vec_cap = if bitmap_viable {
-        (bitmap_bytes / std::mem::size_of::<u64>() as u64) as usize
-    } else {
-        SCALAR_RANGE_SET_CAP
-    };
+    let budget = MembershipBudget::new(db, info.collection)?;
+    let (bitmap_bytes, bitmap_viable, vec_cap) =
+        (budget.bitmap_bytes, budget.bitmap_viable, budget.vec_cap);
     let mut ids: Vec<u64> = Vec::new();
     let mut bits: Option<Vec<u8>> = None;
     loop {
@@ -4865,16 +5407,16 @@ fn build_scalar_range_set<C: FnMut() -> bool>(
         walk.step();
         if let Some(sequence) = sequence {
             match bits.as_mut() {
-                Some(bits) => scalar_range_bitmap_set(bits, sequence),
+                Some(bits) => membership_bitmap_set(bits, sequence),
                 None if ids.len() == vec_cap => {
                     if !bitmap_viable {
-                        return Ok(ScalarRangeSet::Overflow);
+                        return Ok(MembershipSet::Overflow);
                     }
                     let mut fresh = vec![0u8; bitmap_bytes as usize];
                     for &s in &ids {
-                        scalar_range_bitmap_set(&mut fresh, s);
+                        membership_bitmap_set(&mut fresh, s);
                     }
-                    scalar_range_bitmap_set(&mut fresh, sequence);
+                    membership_bitmap_set(&mut fresh, sequence);
                     ids = Vec::new();
                     bits = Some(fresh);
                 }
@@ -4883,10 +5425,131 @@ fn build_scalar_range_set<C: FnMut() -> bool>(
         }
     }
     if let Some(bits) = bits {
-        return Ok(ScalarRangeSet::Bitmap(bits));
+        return Ok(MembershipSet::Bitmap(bits));
     }
     ids.sort_unstable();
-    Ok(ScalarRangeSet::Ids(ids))
+    Ok(MembershipSet::Ids(ids))
+}
+
+/// The Vec/bitmap/Overflow budget every [`MembershipSet`] walk shares.
+///
+/// Stated once so a scalar range and a point cover are bounded by the SAME
+/// rule: a bitmap is viable when one bit per sequence in the collection's
+/// span fits [`MEMBERSHIP_BITMAP_CAP_BYTES`]; while it is, the plain Vec is
+/// kept only while it would stay smaller than that bitmap; when it is not,
+/// the Vec's own [`MEMBERSHIP_SET_CAP`] is the ceiling and passing it is
+/// `Overflow`.
+struct MembershipBudget {
+    bitmap_bytes: u64,
+    bitmap_viable: bool,
+    vec_cap: usize,
+}
+
+impl MembershipBudget {
+    fn new(db: &Database, collection: CollectionId) -> QueryResult<Self> {
+        let span = db.collection_span(collection).map_err(QueryError::from)?;
+        let bitmap_bytes = membership_bitmap_bytes(span);
+        let bitmap_viable = bitmap_bytes <= MEMBERSHIP_BITMAP_CAP_BYTES as u64;
+        let vec_cap = if bitmap_viable {
+            (bitmap_bytes / std::mem::size_of::<u64>() as u64) as usize
+        } else {
+            MEMBERSHIP_SET_CAP
+        };
+        Ok(Self {
+            bitmap_bytes,
+            bitmap_viable,
+            vec_cap,
+        })
+    }
+}
+
+/// Walk one non-driving POINT filter's cover ranges once and collect every
+/// entity SEQUENCE the predicate admits, ascending.
+///
+/// Same walk `SpatialCursor::next` makes when this filter drives -- the same
+/// cover ranges from `point_ranges`, the same per-posting exact test against
+/// the coordinates the posting itself carries -- with no candidate to build
+/// and no page size to stop at. So a set this returns answers the filter
+/// exactly as the driving walk answers it, and exactly as a row read answers
+/// it: a stored point that is missing or unindexable has no posting, and
+/// neither path ever admits one.
+///
+/// `Overflow` abandons whatever it collected rather than handing back a
+/// partial set: a membership test over less than the whole cover would answer
+/// "not found" for members the row-read path would have kept.
+fn build_point_set<C: FnMut() -> bool>(
+    db: &Database,
+    info: &IndexInfo,
+    predicate: PointFilter,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<MembershipSet> {
+    let (ranges, _) = point_ranges(predicate)?;
+    let prefix = super::spatial_indexes::posting_prefix(info.id);
+    let budget = MembershipBudget::new(db, info.collection)?;
+    let mut ids: Vec<u64> = Vec::new();
+    let mut bits: Option<Vec<u8>> = None;
+    for (lo, hi) in ranges {
+        let mut start = prefix.clone();
+        start.extend((lo as u32).to_be_bytes());
+        // An index whose tree is still empty has no postings in any range.
+        let Some(mut walk) = db.index_range(info, &start).map_err(QueryError::from)? else {
+            break;
+        };
+        loop {
+            meter.check_cancelled()?;
+            meter.charge(WorkResource::SpatialPostings, 1)?;
+            let sequence = {
+                let Some((key, value)) =
+                    walk.peek_ref().map_err(Error::from).map_err(QueryError::from)?
+                else {
+                    break;
+                };
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let cell = key
+                    .get(prefix.len()..prefix.len() + 4)
+                    .ok_or_else(|| corrupt_query("spatial point posting key"))?;
+                if u64::from(u32::from_be_bytes(cell.try_into().unwrap())) > hi {
+                    break;
+                }
+                let (_, sequence, point) =
+                    super::spatial_indexes::decode_posting(&prefix, key, value)?;
+                let matches = match predicate {
+                    PointFilter::Bbox(bounds) => bounds.contains(point),
+                    PointFilter::Radius {
+                        center,
+                        radius_metres,
+                    } => within_radius(center, point, radius_metres).map_err(corrupt_query)?,
+                };
+                matches.then_some(sequence)
+            };
+            walk.step();
+            if let Some(sequence) = sequence {
+                match bits.as_mut() {
+                    Some(bits) => membership_bitmap_set(bits, sequence),
+                    None if ids.len() == budget.vec_cap => {
+                        if !budget.bitmap_viable {
+                            return Ok(MembershipSet::Overflow);
+                        }
+                        let mut fresh = vec![0u8; budget.bitmap_bytes as usize];
+                        for &s in &ids {
+                            membership_bitmap_set(&mut fresh, s);
+                        }
+                        membership_bitmap_set(&mut fresh, sequence);
+                        ids = Vec::new();
+                        bits = Some(fresh);
+                    }
+                    None => ids.push(sequence),
+                }
+            }
+        }
+    }
+    if let Some(bits) = bits {
+        return Ok(MembershipSet::Bitmap(bits));
+    }
+    ids.sort_unstable();
+    Ok(MembershipSet::Ids(ids))
 }
 
 fn number_parts(number: &serde_json::Number) -> std::result::Result<i128, f64> {
@@ -5334,7 +5997,7 @@ fn filters_match<'a, C: FnMut() -> bool>(
     db: &'a Database,
     rows: &mut PrimaryRows<'a>,
     filters: &[CompiledFilter],
-    ranges: &[ScalarRangeSet],
+    ranges: &[MembershipSet],
     candidate: &Candidate,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
@@ -5354,8 +6017,8 @@ fn filters_match<'a, C: FnMut() -> bool>(
                 predicate,
                 posting_membership,
             } => match &ranges[position] {
-                ScalarRangeSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
-                ScalarRangeSet::Bitmap(bits) => scalar_range_bitmap_contains(bits, id.sequence),
+                MembershipSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
+                MembershipSet::Bitmap(bits) => membership_bitmap_contains(bits, id.sequence),
                 _ => match (
                     *posting_membership,
                     predicate,
@@ -5389,27 +6052,34 @@ fn filters_match<'a, C: FnMut() -> bool>(
                 // Sorted, so membership is a binary search rather than a walk
                 // down a tree whose nodes were allocated to answer this.
                 .is_some_and(|ids| ids.binary_search(&id).is_ok()),
-            CompiledFilter::Point { info, predicate } => {
-                let point = if let Some(point) = candidate.point(info.id) {
-                    point
-                } else {
-                    ensure_row_seq(db, rows, id, row, encoded, meter)?;
-                    let row = row.as_ref().unwrap();
-                    meter.charge(WorkResource::SpatialPostings, 1)?;
-                    meter.note_row_decode();
-                    let Some(point) = point_from_field(selected_field(row, &info.field)?)? else {
-                        return Ok(false);
+            CompiledFilter::Point { info, predicate } => match &ranges[position] {
+                // The cover walk decided this predicate from the postings'
+                // own coordinates; the row has nothing to add.
+                MembershipSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
+                MembershipSet::Bitmap(bits) => membership_bitmap_contains(bits, id.sequence),
+                _ => {
+                    let point = if let Some(point) = candidate.point(info.id) {
+                        point
+                    } else {
+                        ensure_row_seq(db, rows, id, row, encoded, meter)?;
+                        let row = row.as_ref().unwrap();
+                        meter.charge(WorkResource::SpatialPostings, 1)?;
+                        meter.note_row_decode();
+                        let Some(point) = point_from_field(selected_field(row, &info.field)?)?
+                        else {
+                            return Ok(false);
+                        };
+                        point
                     };
-                    point
-                };
-                match predicate {
-                    PointFilter::Bbox(bounds) => bounds.contains(point),
-                    PointFilter::Radius {
-                        center,
-                        radius_metres,
-                    } => within_radius(*center, point, *radius_metres).map_err(corrupt_query)?,
+                    match predicate {
+                        PointFilter::Bbox(bounds) => bounds.contains(point),
+                        PointFilter::Radius {
+                            center,
+                            radius_metres,
+                        } => within_radius(*center, point, *radius_metres).map_err(corrupt_query)?,
+                    }
                 }
-            }
+            },
             CompiledFilter::Geometry { info, predicate } => {
                 ensure_row_seq(db, rows, id, row, encoded, meter)?;
                 let row = row.as_ref().unwrap();
@@ -5446,6 +6116,124 @@ fn filters_match<'a, C: FnMut() -> bool>(
         }
     }
     Ok(true)
+}
+
+fn scalar_key_to_score(info: &IndexInfo, key: &[u8]) -> QueryResult<f64> {
+    match scalar_order_value(info, key)? {
+        OwnedScalarValue::Nullish => Ok(0.0),
+        OwnedScalarValue::Bool(value) => Ok(if value { 1.0 } else { 0.0 }),
+        OwnedScalarValue::I64(value) => Ok(value as f64),
+        OwnedScalarValue::F64(value) => Ok(value),
+        OwnedScalarValue::Text(_) => Err(corrupt_query("score scalar is not numeric")),
+    }
+}
+
+fn eval_score_expr<'a, C: FnMut() -> bool>(
+    db: &'a Database,
+    rows: &mut PrimaryRows<'a>,
+    expr: &CompiledScoreExpr,
+    candidate: &Candidate,
+    row: &mut Option<RowData>,
+    encoded: &mut Option<Vec<u8>>,
+    scratch: &mut RowScratch,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<f64> {
+    match expr {
+        CompiledScoreExpr::Lit(value) => Ok(*value),
+        CompiledScoreExpr::Scalar { info } => {
+            let key = if let Some(key) = candidate.scalar(info.id) {
+                Some(key.to_vec())
+            } else {
+                let fresh = row.is_none();
+                ensure_row_seq(db, rows, candidate.id, row, encoded, meter)?;
+                if fresh {
+                    meter.note_row_decode();
+                }
+                persisted_scalar_key(info, selected_field(row.as_ref().unwrap(), &info.field)?)?
+            };
+            match key {
+                Some(key) => scalar_key_to_score(info, &key),
+                None => Ok(0.0),
+            }
+        }
+        CompiledScoreExpr::Bm25(prepared) => Ok(text_score(
+            db,
+            rows,
+            prepared,
+            candidate.id,
+            candidate.text.as_ref(),
+            row,
+            encoded,
+            scratch,
+            meter,
+        )?
+        .unwrap_or(0.0)),
+        CompiledScoreExpr::VectorSimilarity {
+            info,
+            query,
+            query_norm,
+            metric,
+        } => {
+            let Some(distance) =
+                vector_score(db, candidate, info, query, *query_norm, *metric, meter)?
+            else {
+                // No stored vector: the worst possible similarity under both
+                // directions, so a plan that enumerates vector-less rows
+                // (Entities) ranks them where ExactVector's driver omits them.
+                return Ok(f64::NEG_INFINITY);
+            };
+            Ok(-distance)
+        }
+        CompiledScoreExpr::Distance { info, center } => {
+            let distance = if let Some(distance) = candidate.distance_metres(info.id) {
+                Some(distance)
+            } else if let Some(point) = candidate.point(info.id) {
+                Some(wgs84_distance_metres(*center, point))
+            } else {
+                let fresh = row.is_none();
+                ensure_row_seq(db, rows, candidate.id, row, encoded, meter)?;
+                if fresh {
+                    meter.note_row_decode();
+                }
+                match point_from_field(selected_field(row.as_ref().unwrap(), &info.field)?)? {
+                    Some(point) => Some(wgs84_distance_metres(*center, point)),
+                    None => None,
+                }
+            };
+            Ok(distance.unwrap_or(f64::INFINITY))
+        }
+        CompiledScoreExpr::Add(left, right) => Ok(eval_score_expr(
+            db, rows, left, candidate, row, encoded, scratch, meter,
+        )? + eval_score_expr(
+            db, rows, right, candidate, row, encoded, scratch, meter,
+        )?),
+        CompiledScoreExpr::Sub(left, right) => Ok(eval_score_expr(
+            db, rows, left, candidate, row, encoded, scratch, meter,
+        )? - eval_score_expr(
+            db, rows, right, candidate, row, encoded, scratch, meter,
+        )?),
+        CompiledScoreExpr::Mul(left, right) => Ok(eval_score_expr(
+            db, rows, left, candidate, row, encoded, scratch, meter,
+        )? * eval_score_expr(
+            db, rows, right, candidate, row, encoded, scratch, meter,
+        )?),
+        CompiledScoreExpr::Div(left, right) => {
+            let numer = eval_score_expr(
+                db, rows, left, candidate, row, encoded, scratch, meter,
+            )?;
+            let denom = eval_score_expr(
+                db, rows, right, candidate, row, encoded, scratch, meter,
+            )?;
+            if denom == 0.0 {
+                Ok(f64::NAN)
+            } else {
+                Ok(numer / denom)
+            }
+        }
+        CompiledScoreExpr::Neg(inner) => Ok(-eval_score_expr(
+            db, rows, inner, candidate, row, encoded, scratch, meter,
+        )?),
+    }
 }
 
 fn rank_candidate<'a, C: FnMut() -> bool>(
@@ -5550,6 +6338,12 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
             };
             RankValue::Score(score.to_bits())
         }
+        CompiledOrder::Score { expr, .. } => RankValue::Score(
+            eval_score_expr(
+                db, rows, expr, candidate, row, encoded, scratch, meter,
+            )?
+            .to_bits(),
+        ),
     };
     Ok(Some(RankKey {
         value,
@@ -5718,7 +6512,7 @@ fn checked_output_size(row: &QueryRow) -> QueryResult<u64> {
                 .checked_add(u64::try_from(value.len()).map_err(invalid_query)?)
                 .ok_or_else(|| invalid_query("query output size overflow"))?,
         },
-        OrderValue::Distance(_) | OrderValue::Bm25(_) => 9,
+        OrderValue::Distance(_) | OrderValue::Bm25(_) | OrderValue::Score(_) => 9,
         // Neither carries a value the caller is charged for: an id-ordered
         // row's key is its id, and a driver-ordered row's place is the
         // candidate stream's, not a value in the row.
@@ -5853,7 +6647,12 @@ impl PreparedQuery<'_> {
                     | CompiledOrder::Bm25(_)
                     | CompiledOrder::Driver(_)
                     | CompiledOrder::Distance { .. }
+                    | CompiledOrder::Score { .. }
             ) || self.distance_order_needs_the_row()
+                || matches!(
+                    &self.order,
+                    CompiledOrder::Score { expr, .. } if expr.needs_row(&self.driver)
+                )
                 // A projection reads the row as surely as a filter does, and
                 // the cursor is standing on it: copying it here costs one
                 // allocation, fetching it back costs a whole point-get.
@@ -5868,6 +6667,9 @@ impl PreparedQuery<'_> {
                 // cursor is standing on.
                 (DriverPlan::Scalar { info, .. }, CompiledOrder::Driver(DriverKey::Scalar(order))) => {
                     info.id == *order
+                }
+                (DriverPlan::Scalar { info, .. }, CompiledOrder::Score { expr, .. }) => {
+                    expr.uses_scalar(info.id)
                 }
                 _ => false,
             },
@@ -5952,6 +6754,9 @@ impl PreparedQuery<'_> {
         // is no longer refused by a BM25 page; it is refused by the norm, and
         // `verify_index` still refuses it outright. Every other page shape
         // keeps the probe.
+        // A Score page keeps the probe: a Score Bm25 leaf scores a missing
+        // document as 0.0 and KEEPS the candidate, so the norm lookup proves
+        // nothing about liveness there.
         if matches!(self.order, CompiledOrder::Bm25(_)) {
             return true;
         }
@@ -6026,22 +6831,24 @@ impl PreparedQuery<'_> {
         // can do -- is no longer refused by a bbox/radius page under those
         // two orders. `verify_index` refuses it outright either way.
         if matches!(self.driver, DriverPlan::Nearest { .. })
-            && matches!(
-                self.order,
+            && match &self.order {
                 CompiledOrder::Distance { .. }
-                    | CompiledOrder::EntityId
-                    | CompiledOrder::Driver(_)
-            )
+                | CompiledOrder::EntityId
+                | CompiledOrder::Driver(_) => true,
+                CompiledOrder::Score { expr, .. } => !expr.needs_row(&self.driver),
+                _ => false,
+            }
         {
             return true;
         }
         if matches!(self.driver, DriverPlan::Spatial { .. })
-            && matches!(
-                self.order,
+            && match &self.order {
                 CompiledOrder::EntityId
-                    | CompiledOrder::Driver(DriverKey::Cell(_))
-                    | CompiledOrder::Distance { .. }
-            )
+                | CompiledOrder::Driver(DriverKey::Cell(_))
+                | CompiledOrder::Distance { .. } => true,
+                CompiledOrder::Score { expr, .. } => !expr.needs_row(&self.driver),
+                _ => false,
+            }
         {
             return true;
         }
@@ -6107,6 +6914,7 @@ impl PreparedQuery<'_> {
         match &self.order {
             CompiledOrder::Scalar { .. } => !self.cursor_needs().scalar_key,
             CompiledOrder::Distance { .. } => self.distance_order_needs_the_row(),
+            CompiledOrder::Score { expr, .. } => expr.needs_row(&self.driver),
             CompiledOrder::EntityId
             | CompiledOrder::ExactVector { .. }
             | CompiledOrder::ApproximateVector { .. }
@@ -6243,18 +7051,24 @@ impl PreparedQuery<'_> {
             _ if Some(position) == driving => false,
             // A non-driving equality answered from its posting reads no row,
             // and neither does a non-driving RANGE once its own posting walk
-            // has been collected into a set (`ScalarRangeSet::Ids` or
-            // `ScalarRangeSet::Bitmap`); every other scalar predicate does.
+            // has been collected into a set (`MembershipSet::Ids` or
+            // `MembershipSet::Bitmap`); every other scalar predicate does.
             CompiledFilter::Scalar {
                 posting_membership, ..
             } => {
                 !*posting_membership
                     && !matches!(
-                        self.scalar_ranges[position],
-                        ScalarRangeSet::Ids(_) | ScalarRangeSet::Bitmap(_)
+                        self.membership[position],
+                        MembershipSet::Ids(_) | MembershipSet::Bitmap(_)
                     )
             }
-            CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
+            CompiledFilter::JsonEq { .. } => true,
+            // A non-driving point filter whose cover ranges have been walked
+            // into a set reads no row either; without one it reads every row.
+            CompiledFilter::Point { .. } => !matches!(
+                self.membership[position],
+                MembershipSet::Ids(_) | MembershipSet::Bitmap(_)
+            ),
             CompiledFilter::Graph { .. } | CompiledFilter::Folded { .. } => false,
             // Certified straight from the mapping entry, at the driving
             // position `_ if Some(position) == driving` already caught above;
@@ -6302,6 +7116,169 @@ impl PreparedQuery<'_> {
             self.order,
             CompiledOrder::EntityId | CompiledOrder::Driver(DriverKey::Entity)
         )
+    }
+
+    /// This page's vector cursor: the `(distance, entity)` the previous page
+    /// ended on, in the form the scans filter candidates by.
+    ///
+    /// A vector page ranks by score, so its cursor can only be a score key.
+    /// Anything else is a prepared query whose order and cursor disagree.
+    fn vector_after(&self) -> QueryResult<Option<super::vector_indexes::VectorAfter>> {
+        match self.after.as_ref() {
+            None => Ok(None),
+            Some(RankKey {
+                value: RankValue::Score(bits),
+                id,
+            }) => Ok(Some(super::vector_indexes::VectorAfter {
+                distance: f64::from_bits(*bits),
+                id: *id,
+            })),
+            Some(_) => Err(corrupt_query("vector page cursor is not a score")),
+        }
+    }
+
+    /// Unfiltered exact/ANN order over its own driver: one page-order scan of
+    /// sidecar or compact leaves instead of a per-entity locator lookup plus a
+    /// per-entity sidecar get. Filters and a non-vector driver keep the
+    /// candidate loop.
+    ///
+    /// Two things the scan does that the candidate loop used to do for it.
+    /// The page CURSOR goes in, so the bounded heap is taken over the rows
+    /// after it and page two is the next `held` rows rather than page one
+    /// with its returned rows removed. And the BUDGET goes in, as a record
+    /// ceiling and as a charge every `SCAN_STEP` records, so a candidate
+    /// budget of 100 stops the walk at 100 instead of reading the collection
+    /// and reporting the overrun afterwards.
+    fn unfiltered_vector_scan<C: FnMut() -> bool>(
+        &self,
+        held: usize,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<(Winners, Option<ApproximationDiagnostics>)>> {
+        if !self.filters.is_empty() {
+            return Ok(None);
+        }
+        match (&self.order, &self.driver) {
+            (
+                CompiledOrder::ExactVector {
+                    info,
+                    query,
+                    query_norm,
+                    metric,
+                },
+                DriverPlan::ExactVector { .. },
+            ) => {
+                let dim =
+                    u64::try_from(super::vector_indexes::dimension(info)?).map_err(invalid_query)?;
+                let after = self.vector_after()?;
+                // One past what the budget allows, so the scan's own ceiling
+                // trips only after the charge that names the exhausted
+                // resource has been made.
+                let ceiling = scan_ceiling(meter, dim, WorkResource::VectorSidecars);
+                let mut budget = None;
+                let scan = {
+                    let mut progress =
+                        vector_scan_progress(meter, &mut budget, dim, WorkResource::VectorSidecars);
+                    super::vector_indexes::scan_exact_all(
+                        self.db,
+                        info,
+                        query,
+                        *query_norm,
+                        *metric,
+                        held,
+                        after,
+                        ceiling,
+                        &mut progress,
+                    )
+                };
+                if let Some(error) = budget {
+                    return Err(error);
+                }
+                let hits = scan?;
+                // The scan's own heap was bounded by `held`, so what it hands
+                // back IS the page's winner set: reserving `held` here would
+                // allocate a whole run's worth of rank keys to hold ten.
+                let bound = hits.len().max(1);
+                let mut winners = Winners::new();
+                for hit in hits {
+                    let entry = HeapEntry {
+                        key: RankKey {
+                            value: RankValue::Score(hit.distance.to_bits()),
+                            id: hit.id,
+                        },
+                        descending: false,
+                        row: None,
+                    };
+                    winners.push(bound, entry);
+                }
+                Ok(Some((winners, None)))
+            }
+            (
+                CompiledOrder::ApproximateVector {
+                    info,
+                    query,
+                    query_norm,
+                    metric,
+                    ef,
+                },
+                DriverPlan::QuantizedVector { .. },
+            ) => {
+                let dim = u64::try_from(super::quantized_vector_indexes::dimension(info)?)
+                    .map_err(invalid_query)?;
+                let after = self.vector_after()?;
+                let k = (*ef).min(held.max(1));
+                let ceiling = scan_ceiling(meter, dim, WorkResource::VectorLocators);
+                let mut budget = None;
+                let result = {
+                    let mut progress =
+                        vector_scan_progress(meter, &mut budget, dim, WorkResource::VectorLocators);
+                    self.db.scan_quantized(
+                        info.id,
+                        query,
+                        *metric,
+                        k,
+                        *ef,
+                        super::quantized_vector_indexes::QuantizedVectorCandidates::All,
+                        after,
+                        ceiling,
+                        &mut progress,
+                    )
+                };
+                if let Some(error) = budget {
+                    return Err(error);
+                }
+                let result = result?;
+                // The shortlist was charged as it was scanned; the rerank's
+                // sidecar gets are `reranked` and are charged here, once,
+                // because `ef` already bounds them.
+                let reranked = u64::try_from(result.reranked).map_err(invalid_query)?;
+                meter.charge(WorkResource::VectorSidecars, reranked)?;
+                meter.charge(WorkResource::VectorLanes, reranked.saturating_mul(dim))?;
+                let bound = result.hits.len().max(1);
+                let mut winners = Winners::new();
+                for hit in result.hits {
+                    let entry = HeapEntry {
+                        key: RankKey {
+                            value: RankValue::Score(hit.distance.to_bits()),
+                            id: hit.id,
+                        },
+                        descending: false,
+                        row: None,
+                    };
+                    winners.push(bound, entry);
+                }
+                let _ = query_norm;
+                Ok(Some((
+                    winners,
+                    Some(ApproximationDiagnostics {
+                        method: result.method,
+                        ef: result.ef,
+                        examined: result.examined,
+                        reranked: result.reranked,
+                    }),
+                )))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// The bookkeeping every page ends with, however its winners were found:
@@ -6420,6 +7397,9 @@ impl PreparedQuery<'_> {
                 (CompiledOrder::Distance { .. }, RankValue::Score(score)) => {
                     OrderValue::Distance(f64::from_bits(*score))
                 }
+                (CompiledOrder::Score { .. }, RankValue::Score(score)) => {
+                    OrderValue::Score(f64::from_bits(*score))
+                }
                 // The driver's key is the walk's own bookkeeping, not an
                 // answer about the row: a cell number is not a distance and a
                 // sequence is already `id`.
@@ -6483,37 +7463,45 @@ impl PreparedQuery<'_> {
         Ok(rows)
     }
 
-    /// Walk every not-yet-built [`ScalarRangeSet`] once, so this call's
+    /// Walk every not-yet-built [`MembershipSet`] once, so this call's
     /// `work.scalar_postings` pays for it and every later page -- including a
     /// resumed one -- finds it already there.
     ///
     /// Idempotent: a position the loop has already resolved, in this call or
     /// an earlier one, is `Ineligible`, `Overflow`, or `Ids` and is skipped.
-    fn ensure_scalar_range_sets<C: FnMut() -> bool>(
+    fn ensure_membership_sets<C: FnMut() -> bool>(
         &mut self,
         meter: &mut WorkMeter<'_, C>,
     ) -> QueryResult<()> {
         for position in 0..self.filters.len() {
-            if !matches!(self.scalar_ranges[position], ScalarRangeSet::Unbuilt) {
+            if !matches!(self.membership[position], MembershipSet::Unbuilt) {
                 continue;
             }
-            let (info, predicate) = match &self.filters[position] {
-                CompiledFilter::Scalar { info, predicate, .. } => (info.clone(), predicate.clone()),
-                _ => unreachable!("only a scalar filter's position is marked Unbuilt"),
+            let built = match &self.filters[position] {
+                CompiledFilter::Scalar { info, predicate, .. } => {
+                    let (info, predicate) = (info.clone(), predicate.clone());
+                    build_scalar_range_set(self.db, &info, &predicate, meter)
+                }
+                CompiledFilter::Point { info, predicate } => {
+                    let (info, predicate) = (info.clone(), *predicate);
+                    build_point_set(self.db, &info, predicate, meter)
+                }
+                _ => unreachable!("only a scalar range or a point filter is marked Unbuilt"),
             };
-            self.scalar_ranges[position] = match build_scalar_range_set(self.db, &info, &predicate, meter)
-            {
+            self.membership[position] = match built {
                 Ok(set) => set,
-                // The row-read path this filter used before this walk existed
-                // never spent `ScalarPostings` -- only `PrimaryReads` -- so a
-                // caller whose budget cannot afford even one posting of this
-                // walk must get exactly that path back, not a new way for the
-                // same query to fail. Postings already charged before this
-                // one stay charged; nothing here refunds real reads.
+                // The row-read path these filters used before this walk
+                // existed never spent `ScalarPostings` -- and a non-driving
+                // point filter spent one `SpatialPostings` per candidate, not
+                // per posting -- so a caller whose budget cannot afford even
+                // one posting of this walk must get exactly that path back,
+                // not a new way for the same query to fail. Postings already
+                // charged before this one stay charged; nothing here refunds
+                // real reads.
                 Err(QueryError::BudgetExceeded {
-                    resource: WorkResource::ScalarPostings,
+                    resource: WorkResource::ScalarPostings | WorkResource::SpatialPostings,
                     ..
-                }) => ScalarRangeSet::Overflow,
+                }) => MembershipSet::Overflow,
                 Err(other) => return Err(other),
             };
         }
@@ -6559,10 +7547,14 @@ impl PreparedQuery<'_> {
                 direction: SortDirection::Descending,
                 ..
             } | CompiledOrder::Bm25(_)
+                | CompiledOrder::Score {
+                    direction: SortDirection::Descending,
+                    ..
+                }
         );
         let mut meter = WorkMeter::new(budget, &mut cancelled);
         meter.check_cancelled()?;
-        self.ensure_scalar_range_sets(&mut meter)?;
+        self.ensure_membership_sets(&mut meter)?;
         // Rows an earlier page's walk already ranked and could not return.
         // They are in rank order, last first, so this takes the next ones off
         // the end -- and the whole walk is skipped, which is the point.
@@ -6591,6 +7583,24 @@ impl PreparedQuery<'_> {
             .filter(|_| in_rank_order != RankWalk::No);
         let mut nearest_walk = self.nearest.take();
         let result = (|| {
+        if let Some((fast_winners, fast_approx)) =
+            self.unfiltered_vector_scan(held, &mut meter)?
+        {
+            let mut winners = fast_winners.into_vec();
+            winners.sort_unstable_by(|left, right| {
+                compare_rank(&left.key, &right.key, descending)
+            });
+            let has_more = winners.len() > wanted;
+            if winners.len() > wanted && self.keeps_a_run() {
+                self.run_bounded = winners.len() == held;
+                self.run = winners.split_off(wanted);
+                self.run.reverse();
+            }
+            winners.truncate(wanted);
+            let rows = self.emit_rows(&mut winners, &mut meter)?;
+            let work = meter.used;
+            return self.finish_page(rows, &winners, has_more, fast_approx, work);
+        }
         let geometry_seen = if in_rank_order == RankWalk::Exact {
             self.geometry_seen.clone()
         } else {
@@ -6634,7 +7644,7 @@ impl PreparedQuery<'_> {
                         db,
                         &mut rows,
                         &self.filters,
-                        &self.scalar_ranges,
+                        &self.membership,
                         &candidate,
                         &mut row,
                         &mut encoded,
@@ -6664,7 +7674,15 @@ impl PreparedQuery<'_> {
                 }
 
                 let reranked = shortlist.len();
-                for candidate in shortlist {
+                let mut ordered: Vec<ApproxHeapEntry> = shortlist.into_vec();
+                ordered.sort_unstable_by(|left, right| {
+                    left.id
+                        .sequence
+                        .cmp(&right.id.sequence)
+                        .then_with(|| left.locator.cmp(&right.locator))
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                for candidate in ordered {
                     let Some(distance) = rerank_quantized_vector(
                         self.db,
                         info,
@@ -6728,6 +7746,10 @@ impl PreparedQuery<'_> {
                     && !keep_batch_rows
                     && self.a_filter_reads_the_row()
                     && self.filters_are_row_pure();
+                // Only a filtered nearest walk has a use for how often its
+                // hits are rejected, so only it pays the per-candidate call.
+                let reports_acceptance =
+                    matches!(self.driver, DriverPlan::Nearest { .. }) && !self.filters.is_empty();
                 let batch_bound = capacity.min(ROW_BATCH);
                 let mut batch: Vec<Candidate> = Vec::new();
                 let mut batch_order: Vec<(u64, u32)> = Vec::new();
@@ -6753,7 +7775,7 @@ impl PreparedQuery<'_> {
                                 db,
                                 &mut rows,
                                 &self.filters,
-                                &self.scalar_ranges,
+                                &self.membership,
                                 keep_batch_rows,
                                 &mut batch,
                                 &mut batch_order,
@@ -6784,7 +7806,7 @@ impl PreparedQuery<'_> {
                         let id = candidate.id;
                         let satisfied = candidate.satisfied_filter;
                         let filters = &self.filters;
-                        let ranges = &self.scalar_ranges;
+                        let ranges = &self.membership;
                         let scratch = &mut scratch;
                         let meter = &mut meter;
                         candidate.row_filtered = rows.with_row(id, |bytes| match bytes {
@@ -6796,33 +7818,36 @@ impl PreparedQuery<'_> {
                             )),
                         })?;
                     }
-                    match candidate.row_filtered {
+                    let kept = match candidate.row_filtered {
                         // The batched pass read this candidate's row and ran
                         // every filter against it; there is nothing here to
                         // repeat.
-                        Some(true) => {}
-                        Some(false) => continue,
+                        Some(kept) => kept,
                         // `filters_match` over an empty slice can only say
                         // yes, and saying it costs a nine-argument call per
                         // row: 5.6% of a key-only enumeration that has no
                         // filters to evaluate at all.
-                        None if self.filters.is_empty() => {}
-                        None => {
-                            if !filters_match(
-                                db,
-                                &mut rows,
-                                &self.filters,
-                                &self.scalar_ranges,
-                                &candidate,
-                                &mut row,
-                                &mut encoded,
-                                &graph,
-                                &mut scratch,
-                                &mut meter,
-                            )? {
-                                continue;
-                            }
-                        }
+                        None if self.filters.is_empty() => true,
+                        None => filters_match(
+                            db,
+                            &mut rows,
+                            &self.filters,
+                            &self.membership,
+                            &candidate,
+                            &mut row,
+                            &mut encoded,
+                            &graph,
+                            &mut scratch,
+                            &mut meter,
+                        )?,
+                    };
+                    // The nearest walk sizes its next ring from how many of
+                    // the hits it offered survived; nothing else listens.
+                    if reports_acceptance {
+                        driver.note_kept(kept);
+                    }
+                    if !kept {
+                        continue;
                     }
                     let Some(key) = rank_candidate(
                         db,

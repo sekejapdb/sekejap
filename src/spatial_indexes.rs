@@ -20,6 +20,11 @@ const NEAREST_GROWTH_FACTOR: f64 = 4.0;
 const NEAREST_COVER_RANGES: usize = 8;
 /// Postings the probe reads on each side of the centre's cell (whole cells).
 const NEAREST_PROBE: usize = 32;
+/// The most a reported acceptance rate may multiply a ring's target by. A
+/// caller whose filter has rejected every hit so far would otherwise ask for
+/// a cover the size of its sample, one ring at a time; this bounds the guess
+/// at the same place the planner's own crossover sits.
+const NEAREST_ACCEPTANCE_CAP: usize = 64;
 
 pub(super) const SPATIAL_FEATURE: u64 = 0x08;
 pub(super) const POINT_ENTRY: u8 = 0x74;
@@ -103,6 +108,10 @@ pub(super) struct NearestWalk {
     ready_at: usize,
     /// Postings the most recently completed ring examined, for density growth.
     last_seen: usize,
+    /// Hits the walk has handed over, and how many of them the caller's own
+    /// filters kept. See [`NearestWalk::note`].
+    offered: usize,
+    accepted: usize,
 }
 
 impl NearestWalk {
@@ -131,7 +140,52 @@ impl NearestWalk {
             ready: Vec::new(),
             ready_at: 0,
             last_seen: 0,
+            offered: 0,
+            accepted: 0,
         }
+    }
+
+    /// Tell the walk whether the hit it just handed over survived the
+    /// caller's filters.
+    ///
+    /// The walk sizes each ring to hold about `hint_k` postings, because
+    /// without this the only thing it knows about its caller is how many rows
+    /// the caller asked for. Under a filter that is the wrong target: if one
+    /// candidate in eight is kept, a ring holding `k` postings yields `k/8`
+    /// answers, and the walk grows ring by ring -- re-covering, re-seeking and
+    /// re-differencing the same space eight times over to reach a radius one
+    /// ring could have named. Feeding the acceptance back makes the NEXT
+    /// ring's target `k / acceptance` instead, so the ring the answer lives in
+    /// is the ring the walk builds.
+    ///
+    /// It is a hint and only a hint: it moves no boundary and admits nothing.
+    /// Each ring is still examined whole and still emits only what is within
+    /// its radius, so the order this walk yields is the same whatever the
+    /// caller reports here, or if it reports nothing at all.
+    pub(super) fn note(&mut self, accepted: bool) {
+        self.offered += 1;
+        if accepted {
+            self.accepted += 1;
+        }
+    }
+
+    /// How many postings the next ring should aim to hold: `hint_k` when
+    /// nothing is known about acceptance, and `hint_k / acceptance` once the
+    /// caller has reported on a ring's worth of hits.
+    ///
+    /// The estimate is deliberately blunt -- it is a radius guess, and a ring
+    /// that overshoots costs sorting, not correctness. `offered` below
+    /// `hint_k` is too little evidence to act on (one unlucky rejection would
+    /// multiply the target by the sample size), and the factor is capped so a
+    /// filter that has rejected EVERYTHING so far grows the cover by a bounded
+    /// amount rather than jumping to the world.
+    fn ring_target(&self) -> usize {
+        let k = self.hint_k.max(1);
+        if self.offered < k {
+            return k + 2;
+        }
+        let factor = (self.offered / self.accepted.max(1)).min(NEAREST_ACCEPTANCE_CAP);
+        k.saturating_mul(factor).saturating_add(2)
     }
 
     /// Next posting in ascending `(distance, id)`, or `None` at the end of
@@ -209,15 +263,23 @@ impl NearestWalk {
 
     fn grow_radius(&mut self) {
         let seen = self.last_seen as f64;
+        let target = self.ring_target();
         let jump = if seen > 0.0 {
             let density = seen / (core::f64::consts::PI * self.radius * self.radius);
-            (((self.hint_k.max(1) + 2) as f64) / (core::f64::consts::PI * density)).sqrt() * 1.25
+            ((target as f64) / (core::f64::consts::PI * density)).sqrt() * 1.25
         } else {
             0.0
         };
-        let mut radius = jump
-            .max(self.radius * 2.0)
-            .min(self.radius * NEAREST_GROWTH_FACTOR);
+        // The growth ceiling rises with the target for the same reason the
+        // target does: a filter that keeps one candidate in eight needs a
+        // cover about eight times wider in AREA, which is under three times
+        // wider in radius, and clamping that back to 4x per ring would just
+        // spread the same growth over more re-seeks.
+        let ceiling = NEAREST_GROWTH_FACTOR
+            * ((target as f64) / ((self.hint_k.max(1) + 2) as f64))
+                .sqrt()
+                .max(1.0);
+        let mut radius = jump.max(self.radius * 2.0).min(self.radius * ceiling);
         if let Some(cap) = self.radius_cap {
             radius = radius.min(cap);
         }
