@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Tests for tools/battle50k_compare.py.
 
-NOT RUN as part of this change -- written as source only, per the worker
-brief's HARD RULES (no test/benchmark execution). stdlib only (unittest +
-subprocess), so it can be run later with:
+stdlib only (unittest + subprocess), run with either:
 
+    python3 -m pytest tests/battle50k_compare_test.py -q
     python3 tests/battle50k_compare_test.py
 """
 
@@ -160,6 +159,56 @@ DISAGREEING_PG = json.loads(json.dumps(AGREEING_PG))
 DISAGREEING_PG["cases"][0]["total_rows"] = 4199
 
 
+def sweep_case(name, recall, median_us):
+    return {
+        "name": name,
+        "kind": "approx",
+        "queries": 50,
+        "median_us": median_us,
+        "p90_us": median_us * 1.2,
+        "total_rows": 500,
+        "first_keys": ["a"],
+        "k": 10,
+        "recall_at_k": recall,
+        "note": f"sweep point {name}",
+    }
+
+
+# A fixture with a real recall-vs-latency SWEEP on `vec_ann_10`: E4's `ef`
+# axis crosses recall 0.95 quickly and cheaply (ef=100, 150.0 us); Postgres's
+# `sls` axis never reaches 0.95 even at its widest point (sls=800, recall
+# 0.75) -- the shape the brief's PROBLEM section describes (equal ef / sls
+# numerals do not mean equal recall), and the "never reached" branch of the
+# headline the compare script must print instead of a ratio.
+SWEEP_E4 = make_report(
+    "e4",
+    50000,
+    "abc1234",
+    stages=[{"name": "disk_bytes", "bytes": 10 * 1024 * 1024}],
+    cases=[
+        sweep_case("vec_ann_10@ef20", 0.70, 50.0),
+        sweep_case("vec_ann_10@ef50", 0.85, 80.0),
+        sweep_case("vec_ann_10@ef100", 0.97, 150.0),
+        sweep_case("vec_ann_10@ef200", 0.99, 300.0),
+        sweep_case("vec_ann_10@ef400", 1.00, 600.0),
+    ],
+)
+
+SWEEP_PG = make_report(
+    "postgres",
+    50000,
+    "abc1234",
+    stages=[{"name": "disk_bytes", "bytes": 12 * 1024 * 1024}],
+    cases=[
+        sweep_case("vec_ann_10@sls50", 0.20, 30.0),
+        sweep_case("vec_ann_10@sls100", 0.29, 45.0),
+        sweep_case("vec_ann_10@sls200", 0.40, 70.0),
+        sweep_case("vec_ann_10@sls400", 0.60, 120.0),
+        sweep_case("vec_ann_10@sls800", 0.75, 220.0),
+    ],
+)
+
+
 class Battle50kCompareTest(unittest.TestCase):
     def _run(self, e4_report, pg_report, extra_args=None):
         with tempfile.TemporaryDirectory() as tmp:
@@ -199,6 +248,49 @@ class Battle50kCompareTest(unittest.TestCase):
     def test_null_median_case_reports_note(self):
         result = self._run(AGREEING_E4, AGREEING_PG)
         self.assertIn("n/a: deviation: E4 has no score expression", result.stdout)
+
+    def test_sweep_table_and_headline_when_pg_never_reaches_recall(self):
+        result = self._run(SWEEP_E4, SWEEP_PG)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        # Every sweep point from both arms lands in the SWEEP table -- E4's
+        # ef axis and Postgres's sls axis are distinct case names, so both
+        # sets of rows appear rather than one crowding the other out.
+        self.assertIn("SWEEP vec_ann_10", result.stdout)
+        for label in ("ef20", "ef50", "ef100", "ef200", "ef400"):
+            self.assertIn(label, result.stdout)
+        for label in ("sls50", "sls100", "sls200", "sls400", "sls800"):
+            self.assertIn(label, result.stdout)
+
+        # The headline: E4 clears recall 0.95 at ef=100 for 150.0 us;
+        # Postgres never clears it (best is sls=800 at recall 0.75), so the
+        # line names that instead of printing a meaningless ratio.
+        headline_lines = [
+            line for line in result.stdout.splitlines() if line.startswith("HEADLINE vec_ann_10:")
+        ]
+        self.assertEqual(len(headline_lines), 1)
+        headline = headline_lines[0]
+        self.assertIn("no cross-arm ratio at recall>=0.95", headline)
+        self.assertIn("e4 cheapest at recall>=0.95: ef100", headline)
+        self.assertIn("median_us=150.0", headline)
+        self.assertIn("pg never reached recall>=0.95; best is sls800", headline)
+        self.assertIn("recall=0.750", headline)
+
+    def test_sweep_headline_ratio_when_both_arms_reach_recall(self):
+        pg_reaches = json.loads(json.dumps(SWEEP_PG))
+        pg_reaches["cases"].append(sweep_case("vec_ann_10@sls1600", 0.96, 400.0))
+        result = self._run(SWEEP_E4, pg_reaches)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        headline_lines = [
+            line for line in result.stdout.splitlines() if line.startswith("HEADLINE vec_ann_10:")
+        ]
+        self.assertEqual(len(headline_lines), 1)
+        headline = headline_lines[0]
+        # E4's cheapest >=0.95 point is ef100 at 150.0 us; Postgres's is the
+        # new sls1600 point at 400.0 us -- so the ratio is 150/400.
+        self.assertIn("e4 ef100 = 150.0 us", headline)
+        self.assertIn("pg sls1600 = 400.0 us", headline)
+        self.assertIn(f"e4/pg = {150.0 / 400.0:.3f}x", headline)
 
 
 if __name__ == "__main__":

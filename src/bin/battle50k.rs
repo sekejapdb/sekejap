@@ -38,7 +38,7 @@
 //!               each `CREATE INDEX` is its own timed stage. `disk_bytes` is
 //!               `pg_total_relation_size('place')`.
 //!
-//! BATTERY. The same twenty-two cases, in the same order, in both arms, fifty
+//! BATTERY. The same twenty cases, in the same order, in both arms, fifty
 //! query instances each, driven by `queries.json` (`points`, `boxes`,
 //! `polygons`, `radii`, `vectors`, `terms`, fifty of each). Thirteen FILTER
 //! cases return every matching row and are compared on row count:
@@ -47,9 +47,32 @@
 //! `text_two`, `text_and_kind`, `born_range`, `kind_eq`, `radius_and_born`.
 //! Seven RANKED cases return ten rows and are compared on top-ten overlap,
 //! never on order: `knn_10`, `knn_10_kind`, `text_top10`, `vec_exact_10`,
-//! `vec_exact_radius`, `hybrid_10`, `hybrid_blend_10`. Two APPROX cases
-//! report recall at ten against that same arm's own exact answer:
-//! `vec_ann_10`, `vec_ann_10_kind`.
+//! `vec_exact_radius`, `hybrid_10`, `hybrid_blend_10`.
+//!
+//! APPROXIMATE SWEEP. `vec_ann_10` and `vec_ann_10_kind` are not single
+//! cases: each is a SWEEP of cases, one per point on a recall-vs-latency
+//! curve, because `ef = 100` and `diskann.query_search_list_size = 100` are
+//! equal numbers but not the same knob (deviation 12 below), so comparing
+//! one point from each at "the same" setting compares nothing. E4 sweeps
+//! `ef` over `EF_SWEEP` (20, 50, 100, 200, 400), naming each point
+//! `vec_ann_10@ef<N>` / `vec_ann_10_kind@ef<N>`; Postgres sweeps
+//! `diskann.query_search_list_size` over `SLS_SWEEP` (50, 100, 200, 400,
+//! 800), naming each point `vec_ann_10@sls<N>` / `vec_ann_10_kind@sls<N>`,
+//! plus one extra point per base at the ef=100-matching `sls=100` with
+//! `diskann.query_rescore` raised from this server's default to
+//! `RESCORE_PROBE` (400), named `..@sls100+resc400`, run only when the
+//! server actually exposes that GUC (`pg_has_query_rescore`, probed by
+//! `SET LOCAL`, not trusted from `pg_settings` — see the deviation on
+//! `place_emb_ann`'s build defaults). Every sweep point is still `kind:
+//! approx` with its own `recall_at_k` and `median_us`, measured against the
+//! same in-arm exact twin the old fixed-ef case used
+//! (`vec_exact_10` / `vec_ann_10_kind:exact`). `compare` and
+//! `tools/battle50k_compare.py` print the full sweep table for both arms and
+//! then the HEADLINE: each arm's cheapest point with `recall_at_k >= 0.95`
+//! and the E4/PG ratio of their `median_us` AT THAT RECALL — the number that
+//! actually means something for approximate vector search, unlike a ratio at
+//! two knobs that merely share a numeral. An arm that never reaches 0.95
+//! reports its best recall instead of a ratio.
 //!
 //! Each case is warmed by one untimed pass over all fifty instances and then
 //! measured by one timed pass; `median_us` and `p90_us` are over the fifty
@@ -213,7 +236,28 @@ pub const BATCH: usize = 256;
 /// Top-k for every ranked and approximate case.
 pub const K: usize = 10;
 /// E4's approximate shortlist bound, and pgvectorscale's search list size.
+/// Superseded as the single approx-case setting by `EF_SWEEP` /
+/// `SLS_SWEEP` below; kept because it is still the ef=100 / sls=100 point
+/// both sweeps carry, the one the two knobs share by number alone.
 pub const EF: usize = 100;
+/// E4 `ef` values the approximate cases sweep, tracing a recall-vs-latency
+/// curve instead of comparing recall at one arbitrary shortlist width.
+pub const EF_SWEEP: [usize; 5] = [20, 50, 100, 200, 400];
+/// pgvectorscale `diskann.query_search_list_size` values the approximate
+/// cases sweep — the Postgres axis of the same curve, not the same knob as
+/// `EF_SWEEP` (deviation 12): E4's `ef` bounds a compact int8 shortlist that
+/// is then reranked from f32 sidecars, this bounds a graph beam.
+pub const SLS_SWEEP: [usize; 5] = [50, 100, 200, 400, 800];
+/// `diskann.query_rescore` value tried at the sweep's ef=100-matching
+/// midpoint (`sls = 100`), on top of the server's own default, to see
+/// whether rescoring more candidates recovers recall without widening the
+/// search list itself. Only tried when `pg_has_query_rescore` confirms the
+/// GUC exists on the server actually running.
+pub const RESCORE_PROBE: usize = 400;
+/// The base case names whose single approximate point becomes a sweep.
+pub const APPROX_BASES: [&str; 2] = ["vec_ann_10", "vec_ann_10_kind"];
+/// The recall threshold the sweep's headline ratio is measured at.
+pub const HEADLINE_RECALL: f64 = 0.95;
 /// E4's maximum page. A complete answer is assembled from repeated pages and
 /// that assembly is part of what a case costs.
 const PAGE: usize = 8192;
@@ -523,7 +567,11 @@ pub struct CaseSpec {
 
 /// The same names in the same order in both arms. `compare` walks this list,
 /// not either report's own ordering, so a missing case is a visible hole.
-pub const BATTERY: [CaseSpec; 22] = [
+/// `vec_ann_10` and `vec_ann_10_kind` are NOT here: they are the two
+/// approximate sweeps (`APPROX_BASES`), generated at runtime, one case per
+/// `EF_SWEEP` / `SLS_SWEEP` point, because there is no longer one fixed-ef
+/// case for either to be a fixed entry of.
+pub const BATTERY: [CaseSpec; 20] = [
     CaseSpec { name: "pt_radius", kind: CaseKind::Filter },
     CaseSpec { name: "pt_bbox", kind: CaseKind::Filter },
     CaseSpec { name: "plot_within_box", kind: CaseKind::Filter },
@@ -544,18 +592,62 @@ pub const BATTERY: [CaseSpec; 22] = [
     CaseSpec { name: "vec_exact_radius", kind: CaseKind::Ranked },
     CaseSpec { name: "hybrid_10", kind: CaseKind::Ranked },
     CaseSpec { name: "hybrid_blend_10", kind: CaseKind::Ranked },
-    CaseSpec { name: "vec_ann_10", kind: CaseKind::Approx },
-    CaseSpec { name: "vec_ann_10_kind", kind: CaseKind::Approx },
 ];
 
 /// The exact counterpart each approximate case's recall is measured against,
-/// inside the SAME arm. See deviation 12.
+/// inside the SAME arm. See deviation 12. Sweep-point names
+/// (`vec_ann_10@ef20`, `vec_ann_10_kind@sls100+resc400`, ...) carry the same
+/// base before the `@`, so the twin is resolved from the base alone.
 fn exact_twin(name: &str) -> Option<&'static str> {
-    match name {
+    let base = name.split('@').next().unwrap_or(name);
+    match base {
         "vec_ann_10" => Some("vec_exact_10"),
         "vec_ann_10_kind" => Some("vec_ann_10_kind:exact"),
         _ => None,
     }
+}
+
+/// The shape of one approximate-sweep case name, parsed back out of the
+/// generated string so `e4_case` / `pg_case` can dispatch it without a
+/// combinatorial match arm per sweep point. `by_kind` mirrors the `_kind`
+/// suffix on the base name (the case still filters on `kinds[i % KINDS]`
+/// exactly as the old fixed-ef case did); the arm-specific knob is `ef` for
+/// E4 names and `sls` (plus an optional `rescore`) for Postgres names.
+struct ApproxSweepPoint {
+    by_kind: bool,
+    ef: Option<usize>,
+    sls: Option<usize>,
+    rescore: Option<usize>,
+}
+
+fn parse_approx_sweep(name: &str) -> Option<ApproxSweepPoint> {
+    let (base, suffix) = name.split_once('@')?;
+    let by_kind = match base {
+        "vec_ann_10" => false,
+        "vec_ann_10_kind" => true,
+        _ => return None,
+    };
+    if let Some(n) = suffix.strip_prefix("ef") {
+        return Some(ApproxSweepPoint {
+            by_kind,
+            ef: Some(n.parse().ok()?),
+            sls: None,
+            rescore: None,
+        });
+    }
+    if let Some(rest) = suffix.strip_prefix("sls") {
+        let (sls_part, rescore) = match rest.split_once("+resc") {
+            Some((s, r)) => (s, Some(r.parse().ok()?)),
+            None => (rest, None),
+        };
+        return Some(ApproxSweepPoint {
+            by_kind,
+            ef: None,
+            sls: Some(sls_part.parse().ok()?),
+            rescore,
+        });
+    }
+    None
 }
 
 // ── what a case answers with ──────────────────────────────────────────────
@@ -790,6 +882,32 @@ fn e4_run(
 fn e4_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R<Answer> {
     let keys = &corpus.keys;
     let kind = &corpus.kinds[i % KINDS];
+
+    // Approximate sweep points (`vec_ann_10@ef<N>`, `vec_ann_10_kind@ef<N>`):
+    // dispatched here rather than as one match arm per `EF_SWEEP` value.
+    if let Some(sweep) = parse_approx_sweep(name) {
+        let ef = sweep
+            .ef
+            .ok_or_else(|| format!("battle50k: `{name}` has no ef=... suffix for the E4 arm"))?;
+        let filters: Vec<QueryFilter> = if sweep.by_kind {
+            vec![e4_kind_filter(ctx.kind, kind)]
+        } else {
+            Vec::new()
+        };
+        return e4_run(
+            ctx,
+            keys,
+            &filters,
+            QueryOrder::ApproximateVector {
+                index: ctx.emb_ann,
+                query: &q.vectors[i],
+                metric: VectorMetric::Cosine,
+                ef,
+            },
+            Some(K),
+        );
+    }
+
     match name {
         // ── filters: every matching row, in the driver's own walk order ──
         "pt_radius" => e4_run(
@@ -991,31 +1109,11 @@ fn e4_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R
             Some(K),
         ),
 
-        // ── approximate, and the exact twin each recall is measured on ───
-        "vec_ann_10" => e4_run(
-            ctx,
-            keys,
-            &[],
-            QueryOrder::ApproximateVector {
-                index: ctx.emb_ann,
-                query: &q.vectors[i],
-                metric: VectorMetric::Cosine,
-                ef: EF,
-            },
-            Some(K),
-        ),
-        "vec_ann_10_kind" => e4_run(
-            ctx,
-            keys,
-            &[e4_kind_filter(ctx.kind, kind)],
-            QueryOrder::ApproximateVector {
-                index: ctx.emb_ann,
-                query: &q.vectors[i],
-                metric: VectorMetric::Cosine,
-                ef: EF,
-            },
-            Some(K),
-        ),
+        // ── the exact twin the approximate sweep's recall is measured on ─
+        // (`vec_ann_10`'s own twin is `vec_exact_10`, already a case above;
+        // `vec_ann_10` and `vec_ann_10_kind` are no longer match arms here
+        // themselves — every point of their sweep goes through
+        // `parse_approx_sweep` at the top of this function.)
         "vec_ann_10_kind:exact" => e4_run(
             ctx,
             keys,
@@ -1318,12 +1416,6 @@ fn pg_exact_setup() -> Vec<String> {
     ]
 }
 
-/// pgvectorscale's beam width, set to the same number as E4's `ef`; see
-/// deviation 12.
-fn pg_ann_setup() -> Vec<String> {
-    vec![format!("SET LOCAL diskann.query_search_list_size = {EF}")]
-}
-
 /// One case, one query instance, as Postgres spells it: the `SET LOCAL`
 /// statements the case needs and the statement itself.
 fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String>, String)> {
@@ -1345,6 +1437,25 @@ fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String
     let knn_point = pg_point(point[0], point[1]);
 
     let plain = |sql: String| -> R<(Vec<String>, String)> { Ok((Vec::new(), sql)) };
+
+    // Approximate sweep points (`vec_ann_10@sls<N>`,
+    // `vec_ann_10_kind@sls<N>`, and the `..@sls100+resc400` rescore probe):
+    // dispatched here rather than as one match arm per `SLS_SWEEP` value.
+    if let Some(sweep) = parse_approx_sweep(name) {
+        let sls = sweep
+            .sls
+            .ok_or_else(|| format!("battle50k: `{name}` has no sls=... suffix for the Postgres arm"))?;
+        let mut setup = vec![format!("SET LOCAL diskann.query_search_list_size = {sls}")];
+        if let Some(rescore) = sweep.rescore {
+            setup.push(format!("SET LOCAL diskann.query_rescore = {rescore}"));
+        }
+        let sql = if sweep.by_kind {
+            format!("SELECT \"key\" FROM place WHERE kind = {kind} ORDER BY emb <=> {vector} LIMIT {K}")
+        } else {
+            format!("SELECT \"key\" FROM place ORDER BY emb <=> {vector} LIMIT {K}")
+        };
+        return Ok((setup, sql));
+    }
 
     match name {
         // ── filters ─────────────────────────────────────────────────────
@@ -1438,17 +1549,10 @@ fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String
             pg_tsquery(&q.terms[i])
         )),
 
-        // ── approximate, and the exact twin recall is measured on ───────
-        "vec_ann_10" => Ok((
-            pg_ann_setup(),
-            format!("SELECT \"key\" FROM place ORDER BY emb <=> {vector} LIMIT {K}"),
-        )),
-        "vec_ann_10_kind" => Ok((
-            pg_ann_setup(),
-            format!(
-                "SELECT \"key\" FROM place WHERE kind = {kind} ORDER BY emb <=> {vector} LIMIT {K}"
-            ),
-        )),
+        // ── the exact twin the approximate sweep's recall is measured on ─
+        // (`vec_ann_10` and `vec_ann_10_kind` are no longer match arms here
+        // themselves — every point of their sweep goes through
+        // `parse_approx_sweep` at the top of this function.)
         "vec_ann_10_kind:exact" => Ok((
             pg_exact_setup(),
             format!(
@@ -1601,18 +1705,41 @@ fn pg_disk_bytes(client: &mut Client) -> R<u64> {
     Ok(size as u64)
 }
 
+/// Whether this server's diskann build exposes `diskann.query_rescore`,
+/// probed by trying `SET LOCAL` and catching an "unrecognized configuration
+/// parameter" error, INSIDE its own transaction so the probe rolls back
+/// rather than either persisting the setting or poisoning a later statement
+/// with an aborted transaction. `pg_settings` is not trusted for this: on
+/// this loop's own server it holds zero `diskann.%` rows until the diskann
+/// index has actually been touched once by an index-using statement in the
+/// current backend, because the GUCs are registered when pgvectorscale's
+/// library loads, not merely when `CREATE EXTENSION` runs (see the
+/// deviation on `place_emb_ann`'s build parameters).
+fn pg_has_query_rescore(client: &mut Client) -> bool {
+    let mut txn = match client.transaction() {
+        Ok(txn) => txn,
+        Err(_) => return false,
+    };
+    let ok = txn.batch_execute("SET LOCAL diskann.query_rescore = 50").is_ok();
+    drop(txn); // uncommitted, so this rolls back rather than sticking.
+    ok
+}
+
 // ── the report ────────────────────────────────────────────────────────────
 
-fn case_json(spec: &CaseSpec, result: Option<&CaseResult>, recall: Option<f64>, note: &str) -> Value {
-    let k = match spec.kind {
+/// Takes `name`/`kind` directly rather than `&CaseSpec` so both the static
+/// `BATTERY` entries and the dynamically-named approximate sweep points (no
+/// `'static` name to point a `CaseSpec` at) build the same JSON shape.
+fn case_json(name: &str, kind: CaseKind, result: Option<&CaseResult>, recall: Option<f64>, note: &str) -> Value {
+    let k = match kind {
         CaseKind::Filter => Value::Null,
         _ => Value::from(K as u64),
     };
     let recall = recall.map_or(Value::Null, Value::from);
     match result {
         Some(r) => json!({
-            "name": spec.name,
-            "kind": spec.kind.label(),
+            "name": name,
+            "kind": kind.label(),
             "queries": INSTANCES,
             "median_us": r.median_us,
             "p90_us": r.p90_us,
@@ -1623,8 +1750,8 @@ fn case_json(spec: &CaseSpec, result: Option<&CaseResult>, recall: Option<f64>, 
             "note": note,
         }),
         None => json!({
-            "name": spec.name,
-            "kind": spec.kind.label(),
+            "name": name,
+            "kind": kind.label(),
             "queries": INSTANCES,
             "median_us": Value::Null,
             "p90_us": Value::Null,
@@ -1730,10 +1857,14 @@ fn e4_deviations() -> Vec<Value> {
         ),
         deviation(
             "vec_ann_10",
-            "ef = 100 here and diskann.query_search_list_size = 100 in Postgres. They are not the \
-             same knob — one bounds a compact shortlist that is then reranked from f32 sidecars, \
-             the other a graph beam — so recall is computed inside each arm against that arm's \
-             own exact answer and never across arms.",
+            "ef and diskann.query_search_list_size are not the same knob — one bounds a compact \
+             shortlist that is then reranked from f32 sidecars, the other a graph beam — so equal \
+             numbers compare nothing. Both sides sweep instead: vec_ann_10@ef20 through \
+             vec_ann_10@ef400 (EF_SWEEP), with recall computed inside this arm against its own \
+             exact answer (vec_exact_10) at every point. vec_ann_10_kind sweeps the same way \
+             against vec_ann_10_kind:exact. `compare` and battle50k_compare.py print the full \
+             sweep and the headline: each arm's cheapest point with recall_at_k >= 0.95 and the \
+             E4/PG ratio of their median_us AT THAT RECALL.",
         ),
         deviation(
             "*",
@@ -1800,8 +1931,30 @@ fn pg_deviations() -> Vec<Value> {
         ),
         deviation(
             "vec_ann_10",
-            "diskann.query_search_list_size = 100 mirrors E4's ef = 100 by number, not by \
-             algorithm; recall is measured against this arm's own sequential-scan exact answer.",
+            "diskann.query_search_list_size mirrors E4's ef by number, not by algorithm, so both \
+             sides sweep it instead of comparing one shared numeral: vec_ann_10@sls50 through \
+             vec_ann_10@sls800 (SLS_SWEEP), plus vec_ann_10@sls100+resc400 when this server's \
+             diskann build exposes diskann.query_rescore. Recall is measured against this arm's \
+             own sequential-scan exact answer at every point. The `SET LOCAL \
+             diskann.query_search_list_size` for a point is issued in the same transaction as its \
+             `ORDER BY emb <=> v LIMIT 10`, so it is in force for that LIMIT; pgvectorscale's beam \
+             search only returns useful candidates once the search list size is at least the \
+             LIMIT, which every SLS_SWEEP point (>= 50) clears by a wide margin over LIMIT 10, so \
+             that interaction never actually binds in this sweep.",
+        ),
+        deviation(
+            "vec_ann_10",
+            "place_emb_ann's `CREATE INDEX ... USING diskann (emb vector_cosine_ops)` carries no \
+             WITH clause — `pg_get_indexdef` and `pg_class.reloptions` both show no explicit build \
+             parameters — so the index was built entirely on pgvectorscale's own defaults: \
+             num_neighbors=50, (build-time) search_list_size=100, max_alpha=1.2, \
+             storage_layout='memory_optimized' (the project's documented defaults; not \
+             independently re-derived here, and this loop does NOT rebuild the index to confirm \
+             them empirically or to try others, per the brief). A fairer build for this corpus's \
+             32-dimensional cosine geometry would likely raise num_neighbors (e.g. 64-100) and the \
+             build-time search_list_size (e.g. 200-300) to grow the graph's connectivity before any \
+             query-time knob is touched, at the cost of a slower CREATE INDEX and a larger index on \
+             disk — a change that needs its own timed stage and its own loop, not a note.",
         ),
         deviation(
             "*",
@@ -1914,19 +2067,6 @@ pub fn run_arm(options: &Options) -> R<Value> {
                 }
                 let result = measure(|i| e4_case(&ctx, &corpus, &queries, spec.name, i))
                     .map_err(|e| format!("case {}: {e}", spec.name))?;
-                let recall = if spec.kind == CaseKind::Approx {
-                    let twin = exact_twin(spec.name)
-                        .ok_or_else(|| format!("case {}: no exact twin", spec.name))?;
-                    Some(
-                        mean_recall(
-                            |i| e4_case(&ctx, &corpus, &queries, spec.name, i),
-                            |i| e4_case(&ctx, &corpus, &queries, twin, i),
-                        )
-                        .map_err(|e| format!("case {} recall: {e}", spec.name))?,
-                    )
-                } else {
-                    None
-                };
                 eprintln!(
                     "[e4] {:<20} {:>12.1} us  rows={}",
                     spec.name, result.median_us, result.total_rows
@@ -1935,7 +2075,37 @@ pub fn run_arm(options: &Options) -> R<Value> {
                     dump_case(dir, spec.name, |i| e4_case(&ctx, &corpus, &queries, spec.name, i))
                         .map_err(|e| format!("case {} dump: {e}", spec.name))?;
                 }
-                cases.push(case_json(spec, Some(&result), recall, ""));
+                cases.push(case_json(spec.name, spec.kind, Some(&result), None, ""));
+            }
+            // The approximate recall-vs-latency sweep: EF_SWEEP points for
+            // each of vec_ann_10 and vec_ann_10_kind. See "APPROXIMATE
+            // SWEEP" at the top of this file.
+            for &base in &APPROX_BASES {
+                for &ef in &EF_SWEEP {
+                    let name = format!("{base}@ef{ef}");
+                    if !selected(&name) {
+                        continue;
+                    }
+                    let result = measure(|i| e4_case(&ctx, &corpus, &queries, &name, i))
+                        .map_err(|e| format!("case {name}: {e}"))?;
+                    let twin = exact_twin(&name)
+                        .ok_or_else(|| format!("case {name}: no exact twin"))?;
+                    let recall = mean_recall(
+                        |i| e4_case(&ctx, &corpus, &queries, &name, i),
+                        |i| e4_case(&ctx, &corpus, &queries, twin, i),
+                    )
+                    .map_err(|e| format!("case {name} recall: {e}"))?;
+                    eprintln!(
+                        "[e4] {:<20} {:>12.1} us  rows={}  recall={:.3}",
+                        name, result.median_us, result.total_rows, recall
+                    );
+                    if let Some(dir) = options.dump.as_deref() {
+                        dump_case(dir, &name, |i| e4_case(&ctx, &corpus, &queries, &name, i))
+                            .map_err(|e| format!("case {name} dump: {e}"))?;
+                    }
+                    let note = format!("ef={ef}");
+                    cases.push(case_json(&name, CaseKind::Approx, Some(&result), Some(recall), &note));
+                }
             }
             drop(ctx);
             disk_bytes = dir_bytes(&options.db_dir);
@@ -1956,21 +2126,6 @@ pub fn run_arm(options: &Options) -> R<Value> {
                     pg_answer(&mut client, &setup, &sql)
                 })
                 .map_err(|e| format!("case {}: {e}", spec.name))?;
-                let recall = if spec.kind == CaseKind::Approx {
-                    let twin = exact_twin(spec.name)
-                        .ok_or_else(|| format!("case {}: no exact twin", spec.name))?;
-                    let mut total = 0.0;
-                    for i in 0..INSTANCES {
-                        let (setup, sql) = pg_case(&queries, &corpus.kinds, spec.name, i)?;
-                        let approximate = pg_answer(&mut client, &setup, &sql)?;
-                        let (setup, sql) = pg_case(&queries, &corpus.kinds, twin, i)?;
-                        let exact = pg_answer(&mut client, &setup, &sql)?;
-                        total += overlap_at_k(&approximate.keys, &exact.keys, K);
-                    }
-                    Some(total / INSTANCES as f64)
-                } else {
-                    None
-                };
                 eprintln!(
                     "[postgres] {:<20} {:>12.1} us  rows={}",
                     spec.name, result.median_us, result.total_rows
@@ -1982,7 +2137,60 @@ pub fn run_arm(options: &Options) -> R<Value> {
                     })
                     .map_err(|e| format!("case {} dump: {e}", spec.name))?;
                 }
-                cases.push(case_json(spec, Some(&result), recall, ""));
+                cases.push(case_json(spec.name, spec.kind, Some(&result), None, ""));
+            }
+            // The approximate recall-vs-latency sweep: SLS_SWEEP points for
+            // each of vec_ann_10 and vec_ann_10_kind, plus one
+            // diskann.query_rescore probe per base at sls=100 when the
+            // server exposes that GUC. See "APPROXIMATE SWEEP" at the top
+            // of this file.
+            let rescore_supported = pg_has_query_rescore(&mut client);
+            for &base in &APPROX_BASES {
+                let mut points: Vec<(String, String)> = SLS_SWEEP
+                    .iter()
+                    .map(|sls| (format!("{base}@sls{sls}"), format!("diskann.query_search_list_size={sls}")))
+                    .collect();
+                if rescore_supported {
+                    points.push((
+                        format!("{base}@sls100+resc{RESCORE_PROBE}"),
+                        format!(
+                            "diskann.query_search_list_size=100, diskann.query_rescore={RESCORE_PROBE}"
+                        ),
+                    ));
+                }
+                for (name, note) in points {
+                    if !selected(&name) {
+                        continue;
+                    }
+                    let result = measure(|i| {
+                        let (setup, sql) = pg_case(&queries, &corpus.kinds, &name, i)?;
+                        pg_answer(&mut client, &setup, &sql)
+                    })
+                    .map_err(|e| format!("case {name}: {e}"))?;
+                    let twin = exact_twin(&name)
+                        .ok_or_else(|| format!("case {name}: no exact twin"))?;
+                    let mut total = 0.0;
+                    for i in 0..INSTANCES {
+                        let (setup, sql) = pg_case(&queries, &corpus.kinds, &name, i)?;
+                        let approximate = pg_answer(&mut client, &setup, &sql)?;
+                        let (setup, sql) = pg_case(&queries, &corpus.kinds, twin, i)?;
+                        let exact = pg_answer(&mut client, &setup, &sql)?;
+                        total += overlap_at_k(&approximate.keys, &exact.keys, K);
+                    }
+                    let recall = total / INSTANCES as f64;
+                    eprintln!(
+                        "[postgres] {:<20} {:>12.1} us  rows={}  recall={:.3}",
+                        name, result.median_us, result.total_rows, recall
+                    );
+                    if let Some(dir) = options.dump.as_deref() {
+                        dump_case(dir, &name, |i| {
+                            let (setup, sql) = pg_case(&queries, &corpus.kinds, &name, i)?;
+                            pg_answer(&mut client, &setup, &sql)
+                        })
+                        .map_err(|e| format!("case {name} dump: {e}"))?;
+                    }
+                    cases.push(case_json(&name, CaseKind::Approx, Some(&result), Some(recall), &note));
+                }
             }
             disk_bytes = pg_disk_bytes(&mut client)?;
             drop(client);
@@ -2048,6 +2256,60 @@ fn first_keys(case: Option<&Value>) -> Vec<String> {
 
 fn micros(value: Option<f64>) -> String {
     value.map_or_else(|| "-".into(), |v| format!("{v:.1}"))
+}
+
+/// One point of an approximate sweep, extracted from a report's `cases` by
+/// stripping `<base>@` off the case name (`vec_ann_10@ef100` -> `ef100`).
+struct SweepPoint {
+    label: String,
+    median_us: Option<f64>,
+    p90_us: Option<f64>,
+    recall: Option<f64>,
+}
+
+fn sweep_points(report: &Value, base: &str) -> Vec<SweepPoint> {
+    let prefix = format!("{base}@");
+    report
+        .get("cases")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Value::as_str)?;
+            let label = name.strip_prefix(&prefix)?;
+            Some(SweepPoint {
+                label: label.to_string(),
+                median_us: c.get("median_us").and_then(Value::as_f64),
+                p90_us: c.get("p90_us").and_then(Value::as_f64),
+                recall: c.get("recall_at_k").and_then(Value::as_f64),
+            })
+        })
+        .collect()
+}
+
+/// The cheapest (lowest `median_us`) point at `recall_at_k >= threshold`,
+/// paired with `true`; if none clears the threshold, the point with the
+/// HIGHEST recall instead (ties broken by lower `median_us`), paired with
+/// `false` so the caller can say the threshold was never reached. `None`
+/// only when the sweep produced no points with a recall at all.
+fn cheapest_at_recall(points: &[SweepPoint], threshold: f64) -> Option<(&SweepPoint, bool)> {
+    let mut hit: Vec<&SweepPoint> = points
+        .iter()
+        .filter(|p| p.recall.is_some_and(|r| r >= threshold) && p.median_us.is_some())
+        .collect();
+    hit.sort_by(|a, b| a.median_us.unwrap().total_cmp(&b.median_us.unwrap()));
+    if let Some(best) = hit.first() {
+        return Some((best, true));
+    }
+    let mut scored: Vec<&SweepPoint> = points.iter().filter(|p| p.recall.is_some()).collect();
+    scored.sort_by(|a, b| {
+        b.recall.unwrap().total_cmp(&a.recall.unwrap()).then_with(|| {
+            a.median_us
+                .unwrap_or(f64::INFINITY)
+                .total_cmp(&b.median_us.unwrap_or(f64::INFINITY))
+        })
+    });
+    scored.first().map(|p| (*p, false))
 }
 
 /// Print the cross-arm table and say whether every filter case agreed. Ranked
@@ -2129,6 +2391,75 @@ pub fn compare(left: &Path, right: &Path) -> R<bool> {
             rp.map_or_else(|| "-".into(), |v| v.to_string()),
             verdict
         );
+    }
+
+    // The approximate recall-vs-latency sweep: the full table for both
+    // arms, then the headline — each arm's cheapest point with
+    // recall_at_k >= HEADLINE_RECALL and the E4/PG ratio of their
+    // median_us AT THAT RECALL. Equal ef / search_list_size numerals are
+    // not comparable (deviation 12), so this ratio, not the row above, is
+    // the number that means something for approximate vector search.
+    for &base in &APPROX_BASES {
+        let e4_points = sweep_points(&e4, base);
+        let pg_points = sweep_points(&pg, base);
+        println!("\n{base} recall-vs-latency sweep");
+        println!(
+            "{:<5} {:<18} {:>8} {:>12} {:>12}",
+            "arm", "point", "recall", "median_us", "p90_us"
+        );
+        for (arm_label, points) in [("e4", &e4_points), ("pg", &pg_points)] {
+            for p in points {
+                println!(
+                    "{:<5} {:<18} {:>8} {:>12} {:>12}",
+                    arm_label,
+                    p.label,
+                    p.recall.map_or_else(|| "-".into(), |r| format!("{r:.3}")),
+                    micros(p.median_us),
+                    micros(p.p90_us),
+                );
+            }
+        }
+        let e4_best = cheapest_at_recall(&e4_points, HEADLINE_RECALL);
+        let pg_best = cheapest_at_recall(&pg_points, HEADLINE_RECALL);
+        match (&e4_best, &pg_best) {
+            (Some((e, true)), Some((p, true))) => {
+                let e_us = e.median_us.unwrap_or(f64::NAN);
+                let p_us = p.median_us.unwrap_or(f64::NAN);
+                println!(
+                    "HEADLINE {base}: recall>={HEADLINE_RECALL} -- e4 {} = {e_us:.1} us; \
+                     pg {} = {p_us:.1} us; e4/pg = {:.2}",
+                    e.label,
+                    p.label,
+                    e_us / p_us,
+                );
+            }
+            _ => {
+                let describe = |best: &Option<(&SweepPoint, bool)>, name: &str| -> String {
+                    match best {
+                        Some((point, true)) => format!(
+                            "{name} cheapest at recall>={HEADLINE_RECALL}: {} (recall={:.3}, \
+                             median_us={})",
+                            point.label,
+                            point.recall.unwrap_or(0.0),
+                            micros(point.median_us),
+                        ),
+                        Some((point, false)) => format!(
+                            "{name} never reached recall>={HEADLINE_RECALL}; best is {} \
+                             (recall={:.3}, median_us={})",
+                            point.label,
+                            point.recall.unwrap_or(0.0),
+                            micros(point.median_us),
+                        ),
+                        None => format!("{name}: no sweep points in this report"),
+                    }
+                };
+                println!(
+                    "HEADLINE {base}: no cross-arm ratio at recall>={HEADLINE_RECALL} -- {}; {}",
+                    describe(&e4_best, "e4"),
+                    describe(&pg_best, "pg"),
+                );
+            }
+        }
     }
 
     let bytes = |report: &Value| -> Option<u64> {

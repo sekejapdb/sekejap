@@ -14,9 +14,22 @@ Prints, in order:
      AGREE/DISAGREE for filter cases, a first_keys top-k overlap for
      ranked cases, and each arm's recall_at_k for approx cases; a case
      whose median_us is null in either arm prints "n/a: <note>" instead
-     of numeric comparisons.
-  3. the deviations of both arms.
-  4. a one-line verdict: filter agreement count and how many cases (of
+     of numeric comparisons. `vec_ann_10` and `vec_ann_10_kind` are no
+     longer single case names -- each is a SWEEP of cases named
+     `<base>@ef<N>` (E4) or `<base>@sls<N>` / `<base>@sls100+resc<N>`
+     (Postgres), so this table shows each sweep point as its own row,
+     "n/a" in whichever arm's axis it does not belong to (E4's `ef` points
+     and Postgres's `sls` points never share a name).
+  3. for each approximate base (`vec_ann_10`, `vec_ann_10_kind`): the full
+     sweep table for both arms (point, recall, median_us, p90_us), then a
+     HEADLINE line -- the cheapest point in each arm with
+     recall_at_k >= 0.95 and the E4/PG ratio of their median_us AT THAT
+     RECALL, which is the number that means something for approximate
+     vector search (equal ef / search_list_size numerals are not the same
+     knob). An arm that never reaches 0.95 reports its best recall
+     instead of a ratio.
+  4. the deviations of both arms.
+  5. a one-line verdict: filter agreement count and how many cases (of
      those with a timing in both arms) E4 was faster on.
 
 Exit code 1 if any filter-kind case has a row-count DISAGREE between the
@@ -34,6 +47,13 @@ UNIT_MS = "ms"
 UNIT_US = "us"
 UNIT_MIB = "MiB"
 BYTES_PER_MIB = 1024.0 * 1024.0
+
+# The two case bases whose single approximate point is a SWEEP: E4 points
+# are named "<base>@ef<N>", Postgres points "<base>@sls<N>" (plus one
+# "<base>@sls100+resc<N>" rescore probe per base when the server exposes
+# diskann.query_rescore). See battle50k.rs's "APPROXIMATE SWEEP" doc.
+APPROX_BASES = ["vec_ann_10", "vec_ann_10_kind"]
+HEADLINE_RECALL = 0.95
 
 
 def load_report(path):
@@ -262,6 +282,113 @@ def build_cases_table(e4_report, pg_report):
     return headers, rows, stats
 
 
+def sweep_points(cases, base):
+    """(label, recall, median_us, p90_us) for every case in `cases` named
+    `<base>@<label>`, in the report's own order."""
+    prefix = base + "@"
+    out = []
+    for c in cases or []:
+        name = c.get("name", "")
+        if not name.startswith(prefix):
+            continue
+        out.append(
+            (
+                name[len(prefix):],
+                c.get("recall_at_k"),
+                c.get("median_us"),
+                c.get("p90_us"),
+            )
+        )
+    return out
+
+
+def cheapest_at_recall(points, threshold=HEADLINE_RECALL):
+    """(label, median_us, recall, hit) for the cheapest point with
+    recall_at_k >= threshold; if none clears it, the point with the HIGHEST
+    recall instead (ties broken by lower median_us), with hit=False. All
+    four fields are None when `points` has no recall at all."""
+    cleared = [
+        p for p in points if p[1] is not None and p[1] >= threshold and p[2] is not None
+    ]
+    if cleared:
+        label, recall, median_us, _p90 = min(cleared, key=lambda p: p[2])
+        return label, median_us, recall, True
+    scored = [p for p in points if p[1] is not None]
+    if not scored:
+        return None, None, None, False
+    label, recall, median_us, _p90 = max(
+        scored,
+        key=lambda p: (p[1], -(p[2] if p[2] is not None else float("inf"))),
+    )
+    return label, median_us, recall, False
+
+
+def print_sweep_table(base, e4_report, pg_report, md):
+    e4_points = sweep_points(e4_report.get("cases", []), base)
+    pg_points = sweep_points(pg_report.get("cases", []), base)
+    headers = ["arm", "point", "recall", f"median ({UNIT_US})", f"p90 ({UNIT_US})"]
+    rows = []
+    for arm_label, points in (("e4", e4_points), ("pg", pg_points)):
+        for label, recall, median_us, p90_us in points:
+            rows.append(
+                [
+                    arm_label,
+                    label,
+                    fmt_num(recall),
+                    fmt_num(median_us, 1),
+                    fmt_num(p90_us, 1),
+                ]
+            )
+    print(f"SWEEP {base}")
+    print_table(headers, rows, md)
+    return e4_points, pg_points
+
+
+def sweep_headline(base, e4_points, pg_points, threshold=HEADLINE_RECALL):
+    """Print the HEADLINE line for one approximate base and return its
+    stats, so a caller (or a test) can check the numbers rather than just
+    the text."""
+    e4_label, e4_us, e4_recall, e4_hit = cheapest_at_recall(e4_points, threshold)
+    pg_label, pg_us, pg_recall, pg_hit = cheapest_at_recall(pg_points, threshold)
+
+    if e4_hit and pg_hit:
+        ratio = fmt_ratio(e4_us, pg_us)
+        print(
+            f"HEADLINE {base}: recall>={threshold} -- "
+            f"e4 {e4_label} = {fmt_num(e4_us, 1)} {UNIT_US}; "
+            f"pg {pg_label} = {fmt_num(pg_us, 1)} {UNIT_US}; e4/pg = {ratio}"
+        )
+    else:
+
+        def describe(name, label, us, recall, hit):
+            if label is None:
+                return f"{name}: no sweep points"
+            if hit:
+                return f"{name} cheapest at recall>={threshold}: {label} (recall={fmt_num(recall)}, median_us={fmt_num(us, 1)})"
+            return (
+                f"{name} never reached recall>={threshold}; best is {label} "
+                f"(recall={fmt_num(recall)}, median_us={fmt_num(us, 1)})"
+            )
+
+        print(
+            f"HEADLINE {base}: no cross-arm ratio at recall>={threshold} -- "
+            + describe("e4", e4_label, e4_us, e4_recall, e4_hit)
+            + "; "
+            + describe("pg", pg_label, pg_us, pg_recall, pg_hit)
+        )
+    print()
+    return {
+        "e4_label": e4_label,
+        "e4_us": e4_us,
+        "e4_recall": e4_recall,
+        "e4_hit": e4_hit,
+        "pg_label": pg_label,
+        "pg_us": pg_us,
+        "pg_recall": pg_recall,
+        "pg_hit": pg_hit,
+    }
+
+
 def print_deviations(label, report):
     deviations = report.get("deviations", [])
     if not deviations:
@@ -303,6 +430,10 @@ def main():
     c_headers, c_rows, stats = build_cases_table(e4_report, pg_report)
     print_table(c_headers, c_rows, args.md)
     print()
+
+    for base in APPROX_BASES:
+        e4_points, pg_points = print_sweep_table(base, e4_report, pg_report, args.md)
+        sweep_headline(base, e4_points, pg_points)
 
     print("DEVIATIONS")
     print_deviations("e4", e4_report)
