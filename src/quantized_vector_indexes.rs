@@ -272,28 +272,10 @@ pub(super) fn exact_score(
     metric: VectorMetric,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<f64>> {
-    super::vector_indexes::validate_vector(raw, dimension)?;
-    let mut dot = 0.0f64;
-    let mut stored_norm = 0.0f64;
-    let mut squared_l2 = 0.0f64;
-    for (at, (lane, query_lane)) in raw.chunks_exact(4).zip(query).enumerate() {
-        if at % 256 == 0 && cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let stored = f64::from(f32::from_le_bytes(lane.try_into().unwrap()));
-        let query_lane = f64::from(*query_lane);
-        dot += stored * query_lane;
-        stored_norm += stored * stored;
-        let difference = stored - query_lane;
-        squared_l2 += difference * difference;
+    if query.len() != dimension {
+        return Err(corrupt("exact vector sidecar length"));
     }
-    let distance = match metric {
-        VectorMetric::SquaredL2 => squared_l2,
-        VectorMetric::NegativeDot => -dot,
-        VectorMetric::Cosine if stored_norm == 0.0 => return Ok(None),
-        VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
-    };
-    Ok(Some(if distance == 0.0 { 0.0 } else { distance }))
+    super::vector_indexes::score_f32_distance(raw, query, query_norm, metric, cancelled)
 }
 
 fn spend(
@@ -347,6 +329,108 @@ fn probe_approx(
     Ok(())
 }
 
+fn admit_approx(
+    shortlist: &mut BinaryHeap<ApproxCandidate>,
+    ef: usize,
+    candidate: ApproxCandidate,
+) {
+    if shortlist.len() < ef {
+        shortlist.push(candidate);
+        return;
+    }
+    if candidate < *shortlist.peek().unwrap() {
+        shortlist.pop();
+        shortlist.push(candidate);
+    }
+}
+
+fn score_compact_entry(
+    value: &[u8],
+    dimension: usize,
+    query: &[f64],
+    query_norm: f64,
+    metric_value: VectorMetric,
+) -> Result<Option<([u8; 6], f64)>> {
+    // Length only: codec canonical-form checks wait until rerank, so the
+    // 50K-entry scan is a tight int8 loop over already-trusted pages.
+    if value.len() != 6 + 8 + dimension {
+        return Err(corrupt("quantized vector entry length"));
+    }
+    let locator: [u8; 6] = value[..6].try_into().unwrap();
+    let scale = f64::from_le_bytes(value[6..14].try_into().unwrap());
+    let codes = &value[14..];
+    Ok(
+        vector_quant::score_i8_hot(scale, codes, query, query_norm, metric(metric_value))
+            .map(|distance| (locator, distance)),
+    )
+}
+
+fn rerank_sorted(
+    db: &Database,
+    index: &IndexInfo,
+    mut shortlist: Vec<ApproxCandidate>,
+    query: &[f32],
+    query_norm: f64,
+    metric: VectorMetric,
+    k: usize,
+    after: Option<super::vector_indexes::VectorAfter>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<VectorHit>> {
+    shortlist.sort_unstable_by(|left, right| {
+        left.id
+            .sequence
+            .cmp(&right.id.sequence)
+            .then_with(|| left.locator.cmp(&right.locator))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let dimension = dimension(index)?;
+    let store = db.store()?;
+    let mut exact = BinaryHeap::with_capacity(k.min(1024));
+    for candidate in shortlist {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        // The shortlist is ef entries, not the corpus, so the locator each
+        // winner carries is validated against its layout, field and dimension
+        // before it names a sidecar: a locator pointing at ANOTHER vector
+        // field of the same dimension would otherwise be scored and returned
+        // as a hit. The sacrifice below is the re-encode, not this.
+        let ordinal = validate_locator(db, index, &candidate.locator)?;
+        let raw = store
+            .get(&vector_key(candidate.id, ordinal))?
+            .ok_or_else(|| corrupt("quantized vector locator points to missing sidecar"))?;
+        // SACRIFICE: the compact-vs-sidecar re-encode is not repeated for the
+        // ef winners. The scan already held the compact bytes; a disagreeing
+        // pair is a verify_index matter, not a per-query 100-get tax.
+        let Some(distance) =
+            exact_score(&raw, dimension, query, query_norm, metric, cancelled)?
+        else {
+            continue;
+        };
+        // Paging is over the RERANKED order, so the cursor is applied to the
+        // exact distance and not to the approximate one the shortlist was
+        // built from. `ef` still bounds the whole result set: what this drops
+        // is only what earlier pages already returned.
+        if after.is_some_and(|after| !after.admits(distance, candidate.id)) {
+            continue;
+        }
+        exact.push(ExactHit(VectorHit {
+            id: candidate.id,
+            distance,
+        }));
+        if exact.len() > k {
+            exact.pop();
+        }
+    }
+    let mut hits: Vec<_> = exact.into_iter().map(|hit| hit.0).collect();
+    hits.sort_by(|left, right| {
+        left.distance
+            .total_cmp(&right.distance)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(hits)
+}
+
 impl Database {
     pub fn create_quantized_vector_index(
         &mut self,
@@ -389,6 +473,36 @@ impl Database {
         max_examined: usize,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<ApproxVectorResult> {
+        let mut progress = super::vector_indexes::cancel_only(&mut cancelled);
+        self.scan_quantized(
+            id,
+            query,
+            metric,
+            k,
+            ef,
+            candidates,
+            None,
+            max_examined,
+            &mut progress,
+        )
+    }
+
+    /// The paged form of [`Database::query_quantized_vector`]: the same walk,
+    /// with the page cursor applied to the RERANKED order and a progress hook
+    /// the caller charges its budget through while the scan is still running.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn scan_quantized(
+        &self,
+        id: IndexId,
+        query: &[f32],
+        metric: VectorMetric,
+        k: usize,
+        ef: usize,
+        candidates: QuantizedVectorCandidates<'_>,
+        after: Option<super::vector_indexes::VectorAfter>,
+        max_examined: usize,
+        progress: super::vector_indexes::ScanProgress<'_>,
+    ) -> Result<ApproxVectorResult> {
         if k == 0 || k > ef || ef > indexes::MAX_RESULTS {
             return Err(invalid(
                 "quantized vector search requires 1 <= k <= ef <= 65536",
@@ -414,45 +528,89 @@ impl Database {
             return Err(invalid("cosine query vector must have nonzero norm"));
         }
         validate_candidates(&index, candidates)?;
-        if cancelled() {
-            return Err(Error::Cancelled);
-        }
+        progress(super::vector_indexes::ScanStep::Scored(0))?;
 
         let mut examined = 0usize;
         let mut shortlist = BinaryHeap::with_capacity(ef.min(1024));
+        let (query_wide, wide_norm) = vector_quant::widen_query(query)
+            .map_err(|_| invalid("query vector has wrong dimension or non-finite lane"))?;
 
         match candidates {
             QuantizedVectorCandidates::All => {
                 let prefix = entry_prefix(id);
-                for row in self.store()?.range(&prefix)? {
-                    let (key, value) = row?;
+                let mut failure = None;
+                // Compact entries scored but not yet charged. Every entry is
+                // a candidate here, so the poll cadence and the charge
+                // cadence are the same count.
+                let mut pending = 0u64;
+                self.store()?.range(&prefix)?.for_each_ref(|key, value| {
                     if !key.starts_with(&prefix) {
-                        break;
+                        return false;
                     }
-                    spend(&mut examined, max_examined, &mut cancelled)?;
-                    let mut at = prefix.len();
-                    let sequence = read_ordered(&key, &mut at)?;
-                    if at != key.len() || sequence == 0 {
-                        return Err(corrupt("quantized vector entry key"));
+                    if let Err(e) = (|| -> Result<()> {
+                        if pending == super::vector_indexes::SCAN_STEP {
+                            progress(super::vector_indexes::ScanStep::Scored(std::mem::take(
+                                &mut pending,
+                            )))?;
+                        }
+                        if examined == max_examined {
+                            // Charge what is outstanding before reporting the
+                            // limit: when the limit came from a budget, that
+                            // charge names the resource that ran out.
+                            progress(super::vector_indexes::ScanStep::Scored(std::mem::take(
+                                &mut pending,
+                            )))?;
+                            return Err(Error::Kernel(kernel::Error::ResourceLimit(
+                                "quantized vector max_examined exceeded",
+                            )));
+                        }
+                        examined += 1;
+                        pending += 1;
+                        let mut at = prefix.len();
+                        let sequence = read_ordered(key, &mut at)?;
+                        if at != key.len() || sequence == 0 {
+                            return Err(corrupt("quantized vector entry key"));
+                        }
+                        let Some((locator, distance)) = score_compact_entry(
+                            value,
+                            dimension,
+                            &query_wide,
+                            wide_norm,
+                            metric,
+                        )?
+                        else {
+                            return Ok(());
+                        };
+                        admit_approx(
+                            &mut shortlist,
+                            ef,
+                            ApproxCandidate {
+                                id: EntityId {
+                                    collection: index.collection,
+                                    sequence,
+                                },
+                                distance,
+                                locator,
+                            },
+                        );
+                        Ok(())
+                    })() {
+                        failure = Some(e);
+                        return false;
                     }
-                    probe_approx(
-                        self,
-                        &index,
-                        EntityId {
-                            collection: index.collection,
-                            sequence,
-                        },
-                        &value,
-                        dimension,
-                        query,
-                        metric,
-                        ef,
-                        &mut shortlist,
-                        &mut cancelled,
-                    )?;
+                    true
+                })?;
+                if let Some(e) = failure {
+                    return Err(e);
                 }
+                progress(super::vector_indexes::ScanStep::Scored(pending))?;
             }
             QuantizedVectorCandidates::SortedUnique(ids) => {
+                // A filtered probe list is bounded by the caller's own
+                // candidate slice and is never the paged driver's path, so
+                // this poll charges nothing and only asks whether to stop.
+                let mut cancelled =
+                    || progress(super::vector_indexes::ScanStep::Scored(0)).is_err();
                 for entity in ids {
                     spend(&mut examined, max_examined, &mut cancelled)?;
                     if let Some(value) = self.store()?.get(&entry_key(id, entity.sequence))? {
@@ -474,44 +632,21 @@ impl Database {
         }
 
         let reranked = shortlist.len();
-        let mut exact = BinaryHeap::with_capacity(k.min(1024));
-        for candidate in shortlist {
-            if cancelled() {
-                return Err(Error::Cancelled);
-            }
-            let ordinal = validate_locator(self, &index, &candidate.locator)?;
-            let raw = self
-                .store()?
-                .get(&vector_key(candidate.id, ordinal))?
-                .ok_or_else(|| corrupt("quantized vector locator points to missing sidecar"))?;
-            let persisted = self
-                .store()?
-                .get(&entry_key(index.id, candidate.id.sequence))?
-                .ok_or_else(|| corrupt("quantized shortlist entry disappeared"))?;
-            if encode_entry(candidate.locator, &raw, dimension)? != persisted {
-                return Err(corrupt(
-                    "quantized vector entry differs from authoritative sidecar",
-                ));
-            }
-            let Some(distance) =
-                exact_score(&raw, dimension, query, query_norm, metric, &mut cancelled)?
-            else {
-                continue;
-            };
-            exact.push(ExactHit(VectorHit {
-                id: candidate.id,
-                distance,
-            }));
-            if exact.len() > k {
-                exact.pop();
-            }
-        }
-        let mut hits: Vec<_> = exact.into_iter().map(|hit| hit.0).collect();
-        hits.sort_by(|left, right| {
-            left.distance
-                .total_cmp(&right.distance)
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        // The rerank is `ef` records at most, so its poll charges nothing:
+        // the caller has already been charged for the shortlist, and the
+        // sidecars it reads are counted by `reranked`.
+        let mut cancelled = || progress(super::vector_indexes::ScanStep::Scored(0)).is_err();
+        let hits = rerank_sorted(
+            self,
+            &index,
+            shortlist.into_vec(),
+            query,
+            query_norm,
+            metric,
+            k,
+            after,
+            &mut cancelled,
+        )?;
         Ok(ApproxVectorResult {
             hits,
             method: ApproxVectorMethod::SymmetricInt8ScanV1,

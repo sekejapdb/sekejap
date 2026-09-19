@@ -54,8 +54,8 @@ pub(crate) fn encode(lanes: &[f32]) -> Result<Vec<u8>, Error> {
 }
 
 pub(crate) struct Decoded<'a> {
-    scale: f64,
-    codes: &'a [u8],
+    pub(crate) scale: f64,
+    pub(crate) codes: &'a [u8],
 }
 
 pub(crate) fn decode(bytes: &[u8], declared_dimension: usize) -> Result<Decoded<'_>, Error> {
@@ -85,6 +85,138 @@ pub(crate) fn decode(bytes: &[u8], declared_dimension: usize) -> Result<Decoded<
     Ok(Decoded { scale, codes })
 }
 
+/// Convert query lanes to f64 once per search so the int8 inner loop does
+/// not repeat the widening on every compact entry.
+pub(crate) fn widen_query(query: &[f32]) -> Result<(Vec<f64>, f64), Error> {
+    let mut wide = Vec::with_capacity(query.len());
+    let mut query_norm = 0.0f64;
+    for &lane in query {
+        if !lane.is_finite() {
+            return Err(Error::Invalid("non-finite quantized query"));
+        }
+        let wide_lane = f64::from(lane);
+        query_norm += wide_lane * wide_lane;
+        wide.push(wide_lane);
+    }
+    Ok((wide, query_norm))
+}
+
+/// Symmetric-int8 distance. `query` is already widened; `query_norm` is
+/// `sum(q*q)` in lane order. Eight-lane chunks, no bounds checks in the hot
+/// loop. Arithmetic is still per-lane f64 so Cosine/L2/dot match the previous
+/// sequential accumulation.
+pub(crate) fn score_i8(
+    scale: f64,
+    codes: &[u8],
+    query: &[f64],
+    query_norm: f64,
+    metric: Metric,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<f64>, Error> {
+    if query.len() != codes.len() {
+        return Err(Error::Invalid("quantized query dimension"));
+    }
+    let dim = codes.len();
+    let mut dot = 0.0f64;
+    let mut stored_norm = 0.0f64;
+    let mut squared_l2 = 0.0f64;
+    let mut at = 0usize;
+    while at + 8 <= dim {
+        if at % 256 == 0 && cancelled() {
+            return Err(Error::Cancelled);
+        }
+        unsafe {
+            for j in 0..8 {
+                let stored = f64::from(*codes.get_unchecked(at + j) as i8) * scale;
+                let query_lane = *query.get_unchecked(at + j);
+                dot += stored * query_lane;
+                stored_norm += stored * stored;
+                let difference = stored - query_lane;
+                squared_l2 += difference * difference;
+            }
+        }
+        at += 8;
+    }
+    if at % 256 == 0 && at < dim && cancelled() {
+        return Err(Error::Cancelled);
+    }
+    while at < dim {
+        unsafe {
+            let stored = f64::from(*codes.get_unchecked(at) as i8) * scale;
+            let query_lane = *query.get_unchecked(at);
+            dot += stored * query_lane;
+            stored_norm += stored * stored;
+            let difference = stored - query_lane;
+            squared_l2 += difference * difference;
+        }
+        at += 1;
+    }
+    let distance = match metric {
+        Metric::SquaredL2 => squared_l2,
+        Metric::NegativeDot => -dot,
+        Metric::Cosine if query_norm == 0.0 => {
+            return Err(Error::Invalid("zero cosine query"));
+        }
+        Metric::Cosine if stored_norm == 0.0 => return Ok(None),
+        Metric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
+    };
+    Ok(Some(if distance == 0.0 { 0.0 } else { distance }))
+}
+
+/// Same arithmetic as [`score_i8`], with no cancellation poll. The caller has
+/// already widened the query; the one length this asserts is the one the
+/// unchecked lane reads depend on.
+#[inline(always)]
+pub(crate) fn score_i8_hot(
+    scale: f64,
+    codes: &[u8],
+    query: &[f64],
+    query_norm: f64,
+    metric: Metric,
+) -> Option<f64> {
+    let dim = codes.len();
+    // Both lane loops read `query` unchecked at offsets bounded by
+    // `codes.len()`. A plain assert, not a debug one: the proof has to hold
+    // for every caller, not only the builds with debug assertions on, and one
+    // length compare per vector does not show up next to `dim` multiplies.
+    assert_eq!(query.len(), dim, "quantized score lane count");
+    let mut dot = 0.0f64;
+    let mut stored_norm = 0.0f64;
+    let mut squared_l2 = 0.0f64;
+    let mut at = 0usize;
+    while at + 8 <= dim {
+        unsafe {
+            for j in 0..8 {
+                let stored = f64::from(*codes.get_unchecked(at + j) as i8) * scale;
+                let query_lane = *query.get_unchecked(at + j);
+                dot += stored * query_lane;
+                stored_norm += stored * stored;
+                let difference = stored - query_lane;
+                squared_l2 += difference * difference;
+            }
+        }
+        at += 8;
+    }
+    while at < dim {
+        unsafe {
+            let stored = f64::from(*codes.get_unchecked(at) as i8) * scale;
+            let query_lane = *query.get_unchecked(at);
+            dot += stored * query_lane;
+            stored_norm += stored * stored;
+            let difference = stored - query_lane;
+            squared_l2 += difference * difference;
+        }
+        at += 1;
+    }
+    let distance = match metric {
+        Metric::SquaredL2 => squared_l2,
+        Metric::NegativeDot => -dot,
+        Metric::Cosine if stored_norm == 0.0 => return None,
+        Metric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
+    };
+    Some(if distance == 0.0 { 0.0 } else { distance })
+}
+
 impl Decoded<'_> {
     /// Scores the decoded approximation, not the authoritative original.
     /// Cosine excludes stored zero vectors and refuses a zero query. A caller
@@ -93,40 +225,10 @@ impl Decoded<'_> {
         &self,
         query: &[f32],
         metric: Metric,
-        mut cancelled: impl FnMut() -> bool,
+        cancelled: impl FnMut() -> bool,
     ) -> Result<Option<f64>, Error> {
-        if query.len() != self.codes.len() {
-            return Err(Error::Invalid("quantized query dimension"));
-        }
-        let mut dot = 0.0f64;
-        let mut query_norm = 0.0f64;
-        let mut stored_norm = 0.0f64;
-        let mut squared_l2 = 0.0f64;
-        for (at, (&lane, &query_lane)) in self.codes.iter().zip(query).enumerate() {
-            if at % 256 == 0 && cancelled() {
-                return Err(Error::Cancelled);
-            }
-            if !query_lane.is_finite() {
-                return Err(Error::Invalid("non-finite quantized query"));
-            }
-            let stored = f64::from(lane as i8) * self.scale;
-            let query_lane = f64::from(query_lane);
-            dot += stored * query_lane;
-            query_norm += query_lane * query_lane;
-            stored_norm += stored * stored;
-            let difference = stored - query_lane;
-            squared_l2 += difference * difference;
-        }
-        let distance = match metric {
-            Metric::SquaredL2 => squared_l2,
-            Metric::NegativeDot => -dot,
-            Metric::Cosine if query_norm == 0.0 => {
-                return Err(Error::Invalid("zero cosine query"));
-            }
-            Metric::Cosine if stored_norm == 0.0 => return Ok(None),
-            Metric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
-        };
-        Ok(Some(if distance == 0.0 { 0.0 } else { distance }))
+        let (wide, query_norm) = widen_query(query)?;
+        score_i8(self.scale, self.codes, &wide, query_norm, metric, cancelled)
     }
 }
 

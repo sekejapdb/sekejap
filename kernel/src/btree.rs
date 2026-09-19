@@ -3512,7 +3512,9 @@ impl RangeIter<'_> {
             // Children are child0 + one per slot: indices 0..=nentries.
             if i < n { break (page, i + 1); }
         };
-        // Step right, then take the leftmost spine down to a leaf.
+        // Step right, then take the leftmost spine down to a leaf. Keep the
+        // leaf pin so the next for_each_ref / peek does not get the same page
+        // a second time -- decode each page once.
         loop {
             let r = self.pool.get(cur)?;
             let p = open_cached(&r, cur)?;
@@ -3522,6 +3524,10 @@ impl RangeIter<'_> {
             if p.kind() == PageKind::Leaf {
                 self.page = cur;
                 self.idx = 0;
+                self.leaf_entries = p.nentries();
+                self.leaf_markers = leaf_has_marker(&p);
+                drop(p);
+                self.pin = Some(r);
                 break;
             }
             let child = child_at(self.pool, &p, idx_in_parent)?;
@@ -3561,7 +3567,6 @@ impl RangeIter<'_> {
     /// count-only queries. One pin and one validation per leaf, zero allocs,
     /// same sibling-chain, cycle and tree-id checks as `next()`.
     pub fn for_each_ref(mut self, mut f: impl FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
-        self.pin = None;
         // Drain anything already buffered by earlier `next()` calls first.
         while let Some((k, v, is_marker)) = self.buf.pop_front() {
             if is_marker {
@@ -3573,7 +3578,10 @@ impl RangeIter<'_> {
         }
         loop {
             if self.done { return Ok(()); }
-            let r = self.pool.get(self.page)?;
+            let r = match self.pin.take() {
+                Some(pin) => pin,
+                None => self.pool.get(self.page)?,
+            };
             let p = open_cached(&r, self.page)?;
             if p.tree_id() != self.tree_id {
                 return Err(Error::Corrupt {
@@ -3808,8 +3816,14 @@ impl RangeIter<'_> {
 impl Iterator for RangeIter<'_> {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.pin = None;
         loop {
+            // ONE leaf pinned, ever. `advance` now keeps the leaf it landed
+            // on so a following `for_each_ref`/`peek` does not get the same
+            // page twice, and this loop is about to get that page itself --
+            // so the pin is dropped at the TOP of every iteration, not once
+            // on entry. It is also what keeps the `read_overflow` chain walks
+            // below off a pinned leaf.
+            self.pin = None;
             if let Some((k, v, is_marker)) = self.buf.pop_front() {
                 if is_marker {
                     let val = match read_overflow(self.pool, &v) {

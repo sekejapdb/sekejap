@@ -27,6 +27,40 @@ pub struct VectorHit {
     pub distance: f64,
 }
 
+/// The `(distance, entity)` a page must start strictly after: the rank key
+/// the previous page ended on.
+///
+/// A bounded top-k that is taken over the WHOLE corpus and filtered by the
+/// cursor afterwards returns the first page again, minus the rows already
+/// emitted -- which is how page two of a vector query used to lose rows. The
+/// cursor therefore goes INTO the scan: a candidate the cursor does not admit
+/// never enters the heap, so a heap of k holds the next k rows and not the
+/// first k.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct VectorAfter {
+    pub distance: f64,
+    pub id: EntityId,
+}
+
+impl VectorAfter {
+    /// The query engine's own score comparison, lane for lane: ascending by
+    /// distance, entity id breaking ties, NaN last under both directions.
+    #[inline]
+    pub(super) fn admits(&self, distance: f64, id: EntityId) -> bool {
+        let order = match (distance.is_nan(), self.distance.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => distance.total_cmp(&self.distance),
+        };
+        match order {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => id > self.id,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HeapHit(VectorHit);
 
@@ -109,14 +143,16 @@ pub(super) fn sidecar_prefix(c: CollectionId) -> Vec<u8> {
 /// pass over pages the file already has to hold, against one root-to-leaf
 /// descent per candidate row before. It holds one sidecar in RAM at a time --
 /// RAM proportional to a single vector, not to the collection.
-struct SidecarCursor<'a> {
+#[allow(dead_code)]
+pub(super) struct SidecarCursor<'a> {
     prefix: Vec<u8>,
     iter: kernel::btree::RangeIter<'a>,
     done: bool,
 }
 
+#[allow(dead_code)]
 impl<'a> SidecarCursor<'a> {
-    fn new(store: &'a Backend, c: CollectionId) -> Result<Self> {
+    pub(super) fn new(store: &'a Backend, c: CollectionId) -> Result<Self> {
         let prefix = sidecar_prefix(c);
         let iter = store.range(&prefix)?;
         Ok(Self {
@@ -128,7 +164,7 @@ impl<'a> SidecarCursor<'a> {
 
     /// Advance to `target` and return its stored bytes, or `None` when the
     /// cursor is already beyond it. Slices are borrowed from the pinned leaf.
-    fn seek(&mut self, target: &[u8]) -> Result<Option<&[u8]>> {
+    pub(super) fn seek(&mut self, target: &[u8]) -> Result<Option<&[u8]>> {
         if self.done {
             return Ok(None);
         }
@@ -143,6 +179,7 @@ impl<'a> SidecarCursor<'a> {
     }
 }
 
+#[allow(dead_code)]
 fn write_ordered(dst: &mut [u8], n: u64) -> usize {
     let bytes = n.to_be_bytes();
     let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
@@ -153,13 +190,97 @@ fn write_ordered(dst: &mut [u8], n: u64) -> usize {
 }
 
 /// Sidecar key `0x60 || collection || sequence || field` in a stack buffer.
-fn write_vector_key(buf: &mut [u8; 32], id: EntityId, field: usize) -> &[u8] {
+#[allow(dead_code)]
+pub(super) fn write_vector_key(buf: &mut [u8; 32], id: EntityId, field: usize) -> &[u8] {
     buf[0] = 0x60;
     let mut n = 1;
     n += write_ordered(&mut buf[n..], u64::from(id.collection.0));
     n += write_ordered(&mut buf[n..], id.sequence);
     n += write_ordered(&mut buf[n..], field as u64);
     &buf[..n]
+}
+
+#[inline(always)]
+fn load_f32_le(bytes: &[u8], off: usize) -> f32 {
+    // The lane is f32 LITTLE-ENDIAN on disk whatever the host is, so the byte
+    // order is named here rather than inherited from the target. On a
+    // little-endian target this is still one unaligned four-byte load.
+    let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(off) as *const [u8; 4]) };
+    f32::from_le_bytes(raw)
+}
+
+/// f32 sidecar distance against a pre-widened query. Eight-lane chunks, no
+/// bounds checks, sequential f64 accumulation so Cosine/L2/dot match the
+/// previous per-lane zip.
+pub(super) fn score_f32_pre(
+    bytes: &[u8],
+    query: &[f64],
+    query_norm: f64,
+    metric: VectorMetric,
+) -> Result<Option<f64>> {
+    let dim = query.len();
+    if bytes.len() != dim * 4 {
+        return Err(corrupt("exact vector sidecar length"));
+    }
+    let mut dot = 0.0f64;
+    let mut stored_norm = 0.0f64;
+    let mut squared_l2 = 0.0f64;
+    let mut at = 0usize;
+    while at + 8 <= dim {
+        unsafe {
+            for j in 0..8 {
+                let stored = f64::from(load_f32_le(bytes, (at + j) * 4));
+                if !stored.is_finite() {
+                    return Err(corrupt("non-finite exact vector sidecar"));
+                }
+                let query_lane = *query.get_unchecked(at + j);
+                dot += stored * query_lane;
+                stored_norm += stored * stored;
+                let delta = stored - query_lane;
+                squared_l2 += delta * delta;
+            }
+        }
+        at += 8;
+    }
+    while at < dim {
+        unsafe {
+            let stored = f64::from(load_f32_le(bytes, at * 4));
+            if !stored.is_finite() {
+                return Err(corrupt("non-finite exact vector sidecar"));
+            }
+            let query_lane = *query.get_unchecked(at);
+            dot += stored * query_lane;
+            stored_norm += stored * stored;
+            let delta = stored - query_lane;
+            squared_l2 += delta * delta;
+        }
+        at += 1;
+    }
+    let mut distance = match metric {
+        VectorMetric::SquaredL2 => squared_l2,
+        VectorMetric::NegativeDot => -dot,
+        VectorMetric::Cosine if stored_norm == 0.0 => return Ok(None),
+        VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
+    };
+    if distance == 0.0 {
+        distance = 0.0;
+    }
+    Ok(Some(distance))
+}
+
+/// f32 sidecar distance. Widens the query once then scores.
+pub(super) fn score_f32_distance(
+    bytes: &[u8],
+    query: &[f32],
+    query_norm: f64,
+    metric: VectorMetric,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<f64>> {
+    if cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let wide: Vec<f64> = query.iter().map(|lane| f64::from(*lane)).collect();
+    score_f32_pre(bytes, &wide, query_norm, metric)
 }
 
 /// Score one already-loaded sidecar. Shared by the scanned and the
@@ -173,31 +294,392 @@ fn score_vector_bytes(
     metric: VectorMetric,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<VectorHit>> {
-    validate_vector(bytes, dimension)?;
-    let mut dot = 0.0f64;
-    let mut stored_norm = 0.0f64;
-    let mut squared_l2 = 0.0f64;
-    for (at, (lane, query_lane)) in bytes.chunks_exact(4).zip(query.iter()).enumerate() {
-        if at % 256 == 0 && cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let stored = f64::from(f32::from_le_bytes(lane.try_into().unwrap()));
-        let query_lane = f64::from(*query_lane);
-        dot += stored * query_lane;
-        stored_norm += stored * stored;
-        let delta = stored - query_lane;
-        squared_l2 += delta * delta;
+    if query.len() != dimension {
+        return Err(corrupt("exact vector sidecar length"));
     }
-    let mut distance = match metric {
-        VectorMetric::SquaredL2 => squared_l2,
-        VectorMetric::NegativeDot => -dot,
-        VectorMetric::Cosine if stored_norm == 0.0 => return Ok(None),
-        VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
+    let Some(distance) = score_f32_distance(bytes, query, query_norm, metric, cancelled)? else {
+        return Ok(None);
     };
-    if distance == 0.0 {
-        distance = 0.0;
-    }
     Ok(Some(VectorHit { id, distance }))
+}
+
+/// Locator ordinals in sequence order. One page-order walk; the sidecar
+/// scan uses this table so it never does a per-vector locator lookup or
+/// layout get. SACRIFICE: RAM proportional to the candidate set (8 bytes
+/// per locator), not to k.
+fn collect_locator_ordinals(
+    store: &Backend,
+    index_id: IndexId,
+    max_examined: usize,
+    examined: &mut usize,
+    progress: ScanProgress<'_>,
+) -> Result<Vec<(u64, u16)>> {
+    let prefix = locator_prefix(index_id);
+    let mut out = Vec::new();
+    let mut failure = None;
+    let mut pending = 0u64;
+    store.range(&prefix)?.for_each_ref(|key, value| {
+        if !key.starts_with(&prefix) {
+            return false;
+        }
+        if let Err(e) = (|| -> Result<()> {
+            if pending == SCAN_STEP {
+                progress(ScanStep::Locators(std::mem::take(&mut pending)))?;
+            }
+            if *examined == max_examined {
+                progress(ScanStep::Locators(std::mem::take(&mut pending)))?;
+                return Err(Error::Kernel(kernel::Error::ResourceLimit(
+                    "exact vector max_examined exceeded",
+                )));
+            }
+            *examined += 1;
+            pending += 1;
+            let mut at = prefix.len();
+            let sequence = read_ordered(key, &mut at)?;
+            if at != key.len() || sequence == 0 {
+                return Err(corrupt("exact vector locator key"));
+            }
+            let (_, ordinal) = decode_locator(value)?;
+            let ordinal =
+                u16::try_from(ordinal).map_err(|_| corrupt("vector field ordinal overflow"))?;
+            out.push((sequence, ordinal));
+            Ok(())
+        })() {
+            failure = Some(e);
+            return false;
+        }
+        true
+    })?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    progress(ScanStep::Locators(pending))?;
+    Ok(out)
+}
+
+/// How many records a page-order scan may read between two `progress` calls.
+///
+/// The bound this buys is the reason it is small: a budget is charged, and a
+/// cancellation is polled, once per this many records rather than once per
+/// scan, so a query with a candidate budget of 100 over 50M rows stops inside
+/// the walk instead of reading all 50M and reporting the overrun afterwards.
+pub(super) const SCAN_STEP: u64 = 256;
+
+/// What a page-order scan has just read, handed back WHILE it is still
+/// walking so the caller can charge and cancel it in flight.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ScanStep {
+    /// Locator records read out of the `0x73` table.
+    Locators(u64),
+    /// Vector records scored: `0x60` sidecars for the exact scan, `0x79`
+    /// compact entries for the quantized one.
+    Scored(u64),
+}
+
+/// The charge-and-cancel hook a page-order scan calls every [`SCAN_STEP`]
+/// records. Returning `Err` stops the walk: `Error::Cancelled` is the caller
+/// saying stop, and a caller that is metering a budget stashes its own richer
+/// error and returns `Cancelled` too.
+pub(super) type ScanProgress<'a> = &'a mut dyn FnMut(ScanStep) -> Result<()>;
+
+/// The progress hook a plain cancellation callback becomes: no budget, poll
+/// on the same cadence as before.
+pub(super) fn cancel_only(cancelled: &mut impl FnMut() -> bool) -> impl FnMut(ScanStep) -> Result<()> + '_ {
+    move |_| {
+        if cancelled() {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// One layout descriptor by id, or None when that id was never minted.
+///
+/// `Database::layout` cannot say "absent": it folds a missing id into the
+/// same corrupt-metadata error as a damaged one, and it keeps a single-slot
+/// cache that a sweep over every layout would evict on every call. This reads
+/// the three replicas directly and leaves that cache alone.
+fn layout_if_present(db: &Database, id: u32) -> Result<Option<Layout>> {
+    let store = db.store()?;
+    let mut present = false;
+    for copy in 0..3u8 {
+        let Some(bytes) = store.get(&super::layout_key(id, copy))? else {
+            continue;
+        };
+        present = true;
+        if let Ok(layout) = Layout::from_descriptor(&bytes) {
+            return Ok(Some(layout));
+        }
+    }
+    if present {
+        return Err(corrupt("vector index layout descriptor"));
+    }
+    Ok(None)
+}
+
+/// Does this layout agree that `ordinal` is exactly this index's vector
+/// field, and does it put nothing else there?
+///
+/// Two ways to agree. Either the layout declares the indexed field at that
+/// ordinal with the indexed dimension -- its rows write their sidecar exactly
+/// where the scan will look -- or the layout has no vector of ours at all AND
+/// no other vector field at that ordinal, so its rows contribute no sidecar
+/// the scan could either miss or mistake for one of ours.
+fn layout_agrees(layout: &Layout, field: &str, dim: usize, ordinal: usize) -> bool {
+    let ours = layout
+        .fields
+        .iter()
+        .position(|(name, kind)| name == field && matches!(kind, Kind::Vector(_)));
+    match ours {
+        Some(at) => at == ordinal && matches!(layout.fields.get(at), Some((_, Kind::Vector(d))) if *d == dim),
+        None => !matches!(layout.fields.get(ordinal), Some((_, Kind::Vector(_)))),
+    }
+}
+
+/// The one ordinal EVERY layout puts this index's vector field at, when there
+/// is one: the sidecar ordinal is then unique, so the locator table is not
+/// needed to decide which sidecar to score.
+///
+/// The current layout alone is not enough to ask. `alter_collection` mints a
+/// NEW layout id and rewrites no rows, and `validate_indexed_layout` only
+/// requires the indexed field's name and kind to survive -- not its ordinal.
+/// So a collection whose vector field moved from ordinal 1 to ordinal 2 has
+/// its population split across two layouts, and a scan that filtered on the
+/// current ordinal alone would score only the rows written after the alter
+/// and report them, with no error, as the whole top-k. Every layout in the
+/// database is checked rather than only this collection's, because the
+/// catalog records one layout id and not a history: the extra layouts belong
+/// to other collections and can only push this answer onto the locator path,
+/// never off it.
+fn single_vector_ordinal(db: &Database, index: &IndexInfo, dim: usize) -> Result<Option<u16>> {
+    let catalog = db.catalog(index.collection)?;
+    let current = db.layout(catalog.layout)?;
+    let mut found = None;
+    for (ordinal, (name, kind)) in current.fields.iter().enumerate() {
+        if matches!(kind, Kind::Vector(d) if *d == dim) {
+            if found.is_some() || name != &index.field {
+                return Ok(None);
+            }
+            found = Some(ordinal);
+        }
+    }
+    let Some(only) = found else {
+        return Ok(None);
+    };
+    let (_, next_layout) = db.header()?;
+    for id in 0..next_layout {
+        if id == catalog.layout {
+            continue;
+        }
+        let Some(layout) = layout_if_present(db, id)? else {
+            continue;
+        };
+        if !layout_agrees(&layout, &index.field, dim, only) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(
+        u16::try_from(only).map_err(|_| corrupt("vector field ordinal overflow"))?,
+    ))
+}
+
+fn finish_exact_heap(heap: BinaryHeap<HeapHit>) -> Vec<VectorHit> {
+    let mut hits: Vec<_> = heap.into_iter().map(|hit| hit.0).collect();
+    hits.sort_by(|a, b| {
+        a.distance
+            .total_cmp(&b.distance)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    hits
+}
+
+/// Inlined on purpose: this is the per-row body of the page-order scan, and
+/// the cursor it now carries is then an argument the caller keeps in a
+/// register across the walk rather than one it pushes per vector.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn admit_scored(
+    heap: &mut BinaryHeap<HeapHit>,
+    k: usize,
+    collection: CollectionId,
+    sequence: u64,
+    bytes: &[u8],
+    query: &[f64],
+    query_norm: f64,
+    metric: VectorMetric,
+    after: Option<VectorAfter>,
+) -> Result<()> {
+    let Some(distance) = score_f32_pre(bytes, query, query_norm, metric)? else {
+        return Ok(());
+    };
+    let id = EntityId {
+        collection,
+        sequence,
+    };
+    // The page cursor is applied HERE, before the bounded heap, so a heap of
+    // k holds the next k rows in rank order and not the first k with the
+    // already-returned ones cut out of them.
+    if after.is_some_and(|after| !after.admits(distance, id)) {
+        return Ok(());
+    }
+    admit(heap, k, Some(VectorHit { id, distance }));
+    Ok(())
+}
+
+/// Page-order exact top-k: sidecar pages once. Each sidecar leaf is decoded
+/// once and every matching vector on it is scored in a tight loop. When the
+/// current layout has a single vector field, locators are not read at all
+/// (they only map winners back, and the sidecar key already carries the
+/// entity id). Otherwise a locator-page ordinal table filters mixed fields.
+/// SACRIFICE of the mixed path: RAM proportional to the locator set.
+///
+/// `after` is the page cursor and is applied per candidate, before the heap.
+/// `progress` is called every [`SCAN_STEP`] SIDECAR RECORDS -- every record
+/// the walk touches, not only the ones the ordinal filter keeps, so a long
+/// run of another field's sidecars cannot starve the cancellation poll.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_exact_all(
+    db: &Database,
+    index: &IndexInfo,
+    query: &[f32],
+    query_norm: f64,
+    metric: VectorMetric,
+    k: usize,
+    after: Option<VectorAfter>,
+    max_examined: usize,
+    progress: ScanProgress<'_>,
+) -> Result<Vec<VectorHit>> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let dimension = dimension(index)?;
+    let query_wide: Vec<f64> = query.iter().map(|lane| f64::from(*lane)).collect();
+    let only = single_vector_ordinal(db, index, dimension)?;
+    let store = db.store()?;
+    let prefix = sidecar_prefix(index.collection);
+    let mut heap = BinaryHeap::with_capacity(k.min(1024));
+    let mut sidecars = 0u64;
+    // Every sidecar record the walk sees, whatever its ordinal. The poll
+    // cadence rides on this and not on the kept count: a collection whose
+    // matching sidecars are followed by a long run of another field's would
+    // otherwise leave the kept count at a non-multiple of the step and never
+    // poll again.
+    let mut visited = 0u64;
+    // Kept records not yet handed to `progress`.
+    let mut pending = 0u64;
+    let mut failure = None;
+
+    if let Some(only) = only {
+        store.range(&prefix)?.for_each_ref(|key, bytes| {
+            if !key.starts_with(&prefix) {
+                return false;
+            }
+            if let Err(e) = (|| -> Result<()> {
+                visited += 1;
+                if visited % SCAN_STEP == 0 {
+                    progress(ScanStep::Scored(std::mem::take(&mut pending)))?;
+                }
+                let mut cur = prefix.len();
+                let sequence = read_ordered(key, &mut cur)?;
+                let ordinal = read_ordered(key, &mut cur)?;
+                if cur != key.len() || sequence == 0 {
+                    return Err(corrupt("exact vector sidecar key"));
+                }
+                if ordinal != u64::from(only) {
+                    return Ok(());
+                }
+                if sidecars as usize == max_examined {
+                    // Charge what is outstanding BEFORE reporting the limit:
+                    // when the limit came from a budget, that charge is the
+                    // one that names the resource that ran out.
+                    progress(ScanStep::Scored(std::mem::take(&mut pending)))?;
+                    return Err(Error::Kernel(kernel::Error::ResourceLimit(
+                        "exact vector max_examined exceeded",
+                    )));
+                }
+                sidecars += 1;
+                pending += 1;
+                admit_scored(
+                    &mut heap,
+                    k,
+                    index.collection,
+                    sequence,
+                    bytes,
+                    &query_wide,
+                    query_norm,
+                    metric,
+                    after,
+                )
+            })() {
+                failure = Some(e);
+                return false;
+            }
+            true
+        })?;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        progress(ScanStep::Scored(pending))?;
+        return Ok(finish_exact_heap(heap));
+    }
+
+    let mut examined = 0usize;
+    let ordinals =
+        collect_locator_ordinals(store, index.id, max_examined, &mut examined, progress)?;
+    let mut at = 0usize;
+    store.range(&prefix)?.for_each_ref(|key, bytes| {
+        if !key.starts_with(&prefix) {
+            return false;
+        }
+        if let Err(e) = (|| -> Result<()> {
+            visited += 1;
+            if visited % SCAN_STEP == 0 {
+                progress(ScanStep::Scored(std::mem::take(&mut pending)))?;
+            }
+            let mut cur = prefix.len();
+            let sequence = read_ordered(key, &mut cur)?;
+            let ordinal = read_ordered(key, &mut cur)?;
+            if cur != key.len() || sequence == 0 {
+                return Err(corrupt("exact vector sidecar key"));
+            }
+            if at < ordinals.len() && ordinals[at].0 < sequence {
+                return Err(corrupt("indexed vector sidecar is missing"));
+            }
+            if at >= ordinals.len() {
+                return Ok(());
+            }
+            if ordinals[at].0 != sequence || u64::from(ordinals[at].1) != ordinal {
+                return Ok(());
+            }
+            at += 1;
+            sidecars += 1;
+            pending += 1;
+            admit_scored(
+                &mut heap,
+                k,
+                index.collection,
+                sequence,
+                bytes,
+                &query_wide,
+                query_norm,
+                metric,
+                after,
+            )
+        })() {
+            failure = Some(e);
+            return false;
+        }
+        true
+    })?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    if at < ordinals.len() {
+        return Err(corrupt("indexed vector sidecar is missing"));
+    }
+    progress(ScanStep::Scored(pending))?;
+    Ok(finish_exact_heap(heap))
 }
 
 fn admit(heap: &mut BinaryHeap<HeapHit>, k: usize, hit: Option<VectorHit>) {
@@ -397,81 +879,37 @@ impl Database {
             return Ok(Vec::new());
         }
 
-        let mut examined = 0usize;
         let mut heap = BinaryHeap::with_capacity(k.min(1024));
-        let mut spend = || -> Result<()> {
-            if cancelled() {
-                return Err(Error::Cancelled);
-            }
-            if examined == max_examined {
-                return Err(Error::Kernel(kernel::Error::ResourceLimit(
-                    "exact vector max_examined exceeded",
-                )));
-            }
-            examined += 1;
-            Ok(())
-        };
 
         match candidates {
             VectorCandidates::All => {
-                // Two cursors, not one cursor and N descents. The locator scan
-                // still decides WHICH rows are candidates and which ordinal
-                // each one's vector lives at -- that is the authoritative set
-                // and it is unchanged -- but the sidecar bytes now arrive from
-                // a second forward scan running in the same key order, so a
-                // whole-collection top-k costs two range scans instead of one
-                // range scan plus a root-to-leaf descent per row.
-                let prefix = locator_prefix(id);
-                let store = self.store()?;
-                let mut sidecars = SidecarCursor::new(store, index.collection)?;
-                let mut failure = None;
-                store.range(&prefix)?.for_each_ref(|key, value| {
-                    if !key.starts_with(&prefix) {
-                        return false;
-                    }
-                    if let Err(e) = (|| -> Result<()> {
-                        spend()?;
-                        let mut at = prefix.len();
-                        let sequence = read_ordered(key, &mut at)?;
-                        if at != key.len() || sequence == 0 {
-                            return Err(corrupt("exact vector locator key"));
-                        }
-                        let entity = EntityId {
-                            collection: index.collection,
-                            sequence,
-                        };
-                        let ordinal = self.locator_ordinal(&index, value, dimension)?;
-                        let mut target_buf = [0u8; 32];
-                        let target = write_vector_key(&mut target_buf, entity, ordinal);
-                        let hit = match sidecars.seek(target)? {
-                            Some(bytes) => score_vector_bytes(
-                                entity,
-                                bytes,
-                                dimension,
-                                query,
-                                query_norm,
-                                metric,
-                                &mut || false,
-                            )?,
-                            // Not where the scan is: the sidecar is absent or
-                            // damaged. Pay the descent for this one row and let
-                            // the point-read path produce its diagnosis.
-                            None => self
-                                .score_locator(&index, entity, value, query, query_norm, metric)?,
-                        };
-                        admit(&mut heap, k, hit);
-                        Ok(())
-                    })() {
-                        failure = Some(e);
-                        return false;
-                    }
-                    true
-                })?;
-                if let Some(e) = failure {
-                    return Err(e);
-                }
+                let mut progress = cancel_only(&mut cancelled);
+                return Ok(scan_exact_all(
+                    self,
+                    &index,
+                    query,
+                    query_norm,
+                    metric,
+                    k,
+                    None,
+                    max_examined,
+                    &mut progress,
+                )?);
             }
             VectorCandidates::SortedUnique(ids) => {
+                let mut examined = 0usize;
+                let mut spend = || -> Result<()> {
+                    if cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    if examined == max_examined {
+                        return Err(Error::Kernel(kernel::Error::ResourceLimit(
+                            "exact vector max_examined exceeded",
+                        )));
+                    }
+                    examined += 1;
+                    Ok(())
+                };
                 for candidate in ids {
                     spend()?;
                     if let Some(locator) =
