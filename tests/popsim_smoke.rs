@@ -58,6 +58,18 @@ fn both_arms_answer_the_same_questions() {
         lite_counts.iter().map(|(n, _)| n).collect::<Vec<_>>(),
         "the two arms must run the same battery in the same order"
     );
+    let names: Vec<_> = e4_counts.iter().map(|(n, _)| n.as_str()).collect();
+    for case in [
+        "plot_within_box",
+        "plot_intersects_radius_poly",
+        "plot_contains_point",
+        "plot_dwithin_2km",
+    ] {
+        assert!(
+            names.contains(&case),
+            "the battery lost the geometry case {case}: {names:?}"
+        );
+    }
     assert!(
         e4_counts.len() >= 15,
         "the battery lost cases: {}",

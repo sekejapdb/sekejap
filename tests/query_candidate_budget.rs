@@ -11,11 +11,12 @@
 //! it does now, so they fail on a regression rather than on a rounding.
 use e4_prototype::{
     collections::{
-        CandidateDriver, CollectionId, CollectionOptions, Database, IndexId, PointFilter, Projection,
-        QueryBudget, QueryDriver, QueryFilter, QueryOrder, QueryRequest, QueryWork, ScalarFilter,
-        ScalarValue, SortDirection, TextMatch,
+        CandidateDriver, CollectionId, CollectionOptions, Database, Geom, GeometryFilter, IndexId,
+        PointFilter, Projection, QueryBudget, QueryDriver, QueryFilter, QueryOrder, QueryRequest,
+        QueryWork, ScalarFilter, ScalarValue, SortDirection, TextMatch,
     },
-    spatial_math::Bounds,
+    spatial_geometry,
+    spatial_math::{Bounds, Point},
     Kind,
 };
 use kernel::{
@@ -1766,4 +1767,228 @@ fn a_key_filter_without_the_keys_driver_is_refused() {
         Err(e4_prototype::collections::QueryError::Database(_)) => {}
         _ => panic!("a key filter without CandidateDriver::Keys must be refused at prepare time"),
     }
+}
+
+// -- QD: QueryOrder::Distance counted --------------------------------------
+
+fn qd_unit(seed: &mut u64) -> f64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    (*seed >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// (d) Nearest 10 over 50K points with Projection::Ids: no primary reads,
+/// spatial postings examined <= 200, pool accesses <= 48.
+#[test]
+fn distance_order_knn10_over_50k_points_is_a_probe_not_a_scan() {
+    const BBOX_LON: (f64, f64) = (106.4, 108.8);
+    const BBOX_LAT: (f64, f64) = (-7.8, -5.9);
+    const CENTER: (f64, f64) = (107.6, -6.9);
+    const ROWS: usize = 50_000;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(
+        temp.path().join("db"),
+        Config {
+            budget_bytes: 32 << 20,
+            io: IoMode::Buffered,
+            sync: SyncMode::Full,
+        },
+    )
+    .unwrap();
+    let collection = db
+        .create_collection(
+            "points",
+            vec![("position".into(), Kind::Point)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    let mut seed = 0x510a_55ed_c0ff_eeeeu64;
+    for n in 0..ROWS {
+        let lon = BBOX_LON.0 + (BBOX_LON.1 - BBOX_LON.0) * qd_unit(&mut seed);
+        let lat = BBOX_LAT.0 + (BBOX_LAT.1 - BBOX_LAT.0) * qd_unit(&mut seed);
+        db.put(
+            collection,
+            &format!("p{n:05}"),
+            &json!({"position": {"type": "Point", "coordinates": [lon, lat]}}),
+        )
+        .unwrap();
+        if n % 1000 == 999 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let index = db
+        .create_point_index(collection, "position", "position")
+        .unwrap();
+    db.build_index_to_ready(index, 255).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let center = Point::new(CENTER.0, CENTER.1).unwrap();
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &[],
+            order: QueryOrder::Distance {
+                index,
+                center,
+                direction: SortDirection::Ascending,
+            },
+            projection: Projection::Ids,
+            total_limit: Some(10),
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let before = db.pool_accesses().unwrap();
+    let page = prepared
+        .next_page(10, QueryBudget::unlimited(), || false)
+        .unwrap();
+    let pool_accesses = db.pool_accesses().unwrap() - before;
+    assert!(page.done);
+    assert_eq!(page.rows.len(), 10);
+    assert_eq!(
+        page.driver,
+        QueryDriver::Nearest { index },
+        "{:?}",
+        page.driver
+    );
+    assert_eq!(
+        page.work.primary_reads, 0,
+        "Ids projection must not read a row: {:?}",
+        page.work
+    );
+    assert!(
+        page.work.spatial_postings <= 200,
+        "examined {} spatial postings, want <= 200",
+        page.work.spatial_postings
+    );
+    assert!(
+        pool_accesses <= 48,
+        "pool accesses {pool_accesses}, want <= 48"
+    );
+}
+
+
+fn geo_square(lon: f64, lat: f64, half: f64) -> Geom {
+    Geom::Polygon(vec![vec![
+        [lon - half, lat - half],
+        [lon + half, lat - half],
+        [lon + half, lat + half],
+        [lon - half, lat + half],
+        [lon - half, lat - half],
+    ]])
+}
+
+fn geo_json(g: &Geom) -> Value {
+    match g {
+        Geom::Polygon(rs) => json!({"type": "Polygon", "coordinates": rs}),
+        Geom::Point(x, y) => json!({"type": "Point", "coordinates": [x, y]}),
+        _ => panic!("budget fixture only stores polygons and points"),
+    }
+}
+
+/// A within-polygon query over 20K small polygons where 2% overlap the query
+/// box: candidates admitted by BoxF <= 1.5x the true answer, primary reads
+/// equal the admitted candidates (the refine), pool accesses bounded by
+/// cover leaves + candidate rows + a constant.
+#[test]
+fn geometry_within_polygon_admits_a_bounded_candidate_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let rows = db
+        .create_collection(
+            "plots",
+            vec![("plot".into(), Kind::Geo)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+
+    const N: u64 = 20_000;
+    // Query window well inside the grid, with a margin so the 2% that are
+    // placed fully inside are Within, not merely BoxF-overlapping.
+    let query = geo_square(0.0, 0.0, 1.0);
+    let mut truth = 0u64;
+    for i in 0..N {
+        // 2% sit well inside the query square; the rest sit far outside.
+        let inside = i % 50 == 0;
+        let (lon, lat) = if inside {
+            let k = i / 50;
+            (-0.6 + (k % 20) as f64 * 0.06, -0.6 + (k / 20) as f64 * 0.06)
+        } else {
+            (20.0 + (i % 200) as f64 * 0.1, 20.0 + (i / 200) as f64 * 0.1)
+        };
+        let geom = geo_square(lon, lat, 0.02);
+        if spatial_geometry::within(&geom, &query) {
+            truth += 1;
+        }
+        db.put(
+            rows,
+            &format!("p{i:05}"),
+            &json!({"plot": geo_json(&geom)}),
+        )
+        .unwrap();
+        if (i + 1) % 512 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let index = db.create_geometry_index(rows, "by_plot", "plot").unwrap();
+    db.build_index_to_ready(index, 256).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    assert!(truth > 0, "fixture must have a non-empty within-answer");
+    assert!(
+        (truth as f64) <= (N as f64) * 0.03,
+        "fixture 2% band drifted: truth={truth}"
+    );
+
+    let before = db.pool_accesses().unwrap();
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection: rows,
+            filters: &[QueryFilter::Geometry {
+                index,
+                predicate: GeometryFilter::Within(query),
+            }],
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let page = prepared
+        .next_page(PAGE, QueryBudget::unlimited(), || false)
+        .unwrap();
+    let accesses = db.pool_accesses().unwrap() - before;
+
+    assert_eq!(page.rows.len() as u64, truth);
+    // BoxF admission is a superset of Within; on this fixture the inside
+    // squares sit well inside the query box, so the ratio stays near 1.
+    assert!(
+        page.work.candidates as f64 <= truth as f64 * 1.5,
+        "BoxF admitted {} candidates for {truth} hits",
+        page.work.candidates
+    );
+    assert_eq!(
+        page.work.primary_reads, page.work.candidates,
+        "every BoxF-admitted candidate is refined with a primary read: {:?}",
+        page.work
+    );
+    // Cover walk + one row per admitted candidate, plus a small constant for
+    // catalog/descriptor probes.
+    // Each admitted candidate is refined from its row, and under entity
+    // order over a cell-ordered walk each row is its own descent of the
+    // primary tree: three pages deep at 20K rows. Gathering those reads in
+    // id order (as the batched gather does for row-needing filters) would
+    // bring this to about one access per candidate; that is a follow-up,
+    // and this bound pins today's cost so the follow-up has a number to beat.
+    let bound = page.work.spatial_postings + page.work.candidates * 4 + 64;
+    assert!(
+        accesses <= bound,
+        "{accesses} pager accesses vs cover+rows bound {bound} (postings={}, candidates={})",
+        page.work.spatial_postings,
+        page.work.candidates
+    );
 }

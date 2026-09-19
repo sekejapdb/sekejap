@@ -1,7 +1,8 @@
 //! Persisted geometry bbox postings (family `SpatialGeometry`) and their
-//! build/maintain/decode primitives. The query filters over this family are
-//! a later item (X1b); this file is index-only: format, build, maintenance,
-//! and the raw scan the verifier and X1b's oracle test rely on. No query API.
+//! build/maintain/decode primitives. Query filters over this family live in
+//! `query.rs` (`QueryFilter::Geometry`); this file is the index: format,
+//! build, maintenance, and the raw scan the verifier and the query's BoxF
+//! admission walk rely on.
 //!
 //! DESIGN. PostGIS's GiST keeps one bounding box per leaf entry and refines
 //! with the full geometry from the heap. This index's disk-first analogue: a
@@ -80,7 +81,7 @@ pub(super) fn descriptor(i: &IndexInfo) -> Result<()> {
 /// (`crate::geo`, called from `dense_v3::encode` regardless of indexing), so
 /// this only needs to reject the shapes that function does not check:
 /// unsupported types and geometry extensions.
-fn geom_from_value(value: &Value) -> Result<Geom> {
+pub(crate) fn geom_from_value(value: &Value) -> Result<Geom> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid("indexed geometry must be a GeoJSON object"))?;
@@ -157,6 +158,22 @@ fn cover_cells_for(bbox: (f64, f64, f64, f64)) -> (u8, Vec<(u32, u32)>) {
     unreachable!("LEVEL_WORLD's 1x1 grid always fits MAX_CELLS")
 }
 
+/// The box a geometry is filed under. The raw bbox of a geometry whose ring
+/// crosses the antimeridian (a segment from 170 to -170 that means the short
+/// way round) spans almost the whole world in the wrong direction: it names
+/// the part of the world the geometry is NOT in, and a box test would reject
+/// a point at 175. Such a geometry -- any whose raw longitude span exceeds
+/// 180 degrees -- is filed under the full longitude range instead: still a
+/// box the exact predicate refines, never one that misses.
+pub(super) fn indexed_bbox(geom: &Geom) -> Option<(f64, f64, f64, f64)> {
+    let (xmin, xmax, ymin, ymax) = geom.bbox()?;
+    if xmax - xmin > 180.0 {
+        Some((-180.0, 180.0, ymin, ymax))
+    } else {
+        Some((xmin, xmax, ymin, ymax))
+    }
+}
+
 /// The bounded posting set for one geometry: at most `MAX_CELLS` (8)
 /// entries, one per covered cell at the chosen ladder level, each carrying
 /// the SAME value -- the geometry's own outward-rounded bbox. Sorted by key
@@ -167,8 +184,7 @@ pub(super) fn geometry_entries(
     id: EntityId,
     geom: &Geom,
 ) -> Result<Vec<GeometryEntry>> {
-    let (xmin, xmax, ymin, ymax) = geom
-        .bbox()
+    let (xmin, xmax, ymin, ymax) = indexed_bbox(geom)
         .ok_or_else(|| invalid("indexed geometry must not be empty"))?;
     let value = BoxF::from_f64(xmin, xmax, ymin, ymax).encode();
     let (level, cells) = cover_cells_for((xmin, xmax, ymin, ymax));

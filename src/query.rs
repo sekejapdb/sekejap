@@ -1,20 +1,24 @@
-//! Combined queries over scalar, graph, point, text and vector families.
+//! Combined queries over scalar, graph, point, geometry, text and vector families.
 //! Every constraint runs before ranked top-k; pages report their selected
 //! complete driver, logical work and any explicit approximation diagnostics.
 use super::*;
 use crate::spatial_math::{
-    Bounds, MAX_HILBERT_VALUE, Point, bounds_hilbert_ranges, radius_candidate_bounds, within_radius,
+    Bounds, MAX_HILBERT_RANGES, MAX_HILBERT_VALUE, Point, WGS84_MIN_CURVATURE_RADIUS_METRES,
+    bounds_hilbert_ranges, radius_candidate_bounds, wgs84_distance_metres, within_radius,
 };
-use crate::{dense_v3, scalar_key};
+use crate::{dense_v3, scalar_key, spatial_geometry};
 use kernel::btree::{RangeIter, ReverseRangeIter};
+use kernel::spatial::{self, BoxF, cover_ranges};
 use serde_json::Value;
 use std::{
     cmp::Ordering,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashSet},
     fmt,
     ops::Bound,
     sync::Arc,
 };
+
+pub use kernel::spatial::Geom;
 
 const MAX_FILTERS: usize = 64;
 const MAX_PROJECTION_FIELDS: usize = 64;
@@ -72,6 +76,14 @@ pub enum QueryFilter<'a> {
         index: IndexId,
         predicate: PointFilter,
     },
+    /// A predicate over a `SpatialGeometry` index. The posting's `BoxF` is
+    /// only a candidate test: unlike a point posting, it does not prove the
+    /// predicate, so T3's no-row rule does not apply and the row's geometry
+    /// is refined through [`spatial_geometry`].
+    Geometry {
+        index: IndexId,
+        predicate: GeometryFilter,
+    },
     Text {
         index: IndexId,
         query: &'a str,
@@ -91,6 +103,18 @@ pub enum QueryFilter<'a> {
 pub enum PointFilter {
     Bbox(Bounds),
     Radius { center: Point, radius_metres: f64 },
+}
+
+/// Predicates over a stored `Kind::Geo` value, unit-matched to PostGIS the
+/// same way [`spatial_geometry`] is: `Intersects` and `DWithin` are spheroidal
+/// (`ST_Intersects`/`ST_DWithin` on `geography`); `Within` and `Contains` are
+/// planar (`ST_Within`/`ST_Contains` have no geography overload).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GeometryFilter {
+    Intersects(Geom),
+    Within(Geom),
+    Contains(Geom),
+    DWithin { geometry: Geom, metres: f64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +174,15 @@ pub enum QueryOrder<'a> {
     /// walks the same one. It is NOT a promise across two separately prepared
     /// queries that `CandidateDriver::Auto` might plan differently.
     Driver,
+    /// Rows in ascending geodesic distance from `center` on a point index,
+    /// ties broken by entity id. Descending is refused at prepare: there is
+    /// no PostGIS-style reverse KNN walk here, and silently treating DESC as
+    /// ASC would be a different question than the one asked.
+    Distance {
+        index: IndexId,
+        center: Point,
+        direction: SortDirection,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +209,14 @@ pub enum QueryDriver {
         filter: usize,
     },
     Spatial {
+        index: IndexId,
+        fallback_world: bool,
+    },
+    /// Ordered nearest walk over a point index (`QueryOrder::Distance`).
+    Nearest {
+        index: IndexId,
+    },
+    Geometry {
         index: IndexId,
         fallback_world: bool,
     },
@@ -581,6 +622,10 @@ enum CompiledFilter {
         info: IndexInfo,
         predicate: PointFilter,
     },
+    Geometry {
+        info: IndexInfo,
+        predicate: GeometryFilter,
+    },
     Text(PreparedText),
     /// A range over the external-key mapping keyspace. Reuses
     /// `EncodedScalarFilter`'s `Range`/`Empty` shape -- `scalar_key_position`
@@ -738,6 +783,10 @@ enum CompiledOrder {
     /// while the order is being compiled -- the driver is chosen after -- so
     /// `prepare_query` fills it in once the plan is settled.
     Driver(DriverKey),
+    Distance {
+        info: IndexInfo,
+        center: Point,
+    },
 }
 
 /// The key ONE driver's own walk is sorted by, resolved at prepare time so
@@ -752,6 +801,8 @@ enum DriverKey {
     Scalar(IndexId),
     /// `cell || sequence` of one spatial index's postings.
     Cell(IndexId),
+    /// `(level, cell, sequence)` of one geometry index's first admitted posting.
+    GeomCell(IndexId),
     /// The external key bytes of one mapping entry.
     Key,
 }
@@ -772,6 +823,29 @@ enum DriverPlan {
         predicate: PointFilter,
         position: usize,
         ranges: Vec<(u64, u64)>,
+        fallback_world: bool,
+    },
+    /// Outward-ring walk yielding postings in ascending geodesic distance.
+    /// `radius_cap` is a same-index, same-centre radius filter this walk
+    /// certifies; `certifies` is that filter's position.
+    Nearest {
+        info: IndexInfo,
+        center: Point,
+        radius_cap: Option<f64>,
+        certifies: Option<usize>,
+    },
+    /// A geometry index walk. The posting `BoxF` admits a candidate; the
+    /// predicate is refined against the row (T3's no-row rule does not apply).
+    Geometry {
+        info: IndexInfo,
+        /// Held so a future cursor-side refine can read it without going
+        /// back to `CompiledFilter`. Admission uses `query_bbox`; the
+        /// predicate itself is refined from the row.
+        #[allow(dead_code)]
+        predicate: GeometryFilter,
+        position: usize,
+        ranges: Vec<GeomRange>,
+        query_bbox: BoxF,
         fallback_world: bool,
     },
     Text {
@@ -795,6 +869,16 @@ enum DriverPlan {
     },
 }
 
+/// One Hilbert range of a geometry cover, at one ladder level. Walked in
+/// on-disk key order: `LEVEL_WORLD` (0), then `LEVEL_COARSE` (8), then
+/// `LEVEL_FINE` (12), because the posting key is `tag||index||level||cell||seq`.
+#[derive(Clone, Debug)]
+struct GeomRange {
+    level: u8,
+    lo: u64,
+    hi: u64,
+}
+
 impl DriverPlan {
     fn diagnostic(&self) -> QueryDriver {
         match self {
@@ -806,6 +890,15 @@ impl DriverPlan {
                 fallback_world,
                 ..
             } => QueryDriver::Spatial {
+                index: info.id,
+                fallback_world: *fallback_world,
+            },
+            Self::Nearest { info, .. } => QueryDriver::Nearest { index: info.id },
+            Self::Geometry {
+                info,
+                fallback_world,
+                ..
+            } => QueryDriver::Geometry {
                 index: info.id,
                 fallback_world: *fallback_world,
             },
@@ -827,6 +920,9 @@ enum RankValue {
     /// millions of rows, and a `Vec` per row to carry a `u32` is an
     /// allocation per row.
     Cell(u32),
+    /// One geometry posting's `(level, cell)` — the first posting that
+    /// admitted the entity. Level precedes cell, matching the on-disk key.
+    GeomCell { level: u8, cell: u32 },
     /// One mapping entry's external-key bytes.
     Key(Vec<u8>),
 }
@@ -1032,6 +1128,24 @@ fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool) -> Orderin
                 a.cmp(b)
             }
         }
+        (
+            RankValue::GeomCell {
+                level: la,
+                cell: ca,
+            },
+            RankValue::GeomCell {
+                level: lb,
+                cell: cb,
+            },
+        ) => {
+            let a = (*la, *ca);
+            let b = (*lb, *cb);
+            if descending {
+                b.cmp(&a)
+            } else {
+                a.cmp(&b)
+            }
+        }
         (RankValue::Key(a), RankValue::Key(b)) => {
             if descending {
                 b.cmp(a)
@@ -1091,6 +1205,20 @@ pub struct PreparedQuery<'db> {
     /// One [`ScalarRangeSet`] per filter position, built at most once and
     /// reused by every page and by resume -- see `ensure_scalar_range_sets`.
     scalar_ranges: Vec<ScalarRangeSet>,
+    /// The resumable nearest walk, when the driver is [`DriverPlan::Nearest`].
+    /// Kept on the prepared query so page N+1 continues the ring the previous
+    /// page stopped in rather than re-walking from the centre: a `PreparedQuery`
+    /// already owns per-query state (C1's sets), and the walk's `held`/`ready`
+    /// buffers and Hilbert cover are the same kind of thing. Re-walking rings
+    /// up to the previous page's last `(distance, id)` would be correct and
+    /// bounded by that ring, but it would re-examine every posting already
+    /// charged on earlier pages.
+    nearest: Option<super::spatial_indexes::NearestWalk>,
+    /// Sequences a geometry driver has already admitted, carried across
+    /// Driver-order pages so a later posting of an already-emitted entity
+    /// (at most 8 cells) is not re-yielded after a resume. Cleared each page
+    /// under EntityId order, which re-walks from the start.
+    geometry_seen: HashSet<u64>,
 }
 
 fn invalid_query(message: impl fmt::Display) -> QueryError {
@@ -1267,6 +1395,144 @@ fn point_ranges(predicate: PointFilter) -> QueryResult<(Vec<(u64, u64)>, bool)> 
     let ranges = bounds_hilbert_ranges(bounds);
     let fallback_world = ranges.as_slice() == [(0, MAX_HILBERT_VALUE)];
     Ok((ranges, fallback_world))
+}
+
+/// Degree margin matching `radius_candidate_bounds`'s private `OUTWARD_DEGREES`.
+const GEOM_OUTWARD_DEGREES: f64 = 1e-10;
+
+fn geometry_query_geom(predicate: &GeometryFilter) -> &Geom {
+    match predicate {
+        GeometryFilter::Intersects(g)
+        | GeometryFilter::Within(g)
+        | GeometryFilter::Contains(g) => g,
+        GeometryFilter::DWithin { geometry, .. } => geometry,
+    }
+}
+
+fn geometry_query_bbox(predicate: &GeometryFilter) -> QueryResult<(f64, f64, f64, f64)> {
+    let geom = geometry_query_geom(predicate);
+    // The same rule the index files geometries under: a query geometry that
+    // crosses the antimeridian asks about the whole longitude range.
+    let bbox = super::spatial_geometry_indexes::indexed_bbox(geom)
+        .ok_or_else(|| invalid_query("geometry filter requires a non-empty geometry"))?;
+    match predicate {
+        GeometryFilter::DWithin { metres, .. } => {
+            if !metres.is_finite() || *metres < 0.0 {
+                return Err(invalid_query(
+                    "geometry dwithin metres must be finite and non-negative",
+                ));
+            }
+            Ok(expand_bbox_by_metres(bbox, *metres))
+        }
+        _ => Ok(bbox),
+    }
+}
+
+/// Expand a query bbox by a geodesic radius so every stored geometry within
+/// `metres` of any point in the original box has a bbox that overlaps the
+/// expansion. Same conservative envelope as [`radius_candidate_bounds`]:
+///
+/// - `angular = metres / WGS84_MIN_CURVATURE_RADIUS_METRES` (the smallest
+///   WGS84 curvature radius, so the angle is an over-estimate);
+/// - latitude expands by `angular.to_degrees() + 1e-10` on both sides;
+/// - longitude expands by `asin(sin(angular) / cos(φ)) + 1e-10` at the
+///   **poleward** latitude of the expanded band (smallest `cos(φ)` → most
+///   degrees). If that band reaches a pole, longitude is the whole world.
+///
+/// Never misses; may over-cover. A dateline wrap becomes a world longitude.
+fn expand_bbox_by_metres(
+    (xmin, xmax, ymin, ymax): (f64, f64, f64, f64),
+    metres: f64,
+) -> (f64, f64, f64, f64) {
+    let angular = metres / WGS84_MIN_CURVATURE_RADIUS_METRES;
+    if angular >= std::f64::consts::PI {
+        return (-180.0, 180.0, -90.0, 90.0);
+    }
+    let lat_delta = angular.to_degrees() + GEOM_OUTWARD_DEGREES;
+    let south = (ymin - lat_delta).max(-90.0);
+    let north = (ymax + lat_delta).min(90.0);
+    let poleward = south.abs().max(north.abs()).to_radians();
+    if poleward + angular >= std::f64::consts::FRAC_PI_2 {
+        return (-180.0, 180.0, south, north);
+    }
+    let ratio = (angular.sin() / poleward.cos()).clamp(-1.0, 1.0);
+    let lon_delta = ratio.asin().to_degrees() + GEOM_OUTWARD_DEGREES;
+    let west = xmin - lon_delta;
+    let east = xmax + lon_delta;
+    if west < -180.0 || east > 180.0 || west > east {
+        (-180.0, 180.0, south, north)
+    } else {
+        (west, east, south, north)
+    }
+}
+
+/// Cover ranges at one ladder level, budgeted like the point driver
+/// (`MAX_HILBERT_RANGES` = 64). A cover that will not fit becomes the whole
+/// level (never a miss).
+fn geometry_level_ranges(
+    xmin: f64,
+    xmax: f64,
+    ymin: f64,
+    ymax: f64,
+    bits: u8,
+) -> (Vec<(u64, u64)>, bool) {
+    let max_h = if bits == 0 {
+        0
+    } else {
+        (1u64 << (2 * bits)) - 1
+    };
+    if bits == 0 {
+        return (vec![(0, 0)], false);
+    }
+    let mut ranges = cover_ranges(xmin, xmax, ymin, ymax, bits, MAX_HILBERT_RANGES);
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        if lo > hi || hi > max_h {
+            return (vec![(0, max_h)], true);
+        }
+        match merged.last_mut() {
+            Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    if merged.is_empty() || merged.len() > MAX_HILBERT_RANGES {
+        (vec![(0, max_h)], true)
+    } else {
+        (merged, false)
+    }
+}
+
+fn geometry_ranges(predicate: &GeometryFilter) -> QueryResult<(Vec<GeomRange>, BoxF, bool)> {
+    let (xmin, xmax, ymin, ymax) = geometry_query_bbox(predicate)?;
+    let query_bbox = BoxF::from_f64(xmin, xmax, ymin, ymax);
+    let mut out = Vec::new();
+    let mut fallback_world = false;
+    // On-disk key order: level byte first, so WORLD (0), COARSE (8), FINE (12).
+    for level in [spatial::LEVEL_WORLD, spatial::LEVEL_COARSE, spatial::LEVEL_FINE] {
+        let (ranges, world) = geometry_level_ranges(xmin, xmax, ymin, ymax, level);
+        fallback_world |= world;
+        for (lo, hi) in ranges {
+            out.push(GeomRange {
+                level,
+                lo,
+                hi,
+            });
+        }
+    }
+    Ok((out, query_bbox, fallback_world))
+}
+
+fn geometry_predicate_matches(predicate: &GeometryFilter, row: &Geom) -> bool {
+    match predicate {
+        GeometryFilter::Intersects(query) => spatial_geometry::intersects(row, query),
+        GeometryFilter::Within(query) => spatial_geometry::within(row, query),
+        GeometryFilter::Contains(query) => spatial_geometry::contains(row, query),
+        GeometryFilter::DWithin {
+            geometry: query,
+            metres,
+        } => spatial_geometry::dwithin_m(row, query, *metres),
+    }
 }
 
 fn encode_scalar_value(kind: &Kind, value: ScalarValue<'_>) -> QueryResult<Vec<u8>> {
@@ -1582,6 +1848,33 @@ impl Database {
                         predicate: *predicate,
                     }
                 }
+                QueryFilter::Geometry { index, predicate } => {
+                    let info = self.index_info_cached(*index)?;
+                    if info.collection != request.collection {
+                        return Err(invalid_query("query index belongs to another collection"));
+                    }
+                    if info.family == IndexFamily::SpatialPoint {
+                        return Err(invalid_query(
+                            "a Geometry filter requires a spatial geometry index, not a point index",
+                        ));
+                    }
+                    if info.family != IndexFamily::SpatialGeometry {
+                        return Err(invalid_query(
+                            "a Geometry filter requires a spatial geometry index",
+                        ));
+                    }
+                    if info.state != IndexState::Ready {
+                        return Err(invalid_query("query index is not ready"));
+                    }
+                    super::spatial_geometry_indexes::descriptor(&info)?;
+                    // Touch the bbox now so a DWithin with a bad radius, or
+                    // an empty query geometry, is refused at prepare.
+                    let _ = geometry_query_bbox(predicate)?;
+                    CompiledFilter::Geometry {
+                        info,
+                        predicate: predicate.clone(),
+                    }
+                }
                 QueryFilter::Text {
                     index,
                     query,
@@ -1664,6 +1957,27 @@ impl Database {
             // The key is the DRIVER's, and the driver is chosen below. This
             // stands in until it is; `driver_key` replaces it.
             QueryOrder::Driver => CompiledOrder::Driver(DriverKey::Entity),
+            QueryOrder::Distance {
+                index,
+                center,
+                direction,
+            } => {
+                if matches!(direction, SortDirection::Descending) {
+                    return Err(invalid_query("distance order is ascending only"));
+                }
+                let info = require_family_index(
+                    self,
+                    request.collection,
+                    index,
+                    IndexFamily::SpatialPoint,
+                    "spatial-point",
+                )?;
+                super::spatial_indexes::descriptor(&info)?;
+                CompiledOrder::Distance {
+                    info,
+                    center,
+                }
+            }
         };
 
         let fields = match request.projection {
@@ -1715,6 +2029,17 @@ impl Database {
                         fallback_world,
                     })
                 }
+                Some(CompiledFilter::Geometry { info, predicate }) => {
+                    let (ranges, query_bbox, fallback_world) = geometry_ranges(predicate)?;
+                    Ok(DriverPlan::Geometry {
+                        info: info.clone(),
+                        predicate: predicate.clone(),
+                        position,
+                        ranges,
+                        query_bbox,
+                        fallback_world,
+                    })
+                }
                 Some(CompiledFilter::Text(prepared)) => Ok(DriverPlan::Text {
                     prepared: prepared.clone(),
                     position: Some(position),
@@ -1748,6 +2073,9 @@ impl Database {
                 // own order is the answer's. This is also what a driver-
                 // ordered query with no filter at all lands on.
                 CompiledOrder::Driver(_) => Ok(DriverPlan::Entities),
+                CompiledOrder::Distance { info, center } => {
+                    Ok(nearest_plan(info, *center, &filters))
+                }
             }
         };
         // `CandidateDriver::Keys` is not `CandidateDriver::Filter(position)`
@@ -1833,8 +2161,27 @@ impl Database {
                     .position(|filter| matches!(filter, CompiledFilter::Text(_)))
                 {
                     filter_driver(position)?
+                } else if let CompiledOrder::Distance { info, center } = &order {
+                    if distance_can_drive(info.id, *center, &filters) {
+                        nearest_plan(info, *center, &filters)
+                    } else if let Some(position) = filters.iter().position(|filter| {
+                        matches!(filter, CompiledFilter::Point { predicate, .. } if point_ranges(*predicate).is_ok_and(|(_, world)| !world))
+                    }) {
+                        filter_driver(position)?
+                    } else if let Some(position) = filters
+                        .iter()
+                        .position(|filter| matches!(filter, CompiledFilter::Point { .. }))
+                    {
+                        filter_driver(position)?
+                    } else {
+                        nearest_plan(info, *center, &filters)
+                    }
                 } else if let Some(position) = filters.iter().position(|filter| {
                     matches!(filter, CompiledFilter::Point { predicate, .. } if point_ranges(*predicate).is_ok_and(|(_, world)| !world))
+                }) {
+                    filter_driver(position)?
+                } else if let Some(position) = filters.iter().position(|filter| {
+                    matches!(filter, CompiledFilter::Geometry { predicate, .. } if geometry_ranges(predicate).is_ok_and(|(_, _, world)| !world))
                 }) {
                     filter_driver(position)?
                 } else if let Some((_, position)) = filters
@@ -1852,6 +2199,11 @@ impl Database {
                 } else if let Some(position) = filters
                     .iter()
                     .position(|filter| matches!(filter, CompiledFilter::Point { .. }))
+                {
+                    filter_driver(position)?
+                } else if let Some(position) = filters
+                    .iter()
+                    .position(|filter| matches!(filter, CompiledFilter::Geometry { .. }))
                 {
                     filter_driver(position)?
                 } else {
@@ -1947,6 +2299,22 @@ impl Database {
             }
         }
 
+        let nearest = match &driver {
+            DriverPlan::Nearest {
+                info,
+                center,
+                radius_cap,
+                ..
+            } => Some(super::spatial_indexes::NearestWalk::new(
+                info.clone(),
+                *center,
+                request.total_limit.unwrap_or(0),
+                *radius_cap,
+                usize::MAX,
+            )),
+            _ => None,
+        };
+
         Ok(PreparedQuery {
             db: self,
             collection: request.collection,
@@ -1960,6 +2328,8 @@ impl Database {
             run: Vec::new(),
             run_bounded: false,
             scalar_ranges,
+            nearest,
+            geometry_seen: HashSet::new(),
         })
     }
 }
@@ -1988,10 +2358,56 @@ fn driver_key(driver: &DriverPlan) -> QueryResult<DriverKey> {
         }
         DriverPlan::Scalar { info, .. } => Ok(DriverKey::Scalar(info.id)),
         DriverPlan::Spatial { info, .. } => Ok(DriverKey::Cell(info.id)),
+        DriverPlan::Geometry { info, .. } => Ok(DriverKey::GeomCell(info.id)),
         DriverPlan::Keys { .. } => Ok(DriverKey::Key),
-        DriverPlan::ExactVector { .. } | DriverPlan::QuantizedVector { .. } => Err(invalid_query(
+        DriverPlan::ExactVector { .. }
+        | DriverPlan::QuantizedVector { .. }
+        | DriverPlan::Nearest { .. } => Err(invalid_query(
             "driver order needs a driver that walks in an order of its own",
         )),
+    }
+}
+
+/// True when `QueryOrder::Distance` on `order_index` can itself be the
+/// candidate driver: every spatial filter is a same-index, same-centre
+/// radius (the common "nearest k within R" shape). A bbox, or a radius
+/// around a different point, is not monotone in distance from `center`, so
+/// stopping the ordered walk at `k` would drop in-filter rows that sit
+/// farther than k out-of-filter neighbours.
+fn distance_can_drive(order_index: IndexId, center: Point, filters: &[CompiledFilter]) -> bool {
+    filters.iter().all(|filter| match filter {
+        CompiledFilter::Point { info, predicate } if info.id == order_index => {
+            matches!(predicate, PointFilter::Radius { center: c, .. } if *c == center)
+        }
+        CompiledFilter::Point { .. } => false,
+        _ => true,
+    })
+}
+
+fn nearest_plan(info: &IndexInfo, center: Point, filters: &[CompiledFilter]) -> DriverPlan {
+    let mut radius_cap = None;
+    let mut certifies = None;
+    for (position, filter) in filters.iter().enumerate() {
+        if let CompiledFilter::Point {
+            info: filter_info,
+            predicate: PointFilter::Radius {
+                center: filter_center,
+                radius_metres,
+            },
+        } = filter
+        {
+            if filter_info.id == info.id && *filter_center == center {
+                radius_cap = Some(*radius_metres);
+                certifies = Some(position);
+                break;
+            }
+        }
+    }
+    DriverPlan::Nearest {
+        info: info.clone(),
+        center,
+        radius_cap,
+        certifies,
     }
 }
 
@@ -2352,11 +2768,19 @@ enum CarriedKey {
     /// A quantized-vector entry.
     Quantized(IndexId, Vec<u8>),
     /// The Hilbert cell a spatial posting is filed under, read only by a
-    /// ranking in that index's own walk order.
-    Cell(IndexId, u32),
+    /// ranking in that index's own walk order. The point is the posting's
+    /// own coordinates, so a Distance ranking over a spatial driver does
+    /// not open the row.
+    Cell(IndexId, u32, Point),
+    /// The `(level, cell)` of the first geometry posting that admitted this
+    /// entity, read only by a ranking in that index's own walk order.
+    GeomCell(IndexId, u8, u32),
     /// A mapping entry's external-key bytes, read only by a ranking in the
     /// keys driver's own walk order.
     Key(Vec<u8>),
+    /// A nearest-walk posting: coordinates and the geodesic distance already
+    /// computed from the centre the walk was opened at.
+    Distance(IndexId, Point, f64),
 }
 
 struct Candidate {
@@ -2416,7 +2840,32 @@ impl Candidate {
     /// `index`'s postings.
     fn cell(&self, index: IndexId) -> Option<u32> {
         match &self.carried {
-            Some(CarriedKey::Cell(id, cell)) if *id == index => Some(*cell),
+            Some(CarriedKey::Cell(id, cell, _)) if *id == index => Some(*cell),
+            _ => None,
+        }
+    }
+
+    fn point(&self, index: IndexId) -> Option<Point> {
+        match &self.carried {
+            Some(CarriedKey::Cell(id, _, point) | CarriedKey::Distance(id, point, _))
+                if *id == index =>
+            {
+                Some(*point)
+            }
+            _ => None,
+        }
+    }
+
+    fn distance_metres(&self, index: IndexId) -> Option<f64> {
+        match &self.carried {
+            Some(CarriedKey::Distance(id, _, distance)) if *id == index => Some(*distance),
+            _ => None,
+        }
+    }
+
+    fn geom_cell(&self, index: IndexId) -> Option<(u8, u32)> {
+        match &self.carried {
+            Some(CarriedKey::GeomCell(id, level, cell)) if *id == index => Some((*level, *cell)),
             _ => None,
         }
     }
@@ -2578,10 +3027,35 @@ struct SpatialCursor<'a> {
     done: bool,
 }
 
+/// Walks a geometry index's cover ranges, admitting a posting when its `BoxF`
+/// overlaps the query bbox. Dedup is a `HashSet` of sequences: an entity
+/// posts at most 8 cells at one level, and other entities interleave, so a
+/// consecutive-run exploit is not sound. Under Driver order the set is
+/// cloned onto the next page so a later posting of an already-emitted
+/// entity is not re-yielded after a resume.
+///
+/// The box is only a candidate test. This cursor does NOT certify the
+/// filter (`satisfied_filter` stays `None`): T3's no-row rule does not
+/// apply, and the row's geometry is refined through `spatial_geometry`.
+struct GeometryCursor<'a> {
+    db: &'a Database,
+    info: IndexInfo,
+    prefix: Vec<u8>,
+    ranges: Vec<GeomRange>,
+    range: usize,
+    start: Option<Vec<u8>>,
+    inner: Option<RangeIter<'a>>,
+    query_bbox: BoxF,
+    seen: HashSet<u64>,
+    done: bool,
+}
+
 enum DriverCursor<'a> {
     Entities(EntityCursor<'a>),
     Scalar(ScalarCursor<'a>),
     Spatial(SpatialCursor<'a>),
+    Nearest(NearestCursor<'a>),
+    Geometry(GeometryCursor<'a>),
     Text(TextCursor<'a>),
     Vector(VectorCursor<'a>),
     QuantizedVector(QuantizedVectorCursor<'a>),
@@ -2723,16 +3197,16 @@ fn scalar_key_position(predicate: &EncodedScalarFilter, key: &[u8]) -> Ordering 
         EncodedScalarFilter::Eq(value) => key.cmp(value),
         EncodedScalarFilter::Range { lower, upper } => {
             let below = match lower {
-                EncodedBound::Included(value) => key < value,
-                EncodedBound::Excluded(value) => key <= value,
+                EncodedBound::Included(value) => key < value.as_slice(),
+                EncodedBound::Excluded(value) => key <= value.as_slice(),
                 EncodedBound::Unbounded => false,
             };
             if below {
                 return Ordering::Less;
             }
             let above = match upper {
-                EncodedBound::Included(value) => key > value,
-                EncodedBound::Excluded(value) => key >= value,
+                EncodedBound::Included(value) => key > value.as_slice(),
+                EncodedBound::Excluded(value) => key >= value.as_slice(),
                 EncodedBound::Unbounded => false,
             };
             if above {
@@ -2764,6 +3238,8 @@ impl<'a> DriverCursor<'a> {
         needs: CursorNeeds,
         resume: Option<&RankKey>,
         descending: bool,
+        nearest: Option<&'a mut super::spatial_indexes::NearestWalk>,
+        geometry_seen: HashSet<u64>,
     ) -> QueryResult<Self> {
         match plan {
             DriverPlan::Entities => {
@@ -2925,6 +3401,72 @@ impl<'a> DriverCursor<'a> {
                     done: false,
                 }))
             }
+            DriverPlan::Nearest {
+                info, certifies, ..
+            } => {
+                let walk = nearest.ok_or_else(|| {
+                    corrupt_query("nearest walk missing from prepared query")
+                })?;
+                // The page before this one kept one hit past what it returned;
+                // hand it over again so the `after` comparison can drop it.
+                if let Some(RankKey {
+                    value: RankValue::Score(bits),
+                    id,
+                }) = resume
+                {
+                    walk.rewind_past(f64::from_bits(*bits), *id);
+                }
+                Ok(Self::Nearest(NearestCursor {
+                    db,
+                    index: info.id,
+                    certifies: *certifies,
+                    walk,
+                }))
+            }
+            DriverPlan::Geometry {
+                info,
+                position: _,
+                ranges,
+                query_bbox,
+                ..
+            } => {
+                let prefix = super::spatial_geometry_indexes::posting_prefix(info.id);
+                let mut range = 0usize;
+                let mut start = None;
+                if let Some(RankKey {
+                    value: RankValue::GeomCell { level, cell },
+                    id,
+                }) = resume
+                {
+                    while ranges.get(range).is_some_and(|r| {
+                        r.level < *level || (r.level == *level && r.hi < u64::from(*cell))
+                    }) {
+                        range += 1;
+                    }
+                    if ranges.get(range).is_some_and(|r| {
+                        r.level == *level && r.lo <= u64::from(*cell)
+                    }) {
+                        start = Some(super::spatial_geometry_indexes::posting_key_at(
+                            info.id,
+                            *level,
+                            *cell,
+                            id.sequence,
+                        ));
+                    }
+                }
+                Ok(Self::Geometry(GeometryCursor {
+                    db,
+                    info: info.clone(),
+                    prefix,
+                    ranges: ranges.clone(),
+                    range,
+                    start,
+                    inner: None,
+                    query_bbox: *query_bbox,
+                    seen: geometry_seen,
+                    done: false,
+                }))
+            }
             DriverPlan::Text { prepared, position } => {
                 // The merge hands documents over in strictly ascending
                 // sequence -- it says so and refuses a round that does not
@@ -3034,6 +3576,8 @@ impl<'a> DriverCursor<'a> {
             Self::Entities(cursor) => cursor.next(meter),
             Self::Scalar(cursor) => cursor.next(meter),
             Self::Spatial(cursor) => cursor.next(meter),
+            Self::Nearest(cursor) => cursor.next(meter),
+            Self::Geometry(cursor) => cursor.next(meter),
             Self::Text(cursor) => cursor.next(meter),
             Self::Vector(cursor) => cursor.next(meter),
             Self::QuantizedVector(cursor) => cursor.next(meter),
@@ -3439,7 +3983,127 @@ impl SpatialCursor<'_> {
                 // The cell this posting is filed under. A page ranked in the
                 // driver's own order ranks by it; handing it over costs
                 // nothing, because the key it came out of is decoded already.
-                carried: Some(CarriedKey::Cell(self.info.id, cell)),
+                carried: Some(CarriedKey::Cell(self.info.id, cell, point)),
+                ..Candidate::bare(EntityId {
+                    collection: self.info.collection,
+                    sequence,
+                })
+            }));
+        }
+    }
+}
+
+struct NearestCursor<'a> {
+    db: &'a Database,
+    index: IndexId,
+    certifies: Option<usize>,
+    walk: &'a mut super::spatial_indexes::NearestWalk,
+}
+
+impl NearestCursor<'_> {
+    fn next<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<Candidate>> {
+        let mut budget_err = None;
+        let hit = {
+            let mut extra = || match meter.charge(WorkResource::SpatialPostings, 1) {
+                Ok(()) => Ok(()),
+                Err(QueryError::Database(err)) => Err(err),
+                Err(QueryError::Cancelled) => Err(Error::Cancelled),
+                Err(err) => {
+                    budget_err = Some(err);
+                    Err(invalid("query budget"))
+                }
+            };
+            self.walk
+                .next(self.db, &mut || false, &mut extra)
+                .map_err(QueryError::from)
+        };
+        if let Some(err) = budget_err {
+            return Err(err);
+        }
+        let Some(hit) = hit? else {
+            return Ok(None);
+        };
+        Ok(Some(Candidate {
+            satisfied_filter: self.certifies,
+            carried: Some(CarriedKey::Distance(
+                self.index,
+                hit.point,
+                hit.distance_metres,
+            )),
+            ..Candidate::bare(hit.id)
+        }))
+    }
+}
+
+impl GeometryCursor<'_> {
+    fn next<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<Candidate>> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            if self.range == self.ranges.len() {
+                self.done = true;
+                return Ok(None);
+            }
+            let GeomRange { level, lo, hi } = self.ranges[self.range];
+            if self.inner.is_none() {
+                let start = match self.start.take() {
+                    Some(key) => key,
+                    None => {
+                        let mut start = self.prefix.clone();
+                        start.push(level);
+                        start.extend((lo as u32).to_be_bytes());
+                        start
+                    }
+                };
+                let Some(iter) = self.db.index_range(&self.info, &start)? else {
+                    self.done = true;
+                    return Ok(None);
+                };
+                self.inner = Some(iter);
+            }
+            meter.charge(WorkResource::SpatialPostings, 1)?;
+            let Some(row) = self.inner.as_mut().unwrap().next() else {
+                self.inner = None;
+                self.range += 1;
+                continue;
+            };
+            let (key, value) = row.map_err(Error::from)?;
+            if !key.starts_with(&self.prefix) {
+                self.inner = None;
+                self.range += 1;
+                continue;
+            }
+            let (post_level, cell, sequence, bbox) =
+                super::spatial_geometry_indexes::decode_posting(&self.prefix, &key, &value)?;
+            if post_level != level {
+                self.inner = None;
+                self.range += 1;
+                continue;
+            }
+            let hilbert = u64::from(cell);
+            if hilbert > hi {
+                self.inner = None;
+                self.range += 1;
+                continue;
+            }
+            if !bbox.intersects(&self.query_bbox) {
+                continue;
+            }
+            if !self.seen.insert(sequence) {
+                continue;
+            }
+            return Ok(Some(Candidate {
+                // BoxF overlap is a candidate test, not a proof: the filter
+                // is refined against the row. Do not certify.
+                satisfied_filter: None,
+                carried: Some(CarriedKey::GeomCell(self.info.id, level, cell)),
                 ..Candidate::bare(EntityId {
                     collection: self.info.collection,
                     sequence,
@@ -3983,6 +4647,13 @@ fn batch_filters_match<C: FnMut() -> bool>(
                     None => false,
                 }
             }
+            CompiledFilter::Geometry { info, predicate } => {
+                meter.note_row_decode();
+                match geom_from_field(selected_field_in(&layout, bytes, &info.field)?)? {
+                    Some(geom) => geometry_predicate_matches(predicate, &geom),
+                    None => false,
+                }
+            }
             // Already answered by the position it folded into.
             CompiledFilter::Folded { .. } => true,
             CompiledFilter::Graph { .. } | CompiledFilter::Text(_) | CompiledFilter::Key { .. } => {
@@ -4324,6 +4995,19 @@ fn point_from_field(value: dense_v3::FieldValue) -> QueryResult<Option<Point>> {
     Point::new(longitude, latitude)
         .map(Some)
         .map_err(corrupt_query)
+}
+
+fn geom_from_field(value: dense_v3::FieldValue) -> QueryResult<Option<Geom>> {
+    let value = match value {
+        dense_v3::FieldValue::Missing | dense_v3::FieldValue::Null => return Ok(None),
+        dense_v3::FieldValue::Inline(value) => value,
+        dense_v3::FieldValue::Vector { .. } => {
+            return Err(corrupt_query("indexed geometry field is a historical vector"));
+        }
+    };
+    super::spatial_geometry_indexes::geom_from_value(&value)
+        .map(Some)
+        .map_err(QueryError::from)
 }
 
 fn text_score<'a, C: FnMut() -> bool>(
@@ -4706,12 +5390,17 @@ fn filters_match<'a, C: FnMut() -> bool>(
                 // down a tree whose nodes were allocated to answer this.
                 .is_some_and(|ids| ids.binary_search(&id).is_ok()),
             CompiledFilter::Point { info, predicate } => {
-                ensure_row_seq(db, rows, id, row, encoded, meter)?;
-                let row = row.as_ref().unwrap();
-                meter.charge(WorkResource::SpatialPostings, 1)?;
-                meter.note_row_decode();
-                let Some(point) = point_from_field(selected_field(row, &info.field)?)? else {
-                    return Ok(false);
+                let point = if let Some(point) = candidate.point(info.id) {
+                    point
+                } else {
+                    ensure_row_seq(db, rows, id, row, encoded, meter)?;
+                    let row = row.as_ref().unwrap();
+                    meter.charge(WorkResource::SpatialPostings, 1)?;
+                    meter.note_row_decode();
+                    let Some(point) = point_from_field(selected_field(row, &info.field)?)? else {
+                        return Ok(false);
+                    };
+                    point
                 };
                 match predicate {
                     PointFilter::Bbox(bounds) => bounds.contains(point),
@@ -4720,6 +5409,15 @@ fn filters_match<'a, C: FnMut() -> bool>(
                         radius_metres,
                     } => within_radius(*center, point, *radius_metres).map_err(corrupt_query)?,
                 }
+            }
+            CompiledFilter::Geometry { info, predicate } => {
+                ensure_row_seq(db, rows, id, row, encoded, meter)?;
+                let row = row.as_ref().unwrap();
+                meter.note_row_decode();
+                let Some(geom) = geom_from_field(selected_field(row, &info.field)?)? else {
+                    return Ok(false);
+                };
+                geometry_predicate_matches(predicate, &geom)
             }
             // Already answered by the position it folded into.
             CompiledFilter::Folded { .. } => true,
@@ -4791,6 +5489,23 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
         CompiledOrder::ApproximateVector { .. } => {
             unreachable!("approximate order uses shortlist then exact rerank")
         }
+        CompiledOrder::Distance { info, center } => {
+            let distance = if let Some(distance) = candidate.distance_metres(info.id) {
+                distance
+            } else if let Some(point) = candidate.point(info.id) {
+                wgs84_distance_metres(*center, point)
+            } else {
+                ensure_row_seq(db, rows, candidate.id, row, encoded, meter)?;
+                meter.note_row_decode();
+                let Some(point) =
+                    point_from_field(selected_field(row.as_ref().unwrap(), &info.field)?)?
+                else {
+                    return Ok(None);
+                };
+                wgs84_distance_metres(*center, point)
+            };
+            RankValue::Score(distance.to_bits())
+        }
         // Driver order takes the key the driver's own walk is sorted by, and
         // every one of them is already in hand: the candidate's id, the
         // scalar posting's value key, or the spatial posting's cell. Ranking
@@ -4807,6 +5522,12 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
                 .cell(*index)
                 .ok_or_else(|| corrupt_query("driver order lost its spatial cell"))?,
         ),
+        CompiledOrder::Driver(DriverKey::GeomCell(index)) => {
+            let (level, cell) = candidate
+                .geom_cell(*index)
+                .ok_or_else(|| corrupt_query("driver order lost its geometry cell"))?;
+            RankValue::GeomCell { level, cell }
+        }
         CompiledOrder::Driver(DriverKey::Key) => RankValue::Key(
             candidate
                 .key()
@@ -5073,6 +5794,7 @@ impl PreparedQuery<'_> {
             // (`TermPostings::open_from`). Spatial is deliberately NOT here:
             // its cells are walked in cell order, which is not id order.
             (DriverPlan::Text { .. }, CompiledOrder::EntityId) => RankWalk::Exact,
+            (DriverPlan::Nearest { .. }, CompiledOrder::Distance { .. }) => RankWalk::Exact,
             // Driver order IS the driver's walk order -- that is the whole of
             // what it means -- so every driver that has one walks in rank
             // order by construction. The spatial cell walk is the case that
@@ -5086,6 +5808,7 @@ impl PreparedQuery<'_> {
                 DriverPlan::Entities
                 | DriverPlan::Scalar { .. }
                 | DriverPlan::Spatial { .. }
+                | DriverPlan::Geometry { .. }
                 | DriverPlan::Text { .. }
                 | DriverPlan::Graph { .. }
                 | DriverPlan::Keys { .. },
@@ -5126,8 +5849,11 @@ impl PreparedQuery<'_> {
                 !matches!(filter, CompiledFilter::Text(prepared) if prepared.phrase.is_none())
             }) || !matches!(
                 self.order,
-                CompiledOrder::EntityId | CompiledOrder::Bm25(_) | CompiledOrder::Driver(_)
-            )
+                CompiledOrder::EntityId
+                    | CompiledOrder::Bm25(_)
+                    | CompiledOrder::Driver(_)
+                    | CompiledOrder::Distance { .. }
+            ) || self.distance_order_needs_the_row()
                 // A projection reads the row as surely as a filter does, and
                 // the cursor is standing on it: copying it here costs one
                 // allocation, fetching it back costs a whole point-get.
@@ -5299,10 +6025,22 @@ impl PreparedQuery<'_> {
         // removed behind the spatial index's back, which no supported write
         // can do -- is no longer refused by a bbox/radius page under those
         // two orders. `verify_index` refuses it outright either way.
+        if matches!(self.driver, DriverPlan::Nearest { .. })
+            && matches!(
+                self.order,
+                CompiledOrder::Distance { .. }
+                    | CompiledOrder::EntityId
+                    | CompiledOrder::Driver(_)
+            )
+        {
+            return true;
+        }
         if matches!(self.driver, DriverPlan::Spatial { .. })
             && matches!(
                 self.order,
-                CompiledOrder::EntityId | CompiledOrder::Driver(DriverKey::Cell(_))
+                CompiledOrder::EntityId
+                    | CompiledOrder::Driver(DriverKey::Cell(_))
+                    | CompiledOrder::Distance { .. }
             )
         {
             return true;
@@ -5368,6 +6106,7 @@ impl PreparedQuery<'_> {
     fn order_needs_the_row(&self) -> bool {
         match &self.order {
             CompiledOrder::Scalar { .. } => !self.cursor_needs().scalar_key,
+            CompiledOrder::Distance { .. } => self.distance_order_needs_the_row(),
             CompiledOrder::EntityId
             | CompiledOrder::ExactVector { .. }
             | CompiledOrder::ApproximateVector { .. }
@@ -5375,6 +6114,20 @@ impl PreparedQuery<'_> {
             // Every driver-order key is carried by the candidate: its id, the
             // scalar posting's value, or the spatial posting's cell.
             | CompiledOrder::Driver(_) => false,
+        }
+    }
+
+    /// Distance ranking reads a row only when the driver did not already
+    /// hand over that index's point (the nearest walk and a spatial cell
+    /// walk both do).
+    fn distance_order_needs_the_row(&self) -> bool {
+        match (&self.order, &self.driver) {
+            (
+                CompiledOrder::Distance { info, .. },
+                DriverPlan::Nearest { info: driving, .. } | DriverPlan::Spatial { info: driving, .. },
+            ) if driving.id == info.id => false,
+            (CompiledOrder::Distance { .. }, _) => true,
+            _ => false,
         }
     }
 
@@ -5426,6 +6179,7 @@ impl PreparedQuery<'_> {
             } => !*posting_membership,
             CompiledFilter::JsonEq { .. }
             | CompiledFilter::Point { .. }
+            | CompiledFilter::Geometry { .. }
             | CompiledFilter::Folded { .. }
             | CompiledFilter::Key { .. } => true,
             // A text filter rejects from its postings before it looks at a
@@ -5468,6 +6222,10 @@ impl PreparedQuery<'_> {
             | DriverPlan::Text { position, .. }
             | DriverPlan::Keys { position, .. } => *position,
             DriverPlan::Spatial { position, .. } | DriverPlan::Graph { position } => Some(*position),
+            DriverPlan::Nearest { certifies, .. } => *certifies,
+            DriverPlan::Spatial { position, .. }
+            | DriverPlan::Geometry { position, .. }
+            | DriverPlan::Graph { position } => Some(*position),
             _ => None,
         };
         self.filters.iter().enumerate().any(|(position, filter)| match filter {
@@ -5478,6 +6236,10 @@ impl PreparedQuery<'_> {
             // read, and the winner stage's re-fetch is asking a question this
             // walk has answered.
             CompiledFilter::Text(prepared) => prepared.phrase.is_some(),
+            // A geometry posting's BoxF is only a candidate test. Driving or
+            // not, the row's geometry is refined through spatial_geometry;
+            // T3's no-row rule does not apply.
+            CompiledFilter::Geometry { .. } => true,
             _ if Some(position) == driving => false,
             // A non-driving equality answered from its posting reads no row,
             // and neither does a non-driving RANGE once its own posting walk
@@ -5655,6 +6417,9 @@ impl PreparedQuery<'_> {
                 (CompiledOrder::Bm25(_), RankValue::Score(score)) => {
                     OrderValue::Bm25(f64::from_bits(*score))
                 }
+                (CompiledOrder::Distance { .. }, RankValue::Score(score)) => {
+                    OrderValue::Distance(f64::from_bits(*score))
+                }
                 // The driver's key is the walk's own bookkeeping, not an
                 // answer about the row: a cell number is not a distance and a
                 // sequence is already `id`.
@@ -5818,16 +6583,29 @@ impl PreparedQuery<'_> {
         let mut scratch = RowScratch::default();
         let graph = execute_graph_filters(self.db, &self.filters, &mut meter)?;
         let in_rank_order = self.driver_walks_in_rank_order();
+        let needs = self.cursor_needs();
+        let reverse = self.scalar_driver_descends();
+        let resume = self
+            .after
+            .clone()
+            .filter(|_| in_rank_order != RankWalk::No);
+        let mut nearest_walk = self.nearest.take();
+        let result = (|| {
+        let geometry_seen = if in_rank_order == RankWalk::Exact {
+            self.geometry_seen.clone()
+        } else {
+            HashSet::new()
+        };
         let mut driver = DriverCursor::new(
             self.db,
             self.collection,
             &self.driver,
             &graph,
-            self.cursor_needs(),
-            self.after
-                .as_ref()
-                .filter(|_| in_rank_order != RankWalk::No),
-            self.scalar_driver_descends(),
+            needs,
+            resume.as_ref(),
+            reverse,
+            nearest_walk.as_mut(),
+            geometry_seen,
         )?;
         // Whether a kept candidate should carry its row into the heap.
         let wants_rows = !self.projection.is_empty();
@@ -6135,6 +6913,12 @@ impl PreparedQuery<'_> {
                 None
             };
 
+        let geometry_driven = in_rank_order == RankWalk::Exact
+            && matches!(driver, DriverCursor::Geometry(_));
+        if let (true, DriverCursor::Geometry(cursor)) = (geometry_driven, &driver) {
+            self.geometry_seen.clone_from(&cursor.seen);
+        }
+
         // A page that never had to name its worst entry is still in the order
         // the walk handed it over, and an EXACT walk hands it over in rank
         // order. That page is already sorted and sorting it again is 8,192
@@ -6156,6 +6940,15 @@ impl PreparedQuery<'_> {
             "a page returns its winners in rank order"
         );
         let has_more = winners.len() > wanted;
+        // A geometry-driven page kept one candidate past what it returns, to
+        // learn whether more exist. The next page re-opens at the last
+        // RETURNED posting and must be allowed to admit that extra entity
+        // again, so it must not count as seen.
+        if geometry_driven {
+            for extra in winners.iter().skip(wanted) {
+                self.geometry_seen.remove(&extra.key.id.sequence);
+            }
+        }
         // Everything this walk ranked past the page it is returning. It was
         // ranked; the pages after this one take it from here rather than
         // opening the whole candidate stream again. `run_bounded` records
@@ -6171,5 +6964,8 @@ impl PreparedQuery<'_> {
         let rows = self.emit_rows(&mut winners, &mut meter)?;
         let work = meter.used;
         self.finish_page(rows, &winners, has_more, approximation, work)
+        })();
+        self.nearest = nearest_walk;
+        result
     }
 }

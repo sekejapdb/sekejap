@@ -64,6 +64,328 @@ impl Ord for HeapHit {
     }
 }
 
+/// One posting the nearest walk is ready to yield, already in ascending
+/// `(distance, id)` order relative to the rest of its ring.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NearestHit {
+    pub id: EntityId,
+    pub point: Point,
+    pub distance_metres: f64,
+}
+
+/// Resumable outward-ring walk that yields point postings in ascending
+/// geodesic distance from `center`. Shared by [`Database::query_point_nearest`]
+/// and the query engine's `QueryOrder::Distance` driver.
+///
+/// Each ring is fully examined before anything in it is emitted, and only
+/// postings with distance `<=` that ring's radius leave: Hilbert covers are
+/// coarse, so a posting in ring `i`'s ranges can still be farther than `r_i`,
+/// and emitting it now would invert the order. Those wait for a later ring.
+/// The probe around the centre's cell is kept; it is not itself an ordered
+/// stream, so its hits sit in `held` until the first ring completes.
+pub(super) struct NearestWalk {
+    index: IndexInfo,
+    center: Point,
+    geodesic: Geodesic,
+    prefix: Vec<u8>,
+    inner_ranges: Vec<(u64, u64)>,
+    radius: f64,
+    radius_cap: Option<f64>,
+    hint_k: usize,
+    max_examined: usize,
+    examined: usize,
+    probed: bool,
+    /// True after the first ring has been walked (so the next fill grows).
+    ring_started: bool,
+    finished: bool,
+    held: Vec<NearestHit>,
+    ready: Vec<NearestHit>,
+    ready_at: usize,
+    /// Postings the most recently completed ring examined, for density growth.
+    last_seen: usize,
+}
+
+impl NearestWalk {
+    pub(super) fn new(
+        index: IndexInfo,
+        center: Point,
+        hint_k: usize,
+        radius_cap: Option<f64>,
+        max_examined: usize,
+    ) -> Self {
+        Self {
+            prefix: posting_prefix(index.id),
+            index,
+            center,
+            geodesic: Geodesic::wgs84(),
+            inner_ranges: Vec::new(),
+            radius: NEAREST_START_RADIUS_METRES,
+            radius_cap,
+            hint_k,
+            max_examined,
+            examined: 0,
+            probed: false,
+            ring_started: false,
+            finished: false,
+            held: Vec::new(),
+            ready: Vec::new(),
+            ready_at: 0,
+            last_seen: 0,
+        }
+    }
+
+    /// Next posting in ascending `(distance, id)`, or `None` at the end of
+    /// the walk (the world, or `radius_cap` if one was set).
+    ///
+    /// `extra` runs once per examined posting, before the walk's own
+    /// `max_examined` spend: the query engine uses it to charge
+    /// `work.spatial_postings`.
+    pub(super) fn next(
+        &mut self,
+        db: &Database,
+        cancelled: &mut impl FnMut() -> bool,
+        extra: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<NearestHit>> {
+        loop {
+            if self.ready_at < self.ready.len() {
+                let hit = self.ready[self.ready_at];
+                self.ready_at += 1;
+                return Ok(Some(hit));
+            }
+            if self.finished {
+                return Ok(None);
+            }
+            self.ready.clear();
+            self.ready_at = 0;
+            self.fill_one_ring(db, cancelled, extra)?;
+        }
+    }
+
+    /// Reposition the walk just past `(distance, id)`, the last hit the
+    /// previous page returned. A page keeps one hit beyond what it returns to
+    /// learn whether more exist, and a cursor that re-opens at the page's last
+    /// key re-yields that hit; this walk carries its state instead, so the
+    /// hit it handed over past the page would otherwise be lost. Every hit
+    /// yielded so far lies in the current ready buffer (a fill only replaces
+    /// the buffer once it is drained), so the buffer is where to rewind.
+    pub(super) fn rewind_past(&mut self, distance_metres: f64, id: EntityId) {
+        self.ready_at = self.ready.partition_point(|hit| {
+            hit.distance_metres
+                .total_cmp(&distance_metres)
+                .then_with(|| hit.id.cmp(&id))
+                != std::cmp::Ordering::Greater
+        });
+    }
+
+    fn push_held(&mut self, entity: EntityId, point: Point) {
+        self.held.push(NearestHit {
+            id: entity,
+            point,
+            distance_metres: distance(&self.geodesic, self.center, point),
+        });
+    }
+
+    fn initial_radius(&self) -> f64 {
+        let mut radius = if self.hint_k > 0 && self.held.len() >= self.hint_k {
+            let mut distances: Vec<f64> = self.held.iter().map(|hit| hit.distance_metres).collect();
+            distances.sort_by(|a, b| a.total_cmp(b));
+            distances[self.hint_k - 1].max(1.0)
+        } else {
+            NEAREST_START_RADIUS_METRES
+        };
+        if let Some(cap) = self.radius_cap {
+            radius = radius.min(cap);
+        }
+        radius
+    }
+
+    fn at_cap(&self) -> bool {
+        self.radius_cap.is_some_and(|cap| self.radius >= cap)
+    }
+
+    fn world_radius(&self) -> bool {
+        self.radius / WGS84_MIN_CURVATURE_RADIUS_METRES >= core::f64::consts::PI
+    }
+
+    fn grow_radius(&mut self) {
+        let seen = self.last_seen as f64;
+        let jump = if seen > 0.0 {
+            let density = seen / (core::f64::consts::PI * self.radius * self.radius);
+            (((self.hint_k.max(1) + 2) as f64) / (core::f64::consts::PI * density)).sqrt() * 1.25
+        } else {
+            0.0
+        };
+        let mut radius = jump
+            .max(self.radius * 2.0)
+            .min(self.radius * NEAREST_GROWTH_FACTOR);
+        if let Some(cap) = self.radius_cap {
+            radius = radius.min(cap);
+        }
+        self.radius = radius;
+    }
+
+    fn probe(
+        &mut self,
+        db: &Database,
+        cancelled: &mut impl FnMut() -> bool,
+        extra: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let centre_cell = point_hilbert(self.center) as u32;
+        let mut probe_lo = u64::from(centre_cell);
+        let mut probe_hi = u64::from(centre_cell);
+        let mut probed = false;
+        let mut examined = self.examined;
+        let max_examined = self.max_examined;
+        let mut hits = Vec::new();
+        {
+            let start = posting_key_at(self.index.id, centre_cell, 0);
+            let mut seen = 0usize;
+            let mut current: Option<u32> = None;
+            for row in db.index_range(&self.index, &start)?.into_iter().flatten() {
+                let (key, value) = row?;
+                if !key.starts_with(&self.prefix) {
+                    break;
+                }
+                let (cell, sequence, point) = decode_posting(&self.prefix, &key, &value)?;
+                if current.is_some_and(|c| c != cell) && seen >= NEAREST_PROBE {
+                    break;
+                }
+                current = Some(cell);
+                extra()?;
+                spend(&mut examined, max_examined, cancelled)?;
+                hits.push((
+                    EntityId {
+                        collection: self.index.collection,
+                        sequence,
+                    },
+                    point,
+                ));
+                seen += 1;
+                probe_hi = probe_hi.max(u64::from(cell));
+                probed = true;
+            }
+        }
+        {
+            let to = posting_key_at(self.index.id, centre_cell, 0);
+            let mut seen = 0usize;
+            let mut current: Option<u32> = None;
+            if let Some(mut it) = db.index_range_reverse(&self.index, &to)? {
+                loop {
+                    let (cell, sequence, point) = {
+                        let Some((key, value)) = it.peek_ref()? else {
+                            break;
+                        };
+                        if !key.starts_with(&self.prefix) {
+                            break;
+                        }
+                        decode_posting(&self.prefix, key, value)?
+                    };
+                    if current.is_some_and(|c| c != cell) && seen >= NEAREST_PROBE {
+                        break;
+                    }
+                    current = Some(cell);
+                    extra()?;
+                    spend(&mut examined, max_examined, cancelled)?;
+                    hits.push((
+                        EntityId {
+                            collection: self.index.collection,
+                            sequence,
+                        },
+                        point,
+                    ));
+                    seen += 1;
+                    probe_lo = probe_lo.min(u64::from(cell));
+                    probed = true;
+                    it.step();
+                }
+            }
+        }
+        self.examined = examined;
+        for (entity, point) in hits {
+            self.push_held(entity, point);
+        }
+        if probed {
+            self.inner_ranges.push((probe_lo, probe_hi));
+        }
+        Ok(())
+    }
+
+    fn fill_one_ring(
+        &mut self,
+        db: &Database,
+        cancelled: &mut impl FnMut() -> bool,
+        extra: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if !self.probed {
+            self.probe(db, cancelled, extra)?;
+            self.probed = true;
+            self.radius = self.initial_radius();
+        } else if self.ring_started {
+            self.grow_radius();
+        }
+        let world = self.world_radius();
+        let bounds =
+            radius_candidate_bounds(self.center, self.radius).expect("finite non-negative radius");
+        let outer_ranges = bounds_hilbert_ranges_bounded(bounds, NEAREST_COVER_RANGES);
+        let ring_ranges = ranges_difference(&outer_ranges, &self.inner_ranges);
+        let examined_before = self.examined;
+        if std::env::var("E4_DEBUG_RING").is_ok() {
+            eprintln!(
+                "radius={} outer_len={} ring_len={}",
+                self.radius,
+                outer_ranges.len(),
+                ring_ranges.len()
+            );
+        }
+        let index = self.index.clone();
+        let prefix = self.prefix.clone();
+        let mut examined = self.examined;
+        let max_examined = self.max_examined;
+        let mut new_hits = Vec::new();
+        db.visit_ranges(
+            &index,
+            &prefix,
+            &ring_ranges,
+            || {
+                extra()?;
+                spend(&mut examined, max_examined, cancelled)
+            },
+            |entity, point| {
+                new_hits.push((entity, point));
+                Ok(())
+            },
+        )?;
+        self.examined = examined;
+        for (entity, point) in new_hits {
+            self.push_held(entity, point);
+        }
+        let emit_upto = if world || self.at_cap() {
+            self.radius_cap.unwrap_or(f64::INFINITY)
+        } else {
+            self.radius
+        };
+        self.held.sort_by(|a, b| {
+            a.distance_metres
+                .total_cmp(&b.distance_metres)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let split = self
+            .held
+            .partition_point(|hit| hit.distance_metres <= emit_upto);
+        self.ready = self.held.drain(..split).collect();
+        self.ready_at = 0;
+        self.ring_started = true;
+        self.last_seen = self.examined.saturating_sub(examined_before);
+        if world || self.at_cap() {
+            self.finished = true;
+            self.held.clear();
+        } else {
+            self.inner_ranges = ranges_union(&self.inner_ranges, &outer_ranges);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PointEntry {
     pub key: Vec<u8>,
@@ -415,21 +737,25 @@ impl Database {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let geodesic = Geodesic::wgs84();
-        let mut heap = BinaryHeap::with_capacity(k.min(1024));
         match candidates {
             SpatialCandidates::All => {
-                self.ring_walk_nearest(
-                    &index,
-                    center,
-                    k,
-                    max_examined,
-                    &mut cancelled,
-                    &geodesic,
-                    &mut heap,
-                )?;
+                let mut walk = NearestWalk::new(index, center, k, None, max_examined);
+                let mut extra = || -> Result<()> { Ok(()) };
+                let mut out = Vec::with_capacity(k.min(1024));
+                while out.len() < k {
+                    match walk.next(self, &mut cancelled, &mut extra)? {
+                        None => break,
+                        Some(hit) => out.push(SpatialHit {
+                            id: hit.id,
+                            distance_metres: hit.distance_metres,
+                        }),
+                    }
+                }
+                return Ok(out);
             }
             SpatialCandidates::SortedUnique(_) => {
+                let geodesic = Geodesic::wgs84();
+                let mut heap = BinaryHeap::with_capacity(k.min(1024));
                 self.visit_spatial_points(
                     &index,
                     None,
@@ -447,203 +773,17 @@ impl Database {
                         Ok(())
                     },
                 )?;
+                let mut out: Vec<_> = heap.into_iter().map(|hit| hit.0).collect();
+                out.sort_by(|a, b| {
+                    a.distance_metres
+                        .total_cmp(&b.distance_metres)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                Ok(out)
             }
         }
-        let mut out: Vec<_> = heap.into_iter().map(|hit| hit.0).collect();
-        out.sort_by(|a, b| {
-            a.distance_metres
-                .total_cmp(&b.distance_metres)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(out)
     }
 
-    /// Outward concentric-ring walk for [`Database::query_point_nearest`]'s
-    /// `SpatialCandidates::All` path. Ring `i` is the annulus between radius
-    /// `r_{i-1}` (0 for the first ring) and `r_i`; it is covered by
-    /// `radius_candidate_bounds(center, r_i)`'s Hilbert ranges minus every
-    /// ring examined so far, so every posting is examined at most once. (The
-    /// cover is not guaranteed to grow monotonically with `r_i` -- see
-    /// `ranges_union`'s use below -- so "every ring so far" must be an
-    /// accumulated union, not just the immediately preceding ring.) The walk
-    /// stops as soon as the heap holds `k` hits whose worst exact
-    /// distance is `<= r_i`: [`radius_candidate_bounds`] guarantees every
-    /// point within `r_i` of `center` lies in some ring `<= i`'s cover, so
-    /// nothing unexamined can beat the current top-k. The last possible ring
-    /// is the whole world (once `r_i` reaches the antipodal bound); the walk
-    /// always accepts whatever the heap holds after that ring, exact answer
-    /// or not, since no larger radius exists to keep searching.
-    fn ring_walk_nearest(
-        &self,
-        index: &IndexInfo,
-        center: Point,
-        k: usize,
-        max_examined: usize,
-        cancelled: &mut impl FnMut() -> bool,
-        geodesic: &Geodesic,
-        heap: &mut BinaryHeap<HeapHit>,
-    ) -> Result<()> {
-        let prefix = posting_prefix(index.id);
-        let mut examined = 0usize;
-        // The PROBE: before any ring, read the postings nearest to the centre
-        // in KEY order -- whole cells on either side of the centre's own cell
-        // until at least `NEAREST_PROBE` postings have been seen. Hilbert
-        // order keeps neighbours in space mostly neighbours in the key, so
-        // this one descent (plus one reverse) usually yields k candidates and
-        // an UPPER BOUND on the k-th distance: the first ring is then the
-        // circle of that radius, and after it the answer is exact, because
-        // every point closer than the k-th candidate lies inside that circle
-        // and the circle has been examined in full. The cells the probe read
-        // completely are recorded so no ring examines a posting twice.
-        let mut inner_ranges: Vec<(u64, u64)> = Vec::new();
-        let centre_cell = point_hilbert(center) as u32;
-        let mut push = |heap: &mut BinaryHeap<HeapHit>, entity: EntityId, point: Point| {
-            heap.push(HeapHit(SpatialHit {
-                id: entity,
-                distance_metres: distance(geodesic, center, point),
-            }));
-            if heap.len() > k {
-                heap.pop();
-            }
-        };
-        let (mut probe_lo, mut probe_hi) = (u64::from(centre_cell), u64::from(centre_cell));
-        let mut probed = false;
-        // Forward: cells >= the centre's, whole cells only.
-        {
-            let start = posting_key_at(index.id, centre_cell, 0);
-            let mut seen = 0usize;
-            let mut current: Option<u32> = None;
-            for row in self.index_range(index, &start)?.into_iter().flatten() {
-                let (key, value) = row?;
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                let (cell, sequence, point) = decode_posting(&prefix, &key, &value)?;
-                if current.is_some_and(|c| c != cell) && seen >= NEAREST_PROBE {
-                    break;
-                }
-                current = Some(cell);
-                spend(&mut examined, max_examined, cancelled)?;
-                push(
-                    heap,
-                    EntityId {
-                        collection: index.collection,
-                        sequence,
-                    },
-                    point,
-                );
-                seen += 1;
-                probe_hi = probe_hi.max(u64::from(cell));
-                probed = true;
-            }
-            // `current` was fully read unless the loop ended on a cell change,
-            // in which case the last complete cell is the one before it: the
-            // break happens BEFORE the new cell's first posting is counted, so
-            // `probe_hi` already names the last complete cell.
-        }
-        // Backward: cells strictly below the centre's, whole cells only.
-        {
-            let to = posting_key_at(index.id, centre_cell, 0);
-            let mut seen = 0usize;
-            let mut current: Option<u32> = None;
-            // The reverse iterator is a pull cursor (peek, then step).
-            if let Some(mut it) = self.index_range_reverse(index, &to)? {
-                loop {
-                    let (cell, sequence, point) = {
-                        let Some((key, value)) = it.peek_ref()? else {
-                            break;
-                        };
-                        if !key.starts_with(&prefix) {
-                            break;
-                        }
-                        decode_posting(&prefix, key, value)?
-                    };
-                    if current.is_some_and(|c| c != cell) && seen >= NEAREST_PROBE {
-                        break;
-                    }
-                    current = Some(cell);
-                    spend(&mut examined, max_examined, cancelled)?;
-                    push(
-                        heap,
-                        EntityId {
-                            collection: index.collection,
-                            sequence,
-                        },
-                        point,
-                    );
-                    seen += 1;
-                    probe_lo = probe_lo.min(u64::from(cell));
-                    probed = true;
-                    it.step();
-                }
-            }
-        }
-        if probed {
-            inner_ranges.push((probe_lo, probe_hi));
-        }
-        // With k candidates in hand the k-th distance bounds the first ring;
-        // otherwise start small and let the rings grow.
-        let mut radius = match heap.peek() {
-            Some(worst) if heap.len() >= k => worst.0.distance_metres.max(1.0),
-            _ => NEAREST_START_RADIUS_METRES,
-        };
-        loop {
-            let world = radius / WGS84_MIN_CURVATURE_RADIUS_METRES >= core::f64::consts::PI;
-            let bounds =
-                radius_candidate_bounds(center, radius).expect("finite non-negative radius");
-            let outer_ranges = bounds_hilbert_ranges_bounded(bounds, NEAREST_COVER_RANGES);
-            let ring_ranges = ranges_difference(&outer_ranges, &inner_ranges);
-            let examined_before = examined;
-            if std::env::var("E4_DEBUG_RING").is_ok() {
-                eprintln!(
-                    "radius={radius} outer_len={} ring_len={}",
-                    outer_ranges.len(),
-                    ring_ranges.len()
-                );
-            }
-            self.visit_ranges(
-                index,
-                &prefix,
-                &ring_ranges,
-                &mut examined,
-                max_examined,
-                cancelled,
-                |entity, point| {
-                    push(heap, entity, point);
-                    Ok(())
-                },
-            )?;
-            if world {
-                return Ok(());
-            }
-            if heap.len() >= k && heap.peek().is_some_and(|worst| worst.0.distance_metres <= radius)
-            {
-                return Ok(());
-            }
-            // `outer_ranges` is not guaranteed to grow monotonically with
-            // `radius`: `bounds_hilbert_ranges` falls back to the world range
-            // whenever a box's cover fragments past `MAX_HILBERT_RANGES`
-            // (common near the poles), and a later, larger, less-fragmented
-            // box can then cover fewer cells than that fallback. Accumulate
-            // the union of every ring's cover so far, not just the last
-            // ring's, or a later smaller cover would "forget" cells the
-            // fallback already visited and revisit them.
-            inner_ranges = ranges_union(&inner_ranges, &outer_ranges);
-            // The postings this ring examined estimate the local density, and
-            // the density says how far out the k-th neighbour should be: jump
-            // straight to that radius (with a margin) instead of stepping by
-            // the fixed factor, so a walk over uniform data ends in two rings.
-            // Growth never falls below x2, so the walk still terminates.
-            let seen = (examined - examined_before) as f64;
-            let jump = if seen > 0.0 {
-                let density = seen / (core::f64::consts::PI * radius * radius);
-                (((k + 2) as f64) / (core::f64::consts::PI * density)).sqrt() * 1.25
-            } else {
-                0.0
-            };
-            radius = jump.max(radius * 2.0).min(radius * NEAREST_GROWTH_FACTOR);
-        }
-    }
 
     fn ready_spatial_index(&self, id: IndexId) -> Result<IndexInfo> {
         let index = self.index_info(id)?;
@@ -675,9 +815,7 @@ impl Database {
                         index,
                         &prefix,
                         ranges,
-                        &mut examined,
-                        max_examined,
-                        cancelled,
+                        || spend(&mut examined, max_examined, cancelled),
                         visit,
                     )?;
                 } else {
@@ -723,17 +861,15 @@ impl Database {
 
     /// Visit every posting of `index` whose Hilbert cell falls in `ranges`,
     /// in Hilbert order. Shared by the exhaustive `All` scan and by
-    /// [`Database::ring_walk_nearest`], which calls this once per ring with
-    /// one `examined` counter threaded across calls so `max_examined` bounds
-    /// the whole walk, not one ring.
+    /// [`NearestWalk`], which calls this once per ring. `charge` runs once
+    /// per examined posting so `max_examined` and `work.spatial_postings`
+    /// bound the whole walk, not one ring.
     fn visit_ranges(
         &self,
         index: &IndexInfo,
         prefix: &[u8],
         ranges: &[(u64, u64)],
-        examined: &mut usize,
-        max_examined: usize,
-        cancelled: &mut impl FnMut() -> bool,
+        mut charge: impl FnMut() -> Result<()>,
         mut visit: impl FnMut(EntityId, Point) -> Result<()>,
     ) -> Result<()> {
         for &(lo, hi) in ranges {
@@ -751,7 +887,7 @@ impl Database {
                 if u64::from(hilbert) > hi {
                     break;
                 }
-                spend(examined, max_examined, cancelled)?;
+                charge()?;
                 let (_, sequence, point) = decode_posting(prefix, &key, &value)?;
                 visit(
                     EntityId {
@@ -809,8 +945,8 @@ fn ranges_difference(outer: &[(u64, u64)], inner: &[(u64, u64)]) -> Vec<(u64, u6
 /// The union of two sorted, merged, disjoint inclusive range lists (the
 /// shape [`bounds_hilbert_ranges`] returns), itself sorted and merged. Used
 /// to accumulate every ring's Hilbert cover so far: see the comment at its
-/// call site in [`Database::ring_walk_nearest`] for why this must be a true
-/// running union rather than just the previous ring's cover.
+/// call site in [`NearestWalk`] for why this must be a true running union
+/// rather than just the previous ring's cover.
 fn ranges_union(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut all: Vec<(u64, u64)> = a.iter().chain(b.iter()).copied().collect();
     all.sort_unstable();

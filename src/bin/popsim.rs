@@ -4,7 +4,8 @@
 //! three indexes built LATE, then a battery of realistic queries, each timed.
 //!
 //!     record: _key, fullname (ranked full text), born yyyymmdd (ordered
-//!             scalar), born_year (stored, unindexed), addr point (spatial)
+//!             scalar), born_year (stored, unindexed), addr point (spatial),
+//!             plot polygon (geometry: a square 50-500 m on a side around addr)
 //!
 //! This is e3's `bench/popsim.rs` + `bench/popsim_sqlite.rs` rebuilt as ONE
 //! program with two arms, so the 48M-row comparison the previous engine ran
@@ -30,10 +31,12 @@
 //!   other two arms as closely as Postgres's own idiom allows:
 //!
 //!     * `person(k text primary key, fullname text, born bigint,
-//!        born_year int, addr geography(Point,4326))`.
+//!        born_year int, addr geography(Point,4326),
+//!        plot geography(Polygon,4326))`.
 //!     * Indexes built LATE, same as the other two arms: a GIN index on
 //!       `to_tsvector('simple', fullname)` for text, a btree on `born`, a
-//!       GiST index on `addr` for spatial.
+//!       GiST index on `addr` for spatial, a GiST index on `plot` for
+//!       geometry.
 //!     * Text uses the `simple` search configuration, not `english` —
 //!       `simple` does no stemming, which is the closer match to E4's
 //!       tokenizer (case-fold, alphanumeric-run tokens, no stemming). `Any`
@@ -83,9 +86,10 @@
 //!      contrast the indexed aggregate path with the unindexed grouped scan.
 //!      E4 has no aggregate API at all, so neither case can run; `born_year`
 //!      is kept as a stored, unindexed column and the twin is dropped.
-//!   4. THE INDEX SET IS THREE, MATCHED. Text on `fullname`, ordered scalar on
-//!      `born`, point on `addr`; SQLite gets FTS5, `CREATE INDEX`, and an
-//!      R*Tree. e3 additionally indexed `born_year` on both sides.
+//!   4. THE INDEX SET IS FOUR, MATCHED. Text on `fullname`, ordered scalar on
+//!      `born`, point on `addr`, geometry on `plot`; SQLite gets FTS5,
+//!      `CREATE INDEX`, an R*Tree on `addr`, and a second R*Tree on `plot`.
+//!      e3 additionally indexed `born_year` on both sides.
 //!   5. COUNTS ARE ENUMERATED, NOT AGGREGATED. e3 asked `SELECT COUNT(*)`
 //!      through sekejap's SQL front end. E4 has no aggregate API, and counting
 //!      rows in the harness would measure a full materialisation rather than
@@ -156,17 +160,31 @@
 //!      unsorted -- and these cases are compared on ROW COUNT, never on key
 //!      order (they are not in the compare script's `ORDERED` set).
 //!
+//!  10. PLOT GEOMETRY IS REFINED WITH E4's OWN PREDICATES ON SQLITE. SQLite
+//!      has no geometry library. The `person_plot` R*Tree holds each plot's
+//!      bbox (candidate filter); the GeoJSON text is stored on `person.plot`
+//!      and refined by registered functions (`geo_intersects`, `geo_within`,
+//!      `geo_contains`, `geo_dwithin`) that call the same `spatial_geometry`
+//!      routines E4 uses, the same shape as `geodist` for radius. Postgres
+//!      uses `geography` + GiST and PostGIS's matching predicates
+//!      (`ST_Intersects`/`ST_DWithin` spheroidal; `ST_Within`/`ST_Contains`
+//!      planar via a geometry cast, which is what PostGIS itself does).
+//!
 //! MEMORY. Generation is streaming: one row exists at a time, and no case
 //! accumulates its answer — rows are counted as they arrive and only the first
 //! sixteen keys are kept, so a 48M scan costs a page, not a result set.
 
 use e4_prototype::{
     collections::{
-        CandidateDriver, CollectionId, CollectionOptions, Database, IndexId, PointFilter,
-        Projection, QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter, ScalarValue,
-        SortDirection, SpatialCandidates, TextMatch,
+        CandidateDriver, CollectionId, CollectionOptions, Database, Geom, GeometryFilter, IndexId,
+        PointFilter, Projection, QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter,
+        ScalarValue, SortDirection, SpatialCandidates, TextMatch,
     },
-    spatial_math::{radius_candidate_bounds, wgs84_distance_metres, Bounds, Point},
+    spatial_geometry,
+    spatial_math::{
+        radius_candidate_bounds, wgs84_distance_metres, Bounds, Point,
+        WGS84_MIN_CURVATURE_RADIUS_METRES,
+    },
     Kind,
 };
 use kernel::{
@@ -249,6 +267,7 @@ struct Person {
     born_year: i64,
     lon: f64,
     lat: f64,
+    plot_side_m: f64,
 }
 
 fn person(i: u64) -> Person {
@@ -262,6 +281,8 @@ fn person(i: u64) -> Person {
     let lon = BBOX_LON.0 + (r % 100_000) as f64 / 100_000.0 * (BBOX_LON.1 - BBOX_LON.0);
     r = rng(r);
     let lat = BBOX_LAT.0 + (r % 100_000) as f64 / 100_000.0 * (BBOX_LAT.1 - BBOX_LAT.0);
+    r = rng(r);
+    let plot_side_m = 50.0 + (r % 451) as f64;
     Person {
         key: key(i),
         fullname: name(i),
@@ -269,6 +290,93 @@ fn person(i: u64) -> Person {
         born_year: year,
         lon: round5(lon),
         lat: round5(lat),
+        plot_side_m,
+    }
+}
+
+/// A square `side_m` metres on a side, centred on `(lon, lat)`. Half-side
+/// converted to degrees with `WGS84_MIN_CURVATURE_RADIUS_METRES` so every
+/// arm holds the identical vertices.
+fn plot_polygon(lon: f64, lat: f64, side_m: f64) -> Geom {
+    let half = side_m / 2.0;
+    let dlat = (half / WGS84_MIN_CURVATURE_RADIUS_METRES).to_degrees();
+    let dlon = dlat / lat.to_radians().cos().max(1e-6);
+    Geom::Polygon(vec![vec![
+        [lon - dlon, lat - dlat],
+        [lon + dlon, lat - dlat],
+        [lon + dlon, lat + dlat],
+        [lon - dlon, lat + dlat],
+        [lon - dlon, lat - dlat],
+    ]])
+}
+
+fn geom_json(g: &Geom) -> Value {
+    match g {
+        Geom::Point(x, y) => json!({"type": "Point", "coordinates": [x, y]}),
+        Geom::Polygon(rings) => json!({"type": "Polygon", "coordinates": rings}),
+        Geom::LineString(c) => json!({"type": "LineString", "coordinates": c}),
+        Geom::MultiPoint(c) => json!({"type": "MultiPoint", "coordinates": c}),
+        Geom::MultiLineString(rs) => json!({"type": "MultiLineString", "coordinates": rs}),
+        Geom::MultiPolygon(ps) => json!({"type": "MultiPolygon", "coordinates": ps}),
+    }
+}
+
+fn geom_from_json(value: &Value) -> R<Geom> {
+    let ty = value
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or("geometry type")?;
+    let c = value.get("coordinates").cloned().ok_or("geometry coordinates")?;
+    Ok(match ty {
+        "Point" => {
+            let p: [f64; 2] = serde_json::from_value(c)?;
+            Geom::Point(p[0], p[1])
+        }
+        "LineString" => Geom::LineString(serde_json::from_value(c)?),
+        "Polygon" => Geom::Polygon(serde_json::from_value(c)?),
+        "MultiPoint" => Geom::MultiPoint(serde_json::from_value(c)?),
+        "MultiLineString" => Geom::MultiLineString(serde_json::from_value(c)?),
+        "MultiPolygon" => Geom::MultiPolygon(serde_json::from_value(c)?),
+        other => return Err(format!("unsupported geometry type {other}").into()),
+    })
+}
+
+fn plot_bbox(geom: &Geom) -> (f64, f64, f64, f64) {
+    geom.bbox().expect("plot polygon is non-empty")
+}
+
+/// A 32-gon approximating a `radius_m` circle around the battery centre.
+/// Shared by all three arms so Intersects agrees on the same query shape.
+fn radius_poly(radius_m: f64) -> Geom {
+    const N: usize = 32;
+    let dlat = (radius_m / WGS84_MIN_CURVATURE_RADIUS_METRES).to_degrees();
+    let dlon = dlat / CENTER_LAT.to_radians().cos().max(1e-6);
+    let mut ring = Vec::with_capacity(N + 1);
+    for i in 0..N {
+        let theta = (i as f64) * 2.0 * std::f64::consts::PI / N as f64;
+        ring.push([CENTER_LON + dlon * theta.cos(), CENTER_LAT + dlat * theta.sin()]);
+    }
+    ring.push(ring[0]);
+    Geom::Polygon(vec![ring])
+}
+
+fn box_polygon() -> Geom {
+    Geom::Polygon(vec![vec![
+        [BOX_WEST, BOX_SOUTH],
+        [BOX_EAST, BOX_SOUTH],
+        [BOX_EAST, BOX_NORTH],
+        [BOX_WEST, BOX_NORTH],
+        [BOX_WEST, BOX_SOUTH],
+    ]])
+}
+
+fn centre_point() -> Geom {
+    Geom::Point(CENTER_LON, CENTER_LAT)
+}
+
+impl Person {
+    fn plot(&self) -> Geom {
+        plot_polygon(self.lon, self.lat, self.plot_side_m)
     }
 }
 
@@ -364,6 +472,7 @@ pub struct E4Ctx {
     fullname: IndexId,
     born: IndexId,
     addr: IndexId,
+    plot: IndexId,
     rows: u64,
 }
 
@@ -496,25 +605,12 @@ fn strip_box() -> Bounds {
         .expect("strip box is valid")
 }
 
-/// E4's k nearest: an exhaustive pass over the point index's postings (every
-/// posting carries its coordinates) keeping the k closest. There is no
-/// ordered walk from the centre outward yet, so this costs a full index scan
-/// however small k is -- the case exists to keep that cost visible next to
-/// PostGIS's KNN-GiST walk.
-fn e4_knn(c: &E4Ctx, k: usize) -> R<Answer> {
-    let hits = c.db.query_point_nearest(
-        c.addr,
-        center(),
-        k,
-        SpatialCandidates::All,
-        usize::MAX,
-        || false,
-    )?;
-    let mut answer = Answer::default();
-    for hit in hits {
-        answer.push(key(hit.id.sequence - 1));
+fn distance_order(index: IndexId) -> QueryOrder<'static> {
+    QueryOrder::Distance {
+        index,
+        center: center(),
+        direction: SortDirection::Ascending,
     }
-    Ok(answer)
 }
 
 /// e3's battery, in e3's order, as this engine's API spells it.
@@ -688,8 +784,28 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
         ("radius_top10", |c| {
             e4_ids(c, &[radius(c.addr, 10_000.0)], QueryOrder::Driver, Some(10))
         }),
-        ("knn_10", |c| e4_knn(c, 10)),
-        ("knn_100", |c| e4_knn(c, 100)),
+        ("knn_10", |c| e4_ids(c, &[], distance_order(c.addr), Some(10))),
+        ("knn_100", |c| e4_ids(c, &[], distance_order(c.addr), Some(100))),
+        ("knn_10_within_50km", |c| {
+            e4_ids(
+                c,
+                &[radius(c.addr, 50_000.0)],
+                distance_order(c.addr),
+                Some(10),
+            )
+        }),
+        ("knn_10_born_decade", |c| {
+            e4_ids(
+                c,
+                &[born_range(
+                    c.born,
+                    Bound::Included(19_900_101),
+                    Bound::Excluded(20_000_101),
+                )],
+                distance_order(c.addr),
+                Some(10),
+            )
+        }),
         ("radius_and_born", |c| {
             e4_ids(
                 c,
@@ -719,6 +835,53 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
                     ),
                 ],
                 QueryOrder::EntityId,
+                None,
+            )
+        }),
+        ("plot_within_box", |c| {
+            e4_ids(
+                c,
+                &[QueryFilter::Geometry {
+                    index: c.plot,
+                    predicate: GeometryFilter::Within(box_polygon()),
+                }],
+                QueryOrder::Driver,
+                None,
+            )
+        }),
+        ("plot_intersects_radius_poly", |c| {
+            e4_ids(
+                c,
+                &[QueryFilter::Geometry {
+                    index: c.plot,
+                    predicate: GeometryFilter::Intersects(radius_poly(10_000.0)),
+                }],
+                QueryOrder::Driver,
+                None,
+            )
+        }),
+        ("plot_contains_point", |c| {
+            e4_ids(
+                c,
+                &[QueryFilter::Geometry {
+                    index: c.plot,
+                    predicate: GeometryFilter::Contains(centre_point()),
+                }],
+                QueryOrder::Driver,
+                None,
+            )
+        }),
+        ("plot_dwithin_2km", |c| {
+            e4_ids(
+                c,
+                &[QueryFilter::Geometry {
+                    index: c.plot,
+                    predicate: GeometryFilter::DWithin {
+                        geometry: centre_point(),
+                        metres: 2_000.0,
+                    },
+                }],
+                QueryOrder::Driver,
                 None,
             )
         }),
@@ -802,6 +965,7 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
             ("born".into(), Kind::Int),
             ("born_year".into(), Kind::Int),
             ("addr".into(), Kind::Point),
+            ("plot".into(), Kind::Geo),
         ],
         CollectionOptions::default(),
     )?;
@@ -820,6 +984,7 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
                 "born": p.born,
                 "born_year": p.born_year,
                 "addr": {"type": "Point", "coordinates": [p.lon, p.lat]},
+                "plot": geom_json(&p.plot()),
             }),
         )?;
         // The whole comparison rests on key `p{i:09}` being entity sequence
@@ -838,7 +1003,7 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
     }
     db.commit()?;
     let load_s = at.elapsed().as_secs_f64();
-    eprintln!("[e4] {rows} rows in {load_s:.2}s; building three indexes …");
+    eprintln!("[e4] {rows} rows in {load_s:.2}s; building four indexes …");
 
     // Late build, as SQLite's CREATE INDEX / FTS5 rebuild / R*Tree populate
     // are late. A commit follows each create because a build refuses to start
@@ -862,6 +1027,12 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
     db.build_index_to_ready(addr, chunk)?;
     let index_point_s = at.elapsed().as_secs_f64();
 
+    let at = Instant::now();
+    let plot = db.create_geometry_index(person_c, "plot_geo", "plot")?;
+    db.commit()?;
+    db.build_index_to_ready(plot, chunk)?;
+    let index_geometry_s = at.elapsed().as_secs_f64();
+
     db.commit()?;
     let at = Instant::now();
     db.checkpoint()?;
@@ -873,13 +1044,14 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
         "index_text_s": index_text_s,
         "index_scalar_s": index_scalar_s,
         "index_point_s": index_point_s,
-        "index_total_s": index_text_s + index_scalar_s + index_point_s,
+        "index_geometry_s": index_geometry_s,
+        "index_total_s": index_text_s + index_scalar_s + index_point_s + index_geometry_s,
         "checkpoint_s": checkpoint_s,
         "total_s": overall.elapsed().as_secs_f64(),
     });
     eprintln!(
         "[e4] indexes built in {:.2}s; checkpoint {checkpoint_s:.2}s",
-        index_text_s + index_scalar_s + index_point_s
+        index_text_s + index_scalar_s + index_point_s + index_geometry_s
     );
     Ok((
         E4Ctx {
@@ -888,6 +1060,7 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
             fullname,
             born,
             addr,
+            plot,
             rows,
         },
         stages,
@@ -895,7 +1068,7 @@ fn load_e4(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(E4Ctx, 
 }
 
 /// Reopen a database `load_e4` built earlier and find its collection and
-/// three indexes by NAME, the way a program that did not build the file has
+/// four indexes by NAME, the way a program that did not build the file has
 /// to. Every stage but `open_s` is `null`: nothing was loaded or built here,
 /// and a zero would read as "instant".
 fn open_e4(root: &Path, rows: u64, cache_bytes: usize) -> R<(E4Ctx, Value)> {
@@ -909,7 +1082,7 @@ fn open_e4(root: &Path, rows: u64, cache_bytes: usize) -> R<(E4Ctx, Value)> {
         },
     )?;
     let person = db.collection("person")?.ok_or("--reuse: no `person` collection")?;
-    let (mut fullname, mut born, mut addr) = (None, None, None);
+    let (mut fullname, mut born, mut addr, mut plot) = (None, None, None, None);
     for n in 1..=8u64 {
         let Ok(info) = db.index_info(IndexId(n)) else {
             continue;
@@ -918,6 +1091,7 @@ fn open_e4(root: &Path, rows: u64, cache_bytes: usize) -> R<(E4Ctx, Value)> {
             "fullname_text" => fullname = Some(info.id),
             "born_idx" => born = Some(info.id),
             "addr_point" => addr = Some(info.id),
+            "plot_geo" => plot = Some(info.id),
             _ => {}
         }
     }
@@ -927,6 +1101,7 @@ fn open_e4(root: &Path, rows: u64, cache_bytes: usize) -> R<(E4Ctx, Value)> {
         fullname: fullname.ok_or("--reuse: no fullname_text index")?,
         born: born.ok_or("--reuse: no born_idx index")?,
         addr: addr.ok_or("--reuse: no addr_point index")?,
+        plot: plot.ok_or("--reuse: no plot_geo index")?,
         rows,
     };
     let open_s = at.elapsed().as_secs_f64();
@@ -943,6 +1118,7 @@ fn reused_stages(open_s: f64) -> Value {
         "index_text_s": Value::Null,
         "index_scalar_s": Value::Null,
         "index_point_s": Value::Null,
+        "index_geometry_s": Value::Null,
         "index_total_s": Value::Null,
         "checkpoint_s": Value::Null,
         "total_s": Value::Null,
@@ -999,6 +1175,13 @@ fn lite_radius_sql_at(at: Point, metres: f64, extra: &str) -> String {
 fn lite_knn_sql(k: usize) -> String {
     format!(
         "SELECT _key FROM person ORDER BY geodist(lon,lat,{CENTER_LON:?},{CENTER_LAT:?}), _key LIMIT {k}"
+    )
+}
+
+fn lite_knn_within_sql(k: usize, metres: f64) -> String {
+    format!(
+        "SELECT _key FROM person WHERE geodist(lon,lat,{CENTER_LON:?},{CENTER_LAT:?})<={metres:?} \
+         ORDER BY geodist(lon,lat,{CENTER_LON:?},{CENTER_LAT:?}), _key LIMIT {k}"
     )
 }
 
@@ -1095,6 +1278,14 @@ fn lite_cases(rows: u64) -> Vec<(&'static str, String)> {
         ("radius_top10", format!("{} LIMIT 10", lite_radius_sql(10_000.0, ""))),
         ("knn_10", lite_knn_sql(10)),
         ("knn_100", lite_knn_sql(100)),
+        ("knn_10_within_50km", lite_knn_within_sql(10, 50_000.0)),
+        (
+            "knn_10_born_decade",
+            format!(
+                "SELECT _key FROM person WHERE born>=19900101 AND born<20000101 \
+                 ORDER BY geodist(lon,lat,{CENTER_LON:?},{CENTER_LAT:?}), _key LIMIT 10"
+            ),
+        ),
         (
             "radius_and_born",
             lite_radius_sql(10_000.0, " AND p.born>=19900101 AND p.born<20000101"),
@@ -1106,6 +1297,44 @@ fn lite_cases(rows: u64) -> Vec<(&'static str, String)> {
                 .into(),
         ),
         (
+            "plot_within_box",
+            lite_plot_sql(
+                &lite_plot_overlap(BOX_WEST, BOX_EAST, BOX_SOUTH, BOX_NORTH),
+                &format!("geo_within(p.plot, '{}')", geom_json(&box_polygon())),
+            ),
+        ),
+        (
+            "plot_intersects_radius_poly",
+            {
+                let poly = radius_poly(10_000.0);
+                let (xmin, xmax, ymin, ymax) = plot_bbox(&poly);
+                lite_plot_sql(
+                    &lite_plot_overlap(xmin, xmax, ymin, ymax),
+                    &format!("geo_intersects(p.plot, '{}')", geom_json(&poly)),
+                )
+            },
+        ),
+        (
+            "plot_contains_point",
+            lite_plot_sql(
+                &lite_plot_overlap(CENTER_LON, CENTER_LON, CENTER_LAT, CENTER_LAT),
+                &format!("geo_contains(p.plot, '{}')", geom_json(&centre_point())),
+            ),
+        ),
+        (
+            "plot_dwithin_2km",
+            {
+                let b = radius_candidate_bounds(center(), 2_000.0).expect("2 km envelope");
+                lite_plot_sql(
+                    &lite_plot_overlap(b.west(), b.east(), b.south(), b.north()),
+                    &format!(
+                        "geo_dwithin(p.plot, '{}', 2000.0)",
+                        geom_json(&centre_point())
+                    ),
+                )
+            },
+        ),
+        (
             "oldest_10",
             "SELECT _key, born FROM person ORDER BY born ASC, _key ASC LIMIT 10".into(),
         ),
@@ -1114,6 +1343,24 @@ fn lite_cases(rows: u64) -> Vec<(&'static str, String)> {
             "SELECT _key, born FROM person ORDER BY born DESC, _key ASC LIMIT 10".into(),
         ),
     ]
+}
+
+fn lite_parse_geom(s: String) -> rusqlite::Result<Geom> {
+    let v: Value = serde_json::from_str(&s)
+        .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))?;
+    geom_from_json(&v).map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))
+}
+
+fn lite_plot_overlap(xmin: f64, xmax: f64, ymin: f64, ymax: f64) -> String {
+    format!(
+        "g.maxlon>={xmin:?} AND g.minlon<={xmax:?} AND g.maxlat>={ymin:?} AND g.minlat<={ymax:?}"
+    )
+}
+
+fn lite_plot_sql(overlap: &str, refine: &str) -> String {
+    format!(
+        "SELECT p._key FROM person_plot g JOIN person p ON p.rowid=g.id WHERE {overlap} AND {refine}"
+    )
 }
 
 /// Open (or create) the SQLite file with the arm's pragmas and the geodesic
@@ -1134,6 +1381,49 @@ fn lite_connect(root: &Path, cache_bytes: usize) -> R<Connection> {
             Ok(wgs84_distance_metres(a, b))
         },
     )?;
+    // Plot refine: the same spatial_geometry predicates E4 uses. SQLite has
+    // no geometry library of its own; the R*Tree is the candidate box.
+    connection.create_scalar_function(
+        "geo_intersects",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let a = lite_parse_geom(ctx.get::<String>(0)?)?;
+            let b = lite_parse_geom(ctx.get::<String>(1)?)?;
+            Ok(spatial_geometry::intersects(&a, &b))
+        },
+    )?;
+    connection.create_scalar_function(
+        "geo_within",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let a = lite_parse_geom(ctx.get::<String>(0)?)?;
+            let b = lite_parse_geom(ctx.get::<String>(1)?)?;
+            Ok(spatial_geometry::within(&a, &b))
+        },
+    )?;
+    connection.create_scalar_function(
+        "geo_contains",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let a = lite_parse_geom(ctx.get::<String>(0)?)?;
+            let b = lite_parse_geom(ctx.get::<String>(1)?)?;
+            Ok(spatial_geometry::contains(&a, &b))
+        },
+    )?;
+    connection.create_scalar_function(
+        "geo_dwithin",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let a = lite_parse_geom(ctx.get::<String>(0)?)?;
+            let b = lite_parse_geom(ctx.get::<String>(1)?)?;
+            let metres = ctx.get::<f64>(2)?;
+            Ok(spatial_geometry::dwithin_m(&a, &b, metres))
+        },
+    )?;
     connection.execute_batch(&format!(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;
          PRAGMA cache_size=-{}; PRAGMA temp_store=FILE;",
@@ -1147,12 +1437,12 @@ fn open_lite(root: &Path, cache_bytes: usize) -> R<(Connection, Value)> {
     let at = Instant::now();
     let connection = lite_connect(root, cache_bytes)?;
     let tables: i64 = connection.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE name IN ('person','person_fts','person_geo','idx_born')",
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('person','person_fts','person_geo','idx_born','person_plot')",
         [],
         |r| r.get(0),
     )?;
-    if tables != 4 {
-        return Err(format!("--reuse: {} of the 4 expected SQLite objects present", tables).into());
+    if tables != 5 {
+        return Err(format!("--reuse: {} of the 5 expected SQLite objects present", tables).into());
     }
     let open_s = at.elapsed().as_secs_f64();
     eprintln!("[sqlite] reopened {} in {open_s:.3}s; queries only", root.display());
@@ -1167,7 +1457,7 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
     let connection = lite_connect(root, cache_bytes)?;
     connection.execute_batch(
         "CREATE TABLE person(_key TEXT PRIMARY KEY, fullname TEXT, born INTEGER,
-                             born_year INTEGER, lon REAL, lat REAL);",
+                             born_year INTEGER, lon REAL, lat REAL, plot TEXT);",
     )?;
     let open_s = at.elapsed().as_secs_f64();
 
@@ -1176,7 +1466,7 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
     connection.execute_batch("BEGIN")?;
     {
         let mut insert =
-            connection.prepare("INSERT INTO person VALUES (?1,?2,?3,?4,?5,?6)")?;
+            connection.prepare("INSERT INTO person VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
         for i in 0..rows {
             let p = person(i);
             insert.execute(rusqlite::params![
@@ -1185,7 +1475,8 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
                 p.born,
                 p.born_year,
                 p.lon,
-                p.lat
+                p.lat,
+                geom_json(&p.plot()).to_string(),
             ])?;
             if (i + 1) % batch == 0 {
                 connection.execute_batch("COMMIT; BEGIN")?;
@@ -1201,7 +1492,7 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
     }
     connection.execute_batch("COMMIT")?;
     let load_s = at.elapsed().as_secs_f64();
-    eprintln!("[sqlite] {rows} rows in {load_s:.2}s; building three indexes …");
+    eprintln!("[sqlite] {rows} rows in {load_s:.2}s; building four indexes …");
 
     // All three indexes are built AFTER the load, so this arm pays the same
     // late-build cost E4's `build_index_to_ready` does.
@@ -1225,6 +1516,26 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
     let index_point_s = at.elapsed().as_secs_f64();
 
     let at = Instant::now();
+    connection.execute_batch(
+        "CREATE VIRTUAL TABLE person_plot USING rtree(id, minlon, maxlon, minlat, maxlat);",
+    )?;
+    {
+        let mut insert = connection.prepare(
+            "INSERT INTO person_plot(id, minlon, maxlon, minlat, maxlat) VALUES (?1,?2,?3,?4,?5)",
+        )?;
+        let mut rows = connection.prepare("SELECT rowid, plot FROM person")?;
+        let mut iter = rows.query([])?;
+        while let Some(row) = iter.next()? {
+            let id: i64 = row.get(0)?;
+            let plot: String = row.get(1)?;
+            let geom = lite_parse_geom(plot)?;
+            let (xmin, xmax, ymin, ymax) = plot_bbox(&geom);
+            insert.execute(rusqlite::params![id, xmin, xmax, ymin, ymax])?;
+        }
+    }
+    let index_geometry_s = at.elapsed().as_secs_f64();
+
+    let at = Instant::now();
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     let checkpoint_s = at.elapsed().as_secs_f64();
 
@@ -1234,13 +1545,14 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
         "index_text_s": index_text_s,
         "index_scalar_s": index_scalar_s,
         "index_point_s": index_point_s,
-        "index_total_s": index_text_s + index_scalar_s + index_point_s,
+        "index_geometry_s": index_geometry_s,
+        "index_total_s": index_text_s + index_scalar_s + index_point_s + index_geometry_s,
         "checkpoint_s": checkpoint_s,
         "total_s": overall.elapsed().as_secs_f64(),
     });
     eprintln!(
         "[sqlite] indexes built in {:.2}s; checkpoint {checkpoint_s:.2}s",
-        index_text_s + index_scalar_s + index_point_s
+        index_text_s + index_scalar_s + index_point_s + index_geometry_s
     );
     Ok((connection, stages))
 }
@@ -1323,6 +1635,21 @@ fn pg_knn_sql(k: usize) -> String {
     format!(
         "SELECT k FROM person ORDER BY addr <-> \
          ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326)::geography, k LIMIT {k}"
+    )
+}
+
+fn pg_knn_within_sql(k: usize, metres: f64) -> String {
+    format!(
+        "SELECT k FROM person WHERE ST_DWithin(addr, \
+         ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326)::geography, {metres:?}, true) \
+         ORDER BY addr <-> ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326)::geography, k LIMIT {k}"
+    )
+}
+
+fn pg_knn_born_sql(k: usize) -> String {
+    format!(
+        "SELECT k FROM person WHERE born>=19900101 AND born<20000101 \
+         ORDER BY addr <-> ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326)::geography, k LIMIT {k}"
     )
 }
 
@@ -1422,6 +1749,8 @@ fn pg_cases(rows: u64) -> Vec<(&'static str, String)> {
         ("radius_top10", format!("{} LIMIT 10", pg_radius_sql(10_000.0, ""))),
         ("knn_10", pg_knn_sql(10)),
         ("knn_100", pg_knn_sql(100)),
+        ("knn_10_within_50km", pg_knn_within_sql(10, 50_000.0)),
+        ("knn_10_born_decade", pg_knn_born_sql(10)),
         (
             "radius_and_born",
             pg_radius_sql(10_000.0, " AND born>=19900101 AND born<20000101"),
@@ -1431,6 +1760,32 @@ fn pg_cases(rows: u64) -> Vec<(&'static str, String)> {
             "SELECT k FROM person WHERE to_tsvector('simple', fullname) \
              @@ to_tsquery('simple', 'sari') AND born>=19800101 AND born<19900101"
                 .into(),
+        ),
+        (
+            "plot_within_box",
+            format!(
+                "SELECT k FROM person WHERE ST_Within(plot::geometry, ST_MakeEnvelope({:?},{:?},{:?},{:?},4326))",
+                BOX_WEST, BOX_SOUTH, BOX_EAST, BOX_NORTH
+            ),
+        ),
+        (
+            "plot_intersects_radius_poly",
+            format!(
+                "SELECT k FROM person WHERE ST_Intersects(plot, ST_SetSRID(ST_GeomFromGeoJSON('{}'),4326)::geography)",
+                geom_json(&radius_poly(10_000.0))
+            ),
+        ),
+        (
+            "plot_contains_point",
+            format!(
+                "SELECT k FROM person WHERE ST_Contains(plot::geometry, ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326))"
+            ),
+        ),
+        (
+            "plot_dwithin_2km",
+            format!(
+                "SELECT k FROM person WHERE ST_DWithin(plot, ST_SetSRID(ST_MakePoint({CENTER_LON:?},{CENTER_LAT:?}),4326)::geography, 2000, true)"
+            ),
         ),
         (
             "oldest_10",
@@ -1450,21 +1805,22 @@ fn pg_cases(rows: u64) -> Vec<(&'static str, String)> {
 /// straightforward way to hand a dynamic-length batch to `postgres::Client`
 /// without hand-escaping text.
 fn insert_batch(client: &mut Client, people: &[Person]) -> R<()> {
-    let mut sql = String::from("INSERT INTO person (k, fullname, born, born_year, addr) VALUES ");
-    let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::with_capacity(people.len() * 6);
+    let mut sql = String::from("INSERT INTO person (k, fullname, born, born_year, addr, plot) VALUES ");
+    let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::with_capacity(people.len() * 7);
     for (i, p) in people.iter().enumerate() {
         if i > 0 {
             sql.push(',');
         }
-        let base = i * 6;
+        let base = i * 7;
         sql.push_str(&format!(
-            "(${},${},${},${},ST_SetSRID(ST_MakePoint(${},${}),4326)::geography)",
+            "(${},${},${},${},ST_SetSRID(ST_MakePoint(${},${}),4326)::geography,ST_SetSRID(ST_GeomFromGeoJSON(${}),4326)::geography)",
             base + 1,
             base + 2,
             base + 3,
             base + 4,
             base + 5,
-            base + 6
+            base + 6,
+            base + 7
         ));
         params.push(Box::new(p.key.clone()));
         params.push(Box::new(p.fullname.clone()));
@@ -1472,6 +1828,7 @@ fn insert_batch(client: &mut Client, people: &[Person]) -> R<()> {
         params.push(Box::new(p.born_year as i32));
         params.push(Box::new(p.lon));
         params.push(Box::new(p.lat));
+        params.push(Box::new(geom_json(&p.plot()).to_string()));
     }
     let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
     // Explicit BEGIN/COMMIT per batch, matching the other two arms' commit
@@ -1508,8 +1865,8 @@ fn open_pg(root: &Path, dsn_base: &str) -> R<(Client, Value, String, String)> {
             &[],
         )?
         .get(0);
-    if indexes < 3 {
-        return Err(format!("--reuse: {db_name} has {indexes} indexes on person, expected 3").into());
+    if indexes < 4 {
+        return Err(format!("--reuse: {db_name} has {indexes} indexes on person, expected 4").into());
     }
     let open_s = at.elapsed().as_secs_f64();
     eprintln!("[postgres] reopened {db_name} in {open_s:.3}s; queries only");
@@ -1548,7 +1905,8 @@ fn load_pg(
              fullname text,
              born bigint,
              born_year int,
-             addr geography(Point,4326)
+             addr geography(Point,4326),
+             plot geography(Polygon,4326)
          );",
     )?;
     let open_s = at.elapsed().as_secs_f64();
@@ -1574,7 +1932,7 @@ fn load_pg(
         insert_batch(&mut client, &pending)?;
     }
     let load_s = at.elapsed().as_secs_f64();
-    eprintln!("[postgres] {rows} rows in {load_s:.2}s; building three indexes …");
+    eprintln!("[postgres] {rows} rows in {load_s:.2}s; building four indexes …");
 
     // Late build, same as the other two arms.
     let at = Instant::now();
@@ -1591,6 +1949,10 @@ fn load_pg(
     client.batch_execute("CREATE INDEX person_addr_gix ON person USING gist (addr);")?;
     let index_point_s = at.elapsed().as_secs_f64();
 
+    let at = Instant::now();
+    client.batch_execute("CREATE INDEX person_plot_gix ON person USING gist (plot);")?;
+    let index_geometry_s = at.elapsed().as_secs_f64();
+
     // Postgres's analog of the other two arms' checkpoint: ANALYZE so the
     // planner has fresh stats for the indexes just built, then CHECKPOINT so
     // dirty buffers are forced to disk — both folded into one timed stage.
@@ -1604,13 +1966,14 @@ fn load_pg(
         "index_text_s": index_text_s,
         "index_scalar_s": index_scalar_s,
         "index_point_s": index_point_s,
-        "index_total_s": index_text_s + index_scalar_s + index_point_s,
+        "index_geometry_s": index_geometry_s,
+        "index_total_s": index_text_s + index_scalar_s + index_point_s + index_geometry_s,
         "checkpoint_s": checkpoint_s,
         "total_s": overall.elapsed().as_secs_f64(),
     });
     eprintln!(
         "[postgres] indexes built in {:.2}s; analyze+checkpoint {checkpoint_s:.2}s",
-        index_text_s + index_scalar_s + index_point_s
+        index_text_s + index_scalar_s + index_point_s + index_geometry_s
     );
     Ok((client, stages, dsn, db_name))
 }

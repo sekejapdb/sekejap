@@ -88,10 +88,10 @@ pub use quantized_vector_indexes::{
     ApproxVectorMethod, ApproxVectorResult, QuantizedVectorCandidates,
 };
 pub use query::{
-    ApproximationDiagnostics, CandidateDriver, OrderValue, OwnedScalarValue, PointFilter,
-    PreparedQuery, ProjectedValue, Projection, QueryBudget, QueryDriver, QueryError, QueryFilter,
-    QueryOrder, QueryPage, QueryRequest, QueryResult, QueryRow, QueryWork, ScalarFilter,
-    ScalarValue, SortDirection, WorkResource,
+    ApproximationDiagnostics, CandidateDriver, Geom, GeometryFilter, OrderValue, OwnedScalarValue,
+    PointFilter, PreparedQuery, ProjectedValue, Projection, QueryBudget, QueryDriver, QueryError,
+    QueryFilter, QueryOrder, QueryPage, QueryRequest, QueryResult, QueryRow, QueryWork,
+    ScalarFilter, ScalarValue, SortDirection, WorkResource,
 };
 pub use spatial_indexes::{SpatialCandidates, SpatialHit};
 pub use text_indexes::{TextCandidates, TextHit, TextMatch};

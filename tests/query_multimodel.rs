@@ -4,12 +4,14 @@
 use e4_prototype::{
     collections::{
         ApproxVectorMethod, BfsRequest, CandidateDriver, CollectionId, CollectionOptions, Database,
-        Direction, EntityId, Error, GraphContextId, IndexId, OrderValue, PointFilter,
-        ProjectedValue, Projection, QueryBudget, QueryDriver, QueryError, QueryFilter, QueryOrder,
-        QueryRequest, ScalarFilter, ScalarValue, TextMatch, VectorMetric, WorkResource,
+        Direction, EntityId, Error, Geom, GeometryFilter, GraphContextId, IndexId, OrderValue,
+        PointFilter, ProjectedValue, Projection, QueryBudget, QueryDriver, QueryError, QueryFilter,
+        QueryOrder, QueryRequest, ScalarFilter, ScalarValue, SortDirection, SpatialCandidates,
+        TextMatch, VectorMetric, WorkResource,
         verification::{verify_indexed_source, VerificationLimits},
     },
     pagewal::PageWalStore,
+    spatial_geometry,
     spatial_math::{within_radius, Bounds, Point},
     Kind,
 };
@@ -20,6 +22,7 @@ use kernel::{
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    ops::Bound,
     path::Path,
 };
 
@@ -2902,5 +2905,885 @@ fn keys_driver_order_matches_an_entity_enumeration_sorted_by_key() {
     assert_eq!(
         got, oracle,
         "the keys driver's own order must equal entities sorted by key"
+    );
+}
+
+// -- QD: QueryOrder::Distance ----------------------------------------------
+
+fn distance_order(index: IndexId, center: Point) -> QueryOrder<'static> {
+    QueryOrder::Distance {
+        index,
+        center,
+        direction: SortDirection::Ascending,
+    }
+}
+
+fn drain_distance(
+    db: &Database,
+    collection: CollectionId,
+    filters: &[QueryFilter<'_>],
+    index: IndexId,
+    center: Point,
+    k: Option<usize>,
+    page_size: usize,
+    driver: CandidateDriver,
+) -> (Vec<EntityId>, Vec<f64>, QueryDriver, u64) {
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters,
+            order: distance_order(index, center),
+            projection: Projection::Ids,
+            total_limit: k,
+            driver,
+        })
+        .unwrap();
+    let mut ids = Vec::new();
+    let mut distances = Vec::new();
+    let mut primary_reads = 0u64;
+    let mut driver_seen = None;
+    loop {
+        let page = prepared.next_page(page_size, generous(), || false).unwrap();
+        driver_seen = Some(page.driver);
+        primary_reads += page.work.primary_reads;
+        for row in &page.rows {
+            ids.push(row.id);
+            match &row.order {
+                OrderValue::Distance(metres) => distances.push(*metres),
+                other => panic!("distance order returned {other:?}"),
+            }
+        }
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    (
+        ids,
+        distances,
+        driver_seen.expect("a prepared query produces a page"),
+        primary_reads,
+    )
+}
+
+fn next_u64(seed: &mut u64) -> u64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    *seed
+}
+
+fn unit(seed: &mut u64) -> f64 {
+    (next_u64(seed) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// (a) `QueryOrder::Distance` with total_limit k returns exactly
+/// `query_point_nearest`'s ids, in the same order, across page sizes.
+#[test]
+fn distance_order_matches_query_point_nearest_across_page_sizes() {
+    const BBOX_LON: (f64, f64) = (106.4, 108.8);
+    const BBOX_LAT: (f64, f64) = (-7.8, -5.9);
+    const CENTER: (f64, f64) = (107.6, -6.9);
+    const ROWS: usize = 400;
+    const K: usize = 15;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let collection = db
+        .create_collection(
+            "points",
+            vec![("position".into(), Kind::Point)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    let mut seed = 0x51ea_d15c_0de_u64;
+    for n in 0..ROWS {
+        let lon = BBOX_LON.0 + (BBOX_LON.1 - BBOX_LON.0) * unit(&mut seed);
+        let lat = BBOX_LAT.0 + (BBOX_LAT.1 - BBOX_LAT.0) * unit(&mut seed);
+        db.put(
+            collection,
+            &format!("p{n:05}"),
+            &json!({"position": point(lon, lat)}),
+        )
+        .unwrap();
+        if n % 64 == 63 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let index = db
+        .create_point_index(collection, "position", "position")
+        .unwrap();
+    finish_build(&mut db, index);
+    db.checkpoint().unwrap();
+
+    let center = Point::new(CENTER.0, CENTER.1).unwrap();
+    let oracle = db
+        .query_point_nearest(index, center, K, SpatialCandidates::All, ROWS * 2, || false)
+        .unwrap();
+    assert_eq!(oracle.len(), K);
+    let oracle_ids: Vec<EntityId> = oracle.iter().map(|hit| hit.id).collect();
+
+    for page_size in [1, 3, 7, 50] {
+        let (ids, distances, driver, primary_reads) = drain_distance(
+            &db,
+            collection,
+            &[],
+            index,
+            center,
+            Some(K),
+            page_size,
+            CandidateDriver::Auto,
+        );
+        assert_eq!(
+            driver,
+            QueryDriver::Nearest { index },
+            "page_size {page_size}"
+        );
+        assert_eq!(ids, oracle_ids, "page_size {page_size}");
+        assert_eq!(ids.len(), K, "page_size {page_size}");
+        assert_eq!(primary_reads, 0, "page_size {page_size}: {primary_reads}");
+        assert!(
+            distances.windows(2).all(|pair| pair[0] <= pair[1]),
+            "page_size {page_size}: distances not ascending: {distances:?}"
+        );
+        for (got, want) in distances.iter().zip(oracle.iter()) {
+            assert_eq!(got.to_bits(), want.distance_metres.to_bits());
+        }
+    }
+}
+
+/// (b) A radius filter on the same index yields the nearest k WITHIN the
+/// radius, and an empty page when nothing is within.
+#[test]
+fn distance_order_with_a_same_index_radius_is_nearest_within() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let collection = db
+        .create_collection(
+            "points",
+            vec![("position".into(), Kind::Point)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    // A tight cluster around the origin and one far point.
+    let mut near = Vec::new();
+    for n in 0..8 {
+        near.push(
+            db.put(
+                collection,
+                &format!("n{n}"),
+                &json!({"position": point(n as f64 * 0.001, 0.0)}),
+            )
+            .unwrap(),
+        );
+    }
+    db.put(
+        collection,
+        "far",
+        &json!({"position": point(10.0, 10.0)}),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    let index = db
+        .create_point_index(collection, "position", "position")
+        .unwrap();
+    finish_build(&mut db, index);
+
+    let center = Point::new(0.0, 0.0).unwrap();
+    let radius_metres = 500.0;
+    let filters = [QueryFilter::Point {
+        index,
+        predicate: PointFilter::Radius {
+            center,
+            radius_metres,
+        },
+    }];
+    let (ids, _, driver, primary_reads) = drain_distance(
+        &db,
+        collection,
+        &filters,
+        index,
+        center,
+        Some(3),
+        10,
+        CandidateDriver::Auto,
+    );
+    assert_eq!(driver, QueryDriver::Nearest { index });
+    assert_eq!(primary_reads, 0);
+    assert_eq!(ids, near[..3]);
+
+    let empty_filters = [QueryFilter::Point {
+        index,
+        predicate: PointFilter::Radius {
+            center: Point::new(40.0, 40.0).unwrap(),
+            radius_metres: 50.0,
+        },
+    }];
+    let (ids, _, _, _) = drain_distance(
+        &db,
+        collection,
+        &empty_filters,
+        index,
+        Point::new(40.0, 40.0).unwrap(),
+        Some(10),
+        10,
+        CandidateDriver::Auto,
+    );
+    assert!(ids.is_empty(), "nothing is within the empty radius: {ids:?}");
+}
+
+/// (c) A non-spatial born-range filter (C1's set) and a text filter as the
+/// driver both agree with a brute-force oracle sorted by distance then id.
+#[test]
+fn distance_order_with_born_range_or_text_matches_the_brute_force_oracle() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let collection = db
+        .create_collection(
+            "people",
+            vec![
+                ("position".into(), Kind::Point),
+                ("born".into(), Kind::Int),
+                ("body".into(), Kind::Text),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    let mut rows = Vec::new();
+    for i in 0..80u64 {
+        let lon = (i as f64) * 0.02;
+        let lat = ((i % 7) as f64) * 0.01;
+        let born = 1980 + (i % 40) as i64;
+        let body = if i % 5 == 0 { "flood river" } else { "road" };
+        let id = db
+            .put(
+                collection,
+                &format!("p{i:03}"),
+                &json!({"position": point(lon, lat), "born": born, "body": body}),
+            )
+            .unwrap();
+        rows.push((id, Point::new(lon, lat).unwrap(), born, body));
+        if i % 16 == 15 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let position = db
+        .create_point_index(collection, "position", "position")
+        .unwrap();
+    let born = db
+        .create_scalar_index(collection, "born", "born", false)
+        .unwrap();
+    let text = db.create_text_index(collection, "body", "body").unwrap();
+    finish_build(&mut db, position);
+    finish_build(&mut db, born);
+    finish_build(&mut db, text);
+
+    let center = Point::new(0.4, 0.0).unwrap();
+    let brute = |keep: fn(i64, &str) -> bool| {
+        let mut hits: Vec<(f64, EntityId)> = rows
+            .iter()
+            .filter(|(_, _, born, body)| keep(*born, *body))
+            .map(|(id, point, _, _)| {
+                (
+                    e4_prototype::spatial_math::wgs84_distance_metres(center, *point),
+                    *id,
+                )
+            })
+            .collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        hits
+    };
+
+    let born_filters = [QueryFilter::Scalar {
+        index: born,
+        predicate: ScalarFilter::Range {
+            lower: Bound::Included(ScalarValue::I64(1990)),
+            upper: Bound::Excluded(ScalarValue::I64(2000)),
+        },
+    }];
+    let born_oracle: Vec<EntityId> = brute(|year, _| (1990..2000).contains(&year))
+        .into_iter()
+        .take(10)
+        .map(|(_, id)| id)
+        .collect();
+    let (ids, _, driver, primary_reads) = drain_distance(
+        &db,
+        collection,
+        &born_filters,
+        position,
+        center,
+        Some(10),
+        4,
+        CandidateDriver::Auto,
+    );
+    assert_eq!(driver, QueryDriver::Nearest { index: position });
+    assert_eq!(primary_reads, 0);
+    assert_eq!(ids, born_oracle);
+
+    let text_filters = [QueryFilter::Text {
+        index: text,
+        query: "flood",
+        matching: TextMatch::Any,
+    }];
+    let text_oracle: Vec<EntityId> = brute(|_, body| body.contains("flood"))
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    let (ids, _, driver, _) = drain_distance(
+        &db,
+        collection,
+        &text_filters,
+        position,
+        center,
+        None,
+        8,
+        CandidateDriver::Auto,
+    );
+    assert_eq!(driver, QueryDriver::Text(text));
+    assert_eq!(ids, text_oracle);
+}
+
+/// (e) DESC is refused with a clear error, not silently treated as ascending.
+#[test]
+fn distance_order_refuses_descending() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let collection = db
+        .create_collection(
+            "points",
+            vec![("position".into(), Kind::Point)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.put(collection, "p0", &json!({"position": point(0.0, 0.0)}))
+        .unwrap();
+    db.commit().unwrap();
+    let index = db
+        .create_point_index(collection, "position", "position")
+        .unwrap();
+    finish_build(&mut db, index);
+
+    let err = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &[],
+            order: QueryOrder::Distance {
+                index,
+                center: Point::new(0.0, 0.0).unwrap(),
+                direction: SortDirection::Descending,
+            },
+            projection: Projection::Ids,
+            total_limit: Some(1),
+            driver: CandidateDriver::Auto,
+        })
+        .err()
+        .expect("prepare must be refused");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.to_ascii_lowercase().contains("descend")
+            || msg.to_ascii_lowercase().contains("ascending"),
+        "descending distance must be refused clearly, got {msg}"
+    );
+}
+
+/// (f) A deleted point never appears after delete, commit, checkpoint, reopen.
+#[test]
+fn distance_order_never_returns_a_deleted_point_after_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("db");
+    let mut db = Database::create(&path, cfg()).unwrap();
+    let collection = db
+        .create_collection(
+            "points",
+            vec![("position".into(), Kind::Point)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    let mut ids = Vec::new();
+    for n in 0..12 {
+        ids.push(
+            db.put(
+                collection,
+                &format!("p{n}"),
+                &json!({"position": point(n as f64 * 0.01, 0.0)}),
+            )
+            .unwrap(),
+        );
+    }
+    db.commit().unwrap();
+    let index = db
+        .create_point_index(collection, "position", "position")
+        .unwrap();
+    finish_build(&mut db, index);
+    let gone = ids[3];
+    db.delete(collection, "p3").unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+
+    let db = Database::open(&path, cfg()).unwrap();
+    let center = Point::new(0.0, 0.0).unwrap();
+    let (got, _, _, primary_reads) = drain_distance(
+        &db,
+        collection,
+        &[],
+        index,
+        center,
+        Some(12),
+        5,
+        CandidateDriver::Auto,
+    );
+    assert_eq!(primary_reads, 0);
+    assert!(!got.contains(&gone), "deleted point {gone:?} in {got:?}");
+    assert_eq!(got.len(), 11);
+}
+
+
+fn geom_json(g: &Geom) -> Value {
+    match g {
+        Geom::Point(x, y) => json!({"type": "Point", "coordinates": [x, y]}),
+        Geom::LineString(c) => json!({"type": "LineString", "coordinates": c}),
+        Geom::Polygon(rs) => json!({"type": "Polygon", "coordinates": rs}),
+        Geom::MultiPoint(c) => json!({"type": "MultiPoint", "coordinates": c}),
+        Geom::MultiLineString(rs) => json!({"type": "MultiLineString", "coordinates": rs}),
+        Geom::MultiPolygon(ps) => json!({"type": "MultiPolygon", "coordinates": ps}),
+    }
+}
+
+fn square(lon: f64, lat: f64, half: f64) -> Geom {
+    Geom::Polygon(vec![vec![
+        [lon - half, lat - half],
+        [lon + half, lat - half],
+        [lon + half, lat + half],
+        [lon - half, lat + half],
+        [lon - half, lat - half],
+    ]])
+}
+
+fn hoop(lon: f64, lat: f64, outer: f64, inner: f64) -> Geom {
+    Geom::Polygon(vec![
+        vec![
+            [lon - outer, lat - outer],
+            [lon + outer, lat - outer],
+            [lon + outer, lat + outer],
+            [lon - outer, lat + outer],
+            [lon - outer, lat - outer],
+        ],
+        vec![
+            [lon - inner, lat - inner],
+            [lon - inner, lat + inner],
+            [lon + inner, lat + inner],
+            [lon + inner, lat - inner],
+            [lon - inner, lat - inner],
+        ],
+    ])
+}
+
+fn geometry_predicate(row: &Geom, predicate: &GeometryFilter) -> bool {
+    match predicate {
+        GeometryFilter::Intersects(q) => spatial_geometry::intersects(row, q),
+        GeometryFilter::Within(q) => spatial_geometry::within(row, q),
+        GeometryFilter::Contains(q) => spatial_geometry::contains(row, q),
+        GeometryFilter::DWithin { geometry: q, metres } => {
+            spatial_geometry::dwithin_m(row, q, *metres)
+        }
+    }
+}
+
+fn drain_geometry(
+    db: &Database,
+    collection: CollectionId,
+    index: IndexId,
+    predicate: GeometryFilter,
+    order: QueryOrder<'_>,
+    page: usize,
+) -> Vec<EntityId> {
+    let filter = QueryFilter::Geometry {
+        index,
+        predicate,
+    };
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection,
+            filters: &[filter],
+            order,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let mut ids = Vec::new();
+    loop {
+        let result = prepared.next_page(page, QueryBudget::unlimited(), || false).unwrap();
+        ids.extend(result.rows.iter().map(|row| row.id));
+        if result.done || result.rows.is_empty() {
+            break;
+        }
+    }
+    ids
+}
+
+/// ~300 mixed geometries (points, lines, polygons with holes, multipolygons,
+/// a dateline crosser, and shapes that land on all three ladder levels).
+/// Every predicate against several query geometries returns exactly the
+/// brute-force `spatial_geometry` answer, under EntityId and Driver order,
+/// across page sizes 1/7/all with resume, and a deleted geometry is absent.
+#[test]
+fn geometry_filter_matches_a_spatial_geometry_brute_force_oracle() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let shapes = db
+        .create_collection(
+            "shapes",
+            vec![("shape".into(), Kind::Geo), ("born".into(), Kind::Int)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+
+    let mut rows: Vec<(EntityId, Geom)> = Vec::new();
+    let mut push = |db: &mut Database, key: String, geom: Geom, born: i64| {
+        let id = db
+            .put(
+                shapes,
+                &key,
+                &json!({"shape": geom_json(&geom), "born": born}),
+            )
+            .unwrap();
+        rows.push((id, geom));
+    };
+
+    // Fine-level points and tiny squares.
+    for i in 0..80u32 {
+        let lon = -10.0 + f64::from(i % 20) * 0.05;
+        let lat = -5.0 + f64::from(i / 20) * 0.05;
+        push(&mut db, format!("pt{i:03}"), Geom::Point(lon, lat), 1990 + i as i64);
+        push(
+            &mut db,
+            format!("sq{i:03}"),
+            square(lon + 0.2, lat + 0.2, 0.01),
+            2000 + i as i64,
+        );
+    }
+    // Lines.
+    for i in 0..20u32 {
+        let x = 1.0 + f64::from(i) * 0.1;
+        push(
+            &mut db,
+            format!("ln{i:03}"),
+            Geom::LineString(vec![[x, 2.0], [x + 0.05, 2.1], [x + 0.1, 2.0]]),
+            1980,
+        );
+    }
+    // Polygons with holes (coarse-ish).
+    for i in 0..20u32 {
+        push(
+            &mut db,
+            format!("ho{i:03}"),
+            hoop(20.0 + f64::from(i), 10.0, 0.4, 0.1),
+            1970,
+        );
+    }
+    // Medium squares that should drop to COARSE (a 1° box covers many fine cells).
+    for i in 0..20u32 {
+        push(
+            &mut db,
+            format!("md{i:03}"),
+            square(40.0 + f64::from(i) * 2.0, 0.0, 0.6),
+            1960,
+        );
+    }
+    // Multipolygons.
+    for i in 0..10u32 {
+        let a = square(-30.0 + f64::from(i), 15.0, 0.05);
+        let b = square(-29.0 + f64::from(i), 16.0, 0.05);
+        let Geom::Polygon(ra) = a else { unreachable!() };
+        let Geom::Polygon(rb) = b else { unreachable!() };
+        push(
+            &mut db,
+            format!("mp{i:03}"),
+            Geom::MultiPolygon(vec![ra, rb]),
+            1950,
+        );
+    }
+    // World-bucket: a wide continent-scale polygon and a dateline crosser.
+    push(
+        &mut db,
+        "world".into(),
+        square(0.0, 0.0, 40.0),
+        1940,
+    );
+    push(
+        &mut db,
+        "date".into(),
+        Geom::Polygon(vec![vec![
+            [170.0, 1.0],
+            [-170.0, 1.0],
+            [-170.0, 3.0],
+            [170.0, 3.0],
+            [170.0, 1.0],
+        ]]),
+        1930,
+    );
+    // One extra that will be deleted after the index is built.
+    let deleted = db
+        .put(
+            shapes,
+            "gone",
+            &json!({"shape": geom_json(&square(8.0, 8.0, 0.02)), "born": 1900}),
+        )
+        .unwrap();
+    db.commit().unwrap();
+
+    let index = db.create_geometry_index(shapes, "by_shape", "shape").unwrap();
+    db.build_index_to_ready(index, 32).unwrap();
+    db.commit().unwrap();
+    assert!(db.delete(shapes, "gone").unwrap());
+    db.commit().unwrap();
+    rows.retain(|(id, _)| *id != deleted);
+    assert_eq!(rows.len(), 80 * 2 + 20 + 20 + 20 + 10 + 2);
+
+    let queries: Vec<GeometryFilter> = vec![
+        GeometryFilter::Intersects(square(0.0, 0.0, 2.0)),
+        GeometryFilter::Within(square(0.0, 0.0, 12.0)),
+        GeometryFilter::Contains(Geom::Point(0.05, 0.05)),
+        GeometryFilter::DWithin {
+            geometry: Geom::Point(1.0, 2.05),
+            metres: 50_000.0,
+        },
+        GeometryFilter::Intersects(square(20.0, 10.0, 0.5)),
+        GeometryFilter::Intersects(Geom::Point(170.5, 2.0)),
+        GeometryFilter::Within(square(40.0, 0.0, 8.0)),
+        GeometryFilter::Contains(square(-10.0, -5.0, 0.001)),
+    ];
+
+    for predicate in &queries {
+        let mut expected: Vec<EntityId> = rows
+            .iter()
+            .filter(|(_, g)| geometry_predicate(g, predicate))
+            .map(|(id, _)| *id)
+            .collect();
+        expected.sort();
+        for order in [QueryOrder::EntityId, QueryOrder::Driver] {
+            for page in [1usize, 7, 8192] {
+                let mut got = drain_geometry(&db, shapes, index, predicate.clone(), order, page);
+                if matches!(order, QueryOrder::EntityId) {
+                    // Driver order is (level, cell, seq); EntityId is id order.
+                    got.sort();
+                    assert_eq!(
+                        got, expected,
+                        "mismatch order={order:?} page={page} predicate={predicate:?}"
+                    );
+                } else {
+                    let mut sorted = got.clone();
+                    sorted.sort();
+                    assert_eq!(
+                        sorted, expected,
+                        "driver-order set mismatch page={page} predicate={predicate:?}"
+                    );
+                    // Resume must not duplicate.
+                    let unique = got.len();
+                    got.sort();
+                    got.dedup();
+                    assert_eq!(got.len(), unique, "driver-order page={page} duplicated an entity");
+                }
+            }
+        }
+    }
+}
+
+/// A geometry filter combined with a born range (C1 membership set) and with
+/// a text driver (geometry as a non-driving predicate).
+#[test]
+fn geometry_filter_combines_with_a_born_range_and_a_text_driver() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let rows_c = db
+        .create_collection(
+            "combo",
+            vec![
+                ("shape".into(), Kind::Geo),
+                ("born".into(), Kind::Int),
+                ("tag".into(), Kind::Text),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    let mut stored = Vec::new();
+    for i in 0..80u32 {
+        let geom = square(f64::from(i) * 0.02, 0.0, 0.005);
+        let born = 1990 + (i as i64 % 20);
+        let tag = if i % 3 == 0 { "alpha" } else { "beta" };
+        let id = db
+            .put(
+                rows_c,
+                &format!("r{i:03}"),
+                &json!({"shape": geom_json(&geom), "born": born, "tag": tag}),
+            )
+            .unwrap();
+        stored.push((id, geom, born, tag));
+    }
+    db.commit().unwrap();
+    let geo = db.create_geometry_index(rows_c, "by_shape", "shape").unwrap();
+    db.build_index_to_ready(geo, 16).unwrap();
+    let born = db.create_scalar_index(rows_c, "by_born", "born", false).unwrap();
+    db.build_index_to_ready(born, 16).unwrap();
+    let text = db.create_text_index(rows_c, "by_tag", "tag").unwrap();
+    db.build_index_to_ready(text, 16).unwrap();
+    db.commit().unwrap();
+
+    let window = square(0.4, 0.0, 0.3);
+    let geo_filter = QueryFilter::Geometry {
+        index: geo,
+        predicate: GeometryFilter::Intersects(window.clone()),
+    };
+    let born_filter = QueryFilter::Scalar {
+        index: born,
+        predicate: ScalarFilter::Range {
+            lower: std::ops::Bound::Included(ScalarValue::I64(1995)),
+            upper: std::ops::Bound::Excluded(ScalarValue::I64(2005)),
+        },
+    };
+    let mut expected: Vec<EntityId> = stored
+        .iter()
+        .filter(|(_, g, b, _)| {
+            spatial_geometry::intersects(g, &window) && *b >= 1995 && *b < 2005
+        })
+        .map(|(id, _, _, _)| *id)
+        .collect();
+    expected.sort();
+
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection: rows_c,
+            filters: &[geo_filter, born_filter],
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let page = prepared
+        .next_page(8192, QueryBudget::unlimited(), || false)
+        .unwrap();
+    let mut got: Vec<_> = page.rows.iter().map(|r| r.id).collect();
+    got.sort();
+    assert_eq!(got, expected);
+    // C1: the born range is a membership set, so it must not add a primary
+    // read on top of the geometry refine.
+    assert!(
+        page.work.primary_reads <= page.work.candidates,
+        "born range added extra rows: {:?}",
+        page.work
+    );
+
+    let text_filter = QueryFilter::Text {
+        index: text,
+        query: "alpha",
+        matching: TextMatch::Any,
+    };
+    let geo_nd = QueryFilter::Geometry {
+        index: geo,
+        predicate: GeometryFilter::Intersects(window.clone()),
+    };
+    let mut expected_text: Vec<EntityId> = stored
+        .iter()
+        .filter(|(_, g, _, tag)| *tag == "alpha" && spatial_geometry::intersects(g, &window))
+        .map(|(id, _, _, _)| *id)
+        .collect();
+    expected_text.sort();
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection: rows_c,
+            filters: &[text_filter, geo_nd],
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Filter(0),
+        })
+        .unwrap();
+    let page = prepared
+        .next_page(8192, QueryBudget::unlimited(), || false)
+        .unwrap();
+    assert_eq!(page.driver, QueryDriver::Text(text));
+    let mut got: Vec<_> = page.rows.iter().map(|r| r.id).collect();
+    got.sort();
+    assert_eq!(got, expected_text);
+}
+
+/// Unsupported shapes are refused with a clear error: a Geo field with no
+/// geometry index, and a Point index given a Geometry filter.
+#[test]
+fn geometry_filter_refuses_a_missing_index_and_a_point_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let rows = db
+        .create_collection(
+            "g",
+            vec![
+                ("shape".into(), Kind::Geo),
+                ("pt".into(), Kind::Point),
+                ("n".into(), Kind::Int),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    db.put(
+        rows,
+        "a",
+        &json!({
+            "shape": geom_json(&square(0.0, 0.0, 0.1)),
+            "pt": {"type": "Point", "coordinates": [0.0, 0.0]},
+            "n": 1,
+        }),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    let scalar = db.create_scalar_index(rows, "by_n", "n", false).unwrap();
+    db.build_index_to_ready(scalar, 8).unwrap();
+    let point = db.create_point_index(rows, "by_pt", "pt").unwrap();
+    db.build_index_to_ready(point, 8).unwrap();
+    db.commit().unwrap();
+
+    let query = Geom::Point(0.0, 0.0);
+    let err = db
+        .prepare_query(QueryRequest {
+            collection: rows,
+            filters: &[QueryFilter::Geometry {
+                index: scalar,
+                predicate: GeometryFilter::Intersects(query.clone()),
+            }],
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .err()
+        .expect("prepare must be refused");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("spatial geometry") || msg.contains("Geometry"),
+        "geo field without a geometry index must be refused clearly: {msg}"
+    );
+
+    let err = db
+        .prepare_query(QueryRequest {
+            collection: rows,
+            filters: &[QueryFilter::Geometry {
+                index: point,
+                predicate: GeometryFilter::Intersects(query),
+            }],
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .err()
+        .expect("prepare must be refused");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not a point index") || msg.contains("spatial geometry"),
+        "a Point index given a Geometry filter must be refused clearly: {msg}"
     );
 }
