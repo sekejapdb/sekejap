@@ -218,6 +218,17 @@ pub fn point_hilbert(point: Point) -> u64 {
 /// sorted, merged, inclusive, and within the persisted 32-bit Hilbert space.
 /// If the split covers cannot fit the fixed budget, the world range is used.
 pub fn bounds_hilbert_ranges(bounds: Bounds) -> Vec<(u64, u64)> {
+    bounds_hilbert_ranges_bounded(bounds, MAX_HILBERT_RANGES)
+}
+
+/// [`bounds_hilbert_ranges`] with its own range budget. A predicate wants a
+/// tight cover (the default budget), because every covered posting outside
+/// the box is examined and thrown away; an outward nearest-neighbour ring
+/// wants a COARSE cover, because each range is a tree descent and a small
+/// ring is dominated by seeks, not by postings. The budget is clamped to the
+/// default; the world fallback rules are unchanged.
+pub fn bounds_hilbert_ranges_bounded(bounds: Bounds, max_ranges: usize) -> Vec<(u64, u64)> {
+    let max_ranges = max_ranges.clamp(4, MAX_HILBERT_RANGES);
     if bounds.is_world() {
         return world_range();
     }
@@ -246,7 +257,7 @@ pub fn bounds_hilbert_ranges(bounds: Bounds) -> Vec<(u64, u64)> {
             bounds.south,
             bounds.north,
             HILBERT_BITS,
-            MAX_HILBERT_RANGES,
+            max_ranges,
         ));
         if ranges.len() > MAX_HILBERT_RANGES.saturating_mul(2) {
             return world_range();
