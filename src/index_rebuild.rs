@@ -485,6 +485,7 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
             IndexFamily::ExactVector => vector_indexes::VECTOR_FEATURE,
             IndexFamily::QuantizedVector => quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE,
             IndexFamily::SpatialPoint => spatial_indexes::SPATIAL_FEATURE,
+            IndexFamily::SpatialGeometry => spatial_geometry_indexes::GEOMETRY_FEATURE,
             IndexFamily::Text => text_indexes::TEXT_FEATURE,
         };
         if !header
@@ -664,6 +665,7 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
                 | 0x79
                 | 0x7a
                 | 0x7b
+                | 0x7c
         ) {
             return Err(Error::Unsupported(format!(
                 "index rebuild does not understand key tag {tag:#x}"

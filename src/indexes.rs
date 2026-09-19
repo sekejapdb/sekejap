@@ -76,6 +76,7 @@ pub enum IndexFamily {
     SpatialPoint,
     Text,
     QuantizedVector,
+    SpatialGeometry,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct IndexInfo {
@@ -210,6 +211,22 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
             b.push(st);
             b.extend(cursor.to_be_bytes());
         }
+        IndexFamily::SpatialGeometry => {
+            if i.kind != Kind::Geo || i.unique {
+                return Err(invalid(
+                    "spatial geometry index requires a non-unique Geo field",
+                ));
+            }
+            b.push(6);
+            b.extend(i.encoding_version.to_be_bytes());
+            b.push(super::spatial_geometry_indexes::LEVEL_FINE);
+            b.push(super::spatial_geometry_indexes::LEVEL_COARSE);
+            b.push(super::spatial_geometry_indexes::LEVEL_WORLD);
+            b.push(super::spatial_geometry_indexes::MAX_CELLS);
+            b.push(0); // reserved geometry options
+            b.push(st);
+            b.extend(cursor.to_be_bytes());
+        }
         IndexFamily::SpatialPoint => {
             if i.kind != Kind::Point || i.unique {
                 return Err(invalid(
@@ -280,6 +297,7 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
         (3, 1 | 2) => IndexFamily::SpatialPoint,
         (4, 1) => IndexFamily::Text,
         (5, 1) => IndexFamily::QuantizedVector,
+        (6, 1) => IndexFamily::SpatialGeometry,
         _ => {
             return Err(Error::Unsupported(format!(
                 "index family {} encoding {version}",
@@ -316,6 +334,22 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
                 return Err(Error::Unsupported("exact vector index options".into()));
             }
             (Kind::Vector(dimension), false, 20, 21, 29)
+        }
+        IndexFamily::SpatialGeometry => {
+            if b.len() < 29 {
+                return Err(corrupt("short spatial geometry index descriptor"));
+            }
+            if b[15] != super::spatial_geometry_indexes::LEVEL_FINE
+                || b[16] != super::spatial_geometry_indexes::LEVEL_COARSE
+                || b[17] != super::spatial_geometry_indexes::LEVEL_WORLD
+                || b[18] != super::spatial_geometry_indexes::MAX_CELLS
+                || b[19] != 0
+            {
+                return Err(Error::Unsupported(
+                    "spatial geometry ladder/cell-budget/options".into(),
+                ));
+            }
+            (Kind::Geo, false, 20, 21, 29)
         }
         IndexFamily::SpatialPoint => {
             if b.len() < 28 {
@@ -478,6 +512,13 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
         {
             return Err(corrupt(
                 "quantized vector descriptor without feature admission",
+            ));
+        }
+        if i.family == IndexFamily::SpatialGeometry
+            && h.features & super::spatial_geometry_indexes::GEOMETRY_FEATURE == 0
+        {
+            return Err(corrupt(
+                "spatial geometry descriptor without feature admission",
             ));
         }
         if i.tree.is_some() && h.features & INDEX_TREE_FEATURE == 0 {
@@ -651,6 +692,14 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
                 return Err(corrupt(
                     "quantized vector entries without feature admission",
                 ));
+            }
+        }
+    }
+    if !h.is_some_and(|header| header.features & super::spatial_geometry_indexes::GEOMETRY_FEATURE != 0) {
+        if let Some(row) = s.range(&[super::spatial_geometry_indexes::GEOM_ENTRY])?.next() {
+            let (key, _) = row?;
+            if key.first() == Some(&super::spatial_geometry_indexes::GEOM_ENTRY) {
+                return Err(corrupt("spatial geometry entries without feature admission"));
             }
         }
     }
@@ -970,6 +1019,10 @@ impl Database {
                 super::spatial_indexes::maintain_point(self, &mut i, id, old, new)?;
                 continue;
             }
+            if i.family == IndexFamily::SpatialGeometry {
+                super::spatial_geometry_indexes::maintain_geometry(self, &mut i, id, old, new)?;
+                continue;
+            }
             if i.family == IndexFamily::Text {
                 super::text_indexes::maintain_text(self, &i, id, old, new)?;
                 continue;
@@ -1039,6 +1092,7 @@ impl Database {
             ExactVector(Option<[u8; 6]>),
             QuantizedVector(Option<Vec<u8>>),
             SpatialPoint(Option<super::spatial_indexes::PointEntry>),
+            SpatialGeometry(Vec<super::spatial_geometry_indexes::GeometryEntry>),
             Text(Option<crate::text_analyzer::Analysis>),
         }
         self.ready_write()?;
@@ -1087,6 +1141,9 @@ impl Database {
                 ),
                 IndexFamily::SpatialPoint => BuiltEntry::SpatialPoint(
                     super::spatial_indexes::build_point_entry(self, &i, eid, &value)?,
+                ),
+                IndexFamily::SpatialGeometry => BuiltEntry::SpatialGeometry(
+                    super::spatial_geometry_indexes::build_geometry_entries(self, &i, eid, &value)?,
                 ),
                 IndexFamily::Text => {
                     BuiltEntry::Text(super::text_indexes::analyze_row_bytes(self, &i, &value)?)
@@ -1151,6 +1208,11 @@ impl Database {
                         self.index_put(&mut i, &point.key, &point.value)?
                     }
                     BuiltEntry::SpatialPoint(None) => {}
+                    BuiltEntry::SpatialGeometry(entries) => {
+                        for entry in entries {
+                            self.index_put(&mut i, &entry.key, &entry.value)?;
+                        }
+                    }
                     // Text is written above, one whole chunk at a time.
                     BuiltEntry::Text(_) => unreachable!(),
                 }
@@ -1431,7 +1493,7 @@ impl Database {
         }
         let family = self.index_info(id)?.family;
         let sorted = match family {
-            IndexFamily::Scalar | IndexFamily::SpatialPoint => true,
+            IndexFamily::Scalar | IndexFamily::SpatialPoint | IndexFamily::SpatialGeometry => true,
             // A text index can only be packed from a clean slate; otherwise
             // the chunked head-row builder finishes it.
             IndexFamily::Text => {
@@ -1532,6 +1594,13 @@ impl Database {
                         super::spatial_indexes::build_point_entry(self, &i, eid, row)?
                     {
                         sorter.push(point.key, point.value.to_vec())?;
+                    }
+                }
+                IndexFamily::SpatialGeometry => {
+                    for entry in
+                        super::spatial_geometry_indexes::build_geometry_entries(self, &i, eid, row)?
+                    {
+                        sorter.push(entry.key, entry.value.to_vec())?;
                     }
                 }
                 _ => unreachable!(),
@@ -1769,6 +1838,7 @@ impl Database {
                 IndexFamily::ExactVector => super::vector_indexes::locator_prefix(id),
                 IndexFamily::QuantizedVector => super::quantized_vector_indexes::entry_prefix(id),
                 IndexFamily::SpatialPoint => super::spatial_indexes::posting_prefix(id),
+                IndexFamily::SpatialGeometry => super::spatial_geometry_indexes::posting_prefix(id),
                 IndexFamily::Text => unreachable!(),
             };
             let mut keys = Vec::new();
@@ -1993,6 +2063,34 @@ mod codec_tests {
         for payload_offset in [19, 20] {
             let mut future = encoded.clone();
             future[10 + payload_offset] = 2;
+            let n = future.len();
+            let crc = crc32c::crc32c(&future[..n - 4]).to_le_bytes();
+            future[n - 4..].copy_from_slice(&crc);
+            assert!(matches!(decode(&future), Err(Error::Unsupported(_))));
+        }
+    }
+
+    #[test]
+    fn spatial_geometry_descriptor_pins_ladder_and_cell_budget() {
+        let info = IndexInfo {
+            id: IndexId(8),
+            collection: CollectionId(4),
+            name: "by_shape".into(),
+            field: "shape".into(),
+            family: IndexFamily::SpatialGeometry,
+            kind: Kind::Geo,
+            unique: false,
+            state: IndexState::Building { after: 7 },
+            encoding_version: 1,
+            tree: None,
+        };
+        let encoded = encode(&info).unwrap();
+        assert_eq!(decode(&encoded).unwrap(), info);
+        // Any of the ladder/cell-budget/reserved bytes moving is a future,
+        // incompatible layout: refused whole, never silently reinterpreted.
+        for payload_offset in [15, 16, 17, 18, 19] {
+            let mut future = encoded.clone();
+            future[10 + payload_offset] = 0xff;
             let n = future.len();
             let crc = crc32c::crc32c(&future[..n - 4]).to_le_bytes();
             future[n - 4..].copy_from_slice(&crc);

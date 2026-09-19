@@ -738,6 +738,7 @@ pub fn verify_indexed_source(
                         quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE
                     }
                     IndexFamily::SpatialPoint => spatial_indexes::SPATIAL_FEATURE,
+                    IndexFamily::SpatialGeometry => spatial_geometry_indexes::GEOMETRY_FEATURE,
                     IndexFamily::Text => text_indexes::TEXT_FEATURE,
                 };
                 if header.features & required == 0 {
@@ -856,6 +857,7 @@ pub fn verify_indexed_source(
                     | 0x79
                     | 0x7a
                     | 0x7b
+                    | 0x7c
             )
         );
         if !known {
@@ -864,7 +866,7 @@ pub fn verify_indexed_source(
                 key.first()
             )));
         }
-        let Some(tag @ (0x70 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7b)) =
+        let Some(tag @ (0x70 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7b | 0x7c)) =
             key.first().copied()
         else {
             return Ok(());
@@ -876,6 +878,7 @@ pub fn verify_indexed_source(
             0x73 => IndexFamily::ExactVector,
             0x74 => IndexFamily::SpatialPoint,
             0x79 => IndexFamily::QuantizedVector,
+            0x7c => IndexFamily::SpatialGeometry,
             _ => IndexFamily::Text,
         };
         match indexes.iter().find(|index| index.id == id) {
@@ -1288,6 +1291,29 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
                 }
             }
         }
+        IndexFamily::SpatialGeometry => {
+            let f = field(l, row, &i.field)?;
+            if let crate::dense_v3::FieldValue::Inline(v) = f {
+                let mut doc = serde_json::Map::new();
+                doc.insert(i.field.clone(), v);
+                if let Some(g) =
+                    spatial_geometry_indexes::selected_geometry(&Value::Object(doc), &i.field)?
+                {
+                    for e in spatial_geometry_indexes::geometry_entries(i, id, &g)? {
+                        let a = run.read_index(i, &e.key)?;
+                        run.mismatch(
+                            IssueClass::Derived,
+                            &e.key,
+                            Some(i.id),
+                            Some(id),
+                            a.as_deref(),
+                            Some(&e.value),
+                            "spatial geometry posting",
+                        )?;
+                    }
+                }
+            }
+        }
         IndexFamily::Text => {
             let f = field(l, row, &i.field)?;
             if let crate::dense_v3::FieldValue::Inline(Value::String(text)) = f {
@@ -1645,6 +1671,57 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
                         Some(value),
                         good.then_some(value),
                         "extra/mismatched spatial posting",
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        IndexFamily::SpatialGeometry => {
+            let p = spatial_geometry_indexes::posting_prefix(i.id);
+            let end = prefix_end(&p);
+            let source = run.reader.clone();
+            visit_index(&source, i, &p, end.as_deref(), |key, value| {
+                run.row(true)?;
+                let (_, _, seq, _) = match spatial_geometry_indexes::decode_posting(&p, key, value) {
+                    Ok(decoded) => decoded,
+                    Err(_) => {
+                        run.issue(VerificationIssue {
+                            class: IssueClass::Derived,
+                            kind: IssueKind::Malformed,
+                            key: key.to_vec(),
+                            index: Some(i.id),
+                            entity: None,
+                            message: "spatial geometry posting key/value is malformed".into(),
+                        })?;
+                        return Ok(());
+                    }
+                };
+                if let Some((id, l, row)) = primary_field(run, i, seq)? {
+                    let f = field(&l, &row, &i.field)?;
+                    let expected_entries = if let crate::dense_v3::FieldValue::Inline(v) = f {
+                        let mut d = serde_json::Map::new();
+                        d.insert(i.field.clone(), v);
+                        match spatial_geometry_indexes::selected_geometry(
+                            &Value::Object(d),
+                            &i.field,
+                        )? {
+                            Some(g) => spatial_geometry_indexes::geometry_entries(i, id, &g)?,
+                            None => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let good = expected_entries
+                        .iter()
+                        .any(|e| e.key == key && e.value.as_slice() == value);
+                    run.mismatch(
+                        IssueClass::Derived,
+                        key,
+                        Some(i.id),
+                        Some(id),
+                        Some(value),
+                        good.then_some(value),
+                        "extra/mismatched spatial geometry posting",
                     )?;
                 }
                 Ok(())

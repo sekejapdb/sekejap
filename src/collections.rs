@@ -66,6 +66,8 @@ mod quantized_vector_indexes;
 mod query;
 #[path = "index_rebuild.rs"]
 pub mod rebuild;
+#[path = "spatial_geometry_indexes.rs"]
+mod spatial_geometry_indexes;
 #[path = "spatial_indexes.rs"]
 mod spatial_indexes;
 #[path = "text_indexes.rs"]
@@ -479,7 +481,8 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | text_indexes::TEXT_FEATURE
     | text_indexes::segments::SEGMENT_FEATURE
     | quantized_vector_indexes::QUANTIZED_VECTOR_FEATURE
-    | indexes::INDEX_TREE_FEATURE;
+    | indexes::INDEX_TREE_FEATURE
+    | spatial_geometry_indexes::GEOMETRY_FEATURE;
 fn header_bytes(h: HeaderInfo) -> Result<Vec<u8>> {
     let mut payload = h.next_collection.to_be_bytes().to_vec();
     payload.extend_from_slice(&h.next_layout.to_be_bytes());
@@ -2072,7 +2075,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0xff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1ff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -2093,13 +2096,13 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0xff
+            0x1ff
         );
         // One bit past the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x100)),
-            Err(Error::Unsupported(m)) if m.contains("0x1ff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x200)),
+            Err(Error::Unsupported(m)) if m.contains("0x3ff")
         ));
     }
 }
