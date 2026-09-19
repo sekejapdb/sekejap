@@ -447,6 +447,89 @@ enum EncodedBound {
     Unbounded,
 }
 
+/// One non-driving scalar RANGE filter's posting range, walked ONCE and kept
+/// for the rest of the query's pages.
+///
+/// An equality filter already answers a non-driving candidate from its own
+/// posting (`scalar_eq_posting_matches`): the key `value || entity` is known,
+/// so testing it costs one point read. A range predicate cannot do that --
+/// the candidate's value is unknown until something reads it -- so the walk
+/// this holds is the index-side answer Postgres gets from a bitmap AND of two
+/// posting lists: every entity the range's own postings prove, collected
+/// once, so a candidate afterwards is a binary search instead of a primary
+/// read.
+#[derive(Clone, Debug)]
+enum ScalarRangeSet {
+    /// This position is not a candidate for the optimization: not a Range
+    /// predicate, or the position driving the query (whose own walk already
+    /// answers it for free).
+    Ineligible,
+    /// Eligible, but no page has walked it yet.
+    Unbuilt,
+    /// The range's own collection span (every sequence it could ever name) is
+    /// too wide for even a bitmap to fit the budget, or the walk found more
+    /// entities than the plain-Vec cap allows while a bitmap was not a viable
+    /// fallback either. Named sacrifice (Law 4): a range wide enough to fail
+    /// this budget gets no faster than it already was -- every candidate
+    /// still reads its row -- rather than holding an unbounded set in memory.
+    Overflow,
+    /// Every entity SEQUENCE the posting range proved, ascending, so
+    /// `binary_search` answers membership. Chosen over a bitmap when the
+    /// range is narrow enough, in a large enough collection, that the Vec is
+    /// the smaller of the two -- e.g. one day out of decades of `born`
+    /// values.
+    Ids(Vec<u64>),
+    /// One bit per sequence in `1..=collection_span`, set for every entity
+    /// SEQUENCE the posting range proved. Chosen once the Vec representation
+    /// would be bigger than this: unlike the Vec, setting a bit costs no sort
+    /// and no allocation growth once the bitmap is sized, so a wide range
+    /// (e.g. a whole decade of `born`) is one linear pass, no CPU cost from
+    /// the postings count once past the initial allocation.
+    Bitmap(Vec<u8>),
+}
+
+/// How many entity ids one [`ScalarRangeSet`] may hold as a plain `Vec`
+/// before it is either converted to a [`ScalarRangeSet::Bitmap`] (when one
+/// would fit the budget) or abandoned as [`ScalarRangeSet::Overflow`] (when
+/// even a bitmap would not), in the same currency [`RUN_BYTES`] already
+/// bounds a held run in: both are memory one page keeps beyond what it
+/// returns this call.
+///
+/// This is also the ceiling used when a bitmap is not viable at all (the
+/// collection's span alone would need more than `RUN_BYTES` of bits) -- the
+/// same cap the Vec-only design used before bitmaps existed, so a collection
+/// too large even for a bitmap degrades to exactly that prior behaviour
+/// rather than something new.
+const SCALAR_RANGE_SET_CAP: usize = RUN_BYTES / std::mem::size_of::<u64>();
+
+/// A bitmap large enough to need more than this many bytes is not a viable
+/// [`ScalarRangeSet::Bitmap`]: `RUN_BYTES` is the same per-page memory
+/// currency the Vec cap above is drawn from. One bit per sequence, so a
+/// collection whose span exceeds `8 * RUN_BYTES` sequences (about 67
+/// million entities) never gets a bitmap here, whatever the range's own
+/// selectivity.
+const SCALAR_RANGE_BITMAP_CAP_BYTES: usize = RUN_BYTES;
+
+/// The number of bytes a bitmap covering sequences `1..=span` would need.
+fn scalar_range_bitmap_bytes(span: u64) -> u64 {
+    span.div_ceil(8)
+}
+
+/// Sets the bit for `sequence` (1-based, as every allocated entity sequence
+/// is) in a bitmap sized by [`scalar_range_bitmap_bytes`].
+fn scalar_range_bitmap_set(bits: &mut [u8], sequence: u64) {
+    let index = (sequence - 1) as usize;
+    bits[index / 8] |= 1 << (index % 8);
+}
+
+/// Tests the bit for `sequence` (1-based). A sequence at or past the
+/// bitmap's span was never allocated when the bitmap was built and so was
+/// never set -- `false`, not a panic or an out-of-bounds read.
+fn scalar_range_bitmap_contains(bits: &[u8], sequence: u64) -> bool {
+    let index = (sequence - 1) as usize;
+    bits.get(index / 8).is_some_and(|byte| byte & (1 << (index % 8)) != 0)
+}
+
 #[derive(Clone, Debug)]
 enum CompiledFilter {
     Scalar {
@@ -953,6 +1036,9 @@ pub struct PreparedQuery<'db> {
     /// was, emptying the run is not the end of the answer and the next page
     /// walks again, from the last row handed out.
     run_bounded: bool,
+    /// One [`ScalarRangeSet`] per filter position, built at most once and
+    /// reused by every page and by resume -- see `ensure_scalar_range_sets`.
+    scalar_ranges: Vec<ScalarRangeSet>,
 }
 
 fn invalid_query(message: impl fmt::Display) -> QueryError {
@@ -1694,6 +1780,22 @@ impl Database {
             }
         }
 
+        // A non-driving RANGE filter's candidate's value is unknown until
+        // something reads it -- unlike an equality filter, its posting alone
+        // cannot answer one candidate at a time. `ensure_scalar_range_sets`
+        // walks it once instead, on first use, and every position marked here
+        // is what that walk fills in.
+        let mut scalar_ranges = filters.iter().map(|_| ScalarRangeSet::Ineligible).collect::<Vec<_>>();
+        for (position, filter) in filters.iter().enumerate() {
+            if let CompiledFilter::Scalar { predicate, .. } = filter {
+                if matches!(predicate, EncodedScalarFilter::Range { .. })
+                    && scalar_driver_position != Some(position)
+                {
+                    scalar_ranges[position] = ScalarRangeSet::Unbuilt;
+                }
+            }
+        }
+
         // Which scorers may read the frequencies the text driver decodes.
         //
         // Decided once, here, by comparing term lists -- not per candidate,
@@ -1732,6 +1834,7 @@ impl Database {
             after: None,
             run: Vec::new(),
             run_bounded: false,
+            scalar_ranges,
         })
     }
 }
@@ -3485,6 +3588,7 @@ fn read_batch_rows<'a, C: FnMut() -> bool>(
     db: &'a Database,
     rows: &mut PrimaryRows<'a>,
     filters: &[CompiledFilter],
+    ranges: &[ScalarRangeSet],
     keep_rows: bool,
     batch: &mut [Candidate],
     order: &mut Vec<(u64, u32)>,
@@ -3523,7 +3627,7 @@ fn read_batch_rows<'a, C: FnMut() -> bool>(
             let Some(bytes) = bytes else {
                 return Ok((None, None));
             };
-            let verdict = batch_filters_match(db, filters, satisfied, bytes, scratch, meter)?;
+            let verdict = batch_filters_match(db, filters, ranges, satisfied, id, bytes, scratch, meter)?;
             let kept = if keep_rows && verdict != Some(false) && held < ROW_BATCH_BYTES {
                 Some(bytes.to_vec())
             } else {
@@ -3552,7 +3656,9 @@ fn read_batch_rows<'a, C: FnMut() -> bool>(
 fn batch_filters_match<C: FnMut() -> bool>(
     db: &Database,
     filters: &[CompiledFilter],
+    ranges: &[ScalarRangeSet],
     satisfied: Option<usize>,
+    id: EntityId,
     bytes: &[u8],
     scratch: &mut RowScratch,
     meter: &mut WorkMeter<'_, C>,
@@ -3568,18 +3674,22 @@ fn batch_filters_match<C: FnMut() -> bool>(
                 info,
                 predicate,
                 posting_membership,
-            } => {
-                if *posting_membership && matches!(predicate, EncodedScalarFilter::Eq(_)) {
-                    return Ok(None);
+            } => match &ranges[position] {
+                ScalarRangeSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
+                ScalarRangeSet::Bitmap(bits) => scalar_range_bitmap_contains(bits, id.sequence),
+                _ => {
+                    if *posting_membership && matches!(predicate, EncodedScalarFilter::Eq(_)) {
+                        return Ok(None);
+                    }
+                    meter.note_row_decode();
+                    scalar_filter_matches(
+                        info,
+                        predicate,
+                        selected_field_in(&layout, bytes, &info.field)?,
+                        &mut scratch.scalar,
+                    )?
                 }
-                meter.note_row_decode();
-                scalar_filter_matches(
-                    info,
-                    predicate,
-                    selected_field_in(&layout, bytes, &info.field)?,
-                    &mut scratch.scalar,
-                )?
-            }
+            },
             CompiledFilter::JsonEq { field, value } => {
                 meter.note_row_decode();
                 json_filter_matches(selected_field_in(&layout, bytes, field)?, value)?
@@ -3724,6 +3834,111 @@ fn scalar_eq_posting_matches<C: FnMut() -> bool>(
         Some(value) if value.is_empty() => Ok(true),
         Some(_) => Err(corrupt_query("scalar index entry")),
     }
+}
+
+/// Walk one non-driving scalar RANGE's postings once and collect every
+/// entity SEQUENCE it proves, ascending.
+///
+/// Same shape as `ScalarCursor::next`'s own forward walk -- open at the
+/// predicate's lower bound, stop the first key `scalar_key_position` puts
+/// past the upper one -- but with no candidate to build and no direction to
+/// choose: this collects the whole range instead of stopping at a page size.
+/// The nullish entry a NULL and a MISSING field share is excluded exactly as
+/// `proves_predicate` excludes it there, so a set this returns answers a
+/// range predicate exactly as `scalar_filter_matches` answers it from the row
+/// -- neither ever matches null or missing.
+///
+/// `Overflow` abandons whatever it collected rather than handing back a
+/// partial set: a binary search over less than the whole range would answer
+/// "not found" for members the row-read path would have kept.
+fn build_scalar_range_set<C: FnMut() -> bool>(
+    db: &Database,
+    info: &IndexInfo,
+    predicate: &EncodedScalarFilter,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<ScalarRangeSet> {
+    let prefix = scalar_prefix(info.id);
+    let mut start = prefix.clone();
+    if let Some(lower) = scalar_lower(predicate) {
+        start.extend_from_slice(lower);
+    }
+    let mut walk = match db.index_range(info, &start).map_err(QueryError::from)? {
+        Some(iter) => iter,
+        None => return Ok(ScalarRangeSet::Ids(Vec::new())),
+    };
+    // The collection's span bounds a bitmap without a scan: every sequence a
+    // posting in this walk can name is below it. A Vec is kept only while it
+    // would stay smaller than that bitmap; once it would not, converting
+    // loses nothing (every id collected so far still fits the bitmap by
+    // construction) and every posting after that is one bit, not a growing
+    // allocation. When the bitmap itself would not fit the budget, `vec_cap`
+    // falls back to the plain per-element cap the Vec-only design used, and
+    // the walk is abandoned exactly as it was before bitmaps existed.
+    let span = db.collection_span(info.collection).map_err(QueryError::from)?;
+    let bitmap_bytes = scalar_range_bitmap_bytes(span);
+    let bitmap_viable = bitmap_bytes <= SCALAR_RANGE_BITMAP_CAP_BYTES as u64;
+    let vec_cap = if bitmap_viable {
+        (bitmap_bytes / std::mem::size_of::<u64>() as u64) as usize
+    } else {
+        SCALAR_RANGE_SET_CAP
+    };
+    let mut ids: Vec<u64> = Vec::new();
+    let mut bits: Option<Vec<u8>> = None;
+    loop {
+        meter.check_cancelled()?;
+        meter.charge(WorkResource::ScalarPostings, 1)?;
+        let sequence = {
+            let Some((key, value)) = walk.peek_ref().map_err(Error::from).map_err(QueryError::from)?
+            else {
+                break;
+            };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let suffix = &key[prefix.len()..];
+            let value_len = scalar_key::width(&info.kind, suffix)?;
+            let encoded = suffix
+                .get(..value_len)
+                .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
+            match scalar_key_position(predicate, encoded) {
+                Ordering::Greater => break,
+                Ordering::Less => None,
+                Ordering::Equal if encoded == NULLISH_SCALAR_KEY => None,
+                Ordering::Equal => {
+                    let mut at = prefix.len() + value_len;
+                    let sequence = read_ordered(key, &mut at)?;
+                    if at != key.len() || sequence == 0 || !value.is_empty() {
+                        return Err(corrupt_query("scalar index entry"));
+                    }
+                    Some(sequence)
+                }
+            }
+        };
+        walk.step();
+        if let Some(sequence) = sequence {
+            match bits.as_mut() {
+                Some(bits) => scalar_range_bitmap_set(bits, sequence),
+                None if ids.len() == vec_cap => {
+                    if !bitmap_viable {
+                        return Ok(ScalarRangeSet::Overflow);
+                    }
+                    let mut fresh = vec![0u8; bitmap_bytes as usize];
+                    for &s in &ids {
+                        scalar_range_bitmap_set(&mut fresh, s);
+                    }
+                    scalar_range_bitmap_set(&mut fresh, sequence);
+                    ids = Vec::new();
+                    bits = Some(fresh);
+                }
+                None => ids.push(sequence),
+            }
+        }
+    }
+    if let Some(bits) = bits {
+        return Ok(ScalarRangeSet::Bitmap(bits));
+    }
+    ids.sort_unstable();
+    Ok(ScalarRangeSet::Ids(ids))
 }
 
 fn number_parts(number: &serde_json::Number) -> std::result::Result<i128, f64> {
@@ -4158,6 +4373,7 @@ fn filters_match<'a, C: FnMut() -> bool>(
     db: &'a Database,
     rows: &mut PrimaryRows<'a>,
     filters: &[CompiledFilter],
+    ranges: &[ScalarRangeSet],
     candidate: &Candidate,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
@@ -4176,25 +4392,29 @@ fn filters_match<'a, C: FnMut() -> bool>(
                 info,
                 predicate,
                 posting_membership,
-            } => match (
-                *posting_membership,
-                predicate,
-                row.is_none() && encoded.is_none(),
-            ) {
-                (true, EncodedScalarFilter::Eq(expected), true) => {
-                    scalar_eq_posting_matches(db, info, expected, id, meter)?
-                }
-                _ => {
-                    ensure_row_seq(db, rows, id, row, encoded, meter)?;
-                    let row = row.as_ref().unwrap();
-                    meter.note_row_decode();
-                    scalar_filter_matches(
-                        info,
-                        predicate,
-                        selected_field(row, &info.field)?,
-                        &mut scratch.scalar,
-                    )?
-                }
+            } => match &ranges[position] {
+                ScalarRangeSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
+                ScalarRangeSet::Bitmap(bits) => scalar_range_bitmap_contains(bits, id.sequence),
+                _ => match (
+                    *posting_membership,
+                    predicate,
+                    row.is_none() && encoded.is_none(),
+                ) {
+                    (true, EncodedScalarFilter::Eq(expected), true) => {
+                        scalar_eq_posting_matches(db, info, expected, id, meter)?
+                    }
+                    _ => {
+                        ensure_row_seq(db, rows, id, row, encoded, meter)?;
+                        let row = row.as_ref().unwrap();
+                        meter.note_row_decode();
+                        scalar_filter_matches(
+                            info,
+                            predicate,
+                            selected_field(row, &info.field)?,
+                            &mut scratch.scalar,
+                        )?
+                    }
+                },
             },
             CompiledFilter::JsonEq { field, value } => {
                 ensure_row_seq(db, rows, id, row, encoded, meter)?;
@@ -4942,11 +5162,19 @@ impl PreparedQuery<'_> {
             // walk has answered.
             CompiledFilter::Text(prepared) => prepared.phrase.is_some(),
             _ if Some(position) == driving => false,
-            // A non-driving equality answered from its posting reads no row;
-            // every other scalar predicate does.
+            // A non-driving equality answered from its posting reads no row,
+            // and neither does a non-driving RANGE once its own posting walk
+            // has been collected into a set (`ScalarRangeSet::Ids` or
+            // `ScalarRangeSet::Bitmap`); every other scalar predicate does.
             CompiledFilter::Scalar {
                 posting_membership, ..
-            } => !*posting_membership,
+            } => {
+                !*posting_membership
+                    && !matches!(
+                        self.scalar_ranges[position],
+                        ScalarRangeSet::Ids(_) | ScalarRangeSet::Bitmap(_)
+                    )
+            }
             CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
             CompiledFilter::Graph { .. } | CompiledFilter::Folded { .. } => false,
         })
@@ -5168,6 +5396,43 @@ impl PreparedQuery<'_> {
         Ok(rows)
     }
 
+    /// Walk every not-yet-built [`ScalarRangeSet`] once, so this call's
+    /// `work.scalar_postings` pays for it and every later page -- including a
+    /// resumed one -- finds it already there.
+    ///
+    /// Idempotent: a position the loop has already resolved, in this call or
+    /// an earlier one, is `Ineligible`, `Overflow`, or `Ids` and is skipped.
+    fn ensure_scalar_range_sets<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<()> {
+        for position in 0..self.filters.len() {
+            if !matches!(self.scalar_ranges[position], ScalarRangeSet::Unbuilt) {
+                continue;
+            }
+            let (info, predicate) = match &self.filters[position] {
+                CompiledFilter::Scalar { info, predicate, .. } => (info.clone(), predicate.clone()),
+                _ => unreachable!("only a scalar filter's position is marked Unbuilt"),
+            };
+            self.scalar_ranges[position] = match build_scalar_range_set(self.db, &info, &predicate, meter)
+            {
+                Ok(set) => set,
+                // The row-read path this filter used before this walk existed
+                // never spent `ScalarPostings` -- only `PrimaryReads` -- so a
+                // caller whose budget cannot afford even one posting of this
+                // walk must get exactly that path back, not a new way for the
+                // same query to fail. Postings already charged before this
+                // one stay charged; nothing here refunds real reads.
+                Err(QueryError::BudgetExceeded {
+                    resource: WorkResource::ScalarPostings,
+                    ..
+                }) => ScalarRangeSet::Overflow,
+                Err(other) => return Err(other),
+            };
+        }
+        Ok(())
+    }
+
     pub fn next_page<C: FnMut() -> bool>(
         &mut self,
         page_size: usize,
@@ -5210,6 +5475,7 @@ impl PreparedQuery<'_> {
         );
         let mut meter = WorkMeter::new(budget, &mut cancelled);
         meter.check_cancelled()?;
+        self.ensure_scalar_range_sets(&mut meter)?;
         // Rows an earlier page's walk already ranked and could not return.
         // They are in rank order, last first, so this takes the next ones off
         // the end -- and the whole walk is skipped, which is the point.
@@ -5268,6 +5534,7 @@ impl PreparedQuery<'_> {
                         db,
                         &mut rows,
                         &self.filters,
+                        &self.scalar_ranges,
                         &candidate,
                         &mut row,
                         &mut encoded,
@@ -5386,6 +5653,7 @@ impl PreparedQuery<'_> {
                                 db,
                                 &mut rows,
                                 &self.filters,
+                                &self.scalar_ranges,
                                 keep_batch_rows,
                                 &mut batch,
                                 &mut batch_order,
@@ -5416,12 +5684,13 @@ impl PreparedQuery<'_> {
                         let id = candidate.id;
                         let satisfied = candidate.satisfied_filter;
                         let filters = &self.filters;
+                        let ranges = &self.scalar_ranges;
                         let scratch = &mut scratch;
                         let meter = &mut meter;
                         candidate.row_filtered = rows.with_row(id, |bytes| match bytes {
-                            Some(bytes) => {
-                                batch_filters_match(db, filters, satisfied, bytes, scratch, meter)
-                            }
+                            Some(bytes) => batch_filters_match(
+                                db, filters, ranges, satisfied, id, bytes, scratch, meter,
+                            ),
                             None => Err(corrupt_query(
                                 "query candidate points to a missing entity",
                             )),
@@ -5443,6 +5712,7 @@ impl PreparedQuery<'_> {
                                 db,
                                 &mut rows,
                                 &self.filters,
+                                &self.scalar_ranges,
                                 &candidate,
                                 &mut row,
                                 &mut encoded,

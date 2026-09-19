@@ -11,16 +11,18 @@
 //! it does now, so they fail on a regression rather than on a rounding.
 use e4_prototype::{
     collections::{
-        CandidateDriver, CollectionOptions, Database, IndexId, Projection, QueryBudget, QueryFilter,
-        QueryOrder, QueryRequest, ScalarFilter, ScalarValue, SortDirection, TextMatch,
+        CandidateDriver, CollectionOptions, Database, IndexId, PointFilter, Projection, QueryBudget,
+        QueryFilter, QueryOrder, QueryRequest, QueryWork, ScalarFilter, ScalarValue, SortDirection,
+        TextMatch,
     },
+    spatial_math::Bounds,
     Kind,
 };
 use kernel::{
     io::IoMode,
     store::{Config, SyncMode},
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     alloc::{GlobalAlloc, Layout as AllocationLayout, System},
     cell::Cell,
@@ -847,7 +849,6 @@ struct Wide {
     db: Database,
     rows: e4_prototype::collections::CollectionId,
     pod: IndexId,
-    price: IndexId,
 }
 
 fn wide_fixture(dir: &std::path::Path) -> Wide {
@@ -858,6 +859,7 @@ fn wide_fixture(dir: &std::path::Path) -> Wide {
             vec![
                 ("pod".into(), Kind::Text),
                 ("price".into(), Kind::Real),
+                ("expensive".into(), Kind::Json),
                 ("bulk".into(), Kind::Text),
             ],
             CollectionOptions::default(),
@@ -872,6 +874,7 @@ fn wide_fixture(dir: &std::path::Path) -> Wide {
             &json!({
                 "pod": format!("pod{:03}", i % POD_STRIDE),
                 "price": price(i),
+                "expensive": price(i) > 400.0,
                 "bulk": bulk,
             }),
         )
@@ -883,18 +886,9 @@ fn wide_fixture(dir: &std::path::Path) -> Wide {
     db.commit().unwrap();
     let pod = db.create_scalar_index(rows, "pod_idx", "pod", false).unwrap();
     db.build_index_to_ready(pod, 256).unwrap();
-    let price = db
-        .create_scalar_index(rows, "price_idx", "price", false)
-        .unwrap();
-    db.build_index_to_ready(price, 256).unwrap();
     db.commit().unwrap();
     db.checkpoint().unwrap();
-    Wide {
-        db,
-        rows,
-        pod,
-        price,
-    }
+    Wide { db, rows, pod }
 }
 
 /// A page whose candidates are SPARSE in the primary tree must not walk the
@@ -905,6 +899,12 @@ fn wide_fixture(dir: &std::path::Path) -> Wide {
 /// its rows through the lockstep cursor, and a second predicate needs the row
 /// of every candidate. The candidates are a hundred sequences apart, and the
 /// rows are wide enough that a hundred sequences is tens of LEAVES.
+///
+/// The second predicate is JSON equality rather than a scalar range on
+/// purpose: a non-driving scalar RANGE now answers from a posting-built id
+/// set instead of the row (see `ScalarRangeSet`), so it no longer walks the
+/// primary tree at all and cannot stand in for "a predicate that needs the
+/// row" any more. JSON equality still can.
 ///
 /// `peek_at_or_after` reaches a key past its pinned leaf by stepping to the
 /// next leaf, one at a time, and each of those steps climbs and re-descends
@@ -927,16 +927,13 @@ fn a_sparse_page_over_wide_rows_does_not_walk_the_leaves_between_them() {
             index: fixture.pod,
             predicate: ScalarFilter::Eq(ScalarValue::Text("pod007")),
         },
-        QueryFilter::Scalar {
-            index: fixture.price,
-            predicate: ScalarFilter::Range {
-                lower: Bound::Excluded(ScalarValue::F64(400.0)),
-                upper: Bound::Unbounded,
-            },
+        QueryFilter::JsonEq {
+            field: "expensive",
+            value: &json!(true),
         },
     ];
-    // Every row the equality posting names has its row read for the range
-    // predicate; those reads are what this test is about.
+    // Every row the equality posting names has its row read for the JSON
+    // equality predicate; those reads are what this test is about.
     let candidates = (1..=WIDE_ROWS).filter(|i| i % POD_STRIDE == 7).count() as u64;
     let expected = (1..=WIDE_ROWS)
         .filter(|i| i % POD_STRIDE == 7 && price(*i) > 400.0)
@@ -978,5 +975,500 @@ fn a_sparse_page_over_wide_rows_does_not_walk_the_leaves_between_them() {
         accesses < candidates * 8,
         "{accesses} pager accesses for {candidates} candidate rows: {:.2} each, and it was 44.44",
         accesses as f64 / candidates as f64
+    );
+}
+
+// -- C1: a non-driving scalar RANGE answers from a posting-built id set ------
+//
+// Before this file's changes, EVERY candidate a driver offered had its row
+// read just to answer a non-driving `born`-style RANGE predicate -- the value
+// is unknown until something reads it, unlike an equality predicate, which
+// already answers from its own posting (`scalar_eq_posting_matches`). These
+// tests walk the same posting range ONCE into a sorted id set instead, so a
+// candidate afterwards is a binary search.
+
+const RANGE_ROWS: u64 = 30_000;
+const RANGE_BUCKETS: u64 = 100;
+const RANGE_BBOX_BUCKETS: u64 = 10;
+const RANGE_DELETE_STRIDE: u64 = 500;
+
+struct RangeFixture {
+    db: Database,
+    rows: e4_prototype::collections::CollectionId,
+    position: IndexId,
+    born: IndexId,
+    tag: IndexId,
+}
+
+/// A row's longitude bucket, 0..100 -- the spatial half of the fixture.
+fn range_bucket(i: u64) -> u64 {
+    (i - 1) % RANGE_BUCKETS
+}
+
+fn range_lon(i: u64) -> f64 {
+    -180.0 + range_bucket(i) as f64 * 3.6
+}
+
+/// `born`'s value, decorrelated from the spatial bucket AND from the text
+/// tag: both of those repeat with period 100 in `i`, so a `born` that also
+/// had period 100 would make every row of one bucket agree on `born` --
+/// all matching `born < 10` or none of them. Folding in `i / 100` breaks
+/// that periodicity, so roughly one in ten of a bucket's rows match, not all
+/// or none of them.
+fn range_born(i: u64) -> i64 {
+    (((i / 100) * 7 + i * 3) % 100) as i64
+}
+
+/// Whether row `i` carries a `born` value at all. Every 41st row is present
+/// but explicit JSON `null`; every other 37th is entirely absent. Neither is
+/// a value a RANGE predicate can match, on the row or in the posting.
+fn range_has_born(i: u64) -> bool {
+    i % 41 != 0 && i % 37 != 0
+}
+
+fn range_tag(i: u64) -> &'static str {
+    if (i - 1) % 10 == 0 {
+        "alpha widgets travel far"
+    } else {
+        "beta gadgets stay put"
+    }
+}
+
+fn range_deleted(i: u64) -> bool {
+    i % RANGE_DELETE_STRIDE == 0
+}
+
+fn range_row_value(i: u64) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "position".to_string(),
+        json!({"type": "Point", "coordinates": [range_lon(i), 0.0]}),
+    );
+    if i % 41 == 0 {
+        obj.insert("born".to_string(), Value::Null);
+    } else if i % 37 != 0 {
+        obj.insert("born".to_string(), json!(range_born(i)));
+    }
+    obj.insert("tag".to_string(), json!(range_tag(i)));
+    Value::Object(obj)
+}
+
+/// Every index is built to READY before any row is deleted, so the delete
+/// exercises the same snapshot the posting-built set and the row-read path
+/// both read: a posting that outlived its row is not this fixture's question,
+/// a row that is simply gone from every driver is.
+fn range_fixture(dir: &std::path::Path) -> RangeFixture {
+    let mut db = Database::create(dir.join("db"), cfg()).unwrap();
+    let rows = db
+        .create_collection(
+            "r",
+            vec![
+                ("position".into(), Kind::Point),
+                ("born".into(), Kind::Int),
+                ("tag".into(), Kind::Text),
+            ],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    for i in 1..=RANGE_ROWS {
+        db.put(rows, &format!("k{i:08}"), &range_row_value(i)).unwrap();
+        if i % 256 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let position = db
+        .create_point_index(rows, "position_idx", "position")
+        .unwrap();
+    db.build_index_to_ready(position, 256).unwrap();
+    let born = db
+        .create_scalar_index(rows, "born_idx", "born", false)
+        .unwrap();
+    db.build_index_to_ready(born, 256).unwrap();
+    let tag = db.create_text_index(rows, "tag_idx", "tag").unwrap();
+    db.build_index_to_ready(tag, 256).unwrap();
+    db.commit().unwrap();
+    for i in (RANGE_DELETE_STRIDE..=RANGE_ROWS).step_by(RANGE_DELETE_STRIDE as usize) {
+        db.delete(rows, &format!("k{i:08}")).unwrap();
+    }
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    RangeFixture {
+        db,
+        rows,
+        position,
+        born,
+        tag,
+    }
+}
+
+/// Bounds are INCLUSIVE at both edges, so the east edge sits on the last
+/// included bucket's own longitude -- one bucket short of
+/// `RANGE_BBOX_BUCKETS` -- rather than on the first excluded one.
+fn range_bbox_filter(position: IndexId) -> QueryFilter<'static> {
+    QueryFilter::Point {
+        index: position,
+        predicate: PointFilter::Bbox(
+            Bounds::new(
+                -180.0,
+                -180.0 + (RANGE_BBOX_BUCKETS - 1) as f64 * 3.6,
+                -1.0,
+                1.0,
+            )
+            .unwrap(),
+        ),
+    }
+}
+
+fn range_text_filter(tag: IndexId) -> QueryFilter<'static> {
+    QueryFilter::Text {
+        index: tag,
+        query: "alpha",
+        matching: TextMatch::Any,
+    }
+}
+
+fn range_born_filter(born: IndexId) -> QueryFilter<'static> {
+    QueryFilter::Scalar {
+        index: born,
+        predicate: ScalarFilter::Range {
+            lower: Bound::Included(ScalarValue::I64(0)),
+            upper: Bound::Excluded(ScalarValue::I64(10)),
+        },
+    }
+}
+
+/// Rows inside the bbox, undeleted -- the spatial driver's own candidates,
+/// before the `born` filter is asked anything.
+fn range_bbox_candidates() -> Vec<u64> {
+    (1..=RANGE_ROWS)
+        .filter(|&i| range_bucket(i) < RANGE_BBOX_BUCKETS && !range_deleted(i))
+        .collect()
+}
+
+/// Rows carrying the text driver's term, undeleted.
+fn range_text_candidates() -> Vec<u64> {
+    (1..=RANGE_ROWS)
+        .filter(|&i| (i - 1) % 10 == 0 && !range_deleted(i))
+        .collect()
+}
+
+/// The bbox candidates that also satisfy `born IN [0, 10)`.
+fn range_bbox_born_oracle() -> Vec<u64> {
+    range_bbox_candidates()
+        .into_iter()
+        .filter(|&i| range_has_born(i) && range_born(i) < 10)
+        .collect()
+}
+
+/// The text candidates that also satisfy `born IN [0, 10)`.
+fn range_text_born_oracle() -> Vec<u64> {
+    range_text_candidates()
+        .into_iter()
+        .filter(|&i| range_has_born(i) && range_born(i) < 10)
+        .collect()
+}
+
+fn range_zero_scalar_postings() -> QueryBudget {
+    QueryBudget {
+        scalar_postings: 0,
+        ..QueryBudget::unlimited()
+    }
+}
+
+/// Drain a query and report the ids it returned, in order, plus the summed
+/// work every page charged.
+fn range_drain(
+    db: &Database,
+    rows: e4_prototype::collections::CollectionId,
+    filters: &[QueryFilter<'_>],
+    budget: QueryBudget,
+) -> (Vec<u64>, QueryWork) {
+    let mut prepared = db
+        .prepare_query(QueryRequest {
+            collection: rows,
+            filters,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let mut ids = Vec::new();
+    let mut work = QueryWork::default();
+    loop {
+        let page = prepared.next_page(PAGE, budget, || false).unwrap();
+        for row in &page.rows {
+            ids.push(row.id.sequence);
+        }
+        work.candidates += page.work.candidates;
+        work.primary_reads += page.work.primary_reads;
+        work.scalar_postings += page.work.scalar_postings;
+        work.spatial_postings += page.work.spatial_postings;
+        work.text_postings += page.work.text_postings;
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    (ids, work)
+}
+
+/// A spatial-driven page's non-driving `born` RANGE reads no row at all.
+///
+/// Before: every one of the spatial driver's ~3,000 candidates paid a primary
+/// read for `born` alone (the spatial filter already certifies itself from
+/// its own posting's decoded point, so that read was ENTIRELY the range
+/// predicate's). After: `born`'s posting range is walked once into a set, and
+/// membership is a binary search against it.
+#[test]
+fn a_spatial_driven_pages_non_driving_range_reads_no_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let f = range_fixture(temp.path());
+    let filters = [range_bbox_filter(f.position), range_born_filter(f.born)];
+    let candidates = range_bbox_candidates();
+    let oracle = range_bbox_born_oracle();
+    assert!(
+        (2_000..4_000).contains(&candidates.len()),
+        "the fixture should offer about 3,000 spatial candidates, offered {}",
+        candidates.len()
+    );
+    assert!(!oracle.is_empty() && oracle.len() < candidates.len(), "the fixture must have a real, partial answer");
+
+    let (ids, work) = range_drain(&f.db, f.rows, &filters, QueryBudget::unlimited());
+    assert_eq!(ids, oracle);
+    assert_eq!(
+        work.primary_reads, 0,
+        "the spatial filter certifies itself and the range answers from its set"
+    );
+}
+
+/// The same shape under a TEXT driver: `Any` matching certifies from its own
+/// postings, so the only row-reading filter before this change was `born`.
+#[test]
+fn a_text_driven_pages_non_driving_range_reads_no_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let f = range_fixture(temp.path());
+    let filters = [range_text_filter(f.tag), range_born_filter(f.born)];
+    let candidates = range_text_candidates();
+    let oracle = range_text_born_oracle();
+    assert!(
+        (2_000..4_000).contains(&candidates.len()),
+        "the fixture should offer about 3,000 text candidates, offered {}",
+        candidates.len()
+    );
+    assert!(!oracle.is_empty() && oracle.len() < candidates.len(), "the fixture must have a real, partial answer");
+
+    let (ids, work) = range_drain(&f.db, f.rows, &filters, QueryBudget::unlimited());
+    assert_eq!(ids, oracle);
+    assert_eq!(work.primary_reads, 0);
+}
+
+/// The posting-built set and the row-read fallback agree, over a fixture with
+/// missing `born`, explicit-null `born`, out-of-range `born`, and rows
+/// deleted after every index was built.
+///
+/// The fallback is forced by a `scalar_postings` budget of zero: the walk
+/// that would build the set cannot afford its first posting, so
+/// `ensure_scalar_range_sets` steps back to `ScalarRangeSet::Overflow` and
+/// every candidate reads its row exactly as it did before this file's
+/// changes -- the same budget that a non-driving range never spent then, and
+/// still does not spend now that the walk failed to afford it.
+#[test]
+fn the_posting_built_set_and_the_row_read_fallback_agree() {
+    let temp = tempfile::tempdir().unwrap();
+    let f = range_fixture(temp.path());
+    for filters in [
+        vec![range_bbox_filter(f.position), range_born_filter(f.born)],
+        vec![range_text_filter(f.tag), range_born_filter(f.born)],
+    ] {
+        let (built_ids, built_work) = range_drain(&f.db, f.rows, &filters, QueryBudget::unlimited());
+        let (fallback_ids, fallback_work) =
+            range_drain(&f.db, f.rows, &filters, range_zero_scalar_postings());
+        assert_eq!(
+            built_ids, fallback_ids,
+            "the posting-built set must answer exactly what the row-read fallback answers"
+        );
+        assert!(!built_ids.is_empty(), "the fixture must have a real answer");
+        assert_eq!(built_work.primary_reads, 0);
+        assert_eq!(fallback_work.primary_reads, fallback_work.candidates);
+        assert!(fallback_work.primary_reads > 0, "the fallback must still read rows");
+    }
+}
+
+/// A range too wide for the budget still answers correctly, by reading every
+/// candidate's row exactly as the code did before this file's changes.
+#[test]
+fn a_range_the_budget_cannot_afford_still_reads_rows_and_still_answers() {
+    let temp = tempfile::tempdir().unwrap();
+    let f = range_fixture(temp.path());
+    let filters = [range_bbox_filter(f.position), range_born_filter(f.born)];
+    let oracle = range_bbox_born_oracle();
+
+    let (ids, work) = range_drain(&f.db, f.rows, &filters, range_zero_scalar_postings());
+    assert_eq!(ids, oracle);
+    assert_eq!(work.scalar_postings, 0, "the aborted build must not spend the budget it could not afford");
+    assert_eq!(
+        work.primary_reads, work.candidates,
+        "one primary read per candidate is the fallback's shape"
+    );
+    assert!(work.primary_reads > 0);
+}
+
+// -- C1 v3: the id set is a BITMAP over the collection's own allocated span,
+// not a sorted Vec of matches --------------------------------------------
+//
+// A Vec sized by MATCH COUNT sorts before it can answer anything, and a wide
+// range in a large collection can need more matches than `RUN_BYTES` holds as
+// `u64`s even though the collection itself is nowhere near that large (a
+// whole decade of `born` at 48M rows is 5.6M matches -- 45 MB of `u64`,
+// above the old 8 MiB cap, so the set never built there at all). A bitmap
+// costs one bit per sequence the collection has EVER allocated, known from
+// the collection's own counter without a scan, so its size tracks the
+// collection, not the range's selectivity: 48M sequences is 6 MB, comfortably
+// under `RUN_BYTES`, regardless of how many of them the range matches.
+
+/// The `born` matches across the WHOLE `range_fixture` collection, not just
+/// one driver's candidate slice -- what the posting walk this set is built
+/// from actually visits.
+fn range_born_matches_total() -> usize {
+    (1..=RANGE_ROWS)
+        .filter(|&i| !range_deleted(i) && range_has_born(i) && range_born(i) < 10)
+        .count()
+}
+
+/// Even `range_fixture`'s modest 30,001-sequence span keeps the bitmap under
+/// 4 KB, so the plain-Vec representation of this fixture's whole-collection
+/// `born` matches -- a few thousand `u64`s -- is already bigger than that
+/// bitmap would be. The switchover is not just a large-scale phenomenon: any
+/// collection narrow enough for its bitmap to undercut a modest match count
+/// takes the bitmap, and answers exactly as the Vec representation would
+/// have.
+#[test]
+fn a_born_range_set_over_a_narrow_span_uses_the_bitmap() {
+    let temp = tempfile::tempdir().unwrap();
+    let f = range_fixture(temp.path());
+    let bitmap_bytes = (RANGE_ROWS + 1).div_ceil(8);
+    let vec_switchover = bitmap_bytes / 8;
+    let matches = range_born_matches_total();
+    assert!(
+        matches as u64 > vec_switchover,
+        "the fixture must exceed the vec-to-bitmap switchover to exercise it \
+         ({matches} whole-collection matches, switchover at {vec_switchover} \
+         for a {bitmap_bytes}-byte bitmap"
+    );
+
+    let filters = [range_bbox_filter(f.position), range_born_filter(f.born)];
+    let (ids, work) = range_drain(&f.db, f.rows, &filters, QueryBudget::unlimited());
+    assert_eq!(ids, range_bbox_born_oracle());
+    assert_eq!(work.primary_reads, 0);
+}
+
+/// Rows enough that a Vec of every `born` match would be bigger than the old
+/// flat 8 MiB cap (`RUN_BYTES / size_of::<u64>()` ids) allowed -- the shape
+/// of the 48M-row `name_and_born` case, reproduced at a size a test can
+/// build. `born` is a constant every row satisfies, so the range's own match
+/// count is the whole collection; `grp` is the driver, selective enough
+/// (1 in 1,000) that the query itself stays cheap even though the set the
+/// range builds underneath it spans the whole fixture.
+const BIG_SPAN_ROWS: u64 = 1_060_000;
+
+/// The plain-Vec cap `build_scalar_range_set` used before this file's
+/// bitmap existed: `RUN_BYTES` (8 MiB) worth of `u64` ids. Kept here, not
+/// imported, because the production constant is a private implementation
+/// detail of `src/query.rs` -- this is the same arithmetic, restated as the
+/// fact this test exists to check: `BIG_SPAN_ROWS` must exceed it.
+const OLD_VEC_CAP_IDS: u64 = (8usize << 20) as u64 / 8;
+
+struct BigSpanFixture {
+    db: Database,
+    rows: e4_prototype::collections::CollectionId,
+    grp: IndexId,
+    born: IndexId,
+}
+
+fn big_span_fixture(dir: &std::path::Path) -> BigSpanFixture {
+    let mut db = Database::create(dir.join("db"), cfg()).unwrap();
+    let rows = db
+        .create_collection(
+            "big",
+            vec![("grp".into(), Kind::Int), ("born".into(), Kind::Int)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    for i in 1..=BIG_SPAN_ROWS {
+        db.put(
+            rows,
+            &format!("k{i:09}"),
+            &json!({"grp": (i % 1000 == 0) as i64, "born": 5}),
+        )
+        .unwrap();
+        if i % 20_000 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let grp = db.create_scalar_index(rows, "grp_idx", "grp", false).unwrap();
+    db.build_index_to_ready(grp, 256).unwrap();
+    let born = db.create_scalar_index(rows, "born_idx", "born", false).unwrap();
+    db.build_index_to_ready(born, 256).unwrap();
+    db.commit().unwrap();
+    db.checkpoint().unwrap();
+    BigSpanFixture { db, rows, grp, born }
+}
+
+fn big_span_grp_filter(grp: IndexId) -> QueryFilter<'static> {
+    QueryFilter::Scalar {
+        index: grp,
+        predicate: ScalarFilter::Eq(ScalarValue::I64(1)),
+    }
+}
+
+fn big_span_born_filter(born: IndexId) -> QueryFilter<'static> {
+    QueryFilter::Scalar {
+        index: born,
+        predicate: ScalarFilter::Range {
+            lower: Bound::Included(ScalarValue::I64(0)),
+            upper: Bound::Excluded(ScalarValue::I64(10)),
+        },
+    }
+}
+
+fn big_span_oracle() -> Vec<u64> {
+    (1..=BIG_SPAN_ROWS).filter(|&i| i % 1000 == 0).collect()
+}
+
+#[test]
+fn a_range_wider_than_the_old_vec_budget_still_takes_the_set_path() {
+    assert!(
+        BIG_SPAN_ROWS > OLD_VEC_CAP_IDS,
+        "the fixture must out-grow the old flat Vec cap ({OLD_VEC_CAP_IDS} ids) \
+         for this test to mean anything"
+    );
+    let bitmap_bytes = (BIG_SPAN_ROWS + 1).div_ceil(8);
+    assert!(
+        bitmap_bytes <= (8usize << 20) as u64,
+        "the fixture's span must still fit a bitmap within RUN_BYTES ({bitmap_bytes} bytes needed)"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let f = big_span_fixture(temp.path());
+    let filters = [big_span_grp_filter(f.grp), big_span_born_filter(f.born)];
+    let oracle = big_span_oracle();
+    assert!(!oracle.is_empty());
+
+    let (ids, work) = range_drain(&f.db, f.rows, &filters, QueryBudget::unlimited());
+    assert_eq!(ids, oracle);
+    assert_eq!(
+        work.primary_reads, 0,
+        "a range whose match count would have overflowed the old plain-Vec cap \
+         must still answer from a set once a bitmap fits the budget"
+    );
+    assert!(
+        work.scalar_postings as u64 >= BIG_SPAN_ROWS,
+        "the born set's one-time walk must visit every one of its {BIG_SPAN_ROWS} \
+         matches; saw {}",
+        work.scalar_postings
     );
 }

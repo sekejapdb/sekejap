@@ -1197,6 +1197,36 @@ impl Database {
         self.note_allocated(id);
         Ok(id)
     }
+    /// One past the highest sequence this collection has ever handed out,
+    /// read without allocating one. Every entity the collection has ever
+    /// held -- live or since deleted -- has a sequence below this, so it
+    /// bounds a per-sequence structure (a query's range bitmap) sized before
+    /// any row is read, with no scan.
+    ///
+    /// The durable counter (`write_sequence`) is the source of truth across
+    /// handles; a handle with its own uncommitted allocation in flight for
+    /// this collection (`self.sequence`) is ahead of that counter until its
+    /// next commit, so it is checked first, matching what `allocate` itself
+    /// would hand out next.
+    pub(super) fn collection_span(&self, c: CollectionId) -> Result<u64> {
+        if let Some(s) = self.sequence.as_ref().filter(|s| s.collection == c) {
+            return Ok(s.next);
+        }
+        self.replicas(
+            |i| replica_key(2, c.0, i),
+            |b| {
+                let b = unpack(b, COUNTER_MAGIC)?;
+                if b.len() != 8 {
+                    return Err(corrupt("sequence length"));
+                }
+                let n = u64::from_be_bytes(b.try_into().unwrap());
+                if n == 0 {
+                    return Err(corrupt("zero sequence"));
+                }
+                Ok(n)
+            },
+        )
+    }
     /// Extend this collection's allocated range to cover a just-handed-out
     /// identity. `allocate` is the only place sequences are handed out and it
     /// hands them out in order, so the range never needs to grow downwards.
