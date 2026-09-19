@@ -313,7 +313,7 @@ fn a_moved_vector_field_still_scans_both_layouts() {
             || false,
         )
         .unwrap();
-    let old_half: std::collections::HashSet<_> = ids[..HALF].iter().copied().collect();
+    let old_half: std::collections::BTreeSet<_> = ids[..HALF].iter().copied().collect();
     assert!(
         cosine.iter().all(|hit| old_half.contains(&hit.id)),
         "the top-{K} should all come from the rows written before the alter"

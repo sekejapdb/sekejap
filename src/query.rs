@@ -326,7 +326,11 @@ pub enum OrderValue {
 pub struct ApproximationDiagnostics {
     pub method: ApproxVectorMethod,
     pub ef: usize,
-    /// Eligible candidates examined after all filters passed.
+    /// Eligible candidates examined: the entries the approximate stage scored,
+    /// on every plan. On the per-candidate path that is the candidates that
+    /// passed every filter; on the page-order compact scan it is the entries
+    /// the filters admitted. Entries the scan read and refused are charged to
+    /// [`QueryWork`] as candidates and compact reads, not counted here.
     pub examined: usize,
     /// Compact-shortlisted candidates checked and reranked from authoritative
     /// f32 sidecars.
@@ -610,6 +614,41 @@ fn vector_scan_progress<'a, 'm, C: FnMut() -> bool>(
                         records.saturating_mul(lanes_per_record),
                     )
                 }),
+        };
+        match charged {
+            Ok(()) => Ok(()),
+            Err(QueryError::Cancelled) => Err(Error::Cancelled),
+            Err(other) => {
+                *budget = Some(other);
+                Err(Error::Cancelled)
+            }
+        }
+    }
+}
+
+/// The charge hook the FILTERED page-order quantized scan calls, where the
+/// records READ and the records SCORED are different counts.
+///
+/// Every entry the walk steps over is a candidate it considered and a compact
+/// entry it read, whether the filters admitted it or not, so `Locators` --
+/// what the scan reports for entries read -- is charged as both. Only the
+/// admitted ones have their int8 lanes decoded, so `Scored` is charged as
+/// lanes alone. A refused entry therefore costs exactly what it really cost:
+/// one candidate and one compact read, and no lane work.
+fn filtered_vector_scan_progress<'a, 'm, C: FnMut() -> bool>(
+    meter: &'a mut WorkMeter<'m, C>,
+    budget: &'a mut Option<QueryError>,
+    lanes_per_record: u64,
+) -> impl FnMut(super::vector_indexes::ScanStep) -> super::Result<()> + use<'a, 'm, C> {
+    move |step| {
+        let charged = match step {
+            super::vector_indexes::ScanStep::Locators(records) => meter
+                .charge(WorkResource::Candidates, records)
+                .and_then(|()| meter.charge(WorkResource::VectorLocators, records)),
+            super::vector_indexes::ScanStep::Scored(records) => meter.charge(
+                WorkResource::VectorLanes,
+                records.saturating_mul(lanes_per_record),
+            ),
         };
         match charged {
             Ok(()) => Ok(()),
@@ -2472,7 +2511,18 @@ impl Database {
             CandidateDriver::Order => order_driver()?,
             CandidateDriver::Keys => keys_driver(&filters)?,
             CandidateDriver::Auto => {
-                if let Some(position) = filters
+                // A filtered APPROXIMATE VECTOR order whose filters the
+                // compact scan can answer index-side, over a filter broad
+                // enough that scanning beats point-getting the matches: the
+                // quantized index drives and the page is one page-order scan
+                // (`filtered_vector_scan`). Ahead of every filter rule below,
+                // because its own guard already refuses every filter shape
+                // those rules exist for.
+                if matches!(order, CompiledOrder::ApproximateVector { .. })
+                    && approximate_scan_drives(self, request.collection, &filters)?
+                {
+                    order_driver()?
+                } else if let Some(position) = filters
                     .iter()
                     .position(|filter| matches!(filter, CompiledFilter::Graph { .. }))
                 {
@@ -2664,7 +2714,30 @@ impl Database {
         for (position, filter) in filters.iter().enumerate() {
             let eligible = match filter {
                 CompiledFilter::Scalar { predicate, .. } => {
-                    matches!(predicate, EncodedScalarFilter::Range { .. })
+                    (matches!(predicate, EncodedScalarFilter::Range { .. })
+                        // A non-driving EQUALITY under a QUANTIZED VECTOR
+                        // order. Everywhere else an equality already answers
+                        // one candidate at a time from its own posting
+                        // (`scalar_eq_posting_matches`), and a set would buy
+                        // nothing; here the candidates are the compact entries
+                        // of the vector index in page order, and a per-
+                        // candidate posting probe is a root-to-leaf descent
+                        // per entry of the whole collection. An equality is a
+                        // one-key range, so the same walk collects it, and the
+                        // set is what lets the page-order scan refuse an entry
+                        // without decoding its int8 codes.
+                        //
+                        // The nullish key is excluded: `build_scalar_range_set`
+                        // drops it exactly as `scalar_filter_matches` does, so
+                        // an equality that somehow encoded to it would get a
+                        // set that disagrees with the row-read path.
+                        || matches!(
+                            (predicate, &driver),
+                            (
+                                EncodedScalarFilter::Eq(value),
+                                DriverPlan::QuantizedVector { .. },
+                            ) if value.as_slice() != NULLISH_SCALAR_KEY
+                        ))
                         && scalar_driver_position != Some(position)
                 }
                 // A world-wide cover is every posting in the index, which is
@@ -2944,6 +3017,148 @@ const ORDER_DRIVE_PROBE: u64 = 64;
 /// The density the probe must find: one accepted row per this many walked.
 /// It is the crossover of the two plans -- see [`order_index_drives_better`].
 const ORDER_DRIVE_MIN_DENSITY: u64 = 16;
+
+/// One accepted row per this many of the collection's sequences: the density
+/// at which the page-order compact scan beats the filter-driven plan under an
+/// APPROXIMATE VECTOR order. See [`approximate_scan_drives`].
+const APPROX_SCAN_MIN_DENSITY: u64 = 16;
+
+/// The most postings [`approximate_scan_drives`] will walk before it gives up
+/// on deciding. A collection wide enough that even one row in
+/// [`APPROX_SCAN_MIN_DENSITY`] of it is more postings than this keeps the plan
+/// it had; the probe never becomes a pass over a large index to decide how to
+/// read it.
+const APPROX_SCAN_PROBE_CAP: u64 = 4_096;
+
+/// Should a FILTERED approximate vector order be driven from the quantized
+/// index -- one page-order compact scan with the filters tested index-side --
+/// rather than from the filter?
+///
+/// The two plans differ in what they pay per row. Driving from the FILTER
+/// hands over the rows it accepts and point-gets each one's compact entry: one
+/// root-to-leaf descent into the `0x79` table per MATCH. Driving from the
+/// quantized index reads every compact entry of the collection in page order,
+/// one sequential leaf step each, and decodes the int8 codes only for the
+/// entries the filters' membership sets admit. So the filter plan costs
+/// matches x random-read and the scan costs span x sequential-step plus
+/// matches x score, and the two meet around one accepted row in
+/// [`APPROX_SCAN_MIN_DENSITY`] of the collection -- the same crossover, and
+/// for the same reason, that [`ORDER_DRIVE_MIN_DENSITY`] names.
+///
+/// Every filter has to be one the scan can answer from an index, because a
+/// filter that needs the row would put a primary read back in front of every
+/// admitted entry: a scalar equality or range (its postings become a
+/// `MembershipSet`), a point filter with a bounded cover (so does its), or a
+/// folded position, which is already part of another one's predicate.
+///
+/// The density is measured, not guessed, and the measurement is bounded: the
+/// first scalar filter's postings are walked until they reach the count the
+/// crossover needs, and no further. Where that count is more postings than
+/// [`APPROX_SCAN_PROBE_CAP`], nothing is walked at all and the answer is no,
+/// so the plan for a collection too large to decide cheaply is exactly the
+/// plan it had before this existed.
+fn approximate_scan_drives(
+    db: &Database,
+    collection: CollectionId,
+    filters: &[CompiledFilter],
+) -> QueryResult<bool> {
+    if filters.is_empty() {
+        return Ok(false);
+    }
+    let mut scalar = None;
+    for filter in filters {
+        match filter {
+            CompiledFilter::Folded { .. } => {}
+            CompiledFilter::Scalar { info, predicate, .. } => {
+                if !matches!(predicate, EncodedScalarFilter::Range { .. })
+                    && !matches!(predicate, EncodedScalarFilter::Eq(value) if value.as_slice() != NULLISH_SCALAR_KEY)
+                {
+                    return Ok(false);
+                }
+                if scalar.is_none() {
+                    scalar = Some((info, predicate));
+                }
+            }
+            // A world-wide cover builds no set (see `MembershipSet`), so the
+            // scan could not answer it index-side.
+            CompiledFilter::Point { predicate, .. } => {
+                if !point_ranges(*predicate).is_ok_and(|(_, world)| !world) {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    // A point filter alone says nothing about density here, and its cover walk
+    // is not a count. Only a scalar filter is probed, so a query filtered
+    // ONLY by a point keeps the plan it had.
+    let Some((info, predicate)) = scalar else {
+        return Ok(false);
+    };
+    let span = db.collection_span(collection).map_err(QueryError::from)?;
+    let needed = span / APPROX_SCAN_MIN_DENSITY + 1;
+    if needed > APPROX_SCAN_PROBE_CAP {
+        return Ok(false);
+    }
+    scalar_postings_reach(db, info, predicate, needed)
+}
+
+/// Does this predicate's posting walk reach `needed` proved sequences?
+///
+/// The same forward walk `build_scalar_range_set` makes -- open at the
+/// predicate's lower bound, stop at the first key past its upper one, skip the
+/// nullish key a NULL and a MISSING share -- stopped as soon as the answer is
+/// known instead of collecting anything. Nothing is held: this counts.
+///
+/// The step budget is the second bound. A predicate whose lower bound is
+/// EXCLUDED opens on postings it will not count, and they are postings of one
+/// value rather than of the range, so the walk is allowed that many steps
+/// beyond `needed` and then stops whatever it has seen.
+fn scalar_postings_reach(
+    db: &Database,
+    info: &IndexInfo,
+    predicate: &EncodedScalarFilter,
+    needed: u64,
+) -> QueryResult<bool> {
+    let prefix = scalar_prefix(info.id);
+    let mut start = prefix.clone();
+    if let Some(lower) = scalar_lower(predicate) {
+        start.extend_from_slice(lower);
+    }
+    let Some(mut walk) = db.index_range(info, &start).map_err(QueryError::from)? else {
+        return Ok(false);
+    };
+    let mut seen = 0u64;
+    let mut steps = 0u64;
+    let ceiling = needed.saturating_add(APPROX_SCAN_PROBE_CAP);
+    while seen < needed && steps < ceiling {
+        let counted = {
+            let Some((key, _)) = walk.peek_ref().map_err(Error::from).map_err(QueryError::from)?
+            else {
+                break;
+            };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let suffix = &key[prefix.len()..];
+            let value_len = scalar_key::width(&info.kind, suffix)?;
+            let encoded = suffix
+                .get(..value_len)
+                .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
+            match scalar_key_position(predicate, encoded) {
+                Ordering::Greater => break,
+                Ordering::Less => false,
+                Ordering::Equal => encoded != NULLISH_SCALAR_KEY,
+            }
+        };
+        walk.step();
+        steps += 1;
+        if counted {
+            seen += 1;
+        }
+    }
+    Ok(seen >= needed)
+}
 
 /// Should an equality filter plus a scalar order on a DIFFERENT index, under a
 /// LIMIT, be driven from the ORDER index rather than from the filter?
@@ -7240,6 +7455,7 @@ impl PreparedQuery<'_> {
                         super::quantized_vector_indexes::QuantizedVectorCandidates::All,
                         after,
                         ceiling,
+                        usize::MAX,
                         &mut progress,
                     )
                 };
@@ -7279,6 +7495,164 @@ impl PreparedQuery<'_> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// True when every filter of this page can be decided from an index
+    /// alone, with no primary row and no posting probe per candidate:
+    /// each one either has a built [`MembershipSet`] (a scalar equality or
+    /// range walked out of its own postings, a point filter walked out of its
+    /// cover) or is a [`CompiledFilter::Folded`] position, whose predicate a
+    /// surviving position already carries.
+    ///
+    /// `Overflow` is not index-side: the set was abandoned, so the filter is
+    /// back on the row-read path and the whole page must be too. Text,
+    /// geometry, JSON and graph filters are never index-side here -- a text
+    /// posting establishes candidacy but a phrase is settled against the row,
+    /// a geometry posting's box is only a candidate test, and a JSON
+    /// predicate has no index at all.
+    fn vector_filters_are_index_side(&self) -> bool {
+        self.filters
+            .iter()
+            .enumerate()
+            .all(|(position, filter)| match filter {
+                CompiledFilter::Folded { .. } => true,
+                CompiledFilter::Scalar { .. } | CompiledFilter::Point { .. } => matches!(
+                    self.membership[position],
+                    MembershipSet::Ids(_) | MembershipSet::Bitmap(_)
+                ),
+                _ => false,
+            })
+    }
+
+    /// FILTERED approximate order over its own driver: the same page-order
+    /// compact scan [`unfiltered_vector_scan`] runs, with the filters tested
+    /// index-side, per compact entry, BEFORE the entry is scored.
+    ///
+    /// What this replaces is the per-candidate path, where the quantized
+    /// cursor hands over every entry of the collection one at a time -- a key
+    /// and a value copied out of the leaf per entry -- and a non-driving
+    /// equality answers each one with its own root-to-leaf posting descent.
+    /// Here each filter's postings are walked ONCE into a `MembershipSet` (by
+    /// `ensure_membership_sets`, before any page) and an entry the sets refuse
+    /// is stepped over without decoding its int8 codes at all.
+    ///
+    /// `ef` semantics are unchanged: the shortlist is the best `ef` among the
+    /// entries that PASSED the filters, and the rerank over it is the same one
+    /// the unfiltered scan does. So this is the same answer the candidate loop
+    /// produced, and at a selectivity where `ef` covers the matching rows it
+    /// is the exact filtered top-k.
+    ///
+    /// [`unfiltered_vector_scan`]: Self::unfiltered_vector_scan
+    fn filtered_vector_scan<C: FnMut() -> bool>(
+        &self,
+        held: usize,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<(Winners, Option<ApproximationDiagnostics>)>> {
+        if self.filters.is_empty() {
+            return Ok(None);
+        }
+        let (info, query, metric, ef) = match (&self.order, &self.driver) {
+            (
+                CompiledOrder::ApproximateVector {
+                    info,
+                    query,
+                    metric,
+                    ef,
+                    ..
+                },
+                DriverPlan::QuantizedVector { .. },
+            ) => (info, query, *metric, *ef),
+            _ => return Ok(None),
+        };
+        if !self.vector_filters_are_index_side() {
+            return Ok(None);
+        }
+        // The sets this page's admission test consults, gathered once rather
+        // than per entry. A folded position contributes nothing: its predicate
+        // is already part of the surviving position's.
+        let sets = self
+            .filters
+            .iter()
+            .enumerate()
+            .filter(|(_, filter)| !matches!(filter, CompiledFilter::Folded { .. }))
+            .map(|(position, _)| &self.membership[position])
+            .collect::<Vec<_>>();
+        let admit = |sequence: u64| -> bool {
+            sets.iter().all(|set| match set {
+                MembershipSet::Ids(ids) => ids.binary_search(&sequence).is_ok(),
+                MembershipSet::Bitmap(bits) => membership_bitmap_contains(bits, sequence),
+                // `vector_filters_are_index_side` admitted this page, so every
+                // set here is one of the two above. Refusing is the safe
+                // answer for a set that is not, not admitting.
+                _ => false,
+            })
+        };
+        let dim = u64::try_from(super::quantized_vector_indexes::dimension(info)?)
+            .map_err(invalid_query)?;
+        let after = self.vector_after()?;
+        let k = ef.min(held.max(1));
+        // Two ceilings, in the two currencies the filtered walk spends. The
+        // READ ceiling is what a refused entry still costs: one candidate and
+        // one compact read. The SCORED ceiling comes from the lane budget: a
+        // refused entry decodes no lanes, so the lanes bound the entries the
+        // filters admit, one past the budget so the charge that names the
+        // exhausted resource is made before the scan's own limit trips.
+        let ceiling = scan_ceiling(meter, 0, WorkResource::VectorLocators);
+        let scored_ceiling = if dim > 0 {
+            usize::try_from(meter.remaining(WorkResource::VectorLanes) / dim)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        } else {
+            usize::MAX
+        };
+        let mut budget = None;
+        let result = {
+            let mut progress = filtered_vector_scan_progress(meter, &mut budget, dim);
+            self.db.scan_quantized(
+                info.id,
+                query,
+                metric,
+                k,
+                ef,
+                super::quantized_vector_indexes::QuantizedVectorCandidates::Admitted(&admit),
+                after,
+                ceiling,
+                scored_ceiling,
+                &mut progress,
+            )
+        };
+        if let Some(error) = budget {
+            return Err(error);
+        }
+        let result = result?;
+        // The shortlist was charged as it was scanned; the rerank's sidecar
+        // gets are `reranked` and are charged here, once, because `ef` already
+        // bounds them.
+        let reranked = u64::try_from(result.reranked).map_err(invalid_query)?;
+        meter.charge(WorkResource::VectorSidecars, reranked)?;
+        meter.charge(WorkResource::VectorLanes, reranked.saturating_mul(dim))?;
+        let bound = result.hits.len().max(1);
+        let mut winners = Winners::new();
+        for hit in result.hits {
+            let entry = HeapEntry {
+                key: RankKey {
+                    value: RankValue::Score(hit.distance.to_bits()),
+                    id: hit.id,
+                },
+                descending: false,
+                row: None,
+            };
+            winners.push(bound, entry);
+        }
+        Ok(Some((
+            winners,
+            Some(ApproximationDiagnostics {
+                method: result.method,
+                ef: result.ef,
+                examined: result.examined,
+                reranked: result.reranked,
+            }),
+        )))
     }
 
     /// The bookkeeping every page ends with, however its winners were found:
@@ -7560,12 +7934,26 @@ impl PreparedQuery<'_> {
         // the end -- and the whole walk is skipped, which is the point.
         if !self.run.is_empty() {
             let take = wanted.min(self.run.len());
-            let mut winners = Vec::with_capacity(take);
-            for _ in 0..take {
-                winners.push(self.run.pop().expect("the run was just measured"));
-            }
-            let has_more = !self.run.is_empty() || self.run_bounded;
-            let rows = self.emit_rows(&mut winners, &mut meter)?;
+            // Taken, not yet given up. `emit_rows` still charges this page's
+            // output bytes and, where the page owes a winner probe, its
+            // primary reads -- so it can still fail on a budget or a
+            // cancellation, and a page that fails must leave the run exactly
+            // as it found it. Popping first handed the retry the SLICE AFTER
+            // the one that failed, which is the same defect as a committed
+            // `after`. The run is stored last-first, so the tail is this
+            // page's winners and reversing it puts them in rank order.
+            let keep = self.run.len() - take;
+            let mut winners = self.run.split_off(keep);
+            winners.reverse();
+            let has_more = keep > 0 || self.run_bounded;
+            let rows = match self.emit_rows(&mut winners, &mut meter) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    winners.reverse();
+                    self.run.append(&mut winners);
+                    return Err(err);
+                }
+            };
             let work = meter.used;
             return self.finish_page(rows, &winners, has_more, None, work);
         }
@@ -7581,23 +7969,54 @@ impl PreparedQuery<'_> {
             .after
             .clone()
             .filter(|_| in_rank_order != RankWalk::No);
-        let mut nearest_walk = self.nearest.take();
+        // Resume state, exactly like `after` and `run`: the walk carries the
+        // ring the previous page stopped in, and reading it ADVANCES it. A
+        // page that fails must leave it where it found it, so the page walks
+        // a CLONE and the clone is committed only once the page's rows are
+        // final; on any error the original goes back untouched.
+        //
+        // Cost: one clone per Distance page -- the current ring's `held` and
+        // `ready` hits (40 bytes each), the Hilbert cover ranges, and the
+        // index descriptor. That is a copy of what the walk already holds,
+        // taken by a page that is about to examine that same ring's postings,
+        // and it adds no bound proportional to the database. The alternative,
+        // dropping the walk on failure and re-walking from the centre next
+        // page, costs re-examining every posting the earlier pages already
+        // charged.
+        let nearest_before = self.nearest.take();
+        let mut nearest_walk = nearest_before.clone();
         let result = (|| {
-        if let Some((fast_winners, fast_approx)) =
-            self.unfiltered_vector_scan(held, &mut meter)?
-        {
+        let fast_scan = match self.unfiltered_vector_scan(held, &mut meter)? {
+            Some(scan) => Some(scan),
+            None => self.filtered_vector_scan(held, &mut meter)?,
+        };
+        if let Some((fast_winners, fast_approx)) = fast_scan {
             let mut winners = fast_winners.into_vec();
             winners.sort_unstable_by(|left, right| {
                 compare_rank(&left.key, &right.key, descending)
             });
             let has_more = winners.len() > wanted;
-            if winners.len() > wanted && self.keeps_a_run() {
-                self.run_bounded = winners.len() == held;
-                self.run = winners.split_off(wanted);
-                self.run.reverse();
-            }
+            // Split the hold out of the winners, but do not hand it to the
+            // query yet: `emit_rows` can still fail -- on a cancellation or a
+            // budget -- and a failed page must leave the query exactly as it
+            // found it, the hold as much as `after`. A hold committed before
+            // the page was built is a page's worth of ranked rows that the
+            // retry then skips past, because the retry reads the hold instead
+            // of walking, and the rows this page had truncated away are gone.
+            let holds = winners.len() > wanted && self.keeps_a_run();
+            let bounded = winners.len() == held;
+            let mut hold = if holds {
+                winners.split_off(wanted)
+            } else {
+                Vec::new()
+            };
             winners.truncate(wanted);
             let rows = self.emit_rows(&mut winners, &mut meter)?;
+            if holds {
+                hold.reverse();
+                self.run_bounded = bounded;
+                self.run = hold;
+            }
             let work = meter.used;
             return self.finish_page(rows, &winners, has_more, fast_approx, work);
         }
@@ -7940,9 +8359,15 @@ impl PreparedQuery<'_> {
 
         let geometry_driven = in_rank_order == RankWalk::Exact
             && matches!(driver, DriverCursor::Geometry(_));
-        if let (true, DriverCursor::Geometry(cursor)) = (geometry_driven, &driver) {
-            self.geometry_seen.clone_from(&cursor.seen);
-        }
+        // Held, not committed, for the reason `after` and `run` are held: a
+        // page that fails inside `emit_rows` would otherwise leave the seen
+        // set advanced, and the retry would skip the entities the failed page
+        // had marked -- so the first page comes back as a later slice of the
+        // cell walk. One clone either way; only the moment it lands moves.
+        let mut geometry_seen = match (geometry_driven, &driver) {
+            (true, DriverCursor::Geometry(cursor)) => Some(cursor.seen.clone()),
+            _ => None,
+        };
 
         // A page that never had to name its worst entry is still in the order
         // the walk handed it over, and an EXACT walk hands it over in rank
@@ -7969,9 +8394,9 @@ impl PreparedQuery<'_> {
         // learn whether more exist. The next page re-opens at the last
         // RETURNED posting and must be allowed to admit that extra entity
         // again, so it must not count as seen.
-        if geometry_driven {
+        if let Some(seen) = geometry_seen.as_mut() {
             for extra in winners.iter().skip(wanted) {
-                self.geometry_seen.remove(&extra.key.id.sequence);
+                seen.remove(&extra.key.id.sequence);
             }
         }
         // Everything this walk ranked past the page it is returning. It was
@@ -7980,17 +8405,38 @@ impl PreparedQuery<'_> {
         // whether the walk filled the hold -- if it did, emptying the run is
         // not the end of the answer and a later page walks once more, from the
         // last row handed out.
-        if winners.len() > wanted && self.keeps_a_run() {
-            self.run_bounded = winners.len() == held;
-            self.run = winners.split_off(wanted);
-            self.run.reverse();
-        }
+        // Committed only once `emit_rows` has built the page, for the same
+        // reason `after` is: a page that fails hands nothing back, so it must
+        // leave no resume state behind either.
+        let holds = winners.len() > wanted && self.keeps_a_run();
+        let bounded = winners.len() == held;
+        let mut hold = if holds {
+            winners.split_off(wanted)
+        } else {
+            Vec::new()
+        };
         winners.truncate(wanted);
         let rows = self.emit_rows(&mut winners, &mut meter)?;
+        if let Some(seen) = geometry_seen {
+            self.geometry_seen = seen;
+        }
+        if holds {
+            hold.reverse();
+            self.run_bounded = bounded;
+            self.run = hold;
+        }
         let work = meter.used;
         self.finish_page(rows, &winners, has_more, approximation, work)
         })();
-        self.nearest = nearest_walk;
-        result
+        match result {
+            Ok(page) => {
+                self.nearest = nearest_walk;
+                Ok(page)
+            }
+            Err(err) => {
+                self.nearest = nearest_before;
+                Err(err)
+            }
+        }
     }
 }

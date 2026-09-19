@@ -17,11 +17,36 @@ pub enum ApproxVectorMethod {
     SymmetricInt8ScanV1,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub enum QuantizedVectorCandidates<'a> {
     All,
     /// IDs must belong to the index collection and be strictly sorted.
     SortedUnique(&'a [EntityId]),
+    /// The same page-order walk as [`QuantizedVectorCandidates::All`] over
+    /// every compact entry of the index, with one test in front of the
+    /// scoring: an entry whose SEQUENCE this predicate refuses is stepped
+    /// over without its int8 codes being decoded and without a distance being
+    /// computed for it.
+    ///
+    /// What the predicate must be is INDEX-SIDE: a membership test the caller
+    /// has already established from some other index's postings. Nothing here
+    /// reads a row to decide one, so a predicate that needs the row belongs
+    /// on the per-candidate path instead.
+    ///
+    /// The shortlist is the best `ef` among the entries that PASSED -- the
+    /// same `ef` semantics `All` has over the whole index, taken over the
+    /// admitted subset.
+    Admitted(&'a dyn Fn(u64) -> bool),
+}
+
+impl std::fmt::Debug for QuantizedVectorCandidates<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => f.write_str("All"),
+            Self::SortedUnique(ids) => f.debug_tuple("SortedUnique").field(ids).finish(),
+            Self::Admitted(_) => f.write_str("Admitted(..)"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,7 +56,12 @@ pub struct ApproxVectorResult {
     pub method: ApproxVectorMethod,
     /// Requested maximum approximate shortlist size.
     pub ef: usize,
-    /// Quantized index entries or filtered IDs examined.
+    /// Quantized index entries or filtered IDs SCORED: the candidates the
+    /// approximate stage decoded and ranked. Under
+    /// [`QuantizedVectorCandidates::Admitted`] the entries the walk read but
+    /// the filters refused are not counted here -- they are charged to the
+    /// query's work as candidates and compact reads -- so the number means the
+    /// same thing on every plan.
     pub examined: usize,
     /// Authoritative vectors reranked exactly.
     pub reranked: usize,
@@ -483,6 +513,7 @@ impl Database {
             candidates,
             None,
             max_examined,
+            usize::MAX,
             &mut progress,
         )
     }
@@ -501,6 +532,7 @@ impl Database {
         candidates: QuantizedVectorCandidates<'_>,
         after: Option<super::vector_indexes::VectorAfter>,
         max_examined: usize,
+        max_scored: usize,
         progress: super::vector_indexes::ScanProgress<'_>,
     ) -> Result<ApproxVectorResult> {
         if k == 0 || k > ef || ef > indexes::MAX_RESULTS {
@@ -531,46 +563,102 @@ impl Database {
         progress(super::vector_indexes::ScanStep::Scored(0))?;
 
         let mut examined = 0usize;
+        // Entries the approximate stage actually scored. On the `All` walk
+        // and the probe list this equals `examined`; under an admission
+        // predicate the refused entries are read but never scored.
+        let mut scored_total = 0usize;
         let mut shortlist = BinaryHeap::with_capacity(ef.min(1024));
         let (query_wide, wide_norm) = vector_quant::widen_query(query)
             .map_err(|_| invalid("query vector has wrong dimension or non-finite lane"))?;
 
         match candidates {
-            QuantizedVectorCandidates::All => {
+            QuantizedVectorCandidates::All | QuantizedVectorCandidates::Admitted(_) => {
+                let admit = match candidates {
+                    QuantizedVectorCandidates::Admitted(admit) => Some(admit),
+                    _ => None,
+                };
                 let prefix = entry_prefix(id);
                 let mut failure = None;
-                // Compact entries scored but not yet charged. Every entry is
-                // a candidate here, so the poll cadence and the charge
-                // cadence are the same count.
-                let mut pending = 0u64;
+                // Compact entries READ, and of those the ones decoded and
+                // SCORED, since the last progress call. The two are the same
+                // records when every entry is a candidate -- `All` reports
+                // only the scored count, exactly as it always did -- and an
+                // admission predicate is what makes them differ: a refused
+                // entry was read but never scored, and each count is charged
+                // in its own currency.
+                let mut pending_read = 0u64;
+                let mut pending_scored = 0u64;
+                // Entries read since the last progress call, whether scored
+                // or refused, so the poll cadence stays one call per
+                // `SCAN_STEP` records of actual walking.
+                let mut since_poll = 0u64;
+                // The lane budget bounds the entries SCORED, not the entries
+                // read, so an admission predicate that refuses most of the
+                // index cannot let the scan score past what the lanes allow
+                // before the charge that names them is made.
                 self.store()?.range(&prefix)?.for_each_ref(|key, value| {
                     if !key.starts_with(&prefix) {
                         return false;
                     }
                     if let Err(e) = (|| -> Result<()> {
-                        if pending == super::vector_indexes::SCAN_STEP {
+                        if since_poll == super::vector_indexes::SCAN_STEP {
+                            since_poll = 0;
+                            if pending_read > 0 {
+                                progress(super::vector_indexes::ScanStep::Locators(
+                                    std::mem::take(&mut pending_read),
+                                ))?;
+                            }
                             progress(super::vector_indexes::ScanStep::Scored(std::mem::take(
-                                &mut pending,
+                                &mut pending_scored,
                             )))?;
                         }
                         if examined == max_examined {
                             // Charge what is outstanding before reporting the
                             // limit: when the limit came from a budget, that
                             // charge names the resource that ran out.
+                            if pending_read > 0 {
+                                progress(super::vector_indexes::ScanStep::Locators(
+                                    std::mem::take(&mut pending_read),
+                                ))?;
+                            }
                             progress(super::vector_indexes::ScanStep::Scored(std::mem::take(
-                                &mut pending,
+                                &mut pending_scored,
                             )))?;
                             return Err(Error::Kernel(kernel::Error::ResourceLimit(
                                 "quantized vector max_examined exceeded",
                             )));
                         }
                         examined += 1;
-                        pending += 1;
+                        since_poll += 1;
                         let mut at = prefix.len();
                         let sequence = read_ordered(key, &mut at)?;
                         if at != key.len() || sequence == 0 {
                             return Err(corrupt("quantized vector entry key"));
                         }
+                        match admit {
+                            Some(admit) => {
+                                pending_read += 1;
+                                if !admit(sequence) {
+                                    return Ok(());
+                                }
+                            }
+                            None => {}
+                        }
+                        if scored_total == max_scored {
+                            if pending_read > 0 {
+                                progress(super::vector_indexes::ScanStep::Locators(
+                                    std::mem::take(&mut pending_read),
+                                ))?;
+                            }
+                            progress(super::vector_indexes::ScanStep::Scored(std::mem::take(
+                                &mut pending_scored,
+                            )))?;
+                            return Err(Error::Kernel(kernel::Error::ResourceLimit(
+                                "quantized vector max_scored exceeded",
+                            )));
+                        }
+                        scored_total += 1;
+                        pending_scored += 1;
                         let Some((locator, distance)) = score_compact_entry(
                             value,
                             dimension,
@@ -603,7 +691,10 @@ impl Database {
                 if let Some(e) = failure {
                     return Err(e);
                 }
-                progress(super::vector_indexes::ScanStep::Scored(pending))?;
+                if pending_read > 0 {
+                    progress(super::vector_indexes::ScanStep::Locators(pending_read))?;
+                }
+                progress(super::vector_indexes::ScanStep::Scored(pending_scored))?;
             }
             QuantizedVectorCandidates::SortedUnique(ids) => {
                 // A filtered probe list is bounded by the caller's own
@@ -651,7 +742,12 @@ impl Database {
             hits,
             method: ApproxVectorMethod::SymmetricInt8ScanV1,
             ef,
-            examined,
+            examined: match candidates {
+                QuantizedVectorCandidates::All | QuantizedVectorCandidates::Admitted(_) => {
+                    scored_total
+                }
+                QuantizedVectorCandidates::SortedUnique(_) => examined,
+            },
             reranked,
         })
     }

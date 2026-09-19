@@ -430,9 +430,79 @@ fn graph_scalar_spatial_text_and_vector_apply_before_ranked_top_k() {
     );
     assert!(page.work.graph_edges > 0);
     assert!(page.work.graph_visited > 0);
-    assert!(page.work.spatial_postings > 0);
     assert!(page.work.vector_sidecars > 0);
     assert!(page.work.vector_lanes > 0);
+    // The non-driving point filter is answered from its own cover, walked
+    // once per PREPARED QUERY rather than once per candidate, so the postings
+    // are charged to the page that builds the set -- here the first call, the
+    // one that then failed on primary reads. The set it left behind is whole
+    // (a walk that cannot finish leaves `Overflow` or nothing, never a partial
+    // set), so this page charges no postings and still applies the filter.
+    assert_eq!(page.work.spatial_postings, 0);
+
+    // The same filters on a query whose FIRST page succeeds: the cover walk
+    // and the page it pays for are the same call, and the spatial postings
+    // are charged there -- the point filter is applied from its postings,
+    // before the ranked top-k, exactly as the graph and vector work is.
+    let mut spatial_first =
+        f.db.prepare_query(QueryRequest {
+            collection: f.people,
+            filters: &filters,
+            order: QueryOrder::ExactVector {
+                index: f.indexes.vector,
+                query: &[1.0, 0.0],
+                metric: VectorMetric::Cosine,
+            },
+            projection: Projection::Fields(&projection),
+            total_limit: Some(2),
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let built = spatial_first.next_page(2, generous(), || false).unwrap();
+    assert!(built.work.spatial_postings > 0);
+    assert_eq!(
+        built.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![f.ids["p1"]]
+    );
+
+    // A budget that cannot afford one posting gets the row-read path back,
+    // not a half-built set and not a new failure: one `SpatialPostings` per
+    // candidate is what a non-driving point filter always cost.
+    let mut no_postings = generous();
+    no_postings.spatial_postings = 0;
+    let mut starved =
+        f.db.prepare_query(QueryRequest {
+            collection: f.people,
+            filters: &filters,
+            order: QueryOrder::ExactVector {
+                index: f.indexes.vector,
+                query: &[1.0, 0.0],
+                metric: VectorMetric::Cosine,
+            },
+            projection: Projection::Fields(&projection),
+            total_limit: Some(2),
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    assert!(matches!(
+        starved.next_page(2, no_postings, || false),
+        Err(QueryError::BudgetExceeded {
+            resource: WorkResource::SpatialPostings,
+            attempted: 1,
+            ..
+        })
+    ));
+    // ... and the same query, given the budget back, answers as it always did.
+    assert_eq!(
+        starved
+            .next_page(2, generous(), || false)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![f.ids["p1"]]
+    );
 
     // Text is a constraint before vector top-k. p5 is globally tied for best
     // cosine distance but cannot enter because its empty body does not match.
@@ -1587,7 +1657,20 @@ fn approximate_vector_filters_before_shortlist_pages_and_retries_with_diagnostic
         assert_eq!(diagnostic.ef, 3);
         assert_eq!(diagnostic.examined, eligible.len());
         assert_eq!(diagnostic.reranked, 3);
-        assert_eq!(first.work.vector_lanes, 20); // 4 compact + 3*(reencode+exact), dim=2
+        // Two plans answer this request. The per-candidate path (entity or
+        // scalar driver) decodes 4 compact entries and, for each of the 3
+        // rerank winners, re-encodes and scores the exact vector: 4*2 +
+        // 3*(2+2) = 20 lanes. The page-order compact scan (quantized driver)
+        // scores the same 4 entries and reranks the 3 winners from the f32
+        // sidecar without re-encoding: 4*2 + 3*2 = 14 lanes.
+        let scan_plan = matches!(first.driver, QueryDriver::QuantizedVector(_));
+        assert_eq!(
+            first.work.vector_lanes,
+            if scan_plan { 14 } else { 20 },
+            "{:?} {:?}",
+            first.driver,
+            first.work
+        );
         assert_eq!(first.work.vector_sidecars, 3);
         assert!(!first.done);
         let second = query.next_page(2, generous(), || false).unwrap();
@@ -1607,14 +1690,20 @@ fn approximate_vector_filters_before_shortlist_pages_and_retries_with_diagnostic
             assert_eq!(actual.1.total_cmp(&expected.1), std::cmp::Ordering::Equal);
         }
         match driver {
-            CandidateDriver::Order => {
+            // Auto joins Order on the scan plan: 4 of 6 rows pass the equality,
+            // far above the 1-in-16 density at which point-getting the matches
+            // would beat one page-order pass over the compact entries.
+            CandidateDriver::Order | CandidateDriver::Auto => {
                 assert_eq!(
                     first.driver,
                     QueryDriver::QuantizedVector(f.indexes.quantized)
                 );
-                assert_eq!(first.work.vector_locators, 10); // 6 + terminal + 3 rechecks
+                // 6 compact entries read, each charged as one locator; the
+                // rerank's locator validations are covered by the entry read
+                // that carried the locator inline.
+                assert_eq!(first.work.vector_locators, 6, "{:?}", first.work);
             }
-            CandidateDriver::Filter(_) | CandidateDriver::Auto => {
+            CandidateDriver::Filter(_) => {
                 assert_eq!(first.driver, QueryDriver::Scalar(f.indexes.active));
                 assert_eq!(first.work.vector_locators, 7); // 4 point probes + 3 rechecks
             }
@@ -1643,9 +1732,11 @@ fn exact_vector_and_bm25_ties_remain_stable_across_page_boundaries() {
             driver: CandidateDriver::Order,
         })
         .unwrap();
-    // The sixth check is the exact scorer's first lane-chunk check: initial,
-    // locator, candidate, sidecar and lane-budget checks precede it. A failed
-    // page must leave search-after untouched for the retry below.
+    // The sixth check is the one the page's first row is sized by, inside the
+    // emit stage: the page-entry check, the scan's candidate, sidecar and lane
+    // charges, and the winner's existence read precede it. A failed page must
+    // leave search-after -- and every other resume state, the ranked rows the
+    // page held back included -- untouched for the retry below.
     let mut cancellation_checks = 0;
     assert!(matches!(
         exact.next_page(1, generous(), || {

@@ -88,6 +88,13 @@ pub(super) struct NearestHit {
 /// and emitting it now would invert the order. Those wait for a later ring.
 /// The probe around the centre's cell is kept; it is not itself an ordered
 /// stream, so its hits sit in `held` until the first ring completes.
+/// `Clone` is what lets a query page walk this without committing to the
+/// walk: `PreparedQuery::next_page` clones the walk, walks the clone, and
+/// stores it back only once the page's rows are final, so a page that fails
+/// on a budget or a cancellation leaves the ring exactly where it found it.
+/// The copy is the current ring's `held`/`ready` hits and the Hilbert cover --
+/// what the walk already holds -- and nothing proportional to the database.
+#[derive(Clone)]
 pub(super) struct NearestWalk {
     index: IndexInfo,
     center: Point,
