@@ -1,0 +1,2241 @@
+//! BATTLE50K — E4 against PostGIS + pgvector/pgvectorscale on one 50,000-row
+//! corpus, one arm per process, modelled on `src/bin/popsim.rs`.
+//!
+//!     battle50k <arm: e4|postgres> --data <jsonl> --queries <json>
+//!               --out <report.json> [--db-dir <dir>] [--dsn <dsn>]
+//!               [--only <case-substring>] [--reuse] [--dump <dir>]
+//!     battle50k compare <a.json> <b.json>
+//!
+//! PURPOSE. `popsim` compares E4 against SQLite and Postgres on a generated
+//! population of points and squares. This program asks a narrower question on
+//! a FIXED corpus that lives on disk: given the same 50,000 rows — a name, a
+//! description, a date, a category, a point, a polygon with holes and a
+//! 32-dimensional unit vector each — do E4 and a PostGIS + pgvector +
+//! pgvectorscale Postgres return the SAME ROWS, and at what cost per query?
+//! Row-count agreement on every filter case is the precondition; a latency
+//! ratio between two arms that answered different questions is not a
+//! measurement.
+//!
+//! ARMS.
+//!
+//!   `e4`        an embedded `Database` under `--db-dir`, collection `place`,
+//!               seven indexes: text over the concatenated `text` field,
+//!               ordered scalar `born`, Text scalar `kind`, point `loc`,
+//!               geometry `plot`, exact vector `emb`, quantized vector `emb`.
+//!               Loaded with one `commit` every 256 rows, the cadence
+//!               `popsim` uses; every index is built LATE through
+//!               `build_index_to_ready` and each build is its own timed stage.
+//!               `disk_bytes` is the sum of every file size under `--db-dir`.
+//!
+//!   `postgres`  a real server at `--dsn`, table
+//!               `place(key text primary key, name text, descr text,
+//!               born int, kind text, loc geography(Point,4326),
+//!               plot geography(Polygon,4326), emb vector(32))`, six indexes:
+//!               a GIN index on `to_tsvector('simple', name || ' ' || descr)`,
+//!               btrees on `born` and `kind`, GiST on `loc` and on `plot`, and
+//!               `USING diskann (emb vector_cosine_ops)` from pgvectorscale.
+//!               Loaded in 256-row transactions with `synchronous_commit=on`;
+//!               each `CREATE INDEX` is its own timed stage. `disk_bytes` is
+//!               `pg_total_relation_size('place')`.
+//!
+//! BATTERY. The same twenty-two cases, in the same order, in both arms, fifty
+//! query instances each, driven by `queries.json` (`points`, `boxes`,
+//! `polygons`, `radii`, `vectors`, `terms`, fifty of each). Thirteen FILTER
+//! cases return every matching row and are compared on row count:
+//! `pt_radius`, `pt_bbox`, `plot_within_box`, `plot_contains_pt`,
+//! `plot_intersects`, `plot_dwithin_1km`, `plot_vs_poly_within`, `text_one`,
+//! `text_two`, `text_and_kind`, `born_range`, `kind_eq`, `radius_and_born`.
+//! Seven RANKED cases return ten rows and are compared on top-ten overlap,
+//! never on order: `knn_10`, `knn_10_kind`, `text_top10`, `vec_exact_10`,
+//! `vec_exact_radius`, `hybrid_10`, `hybrid_blend_10`. Two APPROX cases
+//! report recall at ten against that same arm's own exact answer:
+//! `vec_ann_10`, `vec_ann_10_kind`.
+//!
+//! Each case is warmed by one untimed pass over all fifty instances and then
+//! measured by one timed pass; `median_us` and `p90_us` are over the fifty
+//! per-instance wall times and `total_rows` is their sum. `first_keys` is
+//! instance 0's answer, in result order, at most ten keys.
+//!
+//! DEVIATIONS. Every one of these is reported in the JSON's `deviations`
+//! block as well; none of them is emulated silently.
+//!
+//!   1. A TEXT INDEX SPANS ONE FIELD, NOT TWO. `Database::create_text_index`
+//!      (`src/text_indexes.rs:1845`) takes a single declared `Kind::Text`
+//!      field and refuses anything else, so there is no E4 index over
+//!      `name` AND `desc`. The loader therefore stores a third Text field,
+//!      `text`, holding `name` + " " + `desc`, and indexes THAT; Postgres
+//!      indexes the expression `to_tsvector('simple', name || ' ' || descr)`
+//!      and every Postgres text query repeats the identical expression, so
+//!      the planner can use the expression index. The consequence for the
+//!      disk comparison is named rather than hidden: E4 stores `name`, `desc`
+//!      AND their concatenation, Postgres stores `name` and `descr` only.
+//!
+//!   2. KEYS COME BACK THROUGH AN ID-TO-KEY VECTOR IN THE E4 ARM. The brief
+//!      asks the filter cases for `Projection::Ids`, and a `QueryRow` carries
+//!      an `EntityId`, not the external key. `popsim` recomputes the key from
+//!      the sequence because it generates its own keys; this corpus's keys
+//!      come from the file, so the loader keeps them in a `Vec<String>`
+//!      indexed by `sequence - 1` (the put order is the file order, so that
+//!      index is exact) and the arm translates ids through it. The Postgres
+//!      arm selects its `key` column directly. Neither translation is inside
+//!      a timed statement in the Postgres arm; in the E4 arm the `Vec` lookup
+//!      IS inside the timed pass, which costs one indexed read per returned
+//!      row and is the closest available match to Postgres returning the
+//!      column.
+//!
+//!   3. `queries.json`'s BOXES ARE `[minlon, maxlon, minlat, maxlat]`. The
+//!      file's actual order is longitude, longitude, latitude, latitude —
+//!      not the lon/lat/lon/lat the brief's prose assumed. Both arms read the
+//!      file's real order, so both build the same rectangle.
+//!
+//!   4. `queries.json` CARRIES NO `kinds` ARRAY. The eight categories the
+//!      `*_kind` cases need are derived instead: the sorted distinct `kind`
+//!      values of the data file. Both arms derive them from the same file by
+//!      the same rule, and an arm refuses to run if that set is not exactly
+//!      eight values.
+//!
+//!   5. THE BLEND IS SPELT DIFFERENTLY. E4 asks `hybrid_blend_10` through
+//!      `QueryOrder::Score` (`0.5 * Bm25 + 0.5 * (1 + VectorSimilarity)`,
+//!      cosine), Postgres through `ORDER BY 0.5 * ts_rank_cd(..) + 0.5 *
+//!      (1 - (emb <=> v))`. The vector halves are the same cosine; the text
+//!      halves are BM25 against ts_rank_cd (deviation 7), so the case is
+//!      compared on top-ten overlap, never on order. Neither engine can
+//!      answer an arithmetic ORDER BY from an index in order: both rank
+//!      every candidate the two filters admit.
+//!
+//!   6. POSTGRES HAS NO EXACT VECTOR INDEX. `ORDER BY emb <=> v LIMIT 10`
+//!      over the diskann index is approximate, and bounding
+//!      `diskann.query_search_list_size` does not make it exact. The three
+//!      exact vector cases therefore run inside a transaction with
+//!      `SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off`,
+//!      which is a sequential scan with an exact distance per row. That also
+//!      removes the GiST and GIN indexes from the filters of
+//!      `vec_exact_radius` and `hybrid_10`, so those two Postgres cases are
+//!      full sequential scans and their latency is not an index measurement.
+//!      E4's exact arm is a real index (`emb_exact`), so the E4 report has an
+//!      `index:place_emb_exact` build stage that the Postgres report does not.
+//!
+//!   7. THE RANKING FORMULAS DIFFER. E4 ranks text by BM25, Postgres by
+//!      `ts_rank_cd`. Like `popsim`'s `name_top10`, `text_top10` is compared
+//!      on row count and on top-ten overlap, never on order.
+//!
+//!   8. K-NEAREST TIE-BREAKING DIFFERS. `QueryOrder::Distance` breaks ties by
+//!      entity id (`src/query.rs:169`); the Postgres spelling the brief asks
+//!      for, `ORDER BY loc <-> point LIMIT 10`, has no tiebreak, because
+//!      adding one would take the ordered KNN-GiST walk away from the
+//!      planner. The comparison of `first_keys` is therefore SET overlap.
+//!
+//!   9. GEOMETRY UNITS ARE MATCHED THE WAY `GeometryFilter` DOCUMENTS THEM
+//!      (`src/query.rs:100`): `Intersects` and `DWithin` are spheroidal, so
+//!      Postgres gets `ST_Intersects` / `ST_DWithin(..., true)` on
+//!      `geography`; `Within` and `Contains` are planar, so Postgres gets
+//!      `ST_Within` / `ST_Contains` on `plot::geometry`, which is what PostGIS
+//!      itself does for lack of a geography overload. What remains is the
+//!      routine, not the model: E4 refines with `spatial_geometry`, Postgres
+//!      with PostGIS's own predicates, and rows within a metre of a spheroidal
+//!      boundary can be decided differently by the two.
+//!
+//!  10. `born` IS `int` IN POSTGRES AND `Kind::Int` (i64) IN E4. Every value
+//!      in this corpus is a yyyymmdd that fits in int4, so no value is
+//!      truncated; the width is still different on the two sides.
+//!
+//!  11. `--reuse` STILL READS THE JSONL. It loads nothing and builds nothing —
+//!      that is the point — but the E4 arm needs the id-to-key vector of
+//!      deviation 2 and both arms need the eight categories of deviation 4,
+//!      and both come from the data file. The stage block reports `null` for
+//!      every stage that did not happen, never zero.
+//!
+//!  12. `ef` AND `diskann.query_search_list_size` ARE BOTH 100. They are not
+//!      the same knob: E4's `ef` bounds a compact shortlist that is then
+//!      reranked from f32 sidecars, and pgvectorscale's search list size
+//!      bounds a graph beam. Setting both to 100 matches the number, not the
+//!      algorithm, which is why recall is computed INSIDE each arm against
+//!      that arm's own exact answer and never across arms.
+//!
+//!  13. THE KEY IS STORED TWICE IN BOTH ARMS, AND THAT IS DELIBERATE. E4
+//!      declares a `key` Text field alongside the external key that
+//!      `Database::put` already maps, because the brief's schema names it;
+//!      Postgres holds `key` in the heap tuple and again in the primary-key
+//!      btree. Neither arm is given the smaller footprint the other cannot
+//!      have.
+//!
+//!  14. THE PLANAR GEOMETRY CASES GET A `&&` CANDIDATE IN POSTGRES.
+//!      `ST_Within` and `ST_Contains` run on `plot::geometry`, and no index on
+//!      a `geography` column can serve a geometry cast, so `plot_within_box`,
+//!      `plot_contains_pt` and `plot_vs_poly_within` each carry a leading
+//!      `plot && <candidate>::geography` bounding-box term that lets the GiST
+//!      index narrow the scan before the exact refine. A bounding box that
+//!      fails to overlap cannot contain or be contained, so the term is a
+//!      superset test for both predicates: it changes the cost, never the
+//!      answer. It is the same candidate-then-refine shape `pt_bbox` uses on
+//!      both sides, and `popsim`'s SQLite arm uses throughout.
+//!
+//!  15. THE SMOKE TEST IS NOT COMPILED BY THE RELEASE BUILD.
+//!      `tests/battle50k_smoke.rs` includes this file by `#[path]`, the way
+//!      `tests/popsim_smoke.rs` includes `popsim.rs`, so what it exercises is
+//!      what a run would execute. `cargo build --release` does not build test
+//!      targets, so the release build proves this binary compiles and says
+//!      nothing about that file.
+
+use e4_prototype::{
+    collections::{
+        CandidateDriver, CollectionId, CollectionOptions, Database, Geom, GeometryFilter, IndexId,
+        PointFilter, Projection, QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter,
+        ScalarValue, ScoreExpr, SortDirection, TextMatch, VectorMetric,
+    },
+    spatial_math::{Bounds, Point},
+    Kind,
+};
+use kernel::{
+    io::IoMode,
+    store::{Config, SyncMode},
+};
+use postgres::{types::ToSql, Client, NoTls};
+use serde_json::{json, Value};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fs,
+    io::{BufRead, BufReader},
+    ops::Bound,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
+
+type R<T> = Result<T, Box<dyn std::error::Error>>;
+
+// ── constants ─────────────────────────────────────────────────────────────
+
+/// Query instances per case, one per entry of every array in `queries.json`.
+pub const INSTANCES: usize = 50;
+/// Rows per commit / per transaction, both arms — `popsim`'s load cadence.
+pub const BATCH: usize = 256;
+/// Top-k for every ranked and approximate case.
+pub const K: usize = 10;
+/// E4's approximate shortlist bound, and pgvectorscale's search list size.
+pub const EF: usize = 100;
+/// E4's maximum page. A complete answer is assembled from repeated pages and
+/// that assembly is part of what a case costs.
+const PAGE: usize = 8192;
+/// Cache budget for the E4 arm, the same 8 MiB `popsim` gives every arm.
+const CACHE_BYTES: usize = 8 << 20;
+/// Keys reported per case, for instance 0 only.
+pub const FIRST_KEYS: usize = 10;
+/// Categories the `*_kind` cases cycle through. Derived, see deviation 4.
+pub const KINDS: usize = 8;
+/// Vector width of the `emb` field.
+pub const DIM: usize = 32;
+
+const DEFAULT_DB_DIR: &str = "<scratch>";
+const DEFAULT_DSN: &str = "postgres://127.0.0.1:5433/e4_bench";
+
+// ── the corpus ────────────────────────────────────────────────────────────
+
+/// One row of `places-50000.jsonl`, held as both arms need it: E4 wants a
+/// `Geom` and an `f32` slice, Postgres wants GeoJSON text and a `vector`
+/// literal, so the row carries both spellings rather than converting inside a
+/// timed statement.
+pub struct Row {
+    pub key: String,
+    pub name: String,
+    pub desc: String,
+    pub born: i64,
+    pub kind: String,
+    pub lon: f64,
+    pub lat: f64,
+    pub plot: Geom,
+    pub plot_json: String,
+    pub emb: Vec<f32>,
+    pub emb_literal: String,
+}
+
+impl Row {
+    /// The concatenation E4's single-field text index is built over. See
+    /// deviation 1.
+    fn text(&self) -> String {
+        format!("{} {}", self.name, self.desc)
+    }
+}
+
+pub struct Corpus {
+    pub rows: Vec<Row>,
+    /// The file's keys in file order, which is put order, which is entity
+    /// sequence order. Index `sequence - 1`. See deviation 2.
+    pub keys: Vec<String>,
+    /// The sorted distinct `kind` values. See deviation 4.
+    pub kinds: Vec<String>,
+}
+
+fn str_at(value: &Value, field: &str) -> R<String> {
+    Ok(value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("row field `{field}` is not a string"))?
+        .to_owned())
+}
+
+fn geom_from_json(value: &Value) -> R<Geom> {
+    let ty = value
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or("geometry has no type")?;
+    let coordinates = value
+        .get("coordinates")
+        .cloned()
+        .ok_or("geometry has no coordinates")?;
+    Ok(match ty {
+        "Point" => {
+            let p: [f64; 2] = serde_json::from_value(coordinates)?;
+            Geom::Point(p[0], p[1])
+        }
+        "LineString" => Geom::LineString(serde_json::from_value(coordinates)?),
+        "Polygon" => Geom::Polygon(serde_json::from_value(coordinates)?),
+        "MultiPoint" => Geom::MultiPoint(serde_json::from_value(coordinates)?),
+        "MultiLineString" => Geom::MultiLineString(serde_json::from_value(coordinates)?),
+        "MultiPolygon" => Geom::MultiPolygon(serde_json::from_value(coordinates)?),
+        other => return Err(format!("unsupported geometry type {other}").into()),
+    })
+}
+
+fn geom_to_json(geom: &Geom) -> Value {
+    match geom {
+        Geom::Point(x, y) => json!({"type": "Point", "coordinates": [x, y]}),
+        Geom::LineString(c) => json!({"type": "LineString", "coordinates": c}),
+        Geom::Polygon(rings) => json!({"type": "Polygon", "coordinates": rings}),
+        Geom::MultiPoint(c) => json!({"type": "MultiPoint", "coordinates": c}),
+        Geom::MultiLineString(rs) => json!({"type": "MultiLineString", "coordinates": rs}),
+        Geom::MultiPolygon(ps) => json!({"type": "MultiPolygon", "coordinates": ps}),
+    }
+}
+
+/// pgvector's text input form: `[a,b,c]`, cast to `vector` at the call site.
+fn vector_literal(v: &[f32]) -> String {
+    let mut out = String::with_capacity(v.len() * 10 + 2);
+    out.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{x:?}"));
+    }
+    out.push(']');
+    out
+}
+
+pub fn load_corpus(path: &Path) -> R<Corpus> {
+    let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut rows = Vec::new();
+    for (lineno, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|e| format!("{}:{}: {e}", path.display(), lineno + 1))?;
+        let loc = geom_from_json(value.get("loc").ok_or("row has no loc")?)?;
+        let Geom::Point(lon, lat) = loc else {
+            return Err(format!("{}:{}: loc is not a Point", path.display(), lineno + 1).into());
+        };
+        let plot = geom_from_json(value.get("plot").ok_or("row has no plot")?)?;
+        let emb: Vec<f32> = value
+            .get("emb")
+            .and_then(Value::as_array)
+            .ok_or("row has no emb array")?
+            .iter()
+            .map(|x| x.as_f64().map(|x| x as f32).ok_or("emb holds a non-number"))
+            .collect::<Result<_, _>>()?;
+        if emb.len() != DIM {
+            return Err(format!(
+                "{}:{}: emb has {} dimensions, expected {DIM}",
+                path.display(),
+                lineno + 1,
+                emb.len()
+            )
+            .into());
+        }
+        rows.push(Row {
+            key: str_at(&value, "key")?,
+            name: str_at(&value, "name")?,
+            desc: str_at(&value, "desc")?,
+            born: value
+                .get("born")
+                .and_then(Value::as_i64)
+                .ok_or("row field `born` is not an integer")?,
+            kind: str_at(&value, "kind")?,
+            lon,
+            lat,
+            plot_json: geom_to_json(&plot).to_string(),
+            plot,
+            emb_literal: vector_literal(&emb),
+            emb,
+        });
+    }
+    if rows.is_empty() {
+        return Err(format!("{} holds no rows", path.display()).into());
+    }
+    let keys = rows.iter().map(|r| r.key.clone()).collect();
+    let kinds: Vec<String> = rows
+        .iter()
+        .map(|r| r.kind.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if kinds.len() != KINDS {
+        return Err(format!(
+            "{} holds {} distinct kinds, expected {KINDS}; the *_kind cases index kinds[i % {KINDS}]",
+            path.display(),
+            kinds.len()
+        )
+        .into());
+    }
+    Ok(Corpus { rows, keys, kinds })
+}
+
+// ── the query instances ───────────────────────────────────────────────────
+
+/// `queries.json`, read as the file actually spells it. `boxes` are
+/// `[minlon, maxlon, minlat, maxlat]`; see deviation 3.
+pub struct Queries {
+    pub points: Vec<[f64; 2]>,
+    pub boxes: Vec<[f64; 4]>,
+    pub polygons: Vec<Geom>,
+    pub polygon_json: Vec<String>,
+    pub radii: Vec<[f64; 3]>,
+    pub vectors: Vec<Vec<f32>>,
+    pub vector_literals: Vec<String>,
+    pub terms: Vec<String>,
+}
+
+fn array_at<'a>(value: &'a Value, field: &str) -> R<&'a Vec<Value>> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("queries.json has no `{field}` array").into())
+}
+
+pub fn load_queries(path: &Path) -> R<Queries> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let value: Value = serde_json::from_str(&text)?;
+    let points: Vec<[f64; 2]> = serde_json::from_value(Value::Array(array_at(&value, "points")?.clone()))?;
+    let boxes: Vec<[f64; 4]> = serde_json::from_value(Value::Array(array_at(&value, "boxes")?.clone()))?;
+    let radii: Vec<[f64; 3]> = serde_json::from_value(Value::Array(array_at(&value, "radii")?.clone()))?;
+    let vectors: Vec<Vec<f32>> = serde_json::from_value(Value::Array(array_at(&value, "vectors")?.clone()))?;
+    let terms: Vec<String> = serde_json::from_value(Value::Array(array_at(&value, "terms")?.clone()))?;
+    let polygons: Vec<Geom> = array_at(&value, "polygons")?
+        .iter()
+        .map(geom_from_json)
+        .collect::<R<_>>()?;
+    let polygon_json = polygons.iter().map(|g| geom_to_json(g).to_string()).collect();
+    let vector_literals = vectors.iter().map(|v| vector_literal(v)).collect();
+    for (name, len) in [
+        ("points", points.len()),
+        ("boxes", boxes.len()),
+        ("polygons", polygons.len()),
+        ("radii", radii.len()),
+        ("vectors", vectors.len()),
+        ("terms", terms.len()),
+    ] {
+        if len < INSTANCES {
+            return Err(format!("queries.json `{name}` holds {len} entries, need {INSTANCES}").into());
+        }
+    }
+    for (i, v) in vectors.iter().enumerate() {
+        if v.len() != DIM {
+            return Err(format!("queries.json vectors[{i}] has {} dimensions, expected {DIM}", v.len()).into());
+        }
+    }
+    Ok(Queries {
+        points,
+        boxes,
+        polygons,
+        polygon_json,
+        radii,
+        vectors,
+        vector_literals,
+        terms,
+    })
+}
+
+impl Queries {
+    /// The rectangle `boxes[i]` names, as E4's `Bounds`.
+    pub fn bounds(&self, i: usize) -> R<Bounds> {
+        let b = self.boxes[i];
+        Bounds::new(b[0], b[1], b[2], b[3]).map_err(|e| format!("boxes[{i}]: {e}").into())
+    }
+
+    /// The same rectangle as a closed polygon ring, for the geometry cases.
+    pub fn box_polygon(&self, i: usize) -> Geom {
+        let b = self.boxes[i];
+        Geom::Polygon(vec![vec![
+            [b[0], b[2]],
+            [b[1], b[2]],
+            [b[1], b[3]],
+            [b[0], b[3]],
+            [b[0], b[2]],
+        ]])
+    }
+
+    pub fn point(&self, i: usize) -> R<Point> {
+        let p = self.points[i];
+        Point::new(p[0], p[1]).map_err(|e| format!("points[{i}]: {e}").into())
+    }
+
+    pub fn radius_centre(&self, i: usize) -> R<Point> {
+        let r = self.radii[i];
+        Point::new(r[0], r[1]).map_err(|e| format!("radii[{i}]: {e}").into())
+    }
+
+    pub fn radius_metres(&self, i: usize) -> f64 {
+        self.radii[i][2]
+    }
+
+    /// `born between 19500101 and 19500101 + 10000*(i%7)` — an inclusive
+    /// range that is one day wide when `i % 7` is zero and roughly six
+    /// decades wide when it is six.
+    pub fn born_range(&self, i: usize) -> (i64, i64) {
+        (19_500_101, 19_500_101 + 10_000 * (i as i64 % 7))
+    }
+}
+
+// ── the battery ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseKind {
+    Filter,
+    Ranked,
+    Approx,
+}
+
+impl CaseKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Filter => "filter",
+            Self::Ranked => "ranked",
+            Self::Approx => "approx",
+        }
+    }
+}
+
+pub struct CaseSpec {
+    pub name: &'static str,
+    pub kind: CaseKind,
+}
+
+/// The same names in the same order in both arms. `compare` walks this list,
+/// not either report's own ordering, so a missing case is a visible hole.
+pub const BATTERY: [CaseSpec; 22] = [
+    CaseSpec { name: "pt_radius", kind: CaseKind::Filter },
+    CaseSpec { name: "pt_bbox", kind: CaseKind::Filter },
+    CaseSpec { name: "plot_within_box", kind: CaseKind::Filter },
+    CaseSpec { name: "plot_contains_pt", kind: CaseKind::Filter },
+    CaseSpec { name: "plot_intersects", kind: CaseKind::Filter },
+    CaseSpec { name: "plot_dwithin_1km", kind: CaseKind::Filter },
+    CaseSpec { name: "plot_vs_poly_within", kind: CaseKind::Filter },
+    CaseSpec { name: "text_one", kind: CaseKind::Filter },
+    CaseSpec { name: "text_two", kind: CaseKind::Filter },
+    CaseSpec { name: "text_and_kind", kind: CaseKind::Filter },
+    CaseSpec { name: "born_range", kind: CaseKind::Filter },
+    CaseSpec { name: "kind_eq", kind: CaseKind::Filter },
+    CaseSpec { name: "radius_and_born", kind: CaseKind::Filter },
+    CaseSpec { name: "knn_10", kind: CaseKind::Ranked },
+    CaseSpec { name: "knn_10_kind", kind: CaseKind::Ranked },
+    CaseSpec { name: "text_top10", kind: CaseKind::Ranked },
+    CaseSpec { name: "vec_exact_10", kind: CaseKind::Ranked },
+    CaseSpec { name: "vec_exact_radius", kind: CaseKind::Ranked },
+    CaseSpec { name: "hybrid_10", kind: CaseKind::Ranked },
+    CaseSpec { name: "hybrid_blend_10", kind: CaseKind::Ranked },
+    CaseSpec { name: "vec_ann_10", kind: CaseKind::Approx },
+    CaseSpec { name: "vec_ann_10_kind", kind: CaseKind::Approx },
+];
+
+/// The exact counterpart each approximate case's recall is measured against,
+/// inside the SAME arm. See deviation 12.
+fn exact_twin(name: &str) -> Option<&'static str> {
+    match name {
+        "vec_ann_10" => Some("vec_exact_10"),
+        "vec_ann_10_kind" => Some("vec_ann_10_kind:exact"),
+        _ => None,
+    }
+}
+
+// ── what a case answers with ──────────────────────────────────────────────
+
+/// The number of rows the case produced plus the first ten keys in result
+/// order. A filter case over 50,000 rows counts as it goes and keeps ten
+/// keys, so no case materialises its whole answer in this process.
+#[derive(Clone, Debug, Default)]
+pub struct Answer {
+    pub rows: u64,
+    pub keys: Vec<String>,
+}
+
+/// While set, a case keeps EVERY key it returned instead of only the first
+/// [`FIRST_KEYS`], so `--dump` can write the whole answer out. It is off for
+/// the warm pass and for the timed pass, so no measured number ever pays for
+/// the extra pushes; `run_arm` turns it on for one extra untimed pass.
+static DUMP_ALL_KEYS: AtomicBool = AtomicBool::new(false);
+
+fn dumping() -> bool {
+    DUMP_ALL_KEYS.load(Ordering::Relaxed)
+}
+
+impl Answer {
+    fn push(&mut self, key: String) {
+        if dumping() || self.keys.len() < FIRST_KEYS {
+            self.keys.push(key);
+        }
+        self.rows += 1;
+    }
+}
+
+/// `<dir>/<case>/<i>.keys` — one key per line, sorted, for one query
+/// instance of one case. Written by the extra untimed `--dump` pass so the
+/// two arms' answers can be diffed key by key rather than by row count.
+fn write_dump(dir: &Path, case: &str, i: usize, keys: &[String]) -> R<()> {
+    let case_dir = dir.join(case);
+    fs::create_dir_all(&case_dir)?;
+    let mut sorted: Vec<&str> = keys.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut body = String::new();
+    for key in sorted {
+        body.push_str(key);
+        body.push('\n');
+    }
+    fs::write(case_dir.join(format!("{i}.keys")), body)?;
+    Ok(())
+}
+
+/// One untimed pass over all fifty instances of one case, writing every
+/// instance's full key set under `dir`.
+fn dump_case(dir: &Path, case: &str, mut run: impl FnMut(usize) -> R<Answer>) -> R<()> {
+    DUMP_ALL_KEYS.store(true, Ordering::Relaxed);
+    let result = (|| {
+        for i in 0..INSTANCES {
+            let answer = run(i)?;
+            write_dump(dir, case, i, &answer.keys)?;
+        }
+        Ok(())
+    })();
+    DUMP_ALL_KEYS.store(false, Ordering::Relaxed);
+    result
+}
+
+#[derive(Clone, Debug)]
+pub struct CaseResult {
+    pub median_us: f64,
+    pub p90_us: f64,
+    pub total_rows: u64,
+    pub first_keys: Vec<String>,
+}
+
+/// Nearest-rank percentile over the fifty samples: `p90` is the 45th smallest.
+fn percentile(sorted: &[f64], fraction: f64) -> f64 {
+    let n = sorted.len();
+    let rank = ((n as f64) * fraction).ceil() as usize;
+    sorted[rank.clamp(1, n) - 1]
+}
+
+/// One untimed warm pass over all fifty instances, then one timed pass. The
+/// reported numbers are the timed pass's.
+fn measure(mut run: impl FnMut(usize) -> R<Answer>) -> R<CaseResult> {
+    for i in 0..INSTANCES {
+        run(i)?;
+    }
+    let mut micros = Vec::with_capacity(INSTANCES);
+    let mut total_rows = 0u64;
+    let mut first_keys = Vec::new();
+    for i in 0..INSTANCES {
+        let at = Instant::now();
+        let answer = run(i)?;
+        micros.push(at.elapsed().as_secs_f64() * 1e6);
+        total_rows += answer.rows;
+        if i == 0 {
+            first_keys = answer.keys.clone();
+        }
+    }
+    let mut sorted = micros;
+    sorted.sort_by(f64::total_cmp);
+    Ok(CaseResult {
+        median_us: percentile(&sorted, 0.5),
+        p90_us: percentile(&sorted, 0.9),
+        total_rows,
+        first_keys,
+    })
+}
+
+/// `|approx ∩ exact| / k`, on keys, for one query instance.
+fn overlap_at_k(approx: &[String], exact: &[String], k: usize) -> f64 {
+    let truth: HashSet<&str> = exact.iter().map(String::as_str).collect();
+    let hits = approx.iter().filter(|key| truth.contains(key.as_str())).count();
+    hits as f64 / k as f64
+}
+
+/// The mean of `overlap_at_k` over all fifty instances, run untimed.
+fn mean_recall(
+    mut approx: impl FnMut(usize) -> R<Answer>,
+    mut exact: impl FnMut(usize) -> R<Answer>,
+) -> R<f64> {
+    let mut total = 0.0;
+    for i in 0..INSTANCES {
+        let a = approx(i)?;
+        let e = exact(i)?;
+        total += overlap_at_k(&a.keys, &e.keys, K);
+    }
+    Ok(total / INSTANCES as f64)
+}
+
+// ── the E4 arm ────────────────────────────────────────────────────────────
+
+/// Index names, shared with the Postgres arm so the two reports' `stages`
+/// blocks line up name for name. Postgres has no `place_emb_exact`; see
+/// deviation 6.
+const IX_TEXT: &str = "place_text";
+const IX_BORN: &str = "place_born";
+const IX_KIND: &str = "place_kind";
+const IX_LOC: &str = "place_loc";
+const IX_PLOT: &str = "place_plot";
+const IX_EMB_EXACT: &str = "place_emb_exact";
+const IX_EMB_ANN: &str = "place_emb_ann";
+
+pub struct E4Ctx {
+    db: Database,
+    place: CollectionId,
+    text: IndexId,
+    born: IndexId,
+    kind: IndexId,
+    loc: IndexId,
+    plot: IndexId,
+    emb_exact: IndexId,
+    emb_ann: IndexId,
+}
+
+fn e4_kind_filter(index: IndexId, kind: &str) -> QueryFilter<'_> {
+    QueryFilter::Scalar {
+        index,
+        predicate: ScalarFilter::Eq(ScalarValue::Text(kind)),
+    }
+}
+
+fn e4_born_filter(index: IndexId, lower: i64, upper: i64) -> QueryFilter<'static> {
+    QueryFilter::Scalar {
+        index,
+        predicate: ScalarFilter::Range {
+            lower: Bound::Included(ScalarValue::I64(lower)),
+            upper: Bound::Included(ScalarValue::I64(upper)),
+        },
+    }
+}
+
+fn e4_radius_filter(index: IndexId, center: Point, radius_metres: f64) -> QueryFilter<'static> {
+    QueryFilter::Point {
+        index,
+        predicate: PointFilter::Radius {
+            center,
+            radius_metres,
+        },
+    }
+}
+
+fn e4_text_filter(index: IndexId, query: &str, matching: TextMatch) -> QueryFilter<'_> {
+    QueryFilter::Text {
+        index,
+        query,
+        matching,
+    }
+}
+
+fn e4_geometry_filter(index: IndexId, predicate: GeometryFilter) -> QueryFilter<'static> {
+    QueryFilter::Geometry { index, predicate }
+}
+
+/// Prepare, page to exhaustion, and translate every returned `EntityId` back
+/// to the corpus key through the load-time vector of deviation 2.
+fn e4_run(
+    ctx: &E4Ctx,
+    keys: &[String],
+    filters: &[QueryFilter<'_>],
+    order: QueryOrder<'_>,
+    total_limit: Option<usize>,
+) -> R<Answer> {
+    let mut prepared = ctx.db.prepare_query(QueryRequest {
+        collection: ctx.place,
+        filters,
+        order,
+        projection: Projection::Ids,
+        total_limit,
+        driver: CandidateDriver::Auto,
+    })?;
+    let mut answer = Answer::default();
+    loop {
+        let page = prepared.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+        for row in &page.rows {
+            let ordinal = (row.id.sequence - 1) as usize;
+            let key = keys
+                .get(ordinal)
+                .ok_or("entity sequence falls outside the corpus's key vector")?;
+            if dumping() || answer.keys.len() < FIRST_KEYS {
+                answer.keys.push(key.clone());
+            }
+            answer.rows += 1;
+        }
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    Ok(answer)
+}
+
+/// One case, one query instance, as E4's API spells it. `hybrid_blend_10`
+/// rides `QueryOrder::Score` (deviation 5 names what still differs).
+fn e4_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R<Answer> {
+    let keys = &corpus.keys;
+    let kind = &corpus.kinds[i % KINDS];
+    match name {
+        // ── filters: every matching row, in the driver's own walk order ──
+        "pt_radius" => e4_run(
+            ctx,
+            keys,
+            &[e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i))],
+            QueryOrder::Driver,
+            None,
+        ),
+        "pt_bbox" => e4_run(
+            ctx,
+            keys,
+            &[QueryFilter::Point {
+                index: ctx.loc,
+                predicate: PointFilter::Bbox(q.bounds(i)?),
+            }],
+            QueryOrder::Driver,
+            None,
+        ),
+        "plot_within_box" => e4_run(
+            ctx,
+            keys,
+            &[e4_geometry_filter(
+                ctx.plot,
+                GeometryFilter::Within(q.box_polygon(i)),
+            )],
+            QueryOrder::Driver,
+            None,
+        ),
+        "plot_contains_pt" => e4_run(
+            ctx,
+            keys,
+            &[e4_geometry_filter(
+                ctx.plot,
+                GeometryFilter::Contains(Geom::Point(q.points[i][0], q.points[i][1])),
+            )],
+            QueryOrder::Driver,
+            None,
+        ),
+        "plot_intersects" => e4_run(
+            ctx,
+            keys,
+            &[e4_geometry_filter(
+                ctx.plot,
+                GeometryFilter::Intersects(q.polygons[i].clone()),
+            )],
+            QueryOrder::Driver,
+            None,
+        ),
+        "plot_dwithin_1km" => e4_run(
+            ctx,
+            keys,
+            &[e4_geometry_filter(
+                ctx.plot,
+                GeometryFilter::DWithin {
+                    geometry: Geom::Point(q.points[i][0], q.points[i][1]),
+                    metres: 1_000.0,
+                },
+            )],
+            QueryOrder::Driver,
+            None,
+        ),
+        "plot_vs_poly_within" => e4_run(
+            ctx,
+            keys,
+            &[e4_geometry_filter(
+                ctx.plot,
+                GeometryFilter::Within(q.polygons[i].clone()),
+            )],
+            QueryOrder::Driver,
+            None,
+        ),
+        "text_one" => e4_run(
+            ctx,
+            keys,
+            &[e4_text_filter(ctx.text, &q.terms[i], TextMatch::Any)],
+            QueryOrder::Driver,
+            None,
+        ),
+        "text_two" => {
+            let pair = format!("{} {}", q.terms[i], q.terms[(i + 1) % INSTANCES]);
+            e4_run(
+                ctx,
+                keys,
+                &[e4_text_filter(ctx.text, &pair, TextMatch::All)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "text_and_kind" => e4_run(
+            ctx,
+            keys,
+            &[
+                e4_text_filter(ctx.text, &q.terms[i], TextMatch::Any),
+                e4_kind_filter(ctx.kind, kind),
+            ],
+            QueryOrder::Driver,
+            None,
+        ),
+        "born_range" => {
+            let (lower, upper) = q.born_range(i);
+            e4_run(
+                ctx,
+                keys,
+                &[e4_born_filter(ctx.born, lower, upper)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "kind_eq" => e4_run(
+            ctx,
+            keys,
+            &[e4_kind_filter(ctx.kind, kind)],
+            QueryOrder::Driver,
+            None,
+        ),
+        "radius_and_born" => {
+            let (lower, upper) = q.born_range(i);
+            e4_run(
+                ctx,
+                keys,
+                &[
+                    e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i)),
+                    e4_born_filter(ctx.born, lower, upper),
+                ],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+
+        // ── ranked: ten rows, one order per request ──────────────────────
+        "knn_10" => e4_run(
+            ctx,
+            keys,
+            &[],
+            QueryOrder::Distance {
+                index: ctx.loc,
+                center: q.point(i)?,
+                direction: SortDirection::Ascending,
+            },
+            Some(K),
+        ),
+        "knn_10_kind" => e4_run(
+            ctx,
+            keys,
+            &[e4_kind_filter(ctx.kind, kind)],
+            QueryOrder::Distance {
+                index: ctx.loc,
+                center: q.point(i)?,
+                direction: SortDirection::Ascending,
+            },
+            Some(K),
+        ),
+        "text_top10" => e4_run(
+            ctx,
+            keys,
+            &[e4_text_filter(ctx.text, &q.terms[i], TextMatch::Any)],
+            QueryOrder::Bm25 {
+                index: ctx.text,
+                query: &q.terms[i],
+                matching: TextMatch::Any,
+            },
+            Some(K),
+        ),
+        "vec_exact_10" => e4_run(
+            ctx,
+            keys,
+            &[],
+            QueryOrder::ExactVector {
+                index: ctx.emb_exact,
+                query: &q.vectors[i],
+                metric: VectorMetric::Cosine,
+            },
+            Some(K),
+        ),
+        "vec_exact_radius" => e4_run(
+            ctx,
+            keys,
+            &[e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i))],
+            QueryOrder::ExactVector {
+                index: ctx.emb_exact,
+                query: &q.vectors[i],
+                metric: VectorMetric::Cosine,
+            },
+            Some(K),
+        ),
+        "hybrid_10" => e4_run(
+            ctx,
+            keys,
+            &[
+                e4_text_filter(ctx.text, &q.terms[i], TextMatch::Any),
+                e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i)),
+            ],
+            QueryOrder::ExactVector {
+                index: ctx.emb_exact,
+                query: &q.vectors[i],
+                metric: VectorMetric::Cosine,
+            },
+            Some(K),
+        ),
+
+        // ── approximate, and the exact twin each recall is measured on ───
+        "vec_ann_10" => e4_run(
+            ctx,
+            keys,
+            &[],
+            QueryOrder::ApproximateVector {
+                index: ctx.emb_ann,
+                query: &q.vectors[i],
+                metric: VectorMetric::Cosine,
+                ef: EF,
+            },
+            Some(K),
+        ),
+        "vec_ann_10_kind" => e4_run(
+            ctx,
+            keys,
+            &[e4_kind_filter(ctx.kind, kind)],
+            QueryOrder::ApproximateVector {
+                index: ctx.emb_ann,
+                query: &q.vectors[i],
+                metric: VectorMetric::Cosine,
+                ef: EF,
+            },
+            Some(K),
+        ),
+        "vec_ann_10_kind:exact" => e4_run(
+            ctx,
+            keys,
+            &[e4_kind_filter(ctx.kind, kind)],
+            QueryOrder::ExactVector {
+                index: ctx.emb_exact,
+                query: &q.vectors[i],
+                metric: VectorMetric::Cosine,
+            },
+            Some(K),
+        ),
+
+        // The blend, as `QueryOrder::Score` spells it: 0.5 * BM25 + 0.5 * cos.
+        // `VectorSimilarity` under Cosine is `-(1 - cos)`, so `1 + leaf` is the
+        // cosine itself, the same quantity Postgres writes as `1 - (emb <=> v)`.
+        // The text halves differ by formula (BM25 against ts_rank_cd; deviation
+        // 7), so this case is compared on top-ten overlap, never on order.
+        "hybrid_blend_10" => {
+            let half = ScoreExpr::Lit(0.5);
+            let one = ScoreExpr::Lit(1.0);
+            let bm25 = ScoreExpr::Bm25 {
+                index: ctx.text,
+                query: &q.terms[i],
+                matching: TextMatch::Any,
+            };
+            let sim = ScoreExpr::VectorSimilarity {
+                index: ctx.emb_exact,
+                query: &q.vectors[i],
+                metric: VectorMetric::Cosine,
+            };
+            let cos = ScoreExpr::Add(&one, &sim);
+            let text_term = ScoreExpr::Mul(&half, &bm25);
+            let vec_term = ScoreExpr::Mul(&half, &cos);
+            let expr = ScoreExpr::Add(&text_term, &vec_term);
+            e4_run(
+                ctx,
+                keys,
+                &[
+                    e4_text_filter(ctx.text, &q.terms[i], TextMatch::Any),
+                    e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i)),
+                ],
+                QueryOrder::Score {
+                    expr: &expr,
+                    direction: SortDirection::Descending,
+                },
+                Some(K),
+            )
+        }
+        other => Err(format!("battle50k: no E4 spelling for case `{other}`").into()),
+    }
+}
+
+fn dir_bytes(root: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(meta) if meta.is_dir() => dir_bytes(&entry.path()),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn stage(name: &str, seconds: f64) -> Value {
+    json!({"name": name, "ms": seconds * 1e3})
+}
+
+fn skipped_stage(name: &str) -> Value {
+    json!({"name": name, "ms": Value::Null})
+}
+
+/// Create the collection, stream every row in with one commit per 256, then
+/// build all seven indexes LATE, each its own timed stage.
+fn load_e4(dir: &Path, corpus: &Corpus) -> R<(E4Ctx, Vec<Value>)> {
+    let _ = fs::remove_dir_all(dir);
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut stages = Vec::new();
+
+    let at = Instant::now();
+    let mut db = Database::create(
+        dir,
+        Config {
+            budget_bytes: CACHE_BYTES,
+            io: IoMode::Buffered,
+            sync: SyncMode::Full,
+        },
+    )?;
+    let place = db.create_collection(
+        "place",
+        vec![
+            ("key".into(), Kind::Text),
+            ("name".into(), Kind::Text),
+            ("desc".into(), Kind::Text),
+            ("text".into(), Kind::Text),
+            ("born".into(), Kind::Int),
+            ("kind".into(), Kind::Text),
+            ("loc".into(), Kind::Point),
+            ("plot".into(), Kind::Geo),
+            ("emb".into(), Kind::Vector(DIM)),
+        ],
+        CollectionOptions::default(),
+    )?;
+    db.commit()?;
+    stages.push(stage("open", at.elapsed().as_secs_f64()));
+
+    eprintln!("[e4] inserting {} rows, commit every {BATCH} …", corpus.rows.len());
+    let at = Instant::now();
+    for (i, row) in corpus.rows.iter().enumerate() {
+        let id = db.put(
+            place,
+            &row.key,
+            &json!({
+                "key": row.key,
+                "name": row.name,
+                "desc": row.desc,
+                "text": row.text(),
+                "born": row.born,
+                "kind": row.kind,
+                "loc": {"type": "Point", "coordinates": [row.lon, row.lat]},
+                "plot": geom_to_json(&row.plot),
+                "emb": row.emb,
+            }),
+        )?;
+        // Deviation 2's key vector is indexed by `sequence - 1`, so the put
+        // order has to be the file order and nothing may be skipped.
+        if id.sequence != (i + 1) as u64 {
+            return Err(format!(
+                "row {i} landed at sequence {}, breaking the id-to-key vector",
+                id.sequence
+            )
+            .into());
+        }
+        if (i + 1) % BATCH == 0 {
+            db.commit()?;
+        }
+    }
+    db.commit()?;
+    stages.push(stage("load", at.elapsed().as_secs_f64()));
+
+    // Every build is explicit and late, the way `popsim` builds its four and
+    // the way Postgres's CREATE INDEX runs after the load. A commit follows
+    // each create because a build refuses to start with user writes pending.
+    let mut build = |db: &mut Database, name: &str, id: IndexId| -> R<()> {
+        let at = Instant::now();
+        db.commit()?;
+        db.build_index_to_ready(id, BATCH)?;
+        db.commit()?;
+        stages.push(stage(&format!("index:{name}"), at.elapsed().as_secs_f64()));
+        Ok(())
+    };
+
+    let text = db.create_text_index(place, IX_TEXT, "text")?;
+    build(&mut db, IX_TEXT, text)?;
+    let born = db.create_scalar_index(place, IX_BORN, "born", false)?;
+    build(&mut db, IX_BORN, born)?;
+    let kind = db.create_scalar_index(place, IX_KIND, "kind", false)?;
+    build(&mut db, IX_KIND, kind)?;
+    let loc = db.create_point_index(place, IX_LOC, "loc")?;
+    build(&mut db, IX_LOC, loc)?;
+    let plot = db.create_geometry_index(place, IX_PLOT, "plot")?;
+    build(&mut db, IX_PLOT, plot)?;
+    let emb_exact = db.create_exact_vector_index(place, IX_EMB_EXACT, "emb")?;
+    build(&mut db, IX_EMB_EXACT, emb_exact)?;
+    let emb_ann = db.create_quantized_vector_index(place, IX_EMB_ANN, "emb")?;
+    build(&mut db, IX_EMB_ANN, emb_ann)?;
+
+    let at = Instant::now();
+    db.checkpoint()?;
+    stages.push(stage("checkpoint", at.elapsed().as_secs_f64()));
+
+    Ok((
+        E4Ctx {
+            db,
+            place,
+            text,
+            born,
+            kind,
+            loc,
+            plot,
+            emb_exact,
+            emb_ann,
+        },
+        stages,
+    ))
+}
+
+/// Reopen a database an earlier pass built and find its collection and seven
+/// indexes BY NAME, the way a process that did not build the file has to.
+/// Every stage but the open is `null`: nothing was loaded or built here, and
+/// a zero would read as "instant".
+fn open_e4(dir: &Path) -> R<(E4Ctx, Vec<Value>)> {
+    let at = Instant::now();
+    let db = Database::open(
+        dir,
+        Config {
+            budget_bytes: CACHE_BYTES,
+            io: IoMode::Buffered,
+            sync: SyncMode::Full,
+        },
+    )?;
+    let place = db
+        .collection("place")?
+        .ok_or("--reuse: no `place` collection in this database")?;
+    let mut found: Vec<(String, IndexId)> = Vec::new();
+    for n in 1..=32u64 {
+        if let Ok(info) = db.index_info(IndexId(n)) {
+            found.push((info.name.clone(), info.id));
+        }
+    }
+    let by_name = |wanted: &str| -> R<IndexId> {
+        found
+            .iter()
+            .find(|(name, _)| name == wanted)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| format!("--reuse: no `{wanted}` index in this database").into())
+    };
+    let ctx = E4Ctx {
+        place,
+        text: by_name(IX_TEXT)?,
+        born: by_name(IX_BORN)?,
+        kind: by_name(IX_KIND)?,
+        loc: by_name(IX_LOC)?,
+        plot: by_name(IX_PLOT)?,
+        emb_exact: by_name(IX_EMB_EXACT)?,
+        emb_ann: by_name(IX_EMB_ANN)?,
+        db,
+    };
+    let mut stages = vec![stage("open", at.elapsed().as_secs_f64()), skipped_stage("load")];
+    for name in [
+        IX_TEXT,
+        IX_BORN,
+        IX_KIND,
+        IX_LOC,
+        IX_PLOT,
+        IX_EMB_EXACT,
+        IX_EMB_ANN,
+    ] {
+        stages.push(skipped_stage(&format!("index:{name}")));
+    }
+    stages.push(skipped_stage("checkpoint"));
+    eprintln!("[e4] reopened {}; queries only", dir.display());
+    Ok((ctx, stages))
+}
+
+// ── the Postgres arm ──────────────────────────────────────────────────────
+
+/// A SQL string literal with its single quotes doubled. Terms and category
+/// names come from files, not from constants in this program, so they are
+/// escaped rather than trusted.
+fn quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A `geography` point literal at `points[i]`-style coordinates.
+fn pg_point(lon: f64, lat: f64) -> String {
+    format!("ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography")
+}
+
+/// The `to_tsvector` expression the GIN index is built over. Every text query
+/// repeats it verbatim so the planner recognises the expression index.
+const PG_TSVECTOR: &str = "to_tsvector('simple', name || ' ' || descr)";
+
+fn pg_tsquery(terms: &str) -> String {
+    format!("to_tsquery('simple', {})", quoted(terms))
+}
+
+/// Rows come back one column wide — the `key` — so nothing else is
+/// materialised per row in either arm. `query_raw` streams instead of
+/// buffering, so a 50,000-row filter case costs a page, not a result set.
+fn pg_answer(client: &mut Client, setup: &[String], sql: &str) -> R<Answer> {
+    use postgres::fallible_iterator::FallibleIterator;
+    let mut txn = client.transaction()?;
+    for statement in setup {
+        txn.batch_execute(statement)?;
+    }
+    let mut answer = Answer::default();
+    {
+        let mut rows = txn.query_raw(sql, std::iter::empty::<i32>())?;
+        while let Some(row) = rows.next()? {
+            answer.push(row.try_get::<_, String>(0)?);
+        }
+    }
+    txn.commit()?;
+    Ok(answer)
+}
+
+/// Exactness by planner knob: with both index-scan paths off, the vector
+/// order is a sort over a sequential scan, which is the exact answer. It also
+/// takes the GIN and GiST indexes away from any filter in the same statement;
+/// see deviation 6.
+fn pg_exact_setup() -> Vec<String> {
+    vec![
+        "SET LOCAL enable_indexscan = off".into(),
+        "SET LOCAL enable_bitmapscan = off".into(),
+    ]
+}
+
+/// pgvectorscale's beam width, set to the same number as E4's `ef`; see
+/// deviation 12.
+fn pg_ann_setup() -> Vec<String> {
+    vec![format!("SET LOCAL diskann.query_search_list_size = {EF}")]
+}
+
+/// One case, one query instance, as Postgres spells it: the `SET LOCAL`
+/// statements the case needs and the statement itself.
+fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String>, String)> {
+    let kind = quoted(&kinds[i % KINDS]);
+    let point = q.points[i];
+    let radius = q.radii[i];
+    let b = q.boxes[i];
+    let envelope = format!("ST_MakeEnvelope({:?},{:?},{:?},{:?},4326)", b[0], b[2], b[1], b[3]);
+    let polygon = format!("ST_SetSRID(ST_GeomFromGeoJSON({}),4326)", quoted(&q.polygon_json[i]));
+    let radius_clause = format!(
+        "ST_DWithin(loc, {}, {:?}, true)",
+        pg_point(radius[0], radius[1]),
+        radius[2]
+    );
+    let text_clause = format!("{PG_TSVECTOR} @@ {}", pg_tsquery(&q.terms[i]));
+    let (born_lower, born_upper) = q.born_range(i);
+    let born_clause = format!("born BETWEEN {born_lower} AND {born_upper}");
+    let vector = format!("{}::vector", quoted(&q.vector_literals[i]));
+    let knn_point = pg_point(point[0], point[1]);
+
+    let plain = |sql: String| -> R<(Vec<String>, String)> { Ok((Vec::new(), sql)) };
+
+    match name {
+        // ── filters ─────────────────────────────────────────────────────
+        "pt_radius" => plain(format!("SELECT \"key\" FROM place WHERE {radius_clause}")),
+        "pt_bbox" => plain(format!(
+            "SELECT \"key\" FROM place WHERE loc && {envelope}::geography \
+             AND ST_X(loc::geometry) BETWEEN {:?} AND {:?} \
+             AND ST_Y(loc::geometry) BETWEEN {:?} AND {:?}",
+            b[0], b[1], b[2], b[3]
+        )),
+        // The planar predicates run on `plot::geometry`, which no index on a
+        // `geography` column can serve; the `&&` term in front of each is the
+        // geodetic bounding-box candidate (a superset for Within and for
+        // Contains alike), so the GiST index still narrows the scan before
+        // the exact refine. Same candidate-then-refine shape `pt_bbox` uses.
+        "plot_within_box" => plain(format!(
+            "SELECT \"key\" FROM place WHERE plot && {envelope}::geography \
+             AND ST_Within(plot::geometry, {envelope})"
+        )),
+        "plot_contains_pt" => plain(format!(
+            "SELECT \"key\" FROM place WHERE plot && {} \
+             AND ST_Contains(plot::geometry, ST_SetSRID(ST_MakePoint({:?},{:?}),4326))",
+            pg_point(point[0], point[1]),
+            point[0],
+            point[1]
+        )),
+        "plot_intersects" => plain(format!(
+            "SELECT \"key\" FROM place WHERE ST_Intersects(plot, {polygon}::geography)"
+        )),
+        "plot_dwithin_1km" => plain(format!(
+            "SELECT \"key\" FROM place WHERE ST_DWithin(plot, {}, 1000, true)",
+            pg_point(point[0], point[1])
+        )),
+        "plot_vs_poly_within" => plain(format!(
+            "SELECT \"key\" FROM place WHERE plot && {polygon}::geography \
+             AND ST_Within(plot::geometry, {polygon})"
+        )),
+        "text_one" => plain(format!("SELECT \"key\" FROM place WHERE {text_clause}")),
+        "text_two" => plain(format!(
+            "SELECT \"key\" FROM place WHERE {PG_TSVECTOR} @@ {}",
+            pg_tsquery(&format!("{} & {}", q.terms[i], q.terms[(i + 1) % INSTANCES]))
+        )),
+        "text_and_kind" => plain(format!(
+            "SELECT \"key\" FROM place WHERE {text_clause} AND kind = {kind}"
+        )),
+        "born_range" => plain(format!("SELECT \"key\" FROM place WHERE {born_clause}")),
+        "kind_eq" => plain(format!("SELECT \"key\" FROM place WHERE kind = {kind}")),
+        "radius_and_born" => plain(format!(
+            "SELECT \"key\" FROM place WHERE {radius_clause} AND {born_clause}"
+        )),
+
+        // ── ranked ──────────────────────────────────────────────────────
+        // No tiebreak after the distance: a second sort key would take the
+        // ordered KNN-GiST walk away from the planner. See deviation 8.
+        "knn_10" => plain(format!(
+            "SELECT \"key\" FROM place ORDER BY loc <-> {knn_point} LIMIT {K}"
+        )),
+        "knn_10_kind" => plain(format!(
+            "SELECT \"key\" FROM place WHERE kind = {kind} ORDER BY loc <-> {knn_point} LIMIT {K}"
+        )),
+        "text_top10" => plain(format!(
+            "SELECT \"key\" FROM place WHERE {text_clause} \
+             ORDER BY ts_rank_cd({PG_TSVECTOR}, {}) DESC LIMIT {K}",
+            pg_tsquery(&q.terms[i])
+        )),
+        "vec_exact_10" => Ok((
+            pg_exact_setup(),
+            format!("SELECT \"key\" FROM place ORDER BY emb <=> {vector} LIMIT {K}"),
+        )),
+        "vec_exact_radius" => Ok((
+            pg_exact_setup(),
+            format!(
+                "SELECT \"key\" FROM place WHERE {radius_clause} \
+                 ORDER BY emb <=> {vector} LIMIT {K}"
+            ),
+        )),
+        "hybrid_10" => Ok((
+            pg_exact_setup(),
+            format!(
+                "SELECT \"key\" FROM place WHERE {text_clause} AND {radius_clause} \
+                 ORDER BY emb <=> {vector} LIMIT {K}"
+            ),
+        )),
+        // The blended score E4 cannot express. The ORDER BY is an arithmetic
+        // expression, so no vector index could answer it in order anyway and
+        // no planner knob is needed to keep it exact.
+        "hybrid_blend_10" => plain(format!(
+            "SELECT \"key\" FROM place WHERE {text_clause} AND {radius_clause} \
+             ORDER BY 0.5 * ts_rank_cd({PG_TSVECTOR}, {}) + 0.5 * (1 - (emb <=> {vector})) \
+             DESC LIMIT {K}",
+            pg_tsquery(&q.terms[i])
+        )),
+
+        // ── approximate, and the exact twin recall is measured on ───────
+        "vec_ann_10" => Ok((
+            pg_ann_setup(),
+            format!("SELECT \"key\" FROM place ORDER BY emb <=> {vector} LIMIT {K}"),
+        )),
+        "vec_ann_10_kind" => Ok((
+            pg_ann_setup(),
+            format!(
+                "SELECT \"key\" FROM place WHERE kind = {kind} ORDER BY emb <=> {vector} LIMIT {K}"
+            ),
+        )),
+        "vec_ann_10_kind:exact" => Ok((
+            pg_exact_setup(),
+            format!(
+                "SELECT \"key\" FROM place WHERE kind = {kind} ORDER BY emb <=> {vector} LIMIT {K}"
+            ),
+        )),
+
+        other => Err(format!("battle50k: no Postgres spelling for case `{other}`").into()),
+    }
+}
+
+/// One multi-row `INSERT ... VALUES (...), (...), ...` inside its own
+/// transaction, the idiomatic shape a real client uses at this cadence.
+fn pg_insert_batch(client: &mut Client, rows: &[Row]) -> R<()> {
+    let mut sql = String::from(
+        "INSERT INTO place (\"key\", name, descr, born, kind, loc, plot, emb) VALUES ",
+    );
+    let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::with_capacity(rows.len() * 9);
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        let base = i * 9;
+        sql.push_str(&format!(
+            "(${},${},${},${},${},ST_SetSRID(ST_MakePoint(${},${}),4326)::geography,\
+             ST_SetSRID(ST_GeomFromGeoJSON(${}),4326)::geography,${}::text::vector)",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9
+        ));
+        params.push(Box::new(row.key.clone()));
+        params.push(Box::new(row.name.clone()));
+        params.push(Box::new(row.desc.clone()));
+        params.push(Box::new(row.born as i32));
+        params.push(Box::new(row.kind.clone()));
+        params.push(Box::new(row.lon));
+        params.push(Box::new(row.lat));
+        params.push(Box::new(row.plot_json.clone()));
+        params.push(Box::new(row.emb_literal.clone()));
+    }
+    let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
+    let mut txn = client.transaction()?;
+    txn.execute(sql.as_str(), &refs)?;
+    txn.commit()?;
+    Ok(())
+}
+
+fn load_pg(dsn: &str, corpus: &Corpus) -> R<(Client, Vec<Value>)> {
+    let mut stages = Vec::new();
+    let at = Instant::now();
+    let mut client = Client::connect(dsn, NoTls)?;
+    client.batch_execute(
+        "CREATE EXTENSION IF NOT EXISTS postgis;
+         CREATE EXTENSION IF NOT EXISTS vector;
+         CREATE EXTENSION IF NOT EXISTS vectorscale;",
+    )?;
+    // `synchronous_commit` is ON by default on a stock server; it is set
+    // explicitly anyway so the load pays the same per-commit durability
+    // barrier E4's page-WAL pays with `SyncMode::Full`.
+    client.batch_execute(
+        "SET synchronous_commit = on;
+         DROP TABLE IF EXISTS place;
+         CREATE TABLE place (
+             \"key\" text primary key,
+             name text,
+             descr text,
+             born int,
+             kind text,
+             loc geography(Point,4326),
+             plot geography(Polygon,4326),
+             emb vector(32)
+         );",
+    )?;
+    stages.push(stage("open", at.elapsed().as_secs_f64()));
+
+    eprintln!("[postgres] inserting {} rows, commit every {BATCH} …", corpus.rows.len());
+    let at = Instant::now();
+    for chunk in corpus.rows.chunks(BATCH) {
+        pg_insert_batch(&mut client, chunk)?;
+    }
+    stages.push(stage("load", at.elapsed().as_secs_f64()));
+
+    // Late build, same as the E4 arm. There is no `place_emb_exact` here:
+    // Postgres's exact vector answer is a sequential scan, not an index.
+    for (name, ddl) in [
+        (
+            IX_TEXT,
+            format!("CREATE INDEX {IX_TEXT} ON place USING gin ({PG_TSVECTOR})"),
+        ),
+        (IX_BORN, format!("CREATE INDEX {IX_BORN} ON place (born)")),
+        (IX_KIND, format!("CREATE INDEX {IX_KIND} ON place (kind)")),
+        (
+            IX_LOC,
+            format!("CREATE INDEX {IX_LOC} ON place USING gist (loc)"),
+        ),
+        (
+            IX_PLOT,
+            format!("CREATE INDEX {IX_PLOT} ON place USING gist (plot)"),
+        ),
+        (
+            IX_EMB_ANN,
+            format!("CREATE INDEX {IX_EMB_ANN} ON place USING diskann (emb vector_cosine_ops)"),
+        ),
+    ] {
+        let at = Instant::now();
+        client.batch_execute(&ddl)?;
+        stages.push(stage(&format!("index:{name}"), at.elapsed().as_secs_f64()));
+    }
+
+    // Postgres's analog of E4's checkpoint: fresh planner statistics for the
+    // indexes just built, then dirty buffers forced to disk.
+    let at = Instant::now();
+    client.batch_execute("ANALYZE place; CHECKPOINT;")?;
+    stages.push(stage("checkpoint", at.elapsed().as_secs_f64()));
+    Ok((client, stages))
+}
+
+/// Reopen a table an earlier pass loaded. `--reuse` is refused unless the
+/// table already holds every row of the corpus, because a query-only pass
+/// over a partial load would be a measurement of a different corpus.
+fn open_pg(dsn: &str, expected_rows: usize) -> R<(Client, Vec<Value>)> {
+    let at = Instant::now();
+    let mut client = Client::connect(dsn, NoTls)?;
+    let count: i64 = client.query_one("SELECT count(*) FROM place", &[])?.get(0);
+    if count != expected_rows as i64 {
+        return Err(format!(
+            "--reuse: place holds {count} rows, expected {expected_rows}; load without --reuse"
+        )
+        .into());
+    }
+    let mut stages = vec![stage("open", at.elapsed().as_secs_f64()), skipped_stage("load")];
+    for name in [IX_TEXT, IX_BORN, IX_KIND, IX_LOC, IX_PLOT, IX_EMB_ANN] {
+        stages.push(skipped_stage(&format!("index:{name}")));
+    }
+    stages.push(skipped_stage("checkpoint"));
+    eprintln!("[postgres] reopened {count} rows; queries only");
+    Ok((client, stages))
+}
+
+fn pg_disk_bytes(client: &mut Client) -> R<u64> {
+    let size: i64 = client
+        .query_one("SELECT pg_total_relation_size('place')", &[])?
+        .get(0);
+    Ok(size as u64)
+}
+
+// ── the report ────────────────────────────────────────────────────────────
+
+fn case_json(spec: &CaseSpec, result: Option<&CaseResult>, recall: Option<f64>, note: &str) -> Value {
+    let k = match spec.kind {
+        CaseKind::Filter => Value::Null,
+        _ => Value::from(K as u64),
+    };
+    let recall = recall.map_or(Value::Null, Value::from);
+    match result {
+        Some(r) => json!({
+            "name": spec.name,
+            "kind": spec.kind.label(),
+            "queries": INSTANCES,
+            "median_us": r.median_us,
+            "p90_us": r.p90_us,
+            "total_rows": r.total_rows,
+            "first_keys": r.first_keys,
+            "k": k,
+            "recall_at_k": recall,
+            "note": note,
+        }),
+        None => json!({
+            "name": spec.name,
+            "kind": spec.kind.label(),
+            "queries": INSTANCES,
+            "median_us": Value::Null,
+            "p90_us": Value::Null,
+            "total_rows": 0,
+            "first_keys": Vec::<String>::new(),
+            "k": k,
+            "recall_at_k": Value::Null,
+            "note": note,
+        }),
+    }
+}
+
+fn deviation(case: &str, text: &str) -> Value {
+    json!({"case": case, "text": text})
+}
+
+/// The prose list at the top of this file, as data. Entries that belong to
+/// one case name it; the rest are arm-wide and use `*`.
+fn e4_deviations() -> Vec<Value> {
+    vec![
+        deviation(
+            "*",
+            "Text index spans ONE field: `Database::create_text_index` (src/text_indexes.rs:1845) \
+             takes a single declared Kind::Text field, so `name` and `desc` are indexed through a \
+             third stored field `text` holding `name` + ' ' + `desc`. Postgres indexes the \
+             expression to_tsvector('simple', name || ' ' || descr) instead. E4 therefore stores \
+             name, desc and their concatenation; Postgres stores name and descr only.",
+        ),
+        deviation(
+            "*",
+            "Keys are returned through an id-to-key vector: the cases ask for Projection::Ids and \
+             a QueryRow carries an EntityId, not the external key, so the loader keeps the file's \
+             keys in a Vec indexed by `sequence - 1` and the arm translates. The Postgres arm \
+             selects its `key` column directly.",
+        ),
+        deviation(
+            "*",
+            "queries.json's `boxes` are [minlon, maxlon, minlat, maxlat], not the \
+             lon/lat/lon/lat order the brief's prose assumed; both arms read the file's real order.",
+        ),
+        deviation(
+            "*",
+            "queries.json carries no `kinds` array: the eight categories are the sorted distinct \
+             `kind` values of the data file, derived the same way in both arms, and an arm refuses \
+             to run if there are not exactly eight.",
+        ),
+        deviation(
+            "hybrid_blend_10",
+            "E4 spells the blend as QueryOrder::Score (0.5 * Bm25 + 0.5 * (1 + VectorSimilarity)); \
+             Postgres as ORDER BY 0.5 * ts_rank_cd + 0.5 * (1 - (emb <=> v)). The vector halves are \
+             the same cosine; the text halves are BM25 against ts_rank_cd, so the case is compared \
+             on top-ten overlap, never on order. Score never drives: E4 ranks every candidate the \
+             two filters admit, as Postgres does for an arithmetic ORDER BY.",
+        ),
+        deviation(
+            "text_top10",
+            "E4 ranks by BM25, Postgres by ts_rank_cd. Different formulas, so this case is \
+             compared on row count and top-ten overlap, never on order.",
+        ),
+        deviation(
+            "knn_10",
+            "QueryOrder::Distance breaks distance ties by entity id (src/query.rs:169); the \
+             Postgres spelling `ORDER BY loc <-> point LIMIT 10` has no tiebreak, because adding \
+             one would take the ordered KNN-GiST walk away from the planner. first_keys is \
+             therefore compared as a set.",
+        ),
+        deviation(
+            "*",
+            "Geometry units follow GeometryFilter's own documentation (src/query.rs:100): \
+             Intersects and DWithin spheroidal, Within and Contains planar. What differs is the \
+             routine, not the model: E4 refines with `spatial_geometry`, Postgres with PostGIS's \
+             predicates, and a row within a metre of a spheroidal boundary can be decided \
+             differently by the two.",
+        ),
+        deviation(
+            "plot_intersects",
+            "The eleven rows the two arms used to answer differently were E4's, not PostGIS's: \
+             `spatial_geometry` tested `geography` edge crossings on the flat lon/lat plane, and \
+             a geodesic edge bows off that line by up to 122 metres per (degree of span) squared \
+             -- enough to close a planar gap (seven rows, ST_Relate FF2FF1212 yet \
+             ST_Distance(geography) = 0 m: q0/p0029206, q28/p0046799, q35/p0029158, q39/p0007895, \
+             q43/p0001572, q43/p0010630, q45/p0018906) or to open a planar sliver the spheroid \
+             does not cut (four rows, ST_Relate 212101212 with the boundaries 0.63-2.18 m apart: \
+             q32/p0016989, q32/p0022998, q42/p0018219, q46/p0007969). Both halves of the \
+             spheroidal test carried the flaw: the edge test is now a great-circle arc \
+             crossing, and the vertex-in-ring ray cast is now corrected for the lens between \
+             each straight lon/lat edge and its own geodesic. All eleven agree, the case's \
+             total rises from 35,186 to PostGIS's 35,189, and every one of the fifty query \
+             instances now returns the same KEY SET as PostGIS, not merely the same count. \
+             plot_dwithin_1km is unchanged at 289 rows, also key for key.",
+        ),
+        deviation(
+            "*",
+            "`born` is Kind::Int (i64) here and `int` (int4) in Postgres. Every value in this \
+             corpus is a yyyymmdd that fits in int4, so nothing is truncated; the width still \
+             differs.",
+        ),
+        deviation(
+            "*",
+            "--reuse still reads the jsonl: it loads and builds nothing, but the id-to-key vector \
+             and the eight categories both come from the data file. Stages that did not happen \
+             report null, never zero.",
+        ),
+        deviation(
+            "vec_ann_10",
+            "ef = 100 here and diskann.query_search_list_size = 100 in Postgres. They are not the \
+             same knob — one bounds a compact shortlist that is then reranked from f32 sidecars, \
+             the other a graph beam — so recall is computed inside each arm against that arm's \
+             own exact answer and never across arms.",
+        ),
+        deviation(
+            "*",
+            "The key is stored twice in both arms: E4 declares a `key` Text field alongside the \
+             external key `Database::put` already maps, and Postgres holds `key` in the heap \
+             tuple and again in the primary-key btree.",
+        ),
+    ]
+}
+
+fn pg_deviations() -> Vec<Value> {
+    let mut list = vec![
+        deviation(
+            "*",
+            "The GIN index is over the expression to_tsvector('simple', name || ' ' || descr) and \
+             every text query repeats that expression verbatim, so the planner recognises the \
+             expression index. E4 indexes a stored concatenated `text` field instead.",
+        ),
+        deviation(
+            "*",
+            "Postgres has no exact vector index: `ORDER BY emb <=> v LIMIT 10` over diskann is \
+             approximate, and bounding diskann.query_search_list_size does not make it exact. \
+             vec_exact_10, vec_exact_radius and hybrid_10 therefore run with \
+             `SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off`, which is a \
+             sequential scan with an exact distance per row.",
+        ),
+        deviation(
+            "vec_exact_radius",
+            "Those two planner knobs also take the GiST index away from this case's radius \
+             filter, so this is a full sequential scan and its latency is not an index \
+             measurement. The E4 side keeps its point index.",
+        ),
+        deviation(
+            "hybrid_10",
+            "Same as vec_exact_radius: with both index-scan paths off, the GIN and GiST indexes \
+             behind the text and radius filters are unavailable, so this is a full sequential \
+             scan.",
+        ),
+        deviation(
+            "*",
+            "There is no `index:place_emb_exact` stage in this arm — the exact vector answer is a \
+             scan, not an index — so this report carries six index stages where E4 carries seven.",
+        ),
+        deviation(
+            "plot_within_box",
+            "The planar predicates run on `plot::geometry`, which no index on a `geography` \
+             column can serve, so each is preceded by a `plot && <candidate>::geography` \
+             bounding-box term that lets the GiST index narrow the scan before the exact refine. \
+             The `&&` term is a superset test for Within and for Contains alike, so it changes \
+             the cost, never the answer. plot_contains_pt and plot_vs_poly_within do the same.",
+        ),
+        deviation(
+            "text_top10",
+            "ts_rank_cd, not BM25. Compared on row count and top-ten overlap, never on order.",
+        ),
+        deviation(
+            "knn_10",
+            "`ORDER BY loc <-> point LIMIT 10` has no tiebreak, so equal-distance rows come back \
+             in an arbitrary order; E4 breaks the same ties by entity id.",
+        ),
+        deviation(
+            "*",
+            "`born` is int4 here and Kind::Int (i64) in E4.",
+        ),
+        deviation(
+            "vec_ann_10",
+            "diskann.query_search_list_size = 100 mirrors E4's ef = 100 by number, not by \
+             algorithm; recall is measured against this arm's own sequential-scan exact answer.",
+        ),
+        deviation(
+            "*",
+            "disk_bytes is pg_total_relation_size('place') — the table with its indexes, TOAST \
+             and maps — against the E4 arm's sum of every file under --db-dir. Neither number \
+             includes the server's own WAL or catalogs.",
+        ),
+    ];
+    list.push(deviation(
+        "hybrid_blend_10",
+        "ORDER BY 0.5 * ts_rank_cd + 0.5 * (1 - (emb <=> v)); E4 spells the same blend as \
+         QueryOrder::Score with BM25 in place of ts_rank_cd, so this case is compared on \
+         top-ten overlap, never on order.",
+    ));
+    list
+}
+
+fn git_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+// ── one arm, end to end ───────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arm {
+    E4,
+    Postgres,
+}
+
+impl Arm {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "e4" => Some(Self::E4),
+            "postgres" => Some(Self::Postgres),
+            _ => None,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::E4 => "e4",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub arm: Arm,
+    pub data: PathBuf,
+    pub queries: PathBuf,
+    pub out: PathBuf,
+    pub db_dir: PathBuf,
+    pub dsn: String,
+    pub only: Option<String>,
+    pub reuse: bool,
+    /// When set, every selected case writes `<dir>/<case>/<i>.keys` in one
+    /// extra untimed pass after its timed pass.
+    pub dump: Option<PathBuf>,
+}
+
+impl Options {
+    pub fn new(arm: Arm, data: impl Into<PathBuf>, queries: impl Into<PathBuf>, out: impl Into<PathBuf>) -> Self {
+        Self {
+            arm,
+            data: data.into(),
+            queries: queries.into(),
+            out: out.into(),
+            db_dir: PathBuf::from(DEFAULT_DB_DIR),
+            dsn: DEFAULT_DSN.into(),
+            only: None,
+            reuse: false,
+            dump: None,
+        }
+    }
+}
+
+/// Run one arm over the whole battery and write its report. The returned
+/// `Value` is exactly what lands in `--out`.
+pub fn run_arm(options: &Options) -> R<Value> {
+    let corpus = load_corpus(&options.data)?;
+    let queries = load_queries(&options.queries)?;
+    let selected = |name: &str| {
+        options
+            .only
+            .as_deref()
+            .is_none_or(|needle| name.contains(needle))
+    };
+    let arm = options.arm.label();
+    let mut cases = Vec::new();
+    let mut stages;
+    let disk_bytes;
+
+    match options.arm {
+        Arm::E4 => {
+            let (ctx, built) = if options.reuse {
+                open_e4(&options.db_dir)?
+            } else {
+                load_e4(&options.db_dir, &corpus)?
+            };
+            stages = built;
+            for spec in &BATTERY {
+                if !selected(spec.name) {
+                    continue;
+                }
+                let result = measure(|i| e4_case(&ctx, &corpus, &queries, spec.name, i))
+                    .map_err(|e| format!("case {}: {e}", spec.name))?;
+                let recall = if spec.kind == CaseKind::Approx {
+                    let twin = exact_twin(spec.name)
+                        .ok_or_else(|| format!("case {}: no exact twin", spec.name))?;
+                    Some(
+                        mean_recall(
+                            |i| e4_case(&ctx, &corpus, &queries, spec.name, i),
+                            |i| e4_case(&ctx, &corpus, &queries, twin, i),
+                        )
+                        .map_err(|e| format!("case {} recall: {e}", spec.name))?,
+                    )
+                } else {
+                    None
+                };
+                eprintln!(
+                    "[e4] {:<20} {:>12.1} us  rows={}",
+                    spec.name, result.median_us, result.total_rows
+                );
+                if let Some(dir) = options.dump.as_deref() {
+                    dump_case(dir, spec.name, |i| e4_case(&ctx, &corpus, &queries, spec.name, i))
+                        .map_err(|e| format!("case {} dump: {e}", spec.name))?;
+                }
+                cases.push(case_json(spec, Some(&result), recall, ""));
+            }
+            drop(ctx);
+            disk_bytes = dir_bytes(&options.db_dir);
+        }
+        Arm::Postgres => {
+            let (mut client, built) = if options.reuse {
+                open_pg(&options.dsn, corpus.rows.len())?
+            } else {
+                load_pg(&options.dsn, &corpus)?
+            };
+            stages = built;
+            for spec in &BATTERY {
+                if !selected(spec.name) {
+                    continue;
+                }
+                let result = measure(|i| {
+                    let (setup, sql) = pg_case(&queries, &corpus.kinds, spec.name, i)?;
+                    pg_answer(&mut client, &setup, &sql)
+                })
+                .map_err(|e| format!("case {}: {e}", spec.name))?;
+                let recall = if spec.kind == CaseKind::Approx {
+                    let twin = exact_twin(spec.name)
+                        .ok_or_else(|| format!("case {}: no exact twin", spec.name))?;
+                    let mut total = 0.0;
+                    for i in 0..INSTANCES {
+                        let (setup, sql) = pg_case(&queries, &corpus.kinds, spec.name, i)?;
+                        let approximate = pg_answer(&mut client, &setup, &sql)?;
+                        let (setup, sql) = pg_case(&queries, &corpus.kinds, twin, i)?;
+                        let exact = pg_answer(&mut client, &setup, &sql)?;
+                        total += overlap_at_k(&approximate.keys, &exact.keys, K);
+                    }
+                    Some(total / INSTANCES as f64)
+                } else {
+                    None
+                };
+                eprintln!(
+                    "[postgres] {:<20} {:>12.1} us  rows={}",
+                    spec.name, result.median_us, result.total_rows
+                );
+                if let Some(dir) = options.dump.as_deref() {
+                    dump_case(dir, spec.name, |i| {
+                        let (setup, sql) = pg_case(&queries, &corpus.kinds, spec.name, i)?;
+                        pg_answer(&mut client, &setup, &sql)
+                    })
+                    .map_err(|e| format!("case {} dump: {e}", spec.name))?;
+                }
+                cases.push(case_json(spec, Some(&result), recall, ""));
+            }
+            disk_bytes = pg_disk_bytes(&mut client)?;
+            drop(client);
+        }
+    }
+
+    stages.push(json!({"name": "disk_bytes", "bytes": disk_bytes}));
+    let report = json!({
+        "arm": arm,
+        "commit": git_commit(),
+        "rows": corpus.rows.len(),
+        "data": options.data.display().to_string(),
+        "queries": options.queries.display().to_string(),
+        "stages": stages,
+        "cases": cases,
+        "deviations": match options.arm {
+            Arm::E4 => e4_deviations(),
+            Arm::Postgres => pg_deviations(),
+        },
+    });
+    if let Some(parent) = options.out.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&options.out, serde_json::to_string_pretty(&report)?)?;
+    eprintln!(
+        "[{arm}] {disk_bytes} bytes on disk; report at {}",
+        options.out.display()
+    );
+    Ok(report)
+}
+
+// ── agreement ─────────────────────────────────────────────────────────────
+
+fn case_of<'a>(report: &'a Value, name: &str) -> Option<&'a Value> {
+    report
+        .get("cases")?
+        .as_array()?
+        .iter()
+        .find(|case| case.get("name").and_then(Value::as_str) == Some(name))
+}
+
+fn number(case: Option<&Value>, field: &str) -> Option<f64> {
+    case?.get(field)?.as_f64()
+}
+
+fn row_count(case: Option<&Value>) -> Option<u64> {
+    case?.get("total_rows")?.as_u64()
+}
+
+fn first_keys(case: Option<&Value>) -> Vec<String> {
+    case.and_then(|c| c.get("first_keys"))
+        .and_then(Value::as_array)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn micros(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".into(), |v| format!("{v:.1}"))
+}
+
+/// Print the cross-arm table and say whether every filter case agreed. Ranked
+/// cases report top-ten overlap and approximate cases each arm's own recall;
+/// neither is a pass/fail, because the two arms rank by different formulas
+/// and approximate by different algorithms.
+pub fn compare(left: &Path, right: &Path) -> R<bool> {
+    let read = |path: &Path| -> R<Value> {
+        Ok(serde_json::from_str(&fs::read_to_string(path).map_err(|e| {
+            format!("{}: {e}", path.display())
+        })?)?)
+    };
+    let a = read(left)?;
+    let b = read(right)?;
+    let arm_of = |report: &Value| report.get("arm").and_then(Value::as_str).unwrap_or("").to_owned();
+    let (e4, pg) = match (arm_of(&a).as_str(), arm_of(&b).as_str()) {
+        ("e4", "postgres") => (a, b),
+        ("postgres", "e4") => (b, a),
+        (x, y) => return Err(format!("expected one `e4` report and one `postgres` report, got `{x}` and `{y}`").into()),
+    };
+
+    println!(
+        "{:<22} {:<7} {:>12} {:>12} {:>9} {:>10} {:>10}  {}",
+        "case", "kind", "e4_us", "pg_us", "e4/pg", "e4_rows", "pg_rows", "agreement"
+    );
+    let mut disagreements = 0usize;
+    for spec in &BATTERY {
+        let ce = case_of(&e4, spec.name);
+        let cp = case_of(&pg, spec.name);
+        if ce.is_none() && cp.is_none() {
+            continue;
+        }
+        let me = number(ce, "median_us");
+        let mp = number(cp, "median_us");
+        let ratio = match (me, mp) {
+            (Some(e), Some(p)) if p > 0.0 => format!("{:.2}", e / p),
+            _ => "-".into(),
+        };
+        let re = row_count(ce);
+        let rp = row_count(cp);
+        let verdict = match spec.kind {
+            CaseKind::Filter => match (me, mp, re, rp) {
+                (Some(_), Some(_), Some(e), Some(p)) if e == p => "AGREE".to_string(),
+                (Some(_), Some(_), Some(e), Some(p)) => {
+                    disagreements += 1;
+                    format!("DISAGREE ({e} vs {p})")
+                }
+                _ => "not run in both arms".to_string(),
+            },
+            CaseKind::Ranked | CaseKind::Approx => {
+                if me.is_none() || mp.is_none() {
+                    "not run in both arms".to_string()
+                } else {
+                    let ke = first_keys(ce);
+                    let kp = first_keys(cp);
+                    let shared: HashSet<&str> = ke.iter().map(String::as_str).collect();
+                    let hits = kp.iter().filter(|k| shared.contains(k.as_str())).count();
+                    let width = ke.len().max(kp.len()).max(1);
+                    let mut text = format!("top-10 overlap {hits}/{width}");
+                    if spec.kind == CaseKind::Approx {
+                        text.push_str(&format!(
+                            "; recall e4={} pg={}",
+                            number(ce, "recall_at_k").map_or_else(|| "-".into(), |v| format!("{v:.3}")),
+                            number(cp, "recall_at_k").map_or_else(|| "-".into(), |v| format!("{v:.3}")),
+                        ));
+                    }
+                    text
+                }
+            }
+        };
+        println!(
+            "{:<22} {:<7} {:>12} {:>12} {:>9} {:>10} {:>10}  {}",
+            spec.name,
+            spec.kind.label(),
+            micros(me),
+            micros(mp),
+            ratio,
+            re.map_or_else(|| "-".into(), |v| v.to_string()),
+            rp.map_or_else(|| "-".into(), |v| v.to_string()),
+            verdict
+        );
+    }
+
+    let bytes = |report: &Value| -> Option<u64> {
+        report
+            .get("stages")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("name").and_then(Value::as_str) == Some("disk_bytes"))?
+            .get("bytes")?
+            .as_u64()
+    };
+    println!(
+        "\ndisk_bytes  e4={}  postgres={}",
+        bytes(&e4).map_or_else(|| "-".into(), |v| v.to_string()),
+        bytes(&pg).map_or_else(|| "-".into(), |v| v.to_string()),
+    );
+    for (arm, report) in [("e4", &e4), ("postgres", &pg)] {
+        if let Some(list) = report.get("deviations").and_then(Value::as_array) {
+            println!("\n{arm} deviations ({}):", list.len());
+            for entry in list {
+                println!(
+                    "  [{}] {}",
+                    entry.get("case").and_then(Value::as_str).unwrap_or("*"),
+                    entry.get("text").and_then(Value::as_str).unwrap_or("")
+                );
+            }
+        }
+    }
+    if disagreements > 0 {
+        println!("\n{disagreements} filter case(s) DISAGREE: the two arms answered different questions.");
+    }
+    Ok(disagreements == 0)
+}
+
+// ── command line ──────────────────────────────────────────────────────────
+
+fn usage() -> String {
+    "usage: battle50k <e4|postgres> --data <jsonl> --queries <json> --out <report.json> \
+     [--db-dir <dir>] [--dsn <dsn>] [--only <case-substring>] [--reuse] \
+     [--dump <dir>]\n\
+     \x20      battle50k compare <a.json> <b.json>"
+        .into()
+}
+
+fn parse(args: &[String]) -> R<Options> {
+    let arm = args
+        .first()
+        .and_then(|a| Arm::parse(a))
+        .ok_or_else(usage)?;
+    let mut data: Option<PathBuf> = None;
+    let mut queries: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut db_dir: Option<PathBuf> = None;
+    let mut dsn: Option<String> = None;
+    let mut only: Option<String> = None;
+    let mut reuse = false;
+    let mut dump: Option<PathBuf> = None;
+    let mut rest = args[1..].iter();
+    while let Some(flag) = rest.next() {
+        let mut value = || {
+            rest.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match flag.as_str() {
+            "--data" => data = Some(PathBuf::from(value()?)),
+            "--queries" => queries = Some(PathBuf::from(value()?)),
+            "--out" => out = Some(PathBuf::from(value()?)),
+            "--db-dir" => db_dir = Some(PathBuf::from(value()?)),
+            "--dsn" => dsn = Some(value()?),
+            "--only" => only = Some(value()?),
+            "--reuse" => reuse = true,
+            "--dump" => dump = Some(PathBuf::from(value()?)),
+            other => return Err(format!("unknown flag {other}\n{}", usage()).into()),
+        }
+    }
+    let mut options = Options::new(
+        arm,
+        data.ok_or_else(|| format!("--data is required\n{}", usage()))?,
+        queries.ok_or_else(|| format!("--queries is required\n{}", usage()))?,
+        out.ok_or_else(|| format!("--out is required\n{}", usage()))?,
+    );
+    if let Some(dir) = db_dir {
+        options.db_dir = dir;
+    }
+    if let Some(url) = dsn {
+        options.dsn = url;
+    }
+    options.only = only;
+    options.reuse = reuse;
+    options.dump = dump;
+    Ok(options)
+}
+
+fn main() -> R<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("compare") {
+        if args.len() != 3 {
+            return Err(usage().into());
+        }
+        let agreed = compare(Path::new(&args[1]), Path::new(&args[2]))?;
+        if !agreed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let options = parse(&args)?;
+    run_arm(&options)?;
+    Ok(())
+}
