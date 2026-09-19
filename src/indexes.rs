@@ -1502,10 +1502,46 @@ impl Database {
             _ => false,
         };
         if !sorted {
+            // A CHUNK COUNT IS NOT A TRANSACTION SIZE -- here too.
+            //
+            // The sorted path already says this about its own runs (see the
+            // comment above the ascending loop in `build_sorted_once`) and
+            // ends them on the byte budget instead. This path -- exact and
+            // quantized vector locators, and a text index that cannot be
+            // packed -- was still committing every `GROUP` chunks whatever
+            // those chunks cost. Counted at 50,000 rows on the `battle50k`
+            // corpus: `place_emb_exact` took 15 transactions to write 345 WAL
+            // page frames (1.49 MB) and `place_emb_ann` 15 to write 825
+            // (3.48 MB). One transaction's WAL allowance is 16 MiB. Thirty
+            // FULL barriers, measured at 11.9 ms each on the reference
+            // volume, for what four would have published.
+            //
+            // The group stays a CHUNK COUNT, because it is also the bound
+            // that keeps a transaction finite and the unit the allowance
+            // back-off halves. What changes is that it is no longer a
+            // constant: after each committed group the driver knows exactly
+            // what that group cost in WAL bytes, and rescales the next one
+            // towards `budget`. A first group of `GROUP` chunks is the
+            // measurement; every group after it is sized by it.
+            //
+            // Sacrifice (Law 4): a crash mid-build, or an allowance refusal,
+            // discards a larger in-flight group, so the resume from the
+            // committed cursor re-does more chunks. Bounded rework, never a
+            // wrong answer -- the same sacrifice the sorted path already
+            // names, and the refusal back-off (halve and retry, down to one
+            // chunk) is unchanged.
+            const MAX_GROUP: usize = 1024;
+            let budget = (self.store()?.store().wal_allowance() / 4).max(1);
             let mut group = GROUP;
+            // A refusal is the allowance telling the driver the size it just
+            // tried is too large. Halving and then letting the very next
+            // measurement grow the group straight back would make the
+            // back-off a loop; the ceiling records what the refusal taught.
+            let mut ceiling = MAX_GROUP;
             let mut chunks = 0;
             loop {
                 let mut pending = 0;
+                let mut at = self.io_counters()?.wal_bytes_written;
                 let outcome = loop {
                     let ready = match self.build_index_step(id, chunk_rows) {
                         Ok(ready) => ready,
@@ -1515,11 +1551,22 @@ impl Database {
                     chunks += 1;
                     pending += 1;
                     if ready || pending >= group {
+                        let sized = pending;
                         match self.commit() {
                             Ok(()) => pending = 0,
                             Err(e) if allowance(&e) && group > 1 => break Err(e),
                             Err(e) => return Err(e),
                         }
+                        // What that group actually cost, and what the next
+                        // one may therefore be. Growth is capped at 8x a
+                        // step so one cheap group cannot leap straight to a
+                        // transaction the allowance refuses; `MAX_GROUP`
+                        // caps it outright.
+                        let now = self.io_counters()?.wal_bytes_written;
+                        let used = now.saturating_sub(at).max(1);
+                        at = now;
+                        let want = (sized as u64).saturating_mul(budget) / used;
+                        group = (want as usize).clamp(1, group.saturating_mul(8).min(ceiling));
                     }
                     if ready {
                         break Ok(chunks);
@@ -1531,6 +1578,7 @@ impl Database {
                         self.rollback()?;
                         chunks -= pending;
                         group /= 2;
+                        ceiling = group;
                     }
                 }
             }

@@ -1068,6 +1068,36 @@ impl PageWalStore {
     }
     pub fn commit(&mut self)->Result<()> {
         self.writable()?;
+        // A COMMIT WITH NOTHING TO PUBLISH PLACES NO BARRIER.
+        //
+        // Every mutator on this handle sets `dirty`, and a publication clears
+        // it, so `!dirty` means not one byte has changed since the last
+        // acknowledged commit. Publishing anyway rewrote the meta page with
+        // the root it already carried, appended a 4 KiB commit frame for it
+        // and issued a FULL barrier -- on macOS `fcntl(F_FULLFSYNC)`, measured
+        // at 11.9 ms on the reference volume against 1.45 ms for `fsync`.
+        // Nothing observable followed from it: readers were already on this
+        // transaction, and the next transaction number is not a promise to
+        // anyone.
+        //
+        // It is not a rare shape. The late-build driver commits the pack and
+        // the READY flip itself, so the `commit` a caller writes after
+        // `build_index_to_ready` -- as `load_e4` in src/bin/battle50k.rs does
+        // after each of its seven builds -- had nothing left to publish and
+        // bought one barrier each. Seven per benchmark run.
+        //
+        // The second condition is belt and braces: no mutator appends a frame
+        // without setting `dirty`, so an unpublished tail with a clean handle
+        // is not reachable, and if it ever were, the publication is the right
+        // answer and this returns to it.
+        if !self.dirty
+            && self.pager.as_ref().is_some_and(|p| {
+                let s = p.state.lock().unwrap();
+                s.end == s.last_commit && s.hint_current
+            })
+        {
+            return Ok(());
+        }
         let result=(||{
             let header={let s=self.pager.as_ref().unwrap().state.lock().unwrap();
                 Header{root:self.root,free:s.free_head,cap:s.cap,identity:s.identity,tx:s.tx,features:s.features}};
