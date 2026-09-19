@@ -75,14 +75,16 @@ fn timed(
     })
 }
 
+/// Item KD: the `page` stage now asks the SAME question `SELECT _key FROM
+/// person` asks in SQLite -- the mapping keyspace, not the primary rows.
 fn count_page(db: &Database, person: CollectionId) -> R<u64> {
     let mut prepared = db.prepare_query(QueryRequest {
         collection: person,
         filters: &[],
-        order: QueryOrder::EntityId,
+        order: QueryOrder::Driver,
         projection: Projection::Ids,
         total_limit: None,
-        driver: CandidateDriver::Auto,
+        driver: CandidateDriver::Keys,
     })?;
     let mut rows = 0u64;
     loop {

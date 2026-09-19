@@ -36,6 +36,7 @@ fn generous() -> QueryBudget {
         vector_locators: 1_000_000,
         vector_sidecars: 1_000_000,
         vector_lanes: 1_000_000,
+        key_postings: 1_000_000,
         output_bytes: 16 << 20,
     }
 }

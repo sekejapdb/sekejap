@@ -96,6 +96,17 @@
 //!      express at all (GROUP BY, AVG, MIN/MAX, OFFSET) are listed in the
 //!      JSON's `unsupported` block with the reason, never silently dropped and
 //!      never emulated to produce a number.
+//!
+//!      As of item KD, `count_all` also asks E4 the SAME question SQLite's
+//!      `SELECT _key FROM person` already asks: an enumeration of the
+//!      `(_key, rowid)` covering index, not the row table. E4's counterpart is
+//!      `CandidateDriver::Keys` over the external-key mapping keyspace
+//!      (`collections.rs:382`), asked in `QueryOrder::Driver` (key order,
+//!      ascending — the mapping keyspace has no descending walk, see item
+//!      KD's report). Both arms now enumerate their key index in key order;
+//!      `key(sequence)`'s zero-padding happens to make that the same order
+//!      `EntityId` gave before, so this is an accounting change, not a
+//!      behaviour change, for THIS fixture's row count or contents.
 //!   6. DURABILITY IS MATCHED AND ON. e3's SQLite arm ran `journal_mode=OFF`,
 //!      `synchronous=OFF`, one transaction. Here both arms commit every 256
 //!      rows and both pay a FULL barrier per commit — E4's page-WAL publishes
@@ -520,10 +531,10 @@ fn e4_cases() -> Vec<(&'static str, fn(&E4Ctx) -> R<Answer>)> {
             e4_run(
                 c,
                 &[],
-                QueryOrder::EntityId,
+                QueryOrder::Driver,
                 Projection::Ids,
                 None,
-                CandidateDriver::Entities,
+                CandidateDriver::Keys,
             )
         }),
         ("name_fulltext", |c| {

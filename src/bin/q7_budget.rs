@@ -47,6 +47,8 @@ struct Case {
     /// resumes, and the same rows in entity order do not. See popsim's
     /// deviations 8 (scalar ranges) and 9 (spatial).
     order: QueryOrder<'static>,
+    /// Item KD: `count_all` drives from the mapping keyspace, same as popsim.
+    driver: CandidateDriver,
 }
 
 fn run(db: &Database, person: CollectionId, case: &Case) -> R<()> {
@@ -58,7 +60,7 @@ fn run(db: &Database, person: CollectionId, case: &Case) -> R<()> {
         order: case.order,
         projection: Projection::Ids,
         total_limit: case.limit,
-        driver: CandidateDriver::Auto,
+        driver: case.driver,
     })?;
     let (mut rows, mut pages) = (0u64, 0u64);
     let (mut candidates, mut primary, mut scalar, mut text, mut spatial) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -164,7 +166,8 @@ fn main() -> R<()> {
             name: "count_all",
             limit: None,
             filters: vec![],
-            order: QueryOrder::EntityId,
+            order: QueryOrder::Driver,
+            driver: CandidateDriver::Keys,
         },
         Case {
             name: "name_fulltext",
@@ -175,6 +178,7 @@ fn main() -> R<()> {
                 matching: TextMatch::Any,
             }],
             order: QueryOrder::EntityId,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "name_two_terms",
@@ -185,6 +189,7 @@ fn main() -> R<()> {
                 matching: TextMatch::Any,
             }],
             order: QueryOrder::EntityId,
+            driver: CandidateDriver::Auto,
         },
         // Wide enough that the answer OUTGROWS the held run (8 MiB of rank
         // keys, 149,796 rows), which is where a text walk that cannot resume
@@ -200,6 +205,7 @@ fn main() -> R<()> {
                 matching: TextMatch::Any,
             }],
             order: QueryOrder::EntityId,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "name_and_born",
@@ -219,6 +225,7 @@ fn main() -> R<()> {
                 },
             ],
             order: QueryOrder::EntityId,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "born_decade",
@@ -228,12 +235,14 @@ fn main() -> R<()> {
                 Bound::Excluded(20_000_101),
             ),
             order: by_born,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "born_ge_open",
             limit: None,
             filters: range(Bound::Included(20_100_101), Bound::Unbounded),
             order: by_born,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "born_one_year",
@@ -243,6 +252,7 @@ fn main() -> R<()> {
                 Bound::Excluded(19_880_101),
             ),
             order: by_born,
+            driver: CandidateDriver::Auto,
         },
         // The spatial cases. Their driver walks Hilbert cells, so cell order
         // is the only order a page of one can resume in; `--entity-order`
@@ -256,6 +266,7 @@ fn main() -> R<()> {
                 radius_metres: 50_000.0,
             })],
             order: QueryOrder::Driver,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "radius_2km",
@@ -265,6 +276,7 @@ fn main() -> R<()> {
                 radius_metres: 2_000.0,
             })],
             order: QueryOrder::Driver,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "radius_top10",
@@ -274,6 +286,7 @@ fn main() -> R<()> {
                 radius_metres: 10_000.0,
             })],
             order: QueryOrder::Driver,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "bbox",
@@ -282,6 +295,7 @@ fn main() -> R<()> {
                 Bounds::new(BOX_WEST, BOX_EAST, BOX_SOUTH, BOX_NORTH).expect("box is valid"),
             ))],
             order: QueryOrder::Driver,
+            driver: CandidateDriver::Auto,
         },
         Case {
             name: "radius_and_born",
@@ -300,6 +314,7 @@ fn main() -> R<()> {
                 },
             ],
             order: QueryOrder::Driver,
+            driver: CandidateDriver::Auto,
         },
     ];
     for case in &cases {
@@ -308,6 +323,7 @@ fn main() -> R<()> {
             limit: case.limit,
             filters: case.filters.clone(),
             order: if entity_order { QueryOrder::EntityId } else { case.order },
+            driver: case.driver,
         };
         run(&db, person, &case)?;
     }

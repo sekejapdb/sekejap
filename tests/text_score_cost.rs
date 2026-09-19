@@ -95,6 +95,7 @@ fn budget() -> QueryBudget {
         vector_locators: 1 << 22,
         vector_sidecars: 1 << 22,
         vector_lanes: 1 << 22,
+        key_postings: 1 << 22,
         output_bytes: 1 << 24,
     }
 }

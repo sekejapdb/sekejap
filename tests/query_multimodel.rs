@@ -71,6 +71,7 @@ fn generous() -> QueryBudget {
         vector_locators: 10_000,
         vector_sidecars: 10_000,
         vector_lanes: 20_000,
+        key_postings: 10_000,
         output_bytes: 1 << 20,
     }
 }
@@ -1615,6 +1616,7 @@ fn approximate_vector_filters_before_shortlist_pages_and_retries_with_diagnostic
                 assert_eq!(first.work.vector_locators, 7); // 4 point probes + 3 rechecks
             }
             CandidateDriver::Entities => assert_eq!(first.driver, QueryDriver::Entities),
+            CandidateDriver::Keys => unreachable!("this test's driver list never includes Keys"),
         }
     }
 }
@@ -2154,6 +2156,7 @@ fn packed_budget() -> QueryBudget {
         vector_locators: 1 << 22,
         vector_sidecars: 1 << 22,
         vector_lanes: 1 << 22,
+        key_postings: 1 << 22,
         output_bytes: 1 << 24,
     }
 }
@@ -2808,4 +2811,96 @@ fn a_deleted_point_is_never_returned_by_a_spatial_page_that_no_longer_probes() {
     ids_by_cell.sort();
     assert_eq!(ids_by_cell, ids_in_order);
     assert_eq!(page.work.primary_reads, 0, "{:?}", page.work);
+}
+
+/// Oracle parity for item KD: `CandidateDriver::Keys` under `QueryOrder::
+/// Driver` must return exactly the entities an independent oracle gets by
+/// enumerating them (`CandidateDriver::Entities`, any order) and sorting the
+/// result by external key.
+///
+/// The fixture's keys are deliberately the REVERSE of insertion/id order
+/// (`m{:05}` counting down as the loop counts up) rather than the zero-padded
+/// ascending keys popsim happens to use -- see `ROOTCAUSE-count-all.md`'s own
+/// warning that popsim's key order coinciding with id order is "a property of
+/// the fixture, not of the engine". A test that passed only because key order
+/// and id order agreed would not be testing the driver at all.
+#[test]
+fn keys_driver_order_matches_an_entity_enumeration_sorted_by_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Database::create(temp.path().join("db"), cfg()).unwrap();
+    let rows = db
+        .create_collection(
+            "kd_oracle",
+            vec![("v".into(), Kind::Int)],
+            CollectionOptions::default(),
+        )
+        .unwrap();
+    db.commit().unwrap();
+    const ROWS: u64 = 300;
+    for i in 1..=ROWS {
+        let key = format!("m{:05}", ROWS + 1 - i);
+        db.put(rows, &key, &json!({"v": i as i64})).unwrap();
+        if i % 97 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    // Delete some so the oracle also has to agree about absence.
+    for i in (11..=ROWS).step_by(11) {
+        let key = format!("m{:05}", ROWS + 1 - i);
+        assert!(db.delete(rows, &key).unwrap());
+    }
+    db.commit().unwrap();
+
+    let mut entities = db
+        .prepare_query(QueryRequest {
+            collection: rows,
+            filters: &[],
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Entities,
+        })
+        .unwrap();
+    let mut by_key: Vec<(String, EntityId)> = Vec::new();
+    loop {
+        let page = entities.next_page(4096, generous(), || false).unwrap();
+        for row in &page.rows {
+            let entity = db.get_by_id(row.id).unwrap().unwrap();
+            by_key.push((entity.key, row.id));
+        }
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    by_key.sort();
+    let oracle: Vec<EntityId> = by_key.into_iter().map(|(_, id)| id).collect();
+
+    let mut keys_query = db
+        .prepare_query(QueryRequest {
+            collection: rows,
+            filters: &[],
+            order: QueryOrder::Driver,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Keys,
+        })
+        .unwrap();
+    let mut got = Vec::new();
+    loop {
+        let page = keys_query.next_page(4096, generous(), || false).unwrap();
+        assert_eq!(page.driver, QueryDriver::Keys);
+        assert_eq!(page.work.primary_reads, 0, "{:?}", page.work);
+        got.extend(page.rows.iter().map(|row| row.id));
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+
+    assert!(got.len() > 200, "the fixture must have a real answer after deletes");
+    assert_eq!(got.len(), oracle.len());
+    assert_eq!(
+        got, oracle,
+        "the keys driver's own order must equal entities sorted by key"
+    );
 }

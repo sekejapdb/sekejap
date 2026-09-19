@@ -77,6 +77,14 @@ pub enum QueryFilter<'a> {
         query: &'a str,
         matching: TextMatch,
     },
+    /// A range (or, with equal-prefixed bounds, a prefix) over the
+    /// external-key mapping keyspace (`mapping_key`, `collections.rs:382`).
+    /// Meaningful only under `CandidateDriver::Keys`, which certifies it from
+    /// the mapping entry itself -- see `DriverPlan::Keys`.
+    Key {
+        lower: Bound<&'a str>,
+        upper: Bound<&'a str>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -150,6 +158,12 @@ pub enum CandidateDriver {
     Entities,
     Filter(usize),
     Order,
+    /// Enumerate the external-key mapping keyspace instead of the primary
+    /// rows -- E4's counterpart of SQLite's automatic covering index on
+    /// `(_key, rowid)`. An optional `QueryFilter::Key` in the request narrows
+    /// it to a range or prefix; with none, the whole collection's keys are
+    /// walked. See `DriverPlan::Keys`.
+    Keys,
 }
 
 /// Candidate source selected during query preparation. This is returned with
@@ -168,6 +182,7 @@ pub enum QueryDriver {
     Text(IndexId),
     ExactVector(IndexId),
     QuantizedVector(IndexId),
+    Keys,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +266,8 @@ pub struct QueryBudget {
     pub vector_locators: u64,
     pub vector_sidecars: u64,
     pub vector_lanes: u64,
+    /// Mapping-keyspace entries walked by `CandidateDriver::Keys`.
+    pub key_postings: u64,
     pub output_bytes: u64,
 }
 
@@ -268,6 +285,7 @@ impl QueryBudget {
             vector_locators: u64::MAX,
             vector_sidecars: u64::MAX,
             vector_lanes: u64::MAX,
+            key_postings: u64::MAX,
             output_bytes: u64::MAX,
         }
     }
@@ -294,6 +312,7 @@ pub struct QueryWork {
     pub vector_locators: u64,
     pub vector_sidecars: u64,
     pub vector_lanes: u64,
+    pub key_postings: u64,
     pub output_bytes: u64,
 }
 
@@ -310,6 +329,7 @@ pub enum WorkResource {
     VectorLocators,
     VectorSidecars,
     VectorLanes,
+    KeyPostings,
     OutputBytes,
 }
 
@@ -409,6 +429,7 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
                 (&mut self.used.vector_sidecars, self.limit.vector_sidecars)
             }
             WorkResource::VectorLanes => (&mut self.used.vector_lanes, self.limit.vector_lanes),
+            WorkResource::KeyPostings => (&mut self.used.key_postings, self.limit.key_postings),
             WorkResource::OutputBytes => (&mut self.used.output_bytes, self.limit.output_bytes),
         };
         let attempted = used.checked_add(amount).ok_or(QueryError::BudgetExceeded {
@@ -561,6 +582,16 @@ enum CompiledFilter {
         predicate: PointFilter,
     },
     Text(PreparedText),
+    /// A range over the external-key mapping keyspace. Reuses
+    /// `EncodedScalarFilter`'s `Range`/`Empty` shape -- `scalar_key_position`
+    /// and `range_or_empty` are pure byte-range logic with nothing
+    /// scalar-index-specific in them, and a key has no `Eq`/`IsNull`/
+    /// `IsMissing` counterpart (every mapping entry is a present real key).
+    /// Meaningful only at the position `DriverPlan::Keys` certifies;
+    /// `prepare_query` refuses any other placement.
+    Key {
+        predicate: EncodedScalarFilter,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -721,6 +752,8 @@ enum DriverKey {
     Scalar(IndexId),
     /// `cell || sequence` of one spatial index's postings.
     Cell(IndexId),
+    /// The external key bytes of one mapping entry.
+    Key,
 }
 
 #[derive(Clone, Debug)]
@@ -751,6 +784,15 @@ enum DriverPlan {
     QuantizedVector {
         info: IndexInfo,
     },
+    /// Walk the external-key mapping keyspace. `predicate` is a range over
+    /// the raw key bytes (`Empty`/`Range` only -- see `CompiledFilter::Key`);
+    /// `position` is the filter position it certifies, or `None` when the
+    /// request named no `QueryFilter::Key` at all and the whole collection's
+    /// keys are walked.
+    Keys {
+        predicate: EncodedScalarFilter,
+        position: Option<usize>,
+    },
 }
 
 impl DriverPlan {
@@ -770,6 +812,7 @@ impl DriverPlan {
             Self::Text { prepared, .. } => QueryDriver::Text(prepared.info.id),
             Self::ExactVector { info } => QueryDriver::ExactVector(info.id),
             Self::QuantizedVector { info } => QueryDriver::QuantizedVector(info.id),
+            Self::Keys { .. } => QueryDriver::Keys,
         }
     }
 }
@@ -784,6 +827,8 @@ enum RankValue {
     /// millions of rows, and a `Vec` per row to carry a `u32` is an
     /// allocation per row.
     Cell(u32),
+    /// One mapping entry's external-key bytes.
+    Key(Vec<u8>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -981,6 +1026,13 @@ fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool) -> Orderin
             }
         }
         (RankValue::Cell(a), RankValue::Cell(b)) => {
+            if descending {
+                b.cmp(a)
+            } else {
+                a.cmp(b)
+            }
+        }
+        (RankValue::Key(a), RankValue::Key(b)) => {
             if descending {
                 b.cmp(a)
             } else {
@@ -1240,6 +1292,18 @@ fn encode_bound(kind: &Kind, bound: &Bound<ScalarValue<'_>>) -> QueryResult<Enco
         Bound::Included(value) => Ok(EncodedBound::Included(encode_scalar_value(kind, *value)?)),
         Bound::Excluded(value) => Ok(EncodedBound::Excluded(encode_scalar_value(kind, *value)?)),
         Bound::Unbounded => Ok(EncodedBound::Unbounded),
+    }
+}
+
+/// A key bound as its raw UTF-8 bytes -- `mapping_key` appends a key's bytes
+/// directly with no order-preserving transform (`collections.rs:382`), so
+/// byte order already is the bound's order and there is no `Kind` to encode
+/// against, unlike a scalar value.
+fn encode_key_bound(bound: &Bound<&str>) -> EncodedBound {
+    match bound {
+        Bound::Included(value) => EncodedBound::Included(value.as_bytes().to_vec()),
+        Bound::Excluded(value) => EncodedBound::Excluded(value.as_bytes().to_vec()),
+        Bound::Unbounded => EncodedBound::Unbounded,
     }
 }
 
@@ -1529,7 +1593,18 @@ impl Database {
                     query,
                     *matching,
                 )?),
+                QueryFilter::Key { lower, upper } => CompiledFilter::Key {
+                    predicate: range_or_empty(encode_key_bound(lower), encode_key_bound(upper)),
+                },
             });
+        }
+        if filters
+            .iter()
+            .filter(|filter| matches!(filter, CompiledFilter::Key { .. }))
+            .count()
+            > 1
+        {
+            return Err(invalid_query("query has more than one key filter"));
         }
 
         // Two predicates on ONE scalar index are one predicate. Folding them
@@ -1675,10 +1750,37 @@ impl Database {
                 CompiledOrder::Driver(_) => Ok(DriverPlan::Entities),
             }
         };
+        // `CandidateDriver::Keys` is not `CandidateDriver::Filter(position)`
+        // because its filter is OPTIONAL: with none, the whole collection's
+        // keys are walked (what `count_all` needs); with one, that position
+        // is the predicate and is certified the same way a driving scalar
+        // range is.
+        let keys_driver = |filters: &[CompiledFilter]| -> QueryResult<DriverPlan> {
+            let found = filters.iter().enumerate().find_map(|(position, filter)| {
+                match filter {
+                    CompiledFilter::Key { predicate } => Some((position, predicate.clone())),
+                    _ => None,
+                }
+            });
+            Ok(match found {
+                Some((position, predicate)) => DriverPlan::Keys {
+                    predicate,
+                    position: Some(position),
+                },
+                None => DriverPlan::Keys {
+                    predicate: EncodedScalarFilter::Range {
+                        lower: EncodedBound::Unbounded,
+                        upper: EncodedBound::Unbounded,
+                    },
+                    position: None,
+                },
+            })
+        };
         let driver = match request.driver {
             CandidateDriver::Entities => DriverPlan::Entities,
             CandidateDriver::Filter(position) => filter_driver(position)?,
             CandidateDriver::Order => order_driver()?,
+            CandidateDriver::Keys => keys_driver(&filters)?,
             CandidateDriver::Auto => {
                 if let Some(position) = filters
                     .iter()
@@ -1757,6 +1859,29 @@ impl Database {
                 }
             }
         };
+
+        // A `QueryFilter::Key` is certified by the mapping-entry walk that
+        // produced the candidate (`CompiledFilter::Key`'s doc); it has no row-
+        // level fallback the way a scalar predicate does. So it is only
+        // meaningful at the position `CandidateDriver::Keys` actually
+        // certifies -- named by a DIFFERENT driver, or left uncertified
+        // because the request chose `CandidateDriver::Keys` but a second key
+        // filter lost the (at most one) slot, it would reach `filters_match`
+        // with no way to answer itself.
+        if let Some(key_position) = filters
+            .iter()
+            .position(|filter| matches!(filter, CompiledFilter::Key { .. }))
+        {
+            let certified = matches!(
+                &driver,
+                DriverPlan::Keys { position: Some(position), .. } if *position == key_position
+            );
+            if !certified {
+                return Err(invalid_query(
+                    "a key filter requires CandidateDriver::Keys to drive it",
+                ));
+            }
+        }
 
         // Driver order ranks by the key the chosen driver's own walk is
         // sorted by, which is knowable only now.
@@ -1863,6 +1988,7 @@ fn driver_key(driver: &DriverPlan) -> QueryResult<DriverKey> {
         }
         DriverPlan::Scalar { info, .. } => Ok(DriverKey::Scalar(info.id)),
         DriverPlan::Spatial { info, .. } => Ok(DriverKey::Cell(info.id)),
+        DriverPlan::Keys { .. } => Ok(DriverKey::Key),
         DriverPlan::ExactVector { .. } | DriverPlan::QuantizedVector { .. } => Err(invalid_query(
             "driver order needs a driver that walks in an order of its own",
         )),
@@ -2228,6 +2354,9 @@ enum CarriedKey {
     /// The Hilbert cell a spatial posting is filed under, read only by a
     /// ranking in that index's own walk order.
     Cell(IndexId, u32),
+    /// A mapping entry's external-key bytes, read only by a ranking in the
+    /// keys driver's own walk order.
+    Key(Vec<u8>),
 }
 
 struct Candidate {
@@ -2288,6 +2417,15 @@ impl Candidate {
     fn cell(&self, index: IndexId) -> Option<u32> {
         match &self.carried {
             Some(CarriedKey::Cell(id, cell)) if *id == index => Some(*cell),
+            _ => None,
+        }
+    }
+
+    /// The external-key bytes this candidate came in on, if it came from the
+    /// keys driver's mapping-entry walk.
+    fn key(&self) -> Option<&[u8]> {
+        match &self.carried {
+            Some(CarriedKey::Key(key)) => Some(key),
             _ => None,
         }
     }
@@ -2363,6 +2501,25 @@ struct ScalarCursor<'a> {
 struct CursorNeeds {
     row: bool,
     scalar_key: bool,
+    key: bool,
+}
+
+/// One mapping-keyspace range, walked ascending. Unlike `ScalarWalk` there is
+/// no reverse variant: `QueryOrder::Driver` has no direction of its own (see
+/// `DriverKey`'s doc), so nothing ever asks this cursor to open backwards --
+/// stated, not implemented, per item KD's scope.
+struct KeysCursor<'a> {
+    inner: RangeIter<'a>,
+    prefix: Vec<u8>,
+    collection: CollectionId,
+    predicate: EncodedScalarFilter,
+    /// The filter position this cursor's own walk already proves, if any.
+    /// Unlike a scalar posting there is no nullish sentinel to leave
+    /// uncertified: every mapping entry this cursor yields is a real,
+    /// present key inside the predicate, full stop.
+    certifies: Option<usize>,
+    wants_key: bool,
+    done: bool,
 }
 
 struct VectorCursor<'a> {
@@ -2428,6 +2585,7 @@ enum DriverCursor<'a> {
     Text(TextCursor<'a>),
     Vector(VectorCursor<'a>),
     QuantizedVector(QuantizedVectorCursor<'a>),
+    Keys(KeysCursor<'a>),
     Ids(std::vec::IntoIter<EntityId>),
 }
 
@@ -2536,6 +2694,23 @@ fn resume_scalar_key(
         _ => return None,
     };
     Some(super::indexes::skey(info, value, after.id.sequence))
+}
+
+/// The mapping key a resumed keys walk should open at: the previous page's
+/// last key, re-yielded and dropped by `next_page`'s own `after` comparison --
+/// the same shape `EntityCursor`'s resume uses. One function serves both
+/// directions here (unlike `resume_scalar_key`/`resume_scalar_reverse_key`)
+/// because a mapping entry is unique per key: there is no tie group whose
+/// still-owed members lie on the far side of it.
+fn resume_key_walk(prefix: &[u8], after: &RankKey) -> Option<Vec<u8>> {
+    match &after.value {
+        RankValue::Key(key) => {
+            let mut start = prefix.to_vec();
+            start.extend_from_slice(key);
+            Some(start)
+        }
+        _ => None,
+    }
 }
 
 /// The nullish scalar key. A NULL field and a MISSING one share it, so a
@@ -2816,6 +2991,38 @@ impl<'a> DriverCursor<'a> {
                     done: false,
                 }))
             }
+            DriverPlan::Keys { predicate, position } => {
+                let prefix = prefix(0x20, collection);
+                let mut start = prefix.clone();
+                if let Some(lower) = scalar_lower(predicate) {
+                    start.extend_from_slice(lower);
+                }
+                if let Some(key) = resume.and_then(|after| resume_key_walk(&prefix, after)) {
+                    start = key;
+                }
+                let inner = db
+                    .store()?
+                    .range(&start)
+                    .map_err(Error::from)
+                    .map_err(QueryError::from)?;
+                // A posting-membership-style certification: every entry this
+                // cursor yields already passed `scalar_key_position` against
+                // the predicate, so there is no candidate left for
+                // `filters_match` to re-check -- see `CompiledFilter::Key`.
+                let certifies = match (position, predicate) {
+                    (Some(position), EncodedScalarFilter::Range { .. }) => Some(*position),
+                    _ => None,
+                };
+                Ok(Self::Keys(KeysCursor {
+                    inner,
+                    prefix,
+                    collection,
+                    predicate: predicate.clone(),
+                    certifies,
+                    wants_key: needs.key,
+                    done: matches!(predicate, EncodedScalarFilter::Empty),
+                }))
+            }
         }
     }
 
@@ -2830,6 +3037,7 @@ impl<'a> DriverCursor<'a> {
             Self::Text(cursor) => cursor.next(meter),
             Self::Vector(cursor) => cursor.next(meter),
             Self::QuantizedVector(cursor) => cursor.next(meter),
+            Self::Keys(cursor) => cursor.next(meter),
             Self::Ids(ids) => Ok(ids.next().map(Candidate::bare)),
         }
     }
@@ -2950,6 +3158,73 @@ impl ScalarCursor<'_> {
                 satisfied_filter: self.certifies.filter(|_| proves_predicate),
                 ..Candidate::bare(EntityId {
                     collection: self.info.collection,
+                    sequence,
+                })
+            }));
+        }
+    }
+}
+
+impl KeysCursor<'_> {
+    fn next<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<Candidate>> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            meter.charge(WorkResource::KeyPostings, 1)?;
+            let decoded = {
+                let Some((key, value)) = self
+                    .inner
+                    .peek_ref()
+                    .map_err(Error::from)
+                    .map_err(QueryError::from)?
+                else {
+                    self.done = true;
+                    return Ok(None);
+                };
+                if !super::has_prefix(key, &self.prefix) {
+                    self.done = true;
+                    return Ok(None);
+                }
+                let suffix = &key[self.prefix.len()..];
+                let position = scalar_key_position(&self.predicate, suffix);
+                if position == Ordering::Greater {
+                    self.done = true;
+                    return Ok(None);
+                }
+                match position {
+                    Ordering::Equal => {
+                        let mut at = 0;
+                        let sequence = read_ordered(value, &mut at)?;
+                        if at != value.len() || sequence == 0 {
+                            return Err(corrupt_query("external-key mapping entry"));
+                        }
+                        Some((
+                            sequence,
+                            if self.wants_key {
+                                Some(suffix.to_vec())
+                            } else {
+                                None
+                            },
+                        ))
+                    }
+                    // Below the predicate's lower bound: keep walking.
+                    Ordering::Less => None,
+                    Ordering::Greater => unreachable!("handled above"),
+                }
+            };
+            self.inner.step();
+            let Some((sequence, key_bytes)) = decoded else {
+                continue;
+            };
+            return Ok(Some(Candidate {
+                carried: key_bytes.map(CarriedKey::Key),
+                satisfied_filter: self.certifies,
+                ..Candidate::bare(EntityId {
+                    collection: self.collection,
                     sequence,
                 })
             }));
@@ -3710,7 +3985,9 @@ fn batch_filters_match<C: FnMut() -> bool>(
             }
             // Already answered by the position it folded into.
             CompiledFilter::Folded { .. } => true,
-            CompiledFilter::Graph { .. } | CompiledFilter::Text(_) => return Ok(None),
+            CompiledFilter::Graph { .. } | CompiledFilter::Text(_) | CompiledFilter::Key { .. } => {
+                return Ok(None)
+            }
         };
         if !matches {
             return Ok(Some(false));
@@ -4458,6 +4735,13 @@ fn filters_match<'a, C: FnMut() -> bool>(
                 meter,
             )?
             .is_some(),
+            // Reached only if a candidate arrived here uncertified, which
+            // `prepare_query` refuses to compile: a key filter exists only at
+            // the position `CandidateDriver::Keys` certifies, and `KeysCursor`
+            // never yields an entry outside its own predicate.
+            CompiledFilter::Key { .. } => {
+                unreachable!("a key filter is always certified by CandidateDriver::Keys")
+            }
         };
         if !matches {
             return Ok(false);
@@ -4522,6 +4806,12 @@ fn rank_candidate<'a, C: FnMut() -> bool>(
             candidate
                 .cell(*index)
                 .ok_or_else(|| corrupt_query("driver order lost its spatial cell"))?,
+        ),
+        CompiledOrder::Driver(DriverKey::Key) => RankValue::Key(
+            candidate
+                .key()
+                .ok_or_else(|| corrupt_query("driver order lost its mapping key"))?
+                .to_vec(),
         ),
         CompiledOrder::Bm25(prepared) => {
             let Some(score) = text_score(
@@ -4797,7 +5087,8 @@ impl PreparedQuery<'_> {
                 | DriverPlan::Scalar { .. }
                 | DriverPlan::Spatial { .. }
                 | DriverPlan::Text { .. }
-                | DriverPlan::Graph { .. },
+                | DriverPlan::Graph { .. }
+                | DriverPlan::Keys { .. },
                 CompiledOrder::Driver(_),
             ) => RankWalk::Exact,
             (
@@ -4854,6 +5145,9 @@ impl PreparedQuery<'_> {
                 }
                 _ => false,
             },
+            // The mapping entry's key bytes are read only by a driver-ordered
+            // ranking over the keys walk itself.
+            key: matches!(self.order, CompiledOrder::Driver(DriverKey::Key)),
         }
     }
 
@@ -4960,6 +5254,26 @@ impl PreparedQuery<'_> {
         // merge, exactly as it is not refused by a BM25 page. `verify_index`
         // refuses it outright either way.
         if matches!(self.driver, DriverPlan::Text { .. }) {
+            return true;
+        }
+        // A key-driven page reads the same guarantee off the mapping entry
+        // itself, unconditionally (no order restriction needed, unlike
+        // spatial below): `Database::delete` removes a collection's mapping
+        // entry (`self.writer()?.delete(&mapping_key(c, key))?`,
+        // `collections.rs:1502`) in the SAME closure that removes its row
+        // (`collections.rs:1501`), committed or failed as one frame
+        // (`collections.rs:1476`, via `self.finish`). So a mapping entry
+        // `KeysCursor` still walks in this snapshot names a row that was
+        // alive when the snapshot was taken -- there is no "packed tier"
+        // complication here the way there is for text: one entry, one key,
+        // retired exactly once.
+        //
+        // Named sacrifice (Law 4): a store-level orphan -- a primary row
+        // removed behind the mapping keyspace's back, which no supported
+        // write can do -- is no longer refused by a key-only page. No
+        // supported write can produce one; `verify_index`-style consistency
+        // checking is out of this item's scope.
+        if matches!(self.driver, DriverPlan::Keys { .. }) {
             return true;
         }
         // A spatial-driven page reads the same guarantee off the cell
@@ -5112,7 +5426,8 @@ impl PreparedQuery<'_> {
             } => !*posting_membership,
             CompiledFilter::JsonEq { .. }
             | CompiledFilter::Point { .. }
-            | CompiledFilter::Folded { .. } => true,
+            | CompiledFilter::Folded { .. }
+            | CompiledFilter::Key { .. } => true,
             // A text filter rejects from its postings before it looks at a
             // row, so it is a cheap refusal standing in front of the expensive
             // one -- and a PHRASE is not a pure function of the row at all: it
@@ -5149,7 +5464,9 @@ impl PreparedQuery<'_> {
     /// moving".
     fn a_filter_reads_the_row(&self) -> bool {
         let driving = match &self.driver {
-            DriverPlan::Scalar { position, .. } | DriverPlan::Text { position, .. } => *position,
+            DriverPlan::Scalar { position, .. }
+            | DriverPlan::Text { position, .. }
+            | DriverPlan::Keys { position, .. } => *position,
             DriverPlan::Spatial { position, .. } | DriverPlan::Graph { position } => Some(*position),
             _ => None,
         };
@@ -5177,6 +5494,11 @@ impl PreparedQuery<'_> {
             }
             CompiledFilter::JsonEq { .. } | CompiledFilter::Point { .. } => true,
             CompiledFilter::Graph { .. } | CompiledFilter::Folded { .. } => false,
+            // Certified straight from the mapping entry, at the driving
+            // position `_ if Some(position) == driving` already caught above;
+            // reached only if it were somehow not driving, which
+            // `prepare_query` refuses to compile.
+            CompiledFilter::Key { .. } => false,
         })
     }
 

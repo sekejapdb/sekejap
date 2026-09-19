@@ -11,9 +11,9 @@
 //! it does now, so they fail on a regression rather than on a rounding.
 use e4_prototype::{
     collections::{
-        CandidateDriver, CollectionOptions, Database, IndexId, PointFilter, Projection, QueryBudget,
-        QueryFilter, QueryOrder, QueryRequest, QueryWork, ScalarFilter, ScalarValue, SortDirection,
-        TextMatch,
+        CandidateDriver, CollectionId, CollectionOptions, Database, IndexId, PointFilter, Projection,
+        QueryBudget, QueryDriver, QueryFilter, QueryOrder, QueryRequest, QueryWork, ScalarFilter,
+        ScalarValue, SortDirection, TextMatch,
     },
     spatial_math::Bounds,
     Kind,
@@ -1471,4 +1471,299 @@ fn a_range_wider_than_the_old_vec_budget_still_takes_the_set_path() {
          matches; saw {}",
         work.scalar_postings
     );
+}
+
+// -- KD: CandidateDriver::Keys ------------------------------------------
+//
+// The external-key mapping keyspace (`mapping_key`, collections.rs:382) is
+// E4's counterpart of SQLite's automatic `(_key, rowid)` covering index --
+// see `.insert-loop/loop3/ROOTCAUSE-count-all.md`. `CandidateDriver::Keys`
+// enumerates it directly instead of the primary rows.
+
+/// A full key enumeration touches the mapping leaves, not the primary rows.
+///
+/// BEFORE (`CandidateDriver::Entities`, still exercised here for the
+/// comparison): one primary read per row, walking the >384 B wide rows this
+/// fixture writes -- the same shape `ROOTCAUSE-count-all.md` measured as one
+/// primary leaf per ~25 rows at popsim's narrower 150 B row width, so a wider
+/// row here fits fewer per leaf still. AFTER (`CandidateDriver::Keys`): the
+/// mapping entry (~10 B key + a handful of header/value bytes) is the only
+/// thing read, and an empty-projection page never opens the primary row at
+/// all (`PreparedQuery::winner_needs_no_row`).
+#[test]
+fn a_full_key_enumeration_reads_no_primary_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = wide_fixture(temp.path());
+
+    let mut before = fixture
+        .db
+        .prepare_query(QueryRequest {
+            collection: fixture.rows,
+            filters: &[],
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Entities,
+        })
+        .unwrap();
+    let before_accesses_start = fixture.db.pool_accesses().unwrap();
+    let mut before_ids = Vec::new();
+    let mut before_reads = 0u64;
+    loop {
+        let page = before.next_page(PAGE, QueryBudget::unlimited(), || false).unwrap();
+        before_ids.extend(page.rows.iter().map(|row| row.id.sequence));
+        before_reads += page.work.primary_reads;
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    let before_accesses = fixture.db.pool_accesses().unwrap() - before_accesses_start;
+    assert_eq!(before_ids.len(), WIDE_ROWS as usize);
+    // At least one primary read per entity -- WIDE_ROWS exceeds one page, so
+    // the walk also pays a few boundary reads at each resume (the same
+    // mechanism `DriverCursor::new`'s doc describes: a resumed page reopens
+    // AT its predecessor's last key and drops the duplicate after ranking
+    // it), which is page-count noise `>=` absorbs without hiding the real
+    // shape: one full row per entity, every entity.
+    assert!(
+        before_reads >= WIDE_ROWS,
+        "the old driver must read at least one primary row per entity: saw {before_reads} for {WIDE_ROWS} rows"
+    );
+
+    let mut after = fixture
+        .db
+        .prepare_query(QueryRequest {
+            collection: fixture.rows,
+            filters: &[],
+            order: QueryOrder::Driver,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Keys,
+        })
+        .unwrap();
+    let after_accesses_start = fixture.db.pool_accesses().unwrap();
+    let mut after_ids = Vec::new();
+    let mut after_reads = 0u64;
+    let mut after_key_postings = 0u64;
+    loop {
+        let page = after.next_page(PAGE, QueryBudget::unlimited(), || false).unwrap();
+        assert_eq!(page.driver, QueryDriver::Keys);
+        after_ids.extend(page.rows.iter().map(|row| row.id.sequence));
+        after_reads += page.work.primary_reads;
+        after_key_postings += page.work.key_postings;
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    let after_accesses = fixture.db.pool_accesses().unwrap() - after_accesses_start;
+
+    let mut sorted_before = before_ids.clone();
+    sorted_before.sort_unstable();
+    let mut sorted_after = after_ids.clone();
+    sorted_after.sort_unstable();
+    assert_eq!(
+        sorted_after, sorted_before,
+        "both drivers must enumerate the same collection"
+    );
+    assert_eq!(
+        after_reads, 0,
+        "a key-driven Ids page must read zero primary pages"
+    );
+    // Same resume-boundary noise as `before_reads` above, on the mapping
+    // walk instead of the primary one.
+    assert!(
+        after_key_postings >= WIDE_ROWS,
+        "one mapping entry touched per row, at least: saw {after_key_postings} for {WIDE_ROWS} rows"
+    );
+    assert!(
+        after_key_postings < WIDE_ROWS * 2,
+        "a key enumeration must not be re-walking whole pages: saw {after_key_postings} for {WIDE_ROWS} rows"
+    );
+    assert!(
+        after_accesses.saturating_mul(3) <= before_accesses,
+        "key enumeration touched {after_accesses} pool accesses against {before_accesses} \
+         for the primary walk over {WIDE_ROWS} rows -- wanted at least 3x fewer"
+    );
+}
+
+const KD_ROWS: u64 = 200;
+const KD_DELETE_STRIDE: u64 = 7;
+
+/// `i` maps to a key that DECREASES as `i` increases -- key order is the
+/// reverse of insertion/id order, so a test that passes here cannot be
+/// passing by accident the way `wide_fixture`'s zero-padded, id-ordered keys
+/// could (see `ROOTCAUSE-count-all.md`'s note that popsim's own keys happen
+/// to coincide with id order, "a property of the fixture, not of the
+/// engine").
+fn kd_key(i: u64) -> String {
+    format!("u{:05}", KD_ROWS + 1 - i)
+}
+
+struct KdFixture {
+    db: Database,
+    rows: CollectionId,
+    /// Every inserted (sequence, key) pair, insertion order.
+    all: Vec<(u64, String)>,
+    deleted: std::collections::HashSet<String>,
+}
+
+fn kd_fixture(dir: &std::path::Path) -> KdFixture {
+    let mut db = Database::create(dir.join("db"), cfg()).unwrap();
+    let rows = db
+        .create_collection("kd", vec![("v".into(), Kind::Int)], CollectionOptions::default())
+        .unwrap();
+    db.commit().unwrap();
+    let mut all = Vec::new();
+    for i in 1..=KD_ROWS {
+        let key = kd_key(i);
+        let id = db.put(rows, &key, &json!({"v": i as i64})).unwrap();
+        all.push((id.sequence, key));
+    }
+    db.commit().unwrap();
+    let mut deleted = std::collections::HashSet::new();
+    for i in (KD_DELETE_STRIDE..=KD_ROWS).step_by(KD_DELETE_STRIDE as usize) {
+        let key = kd_key(i);
+        assert!(db.delete(rows, &key).unwrap());
+        deleted.insert(key);
+    }
+    db.commit().unwrap();
+    KdFixture { db, rows, all, deleted }
+}
+
+/// Every alive (sequence, key) pair whose key falls in `[lower, upper)`,
+/// sorted by key ascending.
+fn kd_oracle_range(fixture: &KdFixture, lower: &str, upper: &str) -> Vec<u64> {
+    let mut matches: Vec<(String, u64)> = fixture
+        .all
+        .iter()
+        .filter(|(_, key)| !fixture.deleted.contains(key))
+        .filter(|(_, key)| key.as_str() >= lower && key.as_str() < upper)
+        .map(|(seq, key)| (key.clone(), *seq))
+        .collect();
+    matches.sort();
+    matches.into_iter().map(|(_, seq)| seq).collect()
+}
+
+/// How many keys `[lower, upper)` would hold with NOTHING deleted -- the
+/// witness that `kd_oracle_range` genuinely has fewer, i.e. that deleted
+/// keys inside the range are not silently still being counted.
+fn kd_dense_range_count(fixture: &KdFixture, lower: &str, upper: &str) -> usize {
+    fixture
+        .all
+        .iter()
+        .filter(|(_, key)| key.as_str() >= lower && key.as_str() < upper)
+        .count()
+}
+
+fn kd_drain_range(
+    fixture: &KdFixture,
+    lower: Bound<&str>,
+    upper: Bound<&str>,
+    page_size: usize,
+) -> (Vec<u64>, u64, usize) {
+    let filters = [QueryFilter::Key { lower, upper }];
+    let mut prepared = fixture
+        .db
+        .prepare_query(QueryRequest {
+            collection: fixture.rows,
+            filters: &filters,
+            order: QueryOrder::Driver,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Keys,
+        })
+        .unwrap();
+    let mut ids = Vec::new();
+    let mut primary_reads = 0u64;
+    let mut pages = 0usize;
+    loop {
+        let page = prepared.next_page(page_size, QueryBudget::unlimited(), || false).unwrap();
+        assert_eq!(page.driver, QueryDriver::Keys);
+        assert!(page.rows.len() <= page_size);
+        ids.extend(page.rows.iter().map(|row| row.id.sequence));
+        primary_reads += page.work.primary_reads;
+        pages += 1;
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    (ids, primary_reads, pages)
+}
+
+/// A key RANGE returns exactly the alive rows whose keys fall in it, in key
+/// order, resumed across several small pages, with deleted keys absent.
+#[test]
+fn a_key_range_pages_resume_in_key_order_with_deleted_keys_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = kd_fixture(temp.path());
+
+    let oracle = kd_oracle_range(&fixture, "u00050", "u00100");
+    let dense = kd_dense_range_count(&fixture, "u00050", "u00100");
+    assert!(oracle.len() > 20, "the fixture must have a real range to page through");
+    assert!(
+        oracle.len() < dense,
+        "the range must contain at least one deleted key for this test to mean anything: \
+         {} alive of {dense} dense",
+        oracle.len()
+    );
+
+    let (ids, primary_reads, pages) =
+        kd_drain_range(&fixture, Bound::Included("u00050"), Bound::Excluded("u00100"), 7);
+    assert!(pages > 1, "the fixture and page size must force a resume");
+    assert_eq!(
+        ids, oracle,
+        "a key range must return exactly the alive in-range rows, in key order"
+    );
+    assert_eq!(
+        primary_reads, 0,
+        "a certified key range answers Ids with no primary reads"
+    );
+}
+
+/// A key PREFIX is a range: bytes `[prefix, one-past-the-last-digit)`.
+#[test]
+fn a_key_prefix_is_expressed_as_a_range_and_resumes_the_same_way() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = kd_fixture(temp.path());
+
+    // Every key with prefix "u001" is exactly u00100..=u00199: the fourth
+    // byte is what would have to change to leave the prefix, and '1' < '2'
+    // decides the comparison at that byte regardless of what follows, so
+    // "u002" is the exact exclusive upper bound of the prefix "u001".
+    let oracle = kd_oracle_range(&fixture, "u001", "u002");
+    let dense = kd_dense_range_count(&fixture, "u001", "u002");
+    assert_eq!(dense, 100, "the prefix must name exactly u00100..=u00199");
+    assert!(oracle.len() < dense, "the prefix must contain a deleted key too");
+
+    let (ids, primary_reads, pages) =
+        kd_drain_range(&fixture, Bound::Included("u001"), Bound::Excluded("u002"), 9);
+    assert!(pages > 1, "the fixture and page size must force a resume");
+    assert_eq!(ids, oracle, "a key prefix must return exactly its alive rows, in key order");
+    assert_eq!(primary_reads, 0);
+}
+
+/// A `QueryFilter::Key` named at a position `CandidateDriver::Keys` is not
+/// driving from is refused at prepare time -- see `prepare_query`'s
+/// certification check. There is no row-level fallback for it the way a
+/// scalar predicate has one.
+#[test]
+fn a_key_filter_without_the_keys_driver_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = kd_fixture(temp.path());
+    let filters = [QueryFilter::Key {
+        lower: Bound::Included("u00050"),
+        upper: Bound::Excluded("u00100"),
+    }];
+    let result = fixture.db.prepare_query(QueryRequest {
+        collection: fixture.rows,
+        filters: &filters,
+        order: QueryOrder::EntityId,
+        projection: Projection::Ids,
+        total_limit: None,
+        driver: CandidateDriver::Auto,
+    });
+    match result {
+        Err(e4_prototype::collections::QueryError::Database(_)) => {}
+        _ => panic!("a key filter without CandidateDriver::Keys must be refused at prepare time"),
+    }
 }
