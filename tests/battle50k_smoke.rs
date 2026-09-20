@@ -41,7 +41,7 @@ use e4_prototype::{
     spatial_math::{wgs84_distance_metres, Point},
 };
 use serde_json::{json, Value};
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 const ROWS: usize = 200;
 
@@ -231,9 +231,46 @@ fn brute_matches(row: &Row, corpus: &Corpus, q: &Queries, name: &str, i: usize) 
     }
 }
 
+/// How many GROUPS one aggregate case produces for one query instance. A
+/// folded answer's `total_rows` is its group count, so this is the brute
+/// force the aggregate battery is compared against (QL_CONTRACT §4.7).
+fn brute_group_count(corpus: &Corpus, q: &Queries, name: &str, i: usize) -> u64 {
+    if name == "agg_count_all" {
+        // `count(*)` with no filter is ONE group whenever the collection has
+        // a row at all.
+        return u64::from(!corpus.rows.is_empty());
+    }
+    let centre = q.radius_centre(i).expect("radius centre is valid");
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for row in &corpus.rows {
+        let key = match name {
+            "agg_count_kind" | "agg_distinct_kind" | "agg_sum_born_by_kind" => {
+                Some(row.kind.clone())
+            }
+            "agg_count_radius_by_kind" => {
+                (wgs84_distance_metres(centre, row_point(row)) <= q.radius_metres(i))
+                    .then(|| row.kind.clone())
+            }
+            "agg_born_decade" => Some((row.born / 10_000).to_string()),
+            other => panic!("no brute force for aggregate case `{other}`"),
+        };
+        if let Some(key) = key {
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    match name {
+        // `HAVING count(*) > 100`, applied to the finished groups.
+        "agg_sum_born_by_kind" => counts.values().filter(|n| **n > 100).count() as u64,
+        _ => counts.len() as u64,
+    }
+}
+
 fn brute_total(corpus: &Corpus, q: &Queries, name: &str) -> u64 {
     (0..INSTANCES)
         .map(|i| {
+            if name.starts_with("agg_") {
+                return brute_group_count(corpus, q, name, i);
+            }
             corpus
                 .rows
                 .iter()

@@ -1139,6 +1139,9 @@ fn work_of(w: &QueryWork, r: WorkResource) -> u64 {
         WorkResource::VectorSidecars => w.vector_sidecars,
         WorkResource::VectorLanes => w.vector_lanes,
         WorkResource::KeyPostings => w.key_postings,
+        // Aggregates are `tests/query_aggregate.rs`; no query in this file
+        // folds groups, so this resource is never charged here.
+        WorkResource::Groups => w.groups,
         WorkResource::OutputBytes => w.output_bytes,
     }
 }
@@ -1157,6 +1160,7 @@ fn set_budget(mut b: QueryBudget, r: WorkResource, n: u64) -> QueryBudget {
         WorkResource::VectorSidecars => b.vector_sidecars = n,
         WorkResource::VectorLanes => b.vector_lanes = n,
         WorkResource::KeyPostings => b.key_postings = n,
+        WorkResource::Groups => b.groups = n,
         WorkResource::OutputBytes => b.output_bytes = n,
     }
     b

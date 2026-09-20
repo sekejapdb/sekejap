@@ -18,9 +18,11 @@ use super::{
     MAX_GRAPH_DEPTH,
 };
 use crate::collections::{
-    BfsRequest, CandidateDriver, CollectionId, CollectionOptions, Database, Direction, DropMode,
-    DropPhase, Geom,
-    GeometryFilter, GraphContextId, IndexFamily, IndexId, IndexInfo, IndexState, PointFilter,
+    Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest, BfsRequest,
+    CandidateDriver, CollectionId, CollectionOptions, Database, Direction, DropMode, DropPhase,
+    EntityId, Geom, GeometryFilter, GraphContextId, GroupCmp, GroupKey, GroupOrder,
+    GroupPredicate, GroupRow, IndexFamily, IndexId, IndexInfo, IndexState, OwnedScalarValue,
+    PointFilter,
     Projection,
     QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
     SortDirection, TextMatch, VectorMetric,
@@ -430,6 +432,144 @@ impl SelectPlan {
     }
 }
 
+// ── the compiled aggregate ────────────────────────────────────────────────
+
+/// Where one column of an aggregate's answer comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggOutput {
+    /// The group key itself.
+    Key,
+    /// One accumulator, by its position in the request.
+    Value(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OwnedAggInput {
+    Index(IndexId),
+    Field(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnedAccumulator {
+    pub(crate) function: AggregateFn,
+    pub(crate) input: Option<OwnedAggInput>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OwnedGroupKey {
+    Index(IndexId),
+    Field(String),
+    IndexDiv { index: IndexId, divisor: i64 },
+}
+
+/// A compiled `GROUP BY` / `DISTINCT` / aggregate statement. It owns what the
+/// borrowed [`AggregateRequest`] points at, exactly as [`SelectPlan`] owns
+/// what a `QueryRequest` points at.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregatePlan {
+    pub(crate) collection: CollectionId,
+    pub(crate) columns: Vec<String>,
+    pub(crate) outputs: Vec<AggOutput>,
+    pub(crate) filters: Vec<OwnedFilter>,
+    pub(crate) group: Option<OwnedGroupKey>,
+    pub(crate) accumulators: Vec<OwnedAccumulator>,
+    pub(crate) having: Vec<GroupPredicate>,
+    pub(crate) order: GroupOrder,
+    pub(crate) driver: CandidateDriver,
+    pub(crate) limit: Option<usize>,
+    pub(crate) text: String,
+}
+
+/// An aggregate row is not a row of the collection: no entity produced it, so
+/// there is no id to report. `SqlRow` carries one, so a group reports
+/// sequence 0, which `Database::put` never issues (sequences are one-based).
+fn group_identity(collection: CollectionId) -> EntityId {
+    EntityId {
+        collection,
+        sequence: 0,
+    }
+}
+
+fn agg_value(value: &AggValue) -> SqlValue {
+    match value {
+        AggValue::Count(n) => SqlValue::Int(*n as i64),
+        AggValue::I64(v) => SqlValue::Int(*v),
+        AggValue::F64(v) => SqlValue::Float(*v),
+        AggValue::Text(v) => SqlValue::Text(v.clone()),
+        AggValue::Bool(v) => SqlValue::Bool(*v),
+        AggValue::Null => SqlValue::Null,
+    }
+}
+
+fn group_key_value(value: Option<&OwnedScalarValue>) -> SqlValue {
+    match value {
+        None | Some(OwnedScalarValue::Nullish) => SqlValue::Null,
+        Some(OwnedScalarValue::Bool(v)) => SqlValue::Bool(*v),
+        Some(OwnedScalarValue::I64(v)) => SqlValue::Int(*v),
+        Some(OwnedScalarValue::F64(v)) => SqlValue::Float(*v),
+        Some(OwnedScalarValue::Text(v)) => SqlValue::Text(v.clone()),
+    }
+}
+
+impl AggregatePlan {
+    pub(crate) fn row(&self, group: &GroupRow) -> SqlRow {
+        let values = self
+            .outputs
+            .iter()
+            .map(|output| match output {
+                AggOutput::Key => group_key_value(group.key.as_ref()),
+                AggOutput::Value(at) => group
+                    .values
+                    .get(*at)
+                    .map_or(SqlValue::Missing, agg_value),
+            })
+            .collect();
+        SqlRow {
+            id: group_identity(self.collection),
+            values,
+        }
+    }
+
+    /// Prepare the aggregate this plan compiled to and hand it to `body`.
+    pub(crate) fn with_aggregate<T>(
+        &self,
+        db: &Database,
+        body: &mut dyn FnMut(&mut crate::collections::PreparedAggregate<'_>) -> SqlResult2<T>,
+    ) -> SqlResult2<T> {
+        let filters: Vec<QueryFilter<'_>> = self.filters.iter().map(OwnedFilter::borrowed).collect();
+        let accumulators: Vec<Accumulator<'_>> = self
+            .accumulators
+            .iter()
+            .map(|accumulator| Accumulator {
+                function: accumulator.function,
+                input: accumulator.input.as_ref().map(|input| match input {
+                    OwnedAggInput::Index(index) => AggregateInput::Index(*index),
+                    OwnedAggInput::Field(field) => AggregateInput::Field(field.as_str()),
+                }),
+            })
+            .collect();
+        let group = self.group.as_ref().map(|group| match group {
+            OwnedGroupKey::Index(index) => GroupKey::Index(*index),
+            OwnedGroupKey::Field(field) => GroupKey::Field(field.as_str()),
+            OwnedGroupKey::IndexDiv { index, divisor } => GroupKey::IndexDiv {
+                index: *index,
+                divisor: *divisor,
+            },
+        });
+        let mut prepared = db.prepare_aggregate(AggregateRequest {
+            collection: self.collection,
+            filters: &filters,
+            group,
+            accumulators: &accumulators,
+            having: &self.having,
+            order: self.order,
+            driver: self.driver,
+            total_limit: self.limit,
+        })?;
+        body(&mut prepared)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CompiledIndex {
     Scalar { field: String, unique: bool },
@@ -601,6 +741,8 @@ impl WritePlan {
 pub(crate) enum Plan {
     Select(SelectPlan),
     Explain(SelectPlan),
+    Aggregate(AggregatePlan),
+    ExplainAggregate(AggregatePlan),
     Write(WritePlan),
     /// An EXPLAIN whose statement is not a query: the text is the plan, and
     /// nothing is run to produce it.
@@ -638,8 +780,14 @@ pub(crate) fn compile(
 impl Compiler<'_> {
     fn statement(&mut self, statement: Stmt) -> SqlResult2<Plan> {
         Ok(match statement {
-            Stmt::Select(select) => Plan::Select(self.select(*select)?),
-            Stmt::Explain(select) => Plan::Explain(self.select(*select)?),
+            Stmt::Select(select) => match self.aggregate(&select)? {
+                Some(plan) => Plan::Aggregate(plan),
+                None => Plan::Select(self.select(*select)?),
+            },
+            Stmt::Explain(select) => match self.aggregate(&select)? {
+                Some(plan) => Plan::ExplainAggregate(plan),
+                None => Plan::Explain(self.select(*select)?),
+            },
             Stmt::Insert {
                 table,
                 columns,
@@ -1135,7 +1283,7 @@ impl Compiler<'_> {
             }
         };
         for (item, alias) in items {
-            match item {
+            match &item {
                 SelectItem::Star => {
                     for field in self.declared_fields(c)? {
                         columns.push(field.clone());
@@ -1143,26 +1291,42 @@ impl Compiler<'_> {
                     }
                 }
                 SelectItem::Id => {
-                    columns.push(alias.unwrap_or_else(|| ID_COLUMN.to_owned()));
+                    columns.push(alias.clone().unwrap_or_else(|| ID_COLUMN.to_owned()));
                     outputs.push(Output::Id);
                 }
                 SelectItem::Key => {
-                    columns.push(alias.unwrap_or_else(|| KEY_COLUMN.to_owned()));
+                    columns.push(alias.clone().unwrap_or_else(|| KEY_COLUMN.to_owned()));
                     outputs.push(Output::Key);
                 }
                 SelectItem::Column(name) => {
-                    self.kind_of(c, &name)?;
-                    columns.push(alias.unwrap_or_else(|| name.clone()));
-                    outputs.push(push_field(name, &mut fields));
+                    self.kind_of(c, name)?;
+                    columns.push(alias.clone().unwrap_or_else(|| name.clone()));
+                    outputs.push(push_field(name.clone(), &mut fields));
                 }
-                SelectItem::OrderValue(what) => {
+                SelectItem::OrderValue(_) | SelectItem::Divided { .. } => {
+                    let what = match &item {
+                        SelectItem::Divided { column, divisor } => {
+                            format!("`{column} / {divisor}`")
+                        }
+                        SelectItem::OrderValue(what) => what.clone(),
+                        _ => unreachable!("this arm took both"),
+                    };
                     if statement.order.is_none() {
                         return Err(SqlError::unsupported(format!(
                             "{what} in a select list: the only expression a row can report here is this statement's own ranking value, and this statement has no ORDER BY"
                         )));
                     }
-                    columns.push(alias.unwrap_or_else(|| "score".to_owned()));
+                    columns.push(alias.clone().unwrap_or_else(|| "score".to_owned()));
                     outputs.push(Output::OrderValue);
+                }
+                // `Compiler::aggregate` has already taken every statement
+                // that names one; reaching here would mean this path was
+                // asked to return ROWS for a folded answer.
+                SelectItem::Aggregate { function, .. } => {
+                    return Err(SqlError::unsupported(format!(
+                        "{}() in a select list that is not a folded answer",
+                        function.written()
+                    )))
                 }
             }
         }
@@ -1193,6 +1357,357 @@ impl Compiler<'_> {
             limit: statement.limit,
             driver,
             text: String::new(),
+        })
+    }
+
+    /// The READY scalar index over `field`, if there is one. Unlike
+    /// [`Compiler::index_for`] a missing index is not an error here: an
+    /// aggregate over an unindexed column reads the ROW, which is a stated
+    /// cost, not a refusal.
+    fn scalar_index_opt(&self, c: CollectionId, field: &str) -> SqlResult2<Option<IndexId>> {
+        let mut lists = self.index_lists.borrow_mut();
+        let position = match lists.iter().position(|(id, _)| *id == c) {
+            Some(position) => position,
+            None => {
+                lists.push((c, self.db.list_indexes(c).map_err(SqlError::from)?));
+                lists.len() - 1
+            }
+        };
+        Ok(lists[position]
+            .1
+            .iter()
+            .find(|info| {
+                info.field == field
+                    && info.family == IndexFamily::Scalar
+                    && info.state == IndexState::Ready
+            })
+            .map(|info| info.id))
+    }
+
+    // ── GROUP BY / DISTINCT / the aggregate functions (QL_CONTRACT §4.7) ──
+
+    /// `Some` when this statement is an aggregate: it names an aggregate
+    /// function, a `GROUP BY`, a `HAVING` or a `DISTINCT`. `None` leaves it
+    /// to [`Compiler::select`], which is the ordinary row path.
+    fn aggregate(&mut self, statement: &SelectStmt) -> SqlResult2<Option<AggregatePlan>> {
+        let has_function = statement
+            .items
+            .iter()
+            .any(|(item, _)| matches!(item, SelectItem::Aggregate { .. }));
+        if !has_function
+            && !statement.distinct
+            && statement.group.is_none()
+            && statement.having.is_empty()
+        {
+            return Ok(None);
+        }
+        let Source::Table(table) = &statement.source else {
+            return Err(SqlError::unsupported(
+                "an aggregate over GRAPH_TABLE: the aggregate atomic folds the candidates of ONE collection's plan; a traversal's COLUMNS are rows, and folding them is the path-accumulator item (QL_CONTRACT §4.3)",
+            ));
+        };
+        let c = collection(self.db, table)?;
+
+        let mut filters: Vec<OwnedFilter> = Vec::new();
+        for predicate in &statement.predicates {
+            filters.push(self.filter(c, predicate)?);
+        }
+
+        // The group key. `DISTINCT col` IS `GROUP BY col` with no
+        // accumulators, so it lands on the same field.
+        let group_expr = match (&statement.group, statement.distinct) {
+            (Some(_), true) => {
+                return Err(SqlError::unsupported(
+                    "SELECT DISTINCT with GROUP BY: DISTINCT is a group with no accumulators, so writing both names the group twice",
+                ))
+            }
+            (Some(group), false) => Some(group.clone()),
+            (None, true) => {
+                let mut named = None;
+                for (item, _) in &statement.items {
+                    match item {
+                        SelectItem::Column(name) if named.is_none() => {
+                            named = Some(name.clone());
+                        }
+                        SelectItem::Column(_) => {
+                            return Err(SqlError::Refused {
+                                keyword: "DISTINCT <two columns>".into(),
+                                tier: Tier::Three,
+                                reason: "QL_CONTRACT §4.7: DISTINCT is a group with no accumulators, and GROUP BY takes ONE key; a composite key has no atomic.",
+                            })
+                        }
+                        _ => {
+                            return Err(SqlError::unsupported(
+                                "SELECT DISTINCT takes one column: it is a group with no accumulators",
+                            ))
+                        }
+                    }
+                }
+                Some(GroupExpr {
+                    column: named.ok_or_else(|| {
+                        SqlError::unsupported("SELECT DISTINCT names no column")
+                    })?,
+                    divisor: None,
+                })
+            }
+            (None, false) => None,
+        };
+
+        let group = match &group_expr {
+            None => None,
+            Some(GroupExpr { column, divisor }) => {
+                let kind = self.kind_of(c, column)?;
+                let index = self.scalar_index_opt(c, column)?;
+                Some(match (divisor, index) {
+                    (Some(divisor), Some(index)) if kind == Kind::Int => {
+                        OwnedGroupKey::IndexDiv {
+                            index,
+                            divisor: *divisor,
+                        }
+                    }
+                    (Some(_), _) => {
+                        // The brief's fallback, said out loud: the expression
+                        // group key rides the posting, so without an Int
+                        // scalar index there is nothing to compute it from
+                        // index-side and it is REFUSED rather than emulated
+                        // over rows.
+                        return Err(SqlError::Refused {
+                            keyword: "GROUP BY <expression>".into(),
+                            tier: Tier::Two,
+                            reason: "QL_CONTRACT §4.7: `GROUP BY col / n` is accepted only when it can be computed INDEX-SIDE from the posting -- an Int scalar index on the column, whose own order the truncating division is monotone in. Without one, write `GROUP BY col` with a range filter instead; an expression folded over rows would be a scan wearing a group key's clothes.",
+                        });
+                    }
+                    (None, Some(index)) => OwnedGroupKey::Index(index),
+                    (None, None) => OwnedGroupKey::Field(column.clone()),
+                })
+            }
+        };
+
+        // The select list: the group key, and the aggregate functions.
+        let mut columns: Vec<String> = Vec::new();
+        let mut outputs: Vec<AggOutput> = Vec::new();
+        let mut accumulators: Vec<OwnedAccumulator> = Vec::new();
+        // The written form of each accumulator, so HAVING and ORDER BY can
+        // find the one they name.
+        let mut written: Vec<(AggFunc, AggArg, Option<String>)> = Vec::new();
+        for (item, alias) in &statement.items {
+            match item {
+                SelectItem::Aggregate { function, argument } => {
+                    let accumulator = self.accumulator(c, *function, argument)?;
+                    let at = accumulators.len();
+                    accumulators.push(accumulator);
+                    written.push((*function, argument.clone(), alias.clone()));
+                    columns.push(alias.clone().unwrap_or_else(|| function.written().to_owned()));
+                    outputs.push(AggOutput::Value(at));
+                }
+                SelectItem::Column(name) => {
+                    let Some(GroupExpr { column, .. }) = &group_expr else {
+                        return Err(SqlError::unsupported(format!(
+                            "`{name}` is neither an aggregate nor a GROUP BY key: a statement that folds rows can only report what is the same for every row of a group"
+                        )));
+                    };
+                    if name != column {
+                        return Err(SqlError::unsupported(format!(
+                            "`{name}` is not the GROUP BY key `{column}`: a statement that folds rows can only report the key it grouped by"
+                        )));
+                    }
+                    columns.push(alias.clone().unwrap_or_else(|| name.clone()));
+                    outputs.push(AggOutput::Key);
+                }
+                SelectItem::Divided { column, divisor } => {
+                    let Some(group) = &group_expr else {
+                        return Err(SqlError::unsupported(format!(
+                            "`{column} / {divisor}` is neither an aggregate nor a GROUP BY key"
+                        )));
+                    };
+                    if group.column != *column || group.divisor != Some(*divisor) {
+                        return Err(SqlError::unsupported(format!(
+                            "`{column} / {divisor}` is not the GROUP BY key: a statement that folds rows can only report the key it grouped by"
+                        )));
+                    }
+                    columns.push(alias.clone().unwrap_or_else(|| column.clone()));
+                    outputs.push(AggOutput::Key);
+                }
+                SelectItem::Star => {
+                    return Err(SqlError::unsupported(
+                        "SELECT * with an aggregate: a folded answer has no row to expand",
+                    ))
+                }
+                SelectItem::Id | SelectItem::Key => {
+                    return Err(SqlError::unsupported(
+                        "an entity id or external key with an aggregate: a group is not a row and has neither",
+                    ))
+                }
+                SelectItem::OrderValue(what) => {
+                    return Err(SqlError::unsupported(format!(
+                        "{what} with an aggregate: the only expressions a folded answer reports are its group key and its accumulators"
+                    )))
+                }
+            }
+        }
+        if group_expr.is_some() && !outputs.contains(&AggOutput::Key) && accumulators.is_empty() {
+            // `SELECT DISTINCT col` always names the key; a bare
+            // `GROUP BY col` with nothing selected has nothing to report.
+            return Err(SqlError::unsupported(
+                "GROUP BY with an empty select list reports nothing",
+            ));
+        }
+
+        // HAVING. A predicate may name an aggregate the select list does not
+        // report, exactly as Postgres allows; that one becomes a HIDDEN
+        // accumulator -- it is folded, it is not a column.
+        let mut having = Vec::new();
+        for predicate in &statement.having {
+            let at = match written.iter().position(|(function, argument, _)| {
+                *function == predicate.function && *argument == predicate.argument
+            }) {
+                Some(at) => at,
+                None => {
+                    let accumulator =
+                        self.accumulator(c, predicate.function, &predicate.argument)?;
+                    accumulators.push(accumulator);
+                    written.push((predicate.function, predicate.argument.clone(), None));
+                    accumulators.len() - 1
+                }
+            };
+            if matches!(predicate.function, AggFunc::Min | AggFunc::Max) {
+                let column = match &predicate.argument {
+                    AggArg::Column(name) => name.clone(),
+                    AggArg::Star => String::new(),
+                };
+                if !column.is_empty() && self.kind_of(c, &column)? == Kind::Text {
+                    return Err(SqlError::unsupported(format!(
+                        "HAVING {}({column}) compares numbers, and this accumulator's value is text",
+                        predicate.function.written()
+                    )));
+                }
+            }
+            having.push(GroupPredicate {
+                accumulator: at,
+                op: match predicate.op {
+                    CmpOp::Eq => GroupCmp::Eq,
+                    CmpOp::Ne => GroupCmp::Ne,
+                    CmpOp::Lt => GroupCmp::Lt,
+                    CmpOp::Le => GroupCmp::Le,
+                    CmpOp::Gt => GroupCmp::Gt,
+                    CmpOp::Ge => GroupCmp::Ge,
+                },
+                value: self.f64_of(&predicate.value)?,
+            });
+        }
+
+        // ORDER BY: the group key, or one accumulator by its alias.
+        let order = match &statement.order {
+            None => GroupOrder::Key,
+            Some(OrderKey::Column { column, descending }) => {
+                let is_key = group_expr
+                    .as_ref()
+                    .is_some_and(|group| group.column == *column)
+                    || outputs.iter().zip(&columns).any(|(output, name)| {
+                        *output == AggOutput::Key && name == column
+                    });
+                if is_key {
+                    if *descending {
+                        return Err(SqlError::unsupported(
+                            "ORDER BY <group key> DESC: the groups arrive in the driving index's own ASCENDING order, and reversing them would mean holding every group to turn it round -- which is the hashed shape's sort, and it sorts by an accumulator, not by the key",
+                        ));
+                    }
+                    GroupOrder::Key
+                } else {
+                    let at = written
+                        .iter()
+                        .position(|(function, _, alias)| {
+                            alias.as_deref() == Some(column.as_str())
+                                || (alias.is_none() && function.written() == column)
+                        })
+                        .ok_or_else(|| {
+                            SqlError::unsupported(format!(
+                                "ORDER BY `{column}`: a folded answer is ordered by its group key or by one of its own aggregate aliases"
+                            ))
+                        })?;
+                    GroupOrder::Accumulator {
+                        at,
+                        direction: if *descending {
+                            SortDirection::Descending
+                        } else {
+                            SortDirection::Ascending
+                        },
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(SqlError::unsupported(
+                    "ORDER BY on a folded answer takes the group key or an aggregate alias; a distance, a vector or a BM25 ranking ranks ROWS",
+                ))
+            }
+        };
+
+        let driver = if filters
+            .iter()
+            .any(|filter| matches!(filter, OwnedFilter::Key { .. }))
+        {
+            CandidateDriver::Keys
+        } else {
+            CandidateDriver::Auto
+        };
+
+        Ok(Some(AggregatePlan {
+            collection: c,
+            columns,
+            outputs,
+            filters,
+            group,
+            accumulators,
+            having,
+            order,
+            driver,
+            limit: statement.limit,
+            text: String::new(),
+        }))
+    }
+
+    fn accumulator(
+        &mut self,
+        c: CollectionId,
+        function: AggFunc,
+        argument: &AggArg,
+    ) -> SqlResult2<OwnedAccumulator> {
+        Ok(match (function, argument) {
+            (AggFunc::Count, AggArg::Star) => OwnedAccumulator {
+                function: AggregateFn::CountStar,
+                input: None,
+            },
+            (_, AggArg::Star) => {
+                return Err(SqlError::unsupported(format!(
+                    "{}(*) is not a function",
+                    function.written()
+                )))
+            }
+            (function, AggArg::Column(column)) => {
+                let kind = self.kind_of(c, column)?;
+                if matches!(function, AggFunc::Sum | AggFunc::Avg)
+                    && !matches!(kind, Kind::Int | Kind::Real)
+                {
+                    return Err(SqlError::unsupported(format!(
+                        "{}({column}): sum and avg take a numeric column",
+                        function.written()
+                    )));
+                }
+                let input = match self.scalar_index_opt(c, column)? {
+                    Some(index) => OwnedAggInput::Index(index),
+                    None => OwnedAggInput::Field(column.clone()),
+                };
+                OwnedAccumulator {
+                    function: match function {
+                        AggFunc::Count => AggregateFn::Count,
+                        AggFunc::Sum => AggregateFn::Sum,
+                        AggFunc::Min => AggregateFn::Min,
+                        AggFunc::Max => AggregateFn::Max,
+                        AggFunc::Avg => AggregateFn::Avg,
+                    },
+                    input: Some(input),
+                }
+            }
         })
     }
 

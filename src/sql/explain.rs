@@ -6,9 +6,11 @@
 //! asks EXPLAIN to print which predicates are answered index-side and to
 //! label a construct whose definition is a scan; both are below.
 
-use super::compile::SelectPlan;
+use super::compile::{AggregatePlan, SelectPlan};
 use super::{RunWork, SqlResult2, PAGE};
-use crate::collections::{Database, FilterAnswer, QueryBudget, QueryPlanDescription};
+use crate::collections::{
+    AggregatePlanDescription, Database, FilterAnswer, QueryBudget, QueryPlanDescription,
+};
 
 fn answer_text(answer: &FilterAnswer) -> String {
     match answer {
@@ -52,6 +54,71 @@ pub(super) fn render(
         Ok((prepared.describe(), approximation))
     })?;
     Ok(format(db, &plan, &work, approximation, notices))
+}
+
+/// Run `aggregate` and render its plan, its shape and its counters.
+///
+/// It runs, for the reason the row EXPLAIN runs: the membership sets and the
+/// groups seen are facts about a walk that happened, not about a plan.
+pub(super) fn render_aggregate(
+    db: &Database,
+    aggregate: &AggregatePlan,
+    notices: &[String],
+) -> SqlResult2<String> {
+    let mut work = RunWork::default();
+    let plan = aggregate.with_aggregate(db, &mut |prepared| {
+        loop {
+            let page = prepared.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+            work.add_groups(&page);
+            if page.done || page.groups.is_empty() {
+                break;
+            }
+        }
+        Ok(prepared.describe())
+    })?;
+    let mut out = format_aggregate(&plan);
+    out.push_str(&format(db, &plan.query, &work, None, notices));
+    Ok(out)
+}
+
+/// The aggregate's own half of the plan: the shape, the group key, where each
+/// accumulator reads its input, and how many groups the walk opened.
+fn format_aggregate(plan: &AggregatePlanDescription) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("shape: {}\n", plan.shape.written()));
+    out.push_str(match plan.shape {
+        crate::collections::AggregateShape::Streaming => "  note:  the group key IS the driving index's own value, so the groups arrive contiguous: ONE accumulator set is alive, the key comes off the posting with no row read, and a page stops and resumes at a group boundary\n",
+        crate::collections::AggregateShape::Hashed => "  note:  the group key is not the driving walk's own order, so every group is open at once and none is final until the walk ends; the memory that costs is bounded by the `groups` budget below, and there is no spill\n",
+    });
+    match &plan.group {
+        None => out.push_str("group: none -- one group over every candidate\n"),
+        Some((key, source)) => out.push_str(&format!("group: {key} -> {source}\n")),
+    }
+    out.push_str("accumulators:\n");
+    if plan.accumulators.is_empty() {
+        out.push_str("  none -- a group with no accumulators is DISTINCT\n");
+    }
+    for (accumulator, source) in &plan.accumulators {
+        out.push_str(&format!("  {accumulator} -> {source}\n"));
+    }
+    if plan.having.is_empty() {
+        out.push_str("having: none\n");
+    } else {
+        out.push_str("having:\n");
+        for predicate in &plan.having {
+            out.push_str(&format!("  {predicate} (applied to a finished group, before paging)\n"));
+        }
+    }
+    out.push_str(&format!(
+        "groups: {} seen, cap {} accumulator set(s) held at once\n",
+        plan.groups_seen, plan.groups_cap
+    ));
+    out.push_str(&format!(
+        "group limit: {}\n",
+        plan.total_limit
+            .map_or_else(|| "none".to_owned(), |n| n.to_string())
+    ));
+    out
 }
 
 fn format(
@@ -128,7 +195,8 @@ fn format(
     out.push_str(&format!(
         "work: candidates={} primary_reads={} row_decodes={} scalar_postings={} \
          spatial_postings={} text_postings={} text_tokens={} graph_edges={} graph_visited={} \
-         vector_locators={} vector_sidecars={} vector_lanes={} key_postings={} output_bytes={}\n",
+         vector_locators={} vector_sidecars={} vector_lanes={} key_postings={} groups={} \
+         output_bytes={}\n",
         w.candidates,
         w.primary_reads,
         w.row_decodes,
@@ -142,6 +210,7 @@ fn format(
         w.vector_sidecars,
         w.vector_lanes,
         w.key_postings,
+        w.groups,
         w.output_bytes,
     ));
     if let Ok(accesses) = db.pool_accesses() {

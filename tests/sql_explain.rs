@@ -576,3 +576,126 @@ fn explain_drop_table_prints_the_phases_and_runs_nothing() {
     let restrict = explain(&mut f, "DROP TABLE place", &[]);
     assert!(restrict.contains("RESTRICT (the default)"), "{restrict}");
 }
+
+// ── the aggregate battery (QL_CONTRACT §4.7) ──────────────────────────────
+//
+// EXPLAIN is where the shape claim is checked: streaming or hashed, where the
+// group key comes from, where every accumulator reads its input, and how many
+// groups the walk opened.
+
+fn line<'a>(text: &'a str, prefix: &str) -> &'a str {
+    text.lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{text}"))
+}
+
+#[test]
+fn agg_count_all_is_streaming_over_the_key_order_driver_and_reads_no_row() {
+    let (_dir, mut f) = open();
+    let text = explain(&mut f, "SELECT count(*) FROM place", &[]);
+    println!("{text}");
+    assert_eq!(line(&text, "shape: "), "shape: streaming");
+    assert!(text.contains("driver: Keys"), "{text}");
+    assert_eq!(line(&text, "group: "), "group: none -- one group over every candidate");
+    assert!(
+        text.contains("count(*) -> nothing is read"),
+        "count(*) reads no column:\n{text}"
+    );
+    assert_eq!(counter(&text, "primary_reads"), 0);
+    assert_eq!(counter(&text, "groups"), 1);
+    assert_eq!(rows_of(&text), 1, "one group");
+}
+
+#[test]
+fn agg_count_kind_streams_off_the_driving_posting() {
+    let (_dir, mut f) = open();
+    let text = explain(&mut f, "SELECT kind, count(*) AS n FROM place GROUP BY kind", &[]);
+    println!("{text}");
+    assert_eq!(line(&text, "shape: "), "shape: streaming");
+    assert!(
+        line(&text, "group: ").contains("the driving walk carries the value"),
+        "{text}"
+    );
+    assert_eq!(counter(&text, "primary_reads"), 0, "no row is read:\n{text}");
+    assert_eq!(counter(&text, "groups"), 1, "one accumulator set is alive");
+    assert_eq!(rows_of(&text), fixture::KINDS.len() as u64);
+}
+
+#[test]
+fn agg_sum_born_by_kind_names_the_row_its_accumulators_read() {
+    let (_dir, mut f) = open();
+    let text = explain(
+        &mut f,
+        "SELECT kind, count(*) AS n, sum(born) AS s, min(born) AS lo, max(born) AS hi, \
+         avg(born) AS mean FROM place GROUP BY kind HAVING count(*) > 100",
+        &[],
+    );
+    println!("{text}");
+    assert_eq!(line(&text, "shape: "), "shape: streaming");
+    // `born` is not the driving index, so every accumulator over it reads the
+    // row -- and EXPLAIN says so rather than leaving it to be guessed.
+    assert!(text.contains("sum(born) -> row (charged as primary_reads)"), "{text}");
+    assert!(text.contains("avg(born) -> row (charged as primary_reads)"), "{text}");
+    assert!(text.contains("having:"), "{text}");
+    assert!(
+        counter(&text, "primary_reads") >= fixture::ROWS as u64,
+        "a row-side accumulator reads one row per candidate:\n{text}"
+    );
+}
+
+#[test]
+fn agg_distinct_kind_is_a_group_with_no_accumulators() {
+    let (_dir, mut f) = open();
+    let text = explain(&mut f, "SELECT DISTINCT kind FROM place", &[]);
+    println!("{text}");
+    assert_eq!(line(&text, "shape: "), "shape: streaming");
+    assert!(text.contains("none -- a group with no accumulators is DISTINCT"), "{text}");
+    assert_eq!(counter(&text, "primary_reads"), 0, "{text}");
+    assert_eq!(rows_of(&text), fixture::KINDS.len() as u64);
+}
+
+#[test]
+fn agg_count_radius_by_kind_hashes_because_the_radius_drives() {
+    let (_dir, mut f) = open();
+    let centre = fixture::centre();
+    let (lon, lat) = (centre.longitude(), centre.latitude());
+    let text = explain(
+        &mut f,
+        &format!(
+            "SELECT kind, count(*) AS n FROM place \
+             WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, 20000, true) \
+             GROUP BY kind"
+        ),
+        &[],
+    );
+    println!("{text}");
+    assert_eq!(line(&text, "shape: "), "shape: hashed");
+    assert!(text.contains("driver: Spatial"), "{text}");
+    assert!(
+        line(&text, "group: ").contains("row (charged as primary_reads)"),
+        "the group key is not the driving walk's value:\n{text}"
+    );
+    assert!(counter(&text, "groups") > 1, "{text}");
+    assert!(counter(&text, "groups") <= fixture::KINDS.len() as u64, "{text}");
+}
+
+#[test]
+fn agg_born_decade_computes_its_expression_key_index_side() {
+    let (_dir, mut f) = open();
+    let text = explain(
+        &mut f,
+        "SELECT born / 10000 AS decade, count(*) AS n FROM place GROUP BY born / 10000",
+        &[],
+    );
+    println!("{text}");
+    assert_eq!(line(&text, "shape: "), "shape: streaming");
+    assert!(
+        line(&text, "group: ").contains("born / 10000"),
+        "{text}"
+    );
+    assert!(
+        line(&text, "group: ").contains("the driving walk carries the value"),
+        "the expression is computed from the posting, not from the row:\n{text}"
+    );
+    assert_eq!(counter(&text, "primary_reads"), 0, "{text}");
+}

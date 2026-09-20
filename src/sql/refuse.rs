@@ -30,9 +30,6 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("||", Tier::Two, "QL_CONTRACT §4.1: `||` is a row function on projected values."),
     // ── §2 statements ────────────────────────────────────────────────────
     ("JOIN", Tier::Two, "QL_CONTRACT §4.8: INNER/LEFT JOIN on key equality is a key lookup per driving row, scheduled after GROUP BY; a join on a non-key column and FULL OUTER JOIN are Tier 3 (they need a hash join with spill). A pattern is never compiled to a join."),
-    ("GROUP BY", Tier::Two, "QL_CONTRACT §4.7: GROUP BY streams when the group key is the driving index order and hashes otherwise, bounded by a groups budget. Not built in this slice."),
-    ("HAVING", Tier::Two, "QL_CONTRACT §4.7: HAVING rides the same aggregate atomic as GROUP BY."),
-    ("DISTINCT", Tier::Two, "QL_CONTRACT §4.7: DISTINCT rides the same aggregate atomic as GROUP BY."),
     ("OFFSET", Tier::Two, "QL_CONTRACT §5 deviation 4: OFFSET is a keyset continuation, never a skip count. The continuation is the prepared query's own next page; a skip count would read and discard rows, which is work proportional to the skip."),
     ("UNION", Tier::Three, "QL_CONTRACT §2: UNION has no atomic; recursion is a GRAPH_TABLE pattern."),
     ("INTERSECT", Tier::Three, "QL_CONTRACT §2: no atomic."),
@@ -119,11 +116,10 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("HIGHLIGHT", Tier::Two, "QL_CONTRACT §4.6: highlight is a row function."),
     ("SEARCH", Tier::Two, "QL_CONTRACT §4.6: typo-tolerant search() needs a term-dictionary prefix range plus a bounded Levenshtein automaton over the dictionary -- a new atomic, no format change."),
     // ── §4.7 aggregates ──────────────────────────────────────────────────
-    ("COUNT", Tier::Two, "QL_CONTRACT §4.7: count/sum/min/max/avg stream when the group key is the driving index order and hash otherwise, bounded by a groups budget."),
-    ("SUM", Tier::Two, "QL_CONTRACT §4.7: an aggregate atomic, bounded by a groups budget."),
-    ("AVG", Tier::Two, "QL_CONTRACT §4.7: an aggregate atomic, bounded by a groups budget."),
-    ("MIN", Tier::Two, "QL_CONTRACT §4.7: an aggregate atomic, bounded by a groups budget."),
-    ("MAX", Tier::Two, "QL_CONTRACT §4.7: an aggregate atomic, bounded by a groups budget."),
+    // count/sum/min/max/avg, GROUP BY, HAVING and DISTINCT moved from this
+    // table to Tier 1 with `src/query/aggregate.rs`: the atomic they named
+    // exists now, so they are ACCEPTED rather than refused. What is left
+    // here is what still has no atomic.
     ("ARRAY_AGG", Tier::Two, "QL_CONTRACT §4.7: array_agg/string_agg/json_agg come after the scalar aggregates, bounded by the row budget."),
     ("STRING_AGG", Tier::Two, "QL_CONTRACT §4.7: array_agg/string_agg/json_agg come after the scalar aggregates, bounded by the row budget."),
     ("JSON_AGG", Tier::Two, "QL_CONTRACT §4.7: array_agg/string_agg/json_agg come after the scalar aggregates, bounded by the row budget."),

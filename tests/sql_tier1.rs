@@ -1146,3 +1146,383 @@ fn drop_table_restricts_on_graph_edges_and_cascades_when_asked() {
     }
     assert!(f.db.collection("place").unwrap().is_none());
 }
+
+// ── GROUP BY / HAVING / DISTINCT and the aggregate functions (§4.7) ────────
+//
+// The direct API is the oracle here too: `Database::prepare_aggregate` is the
+// atomic, and these statements' whole claim is that they compile to it.
+
+/// Every group one statement returns, as `(key, values)` in result order.
+fn sql_groups(db: &mut Database, text: &str, params: &[Param]) -> Vec<Vec<SqlValue>> {
+    match db.sql(text, params).unwrap() {
+        SqlResult::Rows { rows, .. } => rows.into_iter().map(|row| row.values).collect(),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+fn direct_groups(
+    db: &Database,
+    collection: e4_prototype::collections::CollectionId,
+    filters: &[QueryFilter<'_>],
+    group: Option<e4_prototype::collections::GroupKey<'_>>,
+    accumulators: &[e4_prototype::collections::Accumulator<'_>],
+) -> Vec<e4_prototype::collections::GroupRow> {
+    let mut prepared = db
+        .prepare_aggregate(e4_prototype::collections::AggregateRequest {
+            collection,
+            filters,
+            group,
+            accumulators,
+            having: &[],
+            order: e4_prototype::collections::GroupOrder::Key,
+            driver: CandidateDriver::Auto,
+            total_limit: None,
+        })
+        .unwrap();
+    let mut out = Vec::new();
+    loop {
+        let page = prepared
+            .next_page(PAGE, QueryBudget::unlimited(), || false)
+            .unwrap();
+        let empty = page.groups.is_empty();
+        out.extend(page.groups);
+        if page.done || empty {
+            break;
+        }
+    }
+    out
+}
+
+#[test]
+fn count_star_with_no_filter_is_one_row_over_the_key_order_driver() {
+    let (_dir, mut f) = open();
+    let (columns, rows) = sql_rows(&mut f.db, "SELECT count(*) FROM place", &[]);
+    assert_eq!(columns, vec!["count".to_owned()]);
+    assert_eq!(rows, vec![vec![SqlValue::Int(fixture::ROWS as i64)]]);
+
+    let explained = match f.db.sql("EXPLAIN SELECT count(*) FROM place", &[]).unwrap() {
+        SqlResult::Explain(text) => text,
+        other => panic!("expected an explanation, got {other:?}"),
+    };
+    assert!(explained.contains("shape: streaming"), "{explained}");
+    assert!(explained.contains("driver: Keys"), "{explained}");
+    assert!(explained.contains("primary_reads=0"), "{explained}");
+}
+
+#[test]
+fn count_star_with_a_filter_counts_what_the_filter_admits() {
+    let (_dir, mut f) = open();
+    let expected = sql_ids(&mut f.db, "SELECT _id FROM place WHERE kind = 'port'", &[]).len();
+    let rows = sql_groups(
+        &mut f.db,
+        "SELECT count(*) AS n FROM place WHERE kind = $1",
+        &[Param::Text("port".into())],
+    );
+    assert_eq!(rows, vec![vec![SqlValue::Int(expected as i64)]]);
+}
+
+#[test]
+fn group_by_an_indexed_column_streams_and_matches_the_api() {
+    let (_dir, mut f) = open();
+    let accumulators = [e4_prototype::collections::Accumulator {
+        function: e4_prototype::collections::AggregateFn::CountStar,
+        input: None,
+    }];
+    let expected = direct_groups(
+        &f.db,
+        f.place,
+        &[],
+        Some(e4_prototype::collections::GroupKey::Index(f.index.kind)),
+        &accumulators,
+    );
+    let (columns, rows) = sql_rows(
+        &mut f.db,
+        "SELECT kind, count(*) AS n FROM place GROUP BY kind",
+        &[],
+    );
+    assert_eq!(columns, vec!["kind".to_owned(), "n".to_owned()]);
+    assert_eq!(rows.len(), expected.len());
+    assert_eq!(rows.len(), fixture::KINDS.len());
+    for (got, want) in rows.iter().zip(&expected) {
+        let e4_prototype::collections::OwnedScalarValue::Text(key) = want.key.clone().unwrap()
+        else {
+            panic!("kind is a Text column");
+        };
+        assert_eq!(got[0], SqlValue::Text(key));
+        let e4_prototype::collections::AggValue::Count(n) = want.values[0] else {
+            panic!("count(*) is a count");
+        };
+        assert_eq!(got[1], SqlValue::Int(n as i64));
+    }
+}
+
+#[test]
+fn sum_min_max_avg_by_group_with_having() {
+    let (_dir, mut f) = open();
+    // `tag` is unindexed and unevenly filled -- the fixture gives `kind`
+    // exactly 250 rows each, so no HAVING threshold could split THAT.
+    let statement = "SELECT tag, count(*) AS n, sum(born) AS s, min(born) AS lo, max(born) AS hi, \
+         avg(born) AS mean FROM place GROUP BY tag";
+    let all = sql_groups(&mut f.db, statement, &[]);
+    let mut counts: Vec<i64> = all
+        .iter()
+        .map(|row| match row[1] {
+            SqlValue::Int(n) => n,
+            _ => panic!("count is a whole number"),
+        })
+        .collect();
+    counts.sort_unstable();
+    let threshold = counts[counts.len() / 2];
+    let kept = sql_groups(&mut f.db, &format!("{statement} HAVING count(*) > {threshold}"), &[]);
+    let expected: Vec<_> = all
+        .iter()
+        .filter(|row| matches!(row[1], SqlValue::Int(n) if n > threshold))
+        .cloned()
+        .collect();
+    assert_eq!(kept, expected);
+    assert!(
+        !kept.is_empty() && kept.len() < all.len(),
+        "HAVING kept {} of {}",
+        kept.len(),
+        all.len()
+    );
+    // The whole is the sum of its parts: every row lands in exactly one
+    // group, the missing-`tag` rows included.
+    let total: i64 = counts.iter().sum();
+    assert_eq!(total, fixture::ROWS as i64);
+    // sum, min, max and avg agree with one another on every group.
+    for row in &all {
+        let (SqlValue::Int(n), SqlValue::Int(sum), SqlValue::Int(lo), SqlValue::Int(hi), SqlValue::Float(mean)) =
+            (row[1].clone(), row[2].clone(), row[3].clone(), row[4].clone(), row[5].clone())
+        else {
+            panic!("unexpected column types in {row:?}");
+        };
+        assert!(lo <= hi);
+        assert!(sum >= lo * n && sum <= hi * n);
+        assert!((mean - sum as f64 / n as f64).abs() <= 1e-6, "{mean} against {sum}/{n}");
+    }
+}
+
+#[test]
+fn select_distinct_is_a_group_with_no_accumulators() {
+    let (_dir, mut f) = open();
+    let grouped = sql_groups(&mut f.db, "SELECT kind FROM place GROUP BY kind", &[]);
+    let distinct = sql_groups(&mut f.db, "SELECT DISTINCT kind FROM place", &[]);
+    assert_eq!(distinct, grouped);
+    assert_eq!(distinct.len(), fixture::KINDS.len());
+}
+
+#[test]
+fn group_by_with_a_radius_filter_hashes_and_agrees_with_the_filter_itself() {
+    let (_dir, mut f) = open();
+    let centre = fixture::centre();
+    let (lon, lat) = (centre.longitude(), centre.latitude());
+    let statement = format!(
+        "SELECT kind, count(*) AS n FROM place \
+         WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, 20000, true) \
+         GROUP BY kind"
+    );
+    let rows = sql_groups(&mut f.db, &statement, &[]);
+    let total: i64 = rows
+        .iter()
+        .map(|row| match row[1] {
+            SqlValue::Int(n) => n,
+            _ => panic!("count is a whole number"),
+        })
+        .sum();
+    let matching = sql_ids(
+        &mut f.db,
+        &format!(
+            "SELECT _id FROM place WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, 20000, true)"
+        ),
+        &[],
+    )
+    .len();
+    assert_eq!(total, matching as i64);
+    assert!(matching > 0, "the radius admits nothing, so this tests nothing");
+
+    let explained = match f.db.sql(&format!("EXPLAIN {statement}"), &[]).unwrap() {
+        SqlResult::Explain(text) => text,
+        other => panic!("expected an explanation, got {other:?}"),
+    };
+    assert!(explained.contains("shape: hashed"), "{explained}");
+}
+
+#[test]
+fn the_divided_group_key_is_accepted_index_side_and_refused_otherwise() {
+    let (_dir, mut f) = open();
+    let decades = sql_groups(
+        &mut f.db,
+        "SELECT born / 10000 AS decade, count(*) AS n FROM place GROUP BY born / 10000",
+        &[],
+    );
+    let total: i64 = decades
+        .iter()
+        .map(|row| match row[1] {
+            SqlValue::Int(n) => n,
+            _ => panic!("count is a whole number"),
+        })
+        .sum();
+    assert_eq!(total, fixture::ROWS as i64);
+    assert!(!decades.is_empty());
+
+    // The same expression over a column with no Int scalar index is REFUSED
+    // by name, not folded over rows.
+    let refused = f
+        .db
+        .sql("SELECT count(*) FROM place GROUP BY score / 10", &[])
+        .unwrap_err();
+    assert!(format!("{refused}").contains("INDEX-SIDE"), "{refused}");
+}
+
+#[test]
+fn order_by_an_aggregate_alias_sorts_the_finished_groups() {
+    let (_dir, mut f) = open();
+    let rows = sql_groups(
+        &mut f.db,
+        "SELECT kind, count(*) AS n FROM place GROUP BY kind ORDER BY n DESC LIMIT 3",
+        &[],
+    );
+    assert_eq!(rows.len(), 3);
+    let counts: Vec<i64> = rows
+        .iter()
+        .map(|row| match row[1] {
+            SqlValue::Int(n) => n,
+            _ => panic!("count is a whole number"),
+        })
+        .collect();
+    assert!(counts.windows(2).all(|pair| pair[0] >= pair[1]), "{counts:?}");
+    let all = sql_groups(&mut f.db, "SELECT kind, count(*) AS n FROM place GROUP BY kind", &[]);
+    let mut every: Vec<i64> = all
+        .iter()
+        .map(|row| match row[1] {
+            SqlValue::Int(n) => n,
+            _ => panic!("count is a whole number"),
+        })
+        .collect();
+    every.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(counts, every[..3].to_vec());
+}
+
+#[test]
+fn a_folded_answer_refuses_what_it_cannot_report() {
+    let (_dir, mut f) = open();
+    for statement in [
+        // A column that is neither the key nor an aggregate.
+        "SELECT name, count(*) FROM place GROUP BY kind",
+        // Two group keys: there is no composite-key atomic.
+        "SELECT kind, count(*) FROM place GROUP BY kind, born",
+        // A row identity a group does not have.
+        "SELECT _id, count(*) FROM place GROUP BY kind",
+        // An aggregate over DISTINCT values needs a per-group distinct set.
+        "SELECT count(DISTINCT kind) FROM place",
+    ] {
+        let error = f
+            .db
+            .sql(statement, &[])
+            .expect_err(&format!("`{statement}` was not refused"));
+        let shown = format!("{error}");
+        assert!(!shown.is_empty(), "`{statement}` refused with no reason");
+    }
+}
+
+/// The two arms of the `battle50k` aggregate battery ask the SAME question at
+/// the SAME cost: the SQL statement and the direct `AggregateRequest` charge
+/// identical `QueryWork`.
+///
+/// This is the claim the SQL layer makes -- it compiles to the calls the crate
+/// already has and adds no second engine -- pinned as an equality of counters
+/// rather than as a wall-clock comparison, which is a property of the machine
+/// as much as of the code.
+#[test]
+fn the_sql_aggregate_charges_exactly_what_the_api_aggregate_charges() {
+    let (_dir, f) = open();
+    let count_star = [e4_prototype::collections::Accumulator {
+        function: e4_prototype::collections::AggregateFn::CountStar,
+        input: None,
+    }];
+    let cases: Vec<(&str, Option<e4_prototype::collections::GroupKey<'_>>, &str)> = vec![
+        ("agg_count_all", None, "SELECT count(*) FROM place"),
+        (
+            "agg_count_kind",
+            Some(e4_prototype::collections::GroupKey::Index(f.index.kind)),
+            "SELECT kind, count(*) AS n FROM place GROUP BY kind",
+        ),
+        (
+            "agg_born_decade",
+            Some(e4_prototype::collections::GroupKey::IndexDiv {
+                index: f.index.born,
+                divisor: 10_000,
+            }),
+            "SELECT born / 10000 AS decade, count(*) AS n FROM place GROUP BY born / 10000",
+        ),
+    ];
+    for (name, group, statement) in cases {
+        let mut api = f
+            .db
+            .prepare_aggregate(e4_prototype::collections::AggregateRequest {
+                collection: f.place,
+                filters: &[],
+                group,
+                accumulators: &count_star,
+                having: &[],
+                order: e4_prototype::collections::GroupOrder::Key,
+                driver: CandidateDriver::Auto,
+                total_limit: None,
+            })
+            .unwrap();
+        let mut api_work = e4_prototype::collections::QueryWork::default();
+        let mut api_groups = 0usize;
+        loop {
+            let page = api
+                .next_page(PAGE, QueryBudget::unlimited(), || false)
+                .unwrap();
+            api_work.candidates += page.work.candidates;
+            api_work.primary_reads += page.work.primary_reads;
+            api_work.scalar_postings += page.work.scalar_postings;
+            api_work.key_postings += page.work.key_postings;
+            api_groups += page.groups.len();
+            if page.done || page.groups.is_empty() {
+                break;
+            }
+        }
+
+        let prepared = e4_prototype::sql::prepare_sql(&f.db, statement, &[]).unwrap();
+        let (sql_work, sql_groups) = prepared
+            .with_aggregate(&f.db, &mut |aggregate| {
+                let mut work = e4_prototype::collections::QueryWork::default();
+                let mut groups = 0usize;
+                loop {
+                    let page = aggregate.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+                    work.candidates += page.work.candidates;
+                    work.primary_reads += page.work.primary_reads;
+                    work.scalar_postings += page.work.scalar_postings;
+                    work.key_postings += page.work.key_postings;
+                    groups += page.groups.len();
+                    if page.done || page.groups.is_empty() {
+                        break;
+                    }
+                }
+                Ok((work, groups))
+            })
+            .unwrap();
+
+        assert_eq!(api_groups, sql_groups, "{name}: group count");
+        assert_eq!(
+            api_work.candidates, sql_work.candidates,
+            "{name}: candidates"
+        );
+        assert_eq!(
+            api_work.primary_reads, sql_work.primary_reads,
+            "{name}: primary_reads"
+        );
+        assert_eq!(
+            api_work.scalar_postings, sql_work.scalar_postings,
+            "{name}: scalar_postings"
+        );
+        assert_eq!(
+            api_work.key_postings, sql_work.key_postings,
+            "{name}: key_postings"
+        );
+    }
+}

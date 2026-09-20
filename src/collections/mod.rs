@@ -73,6 +73,11 @@ pub use crate::index::vector::quantized::{
     ApproxVectorMethod, ApproxVectorResult, QuantizedVectorCandidates,
 };
 pub use crate::query::{
+    AggValue, Accumulator, AggregateFn, AggregateInput, AggregatePlanDescription, AggregateRequest,
+    AggregateShape, GroupCmp, GroupKey, GroupOrder, GroupPage, GroupPredicate, GroupRow,
+    PreparedAggregate,
+};
+pub use crate::query::{
     ApproximationDiagnostics, CandidateDriver, FilterAnswer, FilterPlan, Geom, GeometryFilter,
     OrderValue, OwnedScalarValue, PointFilter, PreparedQuery, ProjectedValue, Projection,
     QueryBudget, QueryDriver, QueryError, QueryFilter, QueryOrder, QueryPage, QueryPlanDescription,

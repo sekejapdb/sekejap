@@ -144,7 +144,7 @@ impl PreparedQuery<'_> {
     }
     /// What the page will actually read off each candidate. A driver holding
     /// borrowed bytes copies them only for something that will be read.
-    fn cursor_needs(&self) -> CursorNeeds {
+    pub(super) fn cursor_needs(&self) -> CursorNeeds {
         CursorNeeds {
             // The entity cursor's row bytes save `ensure_row` a point-get, but
             // only if something decodes them. With no filters and an id
@@ -404,7 +404,7 @@ impl PreparedQuery<'_> {
     /// leaves the traversal; the entity walk is the primary tree. A range or order walk
     /// is in value order and a spatial or vector walk in neither, so those keep
     /// the point-get.
-    fn driver_walks_ids_ascending(&self) -> bool {
+    pub(super) fn driver_walks_ids_ascending(&self) -> bool {
         matches!(
             self.driver,
             DriverPlan::Entities

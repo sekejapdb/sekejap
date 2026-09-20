@@ -202,7 +202,9 @@
 
 use e4_prototype::{
     collections::{
-        CandidateDriver, CollectionId, CollectionOptions, Database, Geom, GeometryFilter, IndexId,
+        Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest, CandidateDriver,
+        CollectionId, CollectionOptions, Database, Geom, GeometryFilter, GroupCmp, GroupKey,
+        GroupOrder, GroupPredicate, IndexId, OwnedScalarValue,
         PointFilter, Projection, QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter,
         ScalarValue, ScoreExpr, SortDirection, TextMatch, VectorMetric,
     },
@@ -572,7 +574,7 @@ pub struct CaseSpec {
 /// approximate sweeps (`APPROX_BASES`), generated at runtime, one case per
 /// `EF_SWEEP` / `SLS_SWEEP` point, because there is no longer one fixed-ef
 /// case for either to be a fixed entry of.
-pub const BATTERY: [CaseSpec; 20] = [
+pub const BATTERY: [CaseSpec; 26] = [
     CaseSpec { name: "pt_radius", kind: CaseKind::Filter },
     CaseSpec { name: "pt_bbox", kind: CaseKind::Filter },
     CaseSpec { name: "plot_within_box", kind: CaseKind::Filter },
@@ -593,7 +595,39 @@ pub const BATTERY: [CaseSpec; 20] = [
     CaseSpec { name: "vec_exact_radius", kind: CaseKind::Ranked },
     CaseSpec { name: "hybrid_10", kind: CaseKind::Ranked },
     CaseSpec { name: "hybrid_blend_10", kind: CaseKind::Ranked },
+    // ── the aggregate battery (QL_CONTRACT §4.7) ────────────────────────
+    // Filter-kind, because a folded answer is compared the way a filter
+    // answer is: every arm must return the SAME NUMBER OF GROUPS, and each
+    // arm formats every group into one text line, so `--dump` diffs the
+    // VALUES key by key and not only the count.
+    CaseSpec { name: "agg_count_all", kind: CaseKind::Filter },
+    CaseSpec { name: "agg_count_kind", kind: CaseKind::Filter },
+    CaseSpec { name: "agg_sum_born_by_kind", kind: CaseKind::Filter },
+    CaseSpec { name: "agg_distinct_kind", kind: CaseKind::Filter },
+    CaseSpec { name: "agg_count_radius_by_kind", kind: CaseKind::Filter },
+    CaseSpec { name: "agg_born_decade", kind: CaseKind::Filter },
 ];
+
+/// One group of an aggregate case, as a line every arm writes the same way:
+/// the group key, then `|name=value` per accumulator. Counts, sums and
+/// extremes are whole numbers in every arm; `avg` is compared as
+/// `floor(avg)`, because a bigint floor is a number two engines can agree on
+/// and a printed float is not.
+fn agg_line(key: &str, fields: &[(&str, i64)]) -> String {
+    let mut out = key.to_owned();
+    for (name, value) in fields {
+        out.push('|');
+        out.push_str(name);
+        out.push('=');
+        out.push_str(&value.to_string());
+    }
+    out
+}
+
+/// Is this case a folded answer rather than a row answer?
+fn is_aggregate_case(name: &str) -> bool {
+    name.starts_with("agg_")
+}
 
 /// The exact counterpart each approximate case's recall is measured against,
 /// inside the SAME arm. See deviation 12. Sweep-point names
@@ -898,11 +932,157 @@ fn e4_run(
     Ok(answer)
 }
 
+/// Prepare an aggregate, page every group, and write one line per group.
+fn e4_agg_run(
+    ctx: &E4Ctx,
+    filters: &[QueryFilter<'_>],
+    group: Option<GroupKey<'_>>,
+    accumulators: &[Accumulator<'_>],
+    having: &[GroupPredicate],
+    fields: &[&str],
+) -> R<Answer> {
+    let mut prepared = ctx.db.prepare_aggregate(AggregateRequest {
+        collection: ctx.place,
+        filters,
+        group,
+        accumulators,
+        having,
+        order: GroupOrder::Key,
+        driver: CandidateDriver::Auto,
+        total_limit: None,
+    })?;
+    let mut answer = Answer::default();
+    loop {
+        let page = prepared.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+        for row in &page.groups {
+            let key = match &row.key {
+                None => String::new(),
+                Some(OwnedScalarValue::Text(text)) => text.clone(),
+                Some(OwnedScalarValue::I64(value)) => value.to_string(),
+                Some(OwnedScalarValue::F64(value)) => format!("{value}"),
+                Some(OwnedScalarValue::Bool(value)) => value.to_string(),
+                Some(OwnedScalarValue::Nullish) => "NULL".to_owned(),
+            };
+            let mut numbers = Vec::with_capacity(row.values.len());
+            for (at, name) in fields.iter().enumerate() {
+                let value = row.values.get(at).ok_or("an aggregate lost an accumulator")?;
+                numbers.push((*name, agg_number(value)?));
+            }
+            answer.push(agg_line(&key, &numbers));
+        }
+        if page.done || page.groups.is_empty() {
+            break;
+        }
+    }
+    Ok(answer)
+}
+
+/// One accumulator's value as the whole number every arm compares. `avg` is
+/// floored here for the reason `agg_line` gives.
+fn agg_number(value: &AggValue) -> R<i64> {
+    Ok(match value {
+        AggValue::Count(n) => *n as i64,
+        AggValue::I64(v) => *v,
+        AggValue::F64(v) => v.floor() as i64,
+        other => return Err(format!("battle50k: an aggregate produced {other:?}").into()),
+    })
+}
+
+/// The six aggregate cases, as E4's API spells them.
+fn e4_agg_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R<Answer> {
+    let _ = corpus;
+    let count_star = [Accumulator {
+        function: AggregateFn::CountStar,
+        input: None,
+    }];
+    match name {
+        // count(*) with no filter: one group, and the key-order driver.
+        "agg_count_all" => e4_agg_run(ctx, &[], None, &count_star, &[], &["n"]),
+        // GROUP BY an indexed Text column: streaming, off the posting.
+        "agg_count_kind" => e4_agg_run(
+            ctx,
+            &[],
+            Some(GroupKey::Index(ctx.kind)),
+            &count_star,
+            &[],
+            &["n"],
+        ),
+        // Five accumulators over `born`, which is NOT the driving index, so
+        // each of them reads the row; HAVING filters the finished groups.
+        "agg_sum_born_by_kind" => {
+            let accumulators = [
+                Accumulator {
+                    function: AggregateFn::CountStar,
+                    input: None,
+                },
+                Accumulator {
+                    function: AggregateFn::Sum,
+                    input: Some(AggregateInput::Index(ctx.born)),
+                },
+                Accumulator {
+                    function: AggregateFn::Min,
+                    input: Some(AggregateInput::Index(ctx.born)),
+                },
+                Accumulator {
+                    function: AggregateFn::Max,
+                    input: Some(AggregateInput::Index(ctx.born)),
+                },
+                Accumulator {
+                    function: AggregateFn::Avg,
+                    input: Some(AggregateInput::Index(ctx.born)),
+                },
+            ];
+            let having = [GroupPredicate {
+                accumulator: 0,
+                op: GroupCmp::Gt,
+                value: 100.0,
+            }];
+            e4_agg_run(
+                ctx,
+                &[],
+                Some(GroupKey::Index(ctx.kind)),
+                &accumulators,
+                &having,
+                &["n", "s", "lo", "hi", "mean"],
+            )
+        }
+        // DISTINCT: a group with no accumulators.
+        "agg_distinct_kind" => e4_agg_run(ctx, &[], Some(GroupKey::Index(ctx.kind)), &[], &[], &[]),
+        // The radius drives, so the group key is not the walk's own value and
+        // the shape is hashed.
+        "agg_count_radius_by_kind" => e4_agg_run(
+            ctx,
+            &[e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i))],
+            Some(GroupKey::Index(ctx.kind)),
+            &count_star,
+            &[],
+            &["n"],
+        ),
+        // The expression group key, computed index-side from the Int posting.
+        "agg_born_decade" => e4_agg_run(
+            ctx,
+            &[],
+            Some(GroupKey::IndexDiv {
+                index: ctx.born,
+                divisor: 10_000,
+            }),
+            &count_star,
+            &[],
+            &["n"],
+        ),
+        other => Err(format!("battle50k: no E4 spelling for aggregate case `{other}`").into()),
+    }
+}
+
 /// One case, one query instance, as E4's API spells it. `hybrid_blend_10`
 /// rides `QueryOrder::Score` (deviation 5 names what still differs).
 fn e4_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R<Answer> {
     let keys = &corpus.keys;
     let kind = &corpus.kinds[i % KINDS];
+
+    if is_aggregate_case(name) {
+        return e4_agg_case(ctx, corpus, q, name, i);
+    }
 
     // Approximate sweep points (`vec_ann_10@ef<N>`, `vec_ann_10_kind@ef<N>`):
     // dispatched here rather than as one match arm per `EF_SWEEP` value.
@@ -1602,6 +1782,44 @@ fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String
         return Ok((setup, sql));
     }
 
+    // ── the aggregate battery (QL_CONTRACT §4.7) ────────────────────────
+    // Every group comes back as ONE text column, formatted exactly as
+    // `agg_line` formats it in the two E4 arms, so the three reports are
+    // diffable group by group. `floor(avg(born))::bigint` is the avg both
+    // sides can agree on; a printed float is not.
+    if is_aggregate_case(name) {
+        return match name {
+            "agg_count_all" => plain("SELECT '|n=' || count(*)::text FROM place".to_owned()),
+            "agg_count_kind" => plain(
+                "SELECT kind || '|n=' || count(*)::text FROM place GROUP BY kind ORDER BY kind"
+                    .to_owned(),
+            ),
+            "agg_sum_born_by_kind" => plain(
+                "SELECT kind || '|n=' || count(*)::text || '|s=' || sum(born)::text \
+                 || '|lo=' || min(born)::text || '|hi=' || max(born)::text \
+                 || '|mean=' || floor(avg(born))::bigint::text \
+                 FROM place GROUP BY kind HAVING count(*) > 100 ORDER BY kind"
+                    .to_owned(),
+            ),
+            "agg_distinct_kind" => {
+                plain("SELECT DISTINCT kind FROM place ORDER BY kind".to_owned())
+            }
+            "agg_count_radius_by_kind" => plain(format!(
+                "SELECT kind || '|n=' || count(*)::text FROM place \
+                 WHERE {radius_clause} GROUP BY kind ORDER BY kind"
+            )),
+            "agg_born_decade" => plain(
+                "SELECT (born / 10000)::text || '|n=' || count(*)::text FROM place \
+                 GROUP BY born / 10000 ORDER BY born / 10000"
+                    .to_owned(),
+            ),
+            other => Err(format!(
+                "battle50k: no Postgres spelling for aggregate case `{other}`"
+            )
+            .into()),
+        };
+    }
+
     match name {
         // ── filters ─────────────────────────────────────────────────────
         "pt_radius" => plain(format!("SELECT \"key\" FROM place WHERE {radius_clause}")),
@@ -1772,6 +1990,38 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
         return Ok((sql, bound.params, Some(ef)));
     }
 
+    // ── the aggregate battery (QL_CONTRACT §4.7), in SQL ────────────────
+    // E4's `||` is Tier 2 (a row function on projected values), so these
+    // statements return the group key and the accumulators as COLUMNS and
+    // `e4sql_agg_run` formats the line the Postgres arm concatenates in SQL.
+    // Same question, same groups, same text.
+    if is_aggregate_case(name) {
+        let sql = match name {
+            "agg_count_all" => "SELECT count(*) AS n FROM place".to_owned(),
+            "agg_count_kind" => "SELECT kind, count(*) AS n FROM place GROUP BY kind".to_owned(),
+            "agg_sum_born_by_kind" => "SELECT kind, count(*) AS n, sum(born) AS s, \
+                 min(born) AS lo, max(born) AS hi, avg(born) AS mean \
+                 FROM place GROUP BY kind HAVING count(*) > 100"
+                .to_owned(),
+            "agg_distinct_kind" => "SELECT DISTINCT kind FROM place".to_owned(),
+            "agg_count_radius_by_kind" => {
+                let centre = sql_point(v, radius[0], radius[1], true);
+                let clause = sql_dwithin(v, "loc", centre, radius[2]);
+                format!("SELECT kind, count(*) AS n FROM place WHERE {clause} GROUP BY kind")
+            }
+            "agg_born_decade" => {
+                "SELECT born / 10000 AS decade, count(*) AS n FROM place GROUP BY born / 10000"
+                    .to_owned()
+            }
+            other => {
+                return Err(
+                    format!("battle50k: no e4-sql spelling for aggregate case `{other}`").into(),
+                )
+            }
+        };
+        return Ok((sql, bound.params, None));
+    }
+
     let sql = match name {
         // ── filters ─────────────────────────────────────────────────────
         "pt_radius" => {
@@ -1935,9 +2185,73 @@ fn e4sql_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) -> R<Ans
     Ok(answer)
 }
 
+/// The accumulator column names of one aggregate case, in request order --
+/// the same names `agg_line` writes and the Postgres statement concatenates.
+fn agg_fields(name: &str) -> &'static [&'static str] {
+    match name {
+        "agg_distinct_kind" => &[],
+        "agg_sum_born_by_kind" => &["n", "s", "lo", "hi", "mean"],
+        _ => &["n"],
+    }
+}
+
+/// Parse, compile and page one aggregate statement, writing the same line per
+/// group the `e4` arm writes.
+fn e4sql_agg_run(ctx: &E4Ctx, sql: &str, params: &[Param], fields: &[&str]) -> R<Answer> {
+    let t0 = Instant::now();
+    let prepared = prepare_sql(&ctx.db, sql, params)?;
+    let mut answer = Answer {
+        prepare_us: t0.elapsed().as_secs_f64() * 1e6,
+        ..Answer::default()
+    };
+    prepared.with_aggregate(&ctx.db, &mut |aggregate| {
+        loop {
+            let page = aggregate.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+            for row in &page.groups {
+                let key = match &row.key {
+                    None => String::new(),
+                    Some(OwnedScalarValue::Text(text)) => text.clone(),
+                    Some(OwnedScalarValue::I64(value)) => value.to_string(),
+                    Some(OwnedScalarValue::F64(value)) => format!("{value}"),
+                    Some(OwnedScalarValue::Bool(value)) => value.to_string(),
+                    Some(OwnedScalarValue::Nullish) => "NULL".to_owned(),
+                };
+                let mut numbers = Vec::with_capacity(fields.len());
+                for (at, field) in fields.iter().enumerate() {
+                    let value = row.values.get(at).ok_or_else(|| {
+                        SqlError::Engine("an aggregate lost an accumulator".to_owned())
+                    })?;
+                    numbers.push((
+                        *field,
+                        match value {
+                            AggValue::Count(n) => *n as i64,
+                            AggValue::I64(v) => *v,
+                            AggValue::F64(v) => v.floor() as i64,
+                            other => {
+                                return Err(SqlError::Engine(format!(
+                                    "an aggregate produced {other:?}"
+                                )))
+                            }
+                        },
+                    ));
+                }
+                answer.push(agg_line(&key, &numbers));
+            }
+            if page.done || page.groups.is_empty() {
+                break;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(answer)
+}
+
 fn e4sql_answer(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R<Answer> {
     let (sql, params, ef) = e4sql_case(q, &corpus.kinds, name, i)?;
     e4sql_set_ef(ctx, ef)?;
+    if is_aggregate_case(name) {
+        return e4sql_agg_run(ctx, &sql, &params, agg_fields(name));
+    }
     e4sql_run(ctx, &corpus.keys, &sql, &params)
 }
 

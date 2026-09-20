@@ -213,3 +213,75 @@ SELECT key FROM place
 WHERE kind = $2
 ORDER BY emb <=> $1::vector, key
 LIMIT 10;
+
+-- ============================================================
+-- AGGREGATE CASES (QL_CONTRACT §4.7; group-count agreement required
+-- across arms)
+-- ============================================================
+--
+-- A folded answer has no `key` column to return, so each of these produces
+-- ONE TEXT COLUMN per group: the group key, then `|name=value` per
+-- accumulator. The two E4 arms build the identical line in Rust
+-- (`agg_line` in src/bin/battle50k.rs), so the three reports are diffable
+-- group by group and not only by their group COUNT.
+--
+-- `avg` is compared as `floor(avg(born))::bigint`, a whole number two
+-- engines can agree on; a printed float is not. E4's own avg is an f64
+-- mean over exactly-representable integers, so its floor is the same
+-- number.
+
+-- case: agg_count_all kind: filter
+-- params: none
+-- One group over the whole table. E4 drives this from the external-key
+-- mapping keyspace (CandidateDriver::Keys), which is the same choice
+-- popsim's and q7_budget's `count_all` make.
+SELECT '|n=' || count(*)::text FROM place;
+
+-- case: agg_count_kind kind: filter
+-- params: none
+-- GROUP BY the indexed Text column. E4 STREAMS this: `kind` is the driving
+-- scalar index, so the groups arrive contiguous and no row is read.
+SELECT kind || '|n=' || count(*)::text FROM place GROUP BY kind ORDER BY kind;
+
+-- case: agg_sum_born_by_kind kind: filter
+-- params: none
+-- Five accumulators over `born`, which is NOT the driving index, so E4
+-- reads one row per candidate and EXPLAIN says so. HAVING is applied to
+-- the finished groups, before paging.
+SELECT kind || '|n=' || count(*)::text
+    || '|s=' || sum(born)::text
+    || '|lo=' || min(born)::text
+    || '|hi=' || max(born)::text
+    || '|mean=' || floor(avg(born))::bigint::text
+FROM place
+GROUP BY kind
+HAVING count(*) > 100
+ORDER BY kind;
+
+-- case: agg_distinct_kind kind: filter
+-- params: none
+-- DISTINCT is a group with no accumulators, which is why the line is the
+-- bare key.
+SELECT DISTINCT kind FROM place ORDER BY kind;
+
+-- case: agg_count_radius_by_kind kind: filter
+-- params: $1 lon, $2 lat, $3 radius_metres  (radii[i])
+-- The radius drives in E4, so the group key is not the driving walk's own
+-- value and the shape is HASHED -- one accumulator set per distinct kind,
+-- bounded by the `groups` budget.
+SELECT kind || '|n=' || count(*)::text
+FROM place
+WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3, true)
+GROUP BY kind
+ORDER BY kind;
+
+-- case: agg_born_decade kind: filter
+-- params: none
+-- The one grouping EXPRESSION: it is accepted because E4 can compute it
+-- INDEX-SIDE from the Int posting, and truncating division by a positive
+-- divisor is monotone in that index's own order, so the groups stay
+-- contiguous and the shape stays streaming.
+SELECT (born / 10000)::text || '|n=' || count(*)::text
+FROM place
+GROUP BY born / 10000
+ORDER BY born / 10000;

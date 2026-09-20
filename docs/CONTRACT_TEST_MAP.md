@@ -103,13 +103,20 @@ construct the tests do not pin.
 | `ORDER BY ts_rank_cd(...)` | Bm25 order (formula differs from Postgres; documented) | `tests/query_candidate_budget.rs` `bm25_scores_match_the_definition_after_the_constants_are_hoisted`; `tests/text_score_cost.rs` `scoring_a_term_that_matches_most_of_the_corpus_costs_one_pass_not_one_per_document`; `tests/query_score.rs` `score_bm25_leaf_equals_bm25_order` |
 | `bm25(col, 'query')` as an expression | Score leaf | `tests/query_score.rs` `score_bm25_leaf_equals_bm25_order`; `tests/query_score.rs` `score_hybrid_matches_row_oracle_across_page_sizes`; `tests/query_combinations.rs` `hand_picked_surface_combinations` (`hp22_score_hybrid`) |
 
+### §4.7 Aggregates
+
+| Construct | Atomic | Tests |
+| --- | --- | --- |
+| `count(*)`, `count(col)`, `sum`, `min`, `max`, `avg`, `GROUP BY`, `HAVING`, `DISTINCT` | streaming when the group key is the driving index's own value, hashed otherwise, bounded by the `groups` budget (`src/query/aggregate.rs`, `Database::prepare_aggregate`) | `tests/query_aggregate.rs` `every_filter_and_grouping_equals_a_brute_force_fold`; `tests/query_aggregate.rs` `streaming_and_hashed_produce_identical_groups`; `tests/query_aggregate.rs` `the_groups_budget_bounds_the_hashed_shape_and_streaming_holds_one`; `tests/query_aggregate.rs` `pages_of_one_three_and_seven_concatenate`; `tests/query_aggregate.rs` `a_streaming_page_stops_and_resumes_at_a_group_boundary`; `tests/query_aggregate.rs` `having_filters_finished_groups_before_they_are_paged`; `tests/query_aggregate.rs` `distinct_is_a_group_with_no_accumulators`; `tests/query_aggregate.rs` `count_all_is_one_group_over_the_key_order_driver`; `tests/query_aggregate.rs` `cancellation_mid_fold_leaves_no_state`; `tests/query_aggregate.rs` `a_divided_group_key_streams_and_equals_the_fold`; `tests/query_aggregate.rs` `an_order_by_an_accumulator_sorts_the_finished_groups`; SQL: `tests/sql_tier1.rs` `count_star_with_no_filter_is_one_row_over_the_key_order_driver`, `group_by_an_indexed_column_streams_and_matches_the_api`, `sum_min_max_avg_by_group_with_having`, `select_distinct_is_a_group_with_no_accumulators`, `group_by_with_a_radius_filter_hashes_and_agrees_with_the_filter_itself`, `the_divided_group_key_is_accepted_index_side_and_refused_otherwise`, `order_by_an_aggregate_alias_sorts_the_finished_groups`; EXPLAIN: `tests/sql_explain.rs` `agg_count_all_is_streaming_over_the_key_order_driver_and_reads_no_row`, `agg_count_kind_streams_off_the_driving_posting`, `agg_sum_born_by_kind_names_the_row_its_accumulators_read`, `agg_distinct_kind_is_a_group_with_no_accumulators`, `agg_count_radius_by_kind_hashes_because_the_radius_drives`, `agg_born_decade_computes_its_expression_key_index_side` |
+| `array_agg`, `string_agg`, `json_agg`, `percentile_cont`, window functions, `GROUPING SETS`, `CUBE`, `count(DISTINCT col)`, a composite `GROUP BY` key, `GROUP BY <expression>` with no index-side computation | no atomic in this item; refused by name | `tests/query_aggregate.rs` `what_has_no_atomic_is_refused_by_name`; `tests/sql_tier1.rs` `a_folded_answer_refuses_what_it_cannot_report`; `tests/sql_refusals.rs` `every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` |
+
 ## Counts
 
 | Set | Rows | Fully pinned | Contain UNPINNED |
 | --- | ---: | ---: | ---: |
 | GRAPH_CONTRACT numbered rules (1.1–6.3 and L1–L8; no L7 in that document) | 31 | 15 | 16 |
-| QL_CONTRACT T1 table rows | 28 | 24 | 4 |
-| **Total** | **59** | **39** | **20** |
+| QL_CONTRACT T1 table rows | 29 | 25 | 4 |
+| **Total** | **60** | **40** | **20** |
 
 Unpinned count (rows whose Tests cell contains `UNPINNED`): **20**. The count
 did not move with `DROP TABLE`: the two rows it touches (6.1 and the

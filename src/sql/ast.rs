@@ -201,6 +201,54 @@ pub(super) enum OrderKey {
     },
 }
 
+/// The aggregate functions `docs/QL_CONTRACT.md` §4.7 accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+impl AggFunc {
+    pub(super) fn written(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+        }
+    }
+}
+
+/// `count(*)` against `count(col)`: the star is the only argument that names
+/// no column, and only `count` accepts it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum AggArg {
+    Star,
+    Column(String),
+}
+
+/// `GROUP BY col` or `GROUP BY col / n` -- the one grouping EXPRESSION this
+/// slice accepts, because it is computable index-side from an Int posting and
+/// monotone in that index's own order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GroupExpr {
+    pub(super) column: String,
+    pub(super) divisor: Option<i64>,
+}
+
+/// `HAVING <agg>(<arg>) <cmp> <value>`: a predicate on a finished group.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct HavingPredicate {
+    pub(super) function: AggFunc,
+    pub(super) argument: AggArg,
+    pub(super) op: CmpOp,
+    pub(super) value: Literal,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum SelectItem {
     Star,
@@ -213,6 +261,20 @@ pub(super) enum SelectItem {
     Column(String),
     /// The ranking value of this statement's own `ORDER BY`, under an alias.
     OrderValue(String),
+    /// `count(*)`, `count(col)`, `sum(col)`, `min(col)`, `max(col)`,
+    /// `avg(col)`.
+    Aggregate {
+        function: AggFunc,
+        argument: AggArg,
+    },
+    /// `col / n` in a select list: the one grouping expression, written
+    /// again where the answer reports it. Outside a folded answer it is an
+    /// arithmetic expression like any other and reports the ranking value,
+    /// which is what this select list has always done with an expression.
+    Divided {
+        column: String,
+        divisor: i64,
+    },
 }
 
 /// One element of a `GRAPH_TABLE` pattern's path.
@@ -258,6 +320,10 @@ pub(super) struct SelectStmt {
     pub(super) items: Vec<(SelectItem, Option<String>)>,
     pub(super) source: Source,
     pub(super) predicates: Vec<Predicate>,
+    /// `SELECT DISTINCT`, which is a group with no accumulators.
+    pub(super) distinct: bool,
+    pub(super) group: Option<GroupExpr>,
+    pub(super) having: Vec<HavingPredicate>,
     pub(super) order: Option<OrderKey>,
     pub(super) limit: Option<usize>,
 }

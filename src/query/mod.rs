@@ -33,6 +33,7 @@ use std::{
     sync::Arc,
 };
 
+mod aggregate;
 mod cursors;
 mod drivers;
 mod filters;
@@ -44,6 +45,11 @@ mod rows;
 mod score;
 mod vector_scan;
 
+pub use aggregate::{
+    AggValue, Accumulator, AggregateFn, AggregateInput, AggregatePlanDescription, AggregateRequest,
+    AggregateShape, GroupCmp, GroupKey, GroupOrder, GroupPage, GroupPredicate, GroupRow,
+    PreparedAggregate,
+};
 pub use page::PreparedQuery;
 use {cursors::*, drivers::*, filters::*, membership::*, plan::*, rank::*, rows::*, score::*};
 
@@ -400,6 +406,13 @@ pub struct QueryBudget {
     pub vector_lanes: u64,
     /// Mapping-keyspace entries walked by `CandidateDriver::Keys`.
     pub key_postings: u64,
+    /// Accumulator sets an aggregate holds AT ONCE (`src/query/aggregate.rs`).
+    /// A STREAMING aggregate holds one whatever the collection contains; a
+    /// HASHED one holds a set per distinct group, and this is the bound that
+    /// makes that memory a stated quantity rather than the data's. There is
+    /// no spill: past the cap the page is refused with
+    /// [`WorkResource::Groups`].
+    pub groups: u64,
     pub output_bytes: u64,
 }
 
@@ -418,8 +431,21 @@ impl QueryBudget {
             vector_sidecars: u64::MAX,
             vector_lanes: u64::MAX,
             key_postings: u64::MAX,
+            groups: u64::MAX,
             output_bytes: u64::MAX,
         }
+    }
+
+    /// The default ceiling on accumulator sets held at once: the same
+    /// [`RUN_BYTES`](crate::query::rows) memory promise every other per-query
+    /// buffer is written against, divided by what ONE group costs with
+    /// `accumulators` accumulators on it.
+    ///
+    /// `prepare_aggregate` applies `min(caller's groups, this)` so the bound
+    /// holds even under [`QueryBudget::unlimited`]: an aggregate that cannot
+    /// spill must not be allowed to grow without one.
+    pub fn groups_cap(accumulators: usize) -> u64 {
+        aggregate::default_groups_cap(accumulators)
     }
 }
 
@@ -445,6 +471,8 @@ pub struct QueryWork {
     pub vector_sidecars: u64,
     pub vector_lanes: u64,
     pub key_postings: u64,
+    /// The most accumulator sets this page held at once.
+    pub groups: u64,
     pub output_bytes: u64,
 }
 
@@ -462,6 +490,7 @@ pub enum WorkResource {
     VectorSidecars,
     VectorLanes,
     KeyPostings,
+    Groups,
     OutputBytes,
 }
 
@@ -563,6 +592,7 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
             }
             WorkResource::VectorLanes => (&mut self.used.vector_lanes, self.limit.vector_lanes),
             WorkResource::KeyPostings => (&mut self.used.key_postings, self.limit.key_postings),
+            WorkResource::Groups => (&mut self.used.groups, self.limit.groups),
             WorkResource::OutputBytes => (&mut self.used.output_bytes, self.limit.output_bytes),
         }
     }

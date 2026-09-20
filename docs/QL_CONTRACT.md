@@ -149,9 +149,11 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 
 | construct | tier | atomic |
 |---|---|---|
-| `count(*)`, `count(col)`, `sum`, `min`, `max`, `avg` | T2 | streaming when the group key is the driving index order; hashed otherwise, bounded by a groups budget |
-| `GROUP BY`, `HAVING`, `DISTINCT` | T2 | same atomic |
+| `count(*)`, `count(col)`, `sum`, `min`, `max`, `avg` | T1 | `Database::prepare_aggregate` (`src/query/aggregate.rs`): STREAMING when the group key is the driving scalar index's own value (groups contiguous, one accumulator set alive, the key off the posting with no row read, a page stops and resumes at a group boundary); HASHED otherwise, bounded by the `groups` QueryBudget resource. No spill: past the cap the page is `BudgetExceeded { groups }`. An accumulator's input is the driving posting's value where the field IS that index, and the primary row otherwise — charged as `primary_reads` and printed by EXPLAIN |
+| `GROUP BY`, `HAVING`, `DISTINCT` | T1 | same atomic. `DISTINCT` is a group with no accumulators; `HAVING` is a predicate on a FINISHED group's accumulator values, applied before paging. `GROUP BY col / n` is accepted only where it is computable index-side from an Int posting (truncating division by a positive divisor is monotone in that index's own order, so the groups stay contiguous); without such an index the expression form is refused and `GROUP BY col` with a range filter is the spelling. One key only: a composite key has no atomic |
+| `ORDER BY <aggregate alias>` (+ `LIMIT`) | T1 | the finished groups are sorted before they are paged. THE ONE PLACE A SORT OVER MEMORY HAPPENS in this engine, and it is bounded because what it sorts is the group table, which the `groups` budget has already bounded. It forces the hashed shape: no group's value is final before the walk ends |
 | `array_agg`, `string_agg`, `json_agg` | T2 (after the above) | bounded by row budget |
+| `count(DISTINCT col)` | T2 | a per-group distinct set is a second unbounded structure inside each group; the bounded atomic here is one accumulator per group |
 | `percentile_cont`, window functions, `GROUPING SETS`, `CUBE` | T3 | |
 
 ### 4.8 Joins (essentials only)
@@ -175,6 +177,7 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 6. `USING hnsw|diskann|ivfflat` are aliases of the quantized family.
 7. A join never executes a pattern; a relation between rows is an edge.
 8. Declared TIMESTAMPTZ is stored as UTC microseconds in an Int; no time-zone storage.
+11. A nullish group key (NULL or missing) sorts FIRST under `GROUP BY`, the scalar keyspace's own order; Postgres sorts NULL last and `NULLS FIRST|LAST` is refused. `HAVING` over an all-null accumulator drops the group (SQL three-valued logic); a `HAVING` over `min`/`max` of a non-numeric column is refused at prepare.
 9. `DROP TABLE` is RESTRICT by default, and what restricts it is GRAPH EDGES, not foreign keys: Postgres refuses on a dependent constraint, this refuses while any edge in any context references a row of the table and names those contexts (graph contract 6.1). `CASCADE` removes those edges and nothing else -- it never reaches a second table's rows. A table with no edges on it drops under the default.
 10. `DROP TABLE` is bounded and resumable, so it is not one transaction: the DROPPING mark is committed first and each bounded step after it is committed as it goes. An interrupted `DROP TABLE` leaves a collection that answers nothing and resumes from its committed cursor; it never leaves a half-emptied readable table. `ROLLBACK` does not undo a drop that has begun.
 
@@ -182,13 +185,13 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 
 - Every T1/T2 predicate on an indexed field is answered index-side (posting, membership set, or inline edge property); a row is read only for projection or for a predicate the plan names as row-bound. `EXPLAIN` prints which.
 - Work is proportional to candidates walked or rows returned, never to the collection, except for constructs whose definition is a scan (exact vector order without a filter, `count(*)` without a filter), which `EXPLAIN` labels as scans.
-- Memory per query is bounded by QueryBudget: pages, membership sets, groups, frontier.
+- Memory per query is bounded by QueryBudget: pages, membership sets, groups (`WorkResource::Groups` — the accumulator sets an aggregate holds AT ONCE, one under the streaming shape and one per distinct group under the hashed one; its default ceiling is `RUN_BYTES` divided by what one group costs, applied even under `QueryBudget::unlimited`), frontier.
 - Every T3 refusal names the missing atomic in its error text.
 
 ## 7. Order of Phase-3 work
 
 1. Parser for §2 T1 + §3 T1 + §6 guarantees, with `EXPLAIN`.
-2. Aggregates (§4.7), then date/time and string functions (§4.1, §4.2).
+2. Aggregates (§4.7) — DONE, `src/query/aggregate.rs`; then date/time and string functions (§4.1, §4.2).
 3. `OR`/`IN`/`NOT`/`EXISTS` (§3).
 4. Graph T2 (§4.3) in the graph-contract order.
 5. Geometry I/O and `&&` (§4.4), catalog views and wire (p3-pg-surface, p3-wire).

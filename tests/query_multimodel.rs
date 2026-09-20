@@ -75,6 +75,7 @@ fn generous() -> QueryBudget {
         vector_sidecars: 10_000,
         vector_lanes: 20_000,
         key_postings: 10_000,
+        groups: 10_000,
         output_bytes: 1 << 20,
     }
 }
@@ -2251,6 +2252,7 @@ fn packed_budget() -> QueryBudget {
         vector_sidecars: 1 << 22,
         vector_lanes: 1 << 22,
         key_postings: 1 << 22,
+        groups: 1 << 22,
         output_bytes: 1 << 24,
     }
 }

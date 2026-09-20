@@ -20,10 +20,16 @@
 //! statement := select | explain | insert | update | delete
 //!            | create_table | create_index | drop | transaction | set_local
 //!
-//! select    := SELECT items FROM source [WHERE conj] [ORDER BY key] [LIMIT n]
+//! select    := SELECT [DISTINCT] items FROM source [WHERE conj]
+//!              [GROUP BY group] [HAVING having] [ORDER BY key] [LIMIT n]
 //! explain   := EXPLAIN select | EXPLAIN drop_table
 //! items     := '*' | item (',' item)*
-//! item      := '_id' | '_key' | name | order_expression [AS alias]
+//! item      := '_id' | '_key' | name | name '/' n | aggregate
+//!            | order_expression [AS alias]
+//! aggregate := ('count' '(' ('*' | name) ')')
+//!            | ('sum'|'min'|'max'|'avg') '(' name ')'
+//! group     := name ['/' n]        -- one key; `/ n` needs an Int index
+//! having    := aggregate cmp value (AND aggregate cmp value)*
 //! source    := name | graph_table
 //! conj      := predicate (AND predicate)*
 //!
@@ -88,13 +94,13 @@ mod parser;
 mod refuse;
 
 use crate::collections::{
-    CollectionId, Database, EntityId, Error, OrderValue, PreparedQuery, ProjectedValue,
-    QueryBudget, QueryError, QueryPage, QueryWork,
+    CollectionId, Database, EntityId, Error, OrderValue, PreparedAggregate, PreparedQuery,
+    ProjectedValue, QueryBudget, QueryError, QueryPage, QueryWork,
 };
 use serde_json::Value;
 use std::fmt;
 
-pub(crate) use compile::SelectPlan;
+pub(crate) use compile::{AggregatePlan, SelectPlan};
 
 /// The E4 row identity, as a SELECT list writes it. `Database::put` maps an
 /// external key onto it, and a `QueryRow` carries it without reading a row.
@@ -294,17 +300,41 @@ impl PreparedSql {
     pub fn columns(&self) -> &[String] {
         match &self.plan {
             compile::Plan::Select(select) | compile::Plan::Explain(select) => &select.columns,
+            compile::Plan::Aggregate(aggregate) | compile::Plan::ExplainAggregate(aggregate) => {
+                &aggregate.columns
+            }
             _ => &[],
         }
     }
 
     pub fn is_select(&self) -> bool {
-        matches!(&self.plan, compile::Plan::Select(_))
+        matches!(
+            &self.plan,
+            compile::Plan::Select(_) | compile::Plan::Aggregate(_)
+        )
+    }
+
+    /// True when this statement folds rows into groups rather than returning
+    /// them: an aggregate function, `GROUP BY`, `HAVING` or `DISTINCT`.
+    pub fn is_aggregate(&self) -> bool {
+        matches!(
+            &self.plan,
+            compile::Plan::Aggregate(_) | compile::Plan::ExplainAggregate(_)
+        )
     }
 
     pub(crate) fn select_plan(&self) -> Option<&SelectPlan> {
         match &self.plan {
             compile::Plan::Select(select) | compile::Plan::Explain(select) => Some(select),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn aggregate_plan(&self) -> Option<&AggregatePlan> {
+        match &self.plan {
+            compile::Plan::Aggregate(aggregate) | compile::Plan::ExplainAggregate(aggregate) => {
+                Some(aggregate)
+            }
             _ => None,
         }
     }
@@ -328,8 +358,50 @@ impl PreparedSql {
         select.with_query(db, body)
     }
 
+    /// Hand the compiled aggregate to `body` as a live [`PreparedAggregate`],
+    /// so the caller pages the groups itself. A callback for the same reason
+    /// [`PreparedSql::with_query`] is one: the request borrows what the plan
+    /// owns.
+    pub fn with_aggregate<T>(
+        &self,
+        db: &Database,
+        body: &mut dyn FnMut(&mut PreparedAggregate<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let aggregate = self.aggregate_plan().ok_or_else(|| {
+            SqlError::unsupported(
+                "this statement does not fold rows and has no prepared aggregate",
+            )
+        })?;
+        aggregate.with_aggregate(db, body)
+    }
+
+    /// Run a compiled aggregate to exhaustion, in pages of groups.
+    fn groups(&self, db: &Database) -> Result<SqlResult> {
+        let aggregate = self
+            .aggregate_plan()
+            .ok_or_else(|| SqlError::unsupported("not an aggregate"))?;
+        let columns = aggregate.columns.clone();
+        let rows = aggregate.with_aggregate(db, &mut |prepared| {
+            let mut out = Vec::new();
+            loop {
+                let page = prepared.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+                for group in &page.groups {
+                    out.push(aggregate.row(group));
+                }
+                if page.done || page.groups.is_empty() {
+                    break;
+                }
+            }
+            Ok(out)
+        })?;
+        Ok(SqlResult::Rows { columns, rows })
+    }
+
     /// Run a compiled SELECT to exhaustion, in pages.
     fn rows(&self, db: &Database) -> Result<SqlResult> {
+        if self.is_aggregate() {
+            return self.groups(db);
+        }
         let select = self
             .select_plan()
             .ok_or_else(|| SqlError::unsupported("not a SELECT"))?;
@@ -373,6 +445,9 @@ pub fn prepare_sql(db: &Database, text: &str, params: &[Param]) -> Result<Prepar
 /// the plan together with the work the run charged.
 pub fn explain_sql(db: &Database, text: &str, params: &[Param]) -> Result<String> {
     let prepared = prepare_sql(db, text, params)?;
+    if let Some(aggregate) = prepared.aggregate_plan() {
+        return explain::render_aggregate(db, aggregate, prepared.notices());
+    }
     let select = prepared
         .select_plan()
         .ok_or_else(|| SqlError::unsupported("EXPLAIN takes a SELECT"))?;
@@ -402,11 +477,22 @@ impl Database {
                 };
                 prepared.rows(self)
             }
+            compile::Plan::Aggregate(aggregate) => {
+                let prepared = PreparedSql {
+                    plan: compile::Plan::Aggregate(aggregate),
+                    notices,
+                };
+                prepared.groups(self)
+            }
             compile::Plan::Explain(select) => {
                 let text = explain::render(self, &select, &notices)?;
                 Ok(SqlResult::Explain(text))
             }
             compile::Plan::ExplainText(text) => Ok(SqlResult::Explain(text)),
+            compile::Plan::ExplainAggregate(aggregate) => {
+                let text = explain::render_aggregate(self, &aggregate, &notices)?;
+                Ok(SqlResult::Explain(text))
+            }
             compile::Plan::Write(write) => write.run(self, notices),
         }
     }
@@ -464,6 +550,31 @@ pub(crate) struct RunWork {
 }
 
 impl RunWork {
+    /// One aggregate page's work. `groups` is a HIGH-WATER mark of live
+    /// accumulator sets, not a running total, so it is maxed rather than
+    /// summed -- the same reason the budget is a memory bound.
+    pub(crate) fn add_groups(&mut self, page: &crate::collections::GroupPage) {
+        let w = &page.work;
+        let total = &mut self.work;
+        total.candidates += w.candidates;
+        total.primary_reads += w.primary_reads;
+        total.row_decodes += w.row_decodes;
+        total.scalar_postings += w.scalar_postings;
+        total.graph_edges += w.graph_edges;
+        total.graph_visited += w.graph_visited;
+        total.spatial_postings += w.spatial_postings;
+        total.text_postings += w.text_postings;
+        total.text_tokens += w.text_tokens;
+        total.vector_locators += w.vector_locators;
+        total.vector_sidecars += w.vector_sidecars;
+        total.vector_lanes += w.vector_lanes;
+        total.key_postings += w.key_postings;
+        total.groups = total.groups.max(w.groups);
+        total.output_bytes += w.output_bytes;
+        self.rows += page.groups.len() as u64;
+        self.pages += 1;
+    }
+
     pub(crate) fn add(&mut self, page: &QueryPage) {
         let w = &page.work;
         let total = &mut self.work;
@@ -480,6 +591,7 @@ impl RunWork {
         total.vector_sidecars += w.vector_sidecars;
         total.vector_lanes += w.vector_lanes;
         total.key_postings += w.key_postings;
+        total.groups = total.groups.max(w.groups);
         total.output_bytes += w.output_bytes;
         self.rows += page.rows.len() as u64;
         self.pages += 1;
