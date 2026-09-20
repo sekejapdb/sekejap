@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""battle50k_compare.py -- compare an E4 report and a PostgreSQL report that
-both follow the battle50k SHARED JSON REPORT CONTRACT (see
-brief-common-b50k.md).
+"""battle50k_compare.py -- compare an E4 report and a PostgreSQL report, and
+optionally an `e4-sql` report, all following the battle50k SHARED JSON REPORT
+CONTRACT (see brief-common-b50k.md).
 
 Usage:
-    battle50k_compare.py e4.json postgres.json [--md]
+    battle50k_compare.py e4.json postgres.json [e4-sql.json] [--md]
+
+With three reports the filter-agreement precondition is agreement across ALL
+THREE arms: `e4-sql` asks the same twenty-two questions of the same E4
+database in SQL, so a parser that compiled a DIFFERENT question than the API
+it claims to compile to would be invisible in a two-arm table. Exit code 1 if
+any filter case disagrees between any two arms that both ran it.
 
 Prints, in order:
   1. a stages table (name, e4 (ms), pg (ms), ratio (e4/pg)); the
@@ -119,94 +125,100 @@ def print_table(headers, rows, md):
         print(fmt_row(row))
 
 
-def build_stages_table(e4_report, pg_report):
-    e4_stages = e4_report.get("stages", [])
-    pg_stages = pg_report.get("stages", [])
-    e4_idx = index_by_name(e4_stages)
-    pg_idx = index_by_name(pg_stages)
-    names = ordered_union_names(e4_stages, pg_stages)
+def build_stages_table(reports):
+    indexed = [(label, index_by_name(report.get("stages", []))) for label, report in reports]
+    names = []
+    seen = set()
+    for _, report in reports:
+        for stage in report.get("stages", []):
+            name = stage.get("name")
+            if name not in seen:
+                names.append(name)
+                seen.add(name)
 
-    headers = [
-        "stage",
-        f"e4 ({UNIT_MS})",
-        f"pg ({UNIT_MS})",
-        "ratio (e4/pg)",
-    ]
+    headers = ["stage"]
+    for label, _ in reports:
+        headers.append(f"{label} ({UNIT_MS})")
+    headers.append("ratio (e4/pg)")
     rows = []
     for name in names:
-        e4_entry = e4_idx.get(name)
-        pg_entry = pg_idx.get(name)
+        entries = [idx.get(name) for _, idx in indexed]
         if name == "disk_bytes":
-            e4_v = e4_entry.get("bytes") if e4_entry else None
-            pg_v = pg_entry.get("bytes") if pg_entry else None
-            e4_mib = (e4_v / BYTES_PER_MIB) if e4_v is not None else None
-            pg_mib = (pg_v / BYTES_PER_MIB) if pg_v is not None else None
-            rows.append(
-                [
-                    f"{name} ({UNIT_MIB})",
-                    fmt_num(e4_mib) if e4_mib is not None else "n/a",
-                    fmt_num(pg_mib) if pg_mib is not None else "n/a",
-                    fmt_ratio(e4_mib, pg_mib),
-                ]
-            )
-            continue
-        e4_v = e4_entry.get("ms") if e4_entry else None
-        pg_v = pg_entry.get("ms") if pg_entry else None
-        rows.append(
-            [
-                name,
-                fmt_num(e4_v) if e4_v is not None else "n/a",
-                fmt_num(pg_v) if pg_v is not None else "n/a",
-                fmt_ratio(e4_v, pg_v),
+            values = [
+                (e.get("bytes") / BYTES_PER_MIB) if e and e.get("bytes") is not None else None
+                for e in entries
             ]
-        )
+            row = [f"{name} ({UNIT_MIB})"]
+        else:
+            values = [e.get("ms") if e else None for e in entries]
+            row = [name]
+        for value in values:
+            row.append(fmt_num(value) if value is not None else "n/a")
+        row.append(fmt_ratio(values[0], values[1]))
+        rows.append(row)
     return headers, rows
 
 
-def case_result(kind, e4_case, pg_case):
+def case_result(kind, cases):
+    """`cases` is a list of (label, case-or-None), the first two being e4 and
+    pg. A filter case agrees only when every arm that ran it returned the same
+    row count."""
+    e4_case = cases[0][1]
+    pg_case = cases[1][1]
     if kind == "filter":
-        e4_rows = e4_case.get("total_rows") if e4_case else None
-        pg_rows = pg_case.get("total_rows") if pg_case else None
-        if e4_rows is None or pg_rows is None:
+        counts = [(label, (c or {}).get("total_rows")) for label, c in cases]
+        if any(v is None for _, v in counts):
             return "n/a", None
-        if e4_rows == pg_rows:
+        values = {v for _, v in counts}
+        if len(values) == 1:
             return "AGREE", True
-        return "DISAGREE", False
+        return (
+            "DISAGREE (" + ", ".join(f"{label}={v}" for label, v in counts) + ")",
+            False,
+        )
 
     if kind == "ranked":
-        e4_keys = (e4_case or {}).get("first_keys") or []
-        pg_keys = (pg_case or {}).get("first_keys") or []
+        e4_keys = set((e4_case or {}).get("first_keys") or [])
+        pg_keys = set((pg_case or {}).get("first_keys") or [])
         k = (e4_case or {}).get("k") or (pg_case or {}).get("k") or 10
-        overlap = len(set(e4_keys) & set(pg_keys))
-        return f"overlap {overlap}/{k}", None
+        text = f"e4/pg overlap {len(e4_keys & pg_keys)}/{k}"
+        for label, c in cases[2:]:
+            keys = set((c or {}).get("first_keys") or [])
+            text += f"; {label} vs e4 {len(keys & e4_keys)}/{max(len(e4_keys), 1)}"
+        return text, None
 
     if kind == "approx":
-        e4_recall = (e4_case or {}).get("recall_at_k")
-        pg_recall = (pg_case or {}).get("recall_at_k")
-        e4_txt = fmt_num(e4_recall) if e4_recall is not None else "n/a"
-        pg_txt = fmt_num(pg_recall) if pg_recall is not None else "n/a"
-        return f"recall e4={e4_txt} pg={pg_txt}", None
+        parts = []
+        for label, c in cases:
+            recall = (c or {}).get("recall_at_k")
+            parts.append(f"{label}={fmt_num(recall) if recall is not None else 'n/a'}")
+        return "recall " + " ".join(parts), None
 
     return "n/a", None
 
 
-def build_cases_table(e4_report, pg_report):
-    e4_cases = e4_report.get("cases", [])
-    pg_cases = pg_report.get("cases", [])
-    e4_idx = index_by_name(e4_cases)
-    pg_idx = index_by_name(pg_cases)
-    names = ordered_union_names(e4_cases, pg_cases)
+def build_cases_table(reports):
+    """`reports` is a list of (label, report); the first two are e4 and pg."""
+    indexed = [(label, index_by_name(report.get("cases", []))) for label, report in reports]
+    names = []
+    seen = set()
+    for _, report in reports:
+        for name in ordered_union_names(report.get("cases", []), []):
+            if name not in seen:
+                names.append(name)
+                seen.add(name)
 
-    headers = [
-        "case",
-        "kind",
-        f"e4 median ({UNIT_US})",
-        f"pg median ({UNIT_US})",
-        "ratio (e4/pg)",
-        "e4 rows",
-        "pg rows",
-        "result",
-    ]
+    headers = ["case", "kind"]
+    for label, _ in reports:
+        headers.append(f"{label} median ({UNIT_US})")
+    headers.append("ratio (e4/pg)")
+    if len(reports) > 2:
+        headers.append(f"ratio ({reports[2][0]} run/e4)")
+        headers.append(f"{reports[2][0]} prepare (us)")
+    for label, _ in reports:
+        headers.append(f"{label} rows")
+    headers.append("result")
+
     rows = []
     filter_total = 0
     filter_agree = 0
@@ -215,62 +227,50 @@ def build_cases_table(e4_report, pg_report):
     disagreements = []
 
     for name in names:
-        e4_case = e4_idx.get(name)
-        pg_case = pg_idx.get(name)
-        kind = (e4_case or pg_case or {}).get("kind", "?")
-
-        e4_median = (e4_case or {}).get("median_us")
-        pg_median = (pg_case or {}).get("median_us")
-        e4_rows = (e4_case or {}).get("total_rows")
-        pg_rows = (pg_case or {}).get("total_rows")
+        cases = [(label, idx.get(name)) for label, idx in indexed]
+        kind = next((c.get("kind") for _, c in cases if c), "?")
+        medians = [(c or {}).get("median_us") for _, c in cases]
+        counts = [(c or {}).get("total_rows") for _, c in cases]
 
         if kind == "filter":
             filter_total += 1
 
-        if e4_median is None or pg_median is None:
-            note = (e4_case or {}).get("note") or (pg_case or {}).get("note") or ""
-            median_cell = f"n/a: {note}" if note else "n/a"
-            rows.append(
-                [
-                    name,
-                    kind,
-                    median_cell,
-                    median_cell,
-                    "n/a",
-                    e4_rows if e4_rows is not None else "n/a",
-                    pg_rows if pg_rows is not None else "n/a",
-                    case_result(kind, e4_case, pg_case)[0],
-                ]
-            )
-            result_text, agree = case_result(kind, e4_case, pg_case)
-            if kind == "filter" and agree is True:
-                filter_agree += 1
-            if kind == "filter" and agree is False:
-                disagreements.append(name)
-            continue
-
-        timed_total += 1
-        if e4_median < pg_median:
-            e4_faster += 1
-
-        result_text, agree = case_result(kind, e4_case, pg_case)
+        result_text, agree = case_result(kind, cases)
         if kind == "filter" and agree is True:
             filter_agree += 1
         if kind == "filter" and agree is False:
             disagreements.append(name)
 
-        rows.append(
-            [
-                name,
-                kind,
-                fmt_num(e4_median),
-                fmt_num(pg_median),
-                fmt_ratio(e4_median, pg_median),
-                e4_rows if e4_rows is not None else "n/a",
-                pg_rows if pg_rows is not None else "n/a",
-                result_text,
-            ]
-        )
+        if medians[0] is not None and medians[1] is not None:
+            timed_total += 1
+            if medians[0] < medians[1]:
+                e4_faster += 1
+
+        row = [name, kind]
+        for (label, case), value in zip(cases, medians):
+            if value is not None:
+                row.append(fmt_num(value))
+            else:
+                # A null median is a named deviation, never a blank: print
+                # the arm's note beside the n/a so the table says WHY.
+                note = ((case or {}).get("note") or "").strip()
+                row.append(f"n/a: {note}" if note else "n/a")
+        row.append(fmt_ratio(medians[0], medians[1]))
+        if len(reports) > 2:
+            # The third arm's RUN median (wall minus its own prepare) against
+            # the first arm's median: the engine cost on the same footing.
+            # Falls back to the wall median when the report predates the field.
+            third = cases[2][1] or {}
+            run_median = third.get("run_median_us")
+            if run_median is None:
+                run_median = medians[2]
+            row.append(fmt_ratio(run_median, medians[0]))
+            prepare = third.get("prepare_median_us")
+            row.append(fmt_num(prepare, 1) if prepare is not None else "n/a")
+        for value in counts:
+            row.append(value if value is not None else "n/a")
+        row.append(result_text)
+        rows.append(row)
 
     stats = {
         "filter_total": filter_total,
@@ -323,12 +323,13 @@ def cheapest_at_recall(points, threshold=HEADLINE_RECALL):
     return label, median_us, recall, False
 
 
-def print_sweep_table(base, e4_report, pg_report, md):
-    e4_points = sweep_points(e4_report.get("cases", []), base)
-    pg_points = sweep_points(pg_report.get("cases", []), base)
+def print_sweep_table(base, reports, md):
+    per_arm = [(label, sweep_points(report.get("cases", []), base)) for label, report in reports]
+    e4_points = per_arm[0][1]
+    pg_points = per_arm[1][1]
     headers = ["arm", "point", "recall", f"median ({UNIT_US})", f"p90 ({UNIT_US})"]
     rows = []
-    for arm_label, points in (("e4", e4_points), ("pg", pg_points)):
+    for arm_label, points in per_arm:
         for label, recall, median_us, p90_us in points:
             rows.append(
                 [
@@ -405,39 +406,53 @@ def main():
     parser.add_argument("e4_report", help="path to the e4 arm's JSON report")
     parser.add_argument("pg_report", help="path to the postgres arm's JSON report")
     parser.add_argument(
+        "sql_report",
+        nargs="?",
+        help="optional path to the e4-sql arm's JSON report",
+    )
+    parser.add_argument(
         "--md", action="store_true", help="print GitHub markdown tables"
     )
     args = parser.parse_args()
 
     e4_report = load_report(args.e4_report)
     pg_report = load_report(args.pg_report)
+    reports = [("e4", e4_report), ("pg", pg_report)]
+    if args.sql_report:
+        sql_report = load_report(args.sql_report)
+        if sql_report.get("arm") != "e4-sql":
+            print(
+                f"warning: {args.sql_report} arm field is {sql_report.get('arm')!r}, expected 'e4-sql'",
+                file=sys.stderr,
+            )
+        reports.append(("e4-sql", sql_report))
 
     if e4_report.get("arm") != "e4":
         print(f"warning: {args.e4_report} arm field is {e4_report.get('arm')!r}, expected 'e4'", file=sys.stderr)
     if pg_report.get("arm") != "postgres":
         print(f"warning: {args.pg_report} arm field is {pg_report.get('arm')!r}, expected 'postgres'", file=sys.stderr)
 
-    print(f"rows: e4={e4_report.get('rows')} pg={pg_report.get('rows')}")
-    print(f"commit: e4={e4_report.get('commit')} pg={pg_report.get('commit')}")
+    print("rows: " + " ".join(f"{label}={r.get('rows')}" for label, r in reports))
+    print("commit: " + " ".join(f"{label}={r.get('commit')}" for label, r in reports))
     print()
 
     print("STAGES")
-    s_headers, s_rows = build_stages_table(e4_report, pg_report)
+    s_headers, s_rows = build_stages_table(reports)
     print_table(s_headers, s_rows, args.md)
     print()
 
     print("CASES")
-    c_headers, c_rows, stats = build_cases_table(e4_report, pg_report)
+    c_headers, c_rows, stats = build_cases_table(reports)
     print_table(c_headers, c_rows, args.md)
     print()
 
     for base in APPROX_BASES:
-        e4_points, pg_points = print_sweep_table(base, e4_report, pg_report, args.md)
+        e4_points, pg_points = print_sweep_table(base, reports, args.md)
         sweep_headline(base, e4_points, pg_points)
 
     print("DEVIATIONS")
-    print_deviations("e4", e4_report)
-    print_deviations("postgres", pg_report)
+    for label, report in reports:
+        print_deviations(label, report)
     print()
 
     filter_total = stats["filter_total"]
@@ -446,7 +461,10 @@ def main():
     e4_faster = stats["e4_faster"]
 
     print(
-        f"VERDICT: filter cases agreeing {filter_agree}/{filter_total}; "
+        "VERDICT: filter cases agreeing "
+        + (f"across {len(reports)} arm(s) " if len(reports) > 2 else "")
+        + 
+        f"{filter_agree}/{filter_total}; "
         f"E4 faster in {e4_faster}/{timed_total} cases with both medians present ({UNIT_US})."
     )
 

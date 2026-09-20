@@ -605,3 +605,70 @@ fn invalid_query(message: impl fmt::Display) -> QueryError {
 fn corrupt_query(message: impl fmt::Display) -> QueryError {
     QueryError::Database(corrupt(message))
 }
+
+// ── the plan, as a caller can read it ─────────────────────────────────────
+//
+// `EXPLAIN` in `crate::sql` has to say the same thing the planner decided,
+// not a second opinion about it. These types are that answer, read off the
+// compiled plan itself; the SQL layer formats them and adds nothing.
+
+/// How one filter position is answered for a candidate that reaches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterAnswer {
+    /// The driving walk's own postings prove the predicate; nothing else is
+    /// read for this position.
+    Driver,
+    /// A membership set built once from postings answers it by lookup.
+    MembershipSet,
+    /// Eligible for a membership set, but no page has walked it yet.
+    MembershipUnbuilt,
+    /// The membership walk exceeded its budget, so every candidate falls back
+    /// to the row path (`MembershipSet::Overflow`).
+    MembershipOverflow,
+    /// Answered from index postings per candidate, without the row.
+    IndexPosting,
+    /// Answered from a key the candidate already carries.
+    CarriedKey,
+    /// The primary row is read and the predicate refined against it.
+    Row,
+    /// The conjunction was folded into another position, which answers both.
+    Folded(usize),
+    /// Answered from the traversal frontier this query already materialised.
+    GraphFrontier,
+}
+
+/// One filter position, as the plan answers it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterPlan {
+    pub position: usize,
+    /// `scalar`, `point`, `geometry`, `text`, `json`, `graph` or `key`.
+    pub family: &'static str,
+    /// The index name, for the families that name one.
+    pub index: Option<String>,
+    pub field: Option<String>,
+    /// The predicate, spelled the way the compiled form holds it.
+    pub detail: String,
+    pub answer: FilterAnswer,
+}
+
+/// The compiled plan of a prepared query, in the words the planner used.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryPlanDescription {
+    pub driver: QueryDriver,
+    /// What the driver walks: the index and the range, spelled out.
+    pub driver_detail: String,
+    /// True when the driver is a scan by definition rather than a walk over a
+    /// bounded candidate set (`docs/QL_CONTRACT.md` §6).
+    pub driver_is_a_scan: bool,
+    pub filters: Vec<FilterPlan>,
+    /// `entity_id`, `scalar`, `distance`, `bm25`, `exact_vector`,
+    /// `approximate_vector`, `driver` or `score`.
+    pub order_kind: &'static str,
+    pub order_detail: String,
+    /// True when the ranking, not a filter, has to read the row.
+    pub order_reads_row: bool,
+    /// One entry per leaf of a `QueryOrder::Score` expression, in tree order.
+    pub score_leaves: Vec<String>,
+    pub projection: Vec<String>,
+    pub total_limit: Option<usize>,
+}

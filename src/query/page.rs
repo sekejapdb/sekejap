@@ -1359,3 +1359,393 @@ impl PreparedQuery<'_> {
         }
     }
 }
+
+// ── the plan, read back ───────────────────────────────────────────────────
+
+fn bound_text(bound: &EncodedBound) -> String {
+    match bound {
+        EncodedBound::Included(bytes) => format!("[{}", bytes.len()),
+        EncodedBound::Excluded(bytes) => format!("({}", bytes.len()),
+        EncodedBound::Unbounded => "unbounded".to_owned(),
+    }
+}
+
+fn scalar_predicate_text(predicate: &EncodedScalarFilter) -> String {
+    match predicate {
+        EncodedScalarFilter::Empty => "empty range".to_owned(),
+        EncodedScalarFilter::Eq(_) => "= one encoded value".to_owned(),
+        EncodedScalarFilter::Range { lower, upper } => format!(
+            "range lower {} bytes, upper {} bytes",
+            bound_text(lower),
+            bound_text(upper)
+        ),
+        EncodedScalarFilter::IsNull => "IS NULL".to_owned(),
+        EncodedScalarFilter::IsMissing => "IS MISSING".to_owned(),
+    }
+}
+
+fn point_predicate_text(predicate: &PointFilter) -> String {
+    match predicate {
+        PointFilter::Bbox(bounds) => format!(
+            "bbox {:.6},{:.6} .. {:.6},{:.6}",
+            bounds.west(),
+            bounds.south(),
+            bounds.east(),
+            bounds.north()
+        ),
+        PointFilter::Radius {
+            center,
+            radius_metres,
+        } => format!(
+            "radius {radius_metres:.1} m of {:.6},{:.6}",
+            center.longitude(),
+            center.latitude()
+        ),
+    }
+}
+
+fn geometry_predicate_text(predicate: &GeometryFilter) -> String {
+    match predicate {
+        GeometryFilter::Intersects(_) => "ST_Intersects (spheroidal)".to_owned(),
+        GeometryFilter::Within(_) => "ST_Within (planar)".to_owned(),
+        GeometryFilter::Contains(_) => "ST_Contains (planar)".to_owned(),
+        GeometryFilter::DWithin { metres, .. } => {
+            format!("ST_DWithin {metres:.1} m (spheroidal)")
+        }
+    }
+}
+
+fn text_predicate_text(prepared: &PreparedText) -> String {
+    let matching = match prepared.matching {
+        TextMatch::Any => "any",
+        TextMatch::All => "all",
+        TextMatch::Phrase => "phrase",
+    };
+    format!("{matching} of {} term(s)", prepared.terms.len())
+}
+
+fn score_leaves(expr: &CompiledScoreExpr, out: &mut Vec<String>) {
+    match expr {
+        CompiledScoreExpr::Lit(value) => out.push(format!("literal {value}")),
+        CompiledScoreExpr::Scalar { info } => {
+            out.push(format!("scalar {} ({})", info.name, info.field));
+        }
+        CompiledScoreExpr::Bm25(prepared) => out.push(format!(
+            "bm25 {} ({})",
+            prepared.info.name,
+            text_predicate_text(prepared)
+        )),
+        CompiledScoreExpr::VectorSimilarity { info, metric, .. } => {
+            out.push(format!("vector_similarity {} ({metric:?})", info.name));
+        }
+        CompiledScoreExpr::Distance { info, center } => out.push(format!(
+            "distance {} from {:.6},{:.6}",
+            info.name,
+            center.longitude(),
+            center.latitude()
+        )),
+        CompiledScoreExpr::Add(a, b)
+        | CompiledScoreExpr::Sub(a, b)
+        | CompiledScoreExpr::Mul(a, b)
+        | CompiledScoreExpr::Div(a, b) => {
+            score_leaves(a, out);
+            score_leaves(b, out);
+        }
+        CompiledScoreExpr::Neg(a) => score_leaves(a, out),
+    }
+}
+
+impl PreparedQuery<'_> {
+    /// The position the driving walk's own postings certify, if any. A
+    /// geometry cover admits a candidate without proving the predicate, and a
+    /// phrase posting establishes candidacy only, so neither certifies.
+    fn driver_certifies(&self) -> Option<usize> {
+        match &self.driver {
+            DriverPlan::Entities | DriverPlan::ExactVector { .. } => None,
+            DriverPlan::QuantizedVector { .. } | DriverPlan::Geometry { .. } => None,
+            DriverPlan::Scalar { position, .. } => *position,
+            DriverPlan::Graph { position } => Some(*position),
+            DriverPlan::Spatial { position, .. } => Some(*position),
+            DriverPlan::Nearest { certifies, .. } => *certifies,
+            DriverPlan::Text { prepared, position } => {
+                position.filter(|_| prepared.matching != TextMatch::Phrase)
+            }
+            DriverPlan::Keys { position, .. } => *position,
+        }
+    }
+
+    fn driver_detail(&self) -> String {
+        match &self.driver {
+            DriverPlan::Entities => "primary tree, every row of the collection".to_owned(),
+            DriverPlan::Scalar {
+                info, predicate, ..
+            } => format!(
+                "scalar index {} ({}), {}",
+                info.name,
+                info.field,
+                scalar_predicate_text(predicate)
+            ),
+            DriverPlan::Graph { position } => {
+                format!("bounded traversal of filter {position}")
+            }
+            DriverPlan::Spatial {
+                info,
+                predicate,
+                ranges,
+                fallback_world,
+                ..
+            } => format!(
+                "point index {} ({}), {}, {} Hilbert range(s){}",
+                info.name,
+                info.field,
+                point_predicate_text(predicate),
+                ranges.len(),
+                if *fallback_world {
+                    ", world fallback"
+                } else {
+                    ""
+                }
+            ),
+            DriverPlan::Nearest { info, center, .. } => format!(
+                "point index {} ({}), outward ring walk from {:.6},{:.6}",
+                info.name,
+                info.field,
+                center.longitude(),
+                center.latitude()
+            ),
+            DriverPlan::Geometry {
+                info,
+                ranges,
+                fallback_world,
+                ..
+            } => format!(
+                "geometry index {} ({}), {} cell range(s){}, box admits then the row refines",
+                info.name,
+                info.field,
+                ranges.len(),
+                if *fallback_world {
+                    ", world fallback"
+                } else {
+                    ""
+                }
+            ),
+            DriverPlan::Text { prepared, .. } => format!(
+                "text index {} ({}), merge of {} term stream(s), {}",
+                prepared.info.name,
+                prepared.info.field,
+                prepared.terms.len(),
+                text_predicate_text(prepared)
+            ),
+            DriverPlan::ExactVector { info } => format!(
+                "exact vector index {} ({}), page-order sidecar scan",
+                info.name, info.field
+            ),
+            DriverPlan::QuantizedVector { info } => format!(
+                "quantized vector index {} ({}), compact scan then f32 rerank",
+                info.name, info.field
+            ),
+            DriverPlan::Keys { predicate, .. } => format!(
+                "external-key mapping keyspace, {}",
+                scalar_predicate_text(predicate)
+            ),
+        }
+    }
+
+    /// Whether the driving walk is a scan by definition, which
+    /// `docs/QL_CONTRACT.md` §6 asks `EXPLAIN` to label as one.
+    fn driver_is_a_scan(&self) -> bool {
+        matches!(
+            self.driver,
+            DriverPlan::Entities
+                | DriverPlan::ExactVector { .. }
+                | DriverPlan::QuantizedVector { .. }
+        )
+    }
+
+    fn filter_answer(&self, position: usize) -> FilterAnswer {
+        if let CompiledFilter::Folded { into } = self.filters[position] {
+            return FilterAnswer::Folded(into);
+        }
+        if self.driver_certifies() == Some(position) {
+            return FilterAnswer::Driver;
+        }
+        match &self.membership[position] {
+            MembershipSet::Ids(_) | MembershipSet::Bitmap(_) => {
+                return FilterAnswer::MembershipSet
+            }
+            MembershipSet::Unbuilt => return FilterAnswer::MembershipUnbuilt,
+            MembershipSet::Overflow => return FilterAnswer::MembershipOverflow,
+            MembershipSet::Ineligible => {}
+        }
+        match &self.filters[position] {
+            CompiledFilter::Scalar {
+                predicate,
+                posting_membership,
+                ..
+            } => {
+                if *posting_membership
+                    && matches!(predicate, EncodedScalarFilter::Eq(_))
+                    && !self.cursor_needs().row
+                {
+                    FilterAnswer::IndexPosting
+                } else {
+                    FilterAnswer::Row
+                }
+            }
+            CompiledFilter::Point { info, .. } => {
+                // A point posting the driver already carried answers it
+                // without the row; anything else reads the row.
+                match &self.driver {
+                    DriverPlan::Spatial { info: driving, .. }
+                    | DriverPlan::Nearest { info: driving, .. }
+                        if driving.id == info.id =>
+                    {
+                        FilterAnswer::CarriedKey
+                    }
+                    _ => FilterAnswer::Row,
+                }
+            }
+            CompiledFilter::Geometry { .. } => FilterAnswer::Row,
+            CompiledFilter::Text(prepared) => {
+                if prepared.phrase.is_none() {
+                    FilterAnswer::IndexPosting
+                } else {
+                    FilterAnswer::Row
+                }
+            }
+            CompiledFilter::Graph { .. } => FilterAnswer::GraphFrontier,
+            CompiledFilter::JsonEq { .. } => FilterAnswer::Row,
+            CompiledFilter::Key { .. } => FilterAnswer::Driver,
+            CompiledFilter::Folded { into } => FilterAnswer::Folded(*into),
+        }
+    }
+
+    /// The compiled plan, in the planner's own terms. Call it after a page to
+    /// see the membership sets that page built; call it before, and eligible
+    /// positions read `MembershipUnbuilt`.
+    pub fn describe(&self) -> QueryPlanDescription {
+        let filters = (0..self.filters.len())
+            .map(|position| {
+                let (family, index, field, detail) = match &self.filters[position] {
+                    CompiledFilter::Scalar {
+                        info, predicate, ..
+                    } => (
+                        "scalar",
+                        Some(info.name.clone()),
+                        Some(info.field.clone()),
+                        scalar_predicate_text(predicate),
+                    ),
+                    CompiledFilter::Folded { into } => (
+                        "scalar",
+                        None,
+                        None,
+                        format!("folded into position {into}"),
+                    ),
+                    CompiledFilter::JsonEq { field, .. } => (
+                        "json",
+                        None,
+                        Some(field.clone()),
+                        "structural JSON equality".to_owned(),
+                    ),
+                    CompiledFilter::Graph { request, .. } => (
+                        "graph",
+                        None,
+                        None,
+                        format!(
+                            "traversal depth {}..{} from sequence {}",
+                            request.min_depth, request.max_depth, request.seed.sequence
+                        ),
+                    ),
+                    CompiledFilter::Point { info, predicate } => (
+                        "point",
+                        Some(info.name.clone()),
+                        Some(info.field.clone()),
+                        point_predicate_text(predicate),
+                    ),
+                    CompiledFilter::Geometry { info, predicate } => (
+                        "geometry",
+                        Some(info.name.clone()),
+                        Some(info.field.clone()),
+                        geometry_predicate_text(predicate),
+                    ),
+                    CompiledFilter::Text(prepared) => (
+                        "text",
+                        Some(prepared.info.name.clone()),
+                        Some(prepared.info.field.clone()),
+                        text_predicate_text(prepared),
+                    ),
+                    CompiledFilter::Key { predicate } => (
+                        "key",
+                        None,
+                        None,
+                        scalar_predicate_text(predicate),
+                    ),
+                };
+                FilterPlan {
+                    position,
+                    family,
+                    index,
+                    field,
+                    detail,
+                    answer: self.filter_answer(position),
+                }
+            })
+            .collect();
+        let (order_kind, order_detail) = match &self.order {
+            CompiledOrder::EntityId => ("entity_id", "ascending entity id".to_owned()),
+            CompiledOrder::Scalar { info, direction } => (
+                "scalar",
+                format!("{} ({}) {direction:?}", info.name, info.field),
+            ),
+            CompiledOrder::ExactVector { info, metric, .. } => (
+                "exact_vector",
+                format!("{} ({}) {metric:?}", info.name, info.field),
+            ),
+            CompiledOrder::ApproximateVector {
+                info, metric, ef, ..
+            } => (
+                "approximate_vector",
+                format!("{} ({}) {metric:?}, ef={ef}", info.name, info.field),
+            ),
+            CompiledOrder::Bm25(prepared) => (
+                "bm25",
+                format!(
+                    "{} ({}), {}",
+                    prepared.info.name,
+                    prepared.info.field,
+                    text_predicate_text(prepared)
+                ),
+            ),
+            CompiledOrder::Driver(key) => ("driver", format!("driver walk key {key:?}")),
+            CompiledOrder::Distance { info, center } => (
+                "distance",
+                format!(
+                    "{} ({}) ascending from {:.6},{:.6}",
+                    info.name,
+                    info.field,
+                    center.longitude(),
+                    center.latitude()
+                ),
+            ),
+            CompiledOrder::Score { direction, .. } => {
+                ("score", format!("arithmetic expression {direction:?}"))
+            }
+        };
+        let mut leaves = Vec::new();
+        if let CompiledOrder::Score { expr, .. } = &self.order {
+            score_leaves(expr, &mut leaves);
+        }
+        QueryPlanDescription {
+            driver: self.driver.diagnostic(),
+            driver_detail: self.driver_detail(),
+            driver_is_a_scan: self.driver_is_a_scan(),
+            filters,
+            order_kind,
+            order_detail,
+            order_reads_row: self.order_needs_the_row(),
+            score_leaves: leaves,
+            projection: self.projection.clone(),
+            total_limit: self.total_limit,
+        }
+    }
+}

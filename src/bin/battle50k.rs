@@ -207,6 +207,7 @@ use e4_prototype::{
         ScalarValue, ScoreExpr, SortDirection, TextMatch, VectorMetric,
     },
     spatial_math::{Bounds, Point},
+    sql::{prepare_sql, Param, SqlError},
     Kind,
 };
 use kernel::{
@@ -659,6 +660,12 @@ fn parse_approx_sweep(name: &str) -> Option<ApproxSweepPoint> {
 pub struct Answer {
     pub rows: u64,
     pub keys: Vec<String>,
+    /// Microseconds this answer spent OUTSIDE the engine before its query ran
+    /// -- the `e4-sql` arm's parse and compile. Zero for every other arm.
+    /// `measure` subtracts it per instance so the arm's run cost is compared
+    /// to the `e4` arm's on the same footing, instance by instance, instead
+    /// of as a difference of two medians over a skewed spread.
+    pub prepare_us: f64,
 }
 
 /// While set, a case keeps EVERY key it returned instead of only the first
@@ -716,6 +723,11 @@ fn dump_case(dir: &Path, case: &str, mut run: impl FnMut(usize) -> R<Answer>) ->
 pub struct CaseResult {
     pub median_us: f64,
     pub p90_us: f64,
+    /// Median over instances of (wall - prepare): the engine's own cost. Equal
+    /// to `median_us` for arms that prepare nothing.
+    pub run_median_us: f64,
+    /// Median over instances of the prepare cost; 0 for arms that prepare nothing.
+    pub prepare_median_us: f64,
     pub total_rows: u64,
     pub first_keys: Vec<String>,
 }
@@ -734,12 +746,17 @@ fn measure(mut run: impl FnMut(usize) -> R<Answer>) -> R<CaseResult> {
         run(i)?;
     }
     let mut micros = Vec::with_capacity(INSTANCES);
+    let mut run_micros = Vec::with_capacity(INSTANCES);
+    let mut prepare_micros = Vec::with_capacity(INSTANCES);
     let mut total_rows = 0u64;
     let mut first_keys = Vec::new();
     for i in 0..INSTANCES {
         let at = Instant::now();
         let answer = run(i)?;
-        micros.push(at.elapsed().as_secs_f64() * 1e6);
+        let wall = at.elapsed().as_secs_f64() * 1e6;
+        micros.push(wall);
+        run_micros.push((wall - answer.prepare_us).max(0.0));
+        prepare_micros.push(answer.prepare_us);
         total_rows += answer.rows;
         if i == 0 {
             first_keys = answer.keys.clone();
@@ -747,9 +764,13 @@ fn measure(mut run: impl FnMut(usize) -> R<Answer>) -> R<CaseResult> {
     }
     let mut sorted = micros;
     sorted.sort_by(f64::total_cmp);
+    run_micros.sort_by(f64::total_cmp);
+    prepare_micros.sort_by(f64::total_cmp);
     Ok(CaseResult {
         median_us: percentile(&sorted, 0.5),
         p90_us: percentile(&sorted, 0.9),
+        run_median_us: percentile(&run_micros, 0.5),
+        prepare_median_us: percentile(&prepare_micros, 0.5),
         total_rows,
         first_keys,
     })
@@ -1416,25 +1437,149 @@ fn pg_exact_setup() -> Vec<String> {
     ]
 }
 
+
+// ── the statement fragments both SQL arms share ───────────────────────────
+
+/// How a value reaches a statement: INLINED as a literal, which is how the
+/// Postgres arm builds its SQL text, or BOUND as `$n`, which is how the
+/// `e4-sql` arm hands values to `Database::sql`. Every clause below is
+/// written once against this trait, so the two arms cannot drift into asking
+/// different questions -- the whole point of a three-arm comparison.
+trait Values {
+    fn number(&mut self, value: f64) -> String;
+    fn int(&mut self, value: i64) -> String;
+    fn text(&mut self, value: &str) -> String;
+    /// A 32-dimensional query vector, as pgvector's text form or as a bound
+    /// `Param::Vector`.
+    fn vector(&mut self, literal: &str, value: &[f32]) -> String;
+}
+
+/// The Postgres spelling: the value itself, escaped. `{:?}` on an `f64` is
+/// Rust's shortest round-tripping form, which is what this file has always
+/// written into these statements.
+struct Inline;
+
+impl Values for Inline {
+    fn number(&mut self, value: f64) -> String {
+        format!("{value:?}")
+    }
+    fn int(&mut self, value: i64) -> String {
+        value.to_string()
+    }
+    fn text(&mut self, value: &str) -> String {
+        quoted(value)
+    }
+    fn vector(&mut self, literal: &str, _value: &[f32]) -> String {
+        quoted(literal)
+    }
+}
+
+/// The `e4-sql` spelling: a placeholder, and the value on the side. Named
+/// `Binder` because `std::ops::Bound` is already in scope here.
+#[derive(Default)]
+struct Binder {
+    params: Vec<Param>,
+}
+
+impl Binder {
+    fn mark(&mut self) -> String {
+        format!("${}", self.params.len())
+    }
+}
+
+impl Values for Binder {
+    fn number(&mut self, value: f64) -> String {
+        self.params.push(Param::Float(value));
+        self.mark()
+    }
+    fn int(&mut self, value: i64) -> String {
+        self.params.push(Param::Int(value));
+        self.mark()
+    }
+    fn text(&mut self, value: &str) -> String {
+        self.params.push(Param::Text(value.to_owned()));
+        self.mark()
+    }
+    fn vector(&mut self, _literal: &str, value: &[f32]) -> String {
+        self.params.push(Param::Vector(value.to_vec()));
+        self.mark()
+    }
+}
+
+/// `ST_SetSRID(ST_MakePoint(lon, lat), 4326)`, optionally cast to geography.
+fn sql_point(v: &mut dyn Values, lon: f64, lat: f64, geography: bool) -> String {
+    let lon = v.number(lon);
+    let lat = v.number(lat);
+    format!(
+        "ST_SetSRID(ST_MakePoint({lon},{lat}),4326){}",
+        if geography { "::geography" } else { "" }
+    )
+}
+
+/// `queries.json`'s box, which is `[minlon, maxlon, minlat, maxlat]`
+/// (deviation 3), as PostGIS's `(minlon, minlat, maxlon, maxlat)` envelope.
+fn sql_envelope(v: &mut dyn Values, b: [f64; 4]) -> String {
+    let minlon = v.number(b[0]);
+    let minlat = v.number(b[2]);
+    let maxlon = v.number(b[1]);
+    let maxlat = v.number(b[3]);
+    format!("ST_MakeEnvelope({minlon},{minlat},{maxlon},{maxlat},4326)")
+}
+
+fn sql_polygon(v: &mut dyn Values, json: &str) -> String {
+    let json = v.text(json);
+    format!("ST_SetSRID(ST_GeomFromGeoJSON({json}),4326)")
+}
+
+/// `ST_DWithin(loc, <centre>, <metres>, true)` -- spheroidal, which is what
+/// `PointFilter::Radius` and `GeometryFilter::DWithin` are (deviation 9).
+fn sql_dwithin(v: &mut dyn Values, column: &str, centre: String, metres: f64) -> String {
+    let metres = v.number(metres);
+    format!("ST_DWithin({column}, {centre}, {metres}, true)")
+}
+
+fn sql_born(v: &mut dyn Values, lower: i64, upper: i64) -> String {
+    let lower = v.int(lower);
+    let upper = v.int(upper);
+    format!("born BETWEEN {lower} AND {upper}")
+}
+
+fn sql_kind(v: &mut dyn Values, kind: &str) -> String {
+    let kind = v.text(kind);
+    format!("kind = {kind}")
+}
+
+/// `<tsvector expression> @@ to_tsquery('simple', <terms>)`. The tsvector
+/// expression differs per arm and only per arm: Postgres indexes
+/// `name || ' ' || descr`, E4 indexes the stored concatenation `text`,
+/// because a text index spans ONE declared field (deviation 1).
+fn sql_text_match(v: &mut dyn Values, tsvector: &str, terms: &str) -> String {
+    let terms = v.text(terms);
+    format!("{tsvector} @@ to_tsquery('simple', {terms})")
+}
+
+fn sql_vector(v: &mut dyn Values, literal: &str, value: &[f32]) -> String {
+    let vector = v.vector(literal, value);
+    format!("{vector}::vector")
+}
+
 /// One case, one query instance, as Postgres spells it: the `SET LOCAL`
 /// statements the case needs and the statement itself.
 fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String>, String)> {
+    let v = &mut Inline;
     let kind = quoted(&kinds[i % KINDS]);
     let point = q.points[i];
     let radius = q.radii[i];
     let b = q.boxes[i];
-    let envelope = format!("ST_MakeEnvelope({:?},{:?},{:?},{:?},4326)", b[0], b[2], b[1], b[3]);
-    let polygon = format!("ST_SetSRID(ST_GeomFromGeoJSON({}),4326)", quoted(&q.polygon_json[i]));
-    let radius_clause = format!(
-        "ST_DWithin(loc, {}, {:?}, true)",
-        pg_point(radius[0], radius[1]),
-        radius[2]
-    );
-    let text_clause = format!("{PG_TSVECTOR} @@ {}", pg_tsquery(&q.terms[i]));
+    let envelope = sql_envelope(v, b);
+    let polygon = sql_polygon(v, &q.polygon_json[i]);
+    let radius_centre = sql_point(v, radius[0], radius[1], true);
+    let radius_clause = sql_dwithin(v, "loc", radius_centre, radius[2]);
+    let text_clause = sql_text_match(v, PG_TSVECTOR, &q.terms[i]);
     let (born_lower, born_upper) = q.born_range(i);
-    let born_clause = format!("born BETWEEN {born_lower} AND {born_upper}");
-    let vector = format!("{}::vector", quoted(&q.vector_literals[i]));
-    let knn_point = pg_point(point[0], point[1]);
+    let born_clause = sql_born(v, born_lower, born_upper);
+    let vector = sql_vector(v, &q.vector_literals[i], &q.vectors[i]);
+    let knn_point = sql_point(v, point[0], point[1], true);
 
     let plain = |sql: String| -> R<(Vec<String>, String)> { Ok((Vec::new(), sql)) };
 
@@ -1562,6 +1707,256 @@ fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String
 
         other => Err(format!("battle50k: no Postgres spelling for case `{other}`").into()),
     }
+}
+
+// ── the e4-sql arm ────────────────────────────────────────────────────────
+//
+// The same twenty-two cases as the `e4` arm, asked in SQL. It reuses the E4
+// database, the E4 loader and the E4 key vector unchanged, and differs from
+// the `e4` arm in exactly one thing: the request is written as text and
+// parsed, instead of being built as a `QueryRequest` in Rust. That is what
+// makes the two arms' medians comparable -- their difference is the parser.
+
+/// The tsvector expression the E4 text index is built over: ONE declared
+/// field, the stored concatenation (deviation 1). Postgres's `PG_TSVECTOR`
+/// is the two-column expression its expression index is built over.
+const E4_TSVECTOR: &str = "to_tsvector('simple', text)";
+
+thread_local! {
+    /// The `ef_search` this arm last set on the session, so the `SET LOCAL`
+    /// is issued only when the value actually changes. Fifty instances of one
+    /// case therefore pay for it once, which keeps the timed pass measuring
+    /// the SELECT rather than a knob that did not move.
+    static E4SQL_EF: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear) the session's approximate shortlist bound. `SET LOCAL` is
+/// settled while the statement COMPILES, so preparing it is enough.
+fn e4sql_set_ef(ctx: &E4Ctx, want: Option<usize>) -> R<()> {
+    if E4SQL_EF.with(std::cell::Cell::get) == want {
+        return Ok(());
+    }
+    let statement = match want {
+        Some(ef) => format!("SET LOCAL ef_search = {ef}"),
+        None => "SET LOCAL ef_search = DEFAULT".to_owned(),
+    };
+    prepare_sql(&ctx.db, &statement, &[])?;
+    E4SQL_EF.with(|cell| cell.set(want));
+    Ok(())
+}
+
+/// One case, one query instance, as `e4-sql` spells it: the statement and the
+/// parameters it binds, plus the `ef` the session must be at.
+fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String, Vec<Param>, Option<usize>)> {
+    let mut bound = Binder::default();
+    let v = &mut bound;
+    let kind_value = kinds[i % KINDS].clone();
+    let point = q.points[i];
+    let radius = q.radii[i];
+    let b = q.boxes[i];
+    let (born_lower, born_upper) = q.born_range(i);
+
+    // Approximate sweep points: the same `ef` axis the `e4` arm sweeps, said
+    // in SQL as pgvector's own knob.
+    if let Some(sweep) = parse_approx_sweep(name) {
+        let ef = sweep
+            .ef
+            .ok_or_else(|| format!("battle50k: `{name}` has no ef=... suffix for the e4-sql arm"))?;
+        let vector = sql_vector(v, &q.vector_literals[i], &q.vectors[i]);
+        let sql = if sweep.by_kind {
+            let kind = sql_kind(v, &kind_value);
+            format!("SELECT _id FROM place WHERE {kind} ORDER BY emb <=> {vector} LIMIT {K}")
+        } else {
+            format!("SELECT _id FROM place ORDER BY emb <=> {vector} LIMIT {K}")
+        };
+        return Ok((sql, bound.params, Some(ef)));
+    }
+
+    let sql = match name {
+        // ── filters ─────────────────────────────────────────────────────
+        "pt_radius" => {
+            let centre = sql_point(v, radius[0], radius[1], true);
+            let clause = sql_dwithin(v, "loc", centre, radius[2]);
+            format!("SELECT _id FROM place WHERE {clause}")
+        }
+        // Postgres reaches a lon/lat rectangle through `&&` plus ST_X/ST_Y,
+        // both Tier 2 here; the Tier-1 spelling of the same rectangle is
+        // ST_Within against an envelope, which IS `PointFilter::Bbox`.
+        "pt_bbox" => {
+            let envelope = sql_envelope(v, b);
+            format!("SELECT _id FROM place WHERE ST_Within(loc::geometry, {envelope})")
+        }
+        "plot_within_box" => {
+            let envelope = sql_envelope(v, b);
+            format!("SELECT _id FROM place WHERE ST_Within(plot::geometry, {envelope})")
+        }
+        "plot_contains_pt" => {
+            let centre = sql_point(v, point[0], point[1], false);
+            format!("SELECT _id FROM place WHERE ST_Contains(plot::geometry, {centre})")
+        }
+        "plot_intersects" => {
+            let polygon = sql_polygon(v, &q.polygon_json[i]);
+            format!("SELECT _id FROM place WHERE ST_Intersects(plot, {polygon}::geography)")
+        }
+        "plot_dwithin_1km" => {
+            let centre = sql_point(v, point[0], point[1], true);
+            let clause = sql_dwithin(v, "plot", centre, 1_000.0);
+            format!("SELECT _id FROM place WHERE {clause}")
+        }
+        "plot_vs_poly_within" => {
+            let polygon = sql_polygon(v, &q.polygon_json[i]);
+            format!("SELECT _id FROM place WHERE ST_Within(plot::geometry, {polygon})")
+        }
+        "text_one" => {
+            let clause = sql_text_match(v, E4_TSVECTOR, &q.terms[i]);
+            format!("SELECT _id FROM place WHERE {clause}")
+        }
+        "text_two" => {
+            let pair = format!("{} & {}", q.terms[i], q.terms[(i + 1) % INSTANCES]);
+            let clause = sql_text_match(v, E4_TSVECTOR, &pair);
+            format!("SELECT _id FROM place WHERE {clause}")
+        }
+        "text_and_kind" => {
+            let text = sql_text_match(v, E4_TSVECTOR, &q.terms[i]);
+            let kind = sql_kind(v, &kind_value);
+            format!("SELECT _id FROM place WHERE {text} AND {kind}")
+        }
+        "born_range" => {
+            let born = sql_born(v, born_lower, born_upper);
+            format!("SELECT _id FROM place WHERE {born}")
+        }
+        "kind_eq" => {
+            let kind = sql_kind(v, &kind_value);
+            format!("SELECT _id FROM place WHERE {kind}")
+        }
+        "radius_and_born" => {
+            let centre = sql_point(v, radius[0], radius[1], true);
+            let clause = sql_dwithin(v, "loc", centre, radius[2]);
+            let born = sql_born(v, born_lower, born_upper);
+            format!("SELECT _id FROM place WHERE {clause} AND {born}")
+        }
+
+        // ── ranked ──────────────────────────────────────────────────────
+        "knn_10" => {
+            let centre = sql_point(v, point[0], point[1], true);
+            format!("SELECT _id FROM place ORDER BY loc <-> {centre} LIMIT {K}")
+        }
+        "knn_10_kind" => {
+            let kind = sql_kind(v, &kind_value);
+            let centre = sql_point(v, point[0], point[1], true);
+            format!("SELECT _id FROM place WHERE {kind} ORDER BY loc <-> {centre} LIMIT {K}")
+        }
+        "text_top10" => {
+            let clause = sql_text_match(v, E4_TSVECTOR, &q.terms[i]);
+            let rank = sql_text_match(v, E4_TSVECTOR, &q.terms[i]);
+            // `ts_rank_cd(tsvector, tsquery)` is the Bm25 order; the WHERE
+            // repeats the same match, exactly as the Postgres statement does.
+            let rank = rank.replace(" @@ ", ", ");
+            format!(
+                "SELECT _id FROM place WHERE {clause} ORDER BY ts_rank_cd({rank}) DESC LIMIT {K}"
+            )
+        }
+        // Exactness here is which vector index the column has, not a planner
+        // knob: with `ef_search` unset, the exact family answers.
+        "vec_exact_10" => {
+            let vector = sql_vector(v, &q.vector_literals[i], &q.vectors[i]);
+            format!("SELECT _id FROM place ORDER BY emb <=> {vector} LIMIT {K}")
+        }
+        "vec_exact_radius" => {
+            let centre = sql_point(v, radius[0], radius[1], true);
+            let clause = sql_dwithin(v, "loc", centre, radius[2]);
+            let vector = sql_vector(v, &q.vector_literals[i], &q.vectors[i]);
+            format!("SELECT _id FROM place WHERE {clause} ORDER BY emb <=> {vector} LIMIT {K}")
+        }
+        "hybrid_10" => {
+            let text = sql_text_match(v, E4_TSVECTOR, &q.terms[i]);
+            let centre = sql_point(v, radius[0], radius[1], true);
+            let clause = sql_dwithin(v, "loc", centre, radius[2]);
+            let vector = sql_vector(v, &q.vector_literals[i], &q.vectors[i]);
+            format!(
+                "SELECT _id FROM place WHERE {text} AND {clause} ORDER BY emb <=> {vector} LIMIT {K}"
+            )
+        }
+        // The blend Postgres writes with ts_rank_cd, written with bm25():
+        // `1 - (emb <=> v)` is the cosine itself, the same quantity the `e4`
+        // arm builds as `1 + VectorSimilarity`.
+        "hybrid_blend_10" => {
+            let text = sql_text_match(v, E4_TSVECTOR, &q.terms[i]);
+            let centre = sql_point(v, radius[0], radius[1], true);
+            let clause = sql_dwithin(v, "loc", centre, radius[2]);
+            let term = v.text(&q.terms[i]);
+            let vector = sql_vector(v, &q.vector_literals[i], &q.vectors[i]);
+            format!(
+                "SELECT _id FROM place WHERE {text} AND {clause} \
+                 ORDER BY 0.5 * bm25(text, {term}) + 0.5 * (1 - (emb <=> {vector})) DESC LIMIT {K}"
+            )
+        }
+        "vec_ann_10_kind:exact" => {
+            let kind = sql_kind(v, &kind_value);
+            let vector = sql_vector(v, &q.vector_literals[i], &q.vectors[i]);
+            format!("SELECT _id FROM place WHERE {kind} ORDER BY emb <=> {vector} LIMIT {K}")
+        }
+        other => return Err(format!("battle50k: no e4-sql spelling for case `{other}`").into()),
+    };
+    Ok((sql, bound.params, None))
+}
+
+/// Parse, compile and page one statement to exhaustion, translating every
+/// returned `EntityId` through the load-time key vector of deviation 2 --
+/// the identical translation the `e4` arm does.
+fn e4sql_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) -> R<Answer> {
+    let t0 = Instant::now();
+    let prepared = prepare_sql(&ctx.db, sql, params)?;
+    let mut answer = Answer {
+        prepare_us: t0.elapsed().as_secs_f64() * 1e6,
+        ..Answer::default()
+    };
+    prepared.with_query(&ctx.db, &mut |query| {
+        loop {
+            let page = query.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+            for row in &page.rows {
+                let ordinal = (row.id.sequence - 1) as usize;
+                let key = keys.get(ordinal).ok_or_else(|| {
+                    SqlError::Engine(
+                        "entity sequence falls outside the corpus's key vector".to_owned(),
+                    )
+                })?;
+                if dumping() || answer.keys.len() < FIRST_KEYS {
+                    answer.keys.push(key.clone());
+                }
+                answer.rows += 1;
+            }
+            if page.done || page.rows.is_empty() {
+                break;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(answer)
+}
+
+fn e4sql_answer(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R<Answer> {
+    let (sql, params, ef) = e4sql_case(q, &corpus.kinds, name, i)?;
+    e4sql_set_ef(ctx, ef)?;
+    e4sql_run(ctx, &corpus.keys, &sql, &params)
+}
+
+/// The median parse-and-compile cost of one case's statement, in
+/// microseconds, over all fifty instances. It is the ONLY cost the `e4-sql`
+/// arm has that the `e4` arm does not, so it is measured on its own rather
+/// than inferred from the difference of two medians.
+fn e4sql_parse_cost(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str) -> R<f64> {
+    let mut micros = Vec::with_capacity(INSTANCES);
+    for i in 0..INSTANCES {
+        let (sql, params, ef) = e4sql_case(q, &corpus.kinds, name, i)?;
+        e4sql_set_ef(ctx, ef)?;
+        let at = Instant::now();
+        let prepared = prepare_sql(&ctx.db, &sql, &params)?;
+        micros.push(at.elapsed().as_secs_f64() * 1e6);
+        drop(prepared);
+    }
+    micros.sort_by(f64::total_cmp);
+    Ok(percentile(&micros, 0.5))
 }
 
 /// One multi-row `INSERT ... VALUES (...), (...), ...` inside its own
@@ -1743,6 +2138,8 @@ fn case_json(name: &str, kind: CaseKind, result: Option<&CaseResult>, recall: Op
             "queries": INSTANCES,
             "median_us": r.median_us,
             "p90_us": r.p90_us,
+            "run_median_us": r.run_median_us,
+            "prepare_median_us": r.prepare_median_us,
             "total_rows": r.total_rows,
             "first_keys": r.first_keys,
             "k": k,
@@ -1755,6 +2152,8 @@ fn case_json(name: &str, kind: CaseKind, result: Option<&CaseResult>, recall: Op
             "queries": INSTANCES,
             "median_us": Value::Null,
             "p90_us": Value::Null,
+            "run_median_us": Value::Null,
+            "prepare_median_us": Value::Null,
             "total_rows": 0,
             "first_keys": Vec::<String>::new(),
             "k": k,
@@ -1875,6 +2274,70 @@ fn e4_deviations() -> Vec<Value> {
     ]
 }
 
+/// The `e4` arm's deviations, plus the ones that belong to asking the same
+/// twenty-two questions in SQL rather than in Rust.
+fn e4sql_deviations() -> Vec<Value> {
+    let mut list = e4_deviations();
+    list.push(deviation(
+        "*",
+        "THE SELECT LIST IS `_id`, NOT `\"key\"`. E4's projection refuses the reserved field the \
+         external key lives in (`collections::reserved`), so the only atomic that hands a key \
+         back is `get_by_id`, one point-get per RETURNED row. This arm asks for the row identity \
+         and translates it through the same load-time key vector the `e4` arm uses (deviation \
+         2), which is what makes the two arms' medians comparable. The WHERE, the ORDER BY and \
+         the LIMIT are the shared clause builders, byte for byte with the Postgres arm's own \
+         except where a Tier-2 construct is named below.",
+    ));
+    list.push(deviation(
+        "pt_bbox",
+        "Postgres reaches the lon/lat rectangle through `loc && envelope::geography` plus \
+         `ST_X/ST_Y BETWEEN`. Both are Tier 2 in docs/QL_CONTRACT.md -- `&&` with \
+         ST_MakeEnvelope is the Bbox filter of p3-geometry-io, and ST_X/ST_Y are pure I/O \
+         functions -- so this arm writes the Tier-1 spelling of the same rectangle, \
+         `ST_Within(loc::geometry, ST_MakeEnvelope(...))`, which compiles to \
+         PointFilter::Bbox. Same rectangle, same rows.",
+    ));
+    list.push(deviation(
+        "*",
+        "THE `&&` CANDIDATE TERMS OF DEVIATION 14 ARE POSTGRES-ONLY. They narrow a scan before \
+         an exact refine and change the cost, never the answer; there is no planner to hint \
+         here, so `plot_within_box`, `plot_contains_pt` and `plot_vs_poly_within` write the \
+         predicate alone.",
+    ));
+    list.push(deviation(
+        "*",
+        "THERE ARE NO PLANNER KNOBS. `SET LOCAL enable_indexscan = off` and \
+         `enable_bitmapscan = off`, which are how the Postgres arm forces an exact vector \
+         answer (deviation 6), parse here and change nothing, and the statement says so in a \
+         notice. Exactness is which vector index the column has: with `ef_search` unset the \
+         exact family answers, and `SET LOCAL ef_search = <ef>` selects the quantized one -- \
+         which is how the approximate sweep is driven.",
+    ));
+    list.push(deviation(
+        "hybrid_blend_10",
+        "THE BLEND IS EXPRESSIBLE IN TIER-1 SQL. `ts_rank_cd(...)` is BM25 here (deviation 7), \
+         so the statement writes `0.5 * bm25(text, term) + 0.5 * (1 - (emb <=> v))`. The vector \
+         half lowers to `1 - (-VectorSimilarity)`, which is the cosine itself -- the same \
+         quantity the `e4` arm builds as `0.5 * (1 + VectorSimilarity)`. The whole expression \
+         is ONE ORDER BY key, the Score atomic (QL_CONTRACT deviation 3).",
+    ));
+    list.push(deviation(
+        "*",
+        "PARAMETERS ARE BOUND, NOT INLINED. The Postgres arm builds its statement text with the \
+         values in it; this arm binds `$n`. Binding a 32-dimensional query vector copies it \
+         once per statement, inside the timed pass.",
+    ));
+    list.push(deviation(
+        "*",
+        "EVERY TIMED INSTANCE PARSES AND COMPILES ITS OWN STATEMENT. Nothing is cached between \
+         instances, because a cache would measure the cache. Each case's `note` carries the \
+         median parse-and-compile cost of its statement in microseconds, measured on its own in \
+         an untimed pass, so the difference from the `e4` arm can be attributed rather than \
+         guessed at.",
+    ));
+    list
+}
+
 fn pg_deviations() -> Vec<Value> {
     let mut list = vec![
         deviation(
@@ -1987,6 +2450,10 @@ fn git_commit() -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arm {
     E4,
+    /// The same E4 database and the same twenty-two cases, asked in SQL
+    /// through `Database::sql` instead of as a `QueryRequest`. Same CLI as
+    /// `e4`, `--reuse` included.
+    E4Sql,
     Postgres,
 }
 
@@ -1994,6 +2461,7 @@ impl Arm {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "e4" => Some(Self::E4),
+            "e4-sql" => Some(Self::E4Sql),
             "postgres" => Some(Self::Postgres),
             _ => None,
         }
@@ -2001,6 +2469,7 @@ impl Arm {
     fn label(self) -> &'static str {
         match self {
             Self::E4 => "e4",
+            Self::E4Sql => "e4-sql",
             Self::Postgres => "postgres",
         }
     }
@@ -2110,6 +2579,78 @@ pub fn run_arm(options: &Options) -> R<Value> {
             drop(ctx);
             disk_bytes = dir_bytes(&options.db_dir);
         }
+        Arm::E4Sql => {
+            let (ctx, built) = if options.reuse {
+                open_e4(&options.db_dir)?
+            } else {
+                load_e4(&options.db_dir, &corpus)?
+            };
+            stages = built;
+            for spec in &BATTERY {
+                if !selected(spec.name) {
+                    continue;
+                }
+                let result = measure(|i| e4sql_answer(&ctx, &corpus, &queries, spec.name, i))
+                    .map_err(|e| format!("case {}: {e}", spec.name))?;
+                let parse_us = e4sql_parse_cost(&ctx, &corpus, &queries, spec.name)
+                    .map_err(|e| format!("case {} parse cost: {e}", spec.name))?;
+                eprintln!(
+                    "[e4-sql] {:<20} {:>12.1} us  rows={}  parse={:.1} us",
+                    spec.name, result.median_us, result.total_rows, parse_us
+                );
+                if let Some(dir) = options.dump.as_deref() {
+                    dump_case(dir, spec.name, |i| {
+                        e4sql_answer(&ctx, &corpus, &queries, spec.name, i)
+                    })
+                    .map_err(|e| format!("case {} dump: {e}", spec.name))?;
+                }
+                cases.push(case_json(
+                    spec.name,
+                    spec.kind,
+                    Some(&result),
+                    None,
+                    &format!("parse+compile {parse_us:.1} us/statement"),
+                ));
+            }
+            for &base in &APPROX_BASES {
+                for &ef in &EF_SWEEP {
+                    let name = format!("{base}@ef{ef}");
+                    if !selected(&name) {
+                        continue;
+                    }
+                    let result = measure(|i| e4sql_answer(&ctx, &corpus, &queries, &name, i))
+                        .map_err(|e| format!("case {name}: {e}"))?;
+                    let parse_us = e4sql_parse_cost(&ctx, &corpus, &queries, &name)
+                        .map_err(|e| format!("case {name} parse cost: {e}"))?;
+                    let twin = exact_twin(&name)
+                        .ok_or_else(|| format!("case {name}: no exact twin"))?;
+                    let recall = mean_recall(
+                        |i| e4sql_answer(&ctx, &corpus, &queries, &name, i),
+                        |i| e4sql_answer(&ctx, &corpus, &queries, twin, i),
+                    )
+                    .map_err(|e| format!("case {name} recall: {e}"))?;
+                    eprintln!(
+                        "[e4-sql] {:<20} {:>12.1} us  rows={}  recall={:.3}  parse={:.1} us",
+                        name, result.median_us, result.total_rows, recall, parse_us
+                    );
+                    if let Some(dir) = options.dump.as_deref() {
+                        dump_case(dir, &name, |i| {
+                            e4sql_answer(&ctx, &corpus, &queries, &name, i)
+                        })
+                        .map_err(|e| format!("case {name} dump: {e}"))?;
+                    }
+                    cases.push(case_json(
+                        &name,
+                        CaseKind::Approx,
+                        Some(&result),
+                        Some(recall),
+                        &format!("ef={ef}; parse+compile {parse_us:.1} us/statement"),
+                    ));
+                }
+            }
+            drop(ctx);
+            disk_bytes = dir_bytes(&options.db_dir);
+        }
         Arm::Postgres => {
             let (mut client, built) = if options.reuse {
                 open_pg(&options.dsn, corpus.rows.len())?
@@ -2208,6 +2749,7 @@ pub fn run_arm(options: &Options) -> R<Value> {
         "cases": cases,
         "deviations": match options.arm {
             Arm::E4 => e4_deviations(),
+            Arm::E4Sql => e4sql_deviations(),
             Arm::Postgres => pg_deviations(),
         },
     });
@@ -2312,115 +2854,184 @@ fn cheapest_at_recall(points: &[SweepPoint], threshold: f64) -> Option<(&SweepPo
     scored.first().map(|p| (*p, false))
 }
 
-/// Print the cross-arm table and say whether every filter case agreed. Ranked
-/// cases report top-ten overlap and approximate cases each arm's own recall;
-/// neither is a pass/fail, because the two arms rank by different formulas
-/// and approximate by different algorithms.
-pub fn compare(left: &Path, right: &Path) -> R<bool> {
+/// Print the cross-arm table and say whether every filter case agreed.
+///
+/// Takes TWO or THREE reports. Two is the original `e4` against `postgres`.
+/// Three adds `e4-sql` -- the same E4 database asked in SQL -- and then the
+/// filter-agreement precondition is agreement across ALL THREE arms, not two:
+/// a parser that answered a different question than the API it compiles to
+/// would be invisible in a two-arm table.
+///
+/// Ranked cases report top-ten overlap and approximate cases each arm's own
+/// recall; neither is a pass/fail, because the arms rank by different
+/// formulas and approximate by different algorithms.
+pub fn compare(paths: &[&Path]) -> R<bool> {
     let read = |path: &Path| -> R<Value> {
         Ok(serde_json::from_str(&fs::read_to_string(path).map_err(|e| {
             format!("{}: {e}", path.display())
         })?)?)
     };
-    let a = read(left)?;
-    let b = read(right)?;
-    let arm_of = |report: &Value| report.get("arm").and_then(Value::as_str).unwrap_or("").to_owned();
-    let (e4, pg) = match (arm_of(&a).as_str(), arm_of(&b).as_str()) {
-        ("e4", "postgres") => (a, b),
-        ("postgres", "e4") => (b, a),
-        (x, y) => return Err(format!("expected one `e4` report and one `postgres` report, got `{x}` and `{y}`").into()),
+    let mut e4: Option<Value> = None;
+    let mut pg: Option<Value> = None;
+    let mut sql: Option<Value> = None;
+    for path in paths {
+        let report = read(path)?;
+        let arm = report
+            .get("arm")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let slot = match arm.as_str() {
+            "e4" => &mut e4,
+            "e4-sql" => &mut sql,
+            "postgres" => &mut pg,
+            other => {
+                return Err(format!("{}: unknown arm `{other}`", path.display()).into());
+            }
+        };
+        if slot.is_some() {
+            return Err(format!("two reports name the arm `{arm}`").into());
+        }
+        *slot = Some(report);
+    }
+    let e4 = e4.ok_or("no `e4` report among the arguments")?;
+    let pg = pg.ok_or("no `postgres` report among the arguments")?;
+
+    let arms: Vec<(&str, &Value)> = match &sql {
+        Some(sql) => vec![("e4", &e4), ("pg", &pg), ("e4-sql", sql)],
+        None => vec![("e4", &e4), ("pg", &pg)],
     };
 
-    println!(
-        "{:<22} {:<7} {:>12} {:>12} {:>9} {:>10} {:>10}  {}",
-        "case", "kind", "e4_us", "pg_us", "e4/pg", "e4_rows", "pg_rows", "agreement"
-    );
+    print!("{:<22} {:<7}", "case", "kind");
+    for (label, _) in &arms {
+        print!(" {:>12}", format!("{label}_us"));
+    }
+    print!(" {:>9}", "e4/pg");
+    if sql.is_some() {
+        print!(" {:>10}", "sql/e4");
+    }
+    for (label, _) in &arms {
+        print!(" {:>10}", format!("{label}_rows"));
+    }
+    println!("  agreement");
+
     let mut disagreements = 0usize;
     for spec in &BATTERY {
-        let ce = case_of(&e4, spec.name);
-        let cp = case_of(&pg, spec.name);
-        if ce.is_none() && cp.is_none() {
+        let found: Vec<Option<&Value>> = arms
+            .iter()
+            .map(|(_, report)| case_of(report, spec.name))
+            .collect();
+        if found.iter().all(Option::is_none) {
             continue;
         }
-        let me = number(ce, "median_us");
-        let mp = number(cp, "median_us");
-        let ratio = match (me, mp) {
-            (Some(e), Some(p)) if p > 0.0 => format!("{:.2}", e / p),
+        let medians: Vec<Option<f64>> = found
+            .iter()
+            .map(|case| number(*case, "median_us"))
+            .collect();
+        let rows: Vec<Option<u64>> = found.iter().map(|case| row_count(*case)).collect();
+        let ratio = match (medians[0], medians[1]) {
+            (Some(a), Some(b)) if b > 0.0 => format!("{:.2}", a / b),
             _ => "-".into(),
         };
-        let re = row_count(ce);
-        let rp = row_count(cp);
+        let sql_ratio = match (medians.get(2).copied().flatten(), medians[0]) {
+            (Some(a), Some(b)) if b > 0.0 => format!("{:.2}", a / b),
+            _ => "-".into(),
+        };
         let verdict = match spec.kind {
-            CaseKind::Filter => match (me, mp, re, rp) {
-                (Some(_), Some(_), Some(e), Some(p)) if e == p => "AGREE".to_string(),
-                (Some(_), Some(_), Some(e), Some(p)) => {
+            CaseKind::Filter => {
+                let present: Vec<u64> = rows.iter().filter_map(|r| *r).collect();
+                if present.len() != arms.len() || medians.iter().any(Option::is_none) {
+                    "not run in every arm".to_string()
+                } else if present.iter().all(|r| *r == present[0]) {
+                    "AGREE".to_string()
+                } else {
                     disagreements += 1;
-                    format!("DISAGREE ({e} vs {p})")
+                    format!(
+                        "DISAGREE ({})",
+                        present
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" vs ")
+                    )
                 }
-                _ => "not run in both arms".to_string(),
-            },
+            }
             CaseKind::Ranked | CaseKind::Approx => {
-                if me.is_none() || mp.is_none() {
+                if medians.iter().take(2).any(Option::is_none) {
                     "not run in both arms".to_string()
                 } else {
-                    let ke = first_keys(ce);
-                    let kp = first_keys(cp);
+                    let ke = first_keys(found[0]);
+                    let kp = first_keys(found[1]);
                     let shared: HashSet<&str> = ke.iter().map(String::as_str).collect();
                     let hits = kp.iter().filter(|k| shared.contains(k.as_str())).count();
                     let width = ke.len().max(kp.len()).max(1);
-                    let mut text = format!("top-10 overlap {hits}/{width}");
+                    let mut text = format!("e4/pg top-10 overlap {hits}/{width}");
+                    if let Some(case) = found.get(2).copied().flatten() {
+                        let ks = first_keys(Some(case));
+                        let hits = ks.iter().filter(|k| shared.contains(k.as_str())).count();
+                        text.push_str(&format!("; e4-sql vs e4 {hits}/{}", ke.len().max(1)));
+                    }
                     if spec.kind == CaseKind::Approx {
                         text.push_str(&format!(
                             "; recall e4={} pg={}",
-                            number(ce, "recall_at_k").map_or_else(|| "-".into(), |v| format!("{v:.3}")),
-                            number(cp, "recall_at_k").map_or_else(|| "-".into(), |v| format!("{v:.3}")),
+                            number(found[0], "recall_at_k")
+                                .map_or_else(|| "-".into(), |v| format!("{v:.3}")),
+                            number(found[1], "recall_at_k")
+                                .map_or_else(|| "-".into(), |v| format!("{v:.3}")),
                         ));
                     }
                     text
                 }
             }
         };
-        println!(
-            "{:<22} {:<7} {:>12} {:>12} {:>9} {:>10} {:>10}  {}",
-            spec.name,
-            spec.kind.label(),
-            micros(me),
-            micros(mp),
-            ratio,
-            re.map_or_else(|| "-".into(), |v| v.to_string()),
-            rp.map_or_else(|| "-".into(), |v| v.to_string()),
-            verdict
-        );
+        print!("{:<22} {:<7}", spec.name, spec.kind.label());
+        for median in &medians {
+            print!(" {:>12}", micros(*median));
+        }
+        print!(" {ratio:>9}");
+        if sql.is_some() {
+            print!(" {sql_ratio:>10}");
+        }
+        for count in &rows {
+            print!(
+                " {:>10}",
+                count.map_or_else(|| "-".into(), |v| v.to_string())
+            );
+        }
+        println!("  {verdict}");
     }
 
-    // The approximate recall-vs-latency sweep: the full table for both
-    // arms, then the headline — each arm's cheapest point with
-    // recall_at_k >= HEADLINE_RECALL and the E4/PG ratio of their
-    // median_us AT THAT RECALL. Equal ef / search_list_size numerals are
-    // not comparable (deviation 12), so this ratio, not the row above, is
-    // the number that means something for approximate vector search.
+    // The approximate recall-vs-latency sweep: the full table for every arm,
+    // then the headline -- each arm's cheapest point with
+    // recall_at_k >= HEADLINE_RECALL and the E4/PG ratio of their median_us
+    // AT THAT RECALL. Equal ef / search_list_size numerals are not comparable
+    // (deviation 12), so this ratio, not the row above, is the number that
+    // means something for approximate vector search.
     for &base in &APPROX_BASES {
-        let e4_points = sweep_points(&e4, base);
-        let pg_points = sweep_points(&pg, base);
         println!("\n{base} recall-vs-latency sweep");
         println!(
-            "{:<5} {:<18} {:>8} {:>12} {:>12}",
+            "{:<7} {:<18} {:>8} {:>12} {:>12}",
             "arm", "point", "recall", "median_us", "p90_us"
         );
-        for (arm_label, points) in [("e4", &e4_points), ("pg", &pg_points)] {
-            for p in points {
+        let mut per_arm: Vec<(&str, Vec<SweepPoint>)> = Vec::new();
+        for (label, report) in &arms {
+            let points = sweep_points(report, base);
+            for p in &points {
                 println!(
-                    "{:<5} {:<18} {:>8} {:>12} {:>12}",
-                    arm_label,
+                    "{:<7} {:<18} {:>8} {:>12} {:>12}",
+                    label,
                     p.label,
                     p.recall.map_or_else(|| "-".into(), |r| format!("{r:.3}")),
                     micros(p.median_us),
                     micros(p.p90_us),
                 );
             }
+            per_arm.push((label, points));
         }
-        let e4_best = cheapest_at_recall(&e4_points, HEADLINE_RECALL);
-        let pg_best = cheapest_at_recall(&pg_points, HEADLINE_RECALL);
+        let e4_points = &per_arm[0].1;
+        let pg_points = &per_arm[1].1;
+        let e4_best = cheapest_at_recall(e4_points, HEADLINE_RECALL);
+        let pg_best = cheapest_at_recall(pg_points, HEADLINE_RECALL);
         match (&e4_best, &pg_best) {
             (Some((e, true)), Some((p, true))) => {
                 let e_us = e.median_us.unwrap_or(f64::NAN);
@@ -2471,14 +3082,17 @@ pub fn compare(left: &Path, right: &Path) -> R<bool> {
             .get("bytes")?
             .as_u64()
     };
-    println!(
-        "\ndisk_bytes  e4={}  postgres={}",
-        bytes(&e4).map_or_else(|| "-".into(), |v| v.to_string()),
-        bytes(&pg).map_or_else(|| "-".into(), |v| v.to_string()),
-    );
-    for (arm, report) in [("e4", &e4), ("postgres", &pg)] {
+    print!("\ndisk_bytes");
+    for (label, report) in &arms {
+        print!(
+            "  {label}={}",
+            bytes(report).map_or_else(|| "-".into(), |v| v.to_string())
+        );
+    }
+    println!();
+    for (label, report) in &arms {
         if let Some(list) = report.get("deviations").and_then(Value::as_array) {
-            println!("\n{arm} deviations ({}):", list.len());
+            println!("\n{label} deviations ({}):", list.len());
             for entry in list {
                 println!(
                     "  [{}] {}",
@@ -2489,7 +3103,10 @@ pub fn compare(left: &Path, right: &Path) -> R<bool> {
         }
     }
     if disagreements > 0 {
-        println!("\n{disagreements} filter case(s) DISAGREE: the two arms answered different questions.");
+        println!(
+            "\n{disagreements} filter case(s) DISAGREE across {} arms: they answered different questions.",
+            arms.len()
+        );
     }
     Ok(disagreements == 0)
 }
@@ -2497,10 +3114,10 @@ pub fn compare(left: &Path, right: &Path) -> R<bool> {
 // ── command line ──────────────────────────────────────────────────────────
 
 fn usage() -> String {
-    "usage: battle50k <e4|postgres> --data <jsonl> --queries <json> --out <report.json> \
+    "usage: battle50k <e4|e4-sql|postgres> --data <jsonl> --queries <json> --out <report.json> \
      [--db-dir <dir>] [--dsn <dsn>] [--only <case-substring>] [--reuse] \
      [--dump <dir>]\n\
-     \x20      battle50k compare <a.json> <b.json>"
+     \x20      battle50k compare <a.json> <b.json> [<c.json>]"
         .into()
 }
 
@@ -2557,10 +3174,11 @@ fn parse(args: &[String]) -> R<Options> {
 fn main() -> R<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("compare") {
-        if args.len() != 3 {
+        if args.len() < 3 || args.len() > 4 {
             return Err(usage().into());
         }
-        let agreed = compare(Path::new(&args[1]), Path::new(&args[2]))?;
+        let paths: Vec<&Path> = args[1..].iter().map(Path::new).collect();
+        let agreed = compare(&paths)?;
         if !agreed {
             std::process::exit(1);
         }

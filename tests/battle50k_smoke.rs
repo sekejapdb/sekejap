@@ -382,3 +382,75 @@ fn the_e4_arm_answers_what_brute_force_answers() {
         "the arm must write its report to --out"
     );
 }
+
+/// The `e4-sql` arm must answer the SAME questions as the `e4` arm.
+///
+/// Both run over the same 200-row corpus and the same `queries.json`; the
+/// only difference is that one builds a `QueryRequest` in Rust and the other
+/// parses one out of SQL text. So every filter case's row count and every
+/// ranked case's key set must be identical -- a parser that compiled a
+/// different predicate would show up here as a row-count difference, before
+/// a 50,000-row run could disguise it as a latency result.
+#[test]
+fn the_e4_sql_arm_asks_the_same_questions_as_the_e4_arm() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = dir.path().join("places-200.jsonl");
+    let queries_path = dir.path().join("queries.json");
+    write_corpus(&data);
+    write_queries(&queries_path);
+
+    let mut api = Options::new(Arm::E4, &data, &queries_path, dir.path().join("e4.json"));
+    api.db_dir = dir.path().join("e4-db");
+    let api_report = run_arm(&api).expect("the E4 arm runs");
+
+    let mut sql = Options::new(
+        Arm::E4Sql,
+        &data,
+        &queries_path,
+        dir.path().join("e4-sql.json"),
+    );
+    sql.db_dir = dir.path().join("e4-sql-db");
+    let sql_report = run_arm(&sql).expect("the e4-sql arm runs");
+
+    assert_eq!(sql_report["arm"].as_str(), Some("e4-sql"));
+    assert_eq!(sql_report["rows"], api_report["rows"]);
+
+    for spec in &BATTERY {
+        let api_case = case_of(&api_report, spec.name);
+        let sql_case = case_of(&sql_report, spec.name);
+        assert_eq!(
+            sql_case["total_rows"], api_case["total_rows"],
+            "{}: the two arms returned different row counts",
+            spec.name
+        );
+        assert_eq!(
+            sql_case["first_keys"], api_case["first_keys"],
+            "{}: the two arms returned different keys",
+            spec.name
+        );
+        assert!(
+            sql_case["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("parse+compile")),
+            "{}: the e4-sql arm must report what the parse cost",
+            spec.name
+        );
+    }
+
+    // The approximate sweep runs on the same `ef` axis, point for point.
+    for base in ["vec_ann_10", "vec_ann_10_kind"] {
+        for ef in [20usize, 50, 100, 200, 400] {
+            let name = format!("{base}@ef{ef}");
+            let api_case = case_of(&api_report, &name);
+            let sql_case = case_of(&sql_report, &name);
+            assert_eq!(
+                sql_case["first_keys"], api_case["first_keys"],
+                "{name}: the two arms returned different keys"
+            );
+            assert_eq!(
+                sql_case["recall_at_k"], api_case["recall_at_k"],
+                "{name}: the two arms reported different recall"
+            );
+        }
+    }
+}

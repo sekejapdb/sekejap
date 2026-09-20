@@ -72,10 +72,11 @@ pub use crate::index::vector::quantized::{
     ApproxVectorMethod, ApproxVectorResult, QuantizedVectorCandidates,
 };
 pub use crate::query::{
-    ApproximationDiagnostics, CandidateDriver, Geom, GeometryFilter, OrderValue, OwnedScalarValue,
-    PointFilter, PreparedQuery, ProjectedValue, Projection, QueryBudget, QueryDriver, QueryError,
-    QueryFilter, QueryOrder, QueryPage, QueryRequest, QueryResult, QueryRow, QueryWork,
-    ScalarFilter, ScalarValue, ScoreExpr, SortDirection, WorkResource,
+    ApproximationDiagnostics, CandidateDriver, FilterAnswer, FilterPlan, Geom, GeometryFilter,
+    OrderValue, OwnedScalarValue, PointFilter, PreparedQuery, ProjectedValue, Projection,
+    QueryBudget, QueryDriver, QueryError, QueryFilter, QueryOrder, QueryPage, QueryPlanDescription,
+    QueryRequest, QueryResult, QueryRow, QueryWork, ScalarFilter, ScalarValue, ScoreExpr,
+    SortDirection, WorkResource,
 };
 pub use catalog::{
     create_index_trees, set_create_index_trees, IndexFamily, IndexId, IndexInfo, IndexState,

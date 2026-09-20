@@ -3,6 +3,7 @@ use serde_json::{Map, Value};
 pub mod collections;
 mod index;
 mod query;
+pub mod sql;
 pub mod store;
 
 // The public module paths this crate has always offered. The tree below them
