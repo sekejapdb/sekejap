@@ -102,8 +102,18 @@ native, not a layer declared over tables.
     existing bounded cascade. RESTRICT is the default. Reason: a delete that
     silently removes edges from another user's graph is a fallible delete
     (Law 3).
+
+    BUILT at collection granularity (`begin_drop_collection`): the edge key is
+    `tag | collection | sequence | context | type | far endpoint`, so a context
+    cannot be a key prefix at that granularity and the probe is one range per
+    edge tag instead, seeking past each (entity, context) run it has already
+    recorded. That is one descent per distinct (entity, context) pair with
+    edges, capped, and two descents for a collection with none. Single-row
+    `delete(key)` still cascades; RESTRICT there is not built.
 6.2 Deleting an edge removes its forward and reverse postings in its context.
-6.3 Dropping a context removes its range; nodes are untouched.
+6.3 Dropping a context removes its range; nodes are untouched. Dropping a
+    COLLECTION is the mirror of it and is built: the rows go, and the edges on
+    them go only under CASCADE, in every context.
 
 ## 7. Laws
 

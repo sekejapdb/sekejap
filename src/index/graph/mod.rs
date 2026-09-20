@@ -887,6 +887,17 @@ impl Database {
             if id.collection.0 == 0 || id.sequence == 0 {
                 return Err(Error::NotFound("graph endpoint"));
             }
+            // A collection under `begin_drop_collection` accepts no new edge.
+            // Without this a RESTRICT drop could be admitted on an empty
+            // probe and then have an edge written into it, and the drop would
+            // remove that edge without anyone asking for CASCADE. The handle
+            // field is `None` on every database with no drop in flight, so
+            // this is one comparison per endpoint, not a descriptor read.
+            if self.dropping == Some(id.collection) {
+                return Err(invalid(
+                    "graph endpoint is in a collection that is DROPPING; no edge may be written onto it",
+                ));
+            }
             // The existence check stays -- an edge to a row that is not there
             // is the dangling reference this guard exists to refuse. It is the
             // DESCENT that goes away, and only for a row this handle wrote and
@@ -1773,6 +1784,79 @@ impl Database {
             }
         }
         Ok(edges.into_iter().collect())
+    }
+
+    /// Every graph context that holds an edge incident on a row of `c`, and
+    /// whether the probe stopped at its cap before it could say it had them
+    /// all.
+    ///
+    /// This is GRAPH_CONTRACT 6.1's RESTRICT question asked of a whole
+    /// collection rather than of one node. The edge key is
+    /// `tag | collection | sequence | context | type | far endpoint`, so
+    /// `tag | collection` is one contiguous range holding every edge incident
+    /// on any row of the collection in any context -- one range probe per tag,
+    /// not one per context, because a context cannot be a key prefix here.
+    ///
+    /// Law 1: the walk is not proportional to the edges. After the first edge
+    /// of one (entity, context) run it SEEKS past the run to
+    /// `tag | entity | context + 1`, so it pays one descent per distinct
+    /// (entity, context) pair that has edges and stops at `cap` of them. A
+    /// collection with no edges costs two descents.
+    pub(crate) fn collection_edge_contexts(
+        &self,
+        c: CollectionId,
+        cap: usize,
+    ) -> Result<(Vec<GraphContextId>, bool)> {
+        if !self
+            .index_header
+            .is_some_and(|header| header.features & GRAPH_FEATURE != 0)
+        {
+            return Ok((Vec::new(), false));
+        }
+        let h = self.graph_header()?;
+        let mut found = BTreeSet::new();
+        let mut truncated = false;
+        for tag in [PRIMARY_EDGE, REVERSE_EDGE] {
+            let p = crate::collections::prefix(tag, c);
+            let mut from = p.clone();
+            let mut seeks = 0usize;
+            loop {
+                if seeks >= cap {
+                    truncated = true;
+                    break;
+                }
+                seeks += 1;
+                let Some(row) = self.store()?.range(&from)?.next() else {
+                    break;
+                };
+                let (key, _) = row?;
+                if !key.starts_with(&p) {
+                    break;
+                }
+                let edge = parse_edge_key(&key, tag)?;
+                self.validate_stored_edge_ids(h, edge)?;
+                found.insert(edge.context);
+                let near = if tag == PRIMARY_EDGE {
+                    edge.source
+                } else {
+                    edge.destination
+                };
+                let Some(next) = edge.context.0.checked_add(1) else {
+                    break;
+                };
+                from = edge_prefix(tag, near, Some(GraphContextId(next)), None);
+            }
+        }
+        Ok((found.into_iter().collect(), truncated))
+    }
+
+    /// The name a context was interned under, for a refusal that has to name
+    /// it. The base graph has no descriptor and no name.
+    pub(crate) fn graph_context_name(&self, id: GraphContextId) -> Result<String> {
+        if id == GraphContextId::BASE {
+            return Ok("(base graph)".to_owned());
+        }
+        Ok(read_name(|key| self.store()?.get(key).map_err(Error::from), 1, id.0)?.name)
     }
 
     /// Parent `Database::delete` calls this before any entity/index mutation.

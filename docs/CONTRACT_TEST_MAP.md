@@ -32,12 +32,12 @@ construct the tests do not pin.
 | 5.1 | Paths streamed: one accumulator per frontier entry; full path rebuilt only for returned rows | UNPINNED |
 | 5.2 | A path aggregate is a Score leaf | UNPINNED |
 | 5.3 | Shortest path atomic: ANY SHORTEST and ALL SHORTEST, bidirectional, unweighted first | UNPINNED (`cyclic_bfs_is_shortest_hop_deterministic_and_bounded` pins BFS hop order, not this atomic) |
-| 6.1 | RESTRICT (default) refuses node delete while any edge in any context references it; CASCADE is explicit and bounded | CASCADE: `tests/graph_collections.rs` `entity_delete_cascades_both_directions_all_contexts_and_self_edges`; `tests/graph_collections.rs` `entity_delete_refuses_degree_257_before_any_published_change`. RESTRICT default: UNPINNED (cascade is the only delete path) |
+| 6.1 | RESTRICT (default) refuses node delete while any edge in any context references it; CASCADE is explicit and bounded | CASCADE: `tests/graph_collections.rs` `entity_delete_cascades_both_directions_all_contexts_and_self_edges`; `tests/graph_collections.rs` `entity_delete_refuses_degree_257_before_any_published_change`. RESTRICT default, at collection granularity: `tests/drop_collection.rs` `restrict_names_the_referencing_contexts_and_cascade_removes_the_edges`; `tests/sql_tier1.rs` `drop_table_restricts_on_graph_edges_and_cascades_when_asked`. RESTRICT on a SINGLE `delete(key)`: UNPINNED (that path still cascades) |
 | 6.2 | Deleting an edge removes its forward and reverse postings in its context | `tests/graph_collections.rs` `snapshots_unlink_missing_endpoints_and_delete_cascade_are_transactional`; `tests/graph_collections.rs` `directed_typed_context_edges_replace_properties_and_survive_reopen` |
 | 6.3 | Dropping a context removes its range; nodes are untouched | UNPINNED |
 | L1 | Frontier, visited set and one accumulator per visited node, all bounded by the visited budget; never RAM ∝ graph | `tests/graph_collections.rs` `bfs_allocates_a_constant_plus_its_result_not_per_edge`; `tests/graph_collections.rs` `graph_filtered_query_allocates_like_the_traversal_it_runs` |
 | L2 | Work per hop is the postings of that source in that context and type | `tests/graph_collections.rs` `traversal_reads_pay_for_leaf_pages_not_for_edges`; `tests/edge_write_budget.rs` `the_cost_of_an_edge_does_not_grow_with_the_rows_loaded_before_it` |
-| L3 | RESTRICT is the default delete; CASCADE is explicit and bounded | UNPINNED (see 6.1; cascade bound is pinned, default RESTRICT is not) |
+| L3 | RESTRICT is the default delete; CASCADE is explicit and bounded | `tests/drop_collection.rs` `restrict_names_the_referencing_contexts_and_cascade_removes_the_edges` (`begin_drop_collection` is RESTRICT, `begin_drop_collection_mode(.., Cascade)` is the opt-in); `tests/drop_collection.rs` `the_drop_removes_exactly_the_collections_records_and_nothing_else` (the cascade runs inside `budget`-bounded steps). Single-row `delete(key)`: UNPINNED (still cascades) |
 | L4 | Sacrifices named: 8 bytes/edge identity; declared property fixed-width; reverse mirror doubles storage | UNPINNED (identity and declared properties are not on disk; no test measures the reverse-mirror byte cost) |
 | L5 | A corrupt posting or bag is `Corrupt` on that edge, never a panic; offset reads bounds-checked | `tests/graph_admission.rs` `edge_damage_fails_the_read_that_needs_it_and_the_verifier_reports_the_rest`; `tests/graph_admission.rs` `damaged_graph_metadata_replica_falls_back_without_rewriting_source` |
 | L6 | A traversal reads its snapshot; a concurrent writer is invisible to it | `tests/graph_collections.rs` `snapshots_unlink_missing_endpoints_and_delete_cascade_are_transactional`; `tests/query_multimodel.rs` `one_snapshot_stays_old_while_committed_multifamily_mutation_reopens_new` |
@@ -54,7 +54,7 @@ construct the tests do not pin.
 | `INSERT INTO t (...) VALUES (...)`, `$n` params | `put` by key | `tests/collections.rs` `identity_upsert_delete_and_collection_isolation_follow_e3_contracts`; `tests/collection_pagewal.rs` `mixed_records_roundtrip_through_page_wal_commit_and_reopen` |
 | `UPDATE t SET ... WHERE key = $1` | `put` replaces; partial update = read-modify-put | `tests/collections.rs` `identity_upsert_delete_and_collection_isolation_follow_e3_contracts` |
 | `DELETE FROM t WHERE key = $1` | delete by key; RESTRICT/CASCADE per graph 6.1 | delete by key: `tests/collections.rs` `identity_upsert_delete_and_collection_isolation_follow_e3_contracts`; `tests/collection_pagewal.rs` `delete_then_reinsert_allocates_a_fresh_identity_and_never_reuses_after_reopen`. RESTRICT: UNPINNED (see graph 6.1) |
-| `CREATE TABLE`, `CREATE INDEX ... USING {btree,gin,gist,exact,quantized,adjacency}`, `DROP` | catalog descriptors | table: `tests/collections.rs` `undeclared_fields_roundtrip_through_collection_and_reopen`. btree: `tests/index_lifecycle.rs` `late_index_tracks_crud_and_published_snapshots`. gin: `tests/index_text.rs` `building_live_crud_snapshot_rollback_and_reopen_preserve_presence_rules`. gist (point): `tests/index_spatial.rs` `build_live_crud_snapshot_rollback_drop_and_reopen`. gist (geometry): `tests/index_spatial_geometry.rs` `build_vs_maintain_posting_identity_across_geometry_kinds`. exact: `tests/index_vector.rs` `immutable_layout_ordinals_live_crud_snapshots_rollback_and_reopen`. quantized: `tests/index_vector_quantized.rs` `validation_live_crud_snapshot_reopen_and_drop_preserve_authoritative_vectors`. DROP: `tests/index_lifecycle.rs` `drop_and_build_can_resume_after_reopen_without_claiming_ready`. adjacency as `CREATE INDEX`: UNPINNED (graph is `enable_graph` + `put_edge`, not an `IndexFamily`) |
+| `CREATE TABLE`, `CREATE INDEX ... USING {btree,gin,gist,exact,quantized,adjacency}`, `DROP TABLE [IF EXISTS] [CASCADE\|RESTRICT]`, `DROP INDEX` | catalog descriptors; `begin_drop_collection` / `drop_collection_step` | `DROP TABLE`: `tests/drop_collection.rs` `a_dropped_collection_leaves_every_keyspace_empty_and_its_name_free`, `an_interrupted_drop_resumes_to_the_state_an_uninterrupted_one_reaches`, `restrict_names_the_referencing_contexts_and_cascade_removes_the_edges`, `a_published_dropping_mark_refuses_every_reader_and_writer`, `sql_drop_table_if_exists_and_cascade_end_to_end`, `the_drop_removes_exactly_the_collections_records_and_nothing_else`; `tests/sql_tier1.rs` `drop_table_restricts_on_graph_edges_and_cascades_when_asked`; `tests/sql_explain.rs` `explain_drop_table_prints_the_phases_and_runs_nothing`. table: `tests/collections.rs` `undeclared_fields_roundtrip_through_collection_and_reopen`. btree: `tests/index_lifecycle.rs` `late_index_tracks_crud_and_published_snapshots`. gin: `tests/index_text.rs` `building_live_crud_snapshot_rollback_and_reopen_preserve_presence_rules`. gist (point): `tests/index_spatial.rs` `build_live_crud_snapshot_rollback_drop_and_reopen`. gist (geometry): `tests/index_spatial_geometry.rs` `build_vs_maintain_posting_identity_across_geometry_kinds`. exact: `tests/index_vector.rs` `immutable_layout_ordinals_live_crud_snapshots_rollback_and_reopen`. quantized: `tests/index_vector_quantized.rs` `validation_live_crud_snapshot_reopen_and_drop_preserve_authoritative_vectors`. DROP: `tests/index_lifecycle.rs` `drop_and_build_can_resume_after_reopen_without_claiming_ready`. adjacency as `CREATE INDEX`: UNPINNED (graph is `enable_graph` + `put_edge`, not an `IndexFamily`) |
 | `BEGIN [READ ONLY]`, `COMMIT`, `ROLLBACK` | one writer, snapshot readers | `tests/collections.rs` `published_snapshots_rollback_and_streaming_cursor_are_consistent`; `tests/collection_pagewal.rs` `rollback_discards_uncommitted_work_beside_a_live_snapshot`; `tests/collection_pagewal.rs` `snapshots_serve_published_state_defer_checkpoint_and_are_bounded`; `tests/pagewal.rs` `new_snapshot_during_uncommitted_changes_sees_latest_commit` |
 
 ### §3 Predicates
@@ -111,8 +111,17 @@ construct the tests do not pin.
 | QL_CONTRACT T1 table rows | 28 | 24 | 4 |
 | **Total** | **59** | **39** | **20** |
 
-Unpinned count (rows whose Tests cell contains `UNPINNED`): **20**.
+Unpinned count (rows whose Tests cell contains `UNPINNED`): **20**. The count
+did not move with `DROP TABLE`: the two rows it touches (6.1 and the
+`CREATE TABLE ... DROP` row) were partial before and are partial still, for
+the constructs that remain -- single-row RESTRICT, and `adjacency` as a
+`CREATE INDEX` method.
 
-GRAPH fully unpinned (11): 1.3, 2.3, 4.2, 4.3, 4.4, 5.1, 5.2, 5.3, 6.3, L3, L4.
-GRAPH partial (5): 2.4, 3.1, 3.4, 6.1, L8.
-T1 partial (4): `DELETE` RESTRICT; `CREATE INDEX ... adjacency`; `<>`; `IS NOT NULL`. No T1 row is fully unpinned.
+GRAPH fully unpinned (10): 1.3, 2.3, 4.2, 4.3, 4.4, 5.1, 5.2, 5.3, 6.3, L4.
+GRAPH partial (6): 2.4, 3.1, 3.4, 6.1, L3, L8. L3 moved from fully unpinned to
+partial with `DROP TABLE`: RESTRICT is now the default of a real delete path
+and CASCADE its explicit, bounded opposite, so what is left unpinned in that
+row is only the single-row `delete(key)`, which still cascades.
+T1 partial (4): `DELETE` RESTRICT; `CREATE INDEX ... adjacency` (the
+`DROP TABLE` half of that row is now pinned by six tests); `<>`;
+`IS NOT NULL`. No T1 row is fully unpinned.

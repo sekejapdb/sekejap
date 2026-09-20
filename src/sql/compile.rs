@@ -18,7 +18,8 @@ use super::{
     MAX_GRAPH_DEPTH,
 };
 use crate::collections::{
-    BfsRequest, CandidateDriver, CollectionId, CollectionOptions, Database, Direction, Geom,
+    BfsRequest, CandidateDriver, CollectionId, CollectionOptions, Database, Direction, DropMode,
+    DropPhase, Geom,
     GeometryFilter, GraphContextId, IndexFamily, IndexId, IndexInfo, IndexState, PointFilter,
     Projection,
     QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
@@ -467,6 +468,15 @@ pub(crate) enum WritePlan {
         index: IndexId,
         name: String,
     },
+    /// `DROP TABLE [IF EXISTS] name [CASCADE|RESTRICT]`: the DROPPING mark,
+    /// then bounded steps to the end. Nothing here is a second removal path --
+    /// it is `begin_drop_collection` and `drop_collection_step`, the same
+    /// atomics a caller writes by hand.
+    DropTable {
+        collection: CollectionId,
+        name: String,
+        mode: DropMode,
+    },
     Begin,
     Commit,
     Rollback,
@@ -550,6 +560,24 @@ impl WritePlan {
                 let _ = name;
                 SqlResult::Affected(0)
             }
+            Self::DropTable {
+                collection,
+                name,
+                mode,
+            } => {
+                // The mark is committed by `begin_drop_collection_mode`
+                // itself, and every step after it is committed by
+                // `drop_collection_to_end`; a statement that is interrupted
+                // leaves a resumable drop, never a half-removed collection.
+                db.commit()?;
+                db.begin_drop_collection_mode(collection, mode)?;
+                let removed = db.drop_collection_to_end(
+                    collection,
+                    crate::collections::MAX_DROP_BATCH,
+                )?;
+                let _ = name;
+                SqlResult::Affected(removed)
+            }
             Self::Begin => notice(
                 "BEGIN: the writer is single and already inside a transaction; COMMIT ends it"
                     .to_owned(),
@@ -574,6 +602,9 @@ pub(crate) enum Plan {
     Select(SelectPlan),
     Explain(SelectPlan),
     Write(WritePlan),
+    /// An EXPLAIN whose statement is not a query: the text is the plan, and
+    /// nothing is run to produce it.
+    ExplainText(String),
 }
 
 // ── the compiler ──────────────────────────────────────────────────────────
@@ -630,11 +661,21 @@ impl Compiler<'_> {
                 table,
                 method,
             } => Plan::Write(self.create_index(name, &table, method)?),
-            Stmt::DropTable { table, .. } => {
-                return Err(SqlError::unsupported(format!(
-                    "DROP TABLE {table}: there is no drop_collection at this HEAD -- `src/collections/mod.rs` creates and alters a collection but has no removal path for its catalog record, its rows, its indexes or its layout, so nothing here can be compiled to one"
-                )))
-            }
+            Stmt::DropTable {
+                table,
+                if_exists,
+                cascade,
+            } => match self.drop_table(&table, if_exists, cascade)? {
+                Some(plan) => Plan::Write(plan),
+                None => Plan::Write(WritePlan::Notice(format!(
+                    "DROP TABLE IF EXISTS {table}: no such collection"
+                ))),
+            },
+            Stmt::ExplainDropTable {
+                table,
+                if_exists,
+                cascade,
+            } => Plan::ExplainText(self.explain_drop_table(&table, if_exists, cascade)?),
             Stmt::DropIndex { name, if_exists } => {
                 let Some(index) = self.index_named(&name)? else {
                     if if_exists {
@@ -651,6 +692,123 @@ impl Compiler<'_> {
             Stmt::Rollback => Plan::Write(WritePlan::Rollback),
             Stmt::SetLocal { name, value } => Plan::Write(self.set_local(&name, &value)?),
         })
+    }
+
+    /// `DROP TABLE`. `Ok(None)` is `IF EXISTS` on a name that is not there.
+    fn drop_table(
+        &mut self,
+        table: &str,
+        if_exists: bool,
+        cascade: bool,
+    ) -> SqlResult2<Option<WritePlan>> {
+        let found = self.db.collection(table).map_err(SqlError::from);
+        let collection = match found {
+            Ok(Some(id)) => id,
+            Ok(None) if if_exists => return Ok(None),
+            Ok(None) => {
+                return Err(SqlError::engine(format!("no collection named `{table}`")))
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(Some(WritePlan::DropTable {
+            collection,
+            name: table.to_owned(),
+            mode: if cascade {
+                DropMode::Cascade
+            } else {
+                DropMode::Restrict
+            },
+        }))
+    }
+
+    /// `EXPLAIN DROP TABLE`. The one EXPLAIN that does not run: it prints the
+    /// phases, the bound each one honours and what the collection holds, and
+    /// leaves the collection there.
+    fn explain_drop_table(
+        &mut self,
+        table: &str,
+        if_exists: bool,
+        cascade: bool,
+    ) -> SqlResult2<String> {
+        let Some(plan) = self.drop_table(table, if_exists, cascade)? else {
+            return Ok(format!(
+                "drop: nothing -- IF EXISTS and no collection named `{table}`
+"
+            ));
+        };
+        let WritePlan::DropTable { collection, mode, .. } = plan else {
+            unreachable!("drop_table builds only a DropTable plan")
+        };
+        let indexes = self.db.list_indexes(collection).map_err(SqlError::from)?;
+        let mut out = String::new();
+        out.push_str(&format!(
+            "statement: DROP TABLE {table} {}
+",
+            match mode {
+                DropMode::Cascade => "CASCADE",
+                DropMode::Restrict => "RESTRICT (the default)",
+            }
+        ));
+        out.push_str(
+            "note:  this EXPLAIN does not run its statement. Every other EXPLAIN here runs, because a plan printed without running says nothing about the counters; running a DROP would be the drop.
+",
+        );
+        out.push_str(&format!(
+            "mark:  begin_drop_collection publishes DROPPING in the catalog descriptor and commits it before one entry is removed (Law 3); {} refuses while any graph edge in any context references a row of `{table}`, naming those contexts
+",
+            match mode {
+                DropMode::Cascade => "CASCADE does not refuse -- RESTRICT",
+                DropMode::Restrict => "RESTRICT",
+            }
+        ));
+        out.push_str("phases:
+");
+        for phase in [
+            DropPhase::Indexes,
+            DropPhase::Sidecars,
+            DropPhase::Rows,
+            DropPhase::Mappings,
+            DropPhase::Descriptor,
+        ] {
+            let detail = match phase {
+                DropPhase::Indexes => format!(
+                    "{} index(es): {}",
+                    indexes.len(),
+                    if indexes.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        indexes
+                            .iter()
+                            .map(|i| i.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ),
+                DropPhase::Sidecars => "prefix 0x60 | collection -- vector cells".to_owned(),
+                DropPhase::Rows => format!(
+                    "prefix 0x40 | collection -- primary rows{}",
+                    if mode == DropMode::Cascade {
+                        ", each row's incident edges first through cascade_graph_delete (at most 256 per row)"
+                    } else {
+                        ""
+                    }
+                ),
+                DropPhase::Mappings => {
+                    "prefix 0x20 | collection -- the external-key mapping".to_owned()
+                }
+                DropPhase::Descriptor => {
+                    "name, catalog replicas, sequence replicas, layout replicas -- after a range probe proves every keyspace above is empty".to_owned()
+                }
+            };
+            out.push_str(&format!("  {} -- {detail}
+", phase.name()));
+        }
+        out.push_str(&format!(
+            "bound: drop_collection_step(id, budget) removes at most `budget` entries per step, budget in 1..={}; the committed cursor is the phase byte in the descriptor plus the surviving keys, so a crash resumes without a scan
+",
+            crate::collections::MAX_DROP_BATCH
+        ));
+        Ok(out)
     }
 
     fn set_local(&mut self, name: &str, value: &Literal) -> SqlResult2<WritePlan> {

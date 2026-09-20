@@ -260,17 +260,20 @@ fn halfvec_and_sparsevec_are_tier_three() {
     }
 }
 
-/// A Tier-1 construct the engine has no call for is NOT a tier refusal: it is
-/// an `Unsupported` that names what is missing. `DROP TABLE` is the one this
-/// slice found.
+/// A Tier-1 statement the ENGINE refuses is not a tier refusal: it has its
+/// atomic, and the atomic said no for a reason of its own. `DROP TABLE` under
+/// the default RESTRICT is the one this slice has -- the collection's rows are
+/// referenced by graph edges, which GRAPH_CONTRACT 6.1 makes a refusal rather
+/// than a silent cascade.
 #[test]
-fn a_tier_one_statement_with_no_atomic_names_what_is_missing() {
+fn a_tier_one_statement_the_engine_refuses_is_not_a_tier_refusal() {
     let (_dir, mut f) = open();
     let error = f.db.sql("DROP TABLE place", &[]).unwrap_err();
     assert!(error.tier().is_none(), "{error}");
     let shown = format!("{error}");
-    assert!(shown.contains("drop_collection"), "{shown}");
-    assert!(shown.contains("no removal path"), "{shown}");
+    assert!(shown.contains("RESTRICT"), "{shown}");
+    assert!(shown.contains("routes"), "{shown}");
+    assert!(shown.contains("CASCADE"), "{shown}");
 }
 
 #[test]

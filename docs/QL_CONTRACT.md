@@ -37,7 +37,8 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 | `INSERT INTO GRAPH g EDGE type (source, destination, props...) VALUES` | T2 (spelling open) | put_edge |
 | `UPDATE GRAPH g EDGE type SET ... WHERE source = AND destination =` | T2 | edge posting rewrite |
 | `DELETE FROM GRAPH g EDGE type WHERE ...` | T2 | delete_edge |
-| `CREATE TABLE`, `CREATE INDEX ... USING {btree,gin,gist,exact,quantized,adjacency}`, `DROP` | T1 | catalog descriptors |
+| `CREATE TABLE`, `CREATE INDEX ... USING {btree,gin,gist,exact,quantized,adjacency}`, `DROP INDEX [IF EXISTS]` | T1 | catalog descriptors |
+| `DROP TABLE [IF EXISTS] name [CASCADE\|RESTRICT]` | T1 | `begin_drop_collection` publishes a DROPPING mark the readers refuse, then `drop_collection_step(id, budget)` empties the indexes, sidecars, rows and mappings in bounded batches and removes the descriptor last; RESTRICT per graph contract 6.1 |
 | `CREATE SCHEMA`, `schema.table` | T2 | p2-schema-segment |
 | `CREATE PROPERTY GRAPH name NODE TABLES (...) EDGE TYPES (...)` | T2 | optional naming of a context + label map; nothing is built |
 | `BEGIN [READ ONLY]`, `COMMIT`, `ROLLBACK` | T1 | one writer, snapshot readers |
@@ -174,6 +175,8 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 6. `USING hnsw|diskann|ivfflat` are aliases of the quantized family.
 7. A join never executes a pattern; a relation between rows is an edge.
 8. Declared TIMESTAMPTZ is stored as UTC microseconds in an Int; no time-zone storage.
+9. `DROP TABLE` is RESTRICT by default, and what restricts it is GRAPH EDGES, not foreign keys: Postgres refuses on a dependent constraint, this refuses while any edge in any context references a row of the table and names those contexts (graph contract 6.1). `CASCADE` removes those edges and nothing else -- it never reaches a second table's rows. A table with no edges on it drops under the default.
+10. `DROP TABLE` is bounded and resumable, so it is not one transaction: the DROPPING mark is committed first and each bounded step after it is committed as it goes. An interrupted `DROP TABLE` leaves a collection that answers nothing and resumes from its committed cursor; it never leaves a half-emptied readable table. `ROLLBACK` does not undo a drop that has begun.
 
 ## 6. Execution guarantees the contract makes
 

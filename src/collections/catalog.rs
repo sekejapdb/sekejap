@@ -795,6 +795,12 @@ impl Database {
     }
     pub fn list_indexes(&self, c: CollectionId) -> Result<Vec<IndexInfo>> {
         self.catalog(c)?;
+        self.list_indexes_any(c)
+    }
+    /// The same registry walk without the live-collection check. Only the
+    /// drop path uses it: a DROPPING collection still owns indexes, and
+    /// removing them is the first phase of removing it.
+    pub(super) fn list_indexes_any(&self, c: CollectionId) -> Result<Vec<IndexInfo>> {
         if self.index_header.is_none() {
             return Ok(vec![]);
         }

@@ -317,6 +317,18 @@ pub(super) enum Stmt {
     DropTable {
         table: String,
         if_exists: bool,
+        /// `DROP TABLE t CASCADE`. RESTRICT is the default and the spelling
+        /// `RESTRICT` is accepted for it: GRAPH_CONTRACT 6.1 makes the
+        /// default refuse while any edge references a row of the table.
+        cascade: bool,
+    },
+    /// `EXPLAIN DROP TABLE ...`. The only EXPLAIN that does not run its
+    /// statement: printing the plan of a destructive DDL by executing it is
+    /// not an explanation, it is the drop.
+    ExplainDropTable {
+        table: String,
+        if_exists: bool,
+        cascade: bool,
     },
     DropIndex {
         name: String,

@@ -55,6 +55,7 @@ pub(crate) const PAD: usize = 2081;
 const HEADER_MAGIC: &[u8; 8] = b"E4COLL1\0";
 const INDEX_HEADER_MAGIC: &[u8; 8] = b"E4COLL2\0";
 pub(crate) mod catalog;
+pub(crate) mod drop_collection;
 pub mod rebuild;
 mod sort;
 pub mod verification;
@@ -82,6 +83,7 @@ pub use catalog::{
     create_index_trees, set_create_index_trees, IndexFamily, IndexId, IndexInfo, IndexState,
     IndexTree, ScalarPredicate,
 };
+pub use drop_collection::{DropMode, DropPhase, DropProgress, DropState, MAX_DROP_BATCH};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct IndexHeader {
     pub(crate) features: u64,
@@ -140,9 +142,14 @@ impl Clock for SystemClock {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Catalog {
     id: CollectionId,
-    name: String,
+    pub(crate) name: String,
     pub(crate) layout: u32,
     timestamps: bool,
+    /// `Some` exactly while `begin_drop_collection` has published a DROPPING
+    /// mark that `drop_collection_step` has not yet finished. It is the
+    /// committed cursor of the drop: the phase it reached and how many
+    /// entries it has removed. See `drop_collection.rs`.
+    pub(crate) drop: Option<DropState>,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HeaderInfo {
@@ -235,6 +242,15 @@ pub struct Database {
     /// reasonable caller pattern that a plain "is the handle dirty" test
     /// refuses on the second build.
     user_writes_pending: bool,
+    /// The one collection whose descriptor carries a DROPPING mark, if any.
+    ///
+    /// Read at open and after a rollback, and only when the collection header
+    /// declares `DROP_FEATURE`; a database with no drop in flight never pays
+    /// the scan. It is held on the handle so the hot paths that must refuse a
+    /// dropping collection -- the graph endpoint check on every edge written
+    /// -- can do it with an `Option` comparison rather than three descriptor
+    /// reads per endpoint.
+    pub(crate) dropping: Option<CollectionId>,
 }
 
 /// One collection's worth of identities this handle handed out.
@@ -417,29 +433,61 @@ pub(crate) fn unpack<'a>(b: &'a [u8], magic: &[u8; 8]) -> Result<&'a [u8]> {
     }
     Ok(&b[10..10 + n])
 }
+/// Byte 8 of a catalog packet is the frozen flags byte. Bit 0 is the
+/// timestamps flag every release has written; bit 1 says the record carries
+/// the ten-byte DROPPING tail described in `drop_collection.rs`.
+///
+/// The placement is deliberate. Every binary that predates the drop refuses a
+/// flags byte above 1 (`b[8] > 1` was the whole test), so a record marked
+/// DROPPING is refused by an older reader rather than read as live, on all
+/// three replicas. That is a second line behind `DROP_FEATURE`, which refuses
+/// the file at admission before a record is read at all.
+pub(crate) const CATALOG_DROPPING: u8 = 2;
+/// The DROPPING tail: phase, mode, and the entries removed so far.
+const CATALOG_DROP_TAIL: usize = 1 + 1 + 8;
 fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
     let mut b = c.id.0.to_be_bytes().to_vec();
     b.extend_from_slice(&c.layout.to_be_bytes());
-    b.push(u8::from(c.timestamps));
+    b.push(u8::from(c.timestamps) | if c.drop.is_some() { CATALOG_DROPPING } else { 0 });
+    if let Some(d) = c.drop {
+        b.push(d.phase.byte());
+        b.push(d.mode.byte());
+        b.extend_from_slice(&d.removed.to_be_bytes());
+    }
     b.extend_from_slice(c.name.as_bytes());
     packet(CATALOG_MAGIC, &b)
 }
 fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let b = unpack(b, CATALOG_MAGIC)?;
-    if b.len() < 10 || b[8] > 1 {
+    if b.len() < 10 || b[8] & !(1 | CATALOG_DROPPING) != 0 {
         return Err(corrupt("catalog fields"));
     }
     let id = u32::from_be_bytes(b[..4].try_into().unwrap());
     let layout = u32::from_be_bytes(b[4..8].try_into().unwrap());
-    let name = std::str::from_utf8(&b[9..]).map_err(corrupt)?.to_owned();
-    if id == 0 || layout == 0 || name.len() > 255 {
+    let mut at = 9;
+    let drop = if b[8] & CATALOG_DROPPING != 0 {
+        if b.len() < 9 + CATALOG_DROP_TAIL + 1 {
+            return Err(corrupt("catalog drop tail"));
+        }
+        at = 9 + CATALOG_DROP_TAIL;
+        Some(DropState {
+            phase: DropPhase::from_byte(b[9])?,
+            mode: DropMode::from_byte(b[10])?,
+            removed: u64::from_be_bytes(b[11..19].try_into().unwrap()),
+        })
+    } else {
+        None
+    };
+    let name = std::str::from_utf8(&b[at..]).map_err(corrupt)?.to_owned();
+    if id == 0 || layout == 0 || name.is_empty() || name.len() > 255 {
         return Err(corrupt("catalog domain"));
     }
     Ok(Catalog {
         id: CollectionId(id),
         name,
         layout,
-        timestamps: b[8] == 1,
+        timestamps: b[8] & 1 == 1,
+        drop,
     })
 }
 /// The kernel's own `E4LIMIT1` record: a damaged one is corruption, a valid
@@ -468,7 +516,8 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::text::segments::SEGMENT_FEATURE
     | crate::index::vector::quantized::QUANTIZED_VECTOR_FEATURE
     | catalog::INDEX_TREE_FEATURE
-    | crate::index::spatial::geometry_index::GEOMETRY_FEATURE;
+    | crate::index::spatial::geometry_index::GEOMETRY_FEATURE
+    | drop_collection::DROP_FEATURE;
 fn header_bytes(h: HeaderInfo) -> Result<Vec<u8>> {
     let mut payload = h.next_collection.to_be_bytes().to_vec();
     payload.extend_from_slice(&h.next_layout.to_be_bytes());
@@ -652,6 +701,7 @@ impl Database {
         };
         let h = read_header(store.store())?;
         let mut db = Self::wrap(store, false, h.limits, h.indexes);
+        db.dropping = drop_collection::scan_dropping(db.store.store(), h.indexes)?;
         if let Some(l) = h.limits {
             db.store.install_limits(l)?;
         }
@@ -693,7 +743,9 @@ impl Database {
             Ok(s) => s,
             Err(k) => return Err(detail.into_inner().unwrap_or(Error::Kernel(k))),
         };
-        Ok(Self::wrap(store, true, limits.get(), index_header.get()))
+        let mut db = Self::wrap(store, true, limits.get(), index_header.get());
+        db.dropping = drop_collection::scan_dropping(db.store.store(), db.index_header)?;
+        Ok(db)
     }
     fn wrap(
         store: Backend,
@@ -717,6 +769,7 @@ impl Database {
             allocated: BTreeMap::new(),
             create_index_trees: catalog::create_index_trees(),
             user_writes_pending: false,
+            dropping: None,
         }
     }
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
@@ -977,7 +1030,29 @@ impl Database {
         }
         Ok(())
     }
+    /// The catalog record of a LIVE collection.
+    ///
+    /// This is the one funnel every reader and every writer passes through --
+    /// `collection`, `collection_info`, `alter_collection`, `put`, `update`,
+    /// `load_entity`, `get_by_id`, `scan`, `list_indexes` and
+    /// `prepare_query` all call it before they touch a row -- so a DROPPING
+    /// collection is refused here once, for all of them, exactly the way
+    /// `IndexState::Building` is refused for an index by `query_scalar`.
     pub(crate) fn catalog(&self, id: CollectionId) -> Result<Catalog> {
+        let c = self.catalog_any(id)?;
+        if let Some(d) = c.drop {
+            return Err(invalid(format!(
+                "collection `{}` is DROPPING (phase {}, {} entries removed): it holds no readable state and accepts no writes; finish it with drop_collection_step",
+                c.name,
+                d.phase.name(),
+                d.removed
+            )));
+        }
+        Ok(c)
+    }
+    /// The catalog record whatever its state. The drop path itself, and only
+    /// the drop path, reads its own collection through this.
+    pub(crate) fn catalog_any(&self, id: CollectionId) -> Result<Catalog> {
         self.store()?;
         if let Some(c) = self.catalog_cache.borrow().as_ref().filter(|c| c.id == id) {
             return Ok(c.clone());
@@ -992,6 +1067,18 @@ impl Database {
                 Ok(c)
             },
         )?;
+        // The DROPPING tail and `DROP_FEATURE` are written in one commit and
+        // the packet CRC covers the tail, so the two can disagree only through
+        // damage. Checking it on a record already in hand costs nothing and
+        // closes the direction the header check cannot see: a tail in a file
+        // whose header does not declare it.
+        if c.drop.is_some()
+            && !self
+                .index_header
+                .is_some_and(|h| h.features & drop_collection::DROP_FEATURE != 0)
+        {
+            return Err(corrupt("DROPPING catalog record without feature admission"));
+        }
         *self.catalog_cache.borrow_mut() = Some(c.clone());
         Ok(c)
     }
@@ -1082,6 +1169,7 @@ impl Database {
             name: name.into(),
             layout: lid,
             timestamps: options.timestamps,
+            drop: None,
         };
         let result = (|| {
             self.persist_layout(&layout)?;
@@ -1553,6 +1641,7 @@ impl Database {
         // was learned in the discarded transaction; drop the lot.
         self.allocated.clear();
         self.user_writes_pending = false;
+        self.dropping = None;
         self.failed = true;
         self.store.rollback()?;
         if let Some(l) = self.limits {
@@ -1562,6 +1651,7 @@ impl Database {
         let validation = read_header(self.store.store()).and_then(|h| {
             validate_features(self.store.store(), h.indexes)?;
             self.index_header = h.indexes;
+            self.dropping = drop_collection::scan_dropping(self.store.store(), h.indexes)?;
             Ok(())
         });
         self.finish(validation)
@@ -2062,7 +2152,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1ff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x3ff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -2083,13 +2173,13 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x1ff
+            0x3ff
         );
         // One bit past the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x200)),
-            Err(Error::Unsupported(m)) if m.contains("0x3ff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x400)),
+            Err(Error::Unsupported(m)) if m.contains("0x7ff")
         ));
     }
 }

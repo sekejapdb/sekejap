@@ -4,7 +4,8 @@
 //!
 //! What this module is NOT: a second execution engine. Every statement here
 //! compiles to a call the crate already has -- `Database::prepare_query`,
-//! `put`, `delete`, `create_collection`, `create_*_index` -- so text queries
+//! `put`, `delete`, `create_collection`, `create_*_index`,
+//! `begin_drop_collection` / `drop_collection_step` -- so text queries
 //! and code queries run through one engine and cost the same, minus the parse.
 //!
 //! What it refuses: every construct `docs/QL_CONTRACT.md` places in Tier 2 or
@@ -20,7 +21,7 @@
 //!            | create_table | create_index | drop | transaction | set_local
 //!
 //! select    := SELECT items FROM source [WHERE conj] [ORDER BY key] [LIMIT n]
-//! explain   := EXPLAIN select
+//! explain   := EXPLAIN select | EXPLAIN drop_table
 //! items     := '*' | item (',' item)*
 //! item      := '_id' | '_key' | name | order_expression [AS alias]
 //! source    := name | graph_table
@@ -73,7 +74,8 @@
 //! method    := btree(name) | gin(to_tsvector('simple', name)) | gist(name)
 //!            | exact(name) | quantized(name [vector_cosine_ops])
 //!            | hnsw|diskann|ivfflat(name [vector_cosine_ops])
-//! drop      := DROP TABLE [IF EXISTS] name | DROP INDEX [IF EXISTS] name
+//! drop      := drop_table | DROP INDEX [IF EXISTS] name
+//! drop_table:= DROP TABLE [IF EXISTS] name [CASCADE | RESTRICT]
 //! transaction := BEGIN [READ ONLY] | COMMIT | ROLLBACK
 //! set_local := SET [LOCAL] name '=' value
 //! ```
@@ -404,6 +406,7 @@ impl Database {
                 let text = explain::render(self, &select, &notices)?;
                 Ok(SqlResult::Explain(text))
             }
+            compile::Plan::ExplainText(text) => Ok(SqlResult::Explain(text)),
             compile::Plan::Write(write) => write.run(self, notices),
         }
     }

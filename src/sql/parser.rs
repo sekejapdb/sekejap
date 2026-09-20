@@ -274,6 +274,22 @@ impl Parser {
                         "EXPLAIN takes no options here: it always runs the statement and always prints the plan, the filters, the order and the QueryWork counters",
                     ));
                 }
+                if self.word().as_deref() == Some("DROP") {
+                    return match self.drop()? {
+                        Stmt::DropTable {
+                            table,
+                            if_exists,
+                            cascade,
+                        } => Ok(Stmt::ExplainDropTable {
+                            table,
+                            if_exists,
+                            cascade,
+                        }),
+                        _ => Err(SqlError::unsupported(
+                            "EXPLAIN DROP is written for DROP TABLE; DROP INDEX has one bounded phase and nothing to print",
+                        )),
+                    };
+                }
                 Ok(Stmt::Explain(Box::new(self.select()?)))
             }
             "INSERT" => self.insert(),
@@ -628,7 +644,20 @@ impl Parser {
                 self.bump();
                 let if_exists = self.if_exists()?;
                 let table = self.name()?;
-                Ok(Stmt::DropTable { table, if_exists })
+                // Postgres spells the two behaviours this way and RESTRICT is
+                // its default too; here the restriction is graph edges rather
+                // than foreign keys (GRAPH_CONTRACT 6.1).
+                let cascade = if self.eat_word("CASCADE") {
+                    true
+                } else {
+                    let _ = self.eat_word("RESTRICT");
+                    false
+                };
+                Ok(Stmt::DropTable {
+                    table,
+                    if_exists,
+                    cascade,
+                })
             }
             "INDEX" => {
                 self.bump();

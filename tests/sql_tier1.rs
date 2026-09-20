@@ -998,7 +998,8 @@ fn create_table_and_create_index_build_a_queryable_collection() {
     };
     assert_eq!(rows.len(), 50);
 
-    // DROP INDEX has an atomic; DROP TABLE does not, and says so.
+    // Both DROPs have an atomic: the index's is `drop_index_step`, the
+    // table's `drop_collection_step`.
     db.sql("DROP INDEX town_founded", &[]).unwrap();
     let after = db
         .sql(
@@ -1008,11 +1009,15 @@ fn create_table_and_create_index_build_a_queryable_collection() {
         .unwrap_err();
     assert!(format!("{after}").contains("does not exist"), "{after}");
 
-    let refused = db.sql("DROP TABLE town", &[]).unwrap_err();
-    assert!(
-        format!("{refused}").contains("drop_collection"),
-        "{refused}"
-    );
+    // Nothing references `town`, so the default RESTRICT drops it, and the
+    // collection stops answering.
+    match db.sql("DROP TABLE town", &[]).unwrap() {
+        SqlResult::Affected(n) => assert!(n >= 50, "{n} entries removed"),
+        other => panic!("expected an affected count, got {other:?}"),
+    }
+    assert!(db.collection("town").unwrap().is_none());
+    let gone = db.sql("SELECT _key FROM town LIMIT 1", &[]).unwrap_err();
+    assert!(format!("{gone}").contains("no collection named `town`"), "{gone}");
 }
 
 // ── GRAPH_TABLE ───────────────────────────────────────────────────────────
@@ -1065,4 +1070,79 @@ fn limit_is_a_total_limit_on_the_prepared_query() {
     );
     assert_eq!(limited.len(), 7);
     assert_eq!(limited, all[..7]);
+}
+
+// ── DROP TABLE ────────────────────────────────────────────────────────────
+
+/// `DROP TABLE [IF EXISTS] name [CASCADE|RESTRICT]`, against the same 2,000-row
+/// fixture. The oracle is the direct API: the statement compiles to
+/// `begin_drop_collection_mode` and `drop_collection_step` and nothing else,
+/// so the questions asked are "does the collection still answer" and "did the
+/// refusal say what the contract says it says".
+#[test]
+fn drop_table_restricts_on_graph_edges_and_cascades_when_asked() {
+    let (_dir, mut f) = open();
+    // The fixture's every row is an endpoint of a `routes` edge, so RESTRICT
+    // refuses and names that context (GRAPH_CONTRACT 6.1).
+    let refused = f.db.sql("DROP TABLE place", &[]).unwrap_err().to_string();
+    assert!(refused.contains("RESTRICT"), "{refused}");
+    assert!(refused.contains("routes"), "{refused}");
+    assert!(refused.contains("CASCADE"), "{refused}");
+    // A refusal removes nothing.
+    assert_eq!(
+        f.db.scan(f.place, None).unwrap().count(),
+        fixture::ROWS,
+        "the refused drop left every row"
+    );
+
+    // IF EXISTS on a name that is not there is a notice, not an error.
+    match f.db.sql("DROP TABLE IF EXISTS nowhere", &[]).unwrap() {
+        SqlResult::Notice(text) => assert!(text.contains("no such collection"), "{text}"),
+        other => panic!("expected a notice, got {other:?}"),
+    }
+    assert!(f
+        .db
+        .sql("DROP TABLE nowhere", &[])
+        .unwrap_err()
+        .to_string()
+        .contains("nowhere"));
+
+    match f.db.sql("DROP TABLE place CASCADE", &[]).unwrap() {
+        // 2,000 rows + 2,000 mappings + 2,000 sidecars is the floor; the
+        // indexes, the edges and the descriptors are on top of it.
+        SqlResult::Affected(n) => assert!(n >= 6_000, "{n} entries removed"),
+        other => panic!("expected an affected count, got {other:?}"),
+    }
+    assert!(f.db.collection("place").unwrap().is_none());
+    assert!(f
+        .db
+        .sql("SELECT _id FROM place LIMIT 1", &[])
+        .unwrap_err()
+        .to_string()
+        .contains("no collection named `place`"));
+
+    // The name is free again and the identity is not reused.
+    f.db.sql("CREATE TABLE place (key TEXT PRIMARY KEY, born INT)", &[])
+        .unwrap();
+    let again = f.db.collection("place").unwrap().unwrap();
+    assert_ne!(again, f.place);
+    f.db.sql("INSERT INTO place (key, born) VALUES ('a', 1)", &[])
+        .unwrap();
+    f.db.sql("COMMIT", &[]).unwrap();
+    // The fresh collection has no index, so the question is asked of the
+    // external key, which is the key-order driver's own range.
+    match f
+        .db
+        .sql("SELECT born FROM place WHERE _key = 'a'", &[])
+        .unwrap()
+    {
+        SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // Nothing references it, so the default RESTRICT drops it.
+    match f.db.sql("DROP TABLE place RESTRICT", &[]).unwrap() {
+        SqlResult::Affected(_) => {}
+        other => panic!("expected an affected count, got {other:?}"),
+    }
+    assert!(f.db.collection("place").unwrap().is_none());
 }

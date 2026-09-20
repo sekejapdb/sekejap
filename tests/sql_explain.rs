@@ -541,3 +541,38 @@ fn five_explanations_in_full() {
         assert!(text.contains("\nwork: "), "{name}");
     }
 }
+
+/// `EXPLAIN DROP TABLE` is the one EXPLAIN here that does not run its
+/// statement: running a destructive DDL to print its plan would be the drop.
+/// What it prints instead is the phase list, the bound each step honours and
+/// the indexes the first phase has to remove.
+#[test]
+fn explain_drop_table_prints_the_phases_and_runs_nothing() {
+    let (_dir, mut f) = open();
+    let text = explain(&mut f, "DROP TABLE place CASCADE", &[]);
+    println!("{text}");
+    for expected in [
+        "DROP TABLE place CASCADE",
+        "does not run its statement",
+        "begin_drop_collection publishes DROPPING",
+        "  indexes -- 9 index(es)",
+        "place_emb_ann",
+        "  vector sidecars -- prefix 0x60",
+        "  rows -- prefix 0x40",
+        "cascade_graph_delete",
+        "  external-key mappings -- prefix 0x20",
+        "  descriptor --",
+        "range probe proves every keyspace above is empty",
+        "budget in 1..=256",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
+    }
+    assert_eq!(
+        f.db.scan(f.place, None).unwrap().count(),
+        fixture::ROWS,
+        "EXPLAIN ran nothing"
+    );
+    // RESTRICT is the default, and the plan says which one it printed.
+    let restrict = explain(&mut f, "DROP TABLE place", &[]);
+    assert!(restrict.contains("RESTRICT (the default)"), "{restrict}");
+}

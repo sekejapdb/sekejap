@@ -35,6 +35,7 @@ current headings are numbered `## 1.` through `## 7.`),
 | --- | --- | --- |
 | `src/collections/mod.rs` | `Database`, `CollectionId`, `EntityId`, `Kind`-typed collections, put/get/delete, the catalog and header records, and every public re-export the crate has ever offered from `collections`. | `docs/COLLECTIONS.md` |
 | `src/collections/catalog.rs` | The index catalog: `IndexInfo`/`IndexId`/`IndexFamily`/`IndexState`, index create/drop, the index trees, scalar keys (`skey`) and index maintenance on write. | `docs/COLLECTIONS.md` |
+| `src/collections/drop_collection.rs` | Removing a collection: `DropMode`/`DropPhase`/`DropState`/`DropProgress`, `begin_drop_collection[_mode]`, `drop_collection_step`, the `DROP_FEATURE` bit and the descriptor's DROPPING tail. | `docs/QL_CONTRACT.md` §2 (`DROP TABLE`); `docs/GRAPH_CONTRACT.md` §6.1 |
 | `src/collections/rebuild.rs` | Offline rebuild of a database into a fresh file, sorted index builds included. Public as `collections::rebuild`. | `docs/COLLECTIONS.md` |
 | `src/collections/verification.rs` | Whole-database verification against an independent walk of the source. Public as `collections::verification`. | `docs/COLLECTIONS.md` |
 | `src/collections/sort.rs` | The external sort the sorted index build runs on. | `docs/COLLECTIONS.md` |
@@ -139,6 +140,17 @@ lives here so every fault suite is in one place:
    public names keep leaving the crate through `e4_prototype::collections`.
 5. Its fault-injection suite goes in `src/faults/`, declared `cfg(test)` from
    the family's own `mod.rs`.
+
+**A new collection-lifecycle phase.**
+1. The phase goes on `DropPhase` in `src/collections/drop_collection.rs`, with
+   its byte, its `name` and its place in `next`; the byte is persisted, so a
+   phase is appended, never renumbered.
+2. Its step goes beside `drop_step_prefix` / `drop_step_rows` there, and its
+   arm in `drop_collection_step`.
+3. Its range probe goes in `drop_step_descriptor`'s list, which is what proves
+   the keyspace empty before the descriptor is removed.
+4. `src/sql/compile.rs`'s `explain_drop_table` prints the phase list, so it
+   needs the arm too.
 
 **A new driver.**
 1. The `CandidateDriver` and `QueryDriver` variants go in `src/query/mod.rs`
