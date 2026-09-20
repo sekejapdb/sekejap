@@ -236,7 +236,7 @@ fn create_fixture(path: &Path) -> Fixture {
     }
 }
 
-fn graph_request(f: &Fixture) -> BfsRequest {
+fn graph_request(f: &Fixture) -> BfsRequest<'static> {
     BfsRequest {
         seed: f.ids["p0"],
         direction: Direction::Outgoing,
@@ -248,6 +248,8 @@ fn graph_request(f: &Fixture) -> BfsRequest {
         max_visited: 32,
         max_edges: 64,
         result_limit: 32,
+        edge_where: &[],
+        node_where: &[],
     }
 }
 
@@ -1515,6 +1517,8 @@ fn mixed_ids(
         max_visited: 32,
         max_edges: 64,
         result_limit: 32,
+        edge_where: &[],
+        node_where: &[],
     };
     let filters = [
         QueryFilter::Graph(graph),
@@ -1865,6 +1869,8 @@ fn every_native_driver_refuses_an_orphan_winner_without_full_candidate_rescoring
                     max_visited: 32,
                     max_edges: 64,
                     result_limit: 32,
+                    edge_where: &[],
+                    node_where: &[],
                 })];
                 db.prepare_query(QueryRequest {
                     collection: people,

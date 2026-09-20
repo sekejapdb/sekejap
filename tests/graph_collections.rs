@@ -189,6 +189,8 @@ fn cyclic_bfs_is_shortest_hop_deterministic_and_bounded() {
             max_visited: 16,
             max_edges: 32,
             result_limit: 16,
+            edge_where: &[],
+            node_where: &[],
         })
         .unwrap();
     assert_eq!(
@@ -211,6 +213,8 @@ fn cyclic_bfs_is_shortest_hop_deterministic_and_bounded() {
             max_visited: 2,
             max_edges: 32,
             result_limit: 16,
+            edge_where: &[],
+            node_where: &[],
         })
         .is_err());
     // The visited bound is enforced while each distinct next-wave entity is
@@ -227,6 +231,8 @@ fn cyclic_bfs_is_shortest_hop_deterministic_and_bounded() {
             max_visited: 1,
             max_edges: 1_000_000,
             result_limit: 16,
+            edge_where: &[],
+            node_where: &[],
         })
         .is_err());
 }
@@ -272,6 +278,8 @@ fn neighbor_and_bfs_cancellation_never_return_partial_or_poison_reads() {
         max_visited: 16,
         max_edges: 32,
         result_limit: 16,
+        edge_where: &[],
+        node_where: &[],
     };
     let expected_bfs = db.traverse_bfs(bfs).unwrap();
     let immediate = db.traverse_bfs_with_cancel(bfs, || true).unwrap_err();
@@ -699,6 +707,8 @@ fn traversal_reads_pay_for_leaf_pages_not_for_edges() {
             max_visited: 4096,
             max_edges: 4096,
             result_limit: 4096,
+            edge_where: &[],
+            node_where: &[],
         })
         .unwrap();
     }
@@ -715,6 +725,8 @@ fn traversal_reads_pay_for_leaf_pages_not_for_edges() {
             max_visited: 4096,
             max_edges: 4096,
             result_limit: 4096,
+            edge_where: &[],
+            node_where: &[],
         })
         .unwrap();
     let bfs_cost = db.pool_accesses().unwrap() - before;
@@ -813,6 +825,8 @@ fn bfs_allocates_a_constant_plus_its_result_not_per_edge() {
         max_visited: 4096,
         max_edges: 4096,
         result_limit: 4096,
+        edge_where: &[],
+        node_where: &[],
     };
     // Warm the pages and any one-off lazy state, then measure the repeat.
     for _ in 0..2 {
@@ -1052,6 +1066,8 @@ fn graph_reads_still_refuse_a_seed_that_has_no_row() {
         max_visited: 64,
         max_edges: 64,
         result_limit: 64,
+        edge_where: &[],
+        node_where: &[],
     };
 
     // An identity the allocator never issued.
@@ -1109,7 +1125,7 @@ fn graph_reads_still_refuse_a_seed_that_has_no_row() {
 // ── the graph filter inside the query engine ──────────────────────────────
 
 /// One page of a graph-filtered query, as `two_ways`' `hop1_project` asks it.
-fn graph_query(db: &Database, collection: CollectionId, request: BfsRequest) -> Vec<u64> {
+fn graph_query(db: &Database, collection: CollectionId, request: BfsRequest<'_>) -> Vec<u64> {
     let filters = [QueryFilter::Graph(request)];
     page_ids(db, collection, &filters, CandidateDriver::Auto)
 }
@@ -1228,6 +1244,8 @@ fn graph_filtered_query_allocates_like_the_traversal_it_runs() {
         max_visited: 4096,
         max_edges: 4096,
         result_limit: 4096,
+        edge_where: &[],
+        node_where: &[],
     };
     let single = hop(one, Direction::Outgoing);
     let wide = hop(hub, Direction::Incoming);
@@ -1340,6 +1358,8 @@ fn graph_filter_answers_what_traverse_bfs_answers() {
                         max_visited: 4096,
                         max_edges: 4096,
                         result_limit: 4096,
+                        edge_where: &[],
+                        node_where: &[],
                     };
                     let mut traversal = db
                         .traverse_bfs(request)
@@ -1398,6 +1418,8 @@ fn graph_filter_refuses_a_seed_that_is_not_there() {
         max_visited: 4096,
         max_edges: 4096,
         result_limit: 4096,
+        edge_where: &[],
+        node_where: &[],
     };
     assert!(matches!(
         db.traverse_bfs(request),
