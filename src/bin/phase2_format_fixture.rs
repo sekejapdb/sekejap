@@ -328,6 +328,8 @@ fn check_graph(db: &Database, state: State) {
             max_visited: 32,
             max_edges: 64,
             result_limit: 16,
+            edge_where: &[],
+            node_where: &[],
         })
         .unwrap();
     assert_eq!(

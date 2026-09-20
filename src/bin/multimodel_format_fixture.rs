@@ -612,6 +612,8 @@ fn check_graph(db: &Database, state: State) {
             max_visited: 16,
             max_edges: 16,
             result_limit: 16,
+            edge_where: &[],
+            node_where: &[],
         })
         .unwrap();
     assert_eq!(

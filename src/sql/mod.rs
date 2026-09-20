@@ -538,6 +538,9 @@ pub(crate) fn order_value(value: &OrderValue) -> SqlValue {
             crate::collections::OwnedScalarValue::Text(t) => SqlValue::Text(t.clone()),
         },
         OrderValue::Distance(d) | OrderValue::Bm25(d) | OrderValue::Score(d) => SqlValue::Float(*d),
+        // A reaching-edge ranking whose property the bag does not carry has
+        // no number to report, which is SQL's NULL.
+        OrderValue::Edge(value) => value.map_or(SqlValue::Null, SqlValue::Float),
     }
 }
 

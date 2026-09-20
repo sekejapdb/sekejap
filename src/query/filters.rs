@@ -99,9 +99,17 @@ pub(super) fn batch_filters_match<C: FnMut() -> bool>(
             }
             // Already answered by the position it folded into.
             CompiledFilter::Folded { .. } => true,
-            CompiledFilter::Graph { .. } | CompiledFilter::Text(_) | CompiledFilter::Key { .. } => {
-                return Ok(None)
+            // The external key is the row's own first field (`KEY_FIELD`),
+            // so a key range this candidate's driver did not certify is as
+            // pure a function of the row as a JSON equality is.
+            CompiledFilter::Key { predicate } => {
+                meter.note_row_decode();
+                key_filter_matches(
+                    predicate,
+                    selected_field_in(&layout, bytes, crate::collections::KEY_FIELD)?,
+                )?
             }
+            CompiledFilter::Graph { .. } | CompiledFilter::Text(_) => return Ok(None),
         };
         if !matches {
             return Ok(Some(false));
@@ -206,6 +214,22 @@ fn scalar_filter_matches(
                 Err(corrupt_query("scalar index field is a historical vector"))
             }
         },
+    }
+}
+
+/// A key range against the external key a row carries in its own first
+/// field (`KEY_FIELD`, `src/collections/mod.rs`). The bounds are raw key
+/// bytes (`encode_key_bound`), so the comparison is the same byte-range
+/// logic `KeysCursor` applies to a mapping entry.
+fn key_filter_matches(
+    predicate: &EncodedScalarFilter,
+    value: dense_v3::FieldValue,
+) -> QueryResult<bool> {
+    match value {
+        dense_v3::FieldValue::Inline(serde_json::Value::String(key)) => {
+            Ok(scalar_key_position(predicate, key.as_bytes()) == Ordering::Equal)
+        }
+        _ => Err(corrupt_query("row carries no external key")),
     }
 }
 
@@ -338,7 +362,7 @@ pub(super) fn filters_match<'a, C: FnMut() -> bool>(
     candidate: &Candidate,
     row: &mut Option<RowData>,
     encoded: &mut Option<Vec<u8>>,
-    graph: &[Option<Vec<EntityId>>],
+    graph: &[Option<GraphAnswer>],
     scratch: &mut RowScratch,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<bool> {
@@ -388,7 +412,7 @@ pub(super) fn filters_match<'a, C: FnMut() -> bool>(
                 .and_then(Option::as_ref)
                 // Sorted, so membership is a binary search rather than a walk
                 // down a tree whose nodes were allocated to answer this.
-                .is_some_and(|ids| ids.binary_search(&id).is_ok()),
+                .is_some_and(|answer| answer.contains(id)),
             CompiledFilter::Point { info, predicate } => match &ranges[position] {
                 // The cover walk decided this predicate from the postings'
                 // own coordinates; the row has nothing to add.
@@ -444,12 +468,20 @@ pub(super) fn filters_match<'a, C: FnMut() -> bool>(
                 meter,
             )?
             .is_some(),
-            // Reached only if a candidate arrived here uncertified, which
-            // `prepare_query` refuses to compile: a key filter exists only at
-            // the position `CandidateDriver::Keys` certifies, and `KeysCursor`
-            // never yields an entry outside its own predicate.
-            CompiledFilter::Key { .. } => {
-                unreachable!("a key filter is always certified by CandidateDriver::Keys")
+            // A key filter the candidate's driver certified is skipped
+            // above (`satisfied_filter`); `KeysCursor` never yields an entry
+            // outside its own predicate. Reached when some OTHER driver runs
+            // the query -- the traversal that bound the reaching edge is the
+            // case `prepare_query` allows -- and then the answer is the
+            // external key the row carries in its own first field.
+            CompiledFilter::Key { predicate } => {
+                ensure_row_seq(db, rows, id, row, encoded, meter)?;
+                let row = row.as_ref().unwrap();
+                meter.note_row_decode();
+                key_filter_matches(
+                    predicate,
+                    selected_field(row, crate::collections::KEY_FIELD)?,
+                )?
             }
         };
         if !matches {

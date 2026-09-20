@@ -18,7 +18,7 @@ impl<'a> DriverCursor<'a> {
         db: &'a Database,
         collection: CollectionId,
         plan: &DriverPlan,
-        graph: &[Option<Vec<EntityId>>],
+        graph: &[Option<GraphAnswer>],
         needs: CursorNeeds,
         resume: Option<&RankKey>,
         descending: bool,
@@ -109,19 +109,31 @@ impl<'a> DriverCursor<'a> {
                 }))
             }
             DriverPlan::Graph { position } => {
-                let ids = graph
+                let answer = graph
                     .get(*position)
                     .and_then(Option::as_ref)
-                    .ok_or_else(|| corrupt_query("missing prepared graph result"))?
+                    .ok_or_else(|| corrupt_query("missing prepared graph result"))?;
+                let ids = answer
+                    .ids
                     .iter()
                     .copied()
-                    .filter(|id| id.collection == collection)
+                    .enumerate()
+                    .filter(|(_, id)| id.collection == collection)
                     // A traversal hands its result over sorted, so under
                     // driver order a resumed page opens past the row the last
                     // one ended on: the same walk with its head cut off.
-                    .filter(|id| match resume {
+                    .filter(|(_, id)| match resume {
                         Some(after) => *id > after.id,
                         None => true,
+                    })
+                    // The reaching edge travels with the candidate when this
+                    // query reads it (`docs/GRAPH_CONTRACT.md` §4.2): one
+                    // `Arc` clone, shared with the traversal's own answer.
+                    .map(|(at, id)| {
+                        (
+                            id,
+                            needs.edge.then(|| answer.via.get(at).cloned().flatten()).flatten(),
+                        )
                     })
                     .collect::<Vec<_>>();
                 Ok(Self::Ids(ids.into_iter()))
@@ -366,7 +378,10 @@ impl<'a> DriverCursor<'a> {
             Self::Vector(cursor) => cursor.next(meter),
             Self::QuantizedVector(cursor) => cursor.next(meter),
             Self::Keys(cursor) => cursor.next(meter),
-            Self::Ids(ids) => Ok(ids.next().map(Candidate::bare)),
+            Self::Ids(ids) => Ok(ids.next().map(|(id, edge)| Candidate {
+                edge,
+                ..Candidate::bare(id)
+            })),
         }
     }
 

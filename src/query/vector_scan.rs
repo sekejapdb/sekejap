@@ -189,6 +189,7 @@ impl PreparedQuery<'_> {
                         },
                         descending: false,
                         row: None,
+                        edge: None,
                     };
                     winners.push(bound, entry);
                 }
@@ -246,6 +247,7 @@ impl PreparedQuery<'_> {
                         },
                         descending: false,
                         row: None,
+                        edge: None,
                     };
                     winners.push(bound, entry);
                 }
@@ -406,6 +408,7 @@ impl PreparedQuery<'_> {
                 },
                 descending: false,
                 row: None,
+                edge: None,
             };
             winners.push(bound, entry);
         }

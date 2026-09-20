@@ -28,6 +28,17 @@ pub enum Error {
     Unsupported(String),
     /// The caller's cancellation callback stopped a bounded exact query.
     Cancelled,
+    /// A bounded walk exceeded a NAMED budget. The same three fields
+    /// `crate::query::QueryError::BudgetExceeded` carries, so an atomic that
+    /// runs query machinery under the hood (the traversal's node gate,
+    /// `docs/GRAPH_CONTRACT.md` §4.3) reports the resource machine-readably
+    /// instead of flattening it into prose. `From<Error> for QueryError`
+    /// carries it back the other way unchanged.
+    BudgetExceeded {
+        resource: crate::query::WorkResource,
+        limit: u64,
+        attempted: u64,
+    },
     Kernel(kernel::Error),
 }
 impl fmt::Display for Error {
@@ -63,8 +74,8 @@ pub mod verification;
 // `crate::query`; every name this module has ever exported still leaves the
 // crate through `e4_prototype::collections`.
 pub use crate::index::graph::{
-    BfsRequest, Direction, Edge, EdgeBudget, EdgeKey, EdgeTypeId, GraphContextId, NeighborRequest,
-    TraversalNode, TraversalResult,
+    BfsRequest, Cmp, Direction, Edge, EdgeBudget, EdgeKey, EdgePredicate, EdgeRef, EdgeTypeId,
+    GraphContextId, NeighborRequest, TraversalNode, TraversalResult,
 };
 pub use crate::index::spatial::point::{SpatialCandidates, SpatialHit};
 pub use crate::index::text::{TextCandidates, TextHit, TextMatch};

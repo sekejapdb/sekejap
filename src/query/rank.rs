@@ -19,6 +19,9 @@ pub(super) enum RankValue {
     GeomCell { level: u8, cell: u32 },
     /// One mapping entry's external-key bytes.
     Key(Vec<u8>),
+    /// One reaching edge's numeric property, or `None` when the edge does not
+    /// carry one. `None` sorts after every value in either direction.
+    EdgeScore(Option<u64>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,12 +56,35 @@ pub(super) enum RankWalk {
 pub(super) struct HeapEntry {
     pub(super) key: RankKey,
     pub(super) descending: bool,
+    /// The edge the traversal crossed to reach this row, when the page reads
+    /// it (`docs/GRAPH_CONTRACT.md` §4.2). Held here rather than looked up
+    /// again at emit time because a page that cannot resume HOLDS its ranked
+    /// rows across pages (`PreparedQuery::run`), and the traversal's own
+    /// answer is a per-page value.
+    pub(super) edge: Option<Arc<crate::index::graph::EdgeRef>>,
     /// Boxed on purpose. Every query pays this struct's size on every heap
     /// push, pop and sift -- a key-only scan of 20,000 rows sifts an 8,192
     /// entry heap -- so the pointer stays here and the row lives off to one
     /// side. Inlining `RowData` here cost a measured 25-30% on `scan/full_keys`
     /// and `filter/eq_indexed_many`, which carry no rows at all.
     pub(super) row: Option<Box<RowData>>,
+}
+
+/// The ranking value one edge property produces.
+///
+/// A property that is absent, null, or not a number has no ranking value and
+/// sorts LAST in either direction -- the place `RankValue::Score` already
+/// gives a missing score, spelled here as the `None` arm of
+/// [`RankValue::EdgeScore`].
+pub(super) fn edge_rank_value(
+    edge: Option<&Arc<crate::index::graph::EdgeRef>>,
+    property: &str,
+) -> RankValue {
+    let score = edge
+        .and_then(|edge| edge.properties.get(property))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite());
+    RankValue::EdgeScore(score.map(f64::to_bits))
 }
 
 /// The carried row plays no part in the ordering, so equality is the rank
@@ -264,6 +290,19 @@ pub(super) fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool)
                         a.total_cmp(&b)
                     }
                 }
+            }
+        }
+        // A property the edge does not carry is worse than every value it
+        // does, in either direction: the same place a NaN score takes above.
+        (RankValue::EdgeScore(None), RankValue::EdgeScore(None)) => Ordering::Equal,
+        (RankValue::EdgeScore(None), RankValue::EdgeScore(Some(_))) => Ordering::Greater,
+        (RankValue::EdgeScore(Some(_)), RankValue::EdgeScore(None)) => Ordering::Less,
+        (RankValue::EdgeScore(Some(a)), RankValue::EdgeScore(Some(b))) => {
+            let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
+            if descending {
+                b.total_cmp(&a)
+            } else {
+                a.total_cmp(&b)
             }
         }
         _ => unreachable!("prepared order creates one rank-key kind"),
@@ -653,6 +692,8 @@ pub(super) fn rank_candidate<'a, C: FnMut() -> bool>(
         CompiledOrder::ApproximateVector { .. } => {
             unreachable!("approximate order uses shortlist then exact rerank")
         }
+        // The bag the hop already decoded. No row, no second posting read.
+        CompiledOrder::Edge { property, .. } => edge_rank_value(candidate.edge.as_ref(), property),
         CompiledOrder::Distance { info, center } => {
             let distance = if let Some(distance) = candidate.distance_metres(info.id) {
                 distance

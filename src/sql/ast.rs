@@ -277,6 +277,15 @@ pub(super) enum SelectItem {
     },
 }
 
+/// One comparison written inside an edge element's inline `WHERE`, over a
+/// property of the edge's own inline bag (`GRAPH_CONTRACT` 4.3).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct EdgePredicate {
+    pub(super) property: String,
+    pub(super) op: CmpOp,
+    pub(super) value: Literal,
+}
+
 /// One element of a `GRAPH_TABLE` pattern's path.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct GraphHop {
@@ -285,6 +294,9 @@ pub(super) struct GraphHop {
     pub(super) direction: GraphDirection,
     pub(super) min_depth: usize,
     pub(super) max_depth: usize,
+    /// The edge element's inline `WHERE`, a conjunction over the edge's own
+    /// properties. Applied per hop, not to completed matches.
+    pub(super) predicates: Vec<EdgePredicate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,8 +317,21 @@ pub(super) struct GraphTable {
     /// The far element's collection, which is the collection the outer
     /// statement selects from.
     pub(super) target_collection: String,
-    /// `COLUMNS (b.<field> AS <alias>)`.
-    pub(super) columns: Vec<(SelectItem, String)>,
+    /// The far element's inline `WHERE`, a conjunction over the NODE's own
+    /// fields. Applied per hop: a node it refuses is neither returned nor
+    /// expanded.
+    pub(super) node_predicates: Vec<Predicate>,
+    /// `COLUMNS (b.<field> AS <alias>)` and `COLUMNS (r.<property> AS
+    /// <alias>)`.
+    pub(super) columns: Vec<(GraphColumn, String)>,
+}
+
+/// One entry of a `COLUMNS (...)` list: a field of the far NODE, or a
+/// property of the EDGE the pattern bound.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum GraphColumn {
+    Node(SelectItem),
+    Edge(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]

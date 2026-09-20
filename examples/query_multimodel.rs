@@ -81,6 +81,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_visited: 1_000,
             max_edges: 10_000,
             result_limit: 1_000,
+            edge_where: &[],
+            node_where: &[],
         }),
         QueryFilter::Scalar {
             index: active,

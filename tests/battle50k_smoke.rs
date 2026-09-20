@@ -32,6 +32,7 @@
 mod battle50k;
 
 use battle50k::{
+    needs_graph,
     load_corpus, load_queries, run_arm, Arm, CaseKind, Corpus, Options, Queries, Row, BATTERY,
     DIM, INSTANCES, K, KINDS,
 };
@@ -338,6 +339,11 @@ fn the_e4_arm_answers_what_brute_force_answers() {
     let queries = load_queries(&queries_path).expect("queries reload");
 
     for spec in &BATTERY {
+        // The graph cases need a --graph load, which the smoke corpus does
+        // not perform; they are skipped, not answered with zero rows.
+        if needs_graph(spec.name) {
+            continue;
+        }
         let case = case_of(&report, spec.name);
         assert_eq!(
             case["queries"].as_u64(),
@@ -453,6 +459,11 @@ fn the_e4_sql_arm_asks_the_same_questions_as_the_e4_arm() {
     assert_eq!(sql_report["rows"], api_report["rows"]);
 
     for spec in &BATTERY {
+        // The graph cases need a --graph load, which the smoke corpus does
+        // not perform; they are skipped, not answered with zero rows.
+        if needs_graph(spec.name) {
+            continue;
+        }
         let api_case = case_of(&api_report, spec.name);
         let sql_case = case_of(&sql_report, spec.name);
         assert_eq!(

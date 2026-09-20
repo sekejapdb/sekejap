@@ -7,7 +7,13 @@ pub struct PreparedQuery<'db> {
     pub(super) collection: CollectionId,
     pub(super) filters: Vec<CompiledFilter>,
     pub(super) order: CompiledOrder,
+    /// The ROW fields this query projects, in the order the dense-v3 walk
+    /// reads them. An `@edge.<name>` is not here: it is resolved from the
+    /// reaching edge and appears only in [`Self::slots`].
     pub(super) projection: Vec<String>,
+    /// One slot per field the caller asked for, in the caller's order, saying
+    /// whether it comes from the row or from the reaching edge.
+    pub(super) slots: Vec<ProjectedSlot>,
     pub(super) driver: DriverPlan,
     pub(super) total_limit: Option<usize>,
     pub(super) emitted: usize,
@@ -190,7 +196,22 @@ impl PreparedQuery<'_> {
             // The mapping entry's key bytes are read only by a driver-ordered
             // ranking over the keys walk itself.
             key: matches!(self.order, CompiledOrder::Driver(DriverKey::Key)),
+            edge: self.reads_the_edge(),
         }
+    }
+    /// True when something in this query reads the edge a traversal crossed
+    /// to reach a row (`docs/GRAPH_CONTRACT.md` §4.2): an `@edge.<name>`
+    /// projection or an `@edge` ranking.
+    ///
+    /// It is what decides whether the traversal decodes and keeps a property
+    /// bag per admitted node at all. A traversal that is only a membership
+    /// test answers this `false` and allocates no edge.
+    pub(super) fn reads_the_edge(&self) -> bool {
+        matches!(self.order, CompiledOrder::Edge { .. })
+            || self
+                .slots
+                .iter()
+                .any(|slot| matches!(slot, ProjectedSlot::Edge { .. }))
     }
     /// Whether a winner's identity is already established without going back
     /// to the primary tree.
@@ -435,8 +456,10 @@ impl PreparedQuery<'_> {
             | CompiledOrder::ApproximateVector { .. }
             | CompiledOrder::Bm25(_)
             // Every driver-order key is carried by the candidate: its id, the
-            // scalar posting's value, or the spatial posting's cell.
-            | CompiledOrder::Driver(_) => false,
+            // scalar posting's value, or the spatial posting's cell -- and an
+            // edge ranking's value is the bag the hop already decoded.
+            | CompiledOrder::Driver(_)
+            | CompiledOrder::Edge { .. } => false,
         }
     }
     /// Distance ranking reads a row only when the driver did not already
@@ -584,11 +607,12 @@ impl PreparedQuery<'_> {
                 MembershipSet::Ids(_) | MembershipSet::Bitmap(_)
             ),
             CompiledFilter::Graph { .. } | CompiledFilter::Folded { .. } => false,
-            // Certified straight from the mapping entry, at the driving
-            // position `_ if Some(position) == driving` already caught above;
-            // reached only if it were somehow not driving, which
-            // `prepare_query` refuses to compile.
-            CompiledFilter::Key { .. } => false,
+            // Certified straight from the mapping entry at the driving
+            // position, which `_ if Some(position) == driving` already caught
+            // above. Anywhere else it is answered from the external key the
+            // ROW carries in its first field (`filters.rs`,
+            // `key_filter_matches`), so it reads one.
+            CompiledFilter::Key { .. } => true,
         })
     }
     /// True when this page should HOLD BACK the rows it ranked but could not
@@ -609,8 +633,17 @@ impl PreparedQuery<'_> {
     ///   * the order is not the approximate-vector one, whose `ef` already
     ///     bounds the entire result set to one shortlist, and whose page
     ///     reports approximation diagnostics that a held row does not carry.
+    ///   * the page does not read the reaching edge. `RUN_ROWS`
+    ///     (`src/query/rows.rs`) is derived from `size_of::<HeapEntry>()` on
+    ///     the premise that what is held is a rank key and nothing else, and
+    ///     after the Row/Edge projection split a query projecting only
+    ///     `@edge.*` has an EMPTY row projection while every held entry owns
+    ///     an `Arc<EdgeRef>` with the whole property bag
+    ///     (`src/query/rank.rs`). A bound in rows would not be a bound in
+    ///     bytes, exactly as for a projected page.
     fn keeps_a_run(&self) -> bool {
         self.projection.is_empty()
+            && !self.reads_the_edge()
             && self.driver_walks_in_rank_order() == RankWalk::No
             && !matches!(self.order, CompiledOrder::ApproximateVector { .. })
     }
@@ -747,6 +780,9 @@ impl PreparedQuery<'_> {
                 (CompiledOrder::Score { .. }, RankValue::Score(score)) => {
                     OrderValue::Score(f64::from_bits(*score))
                 }
+                (CompiledOrder::Edge { .. }, RankValue::EdgeScore(score)) => {
+                    OrderValue::Edge(score.map(f64::from_bits))
+                }
                 // The driver's key is the walk's own bookkeeping, not an
                 // answer about the row: a cell number is not a distance and a
                 // sequence is already `id`.
@@ -802,12 +838,52 @@ impl PreparedQuery<'_> {
             let row = QueryRow {
                 id: winner.key.id,
                 order,
-                projected,
+                projected: self.assemble(projected, winner.edge.as_ref()),
             };
             meter.charge(WorkResource::OutputBytes, checked_output_size(&row)?)?;
             rows.push(row);
         }
         Ok(rows)
+    }
+    /// The row's projected values in the CALLER's order, with every
+    /// `@edge.<name>` slot filled from the edge the traversal crossed to
+    /// reach it (`docs/GRAPH_CONTRACT.md` §4.2).
+    ///
+    /// `row_values` arrives in `self.projection`'s order -- the row fields
+    /// only. A query with no edge slot at all hands it straight back, so a
+    /// projected page that never mentions an edge pays nothing for this.
+    fn assemble(
+        &self,
+        mut row_values: Vec<(String, ProjectedValue)>,
+        edge: Option<&Arc<crate::index::graph::EdgeRef>>,
+    ) -> Vec<(String, ProjectedValue)> {
+        if !self.reads_the_edge() {
+            return row_values;
+        }
+        let mut taken: Vec<Option<(String, ProjectedValue)>> =
+            row_values.drain(..).map(Some).collect();
+        let mut out = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            match slot {
+                ProjectedSlot::Row(at) => {
+                    if let Some(value) = taken.get_mut(*at).and_then(Option::take) {
+                        out.push(value);
+                    }
+                }
+                ProjectedSlot::Edge { property, label } => {
+                    // A node the traversal never bound an edge to (the seed),
+                    // or a property the bag does not carry, is MISSING -- the
+                    // same answer a row field that is not there gets.
+                    let value = match edge.and_then(|edge| edge.properties.get(property)) {
+                        None => ProjectedValue::Missing,
+                        Some(Value::Null) => ProjectedValue::Null,
+                        Some(value) => ProjectedValue::Value(value.clone()),
+                    };
+                    out.push((label.clone(), value));
+                }
+            }
+        }
+        out
     }
     pub fn next_page<C: FnMut() -> bool>(
         &mut self,
@@ -852,6 +928,10 @@ impl PreparedQuery<'_> {
                     direction: SortDirection::Descending,
                     ..
                 }
+                | CompiledOrder::Edge {
+                    direction: SortDirection::Descending,
+                    ..
+                }
         );
         let mut meter = WorkMeter::new(budget, &mut cancelled);
         meter.check_cancelled()?;
@@ -888,7 +968,7 @@ impl PreparedQuery<'_> {
         // arrive in ascending sequence -- the text and entity cursors -- reuse
         // it 255 times out of 256; one that does not simply re-decodes.
         let mut scratch = RowScratch::default();
-        let graph = execute_graph_filters(self.db, &self.filters, &mut meter)?;
+        let graph = execute_graph_filters(self.db, &self.filters, self.reads_the_edge(), &mut meter)?;
         let in_rank_order = self.driver_walks_in_rank_order();
         let needs = self.cursor_needs();
         let reverse = self.scalar_driver_descends();
@@ -1056,6 +1136,10 @@ impl PreparedQuery<'_> {
                         key,
                         descending: false,
                         row: None,
+                        // An approximate vector page has no traversal in it:
+                        // its candidates are the quantized index's own
+                        // entries, reranked.
+                        edge: None,
                     };
                     if winners.len() < capacity {
                         winners.push(capacity, entry);
@@ -1233,6 +1317,7 @@ impl PreparedQuery<'_> {
                         key,
                         descending,
                         row: None,
+                        edge: candidate.edge.clone(),
                     };
                     // The bytes this candidate's row was read from are still
                     // in hand -- the entity cursor copied them out of the leaf
@@ -1655,15 +1740,34 @@ impl PreparedQuery<'_> {
                         Some(field.clone()),
                         "structural JSON equality".to_owned(),
                     ),
-                    CompiledFilter::Graph { request, .. } => (
-                        "graph",
-                        None,
-                        None,
-                        format!(
+                    CompiledFilter::Graph { request, gate, .. } => {
+                        let mut detail = format!(
                             "traversal depth {}..{} from sequence {}",
                             request.min_depth, request.max_depth, request.seed.sequence
-                        ),
-                    ),
+                        );
+                        // The per-hop predicates of GRAPH_CONTRACT 4.3, so an
+                        // EXPLAIN says which edges are never followed and
+                        // which nodes are never expanded -- and, for the node
+                        // half, which membership set answers it.
+                        for predicate in &request.edge_where {
+                            detail.push_str(&format!(
+                                "; edge {} {} {}",
+                                predicate.property,
+                                predicate.op.written(),
+                                match &predicate.value {
+                                    OwnedScalarValue::Bool(v) => v.to_string(),
+                                    OwnedScalarValue::I64(v) => v.to_string(),
+                                    OwnedScalarValue::F64(v) => v.to_string(),
+                                    OwnedScalarValue::Text(v) => format!("'{v}'"),
+                                    OwnedScalarValue::Nullish => "null".to_owned(),
+                                }
+                            ));
+                        }
+                        for node in gate.describe() {
+                            detail.push_str(&format!("; node {node}"));
+                        }
+                        ("graph", None, None, detail)
+                    }
                     CompiledFilter::Point { info, predicate } => (
                         "point",
                         Some(info.name.clone()),
@@ -1725,6 +1829,13 @@ impl PreparedQuery<'_> {
                 ),
             ),
             CompiledOrder::Driver(key) => ("driver", format!("driver walk key {key:?}")),
+            CompiledOrder::Edge {
+                property,
+                direction,
+            } => (
+                "edge",
+                format!("reaching edge property `{property}` {direction:?}"),
+            ),
             CompiledOrder::Distance { info, center } => (
                 "distance",
                 format!(
@@ -1752,7 +1863,17 @@ impl PreparedQuery<'_> {
             order_detail,
             order_reads_row: self.order_needs_the_row(),
             score_leaves: leaves,
-            projection: self.projection.clone(),
+            // The CALLER's list, in the caller's order: an `@edge.<name>`
+            // slot is a projected field of the answer even though it is not
+            // a field of any row.
+            projection: self
+                .slots
+                .iter()
+                .map(|slot| match slot {
+                    ProjectedSlot::Row(at) => self.projection[*at].clone(),
+                    ProjectedSlot::Edge { label, .. } => label.clone(),
+                })
+                .collect(),
             total_limit: self.total_limit,
         }
     }

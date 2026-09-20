@@ -19,14 +19,14 @@ use super::{
 };
 use crate::collections::{
     Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest, BfsRequest,
-    CandidateDriver, CollectionId, CollectionOptions, Database, Direction, DropMode, DropPhase,
-    EntityId, Geom, GeometryFilter, GraphContextId, GroupCmp, GroupKey, GroupOrder,
-    GroupPredicate, GroupRow, IndexFamily, IndexId, IndexInfo, IndexState, OwnedScalarValue,
-    PointFilter,
-    Projection,
-    QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
-    SortDirection, TextMatch, VectorMetric,
+    CandidateDriver, Cmp, CollectionId, CollectionOptions, Database, Direction, DropMode,
+    DropPhase, EdgePredicate, EdgeTypeId, EntityId, Geom, GeometryFilter, GraphContextId,
+    GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexFamily, IndexId, IndexInfo,
+    IndexState, OwnedScalarValue, PointFilter, Projection, QueryFilter, QueryOrder,
+    QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr, SortDirection, TextMatch,
+    VectorMetric,
 };
+use crate::query::EDGE_FIELD_PREFIX;
 use crate::spatial_math::{Bounds, Point};
 use crate::Kind;
 use serde_json::{Map, Value};
@@ -115,7 +115,7 @@ pub(crate) enum OwnedFilter {
         query: String,
         matching: TextMatch,
     },
-    Graph(BfsRequest),
+    Graph(OwnedGraph),
     Key {
         lower: Bound<String>,
         upper: Bound<String>,
@@ -154,7 +154,9 @@ impl OwnedFilter {
                 query,
                 matching: *matching,
             },
-            Self::Graph(request) => QueryFilter::Graph(*request),
+            // Filled in by `SelectPlan::with_query`, which owns the
+            // borrowed predicate slices for the length of one prepared query.
+            Self::Graph(_) => unreachable!("a graph filter is borrowed through `graph_request`"),
             Self::Key { lower, upper } => QueryFilter::Key {
                 lower: borrow_key_bound(lower),
                 upper: borrow_key_bound(upper),
@@ -254,6 +256,66 @@ fn with_score<R>(node: &OwnedScore, k: &mut dyn FnMut(&ScoreExpr<'_>) -> R) -> R
     }
 }
 
+/// One `GRAPH_TABLE` pattern's traversal, with the per-hop predicates of
+/// `docs/GRAPH_CONTRACT.md` §4.3 owned by the plan.
+///
+/// A `BfsRequest` borrows its predicate slices, and a compiled plan outlives
+/// every statement text it was built from, so the plan holds the owned forms
+/// and [`SelectPlan::with_query`] builds the borrowed ones on the stack for
+/// the length of one prepared query -- the same shape the term strings and
+/// query vectors already have.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnedGraph {
+    pub(crate) seed: EntityId,
+    pub(crate) direction: Direction,
+    pub(crate) context: GraphContextId,
+    pub(crate) edge_type: Option<EdgeTypeId>,
+    pub(crate) min_depth: usize,
+    pub(crate) max_depth: usize,
+    pub(crate) edge_where: Vec<OwnedEdgePredicate>,
+    pub(crate) node_where: Vec<OwnedFilter>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnedEdgePredicate {
+    pub(crate) property: String,
+    pub(crate) op: Cmp,
+    pub(crate) value: Scalar,
+}
+
+impl OwnedEdgePredicate {
+    fn borrowed(&self) -> EdgePredicate<'_> {
+        EdgePredicate {
+            property: &self.property,
+            op: self.op,
+            value: self.value.borrowed(),
+        }
+    }
+}
+
+impl OwnedGraph {
+    pub(crate) fn request<'a>(
+        &'a self,
+        edge_where: &'a [EdgePredicate<'a>],
+        node_where: &'a [QueryFilter<'a>],
+    ) -> BfsRequest<'a> {
+        BfsRequest {
+            seed: self.seed,
+            direction: self.direction,
+            context: self.context,
+            edge_type: self.edge_type,
+            min_depth: self.min_depth,
+            max_depth: self.max_depth,
+            include_seed: false,
+            max_visited: GRAPH_VISITED,
+            max_edges: GRAPH_EDGES,
+            result_limit: GRAPH_RESULTS,
+            edge_where,
+            node_where,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedOrder {
     Driver,
@@ -284,6 +346,11 @@ pub(crate) enum OwnedOrder {
     },
     Score {
         expr: OwnedScore,
+        direction: SortDirection,
+    },
+    /// `ORDER BY <edge alias>` over a property of the edge the pattern bound.
+    Edge {
+        property: String,
         direction: SortDirection,
     },
 }
@@ -363,7 +430,43 @@ impl SelectPlan {
         db: &Database,
         body: &mut dyn FnMut(&mut crate::collections::PreparedQuery<'_>) -> SqlResult2<T>,
     ) -> SqlResult2<T> {
-        let filters: Vec<QueryFilter<'_>> = self.filters.iter().map(OwnedFilter::borrowed).collect();
+        // A traversal's per-hop predicates are BORROWED by its `BfsRequest`,
+        // so the borrowed forms are built here, on this call's stack, and the
+        // request that names them cannot outlive them -- the same reason this
+        // is a callback rather than a returned cursor.
+        let graph_edges: Vec<Vec<EdgePredicate<'_>>> = self
+            .filters
+            .iter()
+            .map(|filter| match filter {
+                OwnedFilter::Graph(graph) => graph
+                    .edge_where
+                    .iter()
+                    .map(OwnedEdgePredicate::borrowed)
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let graph_nodes: Vec<Vec<QueryFilter<'_>>> = self
+            .filters
+            .iter()
+            .map(|filter| match filter {
+                OwnedFilter::Graph(graph) => {
+                    graph.node_where.iter().map(OwnedFilter::borrowed).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let filters: Vec<QueryFilter<'_>> = self
+            .filters
+            .iter()
+            .enumerate()
+            .map(|(at, filter)| match filter {
+                OwnedFilter::Graph(graph) => {
+                    QueryFilter::Graph(graph.request(&graph_edges[at], &graph_nodes[at]))
+                }
+                other => other.borrowed(),
+            })
+            .collect();
         let fields: Vec<&str> = self.fields.iter().map(String::as_str).collect();
         let projection = if fields.is_empty() {
             Projection::Ids
@@ -427,6 +530,13 @@ impl SelectPlan {
                     expr: compiled,
                     direction: *direction,
                 })
+            }),
+            OwnedOrder::Edge {
+                property,
+                direction,
+            } => run(QueryOrder::Edge {
+                property,
+                direction: *direction,
             }),
         }
     }
@@ -1255,20 +1365,62 @@ impl Compiler<'_> {
             filters.push(self.filter(c, predicate)?);
         }
 
+        // An alias a `COLUMNS` entry gave to an EDGE property. `ORDER BY` and
+        // the select list resolve against this before they look for a column
+        // of the far node, because the two namespaces are distinct and the
+        // pattern is what bound the edge one.
+        let edge_aliases: Vec<(String, String)> = graph_columns
+            .iter()
+            .flatten()
+            .filter_map(|(item, alias)| match item {
+                GraphColumn::Edge(property) => Some((alias.clone(), property.clone())),
+                GraphColumn::Node(_) => None,
+            })
+            .collect();
+
         let order = match &statement.order {
             None => OwnedOrder::Driver,
+            Some(OrderKey::Column { column, descending }) => {
+                match edge_aliases
+                    .iter()
+                    .find(|(alias, _)| alias == column)
+                    .map(|(_, property)| property.clone())
+                {
+                    Some(property) => OwnedOrder::Edge {
+                        property,
+                        direction: if *descending {
+                            SortDirection::Descending
+                        } else {
+                            SortDirection::Ascending
+                        },
+                    },
+                    None => self.order(c, &OrderKey::Column {
+                        column: column.clone(),
+                        descending: *descending,
+                    })?,
+                }
+            }
             Some(key) => self.order(c, key)?,
         };
 
         // The select list. `_id` is free (a row carries its id); a named
         // column is a projected field; an expression is this statement's own
         // ranking value.
-        let items: Vec<(SelectItem, Option<String>)> = match graph_columns {
+        // `COLUMNS` entries that read the EDGE become projection fields under
+        // the `@edge.` spelling the engine resolves from the traversal; the
+        // rest are ordinary select items over the far node's row. Both keep
+        // the position the statement wrote them in.
+        let items: Vec<(GraphColumn, Option<String>)> = match graph_columns {
             Some(columns) => columns
                 .into_iter()
                 .map(|(item, alias)| (item, Some(alias)))
                 .collect(),
-            None => statement.items.clone(),
+            None => statement
+                .items
+                .clone()
+                .into_iter()
+                .map(|(item, alias)| (GraphColumn::Node(item), alias))
+                .collect(),
         };
         let mut columns = Vec::new();
         let mut outputs = Vec::new();
@@ -1283,7 +1435,19 @@ impl Compiler<'_> {
             }
         };
         for (item, alias) in items {
-            match &item {
+            let item = match item {
+                GraphColumn::Node(item) => item,
+                GraphColumn::Edge(property) => {
+                    // `@edge.<property>` is the engine's projection spelling
+                    // for the reaching edge (`query::EDGE_FIELD_PREFIX`); it
+                    // reads no row and collides with no declared field.
+                    let field = format!("{EDGE_FIELD_PREFIX}{property}");
+                    columns.push(alias.unwrap_or_else(|| property.clone()));
+                    outputs.push(push_field(field, &mut fields));
+                    continue;
+                }
+            };
+            match item {
                 SelectItem::Star => {
                     for field in self.declared_fields(c)? {
                         columns.push(field.clone());
@@ -1299,7 +1463,7 @@ impl Compiler<'_> {
                     outputs.push(Output::Key);
                 }
                 SelectItem::Column(name) => {
-                    self.kind_of(c, name)?;
+                    self.kind_of(c, &name)?;
                     columns.push(alias.clone().unwrap_or_else(|| name.clone()));
                     outputs.push(push_field(name.clone(), &mut fields));
                 }
@@ -1336,7 +1500,24 @@ impl Compiler<'_> {
                 "selecting `{KEY_COLUMN}` costs one `get_by_id` per returned row: a page cannot project the reserved field the external key lives in, so the key is fetched after the walk. `{ID_COLUMN}` is free"
             ));
         }
-        let driver = if filters
+        // `docs/GRAPH_CONTRACT.md` §4.2: the reaching edge is carried only by
+        // the traversal's own candidate stream, so a statement that reads it
+        // must run on the graph driver. When a `_key` predicate is a POST-
+        // FILTER beside such a traversal, the traversal keeps the driver and
+        // the key range is answered from the external key the row carries
+        // (`plan.rs`, `filters.rs`) -- the alternative would be an answer
+        // ordered by nothing with every edge column `Missing`.
+        let reads_the_edge = matches!(order, OwnedOrder::Edge { .. })
+            || fields
+                .iter()
+                .any(|field| field.starts_with(EDGE_FIELD_PREFIX));
+        let drives_the_graph = reads_the_edge
+            && filters
+                .iter()
+                .any(|filter| matches!(filter, OwnedFilter::Graph(_)));
+        let driver = if drives_the_graph {
+            CandidateDriver::Auto
+        } else if filters
             .iter()
             .any(|filter| matches!(filter, OwnedFilter::Key { .. }))
         {
@@ -2187,13 +2368,20 @@ impl Compiler<'_> {
                 ))
             })?
             .id;
-        let context = self
-            .db
-            .graph_context(&graph.context)
-            .map_err(SqlError::from)?
-            .ok_or_else(|| {
-                SqlError::engine(format!("no graph context named `{}`", graph.context))
-            })?;
+        // `base` is the base graph (GRAPH_CONTRACT 3.1: "no context means the
+        // base graph"), which is context 0 and is never a NAMED context, so
+        // it is resolved here rather than looked up and then special-cased
+        // after the lookup has already failed.
+        let context = if graph.context.eq_ignore_ascii_case("base") {
+            GraphContextId::BASE
+        } else {
+            self.db
+                .graph_context(&graph.context)
+                .map_err(SqlError::from)?
+                .ok_or_else(|| {
+                    SqlError::engine(format!("no graph context named `{}`", graph.context))
+                })?
+        };
         let edge_type = match &graph.hop.edge_type {
             None => None,
             Some(name) => Some(
@@ -2216,30 +2404,103 @@ impl Compiler<'_> {
             ));
         }
         self.notices.push(
-            "GRAPH_TABLE: a WHERE written after the pattern is a POST-FILTER on completed matches (QL_CONTRACT §4.3, Tier 1). Per-hop pruning -- an inline element WHERE -- is Tier 2 and is refused rather than emulated by this post-filter"
+            "GRAPH_TABLE: a WHERE written after the pattern is a POST-FILTER on completed matches (QL_CONTRACT §4.3, Tier 1); an inline element WHERE is the PER-HOP prune (GRAPH_CONTRACT 4.3) and compiles to the traversal's own edge and node predicates"
                 .to_owned(),
         );
-        let request = BfsRequest {
-            seed,
-            direction: match graph.hop.direction {
-                GraphDirection::Outgoing => Direction::Outgoing,
-                GraphDirection::Incoming => Direction::Incoming,
-                GraphDirection::Both => Direction::Both,
+        // The edge element's inline WHERE. Each comparison is against one
+        // property of the edge's own inline bag, so it is typed by the value
+        // as written -- there is no declared kind to coerce it to, and an
+        // edge property bag is untyped JSON (GRAPH_CONTRACT 2.4's declared
+        // properties are a later item).
+        let mut edge_where = Vec::with_capacity(graph.hop.predicates.len());
+        for predicate in &graph.hop.predicates {
+            edge_where.push(OwnedEdgePredicate {
+                property: predicate.property.clone(),
+                op: match predicate.op {
+                    CmpOp::Eq => Cmp::Eq,
+                    CmpOp::Ne => Cmp::Ne,
+                    CmpOp::Lt => Cmp::Lt,
+                    CmpOp::Le => Cmp::Le,
+                    CmpOp::Gt => Cmp::Gt,
+                    CmpOp::Ge => Cmp::Ge,
+                },
+                value: self.edge_value(&predicate.value, &predicate.property)?,
+            });
+        }
+        // The far element's inline WHERE. Compiled exactly as the outer
+        // WHERE's predicates are, and then narrowed to the kinds an index
+        // answers without a row -- anything else is REFUSED, never demoted to
+        // a post-filter, because a post-filter is a different question: it
+        // keeps a node in the frontier that §4.3 says must never be expanded.
+        let mut node_where = Vec::with_capacity(graph.node_predicates.len());
+        for predicate in &graph.node_predicates {
+            let filter = self.filter(target, predicate)?;
+            match &filter {
+                OwnedFilter::Scalar { predicate, .. } => match predicate {
+                    OwnedScalarFilter::Eq(_) | OwnedScalarFilter::Range { .. } => {}
+                    OwnedScalarFilter::IsNull | OwnedScalarFilter::IsMissing => {
+                        return Err(SqlError::Refused {
+                            keyword: "inline element WHERE IS NULL".into(),
+                            tier: Tier::Three,
+                            reason: "QL_CONTRACT §4.3: a per-hop node predicate is answered from index postings (GRAPH_CONTRACT 4.3, `a traversal never reads a row for a predicate on a covered field`). NULL and MISSING share one nullish index key, so only the row tells them apart; write it after COLUMNS as a post-filter on completed matches.",
+                        })
+                    }
+                },
+                OwnedFilter::Point { .. } => {}
+                _ => {
+                    return Err(SqlError::Refused {
+                        keyword: "inline element WHERE".into(),
+                        tier: Tier::Two,
+                        reason: "QL_CONTRACT §4.3: a per-hop node predicate is answered from index postings, so it is a scalar equality, a scalar range or a point predicate (bbox or radius). A text, geometry or JSON predicate is refined from the row, which GRAPH_CONTRACT 4.3 forbids per hop; write it after COLUMNS as a post-filter on completed matches.",
+                    })
+                }
+            }
+            node_where.push(filter);
+        }
+        Ok((
+            target,
+            OwnedFilter::Graph(OwnedGraph {
+                seed,
+                direction: match graph.hop.direction {
+                    GraphDirection::Outgoing => Direction::Outgoing,
+                    GraphDirection::Incoming => Direction::Incoming,
+                    GraphDirection::Both => Direction::Both,
+                },
+                context,
+                edge_type,
+                min_depth: graph.hop.min_depth,
+                max_depth: graph.hop.max_depth,
+                edge_where,
+                node_where,
+            }),
+        ))
+    }
+
+    /// One edge-property predicate's value. An edge bag is untyped JSON, so
+    /// the literal decides the type: a number without a fraction is an
+    /// integer, one with a fraction a real, and both compare mathematically
+    /// against whatever the bag holds (`edge_properties_match`).
+    fn edge_value(&mut self, literal: &Literal, property: &str) -> SqlResult2<Scalar> {
+        Ok(match self.value_of(literal)? {
+            Value::Bool(value) => Scalar::Bool(value),
+            Value::String(value) => Scalar::Text(value),
+            Value::Number(number) => match number.as_i64() {
+                Some(value) => Scalar::I64(value),
+                None => Scalar::F64(number.as_f64().ok_or_else(|| {
+                    SqlError::Parameter(format!("`{property}`'s value is not a number"))
+                })?),
             },
-            context: if graph.context.eq_ignore_ascii_case("base") {
-                GraphContextId::BASE
-            } else {
-                context
-            },
-            edge_type,
-            min_depth: graph.hop.min_depth,
-            max_depth: graph.hop.max_depth,
-            include_seed: false,
-            max_visited: GRAPH_VISITED,
-            max_edges: GRAPH_EDGES,
-            result_limit: GRAPH_RESULTS,
-        };
-        Ok((target, OwnedFilter::Graph(request)))
+            Value::Null => {
+                return Err(SqlError::unsupported(format!(
+                    "`{property} = NULL` on an edge element: an absent or null property satisfies no comparison, so the predicate would refuse every edge"
+                )))
+            }
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "an edge property compares against a scalar literal, found {other}"
+                )))
+            }
+        })
     }
 
     // ── writes ───────────────────────────────────────────────────────────

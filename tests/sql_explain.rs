@@ -697,5 +697,80 @@ fn agg_born_decade_computes_its_expression_key_index_side() {
         line(&text, "group: ").contains("the driving walk carries the value"),
         "the expression is computed from the posting, not from the row:\n{text}"
     );
-    assert_eq!(counter(&text, "primary_reads"), 0, "{text}");
+    assert_eq!(counter(&text, "primary_reads"), 0, "{text}");}
+
+
+// ── GRAPH_TABLE: the per-hop predicates, printed ──────────────────────────
+
+/// A weighted edge type beside the fixture's own, so an inline element WHERE
+/// has a property bag to read. Written here rather than in the fixture
+/// because every other suite over that fixture reads the same edges.
+fn weighted_graph(f: &mut fixture::Fixture) -> e4_prototype::collections::EdgeTypeId {
+    let weighted = f.db.create_edge_type("weighted").unwrap();
+    f.db.commit().unwrap();
+    let ids: Vec<e4_prototype::collections::EntityId> = f
+        .keys
+        .iter()
+        .map(|key| f.db.get(f.place, key).unwrap().unwrap().id)
+        .collect();
+    for (i, pair) in ids.windows(2).enumerate() {
+        f.db.put_edge(
+            f.context,
+            pair[0],
+            weighted,
+            pair[1],
+            &serde_json::json!({"weight": (i % 10) as f64 / 10.0}),
+        )
+        .unwrap();
+        if (i + 1) % 256 == 0 {
+            f.db.commit().unwrap();
+        }
+    }
+    f.db.commit().unwrap();
+    weighted
+}
+
+/// `EXPLAIN` of a pattern says which edges are never followed and which
+/// nodes are never expanded, and names the membership set the node half is
+/// answered from -- `docs/QL_CONTRACT.md` §6's "EXPLAIN prints which".
+#[test]
+fn explain_prints_the_edge_predicates_and_the_node_membership_sets() {
+    let (_dir, mut f) = open();
+    let _ = weighted_graph(&mut f);
+    let text = explain(
+        &mut f,
+        "SELECT k, w FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}\
+            (b:place WHERE b.born BETWEEN 19500101 AND 19600101) \
+            COLUMNS (b._key AS k, r.weight AS w)) \
+         ORDER BY w DESC LIMIT 5",
+        &[Param::Text("k00003".into())],
+    );
+    println!("===== graph_per_hop\n{text}");
+    assert!(text.starts_with("driver: "));
+    assert!(text.contains("Graph"), "{text}");
+    // The edge half, spelled the way the plan holds it.
+    assert!(text.contains("edge weight > 0.2"), "{text}");
+    // The node half, and the set it is answered from.
+    assert!(text.contains("node place_born.born range"), "{text}");
+    assert!(
+        text.contains("membership set") || text.contains("membership bitmap"),
+        "{text}"
+    );
+    // The traversal IS the candidate stream here, so its own position is
+    // certified by the walk and no filter position reads a row.
+    assert!(
+        text.contains("the driving walk certifies it"),
+        "{text}"
+    );
+    assert_eq!(counter(&text, "row_decodes"), 0, "{text}");
+    // The ranking is the reaching edge's own property.
+    assert!(
+        text.contains("order: edge -- reaching edge property `weight` Descending"),
+        "{text}"
+    );
+    // The projection names the edge spelling, not a declared field.
+    assert!(text.contains("@edge.weight"), "{text}");
+    assert!(counter(&text, "graph_edges") > 0, "{text}");
+    assert!(rows_of(&text) > 0, "{text}");
 }

@@ -191,7 +191,7 @@ fn load(root: &Path, rows: u64) -> R<Ctx> {
     })
 }
 
-fn bfs(c: &Ctx, seed: u64, max_depth: usize) -> BfsRequest {
+fn bfs(c: &Ctx, seed: u64, max_depth: usize) -> BfsRequest<'static> {
     let ceiling = c.rows as usize + 1;
     BfsRequest {
         seed: c.entity(seed),
@@ -204,6 +204,8 @@ fn bfs(c: &Ctx, seed: u64, max_depth: usize) -> BfsRequest {
         max_visited: ceiling,
         max_edges: ceiling,
         result_limit: ceiling,
+        edge_where: &[],
+        node_where: &[],
     }
 }
 

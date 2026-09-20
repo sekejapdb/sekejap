@@ -217,7 +217,7 @@ LIMIT 10;
 -- ============================================================
 -- AGGREGATE CASES (QL_CONTRACT §4.7; group-count agreement required
 -- across arms)
--- ============================================================
+-- =====================================================
 --
 -- A folded answer has no `key` column to return, so each of these produces
 -- ONE TEXT COLUMN per group: the group key, then `|name=value` per
@@ -285,3 +285,97 @@ SELECT (born / 10000)::text || '|n=' || count(*)::text
 FROM place
 GROUP BY born / 10000
 ORDER BY born / 10000;
+=======
+-- GRAPH CASES (row-count agreement required; the `related` table is
+-- written by `battle50k postgres --graph`, see below)
+-- ============================================================
+--
+-- The edge set. `battle50k <arm> --graph` writes the SAME edges into all
+-- three arms: every row is linked to its three nearest other rows by `loc`,
+-- with weight = 1 / (1 + metres/1000) and since = the SOURCE row's born.
+--
+--   CREATE TABLE related (
+--       source      text NOT NULL,
+--       destination text NOT NULL,
+--       weight      real NOT NULL,
+--       since       int  NOT NULL
+--   );
+--   CREATE INDEX related_source      ON related USING btree (source);
+--   CREATE INDEX related_destination ON related USING btree (destination);
+--
+-- `related_destination` is there because E4's reverse mirror is
+-- (GRAPH_CONTRACT 2.2): an edge is written in both directions, always, so
+-- an incoming hop is a range read and not a scan. graph_1hop_weight_top10
+-- is the case that walks it.
+--
+-- DEVIATION. E4 answers these with ONE bounded breadth-first traversal --
+-- a posting range per hop, the far endpoint read out of the key, the
+-- predicates decided as the frontier expands (GRAPH_CONTRACT 4.2, 4.3).
+-- Postgres has no such atomic, so each statement below is the
+-- recursive-free form a planner produces for a bounded two-hop pattern:
+-- `related` joined to itself, UNIONed with the one-hop arm. The UNION is
+-- doing what E4's ACYCLIC rule does for nothing -- a node found at one hop
+-- is not returned again at two -- and `d <> $1` is the rule that a seed is
+-- never its own answer. WITH RECURSIVE is deliberately not used: the
+-- pattern's depth is a constant, and a recursive CTE would measure the
+-- recursion machinery rather than the two range reads.
+--
+-- The equivalence is stated FOR DEPTH <= 2, which is every case in this
+-- file. It does not extend to depth >= 3: E4 refuses to expand an
+-- intermediate it has already seen (GRAPH_CONTRACT 4.1, ACYCLIC), while the
+-- join form has no such rule and would follow it again.
+
+-- case: graph_2hop kind: filter
+-- params: $1 seed key  (the row nearest points[i], resolved once for all arms)
+SELECT d FROM (
+    SELECT r1.destination AS d FROM related r1 WHERE r1.source = $1
+    UNION
+    SELECT r2.destination FROM related r1
+      JOIN related r2 ON r2.source = r1.destination
+     WHERE r1.source = $1
+) t WHERE d <> $1;
+
+-- case: graph_2hop_weight kind: filter
+-- params: $1 seed key
+-- The weight predicate is PER HOP: an edge that fails it is not followed,
+-- so a second hop beyond it does not exist. That is why the predicate is
+-- repeated on r1 inside the two-join arm rather than applied once at the
+-- end -- a post-filter would keep paths that E4's traversal never walks.
+SELECT d FROM (
+    SELECT r1.destination AS d FROM related r1
+     WHERE r1.source = $1 AND r1.weight > 0.5
+    UNION
+    SELECT r2.destination FROM related r1
+      JOIN related r2 ON r2.source = r1.destination AND r2.weight > 0.5
+     WHERE r1.source = $1 AND r1.weight > 0.5
+) t WHERE d <> $1;
+
+-- case: graph_2hop_born kind: filter
+-- params: $1 seed key, $2 born lower, $3 born upper  (born_range(i))
+-- Same shape for the NODE predicate: a node outside the range is neither
+-- returned nor expanded, so the intermediate row is joined and filtered
+-- before the second hop is taken.
+SELECT d FROM (
+    SELECT b.key AS d FROM related r1
+      JOIN place b ON b.key = r1.destination AND b.born BETWEEN $2 AND $3
+     WHERE r1.source = $1
+    UNION
+    SELECT c.key FROM related r1
+      JOIN place b ON b.key = r1.destination AND b.born BETWEEN $2 AND $3
+      JOIN related r2 ON r2.source = b.key
+      JOIN place c ON c.key = r2.destination AND c.born BETWEEN $2 AND $3
+     WHERE r1.source = $1
+) t WHERE d <> $1;
+
+-- case: graph_1hop_weight_top10 kind: ranked
+-- params: $1 seed key
+-- One INCOMING hop: the rows that name the seed among their three nearest.
+-- E4 reads the reaching edge's `weight` out of the posting it is standing
+-- on and ranks by it (GRAPH_CONTRACT 4.2); Postgres reads the same column
+-- out of the joined row. Compared on top-ten overlap, never on order:
+-- E4 breaks a weight tie by entity id and this statement has no tiebreak,
+-- for the same reason knn_10 has none.
+SELECT r.source FROM related r
+ WHERE r.destination = $1
+ ORDER BY r.weight DESC
+ LIMIT 10;

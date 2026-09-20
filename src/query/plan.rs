@@ -46,8 +46,12 @@ pub(super) enum CompiledFilter {
         value: Value,
     },
     Graph {
-        request: BfsRequest,
+        request: OwnedBfsRequest,
         position: usize,
+        /// The node predicates of `docs/GRAPH_CONTRACT.md` §4.3, compiled
+        /// once and their membership sets walked once (see
+        /// `PreparedQuery::ensure_membership_sets`).
+        gate: NodeGate,
     },
     Point {
         info: IndexInfo,
@@ -222,6 +226,27 @@ pub(super) enum CompiledOrder {
         expr: CompiledScoreExpr,
         direction: SortDirection,
     },
+    /// Rank by one property of the reaching edge. The property name is
+    /// owned because a prepared query outlives the request it was built from.
+    Edge {
+        property: String,
+        direction: SortDirection,
+    },
+}
+
+/// One slot of a query's projection, in the order the caller asked for it.
+///
+/// Splitting the list at prepare is what keeps `@edge.<name>` off the row
+/// path entirely: a query that projects only edge properties has an EMPTY
+/// row projection, so `winner_needs_no_row` is true and no primary record is
+/// opened for it at all.
+#[derive(Clone, Debug)]
+pub(super) enum ProjectedSlot {
+    /// Field `n` of the row projection.
+    Row(usize),
+    /// A property of the edge that reached this row, and the name the answer
+    /// reports it under (the `@edge.`-prefixed spelling the caller wrote).
+    Edge { property: String, label: String },
 }
 
 pub(super) fn require_scalar_index(
@@ -518,7 +543,7 @@ fn geometry_ranges(predicate: &GeometryFilter) -> QueryResult<(Vec<GeomRange>, B
     Ok((out, query_bbox, fallback_world))
 }
 
-fn encode_scalar_value(kind: &Kind, value: ScalarValue<'_>) -> QueryResult<Vec<u8>> {
+pub(super) fn encode_scalar_value(kind: &Kind, value: ScalarValue<'_>) -> QueryResult<Vec<u8>> {
     if !matches!(
         (kind, value),
         (Kind::Bool, ScalarValue::Bool(_))
@@ -563,7 +588,7 @@ pub(super) fn bound_bytes(bound: &EncodedBound) -> Option<&[u8]> {
     }
 }
 
-fn compile_scalar_filter(
+pub(super) fn compile_scalar_filter(
     kind: &Kind,
     predicate: &ScalarFilter<'_>,
 ) -> QueryResult<EncodedScalarFilter> {
@@ -752,6 +777,86 @@ fn fold_same_index_scalars(filters: &mut [CompiledFilter], driver: CandidateDriv
     }
 }
 
+/// One `QueryFilter::Graph`'s request, owned by the prepared query.
+///
+/// A `BfsRequest` BORROWS its per-hop predicates (`edge_where`,
+/// `node_where`), and a prepared query outlives the `QueryRequest` it was
+/// built from: it is paged, resumed and explained after the caller's slices
+/// are gone. So the request is copied here, once, at prepare.
+#[derive(Clone, Debug)]
+pub(super) struct OwnedBfsRequest {
+    pub(super) seed: EntityId,
+    pub(super) direction: Direction,
+    pub(super) context: crate::index::graph::GraphContextId,
+    pub(super) edge_type: Option<crate::index::graph::EdgeTypeId>,
+    pub(super) min_depth: usize,
+    pub(super) max_depth: usize,
+    pub(super) include_seed: bool,
+    pub(super) max_visited: usize,
+    pub(super) max_edges: usize,
+    pub(super) result_limit: usize,
+    pub(super) edge_where: Vec<OwnedEdgePredicate>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct OwnedEdgePredicate {
+    pub(super) property: String,
+    pub(super) op: crate::index::graph::Cmp,
+    pub(super) value: OwnedScalarValue,
+}
+
+impl OwnedBfsRequest {
+    fn new(request: &BfsRequest<'_>) -> Self {
+        Self {
+            seed: request.seed,
+            direction: request.direction,
+            context: request.context,
+            edge_type: request.edge_type,
+            min_depth: request.min_depth,
+            max_depth: request.max_depth,
+            include_seed: request.include_seed,
+            max_visited: request.max_visited,
+            max_edges: request.max_edges,
+            result_limit: request.result_limit,
+            edge_where: request
+                .edge_where
+                .iter()
+                .map(|predicate| OwnedEdgePredicate {
+                    property: predicate.property.to_owned(),
+                    op: predicate.op,
+                    value: match predicate.value {
+                        ScalarValue::Bool(value) => OwnedScalarValue::Bool(value),
+                        ScalarValue::I64(value) => OwnedScalarValue::I64(value),
+                        ScalarValue::F64(value) => OwnedScalarValue::F64(value),
+                        ScalarValue::Text(value) => OwnedScalarValue::Text(value.to_owned()),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// The borrowed predicates one hop tests against.
+    pub(super) fn edge_predicates(&self) -> Vec<EdgePredicate<'_>> {
+        self.edge_where
+            .iter()
+            .map(|predicate| EdgePredicate {
+                property: &predicate.property,
+                op: predicate.op,
+                value: match &predicate.value {
+                    OwnedScalarValue::Bool(value) => ScalarValue::Bool(*value),
+                    OwnedScalarValue::I64(value) => ScalarValue::I64(*value),
+                    OwnedScalarValue::F64(value) => ScalarValue::F64(*value),
+                    OwnedScalarValue::Text(value) => ScalarValue::Text(value),
+                    // `OwnedScalarValue::Nullish` is a ranking value, never a
+                    // predicate value: `OwnedBfsRequest::new` builds these
+                    // four arms and no other.
+                    OwnedScalarValue::Nullish => ScalarValue::Bool(false),
+                },
+            })
+            .collect()
+    }
+}
+
 fn scalar_driver_score(predicate: &EncodedScalarFilter) -> u8 {
     match predicate {
         EncodedScalarFilter::Empty | EncodedScalarFilter::Eq(_) => 0,
@@ -807,7 +912,8 @@ impl Database {
                     }
                 }
                 QueryFilter::Graph(request) => CompiledFilter::Graph {
-                    request: *request,
+                    gate: NodeGate::compile(self, request.node_where)?,
+                    request: OwnedBfsRequest::new(request),
                     position,
                 },
                 QueryFilter::Point { index, predicate } => {
@@ -940,6 +1046,18 @@ impl Database {
             // The key is the DRIVER's, and the driver is chosen below. This
             // stands in until it is; `driver_key` replaces it.
             QueryOrder::Driver => CompiledOrder::Driver(DriverKey::Entity),
+            QueryOrder::Edge {
+                property,
+                direction,
+            } => {
+                if property.is_empty() || property.len() > MAX_FIELD_BYTES {
+                    return Err(invalid_query("an edge ranking needs a property name"));
+                }
+                CompiledOrder::Edge {
+                    property: property.to_owned(),
+                    direction,
+                }
+            }
             QueryOrder::Distance {
                 index,
                 center,
@@ -970,26 +1088,74 @@ impl Database {
             }
         };
 
-        let fields = match request.projection {
-            Projection::Ids => Vec::new(),
+        let (fields, slots) = match request.projection {
+            Projection::Ids => (Vec::new(), Vec::new()),
             Projection::Fields(fields) => {
                 if fields.len() > MAX_PROJECTION_FIELDS {
                     return Err(invalid_query("query projects more than 64 fields"));
                 }
-                let mut out = Vec::with_capacity(fields.len());
+                let mut out: Vec<String> = Vec::with_capacity(fields.len());
+                let mut slots = Vec::with_capacity(fields.len());
+                let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
                 for field in fields {
                     if field.is_empty()
                         || field.len() > MAX_FIELD_BYTES
-                        || reserved(field)
-                        || out.iter().any(|old| old == field)
+                        || seen.iter().any(|old| old == field)
                     {
                         return Err(invalid_query("invalid or duplicate projection field"));
                     }
+                    seen.push(field);
+                    // The reaching edge, not the row (GRAPH_CONTRACT 4.2).
+                    if let Some(property) = field.strip_prefix(EDGE_FIELD_PREFIX) {
+                        if property.is_empty() {
+                            return Err(invalid_query(
+                                "a projected edge property needs a name after `@edge.`",
+                            ));
+                        }
+                        if !filters
+                            .iter()
+                            .any(|filter| matches!(filter, CompiledFilter::Graph { .. }))
+                        {
+                            return Err(invalid_query(
+                                "`@edge.` projects the edge a traversal crossed, and this query has no graph filter",
+                            ));
+                        }
+                        slots.push(ProjectedSlot::Edge {
+                            property: property.to_owned(),
+                            label: (*field).to_owned(),
+                        });
+                        continue;
+                    }
+                    if reserved(field) {
+                        return Err(invalid_query("invalid or duplicate projection field"));
+                    }
+                    slots.push(ProjectedSlot::Row(out.len()));
                     out.push((*field).to_owned());
                 }
-                out
+                (out, slots)
             }
         };
+        // Does this query READ the reaching edge -- an `@edge.<name>`
+        // projection or an `@edge` ranking (`docs/GRAPH_CONTRACT.md` §4.2)?
+        // Asked once here, because two separate rules turn on the answer:
+        // exactly one traversal may claim the edge, and only that traversal
+        // may drive the candidates.
+        let reads_the_edge = slots
+            .iter()
+            .any(|slot| matches!(slot, ProjectedSlot::Edge { .. }))
+            || matches!(order, CompiledOrder::Edge { .. });
+        if reads_the_edge {
+            // One reaching edge per row, so one traversal may claim it.
+            let traversals = filters
+                .iter()
+                .filter(|filter| matches!(filter, CompiledFilter::Graph { .. }))
+                .count();
+            if traversals != 1 {
+                return Err(invalid_query(
+                    "reading the reaching edge requires exactly one graph filter: a row reached by two traversals has two reaching edges and neither is `the` one",
+                ));
+            }
+        }
 
         let filter_driver = |position: usize| -> QueryResult<DriverPlan> {
             // A folded position names the survivor that holds its predicate,
@@ -1075,6 +1241,20 @@ impl Database {
                         Ok(DriverPlan::ExactVector { info: info.clone() })
                     } else {
                         Ok(DriverPlan::Entities)
+                    }
+                }
+                // An edge ranking names no index of its own: the value comes
+                // from the traversal that produced the row, so the traversal
+                // is the candidate stream and the ranking rides it.
+                CompiledOrder::Edge { .. } => {
+                    match filters
+                        .iter()
+                        .position(|filter| matches!(filter, CompiledFilter::Graph { .. }))
+                    {
+                        Some(position) => Ok(DriverPlan::Graph { position }),
+                        None => Err(invalid_query(
+                            "an edge ranking requires the graph filter whose edge it ranks by",
+                        )),
                     }
                 }
             }
@@ -1246,28 +1426,47 @@ impl Database {
             }
         };
 
-        // A `QueryFilter::Key` is certified by the mapping-entry walk that
-        // produced the candidate (`CompiledFilter::Key`'s doc); it has no row-
-        // level fallback the way a scalar predicate does. So it is only
-        // meaningful at the position `CandidateDriver::Keys` actually
-        // certifies -- named by a DIFFERENT driver, or left uncertified
-        // because the request chose `CandidateDriver::Keys` but a second key
-        // filter lost the (at most one) slot, it would reach `filters_match`
-        // with no way to answer itself.
-        if let Some(key_position) = filters
-            .iter()
-            .position(|filter| matches!(filter, CompiledFilter::Key { .. }))
-        {
-            let certified = matches!(
-                &driver,
-                DriverPlan::Keys { position: Some(position), .. } if *position == key_position
-            );
-            if !certified {
-                return Err(invalid_query(
-                    "a key filter requires CandidateDriver::Keys to drive it",
-                ));
+        // `docs/GRAPH_CONTRACT.md` §4.2: the reaching edge is carried by the
+        // TRAVERSAL's own candidate stream and by nothing else --
+        // `DriverCursor::Ids` is the one place `Candidate::edge` is ever
+        // filled in. Under any other driver every candidate would arrive with
+        // `edge: None`, so an `@edge.` projection would be `Missing` on every
+        // row and an `@edge` ranking would be a total tie, with no error. So
+        // a query that reads the edge and does not run on the traversal that
+        // bound it is REFUSED here, naming the driver that cannot answer it.
+        if reads_the_edge {
+            let claimed = filters
+                .iter()
+                .find_map(|filter| match filter {
+                    CompiledFilter::Graph { position, .. } => Some(*position),
+                    _ => None,
+                })
+                .ok_or_else(|| invalid_query("reading the reaching edge requires a graph filter"))?;
+            let drives = matches!(&driver, DriverPlan::Graph { position } if *position == claimed);
+            if !drives {
+                return Err(invalid_query(format!(
+                    "reading the reaching edge requires the traversal that bound it to drive the candidates; this query's driver is {:?}, whose candidates carry no edge",
+                    driver.diagnostic()
+                )));
             }
         }
+
+        // A `QueryFilter::Key` is certified by the mapping-entry walk that
+        // produced the candidate (`CompiledFilter::Key`'s doc). When some
+        // other driver runs the query -- reading the reaching edge is the
+        // case that takes the driver away from the keys walk, since §4.2
+        // above hands it to the traversal -- the predicate is answered from
+        // the external key the ROW itself carries in its first field, which
+        // is where `Database::get_by_id` reads it from.
+        //
+        // Named sacrifice (Law 4): that is one primary read per candidate
+        // rather than a walk over the mapping keyspace, which
+        // `a_filter_reads_the_row` declares and the page's own row reader
+        // then pays; `CandidateDriver::Keys` is still the cheaper plan and is
+        // still what the SQL compiler chooses whenever nothing outranks it.
+        // (`page.rs`'s `a_filter_reads_the_row` is where that read is
+        // declared; nothing is decided here beyond letting the filter
+        // through.)
 
         // Driver order ranks by the key the chosen driver's own walk is
         // sorted by, which is knowable only now.
@@ -1406,6 +1605,7 @@ impl Database {
             filters,
             order,
             projection: fields,
+            slots,
             driver,
             total_limit: request.total_limit,
             emitted: 0,

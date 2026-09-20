@@ -359,6 +359,25 @@ impl PreparedQuery<'_> {
         &mut self,
         meter: &mut WorkMeter<'_, C>,
     ) -> QueryResult<()> {
+        // A traversal's node predicates (GRAPH_CONTRACT 4.3) are membership
+        // sets like any other, built once for the prepared query: every page,
+        // resumed or not, finds them already walked. The gate is lifted out
+        // of the filter because building needs `&mut` while the walk below
+        // holds `&self.filters`.
+        for position in 0..self.filters.len() {
+            let CompiledFilter::Graph { gate, .. } = &mut self.filters[position] else {
+                continue;
+            };
+            if gate.is_built() {
+                continue;
+            }
+            let mut lifted = std::mem::replace(gate, NodeGate::empty());
+            let outcome = lifted.build(self.db, meter);
+            if let CompiledFilter::Graph { gate, .. } = &mut self.filters[position] {
+                *gate = lifted;
+            }
+            outcome?;
+        }
         for position in 0..self.filters.len() {
             if !matches!(self.membership[position], MembershipSet::Unbuilt) {
                 continue;
@@ -395,5 +414,345 @@ impl PreparedQuery<'_> {
             };
         }
         Ok(())
+    }
+}
+
+// ── per-hop node predicates (docs/GRAPH_CONTRACT.md §4.3) ─────────────────
+
+/// How one node predicate of a traversal is answered for one visited node.
+///
+/// Every arm is index-side. §4.3's rule is absolute: "a traversal never reads
+/// a row for a predicate on a covered field", so there is no row arm here and
+/// no fallback that would quietly become one.
+#[derive(Clone, Debug)]
+enum NodeProbe {
+    /// A scalar EQUALITY. The key `value || sequence` is known before the
+    /// walk starts, so one point read of the index answers one node --
+    /// exactly `scalar_eq_posting_matches`, which is how a non-driving
+    /// equality filter already answers a candidate. No set is built and none
+    /// can overflow.
+    ScalarEq { info: IndexInfo, expected: Vec<u8> },
+    /// A scalar RANGE or a POINT predicate: one [`MembershipSet`] walked
+    /// once, then one binary search or one bit per visited node.
+    Set {
+        info: IndexInfo,
+        predicate: NodeSetPredicate,
+        set: MembershipSet,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum NodeSetPredicate {
+    Scalar(EncodedScalarFilter),
+    Point(PointFilter),
+}
+
+/// The compiled `node_where` of one traversal: what each predicate is, and
+/// the sets they are answered from once those are built.
+#[derive(Clone, Debug)]
+pub(super) struct NodeGate {
+    probes: Vec<NodeProbe>,
+}
+
+impl NodeGate {
+    /// Compile one traversal's `node_where`, refusing every filter kind that
+    /// an index cannot answer without opening the row.
+    ///
+    /// Accepted: `Scalar` `Eq` and `Range`, `Point` `Bbox` and `Radius`.
+    ///
+    /// Refused, each with its own reason: `Scalar` `IsNull` and `IsMissing`,
+    /// because NULL and MISSING share one nullish index key and only the row
+    /// tells them apart; `Geometry`, because a geometry posting's box is a
+    /// candidate test and the refine reads the row; `Text`, because a term
+    /// merge is a stream, not a set; `JsonEq`, which has no index at all;
+    /// `Key`, which is the mapping keyspace and not a predicate on a node;
+    /// and `Graph`, because a traversal inside a traversal is not an atomic
+    /// this engine has.
+    pub(super) fn compile(db: &Database, filters: &[QueryFilter<'_>]) -> QueryResult<Self> {
+        if filters.len() > MAX_FILTERS {
+            return Err(invalid_query(
+                "a traversal's node predicates exceed the filter limit",
+            ));
+        }
+        let mut probes = Vec::with_capacity(filters.len());
+        for filter in filters {
+            probes.push(match filter {
+                QueryFilter::Scalar { index, predicate } => {
+                    let info = db.index_info_cached(*index)?;
+                    if info.family != IndexFamily::Scalar {
+                        return Err(invalid_query(
+                            "a traversal node predicate requires a scalar index",
+                        ));
+                    }
+                    if info.state != IndexState::Ready {
+                        return Err(invalid_query("query index is not ready"));
+                    }
+                    match predicate {
+                        ScalarFilter::Eq(value) => NodeProbe::ScalarEq {
+                            expected: encode_scalar_value(&info.kind, *value)?,
+                            info,
+                        },
+                        ScalarFilter::Range { .. } => {
+                            let predicate = NodeSetPredicate::Scalar(compile_scalar_filter(
+                                &info.kind,
+                                predicate,
+                            )?);
+                            NodeProbe::Set {
+                                info,
+                                predicate,
+                                set: MembershipSet::Unbuilt,
+                            }
+                        }
+                        ScalarFilter::IsNull | ScalarFilter::IsMissing => {
+                            return Err(invalid_query(
+                                "a traversal node predicate cannot be IS NULL or IS MISSING: NULL and MISSING share one nullish index key and only the row tells them apart, and GRAPH_CONTRACT 4.3 forbids a row read for a per-hop predicate",
+                            ))
+                        }
+                    }
+                }
+                QueryFilter::Point { index, predicate } => {
+                    let info = db.index_info_cached(*index)?;
+                    if info.family != IndexFamily::SpatialPoint {
+                        return Err(invalid_query(
+                            "a traversal node predicate requires a spatial-point index",
+                        ));
+                    }
+                    if info.state != IndexState::Ready {
+                        return Err(invalid_query("query index is not ready"));
+                    }
+                    crate::index::spatial::point::descriptor(&info)?;
+                    if let PointFilter::Radius { radius_metres, .. } = predicate {
+                        if !radius_metres.is_finite() || *radius_metres < 0.0 {
+                            return Err(invalid_query(
+                                "point radius must be finite and non-negative",
+                            ));
+                        }
+                    }
+                    NodeProbe::Set {
+                        info,
+                        predicate: NodeSetPredicate::Point(*predicate),
+                        set: MembershipSet::Unbuilt,
+                    }
+                }
+                QueryFilter::Geometry { .. } => {
+                    return Err(invalid_query(
+                        "a traversal node predicate cannot be a geometry predicate: a geometry posting's box is a candidate test and the refine reads the row, which GRAPH_CONTRACT 4.3 forbids per hop",
+                    ))
+                }
+                QueryFilter::Text { .. } => {
+                    return Err(invalid_query(
+                        "a traversal node predicate cannot be a text search: a term merge is a document stream, not a membership set",
+                    ))
+                }
+                QueryFilter::JsonEq { .. } => {
+                    return Err(invalid_query(
+                        "a traversal node predicate cannot be a JSON equality: it has no index and is answered from the row",
+                    ))
+                }
+                QueryFilter::Key { .. } => {
+                    return Err(invalid_query(
+                        "a traversal node predicate cannot be a key range: the external-key mapping is a driver's keyspace, not a predicate on a node",
+                    ))
+                }
+                QueryFilter::Graph(_) => {
+                    return Err(invalid_query(
+                        "a traversal node predicate cannot be another traversal: a nested traversal is not an atomic this engine has",
+                    ))
+                }
+            });
+        }
+        Ok(Self { probes })
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.probes.is_empty()
+    }
+
+    /// The gate a filter holds while its own is lifted out to be built.
+    pub(super) fn empty() -> Self {
+        Self { probes: Vec::new() }
+    }
+
+    /// True once every set this gate needs has been walked.
+    pub(super) fn is_built(&self) -> bool {
+        !self
+            .probes
+            .iter()
+            .any(|probe| matches!(probe, NodeProbe::Set { set: MembershipSet::Unbuilt, .. }))
+    }
+
+    /// Walk every not-yet-built set once. Idempotent, so a prepared query
+    /// pays for it on its first page and every later page finds it there.
+    ///
+    /// A set that overflows its budget is an ERROR here, not a fallback: the
+    /// row path a non-driving filter falls back to is exactly what §4.3
+    /// forbids inside a traversal, and emulating the predicate by reading
+    /// rows would be the eighth law's "emulated" rather than "refused".
+    pub(super) fn build<C: FnMut() -> bool>(
+        &mut self,
+        db: &Database,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<()> {
+        for probe in &mut self.probes {
+            let NodeProbe::Set {
+                info,
+                predicate,
+                set,
+            } = probe
+            else {
+                continue;
+            };
+            if !matches!(set, MembershipSet::Unbuilt) {
+                continue;
+            }
+            *set = match predicate {
+                NodeSetPredicate::Scalar(predicate) => {
+                    build_scalar_range_set(db, info, predicate, meter)?
+                }
+                NodeSetPredicate::Point(predicate) => build_point_set(db, info, *predicate, meter)?,
+            };
+            if matches!(set, MembershipSet::Overflow) {
+                // A NAMED budget, not prose: the resource is the postings
+                // counter the walk that overflowed was charging, so a caller
+                // can match on it the way it matches on every other
+                // `BudgetExceeded`. The limit is the entry cap the walk
+                // stopped at (`MEMBERSHIP_SET_CAP`, the ceiling that applies
+                // whenever a bitmap is not viable, which is the only way a
+                // set reaches `Overflow`), and the attempt is the entry that
+                // passed it. GRAPH_CONTRACT 4.3 forbids falling back to a
+                // row read per hop, so this is a refusal and not a plan.
+                return Err(QueryError::BudgetExceeded {
+                    resource: match predicate {
+                        NodeSetPredicate::Scalar(_) => WorkResource::ScalarPostings,
+                        NodeSetPredicate::Point(_) => WorkResource::SpatialPostings,
+                    },
+                    limit: MEMBERSHIP_SET_CAP as u64,
+                    attempted: MEMBERSHIP_SET_CAP as u64 + 1,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Does one visited node satisfy every predicate?
+    ///
+    /// A node in another collection than a predicate's index REFUSES that
+    /// predicate: a traversal is inter-collection (§2.1) and a row of another
+    /// collection does not have the field, which is the same answer a missing
+    /// field already gets.
+    pub(super) fn admits<C: FnMut() -> bool>(
+        &self,
+        db: &Database,
+        id: EntityId,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<bool> {
+        for probe in &self.probes {
+            let passes = match probe {
+                NodeProbe::ScalarEq { info, expected } => {
+                    info.collection == id.collection
+                        && scalar_eq_posting_matches(db, info, expected, id, meter)?
+                }
+                NodeProbe::Set { info, set, .. } => {
+                    info.collection == id.collection
+                        && match set {
+                            MembershipSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
+                            MembershipSet::Bitmap(bits) => {
+                                membership_bitmap_contains(bits, id.sequence)
+                            }
+                            _ => {
+                                return Err(corrupt_query(
+                                    "a traversal node predicate was tested before its set was built",
+                                ))
+                            }
+                        }
+                }
+            };
+            if !passes {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// One line per node predicate, for `EXPLAIN`.
+    pub(super) fn describe(&self) -> Vec<String> {
+        self.probes
+            .iter()
+            .map(|probe| match probe {
+                NodeProbe::ScalarEq { info, .. } => {
+                    format!("{}.{} = <value> via index posting", info.name, info.field)
+                }
+                NodeProbe::Set { info, predicate, set } => {
+                    let shape = match predicate {
+                        NodeSetPredicate::Scalar(_) => "range",
+                        NodeSetPredicate::Point(PointFilter::Bbox(_)) => "bbox",
+                        NodeSetPredicate::Point(PointFilter::Radius { .. }) => "radius",
+                    };
+                    let built = match set {
+                        MembershipSet::Ids(ids) => format!("membership set, {} ids", ids.len()),
+                        MembershipSet::Bitmap(bits) => {
+                            format!("membership bitmap, {} bytes", bits.len())
+                        }
+                        _ => "membership set, unbuilt".to_owned(),
+                    };
+                    format!("{}.{} {shape} via {built}", info.name, info.field)
+                }
+            })
+            .collect()
+    }
+}
+
+/// [`NodeGate`] for a caller that is not a query: `Database::traverse_bfs`,
+/// the traversal atomic itself, which has no `QueryBudget` and no work meter.
+///
+/// The sets are still bounded -- [`MembershipBudget`] is the same memory rule
+/// whoever walks them -- and the posting reads are still counted, into a
+/// meter that is thrown away. What is absent is a CEILING on those counts,
+/// because the atomic's bounds are its own (`max_visited`, `max_edges`,
+/// `result_limit`), not a page's.
+pub(crate) struct StandaloneNodeGate {
+    gate: NodeGate,
+}
+
+/// The atomic's error type, with nothing lost on the way: a budget refusal
+/// stays a budget refusal with its resource named (`Error::BudgetExceeded`),
+/// so a node membership set that outgrows its memory budget is as
+/// machine-readable through `Database::traverse_bfs` as it is through a
+/// prepared query. `From<Error> for QueryError` carries it back unchanged.
+fn as_database_error(error: QueryError) -> Error {
+    match error {
+        QueryError::Database(error) => error,
+        QueryError::Cancelled => invalid("graph query cancelled"),
+        QueryError::BudgetExceeded {
+            resource,
+            limit,
+            attempted,
+        } => Error::BudgetExceeded {
+            resource,
+            limit,
+            attempted,
+        },
+    }
+}
+
+impl StandaloneNodeGate {
+    pub(crate) fn new(db: &Database, filters: &[QueryFilter<'_>]) -> crate::collections::Result<Self> {
+        let mut never = || false;
+        let mut meter = WorkMeter::new(QueryBudget::unlimited(), &mut never);
+        let mut gate = NodeGate::compile(db, filters).map_err(as_database_error)?;
+        gate.build(db, &mut meter).map_err(as_database_error)?;
+        Ok(Self { gate })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.gate.is_empty()
+    }
+
+    pub(crate) fn admits(&self, db: &Database, id: EntityId) -> crate::collections::Result<bool> {
+        let mut never = || false;
+        let mut meter = WorkMeter::new(QueryBudget::unlimited(), &mut never);
+        self.gate
+            .admits(db, id, &mut meter)
+            .map_err(as_database_error)
     }
 }

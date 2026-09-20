@@ -1719,32 +1719,45 @@ impl Parser {
             });
         }
         self.expect(&Tok::RParen)?;
-        let hop = self.graph_hop()?;
+        let (hop, edge_variable) = self.graph_hop()?;
         self.expect(&Tok::LParen)?;
         let _target_variable = self.name()?;
         let target_collection = self.element_label()?;
-        if self.word().as_deref() == Some("WHERE") {
-            return Err(SqlError::Refused {
-                keyword: "inline element WHERE".into(),
-                tier: super::Tier::Two,
-                reason: "QL_CONTRACT §4.3: an inline WHERE on the far element is the per-hop prune (GRAPH_CONTRACT 4.3). Write it after COLUMNS, where it is the Tier-1 post-pattern filter on completed matches.",
-            });
-        }
+        // The far element's inline WHERE: the per-hop node prune of
+        // GRAPH_CONTRACT 4.3, not a post-filter on completed matches. It is
+        // written in the same predicate grammar the outer WHERE uses, and
+        // `Compiler::graph_table` refuses any of them that an index cannot
+        // answer without opening the row.
+        let node_predicates = if self.eat_word("WHERE") {
+            self.conjunction()?
+        } else {
+            Vec::new()
+        };
         self.expect(&Tok::RParen)?;
         self.expect_word("COLUMNS")?;
         self.expect(&Tok::LParen)?;
         let mut columns = Vec::new();
         loop {
-            // `name()` reads `b._key` and keeps the last segment, which is
-            // the field; the variable in front of it is the element the
-            // pattern already bound.
-            let field = self.name()?;
-            let item = if field == super::ID_COLUMN {
-                SelectItem::Id
+            // A COLUMNS entry is qualified by the element it reads: `b.name`
+            // is a field of the far NODE, `r.weight` a property of the EDGE
+            // the pattern bound. The two namespaces are told apart by the
+            // variable, which is why this keeps it.
+            let (qualifier, field) = self.qualified_name()?;
+            // Case-insensitively, as every other name comparison in this
+            // parser is: `R.weight` against a pattern that bound `r` is the
+            // EDGE's property, not a row field that does not exist.
+            let edge = qualifier
+                .as_deref()
+                .zip(edge_variable.as_deref())
+                .is_some_and(|(written, bound)| written.eq_ignore_ascii_case(bound));
+            let item = if edge {
+                GraphColumn::Edge(field.clone())
+            } else if field == super::ID_COLUMN {
+                GraphColumn::Node(SelectItem::Id)
             } else if super::is_key_column(&field) {
-                SelectItem::Key
+                GraphColumn::Node(SelectItem::Key)
             } else {
-                SelectItem::Column(field.clone())
+                GraphColumn::Node(SelectItem::Column(field.clone()))
             };
             let alias = if self.eat_word("AS") {
                 self.name()?
@@ -1764,8 +1777,58 @@ impl Parser {
             seed_key,
             hop,
             target_collection,
+            node_predicates,
             columns,
         })
+    }
+
+    /// `a.b` as BOTH halves, where [`Self::name`] keeps only the last.
+    ///
+    /// A `GRAPH_TABLE` pattern binds two namespaces -- the far node's fields
+    /// and the edge's properties -- and the element variable is the only
+    /// thing that tells them apart.
+    fn qualified_name(&mut self) -> SqlResult2<(Option<String>, String)> {
+        let at = self.here();
+        let mut parts = Vec::new();
+        loop {
+            let part = match self.peek().clone() {
+                Tok::Word(word) => {
+                    if let Some(error) = self.listed(&word.to_ascii_uppercase()) {
+                        return Err(error);
+                    }
+                    self.bump();
+                    word
+                }
+                Tok::Quoted(word) => {
+                    self.bump();
+                    word
+                }
+                other => {
+                    return Err(SqlError::syntax(
+                        format!("expected a name, found `{}`", other.written()),
+                        at,
+                    ))
+                }
+            };
+            parts.push(part);
+            if !self.eat(&Tok::Dot) {
+                break;
+            }
+        }
+        if parts.len() > 2 {
+            // Not a schema-qualified table: this grammar is a `GRAPH_TABLE`
+            // element name, where the qualifier is the pattern variable and
+            // the tail is the field or the edge property.
+            return Err(SqlError::syntax(
+                format!(
+                    "a GRAPH_TABLE element name is `<variable>.<name>` or `<name>`, found {} parts",
+                    parts.len()
+                ),
+                at,
+            ));
+        }
+        let field = parts.pop().expect("at least one name part");
+        Ok((parts.pop(), field))
     }
 
     /// `:label` or `IS label`, both spellings SQL/PGQ allows.
@@ -1786,15 +1849,19 @@ impl Parser {
         ))
     }
 
-    fn graph_hop(&mut self) -> SqlResult2<GraphHop> {
+    /// One hop, and the variable the edge element bound (if any), which is
+    /// what a `COLUMNS` entry and an `ORDER BY` name the edge by.
+    fn graph_hop(&mut self) -> SqlResult2<(GraphHop, Option<String>)> {
         let incoming = self.eat(&Tok::BackArrow);
         if !incoming {
             self.expect(&Tok::Minus)?;
         }
         let mut edge_type = None;
+        let mut edge_variable = None;
+        let mut predicates = Vec::new();
         if self.eat(&Tok::LBracket) {
             if !matches!(self.peek(), Tok::Colon) {
-                let _variable = self.name()?;
+                edge_variable = Some(self.name()?);
             }
             if self.eat(&Tok::Colon) || self.eat_word("IS") {
                 let name = self.name()?;
@@ -1807,12 +1874,57 @@ impl Parser {
                 }
                 edge_type = Some(name);
             }
-            if self.word().as_deref() == Some("WHERE") {
-                return Err(SqlError::Refused {
-                    keyword: "edge inline WHERE".into(),
-                    tier: super::Tier::Two,
-                    reason: "QL_CONTRACT §4.3: an inline WHERE on an edge element is the per-hop prune over inline edge properties (GRAPH_CONTRACT 4.3); not built in this slice.",
-                });
+            // The edge element's inline WHERE: the per-hop edge prune of
+            // GRAPH_CONTRACT 4.3, read out of the edge's own inline bag as
+            // the frontier expands.
+            if self.eat_word("WHERE") {
+                loop {
+                    let (qualifier, property) = self.qualified_name()?;
+                    if let Some(qualifier) = qualifier.as_deref() {
+                        // An ANONYMOUS edge element bound no variable, so
+                        // every qualifier names something else. Swallowing it
+                        // would compile `c.born > 1990` into an EDGE
+                        // predicate on a property called `born`, which no bag
+                        // carries, and the statement would return zero rows
+                        // instead of refusing.
+                        let Some(bound) = edge_variable.as_deref() else {
+                            return Err(SqlError::unsupported(format!(
+                                "`{qualifier}.{property}` in an edge element's inline WHERE: this edge element bound no variable, so the predicate belongs to `{qualifier}`'s own element WHERE"
+                            )));
+                        };
+                        if !qualifier.eq_ignore_ascii_case(bound) {
+                            return Err(SqlError::unsupported(format!(
+                                "an edge element's inline WHERE names its own element (`{bound}`), not `{qualifier}`: a predicate on another element is that element's own inline WHERE"
+                            )));
+                        }
+                    }
+                    let op = match self.peek() {
+                        Tok::Eq => CmpOp::Eq,
+                        Tok::Ne => CmpOp::Ne,
+                        Tok::Lt => CmpOp::Lt,
+                        Tok::Le => CmpOp::Le,
+                        Tok::Gt => CmpOp::Gt,
+                        Tok::Ge => CmpOp::Ge,
+                        other => {
+                            return Err(SqlError::syntax(
+                                format!(
+                                    "an edge property predicate compares with =, <>, <, <=, > or >=, found `{}`",
+                                    other.written()
+                                ),
+                                self.here(),
+                            ))
+                        }
+                    };
+                    self.bump();
+                    let value = self.literal()?;
+                    predicates.push(EdgePredicate { property, op, value });
+                    if self.word().as_deref() == Some("OR") {
+                        return Err(refuse::refuse("OR"));
+                    }
+                    if !self.eat_word("AND") {
+                        break;
+                    }
+                }
             }
             self.expect(&Tok::RBracket)?;
         }
@@ -1836,12 +1948,16 @@ impl Parser {
             (false, false) => GraphDirection::Both,
         };
         let (min_depth, max_depth) = self.quantifier()?;
-        Ok(GraphHop {
-            edge_type,
-            direction,
-            min_depth,
-            max_depth,
-        })
+        Ok((
+            GraphHop {
+                edge_type,
+                direction,
+                min_depth,
+                max_depth,
+                predicates,
+            },
+            edge_variable,
+        ))
     }
 
     fn quantifier(&mut self) -> SqlResult2<(usize, usize)> {

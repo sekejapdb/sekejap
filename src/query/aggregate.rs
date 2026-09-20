@@ -1040,7 +1040,7 @@ impl PreparedAggregate<'_> {
     ) -> QueryResult<Vec<GroupRow>> {
         let db = self.query.db;
         let collection = self.query.collection;
-        let graph = execute_graph_filters(db, &self.query.filters, meter)?;
+        let graph = execute_graph_filters(db, &self.query.filters, false, meter)?;
         let needs = self.query.cursor_needs();
         let mut cursor = DriverCursor::new(
             db,
@@ -1197,7 +1197,7 @@ impl PreparedAggregate<'_> {
     ) -> QueryResult<(Vec<GroupRow>, bool, Option<RankKey>)> {
         let db = self.query.db;
         let collection = self.query.collection;
-        let graph = execute_graph_filters(db, &self.query.filters, meter)?;
+        let graph = execute_graph_filters(db, &self.query.filters, false, meter)?;
         let needs = self.query.cursor_needs();
         let resume = self.after.clone();
         let mut cursor = DriverCursor::new(

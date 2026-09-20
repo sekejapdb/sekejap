@@ -1172,6 +1172,8 @@ fn run_e4(
             max_visited: 16,
             max_edges: 32,
             result_limit: 16,
+            edge_where: &[],
+            node_where: &[],
         }),
         QueryFilter::Scalar {
             index: active_index,
@@ -1261,6 +1263,8 @@ fn run_e4(
             max_visited: member_limit + 1,
             max_edges: member_limit + 1,
             result_limit: member_limit,
+            edge_where: &[],
+            node_where: &[],
         }),
         QueryFilter::Scalar {
             index: active_index,
@@ -1327,6 +1331,8 @@ fn run_e4(
         max_visited: 1000,
         max_edges: 100_000,
         result_limit: 1000,
+        edge_where: &[],
+        node_where: &[],
     };
     let org_request = |seed: usize| BfsRequest {
         seed: EntityId {
@@ -1342,6 +1348,8 @@ fn run_e4(
         max_visited: member_limit + 1,
         max_edges: member_limit + 1,
         result_limit: member_limit,
+        edge_where: &[],
+        node_where: &[],
     };
 
     // Both arms are asked for the same thing: the adjacent identities. The

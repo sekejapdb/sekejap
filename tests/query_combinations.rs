@@ -778,10 +778,9 @@ impl Combo {
         )
     }
     fn expects_prepare_refuse(&self) -> bool {
-        let has_key = self.filters.iter().any(OwnedFilter::is_key);
-        if has_key && self.driver != OwnedDriver::Keys {
-            return true;
-        }
+        // A key range is the row's own first field, so under any driver but
+        // Keys it is answered from the row (QL_CONTRACT §6 names the cost);
+        // it is no longer a prepare refusal. Only an undrivable Filter(i) is.
         if let OwnedDriver::Filter(i) = self.driver {
             if i >= self.filters.len() || !self.filters[i].is_drivable() {
                 return true;
@@ -1695,9 +1694,9 @@ fn hand_picked() -> Vec<Combo> {
         limit,
     };
     vec![
-        c("hp01_key_auto_refuse", "Key filter is certified only by Keys; Auto must refuse (query.rs:2615)", vec![OwnedFilter::KeyRange { lo: "k0100", hi: "k0400" }], OwnedOrder::EntityId, OwnedDriver::Auto, OwnedProj::Ids, 7, None),
+        c("hp01_key_auto_row_answered", "Key range under Auto is answered from the row's own key field (a named per-candidate read), equal to brute force", vec![OwnedFilter::KeyRange { lo: "k0100", hi: "k0400" }], OwnedOrder::EntityId, OwnedDriver::Auto, OwnedProj::Ids, 7, None),
         c("hp02_key_keys_id", "Mapping-keyspace walk vs brute-force key compare", vec![OwnedFilter::KeyRange { lo: "k0100", hi: "k0400" }], OwnedOrder::EntityId, OwnedDriver::Keys, OwnedProj::Ids, 7, None),
-        c("hp03_key_entities_refuse", "Entities driver cannot certify a Key filter", vec![OwnedFilter::KeyRange { lo: "k0100", hi: "k0400" }], OwnedOrder::EntityId, OwnedDriver::Entities, OwnedProj::Ids, 7, None),
+        c("hp03_key_entities_row_answered", "Key range under the entity driver is a row predicate; rows equal brute force", vec![OwnedFilter::KeyRange { lo: "k0100", hi: "k0400" }], OwnedOrder::EntityId, OwnedDriver::Entities, OwnedProj::Ids, 7, None),
         c("hp04_ismissing_score", "IsMissing is a field-state, not null; score was omitted not nulled", vec![OwnedFilter::IsMissingScore], OwnedOrder::EntityId, OwnedDriver::Auto, OwnedProj::Ids, 7, None),
         c("hp05_isnull_kind", "JSON null kind vs missing; 5% rows store explicit null", vec![OwnedFilter::IsNullKind], OwnedOrder::KindAsc, OwnedDriver::Auto, OwnedProj::Ids, 7, None),
         c("hp06_same_index_contradict", "kind Eq alpha AND kind IsNull: same index, empty intersection", vec![OwnedFilter::EqKind("alpha"), OwnedFilter::IsNullKind], OwnedOrder::EntityId, OwnedDriver::Auto, OwnedProj::Ids, 7, None),
@@ -2074,8 +2073,9 @@ fn run_named(combo: Combo) {
 }
 
 #[test]
-fn hand_picked_key_filter_requires_keys_driver() {
-    run_named(hand_picked().into_iter().find(|c| c.name == "hp01_key_auto_refuse").unwrap());
+fn hand_picked_key_filter_answers_under_any_driver() {
+    run_named(hand_picked().into_iter().find(|c| c.name == "hp01_key_auto_row_answered").unwrap());
+    run_named(hand_picked().into_iter().find(|c| c.name == "hp03_key_entities_row_answered").unwrap());
 }
 
 #[test]

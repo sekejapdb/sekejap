@@ -175,21 +175,13 @@ fn a_distance_as_a_filter_is_tier_two_while_the_same_operator_orders() {
 }
 
 #[test]
+// The inline element WHERE forms (a scalar seed predicate, an edge predicate,
+// a membership-able far-node predicate) are Tier 1 since GRAPH_CONTRACT 4.2/4.3
+// landed and are asserted in tests/sql_tier1.rs; what stays refused here is
+// what still has no atomic.
 fn graph_constructs_beyond_the_slice_name_their_tier() {
     let (_dir, mut f) = open();
     for (statement, expect) in [
-        (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH (a:place WHERE a.born = 1)-[:near]->(b:place) COLUMNS (b._key AS k))",
-            "inline element WHERE",
-        ),
-        (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH (a:place WHERE a._key = 'k00000')-[e:near WHERE e.weight = 1]->(b:place) COLUMNS (b._key AS k))",
-            "edge inline WHERE",
-        ),
-        (
-            "SELECT k FROM GRAPH_TABLE (routes MATCH (a:place WHERE a._key = 'k00000')-[:near]->(b:place WHERE b.kind = 'park') COLUMNS (b._key AS k))",
-            "inline element WHERE",
-        ),
         (
             "SELECT k FROM GRAPH_TABLE (routes MATCH (a:place WHERE a._key = 'k00000')-[:near|far]->(b:place) COLUMNS (b._key AS k))",
             "label alternation",

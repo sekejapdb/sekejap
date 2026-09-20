@@ -6,9 +6,11 @@ use crate::collections::{
     corrupt, invalid, ordered, ordered_into, packet, read_ordered, replicas, row_key, unpack,
     CollectionId, Database, EntityId, Error, IndexHeader, Result, PAD,
 };
+use crate::query::{QueryFilter, ScalarValue};
 use crate::store::pagewal::PageWalStore;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub(crate) const GRAPH_FEATURE: u64 = 2;
 pub(crate) const GRAPH_HEADER: u8 = 0x06;
@@ -60,6 +62,108 @@ pub struct Edge {
     pub properties: Value,
 }
 
+/// The edge a traversal crossed to reach one node, bound to that node
+/// (`docs/GRAPH_CONTRACT.md` §4.2). `properties` is the inline bag of the
+/// PRIMARY posting, decoded once when the edge was walked; nothing here
+/// comes from a row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeRef {
+    pub key: EdgeKey,
+    pub properties: Value,
+}
+
+/// The comparison one [`EdgePredicate`] makes.
+///
+/// `Ne` is here and is NOT the `<>` that `docs/QL_CONTRACT.md` §3 refuses
+/// for a scalar column. That refusal is about an INDEX: the complement of an
+/// equality is not a posting range and so is not over a membership set. An
+/// edge predicate reads the property out of the posting the hop is standing
+/// on, so the complement costs exactly what the predicate costs and no set
+/// is involved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Cmp {
+    pub(crate) fn written(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Ne => "<>",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        }
+    }
+}
+
+/// One per-hop predicate over an edge's inline property bag
+/// (`docs/GRAPH_CONTRACT.md` §4.3). The conjunction of a request's
+/// predicates decides whether the hop is followed; a failing edge is never
+/// crossed and the node beyond it is never reached through it.
+///
+/// A property that is absent from the bag, or is JSON `null`, or holds
+/// another JSON type than the predicate's value, satisfies NO comparison --
+/// `Ne` included. That is the rule `scalar_filter_matches` already applies
+/// to a missing row field, stated once for edges.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgePredicate<'a> {
+    pub property: &'a str,
+    pub op: Cmp,
+    pub value: ScalarValue<'a>,
+}
+
+/// Does one decoded property bag satisfy every predicate?
+pub(crate) fn edge_properties_match(properties: &Value, predicates: &[EdgePredicate<'_>]) -> bool {
+    predicates
+        .iter()
+        .all(|predicate| edge_property_matches(properties, predicate))
+}
+
+fn edge_property_matches(properties: &Value, predicate: &EdgePredicate<'_>) -> bool {
+    let Some(found) = properties.get(predicate.property) else {
+        return false;
+    };
+    let ordering = match (found, predicate.value) {
+        (Value::Bool(left), ScalarValue::Bool(right)) => left.cmp(&right),
+        (Value::String(left), ScalarValue::Text(right)) => left.as_str().cmp(right),
+        (Value::Number(left), ScalarValue::I64(right)) => match left.as_i64() {
+            Some(left) => left.cmp(&right),
+            None => match left.as_f64() {
+                Some(left) => match left.partial_cmp(&(right as f64)) {
+                    Some(ordering) => ordering,
+                    None => return false,
+                },
+                None => return false,
+            },
+        },
+        (Value::Number(left), ScalarValue::F64(right)) => {
+            let Some(left) = left.as_f64() else {
+                return false;
+            };
+            match left.partial_cmp(&right) {
+                Some(ordering) => ordering,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    match predicate.op {
+        Cmp::Eq => ordering == std::cmp::Ordering::Equal,
+        Cmp::Ne => ordering != std::cmp::Ordering::Equal,
+        Cmp::Lt => ordering == std::cmp::Ordering::Less,
+        Cmp::Le => ordering != std::cmp::Ordering::Greater,
+        Cmp::Gt => ordering == std::cmp::Ordering::Greater,
+        Cmp::Ge => ordering != std::cmp::Ordering::Less,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Outgoing,
@@ -77,8 +181,8 @@ pub struct NeighborRequest {
     pub limit: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BfsRequest {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BfsRequest<'a> {
     pub seed: EntityId,
     pub direction: Direction,
     pub context: GraphContextId,
@@ -89,15 +193,39 @@ pub struct BfsRequest {
     pub max_visited: usize,
     pub max_edges: usize,
     pub result_limit: usize,
+    /// The conjunction every edge must satisfy to be followed
+    /// (`docs/GRAPH_CONTRACT.md` §4.3). Decoded from the edge's inline bag as
+    /// the frontier expands; a failing edge is not crossed. The same set
+    /// applies to every hop (§4.4).
+    pub edge_where: &'a [EdgePredicate<'a>],
+    /// The conjunction every node REACHED BY AN EDGE must satisfy to be
+    /// emitted and to be expanded (`docs/GRAPH_CONTRACT.md` §4.3). Restricted
+    /// to the filter kinds an index answers without a row: a scalar equality
+    /// (one posting probe per node) and a scalar range or a point predicate
+    /// (one membership set, built once). Any other kind is refused when the
+    /// traversal is prepared.
+    ///
+    /// The SEED is not tested: it is NAMED by the caller, not found by a hop,
+    /// and §4.3's rule is about the frontier a hop produces.
+    pub node_where: &'a [QueryFilter<'a>],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TraversalNode {
     pub entity: EntityId,
     pub depth: usize,
+    /// The edge this traversal crossed to reach `entity`
+    /// (`docs/GRAPH_CONTRACT.md` §4.2), or `None` for the seed and for a
+    /// traversal that was not asked to bind it.
+    ///
+    /// A node reachable over several edges reports the FIRST one the walk
+    /// admitted: edges are offered to a level in the order the postings are
+    /// walked (outgoing before incoming, each in key order), and the level
+    /// keeps the first offer per entity.
+    pub via: Option<EdgeRef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TraversalResult {
     pub nodes: Vec<TraversalNode>,
     pub visited: usize,
@@ -516,9 +644,28 @@ pub(crate) fn decode_properties(bytes: &[u8]) -> Result<Value> {
 /// the room the level has left, and a level that is full answers membership
 /// by binary search over the sorted vector.
 pub(crate) struct Frontier {
-    items: Vec<EntityId>,
+    items: Vec<FrontierEntry>,
     sorted: bool,
     room: usize,
+    /// How many offers this level has seen, so the FIRST offer of an entity
+    /// is recoverable after an unstable sort. §4.2's "a node reached by
+    /// several edges reports the first admitted" is this counter and nothing
+    /// else.
+    offered: u32,
+}
+
+/// One entity a level discovered, and the edge that reached it.
+///
+/// Named sacrifice (Law 4): a level entry is 8 bytes of reaching-edge
+/// pointer and 4 of offer order wider than the bare `EntityId` it used to
+/// be. The `Arc` is shared with the level's other holders rather than cloned
+/// per node, it is `None` for every traversal that does not bind the edge,
+/// and the visited budget bounds the count exactly as before (Law 1).
+#[derive(Clone)]
+pub(crate) struct FrontierEntry {
+    pub(crate) entity: EntityId,
+    offer: u32,
+    pub(crate) via: Option<Arc<EdgeRef>>,
 }
 
 impl Frontier {
@@ -527,19 +674,26 @@ impl Frontier {
             items: Vec::new(),
             sorted: true,
             room,
+            offered: 0,
         }
     }
 
-    pub(crate) fn offer(&mut self, entity: EntityId) -> Result<()> {
+    pub(crate) fn offer(&mut self, entity: EntityId, via: Option<Arc<EdgeRef>>) -> Result<()> {
+        let offer = self.offered;
+        self.offered = self.offered.saturating_add(1);
         if self.sorted && self.items.len() == self.room {
             // Full and normalised: one more distinct entity is one too many.
-            return if self.items.binary_search(&entity).is_ok() {
+            return if self
+                .items
+                .binary_search_by_key(&entity, |item| item.entity)
+                .is_ok()
+            {
                 Ok(())
             } else {
                 Err(invalid("BFS visited limit exceeded"))
             };
         }
-        self.items.push(entity);
+        self.items.push(FrontierEntry { entity, offer, via });
         self.sorted = false;
         if self.items.len() > self.room {
             self.normalize();
@@ -552,16 +706,50 @@ impl Frontier {
 
     fn normalize(&mut self) {
         if !self.sorted {
-            self.items.sort_unstable();
-            self.items.dedup();
+            // `(entity, offer)` is a total order, so an unstable sort is
+            // deterministic and the first entry of each entity group is the
+            // first offer -- the edge §4.2 reports.
+            self.items
+                .sort_unstable_by_key(|item| (item.entity, item.offer));
+            self.items.dedup_by_key(|item| item.entity);
             self.sorted = true;
         }
     }
 
-    pub(crate) fn into_sorted(mut self) -> Vec<EntityId> {
+    pub(crate) fn into_sorted(mut self) -> Vec<FrontierEntry> {
         self.normalize();
         self.items
     }
+}
+
+/// The node gate, asked at most once per distinct entity for a whole walk.
+///
+/// `docs/GRAPH_CONTRACT.md` §4.3 promises one index point read per visited
+/// NODE. The gate itself is per-node -- the same entity gets the same answer
+/// over every edge that reaches it -- so memoising the refusals changes no
+/// answer and no offer order: an admitted node joins `seen` with its level
+/// and is never offered again, and a refused one joins `refused` here.
+///
+/// Bound (Law 1): a refused entity was reached by at least one edge the walk
+/// charged against `max_edges`, so `refused` holds at most `max_edges`
+/// entries -- 12 bytes each, beside the visited set's own bound.
+fn gate_admits(
+    db: &Database,
+    gate: &crate::query::StandaloneNodeGate,
+    refused: &mut BTreeSet<EntityId>,
+    id: EntityId,
+) -> Result<bool> {
+    if gate.is_empty() {
+        return Ok(true);
+    }
+    if refused.contains(&id) {
+        return Ok(false);
+    }
+    if gate.admits(db, id)? {
+        return Ok(true);
+    }
+    refused.insert(id);
+    Ok(false)
 }
 
 /// Union of two sorted sets with no element in common, in one pass, reusing
@@ -1554,14 +1742,43 @@ impl Database {
         Ok(found)
     }
 
+    /// One direction of one frontier entry's hop.
+    ///
+    /// The per-hop predicates of `docs/GRAPH_CONTRACT.md` §4.3 are applied
+    /// HERE, as the frontier expands, and not afterwards:
+    ///
+    ///   * `edge_where` reads the edge's own inline property bag. An OUTGOING
+    ///     posting carries that bag as its value, so the predicate costs the
+    ///     decode and nothing else. An INCOMING posting is a marker whose
+    ///     value is empty by construction, so the authoritative primary
+    ///     posting of the same edge is read back -- one edge-keyspace point
+    ///     read per candidate edge, never a row. Those reads are made AFTER
+    ///     the range walk, from a list the walk collected, because the walk
+    ///     holds a pinned leaf while it runs.
+    ///   * `gate` (the `node_where` conjunction) is tested on the far
+    ///     endpoint. A node it refuses is neither offered to the level nor
+    ///     expanded, and nothing about it is read from the primary tree. It
+    ///     is tested at most ONCE per distinct entity for the whole walk:
+    ///     an admitted node joins `seen` with its level, and a refused one
+    ///     joins `refused`, so no later edge -- at this depth or a deeper
+    ///     one -- probes it again. That is §4.3's "one index point read per
+    ///     visited node" rather than one per incident edge per depth.
+    ///
+    /// `wants_via` asks for the reaching edge to be bound to the node (§4.2).
+    /// It costs the same decode `edge_where` already pays, and for an
+    /// incoming hop the same primary-posting read.
+    #[allow(clippy::too_many_arguments)]
     fn bfs_direction(
         &self,
         h: GraphHeader,
         entity: EntityId,
         direction: Direction,
-        request: &BfsRequest,
+        request: &BfsRequest<'_>,
+        gate: &crate::query::StandaloneNodeGate,
+        wants_via: bool,
         next: &mut Frontier,
         seen: &[EntityId],
+        refused: &mut BTreeSet<EntityId>,
         scanned: &mut usize,
         cancel: &mut impl FnMut() -> bool,
     ) -> Result<()> {
@@ -1572,6 +1789,8 @@ impl Database {
             edge_prefix_into(&mut prefix, tag, entity, Some(request.context), request.edge_type);
         let p = &prefix[..at0];
         let (pinned, context, max_edges) = (request.edge_type, request.context, request.max_edges);
+        // Whether this hop has to look at an edge's properties at all.
+        let reads_properties = wants_via || !request.edge_where.is_empty();
         // `for_each_ref` hands the callback borrows into the pinned leaf. The
         // allocating iterator built a key `Vec` and a value `Vec` for every
         // edge walked, to hand a parser bytes it only reads and a marker check
@@ -1581,6 +1800,9 @@ impl Database {
         // to take the 88-byte `BfsRequest` by value, so every edge paid for a
         // copy of ten fields to read one of them.
         let mut failure: Option<Error> = None;
+        // Incoming edges whose properties this hop still needs. Bounded by
+        // the edge budget the walk below trips on, so it is not a new bound.
+        let mut deferred: Vec<(EdgeKey, EntityId)> = Vec::new();
         {
             let mut step = |key: &[u8], value: &[u8]| -> Result<bool> {
                 if !key.starts_with(p) {
@@ -1595,18 +1817,42 @@ impl Database {
                 if *scanned > max_edges {
                     return Err(invalid("BFS edge work limit exceeded"));
                 }
-                // BFS returns entities, so it never decodes properties, and it
-                // never reads across to the other direction of the pair: both
-                // directions are written in one transaction, so a committed
-                // snapshot cannot hold half a pair, and `verify_indexed_source`
-                // is the tool that checks pair consistency.
+                // BFS never reads across to the other direction of the pair
+                // for STRUCTURE: both directions are written in one
+                // transaction, so a committed snapshot cannot hold half a
+                // pair, and `verify_indexed_source` is the tool that checks
+                // pair consistency.
                 if incoming && !value.is_empty() {
                     return Err(corrupt("nonempty reverse edge marker"));
                 }
-                let (_, adjacent) = adjacent_from_tail(key, at0, pinned, context, h)?;
-                if seen.binary_search(&adjacent).is_err() {
-                    next.offer(adjacent)?;
+                let (edge_type, adjacent) = adjacent_from_tail(key, at0, pinned, context, h)?;
+                if seen.binary_search(&adjacent).is_ok() {
+                    return Ok(true);
                 }
+                if !reads_properties {
+                    if gate_admits(self, gate, refused, adjacent)? {
+                        next.offer(adjacent, None)?;
+                    }
+                    return Ok(true);
+                }
+                let edge = if incoming {
+                    EdgeKey { source: adjacent, context, edge_type, destination: entity }
+                } else {
+                    EdgeKey { source: entity, context, edge_type, destination: adjacent }
+                };
+                if incoming {
+                    deferred.push((edge, adjacent));
+                    return Ok(true);
+                }
+                let properties = decode_properties(value)?;
+                if !edge_properties_match(&properties, request.edge_where) {
+                    return Ok(true);
+                }
+                if !gate_admits(self, gate, refused, adjacent)? {
+                    return Ok(true);
+                }
+                let via = wants_via.then(|| Arc::new(EdgeRef { key: edge, properties }));
+                next.offer(adjacent, via)?;
                 Ok(true)
             };
             self.store()?
@@ -1622,19 +1868,71 @@ impl Database {
         if let Some(error) = failure {
             return Err(error);
         }
+        // The incoming hop's second pass: the reverse posting is a marker, so
+        // the properties come from the primary posting of the same edge.
+        for (edge, adjacent) in deferred {
+            if cancel() {
+                return Err(invalid("graph query cancelled"));
+            }
+            if seen.binary_search(&adjacent).is_ok() {
+                continue;
+            }
+            // The primary-posting read this loop is about is an edge-keyspace
+            // read like the range walk's own, so `max_edges` bounds it and
+            // `scanned_edges` reports it. It is charged HERE rather than at
+            // the top of the loop because the `seen` test above skips the
+            // read entirely, and charging for a read that does not happen
+            // would report work nobody did. This is the same point the query
+            // engine's meter charges `GraphEdges` for it (`drivers.rs`).
+            *scanned = scanned
+                .checked_add(1)
+                .ok_or_else(|| invalid("BFS edge work overflow"))?;
+            if *scanned > max_edges {
+                return Err(invalid("BFS edge work limit exceeded"));
+            }
+            let value = self
+                .store()?
+                .get(&edge_key(PRIMARY_EDGE, edge))?
+                .ok_or_else(|| corrupt("edge disappeared during traversal"))?;
+            let properties = decode_properties(&value)?;
+            if !edge_properties_match(&properties, request.edge_where) {
+                continue;
+            }
+            if !gate_admits(self, gate, refused, adjacent)? {
+                continue;
+            }
+            let via = wants_via.then(|| Arc::new(EdgeRef { key: edge, properties }));
+            next.offer(adjacent, via)?;
+        }
         Ok(())
     }
 
     /// Deterministic distinct-entity BFS. Budget exhaustion is an error; the
     /// returned vector therefore always represents a complete bounded result.
-    pub fn traverse_bfs(&self, request: BfsRequest) -> Result<TraversalResult> {
+    pub fn traverse_bfs(&self, request: BfsRequest<'_>) -> Result<TraversalResult> {
         self.traverse_bfs_with_cancel(request, || false)
+    }
+
+    /// The same walk, binding the edge that reached each node
+    /// (`docs/GRAPH_CONTRACT.md` §4.2): every returned [`TraversalNode`]
+    /// carries `via`, except the seed, which no edge reached.
+    pub fn traverse_bfs_binding_edges(&self, request: BfsRequest<'_>) -> Result<TraversalResult> {
+        self.traverse_bfs_inner(request, true, || false)
     }
 
     /// Complete-or-error deterministic BFS with cooperative cancellation.
     pub fn traverse_bfs_with_cancel(
         &self,
-        request: BfsRequest,
+        request: BfsRequest<'_>,
+        cancel: impl FnMut() -> bool,
+    ) -> Result<TraversalResult> {
+        self.traverse_bfs_inner(request, false, cancel)
+    }
+
+    fn traverse_bfs_inner(
+        &self,
+        request: BfsRequest<'_>,
+        wants_via: bool,
         mut cancel: impl FnMut() -> bool,
     ) -> Result<TraversalResult> {
         if cancel() {
@@ -1673,8 +1971,15 @@ impl Database {
             nodes.push(TraversalNode {
                 entity: request.seed,
                 depth: 0,
+                via: None,
             });
         }
+        // The node predicates, compiled and their sets walked ONCE before the
+        // first hop. A refused filter kind fails here, not per node.
+        let gate = crate::query::StandaloneNodeGate::new(self, request.node_where)?;
+        // Every entity the gate has already turned away, so no later edge
+        // probes it a second time (`gate_admits`).
+        let mut refused: BTreeSet<EntityId> = BTreeSet::new();
         let mut frontier = vec![request.seed];
         let mut scanned_edges = 0usize;
         for depth in 1..=request.max_depth {
@@ -1692,8 +1997,11 @@ impl Database {
                         entity,
                         Direction::Outgoing,
                         &request,
+                        &gate,
+                        wants_via,
                         &mut next,
                         &seen,
+                        &mut refused,
                         &mut scanned_edges,
                         &mut cancel,
                     )?;
@@ -1704,32 +2012,36 @@ impl Database {
                         entity,
                         Direction::Incoming,
                         &request,
+                        &gate,
+                        wants_via,
                         &mut next,
                         &seen,
+                        &mut refused,
                         &mut scanned_edges,
                         &mut cancel,
                     )?;
                 }
             }
-            let next = next.into_sorted();
-            if seen.len() + next.len() > request.max_visited {
+            let level = next.into_sorted();
+            if seen.len() + level.len() > request.max_visited {
                 return Err(invalid("BFS visited limit exceeded"));
             }
-            merge_sorted_disjoint(&mut seen, &next, &mut merged);
+            let ids: Vec<EntityId> = level.iter().map(|entry| entry.entity).collect();
+            merge_sorted_disjoint(&mut seen, &ids, &mut merged);
             if depth >= request.min_depth {
-                if nodes.len() + next.len() > request.result_limit {
+                if nodes.len() + level.len() > request.result_limit {
                     return Err(invalid("BFS result limit exceeded"));
                 }
-                nodes.extend(
-                    next.iter()
-                        .copied()
-                        .map(|entity| TraversalNode { entity, depth }),
-                );
+                nodes.extend(level.iter().map(|entry| TraversalNode {
+                    entity: entry.entity,
+                    depth,
+                    via: entry.via.as_ref().map(|via| EdgeRef::clone(via)),
+                }));
             }
-            if next.is_empty() {
+            if ids.is_empty() {
                 break;
             }
-            frontier = next;
+            frontier = ids;
         }
         // The seed-existence refusal, paid only when it can still be the
         // answer: a traversal that walked even one edge has already proved the

@@ -1041,6 +1041,8 @@ fn graph_table_compiles_to_one_bounded_traversal() {
                 max_visited: 1 << 16,
                 max_edges: 1 << 18,
                 result_limit: 1 << 16,
+                edge_where: &[],
+                node_where: &[],
             },
         )],
         QueryOrder::Driver,
@@ -1523,6 +1525,331 @@ fn the_sql_aggregate_charges_exactly_what_the_api_aggregate_charges() {
         assert_eq!(
             api_work.key_postings, sql_work.key_postings,
             "{name}: key_postings"
+        );
+    }
+}
+
+// ── GRAPH_TABLE: per-hop predicates (GRAPH_CONTRACT 4.2 and 4.3) ──────────
+
+/// A second edge type over the same rows, carrying properties, so the
+/// per-hop statements below have a bag to read. The fixture's own `near`
+/// edges carry none; this adds `weighted` rather than changing them, because
+/// every other suite over that fixture reads the same edges.
+fn weighted_graph(f: &mut fixture::Fixture) -> e4_prototype::collections::EdgeTypeId {
+    let weighted = f.db.create_edge_type("weighted").unwrap();
+    f.db.commit().unwrap();
+    let ids: Vec<EntityId> = f
+        .keys
+        .iter()
+        .map(|key| f.db.get(f.place, key).unwrap().unwrap().id)
+        .collect();
+    // A chain of 1,999 edges whose weight rises along it, so `r.weight > x`
+    // has a known cut and a node's `born` has a known one too.
+    for (i, pair) in ids.windows(2).enumerate() {
+        let weight = (i % 10) as f64 / 10.0;
+        f.db.put_edge(
+            f.context,
+            pair[0],
+            weighted,
+            pair[1],
+            &serde_json::json!({"weight": weight, "rank": (i % 7) as i64}),
+        )
+        .unwrap();
+        if (i + 1) % 256 == 0 {
+            f.db.commit().unwrap();
+        }
+    }
+    f.db.commit().unwrap();
+    weighted
+}
+
+#[test]
+fn graph_table_inline_edge_where_compiles_to_a_per_hop_prune() {
+    let (_dir, mut f) = open();
+    let weighted = weighted_graph(&mut f);
+    let seed = f.db.get(f.place, "k00000").unwrap().unwrap().id;
+    let edge_where = [e4_prototype::collections::EdgePredicate {
+        property: "weight",
+        op: e4_prototype::collections::Cmp::Gt,
+        value: e4_prototype::collections::ScalarValue::F64(0.2),
+    }];
+    let expected = direct(
+        &f.db,
+        f.place,
+        &[QueryFilter::Graph(
+            e4_prototype::collections::BfsRequest {
+                seed,
+                direction: e4_prototype::collections::Direction::Outgoing,
+                context: f.context,
+                edge_type: Some(weighted),
+                min_depth: 1,
+                max_depth: 4,
+                include_seed: false,
+                max_visited: 1 << 16,
+                max_edges: 1 << 18,
+                result_limit: 1 << 16,
+                edge_where: &edge_where,
+                node_where: &[],
+            },
+        )],
+        QueryOrder::Driver,
+        None,
+    );
+    let got = sql_ids(
+        &mut f.db,
+        "SELECT k FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}(b:place) \
+            COLUMNS (b._key AS k))",
+        &[Param::Text("k00000".into())],
+    );
+    assert_eq!(got, expected);
+    // The chain's first edge has weight 0.0, so the prune stops it dead and
+    // the unpruned pattern does not.
+    assert!(got.is_empty(), "weight 0.0 on the first hop is not > 0.2");
+    let unpruned = sql_ids(
+        &mut f.db,
+        "SELECT k FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = $1)-[r:weighted]->{1,4}(b:place) \
+            COLUMNS (b._key AS k))",
+        &[Param::Text("k00000".into())],
+    );
+    assert_eq!(unpruned.len(), 4, "four hops along the chain");
+    // From `k00003` the chain's weights are 0.3, 0.4, 0.5, 0.6, so the same
+    // predicate admits every hop: the prune is about the EDGE, not about the
+    // pattern.
+    let admitted = sql_ids(
+        &mut f.db,
+        "SELECT k FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = $1)-[r:weighted WHERE r.weight > 0.2]->{1,4}(b:place) \
+            COLUMNS (b._key AS k))",
+        &[Param::Text("k00003".into())],
+    );
+    assert_eq!(admitted.len(), 4);
+    // And a predicate that cuts mid-chain stops it there: from `k00003` the
+    // third hop is weight 0.5, so `< 0.5` returns two rows.
+    let cut = sql_ids(
+        &mut f.db,
+        "SELECT k FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = $1)-[r:weighted WHERE r.weight < 0.5]->{1,4}(b:place) \
+            COLUMNS (b._key AS k))",
+        &[Param::Text("k00003".into())],
+    );
+    assert_eq!(cut.len(), 2, "the chain stops at the first refused edge");
+}
+
+#[test]
+fn graph_table_inline_node_where_compiles_to_a_membership_prune() {
+    let (_dir, mut f) = open();
+    let weighted = weighted_graph(&mut f);
+    let seed = f.db.get(f.place, "k00000").unwrap().unwrap().id;
+    let node_where = [QueryFilter::Scalar {
+        index: f.index.born,
+        predicate: e4_prototype::collections::ScalarFilter::Range {
+            lower: std::ops::Bound::Included(e4_prototype::collections::ScalarValue::I64(
+                19_500_101,
+            )),
+            upper: std::ops::Bound::Included(e4_prototype::collections::ScalarValue::I64(
+                19_600_101,
+            )),
+        },
+    }];
+    let expected = direct(
+        &f.db,
+        f.place,
+        &[QueryFilter::Graph(
+            e4_prototype::collections::BfsRequest {
+                seed,
+                direction: e4_prototype::collections::Direction::Outgoing,
+                context: f.context,
+                edge_type: Some(weighted),
+                min_depth: 1,
+                max_depth: 4,
+                include_seed: false,
+                max_visited: 1 << 16,
+                max_edges: 1 << 18,
+                result_limit: 1 << 16,
+                edge_where: &[],
+                node_where: &node_where,
+            },
+        )],
+        QueryOrder::Driver,
+        None,
+    );
+    let got = sql_ids(
+        &mut f.db,
+        "SELECT k FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = $1)-[r:weighted]->{1,4}\
+            (b:place WHERE b.born BETWEEN 19500101 AND 19600101) \
+            COLUMNS (b._key AS k))",
+        &[Param::Text("k00000".into())],
+    );
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn graph_table_columns_project_the_reaching_edge_and_order_by_it() {
+    let (_dir, mut f) = open();
+    let _ = weighted_graph(&mut f);
+    let (columns, rows) = sql_rows(
+        &mut f.db,
+        "SELECT k, w FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = $1)-[r:weighted]->{1,6}(b:place) \
+            COLUMNS (b._key AS k, r.weight AS w)) \
+         ORDER BY w DESC LIMIT 3",
+        &[Param::Text("k00000".into())],
+    );
+    assert_eq!(columns, vec!["k".to_owned(), "w".to_owned()]);
+    assert_eq!(rows.len(), 3);
+    let weights: Vec<f64> = rows
+        .iter()
+        .map(|row| match &row[1] {
+            SqlValue::Float(value) => *value,
+            other => panic!("edge weight came back as {other:?}"),
+        })
+        .collect();
+    assert!(
+        weights.windows(2).all(|pair| pair[0] >= pair[1]),
+        "not descending: {weights:?}"
+    );
+    // The chain from k00000 crosses weights 0.0 .. 0.5 in six hops, so the
+    // top three are 0.5, 0.4 and 0.3.
+    assert_eq!(weights, vec![0.5, 0.4, 0.3]);
+}
+
+#[test]
+fn a_row_bound_inline_node_predicate_is_refused_with_its_tier() {
+    let (_dir, mut f) = open();
+    let _ = weighted_graph(&mut f);
+    for (sql, needle) in [
+        (
+            "SELECT k FROM GRAPH_TABLE (routes MATCH \
+                (a:place WHERE a._key = 'k00000')-[r:weighted]->(b:place WHERE b.born IS NULL) \
+                COLUMNS (b._key AS k))",
+            "nullish index key",
+        ),
+        (
+            "SELECT k FROM GRAPH_TABLE (routes MATCH \
+                (a:place WHERE a._key = 'k00000')-[r:weighted]->\
+                (b:place WHERE to_tsvector('simple', b.text) @@ to_tsquery('simple', 'harbour')) \
+                COLUMNS (b._key AS k))",
+            "index postings",
+        ),
+    ] {
+        let error = f.db.sql(sql, &[]).unwrap_err();
+        let text = format!("{error}");
+        assert!(text.contains("refused"), "{text}");
+        assert!(text.contains(needle), "{text}");
+    }
+}
+
+/// D1 in the SQL surface: a `_key` predicate beside a `GRAPH_TABLE` that
+/// reads the reaching edge is a POST-FILTER, so the traversal keeps the
+/// driver (`GRAPH_CONTRACT 4.2`: the edge is carried by the walk that crossed
+/// it and by nothing else) and the key range is answered from the external
+/// key the row itself carries. The statement used to compile onto the keys
+/// driver, where every edge column was `Missing` and the ranking a total tie.
+#[test]
+fn a_key_post_filter_beside_a_graph_table_keeps_the_traversal_driving() {
+    let (_dir, mut f) = open();
+    let _ = weighted_graph(&mut f);
+    let (columns, rows) = sql_rows(
+        &mut f.db,
+        "SELECT k, w FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = $1)-[r:weighted]->{1,6}(b:place) \
+            COLUMNS (b._key AS k, r.weight AS w)) \
+         WHERE _key <= 'k00004' ORDER BY w DESC",
+        &[Param::Text("k00000".into())],
+    );
+    assert_eq!(columns, vec!["k".to_owned(), "w".to_owned()]);
+    // The chain leaves k00000 for k00001..k00006 with weights 0.0..0.5; the
+    // key range keeps the first four of them.
+    let keys: Vec<String> = rows
+        .iter()
+        .map(|row| match &row[0] {
+            SqlValue::Text(value) => value.clone(),
+            other => panic!("key came back as {other:?}"),
+        })
+        .collect();
+    assert_eq!(keys, vec!["k00004", "k00003", "k00002", "k00001"]);
+    let weights: Vec<f64> = rows
+        .iter()
+        .map(|row| match &row[1] {
+            SqlValue::Float(value) => *value,
+            other => panic!("edge weight came back as {other:?}, not the edge's own"),
+        })
+        .collect();
+    assert_eq!(weights, vec![0.3, 0.2, 0.1, 0.0]);
+}
+
+/// D6: an edge alias in `COLUMNS` is matched the way every other name in this
+/// parser is -- without case. `R.weight` against a pattern that bound `r` is
+/// the EDGE's property, not a row field of the far node that does not exist.
+#[test]
+fn an_edge_alias_in_columns_is_matched_without_case() {
+    let (_dir, mut f) = open();
+    let _ = weighted_graph(&mut f);
+    let lower = sql_rows(
+        &mut f.db,
+        "SELECT w FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = 'k00000')-[r:weighted]->{1,6}(b:place) \
+            COLUMNS (r.weight AS w)) \
+         ORDER BY w DESC LIMIT 3",
+        &[],
+    );
+    let upper = sql_rows(
+        &mut f.db,
+        "SELECT w FROM GRAPH_TABLE (routes MATCH \
+            (a:place WHERE a._key = 'k00000')-[r:weighted]->{1,6}(b:place) \
+            COLUMNS (R.weight AS w)) \
+         ORDER BY w DESC LIMIT 3",
+        &[],
+    );
+    assert_eq!(lower, upper);
+    assert_eq!(
+        lower.1,
+        vec![
+            vec![SqlValue::Float(0.5)],
+            vec![SqlValue::Float(0.4)],
+            vec![SqlValue::Float(0.3)],
+        ]
+    );
+}
+
+/// D5: an ANONYMOUS edge element bound no variable, so a qualified name in
+/// its inline WHERE names something else. Compiling it as an edge property
+/// would test the bag for a key it does not carry and return no rows at all.
+/// D7: a three-part name inside `GRAPH_TABLE` is a syntax error naming that
+/// construct, not a `CREATE SCHEMA` refusal.
+#[test]
+fn a_graph_table_refuses_a_name_that_belongs_to_another_element() {
+    let (_dir, mut f) = open();
+    let _ = weighted_graph(&mut f);
+    for (sql, needle) in [
+        (
+            "SELECT k FROM GRAPH_TABLE (routes MATCH \
+                (a:place WHERE a._key = 'k00000')-[:weighted WHERE b.born > 1990]->(b:place) \
+                COLUMNS (b._key AS k))",
+            "bound no variable",
+        ),
+        (
+            "SELECT k FROM GRAPH_TABLE (routes MATCH \
+                (a:place WHERE a._key = 'k00000')-[r:weighted WHERE b.born > 1990]->(b:place) \
+                COLUMNS (b._key AS k))",
+            "names its own element",
+        ),
+        (
+            "SELECT k FROM GRAPH_TABLE (routes MATCH \
+                (a:place WHERE a._key = 'k00000')-[r:weighted]->(b:place) \
+                COLUMNS (x.y.z AS k))",
+            "GRAPH_TABLE element name",
+        ),
+    ] {
+        let error = f.db.sql(sql, &[]).unwrap_err();
+        let text = format!("{error}");
+        assert!(text.contains(needle), "want `{needle}`, got: {text}");
+        assert!(
+            !text.contains("CREATE SCHEMA"),
+            "a GRAPH_TABLE name was refused as a schema qualifier: {text}"
         );
     }
 }

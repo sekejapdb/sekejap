@@ -568,7 +568,7 @@ pub(super) fn order_index_drives_better(
 /// exactly this question.
 fn validate_graph_request(
     db: &Database,
-    request: BfsRequest,
+    request: &OwnedBfsRequest,
 ) -> QueryResult<crate::index::graph::GraphHeader> {
     if request.min_depth > request.max_depth
         || request.max_depth > 64
@@ -591,13 +591,18 @@ fn validate_graph_request(
     Ok(header)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_graph_direction<C: FnMut() -> bool>(
     db: &Database,
     header: crate::index::graph::GraphHeader,
     entity: EntityId,
     direction: Direction,
-    request: &BfsRequest,
+    request: &OwnedBfsRequest,
+    edge_where: &[EdgePredicate<'_>],
+    gate: &NodeGate,
+    wants_via: bool,
     seen: &[EntityId],
+    refused: &mut std::collections::BTreeSet<EntityId>,
     next: &mut crate::index::graph::Frontier,
     scanned: &mut usize,
     meter: &mut WorkMeter<'_, C>,
@@ -628,10 +633,20 @@ fn visit_graph_direction<C: FnMut() -> bool>(
     // allocating cursor built a key `Vec` and a value `Vec` for every edge
     // walked, for a parser that only reads them. The work meter is charged on
     // exactly the old schedule: one unit per turn of the loop, including the
-    // turn that found no further row.
+    // turn that found no further row. A PRUNED edge is charged like any
+    // other: `docs/GRAPH_CONTRACT.md` §4.3 prunes the frontier, not the
+    // reading, and `graph_edges` is what was read.
     let (pinned, context, max_edges) = (request.edge_type, request.context, request.max_edges);
+    // Whether this hop has to look at an edge's properties at all.
+    let reads_properties = wants_via || !edge_where.is_empty();
     let mut failure: Option<QueryError> = None;
     let mut stopped = false;
+    // Incoming edges whose properties this hop still needs. A reverse posting
+    // is a marker whose value is empty by construction, so the authoritative
+    // primary posting is read back -- an edge-keyspace point read, never a
+    // row. It happens after the range walk, which holds a pinned leaf while
+    // it runs. Bounded by the edge budget the walk trips on.
+    let mut deferred: Vec<(crate::index::graph::EdgeKey, EntityId)> = Vec::new();
     {
         let mut step = |key: &[u8], value: &[u8]| -> QueryResult<bool> {
             meter.charge(WorkResource::GraphEdges, 1)?;
@@ -644,15 +659,14 @@ fn visit_graph_direction<C: FnMut() -> bool>(
             if *scanned > max_edges {
                 return Err(invalid_query("BFS edge work limit exceeded"));
             }
-            // The SQL traversal returns entities, so it decodes no properties
-            // and reads nothing across the pair: both directions are written in
-            // one transaction, so a committed snapshot cannot hold half a pair,
-            // and `verify_indexed_source` is the tool that checks pair
-            // consistency.
+            // Nothing is read across the pair for STRUCTURE: both directions
+            // are written in one transaction, so a committed snapshot cannot
+            // hold half a pair, and `verify_indexed_source` is the tool that
+            // checks pair consistency.
             if incoming && !value.is_empty() {
                 return Err(corrupt_query("nonempty reverse edge marker"));
             }
-            let (_, adjacent) = crate::index::graph::adjacent_from_tail(
+            let (edge_type, adjacent) = crate::index::graph::adjacent_from_tail(
                 key, at0, pinned, context, header,
             )?;
             // The visited set is a SORTED VECTOR and the level being built is
@@ -660,10 +674,46 @@ fn visit_graph_direction<C: FnMut() -> bool>(
             // three `BTreeSet`s this walk used to keep -- visited, level and
             // answer -- allocated a heap cell every few entities to answer a
             // question a binary search answers for nothing.
-            if seen.binary_search(&adjacent).is_err() {
-                next.offer(adjacent)
-                    .map_err(|_| invalid_query("BFS visited limit exceeded"))?;
+            if seen.binary_search(&adjacent).is_ok() {
+                return Ok(true);
             }
+            if !reads_properties {
+                if gate_admits(db, gate, refused, adjacent, meter)? {
+                    next.offer(adjacent, None)
+                        .map_err(|_| invalid_query("BFS visited limit exceeded"))?;
+                }
+                return Ok(true);
+            }
+            let edge = if incoming {
+                crate::index::graph::EdgeKey {
+                    source: adjacent,
+                    context,
+                    edge_type,
+                    destination: entity,
+                }
+            } else {
+                crate::index::graph::EdgeKey {
+                    source: entity,
+                    context,
+                    edge_type,
+                    destination: adjacent,
+                }
+            };
+            if incoming {
+                deferred.push((edge, adjacent));
+                return Ok(true);
+            }
+            let properties = crate::index::graph::decode_properties(value)?;
+            if !crate::index::graph::edge_properties_match(&properties, edge_where) {
+                return Ok(true);
+            }
+            if !gate_admits(db, gate, refused, adjacent, meter)? {
+                return Ok(true);
+            }
+            let via = wants_via
+                .then(|| Arc::new(crate::index::graph::EdgeRef { key: edge, properties }));
+            next.offer(adjacent, via)
+                .map_err(|_| invalid_query("BFS visited limit exceeded"))?;
             Ok(true)
         };
         db.store()?
@@ -689,7 +739,99 @@ fn visit_graph_direction<C: FnMut() -> bool>(
     if !stopped {
         meter.charge(WorkResource::GraphEdges, 1)?;
     }
+    for (edge, adjacent) in deferred {
+        meter.check_cancelled()?;
+        if seen.binary_search(&adjacent).is_ok() {
+            continue;
+        }
+        // The properties of an incoming edge are one more read in the edge
+        // keyspace, charged to the same counter as the posting that named it
+        // -- and counted into `scanned`, so `max_edges` bounds this read the
+        // way it bounds the range walk's own (`traverse_bfs` charges it at
+        // the same point).
+        *scanned = scanned
+            .checked_add(1)
+            .ok_or_else(|| invalid_query("BFS edge work overflow"))?;
+        if *scanned > max_edges {
+            return Err(invalid_query("BFS edge work limit exceeded"));
+        }
+        meter.charge(WorkResource::GraphEdges, 1)?;
+        let value = db
+            .store()?
+            .get(&crate::index::graph::edge_key(
+                crate::index::graph::PRIMARY_EDGE,
+                edge,
+            ))
+            .map_err(Error::from)?
+            .ok_or_else(|| corrupt_query("edge disappeared during traversal"))?;
+        let properties = crate::index::graph::decode_properties(&value)?;
+        if !crate::index::graph::edge_properties_match(&properties, edge_where) {
+            continue;
+        }
+        if !gate_admits(db, gate, refused, adjacent, meter)? {
+            continue;
+        }
+        let via =
+            wants_via.then(|| Arc::new(crate::index::graph::EdgeRef { key: edge, properties }));
+        next.offer(adjacent, via)
+            .map_err(|_| invalid_query("BFS visited limit exceeded"))?;
+    }
     Ok(())
+}
+
+/// The node gate, asked at most once per distinct entity for a whole walk.
+///
+/// The mirror of `crate::index::graph::gate_admits`, with this walk's work
+/// meter. `docs/GRAPH_CONTRACT.md` §4.3 promises one index point read per
+/// visited NODE, and the gate's answer is a property of the node alone, so
+/// memoising the refusals changes no answer and no offer order: an admitted
+/// node joins `seen` with its level and is never offered again, and a refused
+/// one joins `refused` here instead of being re-probed by every incident edge
+/// at every later depth.
+///
+/// Bound (Law 1): a refused entity was reached by at least one edge charged
+/// against `max_edges`, so `refused` holds at most `max_edges` entries.
+fn gate_admits<C: FnMut() -> bool>(
+    db: &Database,
+    gate: &NodeGate,
+    refused: &mut std::collections::BTreeSet<EntityId>,
+    id: EntityId,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<bool> {
+    if gate.is_empty() {
+        return Ok(true);
+    }
+    if refused.contains(&id) {
+        return Ok(false);
+    }
+    if gate.admits(db, id, meter)? {
+        return Ok(true);
+    }
+    refused.insert(id);
+    Ok(false)
+}
+
+/// One traversal's answer for one page: the entities it reached, ascending,
+/// and -- when this query reads the reaching edge -- the edge that reached
+/// each of them, in the same order (`docs/GRAPH_CONTRACT.md` §4.2).
+pub(super) struct GraphAnswer {
+    pub(super) ids: Vec<EntityId>,
+    /// Parallel to `ids`, or EMPTY when nothing in this query names
+    /// `@edge.<property>`: a traversal that is only a membership test
+    /// decodes no property and allocates no edge.
+    pub(super) via: Vec<Option<Arc<crate::index::graph::EdgeRef>>>,
+}
+
+impl GraphAnswer {
+    pub(super) fn contains(&self, id: EntityId) -> bool {
+        self.ids.binary_search(&id).is_ok()
+    }
+
+    /// The edge that reached `id`, if this answer bound one.
+    pub(super) fn edge(&self, id: EntityId) -> Option<&Arc<crate::index::graph::EdgeRef>> {
+        let at = self.ids.binary_search(&id).ok()?;
+        self.via.get(at)?.as_ref()
+    }
 }
 
 /// The breadth-first walk behind `QueryFilter::Graph`, answering with the
@@ -703,31 +845,36 @@ fn visit_graph_direction<C: FnMut() -> bool>(
 /// per turn of the edge loop, and one per DISTINCT entity a level discovers,
 /// which is what the old per-edge charge added up to.
 ///
-/// PENDING (`docs/GRAPH_CONTRACT.md` §4.3, order-of-work item 1): this walk
-/// prunes by type, direction and depth only, through `visit_graph_direction`.
-/// A predicate on an edge property or a covered node field is not yet
-/// evaluated as the frontier expands, so §4.3's "a traversal never reads a
-/// row for a predicate on a covered field" is not the code's behaviour today
-/// -- a per-hop predicate is still a post-filter over the entities this
-/// function returns.
+/// `docs/GRAPH_CONTRACT.md` §4.2 and §4.3 are the code's behaviour here:
+/// `edge_where` is decided from the edge's own inline bag as the frontier
+/// expands and a failing edge is never followed; `node_where` is decided from
+/// index postings and a failing node is neither emitted nor expanded; and the
+/// reaching edge is bound to each node when the query reads it. No per-hop
+/// predicate opens a primary row.
 fn execute_graph<C: FnMut() -> bool>(
     db: &Database,
-    request: BfsRequest,
+    request: &OwnedBfsRequest,
+    gate: &NodeGate,
+    wants_via: bool,
     meter: &mut WorkMeter<'_, C>,
-) -> QueryResult<Vec<EntityId>> {
+) -> QueryResult<GraphAnswer> {
     let header = validate_graph_request(db, request)?;
+    let edge_where = request.edge_predicates();
     meter.charge(WorkResource::GraphVisited, 1)?;
     let mut seen = vec![request.seed];
     let mut merged: Vec<EntityId> = Vec::new();
-    let mut results: Vec<EntityId> = Vec::new();
+    let mut results: Vec<(EntityId, Option<Arc<crate::index::graph::EdgeRef>>)> = Vec::new();
     if request.include_seed && request.min_depth == 0 {
         if request.result_limit == 0 {
             return Err(invalid_query("BFS result limit exceeded"));
         }
-        results.push(request.seed);
+        results.push((request.seed, None));
     }
     let mut frontier = vec![request.seed];
     let mut scanned = 0usize;
+    // Every entity the gate has already turned away, so no later edge probes
+    // it a second time (`gate_admits`).
+    let mut refused: std::collections::BTreeSet<EntityId> = std::collections::BTreeSet::new();
     for depth in 1..=request.max_depth {
         meter.check_cancelled()?;
         let mut next = crate::index::graph::Frontier::new(request.max_visited - seen.len());
@@ -735,47 +882,34 @@ fn execute_graph<C: FnMut() -> bool>(
             meter.check_cancelled()?;
             if matches!(request.direction, Direction::Outgoing | Direction::Both) {
                 visit_graph_direction(
-                    db,
-                    header,
-                    entity,
-                    Direction::Outgoing,
-                    &request,
-                    &seen,
-                    &mut next,
-                    &mut scanned,
-                    meter,
+                    db, header, entity, Direction::Outgoing, request, &edge_where, gate,
+                    wants_via, &seen, &mut refused, &mut next, &mut scanned, meter,
                 )?;
             }
             if matches!(request.direction, Direction::Incoming | Direction::Both) {
                 visit_graph_direction(
-                    db,
-                    header,
-                    entity,
-                    Direction::Incoming,
-                    &request,
-                    &seen,
-                    &mut next,
-                    &mut scanned,
-                    meter,
+                    db, header, entity, Direction::Incoming, request, &edge_where, gate,
+                    wants_via, &seen, &mut refused, &mut next, &mut scanned, meter,
                 )?;
             }
         }
-        let next = next.into_sorted();
-        meter.charge(WorkResource::GraphVisited, next.len() as u64)?;
-        if seen.len() + next.len() > request.max_visited {
+        let level = next.into_sorted();
+        meter.charge(WorkResource::GraphVisited, level.len() as u64)?;
+        if seen.len() + level.len() > request.max_visited {
             return Err(invalid_query("BFS visited limit exceeded"));
         }
-        crate::index::graph::merge_sorted_disjoint(&mut seen, &next, &mut merged);
+        let ids: Vec<EntityId> = level.iter().map(|entry| entry.entity).collect();
+        crate::index::graph::merge_sorted_disjoint(&mut seen, &ids, &mut merged);
         if depth >= request.min_depth {
-            if results.len() + next.len() > request.result_limit {
+            if results.len() + level.len() > request.result_limit {
                 return Err(invalid_query("BFS result limit exceeded"));
             }
-            results.extend(next.iter().copied());
+            results.extend(level.into_iter().map(|entry| (entry.entity, entry.via)));
         }
-        if next.is_empty() {
+        if ids.is_empty() {
             break;
         }
-        frontier = next;
+        frontier = ids;
     }
     // The seed-existence refusal, paid only when it can still be the answer.
     // An edge cannot outlive its endpoints -- a write validates both and a
@@ -791,20 +925,33 @@ fn execute_graph<C: FnMut() -> bool>(
     }
     // Each level is sorted, but the levels were appended in discovery order.
     // Membership is asked once per candidate and the driver promises
-    // ascending ids, so the answer is sorted once here.
-    results.sort_unstable();
-    Ok(results)
+    // ascending ids, so the answer is sorted once here -- the reaching edges
+    // with it, because they are read back by the id they belong to.
+    results.sort_unstable_by_key(|(id, _)| *id);
+    let ids = results.iter().map(|(id, _)| *id).collect();
+    let via = if wants_via {
+        results.into_iter().map(|(_, via)| via).collect()
+    } else {
+        Vec::new()
+    };
+    Ok(GraphAnswer { ids, via })
 }
 
 pub(super) fn execute_graph_filters<C: FnMut() -> bool>(
     db: &Database,
     filters: &[CompiledFilter],
+    wants_via: bool,
     meter: &mut WorkMeter<'_, C>,
-) -> QueryResult<Vec<Option<Vec<EntityId>>>> {
-    let mut results = vec![None; filters.len()];
+) -> QueryResult<Vec<Option<GraphAnswer>>> {
+    let mut results: Vec<Option<GraphAnswer>> = filters.iter().map(|_| None).collect();
     for filter in filters {
-        if let CompiledFilter::Graph { request, position } = filter {
-            results[*position] = Some(execute_graph(db, *request, meter)?);
+        if let CompiledFilter::Graph {
+            request,
+            position,
+            gate,
+        } = filter
+        {
+            results[*position] = Some(execute_graph(db, request, gate, wants_via, meter)?);
         }
     }
     Ok(results)
@@ -856,6 +1003,15 @@ pub(super) struct Candidate {
     /// text driver fills it in; every other driver leaves it `None` and every
     /// scorer that cannot prove the frequencies are its own ignores it.
     pub(super) text: Option<TextFrequencies>,
+    /// The edge a traversal crossed to reach this candidate
+    /// (`docs/GRAPH_CONTRACT.md` §4.2), shared with the traversal's answer
+    /// rather than cloned per candidate.
+    ///
+    /// Filled in ONLY when the query actually reads it -- an `@edge.<name>`
+    /// projection or an `@edge` ranking, which is what `CursorNeeds::edge`
+    /// says. Every other query leaves it `None` and pays the eight bytes and
+    /// nothing else.
+    pub(super) edge: Option<Arc<crate::index::graph::EdgeRef>>,
 }
 
 impl Candidate {
@@ -868,6 +1024,7 @@ impl Candidate {
             satisfied_filter: None,
             row_filtered: None,
             text: None,
+            edge: None,
         }
     }
 
@@ -1009,6 +1166,9 @@ pub(super) struct CursorNeeds {
     pub(super) row: bool,
     pub(super) scalar_key: bool,
     pub(super) key: bool,
+    /// The reaching edge of a traversal, read by an `@edge.<name>`
+    /// projection or an `@edge` ranking and by nothing else.
+    pub(super) edge: bool,
 }
 
 /// One mapping-keyspace range, walked ascending. Unlike `ScalarWalk` there is
@@ -1119,7 +1279,7 @@ pub(super) enum DriverCursor<'a> {
     Vector(VectorCursor<'a>),
     QuantizedVector(QuantizedVectorCursor<'a>),
     Keys(KeysCursor<'a>),
-    Ids(std::vec::IntoIter<EntityId>),
+    Ids(std::vec::IntoIter<(EntityId, Option<Arc<crate::index::graph::EdgeRef>>)>),
 }
 
 pub(super) fn scalar_prefix(id: IndexId) -> Vec<u8> {

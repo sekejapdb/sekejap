@@ -285,7 +285,7 @@ fn order_by(index: IndexId, ascending: bool) -> QueryOrder<'static> {
 
 /// A BFS whose bounds are set from the graph's size, so nothing is silently
 /// cut: E4's traversal is complete-or-error.
-fn bfs(c: &Ctx, seed: u64, max_depth: usize) -> BfsRequest {
+fn bfs(c: &Ctx, seed: u64, max_depth: usize) -> BfsRequest<'static> {
     let ceiling = c.rows as usize + 1;
     BfsRequest {
         seed: c.entity(seed),
@@ -298,6 +298,8 @@ fn bfs(c: &Ctx, seed: u64, max_depth: usize) -> BfsRequest {
         max_visited: ceiling,
         max_edges: ceiling,
         result_limit: ceiling,
+        edge_where: &[],
+        node_where: &[],
     }
 }
 

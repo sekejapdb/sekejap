@@ -12,7 +12,7 @@ use crate::collections::{
     vector_key, CollectionId, Database, EntityId, Error, IndexFamily, IndexId, IndexInfo,
     IndexState,
 };
-use crate::index::graph::{BfsRequest, Direction};
+use crate::index::graph::{BfsRequest, Direction, EdgePredicate};
 use crate::index::text::TextMatch;
 use crate::index::vector::exact::VectorMetric;
 use crate::index::vector::quantized::ApproxVectorMethod;
@@ -51,6 +51,7 @@ pub use aggregate::{
     PreparedAggregate,
 };
 pub use page::PreparedQuery;
+pub(crate) use membership::StandaloneNodeGate;
 use {cursors::*, drivers::*, filters::*, membership::*, plan::*, rank::*, rows::*, score::*};
 
 pub use kernel::spatial::Geom;
@@ -114,7 +115,7 @@ pub enum QueryFilter<'a> {
         field: &'a str,
         value: &'a Value,
     },
-    Graph(BfsRequest),
+    Graph(BfsRequest<'a>),
     Point {
         index: IndexId,
         predicate: PointFilter,
@@ -224,6 +225,19 @@ pub enum QueryOrder<'a> {
     Distance {
         index: IndexId,
         center: Point,
+        direction: SortDirection,
+    },
+    /// Rank by one property of the edge a traversal crossed to reach the row
+    /// (`docs/GRAPH_CONTRACT.md` §4.2), ties broken by entity id.
+    ///
+    /// The value comes from the bag the hop already decoded, so a page ranked
+    /// this way reads no row for its ordering and no second edge posting. It
+    /// requires exactly one `QueryFilter::Graph` in the query -- there is one
+    /// reaching edge per row, and two traversals would each claim to be it --
+    /// and a property that is absent, null, or not a number sorts LAST in
+    /// either direction, the place a missing ranking value already takes.
+    Edge {
+        property: &'a str,
         direction: SortDirection,
     },
     /// Rank by a combined arithmetic expression over index leaves.
@@ -361,6 +375,11 @@ pub enum OrderValue {
     /// the candidate stream gave it.
     Driver,
     Score(f64),
+    /// The numeric property of the reaching edge this row was ranked by
+    /// (`docs/GRAPH_CONTRACT.md` §4.2), or `None` when the edge does not
+    /// carry one -- which is where such a row sorts, last in either
+    /// direction.
+    Edge(Option<f64>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -517,6 +536,17 @@ impl From<Error> for QueryError {
     fn from(value: Error) -> Self {
         match value {
             Error::Cancelled => Self::Cancelled,
+            // An atomic that ran query machinery under the hood already
+            // named the resource; it is the same error, not a database one.
+            Error::BudgetExceeded {
+                resource,
+                limit,
+                attempted,
+            } => Self::BudgetExceeded {
+                resource,
+                limit,
+                attempted,
+            },
             value => Self::Database(value),
         }
     }
@@ -627,6 +657,17 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
         Ok(())
     }
 }
+
+/// The spelling that names the reaching EDGE rather than a field of the row,
+/// in a projection (`@edge.weight`) and nowhere else.
+///
+/// It is not a field namespace a user can collide with: `Database::put`
+/// refuses a field name that starts with `@` nowhere, so the guard is here --
+/// `prepare_query` refuses a projected row field that begins with this
+/// prefix and resolves it against the traversal instead. The prefix is one
+/// byte no SQL identifier can start with unquoted, which is what keeps the
+/// two namespaces apart.
+pub const EDGE_FIELD_PREFIX: &str = "@edge.";
 
 fn invalid_query(message: impl fmt::Display) -> QueryError {
     QueryError::Database(invalid(message))
