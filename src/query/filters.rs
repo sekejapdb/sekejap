@@ -170,15 +170,37 @@ fn selected_field_in(
         .map_err(|error| corrupt_query(format!("dense-v3 row: {error}")))
 }
 
+/// The value this index STORES for one row value.
+///
+/// An expression index (`IndexExpr`, `src/collections/catalog.rs`) keeps
+/// `expression(field)`, while `info.field` stays the source field, so every
+/// row-side recomputation of a posting or a predicate has to pass through the
+/// expression exactly as `scalar_build_key_into` does. Without it a candidate
+/// the driver did not certify is compared field-against-image and every row
+/// whose stored value is not already its own image is dropped.
+fn indexed_value(info: &IndexInfo, value: Value) -> Value {
+    match info.expression {
+        None => value,
+        // `apply` is total over `Some`: it returns the image, or the value
+        // itself for a kind the expression does not fold.
+        Some(expression) => {
+            let derived = expression.apply(Some(&value));
+            derived.unwrap_or(value)
+        }
+    }
+}
+
 pub(super) fn persisted_scalar_key(
     info: &IndexInfo,
     value: dense_v3::FieldValue,
 ) -> QueryResult<Option<Vec<u8>>> {
     match value {
         dense_v3::FieldValue::Missing | dense_v3::FieldValue::Null => Ok(Some(vec![0])),
-        dense_v3::FieldValue::Inline(value) => scalar_key::encode(&info.kind, Some(&value))
-            .map(Some)
-            .map_err(|error| corrupt_query(format!("indexed scalar row value: {error}"))),
+        dense_v3::FieldValue::Inline(value) => {
+            scalar_key::encode(&info.kind, Some(&indexed_value(info, value)))
+                .map(Some)
+                .map_err(|error| corrupt_query(format!("indexed scalar row value: {error}")))
+        }
         dense_v3::FieldValue::Vector { .. } => {
             Err(corrupt_query("scalar index field is a historical vector"))
         }
@@ -197,7 +219,9 @@ fn scalar_filter_matches(
         EncodedScalarFilter::IsMissing => Ok(matches!(value, dense_v3::FieldValue::Missing)),
         EncodedScalarFilter::Eq(expected) => match value {
             dense_v3::FieldValue::Inline(value) => {
-                scalar_key::encode_into(&info.kind, Some(&value), out)
+                // `expected` is a key of the INDEX, so the row's value has to
+                // be carried to the index's own value first (`indexed_value`).
+                scalar_key::encode_into(&info.kind, Some(&indexed_value(info, value)), out)
                     .map_err(|error| corrupt_query(format!("indexed scalar row value: {error}")))?;
                 Ok(out.as_slice() == expected.as_slice())
             }
@@ -208,7 +232,8 @@ fn scalar_filter_matches(
         },
         EncodedScalarFilter::Range { .. } => match value {
             dense_v3::FieldValue::Inline(value) => {
-                scalar_key::encode_into(&info.kind, Some(&value), out)
+                // The bounds are index keys; see the `Eq` arm above.
+                scalar_key::encode_into(&info.kind, Some(&indexed_value(info, value)), out)
                     .map_err(|error| corrupt_query(format!("indexed scalar row value: {error}")))?;
                 Ok(scalar_key_position(predicate, out) == Ordering::Equal)
             }

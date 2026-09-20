@@ -117,7 +117,8 @@ pub use crate::query::{
     SortDirection, WorkResource,
 };
 pub use catalog::{
-    create_index_trees, set_create_index_trees, IndexFamily, IndexId, IndexInfo, IndexState,
+    create_index_trees, set_create_index_trees, IndexExpr, IndexFamily, IndexId, IndexInfo,
+    IndexState,
     IndexTree, ScalarPredicate,
 };
 pub use drop_collection::{DropMode, DropPhase, DropProgress, DropState, MAX_DROP_BATCH};
@@ -164,6 +165,16 @@ pub struct CollectionInfo {
     pub name: String,
     pub layout: Layout,
     pub timestamps: bool,
+    /// The DECLARED SQL type of a field whose spelling the `Kind` does not
+    /// carry, as `(field, declared)` pairs in layout order.
+    ///
+    /// `TIMESTAMPTZ` and `DATE` are both `Kind::Int` -- UTC microseconds,
+    /// `docs/QL_CONTRACT.md` §5 deviation 8 -- so the `Kind` alone cannot say
+    /// which a column is, and printing a stored integer back as an ISO string
+    /// needs to know. Empty for every collection created before the pairs
+    /// were recorded and for every collection created through the untyped
+    /// `create_collection`.
+    pub declared: Vec<(String, String)>,
 }
 pub trait Clock: Send + Sync {
     fn unix_seconds(&self) -> i64;
@@ -182,6 +193,9 @@ pub(crate) struct Catalog {
     pub(crate) name: String,
     pub(crate) layout: u32,
     timestamps: bool,
+    /// See [`CollectionInfo::declared`]. Recorded behind flag bit 2 of the
+    /// catalog packet, which every binary that predates it refuses.
+    pub(crate) declared: Vec<(String, String)>,
     /// `Some` exactly while `begin_drop_collection` has published a DROPPING
     /// mark that `drop_collection_step` has not yet finished. It is the
     /// committed cursor of the drop: the phase it reached and how many
@@ -480,23 +494,69 @@ pub(crate) fn unpack<'a>(b: &'a [u8], magic: &[u8; 8]) -> Result<&'a [u8]> {
 /// three replicas. That is a second line behind `DROP_FEATURE`, which refuses
 /// the file at admission before a record is read at all.
 pub(crate) const CATALOG_DROPPING: u8 = 2;
+/// Bit 2 of the same frozen flags byte: the record carries a DECLARED-TYPE
+/// tail after the name. It is placed in the flags byte for exactly the reason
+/// the DROPPING bit was -- a binary that predates it tests `b[8] & !(1|2)`
+/// and refuses the record rather than reading the tail as part of the name.
+///
+/// It is the SECOND line, behind [`DECLARED_FEATURE`], exactly as the
+/// DROPPING bit sits behind `DROP_FEATURE`: the feature bit refuses the file
+/// at admission, and this byte refuses the record if a file ever reaches a
+/// reader without it.
+pub(crate) const CATALOG_DECLARED: u8 = 4;
+/// The collection header bit that says this database's catalog carries at
+/// least one DECLARED-TYPE pair, i.e. at least one record with the
+/// [`CATALOG_DECLARED`] tail.
+///
+/// Additive and monotone: set in the same transaction that first records a
+/// pair, never by opening and never by an ordinary write. It exists for the
+/// refusal CLASS. Without it a rollback binary passes header admission,
+/// reaches `parse_catalog`, fails `b[8] & !(1 | CATALOG_DROPPING)` and
+/// reports an intact, valid, newer file as `Corrupt`. Law 8 separates an
+/// unknown-format refusal from damage, so the bit makes that refusal
+/// `Unsupported` at admission, before a record is read at all.
+pub(crate) const DECLARED_FEATURE: u64 = 0x800;
 /// The DROPPING tail: phase, mode, and the entries removed so far.
 const CATALOG_DROP_TAIL: usize = 1 + 1 + 8;
 fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
     let mut b = c.id.0.to_be_bytes().to_vec();
     b.extend_from_slice(&c.layout.to_be_bytes());
-    b.push(u8::from(c.timestamps) | if c.drop.is_some() { CATALOG_DROPPING } else { 0 });
+    b.push(
+        u8::from(c.timestamps)
+            | if c.drop.is_some() { CATALOG_DROPPING } else { 0 }
+            | if c.declared.is_empty() { 0 } else { CATALOG_DECLARED },
+    );
     if let Some(d) = c.drop {
         b.push(d.phase.byte());
         b.push(d.mode.byte());
         b.extend_from_slice(&d.removed.to_be_bytes());
     }
-    b.extend_from_slice(c.name.as_bytes());
+    if c.declared.is_empty() {
+        b.extend_from_slice(c.name.as_bytes());
+    } else {
+        // With a tail the name can no longer be "the rest of the packet", so
+        // it is length-prefixed and the tail follows it.
+        b.extend_from_slice(&(c.name.len() as u16).to_be_bytes());
+        b.extend_from_slice(c.name.as_bytes());
+        let count = u16::try_from(c.declared.len())
+            .map_err(|_| invalid("at most 65535 declared column types"))?;
+        b.extend_from_slice(&count.to_be_bytes());
+        for (field, declared) in &c.declared {
+            if field.is_empty() || field.len() > 255 || declared.is_empty() || declared.len() > 255
+            {
+                return Err(invalid("declared column type entries are 1..255 bytes"));
+            }
+            b.push(field.len() as u8);
+            b.extend_from_slice(field.as_bytes());
+            b.push(declared.len() as u8);
+            b.extend_from_slice(declared.as_bytes());
+        }
+    }
     packet(CATALOG_MAGIC, &b)
 }
 fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let b = unpack(b, CATALOG_MAGIC)?;
-    if b.len() < 10 || b[8] & !(1 | CATALOG_DROPPING) != 0 {
+    if b.len() < 10 || b[8] & !(1 | CATALOG_DROPPING | CATALOG_DECLARED) != 0 {
         return Err(corrupt("catalog fields"));
     }
     let id = u32::from_be_bytes(b[..4].try_into().unwrap());
@@ -515,7 +575,33 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     } else {
         None
     };
-    let name = std::str::from_utf8(&b[at..]).map_err(corrupt)?.to_owned();
+    let mut declared = Vec::new();
+    let name = if b[8] & CATALOG_DECLARED == 0 {
+        std::str::from_utf8(&b[at..]).map_err(corrupt)?.to_owned()
+    } else {
+        let mut read = |n: usize| -> Result<&[u8]> {
+            let out = b.get(at..at + n).ok_or_else(|| corrupt("catalog tail"))?;
+            at += n;
+            Ok(out)
+        };
+        let size = u16::from_be_bytes(read(2)?.try_into().unwrap()) as usize;
+        let name = std::str::from_utf8(read(size)?).map_err(corrupt)?.to_owned();
+        let count = u16::from_be_bytes(read(2)?.try_into().unwrap()) as usize;
+        for _ in 0..count {
+            let n = read(1)?[0] as usize;
+            let field = std::str::from_utf8(read(n)?).map_err(corrupt)?.to_owned();
+            let n = read(1)?[0] as usize;
+            let spelling = std::str::from_utf8(read(n)?).map_err(corrupt)?.to_owned();
+            if field.is_empty() || spelling.is_empty() {
+                return Err(corrupt("catalog declared type entry"));
+            }
+            declared.push((field, spelling));
+        }
+        if at != b.len() {
+            return Err(corrupt("catalog declared type tail"));
+        }
+        name
+    };
     if id == 0 || layout == 0 || name.is_empty() || name.len() > 255 {
         return Err(corrupt("catalog domain"));
     }
@@ -525,6 +611,7 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         layout,
         timestamps: b[8] & 1 == 1,
         drop,
+        declared,
     })
 }
 /// The kernel's own `E4LIMIT1` record: a damaged one is corruption, a valid
@@ -553,8 +640,24 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::text::segments::SEGMENT_FEATURE
     | crate::index::vector::quantized::QUANTIZED_VECTOR_FEATURE
     | catalog::INDEX_TREE_FEATURE
+    | catalog::EXPRESSION_FEATURE
     | crate::index::spatial::geometry_index::GEOMETRY_FEATURE
-    | drop_collection::DROP_FEATURE;
+    | drop_collection::DROP_FEATURE
+    | DECLARED_FEATURE;
+/// One header's feature word against the mask a binary implements.
+///
+/// Split out of [`parse_header`] so a test can put an OLDER mask in place of
+/// this build's own and ask what that binary answers for a file this build
+/// writes. The answer must be `Unsupported` -- the bytes are intact and the
+/// file is merely newer -- never `Corrupt` (Law 8).
+fn admit_features(features: u64, supported: u64) -> Result<()> {
+    if features & 1 == 0 || features & !supported != 0 {
+        return Err(Error::Unsupported(format!(
+            "logical index features {features:#x}"
+        )));
+    }
+    Ok(())
+}
 fn header_bytes(h: HeaderInfo) -> Result<Vec<u8>> {
     let mut payload = h.next_collection.to_be_bytes().to_vec();
     payload.extend_from_slice(&h.next_layout.to_be_bytes());
@@ -618,11 +721,7 @@ fn parse_header(b: &[u8]) -> Result<HeaderInfo> {
             .transpose()?,
         indexes: if indexed {
             let features = u64::from_be_bytes(b[8..16].try_into().unwrap());
-            if features & 1 == 0 || features & !SUPPORTED_LOGICAL_FEATURES != 0 {
-                return Err(Error::Unsupported(format!(
-                    "logical index features {features:#x}"
-                )));
-            }
+            admit_features(features, SUPPORTED_LOGICAL_FEATURES)?;
             let next = u64::from_be_bytes(b[16..24].try_into().unwrap());
             let count = u32::from_be_bytes(b[24..28].try_into().unwrap());
             if next == 0 || u64::from(count) >= next {
@@ -1186,7 +1285,26 @@ impl Database {
         fields: Vec<(String, Kind)>,
         options: CollectionOptions,
     ) -> Result<CollectionId> {
+        self.create_collection_declared(name, fields, Vec::new(), options)
+    }
+    /// The same creation, recording the DECLARED SQL spelling of the columns
+    /// whose `Kind` does not carry it (`TIMESTAMPTZ` and `DATE`, both
+    /// `Kind::Int`). See [`CollectionInfo::declared`]. Additive: the pairs go
+    /// in the catalog record's own tail, behind flag bit 2, and change no row
+    /// byte and no index key.
+    pub fn create_collection_declared(
+        &mut self,
+        name: &str,
+        fields: Vec<(String, Kind)>,
+        declared: Vec<(String, String)>,
+        options: CollectionOptions,
+    ) -> Result<CollectionId> {
         self.user_write()?;
+        for (field, _) in &declared {
+            if !fields.iter().any(|(n, _)| n == field) {
+                return Err(invalid("a declared type names a field of the collection"));
+            }
+        }
         if name.is_empty() || name.len() > 255 {
             return Err(invalid("collection name must contain 1..255 UTF-8 bytes"));
         }
@@ -1207,8 +1325,15 @@ impl Database {
             layout: lid,
             timestamps: options.timestamps,
             drop: None,
+            declared,
         };
         let result = (|| {
+            // The feature bit rides the same transaction as the first record
+            // that carries the tail, so a file whose catalog has one declares
+            // it and an older binary refuses the file at admission.
+            if !c.declared.is_empty() {
+                self.enable_logical_feature(DECLARED_FEATURE)?;
+            }
             self.persist_layout(&layout)?;
             self.persist_catalog(&c)?;
             self.write_sequence(c.id, 1)?;
@@ -1240,6 +1365,7 @@ impl Database {
             name: c.name,
             layout,
             timestamps: c.timestamps,
+            declared: c.declared,
         })
     }
     pub fn alter_collection(
@@ -1247,8 +1373,37 @@ impl Database {
         id: CollectionId,
         fields: Vec<(String, Kind)>,
     ) -> Result<u64> {
+        // A declared pair names a field of the collection, so a rewrite that
+        // REMOVES that field drops its pair with it -- otherwise
+        // `ALTER TABLE ... DROP COLUMN born_ts` would be refused by the
+        // check below for naming a field the new layout no longer has.
+        let declared: Vec<(String, String)> = self
+            .catalog(id)?
+            .declared
+            .into_iter()
+            .filter(|(field, _)| fields.iter().any(|(n, _)| n == field))
+            .collect();
+        self.alter_collection_declared(id, fields, declared)
+    }
+    /// The same rewrite, replacing the DECLARED spellings too. See
+    /// [`CollectionInfo::declared`]: `ALTER TABLE ... ADD COLUMN c
+    /// TIMESTAMPTZ` has to record that the new `Kind::Int` column holds
+    /// microseconds, and the pairs live in the same descriptor the layout
+    /// pointer does, so they are rewritten in the same commit.
+    pub fn alter_collection_declared(
+        &mut self,
+        id: CollectionId,
+        fields: Vec<(String, Kind)>,
+        declared: Vec<(String, String)>,
+    ) -> Result<u64> {
         self.ready_write()?;
         let mut c = self.catalog(id)?;
+        for (field, _) in &declared {
+            if !fields.iter().any(|(n, _)| n == field) {
+                return Err(invalid("a declared type names a field of the collection"));
+            }
+        }
+        c.declared = declared;
         let (next_c, next_l) = self.header()?;
         let layout = Self::make_layout(next_l, fields, c.timestamps)?;
         self.validate_indexed_layout(id, &layout)?;
@@ -1257,6 +1412,9 @@ impl Database {
             .ok_or_else(|| invalid("layout IDs exhausted"))?;
         c.layout = next_l;
         let result = (|| {
+            if !c.declared.is_empty() {
+                self.enable_logical_feature(DECLARED_FEATURE)?;
+            }
             self.persist_layout(&layout)?;
             self.persist_catalog(&c)?;
             self.write_header(next_c, after)?;
@@ -2189,7 +2347,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x3ff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0xfff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -2210,13 +2368,114 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x3ff
+            0xfff
         );
         // One bit past the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x400)),
-            Err(Error::Unsupported(m)) if m.contains("0x7ff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x1000)),
+            Err(Error::Unsupported(m)) if m.contains("0x1fff")
         ));
+    }
+    /// A declared type is a name beside a FIELD, so dropping the field drops
+    /// it -- and the feature bit that says the catalog carries one is set in
+    /// the same transaction as the first pair, never by opening.
+    #[test]
+    fn a_declared_pair_follows_its_field_and_sets_the_feature_bit() {
+        let t = tempfile::tempdir().unwrap();
+        let mut db = Database::create(t.path().join("db"), cfg()).unwrap();
+        // Before any declared pair, the bit is not set.
+        let c = db
+            .create_collection("plain", vec![("n".into(), Kind::Int)], Default::default())
+            .unwrap();
+        db.commit().unwrap();
+        assert_eq!(
+            db.index_header.map_or(0, |h| h.features) & DECLARED_FEATURE,
+            0
+        );
+        let _ = c;
+        let c = db
+            .create_collection_declared(
+                "evt",
+                vec![("at".into(), Kind::Int), ("n".into(), Kind::Int)],
+                vec![("at".into(), "TIMESTAMPTZ".into())],
+                Default::default(),
+            )
+            .unwrap();
+        db.commit().unwrap();
+        assert_eq!(
+            db.index_header.map_or(0, |h| h.features) & DECLARED_FEATURE,
+            DECLARED_FEATURE,
+            "the bit rides the first declared pair"
+        );
+        assert_eq!(db.collection_info(c).unwrap().declared.len(), 1);
+        // Adding a column carries the pair forward.
+        db.alter_collection(
+            c,
+            vec![
+                ("at".into(), Kind::Int),
+                ("n".into(), Kind::Int),
+                ("extra".into(), Kind::Text),
+            ],
+        )
+        .unwrap();
+        db.commit().unwrap();
+        assert_eq!(db.collection_info(c).unwrap().declared.len(), 1);
+        // DROPPING the declared column drops its pair with it, rather than
+        // refusing the rewrite for naming a field the new layout has not got.
+        db.alter_collection(c, vec![("n".into(), Kind::Int)]).unwrap();
+        db.commit().unwrap();
+        assert!(db.collection_info(c).unwrap().declared.is_empty());
+        // Monotone: the bit stays set, because a file that ever carried the
+        // tail is still a file an older binary must refuse.
+        assert_eq!(
+            db.index_header.map_or(0, |h| h.features) & DECLARED_FEATURE,
+            DECLARED_FEATURE
+        );
+        // And the pairs survive a reopen.
+        drop(db);
+        let db = Database::open(t.path().join("db"), cfg()).unwrap();
+        assert!(db.collection_info(c).unwrap().declared.is_empty());
+    }
+    /// The declared-type tail is refused at ADMISSION by a binary that
+    /// predates it, as `Unsupported`, not as `Corrupt` by the flags byte.
+    ///
+    /// The older binary is spelled as the mask it carried -- this build's
+    /// mask with `DECLARED_FEATURE` taken out -- and put through the same
+    /// `admit_features` decision `parse_header` makes, so the test exercises
+    /// the production rule rather than a copy of it. The flags byte is the
+    /// second line and is asserted beside it: it refuses the RECORD, but it
+    /// reports an intact newer file as damage, which is what the bit exists
+    /// to prevent (Law 8).
+    #[test]
+    fn a_declared_type_file_is_unsupported_to_a_binary_that_predates_the_bit() {
+        assert_eq!(DECLARED_FEATURE, 0x800);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES & DECLARED_FEATURE, 0x800);
+        let older = SUPPORTED_LOGICAL_FEATURES & !DECLARED_FEATURE;
+        let written = 1 | DECLARED_FEATURE;
+        // This build opens the file it writes.
+        admit_features(written, SUPPORTED_LOGICAL_FEATURES).unwrap();
+        // The binary that predates the bit refuses it whole, and as
+        // Unsupported.
+        assert!(matches!(
+            admit_features(written, older),
+            Err(Error::Unsupported(m)) if m.contains("0x801")
+        ));
+        // Second line: the frozen flags byte. It refuses the record, but the
+        // class is Corrupt, which is why it cannot be the only line.
+        let record = catalog_bytes(&Catalog {
+            id: CollectionId(1),
+            name: "t".into(),
+            layout: 1,
+            timestamps: false,
+            drop: None,
+            declared: vec![("at".into(), "TIMESTAMPTZ".into())],
+        })
+        .unwrap();
+        assert_eq!(parse_catalog(&record).unwrap().declared.len(), 1);
+        let payload = 10;
+        assert_eq!(record[payload + 8] & CATALOG_DECLARED, CATALOG_DECLARED);
+        // The older reader's guard, verbatim: `b[8] & !(1 | CATALOG_DROPPING)`.
+        assert_ne!(record[payload + 8] & !(1 | CATALOG_DROPPING), 0);
     }
 }

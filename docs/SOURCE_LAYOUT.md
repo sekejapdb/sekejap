@@ -33,8 +33,8 @@ current headings are numbered `## 1.` through `## 7.`),
 
 | Module | Atomic | Contract |
 | --- | --- | --- |
-| `src/collections/mod.rs` | `Database`, `CollectionId`, `EntityId`, `Kind`-typed collections, put/get/delete, the catalog and header records, and every public re-export the crate has ever offered from `collections`. | `docs/COLLECTIONS.md` |
-| `src/collections/catalog.rs` | The index catalog: `IndexInfo`/`IndexId`/`IndexFamily`/`IndexState`, index create/drop, the index trees, scalar keys (`skey`) and index maintenance on write. | `docs/COLLECTIONS.md` |
+| `src/collections/mod.rs` | `Database`, `CollectionId`, `EntityId`, `Kind`-typed collections, put/get/delete, the catalog and header records, and every public re-export the crate has ever offered from `collections`. The catalog record also carries the DECLARED SQL spellings of the columns whose `Kind` does not name them (`TIMESTAMPTZ`, `DATE`: both `Kind::Int`), behind flag bit 2 of its own frozen flags byte. | `docs/COLLECTIONS.md`; `docs/QL_CONTRACT.md` §4.2 |
+| `src/collections/catalog.rs` | The index catalog: `IndexInfo`/`IndexId`/`IndexFamily`/`IndexState`/`IndexExpr`, index create/drop, the index trees, scalar keys (`skey`) and index maintenance on write. An EXPRESSION index is a scalar index whose stored value is a closed function of its declared field (descriptor version 3, `EXPRESSION_FEATURE`). | `docs/COLLECTIONS.md`; `docs/QL_CONTRACT.md` §4.1 |
 | `src/collections/drop_collection.rs` | Removing a collection: `DropMode`/`DropPhase`/`DropState`/`DropProgress`, `begin_drop_collection[_mode]`, `drop_collection_step`, the `DROP_FEATURE` bit and the descriptor's DROPPING tail. | `docs/QL_CONTRACT.md` §2 (`DROP TABLE`); `docs/GRAPH_CONTRACT.md` §6.1 |
 | `src/collections/rebuild.rs` | Offline rebuild of a database into a fresh file, sorted index builds included. Public as `collections::rebuild`. | `docs/COLLECTIONS.md` |
 | `src/collections/verification.rs` | Whole-database verification against an independent walk of the source. Public as `collections::verification`. | `docs/COLLECTIONS.md` |
@@ -70,12 +70,24 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 | `src/query/drivers.rs` | `DriverPlan` and driver selection (the Auto chain, `nearest_plan`, `nearest_drives_better`, `approximate_scan_drives`, `order_index_drives_better`); the bounded graph traversals and their per-hop pruning (`execute_graph`, `GraphAnswer`); the carried-key `Candidate`; every cursor's state and the `DriverCursor` keyspace helpers. | `docs/QL_CONTRACT.md` §6 "Execution guarantees"; `docs/GRAPH_CONTRACT.md` §4.1-4.3 |
 | `src/query/cursors.rs` | One walk per driver: `DriverCursor` dispatch plus the per-cursor `next` (entities, scalar, keys, text, spatial, nearest, geometry, vector, quantized vector). | `docs/QL_CONTRACT.md` §4 "Functions" (per-family dispatch) |
 | `src/query/membership.rs` | `MembershipSet`, `MembershipBudget`, `build_scalar_range_set`, `build_point_set`, the posting probes and `ensure_membership_sets`; the BOOLEAN set algebra (`SetExpr`, the union, the intersection, the complement and the universes they are taken against); `NodeGate`, the per-hop node predicates of a traversal, and `StandaloneNodeGate` for the traversal atomic. | `docs/QL_CONTRACT.md` §3 "Predicates and operators", §6 "Execution guarantees"; `docs/GRAPH_CONTRACT.md` §4.3 |
-| `src/query/filters.rs` | The per-candidate tests: `filters_match`, `batch_filters_match`, `geometry_predicate_matches`, the scalar/text/point/JSON comparisons. | `docs/QL_CONTRACT.md` §3 "Predicates and operators" |
+| `src/query/filters.rs` | The per-candidate tests: `filters_match`, `batch_filters_match`, `geometry_predicate_matches`, the scalar/text/point/JSON comparisons. `indexed_value` is the one place a row value is carried to an EXPRESSION index's stored value, and `scalar_filter_matches` / `persisted_scalar_key` both go through it. | `docs/QL_CONTRACT.md` §3 "Predicates and operators" |
 | `src/query/rank.rs` | `RankKey`/`RankValue`/`HeapEntry`/`Winners`, `compare_rank`, `rank_candidate`, and the scores a rank key is built from: `text_score`, `vector_score`, `approximate_vector_score`, distance. | `docs/QL_CONTRACT.md` §4.5 "Vector", §4.6 "Text search" |
 | `src/query/score.rs` | `CompiledScoreExpr`, `compile_score_expr`, `eval_score_expr`. | `docs/QL_CONTRACT.md` §4.7 "Aggregates" |
 | `src/query/vector_scan.rs` | `unfiltered_vector_scan`, `filtered_vector_scan`, `scan_ceiling`, `vector_scan_progress`, `filtered_vector_scan_progress`, `vector_after`. | `docs/QL_CONTRACT.md` §4.5 "Vector" (exact) |
 | `src/query/rows.rs` | Reading primary rows: `RowData`, the lockstep `PrimaryRows` reader, `read_batch_rows`, and the projection that turns a row into returned values. | `docs/QL_CONTRACT.md` §6 "Execution guarantees" |
 | `src/query/page.rs` | `PreparedQuery`, `next_page`, `emit_rows`, `finish_page`, the shape questions (`keeps_a_run`, `batches_row_reads`, `winner_needs_no_row`, `a_filter_reads_the_row`, ...) and the resume state a page commits once its rows are final. | `docs/QL_CONTRACT.md` §6 "Execution guarantees" |
+
+## `src/sql/` -- the query language
+
+| Module | Atomic | Contract |
+| --- | --- | --- |
+| `src/sql/lexer.rs` | The tokenizer: every operator PostgreSQL and its extensions spell, so a refusal can NAME what it refuses. | `docs/QL_CONTRACT.md` §1 |
+| `src/sql/ast.rs` | The shape of the text: statements, predicates, order keys, row expressions. Nothing here knows about indexes. | `docs/QL_CONTRACT.md` §2 |
+| `src/sql/parser.rs` | Recursive descent over the Tier-1 grammar, and the refusal of everything else. | `docs/QL_CONTRACT.md` §2, §3 |
+| `src/sql/compile.rs` | The AST turned into calls the crate already has: `QueryRequest`, `AggregateRequest`, `put`/`delete`, the `create_*` DDL. Also the §4.1 / §4.2 RANGE REWRITES (`time_filter`, `text_filter`) and the compiled ROW functions (`CompiledRow`). | `docs/QL_CONTRACT.md` §4, §6 |
+| `src/sql/functions.rs` | The §4.1 string and §4.2 date/time functions as PURE functions: the proleptic-Gregorian calendar, the literal reader and the ISO printer, `date_trunc`/`EXTRACT`/`to_char`, the fixed-width interval reader, and the text-prefix successor a `LIKE 'x%'` range needs. One implementation serves both the WHERE fold and the projected row function, so the two cannot disagree. | `docs/QL_CONTRACT.md` §4.1, §4.2 |
+| `src/sql/explain.rs` | `EXPLAIN`: the plan, the counters, and the two function sections (`range rewrites`, `row functions`). | `docs/QL_CONTRACT.md` §6 |
+| `src/sql/refuse.rs` | The Tier-2/Tier-3 table as data, plus `MULTI_RANGE` -- the reason a rewrite whose pre-image is a set of ranges carries. | `docs/QL_CONTRACT.md` §4, `docs/FOUNDATION_TEST_STANDARD.md` law 8 |
 
 ## `src/faults/` -- in-crate fault injection
 

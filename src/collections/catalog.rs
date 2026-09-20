@@ -25,6 +25,15 @@ pub(super) const SORTED_GROUP_FIRST: usize = 64;
 /// work, and one that does contain a per-index tree is refused whole by such a
 /// binary before a byte of it is touched (Law 8).
 pub(super) const INDEX_TREE_FEATURE: u64 = 0x80;
+/// The collection header bit that says this database contains at least one
+/// EXPRESSION index -- a scalar index whose stored value is a closed function
+/// of a declared field rather than the field itself (descriptor version 3).
+///
+/// Monotone and set only by a CREATE that records an expression. A binary
+/// that predates this work refuses such a file whole at admission rather than
+/// reading the index as an ordinary one over the source field, which would
+/// answer `col = 'Home'` from keys that hold `'home'` (Law 8).
+pub(super) const EXPRESSION_FEATURE: u64 = 0x400;
 /// Default for new `Database` handles: whether an index CREATED through that
 /// handle gets its own tree. Like the cell-encoding create switch, it decides
 /// what is created, never what can be opened. Both layouts are read and
@@ -92,6 +101,59 @@ pub struct IndexInfo {
     /// `Some` only for a version-2 scalar or spatial descriptor: every other
     /// family, and every version-1 descriptor, lives in the primary tree.
     pub tree: Option<IndexTree>,
+    /// `Some` for an EXPRESSION index: the index stores `expression(field)`
+    /// rather than `field` itself. Scalar family only, descriptor version 3,
+    /// behind [`EXPRESSION_FEATURE`].
+    ///
+    /// `field` stays the SOURCE field, so the layout check
+    /// (`validate_indexed_layout`), the late build (`scalar_build_key`) and
+    /// the per-write hook (`maintain_indexes`) all read the same declared
+    /// field they always did; only the VALUE they encode passes through
+    /// [`IndexExpr::apply`] first. No row byte changes: the derived value
+    /// lives in the index and nowhere else.
+    pub expression: Option<IndexExpr>,
+}
+/// The expression an expression index stores.
+///
+/// The set is CLOSED and each member is O(value bytes) per write, which is
+/// what keeps the per-write hook bounded (Law 1). `Lower` is the one
+/// `docs/QL_CONTRACT.md` §4.1 names: `lower(col) = x` rewrites to a scalar
+/// range only when an index over `lower(col)` exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexExpr {
+    Lower,
+}
+impl IndexExpr {
+    pub fn written(self) -> &'static str {
+        match self {
+            Self::Lower => "lower",
+        }
+    }
+    fn byte(self) -> u8 {
+        match self {
+            Self::Lower => 1,
+        }
+    }
+    fn from_byte(b: u8) -> Result<Option<Self>> {
+        match b {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Lower)),
+            _ => Err(Error::Unsupported("index expression".into())),
+        }
+    }
+    /// The derived value this index stores for a source value.
+    ///
+    /// Analyzer-free and locale-free on purpose: `to_lowercase` is Unicode
+    /// simple lowercase, the same folding `str::to_lowercase` gives the row
+    /// function in `src/sql/functions.rs`, so the index and the row path
+    /// cannot disagree about what `lower(col)` is. A non-string value passes
+    /// through unchanged -- `lower` of a number is the number.
+    pub(crate) fn apply(self, value: Option<&Value>) -> Option<Value> {
+        match (self, value) {
+            (Self::Lower, Some(Value::String(s))) => Some(Value::String(s.to_lowercase())),
+            (_, other) => other.cloned(),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub enum ScalarPredicate {
@@ -158,7 +220,7 @@ fn kind_byte(k: &Kind) -> Result<u8> {
 fn encode_tree(b: &mut Vec<u8>, i: &IndexInfo) -> Result<()> {
     match (i.encoding_version, i.tree) {
         (1, None) => Ok(()),
-        (2, Some(t)) => {
+        (2 | 3, Some(t)) => {
             if t.id < 2 {
                 return Err(invalid("per-index tree id 0/1 is reserved"));
             }
@@ -175,6 +237,16 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
     }
     if i.tree.is_none() && i.encoding_version != 1 {
         return Err(invalid("index descriptor version does not match its tree"));
+    }
+    // Version 3 is version 2 plus a one-byte expression tail, and only the
+    // scalar family carries one: an expression index is a scalar index whose
+    // value is derived.
+    if (i.encoding_version == 3) != (i.expression.is_some())
+        || (i.expression.is_some() && i.family != IndexFamily::Scalar)
+    {
+        return Err(invalid(
+            "an expression index is a version-3 scalar descriptor and nothing else",
+        ));
     }
     let mut b = i.id.0.to_be_bytes().to_vec();
     b.extend(i.collection.0.to_be_bytes());
@@ -277,6 +349,9 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
         b.extend((s.len() as u16).to_be_bytes());
         b.extend(s.as_bytes());
     }
+    if let Some(expression) = i.expression {
+        b.push(expression.byte());
+    }
     packet(MAGIC, &b)
 }
 pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
@@ -292,7 +367,7 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
     let collection = CollectionId(u32::from_be_bytes(b[8..12].try_into().unwrap()));
     let version = u16::from_be_bytes(b[13..15].try_into().unwrap());
     let family = match (b[12], version) {
-        (1, 1 | 2) => IndexFamily::Scalar,
+        (1, 1 | 2 | 3) => IndexFamily::Scalar,
         (2, 1) => IndexFamily::ExactVector,
         (3, 1 | 2) => IndexFamily::SpatialPoint,
         (4, 1) => IndexFamily::Text,
@@ -404,7 +479,7 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
             (Kind::Vector(dimension), false, 21, 22, 30)
         }
     };
-    let tree = if version == 2 {
+    let tree = if version == 2 || version == 3 {
         let tail = b
             .get(at..at + 6)
             .ok_or_else(|| corrupt("short per-index tree descriptor tail"))?;
@@ -444,6 +519,16 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
     };
     let name = string()?;
     let field = string()?;
+    let expression = if version == 3 {
+        let byte = *b.get(at).ok_or_else(|| corrupt("index expression tail"))?;
+        at += 1;
+        Some(
+            IndexExpr::from_byte(byte)?
+                .ok_or_else(|| corrupt("version-3 index descriptor without an expression"))?,
+        )
+    } else {
+        None
+    };
     if at != b.len() || id.0 == 0 || collection.0 == 0 {
         return Err(corrupt("index descriptor identity/trailing bytes"));
     }
@@ -458,6 +543,7 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
         state,
         encoding_version: version,
         tree,
+        expression,
     })
 }
 pub(super) fn read_index(
@@ -519,6 +605,11 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
         {
             return Err(corrupt(
                 "spatial geometry descriptor without feature admission",
+            ));
+        }
+        if i.expression.is_some() && h.features & EXPRESSION_FEATURE == 0 {
+            return Err(corrupt(
+                "expression index descriptor without feature admission",
             ));
         }
         if i.tree.is_some() && h.features & INDEX_TREE_FEATURE == 0 {
@@ -856,6 +947,51 @@ impl Database {
         self.create_index(c, name, field, kind, unique, IndexFamily::Scalar, 0)
     }
 
+    /// An EXPRESSION scalar index: the same family, the same keys and the
+    /// same walk, over `expression(field)` rather than `field`.
+    ///
+    /// `docs/QL_CONTRACT.md` §4.1: `lower(col) = x` and `lower(col) LIKE
+    /// 'x%'` are answered index-side only when this index exists; without it
+    /// they are REFUSED, never demoted to a scan. The cost of holding one is
+    /// one derived value per write, which is the ordinary scalar maintenance
+    /// plus the expression.
+    pub fn create_expression_index(
+        &mut self,
+        c: CollectionId,
+        name: &str,
+        field: &str,
+        expression: IndexExpr,
+        unique: bool,
+    ) -> Result<IndexId> {
+        self.ready_write()?;
+        if name.is_empty() || name.len() > 128 || field.is_empty() || field.len() > 128 {
+            return Err(invalid("index name and field require 1..128 UTF-8 bytes"));
+        }
+        let info = self.collection_info(c)?;
+        let kind = info
+            .layout
+            .fields
+            .iter()
+            .find(|(n, _)| n == field)
+            .map(|(_, k)| k.clone())
+            .ok_or_else(|| invalid("index field must be declared"))?;
+        if !matches!(expression, IndexExpr::Lower) || kind != Kind::Text {
+            return Err(invalid("lower(col) is an expression over a TEXT field"));
+        }
+        kind_byte(&kind)?;
+        self.create_index_full(
+            c,
+            name,
+            field,
+            kind,
+            unique,
+            IndexFamily::Scalar,
+            EXPRESSION_FEATURE,
+            true,
+            Some(expression),
+        )
+    }
+
     pub(crate) fn create_index(
         &mut self,
         c: CollectionId,
@@ -896,6 +1032,21 @@ impl Database {
         family: IndexFamily,
         feature: u64,
         with_tree: bool,
+    ) -> Result<IndexId> {
+        self.create_index_full(c, name, field, kind, unique, family, feature, with_tree, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_index_full(
+        &mut self,
+        c: CollectionId,
+        name: &str,
+        field: &str,
+        kind: Kind,
+        unique: bool,
+        family: IndexFamily,
+        feature: u64,
+        with_tree: bool,
+        expression: Option<IndexExpr>,
     ) -> Result<IndexId> {
         if name.is_empty() || name.len() > 128 || field.is_empty() || field.len() > 128 {
             return Err(invalid("index name and field require 1..128 UTF-8 bytes"));
@@ -938,8 +1089,22 @@ impl Database {
             kind,
             unique,
             state: IndexState::Building { after: 0 },
-            encoding_version: if tree.is_some() { 2 } else { 1 },
+            encoding_version: match (expression.is_some(), tree.is_some()) {
+                (true, true) => 3,
+                (false, true) => 2,
+                // An expression index needs its own tree: the version that
+                // carries the expression tail is the version that carries the
+                // tree tail, so a handle with per-index trees turned off
+                // cannot create one.
+                (true, false) => {
+                    return Err(invalid(
+                        "an expression index requires a per-index tree (descriptor version 3)",
+                    ))
+                }
+                (false, false) => 1,
+            },
             tree,
+            expression,
         };
         let (nc, nl) = self.header()?;
         let result = (|| {
@@ -963,6 +1128,26 @@ impl Database {
             .index_header
             .ok_or_else(|| corrupt("missing index header"))?;
         if header.features & feature == feature {
+            return Ok(());
+        }
+        header.features |= feature;
+        let (nc, nl) = self.header()?;
+        self.index_header = Some(header);
+        self.write_header(nc, nl)
+    }
+    /// [`Self::enable_index_feature`] for a bit that does not ride an index
+    /// creation and so may be the first thing in a database to need the
+    /// index-header envelope at all -- `DECLARED_FEATURE`, which rides a
+    /// `CREATE TABLE`. The envelope is created rather than demanded, the same
+    /// way `drop_collection.rs` creates it for `DROP_FEATURE`. Still monotone,
+    /// and still written in the caller's own transaction.
+    pub(crate) fn enable_logical_feature(&mut self, feature: u64) -> Result<()> {
+        let mut header = self.index_header.unwrap_or(IndexHeader {
+            features: 1,
+            next: 1,
+            count: 0,
+        });
+        if self.index_header.is_some() && header.features & feature == feature {
             return Ok(());
         }
         header.features |= feature;
@@ -1033,12 +1218,21 @@ impl Database {
                 crate::index::text::maintain_text(self, &i, id, old, new)?;
                 continue;
             }
-            let a = old
-                .map(|doc| scalar_key::encode(&i.kind, doc.get(&i.field)))
-                .transpose()?;
-            let b = new
-                .map(|doc| scalar_key::encode(&i.kind, doc.get(&i.field)))
-                .transpose()?;
+            // An expression index stores `expression(field)`. The derived
+            // value is computed HERE, on the write path, from the field the
+            // row already carries: no row byte changes and no second read
+            // happens.
+            let derived = |doc: &Value| -> Result<Vec<u8>> {
+                match i.expression {
+                    None => scalar_key::encode(&i.kind, doc.get(&i.field)),
+                    Some(expression) => {
+                        let value = expression.apply(doc.get(&i.field));
+                        scalar_key::encode(&i.kind, value.as_ref())
+                    }
+                }
+            };
+            let a = old.map(&derived).transpose()?;
+            let b = new.map(&derived).transpose()?;
             if a == b {
                 continue;
             }
@@ -1088,7 +1282,38 @@ impl Database {
                 return Err(invalid("historical indexed scalar field changed kind"))
             }
         };
-        scalar_key::encode_into(&i.kind, value.as_ref(), out)
+        match i.expression {
+            None => scalar_key::encode_into(&i.kind, value.as_ref(), out),
+            Some(expression) => {
+                let source = value;
+                let value = expression.apply(source.as_ref());
+                scalar_key::encode_into(&i.kind, value.as_ref(), out).map_err(|error| {
+                    // NAMED refusal, because the ordinary one would be a lie
+                    // about which value is too long. Unicode simple
+                    // lowercasing can make a string LONGER in bytes -- `İ`
+                    // (U+0130, 2 bytes) lowers to `i` + U+0307 (3 bytes) --
+                    // so a source value inside the 1024-byte text key limit
+                    // can have an image outside it. The row is written and
+                    // the INDEX cannot hold it; there is no shorter key that
+                    // is still the expression's value, so it is refused
+                    // rather than truncated to a key that would answer
+                    // `lower(col) = x` with the wrong rows (Law 8).
+                    let source_bytes = source
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .map_or(0, |s| s.len());
+                    let image_bytes = value.as_ref().and_then(Value::as_str).map_or(0, |s| s.len());
+                    if image_bytes > source_bytes {
+                        invalid(format!(
+                            "{}(col) of this value is {image_bytes} UTF-8 bytes where the value itself is {source_bytes}, and a scalar Text index key holds at most 1024: Unicode lowercasing can lengthen a string, so an expression index over lower(col) cannot accept every value the column can. Shorten the value or drop the expression index",
+                            expression.written()
+                        ))
+                    } else {
+                        error
+                    }
+                })
+            }
+        }
     }
     /// One transaction's bounded work. No implicit commit; true means READY in
     /// this transaction, visible to other readers only after caller commits.
@@ -2033,6 +2258,7 @@ mod codec_tests {
             state: IndexState::Building { after: 42 },
             encoding_version: 1,
             tree: None,
+            expression: None,
         };
         let mut payload = 9u64.to_be_bytes().to_vec();
         payload.extend(7u32.to_be_bytes());
@@ -2063,6 +2289,7 @@ mod codec_tests {
             state: IndexState::Ready,
             encoding_version: 1,
             tree: None,
+            expression: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);
@@ -2087,6 +2314,7 @@ mod codec_tests {
             state: IndexState::Building { after: 19 },
             encoding_version: 1,
             tree: None,
+            expression: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);
@@ -2111,6 +2339,7 @@ mod codec_tests {
             state: IndexState::Building { after: 91 },
             encoding_version: 1,
             tree: None,
+            expression: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);
@@ -2137,6 +2366,7 @@ mod codec_tests {
             state: IndexState::Building { after: 7 },
             encoding_version: 1,
             tree: None,
+            expression: None,
         };
         let encoded = encode(&info).unwrap();
         assert_eq!(decode(&encoded).unwrap(), info);

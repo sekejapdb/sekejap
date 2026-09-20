@@ -18,7 +18,7 @@
 #[path = "sqlslice/fixture.rs"]
 mod fixture;
 
-use e4_prototype::sql::{Param, SqlResult};
+use e4_prototype::sql::{Param, SqlResult, SqlValue};
 use tempfile::TempDir;
 
 fn open() -> (TempDir, fixture::Fixture) {
@@ -982,4 +982,191 @@ fn a_semi_join_explains_the_set_it_built() {
         "{negated}"
     );
     assert_eq!(rows_of(&negated), (fixture::ROWS - 500) as u64, "{negated}");
+}
+
+// ── §4.1 / §4.2: a range rewrite and a row function are different lines ───
+//
+// The two sections EXPLAIN prints for the function work are not decoration:
+// they are the cost statement. A `range rewrite` line says the function was
+// folded into index bounds at prepare and the walk never evaluates it, so the
+// work is the candidates the range admits. A `row function` line says the
+// value is computed over what a RETURNED row already projected, so the work
+// is one evaluation per row returned. A reader who cannot tell the two apart
+// cannot tell a bounded statement from a scan.
+
+/// A `TIMESTAMPTZ` collection beside the fixture, built through the DDL so
+/// the declared type reaches the catalog the way a statement puts it there.
+fn timeline(f: &mut fixture::Fixture) {
+    f.db.sql(
+        "CREATE TABLE evt (k TEXT PRIMARY KEY, kind TEXT, at TIMESTAMPTZ)",
+        &[],
+    )
+    .unwrap();
+    for (n, at) in [
+        "1950-03-04T05:06:07Z",
+        "1950-12-31T23:59:59Z",
+        "1951-01-01T00:00:00Z",
+        "1962-06-15T12:30:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        f.db.sql(
+            &format!(
+                "INSERT INTO evt (k, kind, at) VALUES ('e{n}', '{}', '{at}')",
+                ["Home", "home", "HOME", "Farm"][n]
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+    f.db.commit().unwrap();
+    for statement in [
+        "CREATE INDEX evt_at ON evt USING btree (at)",
+        "CREATE INDEX evt_kind ON evt USING btree (kind)",
+        "CREATE INDEX evt_kind_lower ON evt (lower(kind))",
+    ] {
+        f.db.sql(statement, &[]).unwrap();
+    }
+    f.db.commit().unwrap();
+}
+
+#[test]
+fn a_date_rewrite_is_printed_as_a_range_and_not_as_a_row_function() {
+    let (_dir, mut f) = open();
+    timeline(&mut f);
+    let text = explain(&mut f, "SELECT k FROM evt WHERE EXTRACT(YEAR FROM at) = 1950", &[]);
+    assert!(
+        text.contains("EXTRACT(year FROM at) = 1950 -> scalar range on `at`"),
+        "{text}"
+    );
+    assert!(
+        text.contains("folded at prepare and never evaluated per candidate"),
+        "the rewrite says where the work is NOT: {text}"
+    );
+    assert!(text.contains("row functions: none"), "{text}");
+    // It drives the `at` btree, and the walk is not a scan.
+    assert!(text.contains("driver: Scalar"), "{text}");
+    assert!(!text.contains("is a SCAN by definition"), "{text}");
+    assert_eq!(rows_of(&text), 2);
+
+    for (sql, needle) in [
+        (
+            "SELECT k FROM evt WHERE date_trunc('month', at) BETWEEN '1950-01-01' AND '1950-06-01'",
+            "date_trunc('month', at) BETWEEN '1950-01-01' AND '1950-06-01' -> scalar range",
+        ),
+        (
+            "SELECT k FROM evt WHERE at::date = '1951-01-01'",
+            "at::date = '1951-01-01' -> scalar range",
+        ),
+        (
+            "SELECT k FROM evt WHERE at >= '1951-01-01'",
+            "at >= '1951-01-01' -> scalar range",
+        ),
+        (
+            "SELECT k FROM evt WHERE at > now() - interval '7 days'",
+            "-> scalar range on `at`",
+        ),
+    ] {
+        let text = explain(&mut f, sql, &[]);
+        assert!(text.contains(needle), "`{sql}` printed:\n{text}");
+        assert!(text.contains("row functions: none"), "`{sql}`:\n{text}");
+    }
+}
+
+#[test]
+fn a_fold_over_an_expression_index_names_the_index_it_rode() {
+    let (_dir, mut f) = open();
+    timeline(&mut f);
+    let text = explain(&mut f, "SELECT k FROM evt WHERE lower(kind) = 'home'", &[]);
+    assert!(
+        text.contains("lower(kind) = 'home' -> scalar equality on `kind` through the expression index over lower(col)"),
+        "{text}"
+    );
+    assert_eq!(rows_of(&text), 3);
+    // The prefix form over the ordinary text key says text-key prefix range.
+    let text = explain(&mut f, "SELECT k FROM evt WHERE kind LIKE 'Ho%'", &[]);
+    assert!(text.contains("-> text-key prefix range on `kind`"), "{text}");
+    assert!(!text.contains("expression index"), "{text}");
+}
+
+#[test]
+fn a_projected_function_is_printed_as_a_row_function_and_costs_returned_rows() {
+    let (_dir, mut f) = open();
+    timeline(&mut f);
+    let text = explain(
+        &mut f,
+        "SELECT upper(kind), to_char(at, 'YYYY-MM'), at FROM evt WHERE at >= '1950-01-01'",
+        &[],
+    );
+    assert!(text.contains("range rewrites:"), "{text}");
+    assert!(text.contains("row functions:"), "{text}");
+    for needle in [
+        "upper(kind) -> evaluated over this row's projected values",
+        "to_char(at, 'YYYY-MM') -> evaluated over this row's projected values",
+        "at -> ISO-8601 text (declared TIMESTAMPTZ, stored Int microseconds)",
+    ] {
+        assert!(text.contains(needle), "want `{needle}` in:\n{text}");
+    }
+    assert!(
+        text.contains("proportional to the rows RETURNED"),
+        "a row function states its cost: {text}"
+    );
+    // A row function reads no extra row: the projection the page already made
+    // is its input, so `primary_reads` is one per returned row and no more.
+    assert_eq!(counter(&text, "primary_reads"), rows_of(&text));
+}
+
+#[test]
+fn a_statement_with_no_function_says_none_in_both_sections() {
+    let (_dir, mut f) = open();
+    let text = explain(&mut f, "SELECT _id FROM place WHERE born >= 19500101", &[]);
+    assert!(text.contains("range rewrites: none"), "{text}");
+    assert!(text.contains("row functions: none"), "{text}");
+}
+
+/// `fn_project_strings`: a projection-only case. The WHERE is an ordinary
+/// Tier-1 range, so nothing is rewritten; the whole function cost is in the
+/// projection, and EXPLAIN puts it all in one section.
+#[test]
+fn the_projection_only_battery_case_puts_every_function_in_one_section() {
+    let (_dir, mut f) = open();
+    let text = explain(
+        &mut f,
+        "SELECT upper(name), length(descr) FROM place WHERE born BETWEEN 19500101 AND 19600101",
+        &[],
+    );
+    assert!(text.contains("range rewrites: none"), "{text}");
+    assert!(
+        text.contains("upper(name) -> evaluated") && text.contains("length(descr) -> evaluated"),
+        "{text}"
+    );
+    assert!(text.contains("driver: Scalar"), "{text}");
+    // EXPLAIN naming a row function proves nothing about the VALUE it
+    // computes: this passes on three substrings while every projected value
+    // is garbage. So the same statement is also run, and its answer compared
+    // against this process's own `to_uppercase` and `chars().count()` over
+    // the fixture rows it named.
+    let statement = "SELECT _key, upper(name), length(descr) FROM place \
+                     WHERE born BETWEEN 19500101 AND 19600101";
+    let rows = match f.db.sql(statement, &[]).unwrap() {
+        SqlResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert!(!rows.is_empty(), "the born window holds rows");
+    for row in &rows {
+        let SqlValue::Text(key) = &row.values[0] else {
+            panic!("the key column is text: {:?}", row.values[0])
+        };
+        let want = f
+            .rows
+            .iter()
+            .find(|r| r.key == *key)
+            .expect("a fixture row");
+        assert_eq!(row.values[1], SqlValue::Text(want.name.to_uppercase()));
+        assert_eq!(
+            row.values[2],
+            SqlValue::Int(want.desc.chars().count() as i64)
+        );
+    }
 }

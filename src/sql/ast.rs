@@ -2,6 +2,7 @@
 //! drivers: the AST is the shape of the text, and `compile.rs` is the only
 //! place that turns a shape into a `QueryRequest` or a write.
 
+use super::functions::TimeUnit;
 use crate::Kind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +100,93 @@ pub(super) struct TsQuery {
     pub(super) tsquery_syntax: bool,
 }
 
+/// The right-hand side of a date/time comparison: a written literal, or the
+/// clock plus a folded interval.
+///
+/// `now()` and `current_date` are constants folded ONCE at prepare
+/// (`docs/QL_CONTRACT.md` §4.2), so `t > now() - interval '7 days'` is one
+/// integer by the time the walk starts and the predicate is the ordinary
+/// scalar Range over it.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum TimeValue {
+    Lit(Literal),
+    Clock {
+        /// `current_date` truncates the clock to midnight UTC; `now()` does
+        /// not.
+        date_only: bool,
+        /// The interval written beside it, in microseconds. Negative for a
+        /// subtraction.
+        offset: i64,
+    },
+}
+
+/// A `WHERE` form over a declared TIMESTAMPTZ/DATE column that rewrites to
+/// scalar index RANGES on that column's own btree.
+///
+/// Every shape here is index-side by construction: the function is folded
+/// into bounds at prepare and the walk never evaluates it. A shape whose
+/// pre-image is a SET of ranges rather than one (`EXTRACT(MONTH FROM t) = 6`
+/// is one interval per year in the corpus) is a membership-set union, which
+/// is what `OR` compiles to, and is refused while that union is unbuilt.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum TimeShape {
+    Extract {
+        unit: TimeUnit,
+        op: CmpOp,
+        value: Literal,
+    },
+    ExtractBetween {
+        unit: TimeUnit,
+        lower: Literal,
+        upper: Literal,
+    },
+    Trunc {
+        unit: TimeUnit,
+        op: CmpOp,
+        value: Literal,
+    },
+    TruncBetween {
+        unit: TimeUnit,
+        lower: Literal,
+        upper: Literal,
+    },
+    /// `t::date <cmp> 'lit'`.
+    CastDate {
+        op: CmpOp,
+        value: Literal,
+    },
+    /// `t <cmp> now() - interval '7 days'`.
+    Clock {
+        op: CmpOp,
+        value: TimeValue,
+    },
+    ClockBetween {
+        lower: TimeValue,
+        upper: TimeValue,
+    },
+}
+
+/// A `WHERE` form over a TEXT column that rewrites to a text-key range.
+///
+/// `Lower*` needs the expression index `CREATE INDEX ... ON t (lower(col))`;
+/// without it the form is REFUSED with that reason and never demoted to a
+/// scan (`docs/QL_CONTRACT.md` §4.1).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum TextShape {
+    LowerEq {
+        value: Literal,
+    },
+    LowerPrefix {
+        value: Literal,
+        /// The spelling the statement used, for the EXPLAIN line.
+        written: &'static str,
+    },
+    Prefix {
+        value: Literal,
+        written: &'static str,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Predicate {
     Compare {
@@ -156,6 +244,10 @@ pub(super) enum Predicate {
         table: String,
         column: String,
     },
+    /// A §4.2 date/time function folded into scalar ranges over `column`.
+    Time { column: String, shape: TimeShape },
+    /// A §4.1 string function folded into a text-key range over `column`.
+    TextFn { column: String, shape: TextShape },
 }
 
 /// A `WHERE` clause, as written: the boolean tree over predicates.
@@ -169,6 +261,98 @@ pub(super) enum Expr {
     Not(Box<Expr>),
     And(Vec<Expr>),
     Or(Vec<Expr>),
+}
+
+/// The §4.1 string functions that are ROW functions: one row in, one value
+/// out, no read of any other row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrFunc {
+    Lower,
+    Upper,
+    Length,
+    Concat,
+    Substring,
+    Left,
+    Right,
+    Trim,
+    SplitPart,
+    Replace,
+    Position,
+    StartsWith,
+}
+
+impl StrFunc {
+    pub(crate) fn written(self) -> &'static str {
+        match self {
+            Self::Lower => "lower",
+            Self::Upper => "upper",
+            Self::Length => "length",
+            Self::Concat => "concat",
+            Self::Substring => "substring",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Trim => "trim",
+            Self::SplitPart => "split_part",
+            Self::Replace => "replace",
+            Self::Position => "position",
+            Self::StartsWith => "starts_with",
+        }
+    }
+}
+
+/// A ROW expression: one row in, one value out, evaluated over PROJECTED
+/// values after the index-side stage.
+///
+/// `docs/QL_CONTRACT.md` §4.1 and §4.2. Cost is proportional to the rows
+/// RETURNED, never to the collection, and `EXPLAIN` prints the expression
+/// under "row functions" so that cost is stated rather than inferred.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum RowExpr {
+    /// A declared field of this row.
+    Column(String),
+    Lit(Literal),
+    /// `now()` -- folded once at prepare, so every row of one statement sees
+    /// the same instant.
+    Now,
+    /// `current_date` -- `now()` truncated to midnight UTC.
+    CurrentDate,
+    /// `interval '7 days'`, already folded to microseconds.
+    Interval(i64),
+    Extract {
+        unit: TimeUnit,
+        arg: Box<RowExpr>,
+    },
+    Trunc {
+        unit: TimeUnit,
+        arg: Box<RowExpr>,
+    },
+    /// `age(t)` is `now() - t`; `age(a, b)` is `a - b`. Both in
+    /// microseconds, which is what §4.2 calls row arithmetic over Int
+    /// microseconds.
+    Age {
+        left: Box<RowExpr>,
+        right: Option<Box<RowExpr>>,
+    },
+    ToChar {
+        arg: Box<RowExpr>,
+        format: String,
+    },
+    /// `to_timestamp(seconds)`.
+    ToTimestamp(Box<RowExpr>),
+    /// `to_date('lit', fmt)` / `'lit'::date`.
+    ToDate(Box<RowExpr>),
+    /// `t::date`: the instant truncated to midnight UTC.
+    CastDate(Box<RowExpr>),
+    /// `x::text`.
+    CastText(Box<RowExpr>),
+    Str {
+        func: StrFunc,
+        args: Vec<RowExpr>,
+    },
+    Add(Box<RowExpr>, Box<RowExpr>),
+    Sub(Box<RowExpr>, Box<RowExpr>),
+    /// `a || b`, which is `concat` written as an operator.
+    Concat(Box<RowExpr>, Box<RowExpr>),
 }
 
 /// An arithmetic `ORDER BY` expression: one key, per deviation 3.
@@ -298,6 +482,8 @@ pub(super) enum SelectItem {
         function: AggFunc,
         argument: AggArg,
     },
+    /// A §4.1 / §4.2 ROW function over this row's own projected values.
+    Function(Box<RowExpr>),
     /// `col / n` in a select list: the one grouping expression, written
     /// again where the answer reports it. Outside a folded answer it is an
     /// arithmetic expression like any other and reports the ranking value,
@@ -397,6 +583,10 @@ pub(super) struct ColumnDef {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum IndexMethod {
     Btree(String),
+    /// `CREATE INDEX i ON t (lower(col))`: an EXPRESSION scalar index over
+    /// `lower(col)`, which is what makes `lower(col) = x` a range rather
+    /// than a refusal (QL_CONTRACT §4.1).
+    LowerBtree(String),
     /// `gin(to_tsvector('simple', col))`.
     Gin(String),
     Gist(String),
@@ -467,4 +657,137 @@ pub(super) enum Stmt {
         name: String,
         value: Literal,
     },
+}
+
+// ── how a compiled form spells itself back ────────────────────────────────
+
+impl Literal {
+    /// The literal as a statement would have written it, for an EXPLAIN line.
+    pub(super) fn written(&self) -> String {
+        match self {
+            Self::Null => "NULL".into(),
+            Self::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
+            Self::Num(value, exact) => {
+                if *exact {
+                    format!("{}", *value as i64)
+                } else {
+                    format!("{value}")
+                }
+            }
+            Self::Str(text) => format!("'{text}'"),
+            Self::Param(n) => format!("${n}"),
+            Self::Subquery(_) => "(SELECT ...)".into(),
+        }
+    }
+}
+
+impl TimeValue {
+    pub(super) fn written(&self) -> String {
+        match self {
+            Self::Lit(literal) => literal.written(),
+            Self::Clock { date_only, offset } => {
+                let clock = if *date_only { "current_date" } else { "now()" };
+                match offset {
+                    0 => clock.to_owned(),
+                    n if *n < 0 => format!("{clock} - interval {}us", -n),
+                    n => format!("{clock} + interval {n}us"),
+                }
+            }
+        }
+    }
+}
+
+impl TimeShape {
+    pub(super) fn written(&self, column: &str) -> String {
+        match self {
+            Self::Extract { unit, op, value } => format!(
+                "EXTRACT({} FROM {column}) {} {}",
+                unit.written(),
+                op.written(),
+                value.written()
+            ),
+            Self::ExtractBetween { unit, lower, upper } => format!(
+                "EXTRACT({} FROM {column}) BETWEEN {} AND {}",
+                unit.written(),
+                lower.written(),
+                upper.written()
+            ),
+            Self::Trunc { unit, op, value } => format!(
+                "date_trunc('{}', {column}) {} {}",
+                unit.written(),
+                op.written(),
+                value.written()
+            ),
+            Self::TruncBetween { unit, lower, upper } => format!(
+                "date_trunc('{}', {column}) BETWEEN {} AND {}",
+                unit.written(),
+                lower.written(),
+                upper.written()
+            ),
+            Self::CastDate { op, value } => {
+                format!("{column}::date {} {}", op.written(), value.written())
+            }
+            Self::Clock { op, value } => {
+                format!("{column} {} {}", op.written(), value.written())
+            }
+            Self::ClockBetween { lower, upper } => format!(
+                "{column} BETWEEN {} AND {}",
+                lower.written(),
+                upper.written()
+            ),
+        }
+    }
+}
+
+impl TextShape {
+    pub(super) fn written(&self, column: &str) -> String {
+        match self {
+            Self::LowerEq { value } => format!("lower({column}) = {}", value.written()),
+            Self::LowerPrefix { value, written } => {
+                format!("{written} over lower({column}), prefix {}", value.written())
+            }
+            Self::Prefix { value, written } => {
+                format!("{written} over {column}, prefix {}", value.written())
+            }
+        }
+    }
+}
+
+impl RowExpr {
+    /// The expression as a statement would have written it. It names the
+    /// output column when no alias was given and it is the EXPLAIN "row
+    /// functions" line, so it is built from the tree rather than from the
+    /// source text: the two cannot then disagree.
+    pub(super) fn written(&self) -> String {
+        match self {
+            Self::Column(name) => name.clone(),
+            Self::Lit(literal) => literal.written(),
+            Self::Now => "now()".into(),
+            Self::CurrentDate => "current_date".into(),
+            Self::Interval(micros) => format!("interval {micros}us"),
+            Self::Extract { unit, arg } => {
+                format!("EXTRACT({} FROM {})", unit.written(), arg.written())
+            }
+            Self::Trunc { unit, arg } => {
+                format!("date_trunc('{}', {})", unit.written(), arg.written())
+            }
+            Self::Age { left, right } => match right {
+                None => format!("age({})", left.written()),
+                Some(right) => format!("age({}, {})", left.written(), right.written()),
+            },
+            Self::ToChar { arg, format } => format!("to_char({}, '{format}')", arg.written()),
+            Self::ToTimestamp(arg) => format!("to_timestamp({})", arg.written()),
+            Self::ToDate(arg) => format!("to_date({})", arg.written()),
+            Self::CastDate(arg) => format!("{}::date", arg.written()),
+            Self::CastText(arg) => format!("{}::text", arg.written()),
+            Self::Str { func, args } => format!(
+                "{}({})",
+                func.written(),
+                args.iter().map(Self::written).collect::<Vec<_>>().join(", ")
+            ),
+            Self::Add(a, b) => format!("({} + {})", a.written(), b.written()),
+            Self::Sub(a, b) => format!("({} - {})", a.written(), b.written()),
+            Self::Concat(a, b) => format!("({} || {})", a.written(), b.written()),
+        }
+    }
 }

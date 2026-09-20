@@ -89,6 +89,7 @@
 mod ast;
 mod compile;
 mod explain;
+mod functions;
 mod lexer;
 mod parser;
 mod refuse;
@@ -375,6 +376,38 @@ impl PreparedSql {
         aggregate.with_aggregate(db, body)
     }
 
+    /// Page a compiled SELECT and hand each ASSEMBLED row to `body`.
+    ///
+    /// [`PreparedSql::with_query`] hands out the engine's own `QueryRow`,
+    /// which carries projected FIELDS; a caller that wants the statement's
+    /// own columns -- a `_key`, this statement's ranking value, a §4.1 / §4.2
+    /// ROW FUNCTION over the projected values -- needs the row the select
+    /// list describes, and that is what this produces. It is the paging half
+    /// of [`Database::sql`] without the `Vec` of every row at the end, so a
+    /// caller can stream an answer larger than it wants to hold.
+    pub fn for_each_row(
+        &self,
+        db: &Database,
+        page_rows: usize,
+        body: &mut dyn FnMut(&SqlRow) -> Result<()>,
+    ) -> Result<()> {
+        let select = self.select_plan().ok_or_else(|| {
+            SqlError::unsupported("this statement is not a row SELECT and pages no rows")
+        })?;
+        select.with_query(db, &mut |prepared| {
+            loop {
+                let page = prepared.next_page(page_rows, QueryBudget::unlimited(), || false)?;
+                for row in &page.rows {
+                    body(&select.row(db, row)?)?;
+                }
+                if page.done || page.rows.is_empty() {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Run a compiled aggregate to exhaustion, in pages of groups.
     fn groups(&self, db: &Database) -> Result<SqlResult> {
         let aggregate = self
@@ -432,6 +465,11 @@ impl PreparedSql {
 pub fn refusals() -> &'static [(&'static str, Tier, &'static str)] {
     refuse::TABLE
 }
+
+/// The reason a §4.2 rewrite whose pre-image is a SET of scalar ranges
+/// carries. Public so a caller -- and `tests/sql_functions.rs` -- can name it
+/// instead of matching on the text.
+pub use refuse::MULTI_RANGE as MULTI_RANGE_REASON;
 
 /// Parse `text` and compile it against `db`'s catalog.
 pub fn prepare_sql(db: &Database, text: &str, params: &[Param]) -> Result<PreparedSql> {

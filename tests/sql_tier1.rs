@@ -2307,3 +2307,302 @@ fn a_negated_tsquery_is_the_complement_of_the_text_set() {
     assert_eq!(with.len() + without.len(), fixture::ROWS);
     assert!(without.iter().all(|id| !with.contains(id)));
 }
+// ── §4.1 string and §4.2 date/time functions ──────────────────────────────
+//
+// The fixture's `place` collection has no declared TIMESTAMPTZ column, so the
+// date/time rows below build a small side collection through the SQL DDL --
+// which is also what proves the declared type reaches the catalog descriptor
+// from `CREATE TABLE` and comes back out of it. The string rows ride the
+// fixture's own `place`, whose `kind` and `name` are ordinary TEXT columns.
+
+/// `CREATE TABLE ... TIMESTAMPTZ` over the same database, with the indexes
+/// the §4.2 rewrites name. Returns the keys, in insert order.
+fn timeline(db: &mut Database) -> Vec<(String, &'static str)> {
+    db.sql(
+        "CREATE TABLE evt (k TEXT PRIMARY KEY, kind TEXT, at TIMESTAMPTZ, on_day DATE)",
+        &[],
+    )
+    .unwrap();
+    let rows: Vec<(String, &'static str)> = vec![
+        ("e1".to_owned(), "1950-03-04T05:06:07Z"),
+        ("e2".to_owned(), "1950-12-31T23:59:59Z"),
+        ("e3".to_owned(), "1951-01-01T00:00:00Z"),
+        ("e4".to_owned(), "1962-06-15T12:30:00Z"),
+    ];
+    for (n, (key, at)) in rows.iter().enumerate() {
+        db.sql(
+            &format!(
+                "INSERT INTO evt (k, kind, at, on_day) VALUES ('{key}', '{}', '{at}', '{}')",
+                ["Home", "home", "HOME", "Farm"][n],
+                &at[..10]
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+    db.commit().unwrap();
+    db.sql("CREATE INDEX evt_at ON evt USING btree (at)", &[])
+        .unwrap();
+    db.sql("CREATE INDEX evt_day ON evt USING btree (on_day)", &[])
+        .unwrap();
+    db.sql("CREATE INDEX evt_kind ON evt USING btree (kind)", &[])
+        .unwrap();
+    db.sql("CREATE INDEX evt_kind_lower ON evt (lower(kind))", &[])
+        .unwrap();
+    db.commit().unwrap();
+    rows
+}
+
+fn evt_keys(f: &mut fixture::Fixture, sql: &str) -> Vec<String> {
+    let mut out = match f.db.sql(sql, &[]).unwrap() {
+        SqlResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|row| match &row.values[0] {
+                SqlValue::Text(text) => text.clone(),
+                other => panic!("expected a key, got {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    out.sort();
+    out
+}
+
+/// §4.2: `EXTRACT(YEAR FROM t)`, `date_trunc`, `t::date`, `t >= lit` and
+/// `t BETWEEN` each fold into ONE scalar range on the column's own index.
+#[test]
+fn a_date_time_function_in_where_is_one_scalar_range() {
+    let (_dir, mut f) = open();
+    timeline(&mut f.db);
+    for (sql, want) in [
+        (
+            "SELECT k FROM evt WHERE EXTRACT(YEAR FROM at) = 1950",
+            vec!["e1", "e2"],
+        ),
+        (
+            "SELECT k FROM evt WHERE EXTRACT(YEAR FROM at) BETWEEN 1951 AND 1962",
+            vec!["e3", "e4"],
+        ),
+        (
+            "SELECT k FROM evt WHERE date_trunc('year', at) = '1950-01-01'",
+            vec!["e1", "e2"],
+        ),
+        (
+            "SELECT k FROM evt WHERE date_trunc('month', at) BETWEEN '1950-01-01' AND '1950-06-01'",
+            vec!["e1"],
+        ),
+        (
+            "SELECT k FROM evt WHERE at::date = '1951-01-01'",
+            vec!["e3"],
+        ),
+        (
+            "SELECT k FROM evt WHERE on_day = '1962-06-15'",
+            vec!["e4"],
+        ),
+        ("SELECT k FROM evt WHERE at >= '1951-01-01'", vec!["e3", "e4"]),
+        (
+            "SELECT k FROM evt WHERE at BETWEEN '1950-01-01' AND '1951-01-01'",
+            vec!["e1", "e2", "e3"],
+        ),
+        (
+            "SELECT k FROM evt WHERE at > now() - interval '7 days'",
+            vec![],
+        ),
+    ] {
+        assert_eq!(evt_keys(&mut f, sql), want, "{sql}");
+    }
+}
+
+/// §4.2: the same functions in a SELECT list are ROW functions, and a
+/// declared TIMESTAMPTZ prints back as the ISO string it was written as.
+#[test]
+fn a_date_time_function_in_a_select_list_is_a_row_function() {
+    let (_dir, mut f) = open();
+    timeline(&mut f.db);
+    let rows = match f
+        .db
+        .sql(
+            "SELECT k, at, on_day, EXTRACT(YEAR FROM at), EXTRACT(MONTH FROM at), \
+             to_char(at, 'YYYY-MM'), to_char(at, 'HH24:MI'), date_trunc('day', at) \
+             FROM evt WHERE at::date = '1962-06-15'",
+            &[],
+        )
+        .unwrap()
+    {
+        SqlResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(rows.len(), 1);
+    let values = &rows[0].values;
+    assert_eq!(values[0], SqlValue::Text("e4".into()));
+    assert_eq!(values[1], SqlValue::Text("1962-06-15T12:30:00Z".into()));
+    assert_eq!(values[2], SqlValue::Text("1962-06-15".into()));
+    assert_eq!(values[3], SqlValue::Int(1962));
+    assert_eq!(values[4], SqlValue::Int(6));
+    assert_eq!(values[5], SqlValue::Text("1962-06".into()));
+    assert_eq!(values[6], SqlValue::Text("12:30".into()));
+    // `date_trunc` in a projection keeps the STORED representation: an
+    // integer of microseconds, which is midnight UTC of that day. Days from
+    // 1970-01-01 to 1962-06-15 is -2757.
+    assert_eq!(values[7], SqlValue::Int(-2757 * 86_400_000_000));
+}
+
+/// §4.1: `lower(col) = x` rides the expression index, `col LIKE 'x%'` and
+/// `starts_with` ride the ordinary text key, and each answers the same
+/// question the direct API answers with the range it compiles to.
+#[test]
+fn a_string_function_in_where_is_a_text_key_range() {
+    let (_dir, mut f) = open();
+    timeline(&mut f.db);
+    assert_eq!(
+        evt_keys(&mut f, "SELECT k FROM evt WHERE lower(kind) = 'home'"),
+        vec!["e1", "e2", "e3"]
+    );
+    assert_eq!(
+        evt_keys(&mut f, "SELECT k FROM evt WHERE kind = 'home'"),
+        vec!["e2"]
+    );
+    assert_eq!(
+        evt_keys(&mut f, "SELECT k FROM evt WHERE lower(kind) LIKE 'ho%'"),
+        vec!["e1", "e2", "e3"]
+    );
+
+    // On the fixture's own collection, over its `kind` btree. The oracle is
+    // a BRUTE-FORCE filter over the rows this process holds, not the
+    // production range walk over the same two bounds: asking the engine for
+    // the bounds it would have computed makes the test agree with a wrong
+    // prefix successor (`functions::prefix_successor`) as readily as with a
+    // right one, which is exactly the thing under test here.
+    let mut want: Vec<EntityId> = f
+        .rows
+        .iter()
+        .filter(|row| row.kind.starts_with("ho"))
+        .map(|row| f.db.get(f.place, &row.key).unwrap().unwrap().id)
+        .collect();
+    want.sort_by_key(|id| id.sequence);
+    assert!(!want.is_empty(), "the fixture holds `home` rows");
+    assert!(
+        want.len() < f.rows.len(),
+        "and rows the prefix must NOT admit"
+    );
+    for statement in [
+        "SELECT _id FROM place WHERE kind LIKE 'ho%'",
+        "SELECT _id FROM place WHERE starts_with(kind, 'ho')",
+    ] {
+        let mut got = sql_ids(&mut f.db, statement, &[]);
+        got.sort_by_key(|id| id.sequence);
+        assert_eq!(got, want, "{statement}");
+    }
+    // The same range walked by the direct API, kept as the second reading:
+    // the SQL layer compiles to the call a caller would have written, and
+    // both agree with the brute-force answer.
+    let mut api = direct(
+        &f.db,
+        f.place,
+        &[QueryFilter::Scalar {
+            index: f.index.kind,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Included(ScalarValue::Text("ho")),
+                upper: Bound::Excluded(ScalarValue::Text("hp")),
+            },
+        }],
+        QueryOrder::Driver,
+        None,
+    );
+    api.sort_by_key(|id| id.sequence);
+    assert_eq!(api, want);
+}
+
+/// §4.1: every string function the contract names, over projected values,
+/// against Rust's own computation on the same row.
+#[test]
+fn a_string_function_in_a_select_list_is_a_row_function() {
+    let (_dir, mut f) = open();
+    let row = f.rows[3].clone();
+    let rows = match f
+        .db
+        .sql(
+            &format!(
+                "SELECT upper(name), lower(name), length(name), left(name, 3), right(name, 2), \
+                 trim(descr), split_part(descr, ' ', 2), replace(name, 'a', 'A'), \
+                 position(name IN name), concat(name, '|', kind), name || '#' || kind, \
+                 substring(descr, 3, 5), starts_with(kind, 'h') \
+                 FROM place WHERE _key = '{}'",
+                row.key
+            ),
+            &[],
+        )
+        .unwrap()
+    {
+        SqlResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(rows.len(), 1);
+    let v = &rows[0].values;
+    assert_eq!(v[0], SqlValue::Text(row.name.to_uppercase()));
+    assert_eq!(v[1], SqlValue::Text(row.name.to_lowercase()));
+    assert_eq!(v[2], SqlValue::Int(row.name.chars().count() as i64));
+    assert_eq!(
+        v[3],
+        SqlValue::Text(row.name.chars().take(3).collect::<String>())
+    );
+    assert_eq!(
+        v[4],
+        SqlValue::Text(row.name.chars().rev().take(2).collect::<String>().chars().rev().collect::<String>())
+    );
+    assert_eq!(v[5], SqlValue::Text(row.desc.trim().to_owned()));
+    assert_eq!(
+        v[6],
+        SqlValue::Text(row.desc.split(' ').nth(1).unwrap_or_default().to_owned())
+    );
+    assert_eq!(v[7], SqlValue::Text(row.name.replace('a', "A")));
+    assert_eq!(v[8], SqlValue::Int(1));
+    assert_eq!(
+        v[9],
+        SqlValue::Text(format!("{}|{}", row.name, row.kind))
+    );
+    assert_eq!(
+        v[10],
+        SqlValue::Text(format!("{}#{}", row.name, row.kind))
+    );
+    assert_eq!(
+        v[11],
+        SqlValue::Text(row.desc.chars().skip(2).take(5).collect::<String>())
+    );
+    assert_eq!(v[12], SqlValue::Bool(row.kind.starts_with('h')));
+}
+
+/// The eighth law: a rewrite whose pre-image is a SET of ranges has no
+/// atomic in this slice and is REFUSED, not answered by a scan.
+#[test]
+fn a_multi_range_rewrite_is_refused_and_a_missing_expression_index_too() {
+    let (_dir, mut f) = open();
+    timeline(&mut f.db);
+    for sql in [
+        "SELECT k FROM evt WHERE EXTRACT(MONTH FROM at) = 3",
+        "SELECT k FROM evt WHERE EXTRACT(DAY FROM at) = 4",
+        "SELECT k FROM evt WHERE EXTRACT(YEAR FROM at) <> 1950",
+    ] {
+        let error = f.db.sql(sql, &[]).unwrap_err();
+        assert_eq!(
+            error.reason(),
+            Some(e4_prototype::sql::MULTI_RANGE_REASON),
+            "{sql}"
+        );
+    }
+    // No `lower(kind)` index exists on the FIXTURE's collection.
+    let error = f
+        .db
+        .sql("SELECT _id FROM place WHERE lower(kind) = 'home'", &[])
+        .unwrap_err();
+    assert!(
+        format!("{error}").contains("expression index"),
+        "the refusal names the index that is missing: {error}"
+    );
+    // And an infix LIKE names the trigram family rather than taking a scan.
+    let error = f
+        .db
+        .sql("SELECT _id FROM place WHERE kind LIKE '%om%'", &[])
+        .unwrap_err();
+    assert!(format!("{error}").contains("trigram"), "{error}");
+}

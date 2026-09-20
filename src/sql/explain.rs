@@ -53,7 +53,40 @@ pub(super) fn render(
         }
         Ok((prepared.describe(), approximation))
     })?;
-    Ok(format(db, &plan, &work, approximation, notices))
+    let mut out = format(db, &plan, &work, approximation, notices);
+    out.push_str(&rewrites_and_row_functions(select));
+    Ok(out)
+}
+
+/// The two sections `docs/QL_CONTRACT.md` §4.1 and §4.2 ask EXPLAIN for.
+///
+/// They answer different questions and the contract keeps them apart: a RANGE
+/// REWRITE is index-side, folded at prepare, and costs the candidates its
+/// range admits; a ROW FUNCTION is evaluated over values a returned row
+/// already carries, and costs one evaluation per row RETURNED. A reader who
+/// wants to know why a statement is cheap or dear reads which list its
+/// functions are in.
+fn rewrites_and_row_functions(select: &SelectPlan) -> String {
+    let mut out = String::new();
+    out.push_str("range rewrites: ");
+    if select.rewrites.is_empty() {
+        out.push_str("none\n");
+    } else {
+        out.push_str("\n");
+        for line in &select.rewrites {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    out.push_str("row functions: ");
+    if select.row_functions.is_empty() {
+        out.push_str("none\n");
+    } else {
+        out.push_str("\n");
+        for line in &select.row_functions {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    out
 }
 
 /// Run `aggregate` and render its plan, its shape and its counters.

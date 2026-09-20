@@ -29,7 +29,6 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("&&", Tier::Two, "QL_CONTRACT §4.4: `&&` with ST_MakeEnvelope is a Bbox filter on the point or geometry index (p3-geometry-io). Not built in this slice; ST_Within against an envelope is the Tier-1 spelling of the same rectangle."),
     ("@>", Tier::Two, "QL_CONTRACT §3: array containment has no Tier-1 atomic in this slice."),
     ("->>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2)."),
-    ("||", Tier::Two, "QL_CONTRACT §4.1: `||` is a row function on projected values."),
     // ── §2 statements ────────────────────────────────────────────────────
     ("JOIN", Tier::Two, "QL_CONTRACT §4.8: INNER/LEFT JOIN on key equality is a key lookup per driving row, scheduled after GROUP BY; a join on a non-key column and FULL OUTER JOIN are Tier 3 (they need a hash join with spill). A pattern is never compiled to a join."),
     ("OFFSET", Tier::Two, "QL_CONTRACT §5 deviation 4: OFFSET is a keyset continuation, never a skip count. The continuation is the prepared query's own next page; a skip count would read and discard rows, which is work proportional to the skip."),
@@ -47,31 +46,20 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("CLOSE", Tier::Two, "QL_CONTRACT §2: CLOSE ends a cursor declared by DECLARE (p3-wire)."),
     ("VALUES", Tier::Two, "QL_CONTRACT §2: a bare VALUES list as a query source has no atomic in this slice."),
     // ── §4.1 string functions ────────────────────────────────────────────
-    ("LOWER", Tier::Two, "QL_CONTRACT §4.1: string functions are row functions on projected values; lower(col) = x rewrites to an index range only when an expression index lower(col) exists."),
-    ("UPPER", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("LENGTH", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("CONCAT", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("SUBSTRING", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("LEFT", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("RIGHT", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("TRIM", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("SPLIT_PART", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("REPLACE", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("POSITION", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values."),
-    ("STARTS_WITH", Tier::Two, "QL_CONTRACT §4.1: a row function; it rewrites to an index range only with an expression index."),
+    // lower/upper/length/concat/substring/left/right/trim/split_part/replace/
+    // position/starts_with and `||` moved from this table to Tier 1 with
+    // `src/sql/functions.rs`: they are row functions over projected values,
+    // and `lower(col) = x` / `LIKE 'x%'` / `starts_with` are index ranges.
+    // What is left here is what still has no atomic.
     ("REGEXP_REPLACE", Tier::Three, "QL_CONTRACT §4.1: regexp_* has no atomic."),
     ("REGEXP_MATCH", Tier::Three, "QL_CONTRACT §4.1: regexp_* has no atomic."),
     ("COALESCE", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values; a text index spans one declared field, so the concatenation Postgres builds with coalesce is a stored field here (battle50k deviation 1)."),
     // ── §4.2 date and time ───────────────────────────────────────────────
-    ("EXTRACT", Tier::Two, "QL_CONTRACT §4.2: EXTRACT in WHERE is rewritten to one or more scalar Ranges; in SELECT/GROUP BY it is a row function. Not built in this slice."),
-    ("DATE_TRUNC", Tier::Two, "QL_CONTRACT §4.2: date_trunc in WHERE is rewritten to scalar Ranges; in SELECT/GROUP BY it is a row function."),
-    ("NOW", Tier::Two, "QL_CONTRACT §4.2: now() is a constant folded at prepare."),
-    ("CURRENT_DATE", Tier::Two, "QL_CONTRACT §4.2: current_date is a constant folded at prepare."),
-    ("INTERVAL", Tier::Two, "QL_CONTRACT §4.2: interval arithmetic is row arithmetic over Int microseconds."),
-    ("AGE", Tier::Two, "QL_CONTRACT §4.2: age(t) is row arithmetic over Int microseconds."),
-    ("TO_CHAR", Tier::Two, "QL_CONTRACT §4.2: to_char is a row function."),
-    ("TO_TIMESTAMP", Tier::Two, "QL_CONTRACT §4.2: to_timestamp is a row function."),
-    ("TO_DATE", Tier::Two, "QL_CONTRACT §4.2: to_date is a row function."),
+    // EXTRACT, date_trunc, now(), current_date, interval arithmetic, age(),
+    // to_char, to_timestamp and to_date moved to Tier 1 with
+    // `src/sql/functions.rs`: in a WHERE they fold into ONE scalar range, in
+    // a SELECT they are row functions. The MULTI-range forms are refused by
+    // `multi_range` below, which is not a keyword row.
     ("AT TIME ZONE", Tier::Three, "QL_CONTRACT §4.2 and §5 deviation 8: a declared TIMESTAMPTZ is stored as UTC microseconds in an Int; there is no time-zone storage, only display conversion."),
     // ── §4.3 graph ───────────────────────────────────────────────────────
     ("ANY SHORTEST", Tier::Two, "QL_CONTRACT §4.3: ANY SHORTEST / ALL SHORTEST need the unweighted shortest-path atomic."),
@@ -139,6 +127,25 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("POSTGIS_VERSION", Tier::Two, "QL_CONTRACT §2: version(), postgis_version() and current_schema() are fixed rows (p3-pg-surface)."),
     ("CURRENT_SCHEMA", Tier::Two, "QL_CONTRACT §2: version(), postgis_version() and current_schema() are fixed rows (p3-pg-surface)."),
 ];
+
+/// The reason a rewrite whose pre-image is a SET of ranges carries.
+///
+/// `EXTRACT(MONTH FROM t) = 6` is one interval per year in the corpus and
+/// `t <> 'lit'` is the two intervals either side of an instant. A set of
+/// ranges IS the membership-set union `OR` compiles to (`docs/QL_CONTRACT.md`
+/// §3), so these forms wait on that union rather than being emulated by a
+/// scan -- §6 does not allow a scan to be taken silently, and the eighth law
+/// does not allow a construct with no atomic to be emulated.
+pub const MULTI_RANGE: &str = "QL_CONTRACT §4.2 and §3: this rewrite's pre-image is a SET of scalar ranges over the index, not one, and a set of ranges is exactly the membership-set union `OR` and `IN (list)` compile to. That union is not built in this slice, so the multi-range form is refused here rather than emulated by a scan (QL_CONTRACT §6). The single-range forms -- EXTRACT(YEAR FROM t), date_trunc('unit', t), t::date, t >= lit, t BETWEEN, t > now() - interval -- are accepted.";
+
+/// The error a multi-range rewrite produces, naming the construct.
+pub(super) fn multi_range(what: &str) -> SqlError {
+    SqlError::Refused {
+        keyword: what.to_owned(),
+        tier: Tier::Two,
+        reason: MULTI_RANGE,
+    }
+}
 
 /// The reason a keyword carries, if it is in the table.
 pub(super) fn lookup(keyword: &str) -> Option<(Tier, &'static str)> {

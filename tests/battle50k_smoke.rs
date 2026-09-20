@@ -244,6 +244,22 @@ fn brute_matches(row: &Row, corpus: &Corpus, q: &Queries, name: &str, i: usize) 
         // Every corpus row has a `born`, so the complement of the nullish key
         // is the whole corpus.
         "bool_not_null_born" => true,
+
+        // ── the function battery (QL_CONTRACT §4.1, §4.2) ───────────────
+        // `born_ts` is `born` -- a yyyymmdd integer -- as the instant it
+        // names, so every date predicate over it is arithmetic on that
+        // integer here, with no engine call and no date library.
+        "fn_year_eq" => row.born / 10_000 == q.fn_year(i),
+        // `date_trunc('month', t) BETWEEN 'Y-01-01' AND 'Y-06-01'` is the
+        // first six months of `Y`: the lower literal IS a month boundary, and
+        // the upper one admits the whole of June.
+        "fn_trunc_month_range" => {
+            row.born / 10_000 == q.fn_year(i) && (1..=6).contains(&(row.born / 100 % 100))
+        }
+        "fn_lower_eq" => row.kind.to_lowercase() == kind.to_lowercase(),
+        "fn_like_prefix" => row.name.starts_with(q.name_prefix(i)),
+        // The projection is the case; its WHERE is `born_range`'s.
+        "fn_project_strings" => in_born(),
         other => panic!("no brute force for filter case `{other}`"),
     }
 }
@@ -514,6 +530,74 @@ fn the_e4_sql_arm_asks_the_same_questions_as_the_e4_arm() {
             assert_eq!(
                 sql_case["recall_at_k"], api_case["recall_at_k"],
                 "{name}: the two arms reported different recall"
+            );
+        }
+    }
+}
+
+/// `--reuse` provisioning is idempotent, and it refuses rather than measures
+/// when it cannot prove the column it added is filled.
+///
+/// The fresh load already writes `born_ts` and its three indexes, so the
+/// first `--reuse` run over that database finds them, PROVES the fill from
+/// the rows (`count(born_ts is not null) == count(*)`), records the proof in
+/// the side marker and adds nothing. The second run reads the marker and
+/// skips even the proof. Both must answer exactly what the fresh load
+/// answered: a provisioning path that quietly changed the answer would show
+/// up here as a row-count difference.
+#[test]
+fn reuse_provisioning_is_idempotent_and_answers_what_the_fresh_load_answers() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = dir.path().join("places-200.jsonl");
+    let queries_path = dir.path().join("queries.json");
+    write_corpus(&data);
+    write_queries(&queries_path);
+
+    let mut fresh = Options::new(Arm::E4, &data, &queries_path, dir.path().join("fresh.json"));
+    fresh.db_dir = dir.path().join("e4-db");
+    let fresh_report = run_arm(&fresh).expect("the fresh E4 arm runs");
+
+    let marker = dir.path().join("e4-db.provision.json");
+    assert!(
+        !marker.exists(),
+        "a fresh load needs no provisioning and writes no marker"
+    );
+
+    for pass in 0..2 {
+        let mut reuse = Options::new(
+            Arm::E4,
+            &data,
+            &queries_path,
+            dir.path().join(format!("reuse{pass}.json")),
+        );
+        reuse.db_dir = dir.path().join("e4-db");
+        reuse.reuse = true;
+        let report = run_arm(&reuse).expect("the reused E4 arm runs");
+        assert!(
+            marker.exists(),
+            "pass {pass}: the provisioning proof is recorded beside the database"
+        );
+        let recorded: Value =
+            serde_json::from_slice(&fs::read(&marker).expect("marker reads")).expect("marker JSON");
+        assert_eq!(
+            recorded["complete"].as_bool(),
+            Some(true),
+            "pass {pass}: the marker records a finished fill"
+        );
+        assert_eq!(
+            recorded["rows"].as_u64(),
+            Some(ROWS as u64),
+            "pass {pass}: the marker records the row count it proved"
+        );
+        for spec in &BATTERY {
+            if needs_graph(spec.name) {
+                continue;
+            }
+            assert_eq!(
+                case_of(&report, spec.name)["total_rows"],
+                case_of(&fresh_report, spec.name)["total_rows"],
+                "pass {pass}, {}: reuse answered a different question",
+                spec.name
             );
         }
     }

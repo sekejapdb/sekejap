@@ -7,10 +7,47 @@
 //! contract does not mention at all is a syntax error naming the place.
 
 use super::ast::*;
+use super::functions::{self, TimeUnit};
 use super::lexer::{tokenize, Tok, Token};
 use super::refuse;
 use super::{SqlError, SqlResult2};
 use crate::Kind;
+
+/// The §4.1 / §4.2 function names this parser reads as ROW functions or, in a
+/// `WHERE`, as range rewrites. Everything outside this set and outside
+/// `refuse::TABLE` is a syntax error naming the place.
+const ROW_FUNCTIONS: &[&str] = &[
+    "EXTRACT",
+    "DATE_TRUNC",
+    "NOW",
+    "CURRENT_DATE",
+    "CURRENT_TIMESTAMP",
+    "INTERVAL",
+    "AGE",
+    "TO_CHAR",
+    "TO_TIMESTAMP",
+    "TO_DATE",
+    "LOWER",
+    "UPPER",
+    "LENGTH",
+    "CHAR_LENGTH",
+    "CONCAT",
+    "SUBSTRING",
+    "SUBSTR",
+    "LEFT",
+    "RIGHT",
+    "TRIM",
+    "BTRIM",
+    "SPLIT_PART",
+    "REPLACE",
+    "POSITION",
+    "STRPOS",
+    "STARTS_WITH",
+];
+
+/// The reason a `LIKE` that is not a pure prefix carries. Named here because
+/// two sites raise it and `docs/QL_CONTRACT.md` §3 writes it once.
+pub(super) const LIKE_NOT_A_PREFIX: &str = "QL_CONTRACT §3: `LIKE 'abc%'` is a text-key PREFIX range and is accepted; any other pattern (`'%abc%'`, `'a_c'`, an interior `%`) needs the trigram index family (pg_trgm-compatible) under a new feature bit, which is not built. Without that index the only way to answer it is a scan, and §6 does not allow one to be taken silently.";
 
 /// A statement nests at most this deep: a scalar subquery inside a predicate
 /// inside a statement, and an arithmetic ORDER BY of bounded depth. The cap is
@@ -193,7 +230,6 @@ impl Parser {
             Tok::Overlaps => "&&",
             Tok::ContainsOp => "@>",
             Tok::LongArrow => "->>",
-            Tok::Concat => "||",
             Tok::VecL1 => "<+>",
             Tok::Tilde => "~",
             _ => return Ok(()),
@@ -536,7 +572,25 @@ impl Parser {
         let name = self.name()?;
         self.expect_word("ON")?;
         let table = self.name()?;
-        self.expect_word("USING")?;
+        // `CREATE INDEX i ON t (lower(col))` -- an EXPRESSION index, written
+        // the way Postgres writes one. `USING btree (lower(col))` is the same
+        // index with the method spelled out (QL_CONTRACT §4.1).
+        if !self.eat_word("USING") {
+            self.expect(&Tok::LParen)?;
+            let method = self.index_expression()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(Stmt::CreateIndex {
+                name,
+                table,
+                method: if unique {
+                    return Err(SqlError::unsupported(
+                        "UNIQUE on an expression index: uniqueness over a folded value would refuse two rows that differ, which is not what the statement says",
+                    ));
+                } else {
+                    method
+                },
+            });
+        }
         let method_at = self.here();
         let Some(method) = self.word() else {
             return Err(SqlError::syntax("expected an index method", method_at));
@@ -544,7 +598,7 @@ impl Parser {
         self.bump();
         self.expect(&Tok::LParen)?;
         let method = match method.as_str() {
-            "BTREE" => IndexMethod::Btree(self.name()?),
+            "BTREE" => self.index_expression()?,
             "GIN" => {
                 // `gin(to_tsvector('simple', col))` -- the expression index
                 // Postgres needs, spelled the same way the query spells it.
@@ -604,6 +658,20 @@ impl Parser {
     }
 
     /// `vector_cosine_ops` and its siblings, which name the metric.
+    /// A btree index's target: a column, or `lower(column)`.
+    fn index_expression(&mut self) -> SqlResult2<IndexMethod> {
+        if self.word().as_deref().map(str::to_ascii_uppercase).as_deref() == Some("LOWER")
+            && matches!(self.peek_at(1), Tok::LParen)
+        {
+            self.bump();
+            self.expect(&Tok::LParen)?;
+            let column = self.name()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(IndexMethod::LowerBtree(column));
+        }
+        Ok(IndexMethod::Btree(self.name()?))
+    }
+
     fn vector_opclass(&mut self) -> SqlResult2<()> {
         if let Some(word) = self.word() {
             match word.as_str() {
@@ -1060,6 +1128,13 @@ impl Parser {
         if let Some((function, argument)) = self.aggregate_call()? {
             return Ok(SelectItem::Aggregate { function, argument });
         }
+        // A §4.1 / §4.2 ROW function, or a plain name that a cast or a `||`
+        // turns into one. Cost is proportional to the rows RETURNED and
+        // EXPLAIN says so (QL_CONTRACT §4.1, §4.2).
+        if self.at_row_function() || self.row_expression_ahead() {
+            let expr = self.row_expr()?;
+            return Ok(SelectItem::Function(Box::new(expr)));
+        }
         // A plain name, possibly qualified, is a column; anything else is an
         // expression, and the only expression a select list can hold here is
         // this statement's own ranking value.
@@ -1273,6 +1348,12 @@ impl Parser {
     }
 
     fn predicate_inner(&mut self, negated: &mut bool) -> SqlResult2<Predicate> {
+        // A §4.1 / §4.2 function at the head of a predicate is a RANGE
+        // REWRITE, not a row test: the function folds into scalar index
+        // bounds at compile time (QL_CONTRACT §4.1, §4.2).
+        if let Some(predicate) = self.function_predicate()? {
+            return Ok(predicate);
+        }
         self.guard_word()?;
         if let Some(word) = self.word() {
             match word.as_str() {
@@ -1286,24 +1367,67 @@ impl Parser {
         let column = self.name()?;
         // A cast on the left of a predicate (`plot::geometry`) is PostGIS's
         // way of choosing the planar overload; the unit semantics here come
-        // from the predicate itself, so the cast is read and dropped.
-        self.optional_cast()?;
+        // from the predicate itself, so the cast is read and dropped. A cast
+        // to DATE is NOT dropped: `t::date = 'lit'` is one day's range.
+        let cast_to_date = self.date_cast()?;
         self.guard_operator()?;
+        if cast_to_date {
+            let op = self.comparison(&format!("{column}::date"))?;
+            return Ok(Predicate::Time {
+                column,
+                shape: TimeShape::CastDate {
+                    op,
+                    value: self.literal()?,
+                },
+            });
+        }
+        // `col LIKE 'abc%'` is a text-key prefix range over `col`'s own
+        // btree; any other pattern needs the trigram family (§3).
+        if self.word().as_deref().map(str::to_ascii_uppercase).as_deref() == Some("LIKE") {
+            self.bump();
+            let value = self.literal()?;
+            return Ok(Predicate::TextFn {
+                column,
+                shape: TextShape::Prefix {
+                    value,
+                    written: "LIKE",
+                },
+            });
+        }
         if let Some(word) = self.word() {
             match word.as_str() {
                 "BETWEEN" => {
                     self.bump();
-                    let lower = self.literal()?;
+                    let lower_clock = self.clock_value()?;
+                    let lower = match lower_clock {
+                        Some(value) => value,
+                        None => TimeValue::Lit(self.literal()?),
+                    };
                     self.expect_word("AND")?;
-                    let upper = self.literal()?;
-                    return Ok(if super::is_key_column(&column) {
-                        Predicate::KeyBetween { lower, upper }
-                    } else {
-                        Predicate::Between {
-                            column,
-                            lower,
-                            upper,
-                        }
+                    let upper_clock = self.clock_value()?;
+                    let upper = match upper_clock {
+                        Some(value) => value,
+                        None => TimeValue::Lit(self.literal()?),
+                    };
+                    // The clock on either side makes this a §4.2 rewrite; two
+                    // plain literals stay the Tier-1 Range they always were.
+                    if let (TimeValue::Lit(lower), TimeValue::Lit(upper)) = (&lower, &upper) {
+                        return Ok(if super::is_key_column(&column) {
+                            Predicate::KeyBetween {
+                                lower: lower.clone(),
+                                upper: upper.clone(),
+                            }
+                        } else {
+                            Predicate::Between {
+                                column,
+                                lower: lower.clone(),
+                                upper: upper.clone(),
+                            }
+                        });
+                    }
+                    return Ok(Predicate::Time {
+                        column,
+                        shape: TimeShape::ClockBetween { lower, upper },
                     });
                 }
                 "IS" => {
@@ -1367,6 +1491,12 @@ impl Parser {
             }
         };
         self.bump();
+        if let Some(value) = self.clock_value()? {
+            return Ok(Predicate::Time {
+                column,
+                shape: TimeShape::Clock { op, value },
+            });
+        }
         let value = self.literal()?;
         Ok(if super::is_key_column(&column) {
             Predicate::KeyCompare { op, value }
@@ -1432,6 +1562,32 @@ impl Parser {
         } else {
             Predicate::InList { column, values }
         })
+    }
+    /// Read the casts on the left of a predicate, reporting whether the last
+    /// one was `::date`.
+    fn date_cast(&mut self) -> SqlResult2<bool> {
+        let mut to_date = false;
+        while matches!(self.peek(), Tok::Cast) {
+            let at = self.here();
+            self.bump();
+            let Some(word) = self.word() else {
+                return Err(SqlError::syntax("expected a type after `::`", at));
+            };
+            self.bump();
+            to_date = false;
+            match word.to_ascii_uppercase().as_str() {
+                "DATE" => to_date = true,
+                "GEOGRAPHY" | "GEOMETRY" | "VECTOR" | "TEXT" | "FLOAT8" | "INT" | "INTEGER"
+                | "BIGINT" | "REAL" | "TIMESTAMPTZ" | "TIMESTAMP" => {}
+                "DOUBLE" => self.expect_word("PRECISION")?,
+                other => {
+                    return Err(SqlError::unsupported(format!(
+                        "cast `::{other}` has no Tier-1 meaning here"
+                    )))
+                }
+            }
+        }
+        Ok(to_date)
     }
 
     fn text_predicate(&mut self) -> SqlResult2<Predicate> {
@@ -1895,6 +2051,647 @@ impl Parser {
                 at,
             )),
         }
+    }
+
+    // ── §4.1 string and §4.2 date/time functions ─────────────────────────
+
+    /// True when the SELECT-list item that starts at the cursor holds a
+    /// §4.1 / §4.2 function, a `||` or a cast anywhere inside it.
+    ///
+    /// The lookahead runs to the item's own terminator -- a comma at depth
+    /// zero, `AS`, or `FROM` -- so it cannot reach into the next item or into
+    /// the rest of the statement. A ranking expression
+    /// (`1 - (emb <=> $v)`) holds none of these tokens and keeps its own
+    /// path, which is the Score atomic.
+    fn row_expression_ahead(&self) -> bool {
+        let mut depth = 0usize;
+        let mut at = 0usize;
+        loop {
+            let token = self.peek_at(at);
+            match token {
+                Tok::Eof => return false,
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                Tok::Comma if depth == 0 => return false,
+                Tok::Concat | Tok::Cast => return true,
+                Tok::Word(word) if depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    if matches!(upper.as_str(), "AS" | "FROM") {
+                        return false;
+                    }
+                    if ROW_FUNCTIONS.contains(&upper.as_str()) {
+                        return true;
+                    }
+                }
+                Tok::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    if ROW_FUNCTIONS.contains(&upper.as_str()) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+    }
+
+    /// True when the cursor stands on a §4.1 / §4.2 function CALL.
+    fn at_row_function(&self) -> bool {
+        let Some(word) = self.word().map(|w| w.to_ascii_uppercase()) else {
+            return false;
+        };
+        if matches!(word.as_str(), "CURRENT_DATE" | "CURRENT_TIMESTAMP") {
+            return true;
+        }
+        ROW_FUNCTIONS.contains(&word.as_str()) && matches!(self.peek_at(1), Tok::LParen)
+    }
+
+    /// The unit `EXTRACT(<unit> FROM t)` names, written bare.
+    fn extract_unit(&mut self) -> SqlResult2<TimeUnit> {
+        let at = self.here();
+        let word = match self.peek().clone() {
+            Tok::Word(word) => word,
+            Tok::Str(text) => text,
+            other => {
+                return Err(SqlError::syntax(
+                    format!("expected an EXTRACT field, found `{}`", other.written()),
+                    at,
+                ))
+            }
+        };
+        self.bump();
+        TimeUnit::parse(&word).ok_or_else(|| {
+            SqlError::unsupported(format!(
+                "EXTRACT({word} FROM t): QL_CONTRACT §4.2 names YEAR, MONTH, DAY, DOW, HOUR, MINUTE, SECOND and EPOCH"
+            ))
+        })
+    }
+
+    /// `interval '<n> <unit>'`, folded to microseconds at parse.
+    fn interval_micros(&mut self) -> SqlResult2<i64> {
+        self.expect_word("INTERVAL")?;
+        let at = self.here();
+        match self.bump() {
+            Tok::Str(text) => functions::parse_interval(&text),
+            other => Err(SqlError::syntax(
+                format!("interval takes a quoted magnitude, found `{}`", other.written()),
+                at,
+            )),
+        }
+    }
+
+    /// `now()` / `current_date` / `current_timestamp`, optionally `+` or `-`
+    /// an interval. `None` when the cursor is not on the clock.
+    fn clock_value(&mut self) -> SqlResult2<Option<TimeValue>> {
+        let word = self.word().map(|w| w.to_ascii_uppercase());
+        let date_only = match word.as_deref() {
+            Some("NOW") => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                self.expect(&Tok::RParen)?;
+                false
+            }
+            Some("CURRENT_TIMESTAMP") => {
+                self.bump();
+                if self.eat(&Tok::LParen) {
+                    self.expect(&Tok::RParen)?;
+                }
+                false
+            }
+            Some("CURRENT_DATE") => {
+                self.bump();
+                true
+            }
+            _ => return Ok(None),
+        };
+        let mut offset = 0i64;
+        loop {
+            let sign = if self.eat(&Tok::Minus) {
+                -1
+            } else if self.eat(&Tok::Plus) {
+                1
+            } else {
+                break;
+            };
+            offset += sign * self.interval_micros()?;
+        }
+        Ok(Some(TimeValue::Clock { date_only, offset }))
+    }
+
+    /// A `WHERE` predicate whose head is a §4.1 / §4.2 function call, or
+    /// `None` when the cursor is not on one.
+    ///
+    /// Every shape here folds into scalar index RANGES at compile time; the
+    /// function is never evaluated per candidate. `compile.rs` is what
+    /// decides whether the pre-image is ONE range (accepted) or a SET of them
+    /// (refused while the membership union `OR` compiles to is unbuilt).
+    fn function_predicate(&mut self) -> SqlResult2<Option<Predicate>> {
+        let Some(word) = self.word().map(|w| w.to_ascii_uppercase()) else {
+            return Ok(None);
+        };
+        match word.as_str() {
+            "EXTRACT" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let unit = self.extract_unit()?;
+                self.expect_word("FROM")?;
+                let column = self.name()?;
+                self.expect(&Tok::RParen)?;
+                let shape = if self.eat_word("BETWEEN") {
+                    let lower = self.literal()?;
+                    self.expect_word("AND")?;
+                    let upper = self.literal()?;
+                    TimeShape::ExtractBetween { unit, lower, upper }
+                } else {
+                    let op = self.comparison(&format!("EXTRACT({} FROM {column})", unit.written()))?;
+                    TimeShape::Extract {
+                        unit,
+                        op,
+                        value: self.literal()?,
+                    }
+                };
+                Ok(Some(Predicate::Time { column, shape }))
+            }
+            "DATE_TRUNC" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let at = self.here();
+                let unit = match self.bump() {
+                    Tok::Str(text) => TimeUnit::parse(&text).ok_or_else(|| {
+                        SqlError::unsupported(format!(
+                            "date_trunc('{text}', t): QL_CONTRACT §4.2 names year, month, day, hour, minute and second"
+                        ))
+                    })?,
+                    other => {
+                        return Err(SqlError::syntax(
+                            format!("date_trunc takes a quoted unit, found `{}`", other.written()),
+                            at,
+                        ))
+                    }
+                };
+                if !unit.truncates() {
+                    return Err(SqlError::unsupported(format!(
+                        "date_trunc('{}', t): `{}` is an EXTRACT field, not a truncation unit",
+                        unit.written(),
+                        unit.written()
+                    )));
+                }
+                self.expect(&Tok::Comma)?;
+                let column = self.name()?;
+                self.expect(&Tok::RParen)?;
+                let shape = if self.eat_word("BETWEEN") {
+                    let lower = self.literal()?;
+                    self.expect_word("AND")?;
+                    let upper = self.literal()?;
+                    TimeShape::TruncBetween { unit, lower, upper }
+                } else {
+                    let op =
+                        self.comparison(&format!("date_trunc('{}', {column})", unit.written()))?;
+                    TimeShape::Trunc {
+                        unit,
+                        op,
+                        value: self.literal()?,
+                    }
+                };
+                Ok(Some(Predicate::Time { column, shape }))
+            }
+            "LOWER" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let column = self.name()?;
+                self.expect(&Tok::RParen)?;
+                if self.eat_word("LIKE") {
+                    let value = self.literal()?;
+                    return Ok(Some(Predicate::TextFn {
+                        column,
+                        shape: TextShape::LowerPrefix {
+                            value,
+                            written: "LIKE",
+                        },
+                    }));
+                }
+                let op = self.comparison(&format!("lower({column})"))?;
+                if op != CmpOp::Eq {
+                    return Err(SqlError::unsupported(format!(
+                        "lower({column}) {} v: QL_CONTRACT §4.1 rewrites lower(col) = v to an index EQUALITY and lower(col) LIKE 'v%' to a prefix range; an ordering comparison over a folded value is neither",
+                        op.written()
+                    )));
+                }
+                Ok(Some(Predicate::TextFn {
+                    column,
+                    shape: TextShape::LowerEq {
+                        value: self.literal()?,
+                    },
+                }))
+            }
+            "STARTS_WITH" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let lowered = self.eat_word("LOWER");
+                if lowered {
+                    self.expect(&Tok::LParen)?;
+                }
+                let column = self.name()?;
+                if lowered {
+                    self.expect(&Tok::RParen)?;
+                }
+                self.expect(&Tok::Comma)?;
+                let value = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Some(Predicate::TextFn {
+                    column,
+                    shape: if lowered {
+                        TextShape::LowerPrefix {
+                            value,
+                            written: "starts_with",
+                        }
+                    } else {
+                        TextShape::Prefix {
+                            value,
+                            written: "starts_with",
+                        }
+                    },
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The comparison operator after a function call, with the call named in
+    /// the error when there is none.
+    fn comparison(&mut self, what: &str) -> SqlResult2<CmpOp> {
+        let at = self.here();
+        let op = match self.peek() {
+            Tok::Eq => CmpOp::Eq,
+            Tok::Ne => CmpOp::Ne,
+            Tok::Lt => CmpOp::Lt,
+            Tok::Le => CmpOp::Le,
+            Tok::Gt => CmpOp::Gt,
+            Tok::Ge => CmpOp::Ge,
+            other => {
+                return Err(SqlError::syntax(
+                    format!("expected a comparison after `{what}`, found `{}`", other.written()),
+                    at,
+                ))
+            }
+        };
+        self.bump();
+        Ok(op)
+    }
+
+    /// A ROW expression: `a + b`, `a - b`, `a || b` over the §4.1 / §4.2
+    /// function set. One row in, one value out.
+    fn row_expr(&mut self) -> SqlResult2<RowExpr> {
+        self.deeper()?;
+        let result = self.row_expr_inner();
+        self.shallower();
+        result
+    }
+
+    fn row_expr_inner(&mut self) -> SqlResult2<RowExpr> {
+        let mut left = self.row_atom()?;
+        loop {
+            left = match self.peek() {
+                Tok::Plus => {
+                    self.bump();
+                    RowExpr::Add(Box::new(left), Box::new(self.row_atom()?))
+                }
+                Tok::Minus => {
+                    self.bump();
+                    RowExpr::Sub(Box::new(left), Box::new(self.row_atom()?))
+                }
+                Tok::Concat => {
+                    self.bump();
+                    RowExpr::Concat(Box::new(left), Box::new(self.row_atom()?))
+                }
+                _ => return Ok(left),
+            };
+        }
+    }
+
+    /// `::date` and `::text` change the value; every other cast this grammar
+    /// already read and dropped keeps doing so.
+    fn row_casts(&mut self, mut expr: RowExpr) -> SqlResult2<RowExpr> {
+        while matches!(self.peek(), Tok::Cast) {
+            let at = self.here();
+            self.bump();
+            let Some(word) = self.word() else {
+                return Err(SqlError::syntax("expected a type after `::`", at));
+            };
+            self.bump();
+            expr = match word.to_ascii_uppercase().as_str() {
+                "DATE" => RowExpr::CastDate(Box::new(expr)),
+                "TEXT" | "VARCHAR" => RowExpr::CastText(Box::new(expr)),
+                "TIMESTAMPTZ" | "TIMESTAMP" => expr,
+                "INT" | "INTEGER" | "BIGINT" | "REAL" | "FLOAT8" => expr,
+                "DOUBLE" => {
+                    self.expect_word("PRECISION")?;
+                    expr
+                }
+                other => {
+                    return Err(SqlError::unsupported(format!(
+                        "cast `::{other}` has no Tier-1 meaning in a row expression"
+                    )))
+                }
+            };
+        }
+        Ok(expr)
+    }
+
+    fn row_atom(&mut self) -> SqlResult2<RowExpr> {
+        if self.eat(&Tok::LParen) {
+            let inner = self.row_expr()?;
+            self.expect(&Tok::RParen)?;
+            return self.row_casts(inner);
+        }
+        let at = self.here();
+        if matches!(self.peek(), Tok::Num(_, _) | Tok::Str(_) | Tok::Param(_) | Tok::Minus) {
+            let literal = self.literal_no_cast()?;
+            return self.row_casts(RowExpr::Lit(literal));
+        }
+        let word = match self.word() {
+            Some(word) => word.to_ascii_uppercase(),
+            None => {
+                return Err(SqlError::syntax(
+                    format!("expected a value, found `{}`", self.peek().written()),
+                    at,
+                ))
+            }
+        };
+        if word == "INTERVAL" {
+            return Ok(RowExpr::Interval(self.interval_micros()?));
+        }
+        if let Some(TimeValue::Clock { date_only, offset }) = self.clock_value()? {
+            let clock = if date_only {
+                RowExpr::CurrentDate
+            } else {
+                RowExpr::Now
+            };
+            let expr = if offset == 0 {
+                clock
+            } else {
+                RowExpr::Add(Box::new(clock), Box::new(RowExpr::Interval(offset)))
+            };
+            return self.row_casts(expr);
+        }
+        let expr = match word.as_str() {
+            "EXTRACT" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let unit = self.extract_unit()?;
+                self.expect_word("FROM")?;
+                let arg = self.row_expr()?;
+                self.expect(&Tok::RParen)?;
+                RowExpr::Extract {
+                    unit,
+                    arg: Box::new(arg),
+                }
+            }
+            "DATE_TRUNC" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let unit_at = self.here();
+                let unit = match self.bump() {
+                    Tok::Str(text) => TimeUnit::parse(&text)
+                        .filter(|unit| unit.truncates())
+                        .ok_or_else(|| {
+                            SqlError::unsupported(format!(
+                                "date_trunc('{text}', t): QL_CONTRACT §4.2 names year, month, day, hour, minute and second"
+                            ))
+                        })?,
+                    other => {
+                        return Err(SqlError::syntax(
+                            format!("date_trunc takes a quoted unit, found `{}`", other.written()),
+                            unit_at,
+                        ))
+                    }
+                };
+                self.expect(&Tok::Comma)?;
+                let arg = self.row_expr()?;
+                self.expect(&Tok::RParen)?;
+                RowExpr::Trunc {
+                    unit,
+                    arg: Box::new(arg),
+                }
+            }
+            "AGE" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let left = self.row_expr()?;
+                let right = if self.eat(&Tok::Comma) {
+                    Some(Box::new(self.row_expr()?))
+                } else {
+                    None
+                };
+                self.expect(&Tok::RParen)?;
+                RowExpr::Age {
+                    left: Box::new(left),
+                    right,
+                }
+            }
+            "TO_CHAR" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let arg = self.row_expr()?;
+                self.expect(&Tok::Comma)?;
+                let format_at = self.here();
+                let format = match self.bump() {
+                    Tok::Str(text) => text,
+                    other => {
+                        return Err(SqlError::syntax(
+                            format!("to_char takes a quoted template, found `{}`", other.written()),
+                            format_at,
+                        ))
+                    }
+                };
+                self.expect(&Tok::RParen)?;
+                RowExpr::ToChar {
+                    arg: Box::new(arg),
+                    format,
+                }
+            }
+            "TO_TIMESTAMP" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let arg = self.row_expr()?;
+                self.expect(&Tok::RParen)?;
+                RowExpr::ToTimestamp(Box::new(arg))
+            }
+            "TO_DATE" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let arg = self.row_expr()?;
+                if self.eat(&Tok::Comma) {
+                    let at = self.here();
+                    match self.bump() {
+                        // The template is read and checked against the one
+                        // form this slice parses; a different template would
+                        // silently mean a different literal grammar.
+                        Tok::Str(text) if text == "YYYY-MM-DD" => {}
+                        other => {
+                            return Err(SqlError::unsupported(format!(
+                                "to_date(t, {}): the literal grammar QL_CONTRACT §4.2 accepts is ISO-8601, so the only template is 'YYYY-MM-DD'",
+                                other.written()
+                            )))
+                            .map_err(|e: SqlError| {
+                                let _ = at;
+                                e
+                            })
+                        }
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                RowExpr::ToDate(Box::new(arg))
+            }
+            "POSITION" | "STRPOS" => {
+                let strpos = word == "STRPOS";
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let first = self.row_expr()?;
+                let second = if strpos {
+                    self.expect(&Tok::Comma)?;
+                    self.row_expr()?
+                } else {
+                    self.expect_word("IN")?;
+                    self.row_expr()?
+                };
+                self.expect(&Tok::RParen)?;
+                // `position(sub IN s)` and `strpos(s, sub)` take their two
+                // arguments in opposite orders, which is Postgres's own shape.
+                let (haystack, needle) = if strpos {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                RowExpr::Str {
+                    func: StrFunc::Position,
+                    args: vec![haystack, needle],
+                }
+            }
+            "SUBSTRING" | "SUBSTR" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let mut args = vec![self.row_expr()?];
+                if self.eat_word("FROM") {
+                    args.push(self.row_expr()?);
+                    if self.eat_word("FOR") {
+                        args.push(self.row_expr()?);
+                    }
+                } else {
+                    self.expect(&Tok::Comma)?;
+                    args.push(self.row_expr()?);
+                    if self.eat(&Tok::Comma) {
+                        args.push(self.row_expr()?);
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                RowExpr::Str {
+                    func: StrFunc::Substring,
+                    args,
+                }
+            }
+            "TRIM" | "BTRIM" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                // `trim(BOTH ' ' FROM s)` picks a side and a fill character;
+                // this slice trims ASCII/Unicode whitespace from both ends,
+                // which is `btrim(s)`.
+                for side in ["BOTH", "LEADING", "TRAILING"] {
+                    if self.word().as_deref() == Some(side) {
+                        return Err(SqlError::unsupported(format!(
+                            "trim({side} ... FROM s): QL_CONTRACT §4.1 names `trim`, which is btrim -- whitespace off both ends"
+                        )));
+                    }
+                }
+                let arg = self.row_expr()?;
+                self.expect(&Tok::RParen)?;
+                RowExpr::Str {
+                    func: StrFunc::Trim,
+                    args: vec![arg],
+                }
+            }
+            other => {
+                let func = match other {
+                    "LOWER" => StrFunc::Lower,
+                    "UPPER" => StrFunc::Upper,
+                    "LENGTH" | "CHAR_LENGTH" => StrFunc::Length,
+                    "CONCAT" => StrFunc::Concat,
+                    "LEFT" => StrFunc::Left,
+                    "RIGHT" => StrFunc::Right,
+                    "SPLIT_PART" => StrFunc::SplitPart,
+                    "REPLACE" => StrFunc::Replace,
+                    "STARTS_WITH" => StrFunc::StartsWith,
+                    _ => {
+                        // Not a function: a plain column, possibly cast.
+                        if matches!(self.peek_at(1), Tok::LParen) {
+                            let name = self.word().unwrap_or_default();
+                            return Err(match self.listed(&name.to_ascii_uppercase()) {
+                                Some(error) => error,
+                                None => SqlError::unsupported(format!(
+                                    "function `{name}` is not in QL_CONTRACT §4.1 or §4.2"
+                                )),
+                            });
+                        }
+                        self.guard_word()?;
+                        let name = self.name()?;
+                        return self.row_casts(RowExpr::Column(name));
+                    }
+                };
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let mut args = Vec::new();
+                if !matches!(self.peek(), Tok::RParen) {
+                    loop {
+                        args.push(self.row_expr()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                RowExpr::Str { func, args }
+            }
+        };
+        self.row_casts(expr)
+    }
+
+    /// A literal without the trailing cast, which a row expression reads
+    /// itself so `'2020-01-01'::date` is one node rather than two.
+    fn literal_no_cast(&mut self) -> SqlResult2<Literal> {
+        if self.eat(&Tok::Minus) {
+            return match self.literal_no_cast()? {
+                Literal::Num(value, exact) => Ok(Literal::Num(-value, exact)),
+                other => Err(SqlError::unsupported(format!(
+                    "unary minus applies to a number, not to {other:?}"
+                ))),
+            };
+        }
+        let at = self.here();
+        Ok(match self.peek().clone() {
+            Tok::Num(value, exact) => {
+                self.bump();
+                Literal::Num(value, exact)
+            }
+            Tok::Str(text) => {
+                self.bump();
+                Literal::Str(text)
+            }
+            Tok::Param(n) => {
+                self.bump();
+                Literal::Param(n)
+            }
+            other => {
+                return Err(SqlError::syntax(
+                    format!("expected a literal, found `{}`", other.written()),
+                    at,
+                ))
+            }
+        })
     }
 
     // ── GRAPH_TABLE ──────────────────────────────────────────────────────

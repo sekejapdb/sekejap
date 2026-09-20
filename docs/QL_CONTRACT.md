@@ -127,8 +127,8 @@ remaining conjuncts or from the order -- but when nothing else can walk, the
 union set itself drives in ascending entity id (`QueryDriver::Membership`).
 Its cost is one candidate per member and no posting and no record: the set is
 already built and already charged.
-| `LIKE 'abc%'` | T2 | text-key prefix range |
-| `LIKE '%abc%'`, `ILIKE` | T2 | trigram index family (pg_trgm-compatible), new family under a feature bit; without the index: full scan, cost printed by EXPLAIN |
+| `LIKE 'abc%'` | T1 | text-key prefix range `[abc, abd)` on the column's own scalar index (`functions::prefix_successor`, §4.1); `starts_with(col, 'abc')` is the same range. A prefix whose successor is not valid UTF-8 (`'\u{ff}%'` is `C3 BF`, whose successor is `C3 C0`) is REFUSED with a named reason: a text bound is a `String`, and widening it to the replacement character would admit every value in between |
+| `LIKE '%abc%'`, an interior `%` or `_`, `ILIKE` | T2 | trigram index family (pg_trgm-compatible), new family under a feature bit. NOT demoted to a scan without it: §6 does not allow a scan to be taken silently, so the form is refused and names the family |
 | `SIMILAR TO`, regex `~` | T3 | no index atomic |
 
 ## 4. Functions
@@ -137,7 +137,8 @@ already built and already charged.
 
 | function | tier | execution |
 |---|---|---|
-| `lower`, `upper`, `length`, `concat`, `||`, `substring`, `left`, `right`, `trim`, `split_part`, `replace`, `position`, `starts_with` | T2 | row functions on projected values; `lower(col) = x` and `starts_with` rewrite to an index range when an expression index `lower(col)` exists |
+| `lower`, `upper`, `length`, `concat`, `||`, `substring`, `left`, `right`, `trim`, `split_part`, `replace`, `position`, `starts_with` | T1 | `src/sql/functions.rs`: row functions on PROJECTED values (`CompiledRow::eval`, `src/sql/compile.rs`) -- one row in, one value out, no read of any other row, so the cost is proportional to the rows RETURNED and `EXPLAIN` prints each under `row functions`. In a WHERE: `col LIKE 'x%'` and `starts_with(col, 'x')` are a text-key prefix `Range` on the column's own scalar index; `lower(col) = x`, `lower(col) LIKE 'x%'` and `starts_with(lower(col), 'x')` need the EXPRESSION index `CREATE INDEX i ON t (lower(col))` (`IndexExpr::Lower`, a scalar index whose stored value is the fold, `src/collections/catalog.rs`) and are REFUSED without it rather than scanned. `concat` ignores NULL, `||` propagates it, as in Postgres |
+| `CREATE INDEX i ON t (lower(col))` | T1 | an EXPRESSION scalar index: descriptor version 3 behind an additive `EXPRESSION_FEATURE` bit, the same keys and the same walk as an ordinary scalar index over a value derived on the write path. The set of expressions is CLOSED (`lower` only) and each is O(value bytes) per write, which is what keeps the per-write hook bounded (Law 1). No row byte changes: the derived value lives in the index and nowhere else. Every row-side recomputation -- the verifier, a non-driving predicate, a rank key -- passes through the same expression the write path does. STATED LIMIT: Unicode lowercasing can LENGTHEN a string (`İ` is 2 bytes, its image is 3), so a value inside the 1024-byte scalar text-key limit can have an image outside it; that write is refused with a named reason at the put and at the late build, never truncated to a key that is not the expression's value |
 | `ILIKE` | T2 | see §3 (trigram) |
 | `CASE WHEN <cond> THEN <value> [WHEN ...] [ELSE <value>] END` | T2 | a row expression: one row in, one value out, no read of any other row. In `ORDER BY` it is one key (§5 deviation 3), so it rides the same order-expression leaf an arithmetic blend does. In `WHERE` it is row-bound -- it never becomes an index range -- and `EXPLAIN` labels it so. |
 | `->`, `->>`, `#>`, `#>>`, `json_array_length` on a `Kind::Json` field | T2 | row functions over the binary JSON the row codec already decodes (`src/lib.rs`): one row, no extra read. None of them becomes an index range without an expression index over the same path, which is the `lower(col)` rule above. |
@@ -147,10 +148,11 @@ already built and already charged.
 
 | function | tier | execution |
 |---|---|---|
-| `EXTRACT(YEAR|MONTH|DAY|DOW|HOUR FROM t)`, `date_trunc('unit', t)` in WHERE | T2 | rewritten to one or more scalar Ranges (index-usable) |
-| same in SELECT / GROUP BY | T2 | row function; GROUP BY streams when the index order equals the truncation order |
-| `now()`, `current_date`, `interval` arithmetic, `age(t)`, `t + interval` | T2 | constants folded at prepare; row arithmetic |
-| `to_char(t, fmt)`, `to_timestamp`, `to_date` | T2 | row functions |
+| `EXTRACT(YEAR FROM t) <cmp> n`, `EXTRACT(YEAR FROM t) BETWEEN`, `date_trunc('unit', t) <cmp>\|BETWEEN lit`, `t::date <cmp> lit`, `t <cmp> lit`, `t BETWEEN lit AND lit` in WHERE | T1 | ONE scalar `Range` on the column's own index, folded at prepare (`Compiler::time_filter`, `src/sql/compile.rs`): the function is never evaluated per candidate and `EXPLAIN` prints the fold under `range rewrites`. A literal off the unit's boundary is its own comparison, as in Postgres: `=` is an EMPTY range (no truncation equals an interior instant), and BOTH inequalities cut at the boundary ABOVE the literal, so `date_trunc('month',t) >= '1950-01-15'` excludes January and `< '1950-01-15'` keeps it. `BETWEEN` carries that rule in its lower half only. Still one range in every case, never a refusal. An `EXTRACT(YEAR ...)` literal outside the representable year range saturates at the ends of the stored microsecond order, which is the same answer without an overflow. INSERT accepts the same ISO-8601 and Postgres date/time literal forms and stores the integer; SELECT prints the column back as an ISO-8601 string -- through `SELECT col`, `SELECT *`, `col::text`, a string function's argument, `concat`, `||`, and a `GROUP BY` key, which are one rule and cannot disagree |
+| `EXTRACT(MONTH\|DAY\|DOW\|HOUR\|MINUTE\|SECOND FROM t) <cmp> n`, and `<>` over any date window | T2 | the pre-image is a SET of ranges -- one interval per period in the corpus -- which is exactly the membership-set union `OR` and `IN (list)` compile to (§3). Refused by name with that reason until the union is built; never emulated by a scan (§6) |
+| same in SELECT / GROUP BY | T1 in SELECT (row function, `CompiledRow`); GROUP BY over a function is T2 | a folded answer returns groups, not rows, so a row function in a folded select list is refused and names `GROUP BY col` as the spelling. GROUP BY streams when the index order equals the truncation order -- that shape is the §4.7 atomic and is unbuilt for a function key |
+| `now()`, `current_date`, `interval` arithmetic, `age(t)`, `t + interval` | T1 | constants folded ONCE at prepare, so every row of one answer sees one instant; `age` and every interval are microseconds (§5 deviation 8). A CALENDAR interval (`interval '1 month'`, `'1 year'`) is T3 in this shape: a month is 28-31 days, so there is no constant to fold, and `date_trunc('month', t)` is the calendar-aware spelling that IS accepted |
+| `to_char(t, fmt)`, `to_timestamp`, `to_date` | T1 for the named templates | `to_char` carries `YYYY-MM-DD`, `YYYY-MM`, `YYYY`, `HH24:MI`, `HH24:MI:SS` and `YYYY-MM-DD HH24:MI:SS`, checked at PREPARE so an unnamed template is a refusal rather than an error on the first row. A general Postgres template is a formatting language of its own and is T3 |
 | time zones other than UTC storage | T3 | declared TIMESTAMPTZ is stored UTC; display conversion only |
 
 ### 4.3 Graph (SQL/PGQ names)
@@ -282,12 +284,18 @@ already built and already charged.
 - A boolean filter's memory is the same membership budget every other set walk is bounded by: a plain Vec while it stays smaller than a bitmap of the collection's span, then that bitmap, then a refusal. A complement is always a bitmap, so a span whose bitmap does not fit `RUN_BYTES` has no complement and the filter is refused rather than degraded. What `RUN_BYTES` bounds is what is held AT ONCE, over every boolean filter of the query together: each union and intersection folds in place into its accumulator rather than copying both sides, every live intermediate is counted against the one budget, and a tree that would hold more is refused with `WorkResource::MembershipBytes` — a resource with no `QueryBudget` field, because the ceiling is the memory promise and not a caller allowance.
 - A semi-join's set is built while the statement is COMPILED, and it runs under the caller's `QueryBudget` and cancellation like any other walk: the edge-keyspace walk is charged `GraphEdges` per edge and `GraphVisited` per entity kept, and the inner collection query is an ordinary prepared query under the same budget.
 - Memory per query is bounded by QueryBudget: pages, membership sets, groups (`WorkResource::Groups` — the accumulator sets an aggregate holds AT ONCE, one under the streaming shape and one per distinct group under the hashed one; its default ceiling is `RUN_BYTES` divided by what one group costs, applied even under `QueryBudget::unlimited`), frontier.
+- A §4.1 / §4.2 function is in exactly one of two places and `EXPLAIN` says which: a RANGE REWRITE, folded into index bounds at prepare and never evaluated per candidate, whose cost is the candidates the range admits; or a ROW FUNCTION over the values a returned row already projected, whose cost is one evaluation per row RETURNED. A function that is neither -- because its pre-image is a set of ranges, or because the expression index it would ride does not exist -- is refused, not quietly moved into the row path.
 - Every T3 refusal names the missing atomic in its error text.
 
 ## 7. Order of Phase-3 work
 
 1. Parser for §2 T1 + §3 T1 + §6 guarantees, with `EXPLAIN`.
-2. Aggregates (§4.7) — DONE, `src/query/aggregate.rs`; then date/time and string functions (§4.1, §4.2).
+2. Aggregates (§4.7) — DONE, `src/query/aggregate.rs`; date/time and string
+   functions (§4.1, §4.2) — DONE, `src/sql/functions.rs` plus the expression
+   scalar index (`IndexExpr::Lower`) and the declared-type descriptor field
+   (`CollectionInfo::declared`). What is left of §4.2 is the MULTI-range
+   rewrites (`EXTRACT(MONTH ...)`, `EXTRACT(DOW ...)`), which item 3's
+   membership union now makes possible: a follow-up, not yet written.
 3. `OR`/`IN`/`NOT`/`EXISTS` (§3) — DONE, `src/query/membership.rs`
    (`SetExpr` and the set algebra) with `QueryFilter::Any`/`All`/`Not`/`Ids`
    and `QueryDriver::Membership`.

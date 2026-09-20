@@ -205,12 +205,13 @@ use e4_prototype::{
         Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest, BfsRequest,
         CandidateDriver, Cmp, CollectionId, CollectionOptions, Database, Direction,
         EdgePredicate, EdgeTypeId, EntityId, Geom, GeometryFilter, GraphContextId, GroupCmp,
-        GroupKey, GroupOrder, GroupPredicate, IndexId, OwnedScalarValue,
-        PointFilter, Projection, QueryBudget, QueryFilter, QueryOrder, QueryRequest, ScalarFilter,
-        ScalarValue, ScoreExpr, SortDirection, TextMatch, VectorMetric,
+        GroupKey, GroupOrder, GroupPredicate, IndexExpr, IndexId, IndexState, OwnedScalarValue,
+        PointFilter, ProjectedValue, Projection, QueryBudget, QueryFilter, QueryOrder,
+        QueryRequest, ScalarFilter, ScalarValue, ScoreExpr, SortDirection, TextMatch,
+        VectorMetric,
     },
     spatial_math::{wgs84_distance_metres, Bounds, Point},
-    sql::{prepare_sql, Param, SqlError},
+    sql::{prepare_sql, Param, SqlError, SqlValue},
     Kind,
 };
 use kernel::{
@@ -550,6 +551,26 @@ impl Queries {
         (19_500_101, 19_500_101 + 10_000 * (i as i64 % 7))
     }
 
+    /// The year `fn_year_eq` asks for. The corpus's `born` spans 1940-01-01
+    /// to 2025-12-28, so every instance names a year that is in it.
+    pub fn fn_year(&self, i: usize) -> i64 {
+        1_940 + (i as i64 % 80)
+    }
+
+    /// The `[first month, last month]` window `fn_trunc_month_range` asks
+    /// for, as two `date_trunc('month', ...)` literals. Six months wide.
+    pub fn fn_month_window(&self, i: usize) -> (String, String) {
+        let year = self.fn_year(i);
+        (format!("{year:04}-01-01"), format!("{year:04}-06-01"))
+    }
+
+    /// The two-letter name prefix `fn_like_prefix` asks for. Each of these
+    /// holds roughly 3,000 of the corpus's 50,000 names.
+    pub fn name_prefix(&self, i: usize) -> &'static str {
+        const PREFIXES: [&str; 8] = ["Ti", "Ni", "Ri", "La", "Bu", "De", "Yu", "An"];
+        PREFIXES[i % PREFIXES.len()]
+    }
+
     /// The key of the row nearest to `points[i]`, which every graph case
     /// seeds its traversal at.
     ///
@@ -615,7 +636,7 @@ pub struct CaseSpec {
 /// approximate sweeps (`APPROX_BASES`), generated at runtime, one case per
 /// `EF_SWEEP` / `SLS_SWEEP` point, because there is no longer one fixed-ef
 /// case for either to be a fixed entry of.
-pub const BATTERY: [CaseSpec; 36] = [
+pub const BATTERY: [CaseSpec; 41] = [
     CaseSpec { name: "pt_radius", kind: CaseKind::Filter },
     CaseSpec { name: "pt_bbox", kind: CaseKind::Filter },
     CaseSpec { name: "plot_within_box", kind: CaseKind::Filter },
@@ -659,6 +680,19 @@ pub const BATTERY: [CaseSpec; 36] = [
     CaseSpec { name: "agg_distinct_kind", kind: CaseKind::Filter },
     CaseSpec { name: "agg_count_radius_by_kind", kind: CaseKind::Filter },
     CaseSpec { name: "agg_born_decade", kind: CaseKind::Filter },
+    // ── the function battery (QL_CONTRACT §4.1, §4.2) ───────────────────
+    // Four index-side RANGE REWRITES and one projection-only case. The
+    // rewrites are filter-kind because that is what they are: a function in
+    // a WHERE folded into scalar bounds at prepare, answered by the same
+    // walk an ordinary range is answered by. `fn_project_strings` is
+    // filter-kind too -- its WHERE is an ordinary Tier-1 range and the
+    // functions are all in the projection, which is the case that shows the
+    // row-function cost on its own.
+    CaseSpec { name: "fn_year_eq", kind: CaseKind::Filter },
+    CaseSpec { name: "fn_trunc_month_range", kind: CaseKind::Filter },
+    CaseSpec { name: "fn_lower_eq", kind: CaseKind::Filter },
+    CaseSpec { name: "fn_like_prefix", kind: CaseKind::Filter },
+    CaseSpec { name: "fn_project_strings", kind: CaseKind::Filter },
     // The four graph cases. They need the `related` edge set, so they are
     // selected only when `--graph` was given (`needs_graph`).
     CaseSpec { name: "graph_2hop", kind: CaseKind::Filter },
@@ -916,6 +950,15 @@ const IX_LOC: &str = "place_loc";
 const IX_PLOT: &str = "place_plot";
 const IX_EMB_EXACT: &str = "place_emb_exact";
 const IX_EMB_ANN: &str = "place_emb_ann";
+/// The three objects the §4.1 / §4.2 function battery names. They are new
+/// with that battery, so a database an earlier pass built does not have them
+/// and `provision_functions` adds them once on reopen.
+const IX_BORN_TS: &str = "place_born_ts";
+const IX_KIND_LOWER: &str = "place_kind_lower";
+const IX_NAME: &str = "place_name";
+/// The declared TIMESTAMPTZ column `fn_year_eq` and `fn_trunc_month_range`
+/// range over: `born` (a yyyymmdd integer) as UTC microseconds.
+const BORN_TS: &str = "born_ts";
 
 pub struct E4Ctx {
     db: Database,
@@ -929,6 +972,71 @@ pub struct E4Ctx {
     plot: IndexId,
     emb_exact: IndexId,
     emb_ann: IndexId,
+    born_ts: IndexId,
+    kind_lower: IndexId,
+    name: IndexId,
+}
+
+/// Midnight UTC of a proleptic-Gregorian date, in microseconds since the
+/// epoch. Howard Hinnant's `days_from_civil`, written out because this binary
+/// takes no date dependency and the two SQL arms must fold the same literal
+/// to the same integer.
+fn micros_of(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = i64::from(month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) * 86_400_000_000
+}
+
+/// The corpus's `born` (a yyyymmdd integer) as the instant the declared
+/// `born_ts` column stores. Every `born` in `places-50000.jsonl` is a valid
+/// date whose day is at most 28, so this conversion is total on the corpus
+/// and a value it is not total on is an error, never a silent clamp.
+fn born_ts_micros(born: i64) -> R<i64> {
+    let (year, month, day) = (born / 10_000, ((born / 100) % 100) as u32, (born % 100) as u32);
+    if !(1..=12).contains(&month) || !(1..=28).contains(&day) || !(1..=9999).contains(&year) {
+        return Err(format!("born {born} is not a yyyymmdd date this battery can convert").into());
+    }
+    Ok(micros_of(year, month, day))
+}
+
+/// A half-open range over `born_ts`, which is what every §4.2 rewrite folds
+/// to: `[start, end)`.
+fn e4_born_ts_filter(index: IndexId, start: i64, end: i64) -> QueryFilter<'static> {
+    QueryFilter::Scalar {
+        index,
+        predicate: ScalarFilter::Range {
+            lower: Bound::Included(ScalarValue::I64(start)),
+            upper: Bound::Excluded(ScalarValue::I64(end)),
+        },
+    }
+}
+
+/// A text-key prefix range, which is what `LIKE 'abc%'` and
+/// `starts_with(col, 'abc')` fold to.
+fn e4_prefix_filter<'a>(index: IndexId, prefix: &'a str, successor: &'a str) -> QueryFilter<'a> {
+    QueryFilter::Scalar {
+        index,
+        predicate: ScalarFilter::Range {
+            lower: Bound::Included(ScalarValue::Text(prefix)),
+            upper: Bound::Excluded(ScalarValue::Text(successor)),
+        },
+    }
+}
+
+/// The smallest string above every string that starts with `prefix`.
+fn prefix_successor(prefix: &str) -> R<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last != 0xFF {
+            bytes.push(last + 1);
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    Err(format!("`{prefix}` has no successor in byte order").into())
 }
 
 fn e4_kind_filter(index: IndexId, kind: &str) -> QueryFilter<'_> {
@@ -1004,6 +1112,58 @@ fn e4_run(
             break;
         }
     }
+    Ok(answer)
+}
+
+/// `SELECT upper(name), length(desc) ... WHERE <range>` through the direct
+/// API: the same walk `born_range` runs, with the two §4.1 row functions
+/// computed over the values the page projected.
+///
+/// The functions are computed and dropped rather than returned, exactly as
+/// the two SQL arms compute and return them: what the three arms compare is
+/// the ROW SET, and what this arm has to pay for is the projection plus the
+/// per-row work. `tests/sql_functions.rs` is where the VALUES are checked
+/// against Rust's own computation.
+fn e4_project_strings(ctx: &E4Ctx, keys: &[String], filters: &[QueryFilter<'_>]) -> R<Answer> {
+    let fields = ["name", "desc"];
+    let mut prepared = ctx.db.prepare_query(QueryRequest {
+        collection: ctx.place,
+        filters,
+        order: QueryOrder::Driver,
+        projection: Projection::Fields(&fields),
+        total_limit: None,
+        driver: CandidateDriver::Auto,
+    })?;
+    let mut answer = Answer::default();
+    let mut sink = 0u64;
+    loop {
+        let page = prepared.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+        for row in &page.rows {
+            let ordinal = (row.id.sequence - 1) as usize;
+            let key = keys
+                .get(ordinal)
+                .ok_or("entity sequence falls outside the corpus's key vector")?;
+            for (at, (_, value)) in row.projected.iter().enumerate() {
+                let ProjectedValue::Value(Value::String(text)) = value else {
+                    continue;
+                };
+                sink = sink.wrapping_add(if at == 0 {
+                    text.to_uppercase().len() as u64
+                } else {
+                    text.chars().count() as u64
+                });
+            }
+            if dumping() || answer.keys.len() < FIRST_KEYS {
+                answer.keys.push(key.clone());
+            }
+            answer.rows += 1;
+        }
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    // The compiler must not delete the work the case exists to measure.
+    std::hint::black_box(sink);
     Ok(answer)
 }
 
@@ -1329,6 +1489,25 @@ fn e4_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R
                 None,
             )
         }
+        // ── the function battery (QL_CONTRACT §4.1, §4.2) ───────────────
+        // The direct API is where the rewrite ENDS UP, so this arm writes
+        // the range the two SQL arms fold their function into. That is the
+        // point of the comparison: if the folding is wrong, the SQL arms
+        // return a different row set than the range written by hand here.
+        "fn_year_eq" => {
+            let year = q.fn_year(i);
+            e4_run(
+                ctx,
+                keys,
+                &[e4_born_ts_filter(
+                    ctx.born_ts,
+                    micros_of(year, 1, 1),
+                    micros_of(year + 1, 1, 1),
+                )],
+                QueryOrder::Driver,
+                None,
+            )
+        }
         "bool_born_or_kind" => {
             let (lower, upper) = q.born_range(i);
             let leaves = [
@@ -1399,6 +1578,52 @@ fn e4_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R
                 QueryOrder::Driver,
                 None,
             )
+        }
+        "fn_trunc_month_range" => {
+            // `date_trunc('month', t) BETWEEN 'Y-01-01' AND 'Y-06-01'` is the
+            // half-open range from the first month's start to the month AFTER
+            // the last one's -- one range, not six.
+            let year = q.fn_year(i);
+            e4_run(
+                ctx,
+                keys,
+                &[e4_born_ts_filter(
+                    ctx.born_ts,
+                    micros_of(year, 1, 1),
+                    micros_of(year, 7, 1),
+                )],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "fn_lower_eq" => {
+            let folded = kind.to_lowercase();
+            e4_run(
+                ctx,
+                keys,
+                &[e4_kind_filter(ctx.kind_lower, &folded)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "fn_like_prefix" => {
+            let prefix = q.name_prefix(i);
+            let successor = prefix_successor(prefix)?;
+            e4_run(
+                ctx,
+                keys,
+                &[e4_prefix_filter(ctx.name, prefix, &successor)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        // A projection-only case: the WHERE is an ordinary Tier-1 range and
+        // every function is in the SELECT list, so what this measures is the
+        // ROW-function cost on top of a walk the battery already times
+        // (`born_range`).
+        "fn_project_strings" => {
+            let (lower, upper) = q.born_range(i);
+            e4_project_strings(ctx, keys, &[e4_born_filter(ctx.born, lower, upper)])
         }
 
         // ── ranked: ten rows, one order per request ──────────────────────
@@ -1889,7 +2114,11 @@ fn load_e4(dir: &Path, corpus: &Corpus) -> R<(E4Ctx, Vec<Value>)> {
             sync: SyncMode::Full,
         },
     )?;
-    let place = db.create_collection(
+    // `born_ts` is `born` as the instant it names: the same date, stored the
+    // way QL_CONTRACT §4.2 stores one (Int microseconds, UTC), with the
+    // DECLARED type recorded in the catalog descriptor so a statement can
+    // fold a date/time function over it (QL_CONTRACT §5 deviation 8).
+    let place = db.create_collection_declared(
         "place",
         vec![
             ("key".into(), Kind::Text),
@@ -1897,11 +2126,13 @@ fn load_e4(dir: &Path, corpus: &Corpus) -> R<(E4Ctx, Vec<Value>)> {
             ("desc".into(), Kind::Text),
             ("text".into(), Kind::Text),
             ("born".into(), Kind::Int),
+            (BORN_TS.into(), Kind::Int),
             ("kind".into(), Kind::Text),
             ("loc".into(), Kind::Point),
             ("plot".into(), Kind::Geo),
             ("emb".into(), Kind::Vector(DIM)),
         ],
+        vec![(BORN_TS.to_owned(), "TIMESTAMPTZ".to_owned())],
         CollectionOptions::default(),
     )?;
     db.commit()?;
@@ -1919,6 +2150,7 @@ fn load_e4(dir: &Path, corpus: &Corpus) -> R<(E4Ctx, Vec<Value>)> {
                 "desc": row.desc,
                 "text": row.text(),
                 "born": row.born,
+                BORN_TS: born_ts_micros(row.born)?,
                 "kind": row.kind,
                 "loc": {"type": "Point", "coordinates": [row.lon, row.lat]},
                 "plot": geom_to_json(&row.plot),
@@ -1967,6 +2199,16 @@ fn load_e4(dir: &Path, corpus: &Corpus) -> R<(E4Ctx, Vec<Value>)> {
     build(&mut db, IX_EMB_EXACT, emb_exact)?;
     let emb_ann = db.create_quantized_vector_index(place, IX_EMB_ANN, "emb")?;
     build(&mut db, IX_EMB_ANN, emb_ann)?;
+    // The three objects the §4.1 / §4.2 function battery names. The last is
+    // an EXPRESSION index: an ordinary scalar index whose stored value is
+    // `lower(kind)`, which is what makes `lower(kind) = x` a range.
+    let born_ts = db.create_scalar_index(place, IX_BORN_TS, BORN_TS, false)?;
+    build(&mut db, IX_BORN_TS, born_ts)?;
+    let name = db.create_scalar_index(place, IX_NAME, "name", false)?;
+    build(&mut db, IX_NAME, name)?;
+    let kind_lower =
+        db.create_expression_index(place, IX_KIND_LOWER, "kind", IndexExpr::Lower, false)?;
+    build(&mut db, IX_KIND_LOWER, kind_lower)?;
 
     let at = Instant::now();
     db.checkpoint()?;
@@ -1984,6 +2226,9 @@ fn load_e4(dir: &Path, corpus: &Corpus) -> R<(E4Ctx, Vec<Value>)> {
             plot,
             emb_exact,
             emb_ann,
+            born_ts,
+            name,
+            kind_lower,
         },
         stages,
     ))
@@ -2006,19 +2251,26 @@ fn open_e4(dir: &Path) -> R<(E4Ctx, Vec<Value>)> {
     let place = db
         .collection("place")?
         .ok_or("--reuse: no `place` collection in this database")?;
-    let mut found: Vec<(String, IndexId)> = Vec::new();
-    for n in 1..=32u64 {
-        if let Ok(info) = db.index_info(IndexId(n)) {
-            found.push((info.name.clone(), info.id));
-        }
-    }
+    let found = indexes_of(&db);
+    // The §4.1 / §4.2 function battery names one column and three indexes
+    // that predate no earlier pass: a database built before this battery
+    // existed does not have them. They are added ONCE here, on the reused
+    // copy, and the cost is reported as its own stage rather than hidden --
+    // it is a load, not a reuse, and calling it a reuse would be a lie about
+    // where the time went.
+    let mut db = db;
+    let at_provision = Instant::now();
+    let provisioned = provision_functions(&mut db, place, &found, &provision_marker(dir))?;
+    let provision_seconds = at_provision.elapsed().as_secs_f64();
+    let found = indexes_of(&db);
     let by_name = |wanted: &str| -> R<IndexId> {
         found
             .iter()
-            .find(|(name, _)| name == wanted)
-            .map(|(_, id)| *id)
+            .find(|(name, _, _)| name == wanted)
+            .map(|(_, id, _)| *id)
             .ok_or_else(|| format!("--reuse: no `{wanted}` index in this database").into())
     };
+    let db = db;
     let ctx = E4Ctx {
         place,
         // `graph_header` refuses a database with no graph feature, which is
@@ -2032,6 +2284,9 @@ fn open_e4(dir: &Path) -> R<(E4Ctx, Vec<Value>)> {
         plot: by_name(IX_PLOT)?,
         emb_exact: by_name(IX_EMB_EXACT)?,
         emb_ann: by_name(IX_EMB_ANN)?,
+        born_ts: by_name(IX_BORN_TS)?,
+        name: by_name(IX_NAME)?,
+        kind_lower: by_name(IX_KIND_LOWER)?,
         db,
     };
     let mut stages = vec![stage("open", at.elapsed().as_secs_f64()), skipped_stage("load")];
@@ -2046,9 +2301,309 @@ fn open_e4(dir: &Path) -> R<(E4Ctx, Vec<Value>)> {
     ] {
         stages.push(skipped_stage(&format!("index:{name}")));
     }
+    for name in [IX_BORN_TS, IX_NAME, IX_KIND_LOWER] {
+        stages.push(if provisioned {
+            stage(&format!("provision:{name}"), provision_seconds / 3.0)
+        } else {
+            skipped_stage(&format!("index:{name}"))
+        });
+    }
     stages.push(skipped_stage("checkpoint"));
-    eprintln!("[e4] reopened {}; queries only", dir.display());
+    if provisioned {
+        eprintln!(
+            "[e4] reopened {}; added `{BORN_TS}`, {IX_BORN_TS}, {IX_NAME} and {IX_KIND_LOWER} in {provision_seconds:.1}s (the function battery's own objects)",
+            dir.display()
+        );
+    } else {
+        eprintln!("[e4] reopened {}; queries only", dir.display());
+    }
     Ok((ctx, stages))
+}
+
+/// Where the resumable provisioning cursor lives: BESIDE the database
+/// directory, never inside it, so the database's own file inventory is
+/// untouched.
+fn provision_marker(dir: &Path) -> PathBuf {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "e4-db".to_owned());
+    dir.with_file_name(format!("{name}.provision.json"))
+}
+
+/// The cursor a previous, possibly killed, run left behind.
+///
+/// It is a HINT, never a proof: it is written only after the batch it
+/// describes has committed, so it can be behind the data but never ahead of
+/// it. A missing, unreadable or foreign marker simply means "start at the
+/// beginning", which re-scans and fills nothing that is already filled.
+fn read_marker(marker: &Path, place: CollectionId) -> (Option<EntityId>, bool) {
+    let Ok(text) = fs::read_to_string(marker) else {
+        return (None, false);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return (None, false);
+    };
+    if value["collection"].as_u64() != Some(u64::from(place.0)) {
+        return (None, false);
+    }
+    let after = value["after"].as_u64().map(|sequence| EntityId {
+        collection: place,
+        sequence,
+    });
+    (after, value["complete"].as_bool() == Some(true))
+}
+
+fn write_marker(
+    marker: &Path,
+    place: CollectionId,
+    after: Option<EntityId>,
+    complete: bool,
+    rows: u64,
+) -> R<()> {
+    let value = json!({
+        "collection": place.0,
+        "after": after.map(|id| id.sequence),
+        "complete": complete,
+        "rows": rows,
+    });
+    fs::write(marker, serde_json::to_vec(&value)?)?;
+    Ok(())
+}
+
+/// Count the collection's rows, and the rows whose `born_ts` is present and
+/// not null.
+///
+/// This is the resume PROOF. The marker can be stale and the layout can say
+/// the column exists while no row carries a value, so the only statement
+/// worth acting on is the one read back off the rows themselves.
+fn born_ts_counts(db: &Database, place: CollectionId) -> R<(u64, u64)> {
+    let mut rows = 0u64;
+    let mut filled = 0u64;
+    let mut after: Option<EntityId> = None;
+    loop {
+        let mut seen = 0usize;
+        let mut last = after;
+        for entity in db.scan(place, after)? {
+            let entity = entity?;
+            last = Some(entity.id);
+            seen += 1;
+            rows += 1;
+            if entity
+                .document
+                .get(BORN_TS)
+                .is_some_and(|value| !value.is_null())
+            {
+                filled += 1;
+            }
+            if seen == BATCH {
+                break;
+            }
+        }
+        if seen == 0 {
+            break;
+        }
+        after = last;
+    }
+    Ok((rows, filled))
+}
+
+/// Fill `born_ts` from `born` for every row still missing it, in bounded
+/// batches, recording a resumable cursor beside the database.
+///
+/// The predicate is the ROW's own value, never the layout's: a row that
+/// already has the column is skipped, so the walk is idempotent and a lost
+/// or stale cursor costs a re-scan and nothing else. The marker is written
+/// only AFTER its batch has committed, so it is behind the data or exactly
+/// on it, never ahead.
+fn fill_born_ts(
+    db: &mut Database,
+    place: CollectionId,
+    marker: &Path,
+    from: Option<EntityId>,
+) -> R<u64> {
+    eprintln!("[e4] filling `{BORN_TS}` from `born` …");
+    let mut filled = 0u64;
+    let mut after = from;
+    loop {
+        // `Database::scan` is the stable id-order walk with an exclusive
+        // cursor, so the fill is bounded per batch and resumes where the
+        // last commit left it rather than holding the collection.
+        let mut batch: Vec<(String, i64)> = Vec::with_capacity(BATCH);
+        let mut seen = 0usize;
+        let mut last = after;
+        for entity in db.scan(place, after)? {
+            let entity = entity?;
+            last = Some(entity.id);
+            seen += 1;
+            if entity
+                .document
+                .get(BORN_TS)
+                .is_some_and(|value| !value.is_null())
+            {
+                continue;
+            }
+            let born = entity
+                .document
+                .get("born")
+                .and_then(Value::as_i64)
+                .ok_or("--reuse: a row has no integer `born` to derive born_ts from")?;
+            batch.push((entity.key.clone(), born));
+            if seen == BATCH {
+                break;
+            }
+        }
+        // A batch can be EMPTY while rows remain -- every row it saw was
+        // already filled -- so the walk ends on the SCAN, not on the batch.
+        if seen == 0 {
+            break;
+        }
+        for (key, born) in &batch {
+            db.update(place, key, &json!({ BORN_TS: born_ts_micros(*born)? }))?;
+            filled += 1;
+        }
+        db.commit()?;
+        after = last;
+        write_marker(marker, place, after, false, 0)?;
+    }
+    eprintln!("[e4] filled {filled} rows");
+    Ok(filled)
+}
+
+/// Add the §4.1 / §4.2 function battery's column and indexes to a database
+/// that does not have them. `false` when they are all already there and the
+/// side marker says the fill finished, which is every run after the first on
+/// one copy.
+///
+/// CRASH SAFETY. The column is added with `alter_collection_declared`, which
+/// writes a new immutable `Layout` and rewrites no row (QL_CONTRACT §2), so
+/// every existing row reads MISSING for it until it is filled. That ALTER
+/// commits before the first fill batch does, so a kill in between leaves a
+/// database whose layout has the column and whose rows do not. Three things
+/// keep that from becoming a silent wrong answer:
+///
+/// 1. The fill is driven by the ROW, not by the layout: only a row still
+///    missing `born_ts` is written, so a resumed run is idempotent and a
+///    lost cursor costs a re-scan and nothing else.
+/// 2. The cursor lives in a side marker written only AFTER its batch has
+///    committed, so it is behind the data or exactly on it, never ahead.
+/// 3. An index left BUILDING by a kill is rebuilt rather than used: a
+///    Building index is refused at `src/query/plan.rs`, and a rebuilt one is
+///    the only kind the cases may read.
+///
+/// And the load-bearing check: `count(born_ts is not null) == count(*)` over
+/// the rows, after everything above. A run that cannot say that refuses to
+/// measure, because every e4-side arm would otherwise read the same
+/// truncated index and agree with itself.
+fn provision_functions(
+    db: &mut Database,
+    place: CollectionId,
+    found: &[(String, IndexId, IndexState)],
+    marker: &Path,
+) -> R<bool> {
+    let has = |wanted: &str| found.iter().any(|(name, _, _)| name == wanted);
+    let ready = |wanted: &str| {
+        found
+            .iter()
+            .any(|(name, _, state)| name == wanted && *state == IndexState::Ready)
+    };
+    let wanted = [IX_BORN_TS, IX_NAME, IX_KIND_LOWER];
+    let (resume_at, complete) = read_marker(marker, place);
+    if complete && wanted.iter().all(|name| ready(name)) {
+        return Ok(false);
+    }
+    if wanted.iter().all(|name| has(name)) && wanted.iter().all(|name| ready(name)) {
+        // Everything is here and Ready but no marker says the fill finished.
+        // Prove it from the rows; if it holds, record the proof and skip.
+        let (rows, filled) = born_ts_counts(db, place)?;
+        if rows == filled && rows > 0 {
+            write_marker(marker, place, None, true, rows)?;
+            return Ok(false);
+        }
+    }
+    let info = db.collection_info(place)?;
+    if !info.layout.fields.iter().any(|(n, _)| n == BORN_TS) {
+        let mut fields: Vec<(String, Kind)> = info.layout.fields.clone();
+        fields.push((BORN_TS.to_owned(), Kind::Int));
+        let declared = vec![(BORN_TS.to_owned(), "TIMESTAMPTZ".to_owned())];
+        db.alter_collection_declared(place, fields, declared)?;
+        db.commit()?;
+    }
+    fill_born_ts(db, place, marker, resume_at)?;
+    // The proof, before anything is built over the column. A marker from a
+    // different run could have started the walk past a row that was never
+    // filled, so a count that does not add up is answered with ONE full pass
+    // from the beginning -- and only a second failure is a refusal.
+    let (rows, filled) = born_ts_counts(db, place)?;
+    if rows != filled {
+        eprintln!("[e4] {} rows still missing `{BORN_TS}`; refilling from the start", rows - filled);
+        fill_born_ts(db, place, marker, None)?;
+    }
+    let build = |db: &mut Database, id: IndexId| -> R<()> {
+        db.commit()?;
+        db.build_index_to_ready(id, BATCH)?;
+        db.commit()?;
+        Ok(())
+    };
+    // An index a kill left BUILDING is finished before it is used -- any
+    // index, not only this battery's three. Without this every later run
+    // hard-fails at `src/query/plan.rs`, and an index built over rows that
+    // were still MISSING their value would answer from a truncated posting
+    // set. A DROPPING index is left alone: a drop in flight is resumed by
+    // the drop, not by a build.
+    for (name, id, state) in found {
+        if matches!(state, IndexState::Building { .. }) {
+            eprintln!("[e4] rebuilding `{name}`, left BUILDING by an earlier run");
+            build(db, *id)?;
+        }
+    }
+    if !has(IX_BORN_TS) {
+        let id = db.create_scalar_index(place, IX_BORN_TS, BORN_TS, false)?;
+        build(db, id)?;
+    }
+    if !has(IX_NAME) {
+        let id = db.create_scalar_index(place, IX_NAME, "name", false)?;
+        build(db, id)?;
+    }
+    if !has(IX_KIND_LOWER) {
+        let id = db.create_expression_index(place, IX_KIND_LOWER, "kind", IndexExpr::Lower, false)?;
+        build(db, id)?;
+    }
+    db.commit()?;
+    // The assertion. Nothing below this line runs the cases on a database
+    // that cannot answer for its own column.
+    let (rows, filled) = born_ts_counts(db, place)?;
+    if rows == 0 {
+        return Err("--reuse: `place` holds no rows".into());
+    }
+    if rows != filled {
+        return Err(format!(
+            "--reuse: provisioning left {} of {rows} rows without a `{BORN_TS}` value; refusing to run the function cases, because every e4-side arm would read the same truncated index and agree with itself",
+            rows - filled
+        )
+        .into());
+    }
+    for (name, id, _) in indexes_of(db) {
+        if wanted.contains(&name.as_str()) {
+            let state = db.index_info(id)?.state;
+            if state != IndexState::Ready {
+                return Err(format!("--reuse: `{name}` is not READY after provisioning").into());
+            }
+        }
+    }
+    write_marker(marker, place, None, true, rows)?;
+    Ok(true)
+}
+
+/// Every index this database holds, by name, id and state.
+fn indexes_of(db: &Database) -> Vec<(String, IndexId, IndexState)> {
+    let mut found = Vec::new();
+    for n in 1..=64u64 {
+        if let Ok(info) = db.index_info(IndexId(n)) {
+            found.push((info.name.clone(), info.id, info.state));
+        }
+    }
+    found
 }
 
 // ── the Postgres arm ──────────────────────────────────────────────────────
@@ -2385,6 +2940,37 @@ fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String
             "SELECT \"key\" FROM place \
              WHERE EXISTS (SELECT 1 FROM {RELATED} r WHERE r.source = place.\"key\")"
         )),
+        // ── the function battery (QL_CONTRACT §4.1, §4.2) ───────────────
+        // These need a `born_ts timestamptz` column with a btree, a btree on
+        // `name` and an expression index on `lower(kind)`. The DDL is in
+        // `tools/battle50k_pg_cases.sql`; a database that has not run it
+        // cannot run these five cases.
+        "fn_year_eq" => plain(format!(
+            "SELECT \"key\" FROM place WHERE {BORN_TS} >= make_timestamptz({}, 1, 1, 0, 0, 0, 'UTC') AND {BORN_TS} < make_timestamptz({}, 1, 1, 0, 0, 0, 'UTC')",
+            q.fn_year(i),
+            q.fn_year(i) + 1
+        )),
+        "fn_trunc_month_range" => {
+            let (from, to) = q.fn_month_window(i);
+            plain(format!(
+                "SELECT \"key\" FROM place WHERE date_trunc('month', {BORN_TS}) BETWEEN {} AND {}",
+                quoted(&from),
+                quoted(&to)
+            ))
+        }
+        "fn_lower_eq" => plain(format!(
+            "SELECT \"key\" FROM place WHERE lower(kind) = {}",
+            quoted(&kinds[i % KINDS].to_lowercase())
+        )),
+        "fn_like_prefix" => plain(format!(
+            "SELECT \"key\" FROM place WHERE name LIKE {}",
+            quoted(&format!("{}%", q.name_prefix(i)))
+        )),
+        // The projection is the case; the key column keeps the three arms
+        // comparing the same row set.
+        "fn_project_strings" => plain(format!(
+            "SELECT \"key\", upper(name), length(descr) FROM place WHERE {born_clause}"
+        )),
 
         // ── ranked ──────────────────────────────────────────────────────
         // No tiebreak after the distance: a second sort key would take the
@@ -2691,6 +3277,35 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
         "bool_exists_related" => format!(
             "SELECT _id FROM place WHERE EXISTS (SELECT 1 FROM {RELATED} WHERE source = _key)"
         ),
+        // ── the function battery (QL_CONTRACT §4.1, §4.2) ───────────────
+        // Written as Postgres writes them. Each WHERE below compiles to ONE
+        // scalar range on the index the column carries -- `EXPLAIN` prints it
+        // under `range rewrites` -- so what the timing compares is a fold at
+        // prepare against the hand-written range in the `e4` arm.
+        "fn_year_eq" => {
+            let year = q.fn_year(i);
+            format!("SELECT _id FROM place WHERE EXTRACT(YEAR FROM {BORN_TS}) = {year}")
+        }
+        "fn_trunc_month_range" => {
+            let (from, to) = q.fn_month_window(i);
+            let from = v.text(&from);
+            let to = v.text(&to);
+            format!(
+                "SELECT _id FROM place WHERE date_trunc('month', {BORN_TS}) BETWEEN {from} AND {to}"
+            )
+        }
+        "fn_lower_eq" => {
+            let folded = v.text(&kind_value.to_lowercase());
+            format!("SELECT _id FROM place WHERE lower(kind) = {folded}")
+        }
+        "fn_like_prefix" => {
+            let pattern = v.text(&format!("{}%", q.name_prefix(i)));
+            format!("SELECT _id FROM place WHERE name LIKE {pattern}")
+        }
+        "fn_project_strings" => {
+            let born = sql_born(v, born_lower, born_upper);
+            format!("SELECT upper(name), length(desc) FROM place WHERE {born}")
+        }
 
         // ── ranked ──────────────────────────────────────────────────────
         "knn_10" => {
@@ -2802,6 +3417,45 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
 /// Parse, compile and page one statement to exhaustion, translating every
 /// returned `EntityId` through the load-time key vector of deviation 2 --
 /// the identical translation the `e4` arm does.
+/// The `e4-sql` arm of a PROJECTION-ONLY case: the statement's own columns,
+/// row functions included, assembled the way `Database::sql` assembles them.
+///
+/// `e4sql_run` pages the engine's `QueryRow`, which never evaluates a §4.1 /
+/// §4.2 row function; a case whose whole point is that per-row cost has to
+/// pay it, or the arm would be timing a projection the statement did not ask
+/// for. The answer key still comes from the row's entity sequence, so the
+/// three arms compare the same ROW SET; the VALUES are checked against Rust's
+/// own computation in `tests/sql_functions.rs`.
+fn e4sql_project_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) -> R<Answer> {
+    let t0 = Instant::now();
+    let prepared = prepare_sql(&ctx.db, sql, params)?;
+    let mut answer = Answer {
+        prepare_us: t0.elapsed().as_secs_f64() * 1e6,
+        ..Answer::default()
+    };
+    let mut sink = 0u64;
+    prepared.for_each_row(&ctx.db, PAGE, &mut |row| {
+        let ordinal = (row.id.sequence - 1) as usize;
+        let key = keys.get(ordinal).ok_or_else(|| {
+            SqlError::Engine("entity sequence falls outside the corpus's key vector".to_owned())
+        })?;
+        for value in &row.values {
+            sink = sink.wrapping_add(match value {
+                SqlValue::Text(text) => text.len() as u64,
+                SqlValue::Int(n) => *n as u64,
+                _ => 0,
+            });
+        }
+        if dumping() || answer.keys.len() < FIRST_KEYS {
+            answer.keys.push(key.clone());
+        }
+        answer.rows += 1;
+        Ok(())
+    })?;
+    std::hint::black_box(sink);
+    Ok(answer)
+}
+
 fn e4sql_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) -> R<Answer> {
     let t0 = Instant::now();
     let prepared = prepare_sql(&ctx.db, sql, params)?;
@@ -2899,6 +3553,9 @@ fn e4sql_answer(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize)
     e4sql_set_ef(ctx, ef)?;
     if is_aggregate_case(name) {
         return e4sql_agg_run(ctx, &sql, &params, agg_fields(name));
+    }
+    if name == "fn_project_strings" {
+        return e4sql_project_run(ctx, &corpus.keys, &sql, &params);
     }
     e4sql_run(ctx, &corpus.keys, &sql, &params)
 }

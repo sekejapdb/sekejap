@@ -431,3 +431,102 @@ WHERE born IS NOT NULL;
 -- four `graph_` cases.
 SELECT key FROM place
 WHERE EXISTS (SELECT 1 FROM related r WHERE r.source = place.key);
+-- ============================================================
+-- THE FUNCTION BATTERY (QL_CONTRACT §4.1 string, §4.2 date/time)
+-- ============================================================
+--
+-- SCHEMA THESE CASES NEED, beyond battle50k_pg_schema.sql. Run it once
+-- against the bench database before the five statements below; a database
+-- that has not run it cannot run them.
+--
+--   ALTER TABLE place ADD COLUMN IF NOT EXISTS born_ts timestamptz;
+--   UPDATE place
+--      SET born_ts = make_timestamptz(
+--                      (born / 10000)::int,
+--                      ((born / 100) % 100)::int,
+--                      (born % 100)::int,
+--                      0, 0, 0, 'UTC')
+--    WHERE born_ts IS NULL;
+--   CREATE INDEX IF NOT EXISTS place_born_ts    ON place USING btree (born_ts);
+--   CREATE INDEX IF NOT EXISTS place_name       ON place USING btree (name);
+--   CREATE INDEX IF NOT EXISTS place_kind_lower ON place USING btree (lower(kind));
+--
+-- IDEMPOTENT, and it has to be: this is run by hand against a bench database
+-- that is reused, so every statement must be safe to run twice. `IF NOT
+-- EXISTS` on the column and the three indexes, and `WHERE born_ts IS NULL`
+-- on the UPDATE, which also makes a killed UPDATE resumable rather than a
+-- 50,000-row rewrite of values that are already right.
+--
+-- UTC-SAFE, and it has to be, because E4 stores midnight UTC and this column
+-- is compared against it at `date_trunc('month', ...)` boundaries below.
+-- `to_timestamp(born::text,'YYYYMMDD') AT TIME ZONE 'UTC'` produces a bare
+-- `timestamp`, which assigning it to a `timestamptz` column then re-promotes
+-- THROUGH THE SESSION's TimeZone -- so unless the session happens to be UTC,
+-- every value lands offset from E4's and a month boundary disagrees.
+-- `make_timestamptz(..., 'UTC')` names the zone in the value itself and is
+-- the same instant whatever `TimeZone` the session carries. The alternative
+-- spelling with the same property is
+-- `(to_timestamp(born::text,'YYYYMMDD') AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`,
+-- where the second `AT TIME ZONE` promotes the bare timestamp back to
+-- `timestamptz` at UTC rather than at the session zone.
+--
+-- `born` in places-50000.jsonl is a yyyymmdd integer whose day is never
+-- above 28, so the conversion above is total on this corpus. E4 stores the
+-- same instant as `Kind::Int` microseconds under a DECLARED TIMESTAMPTZ
+-- (QL_CONTRACT §5 deviation 8), which is the same date and the same order.
+--
+-- `place_name` and `place_kind_lower` are new with this battery: Postgres
+-- needs the first for the prefix range and the second because `lower(kind)`
+-- is not `kind`. E4 needs exactly the same two, and its `lower(kind)` one is
+-- an EXPRESSION index of the scalar family (src/collections/catalog.rs,
+-- `IndexExpr::Lower`) -- the same idea, the same cost, the same DDL.
+
+-- case: fn_year_eq kind: filter
+-- params: $1 year, $2 year + 1  (Queries::fn_year(i), which is 1940 + i % 80)
+-- One YEAR is ONE contiguous interval over the stored instant, which is why
+-- E4 rewrites `EXTRACT(YEAR FROM born_ts) = $1` to a single scalar range
+-- rather than refusing it. This statement writes the range Postgres's own
+-- planner needs to use the btree: `EXTRACT(YEAR FROM born_ts) = $1` written
+-- literally is not sargable in Postgres without an expression index, which
+-- is the deviation this case is here to show -- E4 rewrites it, Postgres
+-- does not.
+SELECT key FROM place
+WHERE born_ts >= make_timestamptz($1, 1, 1, 0, 0, 0, 'UTC')
+  AND born_ts <  make_timestamptz($2, 1, 1, 0, 0, 0, 'UTC');
+
+-- case: fn_trunc_month_range kind: filter
+-- params: $1 first month's first day, $2 last month's first day
+--         (Queries::fn_month_window(i): 'YYYY-01-01' and 'YYYY-06-01')
+-- `date_trunc('month', t) BETWEEN a AND b` is the half-open interval from
+-- a's month to the month AFTER b's -- one range, six months wide. Postgres
+-- evaluates the truncation per row here; E4 folds it into the range at
+-- prepare and EXPLAIN prints it under `range rewrites`.
+SELECT key FROM place
+WHERE date_trunc('month', born_ts) BETWEEN $1::timestamptz AND $2::timestamptz;
+
+-- case: fn_lower_eq kind: filter
+-- params: $1 kind, already folded  (kinds[i % 8] lowercased)
+-- Both engines need an index over lower(kind) for this to be a range: in
+-- Postgres an expression index, in E4 an expression index of the scalar
+-- family. Note on this corpus every `kind` is already lower case, so the
+-- ROW SET equals kind_eq's -- what differs is the index the walk rides.
+SELECT key FROM place WHERE lower(kind) = $1;
+
+-- case: fn_like_prefix kind: filter
+-- params: $1 pattern, e.g. 'Ti%'  (Queries::name_prefix(i) plus '%')
+-- A pure prefix pattern is a text-key range in both engines. The C-locale
+-- `text_pattern_ops` class is not used here because the bench database is
+-- created with the C collation, under which the default class already gives
+-- Postgres the prefix range; E4's text keys are binary UTF-8 order by
+-- definition (src/store/scalar_key.rs).
+SELECT key FROM place WHERE name LIKE $1;
+
+-- case: fn_project_strings kind: filter
+-- params: $1 born lower, $2 born upper  (born_range(i))
+-- A PROJECTION-ONLY case: the WHERE is the ordinary range `born_range`
+-- already times, and the two string functions are per RETURNED row. The
+-- key column is here so the three arms still compare the same row set; the
+-- projected VALUES are checked against Rust's own computation in
+-- tests/sql_functions.rs, not across arms.
+SELECT key, upper(name), length(descr) FROM place
+WHERE born BETWEEN $1 AND $2;

@@ -1203,6 +1203,13 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
                 crate::dense_v3::FieldValue::Missing => None,
                 _ => return Err(corrupt("scalar field changed kind")),
             };
+            // An EXPRESSION index stores `expression(field)`, not `field`
+            // (catalog.rs `scalar_build_key_into`). The expected posting has
+            // to be derived the same way, or every row whose stored value is
+            // not already its own image reads as Derived/Missing here and as
+            // an extra posting in `verify_actual`.
+            let derived = i.expression.map(|e| e.apply(value));
+            let value = derived.as_ref().map_or(value, |v| v.as_ref());
             let encoded = crate::scalar_key::encode(&i.kind, value)?;
             let key = catalog::skey(i, &encoded, id.sequence);
             let actual = run.read_index(i, &key)?;
@@ -1493,6 +1500,11 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
                         crate::dense_v3::FieldValue::Missing => None,
                         _ => return Err(corrupt("scalar field changed kind")),
                     };
+                    // The same derivation as `verify_expected` and
+                    // `scalar_build_key_into`: the posting holds the
+                    // expression's image of the field, never the field.
+                    let derived = i.expression.map(|x| x.apply(v));
+                    let v = derived.as_ref().map_or(v, |x| x.as_ref());
                     let e = crate::scalar_key::encode(&i.kind, v)?;
                     let want = catalog::skey(i, &e, seq);
                     run.mismatch(

@@ -12,6 +12,7 @@
 //! borrowed view for the length of one page loop.
 
 use super::ast::*;
+use super::functions::{self, TimeUnit};
 use super::{
     collection, is_key_column, order_value, projected, refuse, SqlError, SqlResult, SqlResult2,
     SqlRow, SqlValue, Tier, GRAPH_EDGES, GRAPH_RESULTS, GRAPH_VISITED, ID_COLUMN, KEY_COLUMN,
@@ -21,8 +22,8 @@ use crate::collections::{
     Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest, BfsRequest,
     CandidateDriver, Cmp, CollectionId, CollectionOptions, Database, Direction, DropMode,
     DropPhase, EdgePredicate, EdgeTypeId, EntityId, Geom, GeometryFilter, GraphContextId,
-    GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexFamily, IndexId, IndexInfo,
-    IndexState, OwnedScalarValue, PointFilter, ProjectedValue, Projection, QueryBudget,
+    GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexExpr, IndexFamily, IndexId,
+    IndexInfo, IndexState, OwnedScalarValue, PointFilter, ProjectedValue, Projection, QueryBudget,
     QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
     SortDirection, TextMatch, VectorMetric,
 };
@@ -535,6 +536,10 @@ pub(crate) enum Output {
     Key,
     /// This statement's own ranking value.
     OrderValue,
+    /// A §4.1 / §4.2 ROW function, by its position in `SelectPlan::functions`.
+    /// Evaluated over the values this same row already projected, so it reads
+    /// nothing extra.
+    Row(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -550,6 +555,12 @@ pub(crate) struct SelectPlan {
     pub(crate) driver: CandidateDriver,
     /// The statement as written, for the EXPLAIN header.
     pub(crate) text: String,
+    /// The row expressions `Output::Row` indexes into.
+    pub(crate) functions: Vec<CompiledRow>,
+    /// One line per WHERE function that became an index RANGE, for EXPLAIN.
+    pub(crate) rewrites: Vec<String>,
+    /// One line per projected ROW function, for EXPLAIN.
+    pub(crate) row_functions: Vec<String>,
 }
 
 impl SelectPlan {
@@ -568,21 +579,23 @@ impl SelectPlan {
                 .map_err(SqlError::from)?
                 .map(|entity| entity.key);
         }
-        let values = self
-            .outputs
+        // The projected values, once, so every row function reads the same
+        // list rather than re-decoding.
+        let fields: Vec<SqlValue> = row
+            .projected
             .iter()
-            .map(|output| match output {
-                Output::Id => SqlValue::Id(row.id),
-                Output::Field(at) => row
-                    .projected
-                    .get(*at)
-                    .map_or(SqlValue::Missing, |(_, value)| projected(value)),
-                Output::Key => key
-                    .clone()
-                    .map_or(SqlValue::Missing, SqlValue::Text),
-                Output::OrderValue => order_value(&row.order),
-            })
+            .map(|(_, value)| projected(value))
             .collect();
+        let mut values = Vec::with_capacity(self.outputs.len());
+        for output in &self.outputs {
+            values.push(match output {
+                Output::Id => SqlValue::Id(row.id),
+                Output::Field(at) => fields.get(*at).cloned().unwrap_or(SqlValue::Missing),
+                Output::Key => key.clone().map_or(SqlValue::Missing, SqlValue::Text),
+                Output::OrderValue => order_value(&row.order),
+                Output::Row(at) => self.functions[*at].eval(&fields)?,
+            });
+        }
         Ok(SqlRow { id: row.id, values })
     }
 
@@ -744,6 +757,9 @@ pub(crate) struct AggregatePlan {
     pub(crate) order: GroupOrder,
     pub(crate) driver: CandidateDriver,
     pub(crate) limit: Option<usize>,
+    /// `Some(date_only)` when the group key is a declared TIMESTAMPTZ/DATE
+    /// column. See [`group_key_value`].
+    pub(crate) key_iso: Option<bool>,
     pub(crate) text: String,
 }
 
@@ -768,11 +784,23 @@ fn agg_value(value: &AggValue) -> SqlValue {
     }
 }
 
-fn group_key_value(value: Option<&OwnedScalarValue>) -> SqlValue {
+/// The group key as the answer reports it.
+///
+/// `iso` is `Some(date_only)` when the key is a declared TIMESTAMPTZ or DATE
+/// column: the declared type belongs to the column, so `GROUP BY born_ts`
+/// prints the same ISO text `SELECT born_ts` does rather than the decimal of
+/// its microseconds. A DIVIDED key (`GROUP BY col / n`) is a bucket number
+/// and not an instant, so it stays an integer and never reaches here as
+/// `Some`.
+fn group_key_value(value: Option<&OwnedScalarValue>, iso: Option<bool>) -> SqlValue {
     match value {
         None | Some(OwnedScalarValue::Nullish) => SqlValue::Null,
         Some(OwnedScalarValue::Bool(v)) => SqlValue::Bool(*v),
-        Some(OwnedScalarValue::I64(v)) => SqlValue::Int(*v),
+        Some(OwnedScalarValue::I64(v)) => match iso {
+            Some(true) => SqlValue::Text(functions::format_date(*v)),
+            Some(false) => SqlValue::Text(functions::format_timestamp(*v)),
+            None => SqlValue::Int(*v),
+        },
         Some(OwnedScalarValue::F64(v)) => SqlValue::Float(*v),
         Some(OwnedScalarValue::Text(v)) => SqlValue::Text(v.clone()),
     }
@@ -784,7 +812,7 @@ impl AggregatePlan {
             .outputs
             .iter()
             .map(|output| match output {
-                AggOutput::Key => group_key_value(group.key.as_ref()),
+                AggOutput::Key => group_key_value(group.key.as_ref(), self.key_iso),
                 AggOutput::Value(at) => group
                     .values
                     .get(*at)
@@ -841,6 +869,8 @@ impl AggregatePlan {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CompiledIndex {
     Scalar { field: String, unique: bool },
+    /// An EXPRESSION scalar index over `lower(field)`.
+    LowerScalar { field: String },
     Text { field: String },
     Point { field: String },
     Geometry { field: String },
@@ -866,6 +896,11 @@ pub(crate) enum WritePlan {
     CreateTable {
         name: String,
         fields: Vec<(String, Kind)>,
+        /// The DECLARED spelling of the columns whose `Kind` does not carry
+        /// it (`TIMESTAMPTZ`, `DATE`). Recorded in the catalog descriptor so
+        /// a reopened database still knows a column is a timestamp and can
+        /// print it back as an ISO string (QL_CONTRACT §4.2).
+        declared: Vec<(String, String)>,
     },
     CreateIndex {
         collection: CollectionId,
@@ -923,8 +958,17 @@ impl WritePlan {
                 let gone = db.delete(collection, &key)?;
                 SqlResult::Affected(u64::from(gone))
             }
-            Self::CreateTable { name, fields } => {
-                db.create_collection(&name, fields, CollectionOptions::default())?;
+            Self::CreateTable {
+                name,
+                fields,
+                declared,
+            } => {
+                db.create_collection_declared(
+                    &name,
+                    fields,
+                    declared,
+                    CollectionOptions::default(),
+                )?;
                 db.commit()?;
                 SqlResult::Affected(0)
             }
@@ -938,6 +982,13 @@ impl WritePlan {
                     CompiledIndex::Scalar { field, unique } => {
                         db.create_scalar_index(collection, &name, field, *unique)?
                     }
+                    CompiledIndex::LowerScalar { field } => db.create_expression_index(
+                        collection,
+                        &name,
+                        field,
+                        IndexExpr::Lower,
+                        false,
+                    )?,
                     CompiledIndex::Text { field } => db.create_text_index(collection, &name, field)?,
                     CompiledIndex::Point { field } => {
                         db.create_point_index(collection, &name, field)?
@@ -1017,6 +1068,275 @@ pub(crate) enum Plan {
     ExplainText(String),
 }
 
+// ── row functions over projected values (QL_CONTRACT §4.1, §4.2) ──────────
+
+/// A row expression with every name resolved and every constant folded.
+///
+/// `Field(at)` is a position in the plan's `Projection::Fields` list, so
+/// evaluating one costs a read of a value the page already produced: the cost
+/// is proportional to the rows RETURNED, which is what §4.1 and §4.2 promise
+/// and what `EXPLAIN` prints under "row functions".
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CompiledRow {
+    /// The n-th projected field, with the declared spelling that decides how
+    /// a stored integer prints.
+    Field { at: usize, time: bool },
+    Lit(SqlValue),
+    /// The clock, already folded: every row of one answer sees one instant.
+    Micros(i64),
+    Extract { unit: TimeUnit, arg: Box<CompiledRow> },
+    Trunc { unit: TimeUnit, arg: Box<CompiledRow> },
+    Age { left: Box<CompiledRow>, right: Box<CompiledRow> },
+    ToChar { arg: Box<CompiledRow>, format: String },
+    ToTimestamp(Box<CompiledRow>),
+    ToDate(Box<CompiledRow>),
+    CastDate(Box<CompiledRow>),
+    CastText(Box<CompiledRow>),
+    /// A declared TIMESTAMPTZ/DATE printed back as an ISO-8601 string.
+    Iso { arg: Box<CompiledRow>, date_only: bool },
+    Str { func: StrFunc, args: Vec<CompiledRow> },
+    Add(Box<CompiledRow>, Box<CompiledRow>),
+    Sub(Box<CompiledRow>, Box<CompiledRow>),
+    Concat(Box<CompiledRow>, Box<CompiledRow>),
+}
+
+/// NULL propagates the way SQL says it does: any NULL or MISSING input makes
+/// the whole expression NULL, and no function is called on it.
+fn nullish(value: &SqlValue) -> bool {
+    matches!(value, SqlValue::Null | SqlValue::Missing)
+}
+
+fn want_int(value: &SqlValue, what: &str) -> SqlResult2<i64> {
+    match value {
+        SqlValue::Int(n) => Ok(*n),
+        SqlValue::Float(f) if f.fract() == 0.0 => Ok(*f as i64),
+        other => Err(SqlError::Parameter(format!(
+            "{what} takes a whole number and the row holds {other:?}"
+        ))),
+    }
+}
+
+fn want_text(value: &SqlValue, what: &str) -> SqlResult2<String> {
+    match value {
+        SqlValue::Text(text) => Ok(text.clone()),
+        SqlValue::Int(n) => Ok(n.to_string()),
+        SqlValue::Float(f) => Ok(f.to_string()),
+        SqlValue::Bool(b) => Ok(if *b { "true" } else { "false" }.to_owned()),
+        other => Err(SqlError::Parameter(format!(
+            "{what} takes text and the row holds {other:?}"
+        ))),
+    }
+}
+
+impl CompiledRow {
+    /// One value, from one row's projected values. Reads no other row.
+    pub(crate) fn eval(&self, values: &[SqlValue]) -> SqlResult2<SqlValue> {
+        Ok(match self {
+            Self::Field { at, time } => {
+                let value = values.get(*at).cloned().unwrap_or(SqlValue::Missing);
+                let _ = time;
+                value
+            }
+            Self::Lit(value) => value.clone(),
+            Self::Micros(n) => SqlValue::Int(*n),
+            Self::Extract { unit, arg } => {
+                let value = arg.eval(values)?;
+                if nullish(&value) {
+                    return Ok(SqlValue::Null);
+                }
+                SqlValue::Int(functions::extract(
+                    *unit,
+                    want_int(&value, "EXTRACT(... FROM t)")?,
+                ))
+            }
+            Self::Trunc { unit, arg } => {
+                let value = arg.eval(values)?;
+                if nullish(&value) {
+                    return Ok(SqlValue::Null);
+                }
+                SqlValue::Int(functions::date_trunc(
+                    *unit,
+                    want_int(&value, "date_trunc(u, t)")?,
+                )?)
+            }
+            Self::Age { left, right } => {
+                let (a, b) = (left.eval(values)?, right.eval(values)?);
+                if nullish(&a) || nullish(&b) {
+                    return Ok(SqlValue::Null);
+                }
+                SqlValue::Int(
+                    want_int(&a, "age(a, b)")?.saturating_sub(want_int(&b, "age(a, b)")?),
+                )
+            }
+            Self::ToChar { arg, format } => {
+                let value = arg.eval(values)?;
+                if nullish(&value) {
+                    return Ok(SqlValue::Null);
+                }
+                SqlValue::Text(functions::to_char(want_int(&value, "to_char(t, f)")?, format)?)
+            }
+            Self::ToTimestamp(arg) => {
+                let value = arg.eval(values)?;
+                if nullish(&value) {
+                    return Ok(SqlValue::Null);
+                }
+                match value {
+                    // `to_timestamp(seconds)` per Postgres; a text argument is
+                    // the literal reader, which is `to_date`'s job but the
+                    // same grammar.
+                    SqlValue::Text(text) => SqlValue::Int(functions::parse_timestamp(&text)?),
+                    other => SqlValue::Int(
+                        want_int(&other, "to_timestamp(seconds)")?
+                            .saturating_mul(functions::MICROS_PER_SECOND),
+                    ),
+                }
+            }
+            Self::ToDate(arg) | Self::CastDate(arg) => {
+                let value = arg.eval(values)?;
+                if nullish(&value) {
+                    return Ok(SqlValue::Null);
+                }
+                let micros = match value {
+                    SqlValue::Text(text) => functions::parse_timestamp(&text)?,
+                    other => want_int(&other, "to_date(t)")?,
+                };
+                SqlValue::Int(functions::date_trunc(TimeUnit::Day, micros)?)
+            }
+            Self::CastText(arg) => {
+                let value = arg.eval(values)?;
+                if nullish(&value) {
+                    return Ok(SqlValue::Null);
+                }
+                SqlValue::Text(want_text(&value, "::text")?)
+            }
+            Self::Iso { arg, date_only } => {
+                let value = arg.eval(values)?;
+                if nullish(&value) {
+                    return Ok(SqlValue::Null);
+                }
+                let micros = want_int(&value, "a declared timestamp")?;
+                SqlValue::Text(if *date_only {
+                    functions::format_date(micros)
+                } else {
+                    functions::format_timestamp(micros)
+                })
+            }
+            Self::Str { func, args } => {
+                let mut evaluated = Vec::with_capacity(args.len());
+                for arg in args {
+                    let value = arg.eval(values)?;
+                    // `concat` is the one Postgres function that IGNORES
+                    // NULLs rather than propagating them, and it is the one
+                    // exception here too.
+                    if nullish(&value) && *func != StrFunc::Concat {
+                        return Ok(SqlValue::Null);
+                    }
+                    evaluated.push(value);
+                }
+                return string_function(*func, &evaluated);
+            }
+            Self::Add(a, b) | Self::Sub(a, b) => {
+                let (x, y) = (a.eval(values)?, b.eval(values)?);
+                if nullish(&x) || nullish(&y) {
+                    return Ok(SqlValue::Null);
+                }
+                let (x, y) = (want_int(&x, "date arithmetic")?, want_int(&y, "date arithmetic")?);
+                SqlValue::Int(if matches!(self, Self::Add(_, _)) {
+                    x.saturating_add(y)
+                } else {
+                    x.saturating_sub(y)
+                })
+            }
+            Self::Concat(a, b) => {
+                let (x, y) = (a.eval(values)?, b.eval(values)?);
+                // `||` propagates NULL, unlike `concat`.
+                if nullish(&x) || nullish(&y) {
+                    return Ok(SqlValue::Null);
+                }
+                SqlValue::Text(format!("{}{}", want_text(&x, "||")?, want_text(&y, "||")?))
+            }
+        })
+    }
+}
+
+/// The §4.1 string functions, over already-evaluated arguments.
+fn string_function(func: StrFunc, args: &[SqlValue]) -> SqlResult2<SqlValue> {
+    let arity = |want: std::ops::RangeInclusive<usize>| -> SqlResult2<()> {
+        if want.contains(&args.len()) {
+            Ok(())
+        } else {
+            Err(SqlError::unsupported(format!(
+                "{}() takes {}..={} arguments and was given {}",
+                func.written(),
+                want.start(),
+                want.end(),
+                args.len()
+            )))
+        }
+    };
+    let text = |at: usize| want_text(&args[at], func.written());
+    let int = |at: usize| want_int(&args[at], func.written());
+    Ok(match func {
+        StrFunc::Lower => {
+            arity(1..=1)?;
+            SqlValue::Text(text(0)?.to_lowercase())
+        }
+        StrFunc::Upper => {
+            arity(1..=1)?;
+            SqlValue::Text(text(0)?.to_uppercase())
+        }
+        StrFunc::Length => {
+            arity(1..=1)?;
+            SqlValue::Int(functions::length(&text(0)?))
+        }
+        StrFunc::Trim => {
+            arity(1..=1)?;
+            SqlValue::Text(text(0)?.trim().to_owned())
+        }
+        StrFunc::Concat => {
+            let mut out = String::new();
+            for (at, value) in args.iter().enumerate() {
+                if nullish(value) {
+                    continue;
+                }
+                out.push_str(&want_text(value, func.written()).map_err(|_| {
+                    SqlError::Parameter(format!("concat() argument {} is not text", at + 1))
+                })?);
+            }
+            SqlValue::Text(out)
+        }
+        StrFunc::Substring => {
+            arity(2..=3)?;
+            let count = if args.len() == 3 { Some(int(2)?) } else { None };
+            SqlValue::Text(functions::substring(&text(0)?, int(1)?, count)?)
+        }
+        StrFunc::Left => {
+            arity(2..=2)?;
+            SqlValue::Text(functions::left(&text(0)?, int(1)?))
+        }
+        StrFunc::Right => {
+            arity(2..=2)?;
+            SqlValue::Text(functions::right(&text(0)?, int(1)?))
+        }
+        StrFunc::SplitPart => {
+            arity(3..=3)?;
+            SqlValue::Text(functions::split_part(&text(0)?, &text(1)?, int(2)?)?)
+        }
+        StrFunc::Replace => {
+            arity(3..=3)?;
+            SqlValue::Text(text(0)?.replace(&text(1)?, &text(2)?))
+        }
+        StrFunc::Position => {
+            arity(2..=2)?;
+            SqlValue::Int(functions::position(&text(0)?, &text(1)?))
+        }
+        StrFunc::StartsWith => {
+            arity(2..=2)?;
+            SqlValue::Bool(text(0)?.starts_with(&text(1)?))
+        }
+    })
+}
+
 // ── the compiler ──────────────────────────────────────────────────────────
 
 struct Compiler<'a> {
@@ -1037,6 +1357,14 @@ struct Compiler<'a> {
     /// for work the caller had asked to bound.
     budget: QueryBudget,
     cancelled: &'a mut dyn FnMut() -> bool,
+    /// One line per WHERE function folded into an index range, and one per
+    /// projected row function. They are the two EXPLAIN sections
+    /// `docs/QL_CONTRACT.md` §4.1 and §4.2 ask for: a rewrite is index-side
+    /// and costs candidates, a row function is per RETURNED row.
+    rewrites: Vec<String>,
+    row_functions: Vec<String>,
+    /// `now()` and `current_date`, folded ONCE for the whole statement.
+    clock: i64,
 }
 
 pub(crate) fn compile(
@@ -1049,6 +1377,11 @@ pub(crate) fn compile(
 ) -> SqlResult2<Plan> {
     let mut compiler = Compiler {
         index_lists: std::cell::RefCell::new(Vec::new()),
+        rewrites: Vec::new(),
+        row_functions: Vec::new(),
+        clock: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX)),
         db,
         params,
         notices,
@@ -1457,6 +1790,32 @@ impl Compiler<'_> {
             .ok_or_else(|| SqlError::engine(format!("no column `{field}` in this collection")))
     }
 
+    /// The DECLARED SQL spelling of `field`, when the catalog records one.
+    ///
+    /// `TIMESTAMPTZ` and `DATE` are both `Kind::Int` (UTC microseconds,
+    /// §5 deviation 8), so this is what tells a date/time rewrite from an
+    /// ordinary integer comparison, and what makes a projected column print
+    /// back as an ISO string.
+    fn declared_of(&self, c: CollectionId, field: &str) -> SqlResult2<Option<String>> {
+        let info = self.db.collection_info(c).map_err(SqlError::from)?;
+        Ok(info
+            .declared
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, declared)| declared.clone()))
+    }
+
+    /// `Some(declared)` when `field` is a declared TIMESTAMPTZ/DATE stored as
+    /// `Kind::Int`.
+    fn time_column(&self, c: CollectionId, field: &str) -> SqlResult2<Option<String>> {
+        if !matches!(self.kind_of(c, field)?, Kind::Int) {
+            return Ok(None);
+        }
+        Ok(self
+            .declared_of(c, field)?
+            .filter(|declared| functions::is_time_type(declared)))
+    }
+
     fn declared_fields(&self, c: CollectionId) -> SqlResult2<Vec<String>> {
         let info = self.db.collection_info(c).map_err(SqlError::from)?;
         Ok(info
@@ -1478,6 +1837,24 @@ impl Compiler<'_> {
         family: IndexFamily,
         what: &str,
     ) -> SqlResult2<IndexId> {
+        self.index_for_expression(c, field, family, None, what)
+    }
+
+    /// The same lookup, matching the index's EXPRESSION as well as its field.
+    ///
+    /// An expression index records the SOURCE field, so `kind = 'Home'` and
+    /// `lower(kind) = 'home'` both name `kind` and must not pick each other's
+    /// index: the first would be answered from keys that hold `'home'`, the
+    /// second from keys that hold `'Home'`. The expression is part of the
+    /// identity of the index a predicate names.
+    fn index_for_expression(
+        &self,
+        c: CollectionId,
+        field: &str,
+        family: IndexFamily,
+        expression: Option<IndexExpr>,
+        what: &str,
+    ) -> SqlResult2<IndexId> {
         let mut lists = self.index_lists.borrow_mut();
         let position = match lists.iter().position(|(id, _)| *id == c) {
             Some(position) => position,
@@ -1489,7 +1866,7 @@ impl Compiler<'_> {
         let indexes = &lists[position].1;
         let mut building = false;
         for info in indexes {
-            if info.field == field && info.family == family {
+            if info.field == field && info.family == family && info.expression == expression {
                 match info.state {
                     IndexState::Ready => return Ok(info.id),
                     IndexState::Building { .. } => building = true,
@@ -1596,6 +1973,7 @@ impl Compiler<'_> {
         let mut columns = Vec::new();
         let mut outputs = Vec::new();
         let mut fields: Vec<String> = Vec::new();
+        let mut functions: Vec<CompiledRow> = Vec::new();
         let push_field = |field: String, fields: &mut Vec<String>| -> Output {
             match fields.iter().position(|existing| *existing == field) {
                 Some(at) => Output::Field(at),
@@ -1622,7 +2000,27 @@ impl Compiler<'_> {
                 SelectItem::Star => {
                     for field in self.declared_fields(c)? {
                         columns.push(field.clone());
-                        outputs.push(push_field(field, &mut fields));
+                        // `SELECT *` prints a declared TIMESTAMPTZ/DATE the
+                        // same way `SELECT born_ts` does: the declared type
+                        // belongs to the COLUMN, not to the spelling that
+                        // named it, so the two cannot disagree.
+                        match self.time_column(c, &field)? {
+                            None => outputs.push(push_field(field, &mut fields)),
+                            Some(declared) => {
+                                let Output::Field(at) = push_field(field.clone(), &mut fields)
+                                else {
+                                    unreachable!("push_field returns a field position");
+                                };
+                                self.row_functions.push(format!(
+                                    "{field} -> ISO-8601 text (declared {declared}, stored Int microseconds)"
+                                ));
+                                functions.push(CompiledRow::Iso {
+                                    arg: Box::new(CompiledRow::Field { at, time: true }),
+                                    date_only: declared == "DATE",
+                                });
+                                outputs.push(Output::Row(functions.len() - 1));
+                            }
+                        }
                     }
                 }
                 SelectItem::Id => {
@@ -1636,7 +2034,36 @@ impl Compiler<'_> {
                 SelectItem::Column(name) => {
                     self.kind_of(c, &name)?;
                     columns.push(alias.clone().unwrap_or_else(|| name.clone()));
-                    outputs.push(push_field(name.clone(), &mut fields));
+                    // A declared TIMESTAMPTZ/DATE is stored as an integer and
+                    // PRINTS as an ISO-8601 string (QL_CONTRACT §4.2): the
+                    // declared type in the catalog descriptor is what says so,
+                    // and the conversion is a row function like any other.
+                    match self.time_column(c, &name)? {
+                        None => outputs.push(push_field(name.clone(), &mut fields)),
+                        Some(declared) => {
+                            let Output::Field(at) = push_field(name.clone(), &mut fields) else {
+                                unreachable!("push_field returns a field position");
+                            };
+                            self.row_functions.push(format!(
+                                "{name} -> ISO-8601 text (declared {declared}, stored Int microseconds)"
+                            ));
+                            functions.push(CompiledRow::Iso {
+                                arg: Box::new(CompiledRow::Field { at, time: true }),
+                                date_only: declared == "DATE",
+                            });
+                            outputs.push(Output::Row(functions.len() - 1));
+                        }
+                    }
+                }
+                SelectItem::Function(expr) => {
+                    let compiled = self.row_function(c, &expr, &mut fields)?;
+                    let written = expr.written();
+                    self.row_functions.push(format!(
+                        "{written} -> evaluated over this row's projected values, after the index-side stage (cost is proportional to the rows RETURNED)"
+                    ));
+                    columns.push(alias.clone().unwrap_or(written));
+                    functions.push(compiled);
+                    outputs.push(Output::Row(functions.len() - 1));
                 }
                 SelectItem::OrderValue(_) | SelectItem::Divided { .. } => {
                     let what = match &item {
@@ -1709,6 +2136,173 @@ impl Compiler<'_> {
             limit: statement.limit,
             driver,
             text: String::new(),
+            functions,
+            rewrites: std::mem::take(&mut self.rewrites),
+            row_functions: std::mem::take(&mut self.row_functions),
+        })
+    }
+
+    /// A parsed `RowExpr` with every column resolved to a projection slot and
+    /// every constant folded.
+    ///
+    /// Resolving a column APPENDS it to the projection list, so a function
+    /// over a column the select list does not otherwise name still costs one
+    /// projected field and no extra read: the page already decodes the row it
+    /// returns.
+    /// A row expression whose value should be printed as a declared
+    /// timestamp's ISO text rather than as the decimal of its microseconds.
+    ///
+    /// `Some(date_only)` exactly when `expr` is a bare column whose declared
+    /// type is TIMESTAMPTZ or DATE, so `born_day` prints `1940-01-03` and
+    /// `born_ts` prints `1940-01-03T05:06:00Z` on EVERY string path -- the
+    /// two `||` sides, a string function's argument, and `::text`. Stated
+    /// once so those three cannot disagree.
+    fn iso_text(&mut self, c: CollectionId, expr: &RowExpr) -> SqlResult2<Option<bool>> {
+        let RowExpr::Column(name) = expr else {
+            return Ok(None);
+        };
+        Ok(self
+            .time_column(c, name)?
+            .map(|declared| declared == "DATE"))
+    }
+
+    fn row_function(
+        &mut self,
+        c: CollectionId,
+        expr: &RowExpr,
+        fields: &mut Vec<String>,
+    ) -> SqlResult2<CompiledRow> {
+        Ok(match expr {
+            RowExpr::Column(name) => {
+                self.kind_of(c, name)?;
+                let at = match fields.iter().position(|existing| existing == name) {
+                    Some(at) => at,
+                    None => {
+                        fields.push(name.clone());
+                        fields.len() - 1
+                    }
+                };
+                CompiledRow::Field {
+                    at,
+                    time: self.time_column(c, name)?.is_some(),
+                }
+            }
+            RowExpr::Lit(literal) => CompiledRow::Lit(match self.value_of(literal)? {
+                Value::Null => SqlValue::Null,
+                Value::Bool(b) => SqlValue::Bool(b),
+                Value::Number(n) => match n.as_i64() {
+                    Some(i) => SqlValue::Int(i),
+                    None => SqlValue::Float(n.as_f64().unwrap_or(f64::NAN)),
+                },
+                Value::String(text) => SqlValue::Text(text),
+                other => SqlValue::Json(other),
+            }),
+            RowExpr::Now => CompiledRow::Micros(self.clock_micros()),
+            RowExpr::CurrentDate => {
+                CompiledRow::Micros(functions::date_trunc(TimeUnit::Day, self.clock_micros())?)
+            }
+            RowExpr::Interval(micros) => CompiledRow::Micros(*micros),
+            RowExpr::Extract { unit, arg } => CompiledRow::Extract {
+                unit: *unit,
+                arg: Box::new(self.row_function(c, arg, fields)?),
+            },
+            RowExpr::Trunc { unit, arg } => CompiledRow::Trunc {
+                unit: *unit,
+                arg: Box::new(self.row_function(c, arg, fields)?),
+            },
+            RowExpr::Age { left, right } => CompiledRow::Age {
+                left: Box::new(match right {
+                    // `age(t)` is `now() - t`, so the clock is the LEFT side.
+                    None => CompiledRow::Micros(self.clock_micros()),
+                    Some(_) => self.row_function(c, left, fields)?,
+                }),
+                right: Box::new(match right {
+                    None => self.row_function(c, left, fields)?,
+                    Some(right) => self.row_function(c, right, fields)?,
+                }),
+            },
+            RowExpr::ToChar { arg, format } => {
+                // The template is checked HERE, at prepare, so a template
+                // this slice does not carry is a refusal rather than an error
+                // on the first row.
+                functions::to_char(0, format)?;
+                CompiledRow::ToChar {
+                    arg: Box::new(self.row_function(c, arg, fields)?),
+                    format: format.clone(),
+                }
+            }
+            RowExpr::ToTimestamp(arg) => {
+                CompiledRow::ToTimestamp(Box::new(self.row_function(c, arg, fields)?))
+            }
+            RowExpr::ToDate(arg) => {
+                CompiledRow::ToDate(Box::new(self.row_function(c, arg, fields)?))
+            }
+            RowExpr::CastDate(arg) => {
+                CompiledRow::CastDate(Box::new(self.row_function(c, arg, fields)?))
+            }
+            RowExpr::CastText(arg) => {
+                let inner = self.row_function(c, arg, fields)?;
+                // A declared timestamp cast to text is its ISO spelling, not
+                // the decimal of its microseconds.
+                match self.iso_text(c, arg)? {
+                    Some(date_only) => CompiledRow::Iso {
+                        arg: Box::new(inner),
+                        date_only,
+                    },
+                    None => CompiledRow::CastText(Box::new(inner)),
+                }
+            }
+            RowExpr::Str { func, args } => {
+                let mut compiled = Vec::with_capacity(args.len());
+                for arg in args {
+                    compiled.push(self.row_function(c, arg, fields)?);
+                }
+                // A declared timestamp handed to a STRING function is its ISO
+                // spelling: `upper(born_ts)` reads the text a SELECT prints,
+                // not the integer underneath it.
+                for at in 0..compiled.len() {
+                    if let Some(date_only) = self.iso_text(c, &args[at])? {
+                        compiled[at] = CompiledRow::Iso {
+                            arg: Box::new(compiled[at].clone()),
+                            date_only,
+                        };
+                    }
+                }
+                CompiledRow::Str {
+                    func: *func,
+                    args: compiled,
+                }
+            }
+            RowExpr::Add(a, b) => CompiledRow::Add(
+                Box::new(self.row_function(c, a, fields)?),
+                Box::new(self.row_function(c, b, fields)?),
+            ),
+            RowExpr::Sub(a, b) => CompiledRow::Sub(
+                Box::new(self.row_function(c, a, fields)?),
+                Box::new(self.row_function(c, b, fields)?),
+            ),
+            RowExpr::Concat(a, b) => {
+                // `||` is a string operator, so a declared timestamp on
+                // either side of it is its ISO spelling -- the same rule
+                // `concat(born_ts, '')` and `born_ts::text` already follow.
+                // Without this `born_ts || ''` printed the decimal of its
+                // microseconds while `concat(born_ts, '')` printed the text.
+                let mut left = self.row_function(c, a, fields)?;
+                let mut right = self.row_function(c, b, fields)?;
+                if let Some(date_only) = self.iso_text(c, a)? {
+                    left = CompiledRow::Iso {
+                        arg: Box::new(left),
+                        date_only,
+                    };
+                }
+                if let Some(date_only) = self.iso_text(c, b)? {
+                    right = CompiledRow::Iso {
+                        arg: Box::new(right),
+                        date_only,
+                    };
+                }
+                CompiledRow::Concat(Box::new(left), Box::new(right))
+            }
         })
     }
 
@@ -1835,6 +2429,19 @@ impl Compiler<'_> {
             }
         };
 
+        // A declared TIMESTAMPTZ/DATE group key prints as ISO text, the same
+        // way the same column does in a row answer. A DIVIDED key is a bucket
+        // number rather than an instant, so it stays an integer.
+        let key_iso = match &group_expr {
+            Some(GroupExpr {
+                column,
+                divisor: None,
+            }) => self
+                .time_column(c, column)?
+                .map(|declared| declared == "DATE"),
+            _ => None,
+        };
+
         // The select list: the group key, and the aggregate functions.
         let mut columns: Vec<String> = Vec::new();
         let mut outputs: Vec<AggOutput> = Vec::new();
@@ -1844,6 +2451,12 @@ impl Compiler<'_> {
         let mut written: Vec<(AggFunc, AggArg, Option<String>)> = Vec::new();
         for (item, alias) in &statement.items {
             match item {
+                SelectItem::Function(expr) => {
+                    return Err(SqlError::unsupported(format!(
+                        "`{}` in a folded answer: QL_CONTRACT §4.1 and §4.2 make a function over projected values a ROW function, and a folded answer returns groups, not rows. Group by the value the function computes (`GROUP BY col`), or select the function without folding",
+                        expr.written()
+                    )))
+                }
                 SelectItem::Aggregate { function, argument } => {
                     let accumulator = self.accumulator(c, *function, argument)?;
                     let at = accumulators.len();
@@ -2014,6 +2627,7 @@ impl Compiler<'_> {
             order,
             driver,
             limit: statement.limit,
+            key_iso,
             text: String::new(),
         }))
     }
@@ -2213,10 +2827,402 @@ impl Compiler<'_> {
             && !trimmed.contains('|')
             && !trimmed.contains('&'))
     }
+    // ── §4.1 / §4.2 range rewrites (QL_CONTRACT §4.1, §4.2) ──────────────
+
+    /// The instant `now()` folds to for one statement.
+    ///
+    /// Read ONCE per compiled statement, so every row of one answer sees the
+    /// same clock and a page that resumes does not drift. `docs/QL_CONTRACT.md`
+    /// §4.2: "constants folded at prepare".
+    fn clock_micros(&self) -> i64 {
+        self.clock
+    }
+
+    /// A [`TimeValue`] folded to stored microseconds.
+    fn time_value(&self, value: &TimeValue, column: &str) -> SqlResult2<i64> {
+        Ok(match value {
+            TimeValue::Lit(literal) => self.time_literal(literal, column)?,
+            TimeValue::Clock { date_only, offset } => {
+                let base = self.clock_micros();
+                let base = if *date_only {
+                    functions::date_trunc(TimeUnit::Day, base)?
+                } else {
+                    base
+                };
+                base.checked_add(*offset).ok_or_else(|| {
+                    SqlError::unsupported("the folded clock arithmetic overflows i64 microseconds")
+                })?
+            }
+        })
+    }
+
+    /// A written literal read as stored microseconds: a string is an ISO-8601
+    /// or Postgres date/time literal, a whole number is already the stored
+    /// integer.
+    fn time_literal(&self, literal: &Literal, column: &str) -> SqlResult2<i64> {
+        match self.value_of(literal)? {
+            Value::String(text) => functions::parse_timestamp(&text),
+            Value::Number(n) => n.as_i64().ok_or_else(|| {
+                SqlError::Parameter(format!(
+                    "`{column}` stores whole microseconds and {n} is not a whole number"
+                ))
+            }),
+            other => Err(SqlError::Parameter(format!(
+                "`{column}` is a declared timestamp and {other} is neither a date/time literal nor a whole number of microseconds"
+            ))),
+        }
+    }
+
+    /// A whole number written beside an `EXTRACT`.
+    fn whole(&self, literal: &Literal, what: &str) -> SqlResult2<i64> {
+        match self.value_of(literal)? {
+            Value::Number(n) => n.as_i64().ok_or_else(|| {
+                SqlError::Parameter(format!("{what} compares against a whole number, not {n}"))
+            }),
+            other => Err(SqlError::Parameter(format!(
+                "{what} compares against a whole number, not {other}"
+            ))),
+        }
+    }
+
+    /// One half-open range `[lower, upper)` over the stored microseconds, as
+    /// the scalar filter spells it.
+    fn micro_range(lower: Option<i64>, upper: Option<i64>) -> OwnedScalarFilter {
+        OwnedScalarFilter::Range {
+            lower: lower.map_or(Bound::Unbounded, |v| Bound::Included(Scalar::I64(v))),
+            upper: upper.map_or(Bound::Unbounded, |v| Bound::Excluded(Scalar::I64(v))),
+        }
+    }
+
+    /// The empty range: a predicate whose pre-image holds no instant at all
+    /// (`date_trunc('year', t) = '1950-06-01'`). It is still ONE range, so it
+    /// is answered by the index with no candidates walked rather than
+    /// refused: the statement is well formed and its answer is no rows.
+    fn empty_range() -> OwnedScalarFilter {
+        OwnedScalarFilter::Range {
+            lower: Bound::Excluded(Scalar::I64(i64::MAX)),
+            upper: Bound::Excluded(Scalar::I64(i64::MAX)),
+        }
+    }
+
+    /// The bounds a comparison against one folded instant produces.
+    fn compare_range(op: CmpOp, at: i64, what: &str) -> SqlResult2<OwnedScalarFilter> {
+        Ok(match op {
+            CmpOp::Eq => Self::micro_range(Some(at), at.checked_add(1)),
+            CmpOp::Lt => Self::micro_range(None, Some(at)),
+            CmpOp::Le => Self::micro_range(None, at.checked_add(1)),
+            CmpOp::Gt => OwnedScalarFilter::Range {
+                lower: Bound::Excluded(Scalar::I64(at)),
+                upper: Bound::Unbounded,
+            },
+            CmpOp::Ge => Self::micro_range(Some(at), None),
+            CmpOp::Ne => return Err(refuse::multi_range(what)),
+        })
+    }
+
+    /// A `[start, end)` window compared against: `= window` is the window,
+    /// `< window` is everything below its start, and so on. This is what
+    /// makes `EXTRACT(YEAR FROM t) = 1950` and `date_trunc('year', t) = lit`
+    /// ONE range each.
+    fn window_range(op: CmpOp, start: i64, end: i64, what: &str) -> SqlResult2<OwnedScalarFilter> {
+        Ok(match op {
+            CmpOp::Eq => Self::micro_range(Some(start), Some(end)),
+            CmpOp::Lt => Self::micro_range(None, Some(start)),
+            CmpOp::Le => Self::micro_range(None, Some(end)),
+            CmpOp::Gt => Self::micro_range(Some(end), None),
+            CmpOp::Ge => Self::micro_range(Some(start), None),
+            // The complement of a window is TWO ranges: below it and above
+            // it. That is a union.
+            CmpOp::Ne => return Err(refuse::multi_range(what)),
+        })
+    }
+
+    /// The same comparison when the literal is NOT on the unit's boundary --
+    /// `date_trunc('month', t) >= '1950-01-15'`, `t::date < '1950-01-15 12:00'`.
+    ///
+    /// The left-hand side only ever takes boundary values, so an interior
+    /// literal moves every cut to the boundary ABOVE it, which is the window's
+    /// own `end`: `>= lit` and `> lit` are both `t >= end` (January is
+    /// excluded, because `1950-01-01 >= 1950-01-15` is false), `< lit` and
+    /// `<= lit` are both `t < end` (January is kept, because
+    /// `1950-01-01 < 1950-01-15` is true), and `= lit` holds for no instant.
+    /// Postgres answers each of these the same way. `<>` stays refused with
+    /// the window reason rather than becoming a second spelling of "every
+    /// row": one shape, one refusal.
+    fn offset_window_range(op: CmpOp, end: i64, what: &str) -> SqlResult2<OwnedScalarFilter> {
+        Ok(match op {
+            CmpOp::Eq => Self::empty_range(),
+            CmpOp::Lt | CmpOp::Le => Self::micro_range(None, Some(end)),
+            CmpOp::Gt | CmpOp::Ge => Self::micro_range(Some(end), None),
+            CmpOp::Ne => return Err(refuse::multi_range(what)),
+        })
+    }
+
+    /// 1 January of `year`, in stored microseconds, saturating at the ends of
+    /// the representable range.
+    ///
+    /// `EXTRACT(YEAR FROM t) = 300000` is a legal literal a user can write,
+    /// and `days_from_civil(n, 1, 1) * MICROS_PER_DAY` leaves i64 somewhere
+    /// past year 294,000. The release profile sets no `overflow-checks`
+    /// (`Cargo.toml`), so the unchecked form wraps to a garbage window in
+    /// release and panics in a test build, on a literal.
+    ///
+    /// Saturating is not a clamp of the ANSWER. Every instant a column can
+    /// hold lies inside `[i64::MIN, i64::MAX]` microseconds, so a year above
+    /// the range makes `= n` and `>= n` empty and `< n` everything, and a
+    /// year below it makes `<= n` empty and `> n` everything -- which is
+    /// what those comparisons mean. The year is bounded first, because
+    /// `days_from_civil` multiplies the year itself.
+    fn year_start(year: i64) -> i64 {
+        const BOUND: i64 = 400_000;
+        if year > BOUND {
+            return i64::MAX;
+        }
+        if year < -BOUND {
+            return i64::MIN;
+        }
+        match functions::days_from_civil(year, 1, 1).checked_mul(functions::MICROS_PER_DAY) {
+            Some(micros) => micros,
+            None if year > 0 => i64::MAX,
+            None => i64::MIN,
+        }
+    }
+
+    /// The `[start, end)` window `EXTRACT(<unit> FROM t) = n` names.
+    ///
+    /// `YEAR` is the one unit whose equality is contiguous over the stored
+    /// integer: every instant of year `n` lies between 1 January `n` and
+    /// 1 January `n + 1`, and nothing else does. `MONTH`, `DAY`, `DOW`,
+    /// `HOUR`, `MINUTE` and `SECOND` repeat, so their pre-image is one
+    /// interval PER period in the corpus -- a set of ranges, which is the
+    /// membership-set union `OR` compiles to.
+    fn extract_window(unit: TimeUnit, n: i64, what: &str) -> SqlResult2<(i64, i64)> {
+        match unit {
+            TimeUnit::Year => Ok((
+                Self::year_start(n),
+                Self::year_start(n.saturating_add(1)),
+            )),
+            TimeUnit::Epoch => Ok((
+                n.saturating_mul(functions::MICROS_PER_SECOND),
+                n.saturating_add(1).saturating_mul(functions::MICROS_PER_SECOND),
+            )),
+            _ => Err(refuse::multi_range(what)),
+        }
+    }
+
+    /// A `Predicate::Time` folded into ONE scalar range on `column`'s index.
+    fn time_filter(
+        &mut self,
+        c: CollectionId,
+        column: &str,
+        shape: &TimeShape,
+    ) -> SqlResult2<OwnedFilter> {
+        let what = shape.written(column);
+        if self.time_column(c, column)?.is_none() {
+            return Err(SqlError::unsupported(format!(
+                "{what}: `{column}` is not a declared TIMESTAMPTZ or DATE. QL_CONTRACT §4.2 folds a date/time function over a column whose declared type says it holds UTC microseconds; over an untyped Int there is nothing to fold"
+            )));
+        }
+        let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
+        let predicate = match shape {
+            TimeShape::Extract { unit, op, value } => {
+                let n = self.whole(value, &what)?;
+                let (start, end) = Self::extract_window(*unit, n, &what)?;
+                Self::window_range(*op, start, end, &what)?
+            }
+            TimeShape::ExtractBetween { unit, lower, upper } => {
+                let low = self.whole(lower, &what)?;
+                let high = self.whole(upper, &what)?;
+                if high < low {
+                    Self::empty_range()
+                } else {
+                    let (start, _) = Self::extract_window(*unit, low, &what)?;
+                    let (_, end) = Self::extract_window(*unit, high, &what)?;
+                    Self::micro_range(Some(start), Some(end))
+                }
+            }
+            TimeShape::Trunc { unit, op, value } => {
+                let at = self.time_literal(value, column)?;
+                let start = functions::date_trunc(*unit, at)?;
+                let end = functions::next_unit(*unit, start)?;
+                // An off-boundary literal is its own comparison: `= v` holds
+                // for no instant at all, and both inequalities cut at `end`
+                // rather than at `start`. Postgres answers the same.
+                if start == at {
+                    Self::window_range(*op, start, end, &what)?
+                } else {
+                    Self::offset_window_range(*op, end, &what)?
+                }
+            }
+            TimeShape::TruncBetween { unit, lower, upper } => {
+                let low_at = self.time_literal(lower, column)?;
+                let high_at = self.time_literal(upper, column)?;
+                let low = functions::date_trunc(*unit, low_at)?;
+                let high = functions::date_trunc(*unit, high_at)?;
+                // BETWEEN is `>= lower AND <= upper`. The lower half carries
+                // the off-boundary rule above: no truncated instant lies
+                // between `low` and an interior `low_at`, so the window starts
+                // at the next boundary. The upper half does not: `<= high_at`
+                // and `<= high` admit the same truncated instants either way.
+                let start = if low == low_at {
+                    low
+                } else {
+                    functions::next_unit(*unit, low)?
+                };
+                let end = functions::next_unit(*unit, high)?;
+                if end <= start {
+                    Self::empty_range()
+                } else {
+                    Self::micro_range(Some(start), Some(end))
+                }
+            }
+            TimeShape::CastDate { op, value } => {
+                let at = self.time_literal(value, column)?;
+                let start = functions::date_trunc(TimeUnit::Day, at)?;
+                let end = functions::next_unit(TimeUnit::Day, start)?;
+                // `t::date` is a truncation to the day, so it takes the same
+                // off-boundary rule as `date_trunc('day', t)`.
+                if start == at {
+                    Self::window_range(*op, start, end, &what)?
+                } else {
+                    Self::offset_window_range(*op, end, &what)?
+                }
+            }
+            TimeShape::Clock { op, value } => {
+                let at = self.time_value(value, column)?;
+                Self::compare_range(*op, at, &what)?
+            }
+            TimeShape::ClockBetween { lower, upper } => {
+                let low = self.time_value(lower, column)?;
+                let high = self.time_value(upper, column)?;
+                if high < low {
+                    Self::empty_range()
+                } else {
+                    Self::micro_range(Some(low), high.checked_add(1))
+                }
+            }
+        };
+        self.rewrites.push(format!(
+            "{what} -> scalar range on `{column}` (index-side; the function is folded at prepare and never evaluated per candidate)"
+        ));
+        Ok(OwnedFilter::Scalar { index, predicate })
+    }
+
+    /// A `Predicate::TextFn` folded into ONE text-key range.
+    fn text_filter(
+        &mut self,
+        c: CollectionId,
+        column: &str,
+        shape: &TextShape,
+    ) -> SqlResult2<OwnedFilter> {
+        let what = shape.written(column);
+        if !matches!(self.kind_of(c, column)?, Kind::Text) {
+            return Err(SqlError::unsupported(format!(
+                "{what}: `{column}` is not a TEXT column, and a text-key range is over text keys"
+            )));
+        }
+        let lowered = matches!(shape, TextShape::LowerEq { .. } | TextShape::LowerPrefix { .. });
+        let index = if lowered {
+            self.index_for_expression(
+                c,
+                column,
+                IndexFamily::Scalar,
+                Some(IndexExpr::Lower),
+                "an expression index `CREATE INDEX ... ON t (lower(col))`",
+            )?
+        } else {
+            self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?
+        };
+        // The bound is folded the way the INDEX stores it: an expression
+        // index over lower(col) holds folded keys, so the literal is folded
+        // to match. Without that the range would be over a different
+        // alphabet than the keys it walks.
+        let literal = |compiler: &Self, value: &Literal| -> SqlResult2<String> {
+            let text = compiler.text_of(value)?;
+            Ok(if lowered { text.to_lowercase() } else { text })
+        };
+        let predicate = match shape {
+            TextShape::LowerEq { value } => OwnedScalarFilter::Eq(Scalar::Text(literal(self, value)?)),
+            TextShape::LowerPrefix { value, .. } | TextShape::Prefix { value, .. } => {
+                let raw = literal(self, value)?;
+                let prefix = match shape {
+                    TextShape::Prefix { written: "LIKE", .. }
+                    | TextShape::LowerPrefix { written: "LIKE", .. } => {
+                        functions::like_prefix(&raw)
+                            .ok_or_else(|| SqlError::Refused {
+                                keyword: "LIKE".into(),
+                                tier: Tier::Two,
+                                reason: super::parser::LIKE_NOT_A_PREFIX,
+                            })?
+                            .to_owned()
+                    }
+                    _ => raw,
+                };
+                if prefix.is_empty() {
+                    return Err(SqlError::unsupported(format!(
+                        "{what}: an empty prefix admits every row, which is a scan, and §6 does not allow one to be taken silently"
+                    )));
+                }
+                if prefix.contains('\0') {
+                    return Err(SqlError::unsupported(format!(
+                        "{what}: a NUL inside a prefix has no successor in the escaped text key encoding (`src/store/scalar_key.rs`)"
+                    )));
+                }
+                let upper = match functions::prefix_successor(&prefix) {
+                    functions::PrefixSuccessor::Bound(next) => {
+                        Bound::Excluded(Scalar::Text(next))
+                    }
+                    functions::PrefixSuccessor::Unbounded => Bound::Unbounded,
+                    // The bound travels as text and this one is not text.
+                    // Widening it to the replacement character would admit
+                    // every value in between, and the residual filter uses
+                    // the same bound, so nothing downstream would catch it.
+                    functions::PrefixSuccessor::NotUtf8 => {
+                        return Err(SqlError::unsupported(format!(
+                            "{what}: this prefix's upper bound is a byte string that is not valid UTF-8 (incrementing the last byte of `{prefix}` leaves one), and a text range bound is text. QL_CONTRACT §3: there is no byte-valued text bound in this slice, so the prefix is refused rather than answered from a wider range than the one asked for"
+                        )))
+                    }
+                };
+                OwnedScalarFilter::Range {
+                    lower: Bound::Included(Scalar::Text(prefix.clone())),
+                    upper,
+                }
+            }
+        };
+        self.rewrites.push(format!(
+            "{what} -> {} on `{column}`{} (index-side)",
+            match predicate {
+                OwnedScalarFilter::Eq(_) => "scalar equality",
+                _ => "text-key prefix range",
+            },
+            if lowered {
+                " through the expression index over lower(col)"
+            } else {
+                ""
+            }
+        ));
+        Ok(OwnedFilter::Scalar { index, predicate })
+    }
 
     fn filter(&mut self, c: CollectionId, predicate: &Predicate) -> SqlResult2<OwnedFilter> {
         Ok(match predicate {
             Predicate::Compare { column, op, value } => {
+                // `t >= '1950-01-01'` over a declared TIMESTAMPTZ/DATE is a
+                // §4.2 rewrite: the literal is read to stored microseconds
+                // and the predicate is the ordinary scalar Range. Without the
+                // declared type there is no literal grammar to read it with.
+                if self.time_column(c, column)?.is_some()
+                    && matches!(self.value_of(value)?, Value::String(_))
+                {
+                    return self.time_filter(
+                        c,
+                        column,
+                        &TimeShape::Clock {
+                            op: *op,
+                            value: TimeValue::Lit(value.clone()),
+                        },
+                    );
+                }
                 let kind = self.kind_of(c, column)?;
                 let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
                 let scalar = self.scalar(&kind, value, column)?;
@@ -2256,6 +3262,18 @@ impl Compiler<'_> {
                 lower,
                 upper,
             } => {
+                if self.time_column(c, column)?.is_some()
+                    && matches!(self.value_of(lower)?, Value::String(_))
+                {
+                    return self.time_filter(
+                        c,
+                        column,
+                        &TimeShape::ClockBetween {
+                            lower: TimeValue::Lit(lower.clone()),
+                            upper: TimeValue::Lit(upper.clone()),
+                        },
+                    );
+                }
                 let kind = self.kind_of(c, column)?;
                 let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
                 OwnedFilter::Scalar {
@@ -2387,6 +3405,8 @@ impl Compiler<'_> {
                 argument,
                 metres,
             } => self.spatial(c, *predicate, column, argument, metres.as_ref())?,
+            Predicate::Time { column, shape } => self.time_filter(c, column, shape)?,
+            Predicate::TextFn { column, shape } => self.text_filter(c, column, shape)?,
         })
     }
 
@@ -2937,7 +3957,15 @@ impl Compiler<'_> {
                     continue;
                 }
                 let kind = self.kind_of(c, column)?;
-                document.insert(column.clone(), self.document_value(kind, &row[at], column)?);
+                // A declared TIMESTAMPTZ/DATE column accepts an ISO-8601 or
+                // Postgres date/time LITERAL and stores the integer
+                // (QL_CONTRACT §4.2); the same column still accepts the
+                // integer itself.
+                let value = match self.time_column(c, column)? {
+                    Some(declared) => self.time_document_value(&row[at], column, &declared)?,
+                    None => self.document_value(kind, &row[at], column)?,
+                };
+                document.insert(column.clone(), value);
             }
             rows.push((key, Value::Object(document)));
         }
@@ -2962,7 +3990,11 @@ impl Compiler<'_> {
                 ));
             }
             let kind = self.kind_of(c, column)?;
-            patch.insert(column.clone(), self.document_value(kind, literal, column)?);
+            let value = match self.time_column(c, column)? {
+                Some(declared) => self.time_document_value(literal, column, &declared)?,
+                None => self.document_value(kind, literal, column)?,
+            };
+            patch.insert(column.clone(), value);
         }
         Ok(WritePlan::Update {
             collection: c,
@@ -2972,6 +4004,44 @@ impl Compiler<'_> {
     }
 
     /// One written value, checked against the column's declared `Kind`.
+    /// A written value for a declared TIMESTAMPTZ/DATE column, stored as the
+    /// integer microseconds `docs/QL_CONTRACT.md` §5 deviation 8 pins.
+    ///
+    /// A `DATE` is midnight UTC of its day, so a literal that carries a time
+    /// of day is REFUSED rather than silently truncated: a statement that
+    /// wrote one meant a timestamp and the column is not one.
+    fn time_document_value(
+        &self,
+        literal: &Literal,
+        column: &str,
+        declared: &str,
+    ) -> SqlResult2<Value> {
+        let value = self.value_of(literal)?;
+        if value.is_null() {
+            return Ok(Value::Null);
+        }
+        let micros = match &value {
+            Value::String(text) => functions::parse_timestamp(text)?,
+            Value::Number(n) => n.as_i64().ok_or_else(|| {
+                SqlError::Parameter(format!(
+                    "`{column}` is declared {declared} and stores whole microseconds; {n} is not a whole number"
+                ))
+            })?,
+            other => {
+                return Err(SqlError::Parameter(format!(
+                    "`{column}` is declared {declared} and {other} is neither a date/time literal nor a whole number of microseconds"
+                )))
+            }
+        };
+        if declared == "DATE" && micros != functions::date_trunc(TimeUnit::Day, micros)? {
+            return Err(SqlError::Parameter(format!(
+                "`{column}` is declared DATE, which is midnight UTC of its day; `{}` carries a time of day and would be truncated silently",
+                value
+            )));
+        }
+        Ok(Value::from(micros))
+    }
+
     fn document_value(&self, kind: Kind, literal: &Literal, column: &str) -> SqlResult2<Value> {
         let value = self.value_of(literal)?;
         if value.is_null() {
@@ -3042,6 +4112,7 @@ impl Compiler<'_> {
 
     fn create_table(&mut self, table: String, columns: Vec<ColumnDef>) -> SqlResult2<WritePlan> {
         let mut fields = Vec::with_capacity(columns.len());
+        let mut declared: Vec<(String, String)> = Vec::new();
         let mut keys = 0usize;
         for column in &columns {
             if column.name.starts_with('_') {
@@ -3065,6 +4136,9 @@ impl Compiler<'_> {
                     column.name, column.declared
                 ));
             }
+            if functions::is_time_type(&column.declared) {
+                declared.push((column.name.clone(), column.declared.clone()));
+            }
             fields.push((column.name.clone(), column.kind.clone()));
         }
         if keys > 1 {
@@ -3080,6 +4154,7 @@ impl Compiler<'_> {
         Ok(WritePlan::CreateTable {
             name: table,
             fields,
+            declared,
         })
     }
 
@@ -3097,6 +4172,17 @@ impl Compiler<'_> {
                     field,
                     unique: false,
                 }
+            }
+            IndexMethod::LowerBtree(field) => {
+                if !matches!(self.kind_of(c, &field)?, Kind::Text) {
+                    return Err(SqlError::unsupported(format!(
+                        "lower({field}): the expression QL_CONTRACT §4.1 names folds a TEXT column"
+                    )));
+                }
+                self.notices.push(format!(
+                    "an expression index over lower({field}) stores the FOLDED value: `{field} = 'X'` still needs the plain index over `{field}`, and `lower({field}) = 'x'` needs this one"
+                ));
+                CompiledIndex::LowerScalar { field }
             }
             IndexMethod::Gin(field) => {
                 if !matches!(self.kind_of(c, &field)?, Kind::Text) {
