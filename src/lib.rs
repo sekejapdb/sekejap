@@ -1,14 +1,18 @@
 use kernel::spatial::Geom;
 use serde_json::{Map, Value};
-pub mod recovery;
-pub mod collection_backend;
 pub mod collections;
-pub mod pagewal;
-mod scalar_key;
-pub mod spatial_geometry;
-pub mod spatial_math;
-mod text_analyzer;
-mod vector_quant;
+mod index;
+mod query;
+pub mod store;
+
+// The public module paths this crate has always offered. The tree below them
+// moved; the names did not, and neither did what they export.
+pub use crate::index::spatial::{geometry as spatial_geometry, math as spatial_math};
+pub use crate::store as collection_backend;
+pub use crate::store::{pagewal, recovery};
+pub(crate) use crate::index::text::analyzer as text_analyzer;
+pub(crate) use crate::index::vector::quant as vector_quant;
+pub(crate) use crate::store::{dense_v3, scalar_key};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -884,7 +888,6 @@ fn json_path(r: &mut Read<'_>, path: &[&str], depth: usize) -> Result<Option<Val
     Ok(out)
 }
 
-mod dense_v3;
 /// Encode directly into the dense-v3 wire representation.
 pub fn encode_dense_v3(layout: &Layout, doc: &Value) -> Result<Encoded> {
     dense_v3::encode_direct(layout, doc)
