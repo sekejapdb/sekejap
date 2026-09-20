@@ -18,7 +18,7 @@ reason in the error text; never emulated silently.
 | graph | ISO/IEC 9075-16:2023 SQL/PGQ, `GRAPH_TABLE ... COLUMNS` | PostgreSQL 19 ch. 5.15; Oracle 23ai GRAPH_TABLE; patterns per GPML (Deutsch et al., SIGMOD 2022, arXiv 2112.06217), shared with ISO/IEC 39075:2024 GQL |
 | spatial | PostGIS 3.6 function names and unit semantics | docs/SPATIAL_FUNCTIONS.md, tests/spatial_postgis_conformance.rs |
 | vector | pgvector 0.8 type and operators; pgvectorscale knobs where they map | tools/battle50k_pg_cases.sql |
-| text | PostgreSQL tsvector/tsquery for boolean matching; BM25 ranking; search functions in the e1 family (typo, prefix) | src/text_indexes.rs |
+| text | PostgreSQL tsvector/tsquery for boolean matching; BM25 ranking; search functions in the e1 family (typo, prefix) | src/index/text/mod.rs |
 | catalog | `db_*` core rows; `pg_catalog` and `information_schema` as views | p2-catalog-core, p3-pg-surface |
 
 Not adopted: standalone GQL statements, Cypher, AQL, SurrealQL, e3's `FROM

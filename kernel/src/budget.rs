@@ -31,6 +31,10 @@ impl MemoryBudget {
     }
 }
 
+/// `class` is not read today -- `Drop` only needs `bytes` to release the
+/// reservation -- but every `reserve` call already names one, so it is
+/// carried here rather than discarded, for a future per-class usage
+/// breakdown or a same-class-releases-what-it-reserved assertion.
 pub struct Reservation { budget: Arc<MemoryBudget>, bytes: usize, #[allow(dead_code)] class: Class }
 
 impl Drop for Reservation {

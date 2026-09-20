@@ -12,19 +12,21 @@ fixtures, upgrade/rollback checks and the commands required for future changes.
 ## Frozen storage envelope
 
 The typed collection path selects `PageWalStore` in
-[src/collection_backend.rs](../src/collection_backend.rs). Its physical page
+[src/store/mod.rs](../src/store/mod.rs) (the layout restructure at `f5e4c7e`
+moved this out of `src/collection_backend.rs`; re-exported under that name
+still). Its physical page
 version, page-WAL magic, required feature bits and typed metadata versions are
 separate identifiers; the candidate name does not replace these checks.
 
 | Unit | Current representation and source |
 |---|---|
 | Physical page | 4096 bytes; magic `0x53454B32`; little-endian u16 version 1 at offset 4; kind, tree ID, slot count, page number, free pointer, sibling/child link, generation and CRC32C. CRC excludes its own bytes 36–39. Slot directory starts at 40. [kernel/src/page.rs](../kernel/src/page.rs), `PageMut::init`, `PageRef::open`, `seal`. |
-| Metadata pages | Data pages 0 and 1 contain a 56-byte `E4PWAL02` slot: magic at 0, root u32 at 8, free-head u32 at 12, logical allowance u64 at 16, 16-byte database identity at 24, transaction u64 at 40, required features u64 at 48. [src/pagewal/format.rs](../src/pagewal/format.rs), `Header`, `disk_header`. |
-| WAL frame | **4144 bytes**: 32-byte frame header, 4096-byte payload, 16-byte database identity. Header: `E4PWAL02` at 0, kind u32 at 8, page number u32 at 12, transaction u64 at 16, committed page count u32 at 24, CRC32C at 28. CRC covers the entire frame with its checksum field zeroed. [src/pagewal.rs](../src/pagewal.rs), `frame`, `read_frame`. |
-| WAL publication | Kind 1 carries a page image; kind 2 commits a transaction and carries the running page-frame CRC in the payload's first u32. Inspection requires transaction sequence, database identity, extent and checkpoint-history agreement, including transaction metadata; only a verified committed prefix is published. [src/pagewal.rs](../src/pagewal.rs), `Pager::inspect_bounded`. |
+| Metadata pages | Data pages 0 and 1 contain a 56-byte `E4PWAL02` slot: magic at 0, root u32 at 8, free-head u32 at 12, logical allowance u64 at 16, 16-byte database identity at 24, transaction u64 at 40, required features u64 at 48. [src/store/pagewal/format.rs](../src/store/pagewal/format.rs), `Header`, `disk_header`. |
+| WAL frame | **4144 bytes**: 32-byte frame header, 4096-byte payload, 16-byte database identity. Header: `E4PWAL02` at 0, kind u32 at 8, page number u32 at 12, transaction u64 at 16, committed page count u32 at 24, CRC32C at 28. CRC covers the entire frame with its checksum field zeroed. [src/store/pagewal/mod.rs](../src/store/pagewal/mod.rs), `frame`, `read_frame`. |
+| WAL publication | Kind 1 carries a page image; kind 2 commits a transaction and carries the running page-frame CRC in the payload's first u32. Inspection requires transaction sequence, database identity, extent and checkpoint-history agreement, including transaction metadata; only a verified committed prefix is published. [src/store/pagewal/mod.rs](../src/store/pagewal/mod.rs), `Pager::inspect_bounded`. |
 | B-tree cells | Ordinary and compact leaf cells, interior child pointers and overflow references/chains retain their encodings. Every build reads both supported cell families. [kernel/src/btree.rs](../kernel/src/btree.rs), record encoders/decoders; structural checks in [kernel/src/verify.rs](../kernel/src/verify.rs). |
-| Typed records | Dense-v3 positional records with immutable layout IDs, binary JSON, scalar/point values and separate f32 vector rows. Catalog/layout/counter packets retain independent copies. [src/dense_v3.rs](../src/dense_v3.rs), [src/collections.rs](../src/collections.rs), [COLLECTIONS.md](COLLECTIONS.md). |
-| Typed resource policy | Ordinary collection header payload is 8 bytes; `create_limited` appends the kernel's 56-byte `E4LIMIT1` record, giving 64 bytes. Other lengths are unsupported. [src/collections.rs](../src/collections.rs), `HEADER_PLAIN`, `HEADER_LIMITED`, header codec. |
+| Typed records | Dense-v3 positional records with immutable layout IDs, binary JSON, scalar/point values and separate f32 vector rows. Catalog/layout/counter packets retain independent copies. [src/store/dense_v3.rs](../src/store/dense_v3.rs), [src/collections/mod.rs](../src/collections/mod.rs), [COLLECTIONS.md](COLLECTIONS.md). |
+| Typed resource policy | Ordinary collection header payload is 8 bytes; `create_limited` appends the kernel's 56-byte `E4LIMIT1` record, giving 64 bytes. Other lengths are unsupported. [src/collections/mod.rs](../src/collections/mod.rs), `HEADER_PLAIN`, `HEADER_LIMITED`, header codec. |
 
 Required feature bit 0 is `COMPACT_CELLS`; the supported set is currently just
 that bit. Writers adopt the file's declared set and ordinary writes preserve

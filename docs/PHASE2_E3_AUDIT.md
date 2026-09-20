@@ -59,7 +59,7 @@ Schemas `schemas/sekejap/tables/e1_gold_data_resource.json` and `e1_gold_search_
 
 `pipelines/app/functions/e1/management/e1-management-profile-manual-catalog-resource.zf.json` description explicitly says it avoids numeric JSON arrays because Sekejap confuses ordinary JSON with VECTOR. E4 must keep numeric JSON arrays as JSON unless explicitly typed vector. This is a concrete consumer regression fixture.
 
-app help `src/platform/help/db/sekejap.md` documents graph `SELECT ... FROM MATCH (u:users)-[:follows]->(friend:users)` and variable-length `[:caused_by*1..5]`; `$1` parameters; schema index families; `_key`. It also documents numeric-only ranges and missing DDL constraints/defaults in the current installed API. Treat these as documented consumer limitations, not desirable E4 semantics. Precise E4 guarantees require executor tests, not inheriting this help text.
+app help `src/platform/help/db/sekejap.md` documents graph `SELECT ... FROM MATCH (u:users)-[:follows]->(friend:users)` and variable-length `[:caused_by*1..5]`; `$1` parameters; schema index families; `_key`. It also documents numeric-only ranges and missing DDL constraints/defaults in the current installed API. Treat these as documented consumer limitations, not desirable E4 semantics. Precise E4 guarantees require executor tests, not inheriting this help text. `docs/QL_CONTRACT.md` §1 has since settled this: e3's `FROM MATCH` is explicitly not adopted, so this help text is consumer-migration context only, not an open question.
 
 ## Minimum new regression/acceptance fixtures
 

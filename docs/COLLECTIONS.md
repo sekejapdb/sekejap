@@ -3,13 +3,16 @@
 The internal Rust API is `e4_prototype::collections::Database`. It layers a
 persistent catalog, external-key index and typed CRUD over the V2 page-WAL
 store (`pagewal::PageWalStore`, `E4PWAL02`; selected in
-`src/collection_backend.rs`, contract in
+`src/store/mod.rs` (the layout restructure at `f5e4c7e` moved this out of
+`src/collection_backend.rs`; re-exported under that name still), contract in
 [V2_COLLECTION_INTEGRATION.md](V2_COLLECTION_INTEGRATION.md)). The inherited
 kernel `Store` is no longer a collection backend. Statements below that name
 the old engine's behaviour were rewritten in the 2026-09-16 pass; the key,
 record, layout and catalog encodings are unchanged. This is the boundary for
-adapting E3 interfaces. It does not implement SQL, HTTP, scalar indexes, graph
-adjacency or a deployment package. The eight laws in CONTRACT.md are
+adapting E3 interfaces. It does not implement HTTP or a deployment package;
+Tier-1 SQL now has a parser and compiler (`src/sql/`, `docs/QL_CONTRACT.md`),
+and scalar indexes and graph adjacency are both live (`src/collections/catalog.rs`,
+`src/index/graph/mod.rs`). The eight laws in CONTRACT.md are
 unchanged; this slice is not a claim that all have passed, and the backend
 switch is unvalidated until the parent's Linux run.
 

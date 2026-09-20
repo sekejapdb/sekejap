@@ -1,4 +1,7 @@
-//! The ctx contract, held to code.
+//! The ctx contract, held to code, for the KERNEL key-value graph
+//! (`kernel::graph::Graph`) -- a separate layer from the typed-collections
+//! graph in `src/index/graph/mod.rs`, whose element identity is decided by
+//! `docs/GRAPH_CONTRACT.md` §2.3 instead.
 //!
 //! Two lecturers assert overlapping-but-different KGs over SHARED nodes.
 //! Each perspective must see exactly its own edges; re-assertion within a ctx

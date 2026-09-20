@@ -50,14 +50,12 @@ pub(super) enum DriverPlan {
         certifies: Option<usize>,
     },
     /// A geometry index walk. The posting `BoxF` admits a candidate; the
-    /// predicate is refined against the row (T3's no-row rule does not apply).
+    /// predicate is not certified by this driver -- it is a live T1 atomic
+    /// (`docs/QL_CONTRACT.md` §4.4) refined against the row by
+    /// `filters_match`'s `CompiledFilter::Geometry` arm, which reads
+    /// `CompiledFilter` directly rather than through this plan.
     Geometry {
         info: IndexInfo,
-        /// Held so a future cursor-side refine can read it without going
-        /// back to `CompiledFilter`. Admission uses `query_bbox`; the
-        /// predicate itself is refined from the row.
-        #[allow(dead_code)]
-        predicate: GeometryFilter,
         position: usize,
         ranges: Vec<GeomRange>,
         query_bbox: BoxF,
@@ -704,6 +702,14 @@ fn visit_graph_direction<C: FnMut() -> bool>(
 /// engine's work meter, charged on the same schedule as before -- one unit
 /// per turn of the edge loop, and one per DISTINCT entity a level discovers,
 /// which is what the old per-edge charge added up to.
+///
+/// PENDING (`docs/GRAPH_CONTRACT.md` §4.3, order-of-work item 1): this walk
+/// prunes by type, direction and depth only, through `visit_graph_direction`.
+/// A predicate on an edge property or a covered node field is not yet
+/// evaluated as the frontier expands, so §4.3's "a traversal never reads a
+/// row for a predicate on a covered field" is not the code's behaviour today
+/// -- a per-hop predicate is still a post-filter over the entities this
+/// function returns.
 fn execute_graph<C: FnMut() -> bool>(
     db: &Database,
     request: BfsRequest,
@@ -1087,8 +1093,9 @@ pub(super) struct SpatialCursor<'a> {
 /// entity is not re-yielded after a resume.
 ///
 /// The box is only a candidate test. This cursor does NOT certify the
-/// filter (`satisfied_filter` stays `None`): T3's no-row rule does not
-/// apply, and the row's geometry is refined through `spatial_geometry`.
+/// filter (`satisfied_filter` stays `None`): the predicate is a live T1
+/// atomic (`docs/QL_CONTRACT.md` §4.4), not a T3 refusal, and the row's
+/// geometry is refined through `src/index/spatial/geometry.rs`.
 pub(super) struct GeometryCursor<'a> {
     pub(super) db: &'a Database,
     pub(super) info: IndexInfo,

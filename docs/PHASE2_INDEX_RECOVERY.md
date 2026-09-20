@@ -5,14 +5,17 @@ This design extends the source-preserving rules in
 [RECOVERY_CONTRACT.md](RECOVERY_CONTRACT.md). It does not authorize in-place
 repair or automatic publication of a rebuilt database.
 
-The implementation anchors audited for this plan are
-[`recovery.rs`](../src/recovery.rs),
-[`pagewal/repair.rs`](../src/pagewal/repair.rs), `CollectionRecovery` in
-[`collections.rs`](../src/collections.rs), the common catalog in
-[`indexes.rs`](../src/indexes.rs), and the graph, vector and point codecs in
-[`graph_collections.rs`](../src/graph_collections.rs),
-[`vector_indexes.rs`](../src/vector_indexes.rs) and
-[`spatial_indexes.rs`](../src/spatial_indexes.rs). Text keyspaces remain the
+The implementation anchors audited for this plan are (paths below are the
+layout restructure at `f5e4c7e`'s current locations; the names in the next
+sentence are the pre-restructure ones this design was written against)
+[`recovery.rs`](../src/store/recovery.rs),
+[`pagewal/repair.rs`](../src/store/pagewal/repair.rs), `CollectionRecovery` in
+[`collections/mod.rs`](../src/collections/mod.rs), the common catalog in
+[`catalog.rs`](../src/collections/catalog.rs), and the graph, vector and point
+codecs in [`graph/mod.rs`](../src/index/graph/mod.rs),
+[`vector/exact.rs`, `vector/quantized.rs`](../src/index/vector/) and
+[`spatial/point.rs`, `spatial/geometry_index.rs`](../src/index/spatial/).
+Text keyspaces remain the
 candidate specified by [PHASE2_TEXT_DESIGN.md](PHASE2_TEXT_DESIGN.md) until that
 family's persisted implementation is stable.
 

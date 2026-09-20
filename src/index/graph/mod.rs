@@ -928,17 +928,20 @@ impl Database {
     /// ascending run at commit. Two findings stop it.
     ///
     /// * It would not arm the append fast path. `fast_path_leaf`
-    ///   (kernel/src/btree.rs:1293-1316) accepts a hinted leaf only when
-    ///   `next_leaf() == 0` -- rightmost in the WHOLE tree, not in its tag --
-    ///   and there is one tree (kernel/src/store.rs:339). Only the highest tag
-    ///   present can ever satisfy that, so sorting `0x71`/`0x72` into runs
-    ///   still pays a full descent per write. Relaxing that check needs a
-    ///   right-hand bound the hint can trust across a neighbour's growth;
-    ///   getting it wrong appends keys that a scan finds and a `get` does not.
+    ///   (`kernel/src/btree.rs:1928`) accepts a hinted leaf only when
+    ///   `next_leaf() == 0` (check 3, `:1941`) -- rightmost in the WHOLE tree,
+    ///   not in its tag -- and a collection's edge keyspace is one tree
+    ///   (`kernel::Store` in `kernel/src/store.rs`, one `tree_id` per
+    ///   collection). Only the highest tag present can ever satisfy that, so
+    ///   sorting `0x71`/`0x72` into runs still pays a full descent per write.
+    ///   Relaxing that check needs a right-hand bound the hint can trust
+    ///   across a neighbour's growth; getting it wrong appends keys that a
+    ///   scan finds and a `get` does not.
     /// * Deferred entries would be invisible to same-transaction readers.
     ///   `preflight_edge_pair`, `delete_edge`, `neighbors`, `bfs` and
-    ///   `remove_node` (here) and the traversal in `src/query.rs` all read the
-    ///   edge keyspace through `&self`, several by range scan, so they cannot
+    ///   `remove_node` (here) and the traversal in `src/query/drivers.rs` all
+    ///   read the edge keyspace through `&self`, several by range scan, so
+    ///   they cannot
     ///   flush a buffer and cannot cheaply merge one. Correct writes that a
     ///   read in the same transaction cannot see are not a trade this engine
     ///   makes.
@@ -968,8 +971,9 @@ impl Database {
     /// SACRIFICE (Law 4): a corrupt forward/reverse pair on such an endpoint
     /// is no longer reported by THIS call -- it is overwritten by a correct
     /// pair instead. Nothing is believed from the damaged bytes, no other
-    /// record depends on them, and `index_verifier` still finds a mismatch it
-    /// can reach. What is lost is an early warning, not a repair.
+    /// record depends on them, and `src/collections/verification.rs`'s
+    /// `verify_actual` still finds a mismatch it can reach. What is lost is
+    /// an early warning, not a repair.
     fn preflight_unless_provably_absent(&self, key: EdgeKey) -> Result<()> {
         if self.edge_provably_absent(key) {
             return Ok(());

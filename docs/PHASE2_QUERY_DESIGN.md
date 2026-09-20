@@ -1,11 +1,19 @@
 # Phase 2 combined embedded query design
 
-Status: first executable combined slice, 2026-09-17. `src/query.rs` implements
+Status: first executable combined slice, 2026-09-17 (superseded in part by
+2026-09-20 HEAD; see the update below). `src/query/` (the layout restructure
+at `f5e4c7e` split the former `src/query.rs` into this directory) implements
 the API below over the current scalar, graph, exact-vector, quantized-vector,
 point-spatial and text families. Point, text, exact-vector and quantized-vector
 orders have complete native drivers; callers may retain the entity stream as
 an explicit semantic cross-check. Point-distance ordering, extra score
 columns, OR, NOT, joins and a SQL adapter remain unsupported work.
+
+STATUS UPDATE (2026-09-20): point-distance ordering (`CompiledOrder::Distance`)
+and score expressions (`ScoreExpr`, `src/query/mod.rs`, `src/query/score.rs`)
+are both live T1 atomics now (`docs/QL_CONTRACT.md` §4.4, §4.7). A Tier-1 SQL
+parser and compiler exist (`src/sql/`). OR, NOT and joins remain unsupported
+(`docs/QL_CONTRACT.md` §7, order-of-work items 3 and 7).
 
 ## Contract and public shape
 
@@ -16,9 +24,10 @@ snapshot and never calls a path-based family API internally. An immutable
 borrow also keeps a writer's current view stable for the duration of one call,
 but pagination intended to survive other writes uses a read-only snapshot.
 
-The first request surface is typed and AND-only. OR, NOT, joins and arbitrary
-score expressions remain explicit unsupported cases until their duplicate and
-ordering rules are specified.
+The first request surface is typed and AND-only. OR, NOT and joins remain
+explicit unsupported cases until their duplicate and ordering rules are
+specified; score expressions (`ScoreExpr`) are no longer one of them -- see
+the status update above.
 
 ```rust
 pub struct QueryRequest<'a> {

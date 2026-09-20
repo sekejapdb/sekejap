@@ -307,7 +307,8 @@ pub(crate) fn maintain_geometry(
 /// geometry's bbox spans several cells, so unlike a point posting there is
 /// no cheap self-consistency check between `cell` and `bbox` to make here.
 /// The verifier instead recomputes the whole posting set from the primary
-/// row and compares it byte-for-byte (`index_verifier::verify_actual`).
+/// row and compares it byte-for-byte
+/// (`src/collections/verification.rs::verify_actual`).
 pub(crate) fn decode_posting(
     prefix: &[u8],
     key: &[u8],

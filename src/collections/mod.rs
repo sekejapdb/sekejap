@@ -1273,8 +1273,9 @@ impl Database {
     /// in this session, already checksummed on the way in (Law 5). Tracking
     /// which keys those were cost a list per identity and a bound on how many
     /// identities could be tracked at all; the report it bought back is one
-    /// `index_verifier` still produces. What is lost is an early warning on
-    /// this engine's own fresh writes, not a repair and not a refusal.
+    /// `src/collections/verification.rs`'s `verify_actual` still produces.
+    /// What is lost is an early warning on this engine's own fresh writes,
+    /// not a repair and not a refusal.
     pub(super) fn edge_provably_absent(&self, key: EdgeKey) -> bool {
         self.endpoint_known_live(key.source) || self.endpoint_known_live(key.destination)
     }

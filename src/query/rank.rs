@@ -284,6 +284,11 @@ pub(super) fn text_score<'a, C: FnMut() -> bool>(
     if prepared.terms.is_empty() {
         return Ok(None);
     }
+    // This first `TextPostings` unit bills the norm read below, not a
+    // posting: there is no per-term posting to charge yet at this point in
+    // the function, and every scored document pays this one unit regardless
+    // of term count, so it is billed against the same counter the per-term
+    // reads below use rather than adding a resource for one call site.
     meter.charge(WorkResource::TextPostings, 1)?;
     // Head row first, then the packed `0x7B` block -- the same lookup, and the
     // same decoding of the EMPTY head value, that every other norm reader
@@ -564,6 +569,13 @@ pub(super) fn rerank_quantized_vector<C: FnMut() -> bool>(
             candidate.id.sequence,
         ))?
         .ok_or_else(|| corrupt_query("quantized shortlist entry disappeared"))?;
+    // Two `VectorLanes` charges over the one sidecar `get` above, because two
+    // CPU passes run over it: `encode_entry` re-derives the compact entry to
+    // check it against the authoritative persisted one, then `exact_score`
+    // walks the same dimension again to score. `vector_scan.rs`'s per-record
+    // hook charges lanes once because its scan has no such consistency
+    // re-encode -- the two paths' charges are not meant to agree, since the
+    // work they bill for differs by one full pass.
     meter.charge(
         WorkResource::VectorLanes,
         u64::try_from(dimension).map_err(invalid_query)?,

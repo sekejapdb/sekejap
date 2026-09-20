@@ -216,6 +216,14 @@ impl Graph {
     /// `ctx` = perspective / named graph; 0 = the base graph. Edge identity is
     /// the full key, so re-asserting within a ctx overwrites (set semantics)
     /// and two ctxs never collide.
+    ///
+    /// This is the KERNEL key-value graph (`keys::edge`), matched here and in
+    /// `CONTRACT.md:518` and `kernel/tests/graph_ctx.rs`. It is a separate
+    /// layer from the typed-collections `0x71`/`0x72` graph in
+    /// `src/index/graph/mod.rs`: that layer's element identity is decided by
+    /// `docs/GRAPH_CONTRACT.md` §2.3 (PENDING, see `EdgeKey`'s doc comment),
+    /// not by this one. Do not read this set-semantics claim as describing
+    /// the Phase-2/3 collections graph.
     pub fn add_edge(&mut self, ctx: u64, src: u64, ty: u64, dst: u64, props: &[u8]) -> Result<()> {
         self.store.put(&keys::edge(ctx, src, ty, dst), props)?;
         if self.redge {

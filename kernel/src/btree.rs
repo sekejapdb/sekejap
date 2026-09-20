@@ -2722,7 +2722,7 @@ impl<'p> BTree<'p> {
     /// D9's append split fires only at the tree's rightmost leaf. That is one
     /// leaf in the whole file, and D4 makes every feature a key tag inside the
     /// same tree, so a store with several ascending runs gets the append split
-    /// for exactly one of them. `src/collections.rs` writes one document as
+    /// for exactly one of them. `src/collections/mod.rs` writes one document as
     /// three keys -- 0x60 vector, 0x40 row, 0x20 mapping -- each ascending in
     /// itself; the 0x40 and 0x20 runs always have a higher-tag leaf to their
     /// right, so both paid `redistribute_neighbors` (a clone of the parent's
@@ -4686,7 +4686,7 @@ mod tests {
     // ---------------------------------------------------------- D9 per-keyspace append
     //
     // One tree holds several key TAGS (D3/D4: vectors, rows and external-key
-    // mappings are keyspaces, not files). `src/collections.rs` writes one
+    // mappings are keyspaces, not files). `src/collections/mod.rs` writes one
     // document as three keys -- 0x60 vector, 0x40 row, 0x20 mapping -- and each
     // of those three runs is ASCENDING in itself. Only the highest tag is ever
     // the TREE's rightmost leaf, so D9's `next_leaf() == 0` guard fires for
@@ -4697,7 +4697,7 @@ mod tests {
     // clone of the parent's records plus up to three siblings' records and up
     // to four rebuilt page images on every leaf fill, forever.
 
-    /// `src/collections.rs`'s width-tagged big-endian integer component.
+    /// `src/collections/mod.rs`'s width-tagged big-endian integer component.
     fn ordered(n: u64) -> Vec<u8> {
         let b = n.to_be_bytes();
         let start = b.iter().position(|x| *x != 0).unwrap_or(7);
@@ -4707,7 +4707,7 @@ mod tests {
     }
 
     /// One document's key for `tag`, ascending in `i`. Shaped exactly like
-    /// `src/collections.rs`: `[tag][ordered(collection)][...]`.
+    /// `src/collections/mod.rs`: `[tag][ordered(collection)][...]`.
     fn tagged(tag: u8, i: u64) -> Vec<u8> {
         let mut k = vec![tag];
         k.extend(ordered(1));
@@ -4738,7 +4738,7 @@ mod tests {
     }
 
     /// Insert `docs` documents, each as one key per tag in `tags`, in that
-    /// order -- `src/collections.rs` writes vector, then row, then mapping.
+    /// order -- `src/collections/mod.rs` writes vector, then row, then mapping.
     fn load_interleaved(t: &mut BTree<'_>, tags: &[u8], docs: u64) {
         for i in 0..docs {
             for tag in tags {
@@ -5220,7 +5220,7 @@ mod tests {
         Config { budget_bytes: 32 << 20, io: IoMode::Buffered, sync: SyncMode::Off }
     }
 
-    /// `[tag][collection][sequence]` -- a data row, `src/collections.rs`'s shape.
+    /// `[tag][collection][sequence]` -- a data row, `src/collections/mod.rs`'s shape.
     fn row_key(i: u64) -> Vec<u8> {
         let mut k = vec![0x40u8, 1];
         k.extend_from_slice(&i.to_be_bytes());
@@ -5234,7 +5234,7 @@ mod tests {
         k
     }
     /// `[tag][first collection][first seq][ctx][type][last collection][last seq]`
-    /// -- `src/graph_collections.rs`'s edge key, narrowed to one byte per
+    /// -- `src/index/graph/mod.rs`'s edge key, narrowed to one byte per
     /// small identity. 0x71 is the forward row (first = source), 0x72 the
     /// reverse (first = destination). Organizations live in collection 2, so
     /// their rows sort ABOVE every person's, exactly as in the bench.
@@ -5479,7 +5479,7 @@ mod split_byte_equivalence {
         last: (Vec<u8>, Vec<u8>),
     }
 
-    /// `src/collections.rs`'s width-tagged big-endian integer component --
+    /// `src/collections/mod.rs`'s width-tagged big-endian integer component --
     /// the shape that produces `compact-cells` 0xff cells.
     fn ordered(n: u64) -> Vec<u8> {
         let b = n.to_be_bytes();
@@ -5562,7 +5562,7 @@ mod split_byte_equivalence {
         });
 
         // 2. Three keyspaces in one tree, written one document at a time --
-        //    `src/collections.rs`'s exact shape. The 0x40 run is ascending
+        //    `src/collections/mod.rs`'s exact shape. The 0x40 run is ascending
         //    but never at the tree's rightmost leaf, so this is the case
         //    `keyspace-append` widens and `redistribute_neighbors` owned
         //    before it.

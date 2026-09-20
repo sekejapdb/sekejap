@@ -48,8 +48,9 @@ winner reads to this k=10 case.
 ## Text late-build cost
 
 The current build scan retains only an entity ID for a text row, discards the
-row value, and later point-gets the same primary row in `build_document`
-(`src/indexes.rs:762-821`, `src/text_indexes.rs:346-365`). It then calls the
+row value, and later point-gets the same primary row in `build_documents`
+(module moved: `src/collections/catalog.rs` calls it, defined in
+`src/index/text/mod.rs`). It then calls the
 general live-transition path. For each document that has not contributed yet,
 that path:
 
@@ -58,7 +59,8 @@ that path:
    the shared document frequency;
 3. writes the norm and rewrites the shared corpus statistic.
 
-The relevant operations are in `src/text_indexes.rs:197-323`. This is source
+The relevant operations are in `src/index/text/mod.rs` (module moved by the
+layout restructure at `f5e4c7e`). This is source
 inspection, not a profiler result.
 
 The R4 generator emits six distinct terms per document and only repeats the

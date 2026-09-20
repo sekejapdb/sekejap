@@ -640,8 +640,9 @@ Phase 2 acceptance/commit remain outstanding.
 
 tracker p2-fulltext-index's success criteria explicitly include phrase and
 token-position cases. This is now implemented as `TextMatch::Phrase` in
-`src/text_indexes.rs` and `src/query.rs`, with KMP refinement in
-`src/text_analyzer.rs`: candidates come from all-term postings, then a
+`src/index/text/mod.rs` and `src/query/` (the layout restructure at `f5e4c7e`
+split the former `src/query.rs` into `src/query/*`), with KMP refinement in
+`src/index/text/analyzer.rs`: candidates come from all-term postings, then a
 contiguous ordered check against the authoritative primary text on the same
 snapshot runs before ranking/top-k, metered by the TextTokens budget with
 cancellation checks. Persisted encoding and existing BM25/Any/All behavior are

@@ -185,6 +185,11 @@ impl<'a> SidecarCursor<'a> {
     }
 }
 
+/// STATUS (sweep 2026-09-20): not called from `SidecarCursor::seek`, which
+/// takes an already-built key, or from anywhere else -- it exists only to
+/// feed `write_vector_key` below, which is itself unused (see the
+/// `SidecarCursor` STATUS note above). Kept with it as the same reference
+/// shape.
 #[allow(dead_code)]
 fn write_ordered(dst: &mut [u8], n: u64) -> usize {
     let bytes = n.to_be_bytes();
@@ -196,6 +201,9 @@ fn write_ordered(dst: &mut [u8], n: u64) -> usize {
 }
 
 /// Sidecar key `0x60 || collection || sequence || field` in a stack buffer.
+///
+/// STATUS (sweep 2026-09-20): unused -- see the `SidecarCursor` STATUS note
+/// above, which this key format was built for.
 #[allow(dead_code)]
 pub(super) fn write_vector_key(buf: &mut [u8; 32], id: EntityId, field: usize) -> &[u8] {
     buf[0] = 0x60;

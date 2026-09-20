@@ -20,7 +20,7 @@ get written changed.
   the corpus row and the norm row, once per document. It now accumulates a
   chunk (postings, per-term stats, norms, corpus delta) in a `BTreeMap` and
   flushes once per chunk, in key order (`analyze_row_bytes` /
-  `build_documents`, `src/text_indexes.rs`). Rows that already carry a norm
+  `build_documents`, `src/index/text/mod.rs`). Rows that already carry a norm
   fall back to the old per-row `apply_transition` path. The per-posting
   absence probe (Law 5) was kept; removing it measured a further 1.65x and
   was not taken. Live maintenance is unchanged.

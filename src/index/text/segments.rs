@@ -183,11 +183,6 @@ impl Packer {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
     /// Encoded bytes this packer is holding for the segment it is filling.
     ///
     /// The late build keeps one packer per term alive across the whole scan,

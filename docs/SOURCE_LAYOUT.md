@@ -5,8 +5,8 @@ serves. Nothing in this document describes behaviour; the restructure that
 produced it changed none.
 
 Contract documents referenced below: `docs/GRAPH_CONTRACT.md`,
-`docs/QL_CONTRACT.md` (the query-language contract; the brief's
-`docs/QL_CONTRACT.md` does not exist in this tree),
+`docs/QL_CONTRACT.md` (the query-language contract, drafted 2026-09-20;
+current headings are numbered `## 1.` through `## 7.`),
 `docs/SPATIAL_FUNCTIONS.md`, `docs/COLLECTIONS.md`,
 `docs/V2_COLLECTION_INTEGRATION.md`, `docs/RECOVERY_CONTRACT.md`.
 
@@ -44,18 +44,18 @@ Contract documents referenced below: `docs/GRAPH_CONTRACT.md`,
 | Module | Atomic | Contract |
 | --- | --- | --- |
 | `src/index/mod.rs` | The family directory itself; one directory per family. | -- |
-| `src/index/text/mod.rs` | Persisted analyzer-v1 postings, term/corpus statistics and exact BM25 search. | `docs/QL_CONTRACT.md`, "Full text" |
-| `src/index/text/analyzer.rs` | Analyzer v1: pinned Unicode alphanumeric/lowercase behaviour, no std Unicode on the runtime path. | `docs/QL_CONTRACT.md`, "Full text" |
+| `src/index/text/mod.rs` | Persisted analyzer-v1 postings, term/corpus statistics and exact BM25 search. | `docs/QL_CONTRACT.md` §4.6 "Text search" |
+| `src/index/text/analyzer.rs` | Analyzer v1: pinned Unicode alphanumeric/lowercase behaviour, no std Unicode on the runtime path. | `docs/QL_CONTRACT.md` §4.6 "Text search" |
 | `src/index/text/segments.rs` | The segment posting format behind the `SEGMENT_FEATURE` bit. | `docs/FORMAT_FREEZE.md` |
-| `src/index/text/unicode_v1.rs` | The generated Unicode tables the analyzer is pinned to. | `docs/QL_CONTRACT.md`, "Full text" |
-| `src/index/vector/exact.rs` | The exact vector index: locators, sidecar scans, `VectorMetric`, `VectorHit`. | `docs/QL_CONTRACT.md`, "Exact vector" |
-| `src/index/vector/quantized.rs` | The quantized companion index, its candidates and its rerank. | `docs/QL_CONTRACT.md`, "Approximate vector" |
-| `src/index/vector/quant.rs` | The quantizer itself (encode, decode, metrics). | `docs/QL_CONTRACT.md`, "Approximate vector" |
+| `src/index/text/unicode_v1.rs` | The generated Unicode tables the analyzer is pinned to. | `docs/QL_CONTRACT.md` §4.6 "Text search" |
+| `src/index/vector/exact.rs` | The exact vector index: locators, sidecar scans, `VectorMetric`, `VectorHit`. | `docs/QL_CONTRACT.md` §4.5 "Vector" (exact) |
+| `src/index/vector/quantized.rs` | The quantized companion index, its candidates and its rerank. | `docs/QL_CONTRACT.md` §4.5 "Vector" (approximate) |
+| `src/index/vector/quant.rs` | The quantizer itself (encode, decode, metrics). | `docs/QL_CONTRACT.md` §4.5 "Vector" (approximate) |
 | `src/index/spatial/point.rs` | The point index: Hilbert postings, the `NearestWalk` ring walk, `SpatialHit`. | `docs/SPATIAL_FUNCTIONS.md` |
 | `src/index/spatial/geometry_index.rs` | The geometry index: cell cover entries at three levels behind `GEOMETRY_FEATURE`. | `docs/SPATIAL_FUNCTIONS.md` |
 | `src/index/spatial/geometry.rs` | The GeoJSON geometry model and its predicates. Public as `e4_prototype::spatial_geometry`. | `docs/SPATIAL_FUNCTIONS.md` |
 | `src/index/spatial/math.rs` | Geodesic distance, radius bounds, Hilbert ranges. Public as `e4_prototype::spatial_math`. | `docs/SPATIAL_FUNCTIONS.md` |
-| `src/index/graph/mod.rs` | Typed edges, edge/context names, the graph header, bounded neighbour and BFS traversals, cascade delete. | `docs/GRAPH_CONTRACT.md` |
+| `src/index/graph/mod.rs` | Typed edges, edge/context names, the graph header, bounded neighbour and BFS traversals, cascade delete. | `docs/GRAPH_CONTRACT.md` §4.1-4.2 (§4.3 per-hop predicates PENDING, order-of-work item 1) |
 
 The scalar index family has no directory: its keys are `store::scalar_key`,
 its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
@@ -64,17 +64,17 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 
 | Module | Atomic | Contract |
 | --- | --- | --- |
-| `src/query/mod.rs` | The request/response vocabulary a caller names: `QueryRequest`, `QueryFilter`, `QueryOrder`, `ScoreExpr`, `Projection`, `CandidateDriver`, `QueryDriver`, `QueryPage`, `QueryRow`, `OrderValue`, `QueryBudget`, `QueryWork`, `QueryError`, `WorkResource`, `ApproximationDiagnostics`, the `MAX_*` limits, and the `WorkMeter` every walk charges against. | `docs/QL_CONTRACT.md`, "Contract and public shape" |
-| `src/query/plan.rs` | `Database::prepare_query`; the compiled forms (`CompiledFilter`, `CompiledOrder`, `PreparedText`); the `require_*` index checks; the scalar and geometry predicate encodings the index keyspace understands. | `docs/QL_CONTRACT.md`, "Execution pipeline" |
-| `src/query/drivers.rs` | `DriverPlan` and driver selection (the Auto chain, `nearest_plan`, `nearest_drives_better`, `approximate_scan_drives`, `order_index_drives_better`); the bounded graph traversals; the carried-key `Candidate`; every cursor's state and the `DriverCursor` keyspace helpers. | `docs/QL_CONTRACT.md`, "Execution pipeline"; `docs/GRAPH_CONTRACT.md` section 4 |
-| `src/query/cursors.rs` | One walk per driver: `DriverCursor` dispatch plus the per-cursor `next` (entities, scalar, keys, text, spatial, nearest, geometry, vector, quantized vector). | `docs/QL_CONTRACT.md`, "Family hooks" |
-| `src/query/membership.rs` | `MembershipSet`, `MembershipBudget`, `build_scalar_range_set`, `build_point_set`, the posting probes and `ensure_membership_sets`. | `docs/QL_CONTRACT.md`, "Shared work and cancellation" |
-| `src/query/filters.rs` | The per-candidate tests: `filters_match`, `batch_filters_match`, `geometry_predicate_matches`, the scalar/text/point/JSON comparisons. | `docs/QL_CONTRACT.md`, "Scalar semantics" |
-| `src/query/rank.rs` | `RankKey`/`RankValue`/`HeapEntry`/`Winners`, `compare_rank`, `rank_candidate`, and the scores a rank key is built from: `text_score`, `vector_score`, `approximate_vector_score`, distance. | `docs/QL_CONTRACT.md`, "Contract and public shape" |
-| `src/query/score.rs` | `CompiledScoreExpr`, `compile_score_expr`, `eval_score_expr`. | `docs/QL_CONTRACT.md`, "Contract and public shape" |
-| `src/query/vector_scan.rs` | `unfiltered_vector_scan`, `filtered_vector_scan`, `scan_ceiling`, `vector_scan_progress`, `filtered_vector_scan_progress`, `vector_after`. | `docs/QL_CONTRACT.md`, "Exact vector" |
-| `src/query/rows.rs` | Reading primary rows: `RowData`, the lockstep `PrimaryRows` reader, `read_batch_rows`, and the projection that turns a row into returned values. | `docs/QL_CONTRACT.md`, "Execution pipeline" |
-| `src/query/page.rs` | `PreparedQuery`, `next_page`, `emit_rows`, `finish_page`, the shape questions (`keeps_a_run`, `batches_row_reads`, `winner_needs_no_row`, `a_filter_reads_the_row`, ...) and the resume state a page commits once its rows are final. | `docs/QL_CONTRACT.md`, "Execution pipeline" |
+| `src/query/mod.rs` | The request/response vocabulary a caller names: `QueryRequest`, `QueryFilter`, `QueryOrder`, `ScoreExpr`, `Projection`, `CandidateDriver`, `QueryDriver`, `QueryPage`, `QueryRow`, `OrderValue`, `QueryBudget`, `QueryWork`, `QueryError`, `WorkResource`, `ApproximationDiagnostics`, the `MAX_*` limits, and the `WorkMeter` every walk charges against. | `docs/QL_CONTRACT.md` §2 "Statements", §6 "Execution guarantees" |
+| `src/query/plan.rs` | `Database::prepare_query`; the compiled forms (`CompiledFilter`, `CompiledOrder`, `PreparedText`); the `require_*` index checks; the scalar and geometry predicate encodings the index keyspace understands. | `docs/QL_CONTRACT.md` §3 "Predicates and operators" |
+| `src/query/drivers.rs` | `DriverPlan` and driver selection (the Auto chain, `nearest_plan`, `nearest_drives_better`, `approximate_scan_drives`, `order_index_drives_better`); the bounded graph traversals; the carried-key `Candidate`; every cursor's state and the `DriverCursor` keyspace helpers. | `docs/QL_CONTRACT.md` §6 "Execution guarantees"; `docs/GRAPH_CONTRACT.md` §4.1-4.2 (§4.3 PENDING -- see `execute_graph`'s doc comment) |
+| `src/query/cursors.rs` | One walk per driver: `DriverCursor` dispatch plus the per-cursor `next` (entities, scalar, keys, text, spatial, nearest, geometry, vector, quantized vector). | `docs/QL_CONTRACT.md` §4 "Functions" (per-family dispatch) |
+| `src/query/membership.rs` | `MembershipSet`, `MembershipBudget`, `build_scalar_range_set`, `build_point_set`, the posting probes and `ensure_membership_sets`. | `docs/QL_CONTRACT.md` §6 "Execution guarantees" |
+| `src/query/filters.rs` | The per-candidate tests: `filters_match`, `batch_filters_match`, `geometry_predicate_matches`, the scalar/text/point/JSON comparisons. | `docs/QL_CONTRACT.md` §3 "Predicates and operators" |
+| `src/query/rank.rs` | `RankKey`/`RankValue`/`HeapEntry`/`Winners`, `compare_rank`, `rank_candidate`, and the scores a rank key is built from: `text_score`, `vector_score`, `approximate_vector_score`, distance. | `docs/QL_CONTRACT.md` §4.5 "Vector", §4.6 "Text search" |
+| `src/query/score.rs` | `CompiledScoreExpr`, `compile_score_expr`, `eval_score_expr`. | `docs/QL_CONTRACT.md` §4.7 "Aggregates" |
+| `src/query/vector_scan.rs` | `unfiltered_vector_scan`, `filtered_vector_scan`, `scan_ceiling`, `vector_scan_progress`, `filtered_vector_scan_progress`, `vector_after`. | `docs/QL_CONTRACT.md` §4.5 "Vector" (exact) |
+| `src/query/rows.rs` | Reading primary rows: `RowData`, the lockstep `PrimaryRows` reader, `read_batch_rows`, and the projection that turns a row into returned values. | `docs/QL_CONTRACT.md` §6 "Execution guarantees" |
+| `src/query/page.rs` | `PreparedQuery`, `next_page`, `emit_rows`, `finish_page`, the shape questions (`keeps_a_run`, `batches_row_reads`, `winner_needs_no_row`, `a_filter_reads_the_row`, ...) and the resume state a page commits once its rows are final. | `docs/QL_CONTRACT.md` §6 "Execution guarantees" |
 
 ## `src/faults/` -- in-crate fault injection
 

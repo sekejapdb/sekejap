@@ -378,8 +378,11 @@ impl PreparedQuery<'_> {
                 Ok(set) => set,
                 // The row-read path these filters used before this walk
                 // existed never spent `ScalarPostings` -- and a non-driving
-                // point filter spent one `SpatialPostings` per candidate, not
-                // per posting -- so a caller whose budget cannot afford even
+                // point filter's row-read path (`filters.rs`, `Overflow`
+                // arm) charges `SpatialPostings` once per candidate for a
+                // row-field extract, not once per posting; that charge is a
+                // stand-in against the same counter, not a spatial posting
+                // read. Either way, a caller whose budget cannot afford even
                 // one posting of this walk must get exactly that path back,
                 // not a new way for the same query to fail. Postings already
                 // charged before this one stay charged; nothing here refunds

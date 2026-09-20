@@ -1023,7 +1023,6 @@ impl Database {
                     let (ranges, query_bbox, fallback_world) = geometry_ranges(predicate)?;
                     Ok(DriverPlan::Geometry {
                         info: info.clone(),
-                        predicate: predicate.clone(),
                         position,
                         ranges,
                         query_bbox,

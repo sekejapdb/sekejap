@@ -512,8 +512,10 @@ which now decode a typed record:
   directly.
 - **Vector / spatial / text** keyspaces + indexes (HNSW, grid, BM25, GIN,
   SEARCH): adapt field extraction to read a typed slot instead of parsing JSON.
-- **Query engine** (`src/query.rs`, `src/exec.rs`): `Set`/`Step` executor,
-  streaming `for_each_row`, covered/sorted/batched drivers, plan cache.
+- **Query engine** (e3's `src/query.rs`, `src/exec.rs` -- e4's own query
+  engine lives at `src/query/`, unrelated in shape to e3's `Set`/`Step`
+  executor): `Set`/`Step` executor, streaming `for_each_row`,
+  covered/sorted/batched drivers, plan cache.
 - **Service** (`open_as_service()`, snapshot reads), **introspection**
   (`SHOW …`, `EXPLAIN [ANALYZE]`, `information_schema.*`/`pg_indexes` — whose
   column-name+type catalog is exactly the schema source a typed layout needs),

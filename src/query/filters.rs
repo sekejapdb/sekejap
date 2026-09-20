@@ -69,6 +69,10 @@ pub(super) fn batch_filters_match<C: FnMut() -> bool>(
                 MembershipSet::Ids(ids) => ids.binary_search(&id.sequence).is_ok(),
                 MembershipSet::Bitmap(bits) => membership_bitmap_contains(bits, id.sequence),
                 _ => {
+                    // The membership set overflowed (see membership.rs), so
+                    // there is no posting left to read: this bills
+                    // `SpatialPostings` as a stand-in for the per-candidate
+                    // row-field extract below, not for a posting probe.
                     meter.charge(WorkResource::SpatialPostings, 1)?;
                     meter.note_row_decode();
                     match point_from_field(selected_field_in(&layout, bytes, &info.field)?)? {
@@ -396,6 +400,10 @@ pub(super) fn filters_match<'a, C: FnMut() -> bool>(
                     } else {
                         ensure_row_seq(db, rows, id, row, encoded, meter)?;
                         let row = row.as_ref().unwrap();
+                        // Same stand-in charge as the non-driving arm above:
+                        // `SpatialPostings` for a row-field extract, because
+                        // the cover walk already gave up on this filter and
+                        // there is no posting left to bill.
                         meter.charge(WorkResource::SpatialPostings, 1)?;
                         meter.note_row_decode();
                         let Some(point) = point_from_field(selected_field(row, &info.field)?)?

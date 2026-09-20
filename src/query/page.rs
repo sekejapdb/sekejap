@@ -224,12 +224,13 @@ impl PreparedQuery<'_> {
     ///
     /// Graph ids stay on the probing side even though an edge cannot outlive
     /// its endpoints: `Database::delete` cascades every incident edge
-    /// (`cascade_graph_delete`, both primary and reverse markers) before it
-    /// touches the row or the other indexes (`collections.rs:1466-1471`), so
-    /// an edge the traversal still walks in this snapshot does prove its far
-    /// endpoint alive. But `execute_graph` also seeds its result with
-    /// `request.seed` unconditionally when `include_seed && min_depth == 0`
-    /// (`query.rs`, the `include_seed` branch near the top of
+    /// (`cascade_graph_delete`, both primary and reverse markers,
+    /// `src/index/graph/mod.rs:1779`) before it touches the row or the other
+    /// indexes (call site `src/collections/mod.rs:1485`), so an edge the
+    /// traversal still walks in this snapshot does prove its far endpoint
+    /// alive. But `execute_graph` also seeds its result with `request.seed`
+    /// unconditionally when `include_seed && min_depth == 0`
+    /// (`src/query/drivers.rs:715`, the `include_seed` branch near the top of
     /// `execute_graph`) -- no edge is walked to reach that entity, so the
     /// traversal proves nothing about it. A caller can name any entity id as
     /// a seed; the probe is the only thing standing between that and an
@@ -256,7 +257,8 @@ impl PreparedQuery<'_> {
         // the norm row outright; the packed tier cannot cut one document out
         // of a `0x7B` block, so the delete writes the EMPTY head value, which
         // overrides the block and decodes as "not in the index"
-        // (`text_indexes::apply_transition`, `decode_norm`). Either way a
+        // (`src/index/text/mod.rs`, `apply_transition` and `decode_norm`).
+        // Either way a
         // deleted document scores `None`, so a winner of a ranked text page
         // has already been proved present -- and probing the primary tree for
         // it again was a whole root-to-leaf reach, or a cursor step and a key
@@ -274,15 +276,17 @@ impl PreparedQuery<'_> {
             return true;
         }
         // A text-driven page has no orphan left to refuse either, ranked by
-        // BM25 or not. `TermPostings::next` (text_indexes.rs:850 and 863)
-        // never emits a posting whose live term frequency is `0` -- that is
-        // exactly the tombstone form a delete or an update writes when it
-        // retires a posting that a packed segment will not be rewritten to
-        // drop, and it is written in the SAME transaction as the row: the
-        // text family of `maintain_indexes` (`indexes.rs:973-975`) runs
-        // inside the one `Database::delete` closure that goes on to remove
-        // the row itself (`collections.rs:1467,1471`), committed or failed as
-        // one frame (`collections.rs:1476`). So a document the merge still
+        // BM25 or not. `TermPostings::next` (`src/index/text/mod.rs:830`,
+        // the `tf != 0` skip at `:857` and `:870`) never emits a posting
+        // whose live term frequency is `0` -- that is exactly the tombstone
+        // form a delete or an update writes when it retires a posting that a
+        // packed segment will not be rewritten to drop, and it is written in
+        // the SAME transaction as the row: `maintain_text`
+        // (`src/collections/catalog.rs:1027`, called from
+        // `maintain_indexes`) runs inside the one `Database::delete` closure
+        // (`src/collections/mod.rs:1479-1494`) that goes on to remove the row
+        // itself (`:1490`) and its mapping (`:1491`), committed or failed as
+        // one frame (`self.finish`, `:1495`). So a document the merge still
         // hands over in this snapshot is a document whose row was alive when
         // the snapshot was taken -- the same guarantee the BM25 case above
         // reaches through the norm, proved one layer down instead, in the
@@ -304,9 +308,9 @@ impl PreparedQuery<'_> {
         // itself, unconditionally (no order restriction needed, unlike
         // spatial below): `Database::delete` removes a collection's mapping
         // entry (`self.writer()?.delete(&mapping_key(c, key))?`,
-        // `collections.rs:1502`) in the SAME closure that removes its row
-        // (`collections.rs:1501`), committed or failed as one frame
-        // (`collections.rs:1476`, via `self.finish`). So a mapping entry
+        // `src/collections/mod.rs:1491`) in the SAME closure that removes its
+        // row (`:1490`), committed or failed as one frame (`:1495`, via
+        // `self.finish`). So a mapping entry
         // `KeysCursor` still walks in this snapshot names a row that was
         // alive when the snapshot was taken -- there is no "packed tier"
         // complication here the way there is for text: one entry, one key,
@@ -324,10 +328,10 @@ impl PreparedQuery<'_> {
         // posting. `maintain_point` retires a point's old cell posting in the
         // SAME transaction as the row that carried it: on a delete (or a move
         // to a different cell), `db.index_delete(i, &old.key)`
-        // (spatial_indexes.rs:194) runs inside the one `Database::delete`
-        // closure that also removes the row (`collections.rs:1467,1471`), and
-        // the whole closure commits or fails as one frame
-        // (`collections.rs:1476`, via `self.finish`). So a cell posting the
+        // (`src/index/spatial/point.rs:602`, in `maintain_point`) runs inside
+        // the one `Database::delete` closure that also removes the row
+        // (`src/collections/mod.rs:1490`), and the whole closure commits or
+        // fails as one frame (`:1495`, via `self.finish`). So a cell posting the
         // spatial cursor still walks in this snapshot is a document whose row
         // was alive when the snapshot was taken.
         //
@@ -535,11 +539,14 @@ impl PreparedQuery<'_> {
             DriverPlan::Scalar { position, .. }
             | DriverPlan::Text { position, .. }
             | DriverPlan::Keys { position, .. } => *position,
+            // Geometry is kept on its own arm rather than folded into the one
+            // above: it is not certified by any driver, so it always reads a
+            // row (see the `CompiledFilter::Geometry` arm below), while
+            // Spatial and Graph are certified when they are the driving
+            // position.
             DriverPlan::Spatial { position, .. } | DriverPlan::Graph { position } => Some(*position),
             DriverPlan::Nearest { certifies, .. } => *certifies,
-            DriverPlan::Spatial { position, .. }
-            | DriverPlan::Geometry { position, .. }
-            | DriverPlan::Graph { position } => Some(*position),
+            DriverPlan::Geometry { position, .. } => Some(*position),
             _ => None,
         };
         self.filters.iter().enumerate().any(|(position, filter)| match filter {
@@ -551,8 +558,9 @@ impl PreparedQuery<'_> {
             // walk has answered.
             CompiledFilter::Text(prepared) => prepared.phrase.is_some(),
             // A geometry posting's BoxF is only a candidate test. Driving or
-            // not, the row's geometry is refined through spatial_geometry;
-            // T3's no-row rule does not apply.
+            // not, the row's geometry is refined through
+            // `src/index/spatial/geometry.rs`; this is a live T1 atomic
+            // (`docs/QL_CONTRACT.md` §4.4), not a T3 refusal.
             CompiledFilter::Geometry { .. } => true,
             _ if Some(position) == driving => false,
             // A non-driving equality answered from its posting reads no row,
