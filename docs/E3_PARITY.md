@@ -11,36 +11,43 @@ Produced 2026-09-20 from e3 `src/sql.rs`, `src/db.rs`, `src/service.rs`,
 `src/exec.rs`, `src/catalog/mod.rs`, `docs/usage/*.md` against e4 HEAD
 `8167b11` (`docs/QL_CONTRACT.md`, `docs/GRAPH_CONTRACT.md`, `src/sql/refuse.rs`).
 
+Updated 2026-09-20 at e4 HEAD `bdbef43`: the 33 NOT IN CONTRACT rows were
+tiered. 32 became CONTRACT-T2 in `docs/QL_CONTRACT.md` (§2, §4.1, §4.4, §4.5,
+§4.6, §5) or in the new `docs/OPS_CONTRACT.md`; one (`FROM MATCH`) is a named
+refusal with the capability kept under the standard spelling. NOT IN CONTRACT
+is now zero. Three T2 rows carry a named T3 boundary inside them, listed under
+the counts; nothing was emulated to reach a tier.
+
 
 Source of truth read: e3 `src/sql.rs` (grammar header lines 40–104), `src/db.rs`, `src/exec.rs`, `src/service.rs`, `src/catalog/mod.rs`, `docs/usage/*.md`; e4 `docs/QL_CONTRACT.md`, `docs/GRAPH_CONTRACT.md`, `docs/SOURCE_LAYOUT.md`, `src/sql/mod.rs`, `src/sql/refuse.rs`, `src/collections/mod.rs`.
 
-Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3** = named in `docs/QL_CONTRACT.md` at that tier, not built. **NOT IN CONTRACT** = e3 does it, e4's contract does not mention it at any tier.
+Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3** = named in `docs/QL_CONTRACT.md` or `docs/OPS_CONTRACT.md` at that tier, not built. **NOT ADOPTED** = the spelling is refused on purpose and the capability is kept under another one, with the migration written down. **NOT IN CONTRACT** = e3 does it, e4's contract does not mention it at any tier (none remain).
 
 ### 1. SQL statements and DDL
 
 | # | e3 capability | e3 (file:line) | e4 status | atomic e4 would need |
 |---|---|---|---|---|
 | 1 | `SELECT … FROM col [WHERE AND] [ORDER BY] [LIMIT]` | sql.rs:41-46 | DONE — `src/sql/mod.rs:23` | — |
-| 2 | `FROM ALL` (every collection at once) | sql.rs:42 | NOT IN CONTRACT | a multi-collection driver; §2 names one source only |
+| 2 | `FROM ALL` (every collection at once) | sql.rs:42 | CONTRACT-T2 — QL §2 `FROM ALL` | a `Collections` concatenation driver over the catalog in id order, resume `(collection id, inner cursor)`. A ranked `ORDER BY` over it is T3: one order key across different layouts is not one key, and an N-way merge holds one cursor per collection |
 | 3 | `INSERT INTO t (…) VALUES (…)`, multi-row, `$N` params | sql.rs:56, db.rs:10245 | DONE — `src/sql/mod.rs:79` | — |
-| 4 | `UPDATE t SET … WHERE <any predicate>` | sql.rs:3681 | NOT IN CONTRACT | §2 fixes `WHERE key = $1`; predicate-driven update needs a scan-and-put loop with a row budget |
-| 5 | `DELETE FROM t WHERE <predicate>` / `DELETE FROM ALL` | sql.rs:3551 | NOT IN CONTRACT | same: delete over a driver, not by key |
+| 4 | `UPDATE t SET … WHERE <any predicate>` | sql.rs:3681 | CONTRACT-T2 — QL §2 | the prepared query's driver supplies candidates a page at a time, each read-modify-put, bounded by a `rows_written` budget; the walk reads the snapshot it started on |
+| 5 | `DELETE FROM t WHERE <predicate>` / `DELETE FROM ALL` | sql.rs:3551 | CONTRACT-T2 — QL §2 | the same driver walk feeding `delete`, with the graph contract 6.1 RESTRICT preflight per row and the same budget |
 | 6 | `CREATE TABLE t (field type, `_key` PRIMARY KEY)` | sql.rs:3910 | DONE — `src/sql/mod.rs:80` | — |
-| 7 | `WITH (hash:[…], range:[…], fulltext:[…], bm25:[…], spatial:[…])` index hints | sql.rs:66 | NOT IN CONTRACT | inline index declarations on CREATE TABLE; e4 only has separate `CREATE INDEX` |
-| 8 | `TIMESTAMPTZ DEFAULT NOW()` | sql.rs:68, 3803 | NOT IN CONTRACT | column defaults in the descriptor + fill on put |
-| 9 | `DEFAULT uuid4()` / `uuid5(ns, name)` | sql.rs:1228-1231 | NOT IN CONTRACT | generated key values at write time |
-| 10 | `GENERATED ALWAYS AS (expr) STORED` | sql.rs:1232, 3830 | NOT IN CONTRACT | a computed-column evaluator on the write path |
-| 11 | `ALTER TABLE` ADD / DROP / RENAME COLUMN / RENAME TO / ALTER TYPE | sql.rs:72-77, 4006 | NOT IN CONTRACT | §2 lists no ALTER at all, though `Database::alter_collection` exists (`collections/mod.rs:1213`) — a grammar + tier row |
+| 7 | `WITH (hash:[…], range:[…], fulltext:[…], bm25:[…], spatial:[…])` index hints | sql.rs:66 | CONTRACT-T2 — QL §2 | sugar over `CREATE INDEX`: hash/range → btree with a notice, fulltext/bm25 → gin, spatial → gist. No new atomic |
+| 8 | `TIMESTAMPTZ DEFAULT NOW()` | sql.rs:68, 3803 | CONTRACT-T2 — QL §2 | a per-field default in the descriptor under an additive bit, filled on the write path; one clock read per row |
+| 9 | `DEFAULT uuid4()` / `uuid5(ns, name)` | sql.rs:1228-1231 | CONTRACT-T2 — QL §2 | same descriptor slot; the generator set is closed and each member is O(1) per row. An arbitrary expression as a DEFAULT is T3 |
+| 10 | `GENERATED ALWAYS AS (expr) STORED` | sql.rs:1232, 3830 | CONTRACT-T2 — QL §2 | a compiled row expression over other fields of the same row, evaluated before index maintenance so an index over it is maintained normally. Cross-row, aggregate or subquery expressions are T3 |
+| 11 | `ALTER TABLE` ADD / DROP / RENAME COLUMN / RENAME TO / ALTER TYPE | sql.rs:72-77, 4006 | CONTRACT-T2 — QL §2 (four forms); ALTER TYPE T2 same-`Kind`, T3 otherwise | `alter_collection` (`collections/mod.rs:1208`) writes a new Layout and repoints the catalog, O(fields). DROP COLUMN tombstones the slot because dense rows are positional. A `Kind` change rewrites every row and every scalar key: no bounded resumable atomic today |
 | 12 | `DROP TABLE [IF EXISTS]` | sql.rs:70 | DONE — `collections/drop_collection.rs:228,333` | — |
 | 13 | `DROP INDEX [IF EXISTS] ON t USING m (f)` | sql.rs:71 | DONE — `collections/catalog.rs:1869` | — |
 | 14 | `CREATE INDEX … USING {btree,hash,gin,gist,bm25,spatial,vamana,search}` | sql.rs:4157-4169 | DONE — `src/sql/mod.rs:82-84` | — |
-| 15 | `REINDEX` | sql.rs:450 | NOT IN CONTRACT | rebuild-in-place statement |
-| 16 | `COMPACT` | sql.rs:464 | NOT IN CONTRACT | e4 has `checkpoint()` (`collections/mod.rs:1623`), no statement |
-| 17 | `SHOW TABLES` / `SHOW <col>` / `SHOW CREATE TABLE` / `SHOW INDEXES` | sql.rs:79-82, db.rs:8146 | NOT IN CONTRACT | §2 covers `information_schema` only; the `SHOW` sugar has no tier |
-| 18 | `CREATE [MATERIALIZED\|SEARCH] VIEW … WITH (autoindex)` + `REFRESH` | sql.rs:1075-1085, exec.rs:1623-1637 | NOT IN CONTRACT | user views are T3, but *materialized* views + refresh are not mentioned; a stored body + repopulate atomic |
+| 15 | `REINDEX` | sql.rs:450 | CONTRACT-T2 — QL §2 | rebuild through the existing sorted build (`collections/rebuild.rs`) under the `IndexState` machine that already makes a build resumable |
+| 16 | `COMPACT` | sql.rs:464 | CONTRACT-T2 — QL §2 | `checkpoint()` (`collections/mod.rs:1618`) as a statement. It reports *deferred* while a reader holds a slot and never waits; it is not Postgres `VACUUM` |
+| 17 | `SHOW TABLES` / `SHOW <col>` / `SHOW CREATE TABLE` / `SHOW INDEXES` | sql.rs:79-82, db.rs:8146 | CONTRACT-T2 — QL §2 | sugar over the `db_*` catalog rows, one fixed SELECT each. The row-count and size columns are a scan and EXPLAIN says so |
+| 18 | `CREATE [MATERIALIZED\|SEARCH] VIEW … WITH (autoindex)` + `REFRESH` | sql.rs:1075-1085, exec.rs:1623-1637 | CONTRACT-T2 — QL §2 | a bounded atomic can be named, so it is not refused: the body is stored in the catalog and the view is a derived collection populated by the prepared query's own pages; REFRESH is the bounded resumable clear plus that populate. Incremental maintenance is T3. A *user* view stays T3 because it is a prepare-time rewrite, which is a second planner path |
 | 19 | `EXPLAIN` | db.rs:11816 | DONE — `src/sql/mod.rs:506` (`sql_explain`) | — |
-| 20 | `EXPLAIN ANALYZE` (measured counters) | db.rs:11824 | NOT IN CONTRACT | §2 has plain EXPLAIN only; ANALYZE = run + report `QueryWork` |
-| 21 | Parsed-plan cache for repeated text | exec.rs:40-71, db.rs:541 | NOT IN CONTRACT | a bounded prepared-plan cache behind `sql_prepare` |
+| 20 | `EXPLAIN ANALYZE` (measured counters) | db.rs:11824 | CONTRACT-T2 — QL §2 | today's EXPLAIN plan plus the statement run under the caller's budget, printing each page's `QueryWork` (`query/mod.rs:427`). Logical work, not a per-operator wall clock |
+| 21 | Parsed-plan cache for repeated text | exec.rs:40-71, db.rs:541 | CONTRACT-T2 — QL §2 | a bounded LRU with three ceilings fixed at open (entries, cached bytes, longest statement). The key carries the catalog generation, so DDL invalidates plans rather than serving one against a dead layout — e3 keys on text alone |
 | 22 | `BEGIN` / `COMMIT` / `ROLLBACK` | sql.rs:461-463 | DONE — `src/sql/mod.rs:85` | — |
 
 ### 2. Predicates and expressions
@@ -55,10 +62,10 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 | 28 | `NOT <cond>` | sql.rs:2726 | CONTRACT-T2 — §3 `NOT` | complement over a membership set |
 | 29 | `LIKE 'pat'` | sql.rs:2676 | CONTRACT-T2 — §3 | prefix range; infix needs trigram family |
 | 30 | `ILIKE '%x%'` via gin trigram | sql.rs:2681, db.rs:7381 | CONTRACT-T2 — §3 | trigram index family under a feature bit |
-| 31 | `CASE WHEN … THEN … ELSE … END` | sql.rs:2192, 2431-2447 | **NOT IN CONTRACT** | no tier row anywhere; a projected conditional expression |
+| 31 | `CASE WHEN … THEN … ELSE … END` | sql.rs:2192, 2431-2447 | CONTRACT-T2 — QL §4.1 | a row expression: one row in, one value out. In ORDER BY it is one key; in WHERE it is row-bound and EXPLAIN labels it so |
 | 32 | `AGE_DAYS(f)` / `AGE_HOURS(f)` | sql.rs:6870, 1713 | CONTRACT-T2 — §4.2 `age(t)` | Postgres spelling only; e3's names unlisted |
 | 33 | `NOW()` in SELECT list | sql.rs:93 | CONTRACT-T2 — §4.2 `now()` | constant folded at prepare |
-| 34 | `JSON_ARRAY_LENGTH(f)` | sql.rs:6872 | **NOT IN CONTRACT** | only `->>` JSON extraction is tiered (refuse.rs `->>`) |
+| 34 | `JSON_ARRAY_LENGTH(f)` | sql.rs:6872 | CONTRACT-T2 — QL §4.1 | listed with `->`, `->>`, `#>`, `#>>` as row functions over the binary JSON the row codec already decodes |
 | 35 | `LENGTH LEN LOWER UPPER TRIM LTRIM RTRIM SUBSTRING REPLACE CONCAT` | sql.rs:1711, 2260-2279 | CONTRACT-T2 — §4.1 | row functions on projected values |
 | 36 | `YEAR MONTH DAY HOUR MINUTE SECOND DOW QUARTER`, `DATE_TRUNC` | sql.rs:1712, 2341 | CONTRACT-T2 — §4.2 `EXTRACT`/`date_trunc` | rewrite to scalar Ranges |
 | 37 | `ORDER BY a, b` (multi-key sort) | sql.rs:2055-2072 | CONTRACT-T3 — §5 deviation 3 | two keys are a refusal by design |
@@ -69,9 +76,9 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 | # | e3 capability | e3 (file:line) | e4 status | note |
 |---|---|---|---|---|
 | 39 | `SEARCH('q' [, typo => N])` typo budget | sql.rs:2853-2875 | CONTRACT-T2 — §4.6 `search()` | term-dictionary prefix range + bounded Levenshtein automaton |
-| 40 | `SEARCH_SCORE()` as a projectable/orderable score | sql.rs:3249, 1417 | **NOT IN CONTRACT** | the typo-search *score leaf*; §4.6 tiers only the predicate |
+| 40 | `SEARCH_SCORE()` as a projectable/orderable score | sql.rs:3249, 1417 | CONTRACT-T2 — QL §4.6 | the Score leaf of `search()`, normalised to [0,1] from the edit distance spent and the prefix completed; it lands with `search()` and the automaton already knows both numbers |
 | 41 | `BM25(f,'q')` as filter and as ORDER BY term | sql.rs:1657, 3247 | DONE — `src/sql/mod.rs:61` (`bm25()`, `ts_rank_cd`) | — |
-| 42 | `BM25_NORM(f,'q',k)` — [0,1] normalised for blends | sql.rs:3247 | **NOT IN CONTRACT** | a normalised score leaf so hybrid weights are comparable |
+| 42 | `BM25_NORM(f,'q',k)` — [0,1] normalised for blends | sql.rs:3247 | CONTRACT-T2 — QL §4.6 | `bm25/(bm25+k)` on the existing Score leaf: one operation, no extra pass, strictly monotone so the order is unchanged. A weight over an unbounded BM25 is not a weight |
 | 43 | Multi-field search index (`build_search_index`) | db.rs:8011 | CONTRACT-T2 — §4.6 "multi-field text index" | concatenated stored field today |
 | 44 | Highlighting | *none in e3* | CONTRACT-T2 — §4.6 `highlight`/`ts_headline` | e4's contract is ahead of e3 here |
 
@@ -83,7 +90,7 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 | 46 | `<->`, `<=>`, `<#>` and `VECTOR_L2/COSINE/DOT` | sql.rs:97, usage/queries.md:198 | DONE — `index/vector/exact.rs:813` | — |
 | 47 | `<+>` / `VECTOR_L1` (Manhattan) | sql.rs:1686 | CONTRACT-T3 — refuse.rs `<+>` | no atomic; e3 loses this |
 | 48 | `ef_search` knob | db.rs:11811 | DONE — `src/sql/compile.rs:965` (`SET LOCAL`) | — |
-| 49 | `USING vamana (f vector_l2_ops)` index spelling | sql.rs:4157-4165 | **NOT IN CONTRACT** | e4 spells it `exact`/`quantized` + hnsw/diskann/ivfflat aliases; `vamana` is unmapped |
+| 49 | `USING vamana (f vector_l2_ops)` index spelling | sql.rs:4157-4165 | CONTRACT-T2 — QL §4.5 | added to the `hnsw`/`diskann`/`ivfflat` alias list for `quantized`; no new family |
 
 ### 5. Spatial
 
@@ -96,20 +103,20 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 | 54 | `ST_Centroid(f)` | sql.rs:2231 | CONTRACT-T2 — §4.4 | same |
 | 55 | `ST_AsGeoJSON(f)` in the SELECT list | sql.rs:2237-2241 | CONTRACT-T2 — refuse.rs `ST_ASTEXT` family (p3-geometry-io) | — |
 | 56 | `ST_GeomFromGeoJSON('…')` inside INSERT VALUES | sql.rs:1816-1822 | CONTRACT-T2 — §4.4 I/O fns | e4 accepts it only as a WHERE-side geo literal (`src/sql/mod.rs:51`) |
-| 57 | `POINT(lon lat)` / `POLYGON((…))` literal syntax | sql.rs:2931 | **NOT IN CONTRACT** | e4 writes `ST_MakePoint`/`ST_MakeEnvelope`; the WKT-literal spelling has no row |
+| 57 | `POINT(lon lat)` / `POLYGON((…))` literal syntax | sql.rs:2931 | CONTRACT-T2 — QL §4.4 | the `ST_GeomFromText` WKT parser (p3-geometry-io) reached without the function name; I/O only. Axis order is longitude then latitude, stated |
 
 ### 6. Graph
 
 | # | e3 capability | e3 (file:line) | e4 status | note |
 |---|---|---|---|---|
-| 58 | `SELECT … FROM MATCH (a)-[r]->(b)` spelling | sql.rs:48-53 | **NOT IN CONTRACT** (explicitly rejected) — QL_CONTRACT §1 "Not adopted: … e3's `FROM MATCH`" | a documented migration note, not an atomic |
+| 58 | `SELECT … FROM MATCH (a)-[r]->(b)` spelling | sql.rs:48-53 | NOT ADOPTED — QL §1, §5 deviation 11 | the capability is T1 under `FROM GRAPH_TABLE (g MATCH … COLUMNS (…))`; §5 deviation 11 writes the mechanical migration, including `MATCH SHORTEST` → `ANY SHORTEST` and multi-FROM → `CROSS JOIN LATERAL`. A refusal with a named reason: the atomic exists, the spelling does not |
 | 59 | Direction, edge type, `*a..b` var-length | sql.rs:57, usage/graph-queries.md:35-55 | DONE — `src/sql/mod.rs:70-75` (`GRAPH_TABLE`, hops, quantifiers) | — |
 | 60 | `MATCH SHORTEST (a)-[r*]->(b)` | sql.rs:4771-4786 | CONTRACT-T2 — §4.3 `ANY/ALL SHORTEST` | unweighted shortest-path atomic (graph contract 5.3) |
 | 61 | `PATH_AVG/SUM/MIN/MAX/PRODUCT/FIRST/LAST` | sql.rs:86-88 | CONTRACT-T2 — §4.3, graph contract 5.1 | streamed accumulators |
 | 62 | Edge-property reads `r.field` in projection/WHERE | usage/graph-queries.md:79 | CONTRACT-T2 — §4.3 inline element WHERE / graph contract 4.2-4.3 | per-hop predicates are the pending item 1 |
 | 63 | `INSERT ('a')-[:KIND {p: v}]->('b')` | sql.rs:57, 3417 | CONTRACT-T2 — §2 `INSERT INTO GRAPH … EDGE` | `put_edge` exists (`index/graph/mod.rs:997`); only the surface is missing |
 | 64 | `DELETE ('a')-[:KIND]->('b')`, edge UPDATE | sql.rs:3564, 3723 | CONTRACT-T2 — §2 | `delete_edge` at `index/graph/mod.rs:1187` |
-| 65 | `SHOW EDGES [FROM t] [TO t]` | sql.rs:80, db.rs:11892 | **NOT IN CONTRACT** | graph contract 2.5 derives edge-type rows; no statement surfaces them |
+| 65 | `SHOW EDGES [FROM t] [TO t]` | sql.rs:80, db.rs:11892 | CONTRACT-T2 — QL §2 | the `(from, type, to)` triples of graph contract 2.5, read from the interned edge-type records; a count per triple is a scan and is labelled one |
 | 66 | Multi-FROM: `FROM MATCH (…), collection AS alias` | sql.rs:58 | CONTRACT-T2 — §4.8 `CROSS JOIN LATERAL` | one bounded traversal per driving row |
 | 67 | `UNION` across MATCH results | usage/graph-queries.md:148 | CONTRACT-T3 — refuse.rs `UNION` | e3 loses this |
 | 68 | `WITH` multi-stage traversal | usage/graph-queries.md:158 | CONTRACT-T2 — §2 non-recursive `WITH` | materialised once, row-budget bounded |
@@ -128,13 +135,13 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 
 | # | e3 capability | e3 (file:line) | e4 status | note |
 |---|---|---|---|---|
-| 74 | `open_as_service()` — one writer, snapshot readers | service.rs:1-70 | **NOT IN CONTRACT** | no service layer in ARCHITECTURE/SOURCE_LAYOUT; `open_snapshot` (`collections/mod.rs:721`) is the raw ingredient |
-| 75 | `ServiceDb::publish()` + stated staleness window | service.rs:16-26 | **NOT IN CONTRACT** | a publish cadence + read-your-writes barrier |
-| 76 | `set_statement_timeout(Duration)` | db.rs:5008 | **NOT IN CONTRACT** | e4 bounds by `QueryBudget` rows/groups, not wall clock |
-| 77 | `interrupt_handle()` / `cancel()` / `clear_interrupt()` | db.rs:330-334, 5014-5021 | **NOT IN CONTRACT** | internals exist (`Error::Cancelled`, `traverse_bfs_with_cancel` at `index/graph/mod.rs:1635`); no public handle or SQL surface |
-| 78 | `subscribe_changes()` / `unsubscribe_changes()` — one event per committed batch | db.rs:4986-4998 | **NOT IN CONTRACT** | commit-time change feed; the `.watch()` foundation |
-| 79 | `SHOW STATUS` (format, generation, counts, mode) | db.rs:8134, 8175 | **NOT IN CONTRACT** | e4 has `storage_bytes`/`io_counters`, no statement |
-| 80 | `SHOW STORAGE` (live bytes per keyspace + files) | db.rs:8132, 8170 | **NOT IN CONTRACT** | same |
+| 74 | `open_as_service()` — one writer, snapshot readers | service.rs:1-70 | CONTRACT-T2 — OPS §1 | a `ServiceDatabase` owning one writer behind a mutex and one `Arc<Database>` snapshot behind an RwLock, over `open_snapshot` (`collections/mod.rs:716`). Law 6. A second writer process is T3 (the page WAL is single-writer) |
+| 75 | `ServiceDb::publish()` + stated staleness window | service.rs:16-26 | CONTRACT-T2 — OPS §2 | window = publish interval (default 100 ms, as e3) plus one snapshot open. e4's barrier is **one checkpoint cheaper than e3's**: e4's `commit` publishes and `open_snapshot` reads the committed-WAL overlay, where e3 must `publish_generation()` first |
+| 76 | `set_statement_timeout(Duration)` | db.rs:5008 | CONTRACT-T2 — OPS §3 | a deadline beside the cancellation closure in `WorkMeter`, polled on a counted interval of charges (e3 polls every 1,024 rows). It is a bound *in addition to* `QueryBudget`, never instead of it; a timeout never interrupts a commit (T3) |
+| 77 | `interrupt_handle()` / `cancel()` / `clear_interrupt()` | db.rs:330-334, 5014-5021 | CONTRACT-T2 — OPS §4 | the smallest item: `WorkMeter` already threads a cancellation closure through every charge and every family already returns `Cancelled`. What is missing is the public `Arc<AtomicBool>` a second thread can hold |
+| 78 | `subscribe_changes()` / `unsubscribe_changes()` — one event per committed batch | db.rs:4986-4998 | CONTRACT-T2 — OPS §5 | delivered inside `commit` after the barrier, never on rollback. **e4 bounds what e3 does not**: e3 accumulates every changed key in a `Vec`, so a bulk load holds one string per row — a Law 1 violation its own bulk path reaches in one call. e4 caps the key list and degrades to a count. A durable replayable log is T3 |
+| 79 | `SHOW STATUS` (format, generation, counts, mode) | sql.rs:8134, exec.rs:519 | CONTRACT-T2 — OPS §6.1 | a `db_status` view over `storage_bytes` (`collections/mod.rs:794`), `tracked_pages` (`:798`), `io_counters` (`:947`) and the format bits. All O(1); the node and edge counts are scans and are optional columns |
+| 80 | `SHOW STORAGE` (live bytes per keyspace + files) | sql.rs:8132, exec.rs:463 | CONTRACT-T2 — OPS §6.2 | a tag-attributing walk over e4's tag-prefixed keyspaces plus the O(1) file sizes. A scan by definition, and the only statement in either contract whose cost is proportional to the database on purpose |
 | 81 | `information_schema.{tables,columns,schemata,table_constraints,key_column_usage}` | catalog/mod.rs:30-36 | CONTRACT-T2 — §1 catalog row, p3-pg-surface | virtual rows over the catalog |
 | 82 | `pg_indexes` | catalog/mod.rs:36, 112 | CONTRACT-T2 — p3-pg-surface | same |
 | 83 | Dictionary queries compose (WHERE/ORDER/LIMIT/DISTINCT over views) | catalog/mod.rs:135-180 | CONTRACT-T2 — p3-pg-surface | plus `version()`/`current_schema()` (refuse.rs) |
@@ -144,46 +151,131 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 | # | e3 capability | e3 (file:line) | e4 status | note |
 |---|---|---|---|---|
 | 84 | `TEXT INTEGER REAL BOOL TIMESTAMPTZ GEO VECTOR JSON` | sql.rs:1208-1217 | DONE — `src/sql/mod.rs:80-81` (`TEXT/INT/BIGINT/REAL/DOUBLE/BOOLEAN/JSONB/TIMESTAMPTZ/DATE/VECTOR(n)/GEOMETRY`) | e4 adds DATE and typed GEOMETRY(Point, 4326) |
-| 85 | `NOT NULL` on ADD COLUMN (parsed, *not enforced*) | sql.rs:4029 | **NOT IN CONTRACT** | no constraint row at any tier; e3 does not enforce it either, so parity is cheap |
+| 85 | `NOT NULL` on ADD COLUMN (parsed, *not enforced*) | sql.rs:4029 | CONTRACT-T2 — QL §2, §5 deviation 12 | a descriptor flag checked when the row is assembled (MISSING and NULL are distinct in e4), refusing the write and naming the column. e4 **enforces** it where e3 parses it, so a corpus e3 accepted can be refused. `ADD COLUMN … NOT NULL` with no DEFAULT on a non-empty collection is T3 |
 
 ### 10. Other notable
 
 | # | e3 capability | e3 (file:line) | e4 status | note |
 |---|---|---|---|---|
-| 86 | `write_trace` — per-phase transaction timing | write_trace.rs:1-22 | **NOT IN CONTRACT** | e4 has `io_counters`/`pool_counters` (`collections/mod.rs:897,952`); no write-path breakdown |
-| 87 | `stats()` / `memory_report()` / `trim_memory()` | db.rs:10177, 11763, 11726 | **NOT IN CONTRACT** | an introspection surface, no tier |
-| 88 | Bulk load: `begin_bulk`/`put_value_bulk`/`link_many` | db.rs:11922-11987 | **NOT IN CONTRACT** | batched write path below the statement layer |
+| 86 | `write_trace` — per-phase transaction timing | write_trace.rs:1-22 | CONTRACT-T2 — OPS §8 | a feature-gated thread-local phase timer over e4's write path, one line per index family. Law 4: e4 counts the I/O (`io_counters` `:947`, `pool_counters` `:892`) and does not yet attribute the time |
+| 87 | `stats()` / `memory_report()` / `trim_memory()` | db.rs:10177, 11763, 11726 | CONTRACT-T2 — OPS §6.3 | e4's honest report is short — the pool arena (a ceiling, labelled), the index and layout caches, the reader slots — because e4 holds nothing proportional to rows. That short list is Law 1 stated as a measurement. e3's rule that an absent structure is never reported as `0` is adopted verbatim |
+| 88 | Bulk load: `begin_bulk`/`put_value_bulk`/`link_many` | db.rs:11922-11987 | CONTRACT-T2 — OPS §7 | a nesting-counted write scope whose outermost close calls `commit`, with **the same** durability as any other commit (a weakened barrier is T3). e4 is stronger than e3 here: `rollback` makes a failed batch all-or-nothing where e3 leaves the earlier rows stored |
 | 89 | `prepare_insert` / `insert_prepared` | db.rs:10245-10261 | DONE — `src/sql/mod.rs:501` (`sql_prepare`) | — |
 
 ---
 
 ## Counts
 
-| status | count |
-|---|---|
-| DONE | 24 |
-| CONTRACT-T2 | 28 |
-| CONTRACT-T3 | 3 |
-| NOT IN CONTRACT | 33 |
-| informational (e4 ahead / e3 absent) | 2 |
-| **total rows** | **90** |
+| status | before (HEAD `8167b11`) | after (HEAD `bdbef43`) |
+|---|---:|---:|
+| DONE | 24 | 24 |
+| CONTRACT-T2 | 28 | 60 |
+| CONTRACT-T3 | 3 | 3 |
+| NOT ADOPTED (named refusal, capability kept) | 0 | 1 |
+| NOT IN CONTRACT | 33 | **0** |
+| informational (e4 ahead / e3 absent) | 2 | 2 |
+| **total rows** | **90** | **90** |
 
-## The NOT IN CONTRACT list (33)
+Of the 32 rows that moved to CONTRACT-T2, 23 are named in `docs/QL_CONTRACT.md`
+and 9 in `docs/OPS_CONTRACT.md`. The 33rd, `FROM MATCH`, is NOT ADOPTED.
 
-These are the e3 capabilities e4's `docs/QL_CONTRACT.md` does not mention at *any* tier — each needs either a new contract row or an explicit "dropped, here's why".
+### T3 boundaries named inside a T2 row
 
-**DDL/statements (13):** `FROM ALL`; `UPDATE … WHERE <predicate>`; `DELETE … WHERE <predicate>` / `DELETE FROM ALL`; `CREATE TABLE … WITH (…)` index hints; `DEFAULT NOW()`; `DEFAULT uuid4()/uuid5()`; `GENERATED ALWAYS AS … STORED`; all five `ALTER TABLE` forms; `REINDEX`; `COMPACT`; `SHOW TABLES/INDEXES/CREATE TABLE/<col>`; materialized & search views + `REFRESH`; `EXPLAIN ANALYZE`; plan cache.
+The tier on a row is the tier of the capability as e3 ships it. Five rows
+carry an explicit refusal for a form that has no bounded atomic, and none of
+them is emulated:
 
-**Expressions (3):** `CASE WHEN … END`; `JSON_ARRAY_LENGTH`; (nullability `NOT NULL`).
+| row | the T2 part | the T3 part, and why |
+|---|---|---|
+| 2, 5 | `FROM ALL` / `DELETE FROM ALL` as a concatenation driver | `FROM ALL` with a ranked `ORDER BY`: one order key across different layouts is not one key, and the N-way merge holds one cursor per collection, which is no budget dimension |
+| 11 | ADD / DROP / RENAME COLUMN / RENAME TO, and ALTER TYPE within one `Kind` | ALTER TYPE across `Kind`s: it rewrites every row and re-encodes every scalar key, and no bounded resumable rewrite exists |
+| 18 | a stored body, a bounded populate, a bounded clear | incremental maintenance: per-write delta propagation has no atomic |
+| 85 | `NOT NULL` as a write-path check | `ADD COLUMN … NOT NULL` with no DEFAULT on a non-empty collection: the constraint is false the moment it is recorded |
+| 76, 78 | statement timeout; the live change feed | a timeout that interrupts a commit (L3 has no fast path); a durable replayable change log (a second write path with its own retention and recovery) |
 
-**Text (2):** `SEARCH_SCORE()` as a score leaf; `BM25_NORM` normalised score — both matter because e3's hybrid-ranking story (`docs/usage/queries.md:225`) depends on comparable [0,1] terms in one `ORDER BY`.
+## The former NOT IN CONTRACT list (33), now tiered
 
-**Vector/spatial (2):** `USING vamana` spelling; `POINT()/POLYGON()` WKT literals.
+Every row below was a capability e3 ships that e4's contracts did not mention
+at any tier. Each now has a contract row with a tier, or a written refusal.
 
-**Graph (2):** `FROM MATCH` spelling (rejected on purpose — needs a migration note, not an atomic); `SHOW EDGES`.
+**DDL and statements (14) → `docs/QL_CONTRACT.md` §2, all T2.** `FROM ALL`
+(concatenation driver; ranked order refused); predicate-driven `UPDATE` and
+`DELETE` / `DELETE FROM ALL` (driver walk, `rows_written` budget, snapshot-
+consistent); `CREATE TABLE … WITH (…)` (sugar over `CREATE INDEX`);
+`DEFAULT NOW()`; `DEFAULT uuid4()/uuid5()`; `GENERATED … STORED`; the five
+`ALTER TABLE` forms over `alter_collection`; `REINDEX` (rebuild); `COMPACT`
+(checkpoint, reports deferred); the `SHOW` family over `db_*` rows;
+materialized and search views plus `REFRESH` (a bounded atomic was found, so
+it is tiered rather than refused); `EXPLAIN ANALYZE` (today's EXPLAIN plus
+`QueryWork`); the bounded plan cache (keyed on text **and** catalog
+generation).
 
-**Service and ops (7):** `open_as_service`; `publish`/staleness contract; `set_statement_timeout`; `interrupt_handle`/`cancel`; `subscribe_changes`; `SHOW STATUS`; `SHOW STORAGE`.
+**Expressions (3) → §4.1, T2.** `CASE WHEN … END` as a row expression;
+`JSON_ARRAY_LENGTH` with the `->`/`->>`/`#>`/`#>>` family; `NOT NULL` as a
+write-path check (§2 and §5 deviation 12) — e4 enforces what e3 only parses.
 
-**Diagnostics (3):** `write_trace`; `stats`/`memory_report`; bulk-load API.
+**Text (2) → §4.6, T2.** `SEARCH_SCORE()` as the Score leaf of `search()`,
+normalised to [0,1]; `BM25_NORM` as `bm25/(bm25+k)` on the existing leaf. Both
+exist so e3's hybrid-ranking story (`docs/usage/queries.md:225`) has
+comparable terms in one `ORDER BY` — a weight over an unbounded BM25 is not a
+weight.
 
-The single largest gap is **group 8**: e3 ships a long-running service form with publish semantics, a statement timeout, a cancellation handle and a commit-time change feed; e4's contract covers the *query language* and never states a runtime/ops surface. That is a missing contract document, not a missing tier row. The second cluster is **write-time schema behaviour** (defaults, generated columns, ALTER) — `Database::alter_collection` already exists at `src/collections/mod.rs:1213`, so this is surface-only work whose absence from §2 looks like an oversight rather than a decision.
+**Vector and spatial (2) → §4.5, §4.4, T2.** `USING vamana` joins the
+`quantized` alias list; `POINT()`/`POLYGON()` WKT literals ride the
+`ST_GeomFromText` parser, longitude before latitude, stated.
+
+**Graph (2).** `SHOW EDGES` is T2 over graph contract 2.5's derived triples.
+`FROM MATCH` is **NOT ADOPTED**: the capability is T1 under
+`FROM GRAPH_TABLE (…)` and §5 deviation 11 writes the migration.
+
+**Service and ops (7) → `docs/OPS_CONTRACT.md`, T2.** `open_as_service` (§1);
+`publish` and the staleness window (§2); `set_statement_timeout` (§3);
+`interrupt_handle`/`cancel` (§4); `subscribe_changes` (§5); `SHOW STATUS`
+(§6.1); `SHOW STORAGE` (§6.2).
+
+**Diagnostics (3) → `docs/OPS_CONTRACT.md`, T2.** `stats`/`memory_report`/
+`trim_memory` (§6.3); bulk load (§7); `write_trace` (§8).
+
+## What the tiering found
+
+1. **The largest gap was a missing document, not missing tier rows.** Group 8
+   is now `docs/OPS_CONTRACT.md`: service mode, publish, timeout,
+   cancellation, the change feed, introspection, bulk load and `write_trace`,
+   each with e3's semantics cited, e4's ingredient cited, the atomic to build,
+   the Law it must satisfy, and a tier.
+
+2. **e4's publish barrier is one checkpoint cheaper than e3's.** e3's
+   `ServiceDb::publish` must `publish_generation()` — commit *and* checkpoint
+   — before minting, because an e3 snapshot opens the newest published
+   generation and commits alone still live in the WAL (`service.rs:120-122`).
+   e4's `commit` publishes and `open_snapshot` reads the committed-WAL
+   overlay, so read-your-own-writes is a snapshot open and nothing more.
+
+3. **e3's change feed has a Law 1 problem e4 must not copy.**
+   `ChangeEvent.keys` accumulates one `String` per changed key per batch,
+   deduplicated only against the previous entry. e3's own `put_value_bulk`
+   reaches that with a single call. e4's contract caps the key list and
+   degrades to a truncation flag and a count — and the Postgres wire arrives
+   at the same answer independently, since a `NOTIFY` payload is capped at
+   8,000 bytes.
+
+4. **Write-time schema behaviour was surface-only, as suspected.**
+   `Database::alter_collection` (`collections/mod.rs:1208`) already writes a
+   new immutable Layout and repoints the catalog, so four of the five `ALTER
+   TABLE` forms are descriptor work at O(fields). The two real constraints
+   found while tiering: DROP COLUMN must **tombstone** the slot, because dense
+   rows are positional and removing a slot re-interprets every later field;
+   and ALTER TYPE across `Kind`s is a whole-collection rewrite with no bounded
+   resumable atomic, so it is refused rather than tiered.
+
+5. **Materialized views did not need a refusal.** Every atomic they need
+   exists — catalog storage for the body, the prepared query's bounded pages,
+   `put`, and the `begin_drop_collection`/`drop_collection_step` machine for
+   the clear. The line that keeps `CREATE VIEW` at T3 while this is T2 is
+   worth stating once: a user view is a query rewrite at prepare time, which
+   is a second planner path; a materialized view is rows in a collection.
+
+6. **Two places where e4 is stronger than e3, now written down.** A failed
+   bulk batch commits nothing (e3 leaves the earlier rows stored), and
+   `NOT NULL` is enforced (e3 parses it and does not check it). Both are
+   migration notes, because both can refuse a workload e3 accepted.

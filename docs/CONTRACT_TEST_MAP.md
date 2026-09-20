@@ -7,6 +7,13 @@ atomic that exists; the tests named here pin that atomic (there is no SQL
 parser at HEAD). A row that names several constructs is `UNPINNED` for any
 construct the tests do not pin.
 
+Two sections at the end carry the contract rows added on 2026-09-20 when the
+33 `docs/E3_PARITY.md` NOT IN CONTRACT capabilities were tiered: 23 new rows
+in `docs/QL_CONTRACT.md` and 13 in the new `docs/OPS_CONTRACT.md`. All 36 are
+`UNPINNED` and all 36 are T2 — by the tier's own definition nothing behind
+them is built, so there is nothing yet to pin. They are counted separately
+from the T1 set so the T1 unpinned number keeps meaning what it meant.
+
 ## Graph contract (`docs/GRAPH_CONTRACT.md`)
 
 | Rule | Behaviour | Tests |
@@ -25,9 +32,9 @@ construct the tests do not pin.
 | 3.3 | A traversal runs in one context (or the base graph) | `tests/graph_collections.rs` `cyclic_bfs_is_shortest_hop_deterministic_and_bounded`; `tests/graph_collections.rs` `graph_filter_answers_what_traverse_bfs_answers` |
 | 3.4 | A context descriptor (name, owner, created) is catalog data | name intern: `tests/graph_collections.rs` `directed_typed_context_edges_replace_properties_and_survive_reopen`. owner, created: UNPINNED |
 | 4.1 | Budgeted BFS: seed(s), direction, type or all, min/max depth, visited and edge budgets, result limit, cancellation, pageable; a node is never revisited (ACYCLIC) | `tests/graph_collections.rs` `cyclic_bfs_is_shortest_hop_deterministic_and_bounded`; `tests/graph_collections.rs` `neighbor_and_bfs_cancellation_never_return_partial_or_poison_reads`; `tests/graph_collections.rs` `graph_filter_answers_what_traverse_bfs_answers`; `tests/query_multimodel.rs` `graph_scalar_spatial_text_and_vector_apply_before_ranked_top_k` |
-| 4.2 | Traversal binds the reaching edge to each result and can read its properties | UNPINNED (`TraversalNode` is `{entity, depth}` only) |
-| 4.3 | Per-hop predicates on edge properties or node fields; failing edge never followed; covered fields never read a row | UNPINNED (`BfsRequest` has no predicate) |
-| 4.4 | One predicate set applies to every hop; per-hop patterns are Phase 3 | UNPINNED (depends on 4.3) |
+| 4.2 | Traversal binds the reaching edge to each result and can read its properties | `tests/graph_hop_predicates.rs` `oracle_five_hundred_sampled_traversals_equal_a_brute_force_bfs` (the bound edge equals the stored bag); `tests/graph_hop_predicates.rs` `a_node_reached_by_two_edges_reports_the_first_admitted`; `tests/graph_hop_predicates.rs` `the_reaching_edge_projects_and_ranks_without_a_row`; `tests/graph_hop_predicates.rs` `an_incoming_hop_reads_the_primary_posting_for_its_predicate`; `tests/sql_tier1.rs` `graph_table_columns_project_the_reaching_edge_and_order_by_it` |
+| 4.3 | Per-hop predicates on edge properties or node fields; failing edge never followed; covered fields never read a row | `tests/graph_hop_predicates.rs` `oracle_five_hundred_sampled_traversals_equal_a_brute_force_bfs`; `tests/graph_hop_predicates.rs` `a_predicate_that_rejects_shrinks_the_frontier_and_still_counts_the_edge` (no row decode, pruned edges still counted); `tests/graph_hop_predicates.rs` `a_node_predicate_an_index_cannot_answer_is_refused_at_prepare`; `tests/graph_hop_predicates.rs` `a_node_predicate_refuses_a_row_of_another_collection`; `tests/sql_tier1.rs` `graph_table_inline_edge_where_compiles_to_a_per_hop_prune`; `tests/sql_tier1.rs` `graph_table_inline_node_where_compiles_to_a_membership_prune`; `tests/sql_tier1.rs` `a_row_bound_inline_node_predicate_is_refused_with_its_tier`; `tests/sql_explain.rs` `explain_prints_the_edge_predicates_and_the_node_membership_sets` |
+| 4.4 | One predicate set applies to every hop; per-hop patterns are Phase 3 | `tests/graph_hop_predicates.rs` `oracle_five_hundred_sampled_traversals_equal_a_brute_force_bfs` (the reference applies the same set at every depth, up to three); `tests/sql_tier1.rs` `graph_table_inline_edge_where_compiles_to_a_per_hop_prune` (a `{1,4}` quantifier, one predicate set) |
 | 4.5 | Traversal is a query filter and a candidate driver; conjoins with scalar/text/point/geometry and any single order; seeds may come from another order | `tests/graph_collections.rs` `graph_filter_answers_what_traverse_bfs_answers`; `tests/query_multimodel.rs` `graph_scalar_spatial_text_and_vector_apply_before_ranked_top_k`; `tests/query_combinations.rs` `query_engine_surface_combinations` |
 | 5.1 | Paths streamed: one accumulator per frontier entry; full path rebuilt only for returned rows | UNPINNED |
 | 5.2 | A path aggregate is a Score leaf | UNPINNED |
@@ -110,6 +117,80 @@ construct the tests do not pin.
 | `count(*)`, `count(col)`, `sum`, `min`, `max`, `avg`, `GROUP BY`, `HAVING`, `DISTINCT` | streaming when the group key is the driving index's own value, hashed otherwise, bounded by the `groups` budget (`src/query/aggregate.rs`, `Database::prepare_aggregate`) | `tests/query_aggregate.rs` `every_filter_and_grouping_equals_a_brute_force_fold`; `tests/query_aggregate.rs` `streaming_and_hashed_produce_identical_groups`; `tests/query_aggregate.rs` `the_groups_budget_bounds_the_hashed_shape_and_streaming_holds_one`; `tests/query_aggregate.rs` `pages_of_one_three_and_seven_concatenate`; `tests/query_aggregate.rs` `a_streaming_page_stops_and_resumes_at_a_group_boundary`; `tests/query_aggregate.rs` `having_filters_finished_groups_before_they_are_paged`; `tests/query_aggregate.rs` `distinct_is_a_group_with_no_accumulators`; `tests/query_aggregate.rs` `count_all_is_one_group_over_the_key_order_driver`; `tests/query_aggregate.rs` `cancellation_mid_fold_leaves_no_state`; `tests/query_aggregate.rs` `a_divided_group_key_streams_and_equals_the_fold`; `tests/query_aggregate.rs` `an_order_by_an_accumulator_sorts_the_finished_groups`; SQL: `tests/sql_tier1.rs` `count_star_with_no_filter_is_one_row_over_the_key_order_driver`, `group_by_an_indexed_column_streams_and_matches_the_api`, `sum_min_max_avg_by_group_with_having`, `select_distinct_is_a_group_with_no_accumulators`, `group_by_with_a_radius_filter_hashes_and_agrees_with_the_filter_itself`, `the_divided_group_key_is_accepted_index_side_and_refused_otherwise`, `order_by_an_aggregate_alias_sorts_the_finished_groups`; EXPLAIN: `tests/sql_explain.rs` `agg_count_all_is_streaming_over_the_key_order_driver_and_reads_no_row`, `agg_count_kind_streams_off_the_driving_posting`, `agg_sum_born_by_kind_names_the_row_its_accumulators_read`, `agg_distinct_kind_is_a_group_with_no_accumulators`, `agg_count_radius_by_kind_hashes_because_the_radius_drives`, `agg_born_decade_computes_its_expression_key_index_side` |
 | `array_agg`, `string_agg`, `json_agg`, `percentile_cont`, window functions, `GROUPING SETS`, `CUBE`, `count(DISTINCT col)`, a composite `GROUP BY` key, `GROUP BY <expression>` with no index-side computation | no atomic in this item; refused by name | `tests/query_aggregate.rs` `what_has_no_atomic_is_refused_by_name`; `tests/sql_tier1.rs` `a_folded_answer_refuses_what_it_cannot_report`; `tests/sql_refusals.rs` `every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` |
 
+## Query language T2 added 2026-09-20 (`docs/QL_CONTRACT.md`)
+
+T2 by definition has no built atomic, so every row here is `UNPINNED`. The
+Atomic column is what the test must pin once the row lands.
+
+### §2 Statements
+
+| Construct | Atomic to pin | Tests |
+| --- | --- | --- |
+| `SELECT ... FROM ALL` | `Collections` concatenation driver in catalog id order; resume `(collection id, inner cursor)`; `LIMIT` stops inside the collection it is reached in; a ranked `ORDER BY` over it is refused | UNPINNED |
+| `UPDATE t SET ... WHERE <any predicate>` | driver walk feeding read-modify-put; `rows_written` budget refuses rather than truncates; the walk does not re-match its own writes; resume from the committed cursor | UNPINNED |
+| `DELETE FROM t WHERE <any predicate>`, `DELETE FROM ALL` | the same walk feeding `delete`, with the graph contract 6.1 RESTRICT preflight per row | UNPINNED |
+| `CREATE TABLE t (...) WITH (hash/range/fulltext/bm25/spatial)` | expansion to `create_collection` + one `CREATE INDEX` per field; hash/range → btree, fulltext/bm25 → gin, spatial → gist | UNPINNED |
+| column `DEFAULT now()`, `DEFAULT uuid4()`, `DEFAULT uuid5(ns, name)` | per-field default in the descriptor under an additive feature bit; filled on the write path only when the INSERT names no value; old files without the bit open unchanged (L8) | UNPINNED |
+| `GENERATED ALWAYS AS (expr) STORED` | compiled row expression over fields of the same row, evaluated before index maintenance so an index over the generated column is maintained | UNPINNED |
+| `NOT NULL` on a column | descriptor flag tested at row assembly; MISSING and NULL both refuse and the error names the column; `ADD COLUMN ... NOT NULL` without DEFAULT on a non-empty collection is refused | UNPINNED |
+| `ALTER TABLE` ADD / DROP / RENAME COLUMN / RENAME TO | `alter_collection` writes a new `Layout`, no row rewritten; ADD reads MISSING; DROP tombstones the slot so old rows decode unchanged; RENAME keeps `CollectionId`, edges and key mappings | UNPINNED |
+| `ALTER TABLE ... ALTER COLUMN ... TYPE` | same-`Kind` change is the descriptor rewrite; a `Kind` change is refused with the rewrite named | UNPINNED |
+| `REINDEX` | drop + sorted rebuild under the `IndexState` Building/Ready/Dropping machine, resumable across a reopen | UNPINNED |
+| `COMPACT` | `Database::checkpoint`; reports *deferred* on `Ok(false)` while a reader slot is held and never waits | UNPINNED |
+| `SHOW TABLES`, `SHOW <collection>`, `SHOW CREATE TABLE`, `SHOW INDEXES` | one fixed SELECT over a `db_*` catalog view each; the count and size columns are labelled scans by `EXPLAIN` | UNPINNED |
+| `SHOW EDGES [FROM t] [TO t]` | the `(from, type, to)` triples of graph contract 2.5 from the interned edge-type records; per-triple counts labelled scans | UNPINNED |
+| `SHOW STATUS`, `SHOW STORAGE` | `docs/OPS_CONTRACT.md` §6 — pinned in the OPS section below | UNPINNED |
+| `CREATE [MATERIALIZED\|SEARCH] VIEW`, `REFRESH MATERIALIZED VIEW` | stored body in the catalog; populate = the prepared query's bounded pages through `put`; REFRESH = bounded resumable clear (`begin_drop_collection`/`drop_collection_step`) then populate; the view is stale between refreshes and never incrementally maintained | UNPINNED |
+| `EXPLAIN ANALYZE <statement>` | the plan plus each page's `QueryWork`, run under the caller's `QueryBudget`; logical counters, one total wall clock | UNPINNED |
+| bounded prepared-plan cache behind `sql_prepare` | LRU with three ceilings fixed at open; the key carries the catalog generation, so DDL invalidates plans instead of serving one against a dead layout | UNPINNED |
+
+### §4.1 Row expressions
+
+| Construct | Atomic to pin | Tests |
+| --- | --- | --- |
+| `CASE WHEN ... THEN ... [ELSE ...] END` | row expression; one key in `ORDER BY`; row-bound in `WHERE` and labelled so by `EXPLAIN` | UNPINNED |
+| `->`, `->>`, `#>`, `#>>`, `json_array_length` on a `Kind::Json` field | row functions over the decoded binary JSON; no index range without an expression index | UNPINNED |
+
+### §4.4 Spatial
+
+| Construct | Atomic to pin | Tests |
+| --- | --- | --- |
+| `POINT(lon lat)`, `POLYGON((...))` as a literal | the `ST_GeomFromText` WKT parser reached without the function name; longitude before latitude | UNPINNED |
+
+### §4.5 Vector
+
+| Construct | Atomic to pin | Tests |
+| --- | --- | --- |
+| `USING vamana` | alias of `quantized` with a notice, beside `hnsw`/`diskann`/`ivfflat`; no new family | UNPINNED |
+
+### §4.6 Text search
+
+| Construct | Atomic to pin | Tests |
+| --- | --- | --- |
+| `search_score()` | Score leaf of `search()`, in [0,1] from the edit distance spent and the prefix completed; lands with `search()` | UNPINNED |
+| `bm25_norm(col, 'query', k)` | `bm25/(bm25+k)` on the existing Score leaf; one operation, no extra pass, strictly monotone so the `bm25` order is unchanged | UNPINNED |
+
+## Operations contract (`docs/OPS_CONTRACT.md`)
+
+Every row is T2 and `UNPINNED`. The Law column is the one the test must
+falsify, not decorate.
+
+| § | Surface | Atomic to pin | Law | Tests |
+| --- | --- | --- | --- | --- |
+| 1 | Service mode | one writer behind a mutex, one `Arc<Database>` snapshot behind an RwLock; no read takes the writer lock; a reader slot defers a checkpoint and never blocks the writer; past the persisted `readers` bound the service refuses rather than blocks | L6 | UNPINNED |
+| 2 | `publish()` and the staleness window | a publish is a snapshot open and an `Arc` swap, with no checkpoint on the path; a read is stale by at most the interval plus one open; a failed mint leaves the served view in place | L6, L3 | UNPINNED |
+| 3 | Statement timeout | a deadline in `WorkMeter`, polled on a counted interval of charges; `QueryBudget` remains the bound the contract guarantees; a timeout never interrupts a commit | L1, L4 | UNPINNED |
+| 4 | Interrupt handle | a public `Arc<AtomicBool>` wired in as the default cancellation closure; per handle and therefore per snapshot; a cancel is sticky until cleared; a cancelled query errors and never returns a partial answer as complete | L6 | UNPINNED |
+| 5 | Change notifications | exactly one event per committed batch, delivered inside `commit` after the barrier; a rolled-back transaction delivers none; collections and edge types in full; the key list capped, degrading to a truncation flag and a count | L6, L1 | UNPINNED |
+| 6.1 | `SHOW STATUS` | a `db_status` view over `storage_bytes`, `tracked_pages`, `io_counters` and the format bits, all O(1); node and edge counts are optional columns labelled scans | L4 | UNPINNED |
+| 6.2 | `SHOW STORAGE` | a tag-attributing walk over the keyspaces plus O(1) file sizes; reports itself as a scan | L4 | UNPINNED |
+| 6.3 | `stats`, `memory_report`, `trim_memory` | a report over the structures that exist — pool arena as a labelled ceiling, index and layout caches, reader slots — never a `0` for an absent structure; `trim_memory` changes no answer | L4, evidencing L1 | UNPINNED |
+| 7 | Bulk load | a nesting-counted write scope whose outermost close calls `commit`, with the same FULL barrier as any other commit; a failed batch commits nothing | L2, L3 | UNPINNED |
+| 8 | `write_trace` | a `cfg(feature)` thread-local phase timer, one line per index family; zero cost when off | L4 | UNPINNED |
+| 9.1 | `statement_timeout` GUC | `SET [LOCAL] statement_timeout` on the existing `SET LOCAL` dispatch; `0` is no limit; `SHOW` returns it | L4 | UNPINNED |
+| 9.2 | `CancelRequest` | the protocol's backend-id/secret pair selects the handle of §4; both timeout and cancel return Postgres `57014 query_canceled`, distinguished by message, not code | L6 | UNPINNED |
+| 9.3 | `LISTEN` / `NOTIFY` | one notification per committed batch per listening channel, delivered at end of transaction, none on rollback, duplicates collapsed, payload within the 8,000-byte cap that §5's key bound already satisfies | L6, L1 | UNPINNED |
+
 ## Counts
 
 | Set | Rows | Fully pinned | Contain UNPINNED |
@@ -120,6 +201,18 @@ construct the tests do not pin.
 
 Unpinned count (rows whose Tests cell contains `UNPINNED`): **20**. The count
 did not move with `DROP TABLE`: the two rows it touches (6.1 and the
+| QL_CONTRACT T1 table rows | 28 | 24 | 4 |
+| **Subtotal (pinnable at HEAD)** | **59** | **39** | **20** |
+| QL_CONTRACT T2 rows added 2026-09-20 | 23 | 0 | 23 |
+| OPS_CONTRACT rows (§1–9, all T2) | 13 | 0 | 13 |
+| **Total** | **95** | **39** | **56** |
+
+Unpinned count over the pinnable set (rows whose Tests cell contains
+`UNPINNED`): **20**, unchanged. The 36 rows added on 2026-09-20 are all T2
+and all unpinned, which is what T2 means -- they are counted apart so that
+this number keeps measuring what is built but untested, rather than mixing it
+with what is specified and unbuilt. Total unpinned across every set: **56**.
+The pinnable count did not move with `DROP TABLE`: the two rows it touches (6.1 and the
 `CREATE TABLE ... DROP` row) were partial before and are partial still, for
 the constructs that remain -- single-row RESTRICT, and `adjacency` as a
 `CREATE INDEX` method.
@@ -132,3 +225,18 @@ row is only the single-row `delete(key)`, which still cascades.
 T1 partial (4): `DELETE` RESTRICT; `CREATE INDEX ... adjacency` (the
 `DROP TABLE` half of that row is now pinned by six tests); `<>`;
 `IS NOT NULL`. No T1 row is fully unpinned.
+| GRAPH_CONTRACT numbered rules (1.1–6.3 and L1–L8; no L7 in that document) | 31 | 18 | 13 |
+| QL_CONTRACT T1 table rows | 32 | 28 | 4 |
+| **Total** | **63** | **46** | **17** |
+
+Unpinned count (rows whose Tests cell contains `UNPINNED`): **17**.
+
+GRAPH fully unpinned (8): 1.3, 2.3, 5.1, 5.2, 5.3, 6.3, L3, L4.
+GRAPH partial (5): 2.4, 3.1, 3.4, 6.1, L8.
+T1 partial (4): `DELETE` RESTRICT; `CREATE INDEX ... adjacency`; `<>`; `IS NOT NULL`. No T1 row is fully unpinned.
+
+The four rows the T1 table gained with GRAPH_CONTRACT 4.2 and 4.3 (the two
+inline element `WHERE` forms that are now T1, `COLUMNS (r.<prop>)` and
+`ORDER BY <edge alias>`) are pinned by `tests/sql_tier1.rs`'s four
+`graph_table_*` tests and `tests/sql_explain.rs`'s
+`explain_prints_the_edge_predicates_and_the_node_membership_sets`.

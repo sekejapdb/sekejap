@@ -1,6 +1,9 @@
 # Query language contract — sekejap-e4 Phase 3 (draft for owner edit)
 
-Drafted 2026-09-20. Companion to docs/GRAPH_CONTRACT.md (engine semantics).
+Drafted 2026-09-20. Companion to docs/GRAPH_CONTRACT.md (engine semantics)
+and docs/OPS_CONTRACT.md (the runtime and ops surface: service mode, publish,
+statement timeout, cancellation, change notifications, introspection, bulk
+load, write trace).
 This document fixes WHAT the language is: the specifications adopted, every
 keyword and function in one of three tiers, the dialect deviations, and the
 execution guarantee behind each construct. Lean by design: a construct is in
@@ -34,16 +37,33 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 | `INSERT INTO t (...) VALUES (...)`, `$n` params | T1 | put by key |
 | `UPDATE t SET ... WHERE key = $1` | T1 | put replaces the row; partial update = read-modify-put |
 | `DELETE FROM t WHERE key = $1` | T1 | delete by key; RESTRICT/CASCADE per graph contract 6.1 |
+| `SELECT ... FROM ALL` (every collection at once) | T2 | a `Collections` concatenation driver over the catalog's collection ids in id order: each collection is one ordinary bounded driver walk, and the resume key is `(collection id, inner cursor)`. Work is proportional to the collections enumerated plus the candidates walked, and a `LIMIT` stops the concatenation at the collection it is reached in. `FROM ALL` with a ranked `ORDER BY` is **T3**: one order key across different layouts is not one key (the field may be absent, or a different `Kind`, in each collection), and merging N ordered walks holds one cursor per collection, which is no `QueryBudget` dimension. |
+| `UPDATE t SET ... WHERE <any predicate>` | T2 | the prepared query's driver supplies candidates a page at a time and each one is read-modify-put, so work is proportional to the rows matched, never to the collection. Bounded by a `rows_written` `QueryBudget` dimension: over budget the statement is refused with the count it reached, never silently truncated. The walk reads the snapshot it started on, so an update never re-matches its own writes, and it resumes from the committed cursor. |
+| `DELETE FROM t WHERE <any predicate>`, `DELETE FROM ALL [WHERE ...]` | T2 | the same driver walk feeding `delete`, with the graph contract 6.1 RESTRICT preflight per row and the same `rows_written` budget. `DELETE FROM ALL` rides the `FROM ALL` driver above and inherits its refusal for a ranked order. |
 | `INSERT INTO GRAPH g EDGE type (source, destination, props...) VALUES` | T2 (spelling open) | put_edge |
 | `UPDATE GRAPH g EDGE type SET ... WHERE source = AND destination =` | T2 | edge posting rewrite |
 | `DELETE FROM GRAPH g EDGE type WHERE ...` | T2 | delete_edge |
 | `CREATE TABLE`, `CREATE INDEX ... USING {btree,gin,gist,exact,quantized,adjacency}`, `DROP INDEX [IF EXISTS]` | T1 | catalog descriptors |
 | `DROP TABLE [IF EXISTS] name [CASCADE\|RESTRICT]` | T1 | `begin_drop_collection` publishes a DROPPING mark the readers refuse, then `drop_collection_step(id, budget)` empties the indexes, sidecars, rows and mappings in bounded batches and removes the descriptor last; RESTRICT per graph contract 6.1 |
+| `CREATE TABLE t (...) WITH (hash:[...], range:[...], fulltext:[...], bm25:[...], spatial:[...])` | T2 | sugar, no new atomic: one `create_collection` followed by one `CREATE INDEX` per named field inside the same statement. `hash` and `range` both map to `btree` with a notice (there is no separate hash family, and a `btree` answers equality); `fulltext` and `bm25` map to `gin`; `spatial` maps to `gist`. |
+| column `DEFAULT now()`, `DEFAULT uuid4()`, `DEFAULT uuid5(namespace, name)` | T2 | a per-field default recorded in the collection descriptor under an additive feature bit (Law 8) and filled on the write path when the INSERT names no value for that column. The generator set is closed and each member is O(1) per row: one clock read, 16 random bytes, one hash over `namespace` and `name`. An arbitrary expression as a DEFAULT is T3 -- that is the generated-column row below, under its own keyword. |
+| `GENERATED ALWAYS AS (expr) STORED` | T2 | the same descriptor slot holds a compiled row expression over other declared fields of the **same** row (the §4.1 / §4.2 row-function set), evaluated once the row is assembled and before the index-maintenance hook, so an index over a generated column is maintained exactly like an index over a written one. An expression that reads another row, an aggregate, or a subquery is T3: those are not row functions and have no per-write atomic. |
+| `NOT NULL` on a column | T2 | a per-field flag in the same descriptor slot as the default, checked when the row is assembled: a value that is MISSING or NULL (e4 distinguishes them) refuses the write and names the column. `ALTER TABLE ... ADD COLUMN ... NOT NULL` with no `DEFAULT` on a non-empty collection is T3: every existing row would read MISSING, so the constraint is false the moment it is recorded. Add the column with a default, or add it nullable and fill it. |
+| `ALTER TABLE t ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN old TO new`, `RENAME TO new_name` | T2 | `Database::alter_collection` (`src/collections/mod.rs:1208`) writes a new immutable `Layout` and repoints the catalog in one commit; no row is rewritten, so the cost is O(fields), not O(rows). ADD: existing rows read MISSING for the new field, which is already distinct from NULL. DROP: the slot is **tombstoned**, not removed -- dense rows are positional, so removing a slot would re-interpret every later field; the name leaves the layout, projection and predicates stop seeing it, and its index is dropped. RENAME COLUMN and RENAME TO are name records only; `CollectionId` does not change, so edges, indexes and the external-key mapping are untouched. |
+| `ALTER TABLE t ALTER COLUMN c TYPE new_type` | T2 when the new type maps to the same `Kind` (`INT` <-> `BIGINT`, `REAL` <-> `DOUBLE PRECISION`); T3 when the `Kind` changes | the same-`Kind` case changes the declared spelling and leaves the encoding alone, so it is the descriptor rewrite above. A `Kind` change rewrites every row and re-encodes every scalar index key -- work proportional to the collection, with no bounded resumable atomic today. The shape it would need is the `begin_drop_collection` / `drop_collection_step` phase machine applied to a rewrite; until that exists the form is refused and names this. |
+| `REINDEX [ON t] [USING method (field)]` | T2 | rebuild, no new atomic: drop the index tree and rebuild it through the sorted build (`src/collections/rebuild.rs`) under the `IndexState` Building/Ready/Dropping machine that already makes a build resumable across a reopen. |
+| `COMPACT` | T2 | `Database::checkpoint` (`src/collections/mod.rs:1618`): fold the committed pages into the data file and reset the WAL. Deviation, stated: `checkpoint` returns `Ok(false)` while any reader in any process holds a slot, so `COMPACT` reports *deferred* and returns -- it never waits on a reader, and it is not Postgres `VACUUM`: nothing is reclaimed inside a table. |
 | `CREATE SCHEMA`, `schema.table` | T2 | p2-schema-segment |
 | `CREATE PROPERTY GRAPH name NODE TABLES (...) EDGE TYPES (...)` | T2 | optional naming of a context + label map; nothing is built |
 | `BEGIN [READ ONLY]`, `COMMIT`, `ROLLBACK` | T1 | one writer, snapshot readers |
 | `DECLARE c BINARY CURSOR FOR ...`, `FETCH FORWARD n`, `CLOSE` | T2 | pages over prepare_query (p3-wire) |
 | `EXPLAIN` | T2 | prints the plan: driver, membership sets, order, work counters |
+| `EXPLAIN ANALYZE <statement>` | T2 | the same plan, plus the statement run to completion under the caller's `QueryBudget`, with the `QueryWork` counters of every page (`src/query/mod.rs:427`) printed beside it. Deviation, stated: what is reported is logical work -- candidates, postings walked, row decodes, output bytes -- not a per-operator wall clock, because the engine keeps no per-operator timer. Wall clock appears once, as a total. |
+| `SHOW TABLES`, `SHOW <collection>`, `SHOW CREATE TABLE t`, `SHOW INDEXES [ON t]` | T2 | sugar over the `db_*` catalog rows (p2-catalog-core): each is one fixed `SELECT` over one catalog view, costing O(collections), O(fields), O(fields + indexes) and O(indexes) respectively. The row-count and size-in-bytes columns e3 prints are a walk per collection; they are optional columns here and `EXPLAIN` labels them as scans (§6). |
+| `SHOW EDGES [FROM t] [TO t]` | T2 | the `(from collection, edge type, to collection)` triples graph contract 2.5 derives from written edges, read from the interned edge-type records. A count per triple is a walk of the edge keyspace and is labelled a scan, exactly as above. |
+| `SHOW STATUS`, `SHOW STORAGE` | T2 | `docs/OPS_CONTRACT.md` §6: the runtime facts and the per-keyspace byte report. `SHOW STORAGE` is a scan by definition and says so. |
+| `CREATE MATERIALIZED VIEW name AS <select>`, `CREATE SEARCH VIEW name AS <select> WITH (autoindex)`, `REFRESH MATERIALIZED VIEW name` | T2 | the body SQL is stored in the catalog and the view **is** a derived collection, not a rewrite: populate is the prepared query's own bounded pages writing rows through `put`; `REFRESH` is the bounded, resumable clear (`begin_drop_collection` / `drop_collection_step` on the derived collection) followed by that populate. `WITH (autoindex)` is the `CREATE TABLE ... WITH (...)` sugar above, restricted to the view's TEXT fields. Stated plainly: a view is a stale copy between REFRESHes and is never incrementally maintained -- incremental maintenance is T3, because per-write delta propagation has no atomic. This is exactly why a *user* `CREATE VIEW` stays T3 while this is T2: a user view is a query rewrite at prepare time, which is a second planner path; a materialized view is rows in a collection, and every atomic that needs already exists. |
+| a bounded prepared-plan cache behind `sql_prepare` | T2 | a least-recently-used map from statement text to the compiled `SelectPlan`, with three ceilings fixed at open -- entries, total cached statement bytes, and the longest statement that is cached at all -- so Law 1 holds whatever the workload does. The cache key carries the catalog generation: a `CREATE INDEX`, `ALTER TABLE` or `DROP` invalidates every plan compiled before it, rather than serving a plan built against a layout that no longer exists. |
 | `SELECT version()`, `postgis_version()`, `current_schema()` | T2 | fixed rows (p3-pg-surface) |
 | `WITH name AS (SELECT ...)` non-recursive | T2 | materialised once, bounded by QueryBudget rows |
 | `UNION`, `WITH RECURSIVE`, `CREATE VIEW` (user), triggers, window functions | T3 | no atomic; recursion is a GRAPH_TABLE pattern |
@@ -73,6 +93,8 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 |---|---|---|
 | `lower`, `upper`, `length`, `concat`, `||`, `substring`, `left`, `right`, `trim`, `split_part`, `replace`, `position`, `starts_with` | T2 | row functions on projected values; `lower(col) = x` and `starts_with` rewrite to an index range when an expression index `lower(col)` exists |
 | `ILIKE` | T2 | see §3 (trigram) |
+| `CASE WHEN <cond> THEN <value> [WHEN ...] [ELSE <value>] END` | T2 | a row expression: one row in, one value out, no read of any other row. In `ORDER BY` it is one key (§5 deviation 3), so it rides the same order-expression leaf an arithmetic blend does. In `WHERE` it is row-bound -- it never becomes an index range -- and `EXPLAIN` labels it so. |
+| `->`, `->>`, `#>`, `#>>`, `json_array_length` on a `Kind::Json` field | T2 | row functions over the binary JSON the row codec already decodes (`src/lib.rs`): one row, no extra read. None of them becomes an index range without an expression index over the same path, which is the `lower(col)` rule above. |
 | `regexp_*` | T3 | no atomic |
 
 ### 4.2 Date/time (Postgres names; storage = Int microseconds, declared TIMESTAMPTZ / DATE)
@@ -90,7 +112,11 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 | function / construct | tier | atomic |
 |---|---|---|
 | element pattern `(v IS label)` / `(v:label)`, edge `-[e IS type]->`, `<-`, `-` | T1 | direction + type on BFS |
-| inline `WHERE` in element (per-hop prune) | T2 | graph contract 4.3 |
+| inline `WHERE` in element, edge (`-[r:t WHERE r.p > v]->`) | T1 | per-hop edge predicates over the inline bag (graph contract 4.3) |
+| inline `WHERE` in element, far node, membership-able (`=`, range, `BETWEEN`, `ST_DWithin`, `ST_Within` on a point) | T1 | per-hop node predicates over index postings (graph contract 4.3) |
+| inline `WHERE` in element, far node, row-bound (`IS NULL`, `IS MISSING`, text, geometry, JSON) | T2/T3 | a per-hop predicate is answered index-side; these need the row, which graph contract 4.3 forbids per hop |
+| `COLUMNS (r.<prop> AS name)` on the edge element | T1 | the reaching edge, bound by the traversal (graph contract 4.2) |
+| `ORDER BY <edge column alias>` | T1 | rank by the reaching edge's property |
 | `{n,m}`, `{n,}`, `+`, `?` quantifiers | T1 | min/max depth |
 | label alternation `type1|type2` | T2 | multi-type hop (two ranges per hop) |
 | post-pattern `WHERE` | T1 | post-filter on rows |
@@ -113,6 +139,7 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 | `<->` (kNN, `ORDER BY loc <-> pt`) | T1 | Distance order (point index) |
 | `ST_Distance`, `ST_Area`, `ST_Length`, `ST_Perimeter`, `ST_Centroid`, `ST_Covers`, `ST_Crosses` | T1 as row functions | spatial_geometry pub fns |
 | `ST_AsBinary`, `ST_AsEWKB`, `ST_GeomFromWKB(bytea, srid)`, `ST_GeomFromEWKB`, `ST_AsText`, `ST_GeomFromText`, `ST_AsGeoJSON`, `ST_GeomFromGeoJSON`, `ST_MakePoint`, `ST_SetSRID`, `ST_SRID` | T2 | pure I/O functions; SRID per column (p3-geometry-io) |
+| `POINT(lon lat)`, `POLYGON((lon lat, ...))` as a literal in value position | T2 | I/O only: the WKT text parser `ST_GeomFromText` already needs (p3-geometry-io), reached without the function name around it. Axis order is longitude then latitude -- the same order `ST_MakePoint(x, y)` takes and the same order e3 writes -- and the contract says so here because the reverse is the classic import bug. |
 | `ST_Simplify`, `ST_SnapToGrid`, `ST_RemoveRepeatedPoints` | T2 | pure functions (QGIS render path) |
 | `ST_Transform` | T2 (later) | PROJ; storage stays WGS84 |
 | `ST_Buffer`, `ST_Union`, `ST_Intersection`, `ST_Difference`, `ST_SimplifyPreserveTopology` | T3 | GEOS overlay; no pure-Rust substitute accepted |
@@ -127,7 +154,7 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 | `ORDER BY emb <=> $v LIMIT k` | T1 | exact (page-order scan) or quantized (ef) by index choice |
 | `SET LOCAL ef_search = n` (pgvector) / `diskann.query_search_list_size` (pgvectorscale) | T2 | maps to `ef` |
 | `USING exact (emb)`, `USING quantized (emb vector_cosine_ops)` | T1 | index families |
-| `USING hnsw`, `USING diskann`, `USING ivfflat` | T2 | accepted as aliases of `quantized` with a notice; no new family |
+| `USING hnsw`, `USING diskann`, `USING ivfflat`, `USING vamana` | T2 | accepted as aliases of `quantized` with a notice; no new family. `vamana` is e3's and pgvectorscale's spelling of the DiskANN graph and joins the same alias list for the same reason. |
 | distance as a filter `emb <=> $v < 0.3` | T2 | approximate membership set (ef-bounded) |
 | `vector_dims`, `vector_norm`, `l2_normalize` | T2 | row functions |
 | `<+>` L1, halfvec, sparsevec, binary quantization ops | T3 | |
@@ -141,6 +168,8 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 | `bm25(col, 'query')` as an expression | T1 | Score leaf |
 | `websearch_to_tsquery`, `plainto_tsquery` | T2 | parsers onto the same filter |
 | `search(col, 'query')` typo-tolerant, prefix on the last token (e1 family; Meilisearch-class) | T2 | term-dictionary prefix range + bounded Levenshtein automaton over the dictionary; new atomic, no format change |
+| `search_score()` | T2 | the Score leaf of the `search()` predicate above, normalised to [0,1]: 1 for an exact term match, decreasing with the edit distance actually spent and with how much of the final token the prefix had to complete. It lands with `search()` and costs nothing extra -- the automaton already knows both numbers. The formula is written down the way BM25's is (§5 deviation 5). |
+| `bm25_norm(col, 'query', k)` | T2 | `bm25(col, q) / (bm25(col, q) + k)` over the existing Score leaf: one arithmetic operation, no extra pass, and strictly monotone in `bm25`, so the order it produces is the order `bm25` produces. It earns a row because a hybrid `ORDER BY` has to weigh a text term against a vector similarity, and a weight over an unbounded BM25 is not a weight; with both terms in [0,1) it is. |
 | `highlight`, `ts_headline` | T2 | row function |
 | multi-field text index | T2 | index over a concatenated stored field today; declared multi-field later |
 | language stemming beyond 'simple' | T3 | analyzer v1 is language-neutral |
@@ -170,7 +199,10 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 ## 5. Dialect deviations (stated once, each with the reason)
 
 1. The graph is native: `CREATE PROPERTY GRAPH` is optional and uses `EDGE TYPES`, not `EDGE TABLES`; no `SOURCE KEY ... REFERENCES` because endpoints are known from written edges.
-2. Inline element `WHERE` prunes per hop by contract; the post-pattern `WHERE` filters completed matches. Both are standard syntax; the guarantee is ours.
+2. Inline element `WHERE` prunes per hop by contract; the post-pattern `WHERE` filters completed matches. Both are standard syntax; the guarantee is ours. A node predicate an index cannot answer without the row (`IS NULL`, `IS MISSING`, a text search, a geometry predicate, a JSON equality) is REFUSED inline rather than demoted to a post-filter: a post-filter keeps a node in the frontier that graph contract 4.3 says must never be expanded, so it answers a different question at two hops.
+9. `<>` on an edge property is accepted, unlike `<>` on a scalar column (§3). The §3 refusal is about an INDEX -- the complement of an equality is not a posting range, so it is not over a membership set. An edge predicate reads the property out of the posting the hop is standing on, so the complement costs exactly what the predicate costs and no set is involved.
+10. The reaching edge is projected under a reserved `@edge.` prefix (`@edge.weight`), which no unquoted SQL identifier can spell, so it never collides with a declared field. A `COLUMNS (r.weight AS w)` entry compiles to it, and `ORDER BY w` resolves against the pattern's edge aliases before it looks for a column of the far node. An edge column entry and an `ORDER BY` over one are matched to the pattern's edge variable WITHOUT case, as every other name in this dialect is.
+13. A statement that reads the reaching edge runs on the traversal that bound it, because no other candidate stream carries the edge (graph contract 4.2); any other driver is refused when the query is prepared, with the driver named. So a post-pattern `_key` predicate beside such a statement keeps the traversal driving and is answered from the external key the row carries, at one primary read per candidate, instead of taking the driver for the mapping walk. A `_key` predicate with no such pattern still drives the mapping walk, which is the cheaper plan and remains the default.
 3. `ORDER BY` takes one key; an expression is one key (the Score atomic). Two keys are a refusal.
 4. `OFFSET` is a keyset continuation, never a skip count.
 5. BM25 stands behind `ts_rank_cd`; the number differs from Postgres and the docs say so.
@@ -180,6 +212,22 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 11. A nullish group key (NULL or missing) sorts FIRST under `GROUP BY`, the scalar keyspace's own order; Postgres sorts NULL last and `NULLS FIRST|LAST` is refused. `HAVING` over an all-null accumulator drops the group (SQL three-valued logic); a `HAVING` over `min`/`max` of a non-numeric column is refused at prepare.
 9. `DROP TABLE` is RESTRICT by default, and what restricts it is GRAPH EDGES, not foreign keys: Postgres refuses on a dependent constraint, this refuses while any edge in any context references a row of the table and names those contexts (graph contract 6.1). `CASCADE` removes those edges and nothing else -- it never reaches a second table's rows. A table with no edges on it drops under the default.
 10. `DROP TABLE` is bounded and resumable, so it is not one transaction: the DROPPING mark is committed first and each bounded step after it is committed as it goes. An interrupted `DROP TABLE` leaves a collection that answers nothing and resumes from its committed cursor; it never leaves a half-emptied readable table. `ROLLBACK` does not undo a drop that has begun.
+11. e3's `FROM MATCH (a)-[r]->(b)` is not adopted (§1) and never will be. The
+    capability is not lost and is not Tier 3: it is T1 under the standard
+    spelling, `FROM GRAPH_TABLE (g MATCH (a)-[r]->(b) COLUMNS (...))`.
+    Migration is mechanical -- wrap the pattern in `GRAPH_TABLE (...)`, name
+    the graph, and move the SELECT list into `COLUMNS`. `MATCH SHORTEST` is
+    `ANY SHORTEST` (§4.3), and a multi-FROM `..., collection AS alias` is a
+    `CROSS JOIN LATERAL` (§4.8). This is a refusal with a named reason: the
+    atomic exists, the spelling does not.
+12. `NOT NULL` is enforced here. e3 parses it and does not check it, so a
+    corpus e3 accepted can be refused by e4 on the row that was always in
+    violation. The check is a descriptor flag tested when the row is
+    assembled; the error names the column.
+13. `FROM ALL` is unordered by contract: it concatenates the collections in
+    catalog id order and pages within each. It is not a UNION (which stays
+    T3), it does not deduplicate, and a ranked `ORDER BY` over it is refused
+    for the reason in its §2 row.
 
 ## 6. Execution guarantees the contract makes
 
@@ -197,3 +245,10 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 5. Geometry I/O and `&&` (§4.4), catalog views and wire (p3-pg-surface, p3-wire).
 6. Trigram index for `ILIKE` / infix `LIKE`; typo-tolerant `search()` (§4.6).
 7. Key-equality joins (§4.8).
+8. The write-path schema behaviour (`ALTER TABLE`, defaults, generated
+   columns, `NOT NULL`) and the predicate-driven `UPDATE` / `DELETE` walk:
+   surface over atomics that exist, so it is cheap and it unblocks migration.
+9. The `SHOW` family, `EXPLAIN ANALYZE` and the plan cache, alongside the
+   catalog views of p3-pg-surface.
+10. `docs/OPS_CONTRACT.md` in its own order: service mode and publish, then
+    the statement timeout and the interrupt handle, then the change feed.

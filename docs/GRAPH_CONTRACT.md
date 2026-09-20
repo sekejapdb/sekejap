@@ -66,13 +66,48 @@ native, not a layer declared over tables.
     cancellation, pageable. A node is never revisited (GQL ACYCLIC is the only
     path mode in this phase).
 4.2 The traversal binds the reaching edge to each result and can read its
-    properties.
+    properties. BUILT (order-of-work item 1): `TraversalNode::via` carries the
+    edge, `Projection::Fields` accepts `"@edge.<property>"` and
+    `QueryOrder::Edge` ranks by one. A node reachable over several edges
+    reports the FIRST one the walk admitted -- edges are offered to a level in
+    posting order, outgoing before incoming, and the level keeps the first
+    offer per entity. An INCOMING hop's properties come from the primary
+    posting of the same edge, because the reverse posting is a marker; that is
+    one edge-keyspace point read per candidate edge, never a row -- counted
+    in `scanned_edges` and bounded by the edge budget like every other read
+    in that keyspace.
+    Reading the edge requires the traversal to DRIVE: the reaching edge is
+    carried by the traversal's own candidate stream and by nothing else, so a
+    query that projects `@edge.<property>` or ranks by the edge under any
+    other candidate driver is REFUSED when it is prepared, with the driver
+    named. A key-range predicate beside such a query is therefore a
+    post-filter, answered from the external key the row carries in its own
+    first field, and costs a primary read per candidate.
 4.3 Per-hop predicates (DECIDED): a predicate on an edge property or on a node
     field is evaluated as the frontier expands; a failing edge is never
     followed, a failing node is never expanded. Edge predicates read the inline
     posting; node predicates on indexed fields use index-side membership sets.
     A traversal never reads a row for a predicate on a covered field.
     Post-filters on completed matches are a separate, later stage.
+    BUILT (order-of-work item 1): `BfsRequest::edge_where` is a conjunction
+    over the inline bag, decoded once per edge visited; `BfsRequest::node_where`
+    is a conjunction of query filters restricted to what an index answers
+    without a row -- a scalar equality (one posting probe per node), a scalar
+    range or a point predicate (one membership set, built once per prepared
+    query). Every other filter kind is REFUSED when the traversal is prepared,
+    with the reason, and a node set that outgrows its memory budget is refused
+    rather than falling back to the row path. The SEED is not tested against
+    the node predicates: it is named by the caller, not found by a hop.
+    A node predicate is tested at most ONCE per distinct entity for a whole
+    traversal: an admitted node joins the visited set with its level, and a
+    refused one joins a refused set beside it, so no later edge -- at that
+    depth or a deeper one -- probes it again. A membership set that outgrows
+    its memory budget is a BUDGET refusal naming the resource it overran
+    (`BudgetExceeded`), on the query path and on the traversal atomic alike,
+    never prose and never a row-read fallback.
+    Work: `graph_edges` counts every edge decoded, a pruned one included --
+    §4.3 prunes the frontier, not the reading; `graph_visited` counts every
+    node admitted.
 4.4 One predicate set applies to every hop in this phase; per-hop patterns
     (typed multi-hop with different predicates per hop) are Phase 3 surface
     over the same atomic.
@@ -119,13 +154,22 @@ native, not a layer declared over tables.
 
 L1 A traversal holds the frontier, the visited set and one accumulator per
    visited node, all bounded by the visited budget; never RAM proportional to
-   the graph.
+   the graph. It also holds the entities its node predicates REFUSED, so each
+   is probed once (§4.3); a refused entity was reached by at least one edge
+   the walk charged, so that set is bounded by the edge budget.
 L2 Work per hop is the postings of that source in that context and type; a
    whole-graph pass never occurs inside a traversal.
 L3 RESTRICT is the default delete; CASCADE is explicit and bounded.
 L4 Sacrifices named: 8 bytes per edge for identity; a declared property is
    stored fixed-width in the posting (bytes per edge per declared property);
-   the reverse mirror doubles edge storage.
+   the reverse mirror doubles edge storage. Per-hop predicates add: 12 bytes
+   per FRONTIER ENTRY (a reaching-edge pointer and the offer order that makes
+   "first admitted" deterministic), still bounded by the visited budget; 12
+   bytes per REFUSED entity, bounded by the edge budget; and, on an INCOMING
+   hop that reads a property, one primary-posting point read per candidate
+   edge, because a reverse posting is a marker -- so such a hop spends up to
+   twice the edge budget of the same hop that reads no property, and refuses
+   rather than exceeding it.
 L5 A corrupt posting or bag is a Corrupt error on that edge, never a panic; all
    offset reads are bounds-checked.
 L6 A traversal reads its snapshot; a concurrent writer is invisible to it.
@@ -142,7 +186,7 @@ L8 Element identity and typed properties are additive feature bits; old files
 
 ## 9. Order of work
 
-1. 4.2 + 4.3: edge binding and per-hop pruning (no format change).
+1. 4.2 + 4.3: edge binding and per-hop pruning (no format change). BUILT.
 2. 2.4: typed edge properties (additive descriptor).
 3. 5.1–5.3: streamed paths, path aggregates as Score leaves, shortest path.
 4. 2.3: element identity (feature bit; its own commit).
