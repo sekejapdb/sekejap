@@ -40,6 +40,12 @@ impl GraphContextId {
     pub const BASE: Self = Self(0);
 }
 
+/// The structural identity of an edge TODAY: source, context, type,
+/// destination, so a second `put_edge` of the same quadruple overwrites the
+/// first (set semantics). docs/GRAPH_CONTRACT.md §2.3 decides element
+/// identity -- an edge id segment under an additive feature bit, so parallel
+/// edges coexist -- and that is PENDING (contract §9 item 4). Until it lands,
+/// this key is the identity and the contract's rule is not yet the code's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EdgeKey {
     pub source: EntityId,

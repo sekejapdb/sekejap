@@ -81,10 +81,24 @@ fn membership_bitmap_bytes(span: u64) -> u64 {
 }
 
 /// Sets the bit for `sequence` (1-based, as every allocated entity sequence
-/// is) in a bitmap sized by [`membership_bitmap_bytes`].
-fn membership_bitmap_set(bits: &mut [u8], sequence: u64) {
-    let index = (sequence - 1) as usize;
-    bits[index / 8] |= 1 << (index % 8);
+/// is) in a bitmap sized by [`membership_bitmap_bytes`]. A sequence of zero
+/// or one past the bitmap's span was never allocated when the bitmap was
+/// sized, so a posting that names one is corrupt: the caller gets `Err`,
+/// never an out-of-bounds write (Law 5).
+fn membership_bitmap_set(bits: &mut [u8], sequence: u64) -> QueryResult<()> {
+    let index = usize::try_from(sequence.checked_sub(1).ok_or_else(|| {
+        corrupt_query("membership posting sequence is zero")
+    })?)
+    .map_err(|_| corrupt_query("membership posting sequence overflow"))?;
+    match bits.get_mut(index / 8) {
+        Some(byte) => {
+            *byte |= 1 << (index % 8);
+            Ok(())
+        }
+        None => Err(corrupt_query(
+            "membership posting sequence past the collection span",
+        )),
+    }
 }
 
 /// Tests the bit for `sequence` (1-based). A sequence at or past the
@@ -189,16 +203,16 @@ fn build_scalar_range_set<C: FnMut() -> bool>(
         walk.step();
         if let Some(sequence) = sequence {
             match bits.as_mut() {
-                Some(bits) => membership_bitmap_set(bits, sequence),
+                Some(bits) => membership_bitmap_set(bits, sequence)?,
                 None if ids.len() == vec_cap => {
                     if !bitmap_viable {
                         return Ok(MembershipSet::Overflow);
                     }
                     let mut fresh = vec![0u8; bitmap_bytes as usize];
                     for &s in &ids {
-                        membership_bitmap_set(&mut fresh, s);
+                        membership_bitmap_set(&mut fresh, s)?;
                     }
-                    membership_bitmap_set(&mut fresh, sequence);
+                    membership_bitmap_set(&mut fresh, sequence)?;
                     ids = Vec::new();
                     bits = Some(fresh);
                 }
@@ -309,16 +323,16 @@ fn build_point_set<C: FnMut() -> bool>(
             walk.step();
             if let Some(sequence) = sequence {
                 match bits.as_mut() {
-                    Some(bits) => membership_bitmap_set(bits, sequence),
+                    Some(bits) => membership_bitmap_set(bits, sequence)?,
                     None if ids.len() == budget.vec_cap => {
                         if !budget.bitmap_viable {
                             return Ok(MembershipSet::Overflow);
                         }
                         let mut fresh = vec![0u8; budget.bitmap_bytes as usize];
                         for &s in &ids {
-                            membership_bitmap_set(&mut fresh, s);
+                            membership_bitmap_set(&mut fresh, s)?;
                         }
-                        membership_bitmap_set(&mut fresh, sequence);
+                        membership_bitmap_set(&mut fresh, sequence)?;
                         ids = Vec::new();
                         bits = Some(fresh);
                     }

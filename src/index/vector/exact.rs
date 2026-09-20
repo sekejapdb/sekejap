@@ -142,12 +142,13 @@ pub(super) fn sidecar_prefix(c: CollectionId) -> Vec<u8> {
 /// holding. It is a speed claim with a correct slow path underneath it, not a
 /// correctness claim.
 ///
-/// SACRIFICE (Law 4): the cursor walks EVERY vector field of the collection,
-/// not just the indexed one, so a collection with several vector fields pays
-/// a longer walk than the locators strictly need. It is still one sequential
-/// pass over pages the file already has to hold, against one root-to-leaf
-/// descent per candidate row before. It holds one sidecar in RAM at a time --
-/// RAM proportional to a single vector, not to the collection.
+/// STATUS (sweep 2026-09-20): this cursor is not on any live path. Filtered
+/// exact scoring point-gets each candidate's sidecar
+/// (`score_locator_cancelled`), and the unfiltered order walks the sidecar
+/// leaves in page order (`scan_exact_all`). The sacrifice the earlier note
+/// described -- walking every vector field of the collection -- is therefore
+/// not paid by any query today. The type stays as the reference shape for a
+/// sequential filtered walk if a measurement ever asks for one.
 #[allow(dead_code)]
 pub(super) struct SidecarCursor<'a> {
     prefix: Vec<u8>,
