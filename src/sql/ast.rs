@@ -138,6 +138,37 @@ pub(super) enum Predicate {
         /// Metres, for `ST_DWithin` only.
         metres: Option<Literal>,
     },
+    /// `col IN (v1, v2, ...)`: a union of equalities on one index, which is
+    /// one membership set (`docs/QL_CONTRACT.md` §3).
+    InList {
+        column: String,
+        values: Vec<Literal>,
+    },
+    /// `_key IN (v1, v2, ...)` over the external-key mapping keyspace.
+    KeyInList {
+        values: Vec<Literal>,
+    },
+    /// `EXISTS (SELECT 1 FROM t2 WHERE t2.<column> = <this table>._key)`, and
+    /// the same question written `_key IN (SELECT t2.<column> FROM t2)`: a
+    /// SEMI-JOIN, compiled to the membership set of the outer rows `t2`
+    /// names.
+    Semi {
+        table: String,
+        column: String,
+    },
+}
+
+/// A `WHERE` clause, as written: the boolean tree over predicates.
+///
+/// `AND` is the conjunction a filter list already is, so the top level of a
+/// statement is a `Vec<Expr>` and nested `And`s appear only where the shape
+/// could not be flattened -- inside an `Or`, or under a `Not`.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Expr {
+    Leaf(Predicate),
+    Not(Box<Expr>),
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
 }
 
 /// An arithmetic `ORDER BY` expression: one key, per deviation 3.
@@ -344,7 +375,7 @@ pub(super) enum Source {
 pub(super) struct SelectStmt {
     pub(super) items: Vec<(SelectItem, Option<String>)>,
     pub(super) source: Source,
-    pub(super) predicates: Vec<Predicate>,
+    pub(super) predicates: Vec<Expr>,
     /// `SELECT DISTINCT`, which is a group with no accumulators.
     pub(super) distinct: bool,
     pub(super) group: Option<GroupExpr>,

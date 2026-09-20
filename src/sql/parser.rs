@@ -865,7 +865,7 @@ impl Parser {
             return Err(refuse::refuse("JOIN"));
         }
         let predicates = if self.eat_word("WHERE") {
-            self.conjunction()?
+            self.where_clause()?
         } else {
             Vec::new()
         };
@@ -999,7 +999,9 @@ impl Parser {
                 value,
             });
             if self.word().as_deref() == Some("OR") {
-                return Err(refuse::refuse("OR"));
+                return Err(SqlError::unsupported(
+                    "OR inside HAVING: a HAVING predicate is applied to a finished group, and a union of group predicates has no accumulator atomic (QL_CONTRACT §4.7)",
+                ));
             }
             if !self.eat_word("AND") {
                 break;
@@ -1103,12 +1105,24 @@ impl Parser {
 
     // ── WHERE ────────────────────────────────────────────────────────────
 
+    /// A flat conjunction, which is what a GRAPH_TABLE element's inline
+    /// `WHERE` is: per-hop predicates are answered index-side one node at a
+    /// time (`GRAPH_CONTRACT` 4.3), and a union over the whole collection is
+    /// not a per-hop question. `OR` and `NOT` there are refused, naming that.
     fn conjunction(&mut self) -> SqlResult2<Vec<Predicate>> {
         let mut out = Vec::new();
         loop {
-            out.push(self.predicate()?);
+            let mut negated = false;
+            out.push(self.predicate_negatable(&mut negated)?);
+            if negated {
+                return Err(SqlError::unsupported(
+                    "a negated predicate inside a graph pattern element: a per-hop predicate is answered from one node's postings, and a complement is a set over the whole collection (GRAPH_CONTRACT 4.3)",
+                ));
+            }
             if self.word().as_deref() == Some("OR") {
-                return Err(refuse::refuse("OR"));
+                return Err(SqlError::unsupported(
+                    "OR inside a graph pattern element: a per-hop predicate is answered from one node's postings, and a union is a set over the whole collection (GRAPH_CONTRACT 4.3)",
+                ));
             }
             if !self.eat_word("AND") {
                 break;
@@ -1117,19 +1131,148 @@ impl Parser {
         Ok(out)
     }
 
-    fn predicate(&mut self) -> SqlResult2<Predicate> {
+    // ── the boolean tree (docs/QL_CONTRACT.md §3) ────────────────────────
+    //
+    // `AND` is the conjunction a filter list already is, so EVERY `And` in
+    // the tree is flattened into one `Vec<Expr>` and only the shapes that
+    // cannot be -- an `Or`, or an `And` under a `Not` -- keep their node.
+    // Flattening only the TOP one made redundant parentheses matter: `a AND
+    // (b AND ST_Intersects(...))` left a nested conjunction whose geometry
+    // leaf `compile_set_expr` then refused, while the identical `a AND b AND
+    // ST_Intersects(...)` compiled. Parentheses that change nothing about
+    // the meaning now change nothing about the plan.
+
+    fn where_clause(&mut self) -> SqlResult2<Vec<Expr>> {
+        let mut out = Vec::new();
+        flatten_and(self.disjunction()?, &mut out);
+        Ok(out)
+    }
+
+    fn disjunction(&mut self) -> SqlResult2<Expr> {
+        let mut parts = vec![self.boolean_and()?];
+        while self.eat_word("OR") {
+            parts.push(self.boolean_and()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.pop().unwrap_or(Expr::And(Vec::new()))
+        } else {
+            Expr::Or(parts)
+        })
+    }
+
+    fn boolean_and(&mut self) -> SqlResult2<Expr> {
+        let mut parts = vec![self.boolean_unary()?];
+        while self.eat_word("AND") {
+            parts.push(self.boolean_unary()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.pop().unwrap_or(Expr::And(Vec::new()))
+        } else {
+            Expr::And(parts)
+        })
+    }
+
+    fn boolean_unary(&mut self) -> SqlResult2<Expr> {
         self.deeper()?;
-        let result = self.predicate_inner();
+        let result = self.boolean_unary_inner();
         self.shallower();
         result
     }
 
-    fn predicate_inner(&mut self) -> SqlResult2<Predicate> {
+    fn boolean_unary_inner(&mut self) -> SqlResult2<Expr> {
+        if self.eat_word("NOT") {
+            return Ok(Expr::Not(Box::new(self.boolean_unary()?)));
+        }
         if matches!(self.peek(), Tok::LParen) {
-            return Err(SqlError::unsupported(
-                "a parenthesised WHERE group: the conjunction is flat because a filter list is flat; OR and NOT, which are what parentheses are for, are Tier 2",
+            self.bump();
+            let inner = self.disjunction()?;
+            if !self.eat(&Tok::RParen) {
+                return Err(SqlError::syntax(
+                    format!(
+                        "expected `)` to close a WHERE group, found `{}`",
+                        self.peek().written()
+                    ),
+                    self.here(),
+                ));
+            }
+            return Ok(inner);
+        }
+        if self.word().as_deref() == Some("EXISTS") {
+            self.bump();
+            return Ok(Expr::Leaf(self.exists_subquery()?));
+        }
+        let mut negated = false;
+        let predicate = self.predicate_negatable(&mut negated)?;
+        let leaf = Expr::Leaf(predicate);
+        Ok(if negated {
+            Expr::Not(Box::new(leaf))
+        } else {
+            leaf
+        })
+    }
+
+    /// `EXISTS (SELECT 1 FROM t2 WHERE t2.<column> = <outer>._key)`.
+    ///
+    /// One shape, because one shape is what the semi-join atomic answers: the
+    /// subquery's rows name outer keys through one column, and the set of
+    /// outer ids they name is the filter. A correlated subquery over anything
+    /// else has no atomic and is refused where it is written.
+    fn exists_subquery(&mut self) -> SqlResult2<Predicate> {
+        if !self.eat(&Tok::LParen) {
+            return Err(SqlError::syntax(
+                format!("expected `(` after EXISTS, found `{}`", self.peek().written()),
+                self.here(),
             ));
         }
+        self.expect_word("SELECT")?;
+        // `SELECT 1`, `SELECT *` or a column: the subquery's select list is
+        // never read -- EXISTS asks whether a row is there.
+        match self.peek() {
+            Tok::Star => {
+                self.bump();
+            }
+            Tok::Num(_, _) => {
+                self.bump();
+            }
+            _ => {
+                let _ = self.name()?;
+            }
+        }
+        self.expect_word("FROM")?;
+        let table = self.name()?;
+        self.expect_word("WHERE")?;
+        let column = self.name()?;
+        if !self.eat(&Tok::Eq) {
+            return Err(SqlError::unsupported(
+                "an EXISTS subquery whose correlation is not a key equality: the semi-join atomic is a membership set of the outer ids one column names",
+            ));
+        }
+        let outer = self.name()?;
+        if !super::is_key_column(&outer) {
+            return Err(SqlError::unsupported(
+                "an EXISTS subquery correlated on a column other than the outer key: the semi-join atomic maps the subquery's values through the external-key mapping",
+            ));
+        }
+        if !self.eat(&Tok::RParen) {
+            return Err(SqlError::syntax(
+                format!(
+                    "expected `)` to close an EXISTS subquery, found `{}`",
+                    self.peek().written()
+                ),
+                self.here(),
+            ));
+        }
+        Ok(Predicate::Semi { table, column })
+    }
+
+    fn predicate_negatable(&mut self, negated: &mut bool) -> SqlResult2<Predicate> {
+        self.deeper()?;
+        let result = self.predicate_inner(negated);
+        self.shallower();
+        result
+    }
+
+    fn predicate_inner(&mut self, negated: &mut bool) -> SqlResult2<Predicate> {
         self.guard_word()?;
         if let Some(word) = self.word() {
             match word.as_str() {
@@ -1165,14 +1308,17 @@ impl Parser {
                 }
                 "IS" => {
                     self.bump();
-                    let negated = self.eat_word("NOT");
+                    let inverted = self.eat_word("NOT");
                     if self.eat_word("NULL") {
-                        return Ok(Predicate::IsNull { column, negated });
+                        return Ok(Predicate::IsNull {
+                            column,
+                            negated: inverted,
+                        });
                     }
                     if self.eat_word("MISSING") {
-                        if negated {
+                        if inverted {
                             return Err(SqlError::unsupported(
-                                "IS NOT MISSING: the scalar predicates are Eq, Range, IsNull and IsMissing; a complement is Tier 2 (NOT)",
+                                "IS NOT MISSING: a row whose field is present and NULL sits on the same nullish index key as a missing one, so the complement of MISSING cannot be proved from postings",
                             ));
                         }
                         return Ok(Predicate::IsMissing { column });
@@ -1181,6 +1327,16 @@ impl Parser {
                         "expected NULL or MISSING after IS",
                         self.here(),
                     ));
+                }
+                "IN" => {
+                    self.bump();
+                    return self.in_predicate(column);
+                }
+                "NOT" if self.word_at(1).as_deref() == Some("IN") => {
+                    self.bump();
+                    self.bump();
+                    *negated = true;
+                    return self.in_predicate(column);
                 }
                 other => {
                     if let Some(error) = self.listed(other) {
@@ -1216,6 +1372,65 @@ impl Parser {
             Predicate::KeyCompare { op, value }
         } else {
             Predicate::Compare { column, op, value }
+        })
+    }
+
+    /// `col IN (v1, v2, ...)`, or `_key IN (SELECT t2.<column> FROM t2)`.
+    ///
+    /// The list is a union of equalities on one index, which is one
+    /// membership set; the subquery form is the same semi-join `EXISTS`
+    /// writes the other way round.
+    fn in_predicate(&mut self, column: String) -> SqlResult2<Predicate> {
+        if !self.eat(&Tok::LParen) {
+            return Err(SqlError::syntax(
+                format!("expected `(` after IN, found `{}`", self.peek().written()),
+                self.here(),
+            ));
+        }
+        if self.word().as_deref() == Some("SELECT") {
+            if !super::is_key_column(&column) {
+                return Err(SqlError::unsupported(
+                    "IN (SELECT ...) on a column other than the key: the semi-join atomic maps the subquery's values through the external-key mapping, which only the key column names",
+                ));
+            }
+            self.bump();
+            let subject = self.name()?;
+            self.expect_word("FROM")?;
+            let table = self.name()?;
+            if !self.eat(&Tok::RParen) {
+                return Err(SqlError::syntax(
+                    format!(
+                        "expected `)` to close IN (SELECT ...), found `{}`",
+                        self.peek().written()
+                    ),
+                    self.here(),
+                ));
+            }
+            return Ok(Predicate::Semi {
+                table,
+                column: subject,
+            });
+        }
+        let mut values = Vec::new();
+        loop {
+            values.push(self.literal()?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        if !self.eat(&Tok::RParen) {
+            return Err(SqlError::syntax(
+                format!("expected `)` to close IN, found `{}`", self.peek().written()),
+                self.here(),
+            ));
+        }
+        if values.is_empty() {
+            return Err(SqlError::syntax("IN needs at least one value", self.here()));
+        }
+        Ok(if super::is_key_column(&column) {
+            Predicate::KeyInList { values }
+        } else {
+            Predicate::InList { column, values }
         })
     }
 
@@ -1919,7 +2134,9 @@ impl Parser {
                     let value = self.literal()?;
                     predicates.push(EdgePredicate { property, op, value });
                     if self.word().as_deref() == Some("OR") {
-                        return Err(refuse::refuse("OR"));
+                        return Err(SqlError::unsupported(
+                            "OR inside an edge element's WHERE: an edge predicate is decoded from the edge's own inline bag per hop, and a union is a set over a keyspace (GRAPH_CONTRACT 4.3)",
+                        ));
                     }
                     if !self.eat_word("AND") {
                         break;
@@ -2085,6 +2302,22 @@ impl Parser {
         };
         self.optional_cast()?;
         Ok(literal)
+    }
+}
+
+/// Flatten every `And` of a WHERE tree into one conjunct list, recursively.
+///
+/// `AND` is associative, so a nested `And` carries no meaning the flat list
+/// does not -- it only reaches the compiler as a boolean sub-tree whose leaves
+/// then have to be membership sets. See the note above `where_clause`.
+fn flatten_and(expr: Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::And(parts) => {
+            for part in parts {
+                flatten_and(part, out);
+            }
+        }
+        other => out.push(other),
     }
 }
 

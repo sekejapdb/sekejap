@@ -435,9 +435,28 @@ pub fn refusals() -> &'static [(&'static str, Tier, &'static str)] {
 
 /// Parse `text` and compile it against `db`'s catalog.
 pub fn prepare_sql(db: &Database, text: &str, params: &[Param]) -> Result<PreparedSql> {
+    prepare_sql_with(db, text, params, QueryBudget::unlimited(), &mut || false)
+}
+
+/// [`prepare_sql`] under the caller's own budget and cancellation.
+///
+/// Compiling is not always free: `EXISTS (...)` and `key IN (SELECT ...)`
+/// build their membership set while the statement is compiled, and that set
+/// is an edge-keyspace walk or a whole inner query. A caller that wants those
+/// bounded, or wants `Ctrl-C` to reach them, hands the budget and the cancel
+/// in here; [`prepare_sql`] is this with `QueryBudget::unlimited()` and a
+/// cancel that never fires, which is what the SQL layer used to do with no
+/// way to say otherwise.
+pub fn prepare_sql_with(
+    db: &Database,
+    text: &str,
+    params: &[Param],
+    budget: QueryBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<PreparedSql> {
     let statement = parser::parse(text)?;
     let mut notices = Vec::new();
-    let plan = compile::compile(db, statement, params, &mut notices)?;
+    let plan = compile::compile(db, statement, params, &mut notices, budget, cancelled)?;
     Ok(PreparedSql { plan, notices })
 }
 
@@ -464,12 +483,25 @@ impl Database {
     /// A read-only caller that wants a shared borrow uses [`prepare_sql`]
     /// and [`PreparedSql::with_query`], which take `&Database`.
     pub fn sql(&mut self, text: &str, params: &[Param]) -> Result<SqlResult> {
+        self.sql_with(text, params, QueryBudget::unlimited(), &mut || false)
+    }
+
+    /// [`Database::sql`] under the caller's own budget and cancellation, which
+    /// reach the semi-join set a statement builds while it COMPILES. See
+    /// [`prepare_sql_with`].
+    pub fn sql_with(
+        &mut self,
+        text: &str,
+        params: &[Param],
+        budget: QueryBudget,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<SqlResult> {
         let statement = parser::parse(text)?;
         let mut notices = Vec::new();
         // A write compiles and runs in one step: its plan borrows the
         // database immutably while it resolves names, and the write needs the
         // mutable borrow afterwards.
-        match compile::compile(self, statement, params, &mut notices)? {
+        match compile::compile(self, statement, params, &mut notices, budget, cancelled)? {
             compile::Plan::Select(select) => {
                 let prepared = PreparedSql {
                     plan: compile::Plan::Select(select),

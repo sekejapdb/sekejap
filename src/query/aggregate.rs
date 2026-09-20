@@ -1052,6 +1052,7 @@ impl PreparedAggregate<'_> {
             false,
             None,
             HashSet::new(),
+            &self.query.membership,
         )?;
         let mut rows = PrimaryRows::new(db, self.query.driver_walks_ids_ascending());
         let mut scratch = RowScratch::default();
@@ -1210,6 +1211,7 @@ impl PreparedAggregate<'_> {
             false,
             None,
             HashSet::new(),
+            &self.query.membership,
         )?;
         let mut rows = PrimaryRows::new(db, self.query.driver_walks_ids_ascending());
         let mut scratch = RowScratch::default();

@@ -136,7 +136,7 @@ pub(crate) fn norm_key(id: IndexId, sequence: u64) -> Vec<u8> {
 /// empty or punctuation-only string as a PRESENT document with zero tokens,
 /// which is exactly what a `0x76` value of 0 already means; reusing it would
 /// make a deleted document and an empty one the same bytes.
-pub(super) fn decode_norm(bytes: &[u8], segments_on: bool) -> Result<Option<u32>> {
+pub(crate) fn decode_norm(bytes: &[u8], segments_on: bool) -> Result<Option<u32>> {
     if bytes.is_empty() {
         if !segments_on {
             return Err(corrupt("text norm value length"));

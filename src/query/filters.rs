@@ -109,6 +109,9 @@ pub(super) fn batch_filters_match<C: FnMut() -> bool>(
                     selected_field_in(&layout, bytes, crate::collections::KEY_FIELD)?,
                 )?
             }
+            // One binary search or one bit, against a set that was walked
+            // once for the whole query.
+            CompiledFilter::Boolean { .. } => ranges[position].contains(id.sequence)?,
             CompiledFilter::Graph { .. } | CompiledFilter::Text(_) => return Ok(None),
         };
         if !matches {
@@ -483,6 +486,12 @@ pub(super) fn filters_match<'a, C: FnMut() -> bool>(
                     selected_field(row, crate::collections::KEY_FIELD)?,
                 )?
             }
+            // A union, a complement or a semi-join set: one membership test
+            // against a set built once for the whole query. There is no row
+            // arm and no posting arm -- `docs/QL_CONTRACT.md` §3 refuses a
+            // boolean whose leaves an index cannot answer rather than
+            // evaluating it per record.
+            CompiledFilter::Boolean { .. } => ranges[position].contains(id.sequence)?,
         };
         if !matches {
             return Ok(false);

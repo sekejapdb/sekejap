@@ -615,7 +615,7 @@ pub struct CaseSpec {
 /// approximate sweeps (`APPROX_BASES`), generated at runtime, one case per
 /// `EF_SWEEP` / `SLS_SWEEP` point, because there is no longer one fixed-ef
 /// case for either to be a fixed entry of.
-pub const BATTERY: [CaseSpec; 30] = [
+pub const BATTERY: [CaseSpec; 36] = [
     CaseSpec { name: "pt_radius", kind: CaseKind::Filter },
     CaseSpec { name: "pt_bbox", kind: CaseKind::Filter },
     CaseSpec { name: "plot_within_box", kind: CaseKind::Filter },
@@ -629,6 +629,18 @@ pub const BATTERY: [CaseSpec; 30] = [
     CaseSpec { name: "born_range", kind: CaseKind::Filter },
     CaseSpec { name: "kind_eq", kind: CaseKind::Filter },
     CaseSpec { name: "radius_and_born", kind: CaseKind::Filter },
+    // ── the boolean battery (QL_CONTRACT §3) ────────────────────────────
+    // Every one of these is ONE membership set: a union of equalities, a
+    // union across two families, a complement inside one index, a union of
+    // two covers, the complement of the nullish key, and a semi-join set.
+    CaseSpec { name: "bool_kind_in3", kind: CaseKind::Filter },
+    CaseSpec { name: "bool_born_or_kind", kind: CaseKind::Filter },
+    CaseSpec { name: "bool_not_kind", kind: CaseKind::Filter },
+    CaseSpec { name: "bool_radius_or_radius", kind: CaseKind::Filter },
+    CaseSpec { name: "bool_not_null_born", kind: CaseKind::Filter },
+    // Needs the `related` edge set, so `--graph` selects it exactly as it
+    // selects the four `graph_` cases.
+    CaseSpec { name: "bool_exists_related", kind: CaseKind::Filter },
     CaseSpec { name: "knn_10", kind: CaseKind::Ranked },
     CaseSpec { name: "knn_10_kind", kind: CaseKind::Ranked },
     CaseSpec { name: "text_top10", kind: CaseKind::Ranked },
@@ -681,7 +693,7 @@ fn is_aggregate_case(name: &str) -> bool {
 /// load writes. Without it the case has nothing to answer from and is
 /// skipped rather than answered with zero rows.
 pub fn needs_graph(name: &str) -> bool {
-    name.starts_with("graph_")
+    name.starts_with("graph_") || name == "bool_exists_related"
 }
 
 /// How many nearest neighbours by `loc` each row is linked to.
@@ -1297,6 +1309,93 @@ fn e4_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R
                     e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i)),
                     e4_born_filter(ctx.born, lower, upper),
                 ],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+
+        // ── boolean: one membership set per case (QL_CONTRACT §3) ────────
+        "bool_kind_in3" => {
+            let leaves = [
+                e4_kind_filter(ctx.kind, &corpus.kinds[i % KINDS]),
+                e4_kind_filter(ctx.kind, &corpus.kinds[(i + 1) % KINDS]),
+                e4_kind_filter(ctx.kind, &corpus.kinds[(i + 2) % KINDS]),
+            ];
+            e4_run(
+                ctx,
+                keys,
+                &[QueryFilter::Any(&leaves)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "bool_born_or_kind" => {
+            let (lower, upper) = q.born_range(i);
+            let leaves = [
+                e4_born_filter(ctx.born, lower, upper),
+                e4_kind_filter(ctx.kind, kind),
+            ];
+            e4_run(
+                ctx,
+                keys,
+                &[QueryFilter::Any(&leaves)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "bool_not_kind" => {
+            let equality = e4_kind_filter(ctx.kind, kind);
+            e4_run(
+                ctx,
+                keys,
+                &[QueryFilter::Not(&equality)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "bool_radius_or_radius" => {
+            let other = (i + 1) % INSTANCES;
+            let leaves = [
+                e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i)),
+                e4_radius_filter(ctx.loc, q.radius_centre(other)?, q.radius_metres(other)),
+            ];
+            e4_run(
+                ctx,
+                keys,
+                &[QueryFilter::Any(&leaves)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "bool_not_null_born" => {
+            let nullish = QueryFilter::Scalar {
+                index: ctx.born,
+                predicate: ScalarFilter::IsNull,
+            };
+            e4_run(
+                ctx,
+                keys,
+                &[QueryFilter::Not(&nullish)],
+                QueryOrder::Driver,
+                None,
+            )
+        }
+        "bool_exists_related" => {
+            let related = ctx.related.ok_or(GRAPH_NEEDS_LOAD)?;
+            let sources = ctx.db.edge_endpoints(
+                ctx.place,
+                GraphContextId::BASE,
+                related,
+                Direction::Outgoing,
+                usize::MAX,
+                usize::MAX,
+                QueryBudget::unlimited(),
+                || false,
+            )?;
+            e4_run(
+                ctx,
+                keys,
+                &[QueryFilter::Ids(&sources)],
                 QueryOrder::Driver,
                 None,
             )
@@ -2258,6 +2357,35 @@ fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String
             "SELECT \"key\" FROM place WHERE {radius_clause} AND {born_clause}"
         )),
 
+        // ── boolean (QL_CONTRACT §3) ────────────────────────────────────
+        "bool_kind_in3" => plain(format!(
+            "SELECT \"key\" FROM place WHERE kind IN ({}, {}, {})",
+            quoted(&kinds[i % KINDS]),
+            quoted(&kinds[(i + 1) % KINDS]),
+            quoted(&kinds[(i + 2) % KINDS])
+        )),
+        "bool_born_or_kind" => plain(format!(
+            "SELECT \"key\" FROM place WHERE ({born_clause}) OR kind = {kind}"
+        )),
+        "bool_not_kind" => plain(format!(
+            "SELECT \"key\" FROM place WHERE kind <> {kind}"
+        )),
+        "bool_radius_or_radius" => {
+            let other = q.radii[(i + 1) % INSTANCES];
+            let second_centre = sql_point(v, other[0], other[1], true);
+            let second = sql_dwithin(v, "loc", second_centre, other[2]);
+            plain(format!(
+                "SELECT \"key\" FROM place WHERE {radius_clause} OR {second}"
+            ))
+        }
+        "bool_not_null_born" => plain(
+            "SELECT \"key\" FROM place WHERE born IS NOT NULL".to_owned()
+        ),
+        "bool_exists_related" => plain(format!(
+            "SELECT \"key\" FROM place \
+             WHERE EXISTS (SELECT 1 FROM {RELATED} r WHERE r.source = place.\"key\")"
+        )),
+
         // ── ranked ──────────────────────────────────────────────────────
         // No tiebreak after the distance: a second sort key would take the
         // ordered KNN-GiST walk away from the planner. See deviation 8.
@@ -2532,6 +2660,37 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
             let born = sql_born(v, born_lower, born_upper);
             format!("SELECT _id FROM place WHERE {clause} AND {born}")
         }
+
+        // ── boolean (QL_CONTRACT §3) ────────────────────────────────────
+        "bool_kind_in3" => {
+            let first = v.text(&kind_value);
+            let second = v.text(&kinds[(i + 1) % KINDS]);
+            let third = v.text(&kinds[(i + 2) % KINDS]);
+            format!("SELECT _id FROM place WHERE kind IN ({first}, {second}, {third})")
+        }
+        "bool_born_or_kind" => {
+            let born = sql_born(v, born_lower, born_upper);
+            let kind = sql_kind(v, &kind_value);
+            format!("SELECT _id FROM place WHERE ({born}) OR {kind}")
+        }
+        "bool_not_kind" => {
+            let kind = v.text(&kind_value);
+            format!("SELECT _id FROM place WHERE kind <> {kind}")
+        }
+        "bool_radius_or_radius" => {
+            let centre = sql_point(v, radius[0], radius[1], true);
+            let first = sql_dwithin(v, "loc", centre, radius[2]);
+            let other = q.radii[(i + 1) % INSTANCES];
+            let second_centre = sql_point(v, other[0], other[1], true);
+            let second = sql_dwithin(v, "loc", second_centre, other[2]);
+            format!("SELECT _id FROM place WHERE {first} OR {second}")
+        }
+        "bool_not_null_born" => {
+            "SELECT _id FROM place WHERE born IS NOT NULL".to_owned()
+        }
+        "bool_exists_related" => format!(
+            "SELECT _id FROM place WHERE EXISTS (SELECT 1 FROM {RELATED} WHERE source = _key)"
+        ),
 
         // ── ranked ──────────────────────────────────────────────────────
         "knn_10" => {

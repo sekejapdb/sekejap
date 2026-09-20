@@ -58,6 +58,18 @@ pub use kernel::spatial::Geom;
 
 const MAX_FILTERS: usize = 64;
 
+/// How deep one `Any`/`Not` tree may nest. A boolean tree is compiled into
+/// set algebra by recursion, so the depth is a stack bound as much as a
+/// planning one; 8 is the same order as `MAX_SCORE_DEPTH`'s 32 for an
+/// expression whose leaves each cost an index walk rather than a multiply.
+const MAX_BOOLEAN_DEPTH: usize = 8;
+
+/// How many LEAVES one boolean tree may hold. Each leaf is one index walk
+/// under the membership budget, so this is the bound on how many walks one
+/// filter position can ask for -- the same count `MAX_FILTERS` puts on the
+/// conjunction itself.
+const MAX_BOOLEAN_LEAVES: usize = 64;
+
 const MAX_SCORE_DEPTH: usize = 32;
 
 const MAX_SCORE_LEAVES: usize = 8;
@@ -141,6 +153,65 @@ pub enum QueryFilter<'a> {
         lower: Bound<&'a str>,
         upper: Bound<&'a str>,
     },
+    /// An explicit membership set the CALLER already computed: the entity ids
+    /// a semi-join produced (`EXISTS (...)`, `_key IN (SELECT ...)`).
+    ///
+    /// Ascending, without duplicates, every id in the request's own
+    /// collection -- `prepare_query` checks all three rather than trusting
+    /// them, because a set that is not sorted answers `contains` wrongly and
+    /// silently. The subquery that produced it is the caller's to bound; what
+    /// this filter costs the query is one binary search per candidate.
+    Ids(&'a [EntityId]),
+    /// A DISJUNCTION, answered as ONE membership set: the union of the
+    /// leaves' own index-side sets (`docs/QL_CONTRACT.md` §3).
+    ///
+    /// Every leaf must be answerable from postings alone -- a scalar `Eq` or
+    /// `Range`, a point `Bbox` or `Radius`, a key range, a text match through
+    /// the text index's posting ids, an explicit [`QueryFilter::Ids`] set, or
+    /// a [`QueryFilter::Not`] of one of those. A geometry or graph leaf is
+    /// REFUSED at prepare with that reason: a geometry posting's box is a
+    /// candidate test whose refine reads the row, and a traversal is a
+    /// frontier rather than a set, so neither has a set to union.
+    ///
+    /// The union is built once, under the same [`MembershipSet`] memory
+    /// budget every other set walk is bounded by, and a leaf that OVERFLOWS
+    /// that budget refuses the whole disjunction rather than falling back to
+    /// the row path: an OR evaluated per row reads every candidate's record,
+    /// which is the work the set exists to avoid.
+    ///
+    /// A disjunction never drives by preference -- the driver is chosen from
+    /// the remaining conjuncts or from the order -- but when there is nothing
+    /// else to walk, the union set itself drives
+    /// (`QueryDriver::Membership`).
+    Any(&'a [QueryFilter<'a>]),
+    /// A CONJUNCTION as one membership set: the intersection of the leaves'
+    /// sets.
+    ///
+    /// The top-level `filters` list is already a conjunction, so this is for
+    /// the shapes that list cannot hold -- an `AND` inside an `Any`, or the
+    /// `AND` De Morgan produces under a `Not`. The same leaf rule applies:
+    /// every leaf must have a set, because an intersection of sets is what
+    /// this is.
+    All(&'a [QueryFilter<'a>]),
+    /// The COMPLEMENT of a filter: `<>` is `Not` over an equality, and
+    /// `IS NOT NULL` is `Not` over `IsNull`.
+    ///
+    /// Two shapes, and the compiler picks between them by what the child is.
+    /// Over a SCALAR leaf the complement stays inside that index: the
+    /// predicate's negation is a union of at most two ranges over the same
+    /// postings, the nullish key excluded from both, which is SQL's rule that
+    /// `NULL <> x` is unknown and returns no row. Over any other leaf it is a
+    /// bitmap: one bit per sequence of the leaf's own universe (the index's
+    /// postings, or the collection's live rows for a set with no index of its
+    /// own), with the child's bits cleared. The bitmap is bounded by
+    /// `span / 8` bytes and the complement is REFUSED when one that size does
+    /// not fit the membership budget.
+    ///
+    /// `Not` over a disjunction is De Morgan's law, applied while the sets
+    /// are compiled: the complement of a union is the intersection of the
+    /// complements, so every complement this engine builds has a LEAF under
+    /// it and there is never a universe to guess at.
+    Not(&'a QueryFilter<'a>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -330,6 +401,13 @@ pub enum QueryDriver {
     ExactVector(IndexId),
     QuantizedVector(IndexId),
     Keys,
+    /// The membership set of one boolean filter position, walked in ascending
+    /// entity id. Chosen only when no other conjunct and no order names a
+    /// walk of its own: a disjunction never takes the driver away from an
+    /// index range that can narrow the candidates further.
+    Membership {
+        filter: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,6 +570,10 @@ pub struct QueryWork {
     pub key_postings: u64,
     /// The most accumulator sets this page held at once.
     pub groups: u64,
+    /// The most BYTES a boolean filter's intermediate membership sets held at
+    /// once (`WorkResource::MembershipBytes`). A high-water mark, not a
+    /// running total: what the cap bounds is simultaneous memory.
+    pub membership_bytes: u64,
     pub output_bytes: u64,
 }
 
@@ -510,6 +592,16 @@ pub enum WorkResource {
     VectorLanes,
     KeyPostings,
     Groups,
+    /// The memory a BOOLEAN filter's membership sets hold at once, in bytes.
+    ///
+    /// The one resource with no [`QueryBudget`] field, and deliberately: its
+    /// ceiling is the `RUN_BYTES` memory promise every per-query buffer is
+    /// written against, which a caller cannot raise by asking. A set that
+    /// would pass it is refused with this resource, that ceiling as the
+    /// limit, and the byte count that passed it as the attempt -- instead of
+    /// the entry cap of a different representation, which is what the walk
+    /// used to name.
+    MembershipBytes,
     OutputBytes,
 }
 
@@ -576,12 +668,23 @@ pub struct WorkMeter<'a, C> {
 }
 
 impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
-    fn new(limit: QueryBudget, cancelled: &'a mut C) -> Self {
+    /// A meter for a bounded walk that is NOT a page: the SQL layer's
+    /// compile-time semi-join, which used to run under
+    /// `QueryBudget::unlimited()` and a cancel closure that always said no.
+    pub(crate) fn new(limit: QueryBudget, cancelled: &'a mut C) -> Self {
         Self {
             limit,
             used: QueryWork::default(),
             cancelled,
         }
+    }
+
+    /// The high-water mark of simultaneously live boolean intermediates, in
+    /// bytes. A maximum rather than a sum: [`WorkResource::MembershipBytes`]
+    /// bounds what is held AT ONCE, and an intermediate that has been folded
+    /// into its parent is not held any more.
+    pub(super) fn note_membership_bytes(&mut self, bytes: u64) {
+        self.used.membership_bytes = self.used.membership_bytes.max(bytes);
     }
 
     pub(super) fn check_cancelled(&mut self) -> QueryResult<()> {
@@ -623,6 +726,13 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
             WorkResource::VectorLanes => (&mut self.used.vector_lanes, self.limit.vector_lanes),
             WorkResource::KeyPostings => (&mut self.used.key_postings, self.limit.key_postings),
             WorkResource::Groups => (&mut self.used.groups, self.limit.groups),
+            // No caller knob: see `WorkResource::MembershipBytes`. The
+            // ceiling is the fixed memory promise, so `unlimited()` does not
+            // lift it.
+            WorkResource::MembershipBytes => (
+                &mut self.used.membership_bytes,
+                membership::MEMBERSHIP_BYTES_CAP as u64,
+            ),
             WorkResource::OutputBytes => (&mut self.used.output_bytes, self.limit.output_bytes),
         }
     }

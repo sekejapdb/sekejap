@@ -72,6 +72,20 @@ pub(super) enum CompiledFilter {
     Key {
         predicate: EncodedScalarFilter,
     },
+    /// A disjunction, a complement, or an explicit semi-join set, compiled
+    /// into set algebra (`docs/QL_CONTRACT.md` §3).
+    ///
+    /// The set itself lives in `PreparedQuery::membership` at this position,
+    /// like every other set the engine builds: `ensure_membership_sets` walks
+    /// it once on the first page and every later page finds it there. What
+    /// this holds is the ALGEBRA -- which leaves, unioned or complemented in
+    /// what order -- and the word `EXPLAIN` prints for the shape.
+    Boolean {
+        expr: SetExpr,
+        /// `union`, `complement` or `set`: which of §3's three shapes the
+        /// top of this tree is.
+        shape: &'static str,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -865,7 +879,328 @@ fn scalar_driver_score(predicate: &EncodedScalarFilter) -> u8 {
     }
 }
 
+/// Compile one boolean filter into set algebra, pushing every `Not` down to
+/// a LEAF as it goes (`docs/QL_CONTRACT.md` §3).
+///
+/// `negated` is the parity of the `Not`s above this node, so De Morgan is
+/// applied here rather than as a separate rewriting pass: a negated union is
+/// an intersection of negated children, and a negated intersection a union of
+/// them. By the time a leaf is reached, the parity says whether it is the
+/// leaf's set or its complement that is wanted, and the two SCALAR shapes --
+/// a complement of an equality, a complement of a range -- are unions of at
+/// most two ranges over the same postings rather than a bitmap over the
+/// collection.
+///
+/// Every refusal here names the atomic that is missing. Nothing falls back to
+/// the row path: a disjunction evaluated per candidate reads every
+/// candidate's record, which is what the set exists to avoid.
+fn compile_set_expr(
+    db: &Database,
+    collection: CollectionId,
+    filter: &QueryFilter<'_>,
+    negated: bool,
+    depth: usize,
+) -> QueryResult<SetExpr> {
+    if depth > MAX_BOOLEAN_DEPTH {
+        return Err(invalid_query(
+            "a boolean filter nests deeper than 8 levels",
+        ));
+    }
+    Ok(match filter {
+        QueryFilter::Scalar { index, predicate } => {
+            let info = require_scalar_index(db, collection, *index)?;
+            let encoded = compile_scalar_filter(&info.kind, predicate)?;
+            if !negated {
+                if matches!(
+                    encoded,
+                    EncodedScalarFilter::IsNull | EncodedScalarFilter::IsMissing
+                ) {
+                    return Err(invalid_query(
+                        "IS NULL and IS MISSING cannot be a boolean leaf: NULL and MISSING share one nullish index key and only the row tells them apart, so there is no set an index can prove",
+                    ));
+                }
+                return Ok(SetExpr::Scalar {
+                    info,
+                    predicate: encoded,
+                });
+            }
+            match encoded {
+                // The complement of an equality inside its own index: every
+                // posting below the value and every posting above it. The
+                // nullish key is excluded from both by
+                // `build_scalar_range_set`, which is SQL's rule that
+                // `NULL <> x` is unknown and returns no row.
+                EncodedScalarFilter::Eq(value) => SetExpr::Any(vec![
+                    SetExpr::Scalar {
+                        info: info.clone(),
+                        predicate: EncodedScalarFilter::Range {
+                            lower: EncodedBound::Unbounded,
+                            upper: EncodedBound::Excluded(value.clone()),
+                        },
+                    },
+                    SetExpr::Scalar {
+                        info,
+                        predicate: EncodedScalarFilter::Range {
+                            lower: EncodedBound::Excluded(value),
+                            upper: EncodedBound::Unbounded,
+                        },
+                    },
+                ]),
+                EncodedScalarFilter::Range { lower, upper } => {
+                    let mut parts = Vec::new();
+                    if let Some(flipped) = flip_bound(&lower) {
+                        parts.push(SetExpr::Scalar {
+                            info: info.clone(),
+                            predicate: EncodedScalarFilter::Range {
+                                lower: EncodedBound::Unbounded,
+                                upper: flipped,
+                            },
+                        });
+                    }
+                    if let Some(flipped) = flip_bound(&upper) {
+                        parts.push(SetExpr::Scalar {
+                            info: info.clone(),
+                            predicate: EncodedScalarFilter::Range {
+                                lower: flipped,
+                                upper: EncodedBound::Unbounded,
+                            },
+                        });
+                    }
+                    if parts.is_empty() {
+                        // The range was unbounded on both sides, so its
+                        // complement inside the index is empty.
+                        SetExpr::Scalar {
+                            info,
+                            predicate: EncodedScalarFilter::Empty,
+                        }
+                    } else {
+                        SetExpr::Any(parts)
+                    }
+                }
+                // Every posting that is not the nullish one: `IS NOT NULL`,
+                // exactly, with no bitmap and no universe walk.
+                EncodedScalarFilter::IsNull => SetExpr::Scalar {
+                    info,
+                    predicate: EncodedScalarFilter::Range {
+                        lower: EncodedBound::Unbounded,
+                        upper: EncodedBound::Unbounded,
+                    },
+                },
+                EncodedScalarFilter::IsMissing => {
+                    return Err(invalid_query(
+                        "IS NOT MISSING has no set: a row whose field is present and NULL is on the same nullish index key as a missing one, so the complement of MISSING cannot be proved from postings",
+                    ))
+                }
+                EncodedScalarFilter::Empty => SetExpr::Scalar {
+                    info,
+                    predicate: EncodedScalarFilter::Range {
+                        lower: EncodedBound::Unbounded,
+                        upper: EncodedBound::Unbounded,
+                    },
+                },
+            }
+        }
+        QueryFilter::Point { index, predicate } => {
+            let info = require_family_index(
+                db,
+                collection,
+                *index,
+                IndexFamily::SpatialPoint,
+                "spatial-point",
+            )?;
+            crate::index::spatial::point::descriptor(&info)?;
+            if let PointFilter::Radius { radius_metres, .. } = predicate {
+                if !radius_metres.is_finite() || *radius_metres < 0.0 {
+                    return Err(invalid_query("point radius must be finite and non-negative"));
+                }
+            }
+            let leaf = SetExpr::Point {
+                info,
+                predicate: *predicate,
+            };
+            if negated {
+                SetExpr::Complement(Box::new(leaf))
+            } else {
+                leaf
+            }
+        }
+        QueryFilter::Key { lower, upper } => {
+            let predicate = range_or_empty(encode_key_bound(lower), encode_key_bound(upper));
+            if !negated {
+                return Ok(SetExpr::Key {
+                    collection,
+                    predicate,
+                });
+            }
+            match predicate {
+                EncodedScalarFilter::Range { lower, upper } => {
+                    let mut parts = Vec::new();
+                    if let Some(flipped) = flip_bound(&lower) {
+                        parts.push(SetExpr::Key {
+                            collection,
+                            predicate: EncodedScalarFilter::Range {
+                                lower: EncodedBound::Unbounded,
+                                upper: flipped,
+                            },
+                        });
+                    }
+                    if let Some(flipped) = flip_bound(&upper) {
+                        parts.push(SetExpr::Key {
+                            collection,
+                            predicate: EncodedScalarFilter::Range {
+                                lower: flipped,
+                                upper: EncodedBound::Unbounded,
+                            },
+                        });
+                    }
+                    if parts.is_empty() {
+                        SetExpr::Key {
+                            collection,
+                            predicate: EncodedScalarFilter::Empty,
+                        }
+                    } else {
+                        SetExpr::Any(parts)
+                    }
+                }
+                _ => SetExpr::Key {
+                    collection,
+                    predicate: EncodedScalarFilter::Range {
+                        lower: EncodedBound::Unbounded,
+                        upper: EncodedBound::Unbounded,
+                    },
+                },
+            }
+        }
+        QueryFilter::Text {
+            index,
+            query,
+            matching,
+        } => {
+            let prepared = prepare_text(db, collection, *index, query, *matching)?;
+            if prepared.phrase.is_some() {
+                return Err(invalid_query(
+                    "a phrase cannot be a boolean leaf: its postings establish all-term candidacy and the ordered adjacency is settled against the authoritative primary text, which is a row read",
+                ));
+            }
+            let leaf = SetExpr::Text(prepared);
+            if negated {
+                SetExpr::Complement(Box::new(leaf))
+            } else {
+                leaf
+            }
+        }
+        QueryFilter::Ids(ids) => {
+            let leaf = SetExpr::Ids(Arc::new(checked_id_set(db, collection, ids)?));
+            if negated {
+                SetExpr::Complement(Box::new(leaf))
+            } else {
+                leaf
+            }
+        }
+        QueryFilter::Any(children) => {
+            if children.is_empty() {
+                return Err(invalid_query("a disjunction needs at least one leaf"));
+            }
+            let parts = children
+                .iter()
+                .map(|child| compile_set_expr(db, collection, child, negated, depth + 1))
+                .collect::<QueryResult<Vec<_>>>()?;
+            // De Morgan: the complement of a union is the intersection of
+            // the complements.
+            if negated {
+                SetExpr::All(parts)
+            } else {
+                SetExpr::Any(parts)
+            }
+        }
+        QueryFilter::All(children) => {
+            if children.is_empty() {
+                return Err(invalid_query("a conjunction needs at least one leaf"));
+            }
+            let parts = children
+                .iter()
+                .map(|child| compile_set_expr(db, collection, child, negated, depth + 1))
+                .collect::<QueryResult<Vec<_>>>()?;
+            if negated {
+                SetExpr::Any(parts)
+            } else {
+                SetExpr::All(parts)
+            }
+        }
+        QueryFilter::Not(child) => compile_set_expr(db, collection, child, !negated, depth + 1)?,
+        QueryFilter::Geometry { .. } => {
+            return Err(invalid_query(
+                "a geometry predicate cannot be a boolean leaf: a geometry posting's box is a candidate test and the refine reads the row, so there is no set to union or complement",
+            ))
+        }
+        QueryFilter::Graph(_) => {
+            return Err(invalid_query(
+                "a traversal cannot be a boolean leaf: a traversal is a bounded frontier, not a membership set over an index",
+            ))
+        }
+        QueryFilter::JsonEq { .. } => {
+            return Err(invalid_query(
+                "a JSON equality cannot be a boolean leaf: it has no index and is answered from the row",
+            ))
+        }
+    })
+}
+
+/// The bound that starts where `bound` stops: an inclusive bound's complement
+/// excludes the same value and an exclusive one includes it. `Unbounded` has
+/// no complement on that side -- there is nothing beyond it -- so the caller
+/// drops that half of the union.
+fn flip_bound(bound: &EncodedBound) -> Option<EncodedBound> {
+    match bound {
+        EncodedBound::Included(value) => Some(EncodedBound::Excluded(value.clone())),
+        EncodedBound::Excluded(value) => Some(EncodedBound::Included(value.clone())),
+        EncodedBound::Unbounded => None,
+    }
+}
+
+/// An explicit semi-join set, checked rather than trusted: ascending, without
+/// duplicates, every id in this query's own collection. A set that is not
+/// sorted answers `binary_search` wrongly and silently, which is a wrong
+/// answer with no error behind it.
+///
+/// An id PAST the collection's span is DROPPED here, not refused and not
+/// carried: the collection has never issued that sequence, so it can never
+/// name a member, and the answer "no row" is the truth about it. Carried, it
+/// reached `membership_bitmap_set` the moment the set met a bitmap -- a
+/// union with any leaf wider than the Vec cap -- and the caller was told the
+/// DATABASE was corrupt because of an id they had typed.
+fn checked_id_set(
+    db: &Database,
+    collection: CollectionId,
+    ids: &[EntityId],
+) -> QueryResult<Vec<u64>> {
+    let span = db.collection_span(collection).map_err(QueryError::from)?;
+    let mut out = Vec::with_capacity(ids.len());
+    let mut previous: Option<u64> = None;
+    for id in ids {
+        if id.collection != collection {
+            return Err(invalid_query(
+                "a semi-join set names an id of another collection",
+            ));
+        }
+        if id.sequence == 0 {
+            return Err(invalid_query("a semi-join set names entity sequence zero"));
+        }
+        if previous.is_some_and(|last| last >= id.sequence) {
+            return Err(invalid_query(
+                "a semi-join set must be ascending and without duplicates",
+            ));
+        }
+        previous = Some(id.sequence);
+        if id.sequence <= span {
+            out.push(id.sequence);
+        }
+    }
+    Ok(out)
+}
+
 impl Database {
+
     pub fn prepare_query<'db>(
         &'db self,
         request: QueryRequest<'_>,
@@ -978,6 +1313,24 @@ impl Database {
                 QueryFilter::Key { lower, upper } => CompiledFilter::Key {
                     predicate: range_or_empty(encode_key_bound(lower), encode_key_bound(upper)),
                 },
+                QueryFilter::Any(_)
+                | QueryFilter::All(_)
+                | QueryFilter::Not(_)
+                | QueryFilter::Ids(_) => {
+                    let expr = compile_set_expr(self, request.collection, filter, false, 1)?;
+                    if expr.leaves() > MAX_BOOLEAN_LEAVES {
+                        return Err(invalid_query(
+                            "a boolean filter has more than 64 leaves",
+                        ));
+                    }
+                    let shape = match filter {
+                        QueryFilter::Any(_) => "union",
+                        QueryFilter::All(_) => "intersection",
+                        QueryFilter::Not(_) => "complement",
+                        _ => "set",
+                    };
+                    CompiledFilter::Boolean { expr, shape }
+                }
             });
         }
         if filters
@@ -1199,6 +1552,7 @@ impl Database {
                     prepared: prepared.clone(),
                     position: Some(position),
                 }),
+                Some(CompiledFilter::Boolean { .. }) => Ok(DriverPlan::Membership { position }),
                 _ => Err(invalid_query("selected filter cannot drive candidates")),
             }
         };
@@ -1421,7 +1775,22 @@ impl Database {
                 {
                     filter_driver(position)?
                 } else {
-                    order_driver()?
+                    // A disjunction never TAKES the driver: an index range
+                    // that narrows the candidates further is always the
+                    // better walk, and every rule above had first refusal.
+                    // What is left is a query whose only bounded candidate
+                    // stream IS the union, and walking it beats walking the
+                    // whole collection to ask each row whether it is in a set
+                    // that already knows.
+                    match order_driver()? {
+                        DriverPlan::Entities => filters
+                            .iter()
+                            .position(|filter| matches!(filter, CompiledFilter::Boolean { .. }))
+                            .map_or(DriverPlan::Entities, |position| DriverPlan::Membership {
+                                position,
+                            }),
+                        other => other,
+                    }
                 }
             }
         };
@@ -1503,6 +1872,7 @@ impl Database {
             | DriverPlan::Keys { position, .. } => *position,
             DriverPlan::Spatial { position, .. }
             | DriverPlan::Geometry { position, .. }
+            | DriverPlan::Membership { position }
             | DriverPlan::Graph { position } => Some(*position),
             DriverPlan::Nearest { certifies, .. } => *certifies,
             DriverPlan::Entities
@@ -1547,6 +1917,11 @@ impl Database {
                     driving_position != Some(position)
                         && point_ranges(*predicate).is_ok_and(|(_, world)| !world)
                 }
+                // A boolean filter is ALWAYS a set: there is no row path for
+                // it to fall back to, driving or not. The driving position is
+                // no exception -- `DriverPlan::Membership` walks this very
+                // set, so it is the same walk either way.
+                CompiledFilter::Boolean { .. } => true,
                 _ => false,
             };
             if eligible {

@@ -1853,3 +1853,457 @@ fn a_graph_table_refuses_a_name_that_belongs_to_another_element() {
         );
     }
 }
+
+// ── §3 boolean predicates: OR, IN, NOT, `<>`, IS NOT NULL, EXISTS ────────
+//
+// The oracle stays what it is everywhere else in this file: the rows the
+// direct API returns for the same question, with the boolean tree written
+// through `QueryFilter::Any`/`All`/`Not` on the stack.
+
+/// Build a borrowed disjunction of two leaves and hand it to `k`, the way
+/// `src/sql/compile.rs` builds one.
+fn with_union<R>(
+    left: QueryFilter<'_>,
+    right: QueryFilter<'_>,
+    k: &mut dyn FnMut(&QueryFilter<'_>) -> R,
+) -> R {
+    let leaves = [left, right];
+    k(&QueryFilter::Any(&leaves))
+}
+
+#[test]
+fn a_disjunction_of_equalities_is_one_membership_set() {
+    let (_dir, mut f) = open();
+    let sql_rows_ids = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind = $1 OR kind = $2 ORDER BY _id",
+        &[Param::Text("depot".into()), Param::Text("mill".into())],
+    );
+    let want = with_union(
+        QueryFilter::Scalar {
+            index: f.index.kind,
+            predicate: ScalarFilter::Eq(ScalarValue::Text("depot")),
+        },
+        QueryFilter::Scalar {
+            index: f.index.kind,
+            predicate: ScalarFilter::Eq(ScalarValue::Text("mill")),
+        },
+        &mut |filter| direct(&f.db, f.place, &[filter.clone()], QueryOrder::EntityId, None),
+    );
+    assert!(!want.is_empty());
+    assert_eq!(sql_rows_ids, want);
+}
+
+#[test]
+fn in_a_list_is_the_same_union_written_shorter() {
+    let (_dir, mut f) = open();
+    let listed = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind IN ($1, $2, $3) ORDER BY _id",
+        &[
+            Param::Text("depot".into()),
+            Param::Text("mill".into()),
+            Param::Text("port".into()),
+        ],
+    );
+    let written_out = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind = $1 OR kind = $2 OR kind = $3 ORDER BY _id",
+        &[
+            Param::Text("depot".into()),
+            Param::Text("mill".into()),
+            Param::Text("port".into()),
+        ],
+    );
+    assert_eq!(listed, written_out);
+    assert!(!listed.is_empty());
+}
+
+#[test]
+fn a_parenthesised_group_binds_the_way_sql_says() {
+    let (_dir, mut f) = open();
+    let grouped = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE flag = true AND (kind = $1 OR kind = $2) ORDER BY _id",
+        &[Param::Text("depot".into()), Param::Text("mill".into())],
+    );
+    let ungrouped = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE flag = true AND kind = $1 OR kind = $2 ORDER BY _id",
+        &[Param::Text("depot".into()), Param::Text("mill".into())],
+    );
+    assert_ne!(
+        grouped, ungrouped,
+        "AND binds tighter than OR, so the parentheses change the answer"
+    );
+    let want = with_union(
+        QueryFilter::Scalar {
+            index: f.index.kind,
+            predicate: ScalarFilter::Eq(ScalarValue::Text("depot")),
+        },
+        QueryFilter::Scalar {
+            index: f.index.kind,
+            predicate: ScalarFilter::Eq(ScalarValue::Text("mill")),
+        },
+        &mut |union| {
+            direct(
+                &f.db,
+                f.place,
+                &[
+                    QueryFilter::Scalar {
+                        index: f.index.flag,
+                        predicate: ScalarFilter::Eq(ScalarValue::Bool(true)),
+                    },
+                    union.clone(),
+                ],
+                QueryOrder::EntityId,
+                None,
+            )
+        },
+    );
+    assert_eq!(grouped, want);
+}
+
+#[test]
+fn not_equal_is_the_complement_of_an_equality() {
+    let (_dir, mut f) = open();
+    let angle = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind <> $1 ORDER BY _id",
+        &[Param::Text("depot".into())],
+    );
+    let bang = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind != $1 ORDER BY _id",
+        &[Param::Text("depot".into())],
+    );
+    assert_eq!(angle, bang, "`<>` and `!=` are one operator");
+    let eq = QueryFilter::Scalar {
+        index: f.index.kind,
+        predicate: ScalarFilter::Eq(ScalarValue::Text("depot")),
+    };
+    let want = direct(
+        &f.db,
+        f.place,
+        &[QueryFilter::Not(&eq)],
+        QueryOrder::EntityId,
+        None,
+    );
+    assert_eq!(angle, want);
+    let kept = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind = $1 ORDER BY _id",
+        &[Param::Text("depot".into())],
+    );
+    assert_eq!(
+        angle.len() + kept.len(),
+        fixture::ROWS,
+        "every row has a kind, so the two halves are the whole collection"
+    );
+}
+
+#[test]
+fn a_null_value_is_in_neither_half_of_a_complement() {
+    let (_dir, mut f) = open();
+    // One row in seventeen has a JSON null score; `score <> 12.5` is UNKNOWN
+    // for those, so they are in neither answer, exactly as in SQL.
+    let below_or_above = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE score <> $1 ORDER BY _id",
+        &[Param::Float(12.5)],
+    );
+    let equal = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE score = $1 ORDER BY _id",
+        &[Param::Float(12.5)],
+    );
+    let nulls = f.rows.iter().filter(|row| row.score.is_none()).count();
+    assert!(nulls > 0);
+    assert_eq!(below_or_above.len() + equal.len() + nulls, fixture::ROWS);
+}
+
+#[test]
+fn is_not_null_is_the_complement_of_the_nullish_key() {
+    let (_dir, mut f) = open();
+    let present = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE score IS NOT NULL ORDER BY _id",
+        &[],
+    );
+    let absent = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE score IS NULL ORDER BY _id",
+        &[],
+    );
+    assert_eq!(present.len() + absent.len(), fixture::ROWS);
+    let want: Vec<EntityId> = f
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.score.is_some())
+        .map(|(at, _)| EntityId {
+            collection: f.place,
+            sequence: (at + 1) as u64,
+        })
+        .collect();
+    assert_eq!(present, want);
+}
+
+#[test]
+fn not_before_a_group_is_de_morgan() {
+    let (_dir, mut f) = open();
+    let negated = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE NOT (kind = $1 OR kind = $2) ORDER BY _id",
+        &[Param::Text("depot".into()), Param::Text("mill".into())],
+    );
+    let spelled_out = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind <> $1 AND kind <> $2 ORDER BY _id",
+        &[Param::Text("depot".into()), Param::Text("mill".into())],
+    );
+    assert_eq!(negated, spelled_out);
+    assert_eq!(negated.len(), fixture::ROWS - 2 * fixture::ROWS / 8);
+}
+
+#[test]
+fn not_in_a_list_is_the_complement_of_the_union() {
+    let (_dir, mut f) = open();
+    let excluded = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind NOT IN ($1, $2) ORDER BY _id",
+        &[Param::Text("depot".into()), Param::Text("mill".into())],
+    );
+    let included = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE kind IN ($1, $2) ORDER BY _id",
+        &[Param::Text("depot".into()), Param::Text("mill".into())],
+    );
+    assert_eq!(excluded.len() + included.len(), fixture::ROWS);
+    assert!(excluded.iter().all(|id| !included.contains(id)));
+}
+
+#[test]
+fn a_disjunction_across_two_families_unions_two_sets() {
+    let (_dir, mut f) = open();
+    let mixed = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place \
+         WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) OR born < $2 \
+         ORDER BY _id",
+        &[Param::Text("kebun".into()), Param::Int(19_520_101)],
+    );
+    let want = with_union(
+        QueryFilter::Text {
+            index: f.index.text,
+            query: "kebun",
+            matching: TextMatch::Any,
+        },
+        QueryFilter::Scalar {
+            index: f.index.born,
+            predicate: ScalarFilter::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Excluded(ScalarValue::I64(19_520_101)),
+            },
+        },
+        &mut |filter| direct(&f.db, f.place, &[filter.clone()], QueryOrder::EntityId, None),
+    );
+    assert!(!want.is_empty());
+    assert_eq!(mixed, want);
+}
+
+#[test]
+fn a_disjunction_with_a_geometry_leaf_is_refused_with_its_reason() {
+    let (_dir, mut f) = open();
+    let error = f
+        .db
+        .sql(
+            "SELECT _id FROM place \
+             WHERE kind = 'depot' OR ST_DWithin(plot, ST_MakePoint(106.82, -6.17)::geography, 500)",
+            &[],
+        )
+        .unwrap_err();
+    let text = format!("{error}");
+    assert!(
+        text.contains("geometry posting's box is a candidate test"),
+        "the refusal names the missing set: {text}"
+    );
+}
+
+/// `FROM <edge type>` inside a subquery names the BASE graph
+/// (`GRAPH_CONTRACT` 3.1: "no context means the base graph"), so the edges
+/// this test asks about are written there. The fixture's own `near` edges are
+/// in the named `routes` context and are a different graph.
+#[test]
+fn exists_over_an_edge_type_is_a_semi_join() {
+    let (_dir, mut f) = open();
+    let linked = f.db.create_edge_type("linked").unwrap();
+    f.db.commit().unwrap();
+    let sources: Vec<usize> = (0..fixture::ROWS).filter(|at| at % 4 == 1).collect();
+    for at in &sources {
+        let from = f.db.get(f.place, &f.rows[*at].key).unwrap().unwrap().id;
+        let to = f
+            .db
+            .get(f.place, &f.rows[(at + 1) % fixture::ROWS].key)
+            .unwrap()
+            .unwrap()
+            .id;
+        f.db.put_edge(
+            e4_prototype::collections::GraphContextId::BASE,
+            from,
+            linked,
+            to,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    }
+    f.db.commit().unwrap();
+
+    let want: Vec<EntityId> = sources
+        .iter()
+        .map(|at| EntityId {
+            collection: f.place,
+            sequence: (*at + 1) as u64,
+        })
+        .collect();
+    let with_edges = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE EXISTS (SELECT 1 FROM linked WHERE source = _key) \
+         ORDER BY _id",
+        &[],
+    );
+    assert_eq!(with_edges, want);
+    let without = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE NOT EXISTS (SELECT 1 FROM linked WHERE source = _key) \
+         ORDER BY _id",
+        &[],
+    );
+    assert_eq!(with_edges.len() + without.len(), fixture::ROWS);
+    assert!(without.iter().all(|id| !with_edges.contains(id)));
+    let same = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE _key IN (SELECT source FROM linked) ORDER BY _id",
+        &[],
+    );
+    assert_eq!(same, with_edges);
+}
+
+/// Parentheses that change nothing about the MEANING change nothing about
+/// the plan (`docs/QL_CONTRACT.md` §3).
+///
+/// `where_clause` flattened only the top `AND`, so `a AND (b AND geometry)`
+/// left a nested conjunction whose geometry leaf `compile_set_expr` then
+/// refused as a boolean leaf -- while the identical statement written without
+/// the redundant parentheses compiled and ran.
+#[test]
+fn redundant_parentheses_do_not_change_what_compiles() {
+    let (_dir, mut f) = open();
+    let centre = fixture::centre();
+    let (lon, lat) = (centre.longitude(), centre.latitude());
+    let geometry = format!(
+        "ST_DWithin(plot, ST_SetSRID(ST_MakePoint({lon:?}, {lat:?}),4326)::geography, 20000)"
+    );
+    let flat = format!(
+        "SELECT _id FROM place WHERE kind = 'depot' AND born > 19500101 AND {geometry} ORDER BY _id"
+    );
+    let nested = format!(
+        "SELECT _id FROM place WHERE kind = 'depot' AND (born > 19500101 AND {geometry}) ORDER BY _id"
+    );
+    let deeper = format!(
+        "SELECT _id FROM place WHERE (kind = 'depot' AND (born > 19500101)) AND ({geometry}) ORDER BY _id"
+    );
+    let want = sql_ids(&mut f.db, &flat, &[]);
+    assert!(!want.is_empty(), "the flat form answers something");
+    assert_eq!(sql_ids(&mut f.db, &nested, &[]), want, "{nested}");
+    assert_eq!(sql_ids(&mut f.db, &deeper, &[]), want, "{deeper}");
+}
+
+/// A semi-join names outer rows by their EXTERNAL KEY, which is text. A
+/// projected column of any other type used to drop every row of the subquery
+/// silently and answer with the empty set.
+#[test]
+fn a_semi_join_over_a_non_text_column_is_refused_naming_it() {
+    let (_dir, mut f) = open();
+    let error = f
+        .db
+        .sql("SELECT _id FROM place WHERE _key IN (SELECT born FROM place)", &[])
+        .err()
+        .expect("a numeric projected column is refused");
+    let text = format!("{error}");
+    assert!(text.contains("born"), "the refusal names the column: {text}");
+    assert!(text.contains("a number"), "and says what it holds: {text}");
+
+    // The text column still works, and names every row.
+    let all = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE _key IN (SELECT key FROM place) ORDER BY _id",
+        &[],
+    );
+    assert_eq!(all.len(), fixture::ROWS);
+}
+
+/// The semi-join set is built while the statement COMPILES, so the caller's
+/// cancellation has to reach it there -- `Database::sql` used to hand the
+/// inner walk a closure that always said no.
+#[test]
+fn a_semi_join_is_cancellable_while_it_compiles() {
+    let (_dir, mut f) = open();
+    let mut calls = 0usize;
+    let error = f
+        .db
+        .sql_with(
+            "SELECT _id FROM place WHERE _key IN (SELECT key FROM place)",
+            &[],
+            e4_prototype::collections::QueryBudget::unlimited(),
+            &mut || {
+                calls += 1;
+                true
+            },
+        )
+        .err()
+        .expect("the inner walk is cancellable");
+    assert!(
+        format!("{error:?}").contains("Cancelled"),
+        "{error:?} after {calls} polls"
+    );
+    assert!(calls > 0, "the cancel closure was asked");
+
+    // And the caller's budget bounds it: the inner scan reads rows.
+    let mut budget = e4_prototype::collections::QueryBudget::unlimited();
+    budget.primary_reads = 4;
+    let error = f
+        .db
+        .sql_with(
+            "SELECT _id FROM place WHERE _key IN (SELECT key FROM place)",
+            &[],
+            budget,
+            &mut || false,
+        )
+        .err()
+        .expect("the inner walk is bounded");
+    assert!(
+        format!("{error:?}").contains("BudgetExceeded"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_negated_tsquery_is_the_complement_of_the_text_set() {
+    let (_dir, mut f) = open();
+    let without = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) \
+         ORDER BY _id",
+        &[Param::Text("!kebun".into())],
+    );
+    let with = sql_ids(
+        &mut f.db,
+        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', $1) \
+         ORDER BY _id",
+        &[Param::Text("kebun".into())],
+    );
+    assert!(!with.is_empty() && !without.is_empty());
+    assert_eq!(with.len() + without.len(), fixture::ROWS);
+    assert!(without.iter().all(|id| !with.contains(id)));
+}

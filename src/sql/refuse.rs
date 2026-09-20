@@ -16,13 +16,15 @@ use super::{SqlError, Tier};
 /// below tries the two-word forms before the one-word ones.
 pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     // ── §3 predicates and operators ──────────────────────────────────────
-    ("OR", Tier::Two, "QL_CONTRACT §3: OR on one index is a union of ranges as one membership set, OR across indexes a union of two; neither membership union is built in this slice."),
-    ("IN", Tier::Two, "QL_CONTRACT §3: IN (list) is a union of ranges as one membership set; IN (subquery) is a semi-join membership set. Neither is built in this slice."),
-    ("NOT", Tier::Two, "QL_CONTRACT §3: NOT is a complement over a membership set, with the row path otherwise. Not built in this slice."),
+    // OR, IN, NOT, `<>`, IS NOT NULL and EXISTS moved from this table to
+    // Tier 1 with the membership-set algebra in `src/query/membership.rs`:
+    // the union, the intersection and the complement they named exist now,
+    // so they are ACCEPTED rather than refused. A boolean LEAF an index
+    // cannot answer -- a geometry predicate, a traversal, a JSON equality, a
+    // phrase -- is still refused, by `prepare_query`, with that reason.
     ("LIKE", Tier::Two, "QL_CONTRACT §3: LIKE 'abc%' is a text-key prefix range; LIKE '%abc%' needs the trigram index family (pg_trgm-compatible) under a new feature bit. Neither is built."),
     ("ILIKE", Tier::Two, "QL_CONTRACT §3: ILIKE needs the trigram index family (pg_trgm-compatible), a new family under a feature bit."),
     ("SIMILAR TO", Tier::Three, "QL_CONTRACT §3: SIMILAR TO has no index atomic."),
-    ("EXISTS", Tier::Two, "QL_CONTRACT §3: EXISTS (subquery) is a membership set from the subquery (semi/anti join). Not built in this slice."),
     ("~", Tier::Three, "QL_CONTRACT §3: regex `~` has no index atomic."),
     ("&&", Tier::Two, "QL_CONTRACT §4.4: `&&` with ST_MakeEnvelope is a Bbox filter on the point or geometry index (p3-geometry-io). Not built in this slice; ST_Within against an envelope is the Tier-1 spelling of the same rectangle."),
     ("@>", Tier::Two, "QL_CONTRACT §3: array containment has no Tier-1 atomic in this slice."),

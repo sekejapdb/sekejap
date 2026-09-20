@@ -22,9 +22,9 @@ use crate::collections::{
     CandidateDriver, Cmp, CollectionId, CollectionOptions, Database, Direction, DropMode,
     DropPhase, EdgePredicate, EdgeTypeId, EntityId, Geom, GeometryFilter, GraphContextId,
     GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexFamily, IndexId, IndexInfo,
-    IndexState, OwnedScalarValue, PointFilter, Projection, QueryFilter, QueryOrder,
-    QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr, SortDirection, TextMatch,
-    VectorMetric,
+    IndexState, OwnedScalarValue, PointFilter, ProjectedValue, Projection, QueryBudget,
+    QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
+    SortDirection, TextMatch, VectorMetric,
 };
 use crate::query::EDGE_FIELD_PREFIX;
 use crate::spatial_math::{Bounds, Point};
@@ -57,6 +57,17 @@ pub(crate) enum Scalar {
     F64(f64),
     Text(String),
 }
+
+/// How many EDGES one semi-join over an edge type may walk before it is
+/// refused. The set it produces is held in memory for the length of the
+/// statement, so the walk is bounded by the same kind of stated ceiling
+/// every other held set has -- named, not spilled.
+const MAX_SEMI_JOIN_EDGES: usize = 64 << 20;
+
+/// How many OUTER IDS one semi-join may name. Eight bytes each, so this is
+/// the 8 MiB `RUN_BYTES` promise every other per-query buffer is written
+/// against.
+const MAX_SEMI_JOIN_IDS: usize = (8 << 20) / 8;
 
 impl Scalar {
     fn borrowed(&self) -> ScalarValue<'_> {
@@ -120,6 +131,18 @@ pub(crate) enum OwnedFilter {
         lower: Bound<String>,
         upper: Bound<String>,
     },
+    /// A disjunction: one membership set, the union of its leaves'
+    /// (`docs/QL_CONTRACT.md` §3).
+    Any(Vec<OwnedFilter>),
+    /// A complement: `<>`, `NOT`, `IS NOT NULL`, `NOT EXISTS`.
+    Not(Box<OwnedFilter>),
+    /// A conjunction that could not be flattened into the top-level filter
+    /// list: one inside a disjunction, or one under a complement.
+    All(Vec<OwnedFilter>),
+    /// The ids a semi-join produced, ascending and without duplicates. The
+    /// subquery ran while the statement was compiled, so what the prepared
+    /// query sees is a set and not a second plan.
+    Ids(Vec<EntityId>),
 }
 
 impl OwnedFilter {
@@ -161,7 +184,146 @@ impl OwnedFilter {
                 lower: borrow_key_bound(lower),
                 upper: borrow_key_bound(upper),
             },
+            // A `QueryFilter::Any` holds a SLICE of borrowed filters and a
+            // `Not` a reference to one, so neither can be returned from
+            // here: the nodes live in stack frames that enclose the frame
+            // the prepared query runs in. `with_boolean` builds them there,
+            // the same shape `with_score` builds a `ScoreExpr` tree with.
+            Self::Ids(ids) => QueryFilter::Ids(ids),
+            Self::Any(_) | Self::All(_) | Self::Not(_) => {
+                unreachable!("a boolean filter is borrowed through `with_boolean`")
+            }
         }
+    }
+}
+
+/// One borrowed boolean node and the ones built before it in the same list,
+/// each living in its own stack frame.
+///
+/// The chain is what lets a list of children be collected into the contiguous
+/// slice `QueryFilter::Any` needs: every node is still alive in an enclosing
+/// frame when the innermost one runs, so the references are all valid there
+/// at once.
+struct BuiltFilter<'a> {
+    node: &'a QueryFilter<'a>,
+    previous: Option<&'a BuiltFilter<'a>>,
+}
+
+/// One finished boolean tree and the filter position it belongs to, chained
+/// through the frames the way [`BuiltFilter`] chains a disjunction's children.
+struct BuiltAt<'a> {
+    at: usize,
+    node: &'a QueryFilter<'a>,
+    previous: Option<&'a BuiltAt<'a>>,
+}
+
+/// Build the whole borrowed filter list -- traversals, boolean trees and
+/// plain leaves alike -- on this call's stack and hand it to `k`.
+///
+/// One entry point for both `with_query` and `with_aggregate`, because a
+/// `WHERE` clause is the same clause whichever of the two reads it.
+/// `graph_edges` and `graph_nodes` are the traversal's borrowed predicate
+/// slices, empty when the plan has no traversal.
+fn with_borrowed_filters<T>(
+    owned: &[OwnedFilter],
+    graph_edges: &[Vec<EdgePredicate<'_>>],
+    graph_nodes: &[Vec<QueryFilter<'_>>],
+    k: &mut dyn FnMut(&[QueryFilter<'_>]) -> SqlResult2<T>,
+) -> SqlResult2<T> {
+    let boolean: Vec<usize> = owned
+        .iter()
+        .enumerate()
+        .filter(|(_, filter)| matches!(filter, OwnedFilter::Any(_) | OwnedFilter::All(_) | OwnedFilter::Not(_)))
+        .map(|(at, _)| at)
+        .collect();
+    with_boolean_filters(owned, &boolean, None, graph_edges, graph_nodes, k)
+}
+
+fn with_boolean_filters<T>(
+    owned: &[OwnedFilter],
+    remaining: &[usize],
+    built: Option<&BuiltAt<'_>>,
+    graph_edges: &[Vec<EdgePredicate<'_>>],
+    graph_nodes: &[Vec<QueryFilter<'_>>],
+    k: &mut dyn FnMut(&[QueryFilter<'_>]) -> SqlResult2<T>,
+) -> SqlResult2<T> {
+    match remaining.split_first() {
+        None => {
+            let filters: Vec<QueryFilter<'_>> = owned
+                .iter()
+                .enumerate()
+                .map(|(at, filter)| match filter {
+                    OwnedFilter::Graph(graph) => {
+                        QueryFilter::Graph(graph.request(&graph_edges[at], &graph_nodes[at]))
+                    }
+                    OwnedFilter::Any(_) | OwnedFilter::All(_) | OwnedFilter::Not(_) => {
+                        let mut link = built;
+                        loop {
+                            match link {
+                                Some(entry) if entry.at == at => break entry.node.clone(),
+                                Some(entry) => link = entry.previous,
+                                // Unreachable: a frame was built above for
+                                // every boolean position in this list.
+                                None => break QueryFilter::Ids(&[]),
+                            }
+                        }
+                    }
+                    other => other.borrowed(),
+                })
+                .collect();
+            k(&filters)
+        }
+        Some((at, rest)) => {
+            let at = *at;
+            with_boolean(&owned[at], &mut |node| {
+                let link = BuiltAt {
+                    at,
+                    node,
+                    previous: built,
+                };
+                with_boolean_filters(owned, rest, Some(&link), graph_edges, graph_nodes, k)
+            })
+        }
+    }
+}
+
+/// Build the borrowed `QueryFilter` tree on the stack and call `k` with it.
+fn with_boolean<R>(node: &OwnedFilter, k: &mut dyn FnMut(&QueryFilter<'_>) -> R) -> R {
+    match node {
+        OwnedFilter::Not(inner) => {
+            with_boolean(inner, &mut |child| k(&QueryFilter::Not(child)))
+        }
+        OwnedFilter::Any(children) => {
+            with_children(children, None, &mut |built| k(&QueryFilter::Any(built)))
+        }
+        OwnedFilter::All(children) => {
+            with_children(children, None, &mut |built| k(&QueryFilter::All(built)))
+        }
+        other => k(&other.borrowed()),
+    }
+}
+
+/// Build every child of one disjunction, then hand them over as one slice.
+fn with_children<R>(
+    nodes: &[OwnedFilter],
+    previous: Option<&BuiltFilter<'_>>,
+    k: &mut dyn FnMut(&[QueryFilter<'_>]) -> R,
+) -> R {
+    match nodes.split_first() {
+        None => {
+            let mut out = Vec::new();
+            let mut link = previous;
+            while let Some(built) = link {
+                out.push(built.node.clone());
+                link = built.previous;
+            }
+            out.reverse();
+            k(&out)
+        }
+        Some((head, rest)) => with_boolean(head, &mut |node| {
+            let built = BuiltFilter { node, previous };
+            with_children(rest, Some(&built), k)
+        }),
     }
 }
 
@@ -456,18 +618,12 @@ impl SelectPlan {
                 _ => Vec::new(),
             })
             .collect();
-        let filters: Vec<QueryFilter<'_>> = self
-            .filters
-            .iter()
-            .enumerate()
-            .map(|(at, filter)| match filter {
-                OwnedFilter::Graph(graph) => {
-                    QueryFilter::Graph(graph.request(&graph_edges[at], &graph_nodes[at]))
-                }
-                other => other.borrowed(),
-            })
-            .collect();
-        let fields: Vec<&str> = self.fields.iter().map(String::as_str).collect();
+        // The boolean trees go on this call's stack for the same reason the
+        // traversal's predicate slices do: a `QueryFilter::Any` names a
+        // slice and a `Not` a reference, and a compiled plan outlives every
+        // statement it was built from.
+        with_borrowed_filters(&self.filters, &graph_edges, &graph_nodes, &mut |filters| {
+                let fields: Vec<&str> = self.fields.iter().map(String::as_str).collect();
         let projection = if fields.is_empty() {
             Projection::Ids
         } else {
@@ -539,6 +695,7 @@ impl SelectPlan {
                 direction: *direction,
             }),
         }
+        })
     }
 }
 
@@ -646,7 +803,6 @@ impl AggregatePlan {
         db: &Database,
         body: &mut dyn FnMut(&mut crate::collections::PreparedAggregate<'_>) -> SqlResult2<T>,
     ) -> SqlResult2<T> {
-        let filters: Vec<QueryFilter<'_>> = self.filters.iter().map(OwnedFilter::borrowed).collect();
         let accumulators: Vec<Accumulator<'_>> = self
             .accumulators
             .iter()
@@ -666,17 +822,19 @@ impl AggregatePlan {
                 divisor: *divisor,
             },
         });
-        let mut prepared = db.prepare_aggregate(AggregateRequest {
-            collection: self.collection,
-            filters: &filters,
-            group,
-            accumulators: &accumulators,
-            having: &self.having,
-            order: self.order,
-            driver: self.driver,
-            total_limit: self.limit,
-        })?;
-        body(&mut prepared)
+        with_borrowed_filters(&self.filters, &[], &[], &mut |filters| {
+            let mut prepared = db.prepare_aggregate(AggregateRequest {
+                collection: self.collection,
+                filters,
+                group,
+                accumulators: &accumulators,
+                having: &self.having,
+                order: self.order,
+                driver: self.driver,
+                total_limit: self.limit,
+            })?;
+            body(&mut prepared)
+        })
     }
 }
 
@@ -870,6 +1028,15 @@ struct Compiler<'a> {
     /// several point reads per index); a statement with five predicates on
     /// one collection used to pay it five times.
     index_lists: std::cell::RefCell<Vec<(CollectionId, Vec<IndexInfo>)>>,
+    /// The budget and the cancellation this statement's caller handed in.
+    ///
+    /// COMPILING is not free here: a semi-join's set is built while the
+    /// statement is compiled, and it is an index walk or a whole inner query.
+    /// Both used to run under `QueryBudget::unlimited()` and a cancel closure
+    /// that always said no, so `Ctrl-C` was inert and no resource was charged
+    /// for work the caller had asked to bound.
+    budget: QueryBudget,
+    cancelled: &'a mut dyn FnMut() -> bool,
 }
 
 pub(crate) fn compile(
@@ -877,12 +1044,16 @@ pub(crate) fn compile(
     statement: Stmt,
     params: &[super::Param],
     notices: &mut Vec<String>,
+    budget: QueryBudget,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> SqlResult2<Plan> {
     let mut compiler = Compiler {
         index_lists: std::cell::RefCell::new(Vec::new()),
         db,
         params,
         notices,
+        budget,
+        cancelled,
     };
     compiler.statement(statement)
 }
@@ -1361,8 +1532,8 @@ impl Compiler<'_> {
         if let Some(filter) = graph_filter {
             filters.push(filter);
         }
-        for predicate in &statement.predicates {
-            filters.push(self.filter(c, predicate)?);
+        for expr in &statement.predicates {
+            filters.push(self.where_filter(c, expr)?);
         }
 
         // An alias a `COLUMNS` entry gave to an EDGE property. `ORDER BY` and
@@ -1590,8 +1761,8 @@ impl Compiler<'_> {
         let c = collection(self.db, table)?;
 
         let mut filters: Vec<OwnedFilter> = Vec::new();
-        for predicate in &statement.predicates {
-            filters.push(self.filter(c, predicate)?);
+        for expr in &statement.predicates {
+            filters.push(self.where_filter(c, expr)?);
         }
 
         // The group key. `DISTINCT col` IS `GROUP BY col` with no
@@ -1892,6 +2063,157 @@ impl Compiler<'_> {
         })
     }
 
+    /// One conjunct of a `WHERE` clause, as a filter.
+    ///
+    /// The tree is handed to the engine as it was written: `Any` is a union
+    /// of membership sets, `All` an intersection and `Not` a complement, and
+    /// which leaves an index can answer is the engine's question to refuse,
+    /// not this one's. What is decided here is only the SQL spelling --
+    /// `<>` is a complement of an equality, `IN` a union of them.
+    fn where_filter(&mut self, c: CollectionId, expr: &Expr) -> SqlResult2<OwnedFilter> {
+        Ok(match expr {
+            Expr::Leaf(predicate) => self.filter(c, predicate)?,
+            Expr::Not(inner) => OwnedFilter::Not(Box::new(self.where_filter(c, inner)?)),
+            Expr::Or(parts) => OwnedFilter::Any(
+                parts
+                    .iter()
+                    .map(|part| self.where_filter(c, part))
+                    .collect::<SqlResult2<Vec<_>>>()?,
+            ),
+            Expr::And(parts) => OwnedFilter::All(
+                parts
+                    .iter()
+                    .map(|part| self.where_filter(c, part))
+                    .collect::<SqlResult2<Vec<_>>>()?,
+            ),
+        })
+    }
+
+    /// The outer ids a semi-join names (`docs/QL_CONTRACT.md` §3).
+    ///
+    /// Two sources, because this database has two kinds of thing a subquery
+    /// can name. An EDGE TYPE is one walk of the edge keyspace: `related` is
+    /// not a collection here, it is the `related` edges, and its `source`
+    /// column is every entity with an outgoing one. A COLLECTION is
+    /// §4.8's join shape -- one key lookup per driving row -- with the
+    /// driving rows read through an ordinary prepared query, so the
+    /// subquery's own cost is a plan a caller can see rather than a hidden
+    /// scan.
+    ///
+    /// Both sources run under the STATEMENT's own budget and cancellation and
+    /// both are bounded by `MAX_SEMI_JOIN_IDS`, which is the size of the set
+    /// this returns and holds. The edge walk used to have neither the cap nor
+    /// the cancel; the collection walk ran under `QueryBudget::unlimited()`.
+    fn semi_join(
+        &mut self,
+        c: CollectionId,
+        table: &str,
+        column: &str,
+    ) -> SqlResult2<Vec<EntityId>> {
+        let db = self.db;
+        let budget = self.budget;
+        if let Some(edge_type) = db.edge_type(table).ok().flatten() {
+            let direction = if column.eq_ignore_ascii_case("source") {
+                Direction::Outgoing
+            } else if column.eq_ignore_ascii_case("destination") {
+                Direction::Incoming
+            } else {
+                return Err(SqlError::unsupported(format!(
+                    "a semi-join on `{table}.{column}`: an edge type's columns are `source` and `destination`, which are the two ends the edge keyspace is filed by"
+                )));
+            };
+            let cancelled = &mut *self.cancelled;
+            return Ok(db.edge_endpoints(
+                c,
+                GraphContextId::BASE,
+                edge_type,
+                direction,
+                MAX_SEMI_JOIN_EDGES,
+                MAX_SEMI_JOIN_IDS,
+                budget,
+                || cancelled(),
+            )?);
+        }
+        let inner = collection(db, table)?;
+        let fields = [column];
+        let mut prepared = db
+            .prepare_query(QueryRequest {
+                collection: inner,
+                filters: &[],
+                order: QueryOrder::Driver,
+                projection: Projection::Fields(&fields),
+                total_limit: None,
+                driver: CandidateDriver::Auto,
+            })
+            .map_err(SqlError::from)?;
+        let cancelled = &mut *self.cancelled;
+        let mut ids: Vec<EntityId> = Vec::new();
+        loop {
+            let page = prepared
+                .next_page(1024, budget, || cancelled())
+                .map_err(SqlError::from)?;
+            for row in &page.rows {
+                match row.projected.first() {
+                    Some((_, ProjectedValue::Value(serde_json::Value::String(key)))) => {
+                        if let Some(entity) = db.get(c, key).map_err(SqlError::from)? {
+                            ids.push(entity.id);
+                        }
+                    }
+                    // A row whose projected column is NULL or absent names no
+                    // outer row, which is SQL's own answer: `x IN (SELECT c
+                    // ...)` is never TRUE because of a NULL `c`.
+                    None
+                    | Some((_, ProjectedValue::Missing))
+                    | Some((_, ProjectedValue::Null))
+                    | Some((_, ProjectedValue::Value(serde_json::Value::Null))) => {}
+                    // Anything else is a column this join cannot use, and
+                    // silently dropping every row of it returned the EMPTY
+                    // set with no diagnostic. An outer row is named by its
+                    // external key, which is text.
+                    Some((_, ProjectedValue::Value(other))) => {
+                        let kind = match other {
+                            serde_json::Value::Bool(_) => "a boolean",
+                            serde_json::Value::Number(_) => "a number",
+                            serde_json::Value::Array(_) => "an array",
+                            serde_json::Value::Object(_) => "an object",
+                            serde_json::Value::Null | serde_json::Value::String(_) => {
+                                unreachable!("null and text are answered above")
+                            }
+                        };
+                        return Err(SqlError::unsupported(format!(
+                            "a semi-join over `{table}` projects `{column}`, which holds {kind}: an outer row is named by its external key, which is text, so there is no id this column could name"
+                        )));
+                    }
+                }
+            }
+            if ids.len() > MAX_SEMI_JOIN_IDS {
+                return Err(SqlError::engine(format!(
+                    "a semi-join over `{table}` named more than {MAX_SEMI_JOIN_IDS} outer rows: the set is held in memory and is bounded, not spilled"
+                )));
+            }
+            if page.done {
+                break;
+            }
+        }
+        ids.sort_unstable_by_key(|id| id.sequence);
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// True when a tsquery is a bare `!term` -- one leading `!` and no other
+    /// operator -- which is the one negated tsquery this slice compiles.
+    fn negated_tsquery(&self, query: &TsQuery) -> SqlResult2<bool> {
+        if !query.tsquery_syntax {
+            return Ok(false);
+        }
+        let text = self.text_of(&query.source)?;
+        let trimmed = text.trim();
+        Ok(trimmed.starts_with('!')
+            && !trimmed[1..].contains('!')
+            && !trimmed.contains('|')
+            && !trimmed.contains('&'))
+    }
+
     fn filter(&mut self, c: CollectionId, predicate: &Predicate) -> SqlResult2<OwnedFilter> {
         Ok(match predicate {
             Predicate::Compare { column, op, value } => {
@@ -1900,12 +2222,15 @@ impl Compiler<'_> {
                 let scalar = self.scalar(&kind, value, column)?;
                 let predicate = match op {
                     CmpOp::Eq => OwnedScalarFilter::Eq(scalar),
+                    // `<>` is the complement of an equality, which the
+                    // engine takes inside the index itself: a union of the
+                    // postings below the value and the postings above it,
+                    // the nullish key in neither. See `QueryFilter::Not`.
                     CmpOp::Ne => {
-                        return Err(SqlError::Refused {
-                            keyword: op.written().into(),
-                            tier: Tier::Two,
-                            reason: "QL_CONTRACT §3: `<>` is the complement of an equality, which is NOT over a membership set; the scalar atomics are Eq, Range, IsNull and IsMissing.",
-                        })
+                        return Ok(OwnedFilter::Not(Box::new(OwnedFilter::Scalar {
+                            index,
+                            predicate: OwnedScalarFilter::Eq(scalar),
+                        })))
                     }
                     CmpOp::Lt => OwnedScalarFilter::Range {
                         lower: Bound::Unbounded,
@@ -1942,17 +2267,18 @@ impl Compiler<'_> {
                 }
             }
             Predicate::IsNull { column, negated } => {
-                if *negated {
-                    return Err(SqlError::Refused {
-                        keyword: "IS NOT NULL".into(),
-                        tier: Tier::Two,
-                        reason: "QL_CONTRACT §3: IS NOT NULL is the complement of IsNull, which is NOT over a membership set. IS NULL and IS MISSING are the Tier-1 nullish atomics.",
-                    });
-                }
                 let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
-                OwnedFilter::Scalar {
+                let leaf = OwnedFilter::Scalar {
                     index,
                     predicate: OwnedScalarFilter::IsNull,
+                };
+                // `IS NOT NULL` is the complement of the nullish key inside
+                // the index, which is every other posting: one range, no
+                // bitmap and no universe walk. See `QueryFilter::Not`.
+                if *negated {
+                    OwnedFilter::Not(Box::new(leaf))
+                } else {
+                    leaf
                 }
             }
             Predicate::IsMissing { column } => {
@@ -1970,12 +2296,13 @@ impl Compiler<'_> {
                     CmpOp::Le => (Bound::Unbounded, Bound::Included(key)),
                     CmpOp::Gt => (Bound::Excluded(key), Bound::Unbounded),
                     CmpOp::Ge => (Bound::Included(key), Bound::Unbounded),
+                    // The complement of a one-key range, which the engine
+                    // takes as the two mapping ranges either side of it.
                     CmpOp::Ne => {
-                        return Err(SqlError::Refused {
-                            keyword: op.written().into(),
-                            tier: Tier::Two,
-                            reason: "QL_CONTRACT §3: a key `<>` is the complement of a key range, which is NOT over a membership set.",
-                        })
+                        return Ok(OwnedFilter::Not(Box::new(OwnedFilter::Key {
+                            lower: Bound::Included(key.clone()),
+                            upper: Bound::Included(key),
+                        })))
                     }
                 };
                 OwnedFilter::Key { lower, upper }
@@ -1984,6 +2311,67 @@ impl Compiler<'_> {
                 lower: Bound::Included(self.text_of(lower)?),
                 upper: Bound::Included(self.text_of(upper)?),
             },
+            // `col IN (v1, v2, ...)`: one equality per value, unioned into
+            // one membership set. `docs/QL_CONTRACT.md` §3.
+            Predicate::InList { column, values } => {
+                let kind = self.kind_of(c, column)?;
+                let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
+                let mut leaves = Vec::with_capacity(values.len());
+                for value in values {
+                    let scalar = self.scalar(&kind, value, column)?;
+                    leaves.push(OwnedFilter::Scalar {
+                        index,
+                        predicate: OwnedScalarFilter::Eq(scalar),
+                    });
+                }
+                if leaves.len() == 1 {
+                    leaves.pop().ok_or_else(|| {
+                        SqlError::syntax("IN needs at least one value", 0)
+                    })?
+                } else {
+                    OwnedFilter::Any(leaves)
+                }
+            }
+            Predicate::KeyInList { values } => {
+                let mut leaves = Vec::with_capacity(values.len());
+                for value in values {
+                    let key = self.text_of(value)?;
+                    leaves.push(OwnedFilter::Key {
+                        lower: Bound::Included(key.clone()),
+                        upper: Bound::Included(key),
+                    });
+                }
+                if leaves.len() == 1 {
+                    leaves.pop().ok_or_else(|| {
+                        SqlError::syntax("IN needs at least one value", 0)
+                    })?
+                } else {
+                    OwnedFilter::Any(leaves)
+                }
+            }
+            Predicate::Semi { table, column } => OwnedFilter::Ids(self.semi_join(c, table, column)?),
+            // `to_tsquery('simple','!comet')`: the complement of the text
+            // set. Written alone, because a `!` inside a larger tsquery is a
+            // boolean tree over one index's postings rather than one leaf.
+            Predicate::Text { column, query } if self.negated_tsquery(query)? => {
+                let stripped = TsQuery {
+                    source: Literal::Str(
+                        self.text_of(&query.source)?
+                            .trim()
+                            .trim_start_matches('!')
+                            .trim()
+                            .to_owned(),
+                    ),
+                    tsquery_syntax: query.tsquery_syntax,
+                };
+                OwnedFilter::Not(Box::new(self.filter(
+                    c,
+                    &Predicate::Text {
+                        column: column.clone(),
+                        query: stripped,
+                    },
+                )?))
+            }
             Predicate::Text { column, query } => {
                 let index = self.index_for(c, column, IndexFamily::Text, "a text index")?;
                 let (query, matching) = self.tsquery(query)?;
@@ -2044,10 +2432,18 @@ impl Compiler<'_> {
         let has_or = trimmed.contains('|');
         let has_and = trimmed.contains('&');
         if has_or && has_and {
-            return Err(refuse::refuse("OR"));
+            return Err(SqlError::Refused {
+                keyword: "tsquery & |".into(),
+                tier: Tier::Two,
+                reason: "QL_CONTRACT §4.6: a tsquery that mixes `&` and `|` is a boolean TREE inside one index's postings; the Tier-1 tsquery is one operator, and a union ACROSS predicates is written with SQL's own OR.",
+            });
         }
         if trimmed.contains('!') {
-            return Err(refuse::refuse("NOT"));
+            return Err(SqlError::Refused {
+                keyword: "tsquery !".into(),
+                tier: Tier::Two,
+                reason: "QL_CONTRACT §4.6: a tsquery `!` inside a larger tsquery is a boolean TREE over one index's postings; the Tier-1 spelling is `!term` alone, which is NOT over the text set.",
+            });
         }
         if trimmed.contains("<->") {
             return Err(SqlError::Refused {

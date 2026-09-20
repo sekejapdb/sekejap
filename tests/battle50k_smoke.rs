@@ -228,6 +228,22 @@ fn brute_matches(row: &Row, corpus: &Corpus, q: &Queries, name: &str, i: usize) 
         "born_range" => in_born(),
         "kind_eq" => row.kind == *kind,
         "radius_and_born" => in_radius() && in_born(),
+        // The boolean cases (QL_CONTRACT §3), the same shapes e4_case builds.
+        "bool_kind_in3" => {
+            row.kind == corpus.kinds[i % KINDS]
+                || row.kind == corpus.kinds[(i + 1) % KINDS]
+                || row.kind == corpus.kinds[(i + 2) % KINDS]
+        }
+        "bool_born_or_kind" => in_born() || row.kind == *kind,
+        "bool_not_kind" => row.kind != *kind,
+        "bool_radius_or_radius" => {
+            let other = (i + 1) % INSTANCES;
+            let centre = q.radius_centre(other).expect("radius centre is valid");
+            in_radius() || wgs84_distance_metres(centre, row_point(row)) <= q.radius_metres(other)
+        }
+        // Every corpus row has a `born`, so the complement of the nullish key
+        // is the whole corpus.
+        "bool_not_null_born" => true,
         other => panic!("no brute force for filter case `{other}`"),
     }
 }

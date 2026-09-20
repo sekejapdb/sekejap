@@ -373,6 +373,22 @@ fn append_entity(key: &mut Vec<u8>, id: EntityId) {
 /// allocation rather than one per integer in it plus a regrow per component.
 const EDGE_KEY_BYTES: usize = 1 + 2 * (2 + 9) + 9 + 9;
 
+/// The smallest key that sorts ABOVE every key carrying `prefix`: the byte
+/// successor of the prefix. `None` when every byte is `0xFF` and there is no
+/// such key, which means the prefix reaches the end of the keyspace.
+fn key_after_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last == u8::MAX {
+            out.pop();
+            continue;
+        }
+        *last += 1;
+        return Some(out);
+    }
+    None
+}
+
 fn read_entity(key: &[u8], at: &mut usize) -> Result<EntityId> {
     let collection = u32::try_from(read_ordered(key, at)?).map_err(corrupt)?;
     let sequence = read_ordered(key, at)?;
@@ -990,6 +1006,125 @@ impl Database {
         validate_name_input(name, "edge type name")?;
         self.graph_header()?;
         Ok(self.lookup_graph_name(0, name)?.map(EdgeTypeId))
+    }
+
+    /// Every entity of `collection` that has AT LEAST ONE edge of
+    /// `edge_type` in `context`, ascending, without duplicates.
+    ///
+    /// The semi-join half of `docs/QL_CONTRACT.md` §3's `EXISTS`: an edge
+    /// table's `source` column is this walk with `Direction::Outgoing` and
+    /// its `destination` column the same walk over the reverse mirror, so
+    /// `EXISTS (SELECT 1 FROM related WHERE related.source = t._key)` is one
+    /// keyspace walk rather than a probe per outer row.
+    ///
+    /// The keyspace is `tag || near entity || context || type || far
+    /// entity`, and the near entity's COLLECTION is the first thing in it, so
+    /// the walk starts at this collection's own stretch and stops the moment
+    /// it leaves it -- it no longer steps over every other collection's
+    /// edges. Inside that stretch the near entities come out in order and the
+    /// walk SEEKS past the near entity as soon as one of its edges matches:
+    /// an entity with a thousand edges costs one step, not a thousand. The
+    /// doc comment claimed that skip before the walk made it.
+    ///
+    /// Three bounds, each named where it is hit. `max_edges` bounds the steps
+    /// and refuses with `GraphEdges`; `max_ids` bounds the SET this returns --
+    /// it is held in memory for the length of the caller's statement -- and
+    /// refuses with `GraphVisited`; and `meter` is the caller's own budget and
+    /// cancellation, so the walk is charged `GraphEdges` per step and polls
+    /// the caller's cancel between them. Before this the loop had none of the
+    /// three: `EXISTS` over a 60-million-edge graph allocated its ids with
+    /// Ctrl-C inert.
+    pub fn edge_endpoints<C: FnMut() -> bool>(
+        &self,
+        collection: CollectionId,
+        context: GraphContextId,
+        edge_type: EdgeTypeId,
+        direction: Direction,
+        max_edges: usize,
+        max_ids: usize,
+        budget: crate::query::QueryBudget,
+        cancelled: C,
+    ) -> Result<Vec<EntityId>> {
+        let mut cancelled = cancelled;
+        let meter = &mut crate::query::WorkMeter::new(budget, &mut cancelled);
+        let tag = match direction {
+            Direction::Outgoing => PRIMARY_EDGE,
+            Direction::Incoming => REVERSE_EDGE,
+            Direction::Both => {
+                return Err(invalid(
+                    "an edge-endpoint set names one direction: a column of an edge table is either its source or its destination",
+                ))
+            }
+        };
+        self.graph_header()?;
+        // `tag || ordered(collection)`: the ordered integer encoding is
+        // length-tagged, so one collection's stretch cannot be the prefix of
+        // another's and this is the whole of the near end's collection.
+        let mut prefix = vec![tag];
+        prefix.extend(crate::collections::ordered(u64::from(collection.0)));
+        let mut out: Vec<EntityId> = Vec::new();
+        let mut walk = self.store()?.range(&prefix)?;
+        let mut edges = 0usize;
+        // Set once an entity has matched: the next peek resumes at the first
+        // key past every edge of that entity instead of stepping through them.
+        let mut resume_at: Option<Vec<u8>> = None;
+        loop {
+            meter.check_cancelled()?;
+            let peeked = match &resume_at {
+                Some(target) => walk.peek_at_or_after(target)?,
+                None => walk.peek_ref()?,
+            };
+            let Some((key, _)) = peeked else {
+                break;
+            };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            resume_at = None;
+            edges += 1;
+            if edges > max_edges {
+                return Err(Error::BudgetExceeded {
+                    resource: crate::query::WorkResource::GraphEdges,
+                    limit: max_edges as u64,
+                    attempted: edges as u64,
+                });
+            }
+            let mut at = 1;
+            let near = read_entity(key, &mut at)?;
+            let near_end = at;
+            let entry_context = GraphContextId(read_ordered(key, &mut at)?);
+            let entry_type = EdgeTypeId(read_ordered(key, &mut at)?);
+            if entry_context != context || entry_type != edge_type {
+                walk.step();
+                meter.charge(crate::query::WorkResource::GraphEdges, 1)?;
+                continue;
+            }
+            // One edge of this entity is enough. Everything else filed under
+            // it answers the same question, so the walk steps over the whole
+            // run in one seek.
+            let skip = key_after_prefix(&key[..near_end]);
+            meter.charge(crate::query::WorkResource::GraphEdges, 1)?;
+            meter.charge(crate::query::WorkResource::GraphVisited, 1)?;
+            out.push(near);
+            if out.len() > max_ids {
+                return Err(Error::BudgetExceeded {
+                    resource: crate::query::WorkResource::GraphVisited,
+                    limit: max_ids as u64,
+                    attempted: out.len() as u64,
+                });
+            }
+            match skip {
+                Some(target) => resume_at = Some(target),
+                // Every byte was 0xFF: there is no key past this entity.
+                None => break,
+            }
+        }
+        // The walk hands them over in key order, which is ascending sequence
+        // inside one collection, and the seek makes each entity appear once.
+        // Kept as insurance, not as the source of the order.
+        out.sort_unstable_by_key(|id| id.sequence);
+        out.dedup();
+        Ok(out)
     }
 
     pub fn graph_context(&self, name: &str) -> Result<Option<GraphContextId>> {

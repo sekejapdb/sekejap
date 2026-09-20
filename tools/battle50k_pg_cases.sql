@@ -379,3 +379,55 @@ SELECT r.source FROM related r
  WHERE r.destination = $1
  ORDER BY r.weight DESC
  LIMIT 10;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- BOOLEAN CASES (QL_CONTRACT §3). Each one is ONE membership set in E4: a
+-- union of equalities, a union across two index families, a complement
+-- inside one index, a union of two covers, the complement of the nullish
+-- key, and a semi-join set. No new column and no new index: `place_kind`,
+-- `place_born`, the GiST on `loc` and `related_source` already exist.
+
+-- case: bool_kind_in3 kind: filter
+-- params: $1, $2, $3 kinds  (kinds[i%8], kinds[(i+1)%8], kinds[(i+2)%8])
+SELECT key FROM place
+WHERE kind IN ($1, $2, $3);
+
+-- case: bool_born_or_kind kind: filter
+-- params: $1 lower born, $2 upper born, $3 kind
+-- A union ACROSS two indexes, which Postgres answers with a BitmapOr of the
+-- two index scans. E4 unions the two membership sets the same way.
+SELECT key FROM place
+WHERE (born BETWEEN $1 AND $2) OR kind = $3;
+
+-- case: bool_not_kind kind: filter
+-- params: $1 kind
+-- The complement of an equality. E4 takes it inside `place_kind` as the two
+-- ranges either side of the value, the nullish key in neither, which is why
+-- a NULL `kind` would be in no answer here -- exactly as `NULL <> x` is
+-- unknown in Postgres. No row of this corpus has one.
+SELECT key FROM place
+WHERE kind <> $1;
+
+-- case: bool_radius_or_radius kind: filter
+-- params: $1 lon, $2 lat, $3 metres, $4 lon, $5 lat, $6 metres
+SELECT key FROM place
+WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)
+   OR ST_DWithin(loc, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6);
+
+-- case: bool_not_null_born kind: filter
+-- params: none
+-- Every row has a `born`, so this is the whole table -- which is the point:
+-- the complement of the nullish key is a posting range, not a scan, and the
+-- two arms must still agree on 50,000 rows.
+SELECT key FROM place
+WHERE born IS NOT NULL;
+
+-- case: bool_exists_related kind: filter
+-- params: none
+-- A semi-join, and the one case in this file whose subquery is a TABLE in
+-- Postgres and an EDGE TYPE in E4: `related` is a table here and the
+-- `related` edges there, so E4 builds the set from the edge keyspace and
+-- Postgres from `related_source`. Selected only with `--graph`, like the
+-- four `graph_` cases.
+SELECT key FROM place
+WHERE EXISTS (SELECT 1 FROM related r WHERE r.source = place.key);

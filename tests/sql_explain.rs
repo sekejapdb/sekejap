@@ -774,3 +774,212 @@ fn explain_prints_the_edge_predicates_and_the_node_membership_sets() {
     assert!(counter(&text, "graph_edges") > 0, "{text}");
     assert!(rows_of(&text) > 0, "{text}");
 }
+
+/// The six boolean cases of the battery (`docs/QL_CONTRACT.md` §3), each
+/// explained: the driver, the set the filter was walked into, and the rows
+/// the answer read.
+///
+/// The driver is the interesting half. A disjunction never takes the driver
+/// away from a conjunct that can narrow the candidates further, so
+/// `bool_born_or_kind` under a second predicate would still be a scalar
+/// range; on its own it is the union set itself, walked in id order.
+/// A boolean filter is a pure in-memory bit test, so it is answered BEFORE
+/// the row is read -- not by turning the batched row pass off.
+///
+/// `filters_are_row_pure` used to say false for `Boolean`, which switched off
+/// both `batches_row_reads` and the borrowed-row path: the same geometry
+/// query with `kind IN ('a','b')` beside it went from one ordered batch
+/// cursor to a point-get and a row copy per geometry candidate, a cliff
+/// against the identical query with `kind = 'a'`. The bit test now stands in
+/// FRONT of the read, which is visible as rows that are never decoded.
+#[test]
+fn a_boolean_filter_is_answered_before_the_row_is_read() {
+    let (_dir, mut f) = open();
+    let centre = fixture::centre();
+    let (lon, lat) = (centre.longitude(), centre.latitude());
+    let geometry = format!(
+        "ST_DWithin(plot, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, 40000, true)"
+    );
+    let bare = explain(
+        &mut f,
+        &format!("SELECT _id FROM place WHERE {geometry}"),
+        &[],
+    );
+    let boolean = explain(
+        &mut f,
+        &format!("SELECT _id FROM place WHERE {geometry} AND kind IN ('depot','farm')"),
+        &[],
+    );
+    // The geometry walk keeps driving: a union never drives by preference
+    // (`docs/QL_CONTRACT.md` §3), and it no longer costs the walk its shape
+    // either.
+    let driver = |text: &str| text.lines().next().unwrap().to_owned();
+    assert_eq!(driver(&boolean), driver(&bare), "{boolean}");
+    // And the candidates the bit test rejects cost no row: fewer decodes than
+    // the same geometry walk with nothing beside it.
+    let decodes = |text: &str| counter(text, "row_decodes");
+    assert!(
+        decodes(&boolean) < decodes(&bare),
+        "the bit test stands in front of the row read: boolean={} bare={}\n{boolean}",
+        decodes(&boolean),
+        decodes(&bare)
+    );
+    assert!(
+        counter(&boolean, "primary_reads") < counter(&bare, "primary_reads"),
+        "and in front of the primary read too:\n{boolean}"
+    );
+    // The answer is the equality's answer, unioned: the plan changed, the
+    // rows did not. (The equality form takes the SCALAR driver, because an
+    // equality drives and a union by design does not.)
+    let rows_in = |sql: &str, f: &mut fixture::Fixture| rows_of(&explain(f, sql, &[]));
+    let depot = rows_in(
+        &format!("SELECT _id FROM place WHERE {geometry} AND kind = 'depot'"),
+        &mut f,
+    );
+    let farm = rows_in(
+        &format!("SELECT _id FROM place WHERE {geometry} AND kind = 'farm'"),
+        &mut f,
+    );
+    assert_eq!(rows_of(&boolean), depot + farm, "{boolean}");
+}
+
+#[test]
+fn the_boolean_battery_explains_its_sets_and_its_counters() {
+    let (_dir, mut f) = open();
+    let centre = fixture::centre();
+    let (lon, lat) = (centre.longitude(), centre.latitude());
+    let cases: Vec<(&str, String, Vec<Param>, &str, &str, u64)> = vec![
+        (
+            "bool_kind_in3",
+            "SELECT _id FROM place WHERE kind IN ($1, $2, $3)".to_owned(),
+            vec![
+                Param::Text("depot".into()),
+                Param::Text("farm".into()),
+                Param::Text("home".into()),
+            ],
+            "Membership",
+            "union: union(",
+            0,
+        ),
+        (
+            "bool_born_or_kind",
+            "SELECT _id FROM place WHERE (born BETWEEN $1 AND $2) OR kind = $3".to_owned(),
+            vec![
+                Param::Int(19_500_101),
+                Param::Int(19_520_101),
+                Param::Text("mill".into()),
+            ],
+            "Membership",
+            "union: union(",
+            0,
+        ),
+        (
+            "bool_not_kind",
+            "SELECT _id FROM place WHERE kind <> $1".to_owned(),
+            vec![Param::Text("depot".into())],
+            "Membership",
+            "complement: union(",
+            0,
+        ),
+        (
+            "bool_radius_or_radius",
+            format!(
+                "SELECT _id FROM place \
+                 WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint({lon:?},{lat:?}),4326)::geography, 5000, true) \
+                 OR ST_DWithin(loc, ST_SetSRID(ST_MakePoint({:?},{lat:?}),4326)::geography, 5000, true)",
+                lon + 0.3
+            ),
+            vec![],
+            "Membership",
+            "union: union(",
+            0,
+        ),
+        (
+            "bool_not_null_born",
+            "SELECT _id FROM place WHERE born IS NOT NULL".to_owned(),
+            vec![],
+            "Membership",
+            "complement: place_born.born range",
+            0,
+        ),
+    ];
+    for (name, sql, params, driver, detail, primary_reads) in cases {
+        let text = explain(&mut f, &sql, &params);
+        assert!(
+            text.starts_with(&format!("driver: {driver}")),
+            "{name}: expected the {driver} driver\n{text}"
+        );
+        assert!(rows_of(&text) > 0, "{name} matched nothing:\n{text}");
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("[0] boolean"))
+            .unwrap_or_else(|| panic!("{name}: no boolean filter line in\n{text}"));
+        assert!(
+            line.contains(detail),
+            "{name}: expected `{detail}` in `{line}`"
+        );
+        assert!(
+            line.contains(" ids") || line.contains("bitmap,"),
+            "{name}: the set's size is printed: `{line}`"
+        );
+        assert!(
+            line.contains("the driving walk certifies it"),
+            "{name}: the union IS the driver, so it certifies itself: `{line}`"
+        );
+        assert_eq!(
+            counter(&text, "primary_reads"),
+            primary_reads,
+            "{name}: a boolean answer reads no row for its predicate\n{text}"
+        );
+    }
+}
+
+/// `bool_exists_related`'s shape, on the fixture's own base-graph edges: a
+/// semi-join set, applied as a filter, with the complement beside it.
+#[test]
+fn a_semi_join_explains_the_set_it_built() {
+    let (_dir, mut f) = open();
+    let linked = f.db.create_edge_type("linked").unwrap();
+    f.db.commit().unwrap();
+    for at in (0..fixture::ROWS).step_by(4) {
+        let from = f.db.get(f.place, &f.rows[at].key).unwrap().unwrap().id;
+        let to = f
+            .db
+            .get(f.place, &f.rows[(at + 1) % fixture::ROWS].key)
+            .unwrap()
+            .unwrap()
+            .id;
+        f.db.put_edge(
+            e4_prototype::collections::GraphContextId::BASE,
+            from,
+            linked,
+            to,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    }
+    f.db.commit().unwrap();
+    let text = explain(
+        &mut f,
+        "SELECT _id FROM place WHERE EXISTS (SELECT 1 FROM linked WHERE source = _key)",
+        &[],
+    );
+    assert!(text.starts_with("driver: Membership"), "{text}");
+    assert!(text.contains("set: semi-join set, 500 ids"), "{text}");
+    assert_eq!(rows_of(&text), 500, "{text}");
+    // The ids came from the CALLER (the subquery), not from a posting, so
+    // this page keeps the existence probe its winners owe: one primary read
+    // per returned row. `SetExpr::proves_live` is where that is decided.
+    assert_eq!(counter(&text, "primary_reads"), 500, "{text}");
+
+    let negated = explain(
+        &mut f,
+        "SELECT _id FROM place WHERE NOT EXISTS (SELECT 1 FROM linked WHERE source = _key)",
+        &[],
+    );
+    assert!(
+        negated.contains("complement: complement(semi-join set, 500 ids)"),
+        "{negated}"
+    );
+    assert_eq!(rows_of(&negated), (fixture::ROWS - 500) as u64, "{negated}");
+}

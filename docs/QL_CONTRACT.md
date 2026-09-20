@@ -75,12 +75,58 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 | `AND` | T1 | filter conjunction |
 | `=, <>, <, <=, >, >=` on indexed scalar | T1 | Scalar Eq/Range |
 | `BETWEEN a AND b` | T1 | Range |
-| `IS NULL`, `IS NOT NULL`, `IS MISSING` | T1 | Scalar IsNull/IsMissing |
+| `IS NULL`, `IS MISSING` | T1 | Scalar IsNull/IsMissing (both read the row: NULL and MISSING share one nullish index key) |
 | `key BETWEEN`, `key >=` (external key) | T1 | Key filter, key-order driver |
-| `OR` on the same index, `IN (list)` | T2 | union of ranges as one membership set |
-| `NOT` | T2 | complement over a membership set; row path otherwise |
-| `OR` across indexes | T2 | union of two membership sets |
-| `EXISTS (subquery)`, `IN (subquery)` | T2 | membership set from the subquery (semi/anti join) |
+| `OR` on the same index, `IN (list)` | T1 | union of ranges as one membership set (`QueryFilter::Any`) |
+| `NOT`, `<>` on an indexed scalar, `IS NOT NULL` | T1 | complement (`QueryFilter::Not`); see the leaf rule below |
+| `OR` across indexes, parenthesised groups | T1 | union of the leaves' membership sets |
+| `EXISTS (subquery)`, `key IN (subquery)`, `NOT EXISTS` | T1 | semi-join membership set (`QueryFilter::Ids`), and its complement; the subquery's projected column must be TEXT, because an outer row is named by its external key |
+| a boolean leaf with no set: geometry, traversal, `JsonEq`, a text phrase, `IS NULL`/`IS MISSING` | T3 inside a boolean | refused at prepare, naming the leaf; each is answered from the ROW, and a boolean evaluated per row reads every candidate's record |
+
+**The boolean rule.** A disjunction is ONE membership set: the union of its
+leaves' own index-side sets, built once and answered afterwards by one binary
+search or one bit per candidate. A conjunction inside a disjunction is their
+intersection. A complement is taken against the leaf's OWN universe, and the
+universe is always the one that makes a null field UNKNOWN rather than a
+member:
+
+- a scalar or key complement is a union of at most two ranges over the same
+  keyspace, with the nullish key in neither (SQL's rule that `NULL <> x` is
+  unknown);
+- a POINT complement is the point index's own postings, so a row whose `loc`
+  is null or missing is in neither the leaf nor its complement;
+- a TEXT complement is the text index's own DOCUMENT UNIVERSE -- the documents
+  it holds a norm for -- for exactly the same reason: `NOT (name @@ 'x')` over
+  a null `name` is unknown, and an unknown row is not returned;
+- an explicit `Ids` set (a semi-join's) has no index of its own, so its
+  complement is the collection's live rows. That is the only universe that
+  exists for a set the caller named, and a deleted row is not in it.
+
+A complement is always a bitmap of the span, bounded by `span / 8` bytes and
+refused when a bitmap that size does not fit the membership budget. `NOT` over
+a union is De Morgan's law, applied while the filter is compiled, so every
+complement stands over a LEAF and there is never a universe to guess at.
+
+A caller's `Ids` set may name a sequence the collection has never issued. It
+is DROPPED -- it can never be a member of anything -- not reported as
+corruption.
+
+A leaf whose set OVERFLOWS the membership budget refuses the whole boolean
+rather than falling back to the row path: an OR evaluated per candidate reads
+every candidate's record, which is the work the set exists to avoid. The
+refusal names `WorkResource::MembershipBytes` and the byte cap it stopped at,
+which is the currency the cap is stated in.
+
+A boolean filter is a pure in-memory bit test, so it is evaluated BEFORE the
+row is read -- before a batched row pass gathers and before a borrowed row is
+taken -- and never by disabling either. A query with `IN (...)` beside a
+geometry predicate keeps the plan the same query with `= 'x'` gets.
+
+A disjunction never DRIVES by preference -- the driver is chosen from the
+remaining conjuncts or from the order -- but when nothing else can walk, the
+union set itself drives in ascending entity id (`QueryDriver::Membership`).
+Its cost is one candidate per member and no posting and no record: the set is
+already built and already charged.
 | `LIKE 'abc%'` | T2 | text-key prefix range |
 | `LIKE '%abc%'`, `ILIKE` | T2 | trigram index family (pg_trgm-compatible), new family under a feature bit; without the index: full scan, cost printed by EXPLAIN |
 | `SIMILAR TO`, regex `~` | T3 | no index atomic |
@@ -233,6 +279,8 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 
 - Every T1/T2 predicate on an indexed field is answered index-side (posting, membership set, or inline edge property); a row is read only for projection or for a predicate the plan names as row-bound. `EXPLAIN` prints which.
 - Work is proportional to candidates walked or rows returned, never to the collection, except for constructs whose definition is a scan (exact vector order without a filter, `count(*)` without a filter), which `EXPLAIN` labels as scans.
+- A boolean filter's memory is the same membership budget every other set walk is bounded by: a plain Vec while it stays smaller than a bitmap of the collection's span, then that bitmap, then a refusal. A complement is always a bitmap, so a span whose bitmap does not fit `RUN_BYTES` has no complement and the filter is refused rather than degraded. What `RUN_BYTES` bounds is what is held AT ONCE, over every boolean filter of the query together: each union and intersection folds in place into its accumulator rather than copying both sides, every live intermediate is counted against the one budget, and a tree that would hold more is refused with `WorkResource::MembershipBytes` — a resource with no `QueryBudget` field, because the ceiling is the memory promise and not a caller allowance.
+- A semi-join's set is built while the statement is COMPILED, and it runs under the caller's `QueryBudget` and cancellation like any other walk: the edge-keyspace walk is charged `GraphEdges` per edge and `GraphVisited` per entity kept, and the inner collection query is an ordinary prepared query under the same budget.
 - Memory per query is bounded by QueryBudget: pages, membership sets, groups (`WorkResource::Groups` — the accumulator sets an aggregate holds AT ONCE, one under the streaming shape and one per distinct group under the hashed one; its default ceiling is `RUN_BYTES` divided by what one group costs, applied even under `QueryBudget::unlimited`), frontier.
 - Every T3 refusal names the missing atomic in its error text.
 
@@ -240,7 +288,9 @@ MATCH`, Google's `RETURN` inside GRAPH_TABLE (accepted as an alias for
 
 1. Parser for §2 T1 + §3 T1 + §6 guarantees, with `EXPLAIN`.
 2. Aggregates (§4.7) — DONE, `src/query/aggregate.rs`; then date/time and string functions (§4.1, §4.2).
-3. `OR`/`IN`/`NOT`/`EXISTS` (§3).
+3. `OR`/`IN`/`NOT`/`EXISTS` (§3) — DONE, `src/query/membership.rs`
+   (`SetExpr` and the set algebra) with `QueryFilter::Any`/`All`/`Not`/`Ids`
+   and `QueryDriver::Membership`.
 4. Graph T2 (§4.3) in the graph-contract order.
 5. Geometry I/O and `&&` (§4.4), catalog views and wire (p3-pg-surface, p3-wire).
 6. Trigram index for `ILIKE` / infix `LIKE`; typo-tolerant `search()` (§4.6).

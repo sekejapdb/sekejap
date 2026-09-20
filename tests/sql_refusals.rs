@@ -141,6 +141,11 @@ fn offset_is_deviation_four() {
     assert!(reason.contains("keyset continuation"), "{reason}");
 }
 
+/// `<>`, `!=` and `IS NOT NULL` moved from Tier 2 to Tier 1 with the
+/// membership-set algebra (`docs/QL_CONTRACT.md` §3): each is a complement,
+/// and each answers. What stays refused is a complement whose LEAF has no
+/// set -- a geometry predicate, whose box only admits and whose refine reads
+/// the row.
 #[test]
 fn an_inequality_is_the_complement_of_an_equality() {
     let (_dir, mut f) = open();
@@ -150,9 +155,23 @@ fn an_inequality_is_the_complement_of_an_equality() {
         "SELECT _id FROM place WHERE _key <> 'k00001'",
         "SELECT _id FROM place WHERE score IS NOT NULL",
     ] {
-        let (_keyword, tier, _reason) = refused(&mut f, statement, &[]);
-        assert_eq!(tier, 2, "{statement}");
+        f.db.sql(statement, &[])
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
     }
+    // The leaf, not the spelling, is what has no set: the engine refuses a
+    // geometry predicate under a complement when the query is PREPARED, so
+    // this is an engine error rather than a parser refusal.
+    let error = f
+        .db
+        .sql(
+            "SELECT _id FROM place WHERE NOT ST_Intersects(plot, ST_SetSRID(ST_MakePoint(106.8,-6.2),4326)::geography)",
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error}").contains("geometry posting's box is a candidate test"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -214,14 +233,21 @@ fn a_tsquery_that_mixes_and_with_or_is_a_boolean_tree() {
         "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', 'a & b | c')",
         &[],
     );
-    assert_eq!(keyword, "OR");
+    assert_eq!(keyword, "tsquery & |");
     assert_eq!(tier, 2);
+    // A bare `!term` IS the complement of the text set and answers; a `!`
+    // inside a larger tsquery is still a tree inside one index's postings.
+    f.db.sql(
+        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', '!kebun')",
+        &[],
+    )
+    .unwrap();
     let (keyword, tier, _) = refused(
         &mut f,
-        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', '!a')",
+        "SELECT _id FROM place WHERE to_tsvector('simple', text) @@ to_tsquery('simple', '!a & b')",
         &[],
     );
-    assert_eq!(keyword, "NOT");
+    assert_eq!(keyword, "tsquery !");
     assert_eq!(tier, 2);
 }
 

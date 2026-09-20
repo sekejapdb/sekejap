@@ -69,9 +69,18 @@ from the T1 set so the T1 unpinned number keeps meaning what it meant.
 | Construct | Atomic | Tests |
 | --- | --- | --- |
 | `AND` | filter conjunction | `tests/query_multimodel.rs` `graph_scalar_spatial_text_and_vector_apply_before_ranked_top_k`; `tests/query_combinations.rs` `query_engine_surface_combinations`; `tests/query_scalar_fold.rs` `folding_survives_a_third_predicate_and_a_second_index` |
-| `=, <>, <, <=, >, >=` on indexed scalar | Scalar Eq/Range | `=`: `tests/query_scalar.rs` `scalar_json_filters_keep_exact_numbers_null_missing_and_page_order`. range inequalities: `tests/query_scalar_fold.rs` `folding_two_predicates_on_one_index_keeps_the_answer`; `tests/query_combinations.rs` `hand_picked_surface_combinations` (`hp07_same_index_born_fold`). `<>`: UNPINNED (no `NotEq`; `NOT` is T2) |
+| `=, <>, <, <=, >, >=` on indexed scalar | Scalar Eq/Range | `=`: `tests/query_scalar.rs` `scalar_json_filters_keep_exact_numbers_null_missing_and_page_order`. range inequalities: `tests/query_scalar_fold.rs` `folding_two_predicates_on_one_index_keeps_the_answer`; `tests/query_combinations.rs` `hand_picked_surface_combinations` (`hp07_same_index_born_fold`). `<>`: `tests/query_boolean.rs` `random_boolean_trees_match_brute_force`; `tests/sql_tier1.rs` `not_equal_is_the_complement_of_an_equality` |
 | `BETWEEN a AND b` | Range | `tests/query_scalar_fold.rs` `folding_two_predicates_on_one_index_keeps_the_answer`; `tests/query_candidate_budget.rs` `a_spatial_driven_pages_non_driving_range_reads_no_row` |
-| `IS NULL`, `IS NOT NULL`, `IS MISSING` | Scalar IsNull/IsMissing | `IS NULL` / `IS MISSING`: `tests/query_combinations.rs` `hand_picked_surface_combinations` (`hp04_ismissing_score`, `hp05_isnull_kind`); `tests/query_scalar.rs` `scalar_json_filters_keep_exact_numbers_null_missing_and_page_order`. `IS NOT NULL`: UNPINNED |
+| `IS NULL`, `IS MISSING` | Scalar IsNull/IsMissing | `tests/query_combinations.rs` `hand_picked_surface_combinations` (`hp04_ismissing_score`, `hp05_isnull_kind`); `tests/query_scalar.rs` `scalar_json_filters_keep_exact_numbers_null_missing_and_page_order` |
+| `IS NOT NULL` | complement of the nullish key: one posting range | `tests/sql_tier1.rs` `is_not_null_is_the_complement_of_the_nullish_key`; `tests/sql_explain.rs` `the_boolean_battery_explains_its_sets_and_its_counters` |
+| `OR` on the same index, `IN (list)` | union of ranges as one membership set | `tests/query_boolean.rs` `random_boolean_trees_match_brute_force`; `tests/sql_tier1.rs` `a_disjunction_of_equalities_is_one_membership_set`; `tests/sql_tier1.rs` `in_a_list_is_the_same_union_written_shorter` |
+| `OR` across indexes, parenthesised groups | union of the leaves' membership sets; redundant parentheses round an `AND` change nothing about the plan | `tests/sql_tier1.rs` `a_disjunction_across_two_families_unions_two_sets`; `tests/sql_tier1.rs` `a_parenthesised_group_binds_the_way_sql_says`; `tests/sql_tier1.rs` `redundant_parentheses_do_not_change_what_compiles`; `tests/query_boolean.rs` `random_boolean_trees_match_brute_force` |
+| `NOT` | complement over a leaf's own universe (the text index's own documents for a text leaf, the point postings for a point leaf, the live rows for a caller's `Ids` set) | `tests/query_boolean.rs` `a_deleted_row_is_never_in_a_complement`; `tests/query_boolean.rs` `a_complement_is_bounded_by_a_named_resource`; `tests/query_boolean.rs` `a_null_text_field_is_in_neither_the_leaf_nor_its_complement`; `tests/sql_tier1.rs` `not_before_a_group_is_de_morgan`; `tests/sql_tier1.rs` `not_in_a_list_is_the_complement_of_the_union` |
+| `EXISTS (subquery)`, `key IN (subquery)`, `NOT EXISTS` | semi-join membership set, bounded and cancellable while the statement compiles; a non-text projected column is refused naming it | `tests/sql_tier1.rs` `exists_over_an_edge_type_is_a_semi_join`; `tests/sql_tier1.rs` `a_semi_join_over_a_non_text_column_is_refused_naming_it`; `tests/sql_tier1.rs` `a_semi_join_is_cancellable_while_it_compiles`; `tests/query_boolean.rs` `a_semi_join_set_is_checked_not_trusted`; `tests/sql_explain.rs` `a_semi_join_explains_the_set_it_built` |
+| a boolean leaf with no set (geometry, traversal, `JsonEq`, a text phrase, `IS NULL`/`IS MISSING`) | refused at prepare, naming the leaf | `tests/query_boolean.rs` `a_leaf_with_no_set_is_refused_at_prepare`; `tests/sql_tier1.rs` `a_disjunction_with_a_geometry_leaf_is_refused_with_its_reason`; `tests/sql_refusals.rs` `an_inequality_is_the_complement_of_an_equality` |
+| a disjunction as the candidate driver (`QueryDriver::Membership`) | the union set walked in entity-id order, its zero-bit scan charged and pollable every 4 KiB | `tests/query_boolean.rs` `a_union_drives_only_when_nothing_else_can`; `tests/query_boolean.rs` `a_union_pages_disjointly_and_completely`; `tests/query_boolean.rs` `a_union_walk_is_cancellable`; `tests/query_boolean.rs` `a_sparse_bitmap_scan_is_charged_and_pollable` |
+| a boolean filter beside a row-bound one | the bit test is evaluated BEFORE the row read, not by disabling the batched pass | `tests/sql_explain.rs` `a_boolean_filter_is_answered_before_the_row_is_read` |
+| a caller's `Ids` set naming a sequence past the collection's span | dropped, never `Corrupt` | `tests/query_boolean.rs` `an_out_of_span_id_is_dropped_not_corrupt` |
 | `key BETWEEN`, `key >=` (external key) | Key filter, key-order driver | `tests/query_candidate_budget.rs` `a_key_range_pages_resume_in_key_order_with_deleted_keys_absent`; `tests/query_candidate_budget.rs` `a_key_prefix_is_expressed_as_a_range_and_resumes_the_same_way`; `tests/query_candidate_budget.rs` `a_key_filter_without_the_keys_driver_is_refused`; `tests/query_multimodel.rs` `keys_driver_order_matches_an_entity_enumeration_sorted_by_key` |
 
 ### §4.3 Graph (SQL/PGQ)
@@ -222,18 +231,23 @@ GRAPH partial (6): 2.4, 3.1, 3.4, 6.1, L3, L8. L3 moved from fully unpinned to
 partial with `DROP TABLE`: RESTRICT is now the default of a real delete path
 and CASCADE its explicit, bounded opposite, so what is left unpinned in that
 row is only the single-row `delete(key)`, which still cascades.
-T1 partial (4): `DELETE` RESTRICT; `CREATE INDEX ... adjacency` (the
-`DROP TABLE` half of that row is now pinned by six tests); `<>`;
-`IS NOT NULL`. No T1 row is fully unpinned.
+T1 partial (2): `DELETE` RESTRICT; `CREATE INDEX ... adjacency` (the
+`DROP TABLE` half of that row is now pinned by six tests). `<>` and
+`IS NOT NULL` moved off this list with the boolean atomics
+(`tests/query_boolean.rs`), which also added seven T1 rows to §3. No T1 row
+is fully unpinned.
 | GRAPH_CONTRACT numbered rules (1.1–6.3 and L1–L8; no L7 in that document) | 31 | 18 | 13 |
-| QL_CONTRACT T1 table rows | 32 | 28 | 4 |
-| **Total** | **63** | **46** | **17** |
+| QL_CONTRACT T1 table rows | 39 | 37 | 2 |
+| **Total** | **70** | **55** | **15** |
 
-Unpinned count (rows whose Tests cell contains `UNPINNED`): **17**.
+Unpinned count (rows whose Tests cell contains `UNPINNED`): **15**.
 
 GRAPH fully unpinned (8): 1.3, 2.3, 5.1, 5.2, 5.3, 6.3, L3, L4.
 GRAPH partial (5): 2.4, 3.1, 3.4, 6.1, L8.
-T1 partial (4): `DELETE` RESTRICT; `CREATE INDEX ... adjacency`; `<>`; `IS NOT NULL`. No T1 row is fully unpinned.
+T1 partial (2): `DELETE` RESTRICT; `CREATE INDEX ... adjacency`. No T1 row is
+fully unpinned. The seven §3 boolean rows added with the membership-set
+algebra are pinned by `tests/query_boolean.rs`, `tests/sql_tier1.rs` and
+`tests/sql_explain.rs`.
 
 The four rows the T1 table gained with GRAPH_CONTRACT 4.2 and 4.3 (the two
 inline element `WHERE` forms that are now T1, `COLUMNS (r.<prop>)` and

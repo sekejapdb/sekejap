@@ -80,6 +80,22 @@ pub(super) enum DriverPlan {
         predicate: EncodedScalarFilter,
         position: Option<usize>,
     },
+    /// Walk the membership set of one BOOLEAN filter position, in ascending
+    /// entity id.
+    ///
+    /// The set is already built and already charged when the cursor opens
+    /// (`ensure_membership_sets` runs before any page opens its driver), so
+    /// the walk itself reads no posting and no record: its cost is one
+    /// candidate per member, which is the candidate budget every driver is
+    /// charged against, and nothing else.
+    ///
+    /// Every member is a LIVE row. A set built from postings names rows the
+    /// index still holds an entry for, and a complement is taken against a
+    /// universe that was walked rather than assumed, so a deleted row is in
+    /// neither.
+    Membership {
+        position: usize,
+    },
 }
 
 /// One Hilbert range of a geometry cover, at one ladder level. Walked in
@@ -119,6 +135,7 @@ impl DriverPlan {
             Self::ExactVector { info } => QueryDriver::ExactVector(info.id),
             Self::QuantizedVector { info } => QueryDriver::QuantizedVector(info.id),
             Self::Keys { .. } => QueryDriver::Keys,
+            Self::Membership { position } => QueryDriver::Membership { filter: *position },
         }
     }
 }
@@ -149,6 +166,8 @@ pub(super) fn driver_key(driver: &DriverPlan) -> QueryResult<DriverKey> {
         DriverPlan::Spatial { info, .. } => Ok(DriverKey::Cell(info.id)),
         DriverPlan::Geometry { info, .. } => Ok(DriverKey::GeomCell(info.id)),
         DriverPlan::Keys { .. } => Ok(DriverKey::Key),
+        // The set is walked in ascending sequence, which is entity-id order.
+        DriverPlan::Membership { .. } => Ok(DriverKey::Entity),
         DriverPlan::ExactVector { .. }
         | DriverPlan::QuantizedVector { .. }
         | DriverPlan::Nearest { .. } => Err(invalid_query(
@@ -1269,8 +1288,27 @@ pub(super) struct GeometryCursor<'a> {
     pub(super) done: bool,
 }
 
+/// Walks one built [`MembershipSet`] in ascending entity id.
+///
+/// The set is shared with the prepared query rather than copied per page:
+/// both representations are behind an `Arc`, so opening this cursor costs a
+/// reference count whether the set is a hundred ids or a megabyte of bits.
+pub(super) struct MembershipCursor {
+    pub(super) collection: CollectionId,
+    pub(super) set: MembershipSet,
+    /// The filter position this walk proves, which is the filter whose set
+    /// it is.
+    pub(super) certifies: usize,
+    /// For `Ids`, the next index into the vector; for `Bitmap`, the next
+    /// SEQUENCE to test. One field, because only one representation is ever
+    /// present.
+    pub(super) at: u64,
+    pub(super) done: bool,
+}
+
 pub(super) enum DriverCursor<'a> {
     Entities(EntityCursor<'a>),
+    Membership(MembershipCursor),
     Scalar(ScalarCursor<'a>),
     Spatial(SpatialCursor<'a>),
     Nearest(NearestCursor<'a>),

@@ -52,6 +52,27 @@ impl From<kernel::Error> for Error {
         Self::Kernel(e)
     }
 }
+/// The other direction of `From<Error> for QueryError`, for an atomic that
+/// runs query machinery under the hood and reports in this crate's own error:
+/// a cancellation stays a cancellation and a named budget keeps its three
+/// fields, so nothing is flattened into prose on the way back.
+impl From<crate::query::QueryError> for Error {
+    fn from(value: crate::query::QueryError) -> Self {
+        match value {
+            crate::query::QueryError::Database(error) => error,
+            crate::query::QueryError::Cancelled => Self::Cancelled,
+            crate::query::QueryError::BudgetExceeded {
+                resource,
+                limit,
+                attempted,
+            } => Self::BudgetExceeded {
+                resource,
+                limit,
+                attempted,
+            },
+        }
+    }
+}
 pub type Result<T> = std::result::Result<T, Error>;
 pub(crate) fn invalid(e: impl fmt::Display) -> Error {
     Error::InvalidInput(e.to_string())

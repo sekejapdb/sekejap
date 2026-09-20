@@ -1141,6 +1141,10 @@ fn work_of(w: &QueryWork, r: WorkResource) -> u64 {
         // Aggregates are `tests/query_aggregate.rs`; no query in this file
         // folds groups, so this resource is never charged here.
         WorkResource::Groups => w.groups,
+        // The peak bytes a BOOLEAN filter's intermediate sets held at once.
+        // No combo in this matrix writes one, so it is never charged here
+        // either; `tests/query_boolean.rs` is where it is exercised.
+        WorkResource::MembershipBytes => w.membership_bytes,
         WorkResource::OutputBytes => w.output_bytes,
     }
 }
@@ -1160,6 +1164,11 @@ fn set_budget(mut b: QueryBudget, r: WorkResource, n: u64) -> QueryBudget {
         WorkResource::VectorLanes => b.vector_lanes = n,
         WorkResource::KeyPostings => b.key_postings = n,
         WorkResource::Groups => b.groups = n,
+        // `MembershipBytes` has no `QueryBudget` field on purpose: its
+        // ceiling is the fixed `RUN_BYTES` memory promise, which a caller
+        // cannot raise by asking. It is therefore not in `RESOURCES` and
+        // this arm is never reached.
+        WorkResource::MembershipBytes => {}
         WorkResource::OutputBytes => b.output_bytes = n,
     }
     b
@@ -1262,7 +1271,12 @@ fn expect_zero_primary(combo: &Combo, driver: QueryDriver) -> bool {
                 OwnedOrder::EntityId | OwnedOrder::Driver | OwnedOrder::Distance
             )
         }
-        QueryDriver::Entities | QueryDriver::Geometry { .. } | QueryDriver::Graph { .. } => false,
+        // No combination in this matrix writes a boolean filter, so the
+        // membership driver is never the one Auto picks here.
+        QueryDriver::Entities
+        | QueryDriver::Geometry { .. }
+        | QueryDriver::Membership { .. }
+        | QueryDriver::Graph { .. } => false,
         QueryDriver::ExactVector(_) | QueryDriver::QuantizedVector(_) => {
             matches!(combo.order, OwnedOrder::Bm25)
         }

@@ -24,8 +24,41 @@ impl<'a> DriverCursor<'a> {
         descending: bool,
         nearest: Option<&'a mut crate::index::spatial::point::NearestWalk>,
         geometry_seen: HashSet<u64>,
+        membership: &[MembershipSet],
     ) -> QueryResult<Self> {
         match plan {
+            DriverPlan::Membership { position } => {
+                let set = membership
+                    .get(*position)
+                    .ok_or_else(|| corrupt_query("boolean driver names no filter position"))?;
+                if matches!(
+                    set,
+                    MembershipSet::Ineligible | MembershipSet::Unbuilt | MembershipSet::Overflow
+                ) {
+                    return Err(corrupt_query(
+                        "a boolean driver opened before its membership set was built",
+                    ));
+                }
+                // A resumed page re-yields the row the last one stopped on
+                // and lets `next_page`'s own `after` comparison drop it --
+                // the same shape the entity walk resumes with, and for the
+                // same reason: a set is unique per sequence, so there is no
+                // tie group whose still-owed members lie on the far side.
+                let from = resume.map_or(0, |after| after.id.sequence);
+                let at = match set {
+                    MembershipSet::Ids(ids) => {
+                        ids.partition_point(|sequence| *sequence < from) as u64
+                    }
+                    _ => from.max(1),
+                };
+                Ok(Self::Membership(MembershipCursor {
+                    collection,
+                    set: set.clone(),
+                    certifies: *position,
+                    at,
+                    done: false,
+                }))
+            }
             DriverPlan::Entities => {
                 let prefix = prefix(0x40, collection);
                 let start = match resume {
@@ -369,6 +402,7 @@ impl<'a> DriverCursor<'a> {
         meter: &mut WorkMeter<'_, C>,
     ) -> QueryResult<Option<Candidate>> {
         match self {
+            Self::Membership(cursor) => cursor.next(meter),
             Self::Entities(cursor) => cursor.next(meter),
             Self::Scalar(cursor) => cursor.next(meter),
             Self::Spatial(cursor) => cursor.next(meter),
@@ -395,6 +429,88 @@ impl<'a> DriverCursor<'a> {
         if let Self::Nearest(cursor) = self {
             cursor.walk.note(kept);
         }
+    }
+}
+
+/// How many bits of a membership bitmap one cancellation poll and one
+/// `Candidates` charge cover while the walk is scanning past ZERO bits: 4
+/// KiB of bitmap. The walk's cost is a scan whether or not it finds members,
+/// so this is the unit the scan is charged and interrupted in, the same way a
+/// posting walk is charged per posting.
+const MEMBERSHIP_SCAN_POLL_BITS: u64 = (4 << 10) * 8;
+
+impl MembershipCursor {
+    /// The next member, ascending.
+    ///
+    /// Nothing is read: the set is in memory and the postings that built it
+    /// were charged when it was built. What the walk still owes is the
+    /// cancellation check every other cursor makes per candidate, so a
+    /// complement over a million-row collection is as interruptible as a
+    /// posting range is.
+    pub(super) fn next<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<Candidate>> {
+        if self.done {
+            return Ok(None);
+        }
+        meter.check_cancelled()?;
+        let sequence = match &self.set {
+            MembershipSet::Ids(ids) => match ids.get(self.at as usize) {
+                Some(sequence) => {
+                    self.at += 1;
+                    *sequence
+                }
+                None => {
+                    self.done = true;
+                    return Ok(None);
+                }
+            },
+            MembershipSet::Bitmap(bits) => {
+                let span = (bits.len() as u64).saturating_mul(8);
+                let mut found = None;
+                // Where the current run of zero bits started, so the poll
+                // below is one per MEMBERSHIP_SCAN_POLL_BITS of scanning and
+                // not one per member. A sparse complement over a 67-million
+                // sequence collection is ~8 MiB of zero bits between two
+                // members; without this the whole run happened inside one
+                // uninterruptible, uncharged `next`.
+                let mut polled_at = self.at;
+                while self.at <= span {
+                    let sequence = self.at;
+                    if sequence.saturating_sub(polled_at) >= MEMBERSHIP_SCAN_POLL_BITS {
+                        meter.check_cancelled()?;
+                        meter.charge(WorkResource::Candidates, 1)?;
+                        polled_at = sequence;
+                    }
+                    self.at += 1;
+                    if membership_bitmap_contains(bits, sequence) {
+                        found = Some(sequence);
+                        break;
+                    }
+                }
+                match found {
+                    Some(sequence) => sequence,
+                    None => {
+                        self.done = true;
+                        return Ok(None);
+                    }
+                }
+            }
+            _ => {
+                self.done = true;
+                return Err(corrupt_query(
+                    "a boolean driver walked a membership set that was never built",
+                ));
+            }
+        };
+        Ok(Some(Candidate {
+            satisfied_filter: Some(self.certifies),
+            ..Candidate::bare(EntityId {
+                collection: self.collection,
+                sequence,
+            })
+        }))
     }
 }
 

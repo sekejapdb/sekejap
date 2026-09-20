@@ -110,6 +110,10 @@ impl PreparedQuery<'_> {
             // (`TermPostings::open_from`). Spatial is deliberately NOT here:
             // its cells are walked in cell order, which is not id order.
             (DriverPlan::Text { .. }, CompiledOrder::EntityId) => RankWalk::Exact,
+            // The set is walked in ascending sequence, which is exactly what
+            // an id ranking asks for, and the cursor opens at the member the
+            // last page stopped on.
+            (DriverPlan::Membership { .. }, CompiledOrder::EntityId) => RankWalk::Exact,
             (DriverPlan::Nearest { .. }, CompiledOrder::Distance { .. }) => RankWalk::Exact,
             // Driver order IS the driver's walk order -- that is the whole of
             // what it means -- so every driver that has one walks in rank
@@ -127,7 +131,8 @@ impl PreparedQuery<'_> {
                 | DriverPlan::Geometry { .. }
                 | DriverPlan::Text { .. }
                 | DriverPlan::Graph { .. }
-                | DriverPlan::Keys { .. },
+                | DriverPlan::Keys { .. }
+                | DriverPlan::Membership { .. },
                 CompiledOrder::Driver(_),
             ) => RankWalk::Exact,
             (
@@ -392,6 +397,17 @@ impl PreparedQuery<'_> {
         }
         match &self.driver {
             DriverPlan::Entities => true,
+            // A membership set walked as the driver is the same kind of
+            // membership record a driving scalar range is -- every member
+            // came from a posting, or from the universe a complement was
+            // taken against -- so the winner's row is a question this walk
+            // has answered. An explicit semi-join set is the exception: the
+            // CALLER chose those ids, so a page driven by one keeps the
+            // probe (`SetExpr::proves_live`).
+            DriverPlan::Membership { position } => match self.filters.get(*position) {
+                Some(CompiledFilter::Boolean { expr, .. }) => expr.proves_live(),
+                _ => false,
+            },
             DriverPlan::Scalar {
                 predicate: EncodedScalarFilter::Eq(_) | EncodedScalarFilter::Range { .. },
                 position: Some(_),
@@ -429,6 +445,7 @@ impl PreparedQuery<'_> {
         matches!(
             self.driver,
             DriverPlan::Entities
+                | DriverPlan::Membership { .. }
                 | DriverPlan::Graph { .. }
                 // The text merge emits documents in STRICTLY ascending
                 // sequence and refuses a posting that does not advance -- it
@@ -525,13 +542,45 @@ impl PreparedQuery<'_> {
             | CompiledFilter::Geometry { .. }
             | CompiledFilter::Folded { .. }
             | CompiledFilter::Key { .. } => true,
+            // A BOOLEAN filter is a pure in-memory bit test over a set that
+            // was walked once, before the page started: no posting probe, no
+            // merge, nothing read. It is row-pure in the only sense this
+            // question asks about -- and the "cheap refusal must not stand
+            // behind an expensive one" rule is kept by `boolean_keeps`, which
+            // evaluates it BEFORE the batch is gathered rather than by
+            // disqualifying the batch. Saying false here cost a geometry
+            // query with an `IN (...)` beside it its batch cursor AND its
+            // borrowed row, which is a regression against the same query with
+            // a plain equality.
+            CompiledFilter::Boolean { .. } => true,
             // A text filter rejects from its postings before it looks at a
             // row, so it is a cheap refusal standing in front of the expensive
             // one -- and a PHRASE is not a pure function of the row at all: it
             // needs the merge's frequencies first. A graph filter is a
-            // membership test over a set the traversal already built.
+            // membership test over a set the traversal already built, but the
+            // traversal builds it during the walk, not before it.
             CompiledFilter::Text(_) | CompiledFilter::Graph { .. } => false,
         })
+    }
+    /// Does every BOOLEAN filter admit this candidate?
+    ///
+    /// One binary search or one bit each, against sets that were built before
+    /// the walk started. It is asked before a row is read -- before the batch
+    /// gathers, before the borrowed pass -- so a candidate a bit test rejects
+    /// costs no primary read, which is the whole reason a boolean filter is
+    /// allowed to sit in front of a batched page.
+    fn boolean_keeps(&self, candidate: &Candidate) -> QueryResult<bool> {
+        for (position, filter) in self.filters.iter().enumerate() {
+            if !matches!(filter, CompiledFilter::Boolean { .. })
+                || candidate.satisfied_filter == Some(position)
+            {
+                continue;
+            }
+            if !self.membership[position].contains(candidate.id.sequence)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     /// True when EVERY candidate that survives to the heap has already had its
     /// primary record read, so the winner stage's existence re-fetch is asking
@@ -606,7 +655,12 @@ impl PreparedQuery<'_> {
                 self.membership[position],
                 MembershipSet::Ids(_) | MembershipSet::Bitmap(_)
             ),
-            CompiledFilter::Graph { .. } | CompiledFilter::Folded { .. } => false,
+            // A boolean filter is a set lookup by construction: a leaf an
+            // index cannot answer is refused while the filter is compiled,
+            // so there is no row read here to declare.
+            CompiledFilter::Graph { .. }
+            | CompiledFilter::Folded { .. }
+            | CompiledFilter::Boolean { .. } => false,
             // Certified straight from the mapping entry at the driving
             // position, which `_ if Some(position) == driving` already caught
             // above. Anywhere else it is answered from the external key the
@@ -1042,6 +1096,7 @@ impl PreparedQuery<'_> {
             reverse,
             nearest_walk.as_mut(),
             geometry_seen,
+            &self.membership,
         )?;
         // Whether a kept candidate should carry its row into the heap.
         let wants_rows = !self.projection.is_empty();
@@ -1176,6 +1231,11 @@ impl PreparedQuery<'_> {
                     && !keep_batch_rows
                     && self.a_filter_reads_the_row()
                     && self.filters_are_row_pure();
+                // Only pay the per-candidate bit test when there is one.
+                let has_boolean = self
+                    .filters
+                    .iter()
+                    .any(|filter| matches!(filter, CompiledFilter::Boolean { .. }));
                 // Only a filtered nearest walk has a use for how often its
                 // hits are rejected, so only it pays the per-candidate call.
                 let reports_acceptance =
@@ -1195,6 +1255,13 @@ impl PreparedQuery<'_> {
                                     return Err(corrupt_query(
                                         "query driver crossed collection boundary",
                                     ));
+                                }
+                                // The bit test comes BEFORE the row read, so
+                                // a candidate a boolean filter rejects never
+                                // joins the batch and never costs a primary
+                                // read. See `boolean_keeps`.
+                                if has_boolean && !self.boolean_keeps(&candidate)? {
+                                    continue;
                                 }
                                 batch.push(candidate);
                             }
@@ -1220,13 +1287,36 @@ impl PreparedQuery<'_> {
                         }
                         batch.pop().expect("the batch was just filled")
                     } else {
-                        let Some(candidate) = driver.next(&mut meter)? else {
+                        let mut taken = None;
+                        while taken.is_none() {
+                            let Some(candidate) = driver.next(&mut meter)? else {
+                                break;
+                            };
+                            meter.charge(WorkResource::Candidates, 1)?;
+                            if candidate.id.collection != self.collection {
+                                return Err(corrupt_query(
+                                    "query driver crossed collection boundary",
+                                ));
+                            }
+                            // The same bit test the batch gathers behind, on
+                            // the walk that reads one row at a time: a
+                            // candidate a boolean filter rejects must not
+                            // reach the row read that stands behind it. A
+                            // filtered NEAREST walk is the exception -- it
+                            // sizes its next ring from `note_kept`, which
+                            // this shortcut would not call -- so it keeps the
+                            // full per-candidate path.
+                            if has_boolean
+                                && !reports_acceptance
+                                && !self.boolean_keeps(&candidate)?
+                            {
+                                continue;
+                            }
+                            taken = Some(candidate);
+                        }
+                        let Some(candidate) = taken else {
                             break 'walk;
                         };
-                        meter.charge(WorkResource::Candidates, 1)?;
-                        if candidate.id.collection != self.collection {
-                            return Err(corrupt_query("query driver crossed collection boundary"));
-                        }
                         candidate
                     };
                     let mut encoded = candidate.row.take();
@@ -1564,12 +1654,17 @@ impl PreparedQuery<'_> {
                 position.filter(|_| prepared.matching != TextMatch::Phrase)
             }
             DriverPlan::Keys { position, .. } => *position,
+            DriverPlan::Membership { position } => Some(*position),
         }
     }
 
     fn driver_detail(&self) -> String {
         match &self.driver {
             DriverPlan::Entities => "primary tree, every row of the collection".to_owned(),
+            DriverPlan::Membership { position } => format!(
+                "membership set of filter {position} ({}), ascending entity id",
+                self.membership[*position].describe()
+            ),
             DriverPlan::Scalar {
                 info, predicate, ..
             } => format!(
@@ -1709,6 +1804,10 @@ impl PreparedQuery<'_> {
             CompiledFilter::Graph { .. } => FilterAnswer::GraphFrontier,
             CompiledFilter::JsonEq { .. } => FilterAnswer::Row,
             CompiledFilter::Key { .. } => FilterAnswer::Driver,
+            // Only reachable before the first page has run: a boolean
+            // filter's set is marked `Unbuilt` at prepare and walked before
+            // any candidate is offered.
+            CompiledFilter::Boolean { .. } => FilterAnswer::MembershipUnbuilt,
             CompiledFilter::Folded { into } => FilterAnswer::Folded(*into),
         }
     }
@@ -1791,6 +1890,18 @@ impl PreparedQuery<'_> {
                         None,
                         None,
                         scalar_predicate_text(predicate),
+                    ),
+                    // The algebra, then the set it was walked into: the
+                    // shape a caller wrote and the size it cost.
+                    CompiledFilter::Boolean { expr, shape } => (
+                        "boolean",
+                        None,
+                        None,
+                        format!(
+                            "{shape}: {} -> {}",
+                            expr.describe(),
+                            self.membership[position].describe()
+                        ),
                     ),
                 };
                 FilterPlan {
