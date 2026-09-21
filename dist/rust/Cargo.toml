@@ -1,23 +1,19 @@
 [package]
-name = "sekejap-lang"
+name = "sekejap"
+description = "sekejap: the compact typed embedded database -- one crate over the core, language and distribution layers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository = "https://github.com/sekejapdb/sekejap"
 publish = false
 
-[lib]
-name = "sekejap_lang"
-path = "src/lib.rs"
-
 [dependencies]
-sekejap-core = { path = "../core/engine" }
-serde_json = { version = "1", features = ["float_roundtrip"] }
-
-[dev-dependencies]
-kernel = { package = "sekejap-kernel", path = "../core/kernel", features = ["test-support"] }
-tempfile = "3"
+sekejap-core = { path = "../../core/engine" }
+sekejap-lang = { path = "../../lang" }
+sekejap-dist = { path = ".." }
 
 [features]
+default = []
 sqlite-balance = ["sekejap-core/sqlite-balance"]
 compact-cells = ["sekejap-core/compact-cells"]
 keyspace-append = ["sekejap-core/keyspace-append"]

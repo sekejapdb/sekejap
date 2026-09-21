@@ -22,7 +22,7 @@ validate)
   cp "$CARGO_TARGET_DIR/release/collections" "$art/collections-baseline"
   cd "$root/write-src"
   export CARGO_TARGET_DIR="$root/write-current-target"
-  cargo test --release --offline -p kernel --features sqlite-balance,compact-cells --lib --test resource_limits -- --test-threads=1 > "$art/kernel-tests.log" 2>&1
+  cargo test --release --offline -p sekejap-kernel --features sqlite-balance,compact-cells --lib --test resource_limits -- --test-threads=1 > "$art/kernel-tests.log" 2>&1
   cargo test --release --offline -p sekejap-core --features sqlite-balance,compact-cells --lib --test collections --test delete_packing --test write_path -- --test-threads=1 > "$art/collection-tests.log" 2>&1
   cargo build -p sekejap-dist --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/current-build.log" 2>&1
   cp "$CARGO_TARGET_DIR/release/collections" "$art/collections-current"

@@ -17,7 +17,7 @@ cargo build -p sekejap-dist --release --offline --features sqlite-balance,compac
 cp "$CARGO_TARGET_DIR/release/collections" "$art/candidate"
 # Same accepted engine and harness as the prior measured loop; fingerprint it.
 cp "$root/artifacts/freelist-20260912/baseline" "$art/baseline"
-cargo test --release --offline -p kernel --features sqlite-balance,compact-cells --lib --test persistent_free --test freelist --test resource_limits --test snapshot --no-fail-fast -- --test-threads=1 > "$art/tests.log" 2>&1
+cargo test --release --offline -p sekejap-kernel --features sqlite-balance,compact-cells --lib --test persistent_free --test freelist --test resource_limits --test snapshot --no-fail-fast -- --test-threads=1 > "$art/tests.log" 2>&1
 cargo test --release --offline --features sqlite-balance,compact-cells --test delete_packing --test overflow_lifecycle --test recovery_faults --test write_path --no-fail-fast -- --test-threads=1 >> "$art/tests.log" 2>&1
 echo 0 > "$art/tests.status"
 sha256sum "$art/baseline" "$art/candidate" > "$art/binary.sha256"

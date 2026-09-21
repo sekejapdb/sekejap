@@ -45,7 +45,7 @@ path = "src/cli/lifecycle.rs"
 [dependencies]
 sekejap-core = { path = "../core/engine" }
 sekejap-lang = { path = "../lang" }
-kernel = { path = "../core/kernel" }
+kernel = { package = "sekejap-kernel", path = "../core/kernel" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 crc32c = "0.6"

@@ -16,7 +16,7 @@ printf '[source.crates-io]\nreplace-with="vendored-sources"\n[source.vendored-so
 cd "$art/src"
 uname -a > "$art/platform.txt"
 sha256sum "$task_root/artifacts/scan-trace-source-20260914.tar.gz" > "$art/source.sha256"
-cargo test --release --offline --features sqlite-balance,compact-cells,test-support -p kernel --test law1_heap --no-run > "$art/build.log" 2>&1
+cargo test --release --offline --features sqlite-balance,compact-cells,test-support -p sekejap-kernel --test law1_heap --no-run > "$art/build.log" 2>&1
 for binary in "$CARGO_TARGET_DIR"/release/deps/law1_heap-*; do
  if [ -x "$binary" ] && [ -f "$binary" ]; then
   sha256sum "$binary" > "$art/binary.sha256"

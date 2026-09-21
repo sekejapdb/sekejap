@@ -307,15 +307,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernel"
-version = "0.17.0"
-dependencies = [
- "crc32c",
- "libc",
- "tempfile",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -621,15 +612,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "sekejap"
+version = "0.17.0"
+dependencies = [
+ "sekejap-core",
+ "sekejap-dist",
+ "sekejap-lang",
+]
+
+[[package]]
 name = "sekejap-bench"
 version = "0.17.0"
 dependencies = [
  "crc32c",
- "kernel",
  "postgres",
  "rusqlite",
  "sekejap-core",
  "sekejap-dist",
+ "sekejap-kernel",
  "sekejap-lang",
  "serde_json",
  "tempfile",
@@ -642,8 +642,8 @@ dependencies = [
  "crc32c",
  "geographiclib-rs",
  "getrandom",
- "kernel",
  "postgres",
+ "sekejap-kernel",
  "serde_json",
  "tempfile",
 ]
@@ -653,11 +653,20 @@ name = "sekejap-dist"
 version = "0.17.0"
 dependencies = [
  "crc32c",
- "kernel",
  "rusqlite",
  "sekejap-core",
+ "sekejap-kernel",
  "sekejap-lang",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "sekejap-kernel"
+version = "0.17.0"
+dependencies = [
+ "crc32c",
+ "libc",
  "tempfile",
 ]
 
@@ -665,8 +674,8 @@ dependencies = [
 name = "sekejap-lang"
 version = "0.17.0"
 dependencies = [
- "kernel",
  "sekejap-core",
+ "sekejap-kernel",
  "serde_json",
  "tempfile",
 ]

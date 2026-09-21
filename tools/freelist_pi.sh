@@ -22,7 +22,7 @@ done
 cd "$root/free-candidate-src"
 # Preserve negative safety findings; they remain a reason not to promote.
 set +e
-cargo test --release --offline -p kernel --features sqlite-balance,compact-cells --lib --test embedded_free --test freelist --test resource_limits --no-fail-fast -- --test-threads=1 > "$art/tests.log" 2>&1
+cargo test --release --offline -p sekejap-kernel --features sqlite-balance,compact-cells --lib --test embedded_free --test freelist --test resource_limits --no-fail-fast -- --test-threads=1 > "$art/tests.log" 2>&1
 test_status=$?
 set -e
 echo "$test_status" > "$art/tests.status"

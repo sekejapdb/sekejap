@@ -230,7 +230,7 @@ cargo test --manifest-path sekejap-e4/Cargo.toml --lib collections::
 cargo test --manifest-path sekejap-e4/Cargo.toml --lib pagewal::
 cargo test --manifest-path sekejap-e4/Cargo.toml --test pagewal --test pagewal_recovery_identity --test pagewal_repair --test pagewal_transaction_capacity
 cargo test --manifest-path sekejap-e4/Cargo.toml --test schema_recovery --test recovery_faults
-cargo test --manifest-path sekejap-e4/Cargo.toml -p kernel
+cargo test --manifest-path sekejap-e4/Cargo.toml -p sekejap-kernel
 cargo build --manifest-path sekejap-e4/Cargo.toml --bins
 ```
 Repeat with `--features compact-cells,sqlite-balance`. The in-module

@@ -69,7 +69,7 @@ F=compact-cells,sqlite-balance,keyspace-append,slotref-split
 cargo build  --workspace --all-targets --features $F     # everything compiles
 cargo test   -p sekejap-core  --features $F -- --test-threads=1
 cargo test   -p sekejap-lang  --features $F -- --test-threads=1
-cargo test   -p kernel        --features test-support -- --test-threads=1
+cargo test   -p sekejap-kernel        --features test-support -- --test-threads=1
 cargo test   --workspace      --features $F -- --test-threads=1
 ```
 
@@ -88,6 +88,6 @@ python3 tools/run_foundation.py lean <scratch>
 Its command groups live in `docs/FOUNDATION_LEAN_GROUPS.json`. The engine
 groups (`pager`, `typed`, `compatibility`) name no package, so they resolve to
 `default-members`, which is `core/engine`; the kernel groups already said
-`-p kernel`. The harness it builds, `foundation_scale`, is now a `bench`
+`-p sekejap-kernel`. The harness it builds, `foundation_scale`, is now a `bench`
 binary, so the gate builds it with `-p sekejap-bench`. The standard itself is
 `docs/core/FOUNDATION_TEST_STANDARD.md`.

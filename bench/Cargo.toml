@@ -9,7 +9,7 @@ publish = false
 sekejap-core = { path = "../core/engine" }
 sekejap-lang = { path = "../lang" }
 sekejap-dist = { path = "../dist" }
-kernel = { path = "../core/kernel" }
+kernel = { package = "sekejap-kernel", path = "../core/kernel" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 crc32c = "0.6"
@@ -20,7 +20,7 @@ postgres = "0.19"
 
 [dev-dependencies]
 tempfile = "3"
-kernel = { path = "../core/kernel", features = ["test-support"] }
+kernel = { package = "sekejap-kernel", path = "../core/kernel", features = ["test-support"] }
 
 [features]
 sqlite-balance = ["sekejap-core/sqlite-balance", "sekejap-lang/sqlite-balance", "sekejap-dist/sqlite-balance"]
