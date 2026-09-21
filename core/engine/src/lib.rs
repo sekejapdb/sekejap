@@ -10,6 +10,13 @@ pub mod store;
 pub use crate::index::spatial::{geometry as spatial_geometry, math as spatial_math};
 pub use crate::store as collection_backend;
 pub use crate::store::{pagewal, recovery};
+/// The store configuration `Database::create` and `Database::open` take, and
+/// the two enumerations inside it. They belong to `kernel`, which is below
+/// this crate; a caller of `Database::create(path, Config)` that depends on
+/// `sekejap-core` alone could not NAME the parameter without reaching past
+/// the layer it depends on, so the names leave the crate here.
+pub use kernel::io::IoMode;
+pub use kernel::store::{Config, SyncMode};
 pub(crate) use crate::index::text::analyzer as text_analyzer;
 pub(crate) use crate::index::vector::quant as vector_quant;
 pub(crate) use crate::store::{dense_v3, scalar_key};

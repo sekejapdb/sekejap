@@ -118,7 +118,19 @@ impl Compiler<'_> {
         Ok(out)
     }
 
-    pub(super) fn create_table(&mut self, table: String, columns: Vec<ColumnDef>) -> SqlResult2<WritePlan> {
+    pub(super) fn create_table(
+        &mut self,
+        table: String,
+        columns: Vec<ColumnDef>,
+        if_not_exists: bool,
+    ) -> SqlResult2<WritePlan> {
+        // The catalog probe, run before anything is compiled: a table that is
+        // already there is a NOTICE, not a refusal and not a second create.
+        if if_not_exists && self.db.collection(&table)?.is_some() {
+            return Ok(WritePlan::Notice(format!(
+                "CREATE TABLE IF NOT EXISTS {table}: the collection is already in the catalog, so nothing was created"
+            )));
+        }
         let mut fields = Vec::with_capacity(columns.len());
         let mut declared: Vec<(String, String)> = Vec::new();
         let mut rules: Vec<(String, ColumnRule)> = Vec::new();

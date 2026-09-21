@@ -1484,6 +1484,27 @@ impl Database {
         }
         Ok(Some(id))
     }
+    /// Every collection name the catalog holds, in key order.
+    ///
+    /// The name keyspace (tag `0x10`, `name_key`) is one entry per collection
+    /// and nothing else, so this is a walk of the catalog and not of a single
+    /// row. It is bounded by the number of collections, which the catalog
+    /// bounds; it reads no row and opens no index.
+    pub fn list_collections(&self) -> Result<Vec<String>> {
+        let prefix = [0x10u8];
+        let mut out = Vec::new();
+        for row in self.store()?.range(&prefix)? {
+            let (k, _) = row?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            match std::str::from_utf8(&k[1..]) {
+                Ok(name) => out.push(name.to_owned()),
+                Err(_) => return Err(corrupt("collection-name encoding")),
+            }
+        }
+        Ok(out)
+    }
     pub fn collection_info(&self, id: CollectionId) -> Result<CollectionInfo> {
         let c = self.catalog(id)?;
         let mut layout = self.layout(c.layout)?.as_ref().clone();

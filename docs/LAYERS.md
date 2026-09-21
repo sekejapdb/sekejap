@@ -4,7 +4,7 @@ The repository is three layers. Each is a crate, and the dependency direction
 between them is enforced by the compiler, not by a convention:
 
 ```
-dist  ->  lang  ->  core
+dist/rust  ->  dist  ->  lang  ->  core
 ```
 
 Never the reverse. `core` cannot name anything in `lang`, and `lang` cannot
@@ -20,6 +20,7 @@ measures.
 | `core/engine/` | `sekejap-core` | `sekejap_core` | The engine: the row codec, the store, typed collections, the index families, the query engine, the fault suites. |
 | `lang/` | `sekejap-lang` | `sekejap_lang` | The query language: lexer, AST, parser, compiler, `EXPLAIN`, the refusal table, the SQL functions. |
 | `dist/` | `sekejap-dist` | `sekejap_dist` | Distribution: the operator binaries in `src/cli/`, the embedded service in `src/service/` (`docs/dist/OPS_CONTRACT.md` §1-§5), and the one surface this layer owes but does not yet build (`src/pg/`). |
+| `dist/rust/` | `sekejap` | `sekejap` | THE PUBLISHED CRATE, 0.17.0: one handle (`Db`), one error, documents as `serde_json::Value`, SQL with `$n` parameters, edges through the graph atomics. Its whole surface, with the E4 call each item maps to, is `docs/dist/RUST_API.md`. It adds no execution. |
 | `bench/` | `sekejap-bench` | -- | Every benchmark, fixture generator and probe, as binaries. |
 
 The workspace at the root is virtual: it owns `members`,
@@ -50,6 +51,16 @@ be an inherent `impl` here -- the orphan rule forbids it. They are the
 `SqlDatabase` trait instead, with the same names and signatures; a caller adds
 `use sekejap_lang::SqlDatabase;` and changes nothing else.
 
+**dist/rust** -- the one crate an application depends on. It composes `core`,
+`lang` and `dist` into a surface an application can hold: `Db::open` (or
+`Db::open_service` for parallel readers), `put`/`get`/`delete`/`scan` by
+collection and key, `execute`/`query`/`stream`/`explain`, `link`/`unlink`/
+`neighbours`, `collections`/`describe`, the three `scan_count_*` walks that are
+named as walks, and `Tx` for many writes under one barrier. Every `Db::` write
+commits before it returns. A construct with no atomic is REFUSED by name
+(`sekejap::Error::Refused`), never emulated. Contract: `docs/dist/RUST_API.md`;
+test file: `dist/rust/tests/api.rs`.
+
 **dist** -- anything an operator or a foreign runtime touches. The binaries in
 `dist/src/cli/` (`sekejap`, `recover`, `collection_inspect`, `collections`,
 `control_tree_audit`, `pagewal_repair`, `entry`, `lifecycle`), the embedded
@@ -67,6 +78,7 @@ export CARGO_TARGET_DIR=... TMPDIR=...
 F=compact-cells,sqlite-balance,keyspace-append,slotref-split
 
 cargo build  --workspace --all-targets --features $F     # everything compiles
+cargo test   -p sekejap        --features $F -- --test-threads=1
 cargo test   -p sekejap-core  --features $F -- --test-threads=1
 cargo test   -p sekejap-lang  --features $F -- --test-threads=1
 cargo test   -p sekejap-kernel        --features test-support -- --test-threads=1

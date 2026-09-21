@@ -168,7 +168,11 @@ impl Compiler<'_> {
             Stmt::ExplainWrite(write) => Plan::ExplainText(self.explain_write(*write)?),
             Stmt::BeginBulk => Plan::Write(WritePlan::BeginBulk),
             Stmt::EndBulk => Plan::Write(WritePlan::EndBulk),
-            Stmt::CreateTable { table, columns } => Plan::Write(self.create_table(table, columns)?),
+            Stmt::CreateTable {
+                table,
+                columns,
+                if_not_exists,
+            } => Plan::Write(self.create_table(table, columns, if_not_exists)?),
             Stmt::CreateIndex {
                 name,
                 table,

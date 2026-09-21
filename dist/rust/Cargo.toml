@@ -11,9 +11,17 @@ publish = false
 sekejap-core = { path = "../../core/engine" }
 sekejap-lang = { path = "../../lang" }
 sekejap-dist = { path = ".." }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
+[dev-dependencies]
+tempfile = "3"
+
+# The four storage features are the configuration every E4 test group runs
+# under (`docs/LAYERS.md`), so the published crate ships that configuration
+# rather than a second, untested one. Each is additive on disk
+# (`docs/core/FORMAT_FREEZE.md`); `default-features = false` switches them off.
 [features]
-default = []
+default = ["compact-cells", "sqlite-balance", "keyspace-append", "slotref-split"]
 sqlite-balance = ["sekejap-core/sqlite-balance"]
 compact-cells = ["sekejap-core/compact-cells"]
 keyspace-append = ["sekejap-core/keyspace-append"]

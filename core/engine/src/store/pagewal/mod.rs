@@ -807,7 +807,21 @@ impl PageWalStore {
     fn install_codec(pool:&BufferPool,features:u64){ pool.set_compact_cells(features & COMPACT_CELLS != 0); }
     fn open_inner(dir:&Path,create:bool,cache:usize,create_codec:Option<u64>,opener:impl FnOnce(&Path)->Result<Arc<Pager>>,
         check:impl FnOnce(&Self)->Result<()>)->Result<Self>{
-        if create {std::fs::create_dir(dir)?;}
+        if create {
+            // A create makes the directory, so a half-made one can never be
+            // mistaken for a database. A directory the CALLER already made
+            // and left empty is the same create: the three store files are
+            // what say a database is there, and `Pager::initialize` refuses
+            // if `data` or `wal` already carries a byte.
+            match std::fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && !dir.join("data").exists()
+                    && !dir.join("wal").exists()
+                    && !dir.join("writer.lock").exists() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         else { for name in ["data","wal","writer.lock"] { std::fs::metadata(dir.join(name))?; } }
         // Recovery window: an existing gate is taken exclusively BEFORE
         // ownership is claimed and held through inspection, the caller's

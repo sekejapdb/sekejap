@@ -543,3 +543,50 @@ thread-local error. That is a comment fix, not a new ABI.
 D1 workers: DML `brief-dml.md`, SERVICE `brief-service.md`, SCHEMA
 `brief-schema.md`. SHOW, trim_memory, write_trace, change feed, interrupt
 are OPS order-of-work items 4-8 (`OPS_CONTRACT.md:508-521`), not D1.
+
+---
+
+## 7. The Rust facade column
+
+`dist/rust` (`sekejap` 0.17.0, `docs/dist/RUST_API.md`) is a SECOND surface
+over the same three layers, for a caller that links Rust rather than C. It is
+NOT a Rust port of this header: the C ABI keeps e1's shape so existing C
+callers stay valid, and the Rust crate is E4's own design -- collection and key
+instead of a slug string, `serde_json::Value` in and out, `$n` parameters, one
+`Result`, and a refusal by name wherever E4 has no atomic.
+
+The two surfaces therefore share the ENGINE CALLS this document maps, not the
+signatures. The column below says, for each row of §1, whether the Rust facade
+implements the same engine call today and under what name.
+
+| §1 row | Rust facade | name in `sekejap` 0.17.0 |
+|---|---|---|
+| 1, 2 open / open_paged | yes | `Db::open`, `Db::open_with` (E4 has one store; there is no second "resident" layout) |
+| 3 close | yes | `Db::close` |
+| 4 open_read_only | no | not offered: a snapshot handle is what `Db::open_service` gives every reader, and a read-only DATABASE has no separate opener here |
+| 5, 7 execute / execute_params | yes, merged | `Db::execute(sql, &[Value])` -- one call takes the parameters whether or not there are any |
+| 6, 8 query / query_params | yes, merged | `Db::query(sql, &[Value]) -> Rows` (columns + typed values, not a JSON string) |
+| 9, 10, 11 prepare / query_prepared / stmt_free | partly | `Db::stream(sql, params, page_rows, &mut f)` pages a statement without holding its answer; there is no reusable statement HANDLE, because a compiled SELECT owns what its request borrows (`lang/src/lib.rs:362`) |
+| 12 show | yes, as data | `Db::collections()` and `Db::describe(name)`. The SHOW family is not SQL here (`QL_CONTRACT` §2); the same facts are returned as `Vec<String>` and `Collection` |
+| 13 get | yes | `Db::get(addr) -> Option<Value>` -- the document, with `_key` set |
+| 14 put | yes | `Db::put(addr, &Value)`, committed before it returns |
+| 15 put_many | yes | `Db::put_many(collection, rows)`: N puts, ONE commit, and a failure stores none of the batch |
+| 16 remove | yes | `Db::delete(addr) -> bool` |
+| 17, 18 link / link_meta | yes, merged | `Db::link(from, type, to)` and `Db::link_with(.., &Value)`. Both endpoints must EXIST (`validate_endpoints`); a missing one is `Error::UnknownRow`, not a dangling identity |
+| 19 unlink | yes | `Db::unlink(from, type, to) -> bool` |
+| 20 contains | yes | `Db::exists(addr) -> bool` |
+| 21 node_count | yes, NAMED as a scan | `Db::scan_count_rows(collection)`, `Db::scan_count_all_rows()`. E4 keeps no O(1) counter (OPS §6.1), and the method name says so |
+| 22 edge_count | yes, NAMED as a scan | `Db::scan_count_edges()`, over `Database::scan_count_edges` |
+| 23 collection_names | yes | `Db::collections()`, over `Database::list_collections` (new; §9 of `RUST_API.md`) |
+| 24 schema_ddl | no, as data instead | `Db::describe(name) -> Collection` gives the fields, kinds, declared spellings and indexes; rendering DDL text from them is the caller's |
+| 25 compact | yes | `Db::checkpoint() -> bool`. `false` = a live reader holds a slot and the fold is DEFERRED, which in service mode is every call |
+| 26 trim_memory | REFUSED, by absence and by documentation | `RUST_API.md` §7 lists it: E4 holds nothing proportional to rows to trim (OPS §6.3) |
+| 27 sync | folded into every write | every `Db::` write commits with a FULL barrier before it returns; `Db::publish()` is the separate step that makes a commit visible to a snapshot reader |
+| 28, 29, 30 last_error / string_free / version | n/a | Rust returns `Result<_, sekejap::Error>` and owns its own strings; `sekejap::VERSION` is the version |
+| 31-40 engine_* | yes, as a MODE | `Db::open_service` is `ServiceDatabase` (OPS §1-§5) behind the same `Db` calls; `Db::service()` hands out the change feed, the interrupt and the statement timeout |
+| 32 engine_open_memory | REFUSED | E4 is disk-first; `Db::open` takes a directory (`RUST_API.md` §1, §7) |
+| 41 engine_last_error | n/a | as 28-30 |
+
+Nothing in §1-§6 above changes: the C header's ownership rules, its sentinels
+and its JSON envelope are what a C caller still gets. A row marked "no" here is
+a row the Rust facade answers differently, not a row E4 cannot serve.

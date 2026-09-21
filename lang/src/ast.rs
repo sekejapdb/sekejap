@@ -709,6 +709,9 @@ pub(super) enum Stmt {
     CreateTable {
         table: String,
         columns: Vec<ColumnDef>,
+        /// `IF NOT EXISTS`: a catalog probe decides, and a table that is
+        /// already there raises a NOTICE rather than an error.
+        if_not_exists: bool,
     },
     CreateIndex {
         name: String,

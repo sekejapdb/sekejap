@@ -618,6 +618,8 @@ dependencies = [
  "sekejap-core",
  "sekejap-dist",
  "sekejap-lang",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

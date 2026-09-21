@@ -23,13 +23,16 @@ impl Parser {
 
     fn create_table(&mut self) -> SqlResult2<Stmt> {
         self.expect_word("TABLE")?;
-        if self.eat_word("IF") {
+        // The catalog probe this needs is `Database::collection(name)`, which
+        // answers `Option<CollectionId>` without reading a row: the same
+        // probe `DROP TABLE IF EXISTS` uses, run the other way round.
+        let if_not_exists = if self.eat_word("IF") {
             self.expect_word("NOT")?;
             self.expect_word("EXISTS")?;
-            return Err(SqlError::unsupported(
-                "CREATE TABLE IF NOT EXISTS: `Database::create_collection` refuses a duplicate name and there is no catalog probe that makes the refusal conditional",
-            ));
-        }
+            true
+        } else {
+            false
+        };
         let table = self.name()?;
         self.expect(&Tok::LParen)?;
         let mut columns = Vec::new();
@@ -40,7 +43,11 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen)?;
-        Ok(Stmt::CreateTable { table, columns })
+        Ok(Stmt::CreateTable {
+            table,
+            columns,
+            if_not_exists,
+        })
     }
 
     /// One column: a name, a type, and the clauses after it. `DEFAULT` and

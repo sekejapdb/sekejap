@@ -10,7 +10,8 @@ layer owns what and how to run each layer's tests; this document is the module
 map inside them. The crate a path belongs to reads off its first segment:
 `core/kernel/` is `kernel`, `core/engine/` is `sekejap-core` (lib
 `sekejap_core`), `lang/` is `sekejap-lang` (lib `sekejap_lang`), `dist/` is
-`sekejap-dist`, `bench/` is `sekejap-bench`.
+`sekejap-dist`, `dist/rust/` is `sekejap` (the PUBLISHED crate name), `bench/`
+is `sekejap-bench`.
 
 Contract documents referenced below: `docs/core/GRAPH_CONTRACT.md`,
 `docs/lang/QL_CONTRACT.md` (the query-language contract, drafted 2026-09-20;
@@ -128,6 +129,22 @@ this layer is for. `dist/src/cli/` (the operator binaries) and
 | `dist/src/service/interrupt.rs` | `InterruptHandle`: the cloneable `Arc<AtomicBool>` a second thread holds, sticky until cleared, one relaxed load per charge. | `docs/dist/OPS_CONTRACT.md` §4 |
 | `dist/src/service/changes.rs` | The change feed: `ChangeEvent`, `ChangedKey`, `Receiver`, the per-subscriber bounded queue (`CHANGE_QUEUE_BOUND` = 256) and the per-event key cap (`CHANGE_KEY_CAP` = 1,024), the `PendingBatch` accumulator a commit drains and a rollback drops, and `Subscribers::deliver`, which never waits for a slow subscriber. | `docs/dist/OPS_CONTRACT.md` §5 |
 | `dist/tests/service.rs` | One test per rule §1-§5 states, with the oracle held in the test process: the L6 reader, the measured publish window, the `Deadline` refusal and its elapsed microseconds, the cross-thread cancel, one event per commit and none on rollback, the counted `lagged` drop, and the second-writer refusals. | `docs/dist/OPS_CONTRACT.md` §1-§5, `docs/core/FOUNDATION_TEST_STANDARD.md` L3, L4, L6 |
+
+## `dist/rust/src/` -- the published crate
+
+`docs/dist/RUST_API.md`, built here because a crate an application depends on
+is exactly what the outermost layer is for. It adds no execution: every item is
+a composition of calls `core`, `lang` and `dist` already export.
+
+| Module | Atomic | Contract |
+| --- | --- | --- |
+| `dist/rust/src/lib.rs` | The crate root: the layer re-exports, `Mode`, `Addr` (a row's collection and key as ONE argument), `Document`, `Storage`, and the names re-exported so a caller needs no second dependency (`Config`, `FieldKind`, `EntityId`, `Direction`, `IndexFamily`, `SqlValue`, `Param`, `SqlError`, `Tier`). | `docs/dist/RUST_API.md` |
+| `dist/rust/src/db.rs` | `Db` and `Tx`: the two backings (`Mutex<Database>`, `ServiceDatabase`), the read and write paths every call funnels through, durability per call, the document round trip through `_key`, and the three `scan_count_*` walks. | `docs/dist/RUST_API.md` §1-§7 |
+| `dist/rust/src/rows.rs` | `Rows`, `Row` and the two conversions: a `serde_json::Value` into a `Param` by the stated rule, and a `SqlValue` back into JSON with MISSING omitted rather than nulled. | `docs/dist/RUST_API.md` §3 |
+| `dist/rust/src/scan.rs` | `Scan`: one collection in id order, one page of rows held at a time. | `docs/dist/RUST_API.md` §2 |
+| `dist/rust/src/catalog.rs` | `Collection`, `Field`, `Index`: the catalog as data. | `docs/dist/RUST_API.md` §5 |
+| `dist/rust/src/error.rs` | `Error` and `Result`: one error type, with a refusal that carries both what was asked for and why there is no atomic. | `docs/dist/RUST_API.md` §8 |
+| `dist/rust/tests/api.rs` | One test per section of `RUST_API.md`, against a `BTreeMap`/`BTreeSet` oracle held in the test process. | `docs/dist/RUST_API.md`, `docs/core/FOUNDATION_TEST_STANDARD.md` L1, L4, L8 |
 
 ## `core/engine/src/faults/` -- in-crate fault injection
 

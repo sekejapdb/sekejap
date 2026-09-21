@@ -1507,6 +1507,24 @@ impl Database {
         self.finish(result)
     }
 
+    /// Count every edge in the store by WALKING the primary edge keyspace.
+    ///
+    /// A SCAN, named as one (`docs/dist/OPS_CONTRACT.md` §6.1): E4 keeps no
+    /// O(1) edge counter, and the walk is linear in the number of edges. Only
+    /// the primary direction is counted, so an edge is counted once and not
+    /// twice. It lives here because the keyspace tag is this module's own.
+    pub fn scan_count_edges(&self) -> Result<u64> {
+        let prefix = [PRIMARY_EDGE];
+        let mut seen = 0u64;
+        for row in self.store()?.range(&prefix)? {
+            let (k, _) = row?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            seen += 1;
+        }
+        Ok(seen)
+    }
     pub fn delete_edge(&mut self, key: EdgeKey) -> Result<bool> {
         self.user_write()?;
         let h = self.graph_header()?;
