@@ -593,3 +593,269 @@ fn the_crate_names_disk_format_two_and_every_page_it_writes_carries_it() {
         );
     }
 }
+
+// ── §3 prepared statements and the bounded plan cache ─────────────────────
+
+/// One collection of `n` rows, declared and filled through SQL, with a
+/// scalar index so a `WHERE` predicate has one to name.
+fn prepared_fixture(db: &Db, n: i64) -> BTreeMap<i64, Vec<String>> {
+    db.execute("CREATE TABLE item (label TEXT, bucket INT)", &[])
+        .expect("create table");
+    db.execute("CREATE INDEX item_bucket ON item USING btree(bucket)", &[])
+        .expect("create index");
+    let mut oracle: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for i in 0..n {
+        let key = format!("i{i:04}");
+        let bucket = i % 5;
+        db.execute(
+            "INSERT INTO item (_key, label, bucket) VALUES ($1, $2, $3)",
+            &[json!(key), json!(format!("label {i}")), json!(bucket)],
+        )
+        .expect("insert");
+        oracle.entry(bucket).or_default().push(key);
+    }
+    for keys in oracle.values_mut() {
+        keys.sort();
+    }
+    oracle
+}
+
+fn keys_of(rows: &sekejap::Rows) -> Vec<String> {
+    let mut out: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.json("_key"))
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_prepared_statement_compiles_once_and_rebinds_for_every_parameter_list() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    let oracle = prepared_fixture(&db, 200);
+
+    let mut statement = db
+        .prepare("SELECT _key FROM item WHERE bucket = $1")
+        .expect("prepare");
+    assert_eq!(statement.rebindable(), None, "nothing is compiled yet");
+    for bucket in 0..5i64 {
+        let rows = statement.query_with(&[json!(bucket)]).expect("query_with");
+        assert_eq!(&keys_of(&rows), oracle.get(&bucket).expect("bucket"));
+    }
+    assert_eq!(statement.rebindable(), Some(true));
+    assert_eq!(
+        statement.counters(),
+        (5, 1),
+        "five binds, and only the first of them compiled"
+    );
+    assert_eq!(statement.columns(), ["_key"]);
+}
+
+#[test]
+fn a_prepared_statement_streams_and_writes_through_the_same_handle() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    let oracle = prepared_fixture(&db, 64);
+
+    let mut statement = db
+        .prepare("SELECT _key FROM item WHERE bucket = $1")
+        .expect("prepare");
+    let mut seen: Vec<String> = Vec::new();
+    let handed = statement
+        .stream_with(&[json!(2i64)], 8, &mut |row| {
+            if let Some(Value::String(key)) = row.json("_key") {
+                seen.push(key);
+            }
+            Ok(())
+        })
+        .expect("stream_with");
+    seen.sort();
+    assert_eq!(&seen, oracle.get(&2).expect("bucket 2"));
+    assert_eq!(handed as usize, seen.len());
+
+    // A writing statement prepared by hand: never rebindable, because its
+    // document is folded at compile -- but still parsed once.
+    let mut insert = db
+        .prepare("INSERT INTO item (_key, label, bucket) VALUES ($1, $2, $3)")
+        .expect("prepare insert");
+    for i in 0..4i64 {
+        let n = insert
+            .execute_with(&[json!(format!("x{i}")), json!("extra"), json!(9i64)])
+            .expect("execute_with");
+        assert_eq!(n, 1);
+    }
+    assert_eq!(insert.rebindable(), Some(false));
+    assert!(insert
+        .rebind_refusal()
+        .expect("a refusal names its cause")
+        .contains("folded at prepare"));
+    let rows = db
+        .query("SELECT _key FROM item WHERE bucket = $1", &[json!(9i64)])
+        .expect("select");
+    assert_eq!(rows.len(), 4);
+}
+
+#[test]
+fn a_syntax_error_is_refused_by_prepare_before_any_parameter_is_bound() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    prepared_fixture(&db, 8);
+    let error = match db.prepare("SELECT _key FROM item WHERE") {
+        Err(e) => e,
+        Ok(_) => panic!("a truncated statement is a syntax error"),
+    };
+    assert!(
+        matches!(error, Error::Refused { .. } | Error::Sql(_)),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_plan_cache_serves_db_query_and_a_hit_is_a_rebind() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    let oracle = prepared_fixture(&db, 120);
+
+    let before = db.cache_stats();
+    assert_eq!(before.entries, 0);
+    assert_eq!(before.entry_ceiling, sekejap::PLAN_CACHE_ENTRIES);
+    assert_eq!(before.byte_ceiling, sekejap::PLAN_CACHE_BYTES);
+    assert_eq!(before.statement_ceiling, sekejap::PLAN_CACHE_STATEMENT_BYTES);
+
+    let sql = "SELECT _key FROM item WHERE bucket = $1";
+    for bucket in 0..5i64 {
+        let rows = db.query(sql, &[json!(bucket)]).expect("query");
+        assert_eq!(&keys_of(&rows), oracle.get(&bucket).expect("bucket"));
+    }
+    let stats = db.cache_stats();
+    assert_eq!(stats.entries, 1, "one statement text, one entry");
+    assert_eq!(stats.bytes, sql.len());
+    assert_eq!(stats.misses, 1, "only the first execution compiled");
+    assert_eq!(stats.hits, 4);
+    assert_eq!(stats.evictions, 0);
+}
+
+#[test]
+fn the_plan_cache_evicts_at_its_entry_ceiling_least_recently_used_first() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    prepared_fixture(&db, 40);
+
+    // One distinct statement text per entry, more of them than the ceiling
+    // allows. The alias makes each text distinct without changing what any
+    // of them asks.
+    let texts: Vec<String> = (0..sekejap::PLAN_CACHE_ENTRIES + 8)
+        .map(|n| format!("SELECT _key AS c{n} FROM item WHERE bucket = $1"))
+        .collect();
+    for text in &texts {
+        db.query(text, &[json!(1i64)]).expect("query");
+    }
+    let stats = db.cache_stats();
+    assert_eq!(
+        stats.entries,
+        sekejap::PLAN_CACHE_ENTRIES,
+        "the cache holds its ceiling and not one more"
+    );
+    assert!(stats.bytes <= sekejap::PLAN_CACHE_BYTES);
+    assert_eq!(stats.evictions, 8, "the eight oldest were dropped");
+    assert_eq!(stats.misses as usize, texts.len());
+    assert_eq!(stats.hits, 0);
+
+    // Least-recently-used first: the first text is gone and the last is not.
+    db.query(&texts[texts.len() - 1], &[json!(1i64)])
+        .expect("query");
+    assert_eq!(db.cache_stats().hits, 1, "the newest entry is still there");
+    db.query(&texts[0], &[json!(1i64)]).expect("query");
+    assert_eq!(
+        db.cache_stats().hits,
+        1,
+        "the oldest entry was evicted and had to compile again"
+    );
+}
+
+#[test]
+fn a_statement_longer_than_the_statement_ceiling_is_never_cached() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    prepared_fixture(&db, 8);
+    // A long alias, so the text passes the per-statement ceiling without
+    // asking anything unusual.
+    let padding = "c".repeat(sekejap::PLAN_CACHE_STATEMENT_BYTES);
+    let sql = format!("SELECT _key AS {padding} FROM item WHERE bucket = $1");
+    assert!(sql.len() > sekejap::PLAN_CACHE_STATEMENT_BYTES);
+    for _ in 0..3 {
+        db.query(&sql, &[json!(1i64)]).expect("query");
+    }
+    let stats = db.cache_stats();
+    assert_eq!(stats.entries, 0, "nothing that long is held");
+    assert_eq!(stats.misses, 3);
+    assert_eq!(stats.too_long, 3);
+    assert_eq!(stats.hits, 0);
+}
+
+#[test]
+fn a_ddl_statement_invalidates_every_plan_compiled_before_it() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    prepared_fixture(&db, 40);
+    let sql = "SELECT _key FROM item WHERE bucket = $1";
+    db.query(sql, &[json!(1i64)]).expect("query");
+    db.query(sql, &[json!(2i64)]).expect("query");
+    assert_eq!(db.cache_stats().hits, 1);
+
+    // A second index on the same column changes the catalog the plan names.
+    db.execute("CREATE INDEX item_label ON item USING btree(label)", &[])
+        .expect("create index");
+    assert_eq!(db.cache_stats().entries, 0, "the cache was emptied");
+    let hits_before = db.cache_stats().hits;
+    db.query(sql, &[json!(1i64)]).expect("query");
+    assert_eq!(
+        db.cache_stats().hits,
+        hits_before,
+        "the plan compiled before the DDL is never served"
+    );
+
+    // An INSERT does not: a plan holds no rows.
+    db.execute(
+        "INSERT INTO item (_key, label, bucket) VALUES ($1, $2, $3)",
+        &[json!("zzz"), json!("late"), json!(1i64)],
+    )
+    .expect("insert");
+    let hits_before = db.cache_stats().hits;
+    let rows = db.query(sql, &[json!(1i64)]).expect("query");
+    assert_eq!(
+        db.cache_stats().hits,
+        hits_before + 1,
+        "the cached plan was reused"
+    );
+    assert!(
+        keys_of(&rows).contains(&"zzz".to_owned()),
+        "and it sees the row written after it was compiled"
+    );
+}
+
+#[test]
+fn the_cached_plan_answers_what_a_fresh_compile_answers_for_every_binding() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    let oracle = prepared_fixture(&db, 200);
+    let sql = "SELECT _key FROM item WHERE bucket = $1";
+
+    // Interleave a cached path and an uncached one (the plan cache is a
+    // property of `Db`, so a second handle on the same directory has its own
+    // empty one) and require the same answer from both, for every binding.
+    for bucket in 0..5i64 {
+        let cached = db.query(sql, &[json!(bucket)]).expect("cached");
+        let fresh = Db::open(tmp.path());
+        // A second handle cannot open the same directory while the first
+        // holds it, so the fresh side is the explicit statement instead:
+        // parsed and compiled here, bound once, never reused.
+        drop(fresh);
+        let mut once = db.prepare(sql).expect("prepare");
+        let explicit = once.query_with(&[json!(bucket)]).expect("query_with");
+        assert_eq!(keys_of(&cached), keys_of(&explicit));
+        assert_eq!(&keys_of(&cached), oracle.get(&bucket).expect("bucket"));
+    }
+}

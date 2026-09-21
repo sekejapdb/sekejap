@@ -503,3 +503,15 @@ impl Compiler<'_> {
     }
 
 }
+
+impl AggregatePlan {
+    /// Refill every slot of this folded answer from a new parameter list.
+    /// A `HAVING` bound and a group key are folded at prepare, so only the
+    /// WHERE clause carries slots here.
+    pub(crate) fn rebind(&mut self, binder: &Binder<'_>) -> SqlResult2<()> {
+        for filter in self.filters.iter_mut() {
+            filter.rebind(binder)?;
+        }
+        Ok(())
+    }
+}

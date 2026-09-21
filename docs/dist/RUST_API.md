@@ -84,6 +84,41 @@ and rewrites nothing -- a statement goes to `SqlDatabase::sql` as written.
 | `Db::query(sql, &[Value]) -> Result<Rows>` | `SqlDatabase::sql` → `SqlResult::Rows` | `let rows = db.query("SELECT _key, title FROM posts", &[])?;` |
 | `Db::stream(sql, &[Value], page_rows, &mut f) -> Result<u64>` | `prepare_sql` + `PreparedSql::for_each_row` (`lang/src/lib.rs:399`) | `db.stream(sql, &[], 512, &mut |row| { .. Ok(()) })?;` |
 | `Db::explain(sql, &[Value]) -> Result<String>` | `SqlDatabase::sql_explain` / `explain_sql` (`lang/src/lib.rs:523`) | `println!("{}", db.explain("SELECT * FROM posts", &[])?);` |
+| `Db::prepare(sql) -> Result<Statement<'_>>` | `parse_sql` (`lang/src/lib.rs`), then `prepare_sql` on the first bind | `let mut s = db.prepare("SELECT _key FROM item WHERE bucket = $1")?;` |
+| `Statement::query_with(&[Value]) -> Result<Rows>` | `PreparedSql::bind` + `PreparedSql::run` | `let rows = s.query_with(&[json!(3)])?;` |
+| `Statement::execute_with(&[Value]) -> Result<u64>` | `PreparedSql::bind` + `PreparedSql::run_mut` + commit | `s.execute_with(&[json!("p1")])?;` |
+| `Statement::stream_with(&[Value], page_rows, &mut f) -> Result<u64>` | `PreparedSql::bind` + `for_each_row` | `s.stream_with(&[json!(3)], 512, &mut |row| { .. Ok(()) })?;` |
+| `Db::cache_stats() -> CacheStats` | the bounded plan cache of `QL_CONTRACT` §2 (`dist/rust/src/plans.rs`) | `assert_eq!(db.cache_stats().hits, 4);` |
+| `Db::invalidate_plans()` | drops every cached plan | after changing the catalog through `Tx::database` |
+
+### Prepared statements and the plan cache
+
+`Db::query` and `Db::stream` look their statement text up in a bounded
+least-recently-used plan cache, and a HIT is a REBIND: the compiled plan's
+typed slots are refilled from the new parameters and nothing is parsed or
+compiled. Three ceilings are fixed at open and exported --
+`PLAN_CACHE_ENTRIES` (64), `PLAN_CACHE_BYTES` (256 KiB of statement text) and
+`PLAN_CACHE_STATEMENT_BYTES` (8 KiB, the longest statement cached at all) --
+so Law 1 holds whatever the workload does. `Db::cache_stats` reports entries,
+bytes, hits, misses, evictions, the statements too long to cache, and those
+three ceilings.
+
+`Db::prepare` is the same mechanism made explicit. It PARSES -- a syntax error
+is reported there and then -- and compiles on the first `*_with` call, because
+this compiler folds at prepare and therefore needs the first parameter list
+(`QL_CONTRACT` §2). `Statement::rebindable` is `None` until that first bind,
+then `Some(true)` for a statement whose every `$n` landed in a typed slot and
+`Some(false)` for one whose plan depends on a parameter VALUE --
+`Statement::rebind_refusal` names which `$n` and what folded it, and a bind
+then compiles again from the statement parsed ONCE. `Statement::counters`
+gives `(binds, compiles)`; for a rebindable statement the second is 1 however
+many times it runs.
+
+A cache key carries the catalog generation, so a `CREATE`, `ALTER` or `DROP`
+through `Db::execute` or `Tx::execute` empties the cache. A statement that
+only changes ROWS does not: a plan holds no rows. A caller that changes the
+catalog through `Tx::database` or a re-exported layer calls
+`Db::invalidate_plans` itself.
 
 ```rust
 pub struct Rows { pub columns: Arc<Vec<String>>, pub rows: Vec<Row> }

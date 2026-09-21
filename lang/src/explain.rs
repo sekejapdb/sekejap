@@ -6,7 +6,7 @@
 //! asks EXPLAIN to print which predicates are answered index-side and to
 //! label a construct whose definition is a scan; both are below.
 
-use super::compile::{AggregatePlan, SelectPlan};
+use super::compile::{AggregatePlan, Rebind, SelectPlan};
 use super::{RunWork, SqlResult2, PAGE};
 use sekejap_core::collections::{
     AggregatePlanDescription, Database, FilterAnswer, QueryBudget, QueryPlanDescription,
@@ -37,6 +37,7 @@ pub(super) fn render(
     db: &Database,
     select: &SelectPlan,
     notices: &[String],
+    rebind: &Rebind,
 ) -> SqlResult2<String> {
     let mut work = RunWork::default();
     let (plan, approximation) = select.with_query(db, &mut |prepared| {
@@ -55,7 +56,22 @@ pub(super) fn render(
     })?;
     let mut out = format(db, &plan, &work, approximation, notices);
     out.push_str(&rewrites_and_row_functions(select));
+    out.push_str(&rebind_line(rebind));
     Ok(out)
+}
+
+/// Whether this compiled statement can be RE-BOUND with new parameters
+/// without being compiled again, and when it cannot, what folded a value at
+/// prepare. `QL_CONTRACT` §2, the bounded prepared-plan cache: a cache HIT is
+/// a rebind, so which of the two a statement is decides what a second
+/// execution of it costs.
+fn rebind_line(rebind: &Rebind) -> String {
+    match rebind.reason() {
+        None => "rebind: yes -- every $n is a typed slot, so new parameters are written into this same plan\n".to_owned(),
+        Some(reason) => format!(
+            "rebind: no -- {reason}; a new parameter list is COMPILED again from the parsed statement (never re-parsed)\n"
+        ),
+    }
 }
 
 /// The two sections `docs/lang/QL_CONTRACT.md` §4.1 and §4.2 ask EXPLAIN for.
@@ -97,6 +113,7 @@ pub(super) fn render_aggregate(
     db: &Database,
     aggregate: &AggregatePlan,
     notices: &[String],
+    rebind: &Rebind,
 ) -> SqlResult2<String> {
     let mut work = RunWork::default();
     let plan = aggregate.with_aggregate(db, &mut |prepared| {
@@ -111,6 +128,7 @@ pub(super) fn render_aggregate(
     })?;
     let mut out = format_aggregate(&plan);
     out.push_str(&format(db, &plan.query, &work, None, notices));
+    out.push_str(&rebind_line(rebind));
     Ok(out)
 }
 
@@ -122,7 +140,18 @@ fn format_aggregate(plan: &AggregatePlanDescription) -> String {
     out.push_str(match plan.shape {
         sekejap_core::collections::AggregateShape::Streaming => "  note:  the group key IS the driving index's own value, so the groups arrive contiguous: ONE accumulator set is alive, the key comes off the posting with no row read, and a page stops and resumes at a group boundary\n",
         sekejap_core::collections::AggregateShape::Hashed => "  note:  the group key is not the driving walk's own order, so every group is open at once and none is final until the walk ends; the memory that costs is bounded by the `groups` budget below, and there is no spill\n",
+        sekejap_core::collections::AggregateShape::Skip => "  note:  the group has NO accumulators, so nothing but the EXISTENCE of each value matters: the walk seeks to the successor of the current value's key prefix, one descent per DISTINCT VALUE, and reads neither the postings between them nor any row\n",
+        sekejap_core::collections::AggregateShape::PostingJoin => "  note:  the group key is the driving index's own value and every other accumulator has its own numeric scalar index, so NO ROW IS READ: two index passes, the first turning each value's run of postings into a group with a bounded id bitmap, the second folding each (value, id) into the group whose bitmap claims the id\n",
     });
+    if !plan.passes.is_empty() {
+        out.push_str("passes:\n");
+        for pass in &plan.passes {
+            out.push_str(&format!("  {pass}\n"));
+        }
+    }
+    if let Some(reason) = &plan.fell_back {
+        out.push_str(&format!("fell back: {reason}\n"));
+    }
     match &plan.group {
         None => out.push_str("group: none -- one group over every candidate\n"),
         Some((key, source)) => out.push_str(&format!("group: {key} -> {source}\n")),

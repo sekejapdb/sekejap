@@ -9,6 +9,14 @@ impl Compiler<'_> {
     /// same clock and a page that resumes does not drift. `docs/lang/QL_CONTRACT.md`
     /// §4.2: "constants folded at prepare".
     pub(super) fn clock_micros(&self) -> i64 {
+        // The clock is FOLDED, not a slot: one instant per compiled
+        // statement, so every row of one answer sees the same `now()` and a
+        // page that resumes does not drift. A rebind must therefore take a
+        // NEW clock, which is a new compile -- so a statement that reads the
+        // clock is not rebindable, and says so.
+        self.folds_reason(
+            "now()/current_date is folded at prepare, and a rebind takes a NEW clock".to_owned(),
+        );
         self.clock
     }
 
@@ -279,7 +287,13 @@ impl Compiler<'_> {
         self.rewrites.push(format!(
             "{what} -> scalar range on `{column}` (index-side; the function is folded at prepare and never evaluated per candidate)"
         ));
-        Ok(OwnedFilter::Scalar { index, predicate })
+        Ok(OwnedFilter::Scalar {
+            index,
+            predicate,
+            // A §4.1 / §4.2 rewrite folds its pre-image into an index RANGE,
+            // so the value is no longer in the plan to refill.
+            fills: Vec::new(),
+        })
     }
 
     /// A `Predicate::TextFn` folded into ONE text-key range.
@@ -375,7 +389,13 @@ impl Compiler<'_> {
                 ""
             }
         ));
-        Ok(OwnedFilter::Scalar { index, predicate })
+        Ok(OwnedFilter::Scalar {
+            index,
+            predicate,
+            // A §4.1 / §4.2 rewrite folds its pre-image into an index RANGE,
+            // so the value is no longer in the plan to refill.
+            fills: Vec::new(),
+        })
     }
 
 }

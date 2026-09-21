@@ -290,17 +290,107 @@ pub enum SqlResult {
     Notice(String),
 }
 
-/// A statement, parsed and compiled against one database's catalog.
+/// A statement, parsed and compiled against one database's catalog, and
+/// REUSABLE: the same compiled form answers again under new parameters.
 ///
-/// Compilation is the expensive half and it is separable: a caller that runs
-/// the same shape many times prepares once and pages many times, which is
-/// what the `e4-sql` arm of `battle50k` does.
+/// Compilation is the expensive half and it is separable. A caller that runs
+/// the same shape many times prepares ONCE and then [`PreparedSql::bind`]s
+/// each new parameter list -- which parses nothing and, for a statement
+/// whose every `$n` landed in a typed slot, compiles nothing either. That is
+/// what the `e4-sql` arm of `battle50k` does under `--prepared`, and what
+/// the bounded plan cache of `QL_CONTRACT` §2 serves.
+///
+/// ## What a prepare FOLDS, and what a bind fills
+///
+/// A prepare folds everything that is a SHAPE rather than a value: the
+/// driver, the indexes each predicate is answered from, a §4.1 / §4.2 range
+/// rewrite's pre-image, a semi-join's membership set, an INSERT or UPDATE
+/// document -- and the CLOCK. `now()` and `current_date` are read once per
+/// compiled statement (`compile/functions.rs`), so every row of one answer
+/// sees the same instant and a page that resumes does not drift.
+///
+/// A bind fills the typed slots: a scalar value inside its declared kind, an
+/// external key, a tsquery (terms AND `TextMatch`, because `a & b` and
+/// `a | b` arrive through one slot), a point centre and radius, a rectangle,
+/// a geometry, a query vector, a `GRAPH_TABLE` seed key -- the seed is
+/// resolved to its entity id at BIND, one point-get, not at prepare.
+///
+/// ## When a statement is not rebindable
+///
+/// A statement whose plan depends on a parameter VALUE is marked
+/// `rebind: false` and says why: a semi-join set built while it compiled, a
+/// `$n` folded into an index range by a §4.1 / §4.2 rewrite, a document, a
+/// session knob, or the folded clock -- which a rebind must take anew, so a
+/// statement that reads it is compiled again per execution and therefore
+/// gets a NEW clock per execution. [`PreparedSql::bind`] still works for
+/// such a statement: it compiles again from the PARSED statement this holds,
+/// so the parse is still paid once. `EXPLAIN` prints which of the two a
+/// statement is.
 pub struct PreparedSql {
     plan: compile::Plan,
     notices: Vec<String>,
+    /// The statement as parsed. Kept so a compiled form that cannot be
+    /// refilled is COMPILED again without being PARSED again.
+    statement: Option<Box<ast::Stmt>>,
+    /// Empty when every `$n` of this statement landed in a typed slot.
+    rebind: compile::Rebind,
 }
 
 impl PreparedSql {
+    /// True when new parameters can be written into this compiled form
+    /// without compiling it again.
+    pub fn rebindable(&self) -> bool {
+        self.rebind.ok()
+    }
+
+    /// Why a rebind would have to compile again, or `None` when it would
+    /// not. One line per construct that folded a value at prepare.
+    pub fn rebind_refusal(&self) -> Option<String> {
+        self.rebind.reason()
+    }
+
+    /// Bind new parameters to this compiled statement.
+    ///
+    /// For a rebindable statement this writes the new values into the slots
+    /// the prepare marked, and nothing is parsed, compiled, or read from the
+    /// catalog. For one that is not, it compiles again from the parsed
+    /// statement -- still no parse, and a NEW clock, which is what a folded
+    /// `now()` requires.
+    pub fn bind(&mut self, db: &Database, params: &[Param]) -> Result<()> {
+        if self.rebind.ok() {
+            let binder = compile::Binder::new(db, params);
+            return match &mut self.plan {
+                compile::Plan::Select(select) | compile::Plan::Explain(select) => {
+                    select.rebind(&binder)
+                }
+                compile::Plan::Aggregate(aggregate)
+                | compile::Plan::ExplainAggregate(aggregate) => aggregate.rebind(&binder),
+                // A write folds its document and a notice holds no value, so
+                // neither carries a slot; a rebindable one is one with no
+                // parameter at all.
+                compile::Plan::Write(_) | compile::Plan::ExplainText(_) => Ok(()),
+            };
+        }
+        let statement = self.statement.clone().ok_or_else(|| {
+            SqlError::unsupported(
+                "this prepared statement cannot be rebound and did not keep its parsed form",
+            )
+        })?;
+        let mut notices = Vec::new();
+        let (plan, rebind) = compile::compile(
+            db,
+            *statement,
+            params,
+            &mut notices,
+            QueryBudget::unlimited(),
+            &mut || false,
+        )?;
+        self.plan = plan;
+        self.notices = notices;
+        self.rebind = rebind;
+        Ok(())
+    }
+
     /// Notices the compiler raised: a `SET LOCAL` this engine does not have,
     /// an index method accepted as an alias, a post-filter where the contract
     /// promises a per-hop prune.
@@ -419,6 +509,48 @@ impl PreparedSql {
         })
     }
 
+    /// Run this compiled statement to exhaustion and assemble its answer.
+    ///
+    /// The reading half of [`SqlDatabase::sql`], for a statement prepared
+    /// ONCE and [`PreparedSql::bind`]-ed many times: it takes `&Database`,
+    /// so it serves rows and folded answers and refuses a write, which needs
+    /// the mutable borrow.
+    pub fn run(&self, db: &Database) -> Result<SqlResult> {
+        match &self.plan {
+            compile::Plan::Select(_) | compile::Plan::Aggregate(_) => self.rows(db),
+            compile::Plan::Explain(select) => Ok(SqlResult::Explain(explain::render(
+                db,
+                select,
+                &self.notices,
+                &self.rebind,
+            )?)),
+            compile::Plan::ExplainAggregate(aggregate) => Ok(SqlResult::Explain(
+                explain::render_aggregate(db, aggregate, &self.notices, &self.rebind)?,
+            )),
+            compile::Plan::ExplainText(text) => Ok(SqlResult::Explain(text.clone())),
+            compile::Plan::Write(_) => Err(SqlError::unsupported(
+                "a writing statement runs through `SqlDatabase::sql`, which takes the mutable borrow one writer needs",
+            )),
+        }
+    }
+
+    /// Run this compiled statement where it needs the WRITER's borrow.
+    ///
+    /// The reading families go straight to [`PreparedSql::run`]; a write is
+    /// CLONED before it runs, because performing one consumes the plan (a
+    /// bounded write pass owns the request it resumes) and this statement is
+    /// reusable -- the next bind has to find the plan still here.
+    pub fn run_mut(&self, db: &mut Database) -> Result<SqlResult> {
+        match &self.plan {
+            compile::Plan::Write(write) => {
+                write
+                    .clone()
+                    .run(db, self.notices.clone(), QueryBudget::unlimited())
+            }
+            _ => self.run(db),
+        }
+    }
+
     /// Run a compiled aggregate to exhaustion, in pages of groups.
     fn groups(&self, db: &Database) -> Result<SqlResult> {
         let aggregate = self
@@ -482,6 +614,18 @@ pub fn refusals() -> &'static [(&'static str, Tier, &'static str)] {
 /// instead of matching on the text.
 pub use refuse::MULTI_RANGE as MULTI_RANGE_REASON;
 
+/// Parse `text` without compiling it: the half of a prepare that needs
+/// neither a database nor the parameters.
+///
+/// [`prepare_sql`] needs both, because this compiler FOLDS at prepare -- a
+/// §4.1 / §4.2 rewrite computes its index range from the value, a semi-join
+/// builds its set, a `GRAPH_TABLE` seed resolves its key. A caller that
+/// wants a statement's syntax checked before it holds any parameters uses
+/// this; `Db::prepare` in the published crate is exactly that.
+pub fn parse_sql(text: &str) -> Result<()> {
+    parser::parse(text).map(|_| ())
+}
+
 /// Parse `text` and compile it against `db`'s catalog.
 pub fn prepare_sql(db: &Database, text: &str, params: &[Param]) -> Result<PreparedSql> {
     prepare_sql_with(db, text, params, QueryBudget::unlimited(), &mut || false)
@@ -504,9 +648,15 @@ pub fn prepare_sql_with(
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<PreparedSql> {
     let statement = parser::parse(text)?;
+    let kept = statement.clone();
     let mut notices = Vec::new();
-    let plan = compile::compile(db, statement, params, &mut notices, budget, cancelled)?;
-    Ok(PreparedSql { plan, notices })
+    let (plan, rebind) = compile::compile(db, statement, params, &mut notices, budget, cancelled)?;
+    Ok(PreparedSql {
+        plan,
+        notices,
+        statement: Some(Box::new(kept)),
+        rebind,
+    })
 }
 
 /// `EXPLAIN <select>` without the `EXPLAIN` keyword: prepare, run, and print
@@ -523,14 +673,14 @@ pub fn prepare_sql_with(
 pub fn explain_sql(db: &Database, text: &str, params: &[Param]) -> Result<String> {
     let prepared = prepare_sql(db, text, params)?;
     if let Some(aggregate) = prepared.aggregate_plan() {
-        return explain::render_aggregate(db, aggregate, prepared.notices());
+        return explain::render_aggregate(db, aggregate, prepared.notices(), &prepared.rebind);
     }
     let select = prepared.select_plan().ok_or_else(|| {
         SqlError::unsupported(
             "explain_sql/sql_explain RUNS the statement to explain it, so it takes a SELECT or an aggregate. A DROP TABLE or a predicated UPDATE/DELETE is explained WITHOUT being run: `db.sql(\"EXPLAIN <statement>\")`, which prepares and describes it.",
         )
     })?;
-    explain::render(db, select, prepared.notices())
+    explain::render(db, select, prepared.notices(), &prepared.rebind)
 }
 
 /// The `Database::sql` family.
@@ -587,11 +737,15 @@ impl SqlDatabase for Database {
         // A write compiles and runs in one step: its plan borrows the
         // database immutably while it resolves names, and the write needs the
         // mutable borrow afterwards.
-        match compile::compile(self, statement, params, &mut notices, budget, cancelled)? {
+        let (plan, rebind) =
+            compile::compile(self, statement, params, &mut notices, budget, cancelled)?;
+        match plan {
             compile::Plan::Select(select) => {
                 let prepared = PreparedSql {
                     plan: compile::Plan::Select(select),
                     notices,
+                    statement: None,
+                    rebind,
                 };
                 prepared.rows(self)
             }
@@ -599,16 +753,18 @@ impl SqlDatabase for Database {
                 let prepared = PreparedSql {
                     plan: compile::Plan::Aggregate(aggregate),
                     notices,
+                    statement: None,
+                    rebind,
                 };
                 prepared.groups(self)
             }
             compile::Plan::Explain(select) => {
-                let text = explain::render(self, &select, &notices)?;
+                let text = explain::render(self, &select, &notices, &rebind)?;
                 Ok(SqlResult::Explain(text))
             }
             compile::Plan::ExplainText(text) => Ok(SqlResult::Explain(text)),
             compile::Plan::ExplainAggregate(aggregate) => {
-                let text = explain::render_aggregate(self, &aggregate, &notices)?;
+                let text = explain::render_aggregate(self, &aggregate, &notices, &rebind)?;
                 Ok(SqlResult::Explain(text))
             }
             compile::Plan::Write(write) => write.run(self, notices, budget),

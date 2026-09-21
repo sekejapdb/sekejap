@@ -917,6 +917,9 @@ impl Database {
     }
     pub(crate) fn save_index(&mut self, i: &IndexInfo) -> Result<()> {
         let b = encode(i)?;
+        // Every descriptor write in a live handle passes here, so this is
+        // where the write-path descriptor list stops being believable.
+        self.index_descriptors_changed();
         for copy in 0..3 {
             self.writer()?.put(&dkey(i.id, copy), &b)?;
         }
@@ -1194,28 +1197,48 @@ impl Database {
         new: Option<&Value>,
         new_vectors: Option<(&Layout, &VectorCells)>,
     ) -> Result<()> {
-        for mut i in self.list_indexes(id.collection)? {
+        // The descriptors of one collection do not change when a row is
+        // written, so a run of writes reads them ONCE. See
+        // `Database::index_list_cache` for the generation that says when a
+        // taken list has stopped being true.
+        let generation = self.index_list_generation();
+        let mut list = self.take_index_list(id.collection, generation)?;
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(
+                list,
+                self.list_indexes(id.collection)?,
+                "the write-path index list cache is stale: a descriptor writer did not announce itself"
+            );
+        }
+        // A row write is an INSERT when there is no old document: the entity
+        // id was allocated for this write and has never been on disk, so no
+        // index entry keyed by its sequence can exist. The families that
+        // probe for one before writing it can skip that read.
+        let fresh = old.is_none() && new.is_some();
+        let result = (|| -> Result<()> {
+        for i in list.iter_mut() {
             if i.state == IndexState::Dropping {
                 continue;
             }
             if i.family == IndexFamily::ExactVector {
-                crate::index::vector::exact::maintain_locator(self, &i, id, new_vectors)?;
+                crate::index::vector::exact::maintain_locator(self, i, id, new_vectors, fresh)?;
                 continue;
             }
             if i.family == IndexFamily::QuantizedVector {
-                crate::index::vector::quantized::maintain_entry(self, &i, id, new_vectors)?;
+                crate::index::vector::quantized::maintain_entry(self, i, id, new_vectors, fresh)?;
                 continue;
             }
             if i.family == IndexFamily::SpatialPoint {
-                crate::index::spatial::point::maintain_point(self, &mut i, id, old, new)?;
+                crate::index::spatial::point::maintain_point(self, i, id, old, new)?;
                 continue;
             }
             if i.family == IndexFamily::SpatialGeometry {
-                crate::index::spatial::geometry_index::maintain_geometry(self, &mut i, id, old, new)?;
+                crate::index::spatial::geometry_index::maintain_geometry(self, i, id, old, new)?;
                 continue;
             }
             if i.family == IndexFamily::Text {
-                crate::index::text::maintain_text(self, &i, id, old, new)?;
+                crate::index::text::maintain_text(self, i, id, old, new)?;
                 continue;
             }
             // An expression index stores `expression(field)`. The derived
@@ -1237,18 +1260,23 @@ impl Database {
                 continue;
             }
             if let Some(v) = &b {
-                self.check_unique(&i, v, id.sequence)?;
+                self.check_unique(i, v, id.sequence)?;
             }
             if let Some(v) = a {
-                let k = skey(&i, &v, id.sequence);
-                self.index_delete(&mut i, &k)?;
+                let k = skey(i, &v, id.sequence);
+                self.index_delete(i, &k)?;
             }
             if let Some(v) = b {
-                let k = skey(&i, &v, id.sequence);
-                self.index_put(&mut i, &k, &[])?;
+                let k = skey(i, &v, id.sequence);
+                self.index_put(i, &k, &[])?;
             }
         }
         Ok(())
+        })();
+        // The list goes back only if nothing wrote a descriptor while it was
+        // out; `put_index_list` checks the generation itself.
+        self.put_index_list(id.collection, generation, list);
+        result
     }
     /// The scalar key of one immutable row, read without materializing the rest
     /// of the document.
@@ -2147,6 +2175,7 @@ impl Database {
                 if let Some(t) = i.tree {
                     self.writer()?.tree_free_root(t.id, t.root)?;
                 }
+                self.index_descriptors_changed();
                 for copy in 0..3 {
                     self.writer()?.delete(&dkey(id, copy))?;
                 }

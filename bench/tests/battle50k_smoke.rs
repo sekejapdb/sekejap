@@ -34,7 +34,8 @@ mod battle50k;
 use battle50k::{
     needs_graph,
     load_corpus, load_queries, run_arm, Arm, CaseKind, Corpus, Options, Queries, Row, BATTERY,
-    DIM, INSTANCES, K, KINDS,
+    VEC_BULK_ROWS,
+    APPROX_BASES, DIM, INSTANCES, K, KINDS,
 };
 use sekejap_core::{
     collections::Geom,
@@ -104,8 +105,12 @@ fn unit_vector(seed: u64) -> Vec<f32> {
 }
 
 fn write_corpus(path: &Path) {
+    write_corpus_rows(path, ROWS);
+}
+
+fn write_corpus_rows(path: &Path, rows: usize) {
     let mut out = String::new();
-    for i in 0..ROWS {
+    for i in 0..rows {
         let mut r = rng((i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let first = VOCAB[(r % 12) as usize];
         r = rng(r);
@@ -410,6 +415,34 @@ fn the_e4_arm_answers_what_brute_force_answers() {
                     spec.name
                 );
             }
+            CaseKind::Write => {
+                // A write case reports the rows it PUT, not rows it read:
+                // fifty instances of VEC_BULK_ROWS, every one of them a key
+                // this run minted, and a median for the batch.
+                assert_eq!(
+                    case["total_rows"].as_u64(),
+                    Some((INSTANCES * VEC_BULK_ROWS) as u64),
+                    "{}: a write case writes {INSTANCES} x {VEC_BULK_ROWS} rows",
+                    spec.name
+                );
+                assert!(
+                    case["median_us"].is_f64(),
+                    "{}: a write case must report a median",
+                    spec.name
+                );
+                assert_eq!(
+                    case["kind"].as_str(),
+                    Some("write"),
+                    "{}: a write case must say so in its report",
+                    spec.name
+                );
+                let keys = case["first_keys"].as_array().expect("first_keys is an array");
+                assert!(
+                    keys.first().and_then(Value::as_str) == Some("bulk-00-000000"),
+                    "{}: a write case reports the keys it wrote, {keys:?}",
+                    spec.name
+                );
+            }
             CaseKind::Approx => {
                 let recall = case["recall_at_k"].as_f64().unwrap_or_else(|| {
                     panic!("{}: an approximate case must report recall", spec.name)
@@ -508,6 +541,19 @@ fn the_e4_sql_arm_asks_the_same_questions_as_the_e4_arm() {
             "{}: the two arms returned different keys",
             spec.name
         );
+        if spec.kind == CaseKind::Write {
+            // A write case has no prepared query to price: its note names the
+            // batch instead, and both arms must have written the same rows
+            // under the same keys (asserted just above).
+            assert!(
+                sql_case["note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("INSERT")),
+                "{}: the e4-sql write case must name the statement it issued",
+                spec.name
+            );
+            continue;
+        }
         assert!(
             sql_case["note"]
                 .as_str()
@@ -601,4 +647,267 @@ fn reuse_provisioning_is_idempotent_and_answers_what_the_fresh_load_answers() {
             );
         }
     }
+}
+
+/// The `sqlite` arm must answer the SAME questions as the `e4` arm.
+///
+/// This is the precondition of the whole four-arm table: a latency ratio
+/// between two arms that answered different questions is not a measurement.
+/// SQLite has no geometry type, no geodesic, no vector type and no traversal
+/// atomic, so the arm reaches every one of those through a registered scalar
+/// function calling `sekejap-core` itself; this test is what says that
+/// reaching it through SQL, an R*Tree candidate and an FTS5 posting returns
+/// the identical ROW SET, over a corpus ten times the one the other tests
+/// use. A candidate cover that lost a row to 32-bit R*Tree rounding, an FTS5
+/// tokenisation that split a word differently, or a k-nearest ladder that
+/// stopped one ring early would all show up here as a row-count difference.
+const SQLITE_ROWS: usize = 2_000;
+
+#[test]
+fn the_sqlite_arm_asks_the_same_questions_as_the_e4_arm() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = dir.path().join("places-2000.jsonl");
+    let queries_path = dir.path().join("queries.json");
+    write_corpus_rows(&data, SQLITE_ROWS);
+    write_queries(&queries_path);
+
+    let mut api = Options::new(Arm::E4, &data, &queries_path, dir.path().join("e4.json"));
+    api.db_dir = dir.path().join("e4-db");
+    let api_report = run_arm(&api).expect("the E4 arm runs");
+
+    let mut lite = Options::new(
+        Arm::Sqlite,
+        &data,
+        &queries_path,
+        dir.path().join("sqlite.json"),
+    );
+    // The sqlite arm's --db-dir names a FILE, not a directory.
+    lite.db_dir = dir.path().join("place.db");
+    let lite_report = run_arm(&lite).expect("the sqlite arm runs");
+
+    assert_eq!(lite_report["arm"].as_str(), Some("sqlite"));
+    assert_eq!(
+        lite_report["rows"].as_u64(),
+        Some(SQLITE_ROWS as u64),
+        "the arm must have loaded every synthetic row"
+    );
+    assert_eq!(lite_report["rows"], api_report["rows"]);
+
+    for spec in &BATTERY {
+        // The graph cases need a --graph load, which this corpus does not
+        // perform; they are skipped, not answered with zero rows.
+        if needs_graph(spec.name) {
+            continue;
+        }
+        let api_case = case_of(&api_report, spec.name);
+        let lite_case = case_of(&lite_report, spec.name);
+        if spec.kind == CaseKind::Filter || spec.kind == CaseKind::Write {
+            assert_eq!(
+                lite_case["total_rows"], api_case["total_rows"],
+                "{}: the two arms returned different row counts",
+                spec.name
+            );
+        }
+        if spec.kind == CaseKind::Write {
+            // SQLite has no vector index, so its two write cases are the same
+            // statement; what must still hold is that it wrote the same rows
+            // under the same keys as the E4 arm and said which statement it
+            // used.
+            assert_eq!(
+                lite_case["first_keys"], api_case["first_keys"],
+                "{}: the two arms wrote different keys",
+                spec.name
+            );
+        }
+        assert_eq!(
+            lite_case["queries"].as_u64(),
+            Some(INSTANCES as u64),
+            "{}: every case runs {INSTANCES} query instances",
+            spec.name
+        );
+        assert!(
+            lite_case["sql"].as_str().is_some_and(|sql| !sql.is_empty()),
+            "{}: the arm must record the statement it ran",
+            spec.name
+        );
+    }
+
+    // The six aggregate cases are compared on their VALUES, not only on the
+    // group count: both arms order by the group key, so the formatted lines
+    // line up one for one.
+    for name in [
+        "agg_count_all",
+        "agg_count_kind",
+        "agg_sum_born_by_kind",
+        "agg_distinct_kind",
+        "agg_count_radius_by_kind",
+        "agg_born_decade",
+    ] {
+        assert_eq!(
+            case_of(&lite_report, name)["first_keys"],
+            case_of(&api_report, name)["first_keys"],
+            "{name}: the two arms folded the same groups to different values"
+        );
+    }
+
+    // The k-nearest ladder must be EXACT, not merely close: both arms rank by
+    // `wgs84_distance_metres` and break ties by entity sequence, so the ten
+    // keys are the same ten keys in the same order.
+    for name in ["knn_10", "knn_10_kind"] {
+        assert_eq!(
+            case_of(&lite_report, name)["first_keys"],
+            case_of(&api_report, name)["first_keys"],
+            "{name}: the R*Tree ladder did not find E4's k nearest"
+        );
+    }
+
+    // The approximate sweep this arm does not have: one named refusal and one
+    // whole-corpus scan whose recall against its own exact twin is 1.000.
+    for base in APPROX_BASES {
+        let refused = case_of(&lite_report, &format!("{base}@ann"));
+        assert!(
+            refused["median_us"].is_null(),
+            "{base}@ann: a refusal has no timing"
+        );
+        assert!(
+            refused["note"]
+                .as_str()
+                .is_some_and(|note| note.starts_with("n/a:")),
+            "{base}@ann: a refusal must name its reason"
+        );
+        let scan = case_of(&lite_report, &format!("{base}@scan"));
+        assert_eq!(
+            scan["recall_at_k"].as_f64(),
+            Some(1.0),
+            "{base}@scan: a whole-corpus scan IS the exact answer"
+        );
+        assert!(
+            scan["median_us"].is_f64(),
+            "{base}@scan: the scan must report a median"
+        );
+    }
+
+    let stages = lite_report["stages"].as_array().expect("stages is an array");
+    let disk = stages
+        .iter()
+        .find(|s| s["name"].as_str() == Some("disk_bytes"))
+        .expect("the report carries a disk_bytes stage");
+    assert!(
+        disk["bytes"].as_u64().unwrap_or(0) > 0,
+        "a loaded database occupies bytes on disk"
+    );
+    assert!(
+        !lite_report["deviations"]
+            .as_array()
+            .expect("deviations is an array")
+            .is_empty(),
+        "the arm must name what it cannot express"
+    );
+}
+
+/// `--prepared`: the e4-sql arm's statement, prepared ONCE and re-bound per
+/// instance, answers exactly what the unprepared arm answers, and reports a
+/// prepared median beside the per-call one.
+///
+/// The arm checks the agreement itself -- `e4sql_prepared_agrees` refuses
+/// the run when a bound answer differs from a freshly compiled one -- so
+/// what this test adds is that the whole battery goes through that check
+/// and that the report carries the field the compare table reads.
+#[test]
+fn the_prepared_flag_answers_what_the_unprepared_arm_answers_and_reports_its_median() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = dir.path().join("places-200.jsonl");
+    let queries_path = dir.path().join("queries.json");
+    write_corpus(&data);
+    write_queries(&queries_path);
+
+    let mut plain = Options::new(
+        Arm::E4Sql,
+        &data,
+        &queries_path,
+        dir.path().join("e4-sql.json"),
+    );
+    plain.db_dir = dir.path().join("e4-sql-db");
+    let plain_report = run_arm(&plain).expect("the e4-sql arm runs");
+
+    let mut prepared = Options::new(
+        Arm::E4Sql,
+        &data,
+        &queries_path,
+        dir.path().join("e4-sql-prepared.json"),
+    );
+    prepared.db_dir = dir.path().join("e4-sql-prepared-db");
+    prepared.prepared = true;
+    let prepared_report = run_arm(&prepared).expect("the e4-sql arm runs with --prepared");
+
+    // `fn_year_eq` writes its year INTO the statement rather than binding
+    // it, so there is no one statement to prepare and the report says so
+    // instead of reporting a number. Every other battery case binds every
+    // value it varies.
+    const TEXT_VARIES: [&str; 1] = ["fn_year_eq"];
+    let mut reported = 0usize;
+    for spec in &BATTERY {
+        if needs_graph(spec.name) {
+            continue;
+        }
+        let plain_case = case_of(&plain_report, spec.name);
+        let case = case_of(&prepared_report, spec.name);
+        assert_eq!(
+            case["total_rows"], plain_case["total_rows"],
+            "{}: --prepared changed the row count",
+            spec.name
+        );
+        assert_eq!(
+            case["first_keys"], plain_case["first_keys"],
+            "{}: --prepared changed the keys",
+            spec.name
+        );
+        if battle50k::is_write_case(spec.name) {
+            // A write case prepares nothing per instance: the prepared column
+            // is a query's, and the arm leaves it null.
+            assert!(
+                case["prepared_median_us"].is_null(),
+                "{}: a write case has no prepared median",
+                spec.name
+            );
+            continue;
+        }
+        if TEXT_VARIES.contains(&spec.name) {
+            assert!(
+                case["prepared_median_us"].is_null(),
+                "{}: this case writes its value into the statement",
+                spec.name
+            );
+            assert!(
+                case["note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("no one statement to prepare")),
+                "{}: the report must say why there is no prepared median",
+                spec.name
+            );
+            continue;
+        }
+        let median = case["prepared_median_us"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{}: no prepared median", spec.name));
+        assert!(median > 0.0, "{}: a prepared median is a time", spec.name);
+        assert!(
+            case["prepared_bind_median_us"].as_f64().is_some(),
+            "{}: the bind is reported beside the whole call",
+            spec.name
+        );
+        assert!(
+            case["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("re-bound per instance")),
+            "{}: the note must name what --prepared did",
+            spec.name
+        );
+        reported += 1;
+    }
+    assert!(reported > 10, "most of the battery reports a prepared median");
+
+    // And the unprepared run carries neither field, so an older report's
+    // compare table is unchanged.
+    assert!(case_of(&plain_report, "kind_eq")["prepared_median_us"].is_null());
 }

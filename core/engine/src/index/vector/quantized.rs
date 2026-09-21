@@ -72,11 +72,25 @@ pub struct ApproxVectorResult {
     pub reranked: usize,
 }
 
+/// One entry on the `ef`-bounded shortlist.
+///
+/// `entry` is the compact record's own bytes, carried forward from the
+/// page-order scan that already read them. The rerank has to compare the
+/// persisted entry against a re-encode of the authoritative sidecar (Law 5;
+/// see `rerank_sorted`), and it used to fetch those bytes a SECOND time with
+/// a point get keyed by the same sequence the scan had just walked past.
+/// Holding them instead costs `ef * (14 + dim)` bytes -- 920 bytes at the
+/// `ef = 20`, 32-lane shape the 50,000-row battery measures, and bounded by
+/// `ef` at every shape -- and removes one root-to-leaf descent per shortlist
+/// winner. The comparison is against the same bytes either way: the scan and
+/// the rerank read one transaction's committed state, so a second get of the
+/// same key can only return what the first one did.
 #[derive(Clone, Debug)]
 struct ApproxCandidate {
     id: EntityId,
     distance: f64,
     locator: [u8; 6],
+    entry: Vec<u8>,
 }
 
 impl PartialEq for ApproxCandidate {
@@ -228,17 +242,26 @@ fn desired_entry(
     encode_entry(locator, raw, expected).map(Some)
 }
 
+/// `fresh` says the row is an INSERT; see [`crate::index::vector::exact::maintain_locator`]
+/// for why that makes the existence probe below answerable without a read.
 pub(crate) fn maintain_entry(
     db: &mut Database,
     index: &IndexInfo,
     id: EntityId,
     new: Option<(&Layout, &VectorCells)>,
+    fresh: bool,
 ) -> Result<()> {
     let key = entry_key(index.id, id.sequence);
     let desired = new
         .map(|(layout, vectors)| desired_entry(index, layout, vectors))
         .transpose()?
         .flatten();
+    if fresh {
+        if let Some(value) = desired {
+            db.writer()?.put(&key, &value)?;
+        }
+        return Ok(());
+    }
     let existing = db.store()?.get(&key)?;
     match (existing.as_deref(), desired) {
         (Some(old), Some(value)) if old == value => {}
@@ -357,6 +380,7 @@ fn probe_approx(
         id: entity,
         distance,
         locator,
+        entry: value.to_vec(),
     });
     if shortlist.len() > ef {
         shortlist.pop();
@@ -364,19 +388,51 @@ fn probe_approx(
     Ok(())
 }
 
+/// Admit one scored entry to the `ef`-bounded shortlist, or step over it.
+///
+/// The heap is a MAX heap on `(distance, id)`, so its peek is the worst
+/// entry currently held and a candidate no better than that one cannot
+/// belong. That test is made FIRST, before anything is built: a 50,000-entry
+/// scan admits on the order of `ef * ln(n / ef)` times, so the overwhelming
+/// majority of entries never need a candidate at all. When a candidate does
+/// displace the worst one, the displaced candidate's entry buffer is REUSED
+/// rather than freed and reallocated, which keeps the whole scan's
+/// allocations at `ef` instead of one per admission.
 fn admit_approx(
     shortlist: &mut BinaryHeap<ApproxCandidate>,
     ef: usize,
-    candidate: ApproxCandidate,
+    id: EntityId,
+    distance: f64,
+    entry: &[u8],
 ) {
     if shortlist.len() < ef {
-        shortlist.push(candidate);
+        let locator: [u8; 6] = entry[..6].try_into().unwrap();
+        shortlist.push(ApproxCandidate {
+            id,
+            distance,
+            locator,
+            entry: entry.to_vec(),
+        });
         return;
     }
-    if candidate < *shortlist.peek().unwrap() {
-        shortlist.pop();
-        shortlist.push(candidate);
+    // `ApproxCandidate`'s order is `(distance, id)` and nothing else reads
+    // the entry bytes, so the comparison is made on those two alone and the
+    // record is assembled only if it wins.
+    let worst = shortlist.peek().unwrap();
+    let better = distance
+        .total_cmp(&worst.distance)
+        .then_with(|| id.cmp(&worst.id))
+        .is_lt();
+    if !better {
+        return;
     }
+    let mut displaced = shortlist.pop().unwrap();
+    displaced.id = id;
+    displaced.distance = distance;
+    displaced.locator = entry[..6].try_into().unwrap();
+    displaced.entry.clear();
+    displaced.entry.extend_from_slice(entry);
+    shortlist.push(displaced);
 }
 
 fn score_compact_entry(
@@ -385,19 +441,23 @@ fn score_compact_entry(
     query: &[f64],
     query_norm: f64,
     metric_value: VectorMetric,
-) -> Result<Option<([u8; 6], f64)>> {
+) -> Result<Option<f64>> {
     // Length only: codec canonical-form checks wait until rerank, so the
-    // 50K-entry scan is a tight int8 loop over already-trusted pages.
+    // 50K-entry scan is a tight int8 loop over already-trusted pages. The
+    // locator is not copied here either: it is six bytes of a record the
+    // caller still holds, and only an ADMITTED candidate ever needs them.
     if value.len() != 6 + 8 + dimension {
         return Err(corrupt("quantized vector entry length"));
     }
-    let locator: [u8; 6] = value[..6].try_into().unwrap();
     let scale = f64::from_le_bytes(value[6..14].try_into().unwrap());
     let codes = &value[14..];
-    Ok(
-        vector_quant::score_i8_hot(scale, codes, query, query_norm, metric(metric_value))
-            .map(|distance| (locator, distance)),
-    )
+    Ok(vector_quant::score_i8_hot(
+        scale,
+        codes,
+        query,
+        query_norm,
+        metric(metric_value),
+    ))
 }
 
 fn rerank_sorted(
@@ -420,6 +480,19 @@ fn rerank_sorted(
     });
     let dimension = dimension(index)?;
     let store = db.store()?;
+    // WHY NOT A FORWARD CURSOR. The shortlist is sorted by sequence, so its
+    // sidecar keys ascend, and dragging one cursor across them instead of
+    // descending per winner looks like the obvious saving. It is a
+    // PESSIMISATION at this shape and the number says why: `ef` winners are
+    // scattered over the whole corpus, so a cursor dragged from one to the
+    // next steps through every sidecar between them -- 50,000 records of
+    // 128 bytes at the battery's shape -- and those 6.4 MB evict the 2.3 MB
+    // of compact entries the NEXT query's scan wants out of an 8 MiB pool.
+    // Measured at ef=20 over 50,000 rows: the rerank's sidecar reads went
+    // from 1.33 ms to 185 ms per fifty queries and the candidate scan behind
+    // them from 128 ms to 217 ms. `ef` point gets of `ef` scattered keys is
+    // the right shape; page order only pays when the candidates ARE the
+    // pages, which is what `scan_exact_all` does and this is not.
     let mut exact = BinaryHeap::with_capacity(k.min(1024));
     for candidate in shortlist {
         if cancelled() {
@@ -444,16 +517,13 @@ fn rerank_sorted(
         // approximates, and the damage reaches the caller as an answer instead
         // of as `Corrupt` (Law 5). COST: one `get` and one quantize per
         // shortlist winner, bounded by `ef` and never by the corpus.
-        let persisted = store
-            .get(&entry_key(index.id, candidate.id.sequence))?
-            .ok_or_else(|| corrupt("quantized shortlist entry disappeared"))?;
-        if encode_entry(candidate.locator, &raw, dimension)? != persisted {
+        if encode_entry(candidate.locator, &raw, dimension)? != candidate.entry {
             return Err(corrupt(
                 "quantized vector entry differs from authoritative sidecar",
             ));
         }
-        let Some(distance) =
-            exact_score(&raw, dimension, query, query_norm, metric, cancelled)?
+        let scored = exact_score(&raw, dimension, query, query_norm, metric, cancelled)?;
+        let Some(distance) = scored
         else {
             continue;
         };
@@ -679,7 +749,7 @@ impl Database {
                         }
                         scored_total += 1;
                         pending_scored += 1;
-                        let Some((locator, distance)) = score_compact_entry(
+                        let Some(distance) = score_compact_entry(
                             value,
                             dimension,
                             &query_wide,
@@ -692,14 +762,12 @@ impl Database {
                         admit_approx(
                             &mut shortlist,
                             ef,
-                            ApproxCandidate {
-                                id: EntityId {
-                                    collection: index.collection,
-                                    sequence,
-                                },
-                                distance,
-                                locator,
+                            EntityId {
+                                collection: index.collection,
+                                sequence,
                             },
+                            distance,
+                            value,
                         );
                         Ok(())
                     })() {

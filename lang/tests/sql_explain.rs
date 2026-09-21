@@ -623,7 +623,7 @@ fn agg_count_kind_streams_off_the_driving_posting() {
 }
 
 #[test]
-fn agg_sum_born_by_kind_names_the_row_its_accumulators_read() {
+fn agg_sum_born_by_kind_is_a_posting_join_and_names_its_two_passes() {
     let (_dir, mut f) = open();
     let text = explain(
         &mut f,
@@ -632,12 +632,49 @@ fn agg_sum_born_by_kind_names_the_row_its_accumulators_read() {
         &[],
     );
     println!("{text}");
-    assert_eq!(line(&text, "shape: "), "shape: streaming");
-    // `born` is not the driving index, so every accumulator over it reads the
-    // row -- and EXPLAIN says so rather than leaving it to be guessed.
-    assert!(text.contains("sum(born) -> row (charged as primary_reads)"), "{text}");
-    assert!(text.contains("avg(born) -> row (charged as primary_reads)"), "{text}");
+    // `born` is not the driving index -- but it has one of its OWN, and it is
+    // numeric, so nothing here has to read a row: the group key comes off the
+    // `kind` postings and every accumulator off the `born` postings.
+    assert_eq!(line(&text, "shape: "), "shape: posting-join");
+    assert!(text.contains("pass 1: walk the kind index in key order"), "{text}");
+    assert!(text.contains("pass 2: walk the born index in key order"), "{text}");
+    assert!(
+        text.contains("sum(born) -> index posting: its own scalar index, walked in pass 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("avg(born) -> index posting: its own scalar index, walked in pass 2"),
+        "{text}"
+    );
     assert!(text.contains("having:"), "{text}");
+    assert_eq!(
+        counter(&text, "primary_reads"),
+        0,
+        "a posting join reads no row:\n{text}"
+    );
+    // One pass over `kind` and one over `born`, plus the step each walk takes
+    // to find its end.
+    assert_eq!(
+        counter(&text, "scalar_postings"),
+        fixture::ROWS as u64 * 2 + 2,
+        "rows x (1 + accumulated columns):\n{text}"
+    );
+}
+
+/// The same question with the accumulated column named so that it has no
+/// index to walk: `note` is declared and unindexed, so `min(note)` can only
+/// come off the row and the fold is the streaming one it always was.
+#[test]
+fn an_unindexed_accumulator_column_keeps_the_streaming_row_path() {
+    let (_dir, mut f) = open();
+    let text = explain(
+        &mut f,
+        "SELECT kind, count(*) AS n, min(text) AS lo FROM place GROUP BY kind",
+        &[],
+    );
+    println!("{text}");
+    assert_eq!(line(&text, "shape: "), "shape: streaming");
+    assert!(text.contains("min(text) -> row (charged as primary_reads)"), "{text}");
     assert!(
         counter(&text, "primary_reads") >= fixture::ROWS as u64,
         "a row-side accumulator reads one row per candidate:\n{text}"
@@ -649,10 +686,30 @@ fn agg_distinct_kind_is_a_group_with_no_accumulators() {
     let (_dir, mut f) = open();
     let text = explain(&mut f, "SELECT DISTINCT kind FROM place", &[]);
     println!("{text}");
-    assert_eq!(line(&text, "shape: "), "shape: streaming");
+    // A group with no accumulators over the driving scalar index is the
+    // SKIP-SCAN of `QL_CONTRACT` §4.7: one descent per distinct value.
+    assert_eq!(line(&text, "shape: "), "shape: skip-scan");
     assert!(text.contains("none -- a group with no accumulators is DISTINCT"), "{text}");
     assert_eq!(counter(&text, "primary_reads"), 0, "{text}");
     assert_eq!(rows_of(&text), fixture::KINDS.len() as u64);
+    assert!(
+        counter(&text, "scalar_postings") <= fixture::KINDS.len() as u64 + 1,
+        "DISTINCT charged {} scalar postings for {} values over {} rows:\n{text}",
+        counter(&text, "scalar_postings"),
+        fixture::KINDS.len(),
+        fixture::ROWS
+    );
+
+    // A FILTER beside it can reject every row of a value, so the value is a
+    // group only if a row of it survives: the skip does not apply and the
+    // walk sees the candidates. Here the born range also DRIVES, which takes
+    // the group key off the driving posting as well, so the shape is hashed.
+    let filtered = explain(
+        &mut f,
+        "SELECT DISTINCT kind FROM place WHERE born > 19550101",
+        &[],
+    );
+    assert_eq!(line(&filtered, "shape: "), "shape: hashed");
 }
 
 #[test]
@@ -1170,4 +1227,109 @@ fn the_projection_only_battery_case_puts_every_function_in_one_section() {
             SqlValue::Int(want.desc.chars().count() as i64)
         );
     }
+}
+
+/// The SQL arm of `vec_exact_10` and the DIRECT-API arm of the same question
+/// do the same work, counter for counter.
+///
+/// The 50,000-row battery measured the SQL arm at 1.42x the API arm's wall
+/// time for this one case while every other case was within 15% -- so the
+/// question this answers is whether `lang` ADDS anything to the engine here:
+/// a wider projection, a row decode per returned row, a `SqlValue`
+/// conversion of the 32-dim vector, a different driver, a different
+/// candidate mode. It does not. `SELECT _id` projects no field
+/// (`Projection::Ids`, `lang/src/compile/plan.rs` `with_query`), `LIMIT 10`
+/// is `total_limit`, `CandidateDriver::Auto` is the driver both ask for, and
+/// the ORDER BY's vector is the plan's own `Vec<f32>` handed to the engine by
+/// reference -- so the two prepared queries are the same prepared query, and
+/// what separates the two arms is the parse and compile, which
+/// `battle50k` measures on its own.
+#[test]
+fn the_sql_and_api_arms_of_an_exact_vector_order_do_the_same_work() {
+    use sekejap_core::collections::{
+        CandidateDriver, Projection, QueryBudget, QueryOrder, QueryRequest, QueryWork,
+    };
+    use sekejap_core::collections::VectorMetric;
+
+    let (_dir, mut f) = open();
+    let vector = fixture::query_vector();
+
+    // The API arm: exactly what `battle50k`'s `e4_run` prepares.
+    let mut prepared = f
+        .db
+        .prepare_query(QueryRequest {
+            collection: f.place,
+            filters: &[],
+            order: QueryOrder::ExactVector {
+                index: f.index.emb_exact,
+                query: &vector,
+                metric: VectorMetric::Cosine,
+            },
+            projection: Projection::Ids,
+            total_limit: Some(10),
+            driver: CandidateDriver::Auto,
+        })
+        .unwrap();
+    let mut api = QueryWork::default();
+    let mut api_ids = Vec::new();
+    loop {
+        let page = prepared
+            .next_page(1_024, QueryBudget::unlimited(), || false)
+            .unwrap();
+        api.candidates += page.work.candidates;
+        api.primary_reads += page.work.primary_reads;
+        api.row_decodes += page.work.row_decodes;
+        api.vector_sidecars += page.work.vector_sidecars;
+        api.vector_locators += page.work.vector_locators;
+        api.vector_lanes += page.work.vector_lanes;
+        api.output_bytes += page.work.output_bytes;
+        api_ids.extend(page.rows.iter().map(|row| row.id));
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    drop(prepared);
+
+    // The SQL arm: exactly what `battle50k`'s `e4sql_run` prepares.
+    let text = explain(
+        &mut f,
+        "SELECT _id FROM place ORDER BY emb <=> $1::vector LIMIT 10",
+        &[Param::Vector(vector.clone())],
+    );
+    assert!(text.starts_with("driver: ExactVector"), "{text}");
+    for (name, value) in [
+        ("candidates", api.candidates),
+        ("primary_reads", api.primary_reads),
+        ("row_decodes", api.row_decodes),
+        ("vector_sidecars", api.vector_sidecars),
+        ("vector_lanes", api.vector_lanes),
+    ] {
+        assert_eq!(
+            counter(&text, name),
+            value,
+            "the SQL arm's {name} is not the API arm's\n{text}"
+        );
+    }
+    assert_eq!(rows_of(&text), api_ids.len() as u64);
+    // And the same ten winners, in the same order.
+    let rows = match f
+        .db
+        .sql(
+            "SELECT _id FROM place ORDER BY emb <=> $1::vector LIMIT 10",
+            &[Param::Vector(vector)],
+        )
+        .unwrap()
+    {
+        SqlResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    let sql_ids: Vec<u64> = rows
+        .iter()
+        .map(|row| match &row.values[0] {
+            SqlValue::Id(id) => id.sequence,
+            other => panic!("_id is an entity id, got {other:?}"),
+        })
+        .collect();
+    let want: Vec<u64> = api_ids.iter().map(|id| id.sequence).collect();
+    assert_eq!(sql_ids, want);
 }

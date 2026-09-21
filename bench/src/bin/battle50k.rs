@@ -1,10 +1,10 @@
 //! BATTLE50K — E4 against PostGIS + pgvector/pgvectorscale on one 50,000-row
 //! corpus, one arm per process, modelled on `bench/src/bin/popsim.rs`.
 //!
-//!     battle50k <arm: e4|postgres> --data <jsonl> --queries <json>
-//!               --out <report.json> [--db-dir <dir>] [--dsn <dsn>]
-//!               [--only <case-substring>] [--reuse] [--dump <dir>]
-//!     battle50k compare <a.json> <b.json>
+//!     battle50k <arm: e4|e4-sql|postgres|sqlite> --data <jsonl> --queries <json>
+//!               --out <report.json> [--db-dir <dir|sqlite .db file>] [--dsn <dsn>]
+//!               [--only <case-substring>] [--reuse] [--graph] [--dump <dir>]
+//!     battle50k compare <a.json> <b.json> [<c.json>] [<d.json>]
 //!
 //! PURPOSE. `popsim` compares E4 against SQLite and Postgres on a generated
 //! population of points and squares. This program asks a narrower question on
@@ -37,6 +37,26 @@
 //!               Loaded in 256-row transactions with `synchronous_commit=on`;
 //!               each `CREATE INDEX` is its own timed stage. `disk_bytes` is
 //!               `pg_total_relation_size('place')`.
+//!
+//!   `sqlite`    an embedded SQLite 3.46 (rusqlite's bundled build) in the
+//!               FILE named by `--db-dir`, one table
+//!               `place("key" text primary key, name, descr, kind, born int,
+//!               lon real, lat real, emb blob, plot text, born_ts int)` plus
+//!               an FTS5 index over `name || ' ' || descr`, TWO R*Trees (the
+//!               point's box and the plot's box) and five ordinary indexes
+//!               including the expression index on `lower(kind)`. SQLite has
+//!               no geometry type, no geodesic, no vector type and no
+//!               traversal atomic, so each of those is a REGISTERED SCALAR
+//!               FUNCTION calling sekejap-core itself — `geo_dist_m` is
+//!               `spatial_math::wgs84_distance_metres`, the geometry
+//!               predicates are `spatial_geometry::{within, contains,
+//!               intersects, dwithin_m}` — which makes the ORACLE the same
+//!               maths in both arms and the row counts comparable. Loaded in
+//!               256-row transactions with `journal_mode=DELETE` and
+//!               `synchronous=FULL`; every index build is its own timed
+//!               stage. `disk_bytes` is the `.db` file and anything beside
+//!               it. A case SQLite cannot express is reported as
+//!               `n/a: <reason>`, never skipped.
 //!
 //! BATTERY. The same twenty cases, in the same order, in both arms, fifty
 //! query instances each, driven by `queries.json` (`points`, `boxes`,
@@ -205,14 +225,16 @@ use sekejap_core::{
         Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest, BfsRequest,
         CandidateDriver, Cmp, CollectionId, CollectionOptions, Database, Direction,
         EdgePredicate, EdgeTypeId, EntityId, Geom, GeometryFilter, GraphContextId, GroupCmp,
-        GroupKey, GroupOrder, GroupPredicate, IndexExpr, IndexId, IndexState, OwnedScalarValue,
+        GroupKey, GroupOrder, GroupPredicate, IndexExpr, IndexId, IndexState, NewEdge,
+        OwnedScalarValue,
         PointFilter, ProjectedValue, Projection, QueryBudget, QueryFilter, QueryOrder,
         QueryRequest, ScalarFilter, ScalarValue, ScoreExpr, SortDirection, TextMatch,
         VectorMetric,
     },
-    spatial_math::{wgs84_distance_metres, Bounds, Point},
+    spatial_geometry,
+    spatial_math::{radius_candidate_bounds, wgs84_distance_metres, Bounds, Point},
 };
-use sekejap_lang::{prepare_sql, Param, SqlError, SqlValue};
+use sekejap_lang::{prepare_sql, Param, PreparedSql, SqlDatabase, SqlError, SqlValue};
 use sekejap_core::{
     Kind,
 };
@@ -221,6 +243,12 @@ use kernel::{
     store::{Config, SyncMode},
 };
 use postgres::{types::ToSql, Client, NoTls};
+use rusqlite::{
+    functions::FunctionFlags,
+    params_from_iter,
+    types::{Value as LiteValue, ValueRef},
+    Connection,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -276,6 +304,12 @@ pub const FIRST_KEYS: usize = 10;
 pub const KINDS: usize = 8;
 /// Vector width of the `emb` field.
 pub const DIM: usize = 32;
+
+/// Rows one instance of a `vec_bulk_write_1k*` case writes, as one batch
+/// under one commit.
+pub const VEC_BULK_ROWS: usize = 1_000;
+/// The scratch collection / table every write case builds and throws away.
+pub const VEC_BULK_OBJECT: &str = "place_bulk";
 
 const DEFAULT_DB_DIR: &str = "<scratch>";
 const DEFAULT_DSN: &str = "postgres://127.0.0.1:5433/e4_bench";
@@ -615,6 +649,12 @@ pub enum CaseKind {
     Filter,
     Ranked,
     Approx,
+    /// A WRITE case. It returns no rows from the database: `total_rows` is
+    /// the rows it PUT there, and two arms agree when they wrote the same
+    /// number of them, which is the same agreement a filter case is judged
+    /// on. Every write case builds its own scratch state, measures one
+    /// batch, and leaves the corpus it was measured beside untouched.
+    Write,
 }
 
 impl CaseKind {
@@ -623,6 +663,7 @@ impl CaseKind {
             Self::Filter => "filter",
             Self::Ranked => "ranked",
             Self::Approx => "approx",
+            Self::Write => "write",
         }
     }
 }
@@ -638,7 +679,7 @@ pub struct CaseSpec {
 /// approximate sweeps (`APPROX_BASES`), generated at runtime, one case per
 /// `EF_SWEEP` / `SLS_SWEEP` point, because there is no longer one fixed-ef
 /// case for either to be a fixed entry of.
-pub const BATTERY: [CaseSpec; 41] = [
+pub const BATTERY: [CaseSpec; 43] = [
     CaseSpec { name: "pt_radius", kind: CaseKind::Filter },
     CaseSpec { name: "pt_bbox", kind: CaseKind::Filter },
     CaseSpec { name: "plot_within_box", kind: CaseKind::Filter },
@@ -695,6 +736,19 @@ pub const BATTERY: [CaseSpec; 41] = [
     CaseSpec { name: "fn_lower_eq", kind: CaseKind::Filter },
     CaseSpec { name: "fn_like_prefix", kind: CaseKind::Filter },
     CaseSpec { name: "fn_project_strings", kind: CaseKind::Filter },
+    // ── the vector WRITE battery ────────────────────────────────────────
+    // The owner's application writes embeddings in BULK and queries them
+    // approximately; the battery above only ever asked the second half. Each
+    // of these writes VEC_BULK_ROWS rows of a DIM-lane embedding as ONE
+    // batch with ONE commit, into a scratch collection that is rebuilt from
+    // nothing before every instance, so instance 50 pays what instance 1
+    // paid and the 50,000-row corpus the rest of the battery measures is
+    // never written to. The pair is the measurement: the first has both
+    // vector index families LIVE before the first row lands, the second has
+    // no index at all, and the DIFFERENCE is what index maintenance costs
+    // per row.
+    CaseSpec { name: "vec_bulk_write_1k", kind: CaseKind::Write },
+    CaseSpec { name: "vec_bulk_write_1k_noindex", kind: CaseKind::Write },
     // The four graph cases. They need the `related` edge set, so they are
     // selected only when `--graph` was given (`needs_graph`).
     CaseSpec { name: "graph_2hop", kind: CaseKind::Filter },
@@ -724,6 +778,36 @@ fn is_aggregate_case(name: &str) -> bool {
     name.starts_with("agg_")
 }
 
+/// Is this case a WRITE rather than a question? A write case builds its own
+/// scratch state and never touches the corpus the rest of the battery reads.
+pub fn is_write_case(name: &str) -> bool {
+    name.starts_with("vec_bulk_write_")
+}
+
+/// Does this write case want the two vector index families LIVE while it
+/// writes? `..._noindex` does not; the pair's difference is the maintenance.
+pub fn write_case_is_indexed(name: &str) -> bool {
+    name == "vec_bulk_write_1k"
+}
+
+/// The key and the embedding of row `at` of write instance `i`.
+///
+/// The EMBEDDING comes from the corpus, so every arm writes the same lanes in
+/// the same order and the distribution is the corpus's own rather than a
+/// generator's; the KEY is minted from the instance and the offset, so fifty
+/// instances of a thousand rows never collide with each other and never
+/// collide with the corpus's own keys. Reading the corpus modulo its length
+/// is what lets the smoke test drive the same case over two hundred rows.
+pub fn bulk_row(corpus: &Corpus, i: usize, at: usize) -> R<(String, &[f32])> {
+    if corpus.rows.is_empty() {
+        return Err("a write case needs a non-empty corpus to take embeddings from".into());
+    }
+    let source = (i * VEC_BULK_ROWS + at) % corpus.rows.len();
+    Ok((
+        format!("bulk-{i:02}-{at:06}"),
+        corpus.rows[source].emb.as_slice(),
+    ))
+}
 
 /// True for a case that reads the `related` edge set, which only a `--graph`
 /// load writes. Without it the case has nothing to answer from and is
@@ -847,6 +931,18 @@ fn write_dump(dir: &Path, case: &str, i: usize, keys: &[String]) -> R<()> {
     Ok(())
 }
 
+/// `<dir>/<case>/statement.sql` — the exact statement one instance of the
+/// case ran, written beside the keys it returned so a reader of the dump can
+/// see WHAT was asked and not only what came back. Written by the `sqlite`
+/// arm, whose whole subject is how a case has to be spelt without the types
+/// the other engines have.
+fn write_statement(dir: &Path, case: &str, sql: &str) -> R<()> {
+    let case_dir = dir.join(case);
+    fs::create_dir_all(&case_dir)?;
+    fs::write(case_dir.join("statement.sql"), format!("{sql}\n"))?;
+    Ok(())
+}
+
 /// One untimed pass over all fifty instances of one case, writing every
 /// instance's full key set under `dir`.
 fn dump_case(dir: &Path, case: &str, mut run: impl FnMut(usize) -> R<Answer>) -> R<()> {
@@ -871,6 +967,15 @@ pub struct CaseResult {
     pub run_median_us: f64,
     /// Median over instances of the prepare cost; 0 for arms that prepare nothing.
     pub prepare_median_us: f64,
+    /// Median over instances of the whole call when the statement is
+    /// PREPARED ONCE and re-bound per instance (`--prepared`, `e4-sql`
+    /// only). `None` when the run did not ask for it, or when the case's
+    /// statement TEXT is not the same for every instance, in which case a
+    /// prepared statement would be a different statement each time.
+    pub prepared_median_us: Option<f64>,
+    /// Median over instances of the BIND alone, beside
+    /// [`CaseResult::prepared_median_us`].
+    pub prepared_bind_median_us: Option<f64>,
     pub total_rows: u64,
     pub first_keys: Vec<String>,
 }
@@ -914,6 +1019,48 @@ fn measure(mut run: impl FnMut(usize) -> R<Answer>) -> R<CaseResult> {
         p90_us: percentile(&sorted, 0.9),
         run_median_us: percentile(&run_micros, 0.5),
         prepare_median_us: percentile(&prepare_micros, 0.5),
+        prepared_median_us: None,
+        prepared_bind_median_us: None,
+        total_rows,
+        first_keys,
+    })
+}
+
+/// One untimed warm pass then one timed pass, for a case that has to REBUILD
+/// its state before each instance.
+///
+/// [`measure`] times the whole closure, which is right for a question and
+/// wrong for a write: the reset that gives instance `i` the same empty
+/// collection instance 0 had is setup, not the thing being measured. So the
+/// closure here does both and reports the micros of the TIMED half itself,
+/// and this function does nothing but collect them. `prepare_median_us` is
+/// zero for the same reason it is zero in the `e4` arm -- nothing is parsed.
+fn measure_write(mut once: impl FnMut(usize) -> R<(f64, Answer)>) -> R<CaseResult> {
+    for i in 0..INSTANCES {
+        once(i)?;
+    }
+    let mut micros = Vec::with_capacity(INSTANCES);
+    let mut total_rows = 0u64;
+    let mut first_keys = Vec::new();
+    for i in 0..INSTANCES {
+        let (wall, answer) = once(i)?;
+        micros.push(wall);
+        total_rows += answer.rows;
+        if i == 0 {
+            first_keys = answer.keys.clone();
+        }
+    }
+    let mut sorted = micros;
+    sorted.sort_by(f64::total_cmp);
+    Ok(CaseResult {
+        median_us: percentile(&sorted, 0.5),
+        p90_us: percentile(&sorted, 0.9),
+        run_median_us: percentile(&sorted, 0.5),
+        prepare_median_us: 0.0,
+        // A write case prepares nothing per instance; the prepared column is
+        // a query's.
+        prepared_median_us: None,
+        prepared_bind_median_us: None,
         total_rows,
         first_keys,
     })
@@ -1846,6 +1993,116 @@ const GRAPH_NEEDS_LOAD: &str =
 /// arm matches `related.source = <key>` inside its statement. Without this
 /// split the API arm would carry a point-get the SQL arm's run does not, and
 /// the two run medians would differ by exactly that.
+// ── the vector write cases, E4 and e4-sql ─────────────────────────────────
+
+/// Where a write case builds its scratch database: a SIBLING of `--db-dir`,
+/// never inside it.
+///
+/// Two reasons, both of them rules rather than taste. The 50,000-row corpus
+/// is REUSED across runs and across workers, so a case that wrote into it
+/// would change what every later `--reuse` measures; and `disk_bytes` is the
+/// sum of the files under `--db-dir`, so a scratch collection living there
+/// would be counted as corpus. The directory is removed when the case ends.
+pub fn e4_bulk_dir(db_dir: &Path) -> PathBuf {
+    let mut name = db_dir.file_name().unwrap_or_default().to_os_string();
+    name.push("-bulk");
+    db_dir.with_file_name(name)
+}
+
+/// One scratch database with one empty collection, and the two vector index
+/// families made READY on it BEFORE any row lands when `indexed`.
+///
+/// An index created on an empty collection reaches READY in one build step
+/// that walks nothing, so what the rows below meet is a LIVE index doing
+/// per-row maintenance -- not a late build over an already-written corpus,
+/// which is what every `index:*` stage of the load measures instead.
+fn e4_bulk_reset(dir: &Path, indexed: bool) -> R<(Database, CollectionId)> {
+    let _ = fs::remove_dir_all(dir);
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut db = Database::create(
+        dir,
+        Config {
+            budget_bytes: CACHE_BYTES,
+            io: IoMode::Buffered,
+            sync: SyncMode::Full,
+        },
+    )?;
+    let collection = db.create_collection_declared(
+        VEC_BULK_OBJECT,
+        vec![
+            ("key".into(), Kind::Text),
+            ("emb".into(), Kind::Vector(DIM)),
+        ],
+        Vec::new(),
+        CollectionOptions::default(),
+    )?;
+    db.commit()?;
+    if indexed {
+        let exact = db.create_exact_vector_index(collection, "bulk_emb_exact", "emb")?;
+        db.commit()?;
+        db.build_index_to_ready(exact, BATCH)?;
+        db.commit()?;
+        let ann = db.create_quantized_vector_index(collection, "bulk_emb_ann", "emb")?;
+        db.commit()?;
+        db.build_index_to_ready(ann, BATCH)?;
+        db.commit()?;
+    }
+    Ok((db, collection))
+}
+
+/// Reset (untimed), then TIME one batch of [`VEC_BULK_ROWS`] puts closed by
+/// one commit. `begin_bulk`/`end_bulk` is the scope OPS_CONTRACT §7 names:
+/// the outermost close commits, so the whole thousand is one durability
+/// point rather than a thousand.
+fn e4_bulk_write(dir: &Path, corpus: &Corpus, name: &str, i: usize) -> R<(f64, Answer)> {
+    let batch: Vec<(String, &[f32])> = (0..VEC_BULK_ROWS)
+        .map(|at| bulk_row(corpus, i, at))
+        .collect::<R<Vec<_>>>()?;
+    let (mut db, collection) = e4_bulk_reset(dir, write_case_is_indexed(name))?;
+    let started = Instant::now();
+    db.begin_bulk()?;
+    for (key, emb) in &batch {
+        db.put(collection, key, &json!({"key": key, "emb": emb}))?;
+    }
+    db.end_bulk()?;
+    let micros = started.elapsed().as_secs_f64() * 1e6;
+    let mut answer = Answer::default();
+    for (key, _) in &batch {
+        answer.push(key.clone());
+    }
+    drop(db);
+    Ok((micros, answer))
+}
+
+/// The same batch asked in SQL, one `INSERT` per row through the same engine.
+/// The vector is a bound `Param::Vector`, not a literal, so the measured
+/// statement is the one an application would issue.
+fn e4sql_bulk_write(dir: &Path, corpus: &Corpus, name: &str, i: usize) -> R<(f64, Answer)> {
+    let batch: Vec<(String, Vec<f32>)> = (0..VEC_BULK_ROWS)
+        .map(|at| bulk_row(corpus, i, at).map(|(key, emb)| (key, emb.to_vec())))
+        .collect::<R<Vec<_>>>()?;
+    let (mut db, _) = e4_bulk_reset(dir, write_case_is_indexed(name))?;
+    let sql = format!("INSERT INTO {VEC_BULK_OBJECT} (key, emb) VALUES ($1, $2)");
+    let started = Instant::now();
+    db.begin_bulk()?;
+    for (key, emb) in &batch {
+        db.sql(
+            &sql,
+            &[Param::Text(key.clone()), Param::Vector(emb.clone())],
+        )?;
+    }
+    db.end_bulk()?;
+    let micros = started.elapsed().as_secs_f64() * 1e6;
+    let mut answer = Answer::default();
+    for (key, _) in &batch {
+        answer.push(key.clone());
+    }
+    drop(db);
+    Ok((micros, answer))
+}
+
 fn e4_graph_seed(ctx: &E4Ctx, key: &str) -> R<(EntityId, f64)> {
     let at = Instant::now();
     let id = ctx
@@ -2057,17 +2314,27 @@ fn load_graph_e4(ctx: &mut E4Ctx, corpus: &Corpus, edges: &[Related]) -> R<Value
                 })
         })
         .collect::<R<Vec<_>>>()?;
-    for (n, edge) in edges.iter().enumerate() {
-        ctx.db.put_edge(
-            GraphContextId::BASE,
-            ids[edge.source],
-            related,
-            ids[edge.destination],
-            &json!({"weight": edge.weight, "since": edge.since}),
-        )?;
-        if (n + 1) % BATCH == 0 {
+    // One `link_many` per commit, so the arm's transaction boundary and its
+    // batch boundary are the same 256 the row load uses. Inside a batch the
+    // engine proves each DISTINCT endpoint once and writes the two keyspaces
+    // as two ascending runs instead of alternating between them per edge
+    // (`core/engine/src/index/graph/mod.rs` `link_many`); nothing about the
+    // commit cadence, the edge set or the properties changes.
+    let mut batch: Vec<NewEdge> = Vec::with_capacity(BATCH);
+    for edge in edges {
+        batch.push(NewEdge {
+            source: ids[edge.source],
+            destination: ids[edge.destination],
+            properties: json!({"weight": edge.weight, "since": edge.since}),
+        });
+        if batch.len() == BATCH {
+            ctx.db.link_many(GraphContextId::BASE, related, &batch)?;
+            batch.clear();
             ctx.db.commit()?;
         }
+    }
+    if !batch.is_empty() {
+        ctx.db.link_many(GraphContextId::BASE, related, &batch)?;
     }
     ctx.db.commit()?;
     ctx.related = Some(related);
@@ -3431,10 +3698,15 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
 fn e4sql_project_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) -> R<Answer> {
     let t0 = Instant::now();
     let prepared = prepare_sql(&ctx.db, sql, params)?;
-    let mut answer = Answer {
-        prepare_us: t0.elapsed().as_secs_f64() * 1e6,
-        ..Answer::default()
-    };
+    let mut answer = e4sql_project_page(ctx, keys, &prepared)?;
+    answer.prepare_us = t0.elapsed().as_secs_f64() * 1e6;
+    Ok(answer)
+}
+
+/// The paging half of [`e4sql_project_run`], over a statement that is
+/// already compiled. `--prepared` calls this after a REBIND.
+fn e4sql_project_page(ctx: &E4Ctx, keys: &[String], prepared: &PreparedSql) -> R<Answer> {
+    let mut answer = Answer::default();
     let mut sink = 0u64;
     prepared.for_each_row(&ctx.db, PAGE, &mut |row| {
         let ordinal = (row.id.sequence - 1) as usize;
@@ -3461,10 +3733,15 @@ fn e4sql_project_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) 
 fn e4sql_run(ctx: &E4Ctx, keys: &[String], sql: &str, params: &[Param]) -> R<Answer> {
     let t0 = Instant::now();
     let prepared = prepare_sql(&ctx.db, sql, params)?;
-    let mut answer = Answer {
-        prepare_us: t0.elapsed().as_secs_f64() * 1e6,
-        ..Answer::default()
-    };
+    let mut answer = e4sql_page(ctx, keys, &prepared)?;
+    answer.prepare_us = t0.elapsed().as_secs_f64() * 1e6;
+    Ok(answer)
+}
+
+/// The paging half of [`e4sql_run`], over a statement that is already
+/// compiled.
+fn e4sql_page(ctx: &E4Ctx, keys: &[String], prepared: &PreparedSql) -> R<Answer> {
+    let mut answer = Answer::default();
     prepared.with_query(&ctx.db, &mut |query| {
         loop {
             let page = query.next_page(PAGE, QueryBudget::unlimited(), || false)?;
@@ -3504,10 +3781,15 @@ fn agg_fields(name: &str) -> &'static [&'static str] {
 fn e4sql_agg_run(ctx: &E4Ctx, sql: &str, params: &[Param], fields: &[&str]) -> R<Answer> {
     let t0 = Instant::now();
     let prepared = prepare_sql(&ctx.db, sql, params)?;
-    let mut answer = Answer {
-        prepare_us: t0.elapsed().as_secs_f64() * 1e6,
-        ..Answer::default()
-    };
+    let mut answer = e4sql_agg_page(ctx, &prepared, fields)?;
+    answer.prepare_us = t0.elapsed().as_secs_f64() * 1e6;
+    Ok(answer)
+}
+
+/// The paging half of [`e4sql_agg_run`], over a statement that is already
+/// compiled.
+fn e4sql_agg_page(ctx: &E4Ctx, prepared: &PreparedSql, fields: &[&str]) -> R<Answer> {
+    let mut answer = Answer::default();
     prepared.with_aggregate(&ctx.db, &mut |aggregate| {
         loop {
             let page = aggregate.next_page(PAGE, QueryBudget::unlimited(), || false)?;
@@ -3560,6 +3842,110 @@ fn e4sql_answer(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize)
         return e4sql_project_run(ctx, &corpus.keys, &sql, &params);
     }
     e4sql_run(ctx, &corpus.keys, &sql, &params)
+}
+
+/// One case measured with its statement PREPARED ONCE and RE-BOUND per
+/// instance: the median whole call, the median bind on its own, and whether
+/// the compiled form was rebindable (a refused rebind compiles again from
+/// the statement parsed once, which is still one parse for the case).
+///
+/// `None` when the case's statement TEXT is not the same for every instance:
+/// `fn_year_eq` and `agg_born_decade` write their number INTO the statement
+/// rather than binding it, so there is no one statement to prepare, and the
+/// report says so rather than timing fifty different prepares and calling it
+/// a prepared statement.
+fn e4sql_prepared_cost(
+    ctx: &E4Ctx,
+    corpus: &Corpus,
+    q: &Queries,
+    name: &str,
+) -> R<Option<(f64, f64, bool)>> {
+    let (first_sql, first_params, first_ef) = e4sql_case(q, &corpus.kinds, name, 0)?;
+    for i in 1..INSTANCES {
+        let (sql, _, ef) = e4sql_case(q, &corpus.kinds, name, i)?;
+        if sql != first_sql || ef != first_ef {
+            return Ok(None);
+        }
+    }
+    e4sql_set_ef(ctx, first_ef)?;
+    let mut prepared = prepare_sql(&ctx.db, &first_sql, &first_params)?;
+    let rebindable = prepared.rebindable();
+    let aggregate = is_aggregate_case(name);
+    let project = name == "fn_project_strings";
+    let fields = agg_fields(name);
+
+    // One untimed warm pass, then one timed pass -- the same shape `measure`
+    // uses, so the two medians are comparable.
+    let once = |prepared: &mut PreparedSql, i: usize| -> R<(f64, f64, u64)> {
+        let (_, params, _) = e4sql_case(q, &corpus.kinds, name, i)?;
+        let at = Instant::now();
+        prepared.bind(&ctx.db, &params)?;
+        let bind = at.elapsed().as_secs_f64() * 1e6;
+        let answer = if aggregate {
+            e4sql_agg_page(ctx, prepared, fields)?
+        } else if project {
+            e4sql_project_page(ctx, &corpus.keys, prepared)?
+        } else {
+            e4sql_page(ctx, &corpus.keys, prepared)?
+        };
+        Ok((at.elapsed().as_secs_f64() * 1e6, bind, answer.rows))
+    };
+    for i in 0..INSTANCES {
+        once(&mut prepared, i)?;
+    }
+    let mut walls = Vec::with_capacity(INSTANCES);
+    let mut binds = Vec::with_capacity(INSTANCES);
+    for i in 0..INSTANCES {
+        let (wall, bind, _) = once(&mut prepared, i)?;
+        walls.push(wall);
+        binds.push(bind);
+    }
+    walls.sort_by(f64::total_cmp);
+    binds.sort_by(f64::total_cmp);
+    Ok(Some((
+        percentile(&walls, 0.5),
+        percentile(&binds, 0.5),
+        rebindable,
+    )))
+}
+
+/// Every prepared case answers what the unprepared one answers. Run once per
+/// case, untimed, so `--prepared` cannot report a faster number for a
+/// different question.
+fn e4sql_prepared_agrees(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str) -> R<bool> {
+    let (sql, params, ef) = e4sql_case(q, &corpus.kinds, name, 0)?;
+    // A case whose TEXT carries the value has no one statement to prepare,
+    // so there is nothing here to agree or disagree with: it is measured
+    // unprepared and reported as such.
+    for i in 1..INSTANCES {
+        let (other, _, other_ef) = e4sql_case(q, &corpus.kinds, name, i)?;
+        if other != sql || other_ef != ef {
+            return Ok(true);
+        }
+    }
+    e4sql_set_ef(ctx, ef)?;
+    let mut prepared = prepare_sql(&ctx.db, &sql, &params)?;
+    let aggregate = is_aggregate_case(name);
+    let project = name == "fn_project_strings";
+    let fields = agg_fields(name);
+    for i in 0..INSTANCES {
+        let (sql, params, ef) = e4sql_case(q, &corpus.kinds, name, i)?;
+        e4sql_set_ef(ctx, ef)?;
+        prepared.bind(&ctx.db, &params)?;
+        let bound = if aggregate {
+            e4sql_agg_page(ctx, &prepared, fields)?
+        } else if project {
+            e4sql_project_page(ctx, &corpus.keys, &prepared)?
+        } else {
+            e4sql_page(ctx, &corpus.keys, &prepared)?
+        };
+        let fresh = e4sql_answer(ctx, corpus, q, name, i)?;
+        if bound.rows != fresh.rows || bound.keys != fresh.keys {
+            return Ok(false);
+        }
+        let _ = &sql;
+    }
+    Ok(true)
 }
 
 /// The median parse-and-compile cost of one case's statement, in
@@ -3767,6 +4153,52 @@ fn load_graph_pg(client: &mut Client, corpus: &Corpus, edges: &[Related]) -> R<V
     Ok(stage("graph", at.elapsed().as_secs_f64()))
 }
 
+/// The Postgres write case: a scratch table rebuilt before every instance,
+/// with the diskann index LIVE on it before the first row lands.
+///
+/// It is a SEPARATE table, not `place`, for the same two reasons the E4 arm
+/// uses a separate database: `place` is reused across runs, and
+/// `pg_total_relation_size('place')` is the arm's `disk_bytes`. The table is
+/// dropped when the case ends.
+fn pg_bulk_reset(client: &mut Client, indexed: bool) -> R<()> {
+    client.batch_execute(&format!("DROP TABLE IF EXISTS {VEC_BULK_OBJECT}"))?;
+    client.batch_execute(&format!(
+        "CREATE TABLE {VEC_BULK_OBJECT} (key text primary key, emb vector({DIM}))"
+    ))?;
+    if indexed {
+        client.batch_execute(&format!(
+            "CREATE INDEX {VEC_BULK_OBJECT}_emb_ann ON {VEC_BULK_OBJECT} \
+             USING diskann (emb vector_cosine_ops)"
+        ))?;
+    }
+    Ok(())
+}
+
+fn pg_bulk_write(client: &mut Client, corpus: &Corpus, name: &str, i: usize) -> R<(f64, Answer)> {
+    let batch: Vec<(String, String)> = (0..VEC_BULK_ROWS)
+        .map(|at| bulk_row(corpus, i, at).map(|(key, emb)| (key, vector_literal(emb))))
+        .collect::<R<Vec<_>>>()?;
+    pg_bulk_reset(client, write_case_is_indexed(name))?;
+    // `$2::text::vector` for the same reason `pg_insert_batch` spells it that
+    // way: a bare `$2::vector` makes the server resolve the placeholder as
+    // `vector`, and the Rust client has no `ToSql` for that type.
+    let statement = client.prepare(&format!(
+        "INSERT INTO {VEC_BULK_OBJECT} (key, emb) VALUES ($1, $2::text::vector)"
+    ))?;
+    let started = Instant::now();
+    client.batch_execute("BEGIN")?;
+    for (key, literal) in &batch {
+        client.execute(&statement, &[key, literal])?;
+    }
+    client.batch_execute("COMMIT")?;
+    let micros = started.elapsed().as_secs_f64() * 1e6;
+    let mut answer = Answer::default();
+    for (key, _) in &batch {
+        answer.push(key.clone());
+    }
+    Ok((micros, answer))
+}
+
 fn pg_disk_bytes(client: &mut Client) -> R<u64> {
     let size: i64 = client
         .query_one("SELECT pg_total_relation_size('place')", &[])?
@@ -3794,6 +4226,1419 @@ fn pg_has_query_rescore(client: &mut Client) -> bool {
     ok
 }
 
+// ── the sqlite arm ────────────────────────────────────────────────────────
+//
+// The same forty-one cases asked of an embedded SQLite 3.46 (rusqlite's
+// bundled build) holding one `place` table, an FTS5 index over the same
+// concatenation E4 indexes, two R*Trees, five ordinary indexes and — under
+// `--graph` — the same `related` edge set. SQLite has no geometry type, no
+// geodesic, no vector index and no traversal atomic, so every one of those
+// is a REGISTERED SCALAR FUNCTION that calls the very routine E4's own
+// refine calls: the oracle is the same maths, and the row counts can
+// therefore be compared rather than excused. Where SQLite cannot express a
+// case at all the arm reports `n/a: <reason>`; it never skips one.
+
+/// The names the stages block uses, so the four reports line up stage for
+/// stage. `place_text` is the FTS5 table, `place_loc` the point R*Tree and
+/// `place_plot` the plot-bounding-box R*Tree.
+const LITE_FTS: &str = "place_fts";
+const LITE_POINT_RT: &str = "place_rt";
+const LITE_PLOT_RT: &str = "plot_rt";
+
+/// How much wider than the true box an R*Tree row is stored and queried.
+///
+/// An `rtree` column holds a 32-bit float, whose relative precision is
+/// 6.0e-8, so a box written or read at f64 precision can be rounded INWARD
+/// by up to one f32 ulp — about 8 m in longitude at this corpus's 107°E.
+/// A candidate box that lost a row to rounding would make this arm answer a
+/// different question than E4, so every stored box and every query box is
+/// widened by 1.0e-6 relative (about 0.12 m at 107°, sixteen times the ulp)
+/// plus 1.0e-9 absolute for values near zero. Widening a CANDIDATE changes
+/// the cost and never the answer: every one is followed by an exact refine.
+const RT_EPS_REL: f64 = 1e-6;
+const RT_EPS_ABS: f64 = 1e-9;
+
+/// The radii the k-nearest ladder tries, in metres, smallest first. SQLite's
+/// R*Tree has no nearest-neighbour cursor, so `knn_10` asks for the ten
+/// nearest inside a box of this radius and accepts the answer only when it
+/// holds ten rows AND the tenth is no further than the radius — at which
+/// point no row outside the box can displace one inside it. A run that
+/// exhausts the ladder falls back to a whole-corpus scan.
+const KNN_RING_METRES: [f64; 7] = [
+    250.0, 1_000.0, 4_000.0, 16_000.0, 64_000.0, 256_000.0, 1_024_000.0,
+];
+
+/// SQLite's default page size in the bundled 3.46 build, recorded so the
+/// disk comparison names it rather than implying the four arms agreed on one.
+const LITE_PAGE_BYTES: i64 = 4_096;
+
+fn rt_pad(value: f64) -> f64 {
+    value.abs() * RT_EPS_REL + RT_EPS_ABS
+}
+
+/// `[west, east, south, north]` widened outward, in the order an R*Tree
+/// OVERLAP constraint binds them.
+fn rt_overlap(west: f64, east: f64, south: f64, north: f64) -> [LiteValue; 4] {
+    [
+        LiteValue::Real(west - rt_pad(west)),
+        LiteValue::Real(east + rt_pad(east)),
+        LiteValue::Real(south - rt_pad(south)),
+        LiteValue::Real(north + rt_pad(north)),
+    ]
+}
+
+fn bbox_ring(ring: &[[f64; 2]], into: &mut (f64, f64, f64, f64)) {
+    for p in ring {
+        into.0 = into.0.min(p[0]);
+        into.1 = into.1.max(p[0]);
+        into.2 = into.2.min(p[1]);
+        into.3 = into.3.max(p[1]);
+    }
+}
+
+/// `(west, east, south, north)` of any geometry, which is the box the plot
+/// R*Tree stores and the box a geometry predicate's candidate must overlap.
+/// Every predicate in the battery is monotone in this box — a geometry that
+/// is within, contains, intersects or is near another has a bounding box
+/// that overlaps the other's (grown by the distance, for `DWithin`) — so the
+/// overlap test is a true superset of each one.
+fn geom_bbox(g: &Geom) -> (f64, f64, f64, f64) {
+    let mut b = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    match g {
+        Geom::Point(x, y) => bbox_ring(&[[*x, *y]], &mut b),
+        Geom::LineString(c) | Geom::MultiPoint(c) => bbox_ring(c, &mut b),
+        Geom::Polygon(rings) | Geom::MultiLineString(rings) => {
+            for ring in rings {
+                bbox_ring(ring, &mut b);
+            }
+        }
+        Geom::MultiPolygon(polygons) => {
+            for polygon in polygons {
+                for ring in polygon {
+                    bbox_ring(ring, &mut b);
+                }
+            }
+        }
+    }
+    b
+}
+
+/// The 32 lanes of an `emb` as the BLOB the `place` table stores: little-endian
+/// f32, exactly the lanes E4's dense-v3 vector keyspace holds.
+fn emb_blob(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// `1 - cos(a, b)` over two little-endian f32 BLOBs — the same quantity
+/// pgvector writes `a <=> b` and `VectorMetric::Cosine` ranks by.
+fn cosine_distance(a: &[u8], b: &[u8]) -> Result<f64, String> {
+    if a.len() != b.len() || a.len() % 4 != 0 {
+        return Err(format!(
+            "cosine over {} and {} bytes: both must be the same multiple of four",
+            a.len(),
+            b.len()
+        ));
+    }
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for lane in 0..a.len() / 4 {
+        let at = lane * 4;
+        let x = f64::from(f32::from_le_bytes([a[at], a[at + 1], a[at + 2], a[at + 3]]));
+        let y = f64::from(f32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]));
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denominator = (na.sqrt() * nb.sqrt()).max(1e-12);
+    Ok(1.0 - dot / denominator)
+}
+
+fn lite_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::UserFunctionError(message.into())
+}
+
+/// The geometry a constant argument names, parsed ONCE per statement.
+///
+/// SQLite keeps auxiliary data only for arguments it proved constant at
+/// prepare time, and every call below passes the query geometry as a BOUND
+/// PARAMETER, so the parse is paid once per statement rather than once per
+/// row. The stored `plot` column is not constant and is parsed per row; that
+/// cost is a named deviation, not a hidden one.
+fn lite_geom_arg(
+    ctx: &rusqlite::functions::Context<'_>,
+    at: usize,
+) -> rusqlite::Result<std::sync::Arc<Geom>> {
+    if let Some(cached) = ctx.get_aux::<Geom>(at as std::os::raw::c_int)? {
+        return Ok(cached);
+    }
+    let geom = lite_geom_value(ctx, at)?;
+    ctx.set_aux(at as std::os::raw::c_int, geom)
+}
+
+fn lite_geom_value(ctx: &rusqlite::functions::Context<'_>, at: usize) -> rusqlite::Result<Geom> {
+    let text = ctx.get_raw(at).as_str()?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| lite_error(format!("geometry is not JSON: {e}")))?;
+    geom_from_json(&value).map_err(|e| lite_error(format!("geometry is not GeoJSON: {e}")))
+}
+
+/// Register the six functions every case that SQLite cannot express natively
+/// is written against. Each one calls the routine E4's own refine calls, so
+/// the two arms agree on the maths and any row-count difference is a real
+/// difference and not a second implementation of a predicate.
+fn lite_register(conn: &Connection) -> R<()> {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("geo_dist_m", 4, flags, |ctx| {
+        let a = Point::new(ctx.get::<f64>(0)?, ctx.get::<f64>(1)?)
+            .map_err(|e| lite_error(format!("geo_dist_m first point: {e}")))?;
+        let b = Point::new(ctx.get::<f64>(2)?, ctx.get::<f64>(3)?)
+            .map_err(|e| lite_error(format!("geo_dist_m second point: {e}")))?;
+        Ok(wgs84_distance_metres(a, b))
+    })?;
+    conn.create_scalar_function("vec_cos_dist", 2, flags, |ctx| {
+        let a = ctx.get_raw(0).as_blob()?;
+        let b = ctx.get_raw(1).as_blob()?;
+        cosine_distance(a, b).map_err(lite_error)
+    })?;
+    conn.create_scalar_function("geom_within", 2, flags, |ctx| {
+        let a = lite_geom_value(ctx, 0)?;
+        let b = lite_geom_arg(ctx, 1)?;
+        Ok(spatial_geometry::within(&a, &b))
+    })?;
+    conn.create_scalar_function("geom_contains", 2, flags, |ctx| {
+        let a = lite_geom_value(ctx, 0)?;
+        let b = lite_geom_arg(ctx, 1)?;
+        Ok(spatial_geometry::contains(&a, &b))
+    })?;
+    conn.create_scalar_function("geom_intersects", 2, flags, |ctx| {
+        let a = lite_geom_value(ctx, 0)?;
+        let b = lite_geom_arg(ctx, 1)?;
+        Ok(spatial_geometry::intersects(&a, &b))
+    })?;
+    conn.create_scalar_function("geom_dwithin", 3, flags, |ctx| {
+        let a = lite_geom_value(ctx, 0)?;
+        let b = lite_geom_arg(ctx, 1)?;
+        let metres: f64 = ctx.get(2)?;
+        Ok(spatial_geometry::dwithin_m(&a, &b, metres))
+    })?;
+    Ok(())
+}
+
+/// How a value reaches a SQLite statement: bound as `?n`, never inlined, so
+/// the fifty instances of one case share ONE statement text and therefore one
+/// entry in the prepared-statement cache. `Binder` above is the `e4-sql`
+/// arm's `$n` spelling; this is SQLite's.
+#[derive(Default)]
+struct LiteBinder {
+    params: Vec<LiteValue>,
+}
+
+impl LiteBinder {
+    fn mark(&mut self) -> String {
+        format!("?{}", self.params.len())
+    }
+    fn real(&mut self, value: f64) -> String {
+        self.params.push(LiteValue::Real(value));
+        self.mark()
+    }
+    fn int(&mut self, value: i64) -> String {
+        self.params.push(LiteValue::Integer(value));
+        self.mark()
+    }
+    fn text(&mut self, value: &str) -> String {
+        self.params.push(LiteValue::Text(value.to_owned()));
+        self.mark()
+    }
+    fn blob(&mut self, value: Vec<u8>) -> String {
+        self.params.push(LiteValue::Blob(value));
+        self.mark()
+    }
+}
+
+/// `rt.<overlaps the widened box>` — the R*Tree candidate every spatial case
+/// starts from. OVERLAP, never containment: an R*Tree row is a box rounded
+/// outward, so `maxlon >= west AND minlon <= east AND ...` can only ever
+/// admit too much, which the exact refine then removes.
+fn lite_rt_clause(v: &mut LiteBinder, west: f64, east: f64, south: f64, north: f64) -> String {
+    let values = rt_overlap(west, east, south, north);
+    let mut marks = Vec::with_capacity(4);
+    for value in values {
+        v.params.push(value);
+        marks.push(v.mark());
+    }
+    format!(
+        "rt.maxlon >= {} AND rt.minlon <= {} AND rt.maxlat >= {} AND rt.minlat <= {}",
+        marks[0], marks[1], marks[2], marks[3]
+    )
+}
+
+/// The candidate box and the exact refine of a geodesic radius over `loc`.
+/// The box is `radius_candidate_bounds` — the very cover E4's point index
+/// walks — so the candidate set is E4's candidate set and the refine is
+/// E4's refine.
+fn lite_radius(v: &mut LiteBinder, centre: Point, metres: f64) -> R<(String, String)> {
+    let bounds = radius_candidate_bounds(centre, metres)
+        .map_err(|e| format!("radius candidate bounds: {e}"))?;
+    let rt = lite_rt_clause(
+        v,
+        bounds.west(),
+        bounds.east(),
+        bounds.south(),
+        bounds.north(),
+    );
+    let lon = v.real(centre.longitude());
+    let lat = v.real(centre.latitude());
+    let limit = v.real(metres);
+    Ok((rt, format!("geo_dist_m(p.lon, p.lat, {lon}, {lat}) <= {limit}")))
+}
+
+/// The R*Tree candidate for a geometry predicate: the query geometry's own
+/// bounding box.
+fn lite_geom_rt(v: &mut LiteBinder, g: &Geom) -> String {
+    let (west, east, south, north) = geom_bbox(g);
+    lite_rt_clause(v, west, east, south, north)
+}
+
+/// An FTS5 match expression over the one indexed column. Terms are quoted so
+/// a corpus word that happened to be an FTS5 keyword would still be a term.
+fn lite_fts_query(terms: &[&str]) -> String {
+    terms
+        .iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// What one case, at one query instance, asks SQLite.
+enum LitePlan {
+    /// One statement whose first column is the answer — a key, or the text
+    /// line an aggregate group folds to.
+    Rows { sql: String, params: Vec<LiteValue> },
+    /// A projection-only case: the first column is the key and every other
+    /// column is read, because the per-row function cost IS the case.
+    Project { sql: String, params: Vec<LiteValue> },
+    /// k-nearest by a widening R*Tree ring, with a whole-corpus scan behind
+    /// it. Two statements, because SQLite has no nearest-neighbour cursor.
+    Nearest {
+        ring_sql: String,
+        scan_sql: String,
+        centre: [f64; 2],
+        kind: Option<String>,
+    },
+    /// A case SQLite cannot express. The reason is reported as the case's
+    /// `n/a` note; the case is never silently dropped.
+    NotExpressible(String),
+}
+
+/// One case, one query instance, as SQLite spells it.
+fn lite_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<LitePlan> {
+    let mut bound = LiteBinder::default();
+    let v = &mut bound;
+    let kind_value = kinds[i % KINDS].clone();
+    let point = q.points[i];
+    let b = q.boxes[i];
+    let (born_lower, born_upper) = q.born_range(i);
+
+    // The approximate sweep's own axes. E4 sweeps `ef` and Postgres sweeps
+    // `diskann.query_search_list_size`; SQLite has neither, because it has no
+    // approximate vector index at all. Naming the refusal is the point.
+    if parse_approx_sweep(name).is_some() || name.ends_with("@ann") {
+        return Ok(LitePlan::NotExpressible(
+            "SQLite has no approximate vector index and no knob to sweep: there is no ANN \
+             family in the bundled build and no extension is loaded. The arm answers the \
+             same question by whole-corpus scan instead, reported as the `@scan` point of \
+             this sweep, whose recall against this arm's own exact answer is 1.000 by \
+             construction."
+                .to_owned(),
+        ));
+    }
+
+    // `<base>@scan`: the exact answer, standing in for the approximate point
+    // the other two arms sweep.
+    if let Some(base) = name.strip_suffix("@scan") {
+        let vector = v.blob(emb_blob(&q.vectors[i]));
+        let sql = match base {
+            "vec_ann_10" => {
+                format!(
+                    "SELECT \"key\" FROM place ORDER BY vec_cos_dist(emb, {vector}), rowid \
+                     LIMIT {K}"
+                )
+            }
+            "vec_ann_10_kind" => {
+                let kind = v.text(&kind_value);
+                format!(
+                    "SELECT \"key\" FROM place WHERE kind = {kind} \
+                     ORDER BY vec_cos_dist(emb, {vector}), rowid LIMIT {K}"
+                )
+            }
+            other => return Err(format!("battle50k: no SQLite scan point for `{other}`").into()),
+        };
+        return Ok(LitePlan::Rows { sql, params: bound.params });
+    }
+
+    // ── the aggregate battery (QL_CONTRACT §4.7) ────────────────────────
+    // One text column per group, formatted exactly as `agg_line` formats it
+    // in the two E4 arms and as the Postgres statement concatenates it, so
+    // `--dump` diffs the VALUES and not only the group count. `avg` is
+    // `CAST(avg(born) AS INTEGER)`: SQLite's bundled build has no `floor()`
+    // (SQLITE_ENABLE_MATH_FUNCTIONS is not defined) and every `born` is
+    // positive, so the cast's truncation toward zero IS the floor.
+    if is_aggregate_case(name) {
+        let sql = match name {
+            "agg_count_all" => "SELECT '|n=' || count(*) FROM place".to_owned(),
+            "agg_count_kind" => {
+                "SELECT kind || '|n=' || count(*) FROM place GROUP BY kind ORDER BY kind".to_owned()
+            }
+            "agg_sum_born_by_kind" => "SELECT kind || '|n=' || count(*) || '|s=' || sum(born) \
+                 || '|lo=' || min(born) || '|hi=' || max(born) \
+                 || '|mean=' || CAST(avg(born) AS INTEGER) \
+                 FROM place GROUP BY kind HAVING count(*) > 100 ORDER BY kind"
+                .to_owned(),
+            "agg_distinct_kind" => "SELECT DISTINCT kind FROM place ORDER BY kind".to_owned(),
+            "agg_count_radius_by_kind" => {
+                let centre = q.radius_centre(i)?;
+                let (rt, refine) = lite_radius(v, centre, q.radius_metres(i))?;
+                format!(
+                    "SELECT p.kind || '|n=' || count(*) \
+                     FROM {LITE_POINT_RT} rt JOIN place p ON p.rowid = rt.id \
+                     WHERE {rt} AND {refine} GROUP BY p.kind ORDER BY p.kind"
+                )
+            }
+            "agg_born_decade" => "SELECT (born / 10000) || '|n=' || count(*) FROM place \
+                 GROUP BY born / 10000 ORDER BY born / 10000"
+                .to_owned(),
+            other => {
+                return Err(
+                    format!("battle50k: no SQLite spelling for aggregate case `{other}`").into(),
+                )
+            }
+        };
+        return Ok(LitePlan::Rows { sql, params: bound.params });
+    }
+
+    let sql = match name {
+        // ── filters ─────────────────────────────────────────────────────
+        "pt_radius" => {
+            let (rt, refine) = lite_radius(v, q.radius_centre(i)?, q.radius_metres(i))?;
+            format!(
+                "SELECT p.\"key\" FROM {LITE_POINT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND {refine}"
+            )
+        }
+        // The R*Tree candidate is the box rounded outward; the refine is the
+        // inclusive lon/lat comparison `Bounds::contains` makes.
+        "pt_bbox" => {
+            let rt = lite_rt_clause(v, b[0], b[1], b[2], b[3]);
+            let west = v.real(b[0]);
+            let east = v.real(b[1]);
+            let south = v.real(b[2]);
+            let north = v.real(b[3]);
+            format!(
+                "SELECT p.\"key\" FROM {LITE_POINT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND p.lon BETWEEN {west} AND {east} \
+                 AND p.lat BETWEEN {south} AND {north}"
+            )
+        }
+        "plot_within_box" => {
+            let box_polygon = q.box_polygon(i);
+            let rt = lite_geom_rt(v, &box_polygon);
+            let json = v.text(&geom_to_json(&box_polygon).to_string());
+            format!(
+                "SELECT p.\"key\" FROM {LITE_PLOT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND geom_within(p.plot, {json})"
+            )
+        }
+        "plot_contains_pt" => {
+            let probe = Geom::Point(point[0], point[1]);
+            let rt = lite_geom_rt(v, &probe);
+            let json = v.text(&geom_to_json(&probe).to_string());
+            format!(
+                "SELECT p.\"key\" FROM {LITE_PLOT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND geom_contains(p.plot, {json})"
+            )
+        }
+        "plot_intersects" => {
+            let rt = lite_geom_rt(v, &q.polygons[i]);
+            let json = v.text(&q.polygon_json[i]);
+            format!(
+                "SELECT p.\"key\" FROM {LITE_PLOT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND geom_intersects(p.plot, {json})"
+            )
+        }
+        // The candidate is the point's own 1 km cover, because a plot within
+        // a kilometre of the point has a bounding box that meets that cover.
+        "plot_dwithin_1km" => {
+            let probe = Geom::Point(point[0], point[1]);
+            let centre = q.point(i)?;
+            let bounds = radius_candidate_bounds(centre, 1_000.0)
+                .map_err(|e| format!("plot_dwithin_1km candidate bounds: {e}"))?;
+            let rt = lite_rt_clause(
+                v,
+                bounds.west(),
+                bounds.east(),
+                bounds.south(),
+                bounds.north(),
+            );
+            let json = v.text(&geom_to_json(&probe).to_string());
+            format!(
+                "SELECT p.\"key\" FROM {LITE_PLOT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND geom_dwithin(p.plot, {json}, 1000.0)"
+            )
+        }
+        "plot_vs_poly_within" => {
+            let rt = lite_geom_rt(v, &q.polygons[i]);
+            let json = v.text(&q.polygon_json[i]);
+            format!(
+                "SELECT p.\"key\" FROM {LITE_PLOT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND geom_within(p.plot, {json})"
+            )
+        }
+        "text_one" => {
+            let query = v.text(&lite_fts_query(&[&q.terms[i]]));
+            format!(
+                "SELECT p.\"key\" FROM {LITE_FTS} JOIN place p ON p.rowid = {LITE_FTS}.rowid \
+                 WHERE {LITE_FTS} MATCH {query}"
+            )
+        }
+        "text_two" => {
+            let query = v.text(&lite_fts_query(&[
+                &q.terms[i],
+                &q.terms[(i + 1) % INSTANCES],
+            ]));
+            format!(
+                "SELECT p.\"key\" FROM {LITE_FTS} JOIN place p ON p.rowid = {LITE_FTS}.rowid \
+                 WHERE {LITE_FTS} MATCH {query}"
+            )
+        }
+        "text_and_kind" => {
+            let query = v.text(&lite_fts_query(&[&q.terms[i]]));
+            let kind = v.text(&kind_value);
+            format!(
+                "SELECT p.\"key\" FROM {LITE_FTS} JOIN place p ON p.rowid = {LITE_FTS}.rowid \
+                 WHERE {LITE_FTS} MATCH {query} AND p.kind = {kind}"
+            )
+        }
+        "born_range" => {
+            let lower = v.int(born_lower);
+            let upper = v.int(born_upper);
+            format!("SELECT \"key\" FROM place WHERE born BETWEEN {lower} AND {upper}")
+        }
+        "kind_eq" => {
+            let kind = v.text(&kind_value);
+            format!("SELECT \"key\" FROM place WHERE kind = {kind}")
+        }
+        "radius_and_born" => {
+            let (rt, refine) = lite_radius(v, q.radius_centre(i)?, q.radius_metres(i))?;
+            let lower = v.int(born_lower);
+            let upper = v.int(born_upper);
+            format!(
+                "SELECT p.\"key\" FROM {LITE_POINT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND {refine} AND p.born BETWEEN {lower} AND {upper}"
+            )
+        }
+
+        // ── boolean (QL_CONTRACT §3) ────────────────────────────────────
+        "bool_kind_in3" => {
+            let first = v.text(&kind_value);
+            let second = v.text(&kinds[(i + 1) % KINDS]);
+            let third = v.text(&kinds[(i + 2) % KINDS]);
+            format!("SELECT \"key\" FROM place WHERE kind IN ({first}, {second}, {third})")
+        }
+        "bool_born_or_kind" => {
+            let lower = v.int(born_lower);
+            let upper = v.int(born_upper);
+            let kind = v.text(&kind_value);
+            format!(
+                "SELECT \"key\" FROM place WHERE (born BETWEEN {lower} AND {upper}) \
+                 OR kind = {kind}"
+            )
+        }
+        "bool_not_kind" => {
+            let kind = v.text(&kind_value);
+            format!("SELECT \"key\" FROM place WHERE kind <> {kind}")
+        }
+        // Two R*Tree candidate sets, each exactly refined, UNIONed: the union
+        // of two covers, which is what QueryFilter::Any over two radius
+        // leaves is. UNION, not UNION ALL, because a row inside both circles
+        // is one row of one membership set.
+        "bool_radius_or_radius" => {
+            let (first_rt, first_refine) =
+                lite_radius(v, q.radius_centre(i)?, q.radius_metres(i))?;
+            let other = (i + 1) % INSTANCES;
+            let (second_rt, second_refine) =
+                lite_radius(v, q.radius_centre(other)?, q.radius_metres(other))?;
+            format!(
+                "SELECT \"key\" FROM ( \
+                   SELECT p.\"key\" AS \"key\" FROM {LITE_POINT_RT} rt \
+                     JOIN place p ON p.rowid = rt.id WHERE {first_rt} AND {first_refine} \
+                   UNION \
+                   SELECT p.\"key\" FROM {LITE_POINT_RT} rt \
+                     JOIN place p ON p.rowid = rt.id WHERE {second_rt} AND {second_refine} \
+                 )"
+            )
+        }
+        "bool_not_null_born" => "SELECT \"key\" FROM place WHERE born IS NOT NULL".to_owned(),
+        "bool_exists_related" => format!(
+            "SELECT p.\"key\" FROM place p \
+             WHERE EXISTS (SELECT 1 FROM {RELATED} r WHERE r.source = p.\"key\")"
+        ),
+
+        // ── the function battery (QL_CONTRACT §4.1, §4.2) ───────────────
+        // SQLite has no date type and no `EXTRACT`, so the two date cases are
+        // written as the RANGE the other three arms fold their function into.
+        // That is a deviation in the SPELLING and not in the question: the
+        // bounds are `micros_of` in every arm.
+        "fn_year_eq" => {
+            let year = q.fn_year(i);
+            let lower = v.int(micros_of(year, 1, 1));
+            let upper = v.int(micros_of(year + 1, 1, 1));
+            format!("SELECT \"key\" FROM place WHERE {BORN_TS} >= {lower} AND {BORN_TS} < {upper}")
+        }
+        "fn_trunc_month_range" => {
+            let year = q.fn_year(i);
+            let lower = v.int(micros_of(year, 1, 1));
+            let upper = v.int(micros_of(year, 7, 1));
+            format!("SELECT \"key\" FROM place WHERE {BORN_TS} >= {lower} AND {BORN_TS} < {upper}")
+        }
+        "fn_lower_eq" => {
+            let folded = v.text(&kind_value.to_lowercase());
+            format!("SELECT \"key\" FROM place WHERE lower(kind) = {folded}")
+        }
+        "fn_like_prefix" => {
+            let pattern = v.text(&format!("{}%", q.name_prefix(i)));
+            format!("SELECT \"key\" FROM place WHERE name LIKE {pattern}")
+        }
+        "fn_project_strings" => {
+            let lower = v.int(born_lower);
+            let upper = v.int(born_upper);
+            return Ok(LitePlan::Project {
+                sql: format!(
+                    "SELECT \"key\", upper(name), length(descr) FROM place \
+                     WHERE born BETWEEN {lower} AND {upper}"
+                ),
+                params: bound.params,
+            });
+        }
+
+        // ── ranked ──────────────────────────────────────────────────────
+        "knn_10" | "knn_10_kind" => {
+            let by_kind = name == "knn_10_kind";
+            let kind_clause = if by_kind { " AND p.kind = ?7" } else { "" };
+            let scan_kind = if by_kind { " WHERE kind = ?3" } else { "" };
+            return Ok(LitePlan::Nearest {
+                ring_sql: format!(
+                    "SELECT p.\"key\", geo_dist_m(p.lon, p.lat, ?1, ?2) AS d \
+                     FROM {LITE_POINT_RT} rt JOIN place p ON p.rowid = rt.id \
+                     WHERE rt.maxlon >= ?3 AND rt.minlon <= ?4 AND rt.maxlat >= ?5 \
+                     AND rt.minlat <= ?6{kind_clause} ORDER BY d, p.rowid LIMIT {K}"
+                ),
+                scan_sql: format!(
+                    "SELECT \"key\", geo_dist_m(lon, lat, ?1, ?2) AS d FROM place{scan_kind} \
+                     ORDER BY d, rowid LIMIT {K}"
+                ),
+                centre: point,
+                kind: by_kind.then(|| kind_value.clone()),
+            });
+        }
+        // FTS5's bm25() is negative-better, so ascending IS best-first.
+        "text_top10" => {
+            let query = v.text(&lite_fts_query(&[&q.terms[i]]));
+            format!(
+                "SELECT p.\"key\" FROM {LITE_FTS} JOIN place p ON p.rowid = {LITE_FTS}.rowid \
+                 WHERE {LITE_FTS} MATCH {query} ORDER BY bm25({LITE_FTS}), p.rowid LIMIT {K}"
+            )
+        }
+        "vec_exact_10" => {
+            let vector = v.blob(emb_blob(&q.vectors[i]));
+            format!(
+                "SELECT \"key\" FROM place ORDER BY vec_cos_dist(emb, {vector}), rowid LIMIT {K}"
+            )
+        }
+        "vec_exact_radius" => {
+            let (rt, refine) = lite_radius(v, q.radius_centre(i)?, q.radius_metres(i))?;
+            let vector = v.blob(emb_blob(&q.vectors[i]));
+            format!(
+                "SELECT p.\"key\" FROM {LITE_POINT_RT} rt JOIN place p ON p.rowid = rt.id \
+                 WHERE {rt} AND {refine} \
+                 ORDER BY vec_cos_dist(p.emb, {vector}), p.rowid LIMIT {K}"
+            )
+        }
+        // The FTS5 match is the driver here and the radius is an exact refine
+        // with no R*Tree in front of it: a term narrows this corpus far
+        // harder than a radius does, and two virtual tables in one statement
+        // would make SQLite materialise whichever it did not drive from.
+        "hybrid_10" => {
+            let query = v.text(&lite_fts_query(&[&q.terms[i]]));
+            let centre = q.radius_centre(i)?;
+            let lon = v.real(centre.longitude());
+            let lat = v.real(centre.latitude());
+            let metres = v.real(q.radius_metres(i));
+            let vector = v.blob(emb_blob(&q.vectors[i]));
+            format!(
+                "SELECT p.\"key\" FROM {LITE_FTS} JOIN place p ON p.rowid = {LITE_FTS}.rowid \
+                 WHERE {LITE_FTS} MATCH {query} \
+                 AND geo_dist_m(p.lon, p.lat, {lon}, {lat}) <= {metres} \
+                 ORDER BY vec_cos_dist(p.emb, {vector}), p.rowid LIMIT {K}"
+            )
+        }
+        "hybrid_blend_10" => {
+            let query = v.text(&lite_fts_query(&[&q.terms[i]]));
+            let centre = q.radius_centre(i)?;
+            let lon = v.real(centre.longitude());
+            let lat = v.real(centre.latitude());
+            let metres = v.real(q.radius_metres(i));
+            let vector = v.blob(emb_blob(&q.vectors[i]));
+            format!(
+                "SELECT p.\"key\" FROM {LITE_FTS} JOIN place p ON p.rowid = {LITE_FTS}.rowid \
+                 WHERE {LITE_FTS} MATCH {query} \
+                 AND geo_dist_m(p.lon, p.lat, {lon}, {lat}) <= {metres} \
+                 ORDER BY 0.5 * (-bm25({LITE_FTS})) \
+                 + 0.5 * (1.0 - vec_cos_dist(p.emb, {vector})) DESC, p.rowid LIMIT {K}"
+            )
+        }
+        "vec_ann_10_kind:exact" => {
+            let kind = v.text(&kind_value);
+            let vector = v.blob(emb_blob(&q.vectors[i]));
+            format!(
+                "SELECT \"key\" FROM place WHERE kind = {kind} \
+                 ORDER BY vec_cos_dist(emb, {vector}), rowid LIMIT {K}"
+            )
+        }
+
+        // ── the graph cases, as a recursive CTE ──────────────────────────
+        //
+        // `WITH RECURSIVE` is the only bounded traversal SQLite can write:
+        // there is no traversal atomic and no pattern syntax. The per-hop
+        // predicates are inside the recursive term, never a post-filter over
+        // a completed walk, because GRAPH_CONTRACT 4.3 says a failing edge is
+        // never followed and a failing node is never expanded. `depth < 2`
+        // bounds the walk at two hops, `UNION` keeps the queue acyclic, and
+        // `node <> <seed>` is the rule that a seed is never its own answer.
+        "graph_2hop" | "graph_2hop_weight" | "graph_2hop_born" => {
+            let seed = v.text(q.seed_key(i)?);
+            let edge = if name == "graph_2hop_weight" {
+                " AND r.weight > 0.5"
+            } else {
+                ""
+            };
+            let node = if name == "graph_2hop_born" {
+                let lower = v.int(born_lower);
+                let upper = v.int(born_upper);
+                format!(
+                    " JOIN place b ON b.\"key\" = r.destination \
+                     AND b.born BETWEEN {lower} AND {upper}"
+                )
+            } else {
+                String::new()
+            };
+            let tail = v.text(q.seed_key(i)?);
+            format!(
+                "WITH RECURSIVE walk(node, depth) AS ( \
+                   SELECT {seed}, 0 \
+                   UNION \
+                   SELECT r.destination, walk.depth + 1 FROM walk \
+                     JOIN {RELATED} r ON r.source = walk.node{edge}{node} \
+                    WHERE walk.depth < 2 \
+                 ) SELECT DISTINCT node FROM walk WHERE depth > 0 AND node <> {tail}"
+            )
+        }
+        "graph_1hop_weight_top10" => {
+            let seed = v.text(q.seed_key(i)?);
+            format!(
+                "SELECT r.source FROM {RELATED} r WHERE r.destination = {seed} \
+                 ORDER BY r.weight DESC LIMIT {K}"
+            )
+        }
+        other => return Err(format!("battle50k: no SQLite spelling for case `{other}`").into()),
+    };
+    Ok(LitePlan::Rows { sql, params: bound.params })
+}
+
+pub struct SqliteCtx {
+    conn: Connection,
+}
+
+/// One statement, one instance: every row's first column pushed as the answer.
+fn lite_run(ctx: &SqliteCtx, sql: &str, params: &[LiteValue]) -> R<Answer> {
+    let mut statement = ctx.conn.prepare_cached(sql)?;
+    let mut answer = Answer::default();
+    let mut rows = statement.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        answer.push(row.get::<_, String>(0)?);
+    }
+    Ok(answer)
+}
+
+/// A projection-only case: the key comes from column 0 and every other column
+/// is READ, because the per-row function cost is what the case measures.
+fn lite_project_run(ctx: &SqliteCtx, sql: &str, params: &[LiteValue]) -> R<Answer> {
+    let mut statement = ctx.conn.prepare_cached(sql)?;
+    let columns = statement.column_count();
+    let mut answer = Answer::default();
+    let mut sink = 0u64;
+    let mut rows = statement.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        for at in 1..columns {
+            sink = sink.wrapping_add(match row.get_ref(at)? {
+                ValueRef::Text(text) => text.len() as u64,
+                ValueRef::Integer(value) => value as u64,
+                _ => 0,
+            });
+        }
+        answer.push(row.get::<_, String>(0)?);
+    }
+    std::hint::black_box(sink);
+    Ok(answer)
+}
+
+/// One ranked pass that also reports the largest distance it returned, which
+/// is what tells the k-nearest ladder whether its box was wide enough.
+fn lite_ranked(ctx: &SqliteCtx, sql: &str, params: &[LiteValue]) -> R<(Answer, f64)> {
+    let mut statement = ctx.conn.prepare_cached(sql)?;
+    let mut answer = Answer::default();
+    let mut worst = 0.0f64;
+    let mut rows = statement.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        answer.push(row.get::<_, String>(0)?);
+        worst = worst.max(row.get::<_, f64>(1)?);
+    }
+    Ok((answer, worst))
+}
+
+/// k-nearest over an R*Tree that has no nearest-neighbour cursor: ask inside
+/// a box of radius r, and accept the answer only when it holds K rows whose
+/// worst distance is at most r. Every row outside that box is further than r
+/// — `radius_candidate_bounds` is a cover of the r-ball — so no row outside
+/// can displace one inside, and the answer is the exact k-nearest.
+fn lite_nearest(
+    ctx: &SqliteCtx,
+    ring_sql: &str,
+    scan_sql: &str,
+    centre: [f64; 2],
+    kind: Option<&str>,
+) -> R<Answer> {
+    let point = Point::new(centre[0], centre[1])?;
+    for metres in KNN_RING_METRES {
+        let bounds = radius_candidate_bounds(point, metres)
+            .map_err(|e| format!("knn candidate bounds: {e}"))?;
+        let mut params = vec![LiteValue::Real(centre[0]), LiteValue::Real(centre[1])];
+        params.extend(rt_overlap(
+            bounds.west(),
+            bounds.east(),
+            bounds.south(),
+            bounds.north(),
+        ));
+        if let Some(kind) = kind {
+            params.push(LiteValue::Text(kind.to_owned()));
+        }
+        let (answer, worst) = lite_ranked(ctx, ring_sql, &params)?;
+        if answer.rows >= K as u64 && worst <= metres {
+            return Ok(answer);
+        }
+    }
+    let mut params = vec![LiteValue::Real(centre[0]), LiteValue::Real(centre[1])];
+    if let Some(kind) = kind {
+        params.push(LiteValue::Text(kind.to_owned()));
+    }
+    Ok(lite_ranked(ctx, scan_sql, &params)?.0)
+}
+
+fn lite_answer(ctx: &SqliteCtx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R<Answer> {
+    match lite_case(q, &corpus.kinds, name, i)? {
+        LitePlan::Rows { sql, params } => lite_run(ctx, &sql, &params),
+        LitePlan::Project { sql, params } => lite_project_run(ctx, &sql, &params),
+        LitePlan::Nearest {
+            ring_sql,
+            scan_sql,
+            centre,
+            kind,
+        } => lite_nearest(ctx, &ring_sql, &scan_sql, centre, kind.as_deref()),
+        LitePlan::NotExpressible(reason) => {
+            Err(format!("battle50k: `{name}` is not expressible in SQLite: {reason}").into())
+        }
+    }
+}
+
+/// The statement instance 0 of a case runs, for the report's `sql` field and
+/// for `--dump`; `Err(reason)` for a case this arm cannot express, which the
+/// report prints as `n/a: <reason>` rather than dropping.
+fn lite_statement(q: &Queries, kinds: &[String], name: &str) -> R<Result<String, String>> {
+    Ok(match lite_case(q, kinds, name, 0)? {
+        LitePlan::Rows { sql, .. } | LitePlan::Project { sql, .. } => Ok(sql),
+        LitePlan::Nearest {
+            ring_sql, scan_sql, ..
+        } => Ok(format!(
+            "-- widening R*Tree rings ({} m … {} m), each:\n{ring_sql}\n\
+             -- whole-corpus fallback when the ladder is exhausted:\n{scan_sql}",
+            KNN_RING_METRES[0],
+            KNN_RING_METRES[KNN_RING_METRES.len() - 1]
+        )),
+        LitePlan::NotExpressible(reason) => Err(reason),
+    })
+}
+
+/// Open the file and register everything a case needs, whether the arm is
+/// loading it or reusing it.
+fn lite_connect(path: &Path) -> R<Connection> {
+    let conn = Connection::open(path)?;
+    // `journal_mode` answers with a row, so it cannot go through
+    // `execute_batch`. DELETE plus FULL is the rollback-journal durability
+    // that matches E4's `SyncMode::Full` and Postgres's
+    // `synchronous_commit = on`: every commit is on the platter before the
+    // next statement runs.
+    let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(format!("sqlite refused journal_mode=DELETE and stayed in {mode}").into());
+    }
+    conn.execute_batch(&format!(
+        "PRAGMA synchronous = FULL;\n\
+         PRAGMA page_size = {LITE_PAGE_BYTES};\n\
+         PRAGMA cache_size = -{};\n\
+         PRAGMA case_sensitive_like = ON;",
+        CACHE_BYTES / 1024
+    ))?;
+    lite_register(&conn)?;
+    Ok(conn)
+}
+
+/// The database file and anything SQLite keeps beside it.
+fn lite_files(path: &Path) -> [PathBuf; 4] {
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+        PathBuf::from(format!("{}-journal", path.display())),
+    ]
+}
+
+/// The whole database on disk: one file holding the table, the primary key,
+/// the FTS5 index, both R*Trees, every ordinary index and the `related` edges.
+/// Where the SQLite write case builds its scratch file: beside the corpus
+/// `.db`, never in it, and removed when the case ends. `lite_disk_bytes`
+/// names four exact paths, so a sibling is not counted as corpus.
+pub fn lite_bulk_path(db: &Path) -> PathBuf {
+    let mut name = db.file_name().unwrap_or_default().to_os_string();
+    name.push("-bulk.db");
+    db.with_file_name(name)
+}
+
+/// The SQLite write case. SQLite has no vector type and no vector index, so
+/// the embedding is a BLOB of `DIM` little-endian f32 lanes -- the same bytes
+/// `emb_blob` gives the corpus loader -- and NEITHER write case has an index
+/// on it. The pair therefore measures the same statement twice in this arm,
+/// which is the honest answer rather than a fabricated difference; see the
+/// arm's deviation.
+fn lite_bulk_write(path: &Path, corpus: &Corpus, i: usize) -> R<(f64, Answer)> {
+    let batch: Vec<(String, Vec<u8>)> = (0..VEC_BULK_ROWS)
+        .map(|at| bulk_row(corpus, i, at).map(|(key, emb)| (key, emb_blob(emb))))
+        .collect::<R<Vec<_>>>()?;
+    lite_remove(path);
+    let conn = lite_connect(path)?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE {VEC_BULK_OBJECT} (\"key\" text primary key, emb blob)"
+    ))?;
+    let started = Instant::now();
+    conn.execute_batch("BEGIN")?;
+    {
+        let mut statement =
+            conn.prepare(&format!("INSERT INTO {VEC_BULK_OBJECT} (\"key\", emb) VALUES (?, ?)"))?;
+        for (key, blob) in &batch {
+            statement.execute(rusqlite::params![key, blob])?;
+        }
+    }
+    conn.execute_batch("COMMIT")?;
+    let micros = started.elapsed().as_secs_f64() * 1e6;
+    let mut answer = Answer::default();
+    for (key, _) in &batch {
+        answer.push(key.clone());
+    }
+    drop(conn);
+    lite_remove(path);
+    Ok((micros, answer))
+}
+
+fn lite_disk_bytes(path: &Path) -> u64 {
+    lite_files(path)
+        .iter()
+        .filter_map(|candidate| fs::metadata(candidate).ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Delete a database a previous pass left, so a fresh load is a fresh load.
+fn lite_remove(path: &Path) {
+    for candidate in lite_files(path) {
+        let _ = fs::remove_file(candidate);
+    }
+}
+
+/// Stream every row in with one transaction per 256, then build the FTS5
+/// index, the two R*Trees and the five ordinary indexes LATE, each its own
+/// timed stage — the same shape the other three arms load in.
+fn load_sqlite(path: &Path, corpus: &Corpus) -> R<(SqliteCtx, Vec<Value>)> {
+    lite_remove(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut stages = Vec::new();
+
+    let at = Instant::now();
+    let conn = lite_connect(path)?;
+    conn.execute_batch(
+        "CREATE TABLE place (\
+           \"key\" TEXT PRIMARY KEY, \
+           name TEXT NOT NULL, \
+           descr TEXT NOT NULL, \
+           kind TEXT NOT NULL, \
+           born INTEGER NOT NULL, \
+           lon REAL NOT NULL, \
+           lat REAL NOT NULL, \
+           emb BLOB NOT NULL, \
+           plot TEXT NOT NULL, \
+           born_ts INTEGER NOT NULL \
+         );",
+    )?;
+    stages.push(stage("open", at.elapsed().as_secs_f64()));
+
+    eprintln!(
+        "[sqlite] inserting {} rows, commit every {BATCH} …",
+        corpus.rows.len()
+    );
+    let at = Instant::now();
+    // The rowid IS the file ordinal, which is E4's entity sequence, which is
+    // what the FTS5 rows and both R*Tree rows are keyed by. Nothing may be
+    // skipped or reordered, or the three keyspaces would name different rows.
+    let mut first = 0usize;
+    while first < corpus.rows.len() {
+        let last = (first + BATCH).min(corpus.rows.len());
+        conn.execute_batch("BEGIN")?;
+        {
+            let mut statement = conn.prepare_cached(
+                "INSERT INTO place (rowid, \"key\", name, descr, kind, born, lon, lat, emb, \
+                 plot, born_ts) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            )?;
+            for ordinal in first..last {
+                let row = &corpus.rows[ordinal];
+                let values = [
+                    LiteValue::Integer(ordinal as i64 + 1),
+                    LiteValue::Text(row.key.clone()),
+                    LiteValue::Text(row.name.clone()),
+                    LiteValue::Text(row.desc.clone()),
+                    LiteValue::Text(row.kind.clone()),
+                    LiteValue::Integer(row.born),
+                    LiteValue::Real(row.lon),
+                    LiteValue::Real(row.lat),
+                    LiteValue::Blob(emb_blob(&row.emb)),
+                    LiteValue::Text(row.plot_json.clone()),
+                    LiteValue::Integer(born_ts_micros(row.born)?),
+                ];
+                statement.execute(params_from_iter(values.iter()))?;
+            }
+        }
+        conn.execute_batch("COMMIT")?;
+        first = last;
+    }
+    stages.push(stage("load", at.elapsed().as_secs_f64()));
+
+    // ── the FTS5 index (`index:place_text`) ─────────────────────────────
+    // One contentless column holding `name || ' ' || descr`: the SAME
+    // concatenation E4 stores as its `text` field and indexes, so the two
+    // arms tokenise the same string (deviation 1). Contentless, because the
+    // words are already in `place` and storing them twice would put a
+    // duplicate of the corpus in the disk number.
+    let at = Instant::now();
+    conn.execute_batch(&format!(
+        "BEGIN;\
+         CREATE VIRTUAL TABLE {LITE_FTS} USING fts5(body, content='', tokenize='unicode61');\
+         INSERT INTO {LITE_FTS}(rowid, body) SELECT rowid, name || ' ' || descr FROM place;\
+         COMMIT;"
+    ))?;
+    stages.push(stage(&format!("index:{IX_TEXT}"), at.elapsed().as_secs_f64()));
+
+    // ── the point R*Tree (`index:place_loc`) ────────────────────────────
+    let at = Instant::now();
+    conn.execute_batch(&format!(
+        "BEGIN;\
+         CREATE VIRTUAL TABLE {LITE_POINT_RT} USING rtree(id, minlon, maxlon, minlat, maxlat);\
+         INSERT INTO {LITE_POINT_RT}(id, minlon, maxlon, minlat, maxlat) SELECT rowid, \
+           lon - (abs(lon) * {RT_EPS_REL:e} + {RT_EPS_ABS:e}), \
+           lon + (abs(lon) * {RT_EPS_REL:e} + {RT_EPS_ABS:e}), \
+           lat - (abs(lat) * {RT_EPS_REL:e} + {RT_EPS_ABS:e}), \
+           lat + (abs(lat) * {RT_EPS_REL:e} + {RT_EPS_ABS:e}) FROM place;\
+         COMMIT;"
+    ))?;
+    stages.push(stage(&format!("index:{IX_LOC}"), at.elapsed().as_secs_f64()));
+
+    // ── the plot-bounding-box R*Tree (`index:place_plot`) ───────────────
+    // The brief names ONE R*Tree, over the point. A geometry predicate
+    // cannot take its candidates from that one: a plot can meet a query
+    // polygon while its own row's point does not, so the point tree is not a
+    // cover for `plot_*` and using it would drop rows. This second tree over
+    // the plot's own bounding box is the SQLite spelling of the
+    // `plot && <candidate>` term the Postgres arm carries (its deviation 14).
+    let at = Instant::now();
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE {LITE_PLOT_RT} USING rtree(id, minlon, maxlon, minlat, maxlat);"
+    ))?;
+    let mut first = 0usize;
+    while first < corpus.rows.len() {
+        let last = (first + BATCH).min(corpus.rows.len());
+        conn.execute_batch("BEGIN")?;
+        {
+            let mut statement = conn.prepare_cached(&format!(
+                "INSERT INTO {LITE_PLOT_RT}(id, minlon, maxlon, minlat, maxlat) \
+                 VALUES (?1,?2,?3,?4,?5)"
+            ))?;
+            for ordinal in first..last {
+                let (west, east, south, north) = geom_bbox(&corpus.rows[ordinal].plot);
+                let mut values = vec![LiteValue::Integer(ordinal as i64 + 1)];
+                values.extend(rt_overlap(west, east, south, north));
+                statement.execute(params_from_iter(values.iter()))?;
+            }
+        }
+        conn.execute_batch("COMMIT")?;
+        first = last;
+    }
+    stages.push(stage(&format!("index:{IX_PLOT}"), at.elapsed().as_secs_f64()));
+
+    // ── the five ordinary indexes ───────────────────────────────────────
+    for (name, ddl) in [
+        (IX_BORN, format!("CREATE INDEX {IX_BORN} ON place(born)")),
+        (IX_KIND, format!("CREATE INDEX {IX_KIND} ON place(kind)")),
+        (
+            IX_BORN_TS,
+            format!("CREATE INDEX {IX_BORN_TS} ON place({BORN_TS})"),
+        ),
+        (IX_NAME, format!("CREATE INDEX {IX_NAME} ON place(name)")),
+        (
+            IX_KIND_LOWER,
+            format!("CREATE INDEX {IX_KIND_LOWER} ON place(lower(kind))"),
+        ),
+    ] {
+        let at = Instant::now();
+        conn.execute_batch(&ddl)?;
+        stages.push(stage(&format!("index:{name}"), at.elapsed().as_secs_f64()));
+    }
+
+    // SQLite's analog of E4's checkpoint and Postgres's ANALYZE/CHECKPOINT:
+    // planner statistics over everything just built. In DELETE journal mode
+    // every committed page is already on the platter, so there is nothing
+    // else to force.
+    //
+    // THE CONNECTION IS THEN CLOSED AND REOPENED, and that is not tidiness.
+    // SQLite reads `sqlite_stat1` when it PARSES a schema, and a connection
+    // that CREATED the schema object by object has never parsed one, so the
+    // statistics `ANALYZE` just wrote are not in force on it. Measured on
+    // this corpus: `plot_dwithin_1km` is 93,472 us per instance on the
+    // loading connection and 31.6 us on a connection that read the same
+    // file — a factor of 2,958 — because without statistics the planner
+    // drives the five plot_* cases from a whole-table scan with a GeoJSON
+    // parse per row instead of from the R*Tree. Measuring that would be
+    // measuring SQLite with its statistics switched off, which is not
+    // SQLite. The reopen is inside the `checkpoint` stage, where the cost
+    // belongs.
+    let at = Instant::now();
+    conn.execute_batch("ANALYZE;")?;
+    drop(conn);
+    let conn = lite_connect(path)?;
+    stages.push(stage("checkpoint", at.elapsed().as_secs_f64()));
+
+    Ok((SqliteCtx { conn }, stages))
+}
+
+/// Reopen a file an earlier pass built. `--reuse` is refused unless the table
+/// already holds every row of the corpus: a query-only pass over a partial
+/// load would be a measurement of a different corpus.
+fn open_sqlite(path: &Path, expected_rows: usize) -> R<(SqliteCtx, Vec<Value>)> {
+    let at = Instant::now();
+    let conn = lite_connect(path)?;
+    let count: i64 = conn.query_row("SELECT count(*) FROM place", [], |row| row.get(0))?;
+    if count != expected_rows as i64 {
+        return Err(format!(
+            "--reuse: place holds {count} rows, expected {expected_rows}; load without --reuse"
+        )
+        .into());
+    }
+    let mut stages = vec![stage("open", at.elapsed().as_secs_f64()), skipped_stage("load")];
+    for name in [
+        IX_TEXT,
+        IX_LOC,
+        IX_PLOT,
+        IX_BORN,
+        IX_KIND,
+        IX_BORN_TS,
+        IX_NAME,
+        IX_KIND_LOWER,
+    ] {
+        stages.push(skipped_stage(&format!("index:{name}")));
+    }
+    stages.push(skipped_stage("checkpoint"));
+    eprintln!("[sqlite] reopened {count} rows; queries only");
+    Ok((SqliteCtx { conn }, stages))
+}
+
+/// Write the same `related` edges into SQLite, as a timed stage.
+///
+/// `related(source text, destination text, weight real, since integer)` with
+/// an index in each direction, exactly as the Postgres arm writes it: the
+/// forward index is what the recursive CTE's hop reads and the reverse one is
+/// E4's always-written reverse posting (GRAPH_CONTRACT 2.2), which
+/// `graph_1hop_weight_top10` walks.
+fn load_graph_sqlite(ctx: &SqliteCtx, corpus: &Corpus, edges: &[Related]) -> R<Value> {
+    let at = Instant::now();
+    ctx.conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {RELATED};\
+         CREATE TABLE {RELATED} (\
+           source TEXT NOT NULL, \
+           destination TEXT NOT NULL, \
+           weight REAL NOT NULL, \
+           since INTEGER NOT NULL \
+         );"
+    ))?;
+    eprintln!("[sqlite] inserting {} `related` edges …", edges.len());
+    let mut first = 0usize;
+    while first < edges.len() {
+        let last = (first + BATCH).min(edges.len());
+        ctx.conn.execute_batch("BEGIN")?;
+        {
+            let mut statement = ctx.conn.prepare_cached(&format!(
+                "INSERT INTO {RELATED} (source, destination, weight, since) VALUES (?1,?2,?3,?4)"
+            ))?;
+            for edge in &edges[first..last] {
+                let values = [
+                    LiteValue::Text(corpus.rows[edge.source].key.clone()),
+                    LiteValue::Text(corpus.rows[edge.destination].key.clone()),
+                    LiteValue::Real(edge.weight),
+                    LiteValue::Integer(edge.since),
+                ];
+                statement.execute(params_from_iter(values.iter()))?;
+            }
+        }
+        ctx.conn.execute_batch("COMMIT")?;
+        first = last;
+    }
+    ctx.conn.execute_batch(&format!(
+        "CREATE INDEX {RELATED}_source ON {RELATED}(source);\
+         CREATE INDEX {RELATED}_destination ON {RELATED}(destination);\
+         ANALYZE {RELATED};"
+    ))?;
+    Ok(stage("graph", at.elapsed().as_secs_f64()))
+}
+
+/// Every limitation this arm has, as data. Law 4: a limitation is NAMED,
+/// never emulated behind a number that looks like the other arms'.
+fn sqlite_deviations() -> Vec<Value> {
+    vec![
+        deviation(
+            "vec_bulk_write_1k",
+            "SQLITE HAS NO VECTOR TYPE AND NO VECTOR INDEX, so both write cases are the \
+             SAME statement in this arm: a 32-lane little-endian f32 BLOB inserted into a \
+             scratch table with no index on it, 1,000 rows in one transaction with \
+             journal_mode=DELETE and synchronous=FULL. `vec_bulk_write_1k` is therefore \
+             not an indexed write here and the pair's difference is zero by construction, \
+             which is stated rather than hidden: the number this arm contributes is the \
+             floor -- what writing a thousand embeddings costs when nothing maintains an \
+             index over them. The scratch file is a sibling of the corpus `.db` and is \
+             removed when the case ends, so it never enters `disk_bytes`.",
+        ),
+        deviation(
+            "*",
+            "SQLITE HAS NO GEOMETRY TYPE, NO GEODESIC AND NO VECTOR TYPE. `plot` is GeoJSON \
+             TEXT, `loc` is two REAL columns and `emb` is a BLOB of 32 little-endian f32 \
+             lanes. Every predicate over them is a REGISTERED SCALAR FUNCTION calling \
+             sekejap-core itself: geo_dist_m is spatial_math::wgs84_distance_metres (Karney's \
+             geodesic on the WGS84 ellipsoid, not the haversine the brief names — a haversine \
+             would answer a DIFFERENT radius question than E4 and the row counts could not be \
+             compared), and geom_within / geom_contains / geom_intersects / geom_dwithin are \
+             spatial_geometry::{within, contains, intersects, dwithin_m}. The ORACLE is \
+             therefore the same routine in both arms and a row-count difference would be a \
+             real difference; what is measured is SQLite's cost of reaching that routine, \
+             never a second implementation of the predicate.",
+        ),
+        deviation(
+            "*",
+            "A GEOMETRY PREDICATE PARSES GeoJSON PER ROW. The query geometry is a bound \
+             parameter, so SQLite's constant-argument auxiliary data parses it ONCE per \
+             statement; the stored `plot` is a TEXT column and is parsed once per candidate \
+             row. E4 reads a decoded geometry straight out of the row, and PostGIS reads \
+             WKB. This is the largest single cost in the five plot_* cases and it is a \
+             property of storing geometry as text, which is the only geometry SQLite has.",
+        ),
+        deviation(
+            "pt_radius",
+            "THE CANDIDATE IS E4'S OWN COVER. Every radius case takes its R*Tree box from \
+             spatial_math::radius_candidate_bounds — the identical conservative envelope E4's \
+             point index walks — and then refines with geo_dist_m <= metres, which is E4's \
+             `within_radius`. Same candidate set, same refine, so `pt_radius`, \
+             `radius_and_born`, `bool_radius_or_radius`, `agg_count_radius_by_kind` and \
+             `vec_exact_radius` compare like with like.",
+        ),
+        deviation(
+            "*",
+            "AN R*TREE COLUMN IS A 32-BIT FLOAT. Every stored box and every query box is \
+             widened outward by 1.0e-6 relative plus 1.0e-9 absolute (about 0.12 m at this \
+             corpus's 107 degrees east, roughly sixteen f32 ulps) so rounding can only ever \
+             admit too much. The constraint is an OVERLAP test, never a containment test, for \
+             the same reason. Both choices change the candidate count and never the answer: \
+             every candidate is exactly refined.",
+        ),
+        deviation(
+            "plot_within_box",
+            "THE BRIEF NAMES ONE R*TREE, OVER THE POINT; THIS ARM BUILDS TWO. A plot can meet \
+             a query geometry while the row's own point does not, so the point tree is not a \
+             cover for the five plot_* cases and driving them from it would DROP rows. The \
+             second tree, `plot_rt`, holds each plot's own bounding box and is the SQLite \
+             spelling of the `plot && <candidate>::geography` term the Postgres arm carries. \
+             It is a real extra index on disk and it is in the disk_bytes number.",
+        ),
+        deviation(
+            "text_one",
+            "FTS5 OVER ONE CONTENTLESS COLUMN HOLDING `name || ' ' || descr` — the same \
+             concatenation E4 stores as its `text` field and indexes (deviation 1 of the E4 \
+             arm), tokenised by unicode61, which case-folds and splits on non-alphanumerics \
+             the way E4's analyzer does. Contentless (`content=''`), because the words are \
+             already in `place`: storing them a second time would put a duplicate of the \
+             corpus into disk_bytes.",
+        ),
+        deviation(
+            "text_top10",
+            "FTS5's bm25() IS NEGATIVE-BETTER, so the order is ASCENDING bm25, and its \
+             parameters (k1=1.2, b=0.75 over one column) are not E4's BM25 parameters or \
+             Postgres's ts_rank_cd. Compared on row count and top-ten overlap, never on order.",
+        ),
+        deviation(
+            "knn_10",
+            "SQLITE'S R*TREE HAS NO NEAREST-NEIGHBOUR CURSOR. k-nearest is a LADDER: ask for \
+             the ten nearest inside a box of radius r (250 m, then 1 km, 4 km, 16 km, 64 km, \
+             256 km, 1024 km) and accept the answer only when it holds ten rows whose worst \
+             distance is at most r — at which point no row outside the box can displace one \
+             inside, because the box is a cover of the r-ball. A ladder that is exhausted \
+             falls back to a whole-corpus scan. The reported median is the whole ladder, \
+             which is the honest cost of k-nearest here; E4 walks outward from the centre in \
+             ONE cursor and PostGIS uses an ordered KNN-GiST walk.",
+        ),
+        deviation(
+            "knn_10",
+            "Ties are broken by rowid, which is the file ordinal, which is E4's entity \
+             sequence — the same tiebreak `QueryOrder::Distance` applies. The Postgres arm \
+             has no tiebreak at all (its deviation 8), so this arm agrees with E4 on ties \
+             where Postgres need not.",
+        ),
+        deviation(
+            "vec_exact_10",
+            "THERE IS NO VECTOR INDEX IN SQLITE AND NONE IS LOADED. Every vector case is a \
+             FULL SCAN with vec_cos_dist (1 - cosine over the two BLOBs) evaluated per row. \
+             E4 answers the same question from `place_emb_exact`, and Postgres from a \
+             sequential scan forced by planner knobs, so the exact-vector row of this table \
+             compares an index against two scans.",
+        ),
+        deviation(
+            "vec_ann_10",
+            "NO ANN INDEX, FULL SCAN. E4 sweeps `ef` and Postgres sweeps \
+             diskann.query_search_list_size; SQLite has neither knob and no approximate \
+             family, so the sweep has exactly two points here: `@ann`, reported as \
+             `n/a: <reason>` because there is nothing to measure, and `@scan`, the \
+             whole-corpus exact answer, whose recall against this arm's own exact twin is \
+             1.000 by construction. A 1.000 recall at scan cost is not a competitive \
+             approximate result; it is the absence of one.",
+        ),
+        deviation(
+            "hybrid_10",
+            "THE FTS5 MATCH IS THE DRIVER AND THE RADIUS IS AN EXACT REFINE WITH NO R*TREE IN \
+             FRONT OF IT. A term narrows this corpus far harder than a radius does, and two \
+             virtual tables in one statement would make SQLite materialise whichever it did \
+             not drive from. hybrid_blend_10 is the same shape.",
+        ),
+        deviation(
+            "hybrid_blend_10",
+            "ORDER BY 0.5 * (-bm25(place_fts)) + 0.5 * (1 - vec_cos_dist(emb, v)). The vector \
+             half is the same cosine as every other arm; the text half is FTS5's bm25 on a \
+             different scale from E4's BM25 and Postgres's ts_rank_cd, so the blend is \
+             compared on top-ten overlap, never on order.",
+        ),
+        deviation(
+            "fn_year_eq",
+            "SQLITE HAS NO DATE TYPE AND NO `EXTRACT`. `born_ts` is INTEGER microseconds, and \
+             the two date cases are written as the half-open RANGE the other three arms fold \
+             their function into, with the identical bounds (`micros_of`). This arm therefore \
+             shows no fold cost at all: it is handed the answer the fold produces. \
+             fn_trunc_month_range is the same.",
+        ),
+        deviation(
+            "fn_like_prefix",
+            "`PRAGMA case_sensitive_like = ON` is set on every connection. SQLite's LIKE is \
+             ASCII-case-INSENSITIVE by default, which would match a different row set than \
+             E4's and Postgres's case-sensitive prefix range. With the pragma on, `name LIKE \
+             'Ti%'` is both case-sensitive and eligible for SQLite's LIKE optimization \
+             against the BINARY-collated index on `name`.",
+        ),
+        deviation(
+            "agg_sum_born_by_kind",
+            "`CAST(avg(born) AS INTEGER)` stands in for `floor(avg(born))`: the bundled build \
+             defines no SQLITE_ENABLE_MATH_FUNCTIONS, so there is no floor(). Every `born` is \
+             positive, so the cast's truncation toward zero IS the floor, and the line matches \
+             the other three arms character for character.",
+        ),
+        deviation(
+            "graph_2hop",
+            "THERE IS NO TRAVERSAL ATOMIC HERE EITHER, SO THE PATTERN IS A RECURSIVE CTE. \
+             `WITH RECURSIVE walk(node, depth)` bounded by `depth < 2`, `UNION` (not UNION \
+             ALL) to keep the queue acyclic, and `node <> <seed>` for the rule that a seed is \
+             never its own answer. The per-hop predicates are INSIDE the recursive term — the \
+             edge weight on the join, the node's `born` as a join to `place` on the \
+             destination — because GRAPH_CONTRACT 4.3 says a failing edge is never followed \
+             and a failing node is never expanded; a post-filter over a finished walk would \
+             return more rows. The Postgres arm writes the same bounded walk as a self-join \
+             instead, because a recursive CTE there would measure the recursion machinery.",
+        ),
+        deviation(
+            "*",
+            "THE LOADING CONNECTION IS CLOSED AFTER `ANALYZE` AND THE BATTERY RUNS ON A FRESH \
+             ONE. SQLite reads `sqlite_stat1` when it PARSES a schema, and a connection that \
+             created the schema object by object has never parsed one, so the statistics \
+             ANALYZE just wrote are not in force on it. Measured on this corpus: \
+             plot_dwithin_1km is 93,472 us per instance on the loading connection and 31.6 us \
+             on a connection that read the same file, a factor of 2,958, because without \
+             statistics the planner drives the five plot_* cases from a whole-table scan with \
+             a GeoJSON parse per row instead of from the R*Tree. The reopen is timed inside \
+             the `checkpoint` stage. Neither of the other two engines needs it: Postgres's \
+             ANALYZE is server-side and visible to the session that ran it, and E4 has no \
+             planner statistics.",
+        ),
+        deviation(
+            "*",
+            "DURABILITY AND CACHE ARE MATCHED, PAGE SIZE IS NOT. `journal_mode = DELETE` with \
+             `synchronous = FULL` is the rollback-journal equivalent of E4's SyncMode::Full \
+             and Postgres's synchronous_commit = on, and `cache_size = -8192` is the same 8 \
+             MiB budget the E4 arm is given. The page is SQLite's 4096-byte default against \
+             E4's own page size and Postgres's 8 KiB block; no arm was retuned for this \
+             corpus.",
+        ),
+        deviation(
+            "*",
+            "disk_bytes IS THE .db FILE (plus any journal beside it): the table, the primary \
+             key, the FTS5 index, BOTH R*Trees, the five ordinary indexes and — under \
+             --graph — the `related` table and its two indexes, all in one file. That matches \
+             the E4 arm, whose edges are in the same directory, and differs from the Postgres \
+             arm's pg_total_relation_size('place'), which excludes its `related` table.",
+        ),
+        deviation(
+            "*",
+            "EVERY CASE IS ONE PREPARED STATEMENT WITH BOUND `?n` PARAMETERS, cached by text, \
+             so the fifty instances of a case share one compiled program and the median is a \
+             measurement of the walk rather than of SQLite's parser. `knn_10` and \
+             `knn_10_kind` are the exception by construction: the ladder runs one prepared \
+             statement per ring, and every ring is inside the timed pass.",
+        ),
+    ]
+}
+
 // ── the report ────────────────────────────────────────────────────────────
 
 /// Takes `name`/`kind` directly rather than `&CaseSpec` so both the static
@@ -3801,7 +5646,7 @@ fn pg_has_query_rescore(client: &mut Client) -> bool {
 /// `'static` name to point a `CaseSpec` at) build the same JSON shape.
 fn case_json(name: &str, kind: CaseKind, result: Option<&CaseResult>, recall: Option<f64>, note: &str) -> Value {
     let k = match kind {
-        CaseKind::Filter => Value::Null,
+        CaseKind::Filter | CaseKind::Write => Value::Null,
         _ => Value::from(K as u64),
     };
     let recall = recall.map_or(Value::Null, Value::from);
@@ -3814,6 +5659,12 @@ fn case_json(name: &str, kind: CaseKind, result: Option<&CaseResult>, recall: Op
             "p90_us": r.p90_us,
             "run_median_us": r.run_median_us,
             "prepare_median_us": r.prepare_median_us,
+            "prepared_median_us": r
+                .prepared_median_us
+                .map_or(Value::Null, Value::from),
+            "prepared_bind_median_us": r
+                .prepared_bind_median_us
+                .map_or(Value::Null, Value::from),
             "total_rows": r.total_rows,
             "first_keys": r.first_keys,
             "k": k,
@@ -3828,6 +5679,8 @@ fn case_json(name: &str, kind: CaseKind, result: Option<&CaseResult>, recall: Op
             "p90_us": Value::Null,
             "run_median_us": Value::Null,
             "prepare_median_us": Value::Null,
+            "prepared_median_us": Value::Null,
+            "prepared_bind_median_us": Value::Null,
             "total_rows": 0,
             "first_keys": Vec::<String>::new(),
             "k": k,
@@ -3845,6 +5698,25 @@ fn deviation(case: &str, text: &str) -> Value {
 /// one case name it; the rest are arm-wide and use `*`.
 fn e4_deviations() -> Vec<Value> {
     vec![
+        deviation(
+            "vec_bulk_write_1k",
+            "A WRITE CASE BUILDS ITS OWN DATABASE, BESIDE THE CORPUS AND NEVER IN IT. \
+             The 50,000-row file is reused across runs and its `disk_bytes` is the sum of \
+             the files under --db-dir, so a scratch collection living there would change \
+             what every later --reuse measured and would be counted as corpus. Each \
+             instance therefore removes and recreates a sibling directory (`<db-dir>-bulk`), \
+             creates one collection of `key` Text and `emb` Vector(32), and -- for \
+             `vec_bulk_write_1k` -- creates the exact and the quantized vector index on it \
+             while it is still EMPTY, so both reach READY in one build step that walks \
+             nothing and the thousand rows meet LIVE per-row maintenance rather than a \
+             late build. That reset is untimed. What is timed is `begin_bulk`, 1,000 \
+             `put`s and `end_bulk`, whose outermost close commits (OPS_CONTRACT 7): one \
+             batch, one durability point. The scratch directory is removed when the case \
+             ends and its size after one instance is reported in the case note. The rows \
+             are the corpus's own 32 lanes under minted keys (`bulk-<instance>-<offset>`), \
+             so every arm writes the same distribution in the same order and fifty \
+             instances collide neither with each other nor with the corpus.",
+        ),
         deviation(
             "*",
             "Text index spans ONE field: `Database::create_text_index` (src/text_indexes.rs:1845) \
@@ -3992,6 +5864,15 @@ fn e4_deviations() -> Vec<Value> {
 fn e4sql_deviations() -> Vec<Value> {
     let mut list = e4_deviations();
     list.push(deviation(
+        "vec_bulk_write_1k",
+        "THE e4-sql ARM WRITES THE SAME BATCH AS ONE `INSERT` STATEMENT PER ROW, with \
+         the embedding bound as a parameter (`Param::Vector`) rather than spelled as a \
+         literal, which is the statement an application issues. The scratch database, \
+         the live indexes and the single-commit bulk scope are the `e4` arm's; what \
+         this arm adds is the parse and compile of 1,000 statements, and it is INSIDE \
+         the timed batch because that is what the application pays.",
+    ));
+    list.push(deviation(
         "*",
         "THE SELECT LIST IS `_id`, NOT `\"key\"`. E4's projection refuses the reserved field the \
          external key lives in (`collections::reserved`), so the only atomic that hands a key \
@@ -4073,6 +5954,22 @@ fn e4sql_deviations() -> Vec<Value> {
 
 fn pg_deviations() -> Vec<Value> {
     let mut list = vec![
+        deviation(
+            "vec_bulk_write_1k",
+            "THE POSTGRES WRITE CASE USES A SCRATCH TABLE, NOT `place`. `place` is reused \
+             across runs and `pg_total_relation_size('place')` is this arm's `disk_bytes`, \
+             so each instance instead drops and recreates `place_bulk(key text primary \
+             key, emb vector(32))` and, for `vec_bulk_write_1k`, creates \
+             `USING diskann (emb vector_cosine_ops)` on it while it is empty, so the index \
+             is LIVE before the first row lands. That reset is untimed. What is timed is \
+             BEGIN, 1,000 prepared INSERTs with synchronous_commit=on, COMMIT. The table is \
+             dropped when the case ends and its size after one instance is in the note. \
+             Postgres has ONE vector index family here where E4 has two, so the E4 arm's \
+             maintenance is of an exact locator AND a quantized entry and this arm's is of \
+             a diskann graph: the pair of cases still measures each engine's own \
+             index-maintenance cost against its own no-index write, which is what the \
+             difference is for.",
+        ),
         deviation(
             "*",
             "The GIN index is over the expression to_tsvector('simple', name || ' ' || descr) and \
@@ -4217,6 +6114,11 @@ pub enum Arm {
     /// `e4`, `--reuse` included.
     E4Sql,
     Postgres,
+    /// An embedded SQLite under `--db-dir` (which names the `.db` FILE, not
+    /// a directory), asked the same forty-one cases in SQLite SQL. Every
+    /// predicate SQLite has no type for is a registered function calling
+    /// sekejap-core, so the ORACLE is the same maths in both arms.
+    Sqlite,
 }
 
 impl Arm {
@@ -4225,6 +6127,7 @@ impl Arm {
             "e4" => Some(Self::E4),
             "e4-sql" => Some(Self::E4Sql),
             "postgres" => Some(Self::Postgres),
+            "sqlite" => Some(Self::Sqlite),
             _ => None,
         }
     }
@@ -4233,6 +6136,7 @@ impl Arm {
             Self::E4 => "e4",
             Self::E4Sql => "e4-sql",
             Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
         }
     }
 }
@@ -4254,6 +6158,11 @@ pub struct Options {
     /// When set, every selected case writes `<dir>/<case>/<i>.keys` in one
     /// extra untimed pass after its timed pass.
     pub dump: Option<PathBuf>,
+    /// `e4-sql` only: prepare each case's statement ONCE and RE-BIND it per
+    /// instance, and report that median beside the per-call one. The battery
+    /// itself still runs unprepared, so the report carries BOTH numbers and
+    /// the comparison shows what the parse and the compile were costing.
+    pub prepared: bool,
 }
 
 impl Options {
@@ -4269,6 +6178,7 @@ impl Options {
             reuse: false,
             graph: false,
             dump: None,
+            prepared: false,
         }
     }
 }
@@ -4311,6 +6221,10 @@ pub fn run_arm(options: &Options) -> R<Value> {
     let mut cases = Vec::new();
     let mut stages;
     let disk_bytes;
+    // What the arm actually measured, as the engine itself reports it. A
+    // frozen reference is only a reference while the version behind it is
+    // written down, so the arm writes it rather than the reader guessing.
+    let mut engine = Value::Null;
 
     match options.arm {
         Arm::E4 => {
@@ -4328,6 +6242,28 @@ pub fn run_arm(options: &Options) -> R<Value> {
             stages = built;
             for spec in &BATTERY {
                 if !selected(spec.name) {
+                    continue;
+                }
+                if is_write_case(spec.name) {
+                    let dir = e4_bulk_dir(&options.db_dir);
+                    let result =
+                        measure_write(|i| e4_bulk_write(&dir, &corpus, spec.name, i))
+                            .map_err(|e| format!("case {}: {e}", spec.name))?;
+                    let grown = dir_bytes(&dir);
+                    let _ = fs::remove_dir_all(&dir);
+                    eprintln!(
+                        "[e4] {:<20} {:>12.1} us  rows={}  scratch={grown} bytes",
+                        spec.name, result.median_us, result.total_rows
+                    );
+                    cases.push(case_json(
+                        spec.name,
+                        spec.kind,
+                        Some(&result),
+                        None,
+                        &format!(
+                            "{VEC_BULK_ROWS} rows/batch, one commit; scratch database {grown} bytes after one instance"
+                        ),
+                    ));
                     continue;
                 }
                 let result = measure(|i| e4_case(&ctx, &corpus, &queries, spec.name, i))
@@ -4392,13 +6328,70 @@ pub fn run_arm(options: &Options) -> R<Value> {
                 if !selected(spec.name) {
                     continue;
                 }
-                let result = measure(|i| e4sql_answer(&ctx, &corpus, &queries, spec.name, i))
+                if is_write_case(spec.name) {
+                    let dir = e4_bulk_dir(&options.db_dir);
+                    let result =
+                        measure_write(|i| e4sql_bulk_write(&dir, &corpus, spec.name, i))
+                            .map_err(|e| format!("case {}: {e}", spec.name))?;
+                    let grown = dir_bytes(&dir);
+                    let _ = fs::remove_dir_all(&dir);
+                    eprintln!(
+                        "[e4-sql] {:<20} {:>12.1} us  rows={}  scratch={grown} bytes",
+                        spec.name, result.median_us, result.total_rows
+                    );
+                    cases.push(case_json(
+                        spec.name,
+                        spec.kind,
+                        Some(&result),
+                        None,
+                        &format!(
+                            "{VEC_BULK_ROWS} INSERT statements/batch, one commit; scratch database {grown} bytes after one instance"
+                        ),
+                    ));
+                    continue;
+                }
+                let mut result = measure(|i| e4sql_answer(&ctx, &corpus, &queries, spec.name, i))
                     .map_err(|e| format!("case {}: {e}", spec.name))?;
                 let parse_us = e4sql_parse_cost(&ctx, &corpus, &queries, spec.name)
                     .map_err(|e| format!("case {} parse cost: {e}", spec.name))?;
+                let mut prepared_note = String::new();
+                if options.prepared {
+                    if !e4sql_prepared_agrees(&ctx, &corpus, &queries, spec.name)
+                        .map_err(|e| format!("case {} prepared check: {e}", spec.name))?
+                    {
+                        return Err(format!(
+                            "case {}: the prepared statement answered a different question than the freshly compiled one",
+                            spec.name
+                        )
+                        .into());
+                    }
+                    match e4sql_prepared_cost(&ctx, &corpus, &queries, spec.name)
+                        .map_err(|e| format!("case {} prepared cost: {e}", spec.name))?
+                    {
+                        Some((wall, bind, rebindable)) => {
+                            result.prepared_median_us = Some(wall);
+                            result.prepared_bind_median_us = Some(bind);
+                            prepared_note = format!(
+                                "; prepared once, re-bound per instance: {wall:.1} us/call, bind {bind:.1} us, rebind={}",
+                                if rebindable { "yes" } else { "no (compiled again from the parsed statement)" }
+                            );
+                        }
+                        None => {
+                            prepared_note =
+                                "; --prepared: this case writes its value INTO the statement, so there is no one statement to prepare"
+                                    .to_owned();
+                        }
+                    }
+                }
                 eprintln!(
-                    "[e4-sql] {:<20} {:>12.1} us  rows={}  parse={:.1} us",
-                    spec.name, result.median_us, result.total_rows, parse_us
+                    "[e4-sql] {:<20} {:>12.1} us  rows={}  parse={:.1} us{}",
+                    spec.name,
+                    result.median_us,
+                    result.total_rows,
+                    parse_us,
+                    result
+                        .prepared_median_us
+                        .map_or(String::new(), |p| format!("  prepared={p:.1} us"))
                 );
                 if let Some(dir) = options.dump.as_deref() {
                     dump_case(dir, spec.name, |i| {
@@ -4411,7 +6404,7 @@ pub fn run_arm(options: &Options) -> R<Value> {
                     spec.kind,
                     Some(&result),
                     None,
-                    &format!("parse+compile {parse_us:.1} us/statement"),
+                    &format!("parse+compile {parse_us:.1} us/statement{prepared_note}"),
                 ));
             }
             for &base in &APPROX_BASES {
@@ -4420,10 +6413,24 @@ pub fn run_arm(options: &Options) -> R<Value> {
                     if !selected(&name) {
                         continue;
                     }
-                    let result = measure(|i| e4sql_answer(&ctx, &corpus, &queries, &name, i))
+                    let mut result = measure(|i| e4sql_answer(&ctx, &corpus, &queries, &name, i))
                         .map_err(|e| format!("case {name}: {e}"))?;
                     let parse_us = e4sql_parse_cost(&ctx, &corpus, &queries, &name)
                         .map_err(|e| format!("case {name} parse cost: {e}"))?;
+                    let mut prepared_note = String::new();
+                    if options.prepared {
+                        if let Some((wall, bind, rebindable)) =
+                            e4sql_prepared_cost(&ctx, &corpus, &queries, &name)
+                                .map_err(|e| format!("case {name} prepared cost: {e}"))?
+                        {
+                            result.prepared_median_us = Some(wall);
+                            result.prepared_bind_median_us = Some(bind);
+                            prepared_note = format!(
+                                "; prepared {wall:.1} us/call, bind {bind:.1} us, rebind={}",
+                                if rebindable { "yes" } else { "no" }
+                            );
+                        }
+                    }
                     let twin = exact_twin(&name)
                         .ok_or_else(|| format!("case {name}: no exact twin"))?;
                     let recall = mean_recall(
@@ -4446,7 +6453,7 @@ pub fn run_arm(options: &Options) -> R<Value> {
                         CaseKind::Approx,
                         Some(&result),
                         Some(recall),
-                        &format!("ef={ef}; parse+compile {parse_us:.1} us/statement"),
+                        &format!("ef={ef}; parse+compile {parse_us:.1} us/statement{prepared_note}"),
                     ));
                 }
             }
@@ -4467,6 +6474,32 @@ pub fn run_arm(options: &Options) -> R<Value> {
             stages = built;
             for spec in &BATTERY {
                 if !selected(spec.name) {
+                    continue;
+                }
+                if is_write_case(spec.name) {
+                    let result =
+                        measure_write(|i| pg_bulk_write(&mut client, &corpus, spec.name, i))
+                            .map_err(|e| format!("case {}: {e}", spec.name))?;
+                    let grown: i64 = client
+                        .query_one(
+                            &format!("SELECT pg_total_relation_size('{VEC_BULK_OBJECT}')::bigint"),
+                            &[],
+                        )?
+                        .get(0);
+                    client.batch_execute(&format!("DROP TABLE IF EXISTS {VEC_BULK_OBJECT}"))?;
+                    eprintln!(
+                        "[postgres] {:<20} {:>12.1} us  rows={}  scratch={grown} bytes",
+                        spec.name, result.median_us, result.total_rows
+                    );
+                    cases.push(case_json(
+                        spec.name,
+                        spec.kind,
+                        Some(&result),
+                        None,
+                        &format!(
+                            "{VEC_BULK_ROWS} rows in one transaction with synchronous_commit=on; scratch table {grown} bytes after one instance"
+                        ),
+                    ));
                     continue;
                 }
                 let result = measure(|i| {
@@ -4543,6 +6576,145 @@ pub fn run_arm(options: &Options) -> R<Value> {
             disk_bytes = pg_disk_bytes(&mut client)?;
             drop(client);
         }
+        Arm::Sqlite => {
+            let (ctx, mut built) = if options.reuse {
+                open_sqlite(&options.db_dir, corpus.rows.len())?
+            } else {
+                load_sqlite(&options.db_dir, &corpus)?
+            };
+            let version: String =
+                ctx.conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
+            eprintln!("[sqlite] SQLite {version} (rusqlite's bundled build)");
+            engine = json!({"sqlite_version": version});
+            if options.graph {
+                built.push(load_graph_sqlite(&ctx, &corpus, &edges)?);
+            } else {
+                built.push(skipped_stage("graph"));
+            }
+            stages = built;
+            for spec in &BATTERY {
+                if !selected(spec.name) {
+                    continue;
+                }
+                if is_write_case(spec.name) {
+                    let path = lite_bulk_path(&options.db_dir);
+                    let result = measure_write(|i| lite_bulk_write(&path, &corpus, i))
+                        .map_err(|e| format!("case {}: {e}", spec.name))?;
+                    eprintln!(
+                        "[sqlite] {:<20} {:>12.1} us  rows={}",
+                        spec.name, result.median_us, result.total_rows
+                    );
+                    let mut entry = case_json(
+                        spec.name,
+                        spec.kind,
+                        Some(&result),
+                        None,
+                        &format!(
+                            "{VEC_BULK_ROWS} rows in one transaction, journal_mode=DELETE, synchronous=FULL; the embedding is a {DIM}-lane f32 BLOB and SQLite has NO vector index, so this arm's two write cases are the same statement"
+                        ),
+                    );
+                    entry["sql"] = Value::from(format!(
+                        "INSERT INTO {VEC_BULK_OBJECT} (\"key\", emb) VALUES (?, ?)"
+                    ));
+                    cases.push(entry);
+                    continue;
+                }
+                // A case SQLite cannot express is reported as `n/a: <reason>`
+                // with no timing at all — never as a zero, never dropped.
+                let sql = match lite_statement(&queries, &corpus.kinds, spec.name)? {
+                    Ok(sql) => sql,
+                    Err(reason) => {
+                        eprintln!("[sqlite] {:<20} n/a: {reason}", spec.name);
+                        cases.push(case_json(
+                            spec.name,
+                            spec.kind,
+                            None,
+                            None,
+                            &format!("n/a: {reason}"),
+                        ));
+                        continue;
+                    }
+                };
+                let result = measure(|i| lite_answer(&ctx, &corpus, &queries, spec.name, i))
+                    .map_err(|e| format!("case {}: {e}", spec.name))?;
+                eprintln!(
+                    "[sqlite] {:<20} {:>12.1} us  rows={}",
+                    spec.name, result.median_us, result.total_rows
+                );
+                if let Some(dir) = options.dump.as_deref() {
+                    dump_case(dir, spec.name, |i| {
+                        lite_answer(&ctx, &corpus, &queries, spec.name, i)
+                    })
+                    .map_err(|e| format!("case {} dump: {e}", spec.name))?;
+                    write_statement(dir, spec.name, &sql)?;
+                }
+                let mut entry = case_json(spec.name, spec.kind, Some(&result), None, "");
+                entry["sql"] = Value::from(sql);
+                cases.push(entry);
+            }
+            // The only approximate "sweep" this arm has: one refusal, because
+            // there is no ANN family and no knob to sweep, and one whole-corpus
+            // scan whose recall against its own exact twin is 1.000 by
+            // construction. See the `vec_ann_10` deviation.
+            for &base in &APPROX_BASES {
+                let refused = format!("{base}@ann");
+                if selected(&refused) {
+                    match lite_statement(&queries, &corpus.kinds, &refused)? {
+                        Ok(_) => {
+                            return Err(format!(
+                                "battle50k: `{refused}` must be reported as not expressible"
+                            )
+                            .into())
+                        }
+                        Err(reason) => {
+                            eprintln!("[sqlite] {refused:<20} n/a: no ANN index in SQLite");
+                            cases.push(case_json(
+                                &refused,
+                                CaseKind::Approx,
+                                None,
+                                None,
+                                &format!("n/a: {reason}"),
+                            ));
+                        }
+                    }
+                }
+                let name = format!("{base}@scan");
+                if !selected(&name) {
+                    continue;
+                }
+                let sql = lite_statement(&queries, &corpus.kinds, &name)?
+                    .map_err(|reason| format!("case {name}: {reason}"))?;
+                let result = measure(|i| lite_answer(&ctx, &corpus, &queries, &name, i))
+                    .map_err(|e| format!("case {name}: {e}"))?;
+                let twin =
+                    exact_twin(&name).ok_or_else(|| format!("case {name}: no exact twin"))?;
+                let recall = mean_recall(
+                    |i| lite_answer(&ctx, &corpus, &queries, &name, i),
+                    |i| lite_answer(&ctx, &corpus, &queries, twin, i),
+                )
+                .map_err(|e| format!("case {name} recall: {e}"))?;
+                eprintln!(
+                    "[sqlite] {:<20} {:>12.1} us  rows={}  recall={:.3}",
+                    name, result.median_us, result.total_rows, recall
+                );
+                if let Some(dir) = options.dump.as_deref() {
+                    dump_case(dir, &name, |i| lite_answer(&ctx, &corpus, &queries, &name, i))
+                        .map_err(|e| format!("case {name} dump: {e}"))?;
+                    write_statement(dir, &name, &sql)?;
+                }
+                let mut entry = case_json(
+                    &name,
+                    CaseKind::Approx,
+                    Some(&result),
+                    Some(recall),
+                    "no index, full scan",
+                );
+                entry["sql"] = Value::from(sql);
+                cases.push(entry);
+            }
+            drop(ctx);
+            disk_bytes = lite_disk_bytes(&options.db_dir);
+        }
     }
 
     stages.push(json!({"name": "disk_bytes", "bytes": disk_bytes}));
@@ -4550,6 +6722,7 @@ pub fn run_arm(options: &Options) -> R<Value> {
         "arm": arm,
         "commit": git_commit(),
         "rows": corpus.rows.len(),
+        "engine": engine,
         "data": options.data.display().to_string(),
         "queries": options.queries.display().to_string(),
         "stages": stages,
@@ -4558,6 +6731,7 @@ pub fn run_arm(options: &Options) -> R<Value> {
             Arm::E4 => e4_deviations(),
             Arm::E4Sql => e4sql_deviations(),
             Arm::Postgres => pg_deviations(),
+            Arm::Sqlite => sqlite_deviations(),
         },
     });
     if let Some(parent) = options.out.parent() {
@@ -4681,6 +6855,7 @@ pub fn compare(paths: &[&Path]) -> R<bool> {
     let mut e4: Option<Value> = None;
     let mut pg: Option<Value> = None;
     let mut sql: Option<Value> = None;
+    let mut lite: Option<Value> = None;
     for path in paths {
         let report = read(path)?;
         let arm = report
@@ -4692,6 +6867,7 @@ pub fn compare(paths: &[&Path]) -> R<bool> {
             "e4" => &mut e4,
             "e4-sql" => &mut sql,
             "postgres" => &mut pg,
+            "sqlite" => &mut lite,
             other => {
                 return Err(format!("{}: unknown arm `{other}`", path.display()).into());
             }
@@ -4704,18 +6880,33 @@ pub fn compare(paths: &[&Path]) -> R<bool> {
     let e4 = e4.ok_or("no `e4` report among the arguments")?;
     let pg = pg.ok_or("no `postgres` report among the arguments")?;
 
-    let arms: Vec<(&str, &Value)> = match &sql {
-        Some(sql) => vec![("e4", &e4), ("pg", &pg), ("e4-sql", sql)],
-        None => vec![("e4", &e4), ("pg", &pg)],
-    };
+    // e4 and pg are always columns 0 and 1; the optional arms follow in a
+    // fixed order, and their COLUMN INDEX is remembered rather than assumed,
+    // because a table that read the sqlite column as the e4-sql one would
+    // print a ratio between two arms that never met.
+    let mut arms: Vec<(&str, &Value)> = vec![("e4", &e4), ("pg", &pg)];
+    let mut sql_at: Option<usize> = None;
+    let mut lite_at: Option<usize> = None;
+    if let Some(report) = &sql {
+        sql_at = Some(arms.len());
+        arms.push(("e4-sql", report));
+    }
+    if let Some(report) = &lite {
+        lite_at = Some(arms.len());
+        arms.push(("sqlite", report));
+    }
+    let arms = arms;
 
     print!("{:<22} {:<7}", "case", "kind");
     for (label, _) in &arms {
         print!(" {:>12}", format!("{label}_us"));
     }
     print!(" {:>9}", "e4/pg");
-    if sql.is_some() {
+    if sql_at.is_some() {
         print!(" {:>10}", "sql/e4");
+    }
+    if lite_at.is_some() {
+        print!(" {:>10}", "e4/lite");
     }
     for (label, _) in &arms {
         print!(" {:>10}", format!("{label}_rows"));
@@ -4740,12 +6931,18 @@ pub fn compare(paths: &[&Path]) -> R<bool> {
             (Some(a), Some(b)) if b > 0.0 => format!("{:.2}", a / b),
             _ => "-".into(),
         };
-        let sql_ratio = match (medians.get(2).copied().flatten(), medians[0]) {
+        let sql_ratio = match (sql_at.and_then(|at| medians[at]), medians[0]) {
+            (Some(a), Some(b)) if b > 0.0 => format!("{:.2}", a / b),
+            _ => "-".into(),
+        };
+        let lite_ratio = match (medians[0], lite_at.and_then(|at| medians[at])) {
             (Some(a), Some(b)) if b > 0.0 => format!("{:.2}", a / b),
             _ => "-".into(),
         };
         let verdict = match spec.kind {
-            CaseKind::Filter => {
+            // A write case agrees the way a filter case does: every arm has
+            // to have written the same number of rows.
+            CaseKind::Filter | CaseKind::Write => {
                 let present: Vec<u64> = rows.iter().filter_map(|r| *r).collect();
                 if present.len() != arms.len() || medians.iter().any(Option::is_none) {
                     "not run in every arm".to_string()
@@ -4773,10 +6970,13 @@ pub fn compare(paths: &[&Path]) -> R<bool> {
                     let hits = kp.iter().filter(|k| shared.contains(k.as_str())).count();
                     let width = ke.len().max(kp.len()).max(1);
                     let mut text = format!("e4/pg top-10 overlap {hits}/{width}");
-                    if let Some(case) = found.get(2).copied().flatten() {
+                    for (label, at) in [("e4-sql", sql_at), ("sqlite", lite_at)] {
+                        let Some(case) = at.and_then(|at| found[at]) else {
+                            continue;
+                        };
                         let ks = first_keys(Some(case));
                         let hits = ks.iter().filter(|k| shared.contains(k.as_str())).count();
-                        text.push_str(&format!("; e4-sql vs e4 {hits}/{}", ke.len().max(1)));
+                        text.push_str(&format!("; {label} vs e4 {hits}/{}", ke.len().max(1)));
                     }
                     if spec.kind == CaseKind::Approx {
                         text.push_str(&format!(
@@ -4796,8 +6996,11 @@ pub fn compare(paths: &[&Path]) -> R<bool> {
             print!(" {:>12}", micros(*median));
         }
         print!(" {ratio:>9}");
-        if sql.is_some() {
+        if sql_at.is_some() {
             print!(" {sql_ratio:>10}");
+        }
+        if lite_at.is_some() {
+            print!(" {lite_ratio:>10}");
         }
         for count in &rows {
             print!(
@@ -4921,10 +7124,10 @@ pub fn compare(paths: &[&Path]) -> R<bool> {
 // ── command line ──────────────────────────────────────────────────────────
 
 fn usage() -> String {
-    "usage: battle50k <e4|e4-sql|postgres> --data <jsonl> --queries <json> --out <report.json> \
-     [--db-dir <dir>] [--dsn <dsn>] [--only <case-substring>] [--reuse] \
-     [--graph] [--dump <dir>]\n\
-     \x20      battle50k compare <a.json> <b.json> [<c.json>]"
+    "usage: battle50k <e4|e4-sql|postgres|sqlite> --data <jsonl> --queries <json> \
+     --out <report.json> [--db-dir <dir|sqlite .db file>] [--dsn <dsn>] \
+     [--only <case-substring>] [--reuse] [--graph] [--dump <dir>] [--prepared]\n\
+     \x20      battle50k compare <a.json> <b.json> [<c.json>] [<d.json>]"
         .into()
 }
 
@@ -4942,6 +7145,7 @@ fn parse(args: &[String]) -> R<Options> {
     let mut reuse = false;
     let mut graph = false;
     let mut dump: Option<PathBuf> = None;
+    let mut prepared = false;
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         let mut value = || {
@@ -4959,6 +7163,7 @@ fn parse(args: &[String]) -> R<Options> {
             "--reuse" => reuse = true,
             "--graph" => graph = true,
             "--dump" => dump = Some(PathBuf::from(value()?)),
+            "--prepared" => prepared = true,
             other => return Err(format!("unknown flag {other}\n{}", usage()).into()),
         }
     }
@@ -4978,13 +7183,21 @@ fn parse(args: &[String]) -> R<Options> {
     options.reuse = reuse;
     options.graph = graph;
     options.dump = dump;
+    options.prepared = prepared;
+    if prepared && !matches!(arm, Arm::E4Sql) {
+        return Err(format!(
+            "--prepared is the `e4-sql` arm's flag: it prepares each case's statement once and re-binds it per instance, and no other arm here has a statement of its own to prepare\n{}",
+            usage()
+        )
+        .into());
+    }
     Ok(options)
 }
 
 fn main() -> R<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("compare") {
-        if args.len() < 3 || args.len() > 4 {
+        if args.len() < 3 || args.len() > 5 {
             return Err(usage().into());
         }
         let paths: Vec<&Path> = args[1..].iter().map(Path::new).collect();

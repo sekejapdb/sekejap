@@ -113,6 +113,7 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 | `lang/src/compile/ddl.rs` | `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and `DROP TABLE` with their EXPLAINs. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/functions.rs` | The §4.1 string and §4.2 date/time functions as PURE functions: the proleptic-Gregorian calendar, the literal reader and the ISO printer, `date_trunc`/`EXTRACT`/`to_char`, the fixed-width interval reader, and the text-prefix successor a `LIKE 'x%'` range needs. One implementation serves both the WHERE fold and the projected row function, so the two cannot disagree. | `docs/lang/QL_CONTRACT.md` §4.1, §4.2 |
 | `lang/src/explain.rs` | `EXPLAIN`: the plan, the counters, and the two function sections (`range rewrites`, `row functions`). | `docs/lang/QL_CONTRACT.md` §6 |
+| `lang/src/compile/bind.rs` | Parameters as typed SLOTS: `Binder` (the compiler's value reader with the compiler taken away, so one implementation serves a PREPARE and a REBIND), the `*Fill` slots a compiled node keeps beside the value it folded, and `Rebind` -- why a statement cannot be refilled, collected by the compile itself. | `docs/lang/QL_CONTRACT.md` §2 (the reusable `PreparedSql`) |
 | `lang/src/refuse.rs` | The Tier-2/Tier-3 table as data, plus `MULTI_RANGE` -- the reason a rewrite whose pre-image is a set of ranges carries. | `docs/lang/QL_CONTRACT.md` §4, `docs/core/FOUNDATION_TEST_STANDARD.md` law 8 |
 
 ## `dist/src/service/` -- the embedded service surface
@@ -144,6 +145,7 @@ a composition of calls `core`, `lang` and `dist` already export.
 | `dist/rust/src/scan.rs` | `Scan`: one collection in id order, one page of rows held at a time. | `docs/dist/RUST_API.md` §2 |
 | `dist/rust/src/catalog.rs` | `Collection`, `Field`, `Index`: the catalog as data. | `docs/dist/RUST_API.md` §5 |
 | `dist/rust/src/error.rs` | `Error` and `Result`: one error type, with a refusal that carries both what was asked for and why there is no atomic. | `docs/dist/RUST_API.md` §8 |
+| `dist/rust/src/plans.rs` | The bounded prepared-plan cache (`PlanCache`, `CacheStats`, the three ceilings fixed at open) and `Statement`, the statement a caller prepares by hand: parsed at `Db::prepare`, compiled on its first bind, rebound after. | `docs/lang/QL_CONTRACT.md` §2; `docs/dist/RUST_API.md` §3 |
 | `dist/rust/tests/api.rs` | One test per section of `RUST_API.md`, against a `BTreeMap`/`BTreeSet` oracle held in the test process. | `docs/dist/RUST_API.md`, `docs/core/FOUNDATION_TEST_STANDARD.md` L1, L4, L8 |
 
 ## `core/engine/src/faults/` -- in-crate fault injection

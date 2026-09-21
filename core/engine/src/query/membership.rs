@@ -85,7 +85,7 @@ pub(super) const MEMBERSHIP_BYTES_CAP: usize = RUN_BYTES;
 const MEMBERSHIP_BITMAP_CAP_BYTES: usize = MEMBERSHIP_BYTES_CAP;
 
 /// The number of bytes a bitmap covering sequences `1..=span` would need.
-fn membership_bitmap_bytes(span: u64) -> u64 {
+pub(super) fn membership_bitmap_bytes(span: u64) -> u64 {
     span.div_ceil(8)
 }
 
@@ -94,7 +94,7 @@ fn membership_bitmap_bytes(span: u64) -> u64 {
 /// or one past the bitmap's span was never allocated when the bitmap was
 /// sized, so a posting that names one is corrupt: the caller gets `Err`,
 /// never an out-of-bounds write (Law 5).
-fn membership_bitmap_set(bits: &mut [u8], sequence: u64) -> QueryResult<()> {
+pub(super) fn membership_bitmap_set(bits: &mut [u8], sequence: u64) -> QueryResult<()> {
     let index = usize::try_from(sequence.checked_sub(1).ok_or_else(|| {
         corrupt_query("membership posting sequence is zero")
     })?)

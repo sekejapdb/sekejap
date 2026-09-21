@@ -292,7 +292,8 @@ impl Compiler<'_> {
                 let index = self.index_for(c, column, IndexFamily::SpatialPoint, "a point index")?;
                 OwnedOrder::Distance {
                     index,
-                    center: self.point_of(point)?,
+                    center: self.binder().point_of(point)?,
+                    fill: point_is_bound(point).then(|| point.clone()),
                 }
             }
             OrderKey::Vector {
@@ -311,8 +312,9 @@ impl Compiler<'_> {
                     VecOp::L2 => VectorMetric::SquaredL2,
                     VecOp::NegativeDot => VectorMetric::NegativeDot,
                 };
-                let vector = self.vector_of(query)?;
-                self.vector_order(c, column, vector, metric)?
+                let vector = self.binder().vector_of(query)?;
+                let fill = literal_is_bound(query).then(|| query.clone());
+                self.vector_order(c, column, vector, fill, metric)?
             }
             OrderKey::Bm25 {
                 column,
@@ -326,7 +328,7 @@ impl Compiler<'_> {
                     );
                 }
                 let index = self.index_for(c, column, IndexFamily::Text, "a text index")?;
-                let (query, matching) = self.tsquery(query)?;
+                let (text, matching, fill) = self.tsquery_slot(query)?;
                 if !*descending {
                     return Err(SqlError::unsupported(
                         "ORDER BY ts_rank_cd(...) ASC: QueryOrder::Bm25 ranks best-first and has no ascending form; write DESC",
@@ -334,8 +336,9 @@ impl Compiler<'_> {
                 }
                 OwnedOrder::Bm25 {
                     index,
-                    query,
+                    query: text,
                     matching,
+                    fill,
                 }
             }
             OrderKey::Score { expr, descending } => OwnedOrder::Score {
@@ -356,6 +359,7 @@ impl Compiler<'_> {
         c: CollectionId,
         column: &str,
         query: Vec<f32>,
+        fill: Option<Literal>,
         metric: VectorMetric,
     ) -> SqlResult2<OwnedOrder> {
         let indexes = self.db.list_indexes(c).map_err(SqlError::from)?;
@@ -375,6 +379,7 @@ impl Compiler<'_> {
                 index,
                 query,
                 metric,
+                fill,
             }),
             (_, Some(index), ef) => {
                 let ef = ef.unwrap_or(DEFAULT_EF);
@@ -386,6 +391,7 @@ impl Compiler<'_> {
                     query,
                     metric,
                     ef,
+                    fill,
                 })
             }
             (Some(index), None, Some(ef)) => {
@@ -396,6 +402,7 @@ impl Compiler<'_> {
                     index,
                     query,
                     metric,
+                    fill,
                 })
             }
             (None, None, _) => Err(SqlError::engine(format!(
@@ -420,11 +427,12 @@ impl Compiler<'_> {
             }
             ScoreNode::Bm25 { column, query } => {
                 let index = self.index_for(c, column, IndexFamily::Text, "a text index")?;
-                let (query, matching) = self.tsquery(query)?;
+                let (text, matching, fill) = self.tsquery_slot(query)?;
                 OwnedScore::Bm25 {
                     index,
-                    query,
+                    query: text,
                     matching,
+                    fill,
                 }
             }
             ScoreNode::VecDistance { column, query, op } => {
@@ -432,7 +440,8 @@ impl Compiler<'_> {
                     self.index_for(c, column, IndexFamily::ExactVector, "an exact vector index")?;
                 OwnedScore::VectorDistance {
                     index,
-                    query: self.vector_of(query)?,
+                    query: self.binder().vector_of(query)?,
+                    fill: literal_is_bound(query).then(|| query.clone()),
                     metric: match op {
                         VecOp::Cosine => VectorMetric::Cosine,
                         VecOp::L2 => VectorMetric::SquaredL2,
@@ -442,7 +451,8 @@ impl Compiler<'_> {
             }
             ScoreNode::Distance { column, point } => OwnedScore::Distance {
                 index: self.index_for(c, column, IndexFamily::SpatialPoint, "a point index")?,
-                center: self.point_of(point)?,
+                center: self.binder().point_of(point)?,
+                fill: point_is_bound(point).then(|| point.clone()),
             },
             ScoreNode::Add(a, b) => OwnedScore::Add(
                 Box::new(self.score(c, a)?),

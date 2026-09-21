@@ -34,11 +34,17 @@
 mod catalog;
 mod db;
 mod error;
+mod plans;
 mod rows;
 mod scan;
 
 pub use catalog::{Collection, Field, Index};
 pub use db::{Db, Tx, KEY, MAX_NEIGHBOURS, QUERY_PAGE, SCAN_PAGE};
+/// The bounded prepared-plan cache (`docs/lang/QL_CONTRACT.md` §2) and the
+/// statement a caller prepares by hand.
+pub use plans::{
+    CacheStats, Statement, PLAN_CACHE_BYTES, PLAN_CACHE_ENTRIES, PLAN_CACHE_STATEMENT_BYTES,
+};
 pub use error::{Error, Result};
 pub use rows::{param_of, params_of, value_to_json, Row, Rows};
 pub use scan::Scan;

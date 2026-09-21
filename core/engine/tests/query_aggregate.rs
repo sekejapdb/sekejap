@@ -175,6 +175,40 @@ fn accumulators(index: &fixture::Indexes) -> Vec<Accumulator<'static>> {
     ]
 }
 
+/// The IDENTICAL six accumulators with every column named as a FIELD rather
+/// than as its index. A field has no index to walk, so the value can only
+/// come off the row: this is how a test that means to exercise the STREAMING
+/// row path asks for it, now that the indexed spelling of the same question
+/// is a POSTING JOIN.
+fn row_accumulators() -> Vec<Accumulator<'static>> {
+    vec![
+        Accumulator {
+            function: AggregateFn::CountStar,
+            input: None,
+        },
+        Accumulator {
+            function: AggregateFn::Count,
+            input: Some(AggregateInput::Field("score")),
+        },
+        Accumulator {
+            function: AggregateFn::Sum,
+            input: Some(AggregateInput::Field("born")),
+        },
+        Accumulator {
+            function: AggregateFn::Min,
+            input: Some(AggregateInput::Field("born")),
+        },
+        Accumulator {
+            function: AggregateFn::Max,
+            input: Some(AggregateInput::Field("born")),
+        },
+        Accumulator {
+            function: AggregateFn::Avg,
+            input: Some(AggregateInput::Field("born")),
+        },
+    ]
+}
+
 /// One group, as the fold below builds it.
 #[derive(Clone, Debug)]
 struct Folded {
@@ -373,8 +407,10 @@ fn streaming_and_hashed_produce_identical_groups() {
         if which == Which::None {
             assert_eq!(
                 streamed_shape,
-                AggregateShape::Streaming,
-                "with no filter, the group index is the only thing that can drive"
+                AggregateShape::PostingJoin,
+                "with no filter the group index is the only thing that can drive, and \
+                 every accumulator beside count(*) names a numeric scalar index of its \
+                 own: that is the posting join, and it reads no row at all"
             );
         }
         assert_eq!(streamed, hashed, "{which:?}: the two shapes disagree");
@@ -419,8 +455,13 @@ fn the_groups_budget_bounds_the_hashed_shape_and_streaming_holds_one() {
         other => panic!("a hashed fold over {distinct} groups under a budget of {} must be refused, got {other:?}", distinct - 1),
     }
 
-    // The same question, streamed: the walk holds ONE set, so a budget of one
-    // answers all eight groups.
+    // The same question named through the group's own index. Prepare chooses
+    // the POSTING JOIN, which wants one accumulator set per group -- but a
+    // budget of ONE is what the streaming fold has always answered this
+    // question inside, so the join GIVES WAY to it rather than turn a
+    // question that answered yesterday into a refusal
+    // (`docs/lang/QL_CONTRACT.md` section 6). The shape afterwards says which
+    // fold ran.
     let mut streamed = f
         .db
         .prepare_aggregate(AggregateRequest {
@@ -434,7 +475,7 @@ fn the_groups_budget_bounds_the_hashed_shape_and_streaming_holds_one() {
             total_limit: None,
         })
         .unwrap();
-    assert_eq!(streamed.shape(), AggregateShape::Streaming);
+    assert_eq!(streamed.shape(), AggregateShape::PostingJoin);
     let groups = drain(
         &mut streamed,
         8_192,
@@ -443,7 +484,8 @@ fn the_groups_budget_bounds_the_hashed_shape_and_streaming_holds_one() {
             ..QueryBudget::unlimited()
         },
     )
-    .expect("a streaming fold holds one accumulator set");
+    .expect("a streaming fold holds one accumulator set, and the join stands down to it");
+    assert_eq!(streamed.shape(), AggregateShape::Streaming);
     assert_eq!(groups.len(), distinct as usize);
 }
 
@@ -504,7 +546,10 @@ fn pages_of_one_three_and_seven_concatenate() {
 #[test]
 fn a_streaming_page_stops_and_resumes_at_a_group_boundary() {
     let (_dir, f) = open();
-    let accumulators = accumulators(&f.index);
+    // Named as FIELDS, so the accumulators read the row and the shape is the
+    // streaming fold this test is about; named as their indexes the same
+    // question is a posting join, which finishes every group on page one.
+    let accumulators = row_accumulators();
     let mut prepared = f
         .db
         .prepare_aggregate(AggregateRequest {

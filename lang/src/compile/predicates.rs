@@ -9,7 +9,7 @@ impl Compiler<'_> {
                 // and the predicate is the ordinary scalar Range. Without the
                 // declared type there is no literal grammar to read it with.
                 if self.time_column(c, column)?.is_some()
-                    && matches!(self.value_of(value)?, Value::String(_))
+                    && matches!(self.peek_value(value)?, Value::String(_))
                 {
                     return self.time_filter(
                         c,
@@ -22,7 +22,16 @@ impl Compiler<'_> {
                 }
                 let kind = self.kind_of(c, column)?;
                 let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
-                let scalar = self.scalar(&kind, value, column)?;
+                // Which half of the compiled predicate the written value
+                // fills, so a rebind writes the new value into the same
+                // position without re-deciding the operator.
+                let at = match op {
+                    CmpOp::Eq | CmpOp::Ne => ScalarAt::Eq,
+                    CmpOp::Lt | CmpOp::Le => ScalarAt::Upper,
+                    CmpOp::Gt | CmpOp::Ge => ScalarAt::Lower,
+                };
+                let (scalar, fill) = self.scalar_slot(&kind, value, column, at)?;
+                let fills: Vec<ScalarFill> = fill.into_iter().collect();
                 let predicate = match op {
                     CmpOp::Eq => OwnedScalarFilter::Eq(scalar),
                     // `<>` is the complement of an equality, which the
@@ -33,6 +42,7 @@ impl Compiler<'_> {
                         return Ok(OwnedFilter::Not(Box::new(OwnedFilter::Scalar {
                             index,
                             predicate: OwnedScalarFilter::Eq(scalar),
+                            fills,
                         })))
                     }
                     CmpOp::Lt => OwnedScalarFilter::Range {
@@ -52,7 +62,11 @@ impl Compiler<'_> {
                         upper: Bound::Unbounded,
                     },
                 };
-                OwnedFilter::Scalar { index, predicate }
+                OwnedFilter::Scalar {
+                    index,
+                    predicate,
+                    fills,
+                }
             }
             Predicate::Between {
                 column,
@@ -60,7 +74,7 @@ impl Compiler<'_> {
                 upper,
             } => {
                 if self.time_column(c, column)?.is_some()
-                    && matches!(self.value_of(lower)?, Value::String(_))
+                    && matches!(self.peek_value(lower)?, Value::String(_))
                 {
                     return self.time_filter(
                         c,
@@ -73,12 +87,15 @@ impl Compiler<'_> {
                 }
                 let kind = self.kind_of(c, column)?;
                 let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
+                let (low, low_fill) = self.scalar_slot(&kind, lower, column, ScalarAt::Lower)?;
+                let (high, high_fill) = self.scalar_slot(&kind, upper, column, ScalarAt::Upper)?;
                 OwnedFilter::Scalar {
                     index,
                     predicate: OwnedScalarFilter::Range {
-                        lower: Bound::Included(self.scalar(&kind, lower, column)?),
-                        upper: Bound::Included(self.scalar(&kind, upper, column)?),
+                        lower: Bound::Included(low),
+                        upper: Bound::Included(high),
                     },
+                    fills: low_fill.into_iter().chain(high_fill).collect(),
                 }
             }
             Predicate::IsNull { column, negated } => {
@@ -86,6 +103,7 @@ impl Compiler<'_> {
                 let leaf = OwnedFilter::Scalar {
                     index,
                     predicate: OwnedScalarFilter::IsNull,
+                    fills: Vec::new(),
                 };
                 // `IS NOT NULL` is the complement of the nullish key inside
                 // the index, which is every other posting: one range, no
@@ -101,10 +119,28 @@ impl Compiler<'_> {
                 OwnedFilter::Scalar {
                     index,
                     predicate: OwnedScalarFilter::IsMissing,
+                    fills: Vec::new(),
                 }
             }
             Predicate::KeyCompare { op, value } => {
-                let key = self.text_of(value)?;
+                let (key, at) = match op {
+                    CmpOp::Lt | CmpOp::Le => (self.key_slot(value, KeyAt::Upper)?, KeyAt::Upper),
+                    CmpOp::Gt | CmpOp::Ge => (self.key_slot(value, KeyAt::Lower)?, KeyAt::Lower),
+                    CmpOp::Eq | CmpOp::Ne => (self.key_slot(value, KeyAt::Lower)?, KeyAt::Lower),
+                };
+                // A one-key range fills BOTH ends from the same slot.
+                let fills: Vec<KeyFill> = match (&key.1, at) {
+                    (None, _) => Vec::new(),
+                    (Some(fill), KeyAt::Lower) if matches!(op, CmpOp::Eq | CmpOp::Ne) => vec![
+                        fill.clone(),
+                        KeyFill {
+                            at: KeyAt::Upper,
+                            literal: fill.literal.clone(),
+                        },
+                    ],
+                    (Some(fill), _) => vec![fill.clone()],
+                };
+                let key = key.0;
                 let (lower, upper) = match op {
                     CmpOp::Eq => (Bound::Included(key.clone()), Bound::Included(key)),
                     CmpOp::Lt => (Bound::Unbounded, Bound::Excluded(key)),
@@ -117,15 +153,25 @@ impl Compiler<'_> {
                         return Ok(OwnedFilter::Not(Box::new(OwnedFilter::Key {
                             lower: Bound::Included(key.clone()),
                             upper: Bound::Included(key),
+                            fills,
                         })))
                     }
                 };
-                OwnedFilter::Key { lower, upper }
+                OwnedFilter::Key {
+                    lower,
+                    upper,
+                    fills,
+                }
             }
-            Predicate::KeyBetween { lower, upper } => OwnedFilter::Key {
-                lower: Bound::Included(self.text_of(lower)?),
-                upper: Bound::Included(self.text_of(upper)?),
-            },
+            Predicate::KeyBetween { lower, upper } => {
+                let (low, low_fill) = self.key_slot(lower, KeyAt::Lower)?;
+                let (high, high_fill) = self.key_slot(upper, KeyAt::Upper)?;
+                OwnedFilter::Key {
+                    lower: Bound::Included(low),
+                    upper: Bound::Included(high),
+                    fills: low_fill.into_iter().chain(high_fill).collect(),
+                }
+            }
             // `col IN (v1, v2, ...)`: one equality per value, unioned into
             // one membership set. `docs/lang/QL_CONTRACT.md` §3.
             Predicate::InList { column, values } => {
@@ -133,10 +179,11 @@ impl Compiler<'_> {
                 let index = self.index_for(c, column, IndexFamily::Scalar, "a scalar index")?;
                 let mut leaves = Vec::with_capacity(values.len());
                 for value in values {
-                    let scalar = self.scalar(&kind, value, column)?;
+                    let (scalar, fill) = self.scalar_slot(&kind, value, column, ScalarAt::Eq)?;
                     leaves.push(OwnedFilter::Scalar {
                         index,
                         predicate: OwnedScalarFilter::Eq(scalar),
+                        fills: fill.into_iter().collect(),
                     });
                 }
                 if leaves.len() == 1 {
@@ -150,10 +197,21 @@ impl Compiler<'_> {
             Predicate::KeyInList { values } => {
                 let mut leaves = Vec::with_capacity(values.len());
                 for value in values {
-                    let key = self.text_of(value)?;
+                    let (key, fill) = self.key_slot(value, KeyAt::Lower)?;
+                    let fills: Vec<KeyFill> = match fill {
+                        None => Vec::new(),
+                        Some(fill) => vec![
+                            KeyFill {
+                                at: KeyAt::Upper,
+                                literal: fill.literal.clone(),
+                            },
+                            fill,
+                        ],
+                    };
                     leaves.push(OwnedFilter::Key {
                         lower: Bound::Included(key.clone()),
                         upper: Bound::Included(key),
+                        fills,
                     });
                 }
                 if leaves.len() == 1 {
@@ -169,9 +227,17 @@ impl Compiler<'_> {
             // set. Written alone, because a `!` inside a larger tsquery is a
             // boolean tree over one index's postings rather than one leaf.
             Predicate::Text { column, query } if self.negated_tsquery(query)? => {
+                // Whether this predicate is a COMPLEMENT is decided by the
+                // value, so a `$n` here decides the plan's shape and cannot
+                // be a slot.
+                self.folds(
+                    &query.source,
+                    "a `!term` tsquery, whose complement shape is decided by the value",
+                );
                 let stripped = TsQuery {
                     source: Literal::Str(
-                        self.text_of(&query.source)?
+                        self.binder()
+                            .text_of(&query.source)?
                             .trim()
                             .trim_start_matches('!')
                             .trim()
@@ -189,11 +255,12 @@ impl Compiler<'_> {
             }
             Predicate::Text { column, query } => {
                 let index = self.index_for(c, column, IndexFamily::Text, "a text index")?;
-                let (query, matching) = self.tsquery(query)?;
+                let (text, matching, fill) = self.tsquery_slot(query)?;
                 OwnedFilter::Text {
                     index,
-                    query,
+                    query: text,
                     matching,
+                    fill,
                 }
             }
             Predicate::Spatial {
@@ -207,87 +274,46 @@ impl Compiler<'_> {
         })
     }
 
-    fn scalar(&self, kind: &Kind, literal: &Literal, column: &str) -> SqlResult2<Scalar> {
-        let value = self.value_of(literal)?;
-        Ok(match (kind, &value) {
-            (Kind::Int, Value::Number(n)) => Scalar::I64(n.as_i64().ok_or_else(|| {
-                SqlError::Parameter(format!("`{column}` is INT and {n} is not a whole number"))
-            })?),
-            (Kind::Real, Value::Number(n)) => Scalar::F64(n.as_f64().ok_or_else(|| {
-                SqlError::Parameter(format!("`{column}` is REAL and {n} is not a number"))
-            })?),
-            (Kind::Text, Value::String(s)) => Scalar::Text(s.clone()),
-            (Kind::Bool, Value::Bool(b)) => Scalar::Bool(*b),
-            _ => {
-                return Err(SqlError::Parameter(format!(
-                    "`{column}` is declared {kind:?} and the value is {value}; a scalar predicate stays inside the index's declared domain rather than coercing (`ScalarFilter`, src/query/mod.rs)"
-                )))
-            }
-        })
+    /// One scalar value AND the slot it came from. The slot is recorded only
+    /// when the written literal is a `$n`: a constant of the text cannot
+    /// change, so it is not a slot and costs nothing to rebind.
+    pub(super) fn scalar_slot(
+        &self,
+        kind: &Kind,
+        literal: &Literal,
+        column: &str,
+        at: ScalarAt,
+    ) -> SqlResult2<(Scalar, Option<ScalarFill>)> {
+        let value = self.binder().scalar(kind, literal, column)?;
+        let fill = literal_is_bound(literal).then(|| ScalarFill {
+            at,
+            literal: literal.clone(),
+            kind: kind.clone(),
+            column: column.to_owned(),
+        });
+        Ok((value, fill))
     }
 
-    /// The tsquery text, split into E4's `TextMatch`. A tsquery that mixes
-    /// `&` and `|` is an AND/OR tree, which is Tier 2.
-    pub(super) fn tsquery(&self, query: &TsQuery) -> SqlResult2<(String, TextMatch)> {
-        let text = self.text_of(&query.source)?;
-        if !query.tsquery_syntax {
-            return Ok((text, TextMatch::Any));
-        }
-        let trimmed = text.trim();
-        if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-            return Ok((
-                trimmed[1..trimmed.len() - 1].trim().to_owned(),
-                TextMatch::Phrase,
-            ));
-        }
-        if trimmed.contains('\'') {
-            let inner = trimmed.trim_matches('\'').trim();
-            if inner.split_whitespace().count() > 1 {
-                return Ok((inner.to_owned(), TextMatch::Phrase));
-            }
-        }
-        let has_or = trimmed.contains('|');
-        let has_and = trimmed.contains('&');
-        if has_or && has_and {
-            return Err(SqlError::Refused {
-                keyword: "tsquery & |".into(),
-                tier: Tier::Two,
-                reason: "QL_CONTRACT §4.6: a tsquery that mixes `&` and `|` is a boolean TREE inside one index's postings; the Tier-1 tsquery is one operator, and a union ACROSS predicates is written with SQL's own OR.",
-            });
-        }
-        if trimmed.contains('!') {
-            return Err(SqlError::Refused {
-                keyword: "tsquery !".into(),
-                tier: Tier::Two,
-                reason: "QL_CONTRACT §4.6: a tsquery `!` inside a larger tsquery is a boolean TREE over one index's postings; the Tier-1 spelling is `!term` alone, which is NOT over the text set.",
-            });
-        }
-        if trimmed.contains("<->") {
-            return Err(SqlError::Refused {
-                keyword: "tsquery <->".into(),
-                tier: Tier::Two,
-                reason: "QL_CONTRACT §4.6: a tsquery distance operator is a positional constraint; the Tier-1 phrase atomic is a quoted phrase (TextMatch::Phrase).",
-            });
-        }
-        let separator = if has_or { '|' } else { '&' };
-        let terms: Vec<&str> = trimmed
-            .split(separator)
-            .map(str::trim)
-            .filter(|term| !term.is_empty())
-            .collect();
-        if terms.iter().any(|term| term.contains(':')) {
-            return Err(SqlError::Refused {
-                keyword: "tsquery weight".into(),
-                tier: Tier::Three,
-                reason: "QL_CONTRACT §4.6: tsvector weights have no atomic; analyzer v1 stores one weight per token.",
-            });
-        }
-        let matching = if has_or || terms.len() == 1 {
-            TextMatch::Any
-        } else {
-            TextMatch::All
-        };
-        Ok((terms.join(" "), matching))
+    /// One external key AND its slot.
+    pub(super) fn key_slot(&self, literal: &Literal, at: KeyAt) -> SqlResult2<(String, Option<KeyFill>)> {
+        let key = self.binder().text_of(literal)?;
+        let fill = literal_is_bound(literal).then(|| KeyFill {
+            at,
+            literal: literal.clone(),
+        });
+        Ok((key, fill))
+    }
+
+    /// One tsquery AND its slot. Both halves of the answer -- the terms and
+    /// the `TextMatch` -- are re-derived on a rebind, because `a & b` and
+    /// `a | b` arrive through the same slot.
+    pub(super) fn tsquery_slot(
+        &self,
+        query: &TsQuery,
+    ) -> SqlResult2<(String, TextMatch, Option<TsQuery>)> {
+        let (text, matching) = self.binder().tsquery(query)?;
+        let fill = literal_is_bound(&query.source).then(|| query.clone());
+        Ok((text, matching, fill))
     }
 
     fn spatial(
@@ -309,21 +335,31 @@ impl Compiler<'_> {
                                 "ST_DWithin on a Point column takes a point: PointFilter::Radius is a centre and a radius",
                             ));
                         };
-                        let center = self.point_of(point)?;
-                        let radius_metres = self.f64_of(metres.ok_or_else(|| {
+                        let metres = metres.ok_or_else(|| {
                             SqlError::syntax("ST_DWithin needs a distance", 0)
-                        })?)?;
+                        })?;
+                        let center = self.binder().point_of(point)?;
+                        let radius_metres = self.binder().f64_of(metres)?;
+                        let fill = (point_is_bound(point) || literal_is_bound(metres)).then(|| {
+                            PointFill::Radius {
+                                center: point.clone(),
+                                metres: metres.clone(),
+                            }
+                        });
                         Ok(OwnedFilter::Point {
                             index,
                             predicate: PointFilter::Radius {
                                 center,
                                 radius_metres,
                             },
+                            fill,
                         })
                     }
                     SpatialPredicate::Within => Ok(OwnedFilter::Point {
                         index,
-                        predicate: PointFilter::Bbox(self.bounds_of(argument)?),
+                        predicate: PointFilter::Bbox(self.binder().bounds_of(argument)?),
+                        fill: geo_is_bound(argument)
+                            .then(|| PointFill::Bbox(argument.clone())),
                     }),
                     other => Err(SqlError::unsupported(format!(
                         "{other:?} on a Point column: the point atomics are PointFilter::Bbox (ST_Within against an envelope) and PointFilter::Radius (ST_DWithin)"
@@ -333,19 +369,33 @@ impl Compiler<'_> {
             Kind::Geo => {
                 let index =
                     self.index_for(c, column, IndexFamily::SpatialGeometry, "a geometry index")?;
-                let geometry = self.geom_of(argument)?;
-                let predicate = match predicate {
-                    SpatialPredicate::DWithin => GeometryFilter::DWithin {
-                        geometry,
-                        metres: self.f64_of(metres.ok_or_else(|| {
+                let geometry = self.binder().geom_of(argument)?;
+                let mut bound = geo_is_bound(argument);
+                let compiled = match predicate {
+                    SpatialPredicate::DWithin => {
+                        let metres = metres.ok_or_else(|| {
                             SqlError::syntax("ST_DWithin needs a distance", 0)
-                        })?)?,
-                    },
+                        })?;
+                        bound = bound || literal_is_bound(metres);
+                        GeometryFilter::DWithin {
+                            geometry,
+                            metres: self.binder().f64_of(metres)?,
+                        }
+                    }
                     SpatialPredicate::Intersects => GeometryFilter::Intersects(geometry),
                     SpatialPredicate::Within => GeometryFilter::Within(geometry),
                     SpatialPredicate::Contains => GeometryFilter::Contains(geometry),
                 };
-                Ok(OwnedFilter::Geometry { index, predicate })
+                let fill = bound.then(|| GeomFill {
+                    predicate,
+                    argument: argument.clone(),
+                    metres: metres.cloned(),
+                });
+                Ok(OwnedFilter::Geometry {
+                    index,
+                    predicate: compiled,
+                    fill,
+                })
             }
             other => Err(SqlError::unsupported(format!(
                 "`{column}` is declared {other:?}; a spatial predicate needs a Point or a Geo column"

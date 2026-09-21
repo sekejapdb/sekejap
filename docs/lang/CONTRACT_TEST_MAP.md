@@ -166,7 +166,8 @@ Atomic column is what the test must pin once the row lands.
 | `SHOW STATUS`, `SHOW STORAGE` | `docs/dist/OPS_CONTRACT.md` §6 — pinned in the OPS section below | UNPINNED |
 | `CREATE [MATERIALIZED\|SEARCH] VIEW`, `REFRESH MATERIALIZED VIEW` | stored body in the catalog; populate = the prepared query's bounded pages through `put`; REFRESH = bounded resumable clear (`begin_drop_collection`/`drop_collection_step`) then populate; the view is stale between refreshes and never incrementally maintained | UNPINNED |
 | `EXPLAIN ANALYZE <statement>` | the plan plus each page's `QueryWork`, run under the caller's `QueryBudget`; logical counters, one total wall clock | UNPINNED |
-| bounded prepared-plan cache behind `sql_prepare` | LRU with three ceilings fixed at open; the key carries the catalog generation, so DDL invalidates plans instead of serving one against a dead layout | UNPINNED |
+| bounded prepared-plan cache behind `sql_prepare` | LRU with three ceilings fixed at open; the key carries the catalog generation, so DDL invalidates plans instead of serving one against a dead layout | `dist/rust/tests/api.rs::the_plan_cache_serves_db_query_and_a_hit_is_a_rebind`, `::the_plan_cache_evicts_at_its_entry_ceiling_least_recently_used_first`, `::a_statement_longer_than_the_statement_ceiling_is_never_cached`, `::a_ddl_statement_invalidates_every_plan_compiled_before_it`, `::the_cached_plan_answers_what_a_fresh_compile_answers_for_every_binding` |
+| a REUSABLE `PreparedSql` re-bound with new parameters | a bind refills the typed slots and compiles nothing; a statement whose plan depends on a parameter VALUE is marked `rebind: false`, names the `$n` and what folded it, and EXPLAIN prints the line | `lang/tests/sql_prepared.rs` (23 tests: one per statement family, the two refusals, and the two bind-time parameter errors) |
 
 ### §4.1 Row expressions
 

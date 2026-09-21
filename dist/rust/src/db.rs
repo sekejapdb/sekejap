@@ -11,7 +11,8 @@ use sekejap_core::collections::{
 };
 use sekejap_core::{Config, Kind, SyncMode};
 use sekejap_dist::service::{ServiceDatabase, Snapshot, WriterGuard};
-use sekejap_lang::{prepare_sql, SqlDatabase, SqlResult};
+use crate::plans::{CacheStats, PlanCache, Statement};
+use sekejap_lang::{prepare_sql, Param, PreparedSql, SqlDatabase, SqlResult};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -43,6 +44,13 @@ enum Backing {
 pub struct Db {
     backing: Backing,
     path: PathBuf,
+    /// The bounded prepared-plan cache of `QL_CONTRACT` §2. Its three
+    /// ceilings are fixed at open (`crate::plans`), and a HIT is a REBIND.
+    plans: Mutex<PlanCache>,
+    /// The catalog generation every cache key carries. Bumped by every call
+    /// that changes the catalog, so a plan compiled against a layout that no
+    /// longer exists can never be hit again.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl Db {
@@ -72,6 +80,8 @@ impl Db {
         Ok(Self {
             backing: Backing::Single(Mutex::new(db)),
             path,
+            plans: Mutex::new(PlanCache::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -98,6 +108,8 @@ impl Db {
         Ok(Self {
             backing: Backing::Service(service),
             path,
+            plans: Mutex::new(PlanCache::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -174,7 +186,7 @@ impl Db {
 
     /// One write, committed before it returns: durability per call
     /// (`docs/dist/RUST_API.md` §6). A failure rolls the call back whole.
-    fn write<T>(&self, body: impl FnOnce(&mut Database) -> Result<T>) -> Result<T> {
+    pub(crate) fn write<T>(&self, body: impl FnOnce(&mut Database) -> Result<T>) -> Result<T> {
         let mut tx = self.transaction()?;
         match body(tx.database()) {
             Ok(value) => {
@@ -201,26 +213,30 @@ impl Db {
             .iter()
             .map(|(n, k)| ((*n).to_owned(), k.clone()))
             .collect();
-        self.write(|db| {
+        let out = self.write(|db| {
             if db.collection(name)?.is_some() {
                 return Ok(false);
             }
             db.create_collection(name, fields, CollectionOptions::default())?;
             Ok(true)
-        })
+        });
+        self.catalog_changed();
+        out
     }
 
     /// Remove a collection, its rows, its indexes and its descriptor.
     /// `false` if there was no such collection.
     pub fn drop_collection(&self, name: &str) -> Result<bool> {
-        self.write(|db| {
+        let out = self.write(|db| {
             let Some(id) = db.collection(name)? else {
                 return Ok(false);
             };
             db.begin_drop_collection_mode(id, DropMode::Cascade)?;
             while !db.drop_collection_step(id, DROP_BATCH)?.done {}
             Ok(true)
-        })
+        });
+        self.catalog_changed();
+        out
     }
 
     /// Write one document, committed.
@@ -297,23 +313,145 @@ impl Db {
 
     // ── §3 SQL ───────────────────────────────────────────────────────────
 
+    /// The catalog generation every plan-cache key carries.
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// True when a statement can change the CATALOG, which is what a
+    /// cached plan is compiled against: only `CREATE`, `DROP` and `ALTER`
+    /// can, in this grammar. An INSERT, UPDATE or DELETE changes rows, and
+    /// a plan does not hold rows -- the one compiled form that holds a set
+    /// of them, a semi-join, is never rebound and is compiled again instead.
+    fn changes_the_catalog(sql: &str) -> bool {
+        let first = sql
+            .trim_start()
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        first.eq_ignore_ascii_case("create")
+            || first.eq_ignore_ascii_case("drop")
+            || first.eq_ignore_ascii_case("alter")
+    }
+
+    /// Drop every cached plan, for a caller that changed the catalog through
+    /// a handle this crate does not see -- `Tx::database`, or the layers
+    /// re-exported at the crate root.
+    pub fn invalidate_plans(&self) {
+        self.catalog_changed();
+    }
+
+    /// Invalidate every cached plan by moving the generation on. Called by
+    /// each catalog change, because a plan names index ids and a layout.
+    pub(crate) fn catalog_changed(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.plans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// What the bounded prepared-plan cache has done, and the ceilings it
+    /// was opened with. `docs/lang/QL_CONTRACT.md` §2.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.plans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stats()
+    }
+
+    /// Prepare one statement by hand: parsed here, compiled on its first
+    /// bind, rebound after. See [`Statement`].
+    pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
+        Statement::new(self, sql)
+    }
+
+    /// Run `body` against the compiled plan for `sql`, taking it from the
+    /// plan cache when it is there and putting it back when it succeeds.
+    ///
+    /// A cache HIT is a rebind: the plan's typed slots are refilled from
+    /// `params` and nothing is parsed or compiled. A MISS compiles once. A
+    /// plan whose execution FAILED is not returned to the cache -- a rebind
+    /// that refused halfway has written some slots and not others, and a
+    /// half-bound plan is not a plan.
+    fn with_cached_plan<T>(
+        &self,
+        sql: &str,
+        params: &[Param],
+        body: impl FnOnce(&Database, &PreparedSql) -> Result<T>,
+    ) -> Result<T> {
+        let generation = self.generation();
+        let taken = {
+            let mut cache = self.plans.lock().unwrap_or_else(|e| e.into_inner());
+            match cache.take(sql, generation) {
+                Some(prepared) => Some(prepared),
+                None => {
+                    cache.missed(sql);
+                    None
+                }
+            }
+        };
+        let (out, keep) = self.read(|db| {
+            let prepared = match taken {
+                Some(mut prepared) => {
+                    prepared.bind(db, params)?;
+                    prepared
+                }
+                None => prepare_sql(db, sql, params)?,
+            };
+            // Only a reading statement is cached: a write compiles and runs
+            // under the writer's borrow, and this path holds a read borrow.
+            let cacheable = prepared.is_select() || prepared.is_aggregate();
+            let out = body(db, &prepared)?;
+            Ok((out, if cacheable { Some(prepared) } else { None }))
+        })?;
+        if let Some(prepared) = keep {
+            self.plans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .give(sql, generation, prepared);
+        }
+        Ok(out)
+    }
+
     /// Run one writing statement and commit. Returns the rows it moved; a
     /// statement that only raises a notice returns zero.
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         let params = params_of(params);
-        self.write(|db| {
+        let out = self.write(|db| {
             let result = db.sql(sql, &params)?;
             expect_affected(result, sql)
-        })
+        });
+        // A writing statement list includes DDL, and a DDL statement changes
+        // the layout every cached plan was compiled against.
+        if Self::changes_the_catalog(sql) {
+            self.catalog_changed();
+        }
+        out
     }
 
     /// Run one row-returning statement and assemble its answer.
+    ///
+    /// This is the plan cache's own door: the statement text is looked up
+    /// there first, and a hit REBINDS the compiled plan rather than parsing
+    /// and compiling it again. `Db::cache_stats` reports what that is doing.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Rows> {
         let params = params_of(params);
-        self.read_mut(|db| {
-            let result = db.sql(sql, &params)?;
-            expect_rows(result, sql)
-        })
+        match self.with_cached_plan(sql, &params, |db, prepared| {
+            if !(prepared.is_select() || prepared.is_aggregate()) {
+                return Ok(None);
+            }
+            Ok(Some(expect_rows(prepared.run(db)?, sql)?))
+        })? {
+            Some(rows) => Ok(rows),
+            // Not a row-returning statement: the old path runs it and
+            // refuses with the message `docs/dist/RUST_API.md` §3 states.
+            None => self.read_mut(|db| {
+                let result = db.sql(sql, &params)?;
+                expect_rows(result, sql)
+            }),
+        }
     }
 
     /// Page a row-returning statement and hand each row to `body`, holding
@@ -330,8 +468,7 @@ impl Db {
     ) -> Result<u64> {
         let params = params_of(params);
         let page_rows = page_rows.max(1);
-        self.read(|db| {
-            let prepared = prepare_sql(db, sql, &params)?;
+        self.with_cached_plan(sql, &params, |db, prepared| {
             let columns = std::sync::Arc::new(prepared.columns().to_vec());
             let mut seen = 0u64;
             let mut stopped: Option<Error> = None;
@@ -571,10 +708,12 @@ impl Db {
             Backing::Single(m) => Tx {
                 inner: TxInner::Single(m.lock().unwrap_or_else(|e| e.into_inner())),
                 done: false,
+                db: self,
             },
             Backing::Service(s) => Tx {
                 inner: TxInner::Service(s.writer()),
                 done: false,
+                db: self,
             },
         })
     }
@@ -622,6 +761,10 @@ impl Db {
 pub struct Tx<'a> {
     inner: TxInner<'a>,
     done: bool,
+    /// The handle this transaction was opened on, so a DDL statement run
+    /// through [`Tx::execute`] invalidates the plan cache the same way
+    /// `Db::execute` does.
+    db: &'a Db,
 }
 
 enum TxInner<'a> {
@@ -722,6 +865,9 @@ impl Tx<'_> {
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         let params = params_of(params);
         let result: SqlResult = self.database().sql(sql, &params)?;
+        if Db::changes_the_catalog(sql) {
+            self.db.catalog_changed();
+        }
         expect_affected(result, sql)
     }
 

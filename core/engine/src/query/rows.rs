@@ -143,7 +143,7 @@ impl<'a> PrimaryRows<'a> {
     /// for a page that reads its rows in one pass, and wrong for one that
     /// reads them in BATCHES -- each batch ascends from its own smallest id,
     /// so a batch that was sparse says nothing about the next one.
-    fn restart(&mut self, ascending: bool) {
+    pub(super) fn restart(&mut self, ascending: bool) {
         self.ascending = ascending;
         self.cursor = None;
         self.last = 0;

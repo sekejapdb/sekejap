@@ -9,7 +9,18 @@ impl Compiler<'_> {
     pub(super) fn graph_table(&mut self, graph: &GraphTable) -> SqlResult2<(CollectionId, OwnedFilter)> {
         let seed_collection = collection(self.db, &graph.seed_collection)?;
         let target = collection(self.db, &graph.target_collection)?;
-        let key = self.text_of(&graph.seed_key)?;
+        // The seed is ALWAYS a typed slot, even when the pattern wrote the
+        // key as a constant: what the plan holds is an entity id, and an
+        // entity id is the database's and not the text's -- a row deleted
+        // and written again is a new one. So every bind resolves the key
+        // afresh, which is one point-get, and a prepared traversal can never
+        // walk from a seed that no longer exists.
+        let seed_fill = Some(SeedFill {
+            collection: seed_collection,
+            table: graph.seed_collection.clone(),
+            key: graph.seed_key.clone(),
+        });
+        let key = self.binder().text_of(&graph.seed_key)?;
         let seed = self
             .db
             .get(seed_collection, &key)
@@ -68,6 +79,7 @@ impl Compiler<'_> {
         let mut edge_where = Vec::with_capacity(graph.hop.predicates.len());
         for predicate in &graph.hop.predicates {
             edge_where.push(OwnedEdgePredicate {
+                fill: literal_is_bound(&predicate.value).then(|| predicate.value.clone()),
                 property: predicate.property.clone(),
                 op: match predicate.op {
                     CmpOp::Eq => Cmp::Eq,
@@ -77,7 +89,9 @@ impl Compiler<'_> {
                     CmpOp::Gt => Cmp::Gt,
                     CmpOp::Ge => Cmp::Ge,
                 },
-                value: self.edge_value(&predicate.value, &predicate.property)?,
+                value: self
+                    .binder()
+                    .edge_value(&predicate.value, &predicate.property)?,
             });
         }
         // The far element's inline WHERE. Compiled exactly as the outer
@@ -114,6 +128,7 @@ impl Compiler<'_> {
             target,
             OwnedFilter::Graph(OwnedGraph {
                 seed,
+                seed_fill,
                 direction: match graph.hop.direction {
                     GraphDirection::Outgoing => Direction::Outgoing,
                     GraphDirection::Incoming => Direction::Incoming,
@@ -127,33 +142,6 @@ impl Compiler<'_> {
                 node_where,
             }),
         ))
-    }
-
-    /// One edge-property predicate's value. An edge bag is untyped JSON, so
-    /// the literal decides the type: a number without a fraction is an
-    /// integer, one with a fraction a real, and both compare mathematically
-    /// against whatever the bag holds (`edge_properties_match`).
-    fn edge_value(&mut self, literal: &Literal, property: &str) -> SqlResult2<Scalar> {
-        Ok(match self.value_of(literal)? {
-            Value::Bool(value) => Scalar::Bool(value),
-            Value::String(value) => Scalar::Text(value),
-            Value::Number(number) => match number.as_i64() {
-                Some(value) => Scalar::I64(value),
-                None => Scalar::F64(number.as_f64().ok_or_else(|| {
-                    SqlError::Parameter(format!("`{property}`'s value is not a number"))
-                })?),
-            },
-            Value::Null => {
-                return Err(SqlError::unsupported(format!(
-                    "`{property} = NULL` on an edge element: an absent or null property satisfies no comparison, so the predicate would refuse every edge"
-                )))
-            }
-            other => {
-                return Err(SqlError::unsupported(format!(
-                    "an edge property compares against a scalar literal, found {other}"
-                )))
-            }
-        })
     }
 
 }

@@ -105,7 +105,7 @@ pub mod verification;
 // crate through `sekejap_core::collections`.
 pub use crate::index::graph::{
     BfsRequest, Cmp, Direction, Edge, EdgeBudget, EdgeKey, EdgePredicate, EdgeRef, EdgeTypeId,
-    GraphContextId, NeighborRequest, TraversalNode, TraversalResult,
+    GraphContextId, NeighborRequest, NewEdge, TraversalNode, TraversalResult,
 };
 pub use crate::index::spatial::point::{SpatialCandidates, SpatialHit};
 pub use crate::index::text::{TextCandidates, TextHit, TextMatch};
@@ -291,6 +291,32 @@ pub struct Database {
     /// held exclusively, which is the same argument `graph_header_cache`
     /// above rests on.
     index_cache: RefCell<Vec<(catalog::IndexId, catalog::IndexInfo)>>,
+    /// One collection's index descriptors, kept for the length of a RUN of
+    /// writes rather than re-read per row.
+    ///
+    /// `maintain_indexes` needs the whole list, not one descriptor, and it
+    /// needs it for EVERY row written. Reading it costs the collection's
+    /// catalog record, a range over that collection's registry entries and
+    /// then four B-tree point-gets per index (the registry probe and the
+    /// descriptor replicas). Measured on a 1,000-row load into a collection
+    /// with a live exact and a live quantized vector index (32 lanes), that
+    /// list was 10.1 ms of the 30.1 ms the whole load cost -- 34% of a
+    /// vector write spent re-reading descriptors that no row write changes.
+    ///
+    /// INVALIDATION is a GENERATION, not a hook list: every write that can
+    /// change a descriptor or the registry calls
+    /// [`Database::index_descriptors_changed`], which bumps the counter, and
+    /// a cached list is used only while the counter still reads what it read
+    /// when the list was taken. `save_index` is one such writer (so an index
+    /// create, a build step and a tree-root move all invalidate), the index
+    /// drop is another, the collection drop's registry sweep is a third, and
+    /// `rollback` re-reads the durable files. A debug build CHECKS the rule
+    /// instead of trusting it: `maintain_indexes` compares the cached list
+    /// against a fresh read on every row under `debug_assertions`, so the
+    /// whole test suite is the proof that no fourth writer exists.
+    index_list_cache: RefCell<Option<(CollectionId, u64, Vec<catalog::IndexInfo>)>>,
+    /// Bumped by every descriptor or registry write; see `index_list_cache`.
+    index_list_generation: Cell<u64>,
     /// Identities this handle allocated since it opened, one entry per
     /// collection. Sequences are dense, monotonic and never reused (D13) and
     /// the allocator counter rides the commit, so a sequence handed out after
@@ -989,6 +1015,8 @@ impl Database {
             index_header,
             graph_header_cache: Cell::new(None),
             index_cache: RefCell::new(Vec::new()),
+            index_list_cache: RefCell::new(None),
+            index_list_generation: Cell::new(0),
             allocated: BTreeMap::new(),
             create_index_trees: catalog::create_index_trees(),
             user_writes_pending: false,
@@ -1183,6 +1211,56 @@ impl Database {
         // rewrite is one of them. See `index_cache`.
         self.index_cache.borrow_mut().clear();
         Ok(&mut self.store)
+    }
+    /// Announce that a descriptor or the index registry has just been
+    /// written, so no list taken before this call may be believed again.
+    /// See `index_list_cache`.
+    pub(crate) fn index_descriptors_changed(&self) {
+        self.index_list_generation
+            .set(self.index_list_generation.get().wrapping_add(1));
+        *self.index_list_cache.borrow_mut() = None;
+    }
+    /// The generation a list must still match to be usable.
+    pub(crate) fn index_list_generation(&self) -> u64 {
+        self.index_list_generation.get()
+    }
+    /// Take this collection's descriptor list OUT of the cache, or read it.
+    ///
+    /// Taking rather than cloning is what makes the cache worth having: the
+    /// caller mutates the descriptors it walks (a tree root moves), and a
+    /// clone per row would trade four point-gets for a `Vec` of `String`s.
+    pub(crate) fn take_index_list(
+        &self,
+        c: CollectionId,
+        generation: u64,
+    ) -> Result<Vec<catalog::IndexInfo>> {
+        let cached = {
+            let mut slot = self.index_list_cache.borrow_mut();
+            match slot.take() {
+                Some((cached_c, cached_gen, list))
+                    if cached_c == c && cached_gen == generation =>
+                {
+                    Some(list)
+                }
+                _ => None,
+            }
+        };
+        match cached {
+            Some(list) => Ok(list),
+            None => self.list_indexes(c),
+        }
+    }
+    /// Give the list back, unless a descriptor changed while it was out.
+    pub(crate) fn put_index_list(
+        &self,
+        c: CollectionId,
+        generation: u64,
+        list: Vec<catalog::IndexInfo>,
+    ) {
+        if self.index_list_generation.get() != generation {
+            return;
+        }
+        *self.index_list_cache.borrow_mut() = Some((c, generation, list));
     }
     /// [`Database::index_info`] through the per-handle descriptor cache.
     pub(crate) fn index_info_cached(&self, id: catalog::IndexId) -> Result<catalog::IndexInfo> {
@@ -2016,6 +2094,7 @@ impl Database {
         *self.layout_cache.borrow_mut() = None;
         self.graph_header_cache.set(None);
         self.index_cache.borrow_mut().clear();
+        self.index_descriptors_changed();
         // A rollback rewinds the allocator, so a sequence handed out before it
         // can be handed out again. Everything the map claims about those ids
         // was learned in the discarded transaction; drop the lot.

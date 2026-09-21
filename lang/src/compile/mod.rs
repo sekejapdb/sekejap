@@ -55,6 +55,7 @@ thread_local! {
 use super::parser;
 
 mod aggregate;
+mod bind;
 mod boolean;
 mod ddl;
 mod dml;
@@ -69,10 +70,12 @@ mod select;
 #[path = "functions.rs"]
 mod range_rewrites;
 
+use bind::*;
 use plan::*;
 use row::*;
 
 pub(crate) use aggregate::AggregatePlan;
+pub(crate) use bind::{Binder, Rebind};
 pub(crate) use plan::{Plan, SelectPlan};
 
 // ── the compiler ──────────────────────────────────────────────────────────
@@ -103,8 +106,14 @@ struct Compiler<'a> {
     row_functions: Vec<String>,
     /// `now()` and `current_date`, folded ONCE for the whole statement.
     clock: i64,
+    /// Why this statement cannot be REFILLED with new parameters, collected
+    /// while it compiles. Empty means every `$n` landed in a typed slot.
+    /// `RefCell` because the value readers that record a fold take `&self`.
+    rebind: std::cell::RefCell<bind::Rebind>,
 }
 
+/// Compile one statement, and say whether the compiled form can be REFILLED
+/// with new parameters without being compiled again.
 pub(crate) fn compile(
     db: &Database,
     statement: Stmt,
@@ -112,7 +121,7 @@ pub(crate) fn compile(
     notices: &mut Vec<String>,
     budget: QueryBudget,
     cancelled: &mut dyn FnMut() -> bool,
-) -> SqlResult2<Plan> {
+) -> SqlResult2<(Plan, bind::Rebind)> {
     let mut compiler = Compiler {
         index_lists: std::cell::RefCell::new(Vec::new()),
         rewrites: Vec::new(),
@@ -125,8 +134,10 @@ pub(crate) fn compile(
         notices,
         budget,
         cancelled,
+        rebind: std::cell::RefCell::new(bind::Rebind::default()),
     };
-    compiler.statement(statement)
+    let plan = compiler.statement(statement)?;
+    Ok((plan, compiler.rebind.into_inner()))
 }
 
 impl Compiler<'_> {
@@ -250,179 +261,73 @@ impl Compiler<'_> {
     }
 
     // ── values ───────────────────────────────────────────────────────────
+    //
+    // Two doors. The readers below FOLD: they turn a written value into the
+    // plan's own typed form and, when that value was a `$n`, record the fold
+    // so the statement is not rebindable -- a folded parameter cannot be
+    // refilled, because what it produced is no longer a value but a shape.
+    // The slot-producing helpers in `bind.rs` go through `Binder` directly
+    // and record a SLOT instead. The default is therefore the safe one: a
+    // construct nobody taught to rebind refuses.
 
-    fn param(&self, n: usize) -> SqlResult2<&super::Param> {
-        self.params.get(n - 1).ok_or_else(|| {
-            SqlError::Parameter(format!(
-                "${n} is not bound; {} parameter(s) were given",
-                self.params.len()
-            ))
-        })
+    /// The value reader with no compiler state: the same code a REBIND runs.
+    pub(super) fn binder(&self) -> bind::Binder<'_> {
+        bind::Binder::new(self.db, self.params)
+    }
+
+    /// Record that a written `$n` was folded into the plan's shape, with the
+    /// construct that folded it.
+    pub(super) fn folds(&self, literal: &Literal, what: &str) {
+        if bind::literal_is_bound(literal) {
+            let slot = match literal {
+                Literal::Param(n) => format!("${n}"),
+                _ => "a scalar subquery's key".to_owned(),
+            };
+            self.folds_reason(format!("{slot} is folded at prepare by {what}"));
+        }
+    }
+
+    /// Record a refusal that is not about one written value.
+    pub(super) fn folds_reason(&self, reason: String) {
+        let mut rebind = self.rebind.borrow_mut();
+        if !rebind.refusals.contains(&reason) {
+            rebind.refusals.push(reason);
+        }
     }
 
     /// A literal, as JSON. A subquery runs here, at compile time, because by
     /// the time the outer statement runs it is a constant.
     fn value_of(&self, literal: &Literal) -> SqlResult2<Value> {
-        Ok(match literal {
-            Literal::Null => Value::Null,
-            Literal::Bool(b) => Value::Bool(*b),
-            Literal::Num(v, exact) => {
-                if *exact && v.fract() == 0.0 && v.abs() < 9.0e18 {
-                    Value::from(*v as i64)
-                } else {
-                    Value::from(*v)
-                }
-            }
-            Literal::Str(s) => Value::String(s.clone()),
-            Literal::Param(n) => match self.param(*n)? {
-                super::Param::Null => Value::Null,
-                super::Param::Bool(b) => Value::Bool(*b),
-                super::Param::Int(i) => Value::from(*i),
-                super::Param::Float(f) => Value::from(*f),
-                super::Param::Text(t) => Value::String(t.clone()),
-                super::Param::Vector(v) => Value::from(v.clone()),
-                super::Param::Json(v) => v.clone(),
-            },
-            Literal::Subquery(query) => {
-                let collection = collection(self.db, &query.table)?;
-                let key = self.text_of(&query.key)?;
-                let entity = self
-                    .db
-                    .get(collection, &key)
-                    .map_err(SqlError::from)?
-                    .ok_or_else(|| {
-                        SqlError::engine(format!(
-                            "scalar subquery: `{}` has no row at key `{key}`",
-                            query.table
-                        ))
-                    })?;
-                if query.column == KEY_COLUMN {
-                    Value::String(entity.key)
-                } else {
-                    entity
-                        .document
-                        .get(&query.column)
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                }
-            }
-        })
+        self.folds(literal, "a value read into the plan");
+        self.binder().value_of(literal)
+    }
+
+    /// [`Compiler::value_of`] without the fold record: a TYPE TEST that does
+    /// not decide the plan on its own.
+    fn peek_value(&self, literal: &Literal) -> SqlResult2<Value> {
+        self.binder().value_of(literal)
     }
 
     fn text_of(&self, literal: &Literal) -> SqlResult2<String> {
-        match self.value_of(literal)? {
-            Value::String(s) => Ok(s),
-            other => Err(SqlError::Parameter(format!(
-                "expected text, found {other}"
-            ))),
-        }
+        self.folds(literal, "text read into the plan");
+        self.binder().text_of(literal)
     }
 
     fn f64_of(&self, literal: &Literal) -> SqlResult2<f64> {
-        match self.value_of(literal)? {
-            Value::Number(n) => n
-                .as_f64()
-                .ok_or_else(|| SqlError::Parameter("number is not finite".into())),
-            other => Err(SqlError::Parameter(format!(
-                "expected a number, found {other}"
-            ))),
-        }
+        self.folds(literal, "a number read into the plan");
+        self.binder().f64_of(literal)
     }
 
     fn i64_of(&self, literal: &Literal) -> SqlResult2<i64> {
-        match self.value_of(literal)? {
-            Value::Number(n) => n
-                .as_i64()
-                .ok_or_else(|| SqlError::Parameter("expected a whole number".into())),
-            other => Err(SqlError::Parameter(format!(
-                "expected a whole number, found {other}"
-            ))),
-        }
+        self.folds(literal, "a whole number read into the plan");
+        self.binder().i64_of(literal)
     }
 
     /// pgvector's text form `[a,b,c]`, a JSON array, or a bound
     /// `Param::Vector`.
     fn vector_of(&self, literal: &Literal) -> SqlResult2<Vec<f32>> {
-        if let Literal::Param(n) = literal {
-            if let super::Param::Vector(v) = self.param(*n)? {
-                return Ok(v.clone());
-            }
-        }
-        match self.value_of(literal)? {
-            Value::String(text) => parse_vector_literal(&text),
-            Value::Array(items) => items
-                .iter()
-                .map(|item| {
-                    item.as_f64()
-                        .map(|v| v as f32)
-                        .ok_or_else(|| SqlError::Parameter("vector holds a non-number".into()))
-                })
-                .collect(),
-            other => Err(SqlError::Parameter(format!(
-                "expected a vector literal, found {other}"
-            ))),
-        }
-    }
-
-    fn point_of(&self, point: &PointArg) -> SqlResult2<Point> {
-        let lon = self.f64_of(&point.lon)?;
-        let lat = self.f64_of(&point.lat)?;
-        Point::new(lon, lat).map_err(|e| SqlError::engine(format!("ST_MakePoint({lon}, {lat}): {e}")))
-    }
-
-    fn geom_of(&self, argument: &GeoArg) -> SqlResult2<Geom> {
-        Ok(match argument {
-            GeoArg::Point(point) => {
-                let p = self.point_of(point)?;
-                Geom::Point(p.longitude(), p.latitude())
-            }
-            GeoArg::Envelope {
-                minlon,
-                minlat,
-                maxlon,
-                maxlat,
-            } => {
-                let (w, s, e, n) = (
-                    self.f64_of(minlon)?,
-                    self.f64_of(minlat)?,
-                    self.f64_of(maxlon)?,
-                    self.f64_of(maxlat)?,
-                );
-                Geom::Polygon(vec![vec![[w, s], [e, s], [e, n], [w, n], [w, s]]])
-            }
-            GeoArg::GeoJson(literal) => {
-                let value = self.value_of(literal)?;
-                let document = match value {
-                    Value::String(text) => serde_json::from_str::<Value>(&text)
-                        .map_err(|e| SqlError::Parameter(format!("GeoJSON: {e}")))?,
-                    other => other,
-                };
-                geom_from_json(&document)?
-            }
-        })
-    }
-
-    fn bounds_of(&self, argument: &GeoArg) -> SqlResult2<Bounds> {
-        match argument {
-            GeoArg::Envelope {
-                minlon,
-                minlat,
-                maxlon,
-                maxlat,
-            } => {
-                let (w, s, e, n) = (
-                    self.f64_of(minlon)?,
-                    self.f64_of(minlat)?,
-                    self.f64_of(maxlon)?,
-                    self.f64_of(maxlat)?,
-                );
-                Bounds::new(w, e, s, n)
-                    .map_err(|err| SqlError::engine(format!("ST_MakeEnvelope: {err}")))
-            }
-            _ => Err(SqlError::unsupported(
-                "a rectangle over a Point column is ST_Within(col, ST_MakeEnvelope(...)): PointFilter::Bbox is a lon/lat rectangle and has no other shape",
-            )),
-        }
+        self.folds(literal, "a vector read into the plan");
+        self.binder().vector_of(literal)
     }
 
     // ── the catalog ──────────────────────────────────────────────────────

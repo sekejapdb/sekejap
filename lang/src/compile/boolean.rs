@@ -48,6 +48,14 @@ impl Compiler<'_> {
         table: &str,
         column: &str,
     ) -> SqlResult2<Vec<EntityId>> {
+        // The set is built HERE, while the statement compiles, and what it
+        // holds is the database's rows -- not the caller's parameters. A
+        // compiled statement that carries one is therefore a constant of its
+        // PREPARE and is never rebound: it is compiled again, which builds
+        // the set again.
+        self.folds_reason(format!(
+            "a semi-join over `{table}.{column}` builds its membership set while the statement compiles (QL_CONTRACT §3)"
+        ));
         let db = self.db;
         let budget = self.budget;
         if let Some(edge_type) = db.edge_type(table).ok().flatten() {
@@ -140,11 +148,15 @@ impl Compiler<'_> {
 
     /// True when a tsquery is a bare `!term` -- one leading `!` and no other
     /// operator -- which is the one negated tsquery this slice compiles.
+    ///
+    /// A SHAPE test, so it reads the value without recording a fold; the
+    /// negated arm itself records one, because whether the plan is a
+    /// complement is then decided by the parameter's VALUE.
     pub(super) fn negated_tsquery(&self, query: &TsQuery) -> SqlResult2<bool> {
         if !query.tsquery_syntax {
             return Ok(false);
         }
-        let text = self.text_of(&query.source)?;
+        let text = self.binder().text_of(&query.source)?;
         let trimmed = text.trim();
         Ok(trimmed.starts_with('!')
             && !trimmed[1..].contains('!')

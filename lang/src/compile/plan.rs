@@ -75,24 +75,34 @@ pub(crate) enum OwnedFilter {
     Scalar {
         index: IndexId,
         predicate: OwnedScalarFilter,
+        /// The `$n` slots this predicate's value positions came from, empty
+        /// when every value was written as a constant.
+        fills: Vec<ScalarFill>,
     },
     Point {
         index: IndexId,
         predicate: PointFilter,
+        fill: Option<PointFill>,
     },
     Geometry {
         index: IndexId,
         predicate: GeometryFilter,
+        fill: Option<GeomFill>,
     },
     Text {
         index: IndexId,
         query: String,
         matching: TextMatch,
+        /// The tsquery source, when it is a `$n`. Rebinding re-reads it and
+        /// re-derives BOTH the terms and the `TextMatch`, because `a & b`
+        /// and `a | b` are different matches of the same slot.
+        fill: Option<TsQuery>,
     },
     Graph(OwnedGraph),
     Key {
         lower: Bound<String>,
         upper: Bound<String>,
+        fills: Vec<KeyFill>,
     },
     /// A disjunction: one membership set, the union of its leaves'
     /// (`docs/lang/QL_CONTRACT.md` §3).
@@ -111,7 +121,9 @@ pub(crate) enum OwnedFilter {
 impl OwnedFilter {
     fn borrowed(&self) -> QueryFilter<'_> {
         match self {
-            Self::Scalar { index, predicate } => QueryFilter::Scalar {
+            Self::Scalar {
+                index, predicate, ..
+            } => QueryFilter::Scalar {
                 index: *index,
                 predicate: match predicate {
                     OwnedScalarFilter::Eq(v) => ScalarFilter::Eq(v.borrowed()),
@@ -123,11 +135,15 @@ impl OwnedFilter {
                     OwnedScalarFilter::IsMissing => ScalarFilter::IsMissing,
                 },
             },
-            Self::Point { index, predicate } => QueryFilter::Point {
+            Self::Point {
+                index, predicate, ..
+            } => QueryFilter::Point {
                 index: *index,
                 predicate: *predicate,
             },
-            Self::Geometry { index, predicate } => QueryFilter::Geometry {
+            Self::Geometry {
+                index, predicate, ..
+            } => QueryFilter::Geometry {
                 index: *index,
                 predicate: predicate.clone(),
             },
@@ -135,6 +151,7 @@ impl OwnedFilter {
                 index,
                 query,
                 matching,
+                ..
             } => QueryFilter::Text {
                 index: *index,
                 query,
@@ -143,7 +160,7 @@ impl OwnedFilter {
             // Filled in by `SelectPlan::with_query`, which owns the
             // borrowed predicate slices for the length of one prepared query.
             Self::Graph(_) => unreachable!("a graph filter is borrowed through `graph_request`"),
-            Self::Key { lower, upper } => QueryFilter::Key {
+            Self::Key { lower, upper, .. } => QueryFilter::Key {
                 lower: borrow_key_bound(lower),
                 upper: borrow_key_bound(upper),
             },
@@ -332,6 +349,7 @@ pub(crate) enum OwnedScore {
         index: IndexId,
         query: String,
         matching: TextMatch,
+        fill: Option<TsQuery>,
     },
     /// `col <=> v` in an arithmetic ranking is a DISTANCE, and the engine's
     /// leaf is a SIMILARITY (`-distance`). The lowering below writes the
@@ -341,10 +359,12 @@ pub(crate) enum OwnedScore {
         index: IndexId,
         query: Vec<f32>,
         metric: VectorMetric,
+        fill: Option<Literal>,
     },
     Distance {
         index: IndexId,
         center: Point,
+        fill: Option<PointArg>,
     },
     Add(Box<OwnedScore>, Box<OwnedScore>),
     Sub(Box<OwnedScore>, Box<OwnedScore>),
@@ -368,6 +388,7 @@ fn with_score<R>(node: &OwnedScore, k: &mut dyn FnMut(&ScoreExpr<'_>) -> R) -> R
             index,
             query,
             matching,
+            ..
         } => k(&ScoreExpr::Bm25 {
             index: *index,
             query,
@@ -377,6 +398,7 @@ fn with_score<R>(node: &OwnedScore, k: &mut dyn FnMut(&ScoreExpr<'_>) -> R) -> R
             index,
             query,
             metric,
+            ..
         } => {
             let similarity = ScoreExpr::VectorSimilarity {
                 index: *index,
@@ -385,7 +407,7 @@ fn with_score<R>(node: &OwnedScore, k: &mut dyn FnMut(&ScoreExpr<'_>) -> R) -> R
             };
             k(&ScoreExpr::Neg(&similarity))
         }
-        OwnedScore::Distance { index, center } => k(&ScoreExpr::Distance {
+        OwnedScore::Distance { index, center, .. } => k(&ScoreExpr::Distance {
             index: *index,
             center: *center,
         }),
@@ -424,6 +446,10 @@ fn with_score<R>(node: &OwnedScore, k: &mut dyn FnMut(&ScoreExpr<'_>) -> R) -> R
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OwnedGraph {
     pub(crate) seed: EntityId,
+    /// The seed as the pattern WROTE it, when its key is a `$n`. The key is
+    /// then resolved at BIND -- one point-get -- rather than at prepare, so
+    /// the same compiled traversal walks from a new seed without a compile.
+    pub(crate) seed_fill: Option<SeedFill>,
     pub(crate) direction: Direction,
     pub(crate) context: GraphContextId,
     pub(crate) edge_type: Option<EdgeTypeId>,
@@ -438,6 +464,8 @@ pub(crate) struct OwnedEdgePredicate {
     pub(crate) property: String,
     pub(crate) op: Cmp,
     pub(crate) value: Scalar,
+    /// The literal the element WHERE wrote, when it is a `$n`.
+    pub(crate) fill: Option<Literal>,
 }
 
 impl OwnedEdgePredicate {
@@ -484,22 +512,26 @@ pub(crate) enum OwnedOrder {
     Distance {
         index: IndexId,
         center: Point,
+        fill: Option<PointArg>,
     },
     Bm25 {
         index: IndexId,
         query: String,
         matching: TextMatch,
+        fill: Option<TsQuery>,
     },
     ExactVector {
         index: IndexId,
         query: Vec<f32>,
         metric: VectorMetric,
+        fill: Option<Literal>,
     },
     ApproximateVector {
         index: IndexId,
         query: Vec<f32>,
         metric: VectorMetric,
         ef: usize,
+        fill: Option<Literal>,
     },
     Score {
         expr: OwnedScore,
@@ -654,7 +686,7 @@ impl SelectPlan {
                 index: *index,
                 direction: *direction,
             }),
-            OwnedOrder::Distance { index, center } => run(QueryOrder::Distance {
+            OwnedOrder::Distance { index, center, .. } => run(QueryOrder::Distance {
                 index: *index,
                 center: *center,
                 direction: SortDirection::Ascending,
@@ -663,6 +695,7 @@ impl SelectPlan {
                 index,
                 query,
                 matching,
+                ..
             } => run(QueryOrder::Bm25 {
                 index: *index,
                 query,
@@ -672,6 +705,7 @@ impl SelectPlan {
                 index,
                 query,
                 metric,
+                ..
             } => run(QueryOrder::ExactVector {
                 index: *index,
                 query,
@@ -682,6 +716,7 @@ impl SelectPlan {
                 query,
                 metric,
                 ef,
+                ..
             } => run(QueryOrder::ApproximateVector {
                 index: *index,
                 query,
@@ -1183,3 +1218,214 @@ pub(crate) enum Plan {
     ExplainText(String),
 }
 
+
+// ── rebinding ─────────────────────────────────────────────────────────────
+//
+// One pass over the compiled form, refilling every typed slot from a new
+// parameter list. Nothing here parses, compiles, reads the catalog or
+// chooses a driver: the plan's SHAPE is what a prepare decided, and a rebind
+// only writes values into the positions the prepare marked as slots.
+
+/// Write `value` into `bound`, keeping whether the bound is inclusive: the
+/// operator is the statement's, only the value is the caller's.
+fn refill_bound<T>(bound: &mut Bound<T>, value: T) {
+    *bound = match bound {
+        Bound::Excluded(_) => Bound::Excluded(value),
+        Bound::Included(_) | Bound::Unbounded => Bound::Included(value),
+    };
+}
+
+impl OwnedFilter {
+    /// Refill this filter's slots. A filter with no slot is untouched.
+    pub(crate) fn rebind(&mut self, binder: &Binder<'_>) -> SqlResult2<()> {
+        match self {
+            Self::Scalar {
+                predicate, fills, ..
+            } => {
+                for fill in fills.iter() {
+                    let value = binder.scalar(&fill.kind, &fill.literal, &fill.column)?;
+                    match (&mut *predicate, fill.at) {
+                        (OwnedScalarFilter::Eq(slot), ScalarAt::Eq) => *slot = value,
+                        (OwnedScalarFilter::Range { lower, .. }, ScalarAt::Lower) => {
+                            refill_bound(lower, value)
+                        }
+                        (OwnedScalarFilter::Range { upper, .. }, ScalarAt::Upper) => {
+                            refill_bound(upper, value)
+                        }
+                        _ => {
+                            return Err(SqlError::unsupported(
+                                "a rebind found a scalar slot whose compiled predicate has no such position",
+                            ))
+                        }
+                    }
+                }
+            }
+            Self::Key {
+                lower,
+                upper,
+                fills,
+            } => {
+                for fill in fills.iter() {
+                    let key = binder.text_of(&fill.literal)?;
+                    match fill.at {
+                        KeyAt::Lower => refill_bound(lower, key),
+                        KeyAt::Upper => refill_bound(upper, key),
+                    }
+                }
+            }
+            Self::Text {
+                query,
+                matching,
+                fill,
+                ..
+            } => {
+                if let Some(source) = fill {
+                    let (text, how) = binder.tsquery(source)?;
+                    *query = text;
+                    *matching = how;
+                }
+            }
+            Self::Point {
+                predicate, fill, ..
+            } => {
+                if let Some(fill) = fill {
+                    *predicate = match fill {
+                        PointFill::Radius { center, metres } => PointFilter::Radius {
+                            center: binder.point_of(center)?,
+                            radius_metres: binder.f64_of(metres)?,
+                        },
+                        PointFill::Bbox(argument) => PointFilter::Bbox(binder.bounds_of(argument)?),
+                    };
+                }
+            }
+            Self::Geometry {
+                predicate, fill, ..
+            } => {
+                if let Some(fill) = fill {
+                    let geometry = binder.geom_of(&fill.argument)?;
+                    *predicate = match fill.predicate {
+                        SpatialPredicate::Intersects => GeometryFilter::Intersects(geometry),
+                        SpatialPredicate::Within => GeometryFilter::Within(geometry),
+                        SpatialPredicate::Contains => GeometryFilter::Contains(geometry),
+                        SpatialPredicate::DWithin => GeometryFilter::DWithin {
+                            geometry,
+                            metres: match &fill.metres {
+                                Some(literal) => binder.f64_of(literal)?,
+                                None => {
+                                    return Err(SqlError::syntax("ST_DWithin needs a distance", 0))
+                                }
+                            },
+                        },
+                    };
+                }
+            }
+            Self::Graph(graph) => graph.rebind(binder)?,
+            Self::Any(children) | Self::All(children) => {
+                for child in children.iter_mut() {
+                    child.rebind(binder)?;
+                }
+            }
+            Self::Not(child) => child.rebind(binder)?,
+            // A semi-join's set was BUILT at compile, so a statement that
+            // holds one is never rebindable and this arm is never reached
+            // with a changed parameter.
+            Self::Ids(_) => {}
+        }
+        Ok(())
+    }
+}
+
+impl OwnedGraph {
+    fn rebind(&mut self, binder: &Binder<'_>) -> SqlResult2<()> {
+        if let Some(fill) = &self.seed_fill {
+            self.seed = binder.seed_of(fill)?;
+        }
+        for predicate in self.edge_where.iter_mut() {
+            if let Some(literal) = &predicate.fill {
+                predicate.value = binder.edge_value(literal, &predicate.property)?;
+            }
+        }
+        for filter in self.node_where.iter_mut() {
+            filter.rebind(binder)?;
+        }
+        Ok(())
+    }
+}
+
+impl OwnedScore {
+    fn rebind(&mut self, binder: &Binder<'_>) -> SqlResult2<()> {
+        match self {
+            Self::Bm25 {
+                query,
+                matching,
+                fill,
+                ..
+            } => {
+                if let Some(source) = fill {
+                    let (text, how) = binder.tsquery(source)?;
+                    *query = text;
+                    *matching = how;
+                }
+            }
+            Self::VectorDistance { query, fill, .. } => {
+                if let Some(literal) = fill {
+                    *query = binder.vector_of(literal)?;
+                }
+            }
+            Self::Distance { center, fill, .. } => {
+                if let Some(point) = fill {
+                    *center = binder.point_of(point)?;
+                }
+            }
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
+                a.rebind(binder)?;
+                b.rebind(binder)?;
+            }
+            Self::Neg(inner) => inner.rebind(binder)?,
+            Self::Lit(_) | Self::Scalar { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+impl OwnedOrder {
+    fn rebind(&mut self, binder: &Binder<'_>) -> SqlResult2<()> {
+        match self {
+            Self::Distance { center, fill, .. } => {
+                if let Some(point) = fill {
+                    *center = binder.point_of(point)?;
+                }
+            }
+            Self::Bm25 {
+                query,
+                matching,
+                fill,
+                ..
+            } => {
+                if let Some(source) = fill {
+                    let (text, how) = binder.tsquery(source)?;
+                    *query = text;
+                    *matching = how;
+                }
+            }
+            Self::ExactVector { query, fill, .. } | Self::ApproximateVector { query, fill, .. } => {
+                if let Some(literal) = fill {
+                    *query = binder.vector_of(literal)?;
+                }
+            }
+            Self::Score { expr, .. } => expr.rebind(binder)?,
+            Self::Driver | Self::EntityId | Self::Scalar { .. } | Self::Edge { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+impl SelectPlan {
+    /// Refill every slot of this SELECT from a new parameter list.
+    pub(crate) fn rebind(&mut self, binder: &Binder<'_>) -> SqlResult2<()> {
+        for filter in self.filters.iter_mut() {
+            filter.rebind(binder)?;
+        }
+        self.order.rebind(binder)
+    }
+}

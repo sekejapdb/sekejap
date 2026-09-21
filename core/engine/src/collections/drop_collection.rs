@@ -517,6 +517,7 @@ impl Database {
             }
         }
         *self.catalog_cache.borrow_mut() = None;
+        self.index_descriptors_changed();
         *self.layout_cache.borrow_mut() = None;
         self.allocated.remove(&c.id);
         self.dropping = None;

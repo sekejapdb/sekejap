@@ -142,13 +142,21 @@ pub(super) fn sidecar_prefix(c: CollectionId) -> Vec<u8> {
 /// holding. It is a speed claim with a correct slow path underneath it, not a
 /// correctness claim.
 ///
-/// STATUS (sweep 2026-09-20): this cursor is not on any live path. Filtered
+/// STATUS (sweep 2026-09-21): this cursor is still not on any live path, and
+/// one measurement now says why rather than leaving it an accident. Filtered
 /// exact scoring point-gets each candidate's sidecar
 /// (`score_locator_cancelled`), and the unfiltered order walks the sidecar
-/// leaves in page order (`scan_exact_all`). The sacrifice the earlier note
-/// described -- walking every vector field of the collection -- is therefore
-/// not paid by any query today. The type stays as the reference shape for a
-/// sequential filtered walk if a measurement ever asks for one.
+/// leaves in page order (`scan_exact_all`).
+///
+/// The quantized rerank was the obvious third caller -- its `ef` winners are
+/// sorted by sequence, so their sidecar keys ascend -- and it was tried:
+/// at ef=20 over 50,000 rows the rerank's sidecar reads went from 1.33 ms to
+/// 185 ms per fifty queries, and the candidate scan behind them from 128 ms
+/// to 217 ms. A shortlist is SCATTERED, so dragging a cursor across it steps
+/// through every sidecar between two winners and the 6.4 MB it touches
+/// evicts the 2.3 MB of compact entries the next query's scan needs. A
+/// forward cursor pays only when the candidates ARE the pages. The type
+/// stays as the reference shape for a walk of that kind.
 #[allow(dead_code)]
 pub(super) struct SidecarCursor<'a> {
     prefix: Vec<u8>,
@@ -650,17 +658,30 @@ fn desired_locator(
     Ok(Some(encode_locator(layout_id, ordinal)?))
 }
 
+/// `fresh` says the row is an INSERT: its entity id was allocated for this
+/// write, so no locator keyed by that sequence has ever been on disk and the
+/// existence probe below has one possible answer. Skipping it removes one
+/// root-to-leaf descent per indexed row from a bulk load; the bytes written
+/// are the same either way, because a locator that cannot exist cannot be
+/// found equal to the one about to be written.
 pub(crate) fn maintain_locator(
     db: &mut Database,
     i: &IndexInfo,
     id: EntityId,
     new: Option<(&Layout, &VectorCells)>,
+    fresh: bool,
 ) -> Result<()> {
     let key = locator_key(i.id, id.sequence);
     let desired = new
         .map(|(layout, vectors)| desired_locator(i, layout, vectors))
         .transpose()?
         .flatten();
+    if fresh {
+        if let Some(value) = desired {
+            db.writer()?.put(&key, &value)?;
+        }
+        return Ok(());
+    }
     let existing = db.store()?.get(&key)?;
     match (existing.as_deref(), desired) {
         (Some(old), Some(value)) if old == value => {}

@@ -62,6 +62,15 @@ pub struct Edge {
     pub properties: Value,
 }
 
+/// One edge of a [`Database::link_many`] batch: the two endpoints and the
+/// property bag. The context and the edge type are the batch's, named once.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewEdge {
+    pub source: EntityId,
+    pub destination: EntityId,
+    pub properties: Value,
+}
+
 /// The edge a traversal crossed to reach one node, bound to that node
 /// (`docs/core/GRAPH_CONTRACT.md` §4.2). `properties` is the inline bag of the
 /// PRIMARY posting, decoded once when the edge was walked; nothing here
@@ -1206,31 +1215,36 @@ impl Database {
     }
 
     fn validate_endpoints(&self, source: EntityId, destination: EntityId) -> Result<()> {
-        for id in [source, destination] {
-            if id.collection.0 == 0 || id.sequence == 0 {
-                return Err(Error::NotFound("graph endpoint"));
-            }
-            // A collection under `begin_drop_collection` accepts no new edge.
-            // Without this a RESTRICT drop could be admitted on an empty
-            // probe and then have an edge written into it, and the drop would
-            // remove that edge without anyone asking for CASCADE. The handle
-            // field is `None` on every database with no drop in flight, so
-            // this is one comparison per endpoint, not a descriptor read.
-            if self.dropping == Some(id.collection) {
-                return Err(invalid(
-                    "graph endpoint is in a collection that is DROPPING; no edge may be written onto it",
-                ));
-            }
-            // The existence check stays -- an edge to a row that is not there
-            // is the dangling reference this guard exists to refuse. It is the
-            // DESCENT that goes away, and only for a row this handle wrote and
-            // has not deleted, where the answer is already known.
-            if self.endpoint_known_live(id) {
-                continue;
-            }
-            if self.store()?.get(&row_key(id))?.is_none() {
-                return Err(Error::NotFound("graph endpoint"));
-            }
+        self.validate_endpoint(source)?;
+        self.validate_endpoint(destination)
+    }
+
+    /// One endpoint of one edge. `link_many` calls it once per DISTINCT
+    /// entity of a batch, which is the same check with the repeats removed.
+    fn validate_endpoint(&self, id: EntityId) -> Result<()> {
+        if id.collection.0 == 0 || id.sequence == 0 {
+            return Err(Error::NotFound("graph endpoint"));
+        }
+        // A collection under `begin_drop_collection` accepts no new edge.
+        // Without this a RESTRICT drop could be admitted on an empty probe and
+        // then have an edge written into it, and the drop would remove that
+        // edge without anyone asking for CASCADE. The handle field is `None`
+        // on every database with no drop in flight, so this is one comparison
+        // per endpoint, not a descriptor read.
+        if self.dropping == Some(id.collection) {
+            return Err(invalid(
+                "graph endpoint is in a collection that is DROPPING; no edge may be written onto it",
+            ));
+        }
+        // The existence check stays -- an edge to a row that is not there is
+        // the dangling reference this guard exists to refuse. It is the
+        // DESCENT that goes away, and only for a row this handle wrote and has
+        // not deleted, where the answer is already known.
+        if self.endpoint_known_live(id) {
+            return Ok(());
+        }
+        if self.store()?.get(&row_key(id))?.is_none() {
+            return Err(Error::NotFound("graph endpoint"));
         }
         Ok(())
     }
@@ -1344,6 +1358,123 @@ impl Database {
         }
         self.preflight_unless_provably_absent(key)?;
         let result = self.write_edge_pair(key, &bytes).map(|()| key);
+        self.finish(result)
+    }
+
+    /// Many edges of ONE context and ONE type, written under one validation
+    /// pass and in key order.
+    ///
+    /// The same work `put_edge` does, hoisted to what it actually depends on.
+    /// `ready_write`, the graph header read and the type/context identity
+    /// check belong to the BATCH, not to the edge. Endpoint existence is a
+    /// property of an ENTITY, so it is checked once per DISTINCT entity in the
+    /// batch: a source with three edges paid for three identical descents
+    /// before, and a destination that is also a source paid twice more.
+    ///
+    /// The forward/reverse probe stays PER EDGE and stays BEFORE every write,
+    /// so no probe in this batch can read a primary that this same batch wrote
+    /// without its reverse; its skip rule is `put_edge`'s, unchanged.
+    ///
+    /// The writes are then issued in key order, one keyspace at a time: every
+    /// `0x71` posting ascending, then every `0x72` posting ascending. The
+    /// descent per key is unchanged -- `fast_path_leaf` still wants the
+    /// rightmost leaf of the WHOLE tree, for the reason `write_edge_pair`
+    /// records -- but a sorted run walks each leaf and each internal node once
+    /// and in order, so the pages one descent needs are the pages the previous
+    /// descent just left in the pool. One `put_edge` per edge alternates
+    /// between two distant stretches of the same tree on every single edge,
+    /// and on a buffer pool smaller than the tree each stretch evicts the
+    /// other's path.
+    ///
+    /// Duplicates inside one batch are last-wins, the same rule two
+    /// consecutive `put_edge` calls of one quadruple follow: the sort is
+    /// stable, so the later entry is written last.
+    ///
+    /// L3 (`docs/core/FOUNDATION_TEST_STANDARD.md`): nothing commits here.
+    /// The call returns only once both directions of every edge are in the
+    /// transaction, and any failure poisons the handle, so no commit can ever
+    /// publish a primary posting without its reverse marker.
+    ///
+    /// Returns the edge keys, in the caller's order.
+    pub fn link_many(
+        &mut self,
+        context: GraphContextId,
+        edge_type: EdgeTypeId,
+        edges: &[NewEdge],
+    ) -> Result<Vec<EdgeKey>> {
+        self.ready_write()?;
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let h = self.graph_header()?;
+        let result = (|| {
+            // One identity check for the whole batch: the context and the type
+            // are the batch's, so `validate_edge_ids` has one answer for it.
+            self.validate_edge_ids(
+                h,
+                EdgeKey {
+                    source: edges[0].source,
+                    context,
+                    edge_type,
+                    destination: edges[0].destination,
+                },
+            )?;
+            // One existence check per DISTINCT entity. The set is bounded by
+            // the batch the caller handed in, not by the graph.
+            let mut endpoints: BTreeSet<(u32, u64)> = BTreeSet::new();
+            for edge in edges {
+                endpoints.insert((edge.source.collection.0, edge.source.sequence));
+                endpoints.insert((edge.destination.collection.0, edge.destination.sequence));
+            }
+            for (collection, sequence) in &endpoints {
+                self.validate_endpoint(EntityId {
+                    collection: CollectionId(*collection),
+                    sequence: *sequence,
+                })?;
+            }
+            let mut keys = Vec::with_capacity(edges.len());
+            let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(edges.len());
+            for edge in edges {
+                let bytes = encode_properties(&edge.properties)?;
+                if self
+                    .limits
+                    .is_some_and(|l| bytes.len() + 64 > l.record_bytes as usize)
+                {
+                    return Err(invalid("encoded edge exceeds configured record limit"));
+                }
+                keys.push(EdgeKey {
+                    source: edge.source,
+                    context,
+                    edge_type,
+                    destination: edge.destination,
+                });
+                bodies.push(bytes);
+            }
+            // Ascending by primary key. `sort_by_key` is stable, which is what
+            // makes a repeated quadruple inside one batch last-wins.
+            let mut order: Vec<usize> = (0..keys.len()).collect();
+            order.sort_by_key(|i| edge_key(PRIMARY_EDGE, keys[*i]));
+            // EVERY probe before ANY write, in key order: no probe in this
+            // batch can read a primary this same batch wrote without its
+            // reverse, and the probes walk the keyspace once instead of
+            // jumping between two stretches of it per edge.
+            for i in &order {
+                self.preflight_unless_provably_absent(keys[*i])?;
+            }
+            let mut scratch = Vec::with_capacity(EDGE_KEY_BYTES);
+            for i in &order {
+                scratch.clear();
+                edge_key_into(&mut scratch, PRIMARY_EDGE, keys[*i]);
+                self.writer()?.put(&scratch, &bodies[*i])?;
+            }
+            order.sort_by_key(|i| edge_key(REVERSE_EDGE, keys[*i]));
+            for i in &order {
+                scratch.clear();
+                edge_key_into(&mut scratch, REVERSE_EDGE, keys[*i]);
+                self.writer()?.put(&scratch, &[])?;
+            }
+            Ok(keys)
+        })();
         self.finish(result)
     }
 

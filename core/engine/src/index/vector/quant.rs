@@ -101,10 +101,125 @@ pub(crate) fn widen_query(query: &[f32]) -> Result<(Vec<f64>, f64), Error> {
     Ok((wide, query_norm))
 }
 
+/// The lane loop, written once and specialised PER METRIC.
+///
+/// The loop this replaces kept three running sums -- `dot`, `stored_norm`
+/// and `squared_l2` -- and added into all three on every lane, whatever the
+/// metric asked for. Two of the three are dead on any given call: Cosine
+/// reads `dot` and `stored_norm`, `NegativeDot` reads `dot`, `SquaredL2`
+/// reads `squared_l2`. Each arm below keeps only the sums its own metric
+/// reads.
+///
+/// THE VALUE IS BIT-FOR-BIT THE OLD ONE. Every retained sum accumulates the
+/// same terms in the same lane order into the same single f64; what is gone
+/// is arithmetic whose result was discarded. Nothing about the distance an
+/// entry gets, the shortlist it enters or the answer a caller sees moves.
+///
+/// `POLL` is a const so the unfiltered page-order scan -- the one that never
+/// cancels -- compiles with no cancellation test in the loop at all, while
+/// the filtered probe keeps the one-per-256-lane cadence it had.
+///
+/// WHAT THIS IS NOT (Law 4). A 32-lane entry costs 24.4 ns to score on its
+/// own and 24.0 ns with only the two sums Cosine reads, because ONE f64
+/// accumulator makes the loop a chain of `dim` dependent additions and the
+/// chain's LENGTH, not the op count, is what the processor waits on. Four
+/// partial sums per accumulator break that chain and cost 16.2 ns measured
+/// on their own -- and 134 ms against 128 ms per fifty 50,000-entry queries
+/// measured INSIDE the scan, where the surrounding walk already hides the
+/// chain and the extra accumulators only add register pressure. That
+/// version also changes the approximate distance's last place, since f64
+/// addition is not associative. It was measured and dropped; this one keeps
+/// the arithmetic and takes the op count.
+const POLL_LANES: usize = 256;
+const LANE_STEP: usize = 8;
+
+/// One metric's distance. See the note above for why there is an arm per
+/// metric and why each arm keeps a single accumulator per sum.
+#[inline(always)]
+fn distance_of<const POLL: bool>(
+    scale: f64,
+    codes: &[u8],
+    query: &[f64],
+    query_norm: f64,
+    metric: Metric,
+    zero_query_is_an_error: bool,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<f64>, Error> {
+    let dim = codes.len();
+    /// One lane's stored value: an exactly-representable int8 code times the
+    /// entry's own f64 scale, which is one correctly-rounded multiply.
+    macro_rules! stored {
+        ($at:expr) => {
+            f64::from(unsafe { *codes.get_unchecked($at) } as i8) * scale
+        };
+    }
+    macro_rules! lane {
+        ($at:expr) => {
+            unsafe { *query.get_unchecked($at) }
+        };
+    }
+    // The walk: eight-lane chunks then the remainder, with the poll on the
+    // same 256-lane boundaries the single three-sum loop used.
+    macro_rules! walk {
+        ($one:expr) => {{
+            let mut at = 0usize;
+            while at + LANE_STEP <= dim {
+                if POLL && at % POLL_LANES == 0 && cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                for j in 0..LANE_STEP {
+                    $one(at + j);
+                }
+                at += LANE_STEP;
+            }
+            if POLL && at % POLL_LANES == 0 && at < dim && cancelled() {
+                return Err(Error::Cancelled);
+            }
+            while at < dim {
+                $one(at);
+                at += 1;
+            }
+        }};
+    }
+    let distance = match metric {
+        Metric::SquaredL2 => {
+            let mut squared_l2 = 0.0f64;
+            walk!(|at| {
+                let difference = stored!(at) - lane!(at);
+                squared_l2 += difference * difference;
+            });
+            squared_l2
+        }
+        Metric::NegativeDot => {
+            let mut dot = 0.0f64;
+            walk!(|at| {
+                dot += stored!(at) * lane!(at);
+            });
+            -dot
+        }
+        Metric::Cosine => {
+            let mut dot = 0.0f64;
+            let mut stored_norm = 0.0f64;
+            walk!(|at| {
+                let stored = stored!(at);
+                dot += stored * lane!(at);
+                stored_norm += stored * stored;
+            });
+            if zero_query_is_an_error && query_norm == 0.0 {
+                return Err(Error::Invalid("zero cosine query"));
+            }
+            if stored_norm == 0.0 {
+                return Ok(None);
+            }
+            1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt())
+        }
+    };
+    Ok(Some(if distance == 0.0 { 0.0 } else { distance }))
+}
+
 /// Symmetric-int8 distance. `query` is already widened; `query_norm` is
 /// `sum(q*q)` in lane order. Eight-lane chunks, no bounds checks in the hot
-/// loop. Arithmetic is still per-lane f64 so Cosine/L2/dot match the previous
-/// sequential accumulation.
+/// loop, one accumulator per sum the metric reads; see [`distance_of`].
 pub(crate) fn score_i8(
     scale: f64,
     codes: &[u8],
@@ -116,56 +231,13 @@ pub(crate) fn score_i8(
     if query.len() != codes.len() {
         return Err(Error::Invalid("quantized query dimension"));
     }
-    let dim = codes.len();
-    let mut dot = 0.0f64;
-    let mut stored_norm = 0.0f64;
-    let mut squared_l2 = 0.0f64;
-    let mut at = 0usize;
-    while at + 8 <= dim {
-        if at % 256 == 0 && cancelled() {
-            return Err(Error::Cancelled);
-        }
-        unsafe {
-            for j in 0..8 {
-                let stored = f64::from(*codes.get_unchecked(at + j) as i8) * scale;
-                let query_lane = *query.get_unchecked(at + j);
-                dot += stored * query_lane;
-                stored_norm += stored * stored;
-                let difference = stored - query_lane;
-                squared_l2 += difference * difference;
-            }
-        }
-        at += 8;
-    }
-    if at % 256 == 0 && at < dim && cancelled() {
-        return Err(Error::Cancelled);
-    }
-    while at < dim {
-        unsafe {
-            let stored = f64::from(*codes.get_unchecked(at) as i8) * scale;
-            let query_lane = *query.get_unchecked(at);
-            dot += stored * query_lane;
-            stored_norm += stored * stored;
-            let difference = stored - query_lane;
-            squared_l2 += difference * difference;
-        }
-        at += 1;
-    }
-    let distance = match metric {
-        Metric::SquaredL2 => squared_l2,
-        Metric::NegativeDot => -dot,
-        Metric::Cosine if query_norm == 0.0 => {
-            return Err(Error::Invalid("zero cosine query"));
-        }
-        Metric::Cosine if stored_norm == 0.0 => return Ok(None),
-        Metric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
-    };
-    Ok(Some(if distance == 0.0 { 0.0 } else { distance }))
+    distance_of::<true>(scale, codes, query, query_norm, metric, true, &mut cancelled)
 }
 
-/// Same arithmetic as [`score_i8`], with no cancellation poll. The caller has
-/// already widened the query; the one length this asserts is the one the
-/// unchecked lane reads depend on.
+/// Same arithmetic as [`score_i8`], with no cancellation poll: `POLL` is
+/// `false`, so the test is not in the compiled loop at all. The caller has
+/// already widened the query and refused a zero cosine query; the one length
+/// this asserts is the one the unchecked lane reads depend on.
 #[inline(always)]
 pub(crate) fn score_i8_hot(
     scale: f64,
@@ -174,47 +246,17 @@ pub(crate) fn score_i8_hot(
     query_norm: f64,
     metric: Metric,
 ) -> Option<f64> {
-    let dim = codes.len();
     // Both lane loops read `query` unchecked at offsets bounded by
     // `codes.len()`. A plain assert, not a debug one: the proof has to hold
     // for every caller, not only the builds with debug assertions on, and one
     // length compare per vector does not show up next to `dim` multiplies.
-    assert_eq!(query.len(), dim, "quantized score lane count");
-    let mut dot = 0.0f64;
-    let mut stored_norm = 0.0f64;
-    let mut squared_l2 = 0.0f64;
-    let mut at = 0usize;
-    while at + 8 <= dim {
-        unsafe {
-            for j in 0..8 {
-                let stored = f64::from(*codes.get_unchecked(at + j) as i8) * scale;
-                let query_lane = *query.get_unchecked(at + j);
-                dot += stored * query_lane;
-                stored_norm += stored * stored;
-                let difference = stored - query_lane;
-                squared_l2 += difference * difference;
-            }
-        }
-        at += 8;
+    assert_eq!(query.len(), codes.len(), "quantized score lane count");
+    match distance_of::<false>(scale, codes, query, query_norm, metric, false, &mut || false) {
+        Ok(distance) => distance,
+        // `POLL` is false, so the one error this call can produce --
+        // `Cancelled` -- has no way to be raised.
+        Err(_) => unreachable!("the non-polling score cannot cancel"),
     }
-    while at < dim {
-        unsafe {
-            let stored = f64::from(*codes.get_unchecked(at) as i8) * scale;
-            let query_lane = *query.get_unchecked(at);
-            dot += stored * query_lane;
-            stored_norm += stored * stored;
-            let difference = stored - query_lane;
-            squared_l2 += difference * difference;
-        }
-        at += 1;
-    }
-    let distance = match metric {
-        Metric::SquaredL2 => squared_l2,
-        Metric::NegativeDot => -dot,
-        Metric::Cosine if stored_norm == 0.0 => return None,
-        Metric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
-    };
-    Some(if distance == 0.0 { 0.0 } else { distance })
 }
 
 impl Decoded<'_> {

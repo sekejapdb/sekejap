@@ -1607,10 +1607,17 @@ fn b_streaming_and_hashed_identical_unindexed_and_radius() {
                 "{filter:?} field kind"
             );
             if matches!(filter, FilterShape::None) {
+                // With no filter the kind index is the only thing that can
+                // drive, and `count(born)`/`sum`/`min`/`max`/`avg` all name
+                // `born`'s own numeric scalar index: that is the POSTING
+                // JOIN, two index passes and no row read. The claim under
+                // test is unchanged and stronger for it -- an index-only
+                // answer and a row-reading hash must still agree group for
+                // group.
                 assert_eq!(
                     streamed_shape,
-                    AggregateShape::Streaming,
-                    "no filter, kind index must stream"
+                    AggregateShape::PostingJoin,
+                    "no filter, kind index, every accumulator indexed: the posting join"
                 );
             }
             assert_eq!(

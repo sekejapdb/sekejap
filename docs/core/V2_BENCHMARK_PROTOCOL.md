@@ -388,3 +388,78 @@ V2_SQLITE_AUTOCHECKPOINT=0 ./target/release/v2_foundation_bench /authorized/path
   As of this revision it calls the new `Database::checkpoint() -> Result<bool>`
   that the integration is adding; this binary cannot build before that
   method lands.
+
+## The 50K battle: two E4 arms per run, frozen Postgres and SQLite references
+
+`bench/src/bin/battle50k.rs` is a different measurement from the one above:
+not raw writes, but forty-one QUERY cases over a fixed 50,000-row corpus that
+lives on disk — graph, vector, spatial, text, scalar, boolean, aggregate and
+row-function shapes — asked of four arms, one arm per process.
+
+| Arm | What it is |
+| --- | --- |
+| `e4` | an embedded `Database`, the battery built as `QueryRequest`s in Rust |
+| `e4-sql` | the same database and the same battery, asked as SQL text |
+| `postgres` | a real server: PostGIS + pgvector + pgvectorscale |
+| `sqlite` | an embedded SQLite: FTS5, two R*Trees, and registered scalar functions that call `sekejap-core` itself |
+
+The `sqlite` arm's `--db-dir` names the `.db` FILE, not a directory. SQLite
+has no geometry type, no geodesic, no vector type and no traversal atomic, so
+each of those reaches `sekejap-core` through a registered scalar function —
+`geo_dist_m` is `spatial_math::wgs84_distance_metres`, the geometry
+predicates are `spatial_geometry::{within, contains, intersects, dwithin_m}`,
+and every radius candidate box is `spatial_math::radius_candidate_bounds`.
+The ORACLE is therefore the same routine in both arms: a row-count difference
+would be a real difference and not a second implementation of a predicate.
+What the arm measures is SQLite's cost of REACHING that routine — an R*Tree
+candidate, a per-row GeoJSON parse, a full scan for every vector case. A case
+SQLite cannot express is reported as `n/a: <reason>`, never skipped, and the
+statement each case ran is in the report's `sql` field and in
+`<dump>/<case>/statement.sql`.
+
+### Postgres and SQLite are constants; E4 is what moves
+
+Both external engines are frozen. Rerunning them once per E4 pass measures
+two engines that did not change, and costs a running Postgres server for a
+number that did not move. `<scratch>/` holds
+`pg-50k.json` and `sqlite-50k.json` beside a `README.md` and a
+`manifest.json` recording the date, the engine versions (`SELECT version()`,
+`SELECT postgis_full_version()`, `pg_extension`, and SQLite's
+`sqlite_version()` as the arm itself read it into the report's `engine`
+block), the machine, the corpus SHA-256 and the exact commands.
+
+A comparison that names no `postgres` and no `sqlite` report fills both arms
+from that directory:
+
+```sh
+# the ordinary pass: two E4 arms against the frozen references
+python3 tools/battle50k_compare.py <e4.json> <e4-sql.json>
+
+# a refreeze pass, or any run that wants live externals: name them
+python3 tools/battle50k_compare.py <e4.json> <pg.json> <e4-sql.json> <sqlite.json>
+```
+
+Reports are routed by their own `arm` field, so the order on the command line
+is not meaning. `--frozen <dir>` overrides the default directory.
+
+**Provenance is checked, never assumed.** Whenever a frozen file is used, the
+script hashes the corpus the live reports name and refuses unless it equals
+the manifest's `corpus_sha256`, and refuses any report — live or frozen —
+that is older than the corpus file itself. A refusal prints `REFUSED: …` on
+stderr, names the number that differed and exits 2. There is no flag that
+skips it: a frozen median measured on different rows is not a reference, it
+is a wrong answer. Refreeze when the corpus changes, when either engine is
+upgraded, or when a case is added to the battery.
+
+### What the comparison prints
+
+Stages, then one CASES table with a median per arm, the E4/PG and E4/SQLITE
+ratios, the `e4-sql` run/prepare split, a row count per arm, and an
+agreement verdict computed across EVERY arm that ran the case — not two —
+printed with the row count they agreed on. Row-count agreement on every
+filter case is the precondition: a latency ratio between two arms that
+answered different questions is not a measurement. Then the approximate
+recall-vs-latency sweeps, then every arm's deviations, then **ANOMALIES** —
+every case where E4 is slower than Postgres or than SQLite, worst ratio
+first, and every disagreement. That last section is what the battery exists
+for.

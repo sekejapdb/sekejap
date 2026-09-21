@@ -900,6 +900,34 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
         limit.saturating_sub(*used)
     }
 
+    /// Would charging this resource pass its ceiling?
+    ///
+    /// The one question a walk asks when passing a bound means CHOOSING
+    /// ANOTHER SHAPE rather than refusing. The POSTING JOIN
+    /// (`query/aggregate.rs`) asks it: a request that streamed inside ONE
+    /// accumulator set yesterday must not become a `BudgetExceeded` today
+    /// because a new shape wanted one set per group, so the join gives way to
+    /// the fold that ran before it existed. Nothing is charged here.
+    pub(super) fn would_exceed(&mut self, resource: WorkResource, amount: u64) -> bool {
+        let (used, limit) = self.slot(resource);
+        match used.checked_add(amount) {
+            Some(attempted) => attempted > limit,
+            None => true,
+        }
+    }
+
+    /// Give back a MEMORY charge an abandoned pass no longer holds.
+    ///
+    /// Only for the resources that count what is held AT ONCE --
+    /// [`WorkResource::Groups`] is the one that uses it: a pass that gave up
+    /// its accumulator sets before another shape opened its own is not
+    /// holding both, and the high-water mark this page reports must say so.
+    /// It is never used to un-count WORK, which cannot be given back.
+    pub(super) fn release(&mut self, resource: WorkResource, amount: u64) {
+        let (used, _) = self.slot(resource);
+        *used = used.saturating_sub(amount);
+    }
+
     pub(super) fn charge(&mut self, resource: WorkResource, amount: u64) -> QueryResult<()> {
         self.check_cancelled()?;
         let (used, limit) = self.slot(resource);

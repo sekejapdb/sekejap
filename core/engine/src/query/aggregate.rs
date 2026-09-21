@@ -26,6 +26,29 @@
 //! [`WorkResource::Groups`] budget bounds. There is no spill in this item:
 //! past the cap the page is refused with `BudgetExceeded { groups }`.
 //!
+//! **POSTING JOIN.** The group key is the driving scalar index's own value
+//! AND every accumulator that would otherwise read a row has its OWN scalar
+//! index of a numeric kind. Then no row is read at all: pass 1 walks the
+//! driving index and turns each value's contiguous run of postings into one
+//! group with a bounded id BITMAP; pass 2 walks each accumulated column's
+//! index in key order and folds every `(value, id)` into the group whose
+//! bitmap claims the id. The cost is `rows x (1 + accumulated columns)`
+//! posting steps and ZERO `primary_reads`, against one random row read per
+//! candidate -- 50,000 point-gets into a 61 MB tree was the whole of
+//! `agg_sum_born_by_kind`'s 115 ms.
+//!
+//! Its two bounds are not refusals. A collection whose groups x bitmap would
+//! hold more than `MEMBERSHIP_BYTES_CAP`, or more accumulator sets than the
+//! CALLER's `groups` budget allows, gives way to the fold that ran before
+//! this shape existed -- STREAMING, or HASHED where the order is over an
+//! accumulator. That is deliberate and it is `QL_CONTRACT` §6: a request
+//! that answered inside one accumulator set yesterday must not become a
+//! `BudgetExceeded` today because the engine learnt a new shape. `EXPLAIN`
+//! prints the shape that RAN and the reason the join gave way.
+//!
+//! **SKIP-SCAN.** A group with no accumulators at all: see
+//! [`PreparedAggregate::skip_page`].
+//!
 //! ## Where an accumulator's input comes from
 //!
 //! From the driving scalar index's posting when the field IS that index
@@ -179,6 +202,11 @@ pub enum GroupOrder {
 pub enum AggregateShape {
     Streaming,
     Hashed,
+    /// A group with NO accumulators over the DRIVING scalar index: a
+    /// SKIP-SCAN. See `PreparedAggregate::skip_page`.
+    Skip,
+    /// Two index passes and no row: see `PreparedAggregate::posting_join_fold`.
+    PostingJoin,
 }
 
 impl AggregateShape {
@@ -186,6 +214,8 @@ impl AggregateShape {
         match self {
             Self::Streaming => "streaming",
             Self::Hashed => "hashed",
+            Self::Skip => "skip-scan",
+            Self::PostingJoin => "posting-join",
         }
     }
 }
@@ -316,6 +346,117 @@ struct CompiledAccumulator {
     source: Option<CompiledSource>,
 }
 
+/// The compiled POSTING JOIN: which index each of the two passes walks, and
+/// which accumulator each posting feeds.
+#[derive(Clone, Debug)]
+struct PostingJoin {
+    /// The DRIVING scalar index. Pass 1 walks it whole, and its value IS the
+    /// group key -- so one value's contiguous run of postings is one group.
+    driving: IndexInfo,
+    /// The accumulator positions pass 1 folds off the driving posting, with
+    /// `true` where the accumulator takes that value as its input and `false`
+    /// for `count(*)`, which takes none. Neither reads a row today either;
+    /// they ride along so pass 2 walks only the columns that need it.
+    driving_folds: Vec<(usize, bool)>,
+    /// One entry per DISTINCT accumulated index, in request order: the index
+    /// pass 2 walks, and every accumulator position that reads it. `sum`,
+    /// `min`, `max` and `avg` over one column share ONE walk.
+    columns: Vec<(IndexInfo, Vec<usize>)>,
+    /// The fold that runs when a bound gives way: the shape this request had
+    /// before the join existed. Never a refusal (`QL_CONTRACT` §6).
+    fallback: AggregateShape,
+}
+
+/// Is this request a POSTING JOIN, and what does each pass walk?
+///
+/// Every condition is what makes the join SOUND or makes it a WIN, and a
+/// request that fails one gets the shape it always got, with the same answer:
+///
+///   * NO FILTERS -- pass 1 is the driving index's own full forward walk, and
+///     a filter would have to reject candidates the bitmaps have already
+///     claimed (some of them by reading the row this shape exists to avoid);
+///   * the group key is the DRIVING scalar index's own value, UNDIVIDED, so a
+///     value is a group and the postings of one group are contiguous;
+///   * the driver is that index's forward walk over the whole range;
+///   * every accumulator either folds off the driving posting (`count(*)`, or
+///     the driving column itself) or has its OWN scalar index of a NUMERIC
+///     kind, with `sum` and `avg` narrowed to `Int`. The narrowing is the
+///     ANSWER, not the plan: this shape folds a column in its INDEX's key
+///     order where every other shape folds it in entity order, `f64` addition
+///     is not associative, and an engine that answered `avg(price)` with a
+///     different last bit depending on which fold it chose would be wrong in
+///     a way no counter shows. Whole numbers are summed in `i128`, extremes
+///     and `count` do not care what order they see, so everything the join
+///     takes it answers BIT FOR BIT as the fold that reads the rows does;
+///   * at least ONE accumulator would otherwise read a row. With none, the
+///     streaming fold already costs zero `primary_reads` and holds ONE
+///     accumulator set, so the join would spend a bitmap per group to buy
+///     nothing.
+fn posting_join_plan(
+    driver: &DriverPlan,
+    group: Option<&CompiledGroup>,
+    accumulators: &[CompiledAccumulator],
+    filters: &[QueryFilter<'_>],
+    skip: bool,
+    streaming_key: bool,
+) -> Option<PostingJoin> {
+    if skip || accumulators.is_empty() || !filters.is_empty() {
+        return None;
+    }
+    let group = group?;
+    if group.divisor.is_some() || !group.source.index_side {
+        return None;
+    }
+    let driving = group.source.info.clone()?;
+    match driver {
+        DriverPlan::Scalar {
+            info,
+            predicate:
+                EncodedScalarFilter::Range {
+                    lower: EncodedBound::Unbounded,
+                    upper: EncodedBound::Unbounded,
+                },
+            ..
+        } if info.id == driving.id => {}
+        _ => return None,
+    }
+    let mut driving_folds = Vec::new();
+    let mut columns: Vec<(IndexInfo, Vec<usize>)> = Vec::new();
+    for (at, accumulator) in accumulators.iter().enumerate() {
+        match &accumulator.source {
+            None => driving_folds.push((at, false)),
+            Some(source) if source.index_side => driving_folds.push((at, true)),
+            Some(source) => {
+                let info = source.info.clone()?;
+                let admitted = match accumulator.function {
+                    AggregateFn::Sum | AggregateFn::Avg => info.kind == Kind::Int,
+                    _ => matches!(info.kind, Kind::Int | Kind::Real),
+                };
+                if !admitted {
+                    return None;
+                }
+                match columns.iter_mut().find(|(own, _)| own.id == info.id) {
+                    Some((_, positions)) => positions.push(at),
+                    None => columns.push((info, vec![at])),
+                }
+            }
+        }
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    Some(PostingJoin {
+        driving,
+        driving_folds,
+        columns,
+        fallback: if streaming_key {
+            AggregateShape::Streaming
+        } else {
+            AggregateShape::Hashed
+        },
+    })
+}
+
 /// One live accumulator.
 #[derive(Clone, Debug)]
 enum Acc {
@@ -330,8 +471,17 @@ enum Acc {
         best: Option<OwnedScalarValue>,
         max: bool,
     },
+    /// The same integer/float split [`Acc::Sum`] carries, and for the same
+    /// reason ONE step further on: `f64` addition is not associative, so an
+    /// average accumulated as a running `f64` depends on the ORDER its rows
+    /// arrive in -- and the POSTING JOIN folds a column in its index's key
+    /// order while every other shape folds it in entity order. Whole numbers
+    /// are summed in `i128`, which has no such freedom, so the two shapes
+    /// answer bit for bit alike.
     Avg {
-        sum: f64,
+        ints: i128,
+        floats: f64,
+        saw_float: bool,
         n: u64,
     },
 }
@@ -354,7 +504,12 @@ impl Acc {
                 best: None,
                 max: true,
             },
-            AggregateFn::Avg => Self::Avg { sum: 0.0, n: 0 },
+            AggregateFn::Avg => Self::Avg {
+                ints: 0,
+                floats: 0.0,
+                saw_float: false,
+                n: 0,
+            },
         }
     }
 
@@ -421,16 +576,23 @@ impl Acc {
                     return Ok(after.saturating_sub(before));
                 }
             }
-            Self::Avg { sum, n } => {
-                let number = match value {
-                    OwnedScalarValue::I64(v) => *v as f64,
-                    OwnedScalarValue::F64(v) => *v,
+            Self::Avg {
+                ints,
+                floats,
+                saw_float,
+                n,
+            } => {
+                match value {
+                    OwnedScalarValue::I64(v) => *ints += i128::from(*v),
+                    OwnedScalarValue::F64(v) => {
+                        *saw_float = true;
+                        *floats += *v;
+                    }
                     OwnedScalarValue::Bool(_) | OwnedScalarValue::Text(_) => {
                         return Err(invalid_query("avg requires a numeric input"))
                     }
                     OwnedScalarValue::Nullish => return Ok(0),
-                };
-                *sum += number;
+                }
                 *n = n.saturating_add(1);
             }
         }
@@ -464,11 +626,21 @@ impl Acc {
                 Some(OwnedScalarValue::Bool(v)) => AggValue::Bool(*v),
                 Some(OwnedScalarValue::Nullish) => AggValue::Null,
             },
-            Self::Avg { sum, n } => {
+            Self::Avg {
+                ints,
+                floats,
+                saw_float,
+                n,
+            } => {
                 if *n == 0 {
                     AggValue::Null
                 } else {
-                    AggValue::F64(*sum / *n as f64)
+                    let total = if *saw_float {
+                        *ints as f64 + *floats
+                    } else {
+                        *ints as f64
+                    };
+                    AggValue::F64(total / *n as f64)
                 }
             }
         })
@@ -548,6 +720,42 @@ fn field_scalar(value: dense_v3::FieldValue) -> QueryResult<OwnedScalarValue> {
             }
         },
     })
+}
+
+/// The least key strictly greater than every key that begins with `prefix`.
+///
+/// `None` when there is none: every byte is `0xFF`, so the prefix is the last
+/// one byte order holds and there is nothing after it to seek to.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(last) = out.pop() {
+        if last != u8::MAX {
+            out.push(last + 1);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Is this candidate STRICTLY after the key the page resumed from?
+///
+/// The walk ascends in `(value, sequence)`, which is exactly what
+/// `compare_rank` orders a `RankValue::Scalar` by, so this is that comparison
+/// without building the key: a resumed page drops everything at or before its
+/// cursor, and the FIRST candidate past it ends the dropping, because nothing
+/// behind it can come back.
+fn past_resume(bytes: &[u8], id: EntityId, resume: Option<&RankKey>) -> bool {
+    match resume {
+        Some(RankKey {
+            value: RankValue::Scalar(at),
+            id: after,
+        }) => match bytes.cmp(at.as_slice()) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => id > *after,
+        },
+        _ => true,
+    }
 }
 
 // ── preparing ─────────────────────────────────────────────────────────────
@@ -792,7 +1000,57 @@ impl Database {
             // walk has finished every group, so it is hashed by definition.
             (_, GroupOrder::Accumulator { .. }) => false,
         };
-        let shape = if streaming_key {
+        // A SKIP-SCAN, which is DISTINCT and every other group that
+        // accumulates nothing. Four things have to hold, and each of them is
+        // what makes skipping the postings between two values SOUND:
+        //
+        //   * NO ACCUMULATORS -- nothing is folded, so the postings between
+        //     two values carry nothing the answer needs;
+        //   * NO FILTERS -- a filter can reject every row of a value, and
+        //     then the value is not a group; with one, the rows have to be
+        //     seen and the ordinary streaming walk sees them;
+        //   * the group key is the DRIVING scalar index's own value, undivided
+        //     -- so a value IS a group and the keyspace's own order is the
+        //     answer's;
+        //   * the driver is that index's forward walk over the whole range,
+        //     which is what a seek to a value's successor can re-open.
+        //
+        // Nothing is REFUSED by this: a request that fails any of the four
+        // gets the shape it always got, with the same answer.
+        let skip = request.accumulators.is_empty()
+            && request.filters.is_empty()
+            && matches!(request.order, GroupOrder::Key)
+            && group.as_ref().is_some_and(|group| {
+                group.divisor.is_none() && group.source.index_side
+            })
+            && match (&query.driver, &group) {
+                (
+                    DriverPlan::Scalar {
+                        info,
+                        predicate:
+                            EncodedScalarFilter::Range {
+                                lower: EncodedBound::Unbounded,
+                                upper: EncodedBound::Unbounded,
+                            },
+                        ..
+                    },
+                    Some(group),
+                ) => group.source.info.as_ref().is_some_and(|own| own.id == info.id),
+                _ => false,
+            };
+        let posting = posting_join_plan(
+            &query.driver,
+            group.as_ref(),
+            &accumulators,
+            request.filters,
+            skip,
+            streaming_key,
+        );
+        let shape = if skip {
+            AggregateShape::Skip
+        } else if posting.is_some() {
+            AggregateShape::PostingJoin
+        } else if streaming_key {
             AggregateShape::Streaming
         } else {
             AggregateShape::Hashed
@@ -806,6 +1064,8 @@ impl Database {
             having: request.having.to_vec(),
             order: request.order,
             shape,
+            posting,
+            fell_back: None,
             total_limit: request.total_limit,
             groups_cap,
             groups_seen: 0,
@@ -825,7 +1085,15 @@ pub struct PreparedAggregate<'db> {
     accumulators: Vec<CompiledAccumulator>,
     having: Vec<GroupPredicate>,
     order: GroupOrder,
+    /// The shape that RUNS. Chosen at prepare; the one thing that can change
+    /// it afterwards is a POSTING JOIN giving way to its fallback, which is
+    /// why `EXPLAIN` reads it after the walk and not before.
     shape: AggregateShape,
+    /// The compiled posting join, kept even after a fallback so `EXPLAIN` can
+    /// still name the two passes that were planned.
+    posting: Option<PostingJoin>,
+    /// Why the posting join gave way, if it did.
+    fell_back: Option<String>,
     total_limit: Option<usize>,
     /// The engine's own ceiling on live accumulator sets, applied on top of
     /// whatever the caller's budget says.
@@ -847,9 +1115,6 @@ pub struct PreparedAggregate<'db> {
 struct OpenGroup {
     key: Option<OwnedScalarValue>,
     accumulators: Vec<Acc>,
-    /// The rank key of the last candidate folded into it, which is where a
-    /// STREAMING page resumes when this group is the last one it emits.
-    last: Option<RankKey>,
 }
 
 impl PreparedAggregate<'_> {
@@ -893,15 +1158,76 @@ impl PreparedAggregate<'_> {
                 .iter()
                 .map(|accumulator| Acc::new(accumulator.function))
                 .collect(),
-            last: None,
         }
     }
 
-    /// The group key and every accumulator input of one candidate, read from
-    /// the posting where the driving walk carries it and from the row where
-    /// it does not.
+    /// ONE source of one candidate, read from the posting where the driving
+    /// walk carries the value and from the row where it does not.
+    ///
+    /// `row` and `encoded` are the caller's, so the row a group key forced is
+    /// the row every accumulator then reads: one read per candidate, whatever
+    /// the request names.
+    fn read_source<'a, C: FnMut() -> bool>(
+        db: &'a Database,
+        source: &CompiledSource,
+        candidate: &Candidate,
+        row: &mut Option<RowData>,
+        encoded: &mut Option<Vec<u8>>,
+        rows: &mut PrimaryRows<'a>,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<OwnedScalarValue> {
+        if source.index_side {
+            let info = source
+                .info
+                .as_ref()
+                .ok_or_else(|| corrupt_query("an index-side aggregate input names no index"))?;
+            let key = candidate
+                .scalar(info.id)
+                .ok_or_else(|| corrupt_query("an aggregate lost its scalar posting key"))?;
+            return scalar_order_value(info, key);
+        }
+        ensure_row_seq(db, rows, candidate.id, row, encoded, meter)?;
+        meter.note_row_decode();
+        let value = selected_field(
+            row.as_ref().expect("ensure_row_seq filled the row"),
+            &source.field,
+        )?;
+        field_scalar(value)
+    }
+
+    /// The GROUP KEY of one candidate. `None` when the request named no group.
+    fn group_value<'a, C: FnMut() -> bool>(
+        &self,
+        db: &'a Database,
+        rows: &mut PrimaryRows<'a>,
+        candidate: &Candidate,
+        row: &mut Option<RowData>,
+        encoded: &mut Option<Vec<u8>>,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<OwnedScalarValue>> {
+        let Some(group) = &self.group else {
+            return Ok(None);
+        };
+        let value = Self::read_source(db, &group.source, candidate, row, encoded, rows, meter)?;
+        Ok(Some(match (group.divisor, &value) {
+            (Some(divisor), OwnedScalarValue::I64(number)) => {
+                // Truncating division, which is what SQL's integer `/` does;
+                // the divisor is positive by construction.
+                OwnedScalarValue::I64(number / divisor)
+            }
+            (Some(_), OwnedScalarValue::Nullish) => OwnedScalarValue::Nullish,
+            (Some(_), _) => {
+                return Err(corrupt_query(
+                    "a divided group key read a non-integer value",
+                ))
+            }
+            (None, _) => value,
+        }))
+    }
+
+    /// Every accumulator input of one candidate, in request order.
     #[allow(clippy::too_many_arguments)]
-    fn inputs<'a, C: FnMut() -> bool>(
+    fn accumulator_inputs<'a, C: FnMut() -> bool>(
         &self,
         db: &'a Database,
         rows: &mut PrimaryRows<'a>,
@@ -910,61 +1236,41 @@ impl PreparedAggregate<'_> {
         encoded: &mut Option<Vec<u8>>,
         meter: &mut WorkMeter<'_, C>,
         inputs: &mut Vec<Option<OwnedScalarValue>>,
-    ) -> QueryResult<Option<OwnedScalarValue>> {
-        let read = |source: &CompiledSource,
-                    row: &mut Option<RowData>,
-                    encoded: &mut Option<Vec<u8>>,
-                    rows: &mut PrimaryRows<'a>,
-                    meter: &mut WorkMeter<'_, C>|
-         -> QueryResult<OwnedScalarValue> {
-            if source.index_side {
-                let info = source
-                    .info
-                    .as_ref()
-                    .ok_or_else(|| corrupt_query("an index-side aggregate input names no index"))?;
-                let key = candidate
-                    .scalar(info.id)
-                    .ok_or_else(|| corrupt_query("an aggregate lost its scalar posting key"))?;
-                return scalar_order_value(info, key);
-            }
-            ensure_row_seq(db, rows, candidate.id, row, encoded, meter)?;
-            meter.note_row_decode();
-            let value = selected_field(
-                row.as_ref().expect("ensure_row_seq filled the row"),
-                &source.field,
-            )?;
-            field_scalar(value)
-        };
-
-        let key = match &self.group {
-            None => None,
-            Some(group) => {
-                let value = read(&group.source, row, encoded, rows, meter)?;
-                Some(match (group.divisor, &value) {
-                    (Some(divisor), OwnedScalarValue::I64(number)) => {
-                        // Truncating division, which is what SQL's integer
-                        // `/` does; the divisor is positive by construction.
-                        OwnedScalarValue::I64(number / divisor)
-                    }
-                    (Some(_), OwnedScalarValue::Nullish) => OwnedScalarValue::Nullish,
-                    (Some(_), _) => {
-                        return Err(corrupt_query(
-                            "a divided group key read a non-integer value",
-                        ))
-                    }
-                    (None, _) => value,
-                })
-            }
-        };
-
+    ) -> QueryResult<()> {
         inputs.clear();
         for accumulator in &self.accumulators {
             match &accumulator.source {
                 None => inputs.push(None),
-                Some(source) => inputs.push(Some(read(source, row, encoded, rows, meter)?)),
+                Some(source) => inputs.push(Some(Self::read_source(
+                    db, source, candidate, row, encoded, rows, meter,
+                )?)),
             }
         }
-        Ok(key)
+        Ok(())
+    }
+
+    /// The driving scalar index whose POSTING carries the group key, when
+    /// there is one. `Some` for a plain indexed group key under the streaming
+    /// shape; `None` for no group, for a group read from the row, and for the
+    /// DIVIDED expression key -- whose posting bytes are not the group key,
+    /// because many values map to one group.
+    fn carried_group_key(&self) -> Option<IndexId> {
+        let group = self.group.as_ref()?;
+        if !group.source.index_side || group.divisor.is_some() {
+            return None;
+        }
+        group.source.info.as_ref().map(|info| info.id)
+    }
+
+    /// The driving scalar index whose posting this walk can RESUME on: the
+    /// carried key, and the divided key too -- the posting bytes are the
+    /// resume point even where they are not the group key.
+    fn resume_index(&self) -> Option<IndexId> {
+        let group = self.group.as_ref()?;
+        if !group.source.index_side {
+            return None;
+        }
+        group.source.info.as_ref().map(|info| info.id)
     }
 
     pub fn next_page<C: FnMut() -> bool>(
@@ -994,8 +1300,29 @@ impl PreparedAggregate<'_> {
         }
         let wanted = page_size.min(remaining);
 
+        // The POSTING JOIN runs before the dispatch below, because the one
+        // thing it can do besides answer is HAND THE QUESTION BACK: past its
+        // bounds the shape becomes the fold that ran before it existed, and
+        // that fold is what this page then takes.
+        if self.shape == AggregateShape::PostingJoin && self.pending.is_none() {
+            match self.posting_join_fold(&mut meter)? {
+                Some(folded) => self.pending = Some(folded),
+                None => {
+                    let fallback = self
+                        .posting
+                        .as_ref()
+                        .map_or(AggregateShape::Hashed, |plan| plan.fallback);
+                    self.fell_back = Some(format!(
+                        "the posting join's id bitmaps would have held more than the {MEMBERSHIP_BYTES_CAP} bytes a page promises, or more accumulator sets than the caller's groups budget allows; the {} fold ran instead -- the fold this request had before the join existed, so a bound here is not a new refusal (QL_CONTRACT section 6)",
+                        fallback.written()
+                    ));
+                    self.shape = fallback;
+                }
+            }
+        }
+
         let (groups, done) = match self.shape {
-            AggregateShape::Hashed => {
+            AggregateShape::Hashed | AggregateShape::PostingJoin => {
                 if self.pending.is_none() {
                     // One fold, once. Nothing is committed until it has
                     // succeeded: a cancelled or budget-refused fold leaves
@@ -1009,11 +1336,15 @@ impl PreparedAggregate<'_> {
                 let groups: Vec<GroupRow> = pending.drain(..take).collect();
                 (groups, pending.is_empty())
             }
-            AggregateShape::Streaming => {
+            AggregateShape::Streaming | AggregateShape::Skip => {
                 if self.done {
                     (Vec::new(), true)
                 } else {
-                    let (groups, done, after) = self.stream_page(wanted, &mut meter)?;
+                    let (groups, done, after) = if self.shape == AggregateShape::Skip {
+                        self.skip_page(wanted, &mut meter)?
+                    } else {
+                        self.stream_page(wanted, &mut meter)?
+                    };
                     self.after = after;
                     self.done = done;
                     (groups, done)
@@ -1072,8 +1403,12 @@ impl PreparedAggregate<'_> {
             }
             let mut encoded = candidate.row.take();
             let mut row = None;
-            if !self.query.filters.is_empty()
-                && !filters_match(
+            let kept = if self.query.filters.is_empty() {
+                // `filters_match` over an empty slice can only say yes, and
+                // saying it costs a nine-argument call per candidate.
+                true
+            } else {
+                filters_match(
                     db,
                     &mut rows,
                     &self.query.filters,
@@ -1085,10 +1420,12 @@ impl PreparedAggregate<'_> {
                     &mut scratch,
                     meter,
                 )?
-            {
+            };
+            if !kept {
                 continue;
             }
-            let key = self.inputs(
+            let key = self.group_value(db, &mut rows, &candidate, &mut row, &mut encoded, meter)?;
+            self.accumulator_inputs(
                 db,
                 &mut rows,
                 &candidate,
@@ -1148,7 +1485,6 @@ impl PreparedAggregate<'_> {
             if let Some(row) = self.finish_group(OpenGroup {
                 key: None,
                 accumulators,
-                last: None,
             })? {
                 out.push(row);
             }
@@ -1157,36 +1493,415 @@ impl PreparedAggregate<'_> {
             if let Some(row) = self.finish_group(OpenGroup {
                 key: Some(key.0),
                 accumulators,
-                last: None,
             })? {
                 out.push(row);
             }
         }
-        // THE ONE SORT OVER MEMORY (see `GroupOrder::Accumulator`). The map
-        // already hands the groups back in ascending key order, so `Key`
-        // sorts nothing; a ranking over an accumulator sorts the finished
-        // table, which `WorkResource::Groups` has already bounded.
-        if let GroupOrder::Accumulator { at, direction } = self.order {
-            out.sort_by(|left, right| {
-                let ordering = match (left.values[at].as_f64(), right.values[at].as_f64()) {
-                    (Some(a), Some(b)) => a.total_cmp(&b),
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => Ordering::Equal,
-                };
-                let ordering = match direction {
-                    SortDirection::Ascending => ordering,
-                    SortDirection::Descending => ordering.reverse(),
-                };
-                // Ties break on the key, so the order is total and a page
-                // boundary cannot move between two runs of the same request.
-                ordering.then_with(|| match (&left.key, &right.key) {
-                    (Some(a), Some(b)) => compare_scalar(a, b),
-                    _ => Ordering::Equal,
-                })
-            });
-        }
+        self.sort_finished_groups(&mut out);
         Ok(out)
+    }
+
+    /// THE ONE SORT OVER MEMORY (see [`GroupOrder::Accumulator`]).
+    ///
+    /// Both whole-walk folds hand their groups back in ascending key order
+    /// already -- the hashed table is a `BTreeMap`, and the posting join
+    /// opens its groups in the driving index's own key order -- so `Key`
+    /// sorts nothing. A ranking over an accumulator sorts the finished
+    /// table, which [`WorkResource::Groups`] has already bounded. Shared by
+    /// the two so they cannot order the same answer differently.
+    fn sort_finished_groups(&self, out: &mut [GroupRow]) {
+        let GroupOrder::Accumulator { at, direction } = self.order else {
+            return;
+        };
+        out.sort_by(|left, right| {
+            let ordering = match (left.values[at].as_f64(), right.values[at].as_f64()) {
+                (Some(a), Some(b)) => a.total_cmp(&b),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            let ordering = match direction {
+                SortDirection::Ascending => ordering,
+                SortDirection::Descending => ordering.reverse(),
+            };
+            // Ties break on the key, so the order is total and a page
+            // boundary cannot move between two runs of the same request.
+            ordering.then_with(|| match (&left.key, &right.key) {
+                (Some(a), Some(b)) => compare_scalar(a, b),
+                _ => Ordering::Equal,
+            })
+        });
+    }
+
+
+    /// THE WHOLE ANSWER, FROM POSTINGS ALONE: the POSTING JOIN.
+    ///
+    /// **Pass 1** walks the DRIVING index in key order. A scalar posting is
+    /// `value || sequence`, so one value is a contiguous run and that run is
+    /// a GROUP: the group opens at the first posting of a value and every
+    /// posting of it sets one bit in that group's own bounded id BITMAP
+    /// ([`MembershipSet::Bitmap`], `ceil(span / 8)` bytes, charged to
+    /// [`WorkResource::MembershipBytes`] -- 6.25 KB per group at 50,000
+    /// rows). `count(*)` and any accumulator over the driving value itself
+    /// fold here, off the posting.
+    ///
+    /// **Pass 2** walks each accumulated column's index in key order and
+    /// folds every `(value, id)` into the group whose bitmap claims the id.
+    /// A NULL or MISSING field is filed under the one nullish key and is
+    /// skipped, which is exactly SQL's rule for `sum`, `avg`, `min`, `max`
+    /// and `count(col)`. The walk is ascending, so `min` is the first value
+    /// a group is handed and `max` the last -- the same `Acc` fold, on the
+    /// same values, as the row path.
+    ///
+    /// No row is read: `primary_reads == 0`, and `scalar_postings` is
+    /// `rows x (1 + accumulated columns)`.
+    ///
+    /// `Ok(None)` is a BOUND, not a refusal: the groups would hold more than
+    /// [`MEMBERSHIP_BYTES_CAP`] of bitmap, or more accumulator sets than the
+    /// caller's `groups` budget allows. The caller then runs
+    /// [`PostingJoin::fallback`], which is the fold this request had before
+    /// the join existed. Nothing this pass charged for MEMORY is still held
+    /// when that happens, so it is given back.
+    fn posting_join_fold<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<Vec<GroupRow>>> {
+        let db = self.query.db;
+        let plan = self
+            .posting
+            .clone()
+            .ok_or_else(|| corrupt_query("a posting join names no plan"))?;
+        // One bit per sequence in `1..=span`, exactly as a membership set
+        // sizes its bitmap: the collection's highest issued sequence bounds
+        // every posting either pass can name.
+        let span = db
+            .collection_span(self.query.collection)
+            .map_err(QueryError::from)?;
+        let bitmap_bytes = membership_bitmap_bytes(span) as usize;
+        let unit = group_bytes(self.accumulators.len()).max(1);
+
+        struct JoinGroup {
+            key: OwnedScalarValue,
+            bits: Vec<u8>,
+            accumulators: Vec<Acc>,
+        }
+
+        let mut groups: Vec<JoinGroup> = Vec::new();
+        let mut held_extra = 0usize;
+        // Charged as the pass goes, and given BACK if the pass gives way:
+        // sets it no longer holds are not sets the fallback holds too.
+        let mut charged_groups = 0u64;
+        let mut live_bytes = 0usize;
+        let mut gave_way = false;
+
+        // ── pass 1: the driving index, one group per value ────────────────
+        let prefix = scalar_prefix(plan.driving.id);
+        let mut open_bytes: Vec<u8> = Vec::new();
+        let mut have_open = false;
+        if let Some(mut walk) = db
+            .index_range(&plan.driving, &prefix)
+            .map_err(QueryError::from)?
+        {
+            'pass_one: loop {
+                meter.check_cancelled()?;
+                meter.charge(WorkResource::ScalarPostings, 1)?;
+                let step = {
+                    let Some((key, value)) = walk
+                        .peek_ref()
+                        .map_err(Error::from)
+                        .map_err(QueryError::from)?
+                    else {
+                        break 'pass_one;
+                    };
+                    if !key.starts_with(&prefix) {
+                        break 'pass_one;
+                    }
+                    let suffix = &key[prefix.len()..];
+                    let width = scalar_key::width(&plan.driving.kind, suffix)?;
+                    let encoded = suffix
+                        .get(..width)
+                        .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
+                    let mut at = prefix.len() + width;
+                    let sequence = read_ordered(key, &mut at)?;
+                    if at != key.len() || sequence == 0 || !value.is_empty() {
+                        return Err(corrupt_query("scalar index entry"));
+                    }
+                    (encoded.to_vec(), sequence)
+                };
+                walk.step();
+                let (encoded, sequence) = step;
+                meter.charge(WorkResource::Candidates, 1)?;
+                if !have_open || open_bytes != encoded {
+                    // A posting range is `value || sequence`, so one value is
+                    // a contiguous run: a value left behind never reopens.
+                    let key = scalar_order_value(&plan.driving, &encoded)?;
+                    let want = live_bytes.saturating_add(bitmap_bytes);
+                    if want > MEMBERSHIP_BYTES_CAP {
+                        gave_way = true;
+                        break 'pass_one;
+                    }
+                    // The same charge per live accumulator set the hashed
+                    // fold makes, in the same units.
+                    let charge = 1 + (key_heap_bytes(&key) / unit) as u64;
+                    if meter.would_exceed(WorkResource::Groups, charge) {
+                        gave_way = true;
+                        break 'pass_one;
+                    }
+                    meter.charge(WorkResource::Groups, charge)?;
+                    charged_groups += charge;
+                    live_bytes = want;
+                    open_bytes.clear();
+                    open_bytes.extend_from_slice(&encoded);
+                    have_open = true;
+                    groups.push(JoinGroup {
+                        key,
+                        bits: vec![0u8; bitmap_bytes],
+                        accumulators: self
+                            .accumulators
+                            .iter()
+                            .map(|accumulator| Acc::new(accumulator.function))
+                            .collect(),
+                    });
+                }
+                let JoinGroup {
+                    key,
+                    bits,
+                    accumulators,
+                } = groups.last_mut().expect("a posting opened its group");
+                membership_bitmap_set(bits, sequence)?;
+                for &(at, takes_value) in &plan.driving_folds {
+                    let input = if takes_value { Some(&*key) } else { None };
+                    held_extra += accumulators[at].fold(input)?;
+                }
+                while held_extra >= unit {
+                    meter.charge(WorkResource::Groups, 1)?;
+                    charged_groups += 1;
+                    held_extra -= unit;
+                }
+            }
+        }
+        if gave_way {
+            // Nothing is committed: the bitmaps are dropped here, the group
+            // charge is given back, and the fallback fold starts from the
+            // same place a first page always starts from.
+            meter.release(WorkResource::Groups, charged_groups);
+            return Ok(None);
+        }
+        meter.note_membership_bytes(live_bytes as u64);
+
+        // The bitmaps, in the engine's own membership representation, so the
+        // probe in pass 2 is the same `contains` a boolean filter uses. The
+        // bits are MOVED, not copied: `live_bytes` stays the truth.
+        let sets: Vec<MembershipSet> = groups
+            .iter_mut()
+            .map(|group| MembershipSet::Bitmap(Arc::new(std::mem::take(&mut group.bits))))
+            .collect();
+
+        // ── pass 2: each accumulated column, folded into the claiming group ─
+        for (info, positions) in &plan.columns {
+            let prefix = scalar_prefix(info.id);
+            let Some(mut walk) = db.index_range(info, &prefix).map_err(QueryError::from)? else {
+                continue;
+            };
+            loop {
+                meter.check_cancelled()?;
+                meter.charge(WorkResource::ScalarPostings, 1)?;
+                let step = {
+                    let Some((key, value)) = walk
+                        .peek_ref()
+                        .map_err(Error::from)
+                        .map_err(QueryError::from)?
+                    else {
+                        break;
+                    };
+                    if !key.starts_with(&prefix) {
+                        break;
+                    }
+                    let suffix = &key[prefix.len()..];
+                    let width = scalar_key::width(&info.kind, suffix)?;
+                    let encoded = suffix
+                        .get(..width)
+                        .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
+                    let mut at = prefix.len() + width;
+                    let sequence = read_ordered(key, &mut at)?;
+                    if at != key.len() || sequence == 0 || !value.is_empty() {
+                        return Err(corrupt_query("scalar index entry"));
+                    }
+                    (encoded.to_vec(), sequence)
+                };
+                walk.step();
+                let (encoded, sequence) = step;
+                // A NULL and a MISSING field share the one nullish key, and
+                // neither counts for `sum`, `avg`, `min`, `max` or
+                // `count(col)`: SQL's own rule, and the same one `Acc::fold`
+                // applies to a nullish value read off a row.
+                if encoded == NULLISH_SCALAR_KEY {
+                    continue;
+                }
+                let mut claimed = None;
+                for (at, set) in sets.iter().enumerate() {
+                    if set.contains(sequence)? {
+                        claimed = Some(at);
+                        break;
+                    }
+                }
+                // A posting no group claims names a row this walk never saw:
+                // nothing to fold it into, and nothing the answer loses.
+                let Some(at_group) = claimed else {
+                    continue;
+                };
+                let value = scalar_order_value(info, &encoded)?;
+                let accumulators = &mut groups[at_group].accumulators;
+                for &at in positions {
+                    held_extra += accumulators[at].fold(Some(&value))?;
+                }
+                while held_extra >= unit {
+                    meter.charge(WorkResource::Groups, 1)?;
+                    held_extra -= unit;
+                }
+            }
+        }
+
+        self.groups_seen = self.groups_seen.saturating_add(groups.len() as u64);
+        let mut out = Vec::with_capacity(groups.len());
+        for group in groups {
+            if let Some(row) = self.finish_group(OpenGroup {
+                key: Some(group.key),
+                accumulators: group.accumulators,
+            })? {
+                out.push(row);
+            }
+        }
+        self.sort_finished_groups(&mut out);
+        Ok(Some(out))
+    }
+
+    /// One page of a SKIP-SCAN: a group with NO accumulators over the driving
+    /// scalar index.
+    ///
+    /// Nothing but the EXISTENCE of each value matters, so there is nothing
+    /// to fold: the walk reads the FIRST posting of a value, emits that value
+    /// as a group, and then seeks to the successor of that value's key prefix
+    /// -- one root-to-leaf descent per DISTINCT VALUE, never a step over the
+    /// postings in between. `QueryWork::scalar_postings` therefore counts
+    /// distinct values, not rows, which is Law 2 for this shape: the work is
+    /// proportional to the ANSWER.
+    ///
+    /// A value whose only posting names a deleted row is a group here, which
+    /// is what the streaming walk does with the same posting: neither reads a
+    /// row, so neither can tell.
+    fn skip_page<C: FnMut() -> bool>(
+        &mut self,
+        wanted: usize,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<(Vec<GroupRow>, bool, Option<RankKey>)> {
+        let db = self.query.db;
+        let info = self
+            .group
+            .as_ref()
+            .and_then(|group| group.source.info.clone())
+            .ok_or_else(|| corrupt_query("a skip-scan names no scalar index"))?;
+        let prefix = scalar_prefix(info.id);
+        // Where this page opens: the start of the index, or the successor of
+        // the value the last page ended on.
+        let mut start = match &self.after {
+            Some(RankKey {
+                value: RankValue::Scalar(value),
+                ..
+            }) => {
+                let mut bound = prefix.clone();
+                bound.extend_from_slice(value);
+                match prefix_successor(&bound) {
+                    Some(next) => next,
+                    None => return Ok((Vec::new(), true, self.after.clone())),
+                }
+            }
+            Some(_) => return Err(corrupt_query("a skip-scan cursor is not a scalar key")),
+            None => prefix.clone(),
+        };
+        let mut out: Vec<GroupRow> = Vec::with_capacity(wanted.min(64));
+        let mut after = self.after.clone();
+        let mut opened = 0u64;
+        let mut charged = false;
+        let unit = group_bytes(0).max(1);
+        // The walk is finished only when it RAN OFF the end of the index; a
+        // page that filled has more to give.
+        let mut done = false;
+        while out.len() < wanted {
+            meter.check_cancelled()?;
+            meter.charge(WorkResource::ScalarPostings, 1)?;
+            let Some(mut walk) = db.index_range(&info, &start).map_err(QueryError::from)? else {
+                done = true;
+                break;
+            };
+            let value = {
+                let Some((key, value)) = walk
+                    .peek_ref()
+                    .map_err(Error::from)
+                    .map_err(QueryError::from)?
+                else {
+                    // Nothing at or after the seek: the index is finished.
+                    done = true;
+                    break;
+                };
+                if !key.starts_with(&prefix) {
+                    // Past this index's own keyspace.
+                    done = true;
+                    break;
+                }
+                let suffix = &key[prefix.len()..];
+                let width = scalar_key::width(&info.kind, suffix)?;
+                let encoded = suffix
+                    .get(..width)
+                    .ok_or_else(|| corrupt_query("truncated scalar value key"))?;
+                let mut at = prefix.len() + width;
+                let sequence = read_ordered(key, &mut at)?;
+                if at != key.len() || sequence == 0 || !value.is_empty() {
+                    return Err(corrupt_query("scalar index entry"));
+                }
+                encoded.to_vec()
+            };
+            drop(walk);
+            // One candidate: the one posting this value was proved by.
+            meter.charge(WorkResource::Candidates, 1)?;
+            if !charged {
+                meter.charge(WorkResource::Groups, 1)?;
+                charged = true;
+            }
+            let key = scalar_order_value(&info, &value)?;
+            let heap = key_heap_bytes(&key);
+            if heap >= unit {
+                meter.charge(WorkResource::Groups, (heap / unit) as u64)?;
+            }
+            opened += 1;
+            out.push(GroupRow {
+                key: Some(key),
+                values: Vec::new(),
+            });
+            after = Some(RankKey {
+                value: RankValue::Scalar(value.clone()),
+                // The resume is a VALUE, not a row: every posting of this
+                // value is behind the page, so the sequence half of the key
+                // is the last one there can be.
+                id: EntityId {
+                    collection: info.collection,
+                    sequence: u64::MAX,
+                },
+            });
+            let mut bound = prefix.clone();
+            bound.extend_from_slice(&value);
+            match prefix_successor(&bound) {
+                Some(next) => start = next,
+                // The value was the last key byte order holds: there is no
+                // successor to seek to, so the index is finished.
+                None => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        self.groups_seen = self.groups_seen.saturating_add(opened);
+        Ok((out, done, after))
     }
 
     /// One page of a STREAMING aggregate: fold until `wanted` groups have
@@ -1213,7 +1928,6 @@ impl PreparedAggregate<'_> {
             HashSet::new(),
             &self.query.membership,
         )?;
-        let mut rows = PrimaryRows::new(db, self.query.driver_walks_ids_ascending());
         let mut scratch = RowScratch::default();
         let mut inputs: Vec<Option<OwnedScalarValue>> = Vec::new();
         let mut out: Vec<GroupRow> = Vec::with_capacity(wanted.min(64));
@@ -1226,25 +1940,67 @@ impl PreparedAggregate<'_> {
         // Groups opened by THIS page, committed to `groups_seen` only when the
         // page returns Ok: a cancelled or refused page leaves the count alone.
         let mut opened = 0u64;
+        // The group key as the DRIVING POSTING'S OWN BYTES. Where the walk
+        // carries the key, a boundary is a byte comparison against the open
+        // group's key and the value is decoded ONCE per group -- not a
+        // `String` per candidate, which on a Text group key was one
+        // allocation per row for a key eight of them shared.
+        let carried = self.carried_group_key();
+        let group_info = self
+            .group
+            .as_ref()
+            .and_then(|group| group.source.info.clone());
+        // WHERE THE ROWS OF ONE GROUP LIE. A scalar posting is
+        // `value || sequence`, so the candidates of one carried group arrive
+        // in STRICTLY ASCENDING entity id: that run is exactly what the
+        // lockstep reader is for, and the old walk told the reader the
+        // opposite (`driver_walks_ids_ascending` is a question about the WHOLE
+        // walk, and across a group boundary the sequences reset), so every row
+        // of every group paid a fresh root-to-leaf descent. The reader is
+        // restarted at each boundary, which is where the run restarts.
+        let ascends = carried.is_some() || self.query.driver_walks_ids_ascending();
+        let mut rows = PrimaryRows::new(db, ascends);
+        // The index whose posting bytes a page RESUMES on. The divided
+        // expression key resumes here too: many values map to one group, but
+        // the posting is still where the walk left off.
+        let resume_index = self.resume_index();
+        let mut open_bytes: Option<Vec<u8>> = None;
+        // The last folded candidate's posting key, in a buffer this page
+        // reuses: what a closing group's resume point is built from.
+        let mut last_bytes: Vec<u8> = Vec::new();
+        let mut last_seq = 0u64;
+        let mut have_last = false;
+
+        // The resumed candidate is handed over once more by design (see
+        // `DriverCursor::new`), so a page that resumes drops everything at or
+        // before the key it resumed from. The walk ascends, so the FIRST
+        // candidate past that key ends the skipping: nothing behind it can
+        // come back.
+        let mut skipping = resume.is_some();
 
         while let Some(mut candidate) = cursor.next(meter)? {
             meter.charge(WorkResource::Candidates, 1)?;
             if candidate.id.collection != collection {
                 return Err(corrupt_query("an aggregate driver crossed collection boundary"));
             }
-            // The resumed candidate is handed over once more by design (see
-            // `DriverCursor::new`), so a page that resumes drops everything
-            // at or before the key it resumed from.
-            let key = self.candidate_key(&candidate)?;
-            if let (Some(key), Some(resume)) = (key.as_ref(), resume.as_ref()) {
-                if compare_rank(key, resume, false) != Ordering::Greater {
-                    continue;
-                }
-            }
             let mut encoded = candidate.row.take();
             let mut row = None;
-            if !self.query.filters.is_empty()
-                && !filters_match(
+            let posting: Option<&[u8]> = match resume_index {
+                Some(index) => Some(candidate.scalar(index).ok_or_else(|| {
+                    corrupt_query("a streaming aggregate lost its scalar posting key")
+                })?),
+                None => None,
+            };
+            if skipping {
+                match posting {
+                    Some(bytes) if !past_resume(bytes, candidate.id, resume.as_ref()) => continue,
+                    _ => skipping = false,
+                }
+            }
+            let kept = if self.query.filters.is_empty() {
+                true
+            } else {
+                filters_match(
                     db,
                     &mut rows,
                     &self.query.filters,
@@ -1256,29 +2012,53 @@ impl PreparedAggregate<'_> {
                     &mut scratch,
                     meter,
                 )?
-            {
+            };
+            if !kept {
                 continue;
             }
-            let group_key = self.inputs(
-                db,
-                &mut rows,
-                &candidate,
-                &mut row,
-                &mut encoded,
-                meter,
-                &mut inputs,
-            )?;
-            let boundary = match (&open, &group_key) {
+            // The decoded group key, where the posting's bytes are NOT it:
+            // the divided expression, and the single group over everything.
+            let decoded = match carried {
+                Some(_) => None,
+                None => Some(self.group_value(
+                    db,
+                    &mut rows,
+                    &candidate,
+                    &mut row,
+                    &mut encoded,
+                    meter,
+                )?),
+            };
+            let boundary = match (&open, carried) {
                 (None, _) => false,
-                (Some(current), _) => match (&current.key, &group_key) {
-                    (Some(a), Some(b)) => compare_scalar(a, b) != Ordering::Equal,
-                    (None, None) => false,
-                    _ => return Err(corrupt_query("an aggregate group key changed shape")),
-                },
+                (Some(_), Some(_)) => open_bytes.as_deref() != posting,
+                (Some(current), None) => {
+                    match (&current.key, decoded.as_ref().expect("decoded where not carried")) {
+                        (Some(a), Some(b)) => compare_scalar(a, b) != Ordering::Equal,
+                        (None, None) => false,
+                        _ => return Err(corrupt_query("an aggregate group key changed shape")),
+                    }
+                }
             };
             if boundary {
+                let last = if have_last {
+                    Some(RankKey {
+                        value: RankValue::Scalar(last_bytes.clone()),
+                        id: EntityId {
+                            collection,
+                            sequence: last_seq,
+                        },
+                    })
+                } else {
+                    None
+                };
                 let closed = open.take().expect("a boundary has an open group");
-                let last = closed.last.clone();
+                open_bytes = None;
+                if ascends {
+                    // A new group is a new ascending run, from a sequence
+                    // BEHIND the one the reader is parked on.
+                    rows.restart(true);
+                }
                 if let Some(row) = self.finish_group(closed)? {
                     out.push(row);
                     if out.len() >= wanted {
@@ -1298,10 +2078,30 @@ impl PreparedAggregate<'_> {
                     meter.charge(WorkResource::Groups, 1)?;
                     charged = true;
                 }
-                open = Some(self.open_group(group_key));
+                let key = match carried {
+                    Some(_) => {
+                        let bytes = posting.expect("a carried key is a posting");
+                        open_bytes = Some(bytes.to_vec());
+                        let info = group_info
+                            .as_ref()
+                            .ok_or_else(|| corrupt_query("a carried group key names no index"))?;
+                        Some(scalar_order_value(info, bytes)?)
+                    }
+                    None => decoded.clone().expect("decoded where not carried"),
+                };
+                open = Some(self.open_group(key));
                 opened += 1;
             }
             let current = open.as_mut().expect("an open group");
+            self.accumulator_inputs(
+                db,
+                &mut rows,
+                &candidate,
+                &mut row,
+                &mut encoded,
+                meter,
+                &mut inputs,
+            )?;
             for (accumulator, input) in current.accumulators.iter_mut().zip(inputs.iter()) {
                 held_extra += accumulator.fold(input.as_ref())?;
             }
@@ -1309,7 +2109,12 @@ impl PreparedAggregate<'_> {
                 meter.charge(WorkResource::Groups, 1)?;
                 held_extra -= unit;
             }
-            current.last = key;
+            if let Some(bytes) = posting {
+                last_bytes.clear();
+                last_bytes.extend_from_slice(bytes);
+                last_seq = candidate.id.sequence;
+                have_last = true;
+            }
         }
 
         if let Some(closed) = open.take() {
@@ -1319,30 +2124,6 @@ impl PreparedAggregate<'_> {
         }
         self.groups_seen = self.groups_seen.saturating_add(opened);
         Ok((out, true, after))
-    }
-
-    /// The rank key of one candidate under the walk this aggregate drives:
-    /// the scalar posting's `value || sequence`, which is what a STREAMING
-    /// page resumes on. `None` where the walk has no key of its own, which is
-    /// the ungrouped single-group fold -- it never resumes, because its one
-    /// group closes only when the walk ends.
-    fn candidate_key(&self, candidate: &Candidate) -> QueryResult<Option<RankKey>> {
-        let Some(group) = &self.group else {
-            return Ok(None);
-        };
-        let Some(info) = &group.source.info else {
-            return Ok(None);
-        };
-        if !group.source.index_side {
-            return Ok(None);
-        }
-        let key = candidate
-            .scalar(info.id)
-            .ok_or_else(|| corrupt_query("a streaming aggregate lost its scalar posting key"))?;
-        Ok(Some(RankKey {
-            value: RankValue::Scalar(key.to_vec()),
-            id: candidate.id,
-        }))
     }
 
     /// The compiled plan, in the planner's own terms, plus what this file
@@ -1361,7 +2142,8 @@ impl PreparedAggregate<'_> {
             accumulators: self
                 .accumulators
                 .iter()
-                .map(|accumulator| match &accumulator.source {
+                .enumerate()
+                .map(|(at, accumulator)| match &accumulator.source {
                     // `count(*)` names no column, so it is already written in
                     // full.
                     None => (
@@ -1370,7 +2152,7 @@ impl PreparedAggregate<'_> {
                     ),
                     Some(source) => (
                         format!("{}({})", accumulator.function.written(), source.field),
-                        source.where_from().to_owned(),
+                        self.where_accumulator_reads(at, source),
                     ),
                 })
                 .collect(),
@@ -1389,7 +2171,80 @@ impl PreparedAggregate<'_> {
             groups_seen: self.groups_seen,
             groups_cap: self.groups_cap,
             total_limit: self.total_limit,
+            passes: self.posting_passes(),
+            fell_back: self.fell_back.clone(),
         }
+    }
+
+    /// Where one accumulator ACTUALLY read its input, for `EXPLAIN`.
+    ///
+    /// [`CompiledSource::where_from`] knows only whether the DRIVING walk
+    /// carried the value, and under the posting join that is not the whole
+    /// truth: a column with its own index is read from that index's postings
+    /// in pass 2, and no row is read for it either. The shape is the shape
+    /// that RAN, so a join that gave way prints the row it then read.
+    fn where_accumulator_reads(&self, at: usize, source: &CompiledSource) -> String {
+        if self.shape == AggregateShape::PostingJoin {
+            if let Some(plan) = self.posting.as_ref() {
+                if plan
+                    .columns
+                    .iter()
+                    .any(|(_, positions)| positions.contains(&at))
+                {
+                    return "index posting: its own scalar index, walked in pass 2".to_owned();
+                }
+            }
+        }
+        source.where_from().to_owned()
+    }
+
+    /// The two index passes of a POSTING JOIN, written out. Empty for every
+    /// other shape, and kept after a fallback so `EXPLAIN` can still say what
+    /// the join would have walked.
+    fn posting_passes(&self) -> Vec<String> {
+        let Some(plan) = self.posting.as_ref() else {
+            return Vec::new();
+        };
+        let folded = |positions: &[usize]| -> String {
+            positions
+                .iter()
+                .map(|at| match &self.accumulators[*at].source {
+                    None => self.accumulators[*at].function.written().to_owned(),
+                    Some(source) => format!(
+                        "{}({})",
+                        self.accumulators[*at].function.written(),
+                        source.field
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut out = vec![format!(
+            "pass 1: walk the {} index in key order -- one GROUP per value, one bounded id bitmap per group (charged to membership_bytes){}",
+            plan.driving.field,
+            if plan.driving_folds.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; folds {} off the posting",
+                    folded(
+                        &plan
+                            .driving_folds
+                            .iter()
+                            .map(|(at, _)| *at)
+                            .collect::<Vec<_>>()
+                    )
+                )
+            }
+        )];
+        for (info, positions) in &plan.columns {
+            out.push(format!(
+                "pass 2: walk the {} index in key order -- each (value, id) folds into the group whose bitmap claims the id; folds {}; the nullish key counts for nothing",
+                info.field,
+                folded(positions)
+            ));
+        }
+        out
     }
 }
 
@@ -1408,4 +2263,10 @@ pub struct AggregatePlanDescription {
     /// The engine's own ceiling on live accumulator sets.
     pub groups_cap: u64,
     pub total_limit: Option<usize>,
+    /// The POSTING JOIN's two index passes, one line each. Empty for every
+    /// other shape.
+    pub passes: Vec<String>,
+    /// Why the POSTING JOIN gave way to another fold, if it did. `shape` is
+    /// then the fold that RAN, not the one prepare chose.
+    pub fell_back: Option<String>,
 }
