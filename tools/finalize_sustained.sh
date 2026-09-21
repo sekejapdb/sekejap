@@ -3,7 +3,7 @@
 set -euo pipefail
 roots=(<scratch> <scratch> <scratch> <scratch>)
 python3 tools/record_sustained.py "${roots[@]}"
-cargo fmt --package e4-prototype --check
+cargo fmt --package sekejap-core --check
 for root in "${roots[@]}"; do
   python3 tools/cleanup_sustained.py "$root"
 done

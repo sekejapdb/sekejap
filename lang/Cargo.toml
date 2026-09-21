@@ -1,0 +1,24 @@
+[package]
+name = "sekejap-lang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "sekejap_lang"
+path = "src/lib.rs"
+
+[dependencies]
+sekejap-core = { path = "../core/engine" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+kernel = { path = "../core/kernel", features = ["test-support"] }
+tempfile = "3"
+
+[features]
+sqlite-balance = ["sekejap-core/sqlite-balance"]
+compact-cells = ["sekejap-core/compact-cells"]
+keyspace-append = ["sekejap-core/keyspace-append"]
+slotref-split = ["sekejap-core/slotref-split"]

@@ -13,7 +13,7 @@ mkdir -p "$src/.cargo"
 printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "%s/vendor"\n' "$root" > "$src/.cargo/config.toml"
 cd "$src"
 export CARGO_TARGET_DIR="$root/free-candidate-target"
-cargo build --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/candidate-build.log" 2>&1
+cargo build -p sekejap-dist --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/candidate-build.log" 2>&1
 cp "$CARGO_TARGET_DIR/release/collections" "$art/candidate"
 # Same accepted engine and harness as the prior measured loop; fingerprint it.
 cp "$root/artifacts/freelist-20260912/baseline" "$art/baseline"

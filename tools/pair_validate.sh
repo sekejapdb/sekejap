@@ -27,6 +27,6 @@ if [ -d <scratch> ]; then
  mkdir -p .cargo
  printf '[source.crates-io]\nreplace-with="vendored-sources"\n[source.vendored-sources]\ndirectory="<scratch>"\n' > .cargo/config.toml
 fi
-cargo clean --release -p kernel -p e4-prototype > "$art/baseline-clean.log" 2>&1
+cargo clean --release -p kernel -p sekejap-core > "$art/baseline-clean.log" 2>&1
 python3 tools/run_foundation.py lean "$art/baseline-lean"
 echo 'COMPLETE validation'

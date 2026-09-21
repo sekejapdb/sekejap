@@ -1,0 +1,29 @@
+[package]
+name = "sekejap-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+sekejap-core = { path = "../core/engine" }
+sekejap-lang = { path = "../lang" }
+sekejap-dist = { path = "../dist" }
+kernel = { path = "../core/kernel" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+crc32c = "0.6"
+# Synchronous client for the `popsim postgres` arm. Ungated (always available),
+# matching how `rusqlite` is ungated for the `sqlite` arm — this is a bench
+# harness dependency, not a feature the rest of the crate depends on.
+postgres = "0.19"
+
+[dev-dependencies]
+tempfile = "3"
+kernel = { path = "../core/kernel", features = ["test-support"] }
+
+[features]
+sqlite-balance = ["sekejap-core/sqlite-balance", "sekejap-lang/sqlite-balance", "sekejap-dist/sqlite-balance"]
+compact-cells = ["sekejap-core/compact-cells", "sekejap-lang/compact-cells", "sekejap-dist/compact-cells"]
+keyspace-append = ["sekejap-core/keyspace-append", "sekejap-lang/keyspace-append", "sekejap-dist/keyspace-append"]
+slotref-split = ["sekejap-core/slotref-split", "sekejap-lang/slotref-split", "sekejap-dist/slotref-split"]

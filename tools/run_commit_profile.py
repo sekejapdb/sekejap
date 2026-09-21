@@ -5,7 +5,7 @@ base=Path('<scratch>')
 src=Path('/tmp/e4-stage-candidate')
 shutil.copy2('/tmp/e4-commit-candidate/target/release/collections',base/'profile')
 with tarfile.open(base/'profile-source.tar.gz','w:gz') as t:
-    for folder in ('src','kernel'):
+    for folder in ('core','lang','dist','bench'):
         for p in (src/folder).rglob('*'):
             if p.is_file():t.add(p,arcname=str(p.relative_to(src)),recursive=False)
     for n in ('Cargo.toml','Cargo.lock'):t.add(src/n,arcname=n)

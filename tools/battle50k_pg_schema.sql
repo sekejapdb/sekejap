@@ -6,7 +6,7 @@
 -- superuser step, done once, outside this file).
 --
 -- Column-for-column mirror of the E4 `place` collection used by
--- src/bin/popsim.rs: `loc` is a Kind::Point, `plot` is a Kind::Geo (stored
+-- bench/src/bin/popsim.rs: `loc` is a Kind::Point, `plot` is a Kind::Geo (stored
 -- as a polygon here), `emb` is a Kind::Vector(32).
 --
 -- Every CREATE INDEX is preceded by a comment naming the stage exactly as

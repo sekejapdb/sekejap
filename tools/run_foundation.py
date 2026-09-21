@@ -41,11 +41,14 @@ def main():
     pi = out.is_relative_to(PI) or out.is_relative_to(server)
     groups = json.loads((ROOT / 'docs/FOUNDATION_LEAN_GROUPS.json').read_text())
     source = {}
-    for folder in ['src', 'kernel/src', 'tests', 'kernel/tests', 'tools']:
+    for folder in ['core/engine/src', 'core/engine/tests', 'core/kernel/src', 'core/kernel/tests',
+                   'lang/src', 'lang/tests', 'dist/src', 'bench/src', 'bench/tests', 'tools']:
         for path in sorted((ROOT / folder).rglob('*')):
             if path.is_file() and path.suffix in ['.rs', '.py', '.sh']:
                 source[str(path.relative_to(ROOT))] = sha(path)
-    for name in ['Cargo.toml', 'Cargo.lock', 'kernel/Cargo.toml', 'CONTRACT.md', 'docs/FOUNDATION_LEAN_GROUPS.json']:
+    for name in ['Cargo.toml', 'Cargo.lock', 'core/kernel/Cargo.toml', 'core/engine/Cargo.toml',
+                 'lang/Cargo.toml', 'dist/Cargo.toml', 'bench/Cargo.toml',
+                 'CONTRACT.md', 'docs/FOUNDATION_LEAN_GROUPS.json']:
         source[name] = sha(ROOT / name)
     report = dict(version='F1-lean-1', profile=a.profile, platform=platform.platform(),
         machine=platform.machine(), source_sha256=source, groups=groups, commands=[], records=[],
@@ -73,7 +76,7 @@ def main():
             print('passed test group', label, flush=True)
     binary = a.binary.resolve() if a.binary else Path(env.get('CARGO_TARGET_DIR', str(ROOT/'target'))) / 'release/foundation_scale'
     if not a.binary:
-        run('build', ['cargo', 'build', '--release', '--offline', '--features',
+        run('build', ['cargo', 'build', '--release', '--offline', '-p', 'sekejap-bench', '--features',
             'sqlite-balance,compact-cells', '--bin', 'foundation_scale'])
     report['binary_sha256'] = sha(binary)
     sizes, repetitions, changes = {

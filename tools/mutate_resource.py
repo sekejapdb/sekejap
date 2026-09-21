@@ -3,7 +3,7 @@
 import json, os, pathlib, subprocess
 
 root = pathlib.Path('<scratch>')
-source = pathlib.Path('kernel/src/pool.rs')
+source = pathlib.Path('core/kernel/src/pool.rs')
 original = source.read_text()
 mutations = [
     ('data-admission', 'if !reuse && i.next_page as u64 >= l.data_bytes / PAGE_SIZE as u64',

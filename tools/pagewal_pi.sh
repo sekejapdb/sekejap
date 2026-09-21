@@ -10,7 +10,7 @@ tar -xzf "$art/pilot-source.tar.gz" -C "$src"
 mkdir -p "$src/.cargo" "$art/tmp"
 printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "%s/vendor"\n' "$task_root" > "$src/.cargo/config.toml"
 cd "$src"
-cargo build --release --offline --features sqlite-balance,compact-cells --bin pagewal_bench > "$art/build.log" 2>&1
+cargo build -p sekejap-bench --release --offline --features sqlite-balance,compact-cells --bin pagewal_bench > "$art/build.log" 2>&1
 cp "$CARGO_TARGET_DIR/release/pagewal_bench" "$art/pilot"
 cargo test --release --offline --features sqlite-balance,compact-cells --test pagewal -- --test-threads=1 > "$art/tests.log" 2>&1
 sha256sum "$art/pilot" "$art/pilot-source.tar.gz" > "$art/hashes.txt"

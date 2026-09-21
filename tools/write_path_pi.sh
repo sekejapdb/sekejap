@@ -11,20 +11,20 @@ validate)
   mkdir "$root/write-src" "$root/write-baseline-src"
   tar -xzf "$root/write-source.tar.gz" -C "$root/write-src"
   tar -xzf "$root/packing-source.tar.gz" -C "$root/write-baseline-src"
-  cp "$root/write-src/src/bin/collections.rs" "$root/write-baseline-src/src/bin/collections.rs"
+  cp "$root/write-src/dist/src/cli/collections.rs" "$root/write-baseline-src/dist/src/cli/collections.rs"
   for dir in "$root/write-src" "$root/write-baseline-src"; do
     mkdir -p "$dir/.cargo"
     printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "%s/vendor"\n' "$root" > "$dir/.cargo/config.toml"
   done
   cd "$root/write-baseline-src"
   export CARGO_TARGET_DIR="$root/write-baseline-target"
-  cargo build --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/baseline-build.log" 2>&1
+  cargo build -p sekejap-dist --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/baseline-build.log" 2>&1
   cp "$CARGO_TARGET_DIR/release/collections" "$art/collections-baseline"
   cd "$root/write-src"
   export CARGO_TARGET_DIR="$root/write-current-target"
   cargo test --release --offline -p kernel --features sqlite-balance,compact-cells --lib --test resource_limits -- --test-threads=1 > "$art/kernel-tests.log" 2>&1
-  cargo test --release --offline -p e4-prototype --features sqlite-balance,compact-cells --lib --test collections --test delete_packing --test write_path -- --test-threads=1 > "$art/collection-tests.log" 2>&1
-  cargo build --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/current-build.log" 2>&1
+  cargo test --release --offline -p sekejap-core --features sqlite-balance,compact-cells --lib --test collections --test delete_packing --test write_path -- --test-threads=1 > "$art/collection-tests.log" 2>&1
+  cargo build -p sekejap-dist --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/current-build.log" 2>&1
   cp "$CARGO_TARGET_DIR/release/collections" "$art/collections-current"
   sha256sum "$art/collections-baseline" "$art/collections-current" > "$art/binary.sha256"
   date -Is > "$art/validation.complete"
@@ -32,7 +32,7 @@ validate)
 rebuild-current)
   cd "$root/write-src"
   export CARGO_TARGET_DIR="$root/write-current-target"
-  cargo build --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/current-rebuild.log" 2>&1
+  cargo build -p sekejap-dist --release --offline --features sqlite-balance,compact-cells --bin collections > "$art/current-rebuild.log" 2>&1
   cp "$CARGO_TARGET_DIR/release/collections" "$art/collections-current"
   sha256sum "$art/collections-baseline" "$art/collections-current" > "$art/binary.sha256"
   ;;

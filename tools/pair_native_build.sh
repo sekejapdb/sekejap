@@ -31,9 +31,9 @@ for variant in pair compact-pair; do
   cp -a "$art/../v2/targets/$variant" "$CARGO_TARGET_DIR"
   # Reuse only dependency compilation. Remove BOTH workspace packages in this
   # new isolated copy; zero-mtime source archives must never reuse engine code.
-  cargo clean --release -p kernel -p e4-prototype > "$art/clean-$variant.log" 2>&1
+  cargo clean --release -p kernel -p sekejap-core > "$art/clean-$variant.log" 2>&1
  fi
- cargo build --release --offline --features sqlite-balance,compact-cells --bin foundation_scale --bin pagewal_bench --bin pagewal_cap --bin foundation_space > "$art/build-$variant.log" 2>&1
+ cargo build -p sekejap-bench --release --offline --features sqlite-balance,compact-cells --bin foundation_scale --bin pagewal_bench --bin pagewal_cap --bin foundation_space > "$art/build-$variant.log" 2>&1
  grep -q 'Compiling kernel ' "$art/build-$variant.log"
  grep -q 'Compiling e4-prototype ' "$art/build-$variant.log"
  for binary in foundation_scale pagewal_bench pagewal_cap foundation_space; do

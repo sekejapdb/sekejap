@@ -1,5 +1,5 @@
 //! Read a COPY of a refused fixed-work fixture; opening discards uncommitted WAL.
-use e4_prototype::pagewal::PageWalStore;
+use sekejap_core::pagewal::PageWalStore;
 use std::{path::Path, error::Error};
 fn main() -> Result<(), Box<dyn Error>> {
     let a: Vec<String> = std::env::args().collect();

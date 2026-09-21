@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Generates tests/fixtures/spatial_postgis.json ONCE from a live PostGIS 16/3.4
+# Generates core/engine/tests/fixtures/spatial_postgis.json ONCE from a live PostGIS 16/3.4
 # server. Run manually when the fixture needs regenerating; the Rust test
-# (tests/spatial_geometry_postgis.rs) reads the committed JSON offline.
+# (core/engine/tests/spatial_geometry_postgis.rs) reads the committed JSON offline.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 : "${PGDATABASE:=postgres}"
 export PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE
 
-OUT=tests/fixtures/spatial_postgis.json
+OUT=core/engine/tests/fixtures/spatial_postgis.json
 mkdir -p "$(dirname "$OUT")"
 
 psql -v ON_ERROR_STOP=1 -q -tA <<'SQL' > "$OUT"

@@ -11,9 +11,9 @@ columns, OR, NOT, joins and a SQL adapter remain unsupported work.
 
 STATUS UPDATE (2026-09-20): point-distance ordering (`CompiledOrder::Distance`)
 and score expressions (`ScoreExpr`, `src/query/mod.rs`, `src/query/score.rs`)
-are both live T1 atomics now (`docs/QL_CONTRACT.md` §4.4, §4.7). A Tier-1 SQL
-parser and compiler exist (`src/sql/`). OR, NOT and joins remain unsupported
-(`docs/QL_CONTRACT.md` §7, order-of-work items 3 and 7).
+are both live T1 atomics now (`docs/lang/QL_CONTRACT.md` §4.4, §4.7). A Tier-1 SQL
+parser and compiler exist (`lang/src/`). OR, NOT and joins remain unsupported
+(`docs/lang/QL_CONTRACT.md` §7, order-of-work items 3 and 7).
 
 ## Contract and public shape
 

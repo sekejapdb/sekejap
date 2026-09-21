@@ -44,8 +44,8 @@ the same frozen engine revision; later versions must run against the preserved
 baseline. No runtime encoding changed in the completion loop. Interface work
 can proceed within this format contract. Public packaging and complete
 multimodel/eight-law product qualification remain separate. See
-[baseline, evidence and future gate](docs/FORMAT_BASELINE.md),
-[format specification](docs/FORMAT_V1.md) and
+[baseline, evidence and future gate](docs/core/FORMAT_BASELINE.md),
+[format specification](docs/core/FORMAT_V1.md) and
 [recovery runbook](docs/PHASE1_RECOVERY_RUNBOOK.md).
 
 **Law 8 adopted (2026-09-15): compatibility is permanent.** New E4 releases
@@ -61,7 +61,7 @@ Multimodel SELECT performance is the product objective; roughly 1.75× SQLite
 write time can be acceptable when measured query benefits justify it. The
 earlier 1.5× write threshold is no longer an unconditional release veto.
 Include explicit EXPORT/IMPORT and compatible normal upgrades. See
-[the recorded requirements](docs/FORMAT_FREEZE.md) and the new Law 8 above.
+[the recorded requirements](docs/core/FORMAT_FREEZE.md) and the new Law 8 above.
 
 **Owner release direction (2026-09-15): prioritize disk-format stability.**
 The storage shape exists, but upgrade compatibility is not yet qualified:
@@ -70,7 +70,7 @@ on build features. Finish the current reservation evaluation, then focus on
 one explicit release format, format-affecting recovery decisions, collection
 integration and frozen-file upgrade tests. Performance improvements that keep
 the format can follow alongside interfaces; all seven laws remain unchanged.
-See [the bounded format-freeze work and compatibility promise](docs/FORMAT_FREEZE.md).
+See [the bounded format-freeze work and compatibility promise](docs/core/FORMAT_FREEZE.md).
 
 **Format audit / reservation decision (2026-09-15):** Pi and server reproduce
 foreign-WAL acceptance, stale-WAL rollback of a newer checkpoint, and mutation
@@ -186,7 +186,7 @@ remain explicit. No SQL or new multimodel indexes were added.
 
 **Foundation standard F1 / page-WAL exploration (2026-09-13):** the user
 authorizes an isolated SQLite-style publication architecture before query and
-multimodel-index expansion. The [F1 test standard](docs/FOUNDATION_TEST_STANDARD.md)
+multimodel-index expansion. The [F1 test standard](docs/core/FOUNDATION_TEST_STANDARD.md)
 defines fixed payloads/N, load and repeated CRUD cases, all seven law categories,
 SQLite time/size parity targets, peak/cap checks and promotion requirements.
 Raw key/value pager results must remain separate from full collection results.
@@ -276,12 +276,12 @@ broken overflow values, names unknown page extents, and keeps obsolete rootless
 cells separate from current rows. A retained 40K mixed-data trial recovered
 39,999 unaffected entities after one damaged overflow page. The loop also
 reproduced an uncached-I/O failure independently of E4; macOS Direct requests
-now explicitly fall back to Buffered. See [evidence, commands and open gates](docs/RECOVERY_R1.md).
+now explicitly fall back to Buffered. See [evidence, commands and open gates](docs/core/RECOVERY_R1.md).
 **Schema recovery R2:** root-independent discovery of existing layout copies
 now passes the 10K/40K fault matrix. One/two lost copies still permit exact
 field decoding; all-copy loss preserves surviving raw rows and explicitly names
 missing layout IDs. The scanner and codec are separate extension interfaces,
-with no new normal storage bytes. See [commands, results and limits](docs/RECOVERY_R2.md).
+with no new normal storage bytes. See [commands, results and limits](docs/core/RECOVERY_R2.md).
 Current-membership reconstruction and the full seven-law gate remain unfinished.
 
 **Lean lifecycle gate (2026-09-10):** 100K/400K typed update/delete/reinsert,
@@ -343,7 +343,7 @@ API footprint includes external-key indexes and vector records, so the earlier
 entry-only density percentages do not apply. **330 tests pass**, but a matched
 400K/12-cycle check reaches **258.1 MiB E4 / 121.8 MiB SQLite peak**, exceeding
 2× E4 loaded size. Reachable-page growth remains a foundation issue. See the [API/storage/recovery
-contract](docs/COLLECTIONS.md) and [paired measurements](docs/COLLECTION_RESULTS.md).
+contract](docs/core/COLLECTIONS.md) and [paired measurements](docs/COLLECTION_RESULTS.md).
 
 **Delete/page-packing loop (2026-09-12):** bounded sibling merging and root
 collapse eliminate the 30,217 empty entity/vector leaves found in the retained
@@ -456,7 +456,7 @@ so all writers follow it. Opting in adds managed `_created_unix` and
 `_updated_unix` as typed integers. Ordinary user-supplied time fields remain
 independent. This is a product/schema decision; **the laws remain exactly
 seven**. See [the accepted decision and proposed syntax](docs/TIMESTAMPS.md).
-The internal Rust [collection API](docs/COLLECTIONS.md) now implements this
+The internal Rust [collection API](docs/core/COLLECTIONS.md) now implements this
 policy, including creation-time preservation, monotonic update times and
 policy persistence across reopen. SQL syntax remains proposed.
 
@@ -493,7 +493,7 @@ policy persistence across reopen. SQL syntax remains proposed.
    (e.g. two inline copies on separate leaves), bound the descriptor ID domain,
    and keep independently discoverable redundant schema evidence. Positional
    row values cannot reconstruct original field names or exact declarations
-   by inference. See [the recovery contract](docs/RECOVERY_CONTRACT.md).
+   by inference. See [the recovery contract](docs/core/RECOVERY_CONTRACT.md).
 
 ---
 
@@ -504,7 +504,7 @@ source and keeps everything that does not depend on the payload being JSON
 text. None of these read raw JSON directly — they go through field accessors,
 which now decode a typed record:
 
-- **Kernel** (`kernel/`): B-tree, WAL, graft, per-page checksums +
+- **Kernel** (`core/kernel/`): B-tree, WAL, graft, per-page checksums +
   owner-identity verification, snapshots, freelist, the format-version gate, the
   golden-fixture discipline, the published-tree structural verifier.
 - **Graph**: edge keyspaces, `link`/`unlink`/`link_meta`, MATCH. Edges
@@ -513,7 +513,7 @@ which now decode a typed record:
 - **Vector / spatial / text** keyspaces + indexes (HNSW, grid, BM25, GIN,
   SEARCH): adapt field extraction to read a typed slot instead of parsing JSON.
 - **Query engine** (e3's `src/query.rs`, `src/exec.rs` -- e4's own query
-  engine lives at `src/query/`, unrelated in shape to e3's `Set`/`Step`
+  engine lives at `core/engine/src/query/`, unrelated in shape to e3's `Set`/`Step`
   executor): `Set`/`Step` executor, streaming `for_each_row`,
   covered/sorted/batched drivers, plan cache.
 - **Service** (`open_as_service()`, snapshot reads), **introspection**

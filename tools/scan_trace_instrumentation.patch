@@ -1,5 +1,5 @@
---- a/kernel/src/io.rs
-+++ b/kernel/src/io.rs
+--- a/core/kernel/src/io.rs
++++ b/core/kernel/src/io.rs
 @@ -120,0 +121 @@
 +    audit: std::sync::Mutex<std::collections::BTreeMap<u64,u32>>,
 @@ -157,0 +159,7 @@
@@ -21,8 +21,8 @@
 +        audit: Default::default(),
 @@ -360,0 +375 @@
 +        audit: Default::default(),
---- a/kernel/src/pool.rs
-+++ b/kernel/src/pool.rs
+--- a/core/kernel/src/pool.rs
++++ b/core/kernel/src/pool.rs
 @@ -793 +793,17 @@
 -impl Drop for PinnedWrite<'_> { fn drop(&mut self) { self.pool.unpin(self.frame, true) } }
 +impl Drop for PinnedWrite<'_> { fn drop(&mut self) {
@@ -42,7 +42,7 @@
 +    }
 +    self.pool.unpin(self.frame, true)
 +} }
---- a/kernel/tests/law1_heap.rs
-+++ b/kernel/tests/law1_heap.rs
+--- a/core/kernel/tests/law1_heap.rs
++++ b/core/kernel/tests/law1_heap.rs
 @@ -58,0 +59 @@
 +    eprintln!("committed rows {rows} root {}",s.published_root());

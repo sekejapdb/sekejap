@@ -109,7 +109,7 @@ def main():
     corpus = work / "corpus"
     corpus.mkdir()
     driver_path = Path(__file__).resolve()
-    helper_source = driver_path.parent.parent / "src/bin/phase2_lifecycle_fixture.rs"
+    helper_source = driver_path.parent.parent / "bench/src/bin/phase2_lifecycle_fixture.rs"
     helper_source = helper_source.resolve(strict=True)
     report = {
         "format": REPORT_FORMAT,

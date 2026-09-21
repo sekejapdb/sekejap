@@ -1,5 +1,5 @@
---- a/kernel/tests/pack_shape.rs
-+++ b/kernel/tests/pack_shape.rs
+--- a/core/kernel/tests/pack_shape.rs
++++ b/core/kernel/tests/pack_shape.rs
 @@ -2,6 +2,8 @@
  //! through a scratch file instead of holding them in a `Vec` must change
  //! nothing a reader can observe -- not one byte of one page -- and must leave

@@ -1,0 +1,60 @@
+[package]
+name = "sekejap-dist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+default-run = "sekejap"
+
+[lib]
+name = "sekejap_dist"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sekejap"
+path = "src/cli/main.rs"
+
+[[bin]]
+name = "recover"
+path = "src/cli/recover.rs"
+
+[[bin]]
+name = "collection_inspect"
+path = "src/cli/collection_inspect.rs"
+
+[[bin]]
+name = "collections"
+path = "src/cli/collections.rs"
+
+[[bin]]
+name = "control_tree_audit"
+path = "src/cli/control_tree_audit.rs"
+
+[[bin]]
+name = "pagewal_repair"
+path = "src/cli/pagewal_repair.rs"
+
+[[bin]]
+name = "entry"
+path = "src/cli/entry.rs"
+
+[[bin]]
+name = "lifecycle"
+path = "src/cli/lifecycle.rs"
+
+[dependencies]
+sekejap-core = { path = "../core/engine" }
+sekejap-lang = { path = "../lang" }
+kernel = { path = "../core/kernel" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+crc32c = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+sqlite-balance = ["sekejap-core/sqlite-balance", "sekejap-lang/sqlite-balance"]
+compact-cells = ["sekejap-core/compact-cells", "sekejap-lang/compact-cells"]
+keyspace-append = ["sekejap-core/keyspace-append", "sekejap-lang/keyspace-append"]
+slotref-split = ["sekejap-core/slotref-split", "sekejap-lang/slotref-split"]

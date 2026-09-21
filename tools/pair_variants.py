@@ -9,18 +9,18 @@ def read(path):
 full = read('/tmp/e4-pair-working.tar.gz')
 base = read('/tmp/e4-scatter-baseline.tar.gz')
 compact = read('/tmp/e4-scatter-compact.tar.gz')
-old = base['kernel/src/btree.rs'].decode().splitlines(True)
-new = compact['kernel/src/btree.rs'].decode().splitlines(True)
+old = base['core/kernel/src/btree.rs'].decode().splitlines(True)
+new = compact['core/kernel/src/btree.rs'].decode().splitlines(True)
 pair = dict(full)
-source = pair['kernel/src/btree.rs'].decode()
+source = pair['core/kernel/src/btree.rs'].decode()
 for kind, _, _, lo, hi in difflib.SequenceMatcher(a=old, b=new, autojunk=False).get_opcodes():
     if kind == 'equal': continue
     assert kind == 'insert'
     addition = ''.join(new[lo:hi]); assert source.count(addition) == 1
     source = source.replace(addition, '', 1)
-pair['kernel/src/btree.rs'] = source.encode()
-pair['kernel/src/verify.rs'] = subprocess.check_output(['git', 'show', 'HEAD:kernel/src/verify.rs'])
-pair.pop('kernel/tests/compact_cell_bounds.rs')
+pair['core/kernel/src/btree.rs'] = source.encode()
+pair['core/kernel/src/verify.rs'] = subprocess.check_output(['git', 'show', 'HEAD:core/kernel/src/verify.rs'])
+pair.pop('core/kernel/tests/compact_cell_bounds.rs')
 for name, files in [('pair', pair), ('compact-pair', full)]:
     files['VARIANT'] = (name + '\n').encode()
     with tarfile.open('/tmp/e4-pair-' + name + '.tar.gz', 'w:gz') as t:

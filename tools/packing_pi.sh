@@ -23,8 +23,8 @@ CFG
   uname -a >> "$art/versions.txt"
   uptime > "$art/validation-start-load.txt"
   cargo test --release --offline -p kernel --features sqlite-balance,compact-cells --lib --test resource_limits -- --test-threads=1 > "$art/kernel-tests.log" 2>&1
-  cargo test --release --offline -p e4-prototype --features sqlite-balance,compact-cells --lib --test delete_packing --test collections -- --test-threads=1 > "$art/collection-tests.log" 2>&1
-  cargo build --release --offline --features sqlite-balance,compact-cells --bin collections --bin collection_inspect > "$art/build.log" 2>&1
+  cargo test --release --offline -p sekejap-core --features sqlite-balance,compact-cells --lib --test delete_packing --test collections -- --test-threads=1 > "$art/collection-tests.log" 2>&1
+  cargo build -p sekejap-dist --release --offline --features sqlite-balance,compact-cells --bin collections --bin collection_inspect > "$art/build.log" 2>&1
   cp "$root/packing-target/release/collections" "$art/collections"
   cp "$root/packing-target/release/collection_inspect" "$art/collection-inspect"
   sha256sum "$art/collections" > "$art/binary.sha256"

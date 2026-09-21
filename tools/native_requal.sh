@@ -29,13 +29,13 @@ for variant in baseline candidate; do
   printf '[source.crates-io]\nreplace-with="vendored-sources"\n[source.vendored-sources]\ndirectory="%s/vendor"\n' "$task_root" > .cargo/config.toml
  fi
  # Reuse dependency objects only, in distinct targets; never stale engine code.
- cargo clean --release -p kernel -p e4-prototype > "$art/$variant-clean.log" 2>&1
+ cargo clean --release -p kernel -p sekejap-core > "$art/$variant-clean.log" 2>&1
  export E4_LAW1_ARTIFACTS="$art/$variant-law1"
  cargo test --release --offline --workspace --features sqlite-balance,compact-cells -- --test-threads=1 > "$art/$variant-workspace.log" 2>&1
  grep -q 'Compiling kernel ' "$art/$variant-workspace.log"
  grep -q 'Compiling e4-prototype ' "$art/$variant-workspace.log"
  echo "PASS full workspace $variant"
- cargo build --release --offline --features sqlite-balance,compact-cells --bin foundation_scale --bin pagewal_bench --bin pagewal_cap --bin foundation_space > "$art/$variant-build.log" 2>&1
+ cargo build -p sekejap-bench --release --offline --features sqlite-balance,compact-cells --bin foundation_scale --bin pagewal_bench --bin pagewal_cap --bin foundation_space > "$art/$variant-build.log" 2>&1
  for binary in foundation_scale pagewal_bench pagewal_cap foundation_space; do
   cp "$CARGO_TARGET_DIR/release/$binary" "$art/bin/$variant/$binary"
  done

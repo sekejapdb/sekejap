@@ -61,10 +61,10 @@
       "remaining": "First public product release packaging and future shipped interface/index compatibility fixtures. Baseline entity format is fixed; these product obligations do not reopen its byte meanings. Full eight-law product qualification remains separate.",
       "evidence": [
         "CONTRACT.md#law-8--release-compatibility-contract",
-        "docs/FORMAT_FREEZE.md",
+        "docs/core/FORMAT_FREEZE.md",
         "docs/DISK_FORMAT_AUDIT.md",
         "docs/FORMAT_AUDIT_RESULTS.json",
-        "docs/FORMAT_BASELINE.md",
+        "docs/core/FORMAT_BASELINE.md",
         "docs/PHASE1_RECOVERY_RUNBOOK.md"
       ]
     }

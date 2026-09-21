@@ -1,40 +1,12 @@
 [workspace]
-members = ["kernel"]
+members = ["core/kernel", "core/engine", "lang", "dist", "bench"]
+default-members = ["core/engine"]
 resolver = "2"
 
 [workspace.package]
 version = "0.17.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-
-[package]
-name = "e4-prototype"
-default-run = "e4-prototype"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-kernel = { path = "kernel" }
-serde_json = { version = "1", features = ["float_roundtrip"] }
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
-crc32c = "0.6"
-getrandom = "0.4"
-geographiclib-rs = { version = "=0.2.7", default-features = false }
-# Synchronous client for the `popsim postgres` arm. Ungated (always available),
-# matching how `rusqlite` is ungated for the `sqlite` arm — this is a bench
-# harness dependency, not a feature the rest of the crate depends on.
-postgres = "0.19"
-
-[dev-dependencies]
-tempfile = "3"
-kernel = { path = "kernel", features = ["test-support"] }
-
-[features]
-sqlite-balance = ["kernel/sqlite-balance"]
-compact-cells = ["kernel/compact-cells"]
-keyspace-append = ["kernel/keyspace-append"]
-slotref-split = ["kernel/slotref-split"]
 
 [profile.release]
 debug = 1

@@ -4,10 +4,10 @@ set -euo pipefail
 root=<scratch>
 export TMPDIR="$root/tmp"
 export SQLITE_TMPDIR="$root/tmp"
-cargo fmt --package e4-prototype --check
+cargo fmt --package sekejap-core --check
 cargo test --release --offline --workspace --features sqlite-balance,compact-cells -- --test-threads=1 > "$root/direct-workspace-tests.log" 2>&1
 cargo test --release --offline --features sqlite-balance,compact-cells --test codec_allocations -- --nocapture > "$root/direct-allocations.log" 2>&1
-cargo build --release --offline --features sqlite-balance,compact-cells --bin lifecycle > "$root/direct-build.log" 2>&1
+cargo build -p sekejap-dist --release --offline --features sqlite-balance,compact-cells --bin lifecycle > "$root/direct-build.log" 2>&1
 cp target/release/lifecycle "$root/lifecycle-direct"
 tar --exclude=target --exclude=.git -czf "$root/direct-source.tar.gz" Cargo.toml Cargo.lock kernel src tests tools
 if [[ ! -e "$root/direct-policy-crashes" ]]; then

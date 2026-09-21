@@ -1,0 +1,31 @@
+[package]
+name = "sekejap-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "sekejap_core"
+path = "src/lib.rs"
+
+[dependencies]
+kernel = { path = "../kernel" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+crc32c = "0.6"
+getrandom = "0.4"
+geographiclib-rs = { version = "=0.2.7", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+kernel = { path = "../kernel", features = ["test-support"] }
+# `tests/spatial_geometry_postgis.rs` is a conformance oracle: it asks a live
+# PostGIS the same questions and compares. A TEST dependency only -- no module
+# of the engine links it, and the test skips itself when no DSN answers.
+postgres = "0.19"
+
+[features]
+sqlite-balance = ["kernel/sqlite-balance"]
+compact-cells = ["kernel/compact-cells"]
+keyspace-append = ["kernel/keyspace-append"]
+slotref-split = ["kernel/slotref-split"]

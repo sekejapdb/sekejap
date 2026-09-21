@@ -2,7 +2,7 @@
 """Verify explicit index opt-in and frozen typed reader/writer safe refusal.
 
 Linux example (all destinations new, outside the immutable corpus):
-  cargo build --release --bin index_format_fixture
+  cargo build -p sekejap-bench --release --bin index_format_fixture
   python3 tools/index_format_refusal.py --corpus docs/format-v1-baseline \
     --baseline-bin /bench/reference/bin/format_compat-baseline \
     --baseline-source /bench/reference/source \
@@ -102,7 +102,7 @@ def main():
             source_before = complete_inventory(src)
             probe_source = work / "writer-probe-source"
             shutil.copytree(src, probe_source, ignore=shutil.ignore_patterns(".git", "target"))
-            destination = probe_source / "src/bin/index_admission_probe.rs"
+            destination = probe_source / "bench/src/bin/index_admission_probe.rs"
             with destination.open("x") as stream:
                 stream.write(WRITER_PROBE)
             target = work / "writer-probe-target"

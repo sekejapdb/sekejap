@@ -28,7 +28,7 @@ rustc --version > "$root/artifacts/build-versions.txt"
 cargo --version >> "$root/artifacts/build-versions.txt"
 cargo test --offline --release -p kernel --features sqlite-balance,compact-cells --test resource_limits -- --test-threads=1 > "$root/artifacts/resource-tests.log" 2>&1
 cargo test --offline --release -p kernel --features sqlite-balance,compact-cells --lib constrained_commit -- --test-threads=1 > "$root/artifacts/commit-fault-tests.log" 2>&1
-cargo build --offline --release --features sqlite-balance,compact-cells --bin lifecycle > "$root/artifacts/build.log" 2>&1
+cargo build -p sekejap-dist --offline --release --features sqlite-balance,compact-cells --bin lifecycle > "$root/artifacts/build.log" 2>&1
 cp target/release/lifecycle "$root/artifacts/lifecycle-pi"
 sha256sum "$root/artifacts/lifecycle-pi" > "$root/artifacts/lifecycle-pi.sha256"
 date -Is > "$root/artifacts/build-complete"

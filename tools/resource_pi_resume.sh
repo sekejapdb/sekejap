@@ -7,7 +7,7 @@ printf '%s  %s\n' 03fe9026ddfb32fd5fab03f3313360f9c2910dc047cb5494c1fc197f8f7c36
 export PATH="$root/toolchain/bin:$PATH" CARGO_HOME="$root/cargo-home"
 export TMPDIR="$root/tmp" SQLITE_TMPDIR="$root/tmp" CARGO_BUILD_JOBS=2
 cd "$root/src"
-cargo build --offline --release --features sqlite-balance,compact-cells --bin lifecycle > "$root/artifacts/postboot-verifier-build.log" 2>&1
+cargo build -p sekejap-dist --offline --release --features sqlite-balance,compact-cells --bin lifecycle > "$root/artifacts/postboot-verifier-build.log" 2>&1
 cp target/release/lifecycle "$root/artifacts/lifecycle-postboot-verifier"
 sha256sum "$root/artifacts/lifecycle-postboot-verifier" > "$root/artifacts/lifecycle-postboot-verifier.sha256"
 prlimit --as=134217728 -- "$root/artifacts/lifecycle-postboot-verifier" --verify-saved "$matrix" > "$root/artifacts/postboot-verification.json" 2> "$root/artifacts/postboot-verification.log"

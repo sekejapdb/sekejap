@@ -18,7 +18,7 @@ cases = [
     ('conflicting-id', 'src/recovery.rs',
      'if self.path(id, "conflict").try_exists()? {', 'if false {',
      'schema_recovery', 'schema_conflicting_ids_never_pick_a_winner'),
-    ('overflow-value-crc', 'kernel/src/recover/reader.rs',
+    ('overflow-value-crc', 'core/kernel/src/recover/reader.rs',
      'if seen != bound || bytes != total || crc != want {',
      'if seen != bound || bytes != total {',
      'recovery_faults', 'overflow_crossed_chain_is_one_known_loss'),

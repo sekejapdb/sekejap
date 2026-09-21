@@ -24,7 +24,7 @@ for variant in baseline compact packing combined; do
     printf '[source.crates-io]\nreplace-with="vendored-sources"\n[source.vendored-sources]\ndirectory="%s/vendor"\n' "$task_root" > "$art/src/$variant/.cargo/config.toml"
   fi
   cd "$art/src/$variant"
-  cargo build --release --offline --features sqlite-balance,compact-cells --bin foundation_scale --bin pagewal_bench --bin pagewal_cap --bin foundation_space > "$art/build-$variant.log" 2>&1
+  cargo build -p sekejap-bench --release --offline --features sqlite-balance,compact-cells --bin foundation_scale --bin pagewal_bench --bin pagewal_cap --bin foundation_space > "$art/build-$variant.log" 2>&1
   for binary in foundation_scale pagewal_bench pagewal_cap foundation_space; do
     cp "$CARGO_TARGET_DIR/release/$binary" "$art/bin/$variant/$binary"
   done

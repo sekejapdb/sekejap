@@ -31,7 +31,7 @@ WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3);
 -- case: pt_bbox kind: filter
 -- params: $1 minlon, $2 minlat, $3 maxlon, $4 maxlat
 --   NOTE: queries.json stores boxes[i] as [minlon, maxlon, minlat, maxlat];
---   the Rust arm (Queries::bounds in src/bin/battle50k.rs) reorders before binding.
+--   the Rust arm (Queries::bounds in bench/src/bin/battle50k.rs) reorders before binding.
 -- Planar containment (PointFilter::Bbox is a plain lon/lat rectangle test,
 -- not a geodesic one), so this runs against the ::geometry cast.
 SELECT key FROM place
@@ -40,7 +40,7 @@ WHERE ST_Within(loc::geometry, ST_MakeEnvelope($1, $2, $3, $4, 4326));
 -- case: plot_within_box kind: filter
 -- params: $1 minlon, $2 minlat, $3 maxlon, $4 maxlat
 --   NOTE: queries.json stores boxes[i] as [minlon, maxlon, minlat, maxlat];
---   the Rust arm (Queries::bounds in src/bin/battle50k.rs) reorders before binding.
+--   the Rust arm (Queries::bounds in bench/src/bin/battle50k.rs) reorders before binding.
 -- GeometryFilter::Within is planar.
 SELECT key FROM place
 WHERE ST_Within(plot::geometry, ST_MakeEnvelope($1, $2, $3, $4, 4326));
@@ -222,7 +222,7 @@ LIMIT 10;
 -- A folded answer has no `key` column to return, so each of these produces
 -- ONE TEXT COLUMN per group: the group key, then `|name=value` per
 -- accumulator. The two E4 arms build the identical line in Rust
--- (`agg_line` in src/bin/battle50k.rs), so the three reports are diffable
+-- (`agg_line` in bench/src/bin/battle50k.rs), so the three reports are diffable
 -- group by group and not only by their group COUNT.
 --
 -- `avg` is compared as `floor(avg(born))::bigint`, a whole number two
@@ -527,6 +527,6 @@ SELECT key FROM place WHERE name LIKE $1;
 -- already times, and the two string functions are per RETURNED row. The
 -- key column is here so the three arms still compare the same row set; the
 -- projected VALUES are checked against Rust's own computation in
--- tests/sql_functions.rs, not across arms.
+-- lang/tests/sql_functions.rs, not across arms.
 SELECT key, upper(name), length(descr) FROM place
 WHERE born BETWEEN $1 AND $2;

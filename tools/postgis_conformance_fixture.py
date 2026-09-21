@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate tests/fixtures/postgis_conformance.json from a live PostGIS.
+"""Generate core/engine/tests/fixtures/postgis_conformance.json from a live PostGIS.
 
 Deterministic (seed 20260919). One batched SELECT per family, using
 ST_GeomFromGeoJSON(...)::geography for spheroidal predicates and
@@ -18,7 +18,7 @@ from pathlib import Path
 
 SEED = 20260919
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "tests" / "fixtures" / "postgis_conformance.json"
+OUT = ROOT / "core" / "engine" / "tests" / "fixtures" / "postgis_conformance.json"
 
 M_PER_DEG_LAT = 110540.0  # metres per degree of latitude (WGS84-ish mid)
 

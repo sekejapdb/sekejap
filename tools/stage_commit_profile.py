@@ -18,14 +18,14 @@ t=replace(t,'        self.generation = gen;','        eprintln!("STAGE meta {}",
 t=replace(t,'        let _ = crate::verify::persist_checkpoint_freelist(','        eprintln!("STAGE reuse {}", stage_start.elapsed().as_nanos());\n        let stage_start = std::time::Instant::now();\n        let _ = crate::verify::persist_checkpoint_freelist(')
 t=replace(t,'        // 2n recycling horizon:', '        eprintln!("STAGE hint {}", stage_start.elapsed().as_nanos());\n        // 2n recycling horizon:')
 t=replace(t,'        self.wal_mut()?.rotate_published()?;','        let stage_start = std::time::Instant::now();\n        self.wal_mut()?.rotate_published()?;\n        eprintln!("STAGE rotate {}", stage_start.elapsed().as_nanos());')
-(src/'kernel/src/store.rs').write_text(s[:a]+t+s[b:])
+(src/'core/kernel/src/store.rs').write_text(s[:a]+t+s[b:])
 s=files['pool.rs'];a=s.index('    pub fn flush_all(');b=s.index('\n    }',a)+6;t=s[a:b]
 t=replace(t,'        let mut inner =','        let stage_start = std::time::Instant::now();\n        let mut inner =')
 t=replace(t,'        match barrier {','        eprintln!("STAGE page_write {}", stage_start.elapsed().as_nanos());\n        let stage_start = std::time::Instant::now();\n        let result = match barrier {')
 t=t.rsplit('        }',1)[0]+'        };\n        eprintln!("STAGE page_sync {}", stage_start.elapsed().as_nanos());\n        result\n    }'
-(src/'kernel/src/pool.rs').write_text(s[:a]+t+s[b:])
+(src/'core/kernel/src/pool.rs').write_text(s[:a]+t+s[b:])
 s=files['verify.rs'];a=s.index('pub(crate) fn persist_checkpoint_freelist(');b=s.index('\n}\n',a)+2;t=s[a:b]
 t=replace(t,'    use std::io::Write;','    let stage_start = std::time::Instant::now();\n    use std::io::Write;')
 t=replace(t,'    file.sync_all()?;','    eprintln!("STAGE hint_write {}", stage_start.elapsed().as_nanos());\n    let stage_start = std::time::Instant::now();\n    file.sync_all()?;\n    eprintln!("STAGE hint_sync {}", stage_start.elapsed().as_nanos());')
-(src/'kernel/src/verify.rs').write_text(s[:a]+t+s[b:])
+(src/'core/kernel/src/verify.rs').write_text(s[:a]+t+s[b:])
 print('Diagnostic sources instrumented; production unchanged')

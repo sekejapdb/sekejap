@@ -1,6 +1,6 @@
 # Phase 2 admission review — 2026-09-16
 
-Read-only review of current `src/collections.rs`, `src/collection_backend.rs`, `src/pagewal.rs`, `src/pagewal/format.rs`, `docs/FORMAT_V1.md`, the two-corpus compatibility tests and Law 8. No source or tracker changes made.
+Read-only review of current `src/collections.rs`, `src/collection_backend.rs`, `src/pagewal.rs`, `src/pagewal/format.rs`, `docs/core/FORMAT_V1.md`, the two-corpus compatibility tests and Law 8. No source or tracker changes made.
 
 ## Recommendation (revised after parent requirement clarification)
 
