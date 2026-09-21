@@ -8,7 +8,11 @@
 //!   10  nentries   u16
 //!   12  page_no    u32   its own number — proves this is the page asked for
 //!   16  free_ptr   u16   lowest payload byte in use; payloads grow downward
-//!   18  reserved   u16
+//!   18  format     u16   THE DISK-FORMAT STAMP: `FORMAT_VERSION`, 2 on every
+//!                        page this build creates or rewrites. Zero in an e4
+//!                        pre-release file, which is why a value other than 2
+//!                        is refused rather than read. See
+//!                        docs/core/FORMAT_V2.md.
 //!   20  next_leaf  u32   LEAF: right sibling. INTERIOR: leftmost child
 //!                        (child0). 0 = none.
 //!   24  lsn        u64   RESERVED. Always 0 in Phase 1 — every production
@@ -42,6 +46,29 @@ pub const HEADER_LEN: usize = 40;
 const MAGIC: u32 = 0x5345_4B32;
 const VERSION: u16 = 1;
 const SLOT_LEN: usize = 4;
+
+/// The sekejap disk format, stamped into bytes 18-19 of every page.
+///
+/// Defined ONCE, here, because bytes 18-19 of a page are the only place the
+/// number is written; `sekejap_core::FORMAT_VERSION` and
+/// `sekejap::FORMAT_VERSION` are re-exports of this constant, not copies.
+///
+/// It is NOT `meta::FORMAT_VERSION`, which is the logical superblock version
+/// of the inherited kernel `Store` (1 or 2, chosen by the `compact-cells`
+/// cargo feature) and says what the pages of that store CONTAIN. This one is
+/// the envelope: which sekejap disk format the file is. There is no v1 --
+/// every sekejap from 0.17.0 writes and reads 2, an e4 pre-release file
+/// carries 0 here, and a value that is not 2 is refused with the file
+/// unchanged (docs/core/FORMAT_V2.md).
+pub const FORMAT_VERSION: u16 = 2;
+/// Offset of the disk-format stamp inside a page.
+const FORMAT_AT: usize = 18;
+
+/// The disk-format stamp a page image carries, read straight from bytes
+/// 18-19. Public so a test, a repair tool or an inspector can ask what a
+/// page claims WITHOUT opening it -- `PageRef::open` refuses anything but
+/// [`FORMAT_VERSION`], so by then the answer is already known.
+pub fn format_version(b: &[u8]) -> u16 { rd_u16(b, FORMAT_AT) }
 
 /// The largest a leaf record (`BTree`'s key+value encoding, `SLOT_LEN` bytes
 /// of directory overhead included) can be and still fit an empty leaf.
@@ -98,6 +125,7 @@ impl<'a> PageMut<'a> {
         b[8..10].copy_from_slice(&tree_id.to_le_bytes());
         b[12..16].copy_from_slice(&page_no.to_le_bytes());
         b[16..18].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+        b[FORMAT_AT..FORMAT_AT + 2].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         PageMut { b }
     }
 
@@ -213,6 +241,11 @@ impl<'a> PageMut<'a> {
 /// `finalise(0)` call sites are untouched: the stamp happens on the way out.
 pub fn seal(b: &mut [u8], gen: u64) {
     b[24..32].copy_from_slice(&gen.to_le_bytes());
+    // The stamp is written here as well as in `init` because `seal` is the
+    // ONE place a page image leaves for the medium: a page reached through
+    // `reopen` rather than `init` -- a rewrite -- gets the same guarantee
+    // without every mutation site having to remember it.
+    b[FORMAT_AT..FORMAT_AT + 2].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     let c = checksum(b);
     b[36..40].copy_from_slice(&c.to_le_bytes());
 }
@@ -243,6 +276,12 @@ impl<'a> PageRef<'a> {
         if rd_u32(b, 0) != MAGIC { return bad("bad magic"); }
         if rd_u16(b, 4) != VERSION { return bad("unknown format version"); }
         if verify_crc && rd_u32(b, 36) != checksum(b) { return bad("checksum mismatch"); }
+        // After the checksum, never before: a page whose bytes are damaged is
+        // damage, not a foreign format. Only an INTACT page gets to claim a
+        // disk-format version, and a claim other than 2 is refused rather
+        // than read (docs/core/FORMAT_V2.md).
+        let stamp = rd_u16(b, FORMAT_AT);
+        if stamp != FORMAT_VERSION { return Err(Error::UnsupportedFormat { found: stamp }); }
         if rd_u32(b, 12) != want { return bad("page_no mismatch"); }
         if PageKind::from_u16(rd_u16(b, 6)).is_none() { return bad("unknown page kind"); }
 
@@ -276,6 +315,8 @@ impl<'a> PageRef<'a> {
         if b.len() != PAGE_SIZE { return bad("wrong buffer length"); }
         if rd_u32(b, 0) != MAGIC { return bad("bad magic"); }
         if rd_u16(b, 4) != VERSION { return bad("unknown format version"); }
+        let stamp = rd_u16(b, FORMAT_AT);
+        if stamp != FORMAT_VERSION { return Err(Error::UnsupportedFormat { found: stamp }); }
         if rd_u32(b, 12) != want { return bad("page_no mismatch"); }
         if PageKind::from_u16(rd_u16(b, 6)).is_none() { return bad("unknown page kind"); }
         Ok(PageRef { b })

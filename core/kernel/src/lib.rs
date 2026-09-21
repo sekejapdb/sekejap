@@ -158,6 +158,16 @@ pub enum Error {
     /// A packed range can only be grafted where the live tree has no key.
     /// Overwriting through this path would bypass ordinary update semantics.
     RangeNotEmpty,
+    /// The file is not a sekejap disk format v2 file: an intact page claims
+    /// the disk-format version in `found` at bytes 18-19 and this build
+    /// reads 2 and nothing else (`page::FORMAT_VERSION`,
+    /// docs/core/FORMAT_V2.md).
+    ///
+    /// Raised before any byte of the source is changed, and never converted:
+    /// there is no v1, no e1 file and no silent conversion, so the only
+    /// honest answer is to name the number the file carries and stop. Zero
+    /// is what an e4 pre-release file carries.
+    UnsupportedFormat { found: u16 },
 }
 
 impl From<std::io::Error> for Error {
@@ -194,6 +204,10 @@ impl std::fmt::Display for Error {
             Error::ResourceLimit(why) => write!(f, "resource limit: {why}; reduce the transaction, release old snapshots, or export to a larger store"),
             Error::DuplicateKey => write!(f, "bulk load input contained a duplicate key"),
             Error::RangeNotEmpty => write!(f, "packed range overlaps keys already present in the live tree"),
+            // The refusal sentence, written ONCE. Everything above this
+            // layer quotes it rather than composing its own.
+            Error::UnsupportedFormat { found } =>
+                write!(f, "sekejap disk format {found}; this build reads v2"),
         }
     }
 }
@@ -205,6 +219,11 @@ impl std::error::Error for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The sekejap disk format this build reads and writes: 2. Defined in
+/// [`page`] beside the header field it is stamped into, and re-exported here
+/// so a caller names `kernel::FORMAT_VERSION` rather than a page-module path.
+pub use page::FORMAT_VERSION;
 
 /// The gate's edge formula, shared so e3 and the SQLite harness traverse the
 /// IDENTICAL logical graph: per src, 2 near edges (locality) + 2 far (cross).

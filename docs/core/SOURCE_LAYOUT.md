@@ -23,7 +23,7 @@ current headings are numbered `## 1.` through `## 7.`),
 
 | Module | Atomic | Contract |
 | --- | --- | --- |
-| `core/engine/src/lib.rs` | The row codec: `Layout`, `Kind`, dense P1 encode/decode, binary JSON, descriptors, projection. Also the module tree and the `pub use` aliases that keep every historical public path (`collection_backend`, `pagewal`, `recovery`, `spatial_geometry`, `spatial_math`) spelled as it always was. | `docs/core/FORMAT_V1.md` |
+| `core/engine/src/lib.rs` | The row codec: `Layout`, `Kind`, dense P1 encode/decode, binary JSON, descriptors, projection. Also the module tree and the `pub use` aliases that keep every historical public path (`collection_backend`, `pagewal`, `recovery`, `spatial_geometry`, `spatial_math`) spelled as it always was, and the `FORMAT_VERSION` re-export. | `docs/core/FORMAT_V2.md` |
 
 ## `core/engine/src/store/` -- the storage layer
 
@@ -31,11 +31,11 @@ current headings are numbered `## 1.` through `## 7.`),
 | --- | --- | --- |
 | `core/engine/src/store/mod.rs` | The selected V2 backend: mapping a public `Config`/`ResourceLimits` onto the page-WAL and refusing what it cannot honour. Re-exported as `sekejap_core::collection_backend`. | `docs/core/V2_COLLECTION_INTEGRATION.md` |
 | `core/engine/src/store/pagewal/mod.rs` | `PageWalStore`: `E4PWAL02` frames, two checkpoint metadata copies, committed-WAL overlay, publication hint, reader slots. | `docs/core/V2_COLLECTION_INTEGRATION.md` |
-| `core/engine/src/store/pagewal/format.rs` | The on-disk header and create-feature bits. | `docs/core/FORMAT_FREEZE.md` |
+| `core/engine/src/store/pagewal/format.rs` | The on-disk header, the create-feature bits, and the disk-format stamp checked on both metadata copies before any other page is read. | `docs/core/FORMAT_V2.md` |
 | `core/engine/src/store/pagewal/current_reader.rs` | The read-only current-source reader used by rebuild and verification. | `docs/core/RECOVERY_CONTRACT.md` |
 | `core/engine/src/store/pagewal/repair.rs` | `recover_to`: rebuilding a store from intact frames. | `docs/core/RECOVERY_CONTRACT.md` |
 | `core/engine/src/store/recovery.rs` | Typed recovery above the kernel; rootless output is candidate evidence, never a published database. | `docs/core/RECOVERY_CONTRACT.md` |
-| `core/engine/src/store/dense_v3.rs` | The dense-v3 row codec: direct encode, direct decode, single-field reads. | `docs/core/FORMAT_V1.md` |
+| `core/engine/src/store/dense_v3.rs` | The dense-v3 row codec: direct encode, direct decode, single-field reads. | `docs/core/FORMAT_V2.md` |
 | `core/engine/src/store/scalar_key.rs` | Version-1 scalar index keys: lexicographic byte order is value order within a declared kind. | `docs/core/COLLECTIONS.md` |
 
 ## `core/engine/src/collections/` -- typed collections
@@ -58,7 +58,7 @@ current headings are numbered `## 1.` through `## 7.`),
 | `core/engine/src/index/mod.rs` | The family directory itself; one directory per family. | -- |
 | `core/engine/src/index/text/mod.rs` | Persisted analyzer-v1 postings, term/corpus statistics and exact BM25 search. | `docs/lang/QL_CONTRACT.md` §4.6 "Text search" |
 | `core/engine/src/index/text/analyzer.rs` | Analyzer v1: pinned Unicode alphanumeric/lowercase behaviour, no std Unicode on the runtime path. | `docs/lang/QL_CONTRACT.md` §4.6 "Text search" |
-| `core/engine/src/index/text/segments.rs` | The segment posting format behind the `SEGMENT_FEATURE` bit. | `docs/core/FORMAT_FREEZE.md` |
+| `core/engine/src/index/text/segments.rs` | The segment posting format behind the `SEGMENT_FEATURE` bit. | `docs/core/FORMAT_V2.md` |
 | `core/engine/src/index/text/unicode_v1.rs` | The generated Unicode tables the analyzer is pinned to. | `docs/lang/QL_CONTRACT.md` §4.6 "Text search" |
 | `core/engine/src/index/vector/exact.rs` | The exact vector index: locators, sidecar scans, `VectorMetric`, `VectorHit`. | `docs/lang/QL_CONTRACT.md` §4.5 "Vector" (exact) |
 | `core/engine/src/index/vector/quantized.rs` | The quantized companion index, its candidates and its rerank. | `docs/lang/QL_CONTRACT.md` §4.5 "Vector" (approximate) |

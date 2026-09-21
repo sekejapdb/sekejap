@@ -1,5 +1,7 @@
 # V2 disk-format qualification — 2026-09-16
 
+> Superseded 2026-09-21: the envelope named `e4-format-v1` here is now **sekejap disk format v2** ([core/FORMAT_V2.md](core/FORMAT_V2.md)), stamped into page bytes 18-19. e4 was never published; this document is the record of that pre-release baseline.
+
 Status: **qualified storage candidate; retain the changes**. This report distinguishes the storage compatibility
 candidate from a public release and from completion of the multimodel product.
 Live continuation: [PHASE1_STATE.md](PHASE1_STATE.md).
@@ -14,7 +16,7 @@ qualification. Its full-workspace results remain valid for the unchanged engine.
 The current storage shape is `E4PWAL02`, 4096-byte physical version-1 pages,
 4144-byte WAL frames, per-database compact-cell capability, dense-v3 typed
 records, immutable layout IDs, binary JSON, point values and separate vector
-payloads. [FORMAT_V1.md](FORMAT_V1.md) specifies the actual envelope and
+payloads. [core/FORMAT_V2.md](core/FORMAT_V2.md) specifies the actual envelope and
 extension rules. This loop adds no persistent field, encoding or index family.
 
 The eight laws are adopted in CONTRACT.md. Minor updates must preserve the

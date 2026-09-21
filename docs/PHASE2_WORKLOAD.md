@@ -1,5 +1,7 @@
 # Phase 2 workload and semantic contract
 
+> Superseded 2026-09-21: the envelope named `e4-format-v1` here is now **sekejap disk format v2** ([core/FORMAT_V2.md](core/FORMAT_V2.md)), stamped into page bytes 18-19. e4 was never published; this document is the record of that pre-release baseline.
+
 Status: implementation target, 2026-09-16. This document specifies acceptance;
 it does not claim these APIs, indexes or benchmark results already exist.
 tracker `phase2` owns live progress. The immutable `e4-format-v1` foundation

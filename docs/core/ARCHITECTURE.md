@@ -13,8 +13,8 @@ loaded population).
 
 ## 1. Storage
 
-Contract: `docs/core/V2_COLLECTION_INTEGRATION.md`, `docs/core/FORMAT_V1.md`,
-`docs/core/RECOVERY_CONTRACT.md`, `docs/core/FORMAT_FREEZE.md`.
+Contract: `docs/core/V2_COLLECTION_INTEGRATION.md`, `docs/core/FORMAT_V2.md`,
+`docs/core/RECOVERY_CONTRACT.md`.
 
 ### 1.1 Page WAL — `src/store/pagewal/mod.rs`
 
@@ -35,7 +35,7 @@ in any process holds one.
 
 Create-time feature bits (`compact-cells` and friends) are written into the
 header (`src/store/pagewal/format.rs`) and are what an older binary refuses
-before touching bytes (`docs/core/FORMAT_FREEZE.md`). Repair rebuilds a store from
+before touching bytes (`docs/core/FORMAT_V2.md`). Repair rebuilds a store from
 intact frames (`src/store/pagewal/repair.rs`). Typed recovery above the kernel
 treats a rootless output as candidate evidence, never a published database
 (`src/store/recovery.rs`, `docs/core/RECOVERY_CONTRACT.md`).

@@ -1,9 +1,11 @@
 # Phase 1 complete — 2026-09-16
 
+> Superseded 2026-09-21: the envelope named `e4-format-v1` here is now **sekejap disk format v2** ([core/FORMAT_V2.md](core/FORMAT_V2.md)), stamped into page bytes 18-19. e4 was never published; this document is the record of that pre-release baseline.
+
 **Disk-format stabilization is complete.** The declared entity-storage baseline
 is **e4-format-v1**, frozen engine `59d1cbc770284f160ffda53cc1ee545167733d11`.
 Read [FORMAT_BASELINE.md](FORMAT_BASELINE.md) for artifacts and future upgrade
-commands, [FORMAT_V1.md](FORMAT_V1.md) for byte/extension rules, and
+commands, [core/FORMAT_V2.md](core/FORMAT_V2.md) for byte/extension rules, and
 [PHASE1_COMPLETION_AUDIT.md](PHASE1_COMPLETION_AUDIT.md) for acceptance evidence.
 tracker task: `sekejap-e4/phase1-format-qualification`.
 

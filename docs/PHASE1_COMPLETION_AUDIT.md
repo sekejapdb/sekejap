@@ -1,5 +1,7 @@
 # Phase 1 completion audit — 2026-09-16
 
+> Superseded 2026-09-21: the envelope named `e4-format-v1` here is now **sekejap disk format v2** ([core/FORMAT_V2.md](core/FORMAT_V2.md)), stamped into page bytes 18-19. e4 was never published; this document is the record of that pre-release baseline.
+
 Scope: storage format `e4-format-v1`, frozen source baseline `59d1cbc`, and
 completion of the current storage phase. This audit does not require a public
 product release before a storage baseline can be declared. No runtime edits or
@@ -15,10 +17,10 @@ promises remain intact.
 
 | Requirement | Verified source/evidence |
 |---|---|
-| One selected collection backend and explicit envelope | [FORMAT_V1.md](FORMAT_V1.md), [collection_backend.rs](../src/collection_backend.rs), [pagewal/format.rs](../src/pagewal/format.rs): `E4PWAL02`, 4096-byte physical v1 pages, 4144-byte WAL frames, database identity, transaction history and required features. |
+| One selected collection backend and explicit envelope | [core/FORMAT_V2.md](core/FORMAT_V2.md), [store/mod.rs](../core/engine/src/store/mod.rs), [store/pagewal/format.rs](../core/engine/src/store/pagewal/format.rs): `E4PWAL02`, 4096-byte physical v1 pages, 4144-byte WAL frames, database identity, transaction history and required features. |
 | Existing-file codec/feature preservation | Database-installed codec on open/rollback; unchanged features on commits. Both cell families are readable in every build. [pagewal.rs](../src/pagewal.rs), [cell codec test](../tests/pagewal_cell_codec.rs), [creation test](../tests/pagewal_create_codec.rs). |
-| Unsupported-version refusal before mutation | [Replica refusal tests](../tests/format_replica_refusal.rs), [compatibility tests](../tests/format_v1_compat.rs); inherited logical admission precedes version-specific parsing. Broken-code controls failed as intended. |
-| Exact entity and identity compatibility oracle | Mandatory preserved candidate corpus; document, numeric-ID, scan, delete/reinsert and complete post-write/reopen checks. [FORMAT_V1.md](FORMAT_V1.md), [compatibility test](../tests/format_v1_compat.rs). |
+| Unsupported-version refusal before mutation | [Replica refusal tests](../core/engine/tests/format_replica_refusal.rs), [compatibility tests](../core/engine/tests/format_v2_compat.rs); inherited logical admission precedes version-specific parsing. Broken-code controls failed as intended. |
+| Exact entity and identity compatibility oracle | Mandatory preserved candidate corpus; document, numeric-ID, scan, delete/reinsert and complete post-write/reopen checks. [core/FORMAT_V2.md](core/FORMAT_V2.md), [compatibility test](../core/engine/tests/format_v2_compat.rs). |
 | Linux qualification | [Qualification report](PHASE1_QUALIFICATION.md) and [target counts](phase1-evidence/test-results.json): default 422/0/2, compact/balance 427/0/2, retained features 427/0/2 (pass/fail/ignored). Raw logs preserve the failures and corrections. |
 | Scoped recovery semantics | [Recovery runbook](PHASE1_RECOVERY_RUNBOOK.md), [raw repair test](../tests/pagewal_repair.rs), typed `rootless_collection_recovery_preserves_source_and_reports_vector_limit` in [collections.rs](../src/collections.rs). Both tests pass in all three retained Linux logs. |
 

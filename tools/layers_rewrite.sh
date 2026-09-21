@@ -81,8 +81,8 @@ for f in "$@"; do
     -e 's|docs/ARCHITECTURE\.md|docs/core/ARCHITECTURE.md|g' \
     -e 's|docs/COLLECTIONS\.md|docs/core/COLLECTIONS.md|g' \
     -e 's|docs/FORMAT_BASELINE\.md|docs/core/FORMAT_BASELINE.md|g' \
-    -e 's|docs/FORMAT_FREEZE\.md|docs/core/FORMAT_FREEZE.md|g' \
-    -e 's|docs/FORMAT_V1\.md|docs/core/FORMAT_V1.md|g' \
+    -e 's|docs/FORMAT_FREEZE\.md|docs/core/FORMAT_V2.md|g' \
+    -e 's|docs/FORMAT_V1\.md|docs/core/FORMAT_V2.md|g' \
     -e 's|docs/FOUNDATION_TEST_STANDARD\.md|docs/core/FOUNDATION_TEST_STANDARD.md|g' \
     -e 's|docs/GRAPH_CONTRACT\.md|docs/core/GRAPH_CONTRACT.md|g' \
     -e 's|docs/RECOVERY_BLOCKERS_LOOP\.md|docs/core/RECOVERY_BLOCKERS_LOOP.md|g' \

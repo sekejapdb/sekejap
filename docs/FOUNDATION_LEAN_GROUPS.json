@@ -1,5 +1,5 @@
 {
-  "version": "F1-lean-4",
+  "version": "F1-lean-5",
   "purpose": "Fast regression coverage; never a substitute for eight-law release qualification",
   "commands": {
     "pager": [
@@ -60,14 +60,20 @@
       "io::tests"
     ],
     "compatibility": [
+      "-p",
+      "sekejap-core",
       "--test",
-      "format_v1_compat",
+      "format_v2_compat",
       "--test",
       "format_replica_refusal",
       "--test",
       "pagewal_cell_codec",
       "--test",
-      "pagewal_create_codec"
+      "pagewal_create_codec",
+      "-p",
+      "sekejap-kernel",
+      "--test",
+      "format_stamp"
     ]
   },
   "groups": [
@@ -151,8 +157,8 @@
         "compatibility"
       ],
       "status": "BASELINE_QUALIFIED",
-      "coverage": "Mandatory immutable prototype plus59d1cbc baseline corpora (10databases): full document/numericidentity read/write/reopen, both codecs, declared features, and source-preserving unknown-format refusal. Preserved executable cross-build upgrade/rollback20arms passed; command in FORMAT_BASELINE.md.",
-      "remaining": "Repeat the preserved-binary rollback gate for every later engine release; add immutable fixtures for each future shipped index/interface. Public product qualification is separate."
+      "coverage": "The disk-format stamp (page bytes 18-19 = 2, refused by name otherwise, no byte changed) plus two independently captured v2 corpora (10 databases): full document/numeric identity read/write/reopen, both codecs, declared features, and source-preserving refusal of an unknown feature bit, an unsupported physical page version, a foreign WAL and a wrong stamp.",
+      "remaining": "Re-establish the preserved-binary rollback gate against a binary that writes v2, then repeat it for every later engine release; add immutable fixtures for each future shipped index/interface. Public product qualification is separate."
     }
   ]
 }

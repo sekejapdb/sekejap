@@ -1,5 +1,7 @@
 # Candidate full-text format and behavior
 
+> Superseded 2026-09-21: the envelope named `e4-format-v1` here is now **sekejap disk format v2** ([core/FORMAT_V2.md](core/FORMAT_V2.md)), stamped into page bytes 18-19. e4 was never published; this document is the record of that pre-release baseline.
+
 Status: implemented Phase 2 candidate, not released or frozen. Analyzer-v1,
 persisted postings, catalog admission, bounded lifecycle, queries and explicit
 verification/rebuild are integrated. This extends the common catalog without

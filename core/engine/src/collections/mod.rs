@@ -49,6 +49,13 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 impl From<kernel::Error> for Error {
     fn from(e: kernel::Error) -> Self {
+        // A disk-format refusal is not a kernel accident to be wrapped: it is
+        // exactly what `Unsupported` names -- a format this binary does not
+        // implement, raised before any byte of the source changed. The
+        // sentence itself is written once, in `kernel::Error`'s `Display`.
+        if matches!(e, kernel::Error::UnsupportedFormat { .. }) {
+            return Self::Unsupported(e.to_string());
+        }
         Self::Kernel(e)
     }
 }
@@ -913,7 +920,7 @@ impl Database {
         let store = Backend::open(path, cache, |s| typed_check(s, &detail));
         let store = match store {
             Ok(s) => s,
-            Err(k) => return Err(detail.into_inner().unwrap_or(Error::Kernel(k))),
+            Err(k) => return Err(detail.into_inner().unwrap_or_else(|| Error::from(k))),
         };
         let h = read_header(store.store())?;
         let mut db = Self::wrap(store, false, h.limits, h.indexes);
@@ -957,7 +964,7 @@ impl Database {
         });
         let store = match store {
             Ok(s) => s,
-            Err(k) => return Err(detail.into_inner().unwrap_or(Error::Kernel(k))),
+            Err(k) => return Err(detail.into_inner().unwrap_or_else(|| Error::from(k))),
         };
         let mut db = Self::wrap(store, true, limits.get(), index_header.get());
         db.dropping = drop_collection::scan_dropping(db.store.store(), db.index_header)?;

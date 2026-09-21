@@ -24,6 +24,11 @@ const FUTURE_FORMAT: &str = "database format version 3+ is newer than this engin
 const ZERO_FORMAT: &str = "database format version 0 is not one this engine writes";
 /// Version a newly created store is stamped with. The `compact-cells` cargo
 /// feature still decides only this default; opening never restamps it.
+///
+/// NOT the disk-format stamp. `crate::FORMAT_VERSION` (page bytes 18-19) is
+/// the sekejap disk format of the FILE and is always 2; this one is the
+/// logical superblock version of the inherited kernel `Store` and says what
+/// its pages contain.
 pub const FORMAT_VERSION: u16 = if cfg!(feature="compact-cells") {2}else{1};
 /// Optional second meta-page slot, never a user-tree row. Covered by the page
 /// checksum. A normal checkpoint reinitializes the slot without this marker.
@@ -231,6 +236,14 @@ impl Meta {
         let a = read_slot(META_PAGE);
         let b = read_slot(META_PAGE_B);
         for result in [&a, &b] {
+            // An intact slot that claims a disk format other than 2 refuses
+            // for BOTH copies' sake: a v2 sibling may not hide it, exactly as
+            // an intact unsupported logical version may not be hidden. The
+            // stamp is read after the page checksum, so reaching here means
+            // the bytes are what was written, not damage.
+            if let Err(Error::UnsupportedFormat { found }) = result {
+                return Err(Error::UnsupportedFormat { found: *found });
+            }
             if let Err(Error::Corrupt { page_no, why }) = result {
                 if *why == FUTURE_FORMAT || *why == ZERO_FORMAT || *why == "unknown format version" {
                     return Err(Error::Corrupt { page_no: *page_no, why });

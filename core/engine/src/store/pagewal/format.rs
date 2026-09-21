@@ -92,6 +92,14 @@ impl Header {
 
 // A damaged copy may fall back to its independently checksummed sibling. An
 // intact unsupported copy must refuse, never be hidden by the other copy.
+//
+// This is also where the DISK-FORMAT STAMP is judged. `disk_header` is the
+// first thing every open does (`Pager::inspect_bounded`), so both checkpoint
+// metadata copies are checked before any other page of the file is read: a
+// file that is not sekejap disk format v2 is named and refused without a
+// root, a catalog or a WAL frame ever being touched. An intact copy claiming
+// anything but 2 refuses here even when its sibling says 2, for the same
+// reason an intact unsupported feature set does.
 pub(super) fn disk_header(data: &dyn FileIo) -> Result<Option<Header>> {
     if data.len()? < 2 * PAGE as u64 { return Err(bad("missing checkpoint metadata pages")); }
     let mut selected: Option<Header> = None;
@@ -99,6 +107,10 @@ pub(super) fn disk_header(data: &dyn FileIo) -> Result<Option<Header>> {
         let mut bytes = [0; PAGE];
         data.read_at(&mut bytes, no as u64 * PAGE as u64)?;
         if kernel::page::checksum(&bytes) != u32at(&bytes, 36) { continue; }
+        let stamp = kernel::page::format_version(&bytes);
+        if stamp != kernel::FORMAT_VERSION {
+            return Err(kernel::Error::UnsupportedFormat { found: stamp });
+        }
         let header = Header::decode(&bytes, no)?;
         if let Some(old) = selected {
             if old.identity != header.identity || old.features != header.features {

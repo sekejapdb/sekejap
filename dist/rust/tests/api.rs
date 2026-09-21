@@ -555,3 +555,41 @@ fn a_vector_column_round_trips_as_a_json_array() {
         json!([0.25, 0.5, 0.75])
     );
 }
+
+/// `docs/core/FORMAT_V2.md`: the published crate names the disk format it
+/// writes, the number is the kernel's one constant rather than a copy, and a
+/// database this crate creates carries it in page bytes 18-19 of both
+/// checkpoint metadata copies and of its data pages.
+#[test]
+fn the_crate_names_disk_format_two_and_every_page_it_writes_carries_it() {
+    const PAGE: usize = 4096;
+    const STAMP_AT: usize = 18;
+    assert_eq!(sekejap::FORMAT_VERSION, 2);
+    assert_eq!(sekejap::FORMAT_VERSION, sekejap::core::FORMAT_VERSION);
+
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    posts(&db);
+    for n in 0..400 {
+        db.put(("posts", &format!("p{n:05}") as &str), &document(n))
+            .expect("put");
+    }
+    drop(db);
+
+    let data = std::fs::read(tmp.path().join("data")).expect("read data file");
+    assert_eq!(data.len() % PAGE, 0, "the data file is whole pages");
+    let pages = data.len() / PAGE;
+    assert!(
+        pages >= 3,
+        "need both metadata copies and at least one data page; got {pages}"
+    );
+    for no in 0..pages {
+        let at = no * PAGE + STAMP_AT;
+        let stamp = u16::from_le_bytes(data[at..at + 2].try_into().unwrap());
+        assert_eq!(
+            stamp,
+            sekejap::FORMAT_VERSION,
+            "page {no} of a database this crate created must carry disk format 2"
+        );
+    }
+}

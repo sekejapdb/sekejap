@@ -1,5 +1,5 @@
 //! Fixed logical oracle for the preserved five-fixture corpus.
-//! Ported from tests/format_v1_compat.rs; expected values come from its pinned
+//! Ported from core/engine/tests/format_v2_compat.rs; expected values come from its pinned
 //! manifests and the original generator insertion sequence, never readback.
 use sekejap_core::collections::{CollectionId, Database, EntityId};
 use kernel::{

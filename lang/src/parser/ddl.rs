@@ -390,7 +390,7 @@ impl Parser {
             }
             other => {
                 return Err(SqlError::unsupported(format!(
-                    "column type `{other}` has no Kind in docs/core/FORMAT_V1.md"
+                    "column type `{other}` has no Kind in docs/core/FORMAT_V2.md"
                 )))
             }
         };

@@ -1,5 +1,8 @@
-//! Reference fixture generator for format v1. Uses only the public typed API
-//! (`collections::Database` over PageWalStore). Prints nothing on success.
+//! Reference fixture generator for sekejap disk format v2. Uses only the
+//! public typed API (`collections::Database` over PageWalStore). Prints
+//! nothing on success. The disk-format stamp is not written here: every page
+//! this generator's writes produce carries it because `kernel::page` stamps
+//! it (docs/core/FORMAT_V2.md).
 //!
 //! Close does not checkpoint: `Database` / `PageWalStore` have no Drop that
 //! folds the WAL. A wal-pending fixture is `commit()` then `drop` with no
@@ -501,7 +504,7 @@ fn write_fixture(
         });
     }
     let manifest = json!({
-        "format": "e4-format-v1",
+        "format": "sekejap-disk-format-v2",
         "header_magic": "E4PWAL02",
         "features": features,
         "compact_cells": compact,
@@ -582,7 +585,7 @@ fn run(out: &Path) -> Result<(), Box<dyn std::error::Error>> {
             &diff_sha,
         )?);
         let index = json!({
-            "format": "e4-format-v1",
+            "format": "sekejap-disk-format-v2",
             "header_magic": "E4PWAL02",
             "generator": {
                 "source": "bench/src/bin/format_fixture.rs",

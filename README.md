@@ -33,8 +33,15 @@ there. Broad SQL and application adapters remain subsequent product work.
 
 ## 0. Why e4 exists — the finding that forced it
 
-**Phase 1 disk format stabilized (2026-09-16):** `e4-format-v1` is the named
-V2 entity-storage baseline at engine commit `59d1cbc`. Its source, Linux binaries
+**Disk format v2 declared (2026-09-21):** the on-disk envelope as it stands
+is **sekejap disk format v2**, stable the way SQLite's file format is stable.
+Every sekejap from 0.17.0 reads and writes v2; page header bytes 18-19 carry
+the little-endian u16 `2` and a file claiming anything else is refused by name
+with no byte changed. There is no v1, and sekejap reads no e1 file. See
+[the v2 contract](docs/core/FORMAT_V2.md).
+
+**Phase 1 disk format stabilized (2026-09-16):** the pre-release baseline that
+became v2 was named `e4-format-v1` at engine commit `59d1cbc`. Its source, Linux binaries
 and permanent databases are preserved. Full Linux suites passed **422 / 427 /
 427 tests**, with zero failures and two existing ignores per mode. The expanded
 mandatory fixture suite passed **7/7 in all three modes**, covering both old and
@@ -45,7 +52,7 @@ baseline. No runtime encoding changed in the completion loop. Interface work
 can proceed within this format contract. Public packaging and complete
 multimodel/eight-law product qualification remain separate. See
 [baseline, evidence and future gate](docs/core/FORMAT_BASELINE.md),
-[format specification](docs/core/FORMAT_V1.md) and
+[format specification](docs/core/FORMAT_V2.md) and
 [recovery runbook](docs/PHASE1_RECOVERY_RUNBOOK.md).
 
 **Law 8 adopted (2026-09-15): compatibility is permanent.** New E4 releases
@@ -61,7 +68,7 @@ Multimodel SELECT performance is the product objective; roughly 1.75× SQLite
 write time can be acceptable when measured query benefits justify it. The
 earlier 1.5× write threshold is no longer an unconditional release veto.
 Include explicit EXPORT/IMPORT and compatible normal upgrades. See
-[the recorded requirements](docs/core/FORMAT_FREEZE.md) and the new Law 8 above.
+[the recorded requirements](docs/core/FORMAT_V2.md#history) and the new Law 8 above.
 
 **Owner release direction (2026-09-15): prioritize disk-format stability.**
 The storage shape exists, but upgrade compatibility is not yet qualified:
@@ -70,7 +77,7 @@ on build features. Finish the current reservation evaluation, then focus on
 one explicit release format, format-affecting recovery decisions, collection
 integration and frozen-file upgrade tests. Performance improvements that keep
 the format can follow alongside interfaces; all seven laws remain unchanged.
-See [the bounded format-freeze work and compatibility promise](docs/core/FORMAT_FREEZE.md).
+See [the bounded format-freeze work and compatibility promise](docs/core/FORMAT_V2.md#history).
 
 **Format audit / reservation decision (2026-09-15):** Pi and server reproduce
 foreign-WAL acceptance, stale-WAL rollback of a newer checkpoint, and mutation

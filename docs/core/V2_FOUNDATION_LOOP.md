@@ -215,7 +215,7 @@ Keep the integration and the benchmark evidence. Disk behavior is accepted
 relative to SQLite; do not start another disk optimization loop or make a
 separate 2x allocation ceiling a prerequisite. The next product milestone is
 the named format/index namespace and interface contract described in
-[FORMAT_FREEZE.md](FORMAT_FREEZE.md), with remaining correctness and
+[FORMAT_V2.md](FORMAT_V2.md), with remaining correctness and
 compatibility requirements explicit. Write throughput remains a measured
 cost to improve; combined multimodel query benefits have not been measured.
 

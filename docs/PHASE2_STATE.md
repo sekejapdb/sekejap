@@ -1,5 +1,7 @@
 # Phase 2 live handoff — 2026-09-17
 
+> Superseded 2026-09-21: the envelope named `e4-format-v1` here is now **sekejap disk format v2** ([core/FORMAT_V2.md](core/FORMAT_V2.md)), stamped into page bytes 18-19. e4 was never published; this document is the record of that pre-release baseline.
+
 The full Phase 2 objective remains ACTIVE: multimodel indexing, usable embedded
 queries, combined execution, compatibility/recovery and measured acceptance.
 Nothing in Phase 2 is committed, released or frozen yet. Phase 1 stays complete;

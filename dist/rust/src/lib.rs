@@ -66,6 +66,13 @@ use serde_json::Value;
 /// The crate version, as one string for a caller that reports it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The sekejap disk format this build reads and writes: 2. Every file
+/// sekejap creates carries it at page bytes 18-19, and a file that carries
+/// anything else is refused by name with nothing changed. There is no v1.
+/// One constant, defined in `kernel::page` and re-exported through
+/// `sekejap_core`; see `docs/core/FORMAT_V2.md`.
+pub use sekejap_core::FORMAT_VERSION;
+
 /// Which of the two shapes a [`Db`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {

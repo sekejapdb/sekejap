@@ -240,21 +240,23 @@ fn pack_tree_produces_identical_tree() {
     // (1924792605, 1868071275, 1375923709); (2) at 2n step A, when seal
     // began stamping the publishing generation into the formerly-always-0
     // lsn field -- every page's bytes change by design, so the chained
-    // page-checksum digest must move with them.
+    // page-checksum digest must move with them; (3) at format v2, when bytes
+    // 18-19 of every page began carrying the disk-format stamp, which the page
+    // checksum covers -- again every structural field unchanged.
     #[cfg(not(feature = "compact-cells"))]
     let want: [(u32, usize, u32, u32, u64, u32, u32); 3] = [
-        (278,  3, 1, 275, 50_000, 279,  1320246642),
-        (835,  3, 1, 822, 60_000, 836,  2156132941),
-        (1006, 3, 1, 994, 60_000, 1007, 1305404169),
+        (278,  3, 1, 275, 50_000, 279,  3916603230),
+        (835,  3, 1, 822, 60_000, 836,  3391992416),
+        (1006, 3, 1, 994, 60_000, 1007, 3102113070),
     ];
     // Native capture after all cell bytes, point lookups, scans, page fill and
     // published-tree structure were independently checked above. Compact framing
     // removes two bytes per ordinary cell; this intentionally changes density.
     #[cfg(feature = "compact-cells")]
     let want: [(u32, usize, u32, u32, u64, u32, u32); 3] = [
-        (251, 3, 1, 248, 50_000, 252, 944332828),
-        (835, 3, 1, 822, 60_000, 836, 800627646),
-        (973, 3, 1, 961, 60_000, 974, 522263165),
+        (251, 3, 1, 248, 50_000, 252, 3872540161),
+        (835, 3, 1, 822, 60_000, 836, 1695994771),
+        (973, 3, 1, 961, 60_000, 974, 2272463696),
     ];
     for (i, ((name, got), want)) in cases.iter().zip(want.iter()).enumerate() {
         assert_eq!(

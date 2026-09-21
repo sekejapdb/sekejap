@@ -3,7 +3,7 @@
 
 Linux example (all destinations new, outside the immutable corpus):
   cargo build -p sekejap-bench --release --bin index_format_fixture
-  python3 tools/index_format_refusal.py --corpus docs/format-v1-baseline \
+  python3 tools/index_format_refusal.py --corpus docs/format-v2-baseline \
     --baseline-bin /bench/reference/bin/format_compat-baseline \
     --baseline-source /bench/reference/source \
     --current-bin target/release/index_format_fixture --work <scratch>

@@ -1,7 +1,7 @@
 # e3 parity checklist — the phase-3 bar
 
 Owner, 2026-09-20: phase 3 is the shipment path to replace e1, and the bar is
-what sekejap-e3 does today. The disk format (e4-format-v1, engine 59d1cbc,
+what sekejap-e3 does today. The disk format (sekejap disk format v2,
 frozen under Law 8) stays; deeper performance work follows parity. This file
 is the tracked target: every row is DONE, CONTRACT-T2, CONTRACT-T3, or NOT IN
 CONTRACT, and a NOT IN CONTRACT row must become a contract row with a tier or

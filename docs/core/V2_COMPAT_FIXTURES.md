@@ -1,7 +1,7 @@
 # V2 typed-collection compatibility fixture helper
 
 `bench/src/bin/v2_compat_fixture.rs` is a bounded, file-tools-produced helper for
-gathering real older/newer-binary evidence toward `docs/core/FORMAT_FREEZE.md`
+gathering real older/newer-binary evidence toward `docs/core/FORMAT_V2.md`
 step 4, ahead of `collections::Database` being wired to
 `e4_prototype::pagewal::PageWalStore` (see the doc comment at the top of
 `src/pagewal.rs`, which points at the not-yet-written integration doc, and
@@ -125,7 +125,7 @@ known collections. This is an encoding-compatibility test only.
 
 ## What this does NOT prove
 
-- Not proof of the release-frozen format from `docs/core/FORMAT_FREEZE.md`: the
+- Not proof of the release-frozen format from `docs/core/FORMAT_V2.md`: the
   format is explicitly not yet frozen, and this fixture's baseline is
   pre-release.
 - Not proof that the real `Database`-over-`PageWalStore` writer (once it

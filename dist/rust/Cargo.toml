@@ -19,7 +19,7 @@ tempfile = "3"
 # The four storage features are the configuration every E4 test group runs
 # under (`docs/LAYERS.md`), so the published crate ships that configuration
 # rather than a second, untested one. Each is additive on disk
-# (`docs/core/FORMAT_FREEZE.md`); `default-features = false` switches them off.
+# (`docs/core/FORMAT_V2.md`); `default-features = false` switches them off.
 [features]
 default = ["compact-cells", "sqlite-balance", "keyspace-append", "slotref-split"]
 sqlite-balance = ["sekejap-core/sqlite-balance"]

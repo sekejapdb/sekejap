@@ -1,5 +1,7 @@
 # Phase 2 acceptance review
 
+> Superseded 2026-09-21: the envelope named `e4-format-v1` here is now **sekejap disk format v2** ([core/FORMAT_V2.md](core/FORMAT_V2.md)), stamped into page bytes 18-19. e4 was never published; this document is the record of that pre-release baseline.
+
 Status: incomplete candidate, 2026-09-17. This review uses the scope in
 [PHASE2_WORKLOAD.md](PHASE2_WORKLOAD.md). tracker owns live task status.
 No Phase 2 release or accepted commit is claimed here.

@@ -17,6 +17,11 @@ pub use crate::store::{pagewal, recovery};
 /// the layer it depends on, so the names leave the crate here.
 pub use kernel::io::IoMode;
 pub use kernel::store::{Config, SyncMode};
+/// The sekejap disk format every file this engine creates or rewrites
+/// carries at page bytes 18-19: 2. One constant, defined in
+/// `kernel::page`; this is a re-export, not a copy.
+/// See `docs/core/FORMAT_V2.md`.
+pub use kernel::FORMAT_VERSION;
 pub(crate) use crate::index::text::analyzer as text_analyzer;
 pub(crate) use crate::index::vector::quant as vector_quant;
 pub(crate) use crate::store::{dense_v3, scalar_key};

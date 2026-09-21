@@ -35,7 +35,7 @@ The row format, the page-WAL store and its recovery, the catalog, the index
 families (scalar, text, vector, spatial point, spatial geometry, graph), the
 planner, the drivers, the cursors, the budget. Contracts:
 `docs/core/GRAPH_CONTRACT.md`, `docs/core/COLLECTIONS.md`,
-`docs/core/FORMAT_V1.md`, `docs/core/RECOVERY_CONTRACT.md`,
+`docs/core/FORMAT_V2.md`, `docs/core/RECOVERY_CONTRACT.md`,
 `docs/core/SPATIAL_FUNCTIONS.md`, `docs/core/FOUNDATION_TEST_STANDARD.md`.
 Module map: `docs/core/SOURCE_LAYOUT.md`.
 
