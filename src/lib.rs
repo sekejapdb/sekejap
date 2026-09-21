@@ -106,6 +106,28 @@ pub use vector::{CosineDistance, Distance, DotProduct, L2Distance};
 /// ```
 ///
 /// Use [`open_as_service`] instead if the database keeps running and serves others.
+/// Register a function that reports live heap bytes, so compaction can report
+/// memory next to time under `SK_COMPACT_HEAP`. See `CoreDB::heap_probe`.
+///
+/// Only a measuring binary should call this; a process has one global allocator
+/// and the library must not claim it.
+pub fn set_heap_reader(f: fn() -> usize) {
+    HEAP_READER.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
+static HEAP_READER: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn heap_now() -> usize {
+    let p = HEAP_READER.load(std::sync::atomic::Ordering::Relaxed);
+    if p.is_null() {
+        return 0;
+    }
+    // Installed only by `set_heap_reader`, which takes exactly this signature.
+    let f: fn() -> usize = unsafe { std::mem::transmute(p) };
+    f()
+}
+
 pub fn open(path: impl AsRef<Path>) -> io::Result<CoreDB> {
     CoreDB::open(path)
 }
@@ -643,10 +665,14 @@ impl Segments {
 /// through `superseded`, equal keys combine, and a key whose postings have all
 /// moved away is skipped rather than emitted empty.
 pub(crate) struct MergedFieldIter<'a> {
-    base: Option<&'a storage::fieldstore::MappedFieldStore>,
     superseded: &'a std::collections::HashSet<u64>,
-    /// Index of the next base key to consider.
-    bi: usize,
+    /// The durable side, streamed in key order across every segment of the chain.
+    ///
+    /// This used to be an index into one store's directory. That was right while
+    /// the base was a single file; once a base can carry segments beneath it, an
+    /// index walk sees only the outermost one. It stays streaming — materialising
+    /// the base cost 92 MB at a million rows.
+    base: std::iter::Peekable<storage::fieldstore::StackIter<'a>>,
     delta: std::iter::Peekable<std::collections::btree_map::Iter<'a, FieldKey, Vec<u64>>>,
 }
 
@@ -659,7 +685,13 @@ impl<'a> MergedFieldIter<'a> {
         static EMPTY_DELTA: std::sync::OnceLock<std::collections::BTreeMap<FieldKey, Vec<u64>>> =
             std::sync::OnceLock::new();
         let d = delta.unwrap_or_else(|| EMPTY_DELTA.get_or_init(std::collections::BTreeMap::new));
-        Self { base, superseded, bi: 0, delta: d.iter().peekable() }
+        static EMPTY_BASE: std::sync::OnceLock<storage::fieldstore::MappedFieldStore> =
+            std::sync::OnceLock::new();
+        let b = match base {
+            Some(b) => b.stack_iter(),
+            None => storage::fieldstore::MappedFieldStore::empty_ref(&EMPTY_BASE).stack_iter(),
+        };
+        Self { superseded, base: b.peekable(), delta: d.iter().peekable() }
     }
 }
 
@@ -670,16 +702,14 @@ impl<'a> Iterator for MergedFieldIter<'a> {
         // Loops because a key can merge down to nothing, and an empty key must be
         // skipped rather than returned.
         loop {
-            let nbase = self.base.map_or(0, |b| b.len());
-            let bkey = if self.bi < nbase { self.base.map(|b| b.key_at(self.bi)) } else { None };
+            let bkey = self.base.peek().map(|(k, _)| k.clone());
             let dkey = self.delta.peek().map(|(k, _)| (*k).clone());
 
             let (key, mut ids): (FieldKey, Vec<u64>) = match (bkey, dkey) {
                 (None, None) => return None,
-                (Some(bk), None) => {
-                    let ids = self.base.map(|b| b.postings_at(self.bi)).unwrap_or_default();
-                    self.bi += 1;
-                    (bk, ids.into_iter().filter(|id| !self.superseded.contains(id)).collect())
+                (Some(_), None) => {
+                    let (k, v) = self.base.next()?;
+                    (k, v.into_iter().filter(|id| !self.superseded.contains(id)).collect())
                 }
                 (None, Some(_)) => {
                     let (k, v) = self.delta.next()?;
@@ -687,24 +717,22 @@ impl<'a> Iterator for MergedFieldIter<'a> {
                 }
                 (Some(bk), Some(dk)) => match bk.cmp(&dk) {
                     std::cmp::Ordering::Less => {
-                        let ids = self.base.map(|b| b.postings_at(self.bi)).unwrap_or_default();
-                        self.bi += 1;
-                        (bk, ids.into_iter().filter(|id| !self.superseded.contains(id)).collect())
+                        let (k, v) = self.base.next()?;
+                        (k, v.into_iter().filter(|id| !self.superseded.contains(id)).collect())
                     }
                     std::cmp::Ordering::Greater => {
                         let (k, v) = self.delta.next()?;
                         (k.clone(), v.clone())
                     }
                     std::cmp::Ordering::Equal => {
-                        let base_ids = self.base.map(|b| b.postings_at(self.bi)).unwrap_or_default();
-                        self.bi += 1;
+                        let (k, bv) = self.base.next()?;
                         let (_, dv) = self.delta.next()?;
-                        let mut v: Vec<u64> = base_ids
+                        let mut v: Vec<u64> = bv
                             .into_iter()
                             .filter(|id| !self.superseded.contains(id))
                             .collect();
                         v.extend(dv.iter().copied());
-                        (bk, v)
+                        (k, v)
                     }
                 },
             };
@@ -741,12 +769,12 @@ impl<'a> FieldIndexRef<'a> {
     pub(crate) fn len(&self) -> usize {
         match *self {
             FieldIndexRef::Heap(m) => m.len(),
-            FieldIndexRef::Mapped(s) => s.len(),
+            FieldIndexRef::Mapped(s) => s.stack_len(),
             // Distinct keys across both halves. An exact count would have to walk
             // the base to see which of its keys the delta already carries; every
             // caller uses this to size or to decide whether an index is worth
             // using, so an upper bound is what it needs and what it gets.
-            FieldIndexRef::Merged { delta, base, .. } => base.len() + delta.len(),
+            FieldIndexRef::Merged { delta, base, .. } => base.stack_len() + delta.len(),
         }
     }
 
@@ -1905,6 +1933,10 @@ pub struct CoreDB {
     /// the engine asks of it goes through the `base_*` accessors, which is the
     /// only place either backend is chosen.
     paged_nodes: Option<storage::nodestore::NodeStore>,
+    /// The spatial grid over paged records, when `Config::paged_spatial` is set.
+    /// Handed to the grid so its reads can consult it; kept here so a reopen and
+    /// a compaction can reach it too.
+    paged_spatial: Option<std::sync::Arc<std::sync::Mutex<storage::spatialpaged::PagedSpatial>>>,
     /// collection_hash → member slug hashes
     collections: HashMap<u64, Vec<u64>>,
     /// collection_hash → collection name (for O(1) SHOW TABLES without node scan)
@@ -2231,6 +2263,14 @@ pub struct Config {
     /// spend, almost all of it the two B+trees, where the files are packed arrays.
     /// Point reads are faster than the layout it replaces.
     pub paged_nodes: bool,
+
+    /// Serve the spatial grid from paged records instead of `spatialgrid.bin`.
+    ///
+    /// The packed grid cannot absorb a point, so every compaction rewrites the
+    /// whole file: measured at O(N^1.95) over a load. With this on, compaction
+    /// *applies* the overlay to the paged store and nothing is proportional to
+    /// the store. Same move as `paged_nodes` and `paged_adjacency`.
+    pub paged_spatial: bool,
     /// Serve topology (nodes + edges) from the mmap'd files written at
     /// `compact()` instead of loading it into RAM. The OS page cache keeps the
     /// hot working set resident and pages the rest — topology size is no longer
@@ -2326,6 +2366,7 @@ impl Default for Config {
             paged_payloads: true,
             paged_adjacency: true,
             paged_nodes: true,
+            paged_spatial: false, // measured and defaulted separately
             paged_topology: true,
         }
     }
@@ -2433,6 +2474,7 @@ impl CoreDB {
             read_only: false,
             write_error: None,
             paged_nodes: None,
+            paged_spatial: None,
             auto_compact: AutoCompact::Off, // memory DBs have nothing to compact
             compact_thresholds: CompactThresholds::default(),
             wal_sync: SyncMode::Full,
@@ -2567,6 +2609,10 @@ impl CoreDB {
     /// Returns an error if the directory cannot be created, the snapshot cannot be
     /// parsed, or the WAL file cannot be opened.
     pub fn open_with_config(dir: impl AsRef<Path>, config: Config) -> io::Result<Self> {
+        if std::env::var_os("SK_FOLD_BREAKDOWN").is_some() {
+            storage::nodestore::FOLD_BREAKDOWN
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let dir = dir.as_ref();
         let mut config = config;
         std::fs::create_dir_all(dir)?;
@@ -2765,6 +2811,12 @@ impl CoreDB {
         if config.paged_nodes {
             db.paged_nodes = Some(storage::nodestore::NodeStore::open(
                 dir, storage::pagestore::DEFAULT_PAGE_SIZE)?);
+        }
+        if config.paged_spatial {
+            db.paged_spatial = Some(std::sync::Arc::new(std::sync::Mutex::new(
+                storage::spatialpaged::PagedSpatial::open(
+                    dir, storage::pagestore::DEFAULT_PAGE_SIZE)?,
+            )));
         }
         // dict.bin carries these when a compaction writes the edge list; paged
         // adjacency writes no edge list, so they come from their own file.
@@ -3372,6 +3424,12 @@ impl CoreDB {
             for field in bm25_fields {
                 self.dirty_bm25.insert(field);
             }
+            // The field alone is not enough. The deferred flush applies the rows
+            // that changed, so a row that never lands in `dirty_docs` is never
+            // indexed — silently, with no error and an index that simply returns
+            // nothing. Marking the field dirty was sufficient only while the
+            // flush rebuilt the whole corpus and could afford to ignore this.
+            self.dirty_docs.insert(hash);
         } else {
             for field in bm25_fields {
                 // Index this one document rather than rebuilding the corpus.
@@ -4593,6 +4651,28 @@ impl CoreDB {
     /// Unlike BM25 this needs the base documents' text, so it lives here rather
     /// than inside the index.
     fn merge_search_deltas(&mut self) {
+        // This used to call `rebuild_search_for_collection` for every index with
+        // a delta — a full rebuild of the collection's FST and postings, reading
+        // and tokenising every payload, on every compaction. That is the same
+        // change-triggered, store-sized work BM25 had, and it is what made the
+        // search index superlinear over a 500k/1M/2M ladder.
+        //
+        // Segments are written instead: one already on disk is left alone and the
+        // base is untouched, so the cost follows the change.
+        if let Some(dir) = self.data_dir.clone() {
+            let keys: Vec<String> = self.search_indexes.iter()
+                .filter(|(_, ix)| ix.unpersisted_segments() > 0)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in keys {
+                if let Some(ix) = self.search_indexes.get_mut(&key) {
+                    let _ = ix.persist_segments(&dir, &key);
+                }
+            }
+            return;
+        }
+        // No directory to persist to, so an in-memory store still has to rebuild
+        // or the newest documents would have nowhere to live.
         let stale: Vec<String> = self.search_indexes.iter()
             .filter(|(_, ix)| ix.delta_len() > 0)
             .map(|(k, _)| k.clone())
@@ -4605,25 +4685,66 @@ impl CoreDB {
     fn merge_bm25_deltas_inner(&mut self) {
         let dir = self.data_dir.clone();
         for (field, ix) in self.bm25_indexes.iter_mut() {
-            if ix.delta_len() == 0 {
+            if ix.delta_len() == 0 && ix.unpersisted_segments() == 0 {
                 continue;
             }
-            ix.merge_delta();
-            // Merging rebuilds the postings blob, so the dictionary offsets about
-            // to be written no longer address the spilled file. Rewrite it in the
-            // same breath — a dictionary that outlives its postings is exactly the
-            // kind of split-brain that makes an index unreadable on reopen.
-            #[cfg(unix)]
-            if let Some(ref dir) = dir {
-                let _ = ix.spill_to_disk(&dir.join(format!("bm25_{field}.postings")));
+            match dir {
+                // Write the delta out as a segment and persist any segment not
+                // yet on disk. O(change): a segment already written is left
+                // alone, and the base is not touched at all.
+                //
+                // This used to call `merge_delta()`, folding every segment back
+                // into the monolithic base — O(corpus), on every compaction, all
+                // through a load. One million rows: 221.55 s with that collapse,
+                // 15.42 s without it.
+                Some(ref d) => {
+                    let _ = ix.persist(d);
+                }
+                // No directory to persist to, so an in-memory store still has to
+                // fold, or the documents would have nowhere to live.
+                None => {
+                    ix.merge_delta();
+                    let _ = field;
+                }
             }
         }
     }
 
     fn flush_deferred_indexes(&mut self) {
+        // Every index family here applies the rows that changed. None of them
+        // rebuilds, because `flush_deferred_indexes` runs at the end of *every*
+        // batch: at 25 000-row batches over two million rows, a rebuild here is
+        // eighty full passes over the whole corpus, each reading and parsing
+        // every payload in the store. That is the quadratic term in an indexed
+        // load — measured at 91, 149, 238, 341, 426 and then 1712 seconds per
+        // 250 000 rows, while compaction's own phases stayed in the hundreds of
+        // milliseconds and `merging index deltas` took 0.7 ms because the deltas
+        // were already empty.
+        let dirty: Vec<u64> = self.dirty_docs.iter().copied().collect();
+
+        // BM25.
         let bm25_fields: Vec<String> = self.dirty_bm25.drain().collect();
         for field in bm25_fields {
-            self.build_bm25_index(&field);
+            // Nothing to apply to yet: the first build over existing data costs
+            // what that data costs, once.
+            if !self.bm25_indexes.contains_key(&field) {
+                self.build_bm25_index(&field);
+                continue;
+            }
+            for &h in &dirty {
+                let text: Option<String> = self
+                    .get_payload(h)
+                    .and_then(|p| p.get(&field).and_then(|v| v.as_str()).map(|t| t.to_string()));
+                if let Some(ix) = self.bm25_indexes.get_mut(field.as_str()) {
+                    // `insert_doc` retires any previous copy itself; the explicit
+                    // delete is for a row whose field is gone, where there is no
+                    // text to re-file and the old postings would otherwise stay.
+                    match text {
+                        Some(t) => ix.insert_doc(h, &t),
+                        None => { ix.delete(h); }
+                    }
+                }
+            }
         }
         // GIN: apply the rows that changed.
         //
@@ -4634,7 +4755,6 @@ impl CoreDB {
         // one on every batch, so the disk-first serving lasted exactly until the
         // next write.
         let gin_fields: Vec<String> = self.dirty_gin.drain().collect();
-        let dirty: Vec<u64> = self.dirty_docs.iter().copied().collect();
         for field in gin_fields {
             // No index to apply to yet — the first build costs what the data
             // costs, and happens once.
@@ -4658,9 +4778,49 @@ impl CoreDB {
                 }
             }
         }
+        // Search. Same shape, with one extra step: a search index belongs to a
+        // collection, so only the changed rows of *that* collection may be
+        // applied to it.
         let search_colls: Vec<String> = self.dirty_search.drain().collect();
         for coll in search_colls {
-            self.rebuild_search_for_collection(&coll);
+            let key = Self::search_index_key(&coll);
+            let fields = match self.search_indexes.get(&key) {
+                Some(ix) => ix.fields.clone(),
+                // No index yet — build it once from the data that exists.
+                None => {
+                    self.rebuild_search_for_collection(&coll);
+                    continue;
+                }
+            };
+            let coll_hash = sk_hash(&coll);
+            // Gathered first, applied once. Calling `insert_doc` per row rebuilt
+            // the delta index once per row: 5 000-row batches cost 24 s, then
+            // 62 s, then 98 s, on a corpus still under 20 000 rows. The batch
+            // form builds the delta a single time and the curve goes flat.
+            let mut docs: Vec<search::index::DocFields> = Vec::new();
+            let mut vanished: Vec<u64> = Vec::new();
+            for &h in &dirty {
+                if self.node_data(h).map(|n| sk_hash(&n.collection)) != Some(coll_hash) {
+                    continue;
+                }
+                match self.get_payload(h) {
+                    Some(p) => docs.push(search::index::DocFields {
+                        hash: h,
+                        field_values: fields
+                            .iter()
+                            .map(|f| p.get(f).and_then(|v| v.as_str()).unwrap_or("").to_string())
+                            .collect(),
+                    }),
+                    // No payload to re-file: the row is gone, so retire it.
+                    None => vanished.push(h),
+                }
+            }
+            if let Some(ix) = self.search_indexes.get_mut(&key) {
+                for h in vanished {
+                    ix.delete(h);
+                }
+                ix.insert_docs(docs);
+            }
         }
         // Consumed by everything above, so drained once here.
         self.dirty_docs.clear();
@@ -4740,6 +4900,9 @@ impl CoreDB {
         }
         if self.defer_index_rebuild {
             self.dirty_search.insert(collection.to_string());
+            // Same rule as the BM25 path: the deferred flush applies rows, so the
+            // row has to be recorded, not just the collection.
+            self.dirty_docs.insert(hash);
             return;
         }
         let key = Self::search_index_key(collection);
@@ -5460,7 +5623,6 @@ impl CoreDB {
             for f in bm { self.dirty_bm25.insert(f); }
             let gin: Vec<String> = self.gin_indexes.keys().cloned().collect();
             for f in gin { self.dirty_gin.insert(f); }
-            self.dirty_docs.extend(hashes_touched.iter().copied());
         }
         if has_any_search {
             for c in &colls_touched {
@@ -5468,6 +5630,14 @@ impl CoreDB {
                     self.dirty_search.insert(c.clone());
                 }
             }
+        }
+        // `dirty_docs` is what every deferred index applies, so it must be
+        // filled whenever ANY of them is deferred. Marking it only under
+        // `have_bm25_gin` left a search-only index with an empty change set:
+        // its first build ran, and after that it silently stopped seeing new
+        // rows. Nothing errored — the index simply stopped growing.
+        if have_bm25_gin || has_any_search {
+            self.dirty_docs.extend(hashes_touched.iter().copied());
         }
         if (have_bm25_gin || has_any_search) && !self.defer_index_rebuild {
             self.flush_deferred_indexes();
@@ -5889,6 +6059,35 @@ impl CoreDB {
         *since = std::time::Instant::now();
     }
 
+    /// Live-heap reader, installed by whoever owns the allocator.
+    ///
+    /// # Why this indirection
+    ///
+    /// A process may define exactly one global allocator, so the library cannot
+    /// install a counting one without taking that slot from every user. Instead
+    /// the *measuring binary* installs its allocator and registers a reader here,
+    /// and the library reports heap alongside time.
+    ///
+    /// It is worth the indirection because RSS cannot answer Law 1: a mapped base
+    /// counts as resident and the kernel can reclaim all of it, while anonymous
+    /// heap is what an OOM is charged against. `SK_COMPACT_RSS` therefore says a
+    /// compaction got bigger without saying what it allocated — and a transient
+    /// that grows with the store is invisible to steady-state numbers entirely.
+    fn heap_now_or_zero() -> usize { heap_now() }
+
+    fn heap_probe(label: &str, since: &mut usize) {
+        if std::env::var_os("SK_COMPACT_HEAP").is_none() {
+            return;
+        }
+        let now = heap_now();
+        eprintln!(
+            "    heap {:>7} MB  ({:+.1} MB)  {label}",
+            now / 1_048_576,
+            (now as i64 - *since as i64) as f64 / 1_048_576.0
+        );
+        *since = now;
+    }
+
     fn rss_probe(label: &str) {
         if std::env::var_os("SK_COMPACT_RSS").is_none() { return; }
         if let Ok(o) = std::process::Command::new("ps")
@@ -5917,6 +6116,7 @@ impl CoreDB {
         // finally takes effect.
         Self::rss_probe("compact start");
         let mut phase = std::time::Instant::now();
+        let mut hp = Self::heap_now_or_zero();
         // The base is NOT copied into RAM. Every phase below reads it in place —
         // payload locations through payload_loc, records and slugs straight out of
         // the mmap, adjacency through fwd_edges — and the new base replaces it at
@@ -6074,6 +6274,7 @@ impl CoreDB {
         // files, which reopens fine (old snapshot is still self-sufficient or
         // points at the previous, still-valid files; WAL not yet truncated).
         Self::phase_probe("rewriting payloads + indexes", &mut phase);
+        Self::heap_probe("rewriting payloads + indexes", &mut hp);
         // What this compaction must not lose.
         //
         // This must count the same population `write_topology_files` writes: base
@@ -6088,6 +6289,7 @@ impl CoreDB {
         // put everything back.
         let (expect_nodes, expect_edges) = self.compaction_expectation();
         Self::phase_probe("counting what must survive", &mut phase);
+        Self::heap_probe("counting what must survive", &mut hp);
 
         // Keep the outgoing generation reachable until the incoming one has been
         // read back and found complete.
@@ -6102,11 +6304,13 @@ impl CoreDB {
             return Err(e);
         }
         Self::phase_probe("folding edges into pages", &mut phase);
+        Self::heap_probe("folding edges into pages", &mut hp);
         if let Err(e) = self.fold_nodes_into_paged() {
             Self::restore_previous_generation(&staged);
             return Err(e);
         }
         Self::phase_probe("folding nodes into pages", &mut phase);
+        Self::heap_probe("folding nodes into pages", &mut hp);
         // The names the paged graph cannot carry. Written whenever it is on, before
         // the topology files, so a crash between the two leaves names for a
         // generation that still exists rather than for one that does not.
@@ -6133,11 +6337,25 @@ impl CoreDB {
 
         self.merge_index_deltas();
         Self::phase_probe("merging index deltas", &mut phase);
+        Self::heap_probe("merging index deltas", &mut hp);
+        // Paged spatial: move the overlay into the records it belongs in. O(change)
+        // — no base is read or rewritten. The gate is every hash the overlay
+        // supersedes or deletes, because a row updated to *drop* its geometry
+        // never reaches `insert` and would otherwise keep its old cell.
+        if self.spatial_grid.as_ref().is_some_and(|g| g.is_paged()) {
+            let mut gate: std::collections::HashSet<u64> =
+                self.tombstones.iter().copied().collect();
+            gate.extend(self.nodes.keys().copied());
+            if let Some(grid) = self.spatial_grid.as_mut() {
+                grid.apply_overlay(&gate)?;
+            }
+        }
         if let Err(e) = self.write_topology_files(&dir) {
             Self::restore_previous_generation(&staged);
             return Err(e);
         }
         Self::phase_probe("writing topology files", &mut phase);
+        Self::heap_probe("writing topology files", &mut hp);
 
         // Read the new files back, from disk, with a reader that shares nothing with
         // the writer. Only if they hold everything do we go on to drop the old
@@ -6180,6 +6398,7 @@ impl CoreDB {
         }
 
         Self::phase_probe("reading the new generation back", &mut phase);
+        Self::heap_probe("reading the new generation back", &mut hp);
 
         // Persist btree field indexes as mmap'able sidecars so a reopened paged DB
         // serves indexed queries from page cache (not heap). One file per
@@ -6198,14 +6417,65 @@ impl CoreDB {
             let base = self.field_base.get(&key);
             let delta = self.field_indexes.get(&key);
             let superseded = self.superseded_for(&key);
-            let fname = format!("fieldidx_{}_{}.bin", coll_hash, hex_encode(&field));
-            // Streamed, not collected. Asking for the merged view as a map cost
-            // 92 MB of heap at a million rows and grew with the store; the writer
-            // consumes this twice — once to size the file, once to fill it — and
-            // holds one posting list at a time.
-            storage::fieldstore::write_merged(&dir.join(fname), || {
+            // Nothing changed for this field, and its sidecar already holds the
+            // base, so rewriting it would produce the identical file.
+            //
+            // Defensive only. This was reported as a Law 2 fix and it is not one:
+            // it has never been observed to fire, and both halves were checked.
+            //
+            //   paged   — the loop walks `field_indexes`, and the block at the end
+            //             of this function removes every key whose sidecar mapped
+            //             back, so an untouched collection is not visited at all.
+            //             Disabling this branch left the sidecar spared anyway.
+            //   resident— `base` comes from `field_base`, which is only populated
+            //             by `load_field_base`, which is gated behind
+            //             `paged_layout || had_field_base`. Resident maps no
+            //             sidecar, so `base` is always `None` and this is always
+            //             false. Every sidecar is rewritten from the heap index on
+            //             every compaction, untouched or not.
+            //
+            // That second case is a live Law 2 violation, and this branch does not
+            // close it: the fix needs a dirty-collection set, because on resident
+            // the heap index is the only copy and `field_indexes` never empties.
+            // Left as it is rather than deleted because it costs one map lookup
+            // and would start doing work the moment a base is mapped on a layout
+            // that also keeps its overlay.
+            let unchanged = base.is_some()
+                && delta.map_or(true, |d| d.is_empty())
+                && superseded.is_empty();
+            if unchanged {
+                continue;
+            }
+            let stem = format!("fieldidx_{}_{}", coll_hash, hex_encode(&field));
+            let base_path = dir.join(format!("{stem}.bin"));
+            let segs = storage::fieldstore::segment_paths(&dir, &stem);
+
+            // Segmenting the delta instead of folding it was tried and is
+            // reverted. The theory was sound and the measurement was not: the
+            // fold is O(store) behind a change-sized trigger, so writing the
+            // delta as its own segment and merging at a fanout should have been
+            // linear. It was slower at every size that matters -- 2326 ms to
+            // 3193 ms at two million rows, 11.9 s to ~21 s at five million --
+            // because a read of this index is a k-way merge across the stack,
+            // and the compaction that writes segment k+1 must first read all k
+            // of them to know what each one supersedes. The merge cost grows
+            // with the segment count and eats the write saving whole.
+            //
+            // The base is still opened as a stack, and the fold still absorbs
+            // and deletes any segments it finds, so a database written while the
+            // experiment was live converges to a single base on its next
+            // compaction rather than being stranded.
+            storage::fieldstore::write_merged(&base_path, || {
+                // Streamed, not collected. Asking for the merged view as a map
+                // cost 92 MB of heap at a million rows and grew with the store;
+                // the writer consumes this twice -- once to size the file, once
+                // to fill it -- and holds one posting list at a time.
                 MergedFieldIter::new(base, delta, superseded)
             })?;
+            // Only now: the base that replaced them is durable (Law 3).
+            for (_, p) in &segs {
+                let _ = std::fs::remove_file(p);
+            }
         }
         // The sidecars now carry everything, so re-map them and drop both halves
         // of the overlay. Skipping this would leave `field_super` growing for the
@@ -6265,6 +6535,7 @@ impl CoreDB {
         }
 
         Self::phase_probe("field index sidecars", &mut phase);
+        Self::heap_probe("field index sidecars", &mut hp);
 
         let snap_json = serde_json::to_vec(&self.build_snapshot())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -6357,6 +6628,7 @@ impl CoreDB {
         self.renamed_collections.clear();
         self.compact_payload_moves.clear();
         Self::phase_probe("snapshot + adopting the generation", &mut phase);
+        Self::heap_probe("snapshot + adopting the generation", &mut hp);
 
         // Regenerate gin.bin so the next open loads GIN instantly, then serve
         // from it. Writing the sidecar and keeping the heap copy is how the btree
@@ -6387,6 +6659,7 @@ impl CoreDB {
             }
         }
         Self::phase_probe("gin.bin + search.bin", &mut phase);
+        Self::heap_probe("gin.bin + search.bin", &mut hp);
 
         // Reclaim excess RAM capacity as part of compaction (so auto-compact also
         // trims memory automatically, not just disk).
@@ -6639,7 +6912,11 @@ impl CoreDB {
         // Built fresh from all node metas (overlay + base) so it is complete even
         // when compacting in paged mode; ring caches are not persisted.
         Self::phase_probe("  topology files + slot table", &mut inner);
-        if let Some(grid) = self.spatial_grid.as_ref() {
+        // A paged grid has no packed file to rewrite; `compact_inner` applies the
+        // overlay to the records instead, because that needs `&mut self`.
+        if self.spatial_grid.as_ref().is_some_and(|g| g.is_paged()) {
+            // nothing to write
+        } else if let Some(grid) = self.spatial_grid.as_ref() {
             if grid.is_disk_backed() {
                 // Steady state: merge the mapped base with the overlay. The base
                 // already holds its metas by hash and its cells by (cy,cx), the
@@ -6724,7 +7001,7 @@ impl CoreDB {
                 .to_string();
             // Side-table first (48-byte read); payload parse only for legacy dirs
             // written before spatial.bin existed.
-            let spatial_meta = storage::topology::spatial_at(&blob.spat, rec.spatial_ref)
+            let spatial_meta = storage::topology::spatial_at(&blob.spat, rec.spatial_ref, None)
                 .map(|v| geo::SpatialMeta {
                     centroid_lat: v[0], centroid_lon: v[1],
                     bbox_min_lat: v[2], bbox_min_lon: v[3],
@@ -6767,7 +7044,7 @@ impl CoreDB {
                     continue;
                 };
                 let (to_slug, ty) = (to_slug.to_string(), ty.to_string());
-                let meta_json = storage::topology::emeta_bytes_at(&blob.emeta, e.meta_ref)
+                let meta_json = storage::topology::emeta_bytes_at(&blob.emeta, e.meta_ref, None)
                     .and_then(|b| std::str::from_utf8(b).ok().map(|s| s.to_string()));
                 match meta_json {
                     Some(m) => {
@@ -6897,7 +7174,23 @@ impl CoreDB {
     fn save_bm25_binary(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
         if self.bm25_indexes.is_empty() { return Ok(()); }
-        if self.bm25_indexes.values().any(|ix| ix.is_disk_backed()) { return Ok(()); }
+        // Skipping a rewrite because the file is authoritative is only true while
+        // the in-memory base still matches it. A deletion mutates `doc_id_to_idx`
+        // in memory and nowhere else, so skipping then leaves the file holding
+        // documents the store has removed — and on reload they come back, beside
+        // the segment that superseded them. Measured: a 33-document corpus
+        // reading as 45 after a compaction, with every BM25 score shifted.
+        //
+        // This used to be safe by accident: `merge_delta()` rebuilt the base in
+        // memory, which made it not disk-backed, which forced the write. Removing
+        // that collapse removed the accident with it.
+        //
+        // `orphan_count` is exactly "the base has deletions the file does not
+        // know about". A pure load never has any, so the fast path survives.
+        let base_matches_file = self.bm25_indexes.values().all(|ix| ix.orphan_count() == 0);
+        if base_matches_file && self.bm25_indexes.values().any(|ix| ix.is_disk_backed()) {
+            return Ok(());
+        }
         let tmp = path.with_extension("bin.tmp");
         let mut f = std::io::BufWriter::new(
             std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?
@@ -6933,7 +7226,15 @@ impl CoreDB {
         let mut loaded = Vec::with_capacity(count);
         for _ in 0..count {
             match bm25::Bm25Index::open_mapped(&view, pos, dir) {
-                Ok((ix, consumed)) => { pos += consumed; loaded.push(ix); }
+                Ok((mut ix, consumed)) => {
+                    // The base is only half the index now — everything written
+                    // since the last full build lives in segment files beside it.
+                    // Skipping this loses every document added after the base was
+                    // written, silently.
+                    let _ = ix.load_segments(dir);
+                    pos += consumed;
+                    loaded.push(ix);
+                }
                 Err(_) => return false,
             }
         }
@@ -7512,6 +7813,7 @@ impl CoreDB {
             read_only: false,
             write_error: None,
             paged_nodes: None,
+            paged_spatial: None,
             slug_map: self.slug_map.clone(),
             collections: self.collections.clone(),
             collection_names_map: self.collection_names_map.clone(),
@@ -10081,7 +10383,41 @@ impl CoreDB {
             ns.sync()
         })();
         self.paged_nodes = Some(ns);
+        Self::report_fold_breakdown();
         result
+    }
+
+    /// Print where a fold's time went, under `SK_FOLD_BREAKDOWN=1`.
+    ///
+    /// `folding nodes into pages` is the single largest phase of a plain load and
+    /// it is not one operation: every node is read back before it is written, then
+    /// written to a record store, a hash index, and up to two secondary B+trees.
+    /// Which of those to remove is a question about the split, not the total.
+    fn report_fold_breakdown() {
+        use storage::nodestore as nsc;
+        use std::sync::atomic::Ordering::Relaxed;
+        if !nsc::FOLD_BREAKDOWN.load(Relaxed) {
+            return;
+        }
+        let puts = nsc::FOLD_PUTS.swap(0, Relaxed);
+        if puts == 0 {
+            return;
+        }
+        let get = nsc::FOLD_GET_NS.swap(0, Relaxed);
+        let rec = nsc::FOLD_REC_NS.swap(0, Relaxed);
+        let geo = nsc::FOLD_GEO_NS.swap(0, Relaxed);
+        let coll = nsc::FOLD_COLL_NS.swap(0, Relaxed);
+        let total = get + rec + geo + coll;
+        let pct = |v: u64| if total == 0 { 0.0 } else { v as f64 * 100.0 / total as f64 };
+        let per = |v: u64| v as f64 / puts as f64 / 1000.0;
+        eprintln!(
+            "FOLD {puts} nodes  total {:.0}ms\n               read-before-write {:>6.2}us/node {:>5.1}%\n               record + hash idx {:>6.2}us/node {:>5.1}%\n               geometry index    {:>6.2}us/node {:>5.1}%\n               collection index  {:>6.2}us/node {:>5.1}%",
+            total as f64 / 1e6,
+            per(get), pct(get),
+            per(rec), pct(rec),
+            per(geo), pct(geo),
+            per(coll), pct(coll),
+        );
     }
 
     fn fold_edges_into_paged(&mut self) -> io::Result<()> {
@@ -10665,6 +11001,13 @@ impl CoreDB {
                 Some(s) => s,
                 None => continue,
             };
+            // Segment files share the prefix and the extension. They are opened
+            // as part of their base's stack, not as indexes of their own — and
+            // relying on the hex decode below to reject them would be an accident
+            // rather than a decision.
+            if stem.contains(".s") {
+                continue;
+            }
             // stem = "<coll_hash>_<hexfield>"
             let (coll_str, hex_field) = match stem.split_once('_') {
                 Some(p) => p,
@@ -10678,7 +11021,14 @@ impl CoreDB {
                 Some(f) => f,
                 None => continue,
             };
-            if let Some(store) = storage::fieldstore::MappedFieldStore::open_disk(&entry.path())? {
+            // The base is only half the index: everything written since it was
+            // last fully merged lives in segments beside it. Opening the base
+            // alone silently answers with a stale view of every column that has
+            // been written to.
+            let full_stem = format!("fieldidx_{stem}");
+            if let Some(store) =
+                storage::fieldstore::open_stack(dir, &full_stem)?
+            {
                 self.field_base.insert((coll_hash, field), store);
             }
         }
@@ -10780,6 +11130,9 @@ impl CoreDB {
         };
         let mut grid = geo::SpatialGrid::build(items.into_iter());
         for (h, rings) in polys { grid.cache_rings(h, rings); }
+        if let Some(p) = self.paged_spatial.clone() {
+            grid.attach_paged(p);
+        }
         self.spatial_grid = Some(grid);
     }
 
@@ -10794,6 +11147,9 @@ impl CoreDB {
             _ => return false,
         };
         let mut grid = geo::SpatialGrid::from_mapped(base);
+        if let Some(p) = self.paged_spatial.clone() {
+            grid.attach_paged(p);
+        }
         for (&h, node) in &self.nodes {
             if let Some(m) = &node.spatial_meta {
                 if !grid.base_contains(h) {
@@ -11065,6 +11421,12 @@ impl CoreDB {
             .collect();
         let refs: Vec<(u64, &str)> = owned.iter().map(|(h, s)| (*h, s.as_str())).collect();
         let mut index = bm25::Bm25Index::build(field, refs.into_iter());
+        if let Some(ref dir) = self.data_dir {
+            // This base covers every document in the store, so any segment file
+            // left over from before is now a duplicate of part of it. Loading
+            // both counts those documents twice, which moves every IDF.
+            bm25::Bm25Index::remove_segment_files(dir, field);
+        }
         #[cfg(unix)]
         if let Some(ref dir) = self.data_dir {
             let _ = index.spill_to_disk(&dir.join(format!("bm25_{field}.postings")));
@@ -12051,6 +12413,12 @@ impl CoreDB {
 
         let idx = search::SearchIndex::build(fields.to_vec(), docs);
         let key = Self::search_index_key(collection);
+        if let Some(ref dir) = self.data_dir {
+            // This index covers every document in the collection, so a segment
+            // file left from before duplicates part of it. Loading both counts
+            // those documents twice — the trap that bit BM25 first.
+            search::SearchIndex::remove_segment_files(dir, &key);
+        }
         self.search_indexes.insert(key, idx);
     }
 
@@ -12121,7 +12489,13 @@ impl CoreDB {
                 Err(_) => return false,
             }
         }
-        for (key, idx) in loaded {
+        for (key, mut idx) in loaded {
+            // The base is only half the index — everything written since it was
+            // built lives in segment files beside it. Skipping this loses every
+            // document added after the base, silently.
+            if let Some(ref dir) = self.data_dir {
+                let _ = idx.load_segments(dir, &key);
+            }
             self.search_indexes.insert(key, idx);
         }
         true
@@ -12168,7 +12542,13 @@ impl CoreDB {
                 Err(_) => return false,
             }
         }
-        for (key, idx) in loaded {
+        for (key, mut idx) in loaded {
+            // The base is only half the index — everything written since it was
+            // built lives in segment files beside it. Skipping this loses every
+            // document added after the base, silently.
+            if let Some(ref dir) = self.data_dir {
+                let _ = idx.load_segments(dir, &key);
+            }
             self.search_indexes.insert(key, idx);
         }
         true

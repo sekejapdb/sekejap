@@ -194,6 +194,25 @@ pub(crate) struct NodeStore {
     scratch: Vec<u8>,
 }
 
+/// Where the time in a fold actually goes, under `SK_FOLD_BREAKDOWN=1`.
+///
+/// A node write is not one operation. It is a read of the previous record, a
+/// record write, and up to two secondary B+tree writes, and the split between
+/// them decides which of them is worth removing. Off by default and free when
+/// off: one relaxed load of a `bool` per `put`.
+pub(crate) static FOLD_BREAKDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(crate) static FOLD_GET_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FOLD_REC_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FOLD_GEO_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FOLD_COLL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FOLD_PUTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl NodeStore {
     pub(crate) fn open(dir: &Path, page_size: usize) -> io::Result<Self> {
         let tree = |name: &str| -> io::Result<BTree> {
@@ -274,12 +293,27 @@ impl NodeStore {
                          at most {}", node.collection.len(), u16::MAX),
             ));
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        let timed = FOLD_BREAKDOWN.load(Relaxed);
+        let mark = || timed.then(std::time::Instant::now);
+        let since = |t: Option<std::time::Instant>, c: &std::sync::atomic::AtomicU64| {
+            if let Some(t) = t {
+                c.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            }
+        };
+
+        let t = mark();
         let previous = self.get(hash)?;
+        since(t, &FOLD_GET_NS);
+
+        let t = mark();
         let mut scratch = std::mem::take(&mut self.scratch);
         encode(node, &mut scratch);
         let r = self.store.put(hash as u128, &scratch);
         self.scratch = scratch;
         r?;
+        since(t, &FOLD_REC_NS);
+        let t = mark();
         // Geometry comes and goes with an update, so both directions matter: a node
         // that gains an extent has to appear here, and one that loses it has to stop
         // appearing or the grid keeps an extent for a row that no longer has one.
@@ -288,6 +322,8 @@ impl NodeStore {
             (true, false) => { self.geo.remove(hash as u128)?; }
             _ => {}
         }
+        since(t, &FOLD_GEO_NS);
+        let t = mark();
         match previous {
             Some(p) if p.collection == node.collection => {}
             Some(p) => {
@@ -297,6 +333,10 @@ impl NodeStore {
             None => {
                 self.members.insert(member_key(crate::sk_hash(&node.collection), hash), 1)?;
             }
+        }
+        since(t, &FOLD_COLL_NS);
+        if timed {
+            FOLD_PUTS.fetch_add(1, Relaxed);
         }
         Ok(())
     }

@@ -24,7 +24,11 @@ use crate::storage::mmap::MmapView;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"SKGRID01";
-const VERSION: u32 = 1;
+/// Unframed posting runs. Readable, and served exactly as it always was.
+const VERSION_PLAIN: u32 = 1;
+/// Each posting run is preceded by `[cy i32][cx i32][crc32 u32]`, so a run can
+/// be checked to belong to the cell that was asked for. See `geo::CELL_FRAME`.
+const VERSION_FRAMED: u32 = 2;
 const META_REC: usize = 8 + 6 * 8; // 56
 const DIR_REC: usize = 4 + 4 + 8 + 4; // 20
 
@@ -38,6 +42,10 @@ pub(crate) struct MappedSpatialGrid {
     dir_off: usize,
     blob_off: usize,
     blob_len: usize,
+    /// Whether posting runs carry `[cy][cx][crc32]`. False for stores written
+    /// before the framed format; those keep their old behaviour rather than
+    /// being declared corrupt.
+    framed: bool,
 }
 
 fn rd_u32(b: &[u8], o: usize) -> u32 { u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) }
@@ -51,9 +59,13 @@ impl MappedSpatialGrid {
         let len = file.metadata()?.len() as usize;
         let view = match MmapView::try_new(&file, len) { Some(v) => v, None => return Ok(None) };
         let b = match view.slice(0, len) { Some(s) => s, None => return Ok(None) };
-        if len < 24 || &b[0..8] != MAGIC || rd_u32(b, 8) != VERSION {
+        let version = rd_u32(b, 8);
+        if len < 24 || &b[0..8] != MAGIC
+            || (version != VERSION_PLAIN && version != VERSION_FRAMED)
+        {
             return Ok(None);
         }
+        let framed = version == VERSION_FRAMED;
         let cell_size = rd_f64(b, 12);
         let node_count = rd_u32(b, 20) as usize;
         let meta_off = 24;
@@ -66,7 +78,56 @@ impl MappedSpatialGrid {
         let blob_len = rd_u64(b, after_dir) as usize;
         let blob_off = after_dir + 8;
         if blob_off + blob_len > len { return Ok(None); }
-        Ok(Some(Self { view, cell_size, node_count, meta_off, cell_count, dir_off, blob_off, blob_len }))
+        Ok(Some(Self { view, cell_size, node_count, meta_off, cell_count, dir_off, blob_off, blob_len, framed }))
+    }
+
+    /// Postings at `off`, but only if they belong to `want` and survive their
+    /// checksum.
+    ///
+    /// The directory is not evidence about the blob. It says where a cell's run
+    /// begins; the run says which cell it is. When those disagree the read is
+    /// refused, because serving the postings anyway is how one cell's members are
+    /// returned as another's — silently, and indistinguishably from a correct
+    /// answer. `None` here means "this cell cannot be read", which a caller can
+    /// act on; a wrong list is not.
+    fn read_run(&self, blob: &[u8], off: usize, declared: usize, want: (i32, i32)) -> Option<Vec<u64>> {
+        // `declared` comes out of the file, so it is capped by what the blob can
+        // hold before it sizes anything — a corrupt count would otherwise reserve
+        // billions of entries before any bounds check could run.
+        let read_postings = |start: usize, n: usize| -> Vec<u64> {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let p = start + i * 8;
+                if p + 8 > blob.len() { break }
+                out.push(rd_u64(blob, p));
+            }
+            out
+        };
+
+        if !self.framed {
+            let room = blob.len().saturating_sub(off) / 8;
+            return Some(read_postings(off, declared.min(room)));
+        }
+
+        if off + crate::geo::CELL_FRAME > blob.len() {
+            return None;
+        }
+        if (rd_i32(blob, off), rd_i32(blob, off + 4)) != want {
+            return None;
+        }
+        let want_crc = rd_u32(blob, off + 8);
+        let start = off + crate::geo::CELL_FRAME;
+        let room = blob.len().saturating_sub(start) / 8;
+        // A truncated run cannot match its checksum, so capping here refuses it
+        // rather than quietly serving the part that survived.
+        let n = declared.min(room);
+        let body = blob.get(start..start + n * 8)?;
+        let mut h = crc32fast::Hasher::new();
+        h.update(body);
+        if h.finalize() != want_crc || n != declared {
+            return None;
+        }
+        Some(read_postings(start, n))
     }
 
     pub(crate) fn cell_size(&self) -> f64 { self.cell_size }
@@ -132,15 +193,8 @@ impl MappedSpatialGrid {
         let key = (rd_i32(dir, o), rd_i32(dir, o + 4));
         let off = rd_u64(dir, o + 8) as usize;
         let blob = self.view.slice(self.blob_off, self.blob_len)?;
-        let room = blob.len().saturating_sub(off) / 8;
-        let n = (rd_u32(dir, o + 16) as usize).min(room);
-        let mut out = Vec::with_capacity(n);
-        for j in 0..n {
-            let p = off + j * 8;
-            if p + 8 > blob.len() { break }
-            out.push(rd_u64(blob, p));
-        }
-        Some((key, out))
+        let declared = rd_u32(dir, o + 16) as usize;
+        Some((key, self.read_run(blob, off, declared, key)?))
     }
 
     /// Node hashes in cell `(cy, cx)` — binary search the sorted-by-(cy,cx) dir,
@@ -156,22 +210,178 @@ impl MappedSpatialGrid {
             if k == key {
                 let off = rd_u64(dir, o + 8) as usize;
                 let blob = self.view.slice(self.blob_off, self.blob_len)?;
-                // Capped by the blob before it sizes anything. `n` is a `u32` from
-                // the file, so a corrupt one reserves up to 4.3 billion entries —
-                // 32 GB — and the loop's `p + 8 > blob.len()` guard below cannot
-                // help, because the allocation happens first. Every posting is
-                // eight bytes from `off`, so the blob says how many there can be.
-                let room = blob.len().saturating_sub(off) / 8;
-                let n = (rd_u32(dir, o + 16) as usize).min(room);
-                let mut out = Vec::with_capacity(n);
-                for i in 0..n {
-                    let p = off + i * 8;
-                    if p + 8 > blob.len() { break; }
-                    out.push(rd_u64(blob, p));
-                }
-                return Some(out);
+                let declared = rd_u32(dir, o + 16) as usize;
+                return self.read_run(blob, off, declared, key);
             } else if k < key { lo = mid as isize + 1; } else { hi = mid as isize - 1; }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geo::{SpatialGrid, SpatialMeta};
+
+    fn meta(lat: f64, lon: f64) -> SpatialMeta {
+        SpatialMeta {
+            centroid_lat: lat,
+            centroid_lon: lon,
+            bbox_min_lat: lat,
+            bbox_min_lon: lon,
+            bbox_max_lat: lat,
+            bbox_max_lon: lon,
+        }
+    }
+
+    /// Two cells far enough apart that they never share one.
+    fn two_cell_grid() -> SpatialGrid {
+        SpatialGrid::build(
+            [
+                (11u64, meta(-8.80, 115.10)),
+                (12u64, meta(-8.80, 115.10)),
+                (21u64, meta(-8.20, 115.90)),
+                (22u64, meta(-8.20, 115.90)),
+            ]
+            .into_iter(),
+        )
+    }
+
+    fn write_to_temp(grid: &SpatialGrid) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("spatialgrid.bin");
+        let mut buf: Vec<u8> = Vec::new();
+        grid.write_binary(&mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+        (dir, path)
+    }
+
+    /// A cell's postings must belong to the cell that was asked for.
+    ///
+    /// The directory entry carries `(cy, cx, off, len)` and the blob run it points
+    /// at used to carry nothing at all — no identity, no checksum. Flipping `off`
+    /// to another cell's run therefore served that cell's node hashes as this
+    /// one's: a wrong answer, silently, which is the failure Law 5 exists to
+    /// forbid. Recorded as open in `.workbench/STABLE.md` before this test.
+    #[test]
+    fn a_damaged_cell_offset_never_serves_another_cells_postings() {
+        let grid = two_cell_grid();
+        let (_tmp, path) = write_to_temp(&grid);
+        let clean = MappedSpatialGrid::open_disk(&path).unwrap().unwrap();
+        assert_eq!(clean.cell_count(), 2, "test needs two distinct cells");
+
+        let (key_a, members_a) = clean.cell_at(0).unwrap();
+        let (_key_b, members_b) = clean.cell_at(1).unwrap();
+        assert_ne!(members_a, members_b, "cells must differ or the test proves nothing");
+
+        // Point cell 0's directory entry at cell 1's run: exactly what one
+        // flipped byte in `off` can do.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let node_count = rd_u32(&bytes, 20) as usize;
+        let after_meta = 24 + node_count * META_REC;
+        let dir_off = after_meta + 4;
+        let off_b = rd_u64(&bytes, dir_off + DIR_REC + 8);
+        let len_b = rd_u32(&bytes, dir_off + DIR_REC + 16);
+        bytes[dir_off + 8..dir_off + 16].copy_from_slice(&off_b.to_le_bytes());
+        bytes[dir_off + 16..dir_off + 20].copy_from_slice(&len_b.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let damaged = MappedSpatialGrid::open_disk(&path).unwrap().unwrap();
+        let served = damaged.cell_members(key_a.0, key_a.1).unwrap_or_default();
+        assert_ne!(
+            served, members_b,
+            "cell {key_a:?} was served cell 1's postings {members_b:?} — a damaged \
+             offset produced a confidently wrong answer"
+        );
+        assert!(
+            served.is_empty(),
+            "a run that fails its identity check must be refused, not partly served"
+        );
+    }
+
+    /// The fix must not reject good data. A checksum that refuses valid reads is
+    /// a worse bug than the one it closes, and would not show up in the
+    /// corruption test at all.
+    #[test]
+    fn every_cell_of_an_undamaged_grid_still_reads() {
+        let grid = two_cell_grid();
+        let (_tmp, path) = write_to_temp(&grid);
+        let g = MappedSpatialGrid::open_disk(&path).unwrap().unwrap();
+        assert_eq!(g.cell_count(), 2);
+        let mut seen: Vec<u64> = Vec::new();
+        for i in 0..g.cell_count() {
+            let (key, members) = g.cell_at(i).expect("clean cell must read");
+            assert!(!members.is_empty(), "cell {key:?} came back empty");
+            assert_eq!(
+                g.cell_members(key.0, key.1).as_deref(),
+                Some(members.as_slice()),
+                "cell_at and cell_members disagree for {key:?}"
+            );
+            seen.extend(members);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, vec![11, 12, 21, 22], "some node was lost");
+    }
+
+    /// Damage *inside* a run — the case identity alone cannot catch, and the
+    /// reason the frame carries a CRC as well as a cell.
+    #[test]
+    fn a_flipped_byte_inside_a_run_is_refused_not_served() {
+        let grid = two_cell_grid();
+        let (_tmp, path) = write_to_temp(&grid);
+        let clean = MappedSpatialGrid::open_disk(&path).unwrap().unwrap();
+        let (key, before) = clean.cell_at(0).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let node_count = rd_u32(&bytes, 20) as usize;
+        let after_meta = 24 + node_count * META_REC;
+        let dir_off = after_meta + 4;
+        let after_dir = dir_off + 2 * DIR_REC;
+        let blob_off = after_dir + 8;
+        // First posting byte of cell 0, just past its frame.
+        let target = blob_off + crate::geo::CELL_FRAME;
+        bytes[target] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let damaged = MappedSpatialGrid::open_disk(&path).unwrap().unwrap();
+        let served = damaged.cell_members(key.0, key.1);
+        assert_ne!(
+            served.as_deref(),
+            Some(before.as_slice()),
+            "the damaged byte was not noticed at all"
+        );
+        assert_eq!(
+            served, None,
+            "a run failing its CRC must be refused; serving {served:?} is a wrong \
+             answer wearing a correct one's clothes"
+        );
+    }
+
+    /// A grid written before the framed format keeps working. Refusing to read an
+    /// existing store because it predates a checksum would be data loss dressed
+    /// up as safety.
+    #[test]
+    fn a_version_one_grid_still_opens_and_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("spatialgrid.bin");
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(&VERSION_PLAIN.to_le_bytes());
+        b.extend_from_slice(&0.01f64.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // no meta records
+        b.extend_from_slice(&1u32.to_le_bytes()); // one cell
+        b.extend_from_slice(&7i32.to_le_bytes());
+        b.extend_from_slice(&9i32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // off
+        b.extend_from_slice(&2u32.to_le_bytes()); // two postings
+        b.extend_from_slice(&16u64.to_le_bytes()); // blob_len, unframed
+        b.extend_from_slice(&41u64.to_le_bytes());
+        b.extend_from_slice(&42u64.to_le_bytes());
+        std::fs::write(&path, &b).unwrap();
+
+        let g = MappedSpatialGrid::open_disk(&path)
+            .unwrap()
+            .expect("a version 1 grid must still open");
+        assert_eq!(g.cell_members(7, 9), Some(vec![41, 42]));
     }
 }

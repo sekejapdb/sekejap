@@ -239,9 +239,21 @@ pub struct Bm25Hit {
 
 /// How many documents may accumulate in the delta before it is folded into the
 /// base. Bounds the per-query cost of scanning the delta, and makes the
-/// amortised cost of a merge (`O(corpus) / DELTA_MERGE_DOCS` per insert)
+/// amortised cost of a merge (`O(corpus)` divided by the threshold, per insert)
 /// negligible: at 20 k documents that is single-digit microseconds per write.
-const DELTA_MERGE_DOCS: usize = 4096;
+/// The merge threshold used to be scaled with the corpus, to make a full
+/// rebuild affordable by performing it less often: `clamp(N/64, 4096, 262144)`.
+///
+/// It is gone because the rebuild is gone. Scaling was only linear inside a
+/// band — below 262 144 documents the floor bound and merges came every 4096
+/// rows over a growing corpus, and above 16 777 216 the ceiling bound and they
+/// came every 262 144 rows over a corpus larger still. Both ends were quadratic,
+/// and a fifty-million-row load spends most of its life above the ceiling, in
+/// the worse of the two.
+///
+/// A flush now writes a segment and touches nothing that exists, so how often it
+/// happens no longer trades against how much work it does. What remains is
+/// [`DELTA_FLUSH_DOCS`], which bounds only how much the delta may hold in RAM.
 
 /// Documents indexed since the last full build, held as a small in-RAM inverted
 /// index.
@@ -342,6 +354,439 @@ impl Bm25Delta {
 /// returns `true` drop the index and call `build_bm25_index` again.
 ///
 /// [`needs_rebuild`]: Bm25Index::needs_rebuild
+/// Magic at the head of a persisted segment's metadata file.
+const SEG_MAGIC: &[u8; 8] = b"SKB25SEG";
+const SEG_VERSION: u32 = 1;
+/// Where the checksum-trailer flag lives in that header.
+const SEG_FLAGS_OFF: usize = 12;
+/// Fixed prefix before the doc-length array.
+const SEG_HEADER: usize = 48;
+
+/// How many flushed segments may share a level before they are merged into one
+/// segment at the next level up.
+///
+/// This is the whole cost model. Each document is rewritten about once per
+/// level, and there are `log_FANOUT(N)` levels, so a load costs O(N log N) with
+/// a small constant instead of the O(N) full rebuild per flush that the
+/// monolithic base required. Raising it means fewer merges and more segments to
+/// consult per query; lowering it, the reverse.
+const SEG_FANOUT: usize = 8;
+
+/// How many documents accumulate in the RAM delta before it is flushed to a
+/// segment.
+///
+/// Fixed, and small, on purpose. Flushing is O(delta) — it writes a new segment
+/// and touches nothing that already exists — so there is no longer any reason to
+/// scale this with the corpus. Scaling it was an attempt to make a full rebuild
+/// affordable by doing it less often; once the rebuild is gone, the only thing
+/// this number controls is how much RAM the delta may hold, and Law 1 wants that
+/// bounded by the change rather than the store.
+const DELTA_FLUSH_DOCS: usize = 4_096;
+
+/// An immutable slice of the index covering a disjoint set of documents.
+///
+/// # Why this exists
+///
+/// The base is one contiguous structure, so folding new documents into it means
+/// rewriting all of it: every live document re-sorted, every dictionary term
+/// walked, the whole postings blob decoded and re-encoded. Doing that on the
+/// write path made a load quadratic — measured at N^1.86 — because the trigger
+/// was a few thousand documents while the work was the entire store. That is
+/// Law 2 inverted.
+///
+/// A flush now writes one of these instead: built from the delta alone, costing
+/// what the delta costs, touching nothing that already exists. Segments are
+/// merged with each other by level, so the base is never rewritten on the write
+/// path at all. This is the shape SQLite's FTS5 uses (`fts5IndexMerge`) and
+/// Lucene's `TieredMergePolicy`.
+///
+/// **Every read path must consult the base, every segment, and the delta.**
+/// Consulting fewer is how documents silently vanish from search.
+#[derive(Clone)]
+struct Bm25Segment {
+    /// Merge generation. `0` is a fresh flush; `SEG_FANOUT` segments at one
+    /// level become a single segment at the next.
+    level: u32,
+    /// Identifies this segment's files. Monotonic, never reused, so a half-written
+    /// segment can never be mistaken for a live one.
+    id: u64,
+    dict: TermDict,
+    /// Same types the base uses, so a persisted segment is **served from disk**
+    /// rather than held resident. A segment that lived only in RAM would put the
+    /// store back in memory the moment segments carried most of the data.
+    postings: PostingsBlob,
+    doc_lengths: DocLens,
+    /// Liveness for this segment, exactly as `doc_id_to_idx` is for the base:
+    /// absent means deleted.
+    doc_id_to_idx: DocIdx,
+    sum_doc_len: u64,
+    num_docs: u64,
+    /// Where this segment's metadata file lives once written. `None` while it is
+    /// still RAM-only and would be lost on close.
+    persisted: Option<std::path::PathBuf>,
+}
+
+impl Bm25Segment {
+    /// Build a segment from the delta. O(delta) — this is the write path.
+    fn from_delta(delta: &Bm25Delta) -> Option<Bm25Segment> {
+        if delta.is_empty() {
+            return None;
+        }
+        let mut live: Vec<(u64, u32)> =
+            delta.doc_lengths.iter().map(|(k, v)| (*k, *v)).collect();
+        live.sort_unstable_by_key(|(d, _)| *d);
+
+        let mut doc_lengths = Vec::with_capacity(live.len());
+        let mut doc_id_to_idx = HashMap::with_capacity(live.len());
+        let mut sum_doc_len = 0u64;
+        for (doc_id, dl) in &live {
+            doc_id_to_idx.insert(*doc_id, doc_lengths.len());
+            doc_lengths.push(*dl);
+            sum_doc_len += *dl as u64;
+        }
+
+        let mut dict = TermDict::new();
+        let mut blob: Vec<u8> = Vec::new();
+        let mut offset: u64 = 0;
+        for term in delta.terms.keys() {
+            let postings = delta.postings(term);
+            if postings.is_empty() {
+                continue;
+            }
+            let bytes = encode_postings_to_file(&postings);
+            while offset % 8 != 0 { blob.push(0); offset += 1; }
+            dict.insert(term.clone(), offset, bytes.len() as u32);
+            blob.extend_from_slice(&bytes);
+            offset += bytes.len() as u64;
+        }
+        Some(Bm25Segment {
+            level: 0,
+            id: 0,
+            dict,
+            postings: PostingsBlob::Memory(blob),
+            doc_lengths: DocLens::Owned(doc_lengths),
+            doc_id_to_idx: DocIdx::Owned(doc_id_to_idx),
+            sum_doc_len,
+            num_docs: live.len() as u64,
+            persisted: None,
+        })
+    }
+
+    /// Live postings for `term` in this segment.
+    fn postings_for(&self, term: &str) -> Vec<Posting> {
+        let entry = match self.dict.get(term) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let bytes = self.postings.read(entry.postings_offset, entry.postings_len);
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        decode_postings_from_bytes(&bytes)
+            .into_iter()
+            .filter(|p| self.doc_id_to_idx.get(p.doc_id).is_some())
+            .collect()
+    }
+
+    fn live_doc_len(&self, doc_id: u64) -> Option<u32> {
+        self.doc_id_to_idx.get(doc_id).map(|i| self.doc_lengths.get(i))
+    }
+
+    /// Retire a document. The postings stay and are gated by `doc_id_to_idx`,
+    /// which is what keeps the segment immutable.
+    fn remove(&mut self, doc_id: u64) -> bool {
+        if self.doc_id_to_idx.get(doc_id).is_none() {
+            return false;
+        }
+        // The mapped form cannot be edited, so materialise it — the same thing
+        // the base does for the same reason.
+        self.doc_id_to_idx.materialize();
+        match self.doc_id_to_idx.get(doc_id) {
+            Some(i) => {
+                let dl = self.doc_lengths.get(i) as u64;
+                self.sum_doc_len = self.sum_doc_len.saturating_sub(dl);
+                self.num_docs = self.num_docs.saturating_sub(1);
+                self.doc_id_to_idx.remove(doc_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// All live `(doc_id, doc_len)` in this segment, for a merge.
+    fn live_docs(&self) -> Vec<(u64, u32)> {
+        self.doc_id_to_idx
+            .sorted()
+            .into_iter()
+            .map(|(doc_id, idx)| (doc_id, self.doc_lengths.get(idx as usize)))
+            .collect()
+    }
+
+    fn mem_bytes(&self) -> usize {
+        self.postings.mem_bytes()
+            + self.dict.mem_bytes()
+            + match &self.doc_lengths {
+                DocLens::Owned(v) => v.capacity() * 4,
+                DocLens::Mapped { .. } => 0,
+            }
+            + match &self.doc_id_to_idx {
+                DocIdx::Owned(m) => m.capacity() * 24,
+                DocIdx::Mapped { .. } => 0,
+            }
+    }
+
+    /// Write this segment to disk and switch to serving it from there.
+    ///
+    /// # Why segments must persist
+    ///
+    /// Flushing to a segment removed the full rebuild from the *write* path, but
+    /// compaction still collapsed every segment back into the monolithic base,
+    /// because the base format had nowhere to put them. Measured at one million
+    /// rows: 221.55 s with auto-compaction against 15.42 s without, and the
+    /// difference is entirely that collapse. Persisting a segment is what lets
+    /// compaction leave it alone.
+    ///
+    /// Two files, mirroring the base exactly: metadata (`dict` + doc arrays)
+    /// mmap-served, postings `pread` from their own file. After this call the
+    /// segment holds no bulk RAM — which is the point, since segments come to
+    /// hold most of the index.
+    ///
+    /// Sacrifice: two inodes per segment, and the metadata file is verified in
+    /// full at open rather than per block, so open cost is O(segment metadata).
+    /// The postings file carries no checksum yet — the same status the base's
+    /// postings file has today.
+    fn write_to(&mut self, dir: &std::path::Path, field: &str, id: u64) -> std::io::Result<()> {
+        use std::io::Write;
+        let meta_path = dir.join(format!("bm25_{field}.s{id}.meta"));
+        let post_path = dir.join(format!("bm25_{field}.s{id}.post"));
+
+        let live = self.live_docs();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(SEG_MAGIC);
+        buf.extend_from_slice(&SEG_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // flags, filled by blockcrc
+        buf.extend_from_slice(&self.level.to_le_bytes());
+        buf.extend_from_slice(&(live.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.dict.num_terms() as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        buf.extend_from_slice(&self.num_docs.to_le_bytes());
+        buf.extend_from_slice(&self.sum_doc_len.to_le_bytes());
+        // Slots are renumbered densely, so the file carries no orphans.
+        for (i, (_, dl)) in live.iter().enumerate() {
+            let _ = i;
+            buf.extend_from_slice(&dl.to_le_bytes());
+        }
+        for (i, (doc_id, _)) in live.iter().enumerate() {
+            buf.extend_from_slice(&doc_id.to_le_bytes());
+            buf.extend_from_slice(&(i as u32).to_le_bytes());
+        }
+        let terms: Vec<(String, super::dict::TermEntry)> = self
+            .dict
+            .iter()
+            .map(|(t, e)| (t.to_string(), e.clone()))
+            .collect();
+        for (term, e) in &terms {
+            let tb = term.as_bytes();
+            buf.extend_from_slice(&(tb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(tb);
+            buf.extend_from_slice(&e.postings_offset.to_le_bytes());
+            buf.extend_from_slice(&e.postings_len.to_le_bytes());
+        }
+        crate::storage::blockcrc::append(&mut buf, SEG_FLAGS_OFF);
+
+        // Postings first, then metadata: metadata is what makes a segment
+        // visible, so it is written last and renamed into place. A crash between
+        // the two leaves an orphan postings file, which is inert.
+        let blob = self.postings_all();
+        {
+            let tmp = post_path.with_extension("post.tmp");
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&blob)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &post_path)?;
+        }
+        {
+            let tmp = meta_path.with_extension("meta.tmp");
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &meta_path)?;
+        }
+
+        self.id = id;
+        self.persisted = Some(meta_path.clone());
+        // Serve from disk now — this is what frees the RAM the segment held.
+        let reopened = Bm25Segment::open_from(&meta_path, &post_path)?;
+        if let Some(seg) = reopened {
+            self.dict = seg.dict;
+            self.postings = seg.postings;
+            self.doc_lengths = seg.doc_lengths;
+            self.doc_id_to_idx = seg.doc_id_to_idx;
+        }
+        Ok(())
+    }
+
+    /// The whole postings blob, however it is currently held.
+    fn postings_all(&self) -> Vec<u8> {
+        match &self.postings {
+            PostingsBlob::Memory(v) => v.clone(),
+            #[cfg(unix)]
+            PostingsBlob::Disk { file, len } => {
+                use std::os::unix::fs::FileExt;
+                let mut out = vec![0u8; *len as usize];
+                if file.read_exact_at(&mut out, 0).is_err() {
+                    return Vec::new();
+                }
+                out
+            }
+        }
+    }
+
+    /// Read a segment back. `None` when the file is not a segment or fails its
+    /// checksum — the caller rebuilds rather than serves what it cannot vouch for.
+    fn open_from(
+        meta_path: &std::path::Path,
+        post_path: &std::path::Path,
+    ) -> std::io::Result<Option<Bm25Segment>> {
+        let raw = std::fs::read(meta_path)?;
+        if raw.len() < SEG_HEADER || &raw[0..8] != SEG_MAGIC {
+            return Ok(None);
+        }
+        // Verified whole: a segment's doc arrays and dictionary are what every
+        // read of it addresses through, so serving them unchecked would answer
+        // with another document's statistics.
+        let Some(b) = crate::storage::blockcrc::verified_payload(&raw, SEG_FLAGS_OFF) else {
+            return Ok(None);
+        };
+        if u32::from_le_bytes(b[8..12].try_into().unwrap()) != SEG_VERSION {
+            return Ok(None);
+        }
+        let level = u32::from_le_bytes(b[16..20].try_into().unwrap());
+        let n_docs = u32::from_le_bytes(b[20..24].try_into().unwrap()) as usize;
+        let n_terms = u32::from_le_bytes(b[24..28].try_into().unwrap()) as usize;
+        let num_docs = u64::from_le_bytes(b[32..40].try_into().unwrap());
+        let sum_doc_len = u64::from_le_bytes(b[40..48].try_into().unwrap());
+
+        // Capped by the file before anything is sized from them.
+        let room = b.len().saturating_sub(SEG_HEADER);
+        if n_docs.saturating_mul(16) > room {
+            return Ok(None);
+        }
+        let dl_off = SEG_HEADER;
+        let id_off = dl_off + n_docs * 4;
+        let mut p = id_off + n_docs * 12;
+
+        let mut dict = TermDict::new();
+        for _ in 0..n_terms {
+            let Some(tl) = b.get(p..p + 2) else { break };
+            let tlen = u16::from_le_bytes(tl.try_into().unwrap()) as usize;
+            p += 2;
+            let Some(tb) = b.get(p..p + tlen) else { break };
+            let Ok(term) = std::str::from_utf8(tb) else { break };
+            p += tlen;
+            let Some(ob) = b.get(p..p + 8) else { break };
+            let off = u64::from_le_bytes(ob.try_into().unwrap());
+            p += 8;
+            let Some(lb) = b.get(p..p + 4) else { break };
+            let len = u32::from_le_bytes(lb.try_into().unwrap());
+            p += 4;
+            dict.insert(term.to_string(), off, len);
+        }
+
+        let file = std::fs::File::open(post_path)?;
+        let plen = file.metadata()?.len();
+        #[cfg(unix)]
+        let postings = PostingsBlob::Disk { file: std::sync::Arc::new(file), len: plen };
+        #[cfg(not(unix))]
+        let postings = { let _ = (file, plen); PostingsBlob::Memory(std::fs::read(post_path)?) };
+
+        // The doc arrays are served from the map, exactly as the base's are.
+        let mfile = std::fs::File::open(meta_path)?;
+        let mlen = mfile.metadata()?.len() as usize;
+        let view = match MmapView::try_new(&mfile, mlen) {
+            Some(v) => Arc::new(v),
+            None => return Ok(None),
+        };
+        Ok(Some(Bm25Segment {
+            level,
+            id: 0,
+            dict,
+            postings,
+            doc_lengths: DocLens::Mapped { view: view.clone(), off: dl_off, count: n_docs },
+            doc_id_to_idx: DocIdx::Mapped { view, off: id_off, count: n_docs },
+            sum_doc_len,
+            num_docs,
+            persisted: Some(meta_path.to_path_buf()),
+        }))
+    }
+
+    /// Fold several segments into one. Costs what the inputs cost — never the
+    /// store — which is what keeps the merge policy inside Law 2.
+    fn merge(parts: Vec<Bm25Segment>) -> Option<Bm25Segment> {
+        if parts.is_empty() {
+            return None;
+        }
+        let mut live: Vec<(u64, u32)> = Vec::new();
+        for p in &parts {
+            live.extend(p.live_docs());
+        }
+        if live.is_empty() {
+            return None;
+        }
+        live.sort_unstable_by_key(|(d, _)| *d);
+
+        let mut doc_lengths = Vec::with_capacity(live.len());
+        let mut doc_id_to_idx = HashMap::with_capacity(live.len());
+        let mut sum_doc_len = 0u64;
+        for (doc_id, dl) in &live {
+            doc_id_to_idx.insert(*doc_id, doc_lengths.len());
+            doc_lengths.push(*dl);
+            sum_doc_len += *dl as u64;
+        }
+
+        let mut terms: Vec<String> = Vec::new();
+        for p in &parts {
+            terms.extend(p.dict.iter().map(|(t, _)| t.to_string()));
+        }
+        terms.sort();
+        terms.dedup();
+
+        let mut dict = TermDict::new();
+        let mut blob: Vec<u8> = Vec::new();
+        let mut offset: u64 = 0;
+        for term in terms {
+            let mut postings: Vec<Posting> = Vec::new();
+            for p in &parts {
+                postings.extend(p.postings_for(&term));
+            }
+            if postings.is_empty() {
+                continue;
+            }
+            // Segments hold disjoint documents — `insert_doc` retires the old
+            // copy everywhere before writing the new one — so this is a sort of
+            // already-sorted runs, not a deduplication.
+            postings.sort_unstable_by_key(|p| p.doc_id);
+            let bytes = encode_postings_to_file(&postings);
+            while offset % 8 != 0 { blob.push(0); offset += 1; }
+            dict.insert(term, offset, bytes.len() as u32);
+            blob.extend_from_slice(&bytes);
+            offset += bytes.len() as u64;
+        }
+        let level = parts.iter().map(|p| p.level).max().unwrap_or(0) + 1;
+        Some(Bm25Segment {
+            level,
+            id: 0,
+            dict,
+            postings: PostingsBlob::Memory(blob),
+            doc_lengths: DocLens::Owned(doc_lengths),
+            doc_id_to_idx: DocIdx::Owned(doc_id_to_idx),
+            sum_doc_len,
+            num_docs: live.len() as u64,
+            persisted: None,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Bm25Index {
     /// Collection-level metadata (document count, field name).
@@ -376,6 +821,20 @@ pub struct Bm25Index {
     /// Documents written since the last merge. See [`Bm25Delta`] — every read
     /// path must consult this as well as the base.
     delta: Bm25Delta,
+    /// Files of segments a level merge has absorbed. Deleted only once the
+    /// segment that replaced them is safely on disk — write the new state,
+    /// verify it, then drop the old, which is Law 3.
+    retired_segment_files: Vec<std::path::PathBuf>,
+    /// Monotonic, never reused: a half-written segment can never be mistaken for
+    /// a live one.
+    next_segment_id: u64,
+    /// Immutable segments written by flushing the delta, newest last.
+    ///
+    /// The base above is never rewritten on the write path; these absorb every
+    /// write and are merged with each other by level. Empty in an index that has
+    /// only ever been built or freshly opened, which is why an index with no
+    /// segments behaves exactly as it did before they existed.
+    segments: Vec<Bm25Segment>,
 }
 
 impl Bm25Index {
@@ -387,6 +846,7 @@ impl Bm25Index {
             + match &self.doc_lengths { DocLens::Owned(v) => v.capacity() * 4, DocLens::Mapped { .. } => 0 }
             + match &self.doc_id_to_idx { DocIdx::Owned(m) => m.capacity() * 24, DocIdx::Mapped { .. } => 0 }
             + self.delta.mem_bytes()
+            + self.segments.iter().map(|s| s.mem_bytes()).sum::<usize>()
     }
 
     /// Spill the postings blob to `path` and switch to disk-backed reads,
@@ -431,6 +891,9 @@ impl Bm25Index {
         // room for a delta, so persisting an unmerged index would silently drop
         // every recently-written document from search on the next open. Callers
         // must merge_delta() first; refusing here makes that impossible to forget.
+        // Segments are no longer a reason to refuse: they live in their own
+        // files and are reloaded by `load_segments`. An unflushed delta still is,
+        // because it lives nowhere.
         if !self.delta.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -569,6 +1032,9 @@ impl Bm25Index {
             doc_id_to_idx: DocIdx::Mapped { view: view.clone(), off: idmap_off, count: idmap_count },
             sum_doc_len,
             delta: Bm25Delta::default(),
+            segments: Vec::new(),
+            retired_segment_files: Vec::new(),
+            next_segment_id: 0,
         };
         Ok((index, p))
     }
@@ -681,6 +1147,9 @@ impl Bm25Index {
             doc_id_to_idx: DocIdx::Owned(doc_id_to_idx),
             sum_doc_len,
             delta: Bm25Delta::default(),
+            segments: Vec::new(),
+            retired_segment_files: Vec::new(),
+            next_segment_id: 0,
         }
     }
 
@@ -830,6 +1299,13 @@ impl Bm25Index {
         if self.delta.remove(doc_id) {
             return true;
         }
+        // A document lives in exactly one place, because `insert_doc` retires the
+        // previous copy before writing the new one.
+        for seg in &mut self.segments {
+            if seg.remove(doc_id) {
+                return true;
+            }
+        }
         // The liveness map is the only thing that excludes a document, and the
         // mapped form cannot be edited — materialise it so the removal sticks.
         if self.doc_id_to_idx.get(doc_id).is_some() {
@@ -859,11 +1335,12 @@ impl Bm25Index {
     /// [`delete`]: Bm25Index::delete
     #[inline]
     pub fn avg_doc_len(&self) -> f64 {
-        let n = self.meta.num_docs + self.delta.len() as u64;
+        let n = self.num_docs();
         if n == 0 {
             1.0
         } else {
-            (self.sum_doc_len + self.delta.sum_doc_len) as f64 / n as f64
+            let seg: u64 = self.segments.iter().map(|s| s.sum_doc_len).sum();
+            (self.sum_doc_len + seg + self.delta.sum_doc_len) as f64 / n as f64
         }
     }
 
@@ -917,18 +1394,24 @@ impl Bm25Index {
 
     /// Total number of live (non-deleted) documents in the index.
     pub fn num_docs(&self) -> u64 {
-        self.meta.num_docs + self.delta.len() as u64
+        self.meta.num_docs + self.segment_docs() + self.delta.len() as u64
     }
 
     /// Number of unique terms across the dictionary and the delta.
     pub fn num_terms(&self) -> usize {
-        let extra = self.delta.terms.keys().filter(|t| self.dict.get(t).is_none()).count();
-        self.dict.num_terms() + extra
+        let mut extra: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for seg in &self.segments {
+            extra.extend(seg.dict.iter().map(|(t, _)| t).filter(|t| self.dict.get(t).is_none()));
+        }
+        extra.extend(
+            self.delta.terms.keys().map(|t| t.as_str()).filter(|t| self.dict.get(t).is_none()),
+        );
+        self.dict.num_terms() + extra.len()
     }
 
     /// How many documents are waiting in the delta. Exposed so callers can
     /// decide when to [`merge_delta`]; the index also merges itself once the
-    /// delta passes `DELTA_MERGE_DOCS`.
+    /// delta passes [`delta_merge_threshold`].
     ///
     /// [`merge_delta`]: Bm25Index::merge_delta
     pub fn delta_len(&self) -> usize { self.delta.len() }
@@ -944,8 +1427,8 @@ impl Bm25Index {
     pub fn insert_doc(&mut self, doc_id: u64, text: &str) {
         self.delete(doc_id);
         self.delta.insert(doc_id, text);
-        if self.delta.len() >= DELTA_MERGE_DOCS {
-            self.merge_delta();
+        if self.delta.len() >= DELTA_FLUSH_DOCS {
+            self.flush_delta_to_segment();
         }
     }
 
@@ -958,8 +1441,176 @@ impl Bm25Index {
     ///
     /// [`delete`]: Bm25Index::delete
     /// [`needs_rebuild`]: Bm25Index::needs_rebuild
+    /// Write the delta out as a new segment. **O(delta)** — nothing that already
+    /// exists is read or rewritten.
+    ///
+    /// This is what replaced calling [`merge_delta`] from the insert path. That
+    /// rebuilt the entire index every few thousand documents, which measured
+    /// N^1.86 over a 20k/50k/150k ladder: a change-sized trigger doing
+    /// store-sized work, Law 2 exactly backwards.
+    ///
+    /// [`merge_delta`]: Bm25Index::merge_delta
+    fn flush_delta_to_segment(&mut self) {
+        if let Some(seg) = Bm25Segment::from_delta(&self.delta) {
+            self.segments.push(seg);
+            self.delta = Bm25Delta::default();
+            self.merge_segment_levels();
+        }
+    }
+
+    /// Merge segments upward whenever `SEG_FANOUT` of them share a level.
+    ///
+    /// Segment count stays at `O(SEG_FANOUT x log(N))` rather than growing with
+    /// the number of flushes, which is what keeps a query's per-segment
+    /// dictionary probes bounded. Each merge costs what its inputs cost, never
+    /// what the store costs.
+    ///
+    /// The sacrifice: a query consults every segment, so this trades a little
+    /// read cost for removing the rebuild from the write path entirely.
+    fn merge_segment_levels(&mut self) {
+        loop {
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for seg in &self.segments {
+                *counts.entry(seg.level).or_default() += 1;
+            }
+            // Lowest full level first, so merges stay cheap and the work is
+            // spread rather than arriving all at once at the top.
+            let level = match counts
+                .iter()
+                .filter(|(_, c)| **c >= SEG_FANOUT)
+                .map(|(l, _)| *l)
+                .min()
+            {
+                Some(l) => l,
+                None => break,
+            };
+            let (to_merge, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.segments)
+                .into_iter()
+                .partition(|seg| seg.level == level);
+            self.segments = rest;
+            // Their files outlive them until the replacement is durable.
+            for seg in &to_merge {
+                if let Some(path) = &seg.persisted {
+                    self.retired_segment_files.push(path.clone());
+                }
+            }
+            if let Some(merged) = Bm25Segment::merge(to_merge) {
+                self.segments.push(merged);
+            }
+        }
+    }
+
+    /// Delete every persisted segment file for `field`.
+    ///
+    /// # Why a full rebuild must call this
+    ///
+    /// `build_bm25_index` walks the whole store and produces a base covering
+    /// every document, then replaces the index — an index with no segments. The
+    /// segment *files* survive that, and `load_segments` then finds them and adds
+    /// them back, so every document they hold is counted **twice**: once in the
+    /// rebuilt base and once in the segment.
+    ///
+    /// That is not a lost row, which a count would catch. It inflates `num_docs`,
+    /// which moves every IDF, so the index answers with the right documents in
+    /// the wrong order. Measured: a corpus of 33 documents reading as 45 after a
+    /// compaction, and BM25 scores diverging from every other storage mode.
+    ///
+    /// The files are derived data — the rebuild can always be redone from the
+    /// store — so removing them cannot lose anything the store still holds.
+    pub fn remove_segment_files(dir: &std::path::Path, field: &str) {
+        let prefix = format!("bm25_{field}.s");
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix(&prefix) else { continue };
+            if rest.ends_with(".meta") || rest.ends_with(".post") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Segments that exist only in RAM, and would be lost on close.
+    pub fn unpersisted_segments(&self) -> usize {
+        self.segments.iter().filter(|s| s.persisted.is_none()).count()
+    }
+
+    /// Fold the delta into a segment and write every segment that is not yet on
+    /// disk. **O(change)** — a segment already on disk is not rewritten.
+    ///
+    /// This is what replaced collapsing everything into the base at compaction
+    /// time. That collapse was O(corpus) and ran repeatedly during a load: one
+    /// million rows cost 221.55 s with it and 15.42 s without.
+    pub fn persist(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.flush_delta_to_segment();
+        let field = self.meta.field.clone();
+        for i in 0..self.segments.len() {
+            if self.segments[i].persisted.is_some() {
+                continue;
+            }
+            let id = self.next_segment_id;
+            self.next_segment_id += 1;
+            self.segments[i].write_to(dir, &field, id)?;
+        }
+        // Only now — the replacements are durable, so what they replaced can go.
+        for path in std::mem::take(&mut self.retired_segment_files) {
+            let post = path.with_extension("post");
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&post);
+        }
+        Ok(())
+    }
+
+    /// Load every persisted segment for this field back from `dir`.
+    ///
+    /// Segments are found by **scanning the directory**, not from a manifest: a
+    /// single index of everything is a single point of total loss, and Law 5 asks
+    /// that recovery not require the thing that was damaged.
+    pub fn load_segments(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        let field = self.meta.field.clone();
+        let prefix = format!("bm25_{field}.s");
+        let mut found: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        let rd = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix(&prefix) else { continue };
+            let Some(idstr) = rest.strip_suffix(".meta") else { continue };
+            let Ok(id) = idstr.parse::<u64>() else { continue };
+            found.push((id, entry.path()));
+        }
+        // Oldest first, so slot order matches the order they were written.
+        found.sort_by_key(|(id, _)| *id);
+        for (id, meta_path) in found {
+            let post_path = dir.join(format!("bm25_{field}.s{id}.post"));
+            match Bm25Segment::open_from(&meta_path, &post_path) {
+                Ok(Some(mut seg)) => {
+                    seg.id = id;
+                    self.next_segment_id = self.next_segment_id.max(id + 1);
+                    self.segments.push(seg);
+                }
+                // A segment that cannot be vouched for is left out rather than
+                // served. It names what was lost by simply not being there.
+                Ok(None) | Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Documents held in flushed segments, i.e. not in the base and not in the
+    /// delta.
+    pub fn segment_docs(&self) -> u64 {
+        self.segments.iter().map(|s| s.num_docs).sum()
+    }
+
+    /// How many segments a query currently has to consult beyond the base.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
     pub fn merge_delta(&mut self) {
-        if self.delta.is_empty() && self.orphan_count() == 0 {
+        if self.delta.is_empty() && self.segments.is_empty() && self.orphan_count() == 0 {
             return;
         }
 
@@ -969,6 +1620,9 @@ impl Bm25Index {
             .into_iter()
             .map(|(doc_id, idx)| (doc_id, self.doc_lengths.get(idx as usize)))
             .collect();
+        for seg in &self.segments {
+            live.extend(seg.live_docs());
+        }
         for (&doc_id, &dl) in &self.delta.doc_lengths {
             live.push((doc_id, dl));
         }
@@ -986,8 +1640,11 @@ impl Bm25Index {
         // Union of base and delta terms, in sorted order (the dictionary is
         // sorted, and BTreeMap iterates sorted, so this stays cheap).
         let mut terms: Vec<String> = self.dict.iter().map(|(t, _)| t.to_string()).collect();
+        for seg in &self.segments {
+            terms.extend(seg.dict.iter().map(|(t, _)| t.to_string()));
+        }
         for t in self.delta.terms.keys() {
-            if self.dict.get(t).is_none() { terms.push(t.clone()); }
+            terms.push(t.clone());
         }
         terms.sort();
         terms.dedup();
@@ -995,7 +1652,50 @@ impl Bm25Index {
         let mut dict = TermDict::new();
         let mut blob: Vec<u8> = Vec::new();
         let mut offset: u64 = 0;
+
+        // A merge folds in a delta of a few thousand documents, but the loop
+        // below rewrites the WHOLE dictionary. For the terms the delta never
+        // mentions, that work is: read the bytes, decode them into postings,
+        // filter nothing out, and encode them back to the identical bytes.
+        //
+        // A delta touches a small fraction of a real dictionary, so this is the
+        // bulk of a merge, and copying the encoded range verbatim skips all of
+        // it. The output blob is byte-identical either way.
+        //
+        // Only sound while nothing has been deleted from the base: a deletion
+        // has to be filtered out of every posting list, which means every list
+        // genuinely does have to be decoded. `orphan_count` is exactly that
+        // question, and a merge leaves it at zero.
+        //
+        // The sacrifice: none in output, one extra `orphan_count` call, and the
+        // copied range keeps whatever encoding it already had rather than being
+        // re-encoded under any newer scheme. A version bump forces a full
+        // rebuild anyway, which is where re-encoding belongs.
+        // Segments carry postings for terms the delta may not mention, so the
+        // verbatim shortcut is only sound when there are none. Copying a base
+        // range while a segment held newer postings for the same term would drop
+        // those documents from the term, silently.
+        let untouched_keep_their_bytes =
+            self.orphan_count() == 0 && self.segments.is_empty();
+
         for term in terms {
+            let delta_postings = self.delta.postings(&term);
+
+            if untouched_keep_their_bytes && delta_postings.is_empty() {
+                let raw = match self.dict.get(&term) {
+                    Some(entry) => self.postings.read(entry.postings_offset, entry.postings_len),
+                    None => continue,
+                };
+                if raw.is_empty() {
+                    continue;
+                }
+                while offset % 8 != 0 { blob.push(0); offset += 1; }
+                dict.insert(term, offset, raw.len() as u32);
+                blob.extend_from_slice(&raw);
+                offset += raw.len() as u64;
+                continue;
+            }
+
             let mut postings: Vec<Posting> = match self.dict.get(&term) {
                 Some(entry) => self.get_postings(entry)
                     .into_iter()
@@ -1003,7 +1703,15 @@ impl Bm25Index {
                     .collect(),
                 None => Vec::new(),
             };
-            for p in self.delta.postings(&term) {
+            for seg in &self.segments {
+                for p in seg.postings_for(&term) {
+                    match postings.binary_search_by_key(&p.doc_id, |q| q.doc_id) {
+                        Ok(i) => postings[i] = p,
+                        Err(i) => postings.insert(i, p),
+                    }
+                }
+            }
+            for p in delta_postings {
                 match postings.binary_search_by_key(&p.doc_id, |q| q.doc_id) {
                     Ok(i) => postings[i] = p,
                     Err(i) => postings.insert(i, p),
@@ -1032,6 +1740,13 @@ impl Bm25Index {
         self.doc_id_to_idx = DocIdx::Owned(doc_id_to_idx);
         self.sum_doc_len = sum_doc_len;
         self.delta = Bm25Delta::default();
+        // Everything they held is now in the base, so their files are dead.
+        for seg in &self.segments {
+            if let Some(path) = &seg.persisted {
+                self.retired_segment_files.push(path.clone());
+            }
+        }
+        self.segments.clear();
     }
 
     // ── Private helpers ───────────────────────────────────────────────
@@ -1050,6 +1765,16 @@ impl Bm25Index {
                 .collect(),
             None => Vec::new(),
         };
+        // Every segment, then the delta. A read path that skips one of these
+        // does not error — it silently returns fewer documents.
+        for seg in &self.segments {
+            for p in seg.postings_for(term) {
+                match postings.binary_search_by_key(&p.doc_id, |q| q.doc_id) {
+                    Ok(i) => postings[i] = p,
+                    Err(i) => postings.insert(i, p),
+                }
+            }
+        }
         if !self.delta.is_empty() {
             for p in self.delta.postings(term) {
                 match postings.binary_search_by_key(&p.doc_id, |q| q.doc_id) {
@@ -1066,6 +1791,11 @@ impl Bm25Index {
     fn live_doc_len(&self, doc_id: u64) -> Option<u32> {
         if let Some(idx) = self.doc_id_to_idx.get(doc_id) {
             return Some(self.doc_lengths.get(idx));
+        }
+        for seg in &self.segments {
+            if let Some(dl) = seg.live_doc_len(doc_id) {
+                return Some(dl);
+            }
         }
         self.delta.doc_lengths.get(&doc_id).copied()
     }

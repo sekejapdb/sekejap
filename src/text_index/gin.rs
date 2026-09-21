@@ -94,7 +94,27 @@ pub struct GINIndex {
     /// reverse lookup; walking it per mutation would put every insert and delete
     /// back to `O(documents)`, which is the cost this whole change exists to
     /// remove. Built once on the first mutation, maintained from then on.
-    slot_of: Option<HashMap<u64, u32>>,
+    /// hash → this document's newest slot **in the overlay only**.
+    ///
+    /// # Why not the whole store
+    ///
+    /// This was `Option<HashMap<u64, u32>>` covering every slot in the base *and*
+    /// the overlay, built lazily by `delete`. `insert_doc` calls `delete` to
+    /// supersede, so an ordinary insert load built a resident reverse index of
+    /// the entire corpus: measured 22 MB at one million rows and 91 MB at five,
+    /// while every other part of the index stayed flat. RAM proportional to the
+    /// store, which is Law 1.
+    ///
+    /// The map is not actually needed. `delete` never has to *know* the old slot:
+    /// a base slot is stale exactly when the overlay holds a newer slot for the
+    /// same hash, and that question is answered by an overlay-sized map at read
+    /// time. See [`slot_hash`].
+    ///
+    /// [`slot_hash`]: GINIndex::slot_hash
+    overlay_slot: HashMap<u64, u32>,
+    /// Documents retired whose slot is in the base, so it cannot be marked
+    /// directly. Bounded by deletions since the last fold, not by the store.
+    dead_hashes: std::collections::HashSet<u64>,
 }
 
 impl GINIndex {
@@ -138,7 +158,8 @@ impl GINIndex {
             field: field.to_string(),
             mapped: None,
             dead_slots: roaring::RoaringBitmap::new(),
-            slot_of: None,
+            overlay_slot: HashMap::new(),
+            dead_hashes: std::collections::HashSet::new(),
         }
     }
 
@@ -155,10 +176,16 @@ impl GINIndex {
             + self.postings.capacity() * 16;
         let id_map = self.id_map.capacity() * 8;
         let dead = self.dead_slots.serialized_size();
-        let slot_of = self
-            .slot_of
-            .as_ref()
-            .map_or(0, |m| m.capacity() * (8 + 4 + 1));
+        let slot_of = self.overlay_slot.capacity() * (8 + 4 + 1)
+            + self.dead_hashes.capacity() * (8 + 1);
+        if std::env::var_os("SK_GIN_MEM").is_some() {
+            eprintln!(
+                "GINMEM postings={}MB (n={}) id_map={}MB (cap={}) dead={}MB slot_of={}MB",
+                postings / 1_048_576, self.postings.len(),
+                id_map / 1_048_576, self.id_map.capacity(),
+                dead / 1_048_576, slot_of / 1_048_576,
+            );
+        }
         postings + id_map + dead + slot_of + self.field.capacity()
     }
 
@@ -173,7 +200,10 @@ impl GINIndex {
     /// written and would be lost on reopen. The database rebuilds these before
     /// persisting; this is how it knows which ones need it.
     pub fn has_pending_overlay(&self) -> bool {
-        self.mapped.is_some() && (!self.id_map.is_empty() || !self.dead_slots.is_empty())
+        self.mapped.is_some()
+            && (!self.id_map.is_empty()
+                || !self.dead_slots.is_empty()
+                || !self.dead_hashes.is_empty())
     }
 
     /// Disk-first GIN for paged mode: postings + id map served from the mmap base;
@@ -184,7 +214,8 @@ impl GINIndex {
             id_map: Vec::new(),
             doc_count: base.doc_count(),
             dead_slots: roaring::RoaringBitmap::new(),
-            slot_of: None,
+            overlay_slot: HashMap::new(),
+            dead_hashes: std::collections::HashSet::new(),
             field: base.field().to_string(),
             mapped: Some(base),
         }
@@ -220,10 +251,23 @@ impl GINIndex {
             return None;
         }
         let base = self.base_slots();
-        if slot < base {
-            return self.mapped.as_ref().and_then(|m| m.slot_hash(slot));
+        let hash = if slot < base {
+            self.mapped.as_ref().and_then(|m| m.slot_hash(slot))?
+        } else {
+            self.id_map.get((slot - base) as usize).copied()?
+        };
+        // Supersede, decided here rather than at delete time: whichever slot the
+        // overlay names is the live one, so any other slot for that hash is a
+        // stale earlier copy. This is what removes the need for a reverse map
+        // over the whole store.
+        match self.overlay_slot.get(&hash) {
+            Some(&newest) => return (newest == slot).then_some(hash),
+            None => {}
         }
-        self.id_map.get((slot - base) as usize).copied()
+        if self.dead_hashes.contains(&hash) {
+            return None;
+        }
+        Some(hash)
     }
 
     /// Retire every slot holding `doc_id`, so it stops matching.
@@ -231,41 +275,21 @@ impl GINIndex {
     /// Scans the slot table, which costs a pass over an array of `u64` — orders of
     /// magnitude below the full rebuild this replaces, and only on a delete.
     pub fn delete(&mut self, doc_id: u64) -> bool {
-        self.ensure_slot_map();
-        let slot = match self.slot_of.as_mut().and_then(|m| m.remove(&doc_id)) {
-            Some(s) => s,
-            None => return false,
-        };
-        self.dead_slots.insert(slot);
-        self.doc_count = self.doc_count.saturating_sub(1);
-        true
-    }
-
-    /// Populate the reverse slot map, once, by walking both halves of the slot
-    /// space. Later slots win, so a document written twice resolves to its newest.
-    fn ensure_slot_map(&mut self) {
-        if self.slot_of.is_some() {
-            return;
+        if let Some(slot) = self.overlay_slot.remove(&doc_id) {
+            self.dead_slots.insert(slot);
+            self.doc_count = self.doc_count.saturating_sub(1);
+            // A base copy may exist as well — the same document written before
+            // the last fold and again after it — so gate the hash too.
+            self.dead_hashes.insert(doc_id);
+            return true;
         }
-        let base = self.base_slots();
-        let mut map: HashMap<u64, u32> = HashMap::with_capacity(
-            base as usize + self.id_map.len(),
-        );
-        for slot in 0..base {
-            if self.dead_slots.contains(slot) {
-                continue;
-            }
-            if let Some(h) = self.mapped.as_ref().and_then(|m| m.slot_hash(slot)) {
-                map.insert(h, slot);
-            }
-        }
-        for (i, &h) in self.id_map.iter().enumerate() {
-            let slot = base + i as u32;
-            if !self.dead_slots.contains(slot) {
-                map.insert(h, slot);
-            }
-        }
-        self.slot_of = Some(map);
+        // A base copy cannot be located without a reverse map over the whole
+        // store, which is exactly the cost this avoids. Recording the hash gates
+        // every slot that resolves to it, which is the same outcome for a reader.
+        //
+        // `doc_count` is left alone here: it is internal bookkeeping, and moving
+        // it on a document that may never have existed would make it a lie.
+        self.dead_hashes.insert(doc_id)
     }
 
     /// Query the index for documents matching an ILIKE pattern.
@@ -343,9 +367,9 @@ impl GINIndex {
             // with a base slot and make one existing document unreachable.
             let slot = self.base_slots() + self.id_map.len() as u32;
             self.id_map.push(doc_id);
-            if let Some(map) = self.slot_of.as_mut() {
-                map.insert(doc_id, slot);
-            }
+            // Names this as the live copy, which supersedes any base slot for the
+            // same document without needing to know where that slot is.
+            self.overlay_slot.insert(doc_id, slot);
             for trigram in &trigrams {
                 let h = hash_trigram(trigram);
                 self.postings
@@ -380,7 +404,8 @@ impl GINIndex {
             field: field.to_string(),
             mapped: None,
             dead_slots: roaring::RoaringBitmap::new(),
-            slot_of: None,
+            overlay_slot: HashMap::new(),
+            dead_hashes: std::collections::HashSet::new(),
         }
     }
 
@@ -492,7 +517,23 @@ impl GINIndex {
         let mut ov: Vec<(u32, &roaring::RoaringBitmap)> =
             self.postings.iter().map(|(h, b)| (*h, b)).collect();
         ov.sort_unstable_by_key(|(h, _)| *h);
-        let dead = &self.dead_slots;
+
+        // Slots to drop from the postings being written. `dead_slots` covers
+        // overlay slots directly; a base slot retired or superseded is recorded
+        // by HASH (see `delete`), so it is resolved here — during a walk over the
+        // base the fold already performs to write the id map.
+        //
+        // Memory is bounded by the number of retired documents, not by the store,
+        // which is the whole reason `delete` stopped keeping a reverse map.
+        let mut fold_dead = self.dead_slots.clone();
+        if !self.dead_hashes.is_empty() || !self.overlay_slot.is_empty() {
+            for slot in 0..base.doc_count() as u32 {
+                if self.slot_hash(slot).is_none() {
+                    fold_dead.insert(slot);
+                }
+            }
+        }
+        let dead = &fold_dead;
 
         let merged = |mut emit: Box<dyn FnMut(u32, &roaring::RoaringBitmap) -> std::io::Result<()> + '_>|
             -> std::io::Result<()>
@@ -630,7 +671,7 @@ impl GINIndex {
         }
 
         let doc_count = id_map.len();
-        Ok((field.clone(), Self { postings, id_map, doc_count, field, mapped: None, dead_slots: roaring::RoaringBitmap::new(), slot_of: None }))
+        Ok((field.clone(), Self { postings, id_map, doc_count, field, mapped: None, dead_slots: roaring::RoaringBitmap::new(), overlay_slot: HashMap::new(), dead_hashes: std::collections::HashSet::new() }))
     }
 
     /// Get the number of unique trigrams indexed.

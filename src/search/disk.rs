@@ -27,10 +27,13 @@ impl SearchIndex {
         // Guard rail, matching BM25: the on-disk format stores one segment, so
         // serialising an index that still holds a delta would drop the newest
         // documents from search on the next open. Callers rebuild first.
-        if self.delta.is_some() {
+        // Persisted segments live in their own files and are reloaded by
+        // `load_segments`, so they are no longer a reason to refuse. A segment
+        // that is still RAM-only is, because it lives nowhere else.
+        if self.unpersisted_segments() > 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "search: refusing to serialise an index with an unmerged delta",
+                "search: refusing to serialise an index with an unpersisted segment",
             ));
         }
         w.write_all(MAGIC)?;
@@ -184,8 +187,9 @@ impl SearchIndex {
             postings_data,
             field_post,
             position_post,
-            delta: None,
-            delta_docs: Vec::new(),
+            deltas: Vec::new(),
+            retired_segment_files: Vec::new(),
+            next_segment_id: 0,
         })
     }
 
@@ -263,8 +267,9 @@ impl SearchIndex {
             postings_data,
             field_post,
             position_post,
-            delta: None,
-            delta_docs: Vec::new(),
+            deltas: Vec::new(),
+            retired_segment_files: Vec::new(),
+            next_segment_id: 0,
         }, consumed))
     }
 }
@@ -367,5 +372,257 @@ mod tests {
         // Fuzzy match should work after roundtrip
         let results = loaded.search("programing");
         assert!(results.contains(0), "fuzzy should work after disk roundtrip");
+    }
+}
+
+// ── Segments on disk ──────────────────────────────────────────────────────────
+//
+// A flush becomes an immutable segment; persisting it is what lets compaction
+// leave it alone instead of rebuilding the collection's whole index. Measured
+// before this existed: the search index was O(N^1.77) over a 500k/1M/2M ladder,
+// because `merge_search_deltas` called `rebuild_search_for_collection` — a full
+// rebuild — on every compaction.
+//
+// One file per segment: the index exactly as `write_binary` lays it out, then the
+// source rows. The rows are needed only to merge segments later, so they sit past
+// the index and are read back on demand rather than held resident.
+
+use super::index::{DocFields, SearchSegment, SegDocs, SEARCH_MERGE_MAX_DOCS, SEARCH_SEG_FANOUT};
+use std::path::Path;
+
+/// `[n u32]` then per row `[hash u64][nfields u16][(len u32, bytes)...]`.
+pub(crate) fn encode_docs(docs: &[DocFields], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(docs.len() as u32).to_le_bytes());
+    for d in docs {
+        out.extend_from_slice(&d.hash.to_le_bytes());
+        out.extend_from_slice(&(d.field_values.len() as u16).to_le_bytes());
+        for v in &d.field_values {
+            let b = v.as_bytes();
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+    }
+}
+
+/// Every length here comes out of the file, so each one is bounds-checked before
+/// it is used. A truncated or damaged tail yields the rows read so far rather
+/// than a panic.
+pub(crate) fn decode_docs(b: &[u8], mut p: usize) -> Vec<DocFields> {
+    let rd32 = |b: &[u8], p: usize| b.get(p..p + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()));
+    let rd16 = |b: &[u8], p: usize| b.get(p..p + 2).map(|x| u16::from_le_bytes(x.try_into().unwrap()));
+    let rd64 = |b: &[u8], p: usize| b.get(p..p + 8).map(|x| u64::from_le_bytes(x.try_into().unwrap()));
+    let Some(n) = rd32(b, p) else { return Vec::new() };
+    p += 4;
+    // Each row needs at least 10 bytes, so the file bounds how many there can be.
+    let n = (n as usize).min(b.len().saturating_sub(p) / 10);
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let Some(hash) = rd64(b, p) else { break };
+        p += 8;
+        let Some(nf) = rd16(b, p) else { break };
+        p += 2;
+        let mut field_values = Vec::with_capacity(nf as usize);
+        for _ in 0..nf {
+            let Some(len) = rd32(b, p) else { return out };
+            p += 4;
+            let Some(raw) = b.get(p..p + len as usize) else { return out };
+            p += len as usize;
+            field_values.push(String::from_utf8_lossy(raw).into_owned());
+        }
+        out.push(DocFields { hash, field_values });
+    }
+    out
+}
+
+/// `[u32 level][u32 reserved]` in front of a segment file.
+///
+/// # Why the level must be on disk
+///
+/// A merge level is the only thing that says a segment is already large and
+/// should not be merged again until seven more of its size exist. Compaction
+/// reloads the index from `search.bin`, and a loader that cannot read the level
+/// has to guess — guessing zero demotes every merged segment to the bottom, so
+/// the next eight flushes absorb it and rewrite it whole. That turns a level into
+/// a monolithic base: measured at 16 MB rewritten on the first compaction, 178 MB
+/// by the tenth, growing linearly, which is O(N^2) over a load.
+const SEG_HEADER: usize = 8;
+
+fn seg_path(dir: &Path, key: &str, id: u64) -> std::path::PathBuf {
+    // Hashed, because a collection name is user text and this is a filename.
+    dir.join(format!("search_{:016x}.s{}.bin", crate::sk_hash(key), id))
+}
+
+impl SearchIndex {
+    /// Write every segment not yet on disk. **O(change)** — one already written
+    /// is left alone, and the base is not touched.
+    pub(crate) fn persist_segments(&mut self, dir: &Path, key: &str) -> io::Result<()> {
+        for i in 0..self.deltas.len() {
+            if self.deltas[i].persisted.is_some() {
+                continue;
+            }
+            let id = self.next_segment_id;
+            self.next_segment_id += 1;
+            let path = seg_path(dir, key, id);
+
+            let mut buf: Vec<u8> = Vec::new();
+            buf.extend_from_slice(&self.deltas[i].level.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes()); // reserved, keeps the index 8-aligned
+            self.deltas[i].index.write_binary(&mut buf)?;
+            let docs_off = buf.len();
+            encode_docs(&self.deltas[i].docs.load(), &mut buf);
+
+            let tmp = path.with_extension("bin.tmp");
+            {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(&buf)?;
+                f.sync_all()?;
+            }
+            std::fs::rename(&tmp, &path)?;
+
+            // Serve it from the map now, which is what frees the RAM it held.
+            if let Some((mapped, _, _)) = open_segment(&path)? {
+                self.deltas[i].index = Box::new(mapped);
+            }
+            self.deltas[i].id = id;
+            self.deltas[i].docs = SegDocs::OnDisk { path: path.clone(), off: docs_off };
+            self.deltas[i].persisted = Some(path);
+        }
+        // Only now: the replacements are durable, so what they replaced can go.
+        for path in std::mem::take(&mut self.retired_segment_files) {
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(())
+    }
+
+    /// Load persisted segments for `key` back from `dir`.
+    ///
+    /// Found by scanning the directory rather than from a manifest: a single
+    /// index of everything is a single point of total loss.
+    pub(crate) fn load_segments(&mut self, dir: &Path, key: &str) -> io::Result<()> {
+        let prefix = format!("search_{:016x}.s", crate::sk_hash(key));
+        let Ok(rd) = std::fs::read_dir(dir) else { return Ok(()) };
+        let mut found: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix(&prefix) else { continue };
+            let Some(idstr) = rest.strip_suffix(".bin") else { continue };
+            let Ok(id) = idstr.parse::<u64>() else { continue };
+            found.push((id, entry.path()));
+        }
+        found.sort_by_key(|(id, _)| *id);
+        for (id, path) in found {
+            // A segment that cannot be read is left out rather than served.
+            if let Ok(Some((index, docs_off, level))) = open_segment(&path) {
+                self.next_segment_id = self.next_segment_id.max(id + 1);
+                self.deltas.push(SearchSegment {
+                    // From the file. Defaulting to 0 here demoted every merged
+                    // segment on every reload — see `SEG_HEADER`.
+                    level,
+                    // Recomputed rather than stored: it is a function of size
+                    // against the current cap, so a cap change takes effect.
+                    sealed: index.doc_count > SEARCH_MERGE_MAX_DOCS / SEARCH_SEG_FANOUT as u32,
+                    id,
+                    index: Box::new(index),
+                    docs: SegDocs::OnDisk { path: path.clone(), off: docs_off },
+                    persisted: Some(path),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete every persisted segment file for `key`.
+    ///
+    /// A full rebuild produces an index covering every document, so segment files
+    /// left beside it are duplicates of part of it. Loading both counts those
+    /// documents twice — which for search means a slot space that no longer
+    /// matches the corpus. The same trap bit BM25 first.
+    pub(crate) fn remove_segment_files(dir: &Path, key: &str) {
+        let prefix = format!("search_{:016x}.s", crate::sk_hash(key));
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && name.ends_with(".bin") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// mmap one segment file: the index, where its source rows begin, and its level.
+fn open_segment(path: &Path) -> io::Result<Option<(SearchIndex, usize, u32)>> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    if len < SEG_HEADER {
+        return Ok(None);
+    }
+    let Some(view) = MmapView::try_new(&file, len) else { return Ok(None) };
+    let view = Arc::new(view);
+    let level = match view.slice(0, 4) {
+        Some(b) => u32::from_le_bytes(b.try_into().unwrap()),
+        None => return Ok(None),
+    };
+    match SearchIndex::open_mapped(&view, SEG_HEADER) {
+        Ok((ix, consumed)) => Ok(Some((ix, SEG_HEADER + consumed, level))),
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod segment_level_tests {
+    use super::*;
+    use crate::search::index::DocFields;
+
+    fn doc(h: u64) -> DocFields {
+        DocFields { hash: h, field_values: vec![format!("heron riverbank n{h}")] }
+    }
+
+    /// A segment's merge level must survive being written and read back.
+    ///
+    /// The level is the only thing that says a segment is already large and must
+    /// not be merged again until seven more of its size exist. It was not stored,
+    /// so every reload demoted merged segments to level 0 — and compaction
+    /// reloads. The next eight flushes then absorbed the big segment and rewrote
+    /// it whole, every time: 16 MB on the first compaction, 178 MB by the tenth,
+    /// growing linearly. A level turned into a monolithic base, which is O(N^2)
+    /// over a load and the exact shape segments exist to remove.
+    #[test]
+    fn a_segments_merge_level_survives_a_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = "coll:t";
+
+        let mut ix = SearchIndex::build(vec!["body".into()], std::iter::empty());
+        ix.insert_docs((0..50).map(doc));
+        assert_eq!(ix.deltas.len(), 1, "one flush, one segment");
+        // Stand in for a segment that has already been merged upward twice.
+        ix.deltas[0].level = 2;
+        ix.persist_segments(dir.path(), key).unwrap();
+
+        let mut reopened = SearchIndex::build(vec!["body".into()], std::iter::empty());
+        reopened.load_segments(dir.path(), key).unwrap();
+        assert_eq!(reopened.deltas.len(), 1, "the segment was not found again");
+        assert_eq!(
+            reopened.deltas[0].level, 2,
+            "the level came back as {} — a demoted segment is re-merged and \
+             rewritten on every compaction",
+            reopened.deltas[0].level
+        );
+    }
+
+    /// The rows a segment was built from must come back too, or a later merge
+    /// silently drops every document it holds.
+    #[test]
+    fn a_segments_source_rows_survive_a_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = "coll:t";
+        let mut ix = SearchIndex::build(vec!["body".into()], std::iter::empty());
+        ix.insert_docs((0..50).map(doc));
+        ix.persist_segments(dir.path(), key).unwrap();
+
+        let mut reopened = SearchIndex::build(vec!["body".into()], std::iter::empty());
+        reopened.load_segments(dir.path(), key).unwrap();
+        let rows = reopened.deltas[0].docs.load();
+        assert_eq!(rows.len(), 50, "source rows were lost");
+        assert!(rows.iter().any(|d| d.hash == 7), "a specific row went missing");
     }
 }

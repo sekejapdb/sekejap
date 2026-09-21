@@ -34,9 +34,18 @@
 //! classes {1,2,4,8} bytes — compact (~1–2 B/neighbor), decode-4-at-a-time, and
 //! *unbounded* (a delta widens as needed, so there is no `u32` node ceiling).
 
-// Phase 0: the format is built and round-trip tested, but not yet called from the
-// engine (that happens in Phase 1 — `compact()` writes it, `open()` mmaps it). Until
-// then the public surface is exercised only by this module's own tests.
+// This module is LIVE. `CoreDB` holds these segments as `Vec<Arc<MappedTopology>>`
+// and every graph hop reads them, so a change here changes the primary operation.
+//
+// The note that used to sit at this line said the opposite — "the format is built
+// and round-trip tested, but not yet called from the engine ... exercised only by
+// this module's own tests". That was true in Phase 0 and stopped being true when
+// `compact()` began writing these files and `open()` began mapping them. A comment
+// claiming the graph is unused is worse than no comment: it invites exactly the
+// kind of change nobody would make to a hot path.
+//
+// `allow(dead_code)` stays because parts of the format's surface (some accessors,
+// some builders) are still only reached from tests.
 #![allow(dead_code)]
 
 const MAGIC_NODES: [u8; 8] = *b"SKNODE\0\0";
@@ -54,6 +63,21 @@ const MAGIC_SPAT: [u8; 8] = *b"SKSPAT\0\0";
 /// v2 = 32 B node records with the slug hash inline, giving O(1) `id → hash`
 ///      (needed to serve the hash-keyed engine API from mmap without re-hashing
 ///      slug strings on every edge).
+use super::blockcrc::{self, BlockChecks};
+
+/// Where the `flags` word sits in every topology header.
+const FLAGS_OFF: usize = 12;
+
+/// Give a finished topology buffer a block-checksum trailer. See [`blockcrc`].
+fn append_block_checksums(buf: &mut Vec<u8>) {
+    blockcrc::append(buf, FLAGS_OFF);
+}
+
+/// Strip and verify a trailer whole — for the small tables parsed once at open.
+pub(crate) fn verified_payload(b: &[u8]) -> Option<&[u8]> {
+    blockcrc::verified_payload(b, FLAGS_OFF)
+}
+
 const TOPO_VERSION: u32 = 2;
 const HEADER_LEN: usize = 16;
 const NODE_RECSIZE_V1: usize = 24;
@@ -430,8 +454,12 @@ pub fn build_into(
         nodes_buf.extend_from_slice(&[0u8, 0u8]); // pad → 32
     }
     spat_buf[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&spat_count.to_le_bytes());
+    // Checksummed: a damaged record points a row at another row's payload.
+    append_block_checksums(&mut nodes_buf);
     sink("nodes.bin", &nodes_buf)?;
     drop(nodes_buf);
+    // Checksummed: a damaged record puts the row somewhere it is not.
+    append_block_checksums(&mut spat_buf);
     sink("spatial.bin", &spat_buf)?;
     drop(spat_buf);
 
@@ -483,16 +511,22 @@ pub fn build_into(
         emeta_buf.extend_from_slice(b.as_bytes());
     }
 
+    // Checksummed: a damaged offset pair returns another edge's attributes.
+    append_block_checksums(&mut emeta_buf);
     sink("edgemeta.bin", &emeta_buf)?;
     drop(emeta_buf);
     drop(meta_blobs);
 
-    let fwd_buf = serialize_csr(&MAGIC_ADJF, &fwd, n);
+    let mut fwd_buf = serialize_csr(&MAGIC_ADJF, &fwd, n);
     drop(fwd);
+    // Checksummed: a damaged CSR offset returns another node's neighbours.
+    append_block_checksums(&mut fwd_buf);
     sink("adj_fwd.bin", &fwd_buf)?;
     drop(fwd_buf);
-    let rev_buf = serialize_csr(&MAGIC_ADJR, &rev, n);
+    let mut rev_buf = serialize_csr(&MAGIC_ADJR, &rev, n);
     drop(rev);
+    // Checksummed: as adj_fwd.
+    append_block_checksums(&mut rev_buf);
     sink("adj_rev.bin", &rev_buf)?;
     drop(rev_buf);
 
@@ -510,6 +544,8 @@ pub fn build_into(
 
     // slugs.bin — dense_id → slug string (reverse of idx.bin).
     // Layout: header, count, offsets[(n+1)] into the blob, then the UTF-8 blob.
+    // Checksummed: a damaged entry resolves a name to the wrong node.
+    append_block_checksums(&mut idx_buf);
     sink("idx.bin", &idx_buf)?;
     drop(idx_buf);
 
@@ -556,6 +592,8 @@ pub fn build_into(
             block
         })
         .collect();
+    // Checksummed: a damaged offset pair names a node with another node's slug.
+    append_block_checksums(&mut slugs_buf);
     sink("slugs.bin", &slugs_buf)?;
     drop(slugs_buf);
 
@@ -574,6 +612,8 @@ pub fn build_into(
     }
 
     // dict.bin — collections then edge types
+    // Checksummed: a damaged offset pair returns another collection's members.
+    append_block_checksums(&mut colls_buf);
     sink("collections.bin", &colls_buf)?;
     drop(colls_buf);
 
@@ -582,6 +622,8 @@ pub fn build_into(
     write_string_table(&mut dict_buf, &colls.list);
     write_string_table(&mut dict_buf, &types.list);
 
+    // Checksummed: a damaged entry mislabels a collection or an edge type.
+    append_block_checksums(&mut dict_buf);
     sink("dict.bin", &dict_buf)?;
     Ok(())
 }
@@ -768,7 +810,7 @@ impl<'a> TopologyView<'a> {
     /// `dense id → slug` — the reverse of [`resolve`](Self::resolve). Touched only
     /// when building results or disambiguating collisions, never during hops.
     pub fn slug(&self, id: u64) -> Option<&'a str> {
-        slug_in(self.slugs, self.node_count, id)
+        slug_in(self.slugs, self.node_count, id, None)
     }
 
     pub fn node_count(&self) -> usize {
@@ -777,7 +819,7 @@ impl<'a> TopologyView<'a> {
 
     /// `hash → dense id` via binary search over `idx.bin`. Touched only at query roots.
     pub fn resolve(&self, hash: u64) -> Option<u64> {
-        resolve_in(self.idx, hash, None)
+        resolve_in(self.idx, hash, None, None)
     }
 
     /// Fixed-size node record via arithmetic: `record(k) = data_start + k*recsize`.
@@ -807,21 +849,42 @@ impl<'a> TopologyView<'a> {
     }
 
     pub fn fwd_edges(&self, id: u64) -> Vec<EdgeRec> {
-        Self::edges_of(self.fwd, id, self.node_count)
+        Self::edges_of(self.fwd, id, self.node_count, None)
     }
     pub fn rev_edges(&self, id: u64) -> Vec<EdgeRec> {
-        Self::edges_of(self.rev, id, self.node_count)
+        Self::edges_of(self.rev, id, self.node_count, None)
     }
 
-    fn edges_of(csr: &[u8], id: u64, node_count: usize) -> Vec<EdgeRec> {
+    fn edges_of(
+        csr: &[u8],
+        id: u64,
+        node_count: usize,
+        guard: Option<(&[u8], &BlockChecks)>,
+    ) -> Vec<EdgeRec> {
         let k = id as usize;
         if k >= node_count {
             return Vec::new();
         }
         let offsets_start = HEADER_LEN + 8 + 8;
+        // The offset pair says which bytes are this node's edges. Damaged, it
+        // names another node's block, and the hop returns neighbours this node
+        // never had — for a graph store, the worst answer there is.
+        if let Some((all, c)) = guard {
+            if !c.ok(all, offsets_start + k * 8, 16) {
+                return Vec::new();
+            }
+        }
         let start = rd_u64(csr, offsets_start + k * 8) as usize;
         let end = rd_u64(csr, offsets_start + (k + 1) * 8) as usize;
-        let block = &csr[start..end];
+        // Indexed directly before: a corrupt pair panicked here.
+        let Some(block) = csr.get(start..end.max(start)) else {
+            return Vec::new();
+        };
+        if let Some((all, c)) = guard {
+            if !c.ok(all, start, block.len()) {
+                return Vec::new();
+            }
+        }
 
         let (count, mut pos) = read_varint(block, 0);
         let count = count as usize;
@@ -876,7 +939,12 @@ impl<'a> TopologyView<'a> {
 /// Binary search `idx.bin` for `hash`. With a sparse index (every
 /// `SPARSE_STRIDE`-th hash, resident in RAM), the search is first narrowed to one
 /// stride-sized window so a cold lookup touches ~1 page instead of ~log2(n).
-fn resolve_in(idx: &[u8], hash: u64, sparse: Option<&[u64]>) -> Option<u64> {
+fn resolve_in(
+    idx: &[u8],
+    hash: u64,
+    sparse: Option<&[u64]>,
+    guard: Option<(&[u8], &BlockChecks)>,
+) -> Option<u64> {
     let count = rd_u64(idx, HEADER_LEN) as usize;
     let base = HEADER_LEN + 8;
     let (mut lo, mut hi) = match sparse {
@@ -891,27 +959,56 @@ fn resolve_in(idx: &[u8], hash: u64, sparse: Option<&[u64]>) -> Option<u64> {
     };
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let h = rd_u64(idx, base + mid * 16);
+        let at = base + mid * 16;
+        // Checked before it is believed. A damaged `(hash, dense_id)` pair
+        // resolves a name to the WRONG NODE — the worst answer this file can
+        // give, and one nothing downstream could detect.
+        if let Some((all, c)) = guard {
+            if !c.ok(all, at, 16) {
+                return None;
+            }
+        }
+        let h = rd_u64(idx, at);
         if h < hash {
             lo = mid + 1;
         } else if h > hash {
             hi = mid;
         } else {
-            return Some(rd_u64(idx, base + mid * 16 + 8));
+            return Some(rd_u64(idx, at + 8));
         }
     }
     None
 }
 
-fn slug_in(slugs: &[u8], node_count: usize, id: u64) -> Option<&str> {
+fn slug_in<'a>(
+    slugs: &'a [u8],
+    node_count: usize,
+    id: u64,
+    guard: Option<(&[u8], &BlockChecks)>,
+) -> Option<&'a str> {
     let k = id as usize;
     if k >= node_count {
         return None;
     }
     let offsets = HEADER_LEN + 8;
+    // The offset pair says where this node's name lives; damaged, it slices a
+    // string out of the middle of an unrelated slug.
+    if let Some((all, c)) = guard {
+        if !c.ok(all, offsets + k * 8, 16) {
+            return None;
+        }
+    }
     let start = rd_u64(slugs, offsets + k * 8) as usize;
     let end = rd_u64(slugs, offsets + (k + 1) * 8) as usize;
-    std::str::from_utf8(&slugs[start..end]).ok()
+    // Indexed directly before: a corrupt pair panicked here, and a panic at read
+    // time aborts the process instead of reporting a bad name.
+    let bytes = slugs.get(start..end.max(start))?;
+    if let Some((all, c)) = guard {
+        if !c.ok(all, start, bytes.len()) {
+            return None;
+        }
+    }
+    std::str::from_utf8(bytes).ok()
 }
 
 /// Entries per sparse-index bucket for `idx.bin` (16 B/entry → 4 KB pages hold 256;
@@ -920,7 +1017,11 @@ const SPARSE_STRIDE: usize = 256;
 
 /// Read one 48-byte spatial record out of raw `spatial.bin` bytes.
 /// Returns the 6 f64s or `None` on `NO_ID`/OOB/absent file.
-pub(crate) fn spatial_at(spat: &[u8], spatial_ref: u32) -> Option<[f64; 6]> {
+pub(crate) fn spatial_at(
+    spat: &[u8],
+    spatial_ref: u32,
+    guard: Option<(&[u8], &BlockChecks)>,
+) -> Option<[f64; 6]> {
     if spatial_ref == NO_ID || spat.len() < HEADER_LEN + 8 {
         return None;
     }
@@ -930,16 +1031,29 @@ pub(crate) fn spatial_at(spat: &[u8], spatial_ref: u32) -> Option<[f64; 6]> {
         return None;
     }
     let o = HEADER_LEN + 8 + k * 48;
+    // Checked before it is read: a damaged record puts the row somewhere it is
+    // not, and a spatial query answers confidently about the wrong place.
+    if let Some((all, c)) = guard {
+        if !c.ok(all, o, 48) {
+            return None;
+        }
+    }
     let mut vals = [0f64; 6];
     for (i, v) in vals.iter_mut().enumerate() {
-        *v = f64::from_le_bytes(spat[o + i * 8..o + i * 8 + 8].try_into().ok()?);
+        // Indexed directly before, which panics when `o` runs past the mapping.
+        let raw = spat.get(o + i * 8..o + i * 8 + 8)?;
+        *v = f64::from_le_bytes(raw.try_into().ok()?);
     }
     Some(vals)
 }
 
 /// Read one edge-metadata blob out of raw `edgemeta.bin` bytes (free-standing so
 /// the recovery path can use it over an owned buffer). `None` on absence/OOB.
-pub(crate) fn emeta_bytes_at(emeta: &[u8], meta_ref: u32) -> Option<&[u8]> {
+pub(crate) fn emeta_bytes_at<'a>(
+    emeta: &'a [u8],
+    meta_ref: u32,
+    guard: Option<(&[u8], &BlockChecks)>,
+) -> Option<&'a [u8]> {
     if meta_ref == NO_ID || emeta.len() < HEADER_LEN + 8 {
         return None;
     }
@@ -949,16 +1063,27 @@ pub(crate) fn emeta_bytes_at(emeta: &[u8], meta_ref: u32) -> Option<&[u8]> {
         return None;
     }
     let offsets = HEADER_LEN + 8;
+    if let Some((all, c)) = guard {
+        if !c.ok(all, offsets + k * 8, 16) {
+            return None;
+        }
+    }
     let start = rd_u64(emeta, offsets + k * 8) as usize;
     let end = rd_u64(emeta, offsets + (k + 1) * 8) as usize;
-    emeta.get(start..end)
+    let bytes = emeta.get(start..end)?;
+    if let Some((all, c)) = guard {
+        if !c.ok(all, start, bytes.len()) {
+            return None;
+        }
+    }
+    Some(bytes)
 }
 
 // ── MappedTopology — the Phase 1 store: files served via mmap ─────────────────
 
 /// One topology file, mmap'd when possible (unix), owned bytes otherwise. The OS
 /// page cache then holds hot pages and evicts cold ones — RAM adapts automatically.
-enum Backing {
+enum Store {
     #[cfg(unix)]
     Map {
         /// Kept open for the lifetime of the mapping.
@@ -968,26 +1093,57 @@ enum Backing {
     Owned(Vec<u8>),
 }
 
-impl Backing {
-    fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        #[cfg(unix)]
-        {
-            let file = std::fs::File::open(path)?;
-            let len = file.metadata()?.len() as usize;
-            if let Some(map) = super::mmap::MmapView::try_new(&file, len) {
-                return Ok(Backing::Map { _file: file, map });
-            }
-        }
-        Ok(Backing::Owned(std::fs::read(path)?))
-    }
-
-    fn bytes(&self) -> &[u8] {
+impl Store {
+    fn all(&self) -> &[u8] {
         match self {
             #[cfg(unix)]
-            Backing::Map { map, .. } => map.slice(0, map.len()).unwrap_or(&[]),
-            Backing::Owned(v) => v.as_slice(),
+            Store::Map { map, .. } => map.slice(0, map.len()).unwrap_or(&[]),
+            Store::Owned(v) => v.as_slice(),
         }
     }
+}
+
+/// One mapped topology file, with its block checksums if it has any.
+struct Backing {
+    store: Store,
+    checks: Option<BlockChecks>,
+}
+
+impl Backing {
+    fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let store = {
+            #[cfg(unix)]
+            {
+                let file = std::fs::File::open(path)?;
+                let len = file.metadata()?.len() as usize;
+                match super::mmap::MmapView::try_new(&file, len) {
+                    Some(map) => Store::Map { _file: file, map },
+                    None => Store::Owned(std::fs::read(path)?),
+                }
+            }
+            #[cfg(not(unix))]
+            { Store::Owned(std::fs::read(path)?) }
+        };
+        let all = store.all();
+        let flags = if all.len() >= HEADER_LEN { rd_u32(all, FLAGS_OFF) } else { 0 };
+        let checks = BlockChecks::parse(all, flags);
+        Ok(Backing { store, checks })
+    }
+
+    /// The payload. The trailer is not addressable content, so every existing
+    /// bound (`b.len()`, capped counts) stays honest.
+    fn bytes(&self) -> &[u8] {
+        let all = self.store.all();
+        match &self.checks {
+            Some(c) => all.get(..c.payload_len).unwrap_or(all),
+            None => all,
+        }
+    }
+
+    /// Everything, trailer included — only the verifier needs this.
+    fn raw(&self) -> &[u8] { self.store.all() }
+
+    fn checks(&self) -> Option<&BlockChecks> { self.checks.as_ref() }
 }
 
 /// An edge as the hash-keyed engine sees it: neighbor + edge-type as slug hashes.
@@ -1037,7 +1193,16 @@ impl MappedTopology {
         let rev = Backing::open(&dir.join("adj_rev.bin"))?;
         let idx = Backing::open(&dir.join("idx.bin"))?;
         let slugs = Backing::open(&dir.join("slugs.bin"))?;
-        let dict = std::fs::read(dir.join("dict.bin"))?; // tiny — parsed once, not kept
+        let dict_raw = std::fs::read(dir.join("dict.bin"))?; // tiny — parsed once
+        // Verified whole: small, read once, and the names it holds label every
+        // node's collection and every edge's type. Parsing names that failed
+        // their checksum would mislabel rows rather than lose them.
+        let dict = verified_payload(&dict_raw).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "topology: dict.bin failed its block checksum",
+            )
+        })?;
 
         // Validate headers + parse dictionaries via the existing view logic.
         let view = TopologyView::from_slices(
@@ -1046,7 +1211,7 @@ impl MappedTopology {
             rev.bytes(),
             idx.bytes(),
             slugs.bytes(),
-            &dict,
+            dict,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let node_count = view.node_count();
@@ -1070,7 +1235,7 @@ impl MappedTopology {
                 write_header(&mut empty, &MAGIC_EMET, 0);
                 empty.extend_from_slice(&0u64.to_le_bytes()); // count
                 empty.extend_from_slice(&((HEADER_LEN + 16) as u64).to_le_bytes()); // sentinel
-                Backing::Owned(empty)
+                Backing { store: Store::Owned(empty), checks: None }
             }
         };
         let coll_hash_to_id = collections
@@ -1114,7 +1279,7 @@ impl MappedTopology {
                 let mut empty = Vec::new();
                 write_header(&mut empty, &MAGIC_SPAT, 0);
                 empty.extend_from_slice(&0u64.to_le_bytes());
-                Backing::Owned(empty)
+                Backing { store: Store::Owned(empty), checks: None }
             }
         };
 
@@ -1151,9 +1316,20 @@ impl MappedTopology {
             return None;
         }
         let offsets = HEADER_LEN + 8;
+        if let Some(c) = self.colls.checks() {
+            if !c.ok(self.colls.raw(), offsets + cid * 8, 16) {
+                return None;
+            }
+        }
         let start = rd_u64(b, offsets + cid * 8) as usize;
         let end = rd_u64(b, offsets + (cid + 1) * 8) as usize;
-        let block = &b[start..end];
+        // Indexed directly before: a corrupt pair panicked here.
+        let block = b.get(start..end.max(start))?;
+        if let Some(c) = self.colls.checks() {
+            if !c.ok(self.colls.raw(), start, block.len()) {
+                return None;
+            }
+        }
         let (count, mut pos) = read_varint(block, 0);
         // Capped and checked for the same reason as in `edges_of`: the control
         // array needs one byte per four values, so a `count` larger than four
@@ -1178,13 +1354,21 @@ impl MappedTopology {
 
         /// Raw JSON bytes of an edge-metadata blob (`meta_ref` from a [`MappedEdge`]).
     pub fn edge_meta_bytes(&self, meta_ref: u32) -> Option<&[u8]> {
-        emeta_bytes_at(self.emeta.bytes(), meta_ref)
+        emeta_bytes_at(
+            self.emeta.bytes(),
+            meta_ref,
+            self.emeta.checks().map(|c| (self.emeta.raw(), c)),
+        )
     }
 
     /// Spatial record for a node (6 f64s), or `None` if it has no geometry.
     pub fn spatial(&self, id: u64) -> Option<[f64; 6]> {
         let rec = self.node_record(id)?;
-        spatial_at(self.spat.bytes(), rec.spatial_ref)
+        spatial_at(
+            self.spat.bytes(),
+            rec.spatial_ref,
+            self.spat.checks().map(|c| (self.spat.raw(), c)),
+        )
     }
 
     /// All node hashes in the store (iterates `nodes.bin` records — O(n), used by
@@ -1209,11 +1393,21 @@ impl MappedTopology {
 
     /// `slug hash → dense id` (sparse-narrowed binary search over the mmap'd idx).
     pub fn resolve(&self, hash: u64) -> Option<u64> {
-        resolve_in(self.idx.bytes(), hash, Some(&self.sparse))
+        resolve_in(
+            self.idx.bytes(),
+            hash,
+            Some(&self.sparse),
+            self.idx.checks().map(|c| (self.idx.raw(), c)),
+        )
     }
 
     pub fn slug_of(&self, id: u64) -> Option<&str> {
-        slug_in(self.slugs.bytes(), self.node_count, id)
+        slug_in(
+            self.slugs.bytes(),
+            self.node_count,
+            id,
+            self.slugs.checks().map(|c| (self.slugs.raw(), c)),
+        )
     }
 
     pub fn node_record(&self, id: u64) -> Option<NodeRec> {
@@ -1222,7 +1416,15 @@ impl MappedTopology {
             return None;
         }
         let b = self.nodes.bytes();
-        let o = HEADER_LEN + 8 + k * node_recsize(self.version);
+        let recsize = node_recsize(self.version);
+        let o = HEADER_LEN + 8 + k * recsize;
+        // Checked before any field is believed: a damaged `payload_offset`
+        // addresses another row's bytes, so the row comes back wrong, not missing.
+        if let Some(c) = self.nodes.checks() {
+            if !c.ok(self.nodes.raw(), o, recsize) {
+                return None;
+            }
+        }
         if self.version >= 2 {
             Some(NodeRec {
                 hash: rd_u64(b, o),
@@ -1285,7 +1487,10 @@ impl MappedTopology {
             if end <= start || end > csr.len() {
                 continue;
             }
-            let (count, _) = read_varint(&csr[start..end], 0);
+            // Bounds-checked: a corrupt offset pair panicked here, and a panic
+            // while counting edges aborts the process.
+            let Some(block) = csr.get(start..end.max(start)) else { continue };
+            let (count, _) = read_varint(block, 0);
             total += count as usize;
         }
         total
@@ -1297,8 +1502,13 @@ impl MappedTopology {
 
     fn edges_by_hash(&self, hash: u64, fwd: bool) -> Option<Vec<MappedEdge>> {
         let id = self.resolve(hash)?;
-        let csr = if fwd { self.fwd.bytes() } else { self.rev.bytes() };
-        let recs = TopologyView::edges_of(csr, id, self.node_count);
+        let backing = if fwd { &self.fwd } else { &self.rev };
+        let recs = TopologyView::edges_of(
+            backing.bytes(),
+            id,
+            self.node_count,
+            backing.checks().map(|c| (backing.raw(), c)),
+        );
         Some(
             recs.into_iter()
                 .filter_map(|e| {
@@ -1339,6 +1549,160 @@ mod tests {
 
     fn h(s: &str) -> u64 {
         crate::sk_hash(s)
+    }
+
+    /// Write a small graph's topology files into a temp dir. Neighbour sets are
+    /// deliberately distinct per node, so serving one node's block as another's
+    /// is detectable rather than coincidentally identical.
+    fn build_files() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nodes = vec![
+            TopoNode { hash: h("t/a"), slug: "t/a", collection: "t", payload_offset: 0, payload_len: 4, spatial: None },
+            TopoNode { hash: h("t/b"), slug: "t/b", collection: "t", payload_offset: 4, payload_len: 4, spatial: None },
+            TopoNode { hash: h("t/c"), slug: "t/c", collection: "t", payload_offset: 8, payload_len: 4, spatial: None },
+        ];
+        let edges = vec![
+            TopoEdge { from_hash: h("t/a"), to_hash: h("t/b"), edge_type: "e".into(), meta: None },
+            TopoEdge { from_hash: h("t/b"), to_hash: h("t/c"), edge_type: "e".into(), meta: None },
+            TopoEdge { from_hash: h("t/b"), to_hash: h("t/a"), edge_type: "e".into(), meta: None },
+        ];
+        build_into(&nodes, &edges, |name, bytes| std::fs::write(dir.path().join(name), bytes))
+            .unwrap();
+        dir
+    }
+
+    /// `idx.bin` is the `hash -> dense id` map, so a corrupted entry does not
+    /// return a bad row — it returns a DIFFERENT row, and every lookup downstream
+    /// then works perfectly on the wrong node.
+    #[test]
+    fn a_damaged_idx_entry_never_resolves_to_the_wrong_node() {
+        let dir = build_files();
+        let path = dir.path().join("idx.bin");
+        let clean = MappedTopology::open(dir.path()).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let base = HEADER_LEN + 8;
+        let first_hash = rd_u64(&raw, base);
+        let first_id = rd_u64(&raw, base + 8);
+        assert_eq!(clean.resolve(first_hash), Some(first_id));
+
+        let mut b = raw.clone();
+        let wrong = first_id ^ 0x2;
+        b[base + 8..base + 16].copy_from_slice(&wrong.to_le_bytes());
+        std::fs::write(&path, &b).unwrap();
+
+        let damaged = MappedTopology::open(dir.path()).unwrap();
+        let got = damaged.resolve(first_hash);
+        assert_ne!(got, Some(wrong), "resolved to the wrong node {wrong}");
+        assert_eq!(got, None, "a failing block must be refused, not served as {got:?}");
+    }
+
+    /// `nodes.bin` holds `payload_offset`/`payload_len`. Corrupt those and the row
+    /// still answers — with bytes belonging to a different row.
+    #[test]
+    fn a_damaged_node_record_never_points_at_another_rows_payload() {
+        let dir = build_files();
+        let path = dir.path().join("nodes.bin");
+        let clean = MappedTopology::open(dir.path()).unwrap();
+        let before = clean.node_record(0).expect("record 0 must read");
+
+        let mut b = std::fs::read(&path).unwrap();
+        b[HEADER_LEN + 8 + 8] ^= 0xFF; // payload_offset of record 0
+        std::fs::write(&path, &b).unwrap();
+
+        let damaged = MappedTopology::open(dir.path()).unwrap();
+        if let Some(r) = damaged.node_record(0) {
+            panic!("served a damaged record: payload_offset {} (was {})",
+                   r.payload_offset, before.payload_offset);
+        }
+    }
+
+    /// For a graph store this is the worst wrong answer there is: the hop
+    /// succeeds, returns a plausible set of neighbours, and every traversal built
+    /// on it is confidently wrong about the shape of the graph.
+    #[test]
+    fn a_damaged_edge_offset_never_returns_another_nodes_neighbours() {
+        let dir = build_files();
+        let path = dir.path().join("adj_fwd.bin");
+        let clean = MappedTopology::open(dir.path()).unwrap();
+        let a_before = clean.fwd_by_hash(h("t/a")).unwrap_or_default();
+        let b_before = clean.fwd_by_hash(h("t/b")).unwrap_or_default();
+        assert_eq!(a_before.len(), 1);
+        assert_eq!(b_before.len(), 2);
+
+        let mut buf = std::fs::read(&path).unwrap();
+        let offsets = HEADER_LEN + 8 + 8;
+        let id_a = clean.resolve(h("t/a")).unwrap() as usize;
+        let id_b = clean.resolve(h("t/b")).unwrap() as usize;
+        let b_start = rd_u64(&buf, offsets + id_b * 8);
+        let b_end = rd_u64(&buf, offsets + (id_b + 1) * 8);
+        buf[offsets + id_a * 8..offsets + id_a * 8 + 8].copy_from_slice(&b_start.to_le_bytes());
+        buf[offsets + (id_a + 1) * 8..offsets + (id_a + 2) * 8].copy_from_slice(&b_end.to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        let damaged = MappedTopology::open(dir.path()).unwrap();
+        let served = damaged.fwd_by_hash(h("t/a")).unwrap_or_default();
+        assert_ne!(served.len(), b_before.len(), "t/a was served t/b's neighbours");
+        assert!(served.is_empty(), "an unverifiable edge block must be refused");
+    }
+
+    /// A damaged slug offset must not name a node with another node's slug.
+    #[test]
+    fn a_damaged_slug_offset_never_returns_another_nodes_name() {
+        let dir = build_files();
+        let path = dir.path().join("slugs.bin");
+        let clean = MappedTopology::open(dir.path()).unwrap();
+        let before = clean.slug_of(0).expect("slug 0 must read").to_string();
+        assert_eq!(before, "t/a");
+
+        let mut b = std::fs::read(&path).unwrap();
+        b[HEADER_LEN + 8] ^= 0x04;
+        std::fs::write(&path, &b).unwrap();
+
+        let damaged = MappedTopology::open(dir.path()).unwrap();
+        let got = damaged.slug_of(0);
+        assert_ne!(got, Some(before.as_str()), "damage went unnoticed");
+        assert_eq!(got, None, "a failing block must be refused, not served as {got:?}");
+    }
+
+    /// The checksum must not reject good data. A guard that does is worse than
+    /// the bug it closes, and no corruption test would ever notice — this one
+    /// caught the flag byte being written after the checksums, which put it
+    /// inside block 0 and made every valid lookup fail.
+    #[test]
+    fn an_undamaged_topology_answers_on_every_checked_path() {
+        let dir = build_files();
+        let topo = MappedTopology::open(dir.path()).unwrap();
+        for slug in ["t/a", "t/b", "t/c"] {
+            let id = topo.resolve(h(slug)).unwrap_or_else(|| panic!("{slug} did not resolve"));
+            assert!(topo.node_record(id).is_some(), "{slug} lost its node record");
+            assert_eq!(topo.slug_of(id).map(str::to_string), Some(slug.to_string()));
+            assert!(topo.fwd_by_hash(h(slug)).is_some(), "{slug} lost its edges");
+        }
+        assert_eq!(topo.resolve(h("t/nope")), None, "a miss must stay a miss");
+    }
+
+    /// A segment written before the trailer existed keeps working. Refusing an
+    /// existing store because it predates a checksum is data loss dressed up as
+    /// safety.
+    #[test]
+    fn an_idx_without_a_checksum_trailer_still_resolves() {
+        use super::blockcrc::{FLAG_CHECKSUMMED, TRAILER_TAIL};
+        let dir = build_files();
+        let path = dir.path().join("idx.bin");
+        let b = std::fs::read(&path).unwrap();
+
+        let tail = b.len() - TRAILER_TAIL;
+        let nblocks = rd_u32(&b, tail) as usize;
+        let mut old = b[..tail - nblocks * 4].to_vec();
+        let flags = rd_u32(&old, FLAGS_OFF) & !FLAG_CHECKSUMMED;
+        old[FLAGS_OFF..FLAGS_OFF + 4].copy_from_slice(&flags.to_le_bytes());
+        let first_hash = rd_u64(&old, HEADER_LEN + 8);
+        let first_id = rd_u64(&old, HEADER_LEN + 16);
+        std::fs::write(&path, &old).unwrap();
+
+        let topo = MappedTopology::open(dir.path()).unwrap();
+        assert_eq!(topo.resolve(first_hash), Some(first_id),
+                   "a pre-checksum idx.bin must still resolve");
     }
 
     #[test]

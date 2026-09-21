@@ -344,6 +344,79 @@ pub(crate) struct SpatialGrid {
     /// `spatialgrid.bin`. When present, `cells`/`meta` act as the resident write
     /// overlay and reads union the overlay with the base. `None` in heap mode.
     mapped: Option<crate::storage::spatialstore::MappedSpatialGrid>,
+    /// Paged base: the grid over B+tree records instead of one packed file.
+    ///
+    /// `spatialgrid.bin` cannot absorb a point — one more member makes a cell's
+    /// run longer, so every run after it moves — so a fold rewrites the whole
+    /// file. Measured at O(N^1.95) over a load: 340 ms at 500 000 rows, 5 050 ms
+    /// at 2 million, heading for roughly three quarters of an hour at fifty
+    /// million. The trigger is the change and the work is the store, which is
+    /// Law 2 inverted.
+    ///
+    /// With this attached, writes still land in the overlay — bounded by the
+    /// change — and compaction *applies* the overlay to the paged store instead
+    /// of rewriting a base. Nothing is proportional to the store any more. It is
+    /// the same move already made for nodes and adjacency.
+    ///
+    /// Behind an `Arc<Mutex<..>>` because `SpatialGrid` is `Clone` and a
+    /// `PagedStore` holds open files. Reads take the lock for the length of one
+    /// record read, which is nothing against the disk read it is already doing.
+    paged: Option<std::sync::Arc<std::sync::Mutex<crate::storage::spatialpaged::PagedSpatial>>>,
+}
+
+/// The cells a bbox covers, without needing the grid — so a flush can compute
+/// them while holding the paged store mutably.
+pub(crate) fn cells_for_bbox_at(cell_size: f64, meta: &SpatialMeta) -> Vec<(i32, i32)> {
+    let g = SpatialGrid {
+        cell_size,
+        cells: HashMap::new(),
+        meta: HashMap::new(),
+        poly_rings: HashMap::new(),
+        mapped: None,
+        paged: None,
+    };
+    g.cells_for_bbox(meta)
+}
+
+/// Bytes in front of a cell's posting run: `[cy i32][cx i32][crc32 u32]`.
+///
+/// # Why a run carries its own cell
+///
+/// The directory says "cell (cy,cx) lives at `off`, and is `len` postings long".
+/// The run it pointed at used to say nothing at all, so a damaged `off` served
+/// another cell's node hashes as this cell's — a confidently wrong answer, with
+/// nothing in the file able to contradict it. Recorded as open in
+/// `.workbench/STABLE.md`, and now forbidden by Law 5 of the contract.
+///
+/// Stamping the cell into the run makes a misdirected read detectable, and the
+/// CRC makes damage *inside* the run detectable too. Both are checked before the
+/// postings are believed.
+///
+/// The sacrifice: twelve bytes per cell, one CRC over each run that is read, and
+/// a durable format change — stores written before this keep version 1 and its
+/// old behaviour.
+pub(crate) const CELL_FRAME: usize = 12;
+
+/// Write one cell's postings, framed.
+///
+/// Buffers a single cell's run — bounded by the cell, never by the store, which
+/// is the property the streaming fold writer exists to preserve.
+fn write_cell_run<W: std::io::Write>(
+    w: &mut W,
+    cy: i32,
+    cx: i32,
+    ids: &[u64],
+) -> std::io::Result<()> {
+    let mut body: Vec<u8> = Vec::with_capacity(ids.len() * 8);
+    for &h in ids {
+        body.extend_from_slice(&h.to_le_bytes());
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&body);
+    w.write_all(&cy.to_le_bytes())?;
+    w.write_all(&cx.to_le_bytes())?;
+    w.write_all(&hasher.finalize().to_le_bytes())?;
+    w.write_all(&body)
 }
 
 impl SpatialGrid {
@@ -357,6 +430,7 @@ impl SpatialGrid {
                 meta: HashMap::new(),
                 poly_rings: HashMap::new(),
                 mapped: None,
+            paged: None,
             };
         }
 
@@ -390,6 +464,7 @@ impl SpatialGrid {
             meta: HashMap::new(),
             poly_rings: HashMap::new(),
             mapped: None,
+            paged: None,
         };
 
         for (hash, m) in collected {
@@ -409,6 +484,7 @@ impl SpatialGrid {
             meta: HashMap::new(),
             poly_rings: HashMap::new(),
             mapped: Some(base),
+            paged: None,
         }
     }
 
@@ -416,7 +492,7 @@ impl SpatialGrid {
     /// `SKGRID01` sidecar format read by `MappedSpatialGrid`.
     pub fn write_binary<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         w.write_all(b"SKGRID01")?;
-        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&2u32.to_le_bytes())?;
         w.write_all(&self.cell_size.to_le_bytes())?;
 
         // Meta records, sorted by hash (binary-searchable).
@@ -442,7 +518,7 @@ impl SpatialGrid {
             dir.extend_from_slice(&cx.to_le_bytes());
             dir.extend_from_slice(&off.to_le_bytes());
             dir.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
-            for &h in hashes.iter() { blob.extend_from_slice(&h.to_le_bytes()); }
+            write_cell_run(&mut blob, *cy, *cx, hashes)?;
         }
         w.write_all(&dir)?;
         w.write_all(&(blob.len() as u64).to_le_bytes())?;
@@ -490,7 +566,7 @@ impl SpatialGrid {
         let stale = |h: u64| gate.contains(&h) || self.meta.contains_key(&h);
 
         w.write_all(b"SKGRID01")?;
-        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&2u32.to_le_bytes())?;
         w.write_all(&self.cell_size.to_le_bytes())?;
 
         // ── meta: base minus stale, merged with the overlay, ascending by hash ──
@@ -589,16 +665,13 @@ impl SpatialGrid {
             w.write_all(&cx.to_le_bytes())?;
             w.write_all(&off.to_le_bytes())?;
             w.write_all(&(ids.len() as u32).to_le_bytes())?;
-            off += ids.len() as u64 * 8;
+            off += CELL_FRAME as u64 + ids.len() as u64 * 8;
             Ok(())
         }))?;
 
-        w.write_all(&(post_total * 8).to_le_bytes())?;
-        merged_cells(Box::new(|_, ids| {
-            for &h in ids {
-                w.write_all(&h.to_le_bytes())?;
-            }
-            Ok(())
+        w.write_all(&(post_total * 8 + cell_count as u64 * CELL_FRAME as u64).to_le_bytes())?;
+        merged_cells(Box::new(|(cy, cx), ids| {
+            write_cell_run(w, cy, cx, ids)
         }))?;
         Ok(())
     }
@@ -625,7 +698,19 @@ impl SpatialGrid {
     /// Node hashes in cell `(cy,cx)` — resident overlay unioned with the mmap base.
     fn cell_members_at(&self, key: (i32, i32)) -> Option<Vec<u64>> {
         let overlay = self.cells.get(&key);
-        let base = self.mapped.as_ref().and_then(|m| m.cell_members(key.0, key.1));
+        let base = match (&self.mapped, &self.paged) {
+            (Some(m), _) => m.cell_members(key.0, key.1),
+            // Empty is not the same as absent: a cell that exists but holds
+            // nothing must not shadow the overlay.
+            (None, Some(p)) => match p.lock() {
+                Ok(g) => match g.cell_members(key.0, key.1) {
+                    Ok(v) if !v.is_empty() => Some(v),
+                    _ => None,
+                },
+                Err(_) => None,
+            },
+            (None, None) => None,
+        };
         match (overlay, base) {
             (None, None) => None,
             (Some(v), None) => Some(v.clone()),
@@ -637,19 +722,92 @@ impl SpatialGrid {
     /// Spatial metadata for a node — resident overlay first, then the mmap base.
     fn meta_at(&self, hash: u64) -> Option<SpatialMeta> {
         if let Some(m) = self.meta.get(&hash) { return Some(m.clone()); }
-        self.mapped.as_ref().and_then(|m| m.node_meta(hash))
+        if let Some(m) = self.mapped.as_ref().and_then(|m| m.node_meta(hash)) {
+            return Some(m);
+        }
+        self.paged.as_ref().and_then(|p| p.lock().ok()?.node_meta(hash).ok().flatten())
     }
 
     /// Whether the mmap base holds this node (used to avoid double-inserting a
     /// base node into the resident overlay on paged open).
     pub fn base_contains(&self, hash: u64) -> bool {
-        self.mapped.as_ref().map_or(false, |m| m.node_meta(hash).is_some())
+        if self.mapped.as_ref().is_some_and(|m| m.node_meta(hash).is_some()) {
+            return true;
+        }
+        self.paged.as_ref().is_some_and(|p| {
+            p.lock().ok().and_then(|g| g.node_meta(hash).ok().flatten()).is_some()
+        })
     }
 
     /// True when the cell index + meta are served from the mmap base (paged mode)
     /// rather than a resident HashMap. For tests / introspection.
     pub fn is_disk_backed(&self) -> bool {
-        self.mapped.is_some()
+        self.mapped.is_some() || self.paged.is_some()
+    }
+
+    /// True when the base is paged records rather than one packed file — which is
+    /// what makes a compaction cost the change instead of the store.
+    pub fn is_paged(&self) -> bool {
+        self.paged.is_some()
+    }
+
+    /// Attach a paged base. The overlay keeps taking writes; [`apply_overlay`]
+    /// moves them across.
+    ///
+    /// [`apply_overlay`]: SpatialGrid::apply_overlay
+    pub(crate) fn attach_paged(
+        &mut self,
+        p: std::sync::Arc<std::sync::Mutex<crate::storage::spatialpaged::PagedSpatial>>,
+    ) {
+        self.paged = Some(p);
+    }
+
+    /// Move the overlay into the paged base. **O(change)** — nothing proportional
+    /// to the store is read or written.
+    ///
+    /// `gate` is every hash the overlay supersedes or deletes, exactly as the
+    /// packed fold's gate was: a row updated to *drop* its geometry never reaches
+    /// `insert`, so gating on the overlay's own keys alone would leave the base
+    /// reporting a location the row no longer has.
+    pub(crate) fn apply_overlay(
+        &mut self,
+        gate: &std::collections::HashSet<u64>,
+    ) -> std::io::Result<()> {
+        let cell_size = self.cell_size;
+        let Some(handle) = self.paged.as_ref() else { return Ok(()) };
+        let mut paged = handle.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "spatial: paged store lock poisoned")
+        })?;
+        // Retire first, so a row that moved does not keep its old cell.
+        // Ascending, for the same reason the writes are: a `HashSet` hands these
+        // over in an order chosen to be unpredictable, which is precisely the
+        // order a B+tree is worst at.
+        let mut gated: Vec<u64> = gate.iter().copied().collect();
+        gated.sort_unstable();
+        for h in gated {
+            if let Some(m) = paged.node_meta(h)? {
+                let cells = cells_for_bbox_at(cell_size, &m);
+                paged.remove(h, &cells)?;
+            }
+        }
+        let items: Vec<(u64, SpatialMeta, Vec<(i32, i32)>)> = self
+            .meta
+            .iter()
+            .map(|(h, m)| (*h, m.clone(), cells_for_bbox_at(cell_size, m)))
+            .collect();
+        // The duplicate probe stays. Skipping it looked like a free win — the gate
+        // above has just retired everything — but the gate is `tombstones` plus
+        // the NODE overlay, and the grid's own overlay is not always a subset of
+        // it: a grid rebuilt resident from every item holds rows the node overlay
+        // never touched, and those are already in the paged store. Without the
+        // probe each one is appended a second time. Measured: per-compaction cost
+        // stopped being flat, 2120 ms to 2647 ms at two million rows, as the
+        // duplicates piled up in the cells.
+        paged.insert_many(&items)?;
+        paged.sync()?;
+        self.cells.clear();
+        self.meta.clear();
+        Ok(())
     }
 
     /// Insert a node into the grid.
@@ -677,7 +835,9 @@ impl SpatialGrid {
 
     /// Number of nodes in the grid (resident overlay + mmap base).
     pub fn len(&self) -> usize {
-        self.meta.len() + self.mapped.as_ref().map_or(0, |m| m.len())
+        self.meta.len()
+            + self.mapped.as_ref().map_or(0, |m| m.len())
+            + self.paged.as_ref().map_or(0, |p| p.lock().map_or(0, |g| g.len() as usize))
     }
 
     /// Cache a node's parsed polygon rings (`[[lat,lon],…]`) for fast PIP.

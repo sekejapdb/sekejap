@@ -5,6 +5,8 @@
 //! owns one file format or access primitive:
 //!
 //! - [`mmap`] — memory-map a file so it reads like a `&[u8]` (the disk-first base).
+//! - [`blockcrc`] — per-block checksums, so damage in a mapped file is locatable
+//!   and never silently served (Law 5).
 //! - [`wal`] — the write-ahead log: append every change for crash recovery.
 //! - [`skbin`] — the compact binary record encoding written during compaction.
 //! - [`topology`] — the node/edge tables + adjacency (the graph), mmap-served.
@@ -23,6 +25,7 @@ pub(crate) mod adjstore;
 // `CoreDB` so far; the index half waits on the topology moving onto pages. The
 // allow comes off as each one gains its first caller.
 #[allow(dead_code)]
+pub(crate) mod blockcrc;
 pub(crate) mod btree;
 pub(crate) mod edgestore;
 pub(crate) mod fieldstore;
@@ -36,6 +39,7 @@ pub(crate) mod pagestore;
 pub(crate) mod recordstore;
 pub(crate) mod skbin;
 pub(crate) mod slotmap;
+pub(crate) mod spatialpaged;
 pub(crate) mod spatialstore;
 pub(crate) mod topology;
 pub(crate) mod vecstore;
