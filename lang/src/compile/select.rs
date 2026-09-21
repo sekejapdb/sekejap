@@ -6,6 +6,13 @@ impl Compiler<'_> {
     pub(super) fn select(&mut self, statement: SelectStmt) -> SqlResult2<SelectPlan> {
         let (c, graph_filter, graph_columns) = match &statement.source {
             Source::Table(name) => (collection(self.db, name)?, None, None),
+            Source::All => {
+                return Err(SqlError::Refused {
+                    keyword: "FROM ALL".into(),
+                    tier: Tier::Two,
+                    reason: super::dml::FROM_ALL,
+                })
+            }
             Source::Graph(graph) => {
                 let (target, filter) = self.graph_table(graph)?;
                 (target, Some(filter), Some(graph.columns.clone()))

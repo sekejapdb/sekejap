@@ -22,10 +22,11 @@ use sekejap_core::collections::{
     Accumulator, AggValue, AggregateFn, AggregateInput, AggregateRequest, BfsRequest,
     CandidateDriver, Cmp, CollectionId, CollectionOptions, Database, Direction, DropMode,
     DropPhase, EdgePredicate, EdgeTypeId, EntityId, Geom, GeometryFilter, GraphContextId,
-    GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexExpr, IndexFamily, IndexId,
+    ColumnRule, DefaultValue, GroupCmp, GroupKey, GroupOrder, GroupPredicate, GroupRow, IndexExpr,
+    IndexFamily, IndexId,
     IndexInfo, IndexState, OwnedScalarValue, PointFilter, ProjectedValue, Projection, QueryBudget,
     QueryFilter, QueryOrder, QueryRequest, QueryRow, ScalarFilter, ScalarValue, ScoreExpr,
-    SortDirection, TextMatch, VectorMetric,
+    SortDirection, TextMatch, UpdatePatch, VectorMetric, WriteAction, WriteCursor, WriteRequest,
 };
 use sekejap_core::internal::EDGE_FIELD_PREFIX;
 use sekejap_core::spatial_math::{Bounds, Point};
@@ -154,6 +155,19 @@ impl Compiler<'_> {
                 let key = self.text_of(&key)?;
                 Plan::Write(WritePlan::Delete { collection, key })
             }
+            Stmt::UpdateWhere {
+                table,
+                assignments,
+                predicates,
+            } => Plan::Write(self.update_where(&table, &assignments, &predicates)?),
+            Stmt::DeleteWhere {
+                table,
+                predicates,
+                cascade,
+            } => Plan::Write(self.delete_where(table.as_deref(), &predicates, cascade)?),
+            Stmt::ExplainWrite(write) => Plan::ExplainText(self.explain_write(*write)?),
+            Stmt::BeginBulk => Plan::Write(WritePlan::BeginBulk),
+            Stmt::EndBulk => Plan::Write(WritePlan::EndBulk),
             Stmt::CreateTable { table, columns } => Plan::Write(self.create_table(table, columns)?),
             Stmt::CreateIndex {
                 name,
@@ -185,6 +199,12 @@ impl Compiler<'_> {
                     return Err(SqlError::engine(format!("no index named `{name}`")));
                 };
                 Plan::Write(WritePlan::DropIndex { index, name })
+            }
+            Stmt::AlterTable { table, action } => {
+                Plan::Write(self.alter_table(&table, &action)?)
+            }
+            Stmt::ExplainAlterTable { table, action } => {
+                Plan::ExplainText(self.explain_alter_table(&table, &action)?)
             }
             Stmt::Begin => Plan::Write(WritePlan::Begin),
             Stmt::Commit => Plan::Write(WritePlan::Commit),

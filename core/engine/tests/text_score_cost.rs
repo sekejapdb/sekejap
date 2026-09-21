@@ -96,8 +96,10 @@ fn budget() -> QueryBudget {
         vector_sidecars: 1 << 22,
         vector_lanes: 1 << 22,
         key_postings: 1 << 22,
+        rows_written: 1 << 22,
         groups: 1 << 22,
         output_bytes: 1 << 24,
+        deadline: None,
     }
 }
 

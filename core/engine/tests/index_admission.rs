@@ -1,7 +1,9 @@
 //! Catalog admission must precede source mutation, including WAL-tail cleanup.
 //! Run database tests on the authorized Linux test paths, never on Mac by default.
 use sekejap_core::{
-    collections::{CollectionId, Database, EntityId, Error, IndexId, IndexState, ScalarPredicate},
+    collections::{
+        CollectionId, Database, EntityId, Error, IndexExpr, IndexId, IndexState, ScalarPredicate,
+    },
     pagewal::PageWalStore,
     Kind,
 };
@@ -112,9 +114,11 @@ fn one_intact_future_index_encoding_replica_refuses_before_mutation() {
         let mut descriptor = raw.get(&key).unwrap().unwrap();
         assert_eq!(&descriptor[..8], b"E4IDX01\0");
         // Packet header is ten bytes; encoding version follows id/u32/family.
-        // Version 2 is the per-index-tree scalar/spatial layout THIS binary
-        // writes, so the unknown-version probe moved up to 3.
-        descriptor[23..25].copy_from_slice(&3u16.to_be_bytes());
+        // Version 2 is the per-index-tree scalar/spatial layout and version 3
+        // the EXPRESSION layout (`catalog.rs`, `decode`) -- both are written
+        // and read by THIS binary, so the unknown-version probe moved up to 4
+        // exactly as it moved from 2 to 3.
+        descriptor[23..25].copy_from_slice(&4u16.to_be_bytes());
         reseal(&mut descriptor);
         raw.put(&key, &descriptor).unwrap();
         raw.commit().unwrap();
@@ -131,6 +135,78 @@ fn one_intact_future_index_encoding_replica_refuses_before_mutation() {
         drop(raw);
         tail_without_coordination(&path);
         assert_refused_unchanged(&path, true);
+    }
+}
+
+/// The EXPRESSION encoding (descriptor version 3) is additive and rides on
+/// its own header bit, `EXPRESSION_FEATURE` = 0x400. A file that carries a
+/// version-3 descriptor while its header denies the feature is not a newer
+/// file this binary should refuse as `Unsupported` -- the two halves of one
+/// file disagree, which is damage -- and it must be reported before any
+/// source byte moves, live and snapshot alike (Law 8, then Law 5).
+#[test]
+fn a_version_three_descriptor_without_its_feature_bit_is_refused_before_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    for copy in 0..3u8 {
+        let path = temp.path().join(format!("expression-unadmitted-{copy}"));
+        let mut db = Database::create(&path, cfg()).unwrap();
+        let c = db
+            .create_collection(
+                "people",
+                vec![("name".into(), Kind::Text)],
+                Default::default(),
+            )
+            .unwrap();
+        db.put(c, "one", &json!({"name":"Alice"})).unwrap();
+        let index = db
+            .create_expression_index(c, "by_lower_name", "name", IndexExpr::Lower, false)
+            .unwrap();
+        assert!(db.build_index_step(index, 8).unwrap());
+        db.commit().unwrap();
+        drop(db);
+
+        let mut raw = PageWalStore::open(&path, false, 1 << 20).unwrap();
+        let descriptor = raw.get(&[3, copy, 0x81, 1]).unwrap().unwrap();
+        // The descriptor this fixture wrote really is version 3: the probe
+        // below removes the header's admission of it and nothing else.
+        assert_eq!(u16::from_be_bytes(descriptor[23..25].try_into().unwrap()), 3);
+        for header_copy in 0..3u8 {
+            let key = [0, 0, header_copy];
+            let mut header = raw.get(&key).unwrap().unwrap();
+            assert_eq!(&header[..8], b"E4COLL2\0");
+            let features = u64::from_be_bytes(header[18..26].try_into().unwrap());
+            assert_eq!(features & 0x400, 0x400, "fixture did not set EXPRESSION");
+            header[18..26].copy_from_slice(&(features & !0x400).to_be_bytes());
+            reseal(&mut header);
+            raw.put(&key, &header).unwrap();
+        }
+        raw.commit().unwrap();
+        drop(raw);
+        tail_without_coordination(&path);
+
+        let before = files(&path);
+        for snapshot in [false, true] {
+            let result = if snapshot {
+                Database::open_snapshot(&path, cfg())
+            } else {
+                Database::open(&path, cfg())
+            };
+            match result {
+                Err(Error::Corrupt(reason)) => assert_eq!(
+                    reason, "expression index descriptor without feature admission",
+                    "wrong reason, snapshot={snapshot}"
+                ),
+                Err(other) => {
+                    panic!("wrong refusal, snapshot={snapshot}: {other:?}")
+                }
+                Ok(_) => panic!("unadmitted expression descriptor opened, snapshot={snapshot}"),
+            }
+            assert_eq!(
+                files(&path),
+                before,
+                "refusal changed bytes/inventory, snapshot={snapshot}"
+            );
+        }
     }
 }
 

@@ -28,17 +28,36 @@ compatibility.
 
 | # | Surface | e3 (file:line) | e4 ingredient | Tier | Law |
 |---|---|---|---|---|---|
-| 1 | Service mode: one writer, snapshot readers | `src/service.rs:1-70`, `:174-186` | `Database::open_snapshot` (`src/collections/mod.rs:716`) | T2 | L6 |
-| 2 | `publish()` and the staleness window | `src/service.rs:118-151`, `:153-156` | `commit` publishes; `open_snapshot` reads the newest published transaction | T2 | L6 |
-| 3 | Statement timeout (wall clock) | `src/db.rs:5004-5012`, `:5030-5046` | `WorkMeter::charge` / `check_cancelled` (`src/query/mod.rs:528`, `:581`) | T2 | L1, L4 |
-| 4 | Interrupt handle (public cancel) | `src/db.rs:325-337`, `:5014-5023` | `Error::Cancelled`, `QueryError::Cancelled` (`src/query/mod.rs:471`), `traverse_bfs_with_cancel` (`src/index/graph/mod.rs:1635`) | T2 | L6 |
-| 5 | Change notifications, one event per committed batch | `src/db.rs:373-386`, `:4980-5001`, `:5049-5080` | `commit` (`src/collections/mod.rs:1605`) as the single emission point | T2 | L6, **L1** |
+| 1 | Service mode: one writer, snapshot readers | `src/service.rs:1-70`, `:174-186` | `Database::open_snapshot` (`src/collections/mod.rs:716`) | **DONE** — `dist/src/service/mod.rs:142` (`ServiceDatabase`), `:173` (`open`), `:209` (`writer`), `:220` (`try_writer`), `:249` (`reader`), `:259` (`open_reader`), `:504` (`close`), `dist/src/service/snapshot.rs:43` | L6 |
+| 2 | `publish()` and the staleness window | `src/service.rs:118-151`, `:153-156` | `commit` publishes; `open_snapshot` reads the newest published transaction | **DONE** — `dist/src/service/mod.rs:275` (`publish_now`), `:282`/`:289` (`publish_interval`), `:666` (`mark_dirty_and_maybe_publish`), `dist/src/service/snapshot.rs:36` (`PUBLISH_INTERVAL_DEFAULT`) | L6 |
+| 3 | Statement timeout (wall clock) | `src/db.rs:5004-5012`, `:5030-5046` | `WorkMeter::charge` / `check_cancelled` (`src/query/mod.rs:528`, `:581`) | **DONE** — `core/engine/src/query/mod.rs:528` (`QueryBudget::deadline`), `:558` (`with_deadline`), `:647` (`WorkResource::Deadline`), `:717` (`DEADLINE_POLL_CHARGES`), `:778` (`check_deadline`); `dist/src/service/mod.rs:341` (`set_statement_timeout`) | L1, L4 |
+| 4 | Interrupt handle (public cancel) | `src/db.rs:325-337`, `:5014-5023` | `Error::Cancelled`, `QueryError::Cancelled` (`src/query/mod.rs:471`), `traverse_bfs_with_cancel` (`src/index/graph/mod.rs:1635`) | **DONE** — `dist/src/service/interrupt.rs:26` (`InterruptHandle`), `dist/src/service/mod.rs:377` (`interrupt_handle`), `:383` (`cancel`), `:388` (`clear_interrupt`), `:428` (`scan`, which threads it into every `next_page`) | L6 |
+| 5 | Change notifications, one event per committed batch | `src/db.rs:373-386`, `:4980-5001`, `:5049-5080` | `commit` (`src/collections/mod.rs:1605`) as the single emission point | **DONE** — `dist/src/service/changes.rs:70` (`ChangeEvent`), `:46` (`CHANGE_QUEUE_BOUND` = 256), `:51` (`CHANGE_KEY_CAP` = 1,024), `:205` (`deliver`); `dist/src/service/mod.rs:629` (`WriterGuard::commit`, the emission point) | L6, **L1** |
 | 6 | Introspection: `SHOW STATUS`, `SHOW STORAGE`, `stats`, `memory_report`, `trim_memory` | `src/sql.rs:8132-8135`, `src/exec.rs:463-540`, `src/db.rs:10177`, `:11726`, `:11763` | `storage_bytes` (`src/collections/mod.rs:794`), `io_counters` (`:947`), `pool_counters` (`:892`), `tracked_pages` (`:798`) | T2 | L4 |
 | 7 | Bulk load: `begin_bulk` / `put_value_bulk` / `link_many` | `src/db.rs:11913-11997` | `commit` as the durability point; `put`, `put_edge` | T2 | L2, L3 |
 | 8 | `write_trace`: per-phase commit timing | `src/write_trace.rs:1-22` | `io_counters` (`:947`), `pool_counters` (`:892`) | T2 | L4 |
 
-Nothing in this document is T1: none of it is built. Nothing in it is T3
-either, with the three named exceptions inside §1, §3 and §5.
+§1-§5 are BUILT, in `dist/src/service/` over one additive change in core;
+§6-§8 are still T2. The three named T3 exceptions inside §1, §3 and §5 stand,
+and none of them is emulated.
+
+**What §1-§5 cost to build, in one place.** One field
+(`QueryBudget::deadline`), one enum variant (`WorkResource::Deadline`), one
+constant (`DEADLINE_POLL_CHARGES` = 1,024 charges) and one private method
+(`WorkMeter::check_deadline`) in `core/engine/src/query/mod.rs`; everything
+else is composition in `dist/src/service/`, which is where the layering says
+an operator surface lives. The tests are `dist/tests/service.rs`.
+
+**The deviations from this document's wording, both stated where they are
+made.** §1 says the published view is `RwLock<Arc<Database>>`; it is
+`RwLock<Arc<Snapshot>>` with `Snapshot` owning the handle behind its own
+mutex, because `Database` carries per-handle caches (`RefCell`, `Cell`) and is
+therefore `Send` but not `Sync`, so `Arc<Database>` cannot cross a thread
+(`dist/src/service/snapshot.rs:1-28`). §2 says the writer pays the mint so
+readers never do; with no background thread in this build, a reader that finds
+a view dirty and older than the interval pays it instead, and the writer still
+pays it whenever another commit follows within the interval
+(`dist/src/service/mod.rs:239-252`).
 
 ## 1. Service mode — one writer, snapshot readers
 
@@ -75,7 +94,26 @@ that bound rather than block: **a service that blocks a reader to honour a
 reader bound has broken L6 to satisfy L1**, and the refusal is the correct
 shape.
 
-**Tier: T2.** The atomic is a composition of handles that already exist.
+**BUILT.** `dist/src/service/mod.rs:142` (`ServiceDatabase`), `:173`
+(`open`), `:209` (`writer`), `:220` (`try_writer`, the named in-process
+refusal), `:249` (`reader`), `:259` (`open_reader`), `:504` (`close`), and
+`dist/src/service/snapshot.rs:43` (`Snapshot`). Tests:
+`dist/tests/service.rs` --
+`a_reader_keeps_its_old_snapshot_while_a_writer_commits_and_a_later_reader_sees_the_commit`,
+`a_second_writer_is_refused_by_name_while_the_first_holds_it_and_served_once_it_is_dropped`,
+`a_second_service_on_one_directory_is_refused_by_the_stores_own_writer_lock`
+(the T3, refused by the page WAL's own lock as `Kernel(WriterLocked)`),
+`close_discards_uncommitted_work_and_releases_the_reader_slot`.
+
+**The deviation, and why.** The published view is `RwLock<Arc<Snapshot>>`, not
+`RwLock<Arc<Database>>`: `Database` owns four interior-mutability caches and
+the page-WAL store two more, so it is `Send` but not `Sync` and `Arc<Database>`
+cannot cross a thread. `Snapshot` owns the handle behind its own mutex. The
+publication mechanism and the Law are unchanged -- no read takes the writer's
+lock, and no reader blocks the writer -- and the cost this buys is stated at
+`dist/src/service/snapshot.rs:19-28`: two readers sharing the published handle
+take turns, and a caller that wants two walks at once calls `open_reader` and
+spends one more persisted `readers` slot.
 
 **The T3 inside it.** More than one writer process on one directory is T3, and
 the reason is not the service: the page WAL is single-writer, and the file
@@ -126,7 +164,30 @@ the metric in this section.
 to "when does a new reader see the latest acknowledged commit". L3 governs the
 failure mode — a failed mint never destroys the served view.
 
-**Tier: T2.**
+**BUILT.** `dist/src/service/mod.rs:275` (`publish_now`), `:282` / `:289`
+(`publish_interval`), `:666` (`mark_dirty_and_maybe_publish`, the writer-side
+rate limit), `dist/src/service/snapshot.rs:36`
+(`PUBLISH_INTERVAL_DEFAULT` = 100 ms).
+
+**The metric this section asked for, measured.** On a 4,000-row corpus,
+Apple M-series laptop, release build, `IoMode::Buffered` / `SyncMode::Full`,
+four runs: one snapshot open is **0.9 ms to 6.7 ms**, and one `publish_now`
+swap is **0.9 ms to 2.0 ms** -- that open plus an `Arc` store under a write
+lock, and nothing else. A commit made just after a publication became visible
+to a new reader **100.3 ms to 108.5 ms** later, measured from the commit,
+against a stated window of 100 ms + one open. e3's mint costs on e3's path
+were ~12 ms at 1M rows and ~56 ms at 48M; e4's is one checkpoint cheaper by
+construction, and these are the first e4 numbers for it. The open cost grows
+with the corpus and these are 4,000-row numbers: what is fixed is the SHAPE of
+the window, not its second term.
+Test: `a_commit_becomes_visible_within_the_publish_interval_plus_one_snapshot_open`,
+`publish_now_swaps_the_view_in_one_snapshot_open_and_leaves_the_old_one_intact`.
+
+**The second deviation.** e3's writer pays the mint so a reader never does.
+This build starts no background thread, so a reader that finds the view dirty
+and older than the interval pays it; the writer still pays it whenever another
+commit follows within the interval. Without that, a database whose last commit
+is its last write would serve a view that never refreshes.
 
 ## 3. Statement timeout
 
@@ -171,7 +232,45 @@ Cancellation points are on the read path; a commit is the L3 barrier and is
 not interruptible by a clock. A long write is bounded by batching it (§7), not
 by a timer.
 
-**Tier: T2.**
+**BUILT.** The one change in core: `core/engine/src/query/mod.rs:528`
+(`QueryBudget::deadline: Option<Instant>`), `:558`
+(`QueryBudget::with_deadline`, so no caller restates the work bounds it
+already chose), `:647` (`WorkResource::Deadline`), `:717`
+(`DEADLINE_POLL_CHARGES` = **1,024 charges**, e3's precedent), `:762` /
+`:778` (`check_cancelled` -> `check_deadline`). The setter is
+`dist/src/service/mod.rs:341`, and `:361` / `:367` are how it reaches a
+statement.
+
+**The stated interval, and what it means.** The clock is read once per meter
+-- so once per page, which is what lets a paged scan detect a deadline that
+passed between two small pages -- and then once per 1,024 charges. A deadline
+is therefore detected within 1,024 units of work of passing, not at the
+instant it passes.
+
+**The L4 number this paragraph owed.** On the no-deadline path the cost is one
+`Option` discriminant test per charge and **no clock read at all**:
+`QueryBudget::unlimited()` carries `deadline: None`, `WorkMeter::new` does not
+call `Instant::now` when the field is `None`, and `check_deadline` returns on
+the first `let ... else`. What is measured rather than argued is that the
+bound changes no work: a 40,000-row scan charges 40,008 candidates and 40,009
+primary reads, and charges exactly the same after a timeout has been set,
+fired and cleared. No before/after binary comparison of the per-charge test
+was made, and this paragraph does not claim one: a single predictable branch
+per charge is below the noise of a 27-34 ms scan on this machine.
+
+**The refusal's two numbers.** `limit` is the microseconds the PAGE was
+allowed and `attempted` the microseconds it had spent when the clock was read;
+both are measured from the page's own start, because the budget is supplied
+per page while the deadline is one absolute instant for the statement. A
+timeout is `QueryError::BudgetExceeded { resource: Deadline, .. }` and a
+cancel is `QueryError::Cancelled`: different errors on purpose, so a retry
+loop can tell them apart. Test:
+`a_statement_past_its_deadline_is_refused_naming_deadline_the_elapsed_micros_and_the_work_so_far`
+(across four runs the refusal reported limit 78-4,665 us against elapsed
+106-11,001 us, with the work counters holding the completed pages' charges --
+the spread is the point: `limit` is what the PAGE that noticed was allowed,
+and a page that began close to the deadline was allowed very little),
+`a_work_bound_still_refuses_by_its_own_resource_while_a_deadline_is_also_set`.
 
 ## 4. Interrupt handle — public cancel
 
@@ -209,7 +308,16 @@ damage the snapshot, and must leave the handle answering normally after
 partial answer labelled as complete — that is the same rule §6 of
 `docs/lang/QL_CONTRACT.md` makes for a budget refusal.
 
-**Tier: T2.**
+**BUILT.** `dist/src/service/interrupt.rs:26` (`InterruptHandle`), `:35`
+(`cancel`), `:41` (`is_cancelled`), `:47` (`clear`);
+`dist/src/service/mod.rs:377` / `:383` / `:388`, and `:428` (`scan`), which
+hands the handle's load to `prepare_sql_with` and to every `next_page` it
+issues. Test:
+`a_cancel_from_another_thread_stops_a_long_scan_and_clearing_it_restores_the_reader`
+-- which also proves the sticky half (the next statement is refused too) and
+that a cleared handle answers in full -- and
+`a_standing_cancel_does_not_stop_the_writer_from_committing` for L6's other
+half.
 
 ## 5. Change notifications — one event per committed batch
 
@@ -265,7 +373,36 @@ with its own retention, its own truncation and its own recovery story, and it
 has no atomic here. The feed this contract states is in-process, live, and
 lossless only for a listener that was already subscribed.
 
-**Tier: T2.**
+**BUILT.** `dist/src/service/changes.rs:70` (`ChangeEvent`), `:46`
+(`CHANGE_QUEUE_BOUND` = **256 events per subscriber**), `:51`
+(`CHANGE_KEY_CAP` = **1,024 keys per event**), `:205` (`deliver`, which
+`try_send`s and counts a drop rather than waiting);
+`dist/src/service/mod.rs:629` (`WriterGuard::commit`) is the single emission
+point, after `Database::commit` returned `Ok` and while the writer lock is
+still held.
+
+**The ordering, proved without a crash.** By the time a subscriber holds the
+event, a snapshot opened right then already holds the batch: the signal cannot
+run ahead of the durable state. Test:
+`exactly_one_event_per_committed_batch_and_the_event_never_precedes_durability`.
+The rest: `a_rolled_back_batch_and_a_dropped_guard_fire_no_event_and_leave_no_rows`
+(a guard dropped without committing rolls back and emits nothing),
+`a_subscriber_that_stops_draining_drops_events_past_the_stated_bound_and_counts_them`
+(264 commits against a 256-event queue: 8 dropped, 8 counted in `lagged`, and
+the queue held the OLDEST 256 -- a full queue drops the new event, not the
+held one), `the_key_list_stops_at_the_stated_cap_and_the_event_reports_the_total`,
+`unsubscribing_stops_the_feed_and_an_unlistened_commit_records_nothing`.
+
+**What this feed cannot name.** A SQL write through `WriterGuard::sql` is
+counted in `ChangeEvent::unnamed_writes` rather than attributed to a
+collection: `lang`'s compiled `WritePlan`, the only thing that knows a
+statement's target, is `pub(crate)` to `sekejap-lang`, and widening it is a
+lang change this surface does not make. A listener that sees it above zero
+re-runs its query, exactly as one past the key cap does. `BEGIN`, `COMMIT` and
+`ROLLBACK` are refused through the guard
+(`dist/src/service/mod.rs:122`, `:603`): lang compiles `COMMIT` straight to
+`Database::commit`, which would cross the barrier behind the feed's back, and
+this section's whole claim is that the event and the barrier are one point.
 
 ## 6. Introspection
 
@@ -393,7 +530,38 @@ migrating from e3 must expect the stronger guarantee, not the weaker one.
 **and L3** (the failure path deletes nothing and publishes nothing). **L1** is
 what §5 bounds: a large batch must not accumulate an unbounded change event.
 
-**Tier: T2.**
+**Tier: T1 — DONE.** `Database::begin_bulk` / `Database::end_bulk`
+(`core/engine/src/collections/write_set.rs`), nesting-counted on the handle,
+with the outermost `end_bulk` calling `Database::commit` and returning whether
+it did. The SQL spelling is `BEGIN BULK` / `END BULK` (`docs/lang/QL_CONTRACT.md`
+§2), chosen over `BEGIN`/`COMMIT` because the scope is not a transaction: the
+single writer is already inside one, and what the scope moves is the
+durability point.
+
+Three deviations from e3, each stated rather than inherited:
+
+* **No batched entry points.** e3 needs `put_value_bulk(rows)` and
+  `link_many(edges)` because its scope is nesting-*unsafe* without them. e4's
+  `put`, `delete`, `put_edge` and `delete_edge` already write into the working
+  tree with no durability point of their own, so a loop of `put` inside a
+  scope IS the batch; a second entry point would be the same calls behind a
+  second name. `COPY ... FROM STDIN` on the wire (p3-wire) is this scope with
+  a parser in front, and needs nothing new here.
+* **An unbalanced `end_bulk` is an error.** e3 absorbs it because the call
+  arrives across an FFI boundary where a panic is worse than a silence. This
+  is not that boundary, and an `end_bulk` outside a scope would otherwise
+  commit somebody else's uncommitted rows.
+* **`rollback` clears the counter.** The scope's rows are gone and no caller
+  is left to close it, so the depth goes back to zero with them. That is the
+  §7 "a failed batch leaves nothing committed" guarantee, extended to the
+  scope itself.
+
+Tests: `core/engine/tests/write_where.rs`
+`a_bulk_scope_nests_and_only_the_outermost_close_commits`,
+`an_unbalanced_close_is_refused_and_a_rollback_forgets_the_scope`,
+`a_bulk_scope_commits_with_the_same_durability_as_any_other_commit`;
+`lang/tests/sql_dml.rs`
+`begin_bulk_and_end_bulk_nest_and_only_the_outermost_close_commits`.
 
 ## 8. `write_trace` — per-phase commit timing
 
@@ -506,16 +674,16 @@ feature and never appears on the wire.
 
 ## 11. Order of work
 
-1. §1 service mode and §2 publish: the two halves of one object, and the
-   thing every other item is hosted by. Measure the snapshot-open cost and put
-   the metric in §2.
-2. §4 the interrupt handle: the smallest item, because the cancellation
-   closure and every family's `Cancelled` return already exist.
-3. §3 the statement timeout: the same check point as §4, plus a deadline and
-   the counted poll interval.
-4. §6.1 `SHOW STATUS` and §6.3 `stats` / `memory_report` / `trim_memory`:
+1. ~~§1 service mode and §2 publish~~ — **DONE**, and the snapshot-open cost
+   is measured and in §2.
+2. ~~§4 the interrupt handle~~ — **DONE**.
+3. ~~§3 the statement timeout~~ — **DONE**, with the poll interval stated as
+   1,024 charges and the no-deadline cost measured in §3.
+4. ~~§5 the change feed~~ — **DONE**, with both of its L1 bounds decided and
+   stated before a line was written (256 events per subscriber, 1,024 keys per
+   event).
+5. §6.1 `SHOW STATUS` and §6.3 `stats` / `memory_report` / `trim_memory`:
    O(1) reads over counters that exist.
-5. §5 the change feed, with its L1 cap decided before a line is written.
 6. §7 the bulk-load scope.
 7. §6.2 `SHOW STORAGE`: a scan, so it waits for the ones that are not.
 8. §8 `write_trace`, feature-gated, last.

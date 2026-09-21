@@ -129,6 +129,16 @@ through an explicit namespace mapping, never copy these persistent tags blindly.
   A separate 2x physical-space ceiling is not a blocker for this loop.
   Allocated and logical peaks are both recorded, and `ResourceLimits`
   still does not guarantee a hard allocated-block reservation.
+- The LOGICAL index feature word is a separate, additive register from the
+  physical `E4PWAL02` bits below, and its one definition is
+  `SUPPORTED_LOGICAL_FEATURES` in `core/engine/src/collections/mod.rs`, with
+  the bit-by-bit table in the doc comment above it. It stood at `0xfff` and is
+  `0x1fff` from 2026-09-21, when `COLUMN_RULES_FEATURE = 0x1000` was added for
+  the per-field COLUMN RULE tail (`DEFAULT`, `NOT NULL`). Every bit in it is
+  additive: set in the same transaction as the first record that needs it,
+  never cleared, and a file declaring a bit outside the mask is refused as
+  `Unsupported` at admission, before a record is read (Law 8). Adding a bit is
+  the only permitted change to the on-disk format.
 - `E4PWAL02` persists required feature bits, including compact cells.
   Since the loop-2 codec change (2026-09-16) the cell encoding is a
   property of the database, not of the build: every build decodes both

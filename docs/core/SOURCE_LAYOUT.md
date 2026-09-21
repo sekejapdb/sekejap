@@ -43,7 +43,9 @@ current headings are numbered `## 1.` through `## 7.`),
 | --- | --- | --- |
 | `core/engine/src/collections/mod.rs` | `Database`, `CollectionId`, `EntityId`, `Kind`-typed collections, put/get/delete, the catalog and header records, and every public re-export the crate has ever offered from `collections`. The catalog record also carries the DECLARED SQL spellings of the columns whose `Kind` does not name them (`TIMESTAMPTZ`, `DATE`: both `Kind::Int`), behind flag bit 2 of its own frozen flags byte. | `docs/core/COLLECTIONS.md`; `docs/lang/QL_CONTRACT.md` §4.2 |
 | `core/engine/src/collections/catalog.rs` | The index catalog: `IndexInfo`/`IndexId`/`IndexFamily`/`IndexState`/`IndexExpr`, index create/drop, the index trees, scalar keys (`skey`) and index maintenance on write. An EXPRESSION index is a scalar index whose stored value is a closed function of its declared field (descriptor version 3, `EXPRESSION_FEATURE`). | `docs/core/COLLECTIONS.md`; `docs/lang/QL_CONTRACT.md` §4.1 |
+| `core/engine/src/collections/column_rules.rs` | The per-field COLUMN RULE slot: `ColumnRule`/`DefaultValue`, the catalog record's RULES tail and its `CATALOG_RULES` flag bit, the additive `COLUMN_RULES_FEATURE` bit, the write-path application (defaults filled into a MISSING field, then the NOT NULL check), and the RFC 4122 UUID generators with the SHA-1 they need. | `docs/lang/QL_CONTRACT.md` §2 (`DEFAULT`, `NOT NULL`) |
 | `core/engine/src/collections/drop_collection.rs` | Removing a collection: `DropMode`/`DropPhase`/`DropState`/`DropProgress`, `begin_drop_collection[_mode]`, `drop_collection_step`, the `DROP_FEATURE` bit and the descriptor's DROPPING tail. | `docs/lang/QL_CONTRACT.md` §2 (`DROP TABLE`); `docs/core/GRAPH_CONTRACT.md` §6.1 |
+| `core/engine/src/collections/write_set.rs` | Bounded, resumable writes over a CANDIDATE SET: `Database::delete_where` / `update_where` / `write_where`, `WriteRequest`/`WriteAction`/`WriteProgress`, `UpdatePatch`/`PatchValue` (the `&mut dyn FnMut(&Value) -> Result<Value>` closure boundary a row expression crosses), `DeleteMode` and the per-row GRAPH_CONTRACT 6.1 RESTRICT preflight. Also the bulk write scope `begin_bulk` / `end_bulk`, whose outermost close commits. | `docs/lang/QL_CONTRACT.md` §2 (`UPDATE ... WHERE`, `DELETE ... WHERE`, `BEGIN BULK`); `docs/core/GRAPH_CONTRACT.md` §6.1; `docs/dist/OPS_CONTRACT.md` §7 |
 | `core/engine/src/collections/rebuild.rs` | Offline rebuild of a database into a fresh file, sorted index builds included. Public as `collections::rebuild`. | `docs/core/COLLECTIONS.md` |
 | `core/engine/src/collections/verification.rs` | Whole-database verification against an independent walk of the source. Public as `collections::verification`. | `docs/core/COLLECTIONS.md` |
 | `core/engine/src/collections/sort.rs` | The external sort the sorted index build runs on. | `docs/core/COLLECTIONS.md` |
@@ -73,7 +75,7 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 
 | Module | Atomic | Contract |
 | --- | --- | --- |
-| `core/engine/src/query/mod.rs` | The request/response vocabulary a caller names: `QueryRequest`, `QueryFilter`, `QueryOrder`, `ScoreExpr`, `Projection`, `CandidateDriver`, `QueryDriver`, `QueryPage`, `QueryRow`, `OrderValue`, `QueryBudget`, `QueryWork`, `QueryError`, `WorkResource`, `ApproximationDiagnostics`, the `MAX_*` limits, and the `WorkMeter` every walk charges against. | `docs/lang/QL_CONTRACT.md` §2 "Statements", §6 "Execution guarantees" |
+| `core/engine/src/query/mod.rs` | The request/response vocabulary a caller names: `QueryRequest`, `QueryFilter`, `QueryOrder`, `ScoreExpr`, `Projection`, `CandidateDriver`, `QueryDriver`, `QueryPage`, `QueryRow`, `OrderValue`, `QueryBudget`, `QueryWork`, `QueryError`, `WorkResource`, `ApproximationDiagnostics`, the opaque `WriteCursor` a bounded write pass resumes from, the `MAX_*` limits, and the `WorkMeter` every walk charges against -- including its wall-clock half: `QueryBudget::deadline`, `WorkResource::Deadline` and `DEADLINE_POLL_CHARGES`, the stated 1,024-charge interval between two clock reads. | `docs/lang/QL_CONTRACT.md` §2 "Statements", §6 "Execution guarantees"; `docs/dist/OPS_CONTRACT.md` §3 |
 | `core/engine/src/query/plan.rs` | `Database::prepare_query`; the compiled forms (`CompiledFilter`, `CompiledOrder`, `PreparedText`); the `require_*` index checks; the scalar and geometry predicate encodings the index keyspace understands. | `docs/lang/QL_CONTRACT.md` §3 "Predicates and operators" |
 | `core/engine/src/query/drivers.rs` | `DriverPlan` and driver selection (the Auto chain, `nearest_plan`, `nearest_drives_better`, `approximate_scan_drives`, `order_index_drives_better`); the bounded graph traversals and their per-hop pruning (`execute_graph`, `GraphAnswer`); the carried-key `Candidate`; every cursor's state and the `DriverCursor` keyspace helpers. | `docs/lang/QL_CONTRACT.md` §6 "Execution guarantees"; `docs/core/GRAPH_CONTRACT.md` §4.1-4.3 |
 | `core/engine/src/query/cursors.rs` | One walk per driver: `DriverCursor` dispatch plus the per-cursor `next` (entities, scalar, keys, text, spatial, nearest, geometry, vector, quantized vector). | `docs/lang/QL_CONTRACT.md` §4 "Functions" (per-family dispatch) |
@@ -95,8 +97,8 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 | `lang/src/parser/select.rs` | `SELECT`: select list, `GROUP BY`, `HAVING`, aggregate calls. | `docs/lang/QL_CONTRACT.md` §2, §3 |
 | `lang/src/parser/expr.rs` | `WHERE`, the boolean tree, `ORDER BY` arithmetic, the §4.1/§4.2 function predicates and row expressions, literals and casts. | `docs/lang/QL_CONTRACT.md` §2, §3 |
 | `lang/src/parser/graph_table.rs` | `GRAPH_TABLE` patterns, quantifiers, `COLUMNS`. | `docs/lang/QL_CONTRACT.md` §2, §3 |
-| `lang/src/parser/dml.rs` | `INSERT`, `UPDATE`, `DELETE`. | `docs/lang/QL_CONTRACT.md` §2, §3 |
-| `lang/src/parser/ddl.rs` | `CREATE TABLE`, `CREATE INDEX`, `DROP`. | `docs/lang/QL_CONTRACT.md` §2, §3 |
+| `lang/src/parser/dml.rs` | `INSERT`, `UPDATE`, `DELETE`: the key-equality forms (one point write) and the PREDICATED forms (`WHERE <any predicate>`, `[RESTRICT\|CASCADE]`, `FROM ALL`), told apart by looking at the `WHERE` and backing up. | `docs/lang/QL_CONTRACT.md` §2, §3 |
+| `lang/src/parser/ddl.rs` | `CREATE TABLE` and its column clauses (`DEFAULT <generator>`, `NOT NULL`), `CREATE INDEX`, `ALTER TABLE`, `DROP`. | `docs/lang/QL_CONTRACT.md` §2, §3 |
 | `lang/src/compile/mod.rs` | The `Compiler`, statement dispatch, `SET LOCAL`, value and catalog helpers. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/compile/plan.rs` | `SelectPlan`, `OwnedFilter`/`OwnedOrder`, the borrowed-view builders, `WritePlan`. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/compile/aggregate.rs` | `AggregatePlan` and `GROUP BY`/`DISTINCT`/accumulator compilation. | `docs/lang/QL_CONTRACT.md` §4, §6 |
@@ -106,11 +108,26 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 | `lang/src/compile/predicates.rs` | `filter()` and its scalar, text and spatial leaves. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/compile/functions.rs` | The §4.1/§4.2 range rewrites (`time_filter`, `text_filter`, window and year ranges). | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/compile/graph_table.rs` | `GRAPH_TABLE` compilation to one bounded traversal. | `docs/lang/QL_CONTRACT.md` §4, §6 |
-| `lang/src/compile/dml.rs` | `INSERT`/`UPDATE` documents and their declared-type values. | `docs/lang/QL_CONTRACT.md` §4, §6 |
-| `lang/src/compile/ddl.rs` | `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE` and its EXPLAIN. | `docs/lang/QL_CONTRACT.md` §4, §6 |
+| `lang/src/compile/dml.rs` | `INSERT`/`UPDATE` documents and their declared-type values; the predicated `UPDATE ... WHERE` and `DELETE ... WHERE` (their filters, their `SET` values as constants or compiled row functions, and the EXPLAIN that PREPARES the candidate query without running it); the `FROM ALL` refusal text, written once for the three statements that raise it. | `docs/lang/QL_CONTRACT.md` §2, §4, §6 |
+| `lang/src/compile/ddl.rs` | `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and `DROP TABLE` with their EXPLAINs. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/functions.rs` | The §4.1 string and §4.2 date/time functions as PURE functions: the proleptic-Gregorian calendar, the literal reader and the ISO printer, `date_trunc`/`EXTRACT`/`to_char`, the fixed-width interval reader, and the text-prefix successor a `LIKE 'x%'` range needs. One implementation serves both the WHERE fold and the projected row function, so the two cannot disagree. | `docs/lang/QL_CONTRACT.md` §4.1, §4.2 |
 | `lang/src/explain.rs` | `EXPLAIN`: the plan, the counters, and the two function sections (`range rewrites`, `row functions`). | `docs/lang/QL_CONTRACT.md` §6 |
 | `lang/src/refuse.rs` | The Tier-2/Tier-3 table as data, plus `MULTI_RANGE` -- the reason a rewrite whose pre-image is a set of ranges carries. | `docs/lang/QL_CONTRACT.md` §4, `docs/core/FOUNDATION_TEST_STANDARD.md` law 8 |
+
+## `dist/src/service/` -- the embedded service surface
+
+`docs/dist/OPS_CONTRACT.md` §1-§5, built here because an operator surface
+belongs to `dist` and because composing `Database` handles is exactly what
+this layer is for. `dist/src/cli/` (the operator binaries) and
+`dist/src/pg/` (declared, not built) are listed in `docs/LAYERS.md`.
+
+| Module | Atomic | Contract |
+| --- | --- | --- |
+| `dist/src/service/mod.rs` | `ServiceDatabase`: the single writer behind a `Mutex<Database>`, the published read view behind an `RwLock<Arc<Snapshot>>`, `WriterGuard` (the recorded write path and the commit barrier), `ServiceError`, the publish rate limit, the statement-timeout setter, and `scan`, which threads the deadline and the interrupt into every `prepare_sql_with` and `next_page` the service issues. | `docs/dist/OPS_CONTRACT.md` §1, §2, §3, §5 |
+| `dist/src/service/snapshot.rs` | `Snapshot`: one published read-only handle, its publication ordinal, the instant it was swapped in and what minting it cost; `PUBLISH_INTERVAL_DEFAULT` (100 ms). | `docs/dist/OPS_CONTRACT.md` §1, §2 |
+| `dist/src/service/interrupt.rs` | `InterruptHandle`: the cloneable `Arc<AtomicBool>` a second thread holds, sticky until cleared, one relaxed load per charge. | `docs/dist/OPS_CONTRACT.md` §4 |
+| `dist/src/service/changes.rs` | The change feed: `ChangeEvent`, `ChangedKey`, `Receiver`, the per-subscriber bounded queue (`CHANGE_QUEUE_BOUND` = 256) and the per-event key cap (`CHANGE_KEY_CAP` = 1,024), the `PendingBatch` accumulator a commit drains and a rollback drops, and `Subscribers::deliver`, which never waits for a slow subscriber. | `docs/dist/OPS_CONTRACT.md` §5 |
+| `dist/tests/service.rs` | One test per rule §1-§5 states, with the oracle held in the test process: the L6 reader, the measured publish window, the `Deadline` refusal and its elapsed microseconds, the cross-thread cancel, one event per commit and none on rollback, the counted `lagged` drop, and the second-writer refusals. | `docs/dist/OPS_CONTRACT.md` §1-§5, `docs/core/FOUNDATION_TEST_STANDARD.md` L3, L4, L6 |
 
 ## `core/engine/src/faults/` -- in-crate fault injection
 
@@ -186,6 +203,23 @@ lives here so every fault suite is in one place:
    the keyspace empty before the descriptor is removed.
 4. `lang/src/compile/ddl.rs`'s `explain_drop_table` prints the phase list, so it
    needs the arm too.
+
+**A bounded, resumable WRITE over a candidate set.**
+1. The pass goes in `core/engine/src/collections/write_set.rs`, beside
+   `delete_where` / `update_where`: prepare an ordinary query with
+   `Projection::Ids` and `QueryOrder::Driver`, take ONE page, materialise it
+   as ids, drop the prepared query, then write. The page must be materialised
+   before the first write (Law 3) and the prepared query must be dropped
+   before the writes, because it holds `&Database`.
+2. Its bound goes on `QueryBudget` in `core/engine/src/query/mod.rs` beside
+   `rows_written`, with a `QueryWork` field, a `WorkResource` variant and an
+   arm in `WorkMeter::slot`.
+3. Its resume point is `WriteCursor` (`core/engine/src/query/mod.rs`), set on
+   a fresh prepared query by `PreparedQuery::resume_from` and read back by
+   `PreparedQuery::write_cursor` in `core/engine/src/query/page.rs`.
+4. If the write can MOVE the key the driver walks, the preflight that refuses
+   it goes beside `refuse_a_patch_that_moves_its_driver`, and the refusal
+   names the index and the explicit driver that is stable.
 
 **A new driver.**
 1. The `CandidateDriver` and `QueryDriver` variants go in `core/engine/src/query/mod.rs`

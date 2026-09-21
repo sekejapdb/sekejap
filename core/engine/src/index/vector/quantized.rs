@@ -434,9 +434,24 @@ fn rerank_sorted(
         let raw = store
             .get(&vector_key(candidate.id, ordinal))?
             .ok_or_else(|| corrupt("quantized vector locator points to missing sidecar"))?;
-        // SACRIFICE: the compact-vs-sidecar re-encode is not repeated for the
-        // ef winners. The scan already held the compact bytes; a disagreeing
-        // pair is a verify_index matter, not a per-query 100-get tax.
+        // The compact entry is a DERIVED copy of that sidecar, so the pair has
+        // exactly one agreeing form and the ef winners are where a query can
+        // still afford to check it. The page-order scan reads an entry's
+        // LENGTH and nothing else -- canonical scale, canonical lanes and the
+        // locator the entry carries are all unchecked there -- so without this
+        // re-encode a compact entry whose scale, lanes or locator were
+        // rewritten is scored as an approximation of a vector it no longer
+        // approximates, and the damage reaches the caller as an answer instead
+        // of as `Corrupt` (Law 5). COST: one `get` and one quantize per
+        // shortlist winner, bounded by `ef` and never by the corpus.
+        let persisted = store
+            .get(&entry_key(index.id, candidate.id.sequence))?
+            .ok_or_else(|| corrupt("quantized shortlist entry disappeared"))?;
+        if encode_entry(candidate.locator, &raw, dimension)? != persisted {
+            return Err(corrupt(
+                "quantized vector entry differs from authoritative sidecar",
+            ));
+        }
         let Some(distance) =
             exact_score(&raw, dimension, query, query_norm, metric, cancelled)?
         else {

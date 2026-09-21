@@ -36,6 +36,9 @@ impl Parser {
         self.expect_word("FROM")?;
         let source = if self.word().as_deref() == Some("GRAPH_TABLE") {
             Source::Graph(Box::new(self.graph_table()?))
+        } else if self.word().as_deref() == Some("ALL") && !matches!(self.peek_at(1), Tok::Dot) {
+            self.bump();
+            Source::All
         } else {
             let table = self.name()?;
             if self.eat_word("AS") {

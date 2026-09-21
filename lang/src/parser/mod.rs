@@ -124,6 +124,17 @@ impl Parser {
         &self.tokens[index].tok
     }
 
+    /// The cursor, so a decision that turns out not to hold can be undone.
+    /// Used by the two DML statements that have to LOOK at their `WHERE`
+    /// before they know which atomic they are.
+    fn mark(&self) -> usize {
+        self.at
+    }
+
+    fn reset(&mut self, mark: usize) {
+        self.at = mark;
+    }
+
     fn here(&self) -> usize {
         self.tokens[self.at].at
     }
@@ -336,15 +347,44 @@ impl Parser {
                         )),
                     };
                 }
+                if self.word().as_deref() == Some("ALTER") {
+                    let Stmt::AlterTable { table, action } = self.alter()? else {
+                        unreachable!("alter builds only an AlterTable statement")
+                    };
+                    return Ok(Stmt::ExplainAlterTable { table, action });
+                }
+                if matches!(self.word().as_deref(), Some("UPDATE") | Some("DELETE")) {
+                    let write = self.statement()?;
+                    return Ok(match write {
+                        // A write AT ONE KEY has no candidate walk to print;
+                        // the predicated forms do.
+                        Stmt::UpdateWhere { .. } | Stmt::DeleteWhere { .. } => {
+                            Stmt::ExplainWrite(Box::new(write))
+                        }
+                        _ => {
+                            return Err(SqlError::unsupported(
+                                "EXPLAIN is written for the PREDICATED write: `UPDATE t SET ... WHERE <predicate>` and `DELETE FROM t WHERE <predicate>` prepare a candidate query and have a plan; a write at one key is one point-get and one put",
+                            ))
+                        }
+                    });
+                }
                 Ok(Stmt::Explain(Box::new(self.select()?)))
             }
             "INSERT" => self.insert(),
             "UPDATE" => self.update(),
             "DELETE" => self.delete(),
             "CREATE" => self.create(),
+            "ALTER" => self.alter(),
             "DROP" => self.drop(),
             "BEGIN" => {
                 self.bump();
+                // `docs/dist/OPS_CONTRACT.md` §7: e4 spells the bulk scope
+                // `BEGIN BULK` / `END BULK`, because the scope is not a
+                // transaction -- the writer is already inside one -- it is a
+                // deferral of the durability point to the matching close.
+                if self.eat_word("BULK") {
+                    return Ok(Stmt::BeginBulk);
+                }
                 let _ = self.eat_word("TRANSACTION") || self.eat_word("WORK");
                 if self.eat_word("READ") {
                     self.expect_word("ONLY")?;
@@ -358,6 +398,9 @@ impl Parser {
             }
             "COMMIT" | "END" => {
                 self.bump();
+                if self.eat_word("BULK") {
+                    return Ok(Stmt::EndBulk);
+                }
                 let _ = self.eat_word("TRANSACTION") || self.eat_word("WORK");
                 Ok(Stmt::Commit)
             }

@@ -362,9 +362,13 @@ fn the_packed_tier_is_admitted_only_behind_its_own_feature_bit() {
     // refuses the file whole, before anything is normalized or written.
     let older = dir.path().join("older-reader");
     copy_dir(&path, &older);
-    // 0x80 is the per-index-tree bit this release implements, so the
-    // unknown-bit probe is the next one up.
-    set_features(&older, 0x51 | 0x100);
+    // The probe has to name a bit NO released mask implements. This release
+    // implements 0x001 through 0x1000 (typed, graph, vector, spatial, text,
+    // quantized, segments, per-index tree, geometry, drop, expression,
+    // declared spellings, column rules: `SUPPORTED_LOGICAL_FEATURES`), so the
+    // unknown-bit probe is the next one up and moves with that mask -- 0x100
+    // is the geometry family and 0x1000 the column rules now, both admitted.
+    set_features(&older, 0x51 | 0x2000);
     let before = files(&older);
     assert!(matches!(
         Database::open(&older, cfg()),

@@ -3,6 +3,7 @@
 //! place that turns a shape into a `QueryRequest` or a write.
 
 use super::functions::TimeUnit;
+use sekejap_core::collections::ColumnRule;
 use sekejap_core::Kind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -551,10 +552,20 @@ pub(super) enum GraphColumn {
     Edge(String),
 }
 
+/// One `SET column = ...` value: a constant, or a row expression over the
+/// same row (QL_CONTRACT §4.1 / §4.2).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum SetValue {
+    Lit(Literal),
+    Row(RowExpr),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Source {
     Table(String),
     Graph(Box<GraphTable>),
+    /// `FROM ALL`: every collection of the catalog at once (QL_CONTRACT §2).
+    All,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -578,6 +589,57 @@ pub(super) struct ColumnDef {
     /// stored as `Kind::Int` and only the declaration says which.
     pub(super) declared: String,
     pub(super) primary_key: bool,
+    /// `DEFAULT <generator>` and `NOT NULL`, as the per-field COLUMN RULE
+    /// the collection descriptor records (QL_CONTRACT §2). `None` when the
+    /// column clauses set neither.
+    pub(super) rule: Option<ColumnRule>,
+}
+
+/// The one change an `ALTER TABLE` statement makes. Each is `alter_collection`
+/// underneath: a new immutable `Layout` and a repointed catalog in one commit,
+/// O(fields) and no row rewritten (QL_CONTRACT §2).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum AlterAction {
+    AddColumn(Box<ColumnDef>),
+    DropColumn {
+        column: String,
+        if_exists: bool,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    RenameTable {
+        to: String,
+    },
+    /// `ALTER COLUMN c TYPE new_type`: Tier 2 within one `Kind`, Tier 3
+    /// across `Kind`s. The declared spelling is rewritten and no row byte
+    /// changes.
+    ColumnType {
+        column: String,
+        kind: Kind,
+        declared: String,
+    },
+}
+
+impl AlterAction {
+    /// The clause as a statement would have written it, for an EXPLAIN line.
+    pub(super) fn written(&self) -> String {
+        match self {
+            Self::AddColumn(column) => {
+                format!("ADD COLUMN {} {}", column.name, column.declared)
+            }
+            Self::DropColumn { column, if_exists } => format!(
+                "DROP COLUMN {}{column}",
+                if *if_exists { "IF EXISTS " } else { "" }
+            ),
+            Self::RenameColumn { from, to } => format!("RENAME COLUMN {from} TO {to}"),
+            Self::RenameTable { to } => format!("RENAME TO {to}"),
+            Self::ColumnType {
+                column, declared, ..
+            } => format!("ALTER COLUMN {column} TYPE {declared}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -613,10 +675,37 @@ pub(super) enum Stmt {
         assignments: Vec<(String, Literal)>,
         key: Literal,
     },
+    /// `UPDATE t SET ... WHERE <any predicate>` (QL_CONTRACT §2, T1 since
+    /// `Database::update_where`). The key-equality form above stays its own
+    /// statement: it is ONE point-get and one put, and routing it through a
+    /// candidate walk would cost a prepared query to reach a row the key
+    /// already names.
+    UpdateWhere {
+        table: String,
+        assignments: Vec<(String, SetValue)>,
+        predicates: Vec<Expr>,
+    },
     Delete {
         table: String,
         key: Literal,
     },
+    /// `DELETE FROM t WHERE <any predicate> [RESTRICT|CASCADE]`, and
+    /// `DELETE FROM ALL` with `table: None`. RESTRICT is the default
+    /// (GRAPH_CONTRACT 6.1).
+    DeleteWhere {
+        /// `None` is `FROM ALL`: every collection of the catalog.
+        table: Option<String>,
+        predicates: Vec<Expr>,
+        cascade: bool,
+    },
+    /// `EXPLAIN UPDATE ...` / `EXPLAIN DELETE ...`: the plan of a write,
+    /// printed WITHOUT running it, for the reason `ExplainDropTable` is not
+    /// run either -- explaining a destructive statement by executing it is
+    /// not an explanation.
+    ExplainWrite(Box<Stmt>),
+    /// `BEGIN BULK` / `END BULK` (`docs/dist/OPS_CONTRACT.md` §7).
+    BeginBulk,
+    EndBulk,
     CreateTable {
         table: String,
         columns: Vec<ColumnDef>,
@@ -645,6 +734,17 @@ pub(super) enum Stmt {
     DropIndex {
         name: String,
         if_exists: bool,
+    },
+    AlterTable {
+        table: String,
+        action: AlterAction,
+    },
+    /// `EXPLAIN ALTER TABLE ...`. Like `EXPLAIN DROP TABLE`, it does not run
+    /// its statement: printing the plan of a catalog rewrite by performing
+    /// the rewrite is not an explanation.
+    ExplainAlterTable {
+        table: String,
+        action: AlterAction,
     },
     Begin,
     Commit,

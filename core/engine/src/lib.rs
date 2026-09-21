@@ -23,6 +23,9 @@ pub(crate) use crate::store::{dense_v3, scalar_key};
 /// contract (`docs/core/GRAPH_CONTRACT.md`, `docs/core/COLLECTIONS.md`); it is
 /// the core -> lang interface, listed in one place so it can be read.
 pub mod internal {
+    pub use crate::collections::column_rules::{
+        admit_logical_features, logical_features, next_layout_id, parse_uuid, sha1,
+    };
     pub use crate::query::EDGE_FIELD_PREFIX;
 }
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

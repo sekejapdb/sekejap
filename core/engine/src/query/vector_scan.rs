@@ -156,6 +156,17 @@ impl PreparedQuery<'_> {
                 // trips only after the charge that names the exhausted
                 // resource has been made.
                 let ceiling = scan_ceiling(meter, dim, WorkResource::VectorSidecars);
+                // The locator pass charges VectorLocators and nothing else,
+                // so its ceiling comes from that allowance. Bounding it by
+                // the sidecar/candidate ceiling instead would stop the walk
+                // on a resource the locator pass never spends, and the scan's
+                // own `ResourceLimit` -- not the meter's `BudgetExceeded` --
+                // would be what the caller saw.
+                let locator_ceiling = usize::try_from(
+                    meter.remaining(WorkResource::VectorLocators),
+                )
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
                 let mut budget = None;
                 let scan = {
                     let mut progress =
@@ -168,6 +179,7 @@ impl PreparedQuery<'_> {
                         *metric,
                         held,
                         after,
+                        locator_ceiling,
                         ceiling,
                         &mut progress,
                     )

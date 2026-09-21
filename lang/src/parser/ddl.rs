@@ -1,4 +1,5 @@
 use super::*;
+use sekejap_core::collections::{ColumnRule, DefaultValue};
 
 impl Parser {
     pub(super) fn create(&mut self) -> SqlResult2<Stmt> {
@@ -33,42 +34,264 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let mut columns = Vec::new();
         loop {
-            let name = self.name()?;
-            let (kind, declared) = self.column_type()?;
-            let mut primary_key = false;
-            loop {
-                match self.word().as_deref() {
-                    Some("PRIMARY") => {
-                        self.bump();
-                        self.expect_word("KEY")?;
-                        primary_key = true;
-                    }
-                    Some("NOT") if self.word_at(1).as_deref() == Some("NULL") => {
-                        return Err(SqlError::unsupported(
-                            "NOT NULL: a declared field is present or absent per row and the codec has no column constraint to enforce",
-                        ));
-                    }
-                    Some("DEFAULT") | Some("UNIQUE") | Some("REFERENCES") | Some("CHECK") => {
-                        return Err(SqlError::unsupported(format!(
-                            "column constraint `{}`: the catalog holds a name and a Kind per field and nothing else",
-                            self.peek().written()
-                        )));
-                    }
-                    _ => break,
-                }
-            }
-            columns.push(ColumnDef {
-                name,
-                kind,
-                declared,
-                primary_key,
-            });
+            columns.push(self.column_def()?);
             if !self.eat(&Tok::Comma) {
                 break;
             }
         }
         self.expect(&Tok::RParen)?;
         Ok(Stmt::CreateTable { table, columns })
+    }
+
+    /// One column: a name, a type, and the clauses after it. `DEFAULT` and
+    /// `NOT NULL` become the COLUMN RULE the descriptor records
+    /// (QL_CONTRACT §2); the rest of the clause set has no atomic and is
+    /// refused by name.
+    fn column_def(&mut self) -> SqlResult2<ColumnDef> {
+        let name = self.name()?;
+        let (kind, declared) = self.column_type()?;
+        let mut primary_key = false;
+        let mut rule = ColumnRule::default();
+        loop {
+            match self.word().as_deref() {
+                Some("PRIMARY") => {
+                    self.bump();
+                    self.expect_word("KEY")?;
+                    primary_key = true;
+                }
+                Some("NOT") if self.word_at(1).as_deref() == Some("NULL") => {
+                    self.bump();
+                    self.bump();
+                    rule.not_null = true;
+                }
+                // `NULL` written out is Postgres's way of saying "the
+                // default nullability", and it decides nothing here either.
+                Some("NULL") => {
+                    self.bump();
+                }
+                Some("DEFAULT") => {
+                    self.bump();
+                    rule.default = Some(self.default_generator()?);
+                }
+                Some("UNIQUE") | Some("REFERENCES") | Some("CHECK") => {
+                    return Err(SqlError::unsupported(format!(
+                        "column constraint `{}`: the descriptor's per-field slot holds a DEFAULT generator and a NOT NULL flag, and nothing else",
+                        self.peek().written()
+                    )));
+                }
+                Some("GENERATED") => {
+                    return Err(SqlError::Refused {
+                        keyword: "GENERATED ALWAYS".to_owned(),
+                        tier: super::Tier::Two,
+                        reason: "QL_CONTRACT §2: a generated column is a compiled row expression in the same descriptor slot, evaluated before the index-maintenance hook; the slot holds the closed generator set today.",
+                    });
+                }
+                _ => break,
+            }
+        }
+        Ok(ColumnDef {
+            name,
+            kind,
+            declared,
+            primary_key,
+            rule: (rule != ColumnRule::default()).then_some(rule),
+        })
+    }
+
+    /// The generator a `DEFAULT` names. The set is CLOSED (QL_CONTRACT §2):
+    /// `now()`, `uuid4()`, `uuid5(namespace, name)` and the Postgres
+    /// spellings of those three. Anything else -- a literal, an arithmetic
+    /// expression, a call this engine does not have -- is refused by name,
+    /// because a default that is an expression is the generated-column row
+    /// of the contract and has no write-path atomic.
+    fn default_generator(&mut self) -> SqlResult2<DefaultValue> {
+        let at = self.here();
+        let Some(word) = self.word() else {
+            return Err(SqlError::unsupported(format!(
+                "DEFAULT {}: the generator set is closed -- now(), uuid4(), uuid5(namespace, name) -- and an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2",
+                self.peek().written()
+            )));
+        };
+        self.bump();
+        let no_args = |p: &mut Self| -> SqlResult2<()> {
+            if p.eat(&Tok::LParen) {
+                p.expect(&Tok::RParen)?;
+            }
+            Ok(())
+        };
+        match word.as_str() {
+            "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" | "STATEMENT_TIMESTAMP" => {
+                no_args(self)?;
+                Ok(DefaultValue::Now)
+            }
+            "UUID4" | "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => {
+                no_args(self)?;
+                Ok(DefaultValue::Uuid4)
+            }
+            "UUID5" | "UUID_GENERATE_V5" => {
+                self.expect(&Tok::LParen)?;
+                let namespace = match self.bump() {
+                    Tok::Str(text) => text,
+                    other => {
+                        return Err(SqlError::syntax(
+                            format!(
+                                "uuid5 takes a namespace UUID written as a string, found `{}`",
+                                other.written()
+                            ),
+                            at,
+                        ))
+                    }
+                };
+                self.expect(&Tok::Comma)?;
+                let name = match self.bump() {
+                    Tok::Str(text) => text,
+                    other => {
+                        return Err(SqlError::syntax(
+                            format!(
+                                "uuid5 takes a name written as a string, found `{}`",
+                                other.written()
+                            ),
+                            at,
+                        ))
+                    }
+                };
+                self.expect(&Tok::RParen)?;
+                Ok(DefaultValue::Uuid5 {
+                    namespace: sekejap_core::internal::parse_uuid(&namespace)
+                        .map_err(|e| SqlError::unsupported(format!("uuid5 namespace: {e}")))?,
+                    name,
+                })
+            }
+            other => Err(SqlError::unsupported(format!(
+                "DEFAULT {other}: the generator set is closed -- now(), uuid4(), uuid5(namespace, name) -- and each member is O(1) per row; an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2"
+            ))),
+        }
+    }
+
+    /// `ALTER TABLE t <action>`: the four descriptor rewrites of
+    /// QL_CONTRACT §2, plus `ALTER COLUMN ... TYPE` within one `Kind`.
+    pub(super) fn alter(&mut self) -> SqlResult2<Stmt> {
+        self.expect_word("ALTER")?;
+        match self.word().as_deref() {
+            Some("TABLE") => {}
+            Some(other) => {
+                return Err(SqlError::unsupported(format!(
+                    "ALTER {other}: ALTER TABLE is the catalog's own; there is no other alterable object"
+                )))
+            }
+            None => {
+                return Err(SqlError::syntax(
+                    format!("expected TABLE after ALTER, found `{}`", self.peek().written()),
+                    self.here(),
+                ))
+            }
+        }
+        self.bump();
+        if self.eat_word("IF") {
+            self.expect_word("EXISTS")?;
+            return Err(SqlError::unsupported(
+                "ALTER TABLE IF EXISTS: `Database::alter_collection` takes a CollectionId and there is no catalog probe that makes the rewrite conditional",
+            ));
+        }
+        if self.eat_word("ONLY") {
+            return Err(SqlError::unsupported(
+                "ALTER TABLE ONLY: there is no inheritance here, so ONLY names a distinction the catalog has not got",
+            ));
+        }
+        let table = self.name()?;
+        let action = self.alter_action()?;
+        if self.eat(&Tok::Comma) {
+            return Err(SqlError::unsupported(
+                "two actions in one ALTER TABLE: each action is its own `alter_collection` commit, so a comma would hide a partial rewrite; write them as separate statements",
+            ));
+        }
+        Ok(Stmt::AlterTable { table, action })
+    }
+
+    fn alter_action(&mut self) -> SqlResult2<AlterAction> {
+        match self.word().as_deref() {
+            Some("ADD") => {
+                self.bump();
+                if let Some(what @ ("CONSTRAINT" | "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK"
+                | "EXCLUDE")) = self.word().as_deref()
+                {
+                    return Err(SqlError::unsupported(format!(
+                        "ALTER TABLE ... ADD {what}: the descriptor's per-field slot holds a DEFAULT generator and a NOT NULL flag; the forms are ADD COLUMN, DROP COLUMN, RENAME COLUMN, RENAME TO and ALTER COLUMN ... TYPE (QL_CONTRACT §2)"
+                    )));
+                }
+                let _ = self.eat_word("COLUMN");
+                if self.eat_word("IF") {
+                    self.expect_word("NOT")?;
+                    self.expect_word("EXISTS")?;
+                    return Err(SqlError::unsupported(
+                        "ADD COLUMN IF NOT EXISTS: the rewrite is refused for a duplicate name and there is no probe that makes it conditional",
+                    ));
+                }
+                Ok(AlterAction::AddColumn(Box::new(self.column_def()?)))
+            }
+            Some("DROP") => {
+                self.bump();
+                let _ = self.eat_word("COLUMN");
+                let if_exists = if self.eat_word("IF") {
+                    self.expect_word("EXISTS")?;
+                    true
+                } else {
+                    false
+                };
+                let column = self.name()?;
+                if self.eat_word("CASCADE") {
+                    return Err(SqlError::unsupported(
+                        "DROP COLUMN ... CASCADE: a dependent object here is an INDEX over the column, and dropping it silently is what CASCADE would do; DROP INDEX first",
+                    ));
+                }
+                let _ = self.eat_word("RESTRICT");
+                Ok(AlterAction::DropColumn { column, if_exists })
+            }
+            Some("RENAME") => {
+                self.bump();
+                if self.eat_word("TO") {
+                    return Ok(AlterAction::RenameTable { to: self.name()? });
+                }
+                let _ = self.eat_word("COLUMN");
+                let from = self.name()?;
+                self.expect_word("TO")?;
+                Ok(AlterAction::RenameColumn {
+                    from,
+                    to: self.name()?,
+                })
+            }
+            Some("ALTER") => {
+                self.bump();
+                let _ = self.eat_word("COLUMN");
+                let column = self.name()?;
+                if self.eat_word("SET") {
+                    if self.eat_word("DATA") {
+                        self.expect_word("TYPE")?;
+                    } else {
+                        return Err(SqlError::unsupported(format!(
+                            "ALTER COLUMN {column} SET ...: the descriptor slot is written whole by ADD COLUMN and ALTER COLUMN ... TYPE; there is no per-clause SET"
+                        )));
+                    }
+                } else {
+                    self.expect_word("TYPE")?;
+                }
+                let (kind, declared) = self.column_type()?;
+                if self.eat_word("USING") {
+                    return Err(SqlError::unsupported(format!(
+                        "ALTER COLUMN {column} TYPE ... USING <expr>: a USING clause rewrites every row through an expression, and no bounded resumable rewrite exists (QL_CONTRACT §2)"
+                    )));
+                }
+                Ok(AlterAction::ColumnType {
+                    column,
+                    kind,
+                    declared,
+                })
+            }
+            _ => Err(SqlError::unsupported(format!(
+                "ALTER TABLE ... {}: the forms are ADD COLUMN, DROP COLUMN, RENAME COLUMN, RENAME TO and ALTER COLUMN ... TYPE (QL_CONTRACT §2)",
+                self.peek().written()
+            ))),
+        }
     }
 
     /// The declared SQL type, and the `Kind` it is stored as.

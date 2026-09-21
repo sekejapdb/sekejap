@@ -19,7 +19,7 @@ measures.
 | `core/kernel/` | `kernel` | `kernel` | The pager, the B-tree, the WAL, the I/O. Unchanged by the restructure. |
 | `core/engine/` | `sekejap-core` | `sekejap_core` | The engine: the row codec, the store, typed collections, the index families, the query engine, the fault suites. |
 | `lang/` | `sekejap-lang` | `sekejap_lang` | The query language: lexer, AST, parser, compiler, `EXPLAIN`, the refusal table, the SQL functions. |
-| `dist/` | `sekejap-dist` | `sekejap_dist` | Distribution: the operator binaries in `src/cli/`, and the two surfaces this layer owes but does not yet build (`src/service/`, `src/pg/`). |
+| `dist/` | `sekejap-dist` | `sekejap_dist` | Distribution: the operator binaries in `src/cli/`, the embedded service in `src/service/` (`docs/dist/OPS_CONTRACT.md` §1-§5), and the one surface this layer owes but does not yet build (`src/pg/`). |
 | `bench/` | `sekejap-bench` | -- | Every benchmark, fixture generator and probe, as binaries. |
 
 The workspace at the root is virtual: it owns `members`,

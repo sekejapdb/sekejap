@@ -87,7 +87,9 @@ pub(crate) const PAD: usize = 2081;
 const HEADER_MAGIC: &[u8; 8] = b"E4COLL1\0";
 const INDEX_HEADER_MAGIC: &[u8; 8] = b"E4COLL2\0";
 pub(crate) mod catalog;
+pub(crate) mod column_rules;
 pub(crate) mod drop_collection;
+mod write_set;
 pub mod rebuild;
 mod sort;
 pub mod verification;
@@ -109,6 +111,11 @@ pub use crate::query::{
     AggregateShape, GroupCmp, GroupKey, GroupOrder, GroupPage, GroupPredicate, GroupRow,
     PreparedAggregate,
 };
+/// The stated charge interval between two reads of the wall clock when a
+/// [`QueryBudget::deadline`] is set (`docs/dist/OPS_CONTRACT.md` §3). Public
+/// so the layer that sets a statement timeout, and the test that measures
+/// one, can name the number instead of assuming it.
+pub use crate::query::DEADLINE_POLL_CHARGES;
 pub use crate::query::{
     ApproximationDiagnostics, CandidateDriver, FilterAnswer, FilterPlan, Geom, GeometryFilter,
     OrderValue, OwnedScalarValue, PointFilter, PreparedQuery, ProjectedValue, Projection,
@@ -121,7 +128,13 @@ pub use catalog::{
     IndexState,
     IndexTree, ScalarPredicate,
 };
+pub use column_rules::{ColumnRule, DefaultValue, COLUMN_RULES_FEATURE};
 pub use drop_collection::{DropMode, DropPhase, DropProgress, DropState, MAX_DROP_BATCH};
+pub use write_set::{
+    DeleteMode, PatchValue, UpdatePatch, WriteAction, WriteProgress, WriteRequest,
+    MAX_PATCH_COLUMNS, MAX_WRITE_BATCH, RESTRICT_ROW_PROBE_SEEKS,
+};
+pub use crate::query::WriteCursor;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct IndexHeader {
     pub(crate) features: u64,
@@ -175,12 +188,30 @@ pub struct CollectionInfo {
     /// were recorded and for every collection created through the untyped
     /// `create_collection`.
     pub declared: Vec<(String, String)>,
+    /// The COLUMN RULES of this collection, as `(field, rule)` pairs: a
+    /// `DEFAULT` generator, a `NOT NULL` flag, or both. See the
+    /// [`column_rules`] module. Empty for every collection that declares
+    /// none, which is every collection written before the slot existed.
+    pub rules: Vec<(String, ColumnRule)>,
 }
 pub trait Clock: Send + Sync {
     fn unix_seconds(&self) -> i64;
+    /// The same instant in UTC MICROSECONDS, the encoding a stored
+    /// TIMESTAMPTZ uses (`docs/lang/QL_CONTRACT.md` §5 deviation 8) and what
+    /// `DEFAULT now()` fills. The default body is the seconds reading scaled,
+    /// so a clock written before this method still answers; the system clock
+    /// below overrides it with the resolution it actually has.
+    fn unix_micros(&self) -> i64 {
+        self.unix_seconds().saturating_mul(1_000_000)
+    }
 }
 struct SystemClock;
 impl Clock for SystemClock {
+    fn unix_micros(&self) -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+    }
     fn unix_seconds(&self) -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -196,6 +227,9 @@ pub(crate) struct Catalog {
     /// See [`CollectionInfo::declared`]. Recorded behind flag bit 2 of the
     /// catalog packet, which every binary that predates it refuses.
     pub(crate) declared: Vec<(String, String)>,
+    /// See [`CollectionInfo::rules`]. Recorded behind flag bit 3 of the same
+    /// frozen flags byte, behind `COLUMN_RULES_FEATURE` at admission.
+    pub(crate) rules: Vec<(String, ColumnRule)>,
     /// `Some` exactly while `begin_drop_collection` has published a DROPPING
     /// mark that `drop_collection_step` has not yet finished. It is the
     /// committed cursor of the drop: the phase it reached and how many
@@ -293,6 +327,12 @@ pub struct Database {
     /// reasonable caller pattern that a plain "is the handle dirty" test
     /// refuses on the second build.
     user_writes_pending: bool,
+    /// How many `begin_bulk` scopes are open on this handle
+    /// (`docs/dist/OPS_CONTRACT.md` §7). Zero is the ordinary state. A put
+    /// inside a scope is an ordinary put; the counter changes nothing about
+    /// what is written, only WHO calls `commit`: the OUTERMOST `end_bulk`,
+    /// once, instead of the caller after every write.
+    bulk_depth: u32,
     /// The one collection whose descriptor carries a DROPPING mark, if any.
     ///
     /// Read at open and after a rollback, and only when the collection header
@@ -504,6 +544,10 @@ pub(crate) const CATALOG_DROPPING: u8 = 2;
 /// at admission, and this byte refuses the record if a file ever reaches a
 /// reader without it.
 pub(crate) const CATALOG_DECLARED: u8 = 4;
+/// Bit 3 of the same frozen flags byte: the record carries a COLUMN RULES
+/// tail. See `column_rules.rs`; it is that module's `CATALOG_RULES`, named
+/// here beside the two bits it follows so the byte reads in one place.
+pub(crate) use column_rules::CATALOG_RULES;
 /// The collection header bit that says this database's catalog carries at
 /// least one DECLARED-TYPE pair, i.e. at least one record with the
 /// [`CATALOG_DECLARED`] tail.
@@ -524,39 +568,54 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
     b.push(
         u8::from(c.timestamps)
             | if c.drop.is_some() { CATALOG_DROPPING } else { 0 }
-            | if c.declared.is_empty() { 0 } else { CATALOG_DECLARED },
+            | if c.declared.is_empty() { 0 } else { CATALOG_DECLARED }
+            | if c.rules.is_empty() { 0 } else { CATALOG_RULES },
     );
     if let Some(d) = c.drop {
         b.push(d.phase.byte());
         b.push(d.mode.byte());
         b.extend_from_slice(&d.removed.to_be_bytes());
     }
-    if c.declared.is_empty() {
+    if c.declared.is_empty() && c.rules.is_empty() {
         b.extend_from_slice(c.name.as_bytes());
     } else {
         // With a tail the name can no longer be "the rest of the packet", so
-        // it is length-prefixed and the tail follows it.
+        // it is length-prefixed and the tails follow it, each behind its own
+        // flag bit and in bit order.
         b.extend_from_slice(&(c.name.len() as u16).to_be_bytes());
         b.extend_from_slice(c.name.as_bytes());
-        let count = u16::try_from(c.declared.len())
-            .map_err(|_| invalid("at most 65535 declared column types"))?;
-        b.extend_from_slice(&count.to_be_bytes());
-        for (field, declared) in &c.declared {
-            if field.is_empty() || field.len() > 255 || declared.is_empty() || declared.len() > 255
-            {
-                return Err(invalid("declared column type entries are 1..255 bytes"));
+        if !c.declared.is_empty() {
+            let count = u16::try_from(c.declared.len())
+                .map_err(|_| invalid("at most 65535 declared column types"))?;
+            b.extend_from_slice(&count.to_be_bytes());
+            for (field, declared) in &c.declared {
+                if field.is_empty()
+                    || field.len() > 255
+                    || declared.is_empty()
+                    || declared.len() > 255
+                {
+                    return Err(invalid("declared column type entries are 1..255 bytes"));
+                }
+                b.push(field.len() as u8);
+                b.extend_from_slice(field.as_bytes());
+                b.push(declared.len() as u8);
+                b.extend_from_slice(declared.as_bytes());
             }
-            b.push(field.len() as u8);
-            b.extend_from_slice(field.as_bytes());
-            b.push(declared.len() as u8);
-            b.extend_from_slice(declared.as_bytes());
+        }
+        if !c.rules.is_empty() {
+            let count = u16::try_from(c.rules.len())
+                .map_err(|_| invalid("at most 65535 column rules"))?;
+            b.extend_from_slice(&count.to_be_bytes());
+            for (field, rule) in &c.rules {
+                column_rules::encode_rule(&mut b, field, rule)?;
+            }
         }
     }
     packet(CATALOG_MAGIC, &b)
 }
 fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let b = unpack(b, CATALOG_MAGIC)?;
-    if b.len() < 10 || b[8] & !(1 | CATALOG_DROPPING | CATALOG_DECLARED) != 0 {
+    if b.len() < 10 || b[8] & !(1 | CATALOG_DROPPING | CATALOG_DECLARED | CATALOG_RULES) != 0 {
         return Err(corrupt("catalog fields"));
     }
     let id = u32::from_be_bytes(b[..4].try_into().unwrap());
@@ -576,7 +635,8 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         None
     };
     let mut declared = Vec::new();
-    let name = if b[8] & CATALOG_DECLARED == 0 {
+    let mut rules = Vec::new();
+    let name = if b[8] & (CATALOG_DECLARED | CATALOG_RULES) == 0 {
         std::str::from_utf8(&b[at..]).map_err(corrupt)?.to_owned()
     } else {
         let mut read = |n: usize| -> Result<&[u8]> {
@@ -586,16 +646,24 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         };
         let size = u16::from_be_bytes(read(2)?.try_into().unwrap()) as usize;
         let name = std::str::from_utf8(read(size)?).map_err(corrupt)?.to_owned();
-        let count = u16::from_be_bytes(read(2)?.try_into().unwrap()) as usize;
-        for _ in 0..count {
-            let n = read(1)?[0] as usize;
-            let field = std::str::from_utf8(read(n)?).map_err(corrupt)?.to_owned();
-            let n = read(1)?[0] as usize;
-            let spelling = std::str::from_utf8(read(n)?).map_err(corrupt)?.to_owned();
-            if field.is_empty() || spelling.is_empty() {
-                return Err(corrupt("catalog declared type entry"));
+        if b[8] & CATALOG_DECLARED != 0 {
+            let count = u16::from_be_bytes(read(2)?.try_into().unwrap()) as usize;
+            for _ in 0..count {
+                let n = read(1)?[0] as usize;
+                let field = std::str::from_utf8(read(n)?).map_err(corrupt)?.to_owned();
+                let n = read(1)?[0] as usize;
+                let spelling = std::str::from_utf8(read(n)?).map_err(corrupt)?.to_owned();
+                if field.is_empty() || spelling.is_empty() {
+                    return Err(corrupt("catalog declared type entry"));
+                }
+                declared.push((field, spelling));
             }
-            declared.push((field, spelling));
+        }
+        if b[8] & CATALOG_RULES != 0 {
+            let count = u16::from_be_bytes(read(2)?.try_into().unwrap()) as usize;
+            for _ in 0..count {
+                rules.push(column_rules::decode_rule(|n| read(n).map(<[u8]>::to_vec))?);
+            }
         }
         if at != b.len() {
             return Err(corrupt("catalog declared type tail"));
@@ -612,6 +680,7 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         timestamps: b[8] & 1 == 1,
         drop,
         declared,
+        rules,
     })
 }
 /// The kernel's own `E4LIMIT1` record: a damaged one is corruption, a valid
@@ -623,6 +692,16 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
     check_limits(l).map_err(|e| Error::Unsupported(format!("persisted resource policy: {e:?}")))
 }
 /// Every logical index feature bit this binary implements, in one place.
+///
+/// The table, low bit first: `0x1` typed indexes exist; `0x2` graph; `0x4`
+/// exact vector; `0x8` spatial point; `0x10` text; `0x20` quantized vector;
+/// `0x40` packed text posting segments; `0x80` per-index B-trees; `0x100`
+/// geometry index; `0x200` DROPPING collections; `0x400` expression index;
+/// `0x800` declared-type catalog tail; `0x1000` COLUMN RULES catalog tail.
+/// The mask is therefore `0x1fff`.
+/// Every one is additive: set in the same transaction as the first record
+/// that uses it, never cleared, and a file that declares a bit outside this
+/// mask is refused as `Unsupported` at admission (Law 8).
 ///
 /// The collection header carries the set of logical index features the file
 /// actually uses. This binary opens a file only when that set is a subset of
@@ -643,7 +722,8 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | catalog::EXPRESSION_FEATURE
     | crate::index::spatial::geometry_index::GEOMETRY_FEATURE
     | drop_collection::DROP_FEATURE
-    | DECLARED_FEATURE;
+    | DECLARED_FEATURE
+    | column_rules::COLUMN_RULES_FEATURE;
 /// One header's feature word against the mask a binary implements.
 ///
 /// Split out of [`parse_header`] so a test can put an OLDER mask in place of
@@ -905,6 +985,7 @@ impl Database {
             allocated: BTreeMap::new(),
             create_index_trees: catalog::create_index_trees(),
             user_writes_pending: false,
+            bulk_depth: 0,
             dropping: None,
         }
     }
@@ -1299,12 +1380,28 @@ impl Database {
         declared: Vec<(String, String)>,
         options: CollectionOptions,
     ) -> Result<CollectionId> {
+        self.create_collection_rules(name, fields, declared, Vec::new(), options)
+    }
+    /// The same creation, recording the per-field COLUMN RULES too: a
+    /// `DEFAULT` generator, a `NOT NULL` flag, or both. See
+    /// [`CollectionInfo::rules`]. Additive: the rules go in the catalog
+    /// record's own tail behind flag bit 3, change no row byte and no index
+    /// key, and set [`COLUMN_RULES_FEATURE`] in the same transaction.
+    pub fn create_collection_rules(
+        &mut self,
+        name: &str,
+        fields: Vec<(String, Kind)>,
+        declared: Vec<(String, String)>,
+        rules: Vec<(String, ColumnRule)>,
+        options: CollectionOptions,
+    ) -> Result<CollectionId> {
         self.user_write()?;
         for (field, _) in &declared {
             if !fields.iter().any(|(n, _)| n == field) {
                 return Err(invalid("a declared type names a field of the collection"));
             }
         }
+        column_rules::check_rules(&fields, &rules)?;
         if name.is_empty() || name.len() > 255 {
             return Err(invalid("collection name must contain 1..255 UTF-8 bytes"));
         }
@@ -1326,6 +1423,7 @@ impl Database {
             timestamps: options.timestamps,
             drop: None,
             declared,
+            rules,
         };
         let result = (|| {
             // The feature bit rides the same transaction as the first record
@@ -1334,12 +1432,42 @@ impl Database {
             if !c.declared.is_empty() {
                 self.enable_logical_feature(DECLARED_FEATURE)?;
             }
+            if !c.rules.is_empty() {
+                self.enable_logical_feature(column_rules::COLUMN_RULES_FEATURE)?;
+            }
             self.persist_layout(&layout)?;
             self.persist_catalog(&c)?;
             self.write_sequence(c.id, 1)?;
             self.writer()?.put(&name_key(name), &cid.to_be_bytes())?;
             self.write_header(next_c, next_l)?;
             Ok(c.id)
+        })();
+        self.finish(result)
+    }
+    /// `ALTER TABLE t RENAME TO new_name`: a NAME record only.
+    ///
+    /// The `CollectionId` does not change, so every edge, index, layout,
+    /// sequence and external-key mapping is untouched; what moves is the one
+    /// name -> id entry and the name inside the catalog descriptor, in a
+    /// single commit. O(1), and no row is read.
+    pub fn rename_collection(&mut self, id: CollectionId, name: &str) -> Result<()> {
+        self.user_write()?;
+        if name.is_empty() || name.len() > 255 {
+            return Err(invalid("collection name must contain 1..255 UTF-8 bytes"));
+        }
+        let mut c = self.catalog(id)?;
+        if c.name == name {
+            return Ok(());
+        }
+        if self.collection(name)?.is_some() {
+            return Err(Error::AlreadyExists);
+        }
+        let old = std::mem::replace(&mut c.name, name.to_owned());
+        let result = (|| {
+            self.persist_catalog(&c)?;
+            self.writer()?.put(&name_key(name), &id.0.to_be_bytes())?;
+            self.writer()?.delete(&name_key(&old))?;
+            Ok(())
         })();
         self.finish(result)
     }
@@ -1366,6 +1494,7 @@ impl Database {
             layout,
             timestamps: c.timestamps,
             declared: c.declared,
+            rules: c.rules,
         })
     }
     pub fn alter_collection(
@@ -1385,16 +1514,17 @@ impl Database {
             .collect();
         self.alter_collection_declared(id, fields, declared)
     }
-    /// The same rewrite, replacing the DECLARED spellings too. See
-    /// [`CollectionInfo::declared`]: `ALTER TABLE ... ADD COLUMN c
-    /// TIMESTAMPTZ` has to record that the new `Kind::Int` column holds
-    /// microseconds, and the pairs live in the same descriptor the layout
-    /// pointer does, so they are rewritten in the same commit.
-    pub fn alter_collection_declared(
+    /// The layout rewrite, carrying the COLUMN RULES of the surviving fields
+    /// and replacing the declared spellings. A rule is a name beside a FIELD,
+    /// so a rewrite that removes the field drops its rule with it; a caller
+    /// that RENAMES a column passes the rules spelled with the new name, and
+    /// the rule follows the column.
+    pub fn alter_collection_rules(
         &mut self,
         id: CollectionId,
         fields: Vec<(String, Kind)>,
         declared: Vec<(String, String)>,
+        rules: Vec<(String, ColumnRule)>,
     ) -> Result<u64> {
         self.ready_write()?;
         let mut c = self.catalog(id)?;
@@ -1403,7 +1533,9 @@ impl Database {
                 return Err(invalid("a declared type names a field of the collection"));
             }
         }
+        column_rules::check_rules(&fields, &rules)?;
         c.declared = declared;
+        c.rules = rules;
         let (next_c, next_l) = self.header()?;
         let layout = Self::make_layout(next_l, fields, c.timestamps)?;
         self.validate_indexed_layout(id, &layout)?;
@@ -1415,12 +1547,34 @@ impl Database {
             if !c.declared.is_empty() {
                 self.enable_logical_feature(DECLARED_FEATURE)?;
             }
+            if !c.rules.is_empty() {
+                self.enable_logical_feature(column_rules::COLUMN_RULES_FEATURE)?;
+            }
             self.persist_layout(&layout)?;
             self.persist_catalog(&c)?;
             self.write_header(next_c, after)?;
             Ok(u64::from(next_l))
         })();
         self.finish(result)
+    }
+    /// The same rewrite, replacing the DECLARED spellings too. See
+    /// [`CollectionInfo::declared`]: `ALTER TABLE ... ADD COLUMN c
+    /// TIMESTAMPTZ` has to record that the new `Kind::Int` column holds
+    /// microseconds, and the pairs live in the same descriptor the layout
+    /// pointer does, so they are rewritten in the same commit.
+    pub fn alter_collection_declared(
+        &mut self,
+        id: CollectionId,
+        fields: Vec<(String, Kind)>,
+        declared: Vec<(String, String)>,
+    ) -> Result<u64> {
+        let rules: Vec<(String, ColumnRule)> = self
+            .catalog(id)?
+            .rules
+            .into_iter()
+            .filter(|(field, _)| fields.iter().any(|(n, _)| n == field))
+            .collect();
+        self.alter_collection_rules(id, fields, declared, rules)
     }
     fn write_sequence(&mut self, c: CollectionId, next: u64) -> Result<()> {
         let b = packet(COUNTER_MAGIC, &next.to_be_bytes())?;
@@ -1622,6 +1776,9 @@ impl Database {
             })?;
             doc[CREATED] = Value::from(created);
             doc[UPDATED] = Value::from(now.max(created).max(previous));
+        }
+        if !c.rules.is_empty() {
+            self.apply_column_rules(c, &mut doc)?;
         }
         doc[KEY_FIELD] = Value::from(key);
         let encoded = encode_dense_v3(&layout, &doc).map_err(invalid)?;
@@ -1836,6 +1993,10 @@ impl Database {
         // was learned in the discarded transaction; drop the lot.
         self.allocated.clear();
         self.user_writes_pending = false;
+        // A rollback discards the working tree, so there is nothing for an
+        // open bulk scope to commit and no caller left to close it: the
+        // counter goes back to zero with the rows it was batching.
+        self.bulk_depth = 0;
         self.dropping = None;
         self.failed = true;
         self.store.rollback()?;
@@ -2347,7 +2508,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0xfff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1fff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -2368,13 +2529,13 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0xfff
+            0x1fff
         );
         // One bit past the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x1000)),
-            Err(Error::Unsupported(m)) if m.contains("0x1fff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x2000)),
+            Err(Error::Unsupported(m)) if m.contains("0x3fff")
         ));
     }
     /// A declared type is a name beside a FIELD, so dropping the field drops
@@ -2470,6 +2631,7 @@ mod tests {
             timestamps: false,
             drop: None,
             declared: vec![("at".into(), "TIMESTAMPTZ".into())],
+            rules: Vec::new(),
         })
         .unwrap();
         assert_eq!(parse_catalog(&record).unwrap().declared.len(), 1);

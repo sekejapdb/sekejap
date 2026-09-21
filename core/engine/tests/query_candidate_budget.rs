@@ -1744,29 +1744,85 @@ fn a_key_prefix_is_expressed_as_a_range_and_resumes_the_same_way() {
 }
 
 /// A `QueryFilter::Key` named at a position `CandidateDriver::Keys` is not
-/// driving from is refused at prepare time -- see `prepare_query`'s
-/// certification check. There is no row-level fallback for it the way a
-/// scalar predicate has one.
+/// driving from is no longer refused: it is a ROW predicate, answered from
+/// each candidate's own key field, and `query_combinations.rs`'s
+/// `hand_picked_key_filter_answers_under_any_driver` pins the ANSWER against
+/// brute force under Auto and under the entity driver.
+///
+/// What this probe keeps is the COST side of that answer, which no oracle
+/// test states: the row-predicate path is not the certified one. The key
+/// range that `a_key_range_pages_resume_in_key_order_with_deleted_keys_absent`
+/// drains for zero primary reads under `CandidateDriver::Keys` must charge a
+/// primary read per candidate it tests once the mapping keyspace is not the
+/// driver -- the named per-candidate read, not a free filter.
 #[test]
-fn a_key_filter_without_the_keys_driver_is_refused() {
+fn a_key_filter_without_the_keys_driver_is_a_row_predicate_it_pays_for() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = kd_fixture(temp.path());
+    let (lower, upper) = ("u00050", "u00100");
+
+    // Id order, not key order: `kd_key` makes the two the reverse of each
+    // other, so this is a different sequence and not the same list renamed.
+    let mut expected = kd_oracle_range(&fixture, lower, upper);
+    expected.sort_unstable();
+    assert!(expected.len() > 20, "the fixture must have a real range to page through");
+    assert!(
+        expected.len() < kd_dense_range_count(&fixture, lower, upper),
+        "the range must contain at least one deleted key for this test to mean anything"
+    );
+
     let filters = [QueryFilter::Key {
-        lower: Bound::Included("u00050"),
-        upper: Bound::Excluded("u00100"),
+        lower: Bound::Included(lower),
+        upper: Bound::Excluded(upper),
     }];
-    let result = fixture.db.prepare_query(QueryRequest {
-        collection: fixture.rows,
-        filters: &filters,
-        order: QueryOrder::EntityId,
-        projection: Projection::Ids,
-        total_limit: None,
-        driver: CandidateDriver::Auto,
-    });
-    match result {
-        Err(sekejap_core::collections::QueryError::Database(_)) => {}
-        _ => panic!("a key filter without CandidateDriver::Keys must be refused at prepare time"),
+    let mut prepared = fixture
+        .db
+        .prepare_query(QueryRequest {
+            collection: fixture.rows,
+            filters: &filters,
+            order: QueryOrder::EntityId,
+            projection: Projection::Ids,
+            total_limit: None,
+            driver: CandidateDriver::Auto,
+        })
+        .expect("a key filter under Auto is a row predicate, not a refusal");
+    let mut ids = Vec::new();
+    let mut primary_reads = 0u64;
+    let mut pages = 0usize;
+    loop {
+        let page = prepared.next_page(7, QueryBudget::unlimited(), || false).unwrap();
+        assert_ne!(
+            page.driver,
+            QueryDriver::Keys,
+            "Auto must not silently take the certified mapping walk here"
+        );
+        ids.extend(page.rows.iter().map(|row| row.id.sequence));
+        primary_reads += page.work.primary_reads;
+        pages += 1;
+        if page.done || page.rows.is_empty() {
+            break;
+        }
     }
+    assert!(pages > 1, "the fixture and page size must force a resume");
+    assert_eq!(
+        ids, expected,
+        "a key range under Auto must return exactly the alive in-range rows, in id order"
+    );
+    assert!(
+        primary_reads >= expected.len() as u64,
+        "a row-answered key filter must charge a primary read per row it returns: \
+         {primary_reads} reads for {} rows",
+        expected.len()
+    );
+
+    // The same range, driven by the mapping keyspace, is the certified path
+    // and still charges nothing -- the contrast is the point.
+    let (certified, certified_reads, _) =
+        kd_drain_range(&fixture, Bound::Included(lower), Bound::Excluded(upper), 7);
+    assert_eq!(certified_reads, 0, "the certified key range still reads no primary page");
+    let mut certified_sorted = certified;
+    certified_sorted.sort_unstable();
+    assert_eq!(certified_sorted, expected, "both paths must answer the same rows");
 }
 
 // -- QD: QueryOrder::Distance counted --------------------------------------

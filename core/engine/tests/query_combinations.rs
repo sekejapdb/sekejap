@@ -1138,6 +1138,9 @@ fn work_of(w: &QueryWork, r: WorkResource) -> u64 {
         WorkResource::VectorSidecars => w.vector_sidecars,
         WorkResource::VectorLanes => w.vector_lanes,
         WorkResource::KeyPostings => w.key_postings,
+        // A bounded WRITE pass is `tests/write_where.rs`; no query in this
+        // matrix writes a row, so this resource is never charged here.
+        WorkResource::RowsWritten => w.rows_written,
         // Aggregates are `tests/query_aggregate.rs`; no query in this file
         // folds groups, so this resource is never charged here.
         WorkResource::Groups => w.groups,
@@ -1146,6 +1149,9 @@ fn work_of(w: &QueryWork, r: WorkResource) -> u64 {
         // either; `tests/query_boolean.rs` is where it is exercised.
         WorkResource::MembershipBytes => w.membership_bytes,
         WorkResource::OutputBytes => w.output_bytes,
+        // Wall clock, not work: it has no `QueryWork` counter and is not in
+        // `RESOURCES`, so this arm is never reached.
+        WorkResource::Deadline => 0,
     }
 }
 
@@ -1163,12 +1169,16 @@ fn set_budget(mut b: QueryBudget, r: WorkResource, n: u64) -> QueryBudget {
         WorkResource::VectorSidecars => b.vector_sidecars = n,
         WorkResource::VectorLanes => b.vector_lanes = n,
         WorkResource::KeyPostings => b.key_postings = n,
+        WorkResource::RowsWritten => b.rows_written = n,
         WorkResource::Groups => b.groups = n,
         // `MembershipBytes` has no `QueryBudget` field on purpose: its
         // ceiling is the fixed `RUN_BYTES` memory promise, which a caller
         // cannot raise by asking. It is therefore not in `RESOURCES` and
         // this arm is never reached.
         WorkResource::MembershipBytes => {}
+        // `Deadline` is an instant, not an amount; `QueryBudget::with_deadline`
+        // is how it is set and no combo in this matrix asks for one.
+        WorkResource::Deadline => {}
         WorkResource::OutputBytes => b.output_bytes = n,
     }
     b

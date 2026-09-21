@@ -60,9 +60,12 @@ from the T1 set so the T1 unpinned number keeps meaning what it meant.
 | `SELECT ... FROM GRAPH_TABLE (...)` | traversal driver/filter | `tests/graph_collections.rs` `graph_filter_answers_what_traverse_bfs_answers`; `tests/query_multimodel.rs` `graph_scalar_spatial_text_and_vector_apply_before_ranked_top_k` |
 | `INSERT INTO t (...) VALUES (...)`, `$n` params | `put` by key | `tests/collections.rs` `identity_upsert_delete_and_collection_isolation_follow_e3_contracts`; `tests/collection_pagewal.rs` `mixed_records_roundtrip_through_page_wal_commit_and_reopen` |
 | `UPDATE t SET ... WHERE key = $1` | `put` replaces; partial update = read-modify-put | `tests/collections.rs` `identity_upsert_delete_and_collection_isolation_follow_e3_contracts` |
-| `DELETE FROM t WHERE key = $1` | delete by key; RESTRICT/CASCADE per graph 6.1 | delete by key: `tests/collections.rs` `identity_upsert_delete_and_collection_isolation_follow_e3_contracts`; `tests/collection_pagewal.rs` `delete_then_reinsert_allocates_a_fresh_identity_and_never_reuses_after_reopen`. RESTRICT: UNPINNED (see graph 6.1) |
+| `DELETE FROM t WHERE key = $1` | delete by key; RESTRICT/CASCADE per graph 6.1 | delete by key: `tests/collections.rs` `identity_upsert_delete_and_collection_isolation_follow_e3_contracts`; `tests/collection_pagewal.rs` `delete_then_reinsert_allocates_a_fresh_identity_and_never_reuses_after_reopen`. RESTRICT at ROW granularity is now built for the PREDICATED delete (`tests/write_where.rs` `a_restrict_pass_refuses_a_row_with_edges_naming_the_context_and_changes_nothing`); single-key `delete(key)` still cascades and is UNPINNED for RESTRICT (see graph 6.1) |
 | `CREATE TABLE`, `CREATE INDEX ... USING {btree,gin,gist,exact,quantized,adjacency}`, `DROP TABLE [IF EXISTS] [CASCADE\|RESTRICT]`, `DROP INDEX` | catalog descriptors; `begin_drop_collection` / `drop_collection_step` | `DROP TABLE`: `tests/drop_collection.rs` `a_dropped_collection_leaves_every_keyspace_empty_and_its_name_free`, `an_interrupted_drop_resumes_to_the_state_an_uninterrupted_one_reaches`, `restrict_names_the_referencing_contexts_and_cascade_removes_the_edges`, `a_published_dropping_mark_refuses_every_reader_and_writer`, `sql_drop_table_if_exists_and_cascade_end_to_end`, `the_drop_removes_exactly_the_collections_records_and_nothing_else`; `lang/tests/sql_tier1.rs` `drop_table_restricts_on_graph_edges_and_cascades_when_asked`; `lang/tests/sql_explain.rs` `explain_drop_table_prints_the_phases_and_runs_nothing`. table: `tests/collections.rs` `undeclared_fields_roundtrip_through_collection_and_reopen`. btree: `tests/index_lifecycle.rs` `late_index_tracks_crud_and_published_snapshots`. gin: `tests/index_text.rs` `building_live_crud_snapshot_rollback_and_reopen_preserve_presence_rules`. gist (point): `tests/index_spatial.rs` `build_live_crud_snapshot_rollback_drop_and_reopen`. gist (geometry): `tests/index_spatial_geometry.rs` `build_vs_maintain_posting_identity_across_geometry_kinds`. exact: `tests/index_vector.rs` `immutable_layout_ordinals_live_crud_snapshots_rollback_and_reopen`. quantized: `tests/index_vector_quantized.rs` `validation_live_crud_snapshot_reopen_and_drop_preserve_authoritative_vectors`. DROP: `tests/index_lifecycle.rs` `drop_and_build_can_resume_after_reopen_without_claiming_ready`. adjacency as `CREATE INDEX`: UNPINNED (graph is `enable_graph` + `put_edge`, not an `IndexFamily`) |
 | `BEGIN [READ ONLY]`, `COMMIT`, `ROLLBACK` | one writer, snapshot readers | `tests/collections.rs` `published_snapshots_rollback_and_streaming_cursor_are_consistent`; `tests/collection_pagewal.rs` `rollback_discards_uncommitted_work_beside_a_live_snapshot`; `tests/collection_pagewal.rs` `snapshots_serve_published_state_defer_checkpoint_and_are_bounded`; `tests/pagewal.rs` `new_snapshot_during_uncommitted_changes_sees_latest_commit` |
+| `UPDATE t SET ... WHERE <any predicate>` | `Database::update_where`: a page of candidates materialised as ids, then read-modify-put per row; `rows_written` budget; resume from `WriteProgress::cursor`; a SET over the driving index's column refused by name | `tests/write_where.rs` `update_where_rewrites_exactly_the_rows_a_brute_force_pass_names`, `a_row_expression_patch_reads_the_row_it_writes_and_never_another`, `a_budget_that_stops_mid_way_leaves_a_committed_prefix_and_a_cursor_that_reaches_the_same_end`, `law_two_the_work_of_a_write_pass_is_the_rows_matched_and_not_the_collection`, `law_six_a_snapshot_opened_before_the_update_still_sees_the_old_rows`, `law_three_a_write_pass_commits_nothing_of_its_own_and_a_rollback_discards_all_of_it`, `the_candidate_walk_of_a_write_pass_is_the_same_walk_the_same_select_takes`; `lang/tests/sql_dml.rs` `update_t_set_where_a_predicate_rewrites_exactly_the_rows_the_oracle_names`, `a_set_expression_over_the_same_row_is_a_row_function_and_reads_no_other_row`, `a_set_expression_over_the_driving_index_is_refused_and_names_the_index`, `the_rows_written_budget_refuses_the_statement_rather_than_truncating_it`, `explain_of_a_predicated_write_prints_the_driver_the_bound_and_the_mode_without_running_it` |
+| `DELETE FROM t WHERE <any predicate> [RESTRICT\|CASCADE]` | `Database::delete_where` / `write_where`: the same walk feeding `delete`, with the graph contract 6.1 RESTRICT preflight PER ROW | `tests/write_where.rs` `delete_where_removes_exactly_the_rows_a_brute_force_pass_names_and_leaves_the_rest`, `a_restrict_pass_refuses_a_row_with_edges_naming_the_context_and_changes_nothing`, `a_pass_over_a_predicate_nothing_matches_writes_nothing_and_reports_done`, `a_zero_rows_written_budget_writes_nothing_and_says_it_is_not_done`, `the_rows_written_budget_is_a_work_resource_a_caller_can_name`; `lang/tests/sql_dml.rs` `delete_from_t_where_a_predicate_removes_exactly_the_rows_the_oracle_names`, `delete_where_a_key_range_is_the_predicated_form_over_the_key_driver`, `restrict_is_the_default_and_cascade_is_the_explicit_word` |
+| `BEGIN BULK`, `END BULK` | `Database::begin_bulk` / `end_bulk`, nesting-counted; the outermost close calls `commit` with the same FULL barrier | `tests/write_where.rs` `a_bulk_scope_nests_and_only_the_outermost_close_commits`, `an_unbalanced_close_is_refused_and_a_rollback_forgets_the_scope`, `a_bulk_scope_commits_with_the_same_durability_as_any_other_commit`; `lang/tests/sql_dml.rs` `begin_bulk_and_end_bulk_nest_and_only_the_outermost_close_commits` |
 
 ### §3 Predicates
 
@@ -148,15 +151,14 @@ Atomic column is what the test must pin once the row lands.
 
 | Construct | Atomic to pin | Tests |
 | --- | --- | --- |
-| `SELECT ... FROM ALL` | `Collections` concatenation driver in catalog id order; resume `(collection id, inner cursor)`; `LIMIT` stops inside the collection it is reached in; a ranked `ORDER BY` over it is refused | UNPINNED |
-| `UPDATE t SET ... WHERE <any predicate>` | driver walk feeding read-modify-put; `rows_written` budget refuses rather than truncates; the walk does not re-match its own writes; resume from the committed cursor | UNPINNED |
-| `DELETE FROM t WHERE <any predicate>`, `DELETE FROM ALL` | the same walk feeding `delete`, with the graph contract 6.1 RESTRICT preflight per row | UNPINNED |
+| `SELECT ... FROM ALL` | `Collections` concatenation driver in catalog id order; resume `(collection id, inner cursor)`; `LIMIT` stops inside the collection it is reached in; a ranked `ORDER BY` over it is refused | UNPINNED (refused by name; `lang/tests/sql_dml.rs` `from_all_is_refused_by_name_in_both_statements_that_can_write_it` pins the refusal, not the construct) |
+| `DELETE FROM ALL` | the `FROM ALL` driver above, feeding `delete` | UNPINNED (refused by name; `lang/tests/sql_dml.rs` `from_all_is_refused_by_name_in_both_statements_that_can_write_it` pins the refusal, not the construct) |
 | `CREATE TABLE t (...) WITH (hash/range/fulltext/bm25/spatial)` | expansion to `create_collection` + one `CREATE INDEX` per field; hash/range → btree, fulltext/bm25 → gin, spatial → gist | UNPINNED |
-| column `DEFAULT now()`, `DEFAULT uuid4()`, `DEFAULT uuid5(ns, name)` | per-field default in the descriptor under an additive feature bit; filled on the write path only when the INSERT names no value; old files without the bit open unchanged (L8) | UNPINNED |
+| column `DEFAULT now()`, `DEFAULT uuid4()`, `DEFAULT uuid5(ns, name)` | LANDED 2026-09-21 -- now T1; pinned in "Query language §2 schema rows" below | see below |
 | `GENERATED ALWAYS AS (expr) STORED` | compiled row expression over fields of the same row, evaluated before index maintenance so an index over the generated column is maintained | UNPINNED |
-| `NOT NULL` on a column | descriptor flag tested at row assembly; MISSING and NULL both refuse and the error names the column; `ADD COLUMN ... NOT NULL` without DEFAULT on a non-empty collection is refused | UNPINNED |
-| `ALTER TABLE` ADD / DROP / RENAME COLUMN / RENAME TO | `alter_collection` writes a new `Layout`, no row rewritten; ADD reads MISSING; DROP tombstones the slot so old rows decode unchanged; RENAME keeps `CollectionId`, edges and key mappings | UNPINNED |
-| `ALTER TABLE ... ALTER COLUMN ... TYPE` | same-`Kind` change is the descriptor rewrite; a `Kind` change is refused with the rewrite named | UNPINNED |
+| `NOT NULL` on a column | LANDED 2026-09-21 -- now T1; pinned in "Query language §2 schema rows" below | see below |
+| `ALTER TABLE` ADD / DROP / RENAME COLUMN / RENAME TO | LANDED 2026-09-21 -- now T1 (RENAME COLUMN T3 on a populated collection); pinned in "Query language §2 schema rows" below | see below |
+| `ALTER TABLE ... ALTER COLUMN ... TYPE` | LANDED 2026-09-21 -- now T1 within one `Kind`; pinned in "Query language §2 schema rows" below | see below |
 | `REINDEX` | drop + sorted rebuild under the `IndexState` Building/Ready/Dropping machine, resumable across a reopen | UNPINNED |
 | `COMPACT` | `Database::checkpoint`; reports *deferred* on `Ok(false)` while a reader slot is held and never waits | UNPINNED |
 | `SHOW TABLES`, `SHOW <collection>`, `SHOW CREATE TABLE`, `SHOW INDEXES` | one fixed SELECT over a `db_*` catalog view each; the count and size columns are labelled scans by `EXPLAIN` | UNPINNED |
@@ -207,7 +209,7 @@ falsify, not decorate.
 | 6.1 | `SHOW STATUS` | a `db_status` view over `storage_bytes`, `tracked_pages`, `io_counters` and the format bits, all O(1); node and edge counts are optional columns labelled scans | L4 | UNPINNED |
 | 6.2 | `SHOW STORAGE` | a tag-attributing walk over the keyspaces plus O(1) file sizes; reports itself as a scan | L4 | UNPINNED |
 | 6.3 | `stats`, `memory_report`, `trim_memory` | a report over the structures that exist — pool arena as a labelled ceiling, index and layout caches, reader slots — never a `0` for an absent structure; `trim_memory` changes no answer | L4, evidencing L1 | UNPINNED |
-| 7 | Bulk load | a nesting-counted write scope whose outermost close calls `commit`, with the same FULL barrier as any other commit; a failed batch commits nothing | L2, L3 | UNPINNED |
+| 7 | Bulk load | a nesting-counted write scope whose outermost close calls `commit`, with the same FULL barrier as any other commit; a failed batch commits nothing | L2, L3 | `tests/write_where.rs` `a_bulk_scope_nests_and_only_the_outermost_close_commits`, `an_unbalanced_close_is_refused_and_a_rollback_forgets_the_scope`, `a_bulk_scope_commits_with_the_same_durability_as_any_other_commit`; `lang/tests/sql_dml.rs` `begin_bulk_and_end_bulk_nest_and_only_the_outermost_close_commits` |
 | 8 | `write_trace` | a `cfg(feature)` thread-local phase timer, one line per index family; zero cost when off | L4 | UNPINNED |
 | 9.1 | `statement_timeout` GUC | `SET [LOCAL] statement_timeout` on the existing `SET LOCAL` dispatch; `0` is no limit; `SHOW` returns it | L4 | UNPINNED |
 | 9.2 | `CancelRequest` | the protocol's backend-id/secret pair selects the handle of §4; both timeout and cancel return Postgres `57014 query_canceled`, distinguished by message, not code | L6 | UNPINNED |
@@ -223,11 +225,11 @@ falsify, not decorate.
 
 Unpinned count (rows whose Tests cell contains `UNPINNED`): **20**. The count
 did not move with `DROP TABLE`: the two rows it touches (6.1 and the
-| QL_CONTRACT T1 table rows | 28 | 24 | 4 |
-| **Subtotal (pinnable at HEAD)** | **59** | **39** | **20** |
-| QL_CONTRACT T2 rows added 2026-09-20 | 23 | 0 | 23 |
-| OPS_CONTRACT rows (§1–9, all T2) | 13 | 0 | 13 |
-| **Total** | **95** | **39** | **56** |
+| QL_CONTRACT T1 table rows | 31 | 27 | 4 |
+| **Subtotal (pinnable at HEAD)** | **62** | **42** | **20** |
+| QL_CONTRACT T2 rows added 2026-09-20 | 22 | 0 | 22 |
+| OPS_CONTRACT rows (§1–9) | 13 | 1 | 12 |
+| **Total** | **97** | **43** | **52** |
 
 Unpinned count over the pinnable set (rows whose Tests cell contains
 `UNPINNED`): **20**, unchanged. The 36 rows added on 2026-09-20 are all T2
@@ -267,3 +269,67 @@ inline element `WHERE` forms that are now T1, `COLUMNS (r.<prop>)` and
 `ORDER BY <edge alias>`) are pinned by `lang/tests/sql_tier1.rs`'s four
 `graph_table_*` tests and `lang/tests/sql_explain.rs`'s
 `explain_prints_the_edge_predicates_and_the_node_membership_sets`.
+
+## Query language §2 schema rows (landed 2026-09-21)
+
+The four `docs/lang/QL_CONTRACT.md` §2 rows that moved from T2 to T1 with the
+per-field COLUMN RULE slot. Every row below names the test that pins it.
+
+| Construct | Atomic | Tests |
+| --- | --- | --- |
+| column `DEFAULT now()` | `ColumnRule { default: Some(DefaultValue::Now) }` in the catalog descriptor, filled when the row is assembled; ONE clock read per row through `Clock::unix_micros`, shared by every `now()` column of that row (`core/engine/src/collections/column_rules.rs`) | `core/engine/tests/column_rules.rs` `a_missing_field_takes_its_default_and_now_is_one_clock_read_per_row`; `lang/tests/sql_schema.rs` `the_three_default_generators_fill_a_column_the_insert_does_not_name` |
+| column `DEFAULT uuid4()` | 16 bytes from `getrandom::fill`, RFC 4122 version 4 and variant 2 | `core/engine/tests/column_rules.rs` `a_missing_field_takes_its_default_and_now_is_one_clock_read_per_row`; `lang/tests/sql_schema.rs` `select_star_after_add_column_shows_the_new_column_and_its_default` |
+| column `DEFAULT uuid5(ns, name)` | RFC 4122 §4.3: SHA-1 over the namespace bytes and the name, truncated to 16 bytes, version 5. The SHA-1 is in the tree (`column_rules::sha1`), no dependency added | `core/engine/tests/column_rules.rs` `uuid5_reproduces_the_rfc_4122_vector_and_is_the_same_for_every_row`, `the_sha1_in_the_tree_answers_the_fips_180_vectors`; `lang/tests/sql_schema.rs` `the_three_default_generators_fill_a_column_the_insert_does_not_name` |
+| a DEFAULT outside the closed generator set | refused by name; the generator set is closed and an arbitrary expression is the `GENERATED ALWAYS` row, which keeps its own tier | `lang/tests/sql_schema.rs` `a_default_outside_the_closed_generator_set_is_refused_by_name` |
+| `NOT NULL` on a column | the same descriptor slot's flag, checked AFTER the defaults are filled; MISSING and NULL both refuse, the message names the column and says both are refused, and nothing is written | `core/engine/tests/column_rules.rs` `not_null_refuses_a_missing_field_and_a_null_one_and_names_the_column`, `a_default_satisfies_the_not_null_on_the_same_column`, `an_update_sees_the_merged_row_when_the_rules_are_applied`; `lang/tests/sql_schema.rs` `not_null_refuses_a_missing_column_and_an_explicit_null_by_name` |
+| `ALTER TABLE ... ADD COLUMN` | `alter_collection_rules`: one new immutable `Layout` and a repointed catalog in one commit, O(fields); existing rows read MISSING. `ADD COLUMN ... NOT NULL` with no DEFAULT on a populated collection is T3 and refused by name | `lang/tests/sql_schema.rs` `select_star_after_add_column_shows_the_new_column_and_its_default`, `add_column_not_null_without_a_default_is_refused_on_a_collection_with_rows` |
+| `ALTER TABLE ... DROP COLUMN` | the name leaves the layout; no row is rewritten, because a dense row decodes under the immutable layout it was written with; the column's index is dropped with it by `drop_index_step`, committed first | `lang/tests/sql_schema.rs` `drop_column_removes_the_name_from_the_layout_and_leaves_the_rows_alone`, `drop_column_drops_the_index_over_that_column_with_it`; `core/engine/tests/column_rules.rs` `a_rule_follows_its_field_through_alter_and_the_bit_is_monotone` |
+| `ALTER TABLE ... RENAME COLUMN old TO new` | the declared type and the COLUMN RULE follow the column. T3 on a populated collection: the old layout carries the old name, so every existing row would read MISSING under the new one | `lang/tests/sql_schema.rs` `select_after_rename_column_shows_the_new_name_and_the_rule_follows_it`; `core/engine/tests/column_rules.rs` `a_rule_follows_its_field_through_alter_and_the_bit_is_monotone` |
+| `ALTER TABLE ... RENAME TO` | `Database::rename_collection`: the name -> id record and the name in the catalog descriptor, one commit; `CollectionId`, rows, edges, indexes and key mappings are untouched | `lang/tests/sql_schema.rs` `rename_to_moves_the_name_and_nothing_else`; `core/engine/tests/column_rules.rs` `renaming_a_collection_keeps_its_id_its_rows_and_its_rules` |
+| `ALTER TABLE ... ALTER COLUMN ... TYPE` | within one `Kind` the DECLARED spelling is rewritten and no row byte or index key moves; across `Kind`s it is refused by name with BOTH `Kind`s in the refusal | `lang/tests/sql_schema.rs` `alter_column_type_is_accepted_within_one_kind_and_refused_across_kinds` |
+| `EXPLAIN ALTER TABLE ...` | prints the layout id the commit would write and what the new descriptor carries, and does NOT run its statement | `lang/tests/sql_schema.rs` `explain_alter_prints_the_new_layout_id_and_what_is_carried_without_running` |
+| an `ALTER TABLE` form with no atomic | refused by name, naming the five forms there are | `lang/tests/sql_schema.rs` `an_alter_form_with_no_atomic_is_refused_and_names_what_there_is` |
+| the COLUMN RULES catalog tail | additive `COLUMN_RULES_FEATURE = 0x1000` in `SUPPORTED_LOGICAL_FEATURES` (`0xfff` -> `0x1fff`), set in the same transaction as the first rule and never cleared, with the frozen flags byte (`CATALOG_RULES = 8`) as the second line (`core/engine/src/collections/column_rules.rs`) | `core/engine/tests/column_rules.rs` `a_column_rules_file_is_unsupported_to_a_binary_that_predates_the_bit`, `a_rule_follows_its_field_through_alter_and_the_bit_is_monotone`, `the_rules_are_in_the_file_and_answer_after_a_reopen` (lang); `src/collections/mod.rs` `collections::tests::supported_logical_feature_mask_is_the_only_definition` |
+
+## 2026-09-21 — the predicated writes and the bulk scope
+
+Three QL_CONTRACT §2 rows moved from T2 to T1 and are fully pinned:
+`UPDATE t SET ... WHERE <any predicate>`, `DELETE FROM t WHERE <any
+predicate> [RESTRICT|CASCADE]`, and the new `BEGIN BULK` / `END BULK`. The
+first two left the T2 §2 table, which is why that set drops from 23 rows to
+22 -- the old `DELETE FROM t WHERE ... / DELETE FROM ALL` row is now the
+`DELETE FROM ALL` half alone. OPS_CONTRACT §7 is the first OPS row with a
+test, so that set is 1 pinned of 13.
+
+`FROM ALL` stays T2 and unpinned: it is PARSED and refused by name
+(`lang/src/compile/dml.rs::FROM_ALL`), and the test named against it pins the
+refusal, not the construct. That is deliberate -- a refusal test proves the
+eighth law held, and the row stays unpinned because the construct is not
+built.
+
+The new tests are `core/engine/tests/write_where.rs` (16 tests) and
+`lang/tests/sql_dml.rs` (12 tests).
+
+Added by the adversarial review of the same slice (2026-09-21):
+`core/engine/tests/write_where_adversarial.rs` (12 tests) and
+`lang/tests/sql_dml_adversarial.rs` (7 tests). They pin the parts the first
+pass left unpinned: a budgeted resume over EVERY driver kind the pass accepts
+(scalar range, entity cursor, external-key walk, text merge, membership union,
+spatial radius, graph traversal) against a brute-force set, with rows deleted
+and inserted between two calls; the three Halloween shapes (a patch that moves
+a NON-driving index, a text-driven UPDATE that rewrites the very text it walks,
+a membership-driven UPDATE that moves one leaf's postings) each asserting the
+row is written exactly ONCE; a row with more graph contexts than
+`RESTRICT_ROW_PROBE_SEEKS`; the parser's back-up over three `_key`-shaped
+predicates that are not key equalities; `DELETE ... CASCADE` across three
+contexts in both directions; the bulk counter across a refusal; and the rule
+below.
+
+**A refusal raised after a predicated write has begun writing names the rows
+it already wrote** (`write_set.rs::refusal_names_the_rows_already_written`):
+`core/engine/tests/write_where_adversarial.rs`
+`a_refusal_raised_after_the_pass_has_written_rows_names_them_and_the_rows_stay_pending`,
+`a_refusal_before_the_first_write_carries_no_pending_row_sentence`;
+`lang/tests/sql_dml_adversarial.rs`
+`a_restrict_refusal_raised_after_rows_are_written_says_so_in_the_same_words_the_budget_does`,
+`a_rows_written_refusal_names_the_rows_it_already_wrote_and_they_are_pending_until_the_caller_speaks`.

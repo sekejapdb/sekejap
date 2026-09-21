@@ -59,6 +59,17 @@ pub(crate) enum OwnedScalarFilter {
     IsMissing,
 }
 
+/// One compiled `SET column = ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CompiledSet {
+    /// A constant, already checked against the column's declared `Kind`.
+    Lit(Value),
+    /// A §4.1 / §4.2 ROW EXPRESSION over the same row. It reaches the engine
+    /// as the `UpdatePatch` closure: core calls it once per candidate with
+    /// that row's document and stores what it returns.
+    Row { expr: CompiledRow, kind: Kind },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedFilter {
     Scalar {
@@ -176,6 +187,38 @@ struct BuiltAt<'a> {
 /// `WHERE` clause is the same clause whichever of the two reads it.
 /// `graph_edges` and `graph_nodes` are the traversal's borrowed predicate
 /// slices, empty when the plan has no traversal.
+/// The borrowed view of a WRITE statement's filters, for the length of one
+/// `Database::write_where` call. The same stack-built view
+/// `SelectPlan::with_query` hands a prepared query: a `QueryFilter::Any`
+/// names a SLICE and a `Not` a reference, so neither can be returned from a
+/// compiled plan that outlives the statement.
+pub(super) fn with_write_filters<T>(
+    owned: &[OwnedFilter],
+    k: &mut dyn FnMut(&[QueryFilter<'_>]) -> SqlResult2<T>,
+) -> SqlResult2<T> {
+    let graph_edges: Vec<Vec<EdgePredicate<'_>>> = owned
+        .iter()
+        .map(|filter| match filter {
+            OwnedFilter::Graph(graph) => graph
+                .edge_where
+                .iter()
+                .map(OwnedEdgePredicate::borrowed)
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let graph_nodes: Vec<Vec<QueryFilter<'_>>> = owned
+        .iter()
+        .map(|filter| match filter {
+            OwnedFilter::Graph(graph) => {
+                graph.node_where.iter().map(OwnedFilter::borrowed).collect()
+            }
+            _ => Vec::new(),
+        })
+        .collect();
+    with_borrowed_filters(owned, &graph_edges, &graph_nodes, k)
+}
+
 pub(super) fn with_borrowed_filters<T>(
     owned: &[OwnedFilter],
     graph_edges: &[Vec<EdgePredicate<'_>>],
@@ -675,6 +718,21 @@ pub(crate) enum CompiledIndex {
     QuantizedVector { field: String },
 }
 
+/// What one `ALTER TABLE` action became: a descriptor rewrite, or a rename.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CompiledAlter {
+    /// The new field list, the declared spellings and the COLUMN RULES that
+    /// survive it, plus the indexes a DROP COLUMN takes with the column.
+    Layout {
+        fields: Vec<(String, Kind)>,
+        declared: Vec<(String, String)>,
+        rules: Vec<(String, ColumnRule)>,
+        drop_indexes: Vec<(IndexId, String)>,
+    },
+    /// `RENAME TO`: one name record, and the `CollectionId` does not change.
+    Rename { to: String },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WritePlan {
     Insert {
@@ -690,6 +748,29 @@ pub(crate) enum WritePlan {
         collection: CollectionId,
         key: String,
     },
+    /// `UPDATE t SET ... WHERE <any predicate>`: `Database::update_where`,
+    /// which pages the same prepared query a `SELECT` with that predicate
+    /// pages and read-modify-puts each candidate.
+    UpdateWhere {
+        collection: CollectionId,
+        filters: Vec<OwnedFilter>,
+        sets: Vec<(String, CompiledSet)>,
+        /// The row fields every `CompiledSet::Row` expression indexes into,
+        /// in the order `CompiledRow::Field` numbers them.
+        fields: Vec<String>,
+        driver: CandidateDriver,
+    },
+    /// `DELETE FROM t WHERE <any predicate> [RESTRICT|CASCADE]`:
+    /// `Database::write_where` with `WriteAction::Delete`.
+    DeleteWhere {
+        collection: CollectionId,
+        filters: Vec<OwnedFilter>,
+        cascade: bool,
+        driver: CandidateDriver,
+    },
+    /// `BEGIN BULK` / `END BULK` (`docs/dist/OPS_CONTRACT.md` §7).
+    BeginBulk,
+    EndBulk,
     CreateTable {
         name: String,
         fields: Vec<(String, Kind)>,
@@ -698,6 +779,17 @@ pub(crate) enum WritePlan {
         /// a reopened database still knows a column is a timestamp and can
         /// print it back as an ISO string (QL_CONTRACT §4.2).
         declared: Vec<(String, String)>,
+        /// The per-field COLUMN RULES: `DEFAULT <generator>` and `NOT NULL`
+        /// (QL_CONTRACT §2), recorded in the same descriptor behind the
+        /// additive `COLUMN_RULES_FEATURE` bit.
+        rules: Vec<(String, ColumnRule)>,
+    },
+    /// `ALTER TABLE t <action>`: one `alter_collection_rules` commit, or one
+    /// `rename_collection` commit. Nothing here is a second rewrite path.
+    AlterTable {
+        collection: CollectionId,
+        table: String,
+        action: CompiledAlter,
     },
     CreateIndex {
         collection: CollectionId,
@@ -724,8 +816,72 @@ pub(crate) enum WritePlan {
     Notice(String),
 }
 
+/// One row field as a row expression reads it. `Missing` and `Null` are
+/// distinct in e4 and both are nullish to a row function, exactly as they are
+/// to a projected value.
+fn field_value(row: &Value, name: &str) -> SqlValue {
+    match row.get(name) {
+        None => SqlValue::Missing,
+        Some(Value::Null) => SqlValue::Null,
+        Some(Value::Bool(b)) => SqlValue::Bool(*b),
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(i) => SqlValue::Int(i),
+            None => SqlValue::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        Some(Value::String(text)) => SqlValue::Text(text.clone()),
+        Some(other) => SqlValue::Json(other.clone()),
+    }
+}
+
+/// What a row expression produced, checked against the column's declared
+/// `Kind` before it is stored. The check is at RUN time because the value is
+/// the row's, not the statement's; a literal is checked while the statement
+/// compiles, where it belongs.
+fn stored_value(kind: &Kind, column: &str, value: SqlValue) -> Result<Value, String> {
+    let mismatch = |what: &str| {
+        Err(format!(
+            "UPDATE ... SET `{column}`: the column is {what} and the row expression produced a value that is not"
+        ))
+    };
+    Ok(match value {
+        SqlValue::Missing | SqlValue::Null => Value::Null,
+        SqlValue::Id(_) => return mismatch("a declared column, and `_id` is the row identity"),
+        SqlValue::Bool(b) => match kind {
+            Kind::Bool | Kind::Json => Value::Bool(b),
+            _ => return mismatch("not BOOLEAN"),
+        },
+        SqlValue::Int(i) => match kind {
+            Kind::Int | Kind::Json => Value::from(i),
+            Kind::Real => Value::from(i as f64),
+            _ => return mismatch("not a number"),
+        },
+        SqlValue::Float(f) => match kind {
+            Kind::Real | Kind::Json => Value::from(f),
+            Kind::Int if f.fract() == 0.0 => Value::from(f as i64),
+            _ => return mismatch("not a number"),
+        },
+        SqlValue::Text(text) => match kind {
+            Kind::Text | Kind::Json => Value::String(text),
+            _ => return mismatch("not TEXT"),
+        },
+        SqlValue::Json(value) => match kind {
+            Kind::Json | Kind::Geo | Kind::Point => value,
+            _ => return mismatch("not JSONB"),
+        },
+    })
+}
+
+fn engine_error(message: String) -> sekejap_core::collections::Error {
+    sekejap_core::collections::Error::InvalidInput(message)
+}
+
 impl WritePlan {
-    pub(crate) fn run(self, db: &mut Database, notices: Vec<String>) -> SqlResult2<SqlResult> {
+    pub(crate) fn run(
+        self,
+        db: &mut Database,
+        notices: Vec<String>,
+        budget: QueryBudget,
+    ) -> SqlResult2<SqlResult> {
         let notice = |extra: String| -> SqlResult<> {
             let mut all = notices.clone();
             all.push(extra);
@@ -755,18 +911,157 @@ impl WritePlan {
                 let gone = db.delete(collection, &key)?;
                 SqlResult::Affected(u64::from(gone))
             }
+            Self::UpdateWhere {
+                collection,
+                filters,
+                sets,
+                fields,
+                driver,
+            } => {
+                // The row expressions become the `&mut dyn FnMut` closures
+                // the engine's `UpdatePatch` takes. They are built here, on
+                // this call's stack, because the patch borrows them for the
+                // length of the pass -- the same reason a prepared query is
+                // handed out through a callback.
+                type RowFn<'a> = Box<
+                    dyn FnMut(&Value) -> sekejap_core::collections::Result<Value> + 'a,
+                >;
+                let mut closures: Vec<RowFn<'_>> = Vec::new();
+                for (column, set) in &sets {
+                    if let CompiledSet::Row { expr, kind } = set {
+                        let expr = expr.clone();
+                        let kind = kind.clone();
+                        let column = column.clone();
+                        let names = fields.clone();
+                        closures.push(Box::new(move |row: &Value| {
+                            let values: Vec<SqlValue> =
+                                names.iter().map(|name| field_value(row, name)).collect();
+                            let produced = expr
+                                .eval(&values)
+                                .map_err(|e| engine_error(e.to_string()))?;
+                            stored_value(&kind, &column, produced).map_err(engine_error)
+                        }));
+                    }
+                }
+                let mut patch = UpdatePatch::new();
+                let mut rows = closures.iter_mut();
+                for (column, set) in &sets {
+                    match set {
+                        CompiledSet::Lit(value) => patch.set(column, value.clone())?,
+                        CompiledSet::Row { .. } => {
+                            let f = rows.next().expect("one closure per row expression");
+                            patch.set_row(column, &mut **f)?;
+                        }
+                    }
+                }
+                let patch = &patch;
+                let written = with_write_filters(&filters, &mut |borrowed| {
+                    run_write(
+                        db,
+                        WriteRequest {
+                            collection,
+                            filters: borrowed,
+                            action: WriteAction::Update(patch),
+                            driver,
+                            after: WriteCursor::start(),
+                        },
+                        budget,
+                        "UPDATE",
+                    )
+                })?;
+                SqlResult::Affected(written)
+            }
+            Self::DeleteWhere {
+                collection,
+                filters,
+                cascade,
+                driver,
+            } => {
+                let mode = if cascade {
+                    sekejap_core::collections::DeleteMode::Cascade
+                } else {
+                    sekejap_core::collections::DeleteMode::Restrict
+                };
+                let written = with_write_filters(&filters, &mut |borrowed| {
+                    run_write(
+                        db,
+                        WriteRequest {
+                            collection,
+                            filters: borrowed,
+                            action: WriteAction::Delete(mode),
+                            driver,
+                            after: WriteCursor::start(),
+                        },
+                        budget,
+                        "DELETE",
+                    )
+                })?;
+                SqlResult::Affected(written)
+            }
+            Self::BeginBulk => {
+                db.begin_bulk()?;
+                notice(format!(
+                    "BEGIN BULK: the durability point moves to the matching END BULK; {} scope(s) open",
+                    db.bulk_depth()
+                ))
+            }
+            Self::EndBulk => {
+                let committed = db.end_bulk()?;
+                if committed {
+                    SqlResult::Affected(0)
+                } else {
+                    notice(format!(
+                        "END BULK: an inner scope closed and committed nothing; {} scope(s) still open",
+                        db.bulk_depth()
+                    ))
+                }
+            }
             Self::CreateTable {
                 name,
                 fields,
                 declared,
+                rules,
             } => {
-                db.create_collection_declared(
+                db.create_collection_rules(
                     &name,
                     fields,
                     declared,
+                    rules,
                     CollectionOptions::default(),
                 )?;
                 db.commit()?;
+                SqlResult::Affected(0)
+            }
+            Self::AlterTable {
+                collection,
+                table,
+                action,
+            } => {
+                db.commit()?;
+                match action {
+                    CompiledAlter::Rename { to } => db.rename_collection(collection, &to)?,
+                    CompiledAlter::Layout {
+                        fields,
+                        declared,
+                        rules,
+                        drop_indexes,
+                    } => {
+                        // The contract's DROP COLUMN drops the column's index
+                        // with it. It is the ordinary bounded drop, committed
+                        // before the layout is repointed, so an interrupted
+                        // statement leaves a dropped index and the old layout
+                        // -- never a layout pointing at an index tree keyed on
+                        // a field the layout has not got.
+                        for (index, _) in drop_indexes {
+                            db.begin_drop_index(index)?;
+                            while !db.drop_index_step(index, 256)? {}
+                            db.commit()?;
+                        }
+                        db.alter_collection_rules(collection, fields, declared, rules)?;
+                    }
+                }
+                db.commit()?;
+                let _ = table;
                 SqlResult::Affected(0)
             }
             Self::CreateIndex {
@@ -851,6 +1146,29 @@ impl WritePlan {
             Self::Notice(text) => notice(text),
         })
     }
+}
+
+/// One bounded write pass, run to completion under the caller's budget.
+///
+/// The pass loops inside `Database::write_where` until it is done or its
+/// `rows_written` budget stops it. A statement that runs out of budget is
+/// REFUSED with the count it reached, never truncated silently
+/// (`docs/lang/QL_CONTRACT.md` §2): the rows it did write are in the caller's
+/// uncommitted transaction and a `ROLLBACK` discards them.
+fn run_write(
+    db: &mut Database,
+    request: WriteRequest<'_, '_>,
+    budget: QueryBudget,
+    statement: &'static str,
+) -> SqlResult2<u64> {
+    let progress = db.write_where(request, budget)?;
+    if !progress.done {
+        return Err(SqlError::engine(format!(
+            "{statement}: the `rows_written` budget of {} was reached after {} row(s); the statement is refused rather than truncated. The rows written so far are uncommitted -- ROLLBACK discards them, or raise the budget and run it again.",
+            budget.rows_written, progress.rows_written
+        )));
+    }
+    Ok(progress.rows_written)
 }
 
 #[derive(Clone, Debug, PartialEq)]

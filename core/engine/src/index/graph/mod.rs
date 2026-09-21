@@ -2297,6 +2297,62 @@ impl Database {
         Ok((found.into_iter().collect(), truncated))
     }
 
+    /// Every graph context that holds an edge incident on ONE row, and
+    /// whether the probe stopped at its cap.
+    ///
+    /// GRAPH_CONTRACT 6.1's RESTRICT question asked of a node, which is the
+    /// granularity the contract states it at and the granularity
+    /// `collection_edge_contexts` (the same question asked of a collection)
+    /// could not reach. Here the edge key IS prefixed by the entity --
+    /// `tag | collection | sequence | context | type | far endpoint` -- so
+    /// `tag | entity` is one contiguous range and a context is a prefix
+    /// INSIDE it. Law 1: after the first edge of a context run the walk seeks
+    /// past the run to `tag | entity | context + 1`, so it pays one descent
+    /// per context that has edges, not one per edge, and two descents for a
+    /// row with none.
+    pub(crate) fn entity_edge_contexts(
+        &self,
+        entity: EntityId,
+        cap: usize,
+    ) -> Result<(Vec<GraphContextId>, bool)> {
+        if !self
+            .index_header
+            .is_some_and(|header| header.features & GRAPH_FEATURE != 0)
+        {
+            return Ok((Vec::new(), false));
+        }
+        let h = self.graph_header()?;
+        let mut found = BTreeSet::new();
+        let mut truncated = false;
+        for tag in [PRIMARY_EDGE, REVERSE_EDGE] {
+            let p = edge_prefix(tag, entity, None, None);
+            let mut from = p.clone();
+            let mut seeks = 0usize;
+            loop {
+                if seeks >= cap {
+                    truncated = true;
+                    break;
+                }
+                seeks += 1;
+                let Some(row) = self.store()?.range(&from)?.next() else {
+                    break;
+                };
+                let (key, _) = row?;
+                if !key.starts_with(&p) {
+                    break;
+                }
+                let edge = parse_edge_key(&key, tag)?;
+                self.validate_stored_edge_ids(h, edge)?;
+                found.insert(edge.context);
+                let Some(next) = edge.context.0.checked_add(1) else {
+                    break;
+                };
+                from = edge_prefix(tag, entity, Some(GraphContextId(next)), None);
+            }
+        }
+        Ok((found.into_iter().collect(), truncated))
+    }
+
     /// The name a context was interned under, for a refusal that has to name
     /// it. The base graph has no descriptor and no name.
     pub(crate) fn graph_context_name(&self, id: GraphContextId) -> Result<String> {

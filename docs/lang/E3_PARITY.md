@@ -28,16 +28,16 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 | # | e3 capability | e3 (file:line) | e4 status | atomic e4 would need |
 |---|---|---|---|---|
 | 1 | `SELECT … FROM col [WHERE AND] [ORDER BY] [LIMIT]` | sql.rs:41-46 | DONE — `lang/src/mod.rs:23` | — |
-| 2 | `FROM ALL` (every collection at once) | sql.rs:42 | CONTRACT-T2 — QL §2 `FROM ALL` | a `Collections` concatenation driver over the catalog in id order, resume `(collection id, inner cursor)`. A ranked `ORDER BY` over it is T3: one order key across different layouts is not one key, and an N-way merge holds one cursor per collection |
+| 2 | `FROM ALL` (every collection at once) | sql.rs:42 | CONTRACT-T2 — QL §2 `FROM ALL`; PARSED and refused by name at `lang/src/compile/dml.rs::FROM_ALL`, pinned by `lang/tests/sql_dml.rs` `from_all_is_refused_by_name_in_both_statements_that_can_write_it` | a `Collections` concatenation driver over the catalog in id order, resume `(collection id, inner cursor)`. Not built: `prepare_query` compiles predicates against ONE collection (a `QueryFilter::Scalar` names an `IndexId`, and an `IndexId` belongs to a collection), so `FROM ALL` is one compiled plan PER collection plus a refusal naming the collection whose index is missing -- not one plan over a wider driver. A ranked `ORDER BY` over it stays T3: one order key across different layouts is not one key, and an N-way merge holds one cursor per collection |
 | 3 | `INSERT INTO t (…) VALUES (…)`, multi-row, `$N` params | sql.rs:56, db.rs:10245 | DONE — `lang/src/mod.rs:79` | — |
-| 4 | `UPDATE t SET … WHERE <any predicate>` | sql.rs:3681 | CONTRACT-T2 — QL §2 | the prepared query's driver supplies candidates a page at a time, each read-modify-put, bounded by a `rows_written` budget; the walk reads the snapshot it started on |
-| 5 | `DELETE FROM t WHERE <predicate>` / `DELETE FROM ALL` | sql.rs:3551 | CONTRACT-T2 — QL §2 | the same driver walk feeding `delete`, with the graph contract 6.1 RESTRICT preflight per row and the same budget |
+| 4 | `UPDATE t SET … WHERE <any predicate>` | sql.rs:3681 | DONE — `core/engine/src/collections/write_set.rs` (`Database::update_where`), `lang/src/compile/dml.rs` (`Compiler::update_where`) | — (the driver supplies candidates a page at a time, each read-modify-put, bounded by the `rows_written` budget and resumable from `WriteProgress::cursor`; a SET over the driving index's own column is refused by name, with `CandidateDriver::Entities` as the stated remedy) |
+| 5 | `DELETE FROM t WHERE <predicate>` / `DELETE FROM ALL` | sql.rs:3551 | DONE for `DELETE FROM t WHERE …` — `core/engine/src/collections/write_set.rs` (`Database::delete_where`), `lang/src/compile/dml.rs` (`Compiler::delete_where`); `DELETE FROM ALL` stays CONTRACT-T2 with row 2's refusal | the same driver walk feeding `delete`, with the graph contract 6.1 RESTRICT preflight PER ROW (`Database::entity_edge_contexts`, one descent per (entity, context) pair with edges), `CASCADE` as the explicit word, and the same budget and cursor |
 | 6 | `CREATE TABLE t (field type, `_key` PRIMARY KEY)` | sql.rs:3910 | DONE — `lang/src/mod.rs:80` | — |
 | 7 | `WITH (hash:[…], range:[…], fulltext:[…], bm25:[…], spatial:[…])` index hints | sql.rs:66 | CONTRACT-T2 — QL §2 | sugar over `CREATE INDEX`: hash/range → btree with a notice, fulltext/bm25 → gin, spatial → gist. No new atomic |
-| 8 | `TIMESTAMPTZ DEFAULT NOW()` | sql.rs:68, 3803 | CONTRACT-T2 — QL §2 | a per-field default in the descriptor under an additive bit, filled on the write path; one clock read per row |
-| 9 | `DEFAULT uuid4()` / `uuid5(ns, name)` | sql.rs:1228-1231 | CONTRACT-T2 — QL §2 | same descriptor slot; the generator set is closed and each member is O(1) per row. An arbitrary expression as a DEFAULT is T3 |
+| 8 | `TIMESTAMPTZ DEFAULT NOW()` | sql.rs:68, 3803 | DONE — QL §2 | a per-field `ColumnRule` in the catalog descriptor behind the additive `COLUMN_RULES_FEATURE = 0x1000`, filled when the row is assembled; ONE clock read per row, shared by every `now()` column of it. `core/engine/src/collections/column_rules.rs`; `core/engine/tests/column_rules.rs`, `lang/tests/sql_schema.rs` |
+| 9 | `DEFAULT uuid4()` / `uuid5(ns, name)` | sql.rs:1228-1231 | DONE — QL §2 | the same descriptor slot; the generator set is closed and each member is O(1) per row. `uuid4` is 16 bytes from `getrandom`; `uuid5` is RFC 4122 §4.3 SHA-1 over namespace+name, implemented in `column_rules.rs` with no new dependency. An arbitrary expression as a DEFAULT is refused by name |
 | 10 | `GENERATED ALWAYS AS (expr) STORED` | sql.rs:1232, 3830 | CONTRACT-T2 — QL §2 | a compiled row expression over other fields of the same row, evaluated before index maintenance so an index over it is maintained normally. Cross-row, aggregate or subquery expressions are T3 |
-| 11 | `ALTER TABLE` ADD / DROP / RENAME COLUMN / RENAME TO / ALTER TYPE | sql.rs:72-77, 4006 | CONTRACT-T2 — QL §2 (four forms); ALTER TYPE T2 same-`Kind`, T3 otherwise | `alter_collection` (`collections/mod.rs:1208`) writes a new Layout and repoints the catalog, O(fields). DROP COLUMN tombstones the slot because dense rows are positional. A `Kind` change rewrites every row and every scalar key: no bounded resumable atomic today |
+| 11 | `ALTER TABLE` ADD / DROP / RENAME COLUMN / RENAME TO / ALTER TYPE | sql.rs:72-77, 4006 | DONE — QL §2; ALTER TYPE T1 same-`Kind`, T3 otherwise; RENAME COLUMN T3 on a populated collection | `alter_collection_rules` writes a new Layout and repoints the catalog, O(fields), carrying the declared types and the COLUMN RULES of the surviving fields; `rename_collection` is a name record. No row is rewritten because a dense row decodes under its OWN immutable layout -- which is also why RENAME COLUMN is refused on a populated collection, and why a `Kind` change is: both would need every row rewritten and no bounded resumable atomic exists. `lang/src/parser/ddl.rs`, `lang/src/compile/ddl.rs`; `lang/tests/sql_schema.rs` |
 | 12 | `DROP TABLE [IF EXISTS]` | sql.rs:70 | DONE — `collections/drop_collection.rs:228,333` | — |
 | 13 | `DROP INDEX [IF EXISTS] ON t USING m (f)` | sql.rs:71 | DONE — `collections/catalog.rs:1869` | — |
 | 14 | `CREATE INDEX … USING {btree,hash,gin,gist,bm25,spatial,vamana,search}` | sql.rs:4157-4169 | DONE — `lang/src/mod.rs:82-84` | — |
@@ -135,11 +135,11 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 
 | # | e3 capability | e3 (file:line) | e4 status | note |
 |---|---|---|---|---|
-| 74 | `open_as_service()` — one writer, snapshot readers | service.rs:1-70 | CONTRACT-T2 — OPS §1 | a `ServiceDatabase` owning one writer behind a mutex and one `Arc<Database>` snapshot behind an RwLock, over `open_snapshot` (`collections/mod.rs:716`). Law 6. A second writer process is T3 (the page WAL is single-writer) |
-| 75 | `ServiceDb::publish()` + stated staleness window | service.rs:16-26 | CONTRACT-T2 — OPS §2 | window = publish interval (default 100 ms, as e3) plus one snapshot open. e4's barrier is **one checkpoint cheaper than e3's**: e4's `commit` publishes and `open_snapshot` reads the committed-WAL overlay, where e3 must `publish_generation()` first |
-| 76 | `set_statement_timeout(Duration)` | db.rs:5008 | CONTRACT-T2 — OPS §3 | a deadline beside the cancellation closure in `WorkMeter`, polled on a counted interval of charges (e3 polls every 1,024 rows). It is a bound *in addition to* `QueryBudget`, never instead of it; a timeout never interrupts a commit (T3) |
-| 77 | `interrupt_handle()` / `cancel()` / `clear_interrupt()` | db.rs:330-334, 5014-5021 | CONTRACT-T2 — OPS §4 | the smallest item: `WorkMeter` already threads a cancellation closure through every charge and every family already returns `Cancelled`. What is missing is the public `Arc<AtomicBool>` a second thread can hold |
-| 78 | `subscribe_changes()` / `unsubscribe_changes()` — one event per committed batch | db.rs:4986-4998 | CONTRACT-T2 — OPS §5 | delivered inside `commit` after the barrier, never on rollback. **e4 bounds what e3 does not**: e3 accumulates every changed key in a `Vec`, so a bulk load holds one string per row — a Law 1 violation its own bulk path reaches in one call. e4 caps the key list and degrades to a count. A durable replayable log is T3 |
+| 74 | `open_as_service()` — one writer, snapshot readers | service.rs:1-70 | DONE — `dist/src/service/mod.rs:142` (`ServiceDatabase`), `:173` (`open`), `:209` (`writer`), `:249` (`reader`), `:504` (`close`); `dist/src/service/snapshot.rs:43` | Published view is `RwLock<Arc<Snapshot>>`, not `RwLock<Arc<Database>>`: `Database` carries per-handle `RefCell`/`Cell` caches and is `Send` but not `Sync`. A second writer process is still T3 and is refused by the page WAL's file lock |
+| 75 | `ServiceDb::publish()` + stated staleness window | service.rs:16-26 | DONE — `dist/src/service/mod.rs:275` (`publish_now`), `:282`/`:289` (interval), `:666` (writer-side rate limit) | Window measured on 4,000 rows, four runs: one snapshot open 0.9–6.7 ms, one `publish_now` swap 0.9–2.0 ms, a commit visible to a new reader 100.3–108.5 ms after it under the 100 ms default. With no background thread, a reader past the interval pays the mint |
+| 76 | `set_statement_timeout(Duration)` | db.rs:5008 | DONE — `core/engine/src/query/mod.rs:528` (`QueryBudget::deadline`), `:647` (`WorkResource::Deadline`), `:717` (`DEADLINE_POLL_CHARGES` = 1,024), `:778` (`check_deadline`); `dist/src/service/mod.rs:341` | The clock is read once per page and then once per 1,024 charges; no clock read at all on the no-deadline path. Still in addition to `QueryBudget`, never instead of it; a timeout never interrupts a commit (T3) |
+| 77 | `interrupt_handle()` / `cancel()` / `clear_interrupt()` | db.rs:330-334, 5014-5021 | DONE — `dist/src/service/interrupt.rs:26`; `dist/src/service/mod.rs:377`/`:383`/`:388`, threaded into every `prepare_sql_with` and `next_page` by `:428` (`scan`) | Sticky until cleared, one relaxed load per charge |
+| 78 | `subscribe_changes()` / `unsubscribe_changes()` — one event per committed batch | db.rs:4986-4998 | DONE — `dist/src/service/changes.rs:70` (`ChangeEvent`), `:205` (`deliver`); `dist/src/service/mod.rs:629` (`WriterGuard::commit`) | Delivered after the barrier, never on rollback. Both L1 bounds are stated constants: 256 events per subscriber (a full queue drops the NEW event and counts it in `lagged`) and 1,024 keys per event, past which the key list is dropped whole and the total reported. A durable replayable log is still T3 |
 | 79 | `SHOW STATUS` (format, generation, counts, mode) | sql.rs:8134, exec.rs:519 | CONTRACT-T2 — OPS §6.1 | a `db_status` view over `storage_bytes` (`collections/mod.rs:794`), `tracked_pages` (`:798`), `io_counters` (`:947`) and the format bits. All O(1); the node and edge counts are scans and are optional columns |
 | 80 | `SHOW STORAGE` (live bytes per keyspace + files) | sql.rs:8132, exec.rs:463 | CONTRACT-T2 — OPS §6.2 | a tag-attributing walk over e4's tag-prefixed keyspaces plus the O(1) file sizes. A scan by definition, and the only statement in either contract whose cost is proportional to the database on purpose |
 | 81 | `information_schema.{tables,columns,schemata,table_constraints,key_column_usage}` | catalog/mod.rs:30-36 | CONTRACT-T2 — §1 catalog row, p3-pg-surface | virtual rows over the catalog |
@@ -151,7 +151,7 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 | # | e3 capability | e3 (file:line) | e4 status | note |
 |---|---|---|---|---|
 | 84 | `TEXT INTEGER REAL BOOL TIMESTAMPTZ GEO VECTOR JSON` | sql.rs:1208-1217 | DONE — `lang/src/mod.rs:80-81` (`TEXT/INT/BIGINT/REAL/DOUBLE/BOOLEAN/JSONB/TIMESTAMPTZ/DATE/VECTOR(n)/GEOMETRY`) | e4 adds DATE and typed GEOMETRY(Point, 4326) |
-| 85 | `NOT NULL` on ADD COLUMN (parsed, *not enforced*) | sql.rs:4029 | CONTRACT-T2 — QL §2, §5 deviation 12 | a descriptor flag checked when the row is assembled (MISSING and NULL are distinct in e4), refusing the write and naming the column. e4 **enforces** it where e3 parses it, so a corpus e3 accepted can be refused. `ADD COLUMN … NOT NULL` with no DEFAULT on a non-empty collection is T3 |
+| 85 | `NOT NULL` on ADD COLUMN (parsed, *not enforced*) | sql.rs:4029 | DONE — QL §2, §5 deviation 12 | a descriptor flag checked when the row is assembled and after the defaults are filled (MISSING and NULL are distinct in e4), refusing the write and naming the column, and saying both are refused. e4 **enforces** it where e3 parses it, so a corpus e3 accepted can be refused. `ADD COLUMN … NOT NULL` with no DEFAULT on a non-empty collection is T3 and refused by name. `core/engine/tests/column_rules.rs`, `lang/tests/sql_schema.rs` |
 
 ### 10. Other notable
 
@@ -159,22 +159,30 @@ Status key: **DONE** = accepted by e4 at HEAD (cite e4 file). **CONTRACT-T2 / T3
 |---|---|---|---|---|
 | 86 | `write_trace` — per-phase transaction timing | write_trace.rs:1-22 | CONTRACT-T2 — OPS §8 | a feature-gated thread-local phase timer over e4's write path, one line per index family. Law 4: e4 counts the I/O (`io_counters` `:947`, `pool_counters` `:892`) and does not yet attribute the time |
 | 87 | `stats()` / `memory_report()` / `trim_memory()` | db.rs:10177, 11763, 11726 | CONTRACT-T2 — OPS §6.3 | e4's honest report is short — the pool arena (a ceiling, labelled), the index and layout caches, the reader slots — because e4 holds nothing proportional to rows. That short list is Law 1 stated as a measurement. e3's rule that an absent structure is never reported as `0` is adopted verbatim |
-| 88 | Bulk load: `begin_bulk`/`put_value_bulk`/`link_many` | db.rs:11922-11987 | CONTRACT-T2 — OPS §7 | a nesting-counted write scope whose outermost close calls `commit`, with **the same** durability as any other commit (a weakened barrier is T3). e4 is stronger than e3 here: `rollback` makes a failed batch all-or-nothing where e3 leaves the earlier rows stored |
+| 88 | Bulk load: `begin_bulk`/`put_value_bulk`/`link_many` | db.rs:11922-11987 | DONE — `core/engine/src/collections/write_set.rs` (`Database::begin_bulk` / `end_bulk`), SQL `BEGIN BULK` / `END BULK` | the scope is built and nesting-counted; the outermost close calls `commit` with the same FULL barrier and publication as any other commit. The two batched entry points are NOT adopted and the reason is written in OPS §7: e4's `put`/`delete`/`put_edge` already write with no durability point of their own, so a loop inside the scope IS the batch. `rollback` makes a failed batch all-or-nothing, and clears the scope with it |
 | 89 | `prepare_insert` / `insert_prepared` | db.rs:10245-10261 | DONE — `lang/src/mod.rs:501` (`sql_prepare`) | — |
 
 ---
 
 ## Counts
 
-| status | before (HEAD `8167b11`) | after (HEAD `bdbef43`) |
-|---|---:|---:|
-| DONE | 24 | 24 |
-| CONTRACT-T2 | 28 | 60 |
-| CONTRACT-T3 | 3 | 3 |
-| NOT ADOPTED (named refusal, capability kept) | 0 | 1 |
-| NOT IN CONTRACT | 33 | **0** |
-| informational (e4 ahead / e3 absent) | 2 | 2 |
-| **total rows** | **90** | **90** |
+| status | before (HEAD `8167b11`) | tiered (HEAD `bdbef43`) | after OPS §1-§5 built |
+|---|---:|---:|---:|
+| DONE | 24 | 24 | **29** |
+| CONTRACT-T2 | 28 | 60 | 55 |
+| CONTRACT-T3 | 3 | 3 | 3 |
+| NOT ADOPTED (named refusal, capability kept) | 0 | 1 | 1 |
+| NOT IN CONTRACT | 33 | **0** | **0** |
+| informational (e4 ahead / e3 absent) | 2 | 2 | 2 |
+| **total rows** | **90** | **90** | **90** |
+
+Rows 74-78 (`docs/dist/OPS_CONTRACT.md` §1-§5: service mode, publish, the
+statement timeout, the interrupt handle and the change feed) moved
+CONTRACT-T2 -> DONE. They are built in `dist/src/service/` over one additive
+change in `core/engine/src/query/mod.rs`, and tested in
+`dist/tests/service.rs`. The T3 boundaries inside rows 76 and 78 stand: a
+timeout still never interrupts a commit, and a durable replayable change log
+is still not built.
 
 Of the 32 rows that moved to CONTRACT-T2, 23 are named in `docs/lang/QL_CONTRACT.md`
 and 9 in `docs/dist/OPS_CONTRACT.md`. The 33rd, `FROM MATCH`, is NOT ADOPTED.

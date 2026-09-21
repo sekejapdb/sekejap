@@ -939,6 +939,26 @@ impl PreparedQuery<'_> {
         }
         out
     }
+    /// Seed this query at the point a previous bounded write pass stopped.
+    ///
+    /// The same state `finish_page` commits after a page, set before the
+    /// first one: every candidate that does not rank strictly after the
+    /// cursor is skipped, and a driver that can resume opens AT it rather
+    /// than walking to it. Called only by `collections::write_set`, which
+    /// prepares a fresh query per page because the pages in between write
+    /// through `&mut Database` and a prepared query holds `&Database`.
+    pub(crate) fn resume_from(&mut self, cursor: &WriteCursor) {
+        self.after = cursor.after.clone();
+    }
+
+    /// The resume point of the last row this query handed out, as a write
+    /// pass records it.
+    pub(crate) fn write_cursor(&self) -> WriteCursor {
+        WriteCursor {
+            after: self.after.clone(),
+        }
+    }
+
     pub fn next_page<C: FnMut() -> bool>(
         &mut self,
         page_size: usize,

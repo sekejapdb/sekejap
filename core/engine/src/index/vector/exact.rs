@@ -318,17 +318,28 @@ fn score_vector_bytes(
 }
 
 /// Locator ordinals in sequence order. One page-order walk; the sidecar
-/// scan uses this table so it never does a per-vector locator lookup or
-/// layout get. SACRIFICE: RAM proportional to the candidate set (8 bytes
-/// per locator), not to k.
+/// scan uses this table so it never does a per-vector locator lookup.
+///
+/// Each locator is put through exactly the check the filtered path applies
+/// before it believes a row: the layout it names must exist and must declare
+/// THIS index's field, at that ordinal, with this index's dimension. Without
+/// it a locator whose ordinal was rewritten points the join at another
+/// field's sidecar -- the hidden external-key slot at ordinal zero, for one --
+/// and the scan scores those bytes as a vector instead of reporting damage
+/// (Law 5). The layout get is a single-slot cache hit for every locator after
+/// the first of its layout, so the walk still reads only locator pages.
+/// SACRIFICE: RAM proportional to the candidate set (8 bytes per locator),
+/// not to k.
 fn collect_locator_ordinals(
-    store: &Backend,
-    index_id: IndexId,
+    db: &Database,
+    index: &IndexInfo,
+    dimension: usize,
     max_examined: usize,
     examined: &mut usize,
     progress: ScanProgress<'_>,
 ) -> Result<Vec<(u64, u16)>> {
-    let prefix = locator_prefix(index_id);
+    let store = db.store()?;
+    let prefix = locator_prefix(index.id);
     let mut out = Vec::new();
     let mut failure = None;
     let mut pending = 0u64;
@@ -353,7 +364,7 @@ fn collect_locator_ordinals(
             if at != key.len() || sequence == 0 {
                 return Err(corrupt("exact vector locator key"));
             }
-            let (_, ordinal) = decode_locator(value)?;
+            let ordinal = db.locator_ordinal(index, value, dimension)?;
             let ordinal =
                 u16::try_from(ordinal).map_err(|_| corrupt("vector field ordinal overflow"))?;
             out.push((sequence, ordinal));
@@ -408,96 +419,6 @@ pub(super) fn cancel_only(cancelled: &mut impl FnMut() -> bool) -> impl FnMut(Sc
     }
 }
 
-/// One layout descriptor by id, or None when that id was never minted.
-///
-/// `Database::layout` cannot say "absent": it folds a missing id into the
-/// same corrupt-metadata error as a damaged one, and it keeps a single-slot
-/// cache that a sweep over every layout would evict on every call. This reads
-/// the three replicas directly and leaves that cache alone.
-fn layout_if_present(db: &Database, id: u32) -> Result<Option<Layout>> {
-    let store = db.store()?;
-    let mut present = false;
-    for copy in 0..3u8 {
-        let Some(bytes) = store.get(&crate::collections::layout_key(id, copy))? else {
-            continue;
-        };
-        present = true;
-        if let Ok(layout) = Layout::from_descriptor(&bytes) {
-            return Ok(Some(layout));
-        }
-    }
-    if present {
-        return Err(corrupt("vector index layout descriptor"));
-    }
-    Ok(None)
-}
-
-/// Does this layout agree that `ordinal` is exactly this index's vector
-/// field, and does it put nothing else there?
-///
-/// Two ways to agree. Either the layout declares the indexed field at that
-/// ordinal with the indexed dimension -- its rows write their sidecar exactly
-/// where the scan will look -- or the layout has no vector of ours at all AND
-/// no other vector field at that ordinal, so its rows contribute no sidecar
-/// the scan could either miss or mistake for one of ours.
-fn layout_agrees(layout: &Layout, field: &str, dim: usize, ordinal: usize) -> bool {
-    let ours = layout
-        .fields
-        .iter()
-        .position(|(name, kind)| name == field && matches!(kind, Kind::Vector(_)));
-    match ours {
-        Some(at) => at == ordinal && matches!(layout.fields.get(at), Some((_, Kind::Vector(d))) if *d == dim),
-        None => !matches!(layout.fields.get(ordinal), Some((_, Kind::Vector(_)))),
-    }
-}
-
-/// The one ordinal EVERY layout puts this index's vector field at, when there
-/// is one: the sidecar ordinal is then unique, so the locator table is not
-/// needed to decide which sidecar to score.
-///
-/// The current layout alone is not enough to ask. `alter_collection` mints a
-/// NEW layout id and rewrites no rows, and `validate_indexed_layout` only
-/// requires the indexed field's name and kind to survive -- not its ordinal.
-/// So a collection whose vector field moved from ordinal 1 to ordinal 2 has
-/// its population split across two layouts, and a scan that filtered on the
-/// current ordinal alone would score only the rows written after the alter
-/// and report them, with no error, as the whole top-k. Every layout in the
-/// database is checked rather than only this collection's, because the
-/// catalog records one layout id and not a history: the extra layouts belong
-/// to other collections and can only push this answer onto the locator path,
-/// never off it.
-fn single_vector_ordinal(db: &Database, index: &IndexInfo, dim: usize) -> Result<Option<u16>> {
-    let catalog = db.catalog(index.collection)?;
-    let current = db.layout(catalog.layout)?;
-    let mut found = None;
-    for (ordinal, (name, kind)) in current.fields.iter().enumerate() {
-        if matches!(kind, Kind::Vector(d) if *d == dim) {
-            if found.is_some() || name != &index.field {
-                return Ok(None);
-            }
-            found = Some(ordinal);
-        }
-    }
-    let Some(only) = found else {
-        return Ok(None);
-    };
-    let (_, next_layout) = db.header()?;
-    for id in 0..next_layout {
-        if id == catalog.layout {
-            continue;
-        }
-        let Some(layout) = layout_if_present(db, id)? else {
-            continue;
-        };
-        if !layout_agrees(&layout, &index.field, dim, only) {
-            return Ok(None);
-        }
-    }
-    Ok(Some(
-        u16::try_from(only).map_err(|_| corrupt("vector field ordinal overflow"))?,
-    ))
-}
-
 fn finish_exact_heap(heap: BinaryHeap<HeapHit>) -> Vec<VectorHit> {
     let mut hits: Vec<_> = heap.into_iter().map(|hit| hit.0).collect();
     hits.sort_by(|a, b| {
@@ -542,11 +463,26 @@ fn admit_scored(
 }
 
 /// Page-order exact top-k: sidecar pages once. Each sidecar leaf is decoded
-/// once and every matching vector on it is scored in a tight loop. When the
-/// current layout has a single vector field, locators are not read at all
-/// (they only map winners back, and the sidecar key already carries the
-/// entity id). Otherwise a locator-page ordinal table filters mixed fields.
-/// SACRIFICE of the mixed path: RAM proportional to the locator set.
+/// once and every matching vector on it is scored in a tight loop, filtered
+/// by an ordinal table read from the locator pages in one page-order pass.
+///
+/// The locator table is not an optimization that a single-vector layout can
+/// skip: it is the index's own record of WHICH rows this index holds and of
+/// where each one's vector lives. A scan that reads only the `0x60` sidecars
+/// answers from the ROWS, so a locator that is malformed, points at another
+/// field, or names a sidecar that is gone is neither reported nor felt -- the
+/// query returns a wrong answer instead of `Corrupt` (Law 5). Every locator is
+/// therefore decoded and checked against the layout it names before the
+/// sidecar it points at is believed.
+/// SACRIFICE: RAM proportional to the locator set (8 bytes per locator), not
+/// to k.
+///
+/// The two passes have two ceilings because they spend two different
+/// resources. `max_locators` bounds the locator table read out of the `0x73`
+/// keyspace and `max_examined` bounds the `0x60` sidecars scored; a caller
+/// metering a budget derives each from the resource that pass actually
+/// charges, so the charge that names the exhausted resource is the one that
+/// stops the walk. A caller with a single allowance passes it as both.
 ///
 /// `after` is the page cursor and is applied per candidate, before the heap.
 /// `progress` is called every [`SCAN_STEP`] SIDECAR RECORDS -- every record
@@ -561,6 +497,7 @@ pub(crate) fn scan_exact_all(
     metric: VectorMetric,
     k: usize,
     after: Option<VectorAfter>,
+    max_locators: usize,
     max_examined: usize,
     progress: ScanProgress<'_>,
 ) -> Result<Vec<VectorHit>> {
@@ -569,7 +506,6 @@ pub(crate) fn scan_exact_all(
     }
     let dimension = dimension(index)?;
     let query_wide: Vec<f64> = query.iter().map(|lane| f64::from(*lane)).collect();
-    let only = single_vector_ordinal(db, index, dimension)?;
     let store = db.store()?;
     let prefix = sidecar_prefix(index.collection);
     let mut heap = BinaryHeap::with_capacity(k.min(1024));
@@ -584,63 +520,9 @@ pub(crate) fn scan_exact_all(
     let mut pending = 0u64;
     let mut failure = None;
 
-    if let Some(only) = only {
-        store.range(&prefix)?.for_each_ref(|key, bytes| {
-            if !key.starts_with(&prefix) {
-                return false;
-            }
-            if let Err(e) = (|| -> Result<()> {
-                visited += 1;
-                if visited % SCAN_STEP == 0 {
-                    progress(ScanStep::Scored(std::mem::take(&mut pending)))?;
-                }
-                let mut cur = prefix.len();
-                let sequence = read_ordered(key, &mut cur)?;
-                let ordinal = read_ordered(key, &mut cur)?;
-                if cur != key.len() || sequence == 0 {
-                    return Err(corrupt("exact vector sidecar key"));
-                }
-                if ordinal != u64::from(only) {
-                    return Ok(());
-                }
-                if sidecars as usize == max_examined {
-                    // Charge what is outstanding BEFORE reporting the limit:
-                    // when the limit came from a budget, that charge is the
-                    // one that names the resource that ran out.
-                    progress(ScanStep::Scored(std::mem::take(&mut pending)))?;
-                    return Err(Error::Kernel(kernel::Error::ResourceLimit(
-                        "exact vector max_examined exceeded",
-                    )));
-                }
-                sidecars += 1;
-                pending += 1;
-                admit_scored(
-                    &mut heap,
-                    k,
-                    index.collection,
-                    sequence,
-                    bytes,
-                    &query_wide,
-                    query_norm,
-                    metric,
-                    after,
-                )
-            })() {
-                failure = Some(e);
-                return false;
-            }
-            true
-        })?;
-        if let Some(e) = failure {
-            return Err(e);
-        }
-        progress(ScanStep::Scored(pending))?;
-        return Ok(finish_exact_heap(heap));
-    }
-
     let mut examined = 0usize;
     let ordinals =
-        collect_locator_ordinals(store, index.id, max_examined, &mut examined, progress)?;
+        collect_locator_ordinals(db, index, dimension, max_locators, &mut examined, progress)?;
     let mut at = 0usize;
     store.range(&prefix)?.for_each_ref(|key, bytes| {
         if !key.starts_with(&prefix) {
@@ -665,6 +547,19 @@ pub(crate) fn scan_exact_all(
             }
             if ordinals[at].0 != sequence || u64::from(ordinals[at].1) != ordinal {
                 return Ok(());
+            }
+            if sidecars as usize == max_examined {
+                // The ceiling stops the walk INSIDE it, at one record past
+                // what the allowance holds, and the outstanding batch is
+                // charged BEFORE the stop is reported: that charge is the one
+                // that names the resource which ran out, and it lands at
+                // exactly `limit + 1` because `sidecars` has never been
+                // allowed past `max_examined`, so no batch can carry more
+                // than the allowance into a single charge.
+                progress(ScanStep::Scored(std::mem::take(&mut pending)))?;
+                return Err(Error::Kernel(kernel::Error::ResourceLimit(
+                    "exact vector max_examined exceeded",
+                )));
             }
             at += 1;
             sidecars += 1;
@@ -898,6 +793,10 @@ impl Database {
         match candidates {
             VectorCandidates::All => {
                 let mut progress = cancel_only(&mut cancelled);
+                // The public API states ONE allowance and calls it locator
+                // probes, so it bounds both passes: a caller that asked for
+                // `n` probes gets no more than `n` locators and no more than
+                // `n` sidecars scored out of them.
                 return Ok(scan_exact_all(
                     self,
                     &index,
@@ -906,6 +805,7 @@ impl Database {
                     metric,
                     k,
                     None,
+                    max_examined,
                     max_examined,
                     &mut progress,
                 )?);
@@ -984,7 +884,7 @@ impl Database {
     /// Validate a locator against the layout it names and return the physical
     /// sidecar ordinal it points at. Split out of `score_locator_cancelled` so
     /// the scanned path performs exactly the same check before believing a row.
-    fn locator_ordinal(
+    pub(super) fn locator_ordinal(
         &self,
         index: &IndexInfo,
         locator: &[u8],

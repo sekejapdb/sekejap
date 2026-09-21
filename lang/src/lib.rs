@@ -19,10 +19,14 @@
 //! ```text
 //! statement := select | explain | insert | update | delete
 //!            | create_table | create_index | drop | transaction | set_local
+//!            | bulk
 //!
 //! select    := SELECT [DISTINCT] items FROM source [WHERE conj]
 //!              [GROUP BY group] [HAVING having] [ORDER BY key] [LIMIT n]
 //! explain   := EXPLAIN select | EXPLAIN drop_table
+//!            | EXPLAIN update | EXPLAIN delete   -- predicated only; the
+//!                                                   plan is PREPARED, never
+//!                                                   run
 //! items     := '*' | item (',' item)*
 //! item      := '_id' | '_key' | name | name '/' n | aggregate
 //!            | order_expression [AS alias]
@@ -30,7 +34,7 @@
 //!            | ('sum'|'min'|'max'|'avg') '(' name ')'
 //! group     := name ['/' n]        -- one key; `/ n` needs an Int index
 //! having    := aggregate cmp value (AND aggregate cmp value)*
-//! source    := name | graph_table
+//! source    := name | graph_table | ALL   -- ALL is refused by name (§2)
 //! conj      := predicate (AND predicate)*
 //!
 //! predicate := name cmp value
@@ -70,8 +74,15 @@
 //!
 //! insert    := INSERT INTO name '(' names ')' VALUES '(' values ')'
 //!                                                  (',' '(' values ')')*
-//! update    := UPDATE name SET (name '=' value)+ WHERE '_key' '=' value
-//! delete    := DELETE FROM name WHERE '_key' '=' value
+//! update    := UPDATE name SET (name '=' set_value)+ WHERE where_tail
+//! delete    := DELETE FROM (name | ALL) [WHERE conj] [RESTRICT | CASCADE]
+//! set_value := value | expression        -- a row function over the SAME row
+//! where_tail:= '_key' '=' value          -- one point write
+//!            | conj                      -- Database::update_where /
+//!                                           delete_where, a bounded
+//!                                           resumable pass over the
+//!                                           candidates the predicate admits
+//! bulk      := BEGIN BULK | END BULK     -- OPS_CONTRACT §7
 //! create_table := CREATE TABLE name '(' (name type [PRIMARY KEY])+ ')'
 //! type      := TEXT | INT | BIGINT | REAL | DOUBLE PRECISION | BOOLEAN
 //!            | JSONB | TIMESTAMPTZ | DATE | VECTOR '(' n ')'
@@ -500,14 +511,25 @@ pub fn prepare_sql_with(
 
 /// `EXPLAIN <select>` without the `EXPLAIN` keyword: prepare, run, and print
 /// the plan together with the work the run charged.
+///
+/// This entry point runs the statement to explain it, so it takes the two
+/// families that can be run for an answer -- a SELECT and an aggregate -- and
+/// nothing else. The EXPLAIN families that must NOT be run to be explained
+/// (`DROP TABLE` and the predicated `UPDATE`/`DELETE`) go through
+/// `SqlDatabase::sql` with the `EXPLAIN` keyword, which prepares and
+/// describes without executing; the refusal below names that route rather
+/// than leaving a caller with "EXPLAIN takes a SELECT" in front of a
+/// statement that does have an EXPLAIN.
 pub fn explain_sql(db: &Database, text: &str, params: &[Param]) -> Result<String> {
     let prepared = prepare_sql(db, text, params)?;
     if let Some(aggregate) = prepared.aggregate_plan() {
         return explain::render_aggregate(db, aggregate, prepared.notices());
     }
-    let select = prepared
-        .select_plan()
-        .ok_or_else(|| SqlError::unsupported("EXPLAIN takes a SELECT"))?;
+    let select = prepared.select_plan().ok_or_else(|| {
+        SqlError::unsupported(
+            "explain_sql/sql_explain RUNS the statement to explain it, so it takes a SELECT or an aggregate. A DROP TABLE or a predicated UPDATE/DELETE is explained WITHOUT being run: `db.sql(\"EXPLAIN <statement>\")`, which prepares and describes it.",
+        )
+    })?;
     explain::render(db, select, prepared.notices())
 }
 
@@ -589,7 +611,7 @@ impl SqlDatabase for Database {
                 let text = explain::render_aggregate(self, &aggregate, &notices)?;
                 Ok(SqlResult::Explain(text))
             }
-            compile::Plan::Write(write) => write.run(self, notices),
+            compile::Plan::Write(write) => write.run(self, notices, budget),
         }
     }
 

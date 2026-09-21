@@ -31,6 +31,7 @@ use std::{
     fmt,
     ops::Bound,
     sync::Arc,
+    time::Instant,
 };
 
 mod aggregate;
@@ -475,6 +476,39 @@ pub struct ApproximationDiagnostics {
     pub reranked: usize,
 }
 
+/// Where a bounded write pass stopped, so the next one continues instead of
+/// starting over.
+///
+/// Opaque on purpose. Inside, it is the RANK KEY of the last candidate the
+/// pass wrote -- the same key a page of an ordinary query commits as its
+/// resume point (`page.rs::finish_page`) -- and a resumed pass skips every
+/// candidate that does not rank strictly after it. Holding the key rather
+/// than the entity id is what makes the resume cost one seek on a driver that
+/// can resume (the scalar walk opens at `value || sequence`, the key walk at
+/// the key bytes) instead of a re-walk of everything already written.
+///
+/// The cursor is valid against the SAME collection, the SAME filters and the
+/// SAME catalog it was produced under: `CandidateDriver::Auto` chooses the
+/// driver at prepare time, and a cursor in one driver's keyspace means
+/// nothing in another's. A cursor handed to a different query is not
+/// corruption and is not detected; it resumes a walk that was never started.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WriteCursor {
+    after: Option<RankKey>,
+}
+
+impl WriteCursor {
+    /// The beginning: a pass that has written nothing.
+    pub fn start() -> Self {
+        Self { after: None }
+    }
+
+    /// True while nothing has been written under this cursor.
+    pub fn is_start(&self) -> bool {
+        self.after.is_none()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryRow {
     pub id: EntityId,
@@ -503,6 +537,11 @@ pub struct QueryBudget {
     pub vector_lanes: u64,
     /// Mapping-keyspace entries walked by `CandidateDriver::Keys`.
     pub key_postings: u64,
+    /// Rows one bounded write pass may WRITE: a put that replaces a row, or a
+    /// delete that removes one (`collections::write_set`). The dimension a
+    /// `DELETE ... WHERE` or an `UPDATE ... WHERE` is bounded by; over it the
+    /// pass stops and hands back a cursor, rather than truncating silently.
+    pub rows_written: u64,
     /// Accumulator sets an aggregate holds AT ONCE (`src/query/aggregate.rs`).
     /// A STREAMING aggregate holds one whatever the collection contains; a
     /// HASHED one holds a set per distinct group, and this is the bound that
@@ -511,6 +550,20 @@ pub struct QueryBudget {
     /// [`WorkResource::Groups`].
     pub groups: u64,
     pub output_bytes: u64,
+    /// The wall-clock instant past which this page is refused with
+    /// [`WorkResource::Deadline`] (`docs/dist/OPS_CONTRACT.md` §3).
+    ///
+    /// It is a bound IN ADDITION to the work bounds above, never instead of
+    /// one: the work bounds are what make a cost reproducible, and a clock
+    /// bound is not reproducible. `None` -- which is what
+    /// [`QueryBudget::unlimited`] and every builder that does not ask for one
+    /// carry -- costs one `Option` discriminant test per charge and no clock
+    /// read at all.
+    ///
+    /// The clock is read once per meter and then once per
+    /// [`DEADLINE_POLL_CHARGES`] charges, so a deadline is detected within
+    /// that many units of work rather than at the instant it passes.
+    pub deadline: Option<Instant>,
 }
 
 impl QueryBudget {
@@ -528,9 +581,22 @@ impl QueryBudget {
             vector_sidecars: u64::MAX,
             vector_lanes: u64::MAX,
             key_postings: u64::MAX,
+            rows_written: u64::MAX,
             groups: u64::MAX,
             output_bytes: u64::MAX,
+            deadline: None,
         }
+    }
+
+    /// This budget with a wall-clock deadline on top of it
+    /// (`docs/dist/OPS_CONTRACT.md` §3).
+    ///
+    /// A builder rather than a constructor so an existing budget -- including
+    /// [`QueryBudget::unlimited`] -- gains the clock bound without any caller
+    /// restating the work bounds it already chose.
+    pub const fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// The default ceiling on accumulator sets held at once: the same
@@ -568,6 +634,9 @@ pub struct QueryWork {
     pub vector_sidecars: u64,
     pub vector_lanes: u64,
     pub key_postings: u64,
+    /// Rows this pass WROTE: one per row put back or deleted. Zero for every
+    /// read-only page; a write pass is the only thing that charges it.
+    pub rows_written: u64,
     /// The most accumulator sets this page held at once.
     pub groups: u64,
     /// The most BYTES a boolean filter's intermediate membership sets held at
@@ -591,6 +660,8 @@ pub enum WorkResource {
     VectorSidecars,
     VectorLanes,
     KeyPostings,
+    /// Rows written by a bounded write pass. See [`QueryBudget::rows_written`].
+    RowsWritten,
     Groups,
     /// The memory a BOOLEAN filter's membership sets hold at once, in bytes.
     ///
@@ -603,6 +674,21 @@ pub enum WorkResource {
     /// used to name.
     MembershipBytes,
     OutputBytes,
+    /// Wall-clock time, in microseconds (`docs/dist/OPS_CONTRACT.md` §3).
+    ///
+    /// The second resource with no [`QueryBudget`] field of its own kind: the
+    /// budget carries an `Option<Instant>`, not a count, because a deadline
+    /// is an instant and not an amount. It is never `charge`d -- its ceiling
+    /// in [`WorkMeter::slot`] is zero for exactly that reason -- it is raised
+    /// by the clock poll inside `check_cancelled`.
+    ///
+    /// On a refusal `limit` is the microseconds this page was allowed
+    /// (zero when the deadline had already passed before the page began) and
+    /// `attempted` is the microseconds it had spent when the clock was read;
+    /// `attempted >= limit` always. Both are measured from the page's own
+    /// start, because the budget is supplied per page while the deadline is
+    /// one absolute instant for the whole statement.
+    Deadline,
 }
 
 #[derive(Debug)]
@@ -661,10 +747,37 @@ pub struct QueryPage {
     pub approximation: Option<ApproximationDiagnostics>,
 }
 
+/// Charges between two reads of the wall clock, when a
+/// [`QueryBudget::deadline`] is set (`docs/dist/OPS_CONTRACT.md` §3).
+///
+/// A stated constant, not a tuning knob. 1,024 is e3's precedent
+/// (`src/db.rs:5030-5046`) and it is the same trade: the cancellation flag is
+/// read on every charge because it is one relaxed load, and the clock is read
+/// once per this many charges because `Instant::now` is a syscall-shaped cost
+/// that would otherwise sit on the per-candidate path. A deadline is
+/// therefore detected within 1,024 units of work of passing, not at the
+/// instant it passes, and the contract says so rather than implying a
+/// precision the check does not have.
+pub const DEADLINE_POLL_CHARGES: u64 = 1_024;
+
 pub struct WorkMeter<'a, C> {
     limit: QueryBudget,
     used: QueryWork,
     cancelled: &'a mut C,
+    /// When this meter was built: the origin the `Deadline` refusal's two
+    /// microsecond numbers are measured from. `None` when no deadline is set,
+    /// which is what keeps `Instant::now` off the no-deadline path entirely.
+    started: Option<Instant>,
+    /// Charges since the clock was last read. Seeded so the FIRST
+    /// `check_cancelled` of every meter reads the clock: a page small enough
+    /// to charge fewer than [`DEADLINE_POLL_CHARGES`] units would otherwise
+    /// never poll, and a paged scan is exactly how a service runs a long
+    /// statement.
+    since_clock: u64,
+    /// The slot [`WorkResource::Deadline`] maps to in
+    /// [`WorkMeter::slot`]. Never read as a total; it exists so the match is
+    /// exhaustive without giving a clock a counter it does not have.
+    deadline_charges: u64,
 }
 
 impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
@@ -673,9 +786,12 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
     /// `QueryBudget::unlimited()` and a cancel closure that always said no.
     pub(crate) fn new(limit: QueryBudget, cancelled: &'a mut C) -> Self {
         Self {
+            started: limit.deadline.map(|_| Instant::now()),
             limit,
             used: QueryWork::default(),
             cancelled,
+            since_clock: DEADLINE_POLL_CHARGES - 1,
+            deadline_charges: 0,
         }
     }
 
@@ -689,10 +805,39 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
 
     pub(super) fn check_cancelled(&mut self) -> QueryResult<()> {
         if (self.cancelled)() {
-            Err(QueryError::Cancelled)
-        } else {
-            Ok(())
+            return Err(QueryError::Cancelled);
         }
+        self.check_deadline()
+    }
+
+    /// The wall-clock half of the check point, on a counted interval of
+    /// charges (`docs/dist/OPS_CONTRACT.md` §3).
+    ///
+    /// A cancel and a timeout are deliberately DIFFERENT errors: a cancel is
+    /// [`QueryError::Cancelled`] and says a caller asked for the stop, a
+    /// timeout is [`QueryError::BudgetExceeded`] naming
+    /// [`WorkResource::Deadline`] and says the statement outran the clock it
+    /// was given. A caller that must tell them apart -- a retry loop, an
+    /// operator log -- can.
+    fn check_deadline(&mut self) -> QueryResult<()> {
+        let (Some(deadline), Some(started)) = (self.limit.deadline, self.started) else {
+            return Ok(());
+        };
+        self.since_clock += 1;
+        if self.since_clock < DEADLINE_POLL_CHARGES {
+            return Ok(());
+        }
+        self.since_clock = 0;
+        let now = Instant::now();
+        if now < deadline {
+            return Ok(());
+        }
+        let micros = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        Err(QueryError::BudgetExceeded {
+            resource: WorkResource::Deadline,
+            limit: micros(deadline.saturating_duration_since(started)),
+            attempted: micros(now.saturating_duration_since(started)),
+        })
     }
 
     /// Note one complete dense-v3 row traversal. Unbudgeted on purpose: see
@@ -725,6 +870,7 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
             }
             WorkResource::VectorLanes => (&mut self.used.vector_lanes, self.limit.vector_lanes),
             WorkResource::KeyPostings => (&mut self.used.key_postings, self.limit.key_postings),
+            WorkResource::RowsWritten => (&mut self.used.rows_written, self.limit.rows_written),
             WorkResource::Groups => (&mut self.used.groups, self.limit.groups),
             // No caller knob: see `WorkResource::MembershipBytes`. The
             // ceiling is the fixed memory promise, so `unlimited()` does not
@@ -734,6 +880,12 @@ impl<'a, C: FnMut() -> bool> WorkMeter<'a, C> {
                 membership::MEMBERSHIP_BYTES_CAP as u64,
             ),
             WorkResource::OutputBytes => (&mut self.used.output_bytes, self.limit.output_bytes),
+            // Not a chargeable resource: a deadline is an instant, not an
+            // amount, and `check_cancelled` raises it from the clock. The
+            // ceiling of zero means any `charge(Deadline, n > 0)` is refused
+            // outright rather than silently counted somewhere it does not
+            // belong.
+            WorkResource::Deadline => (&mut self.deadline_charges, 0),
         }
     }
 

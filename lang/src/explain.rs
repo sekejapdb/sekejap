@@ -154,6 +154,37 @@ fn format_aggregate(plan: &AggregatePlanDescription) -> String {
     out
 }
 
+/// The driver-and-filters half of a plan, for the two predicated WRITES.
+///
+/// The same lines `format` prints for a SELECT, minus the counters: a write
+/// EXPLAIN does not run, so there are no counters to print and the
+/// membership sets read "not walked yet". Shared so the two cannot drift.
+pub(crate) fn format_write_plan(plan: &QueryPlanDescription) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("driver: {:?}\n", plan.driver));
+    out.push_str(&format!("  walks: {}\n", plan.driver_detail));
+    if plan.driver_is_a_scan {
+        out.push_str(
+            "  note:  this driver is a SCAN by definition (QL_CONTRACT §6): its work is proportional to the collection, not to the candidates a predicate admits\n",
+        );
+    }
+    if plan.filters.is_empty() {
+        out.push_str("filters: none\n");
+    } else {
+        out.push_str("filters:\n");
+        for filter in &plan.filters {
+            out.push_str(&format!(
+                "  [{}] {} {} -> {}\n",
+                filter.position,
+                filter.family,
+                filter.detail,
+                answer_text(&filter.answer)
+            ));
+        }
+    }
+    out
+}
+
 fn format(
     db: &Database,
     plan: &QueryPlanDescription,

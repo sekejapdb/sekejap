@@ -59,8 +59,12 @@ fn budget(scalar_postings: u64) -> QueryBudget {
         vector_sidecars: 1_000_000,
         vector_lanes: 1_000_000,
         key_postings: 1_000_000,
+        rows_written: 1_000_000,
         groups: 1_000_000,
         output_bytes: 16 << 20,
+        // No wall-clock bound: this suite asserts WORK, which is the
+        // reproducible bound (`docs/dist/OPS_CONTRACT.md` §3).
+        deadline: None,
     }
 }
 
