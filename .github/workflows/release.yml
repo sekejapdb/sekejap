@@ -1,0 +1,485 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}   # allow manual runs from the Actions UI (test publishes)
+
+jobs:
+  # ── Single source of truth: the pushed tag must equal Cargo.toml's version ──
+  # [workspace.package].version drives every wrapper (Rust/Python inherit it,
+  # Kotlin reads it, sync-wrapper-versions.sh stamps npm+dart from it). This job
+  # refuses the release if the tag and Cargo.toml disagree, so a shipped version
+  # can never diverge from its tag. Registries are immutable — fail before, not after.
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        shell: bash
+        run: |
+          CARGO_VERSION=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Cargo.toml [workspace.package] version: $CARGO_VERSION"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            echo "Release tag: ${GITHUB_REF_NAME} (version $TAG_VERSION)"
+            if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} != Cargo.toml version ${CARGO_VERSION}. Bump [workspace.package].version in Cargo.toml to match the tag (or retag), then push again."
+              exit 1
+            fi
+            echo "tag and Cargo.toml agree on ${CARGO_VERSION}"
+          else
+            echo "Manual run (not a tag) — skipping the tag/Cargo equality check."
+          fi
+          echo "version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+
+  publish-rust-library:
+    name: Publish Rust Library
+    needs: verify-version
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish sekejap to Crates.io
+        run: cargo publish -p sekejap --all-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          RUSTFLAGS: "-C target-feature=+aes,+sse2"
+
+  publish-rust-cli:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Publish Rust CLI
+    runs-on: ubuntu-latest
+    needs: publish-rust-library
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Inject version into workspace dependency
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='sekejap'))")
+          sed -i "s|sekejap = { path = \".\" }|sekejap = { path = \".\", version = \"$VERSION\" }|" Cargo.toml
+      - name: Publish sekejap-cli to Crates.io
+        run: cargo publish -p sekejap-cli --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          RUSTFLAGS: "-C target-feature=+aes,+sse2"
+
+  build-python-wheels:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Build Python Wheels
+    runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: manylinux_2_28
+          - os: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist --features s3 -i python3.8 -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          working-directory: wrappers/python
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist-${{ matrix.os }}-${{ matrix.target }}
+          path: wrappers/python/dist
+
+  build-python-sdist:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Build Python sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: wrappers/python
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: wrappers/python/dist
+
+  publish-python:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Publish Python Distributions
+    runs-on: ubuntu-latest
+    needs:
+      - verify-version
+      - build-python-wheels
+      - build-python-sdist
+    permissions:
+      id-token: write
+    environment:
+      name: release
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-dist-*
+          path: wrappers/python/dist
+          merge-multiple: true
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: python-sdist
+          path: wrappers/python/dist
+      - name: Publish to PyPI via Trusted Publisher
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wrappers/python/dist
+          skip-existing: true
+
+  # ── Dart/Flutter: precompile + sign the native library (cargokit) ──────────
+  # Builds libsekejap_ffi for every platform buildable from each host, signs it
+  # with DART_PRECOMPILED_PRIVATE_KEY, and uploads it to a `precompiled_<hash>`
+  # GitHub Release. Consumers download+verify it during `flutter build` (no Rust).
+  precompile-dart:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Precompile native libs (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write        # create/upload the precompiled_<hash> release
+    environment:
+      name: release
+    strategy:
+      fail-fast: false
+      # Serialize the legs: the first creates the `precompiled_<hash>` GitHub release,
+      # the others just get it. Running in parallel races on release-create (GitHub
+      # returns "Published releases must have a valid tag" to the losers).
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - name: Install GTK (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Precompile (desktop + iOS on macOS host)
+        if: matrix.os != 'ubuntu-latest'
+        working-directory: wrappers/dart/cargokit/build_tool
+        shell: bash              # Windows default is PowerShell; force bash for \ continuations
+        run: |
+          dart pub get
+          dart run build_tool precompile-binaries -v \
+            --manifest-dir=../../rust \
+            --repository=sekejapdb/sekejap
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.DART_PRECOMPILED_PRIVATE_KEY }}
+      - name: Precompile (Linux desktop + Android)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: wrappers/dart/cargokit/build_tool
+        run: |
+          dart pub get
+          NDK_VERSION=$(ls "$ANDROID_SDK_ROOT/ndk" | sort -V | tail -1)
+          echo "Using Android NDK $NDK_VERSION"
+          dart run build_tool precompile-binaries -v \
+            --manifest-dir=../../rust \
+            --repository=sekejapdb/sekejap \
+            --android-sdk-location="$ANDROID_SDK_ROOT" \
+            --android-ndk-version="$NDK_VERSION" \
+            --android-min-sdk-version=23
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.DART_PRECOMPILED_PRIVATE_KEY }}
+
+  # ── Publish the Dart package to pub.dev (OIDC — no stored token) ───────────
+  publish-dart:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Publish to pub.dev
+    needs: [verify-version, precompile-dart]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # OIDC trusted publishing to pub.dev
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2       # provides flutter (FLUTTER_ROOT) for the sdk: flutter dep
+        with:
+          channel: stable
+      - uses: dart-lang/setup-dart@v1          # standalone Dart whose pub client does OIDC (must come AFTER flutter)
+      - name: Sync version from Cargo.toml
+        run: ./scripts/sync-wrapper-versions.sh
+      - name: Publish
+        working-directory: wrappers/dart
+        run: |
+          flutter pub get
+          dart pub publish --force
+
+  # ── Publish the Dart codegen generator to pub.dev (dev-only package) ────────
+  # Pure Dart (no Flutter). Requires OIDC trusted publishing to be enabled for
+  # `sekejap_generator` on pub.dev (one-time, per-package, same as `sekejap`).
+  publish-dart-generator:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Publish sekejap_generator to pub.dev
+    needs: [verify-version, publish-dart]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # OIDC trusted publishing to pub.dev
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - name: Sync version from Cargo.toml
+        run: ./scripts/sync-wrapper-versions.sh
+      - name: Publish (skip if this version is already on pub.dev)
+        working-directory: wrappers/dart/sekejap_generator
+        run: |
+          VERSION=$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version:[[:space:]]*//')
+          # pub.dev versions are immutable; skip-existing keeps a re-tag (or the
+          # manual bootstrap release) from failing this job. Mirrors PyPI's skip-existing.
+          EXISTS=$(curl -s "https://pub.dev/api/packages/sekejap_generator" | grep -c "\"version\":\"$VERSION\"" || true)
+          if [ "$EXISTS" != "0" ]; then
+            echo "sekejap_generator $VERSION already on pub.dev — skipping."
+            exit 0
+          fi
+          dart pub get
+          dart pub publish --force
+
+  # ── C ABI native libraries (serves C/C++, Go, Swift, any C-ABI consumer) ───
+  # Builds libsekejap for each desktop platform and attaches a tarball
+  # (lib + header) to the GitHub Release. This is the "download & link" path
+  # C/Go/Swift consumers use.
+  build-native-libs:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: libsekejap (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,   runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  ext: so,    prefix: lib }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: so,    prefix: lib }
+          - { name: macos-arm64, runner: macos-14,         target: aarch64-apple-darwin,      ext: dylib, prefix: lib }
+          - { name: macos-x64,   runner: macos-14,         target: x86_64-apple-darwin,       ext: dylib, prefix: lib }
+          - { name: windows-x64, runner: windows-latest,   target: x86_64-pc-windows-msvc,    ext: dll,   prefix: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build C ABI (regenerates sekejap.h via cbindgen)
+        run: cargo build --release -p sekejap-capi --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          STAGE="libsekejap-${{ matrix.name }}"
+          mkdir -p "$STAGE/lib" "$STAGE/include"
+          cp "target/${{ matrix.target }}/release/${{ matrix.prefix }}sekejap.${{ matrix.ext }}" "$STAGE/lib/"
+          # static/import lib alongside the dynamic one, when present
+          cp "target/${{ matrix.target }}/release/libsekejap.a"  "$STAGE/lib/" 2>/dev/null || true
+          cp "target/${{ matrix.target }}/release/sekejap.lib"   "$STAGE/lib/" 2>/dev/null || true
+          cp wrappers/c/include/sekejap.h "$STAGE/include/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.name }}
+          path: libsekejap-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+  release-native-libs:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Attach native libs to Release
+    needs: build-native-libs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+
+  # ── Swift: build an xcframework (macOS + iOS) and attach it to the Release ──
+  build-swift-xcframework:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Swift xcframework
+    needs: release-native-libs   # let that job create the Release first (avoid a create race)
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Build static lib for all Apple targets
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+            cargo build --release -p sekejap-capi --target "$t"
+          done
+      - name: Assemble xcframework
+        run: |
+          HDR=wrappers/c/include
+          mkdir -p build
+          lipo -create target/aarch64-apple-darwin/release/libsekejap.a \
+                       target/x86_64-apple-darwin/release/libsekejap.a \
+               -output build/libsekejap-macos.a
+          lipo -create target/aarch64-apple-ios-sim/release/libsekejap.a \
+                       target/x86_64-apple-ios/release/libsekejap.a \
+               -output build/libsekejap-iossim.a
+          xcodebuild -create-xcframework \
+            -library build/libsekejap-macos.a  -headers "$HDR" \
+            -library target/aarch64-apple-ios/release/libsekejap.a -headers "$HDR" \
+            -library build/libsekejap-iossim.a -headers "$HDR" \
+            -output build/CSekejap.xcframework
+          (cd build && zip -r libsekejap.xcframework.zip CSekejap.xcframework)
+          swift package compute-checksum build/libsekejap.xcframework.zip | tee build/xcframework.checksum.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libsekejap.xcframework.zip
+            build/xcframework.checksum.txt
+
+  # ── Node.js: build the N-API addon per platform and publish to npm ─────────
+  build-node:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: node addon (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runner: macos-14,         target: aarch64-apple-darwin }
+          - { runner: macos-14,         target: x86_64-apple-darwin }
+          - { runner: windows-latest,   target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # Stamp the version from Cargo.toml BEFORE building — the addon bakes
+      # CARGO_PKG_VERSION into version() at compile time, so this must run first
+      # or the published binary reports a stale version.
+      - name: Sync version from Cargo.toml
+        run: ./scripts/sync-wrapper-versions.sh
+      - name: Build addon
+        working-directory: wrappers/node
+        run: |
+          npm install
+          npx napi build --platform --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.target }}
+          path: wrappers/node/*.node
+          if-no-files-found: error
+
+  publish-node:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Publish to npm
+    needs: [verify-version, build-node]
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          path: wrappers/node/artifacts
+      - name: Sync version from Cargo.toml
+        run: ./scripts/sync-wrapper-versions.sh
+      - name: Bundle all binaries into the single package + publish
+        # Single-package model (like lmdb / better-sqlite3): the one `sekejap`
+        # package ships all 5 platform .node files; index.js loads the right one
+        # at runtime. No platform sub-packages → no npm spam filter.
+        working-directory: wrappers/node
+        run: |
+          find artifacts -name '*.node' -exec cp {} . \;   # collect all 5 into the package root
+          rm -rf artifacts
+          ls -lh *.node
+          npm publish --access public                       # `files` allowlist ships index.js + index.d.ts + *.node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Kotlin/JVM → Maven Central. Bundles the per-platform native libs (from
+  # build-native-libs) into resources so the published jar is self-contained. ─
+  publish-kotlin:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Publish to Maven Central
+    needs: [verify-version, build-native-libs]
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-artifacts
+          merge-multiple: true
+      - name: Stage native libs into resources
+        run: |
+          RES=wrappers/kotlin/src/main/resources/natives
+          declare -A MAP=( [linux-x64]=linux-x86_64 [linux-arm64]=linux-aarch64 \
+                           [macos-arm64]=macos-aarch64 [macos-x64]=macos-x86_64 \
+                           [windows-x64]=windows-x86_64 )
+          for tgz in native-artifacts/*.tar.gz; do
+            base=$(basename "$tgz" .tar.gz)          # libsekejap-linux-x64
+            name=${base#libsekejap-}                 # linux-x64
+            dest="$RES/${MAP[$name]}"
+            mkdir -p "$dest"
+            tar -xzf "$tgz" -C /tmp
+            cp /tmp/"$base"/lib/*.so /tmp/"$base"/lib/*.dylib /tmp/"$base"/lib/*.dll "$dest/" 2>/dev/null || true
+          done
+          find "$RES" -type f
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "22"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Publish
+        working-directory: wrappers/kotlin
+        run: gradle publishAndReleaseToMavenCentral --no-configuration-cache --stacktrace
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_GPG_PASSPHRASE }}

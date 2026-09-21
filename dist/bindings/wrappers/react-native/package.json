@@ -1,0 +1,32 @@
+{
+  "name": "@sekejap/react-native",
+  "version": "0.1.0",
+  "description": "sekejap for React Native — typed, reactive, synchronous via JSI (New Architecture).",
+  "license": "MIT OR Apache-2.0",
+  "repository": "github:sekejapdb/sekejap",
+  "homepage": "https://sekejap.life",
+  "keywords": ["database", "react-native", "jsi", "graph", "vector", "spatial", "multi-model"],
+  "main": "src/index.ts",
+  "source": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "src/",
+    "cpp/",
+    "android/",
+    "ios/",
+    "*.podspec",
+    "README.md"
+  ],
+  "dependencies": {
+    "sekejap": "^0.16.2"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.76"
+  },
+  "codegenConfig": {
+    "name": "SekejapJsiSpec",
+    "type": "modules",
+    "jsSrcsDir": "src"
+  }
+}

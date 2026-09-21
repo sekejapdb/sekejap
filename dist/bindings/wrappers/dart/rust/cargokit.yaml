@@ -1,0 +1,9 @@
+# Cargokit precompiled-binaries config. CI builds + signs libsekejap_ffi per platform
+# and uploads to GitHub Releases; consumers download it during `flutter build` (no Rust
+# toolchain needed). Verified against public_key below; falls back to source build on failure.
+#
+# Private key lives in the `release` GitHub env as secret DART_PRECOMPILED_PRIVATE_KEY.
+# Regenerate with: (cd cargokit/build_tool && dart run build_tool gen-key)
+precompiled_binaries:
+  url_prefix: https://github.com/sekejapdb/sekejap/releases/download/precompiled_
+  public_key: 910b23128a2716ac54ceeb947abac6721df2d717dad8c899bcc7afe7c1b5bd5c

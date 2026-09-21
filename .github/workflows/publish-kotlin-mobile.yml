@@ -1,0 +1,107 @@
+# Publishes the ergonomic Kotlin/Android layer to Maven Central under life.sekejap:
+#   life.sekejap:sekejap            (typed runtime, JVM jar)
+#   life.sekejap:sekejap-processor  (KSP processor, JVM jar)
+#   life.sekejap:sekejap-android    (AAR bundling the JNI .so for 3 ABIs)
+#
+# Version is the single source of truth in the root Cargo.toml — no manual bump.
+# Trigger: a release tag `v*` (same tag that releases the rest of the ecosystem),
+# or run it manually (Actions → this workflow → Run workflow). Central versions
+# are immutable, so a re-tag of an already-published version will fail.
+name: Publish Kotlin (mobile ergonomic)
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    name: Publish orm + processor + AAR to Maven Central
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    steps:
+      - uses: actions/checkout@v4
+
+      # The AAR/orm/processor versions are read from Cargo.toml (single source of
+      # truth). On a release tag, refuse to publish if the tag disagrees, so the
+      # mobile artifacts can never diverge from the tag they were cut from.
+      - name: Verify tag matches Cargo.toml
+        shell: bash
+        run: |
+          CARGO_VERSION=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Cargo.toml [workspace.package] version: $CARGO_VERSION"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} != Cargo.toml version ${CARGO_VERSION}. Bump [workspace.package].version to match the tag (or retag), then push again."
+              exit 1
+            fi
+            echo "tag and Cargo.toml agree on ${CARGO_VERSION}"
+          else
+            echo "Manual run (not a tag) — skipping the tag/Cargo equality check."
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Rust (Android targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Remove machine-specific Gradle JDK path (use the CI JDK)
+        run: |
+          sed -i '/org.gradle.java.home/d' \
+            wrappers/kotlin/orm/gradle.properties \
+            wrappers/kotlin/sekejap-android/gradle.properties
+
+      - name: Locate the Android NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-}"
+          if [ -z "$NDK" ]; then
+            NDK=$(ls -d "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/ndk/* 2>/dev/null | sort -V | tail -1)
+          fi
+          test -n "$NDK" || { echo "No Android NDK found"; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "Using NDK: $NDK"
+
+      - name: Cross-compile the JNI library into the AAR (arm64-v8a, armeabi-v7a, x86_64)
+        working-directory: wrappers/kotlin/orm
+        run: |
+          chmod +x build-native.sh
+          JNILIBS="$PWD/../sekejap-android/jniLibs" ./build-native.sh android
+
+      - name: Publish sekejap-orm + sekejap-orm-processor
+        working-directory: wrappers/kotlin/orm
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          chmod +x gradlew
+          # publishToMavenLocal so the AAR build (next step) resolves sekejap-orm.
+          ./gradlew publishToMavenLocal publishAndReleaseToMavenCentral \
+            --no-configuration-cache --stacktrace
+
+      - name: Publish sekejap-android (AAR)
+        working-directory: wrappers/kotlin/sekejap-android
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          chmod +x gradlew
+          ./gradlew publishAndReleaseToMavenCentral --no-configuration-cache --stacktrace

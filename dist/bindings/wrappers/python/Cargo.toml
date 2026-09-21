@@ -1,0 +1,45 @@
+[package]
+name = "sekejap-python"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+documentation = "https://github.com/sekejapdb/sekejap#readme"
+keywords = ["database", "graph", "vector", "multi-model"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[lib]
+name = "sekejap"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# sekejap core (same workspace)
+sekejap = { path = "../.." }
+
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module", "generate-import-lib"] }
+
+# Serialization
+serde_json = "1.0"
+
+[build-dependencies]
+pyo3-build-config = "0.22"
+
+[tool.maturin]
+module-name = "sekejap"
+package-name = "sekejap"
