@@ -90,6 +90,30 @@ dirties about 260 KiB, and the figure is set by R and barely by the
 dimension. The price is one extra point read per node a walk reaches, against
 fewer bytes read per node.
 
+**What a BUILD costs, and what bounds one transaction.** A late build is driven
+in bounded transactions (`Database::build_index_to_ready(id, chunk_rows)`), and
+one transaction may occupy at most 16 MiB of the page-WAL (`WAL_CAP`,
+`core/engine/src/store/pagewal/mod.rs:30`, checked at `:509`). That ceiling is
+not a policy a caller can raise: `wal_allowance()` at `:1244` is
+`WAL_CAP.min(limits.1)`, so `set_runtime_limits` can only lower it. For `exact`
+and `quantized` the ceiling is unreachable -- a locator is 8 bytes and an int8
+entry is the vector's width. For `vamana` it is not, because a build
+transaction's page footprint is set by the SEARCH and the degree rather than by
+the row count: each insert writes its own node record AND read-modify-writes up
+to R = 48 neighbour records scattered across the `0x7D` keyspace, and every
+page so touched is framed. Measured over 10,000 rows at 4,096 lanes
+(`bench/src/bin/vector10k.rs`): **1.53 MB of page-WAL per inserted node**, so
+about ELEVEN nodes fill one transaction, the build is admitted only at 4 rows
+per transaction, and it writes 15.3 GB of page-WAL in total -- ninety-four
+times the 163.8 MB the vectors themselves occupy. At 128 lanes the same
+statement is admitted at 256 rows per transaction. The consequence for the
+query language is stated where it bites: `CREATE INDEX ... USING vamana`
+compiles to `build_index_to_ready(id, 256)` with the chunk fixed in the
+compiler (`lang/src/compile/plan.rs`), so at 4,096 lanes there is NO SQL
+spelling of this index -- the statement is refused with
+`ResourceLimit("page-WAL managed-byte allowance")`, and only a caller using the
+engine atomic, which chooses its own transaction size, can build one.
+
 **What a vamana index promises while it is BUILDING.** Nothing, and it says
 so. A graph over part of a corpus answers a different question from a graph
 over all of it, so a vector order over a `BUILDING` vamana index is REFUSED by

@@ -2,7 +2,7 @@ use sekejap_core::{
     collections::{
         rebuild::{rebuild_derived_indexes, RebuildLimits},
         verification::{verify_indexed_source, VerificationLimits},
-        CollectionOptions, Database, ScalarPredicate,
+        CollectionOptions, Database, ScalarPredicate, VectorMetric,
     },
     pagewal::PageWalStore,
     Kind,
@@ -96,12 +96,16 @@ fn fixture(
     build(&mut db, point);
     let text = db.create_text_index(docs, "body", "body").unwrap();
     build(&mut db, text);
+    let vamana = db
+        .create_vamana_index(docs, "embedding-vamana", "embedding")
+        .unwrap();
+    build(&mut db, vamana);
     db.enable_graph().unwrap();
     db.link(a, "knows", b, "work", &json!({"weight":u64::MAX}))
         .unwrap();
     db.commit().unwrap();
     drop(db);
-    (docs, vec![scalar, vector, quantized, point, text])
+    (docs, vec![scalar, vector, quantized, point, text, vamana])
 }
 
 #[test]
@@ -145,7 +149,7 @@ fn rebuilds_all_derived_families_and_catalog_references_without_touching_source(
 
     let before = inventory(&source);
     let report = rebuild_derived_indexes(&source, &destination, RebuildLimits::default()).unwrap();
-    assert_eq!(report.indexes, 5);
+    assert_eq!(report.indexes, 6);
     assert_eq!(report.primary_rows, 2);
     assert_eq!(report.vector_sidecars, 1);
     assert_eq!(report.primary_edges, 1);
@@ -164,6 +168,12 @@ fn rebuilds_all_derived_families_and_catalog_references_without_touching_source(
             .len(),
         1
     );
+    let approximate = db
+        .query_vamana_vector(indexes[5], &[1.0, 2.0], VectorMetric::SquaredL2, 4, 16, 1 << 16, || {
+            false
+        })
+        .unwrap();
+    assert_eq!(approximate.hits.len(), 1);
 }
 
 #[test]

@@ -701,7 +701,9 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
                 | 0x7a
                 | 0x7b
                 | 0x7c
+                | crate::index::vector::graph::VAMANA_ENTRY
                 | 0x7e
+                | crate::index::vector::graph::VAMANA_ADJACENCY
         ) {
             return Err(Error::Unsupported(format!(
                 "index rebuild does not understand key tag {tag:#x}"
@@ -762,6 +764,16 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
             }
             6 | 7 | 0x12 | 0x71 | 0x72 if metadata.graph_header.is_none() => {
                 return Err(corrupt("graph namespace exists without graph feature"));
+            }
+            crate::index::vector::graph::VAMANA_ENTRY
+            | crate::index::vector::graph::VAMANA_ADJACENCY
+                if metadata.header.indexes.is_none_or(|h| {
+                    h.features & crate::index::vector::graph::VAMANA_FEATURE == 0
+                }) =>
+            {
+                return Err(corrupt(
+                    "vamana keyspace exists without its feature bit",
+                ));
             }
             6 => {
                 if key.len() != 2 || key[1] > 2 {
@@ -1028,13 +1040,26 @@ fn compare_authoritative(source: &SourceView, destination: &CurrentSourceReader)
     Ok(())
 }
 
+/// A Vamana chunk is not a Vamana-sized version of a scalar chunk. A scalar
+/// chunk appends one key per row; a Vamana chunk inserts each row into the
+/// graph, up to `1 + 2R` records for it and for every neighbour a prune
+/// displaces. The same row count is a transaction two orders of magnitude
+/// larger, so the caller's batch is a ceiling for this family, not the value.
+/// The lang-side late build makes the same reduction for the same reason
+/// (`lang/src/compile/plan.rs`, `VAMANA_CHUNK_ROWS`).
+const VAMANA_REBUILD_CHUNK_ROWS: usize = 32;
+
 fn build_indexes(path: &Path, indexes: &[IndexInfo], limits: RebuildLimits) -> Result<()> {
     let mut database = Database::open(path, config(limits.cache_bytes))?;
     for index in indexes {
+        let chunk = match index.family {
+            IndexFamily::VamanaGraph => limits.batch.min(VAMANA_REBUILD_CHUNK_ROWS),
+            _ => limits.batch,
+        };
         // The same entry point a late `CREATE INDEX` uses, so a rebuilt text
         // index is packed into segments exactly as the original build packed
         // it -- byte for byte -- instead of being re-materialized as head rows.
-        database.build_index_to_ready(index.id, limits.batch)?;
+        database.build_index_to_ready(index.id, chunk)?;
     }
     drop(database);
     Ok(())
