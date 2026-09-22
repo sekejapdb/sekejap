@@ -37,9 +37,9 @@ actually has, not a spheroidal predicate PostGIS never shipped.
 | `distance_m` | m | `ST_Distance(a::geography, b::geography)` | Spheroid (Karney geodesic) | Minimum geodesic distance over all part/edge pairs (point-to-point, point-to-segment, segment-to-segment via endpoint+closest-point sampling — see module docs for the exact method and its limits). 0 when the geometries overlap. |
 | `centroid` | lon/lat degrees | `ST_Centroid(g::geography)` | Spheroid (PostGIS ≥2.x computes geography centroids on the sphere) | sekejap computes an area/length-weighted centroid in the same spirit; see module doc for the per-type formula and its divergence from a naive vertex average. |
 | `centroid_distance_m` | m | `ST_Distance(ST_Centroid(a::geography)::geography, ST_Centroid(b::geography)::geography)` | Spheroid | Composition of the two functions above. |
-| `within` | bool | `ST_Within(a::geometry, b::geometry)` | **Planar** | No `geography` overload in PostGIS — casts silently. Vertex/edge test on raw lon/lat as Cartesian coordinates. |
-| `contains` | bool | `ST_Contains(a::geometry, b::geometry)` | **Planar** | Same cast-to-geometry behaviour; `contains(a, b) == within(b, a)` by construction (duality). |
-| `covers` | bool | `ST_Covers(a::geometry, b::geometry)` | **Planar** | No `geography` overload. Boundary-inclusive `contains` (a shared boundary point still counts). |
+| `within` | bool | `ST_Within(a::geometry, b::geometry)` | **Planar** | No `geography` overload: PostGIS refuses a geography argument. Vertex/edge test on raw lon/lat as Cartesian coordinates. |
+| `contains` | bool | `ST_Contains(a::geometry, b::geometry)` | **Planar** | No `geography` overload either; `contains(a, b) == within(b, a)` by construction (duality). |
+| `covers` | bool | `ST_Covers(a::geometry, b::geometry)` | **Planar** | Matches the geometry form. PostGIS also has a geography `ST_Covers`, which sekejap does not answer. Boundary-inclusive `contains` (a shared boundary point still counts). |
 | `crosses` | bool | `ST_Crosses(a::geometry, b::geometry)` | **Planar** | No `geography` overload. Dimensionally-heterogeneous intersection with interior overlap in both directions; PostGIS defines it only for differing-dimension pairs, and returns false for same-dimension pairs (e.g. polygon/polygon) — sekejap matches that. |
 | `intersects` (`intersects_geography`) | bool | `ST_Intersects(a::geography, b::geography)` | Spheroid | PostGIS *does* ship a geography overload (spheroidal edges via GEOS on a sphere). This is the geography-input default and the one sekejap's plain `intersects` matches. |
 | `intersects_planar` | bool | `ST_Intersects(a::geometry, b::geometry)` | Planar | Exposed separately (named explicitly) because the geometry cast form disagrees with the geography form near geodesic edges spanning >0 curvature — callers who need PostGIS's planar answer (e.g. matching `within`/`contains`/`crosses`, which have no geography form) use this one, not `intersects`. |
@@ -56,8 +56,9 @@ index:
 
 ```sql
 -- ST_DWithin on a Point column: PointFilter::Radius, geodesic metres.
+-- ::geography is what makes the radius metres, in PostGIS and here.
 SELECT _key, title FROM posts
-  WHERE ST_DWithin(loc, ST_MakePoint(106.85, -6.25), 5000) LIMIT 5;
+  WHERE ST_DWithin(loc, ST_MakePoint(106.85, -6.25)::geography, 5000) LIMIT 5;
 
 -- A rectangle is ST_Within against an envelope: PointFilter::Bbox.
 SELECT _key FROM posts
@@ -65,19 +66,65 @@ SELECT _key FROM posts
 
 -- The same predicates over a Geo column go to the geometry index.
 SELECT _key FROM posts
-  WHERE ST_Intersects(area, ST_MakeEnvelope(106.80, -6.35, 106.95, -6.20, 4326));
+  WHERE ST_Intersects(area, ST_MakeEnvelope(106.80, -6.35, 106.95, -6.20, 4326)::geography);
 
 -- params: ["{\"type\":\"Point\",\"coordinates\":[106.85,-6.25]}"]
 SELECT _key FROM posts WHERE ST_Contains(area, ST_GeomFromGeoJSON($1));
 
 -- Nearest first: the ring walk out of one centre, not a sort of every row.
 SELECT _key, title FROM posts
-  ORDER BY loc <-> ST_MakePoint(106.85, -6.25) ASC LIMIT 3;
+  ORDER BY loc <-> ST_MakePoint(106.85, -6.25)::geography ASC LIMIT 3;
 
 -- ST_Distance as a ranking leaf, in geodesic metres.
 SELECT _key FROM posts
-  ORDER BY ST_Distance(loc, ST_MakePoint(106.85, -6.25)) ASC LIMIT 3
+  ORDER BY ST_Distance(loc, ST_MakePoint(106.85, -6.25)::geography) ASC LIMIT 3
 ```
+
+## The unit is the type
+
+PostGIS picks a distance's unit from the TYPE of its arguments. On
+`geometry` it measures in the SRID's own units, which for 4326 is degrees. On
+`geography` it measures metres. A column declared `GEOMETRY(Point,4326)` and
+a bare `ST_MakePoint` are both geometry, and geometry is PostGIS's default,
+so in PostGIS `ST_DWithin(loc, ST_MakePoint(106.85, -6.25), 5000)` means
+"within 5,000 degrees" and matches every row on Earth.
+
+sekejap measures metres only. So it accepts a distance form only when
+PostGIS would ALSO read it as metres, and refuses the rest by name with the
+spelling to use instead. A statement sekejap runs therefore means the same
+thing when it is pasted into PostGIS. Checked against PostGIS 3.4.3:
+
+| Written | PostGIS reads it as | sekejap |
+|---|---|---|
+| `ST_DWithin(geom, pt::geography, m)` | metres (the column casts to geography implicitly) | runs |
+| `ST_DWithin(geom, pt, m, true)` | metres (only the geography form has a fourth argument) | runs |
+| `ST_DWithin(geom, pt, m)` | degrees | refused |
+| `ST_Distance(geom, pt::geography)` | metres | runs |
+| `ST_Distance(geom, pt)` | degrees | refused |
+| `geom <-> pt::geography` | metres | runs |
+| `geom <-> pt` | degrees | refused |
+| `ST_Intersects(geom, shape::geography)` | on the Earth's curve | runs |
+| `ST_Intersects(geom, shape)` | on the flat lon/lat plane | refused |
+| `ST_Within` / `ST_Contains` with a 4326 shape | on the flat lon/lat plane | runs |
+| `ST_Within` / `ST_Contains` with `::geography` | no such function, an error | refused |
+| `ST_Within` / `ST_Contains` with a bare `ST_MakePoint` | mixed SRID 0 and 4326, an error | refused |
+
+A shape inside a geography form may leave its SRID off: PostGIS gives a
+geography with no SRID 4326. Inside `ST_Within` and `ST_Contains` it may not,
+so write `ST_SetSRID(ST_MakePoint(lon, lat), 4326)` or pass the SRID as
+`ST_MakeEnvelope`'s fifth argument.
+
+Two things are refused today only because sekejap cannot see them yet, and
+may be accepted later without changing any answer. The first is a column
+declared `GEOGRAPHY`, where PostGIS reads a bare distance as metres. sekejap
+stores the two column types the same way and cannot tell them apart. The
+second is the planar reading of geometry distances, which sekejap does not
+compute.
+
+One small difference remains in `<->`. PostGIS orders geography by distance on
+a sphere, and sekejap orders by distance on the WGS84 spheroid. Two rows
+whose distances differ by less than about half a percent can come back in
+the other order.
 
 A function in the table above that has no Tier-1 spelling is REFUSED by name,
 with the reason, rather than answered from a second implementation:
@@ -94,15 +141,16 @@ SELECT _key FROM posts WHERE ST_Intersects(area, ST_Buffer(loc, 100))
 
 ## Where PostGIS's own default is planar
 
-`ST_Within`, `ST_Contains`, `ST_Covers`, and `ST_Crosses` have **no**
-`geography` overload at all in PostGIS 3.4 or 3.6. Calling them with two
-`geography` arguments compiles (implicit cast) but silently answers on the
-**planar** lon/lat plane, not the spheroid — the same lon/lat values treated
-as flat Cartesian coordinates. This is a real PostGIS behaviour, not a
-limitation sekejap is working around, and worth the owner knowing: a polygon that
-"contains" a point near the antimeridian or a pole under `ST_Contains` may
-disagree with what `ST_DWithin`/`ST_Intersects(geography)` say about the same
-pair, because those two families are quietly using different math. sekejap
+`ST_Within`, `ST_Contains` and `ST_Crosses` have **no** `geography` overload
+in PostGIS. Called with a `geography` argument, PostGIS refuses it as a
+missing function (checked on 3.4.3: `function st_within(geography, geography)
+does not exist`), so they only ever answer on the **planar** lon/lat plane,
+the same lon/lat values treated as flat Cartesian coordinates. `ST_Covers`
+is the exception: PostGIS does have a geography `ST_Covers`, and sekejap's
+`covers` matches only its planar geometry form. This is worth knowing: a
+polygon that "contains" a point near the antimeridian or a pole under
+`ST_Contains` may disagree with what `ST_DWithin`/`ST_Intersects(geography)`
+say about the same pair, because those two families use different math. sekejap
 reproduces this split exactly (`within`/`contains`/`covers`/`crosses` planar,
 `intersects`/`dwithin_m`/`distance_m`/`area_m2`/`length_m`/`perimeter_m`
 spheroidal) rather than "fixing" it, since the owner's ask is unit-for-unit

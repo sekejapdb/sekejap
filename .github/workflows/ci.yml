@@ -46,7 +46,9 @@ jobs:
       # `--no-fail-fast` because cargo stops at the first failing binary
       # otherwise, and a summary read from that output reports the binaries that
       # did run as though they were all of them.
-      - run: cargo test --release --no-fail-fast --features ${{ env.FEATURES }}
+      # --workspace: default-members is core/engine alone, so without it the
+      # kernel, the SQL layer, dist and its doc examples never ran here.
+      - run: cargo test --release --workspace --no-fail-fast --features ${{ env.FEATURES }}
       # The one thing the Rust suite cannot prove about the C ABI: that a C
       # COMPILER accepts the generated header and links the library. `make
       # check` compiles examples/smoke.c against the freshly built libsekejap

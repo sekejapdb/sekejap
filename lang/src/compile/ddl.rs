@@ -147,11 +147,27 @@ impl Compiler<'_> {
         let mut fields = Vec::with_capacity(columns.len());
         let mut declared: Vec<(String, String)> = Vec::new();
         let mut rules: Vec<(String, ColumnRule)> = Vec::new();
-        let mut keys = 0usize;
+        // `_key TEXT PRIMARY KEY` names the key every table already has, the
+        // spelling e1 accepted and its README taught. It declares nothing new,
+        // so it is read and dropped here, before the field list and the
+        // automatic indexes see it: a second copy of the key is exactly what a
+        // user-named PRIMARY KEY column costs, and this spelling asks for none.
+        let names_builtin_key = |column: &ColumnDef| {
+            column.name == "_key"
+                && column.primary_key
+                && matches!(column.kind, Kind::Text)
+                && column.rule.is_none()
+        };
+        let builtin_key = columns.iter().any(names_builtin_key);
+        let columns: Vec<ColumnDef> = columns
+            .into_iter()
+            .filter(|column| !names_builtin_key(column))
+            .collect();
+        let mut keys = usize::from(builtin_key);
         for column in &columns {
             if column.name.starts_with('_') {
                 return Err(SqlError::unsupported(format!(
-                    "column `{}`: names beginning with `_` are reserved (`_id`, `_key`, `_collection`)",
+                    "column `{}`: names beginning with `_` are reserved (`_id`, `_key`, `_collection`). Every table already has `_key` as its primary key; `_key TEXT PRIMARY KEY` may name it, and nothing else may use the name.",
                     column.name
                 )));
             }
@@ -184,7 +200,7 @@ impl Compiler<'_> {
                 "two PRIMARY KEY columns: a row has one external key",
             ));
         }
-        if keys == 1 {
+        if keys == 1 && !builtin_key {
             self.notices.push(format!(
                 "PRIMARY KEY on `{table}`: the column is stored as a declared field AND supplies the external key `Database::put` maps, so the key is held twice (battle50k deviation 13)"
             ));

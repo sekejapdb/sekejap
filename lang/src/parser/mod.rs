@@ -58,6 +58,24 @@ pub(super) struct Parser {
     tokens: Vec<Token>,
     at: usize,
     depth: usize,
+    /// The geometry/geography cast the most recent `optional_cast` chain
+    /// ended on, if any. PostGIS decides a distance's UNIT from the argument
+    /// types -- degrees on `geometry`, metres on `geography` -- so the
+    /// spatial forms read this to tell which of the two a statement wrote
+    /// (`docs/core/SPATIAL_FUNCTIONS.md`, "The unit is the type").
+    last_geo_cast: Option<GeoCast>,
+    /// Whether the most recent spatial argument carried SRID 4326 itself
+    /// (`ST_SetSRID(.., 4326)`, `ST_MakeEnvelope(.., 4326)`, GeoJSON). A bare
+    /// `ST_MakePoint` has SRID 0, which PostGIS refuses against a 4326 column
+    /// in a geometry predicate ("mixed SRID geometries").
+    last_geo_srid: bool,
+}
+
+/// The two spatial types a `::` cast can name. Only the unit rule reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeoCast {
+    Geography,
+    Geometry,
 }
 
 /// What an expression position parsed to, before it is classified into an
@@ -96,6 +114,8 @@ pub(super) fn parse(text: &str) -> SqlResult2<Stmt> {
         tokens: tokenize(text)?,
         at: 0,
         depth: 0,
+        last_geo_cast: None,
+        last_geo_srid: false,
     };
     let statement = parser.statement()?;
     parser.eat(&Tok::Semicolon);

@@ -543,21 +543,29 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let column = self.name()?;
         self.optional_cast()?;
+        let column_cast = self.last_geo_cast;
         self.expect(&Tok::Comma)?;
         let argument = self.geo_argument()?;
+        let argument_cast = self.last_geo_cast;
+        let argument_srid = self.last_geo_srid;
+        let geography = column_cast == Some(GeoCast::Geography)
+            || argument_cast == Some(GeoCast::Geography);
+        let mut use_spheroid = false;
         let metres = if predicate == SpatialPredicate::DWithin {
             self.expect(&Tok::Comma)?;
             let metres = self.literal()?;
-            // PostGIS's fourth argument chooses the spheroid; E4's radius is
-            // spheroidal and has no planar twin.
+            // The fourth argument exists only on PostGIS's GEOGRAPHY
+            // overload, so writing it selects metres there even over a
+            // geometry column (the implicit geometry -> geography cast).
             if self.eat(&Tok::Comma) {
                 match self.word().as_deref() {
                     Some("TRUE") => {
                         self.bump();
+                        use_spheroid = true;
                     }
                     Some("FALSE") => {
                         return Err(SqlError::unsupported(
-                            "ST_DWithin(..., false): use_spheroid = false is a planar distance; PointFilter::Radius and GeometryFilter::DWithin are spheroidal (docs/core/SPATIAL_FUNCTIONS.md) and there is no planar-distance atomic",
+                            "ST_DWithin(..., false): use_spheroid = false measures on a SPHERE; sekejap measures on the WGS84 spheroid only, so the two answers would differ near the radius. Drop the fourth argument or pass true.",
                         ))
                     }
                     _ => {
@@ -574,6 +582,34 @@ impl Parser {
         };
         self.expect(&Tok::RParen)?;
         let _ = at;
+        match predicate {
+            SpatialPredicate::DWithin if !geography && !use_spheroid => {
+                return Err(SqlError::unsupported(
+                    "ST_DWithin needs geography here. PostGIS measures a geometry radius in the SRID's units, which for 4326 is DEGREES: `ST_DWithin(geom, point, 5000)` matches every row on Earth there. sekejap measures metres only, so it accepts the forms PostGIS also reads as metres: `ST_DWithin(geom, ST_MakePoint(lon, lat)::geography, metres)` or `ST_DWithin(geom, point, metres, true)`.",
+                ))
+            }
+            SpatialPredicate::Intersects if !geography => {
+                return Err(SqlError::unsupported(
+                    "ST_Intersects needs geography here. PostGIS answers geometry ST_Intersects on the flat lon/lat plane, and sekejap's intersection filter follows the Earth's curve, so the two can disagree near long edges. Write `ST_Intersects(geom, <shape>::geography)`, which PostGIS also answers on the curve.",
+                ))
+            }
+            SpatialPredicate::Within | SpatialPredicate::Contains if geography => {
+                let name = if predicate == SpatialPredicate::Within {
+                    "ST_Within"
+                } else {
+                    "ST_Contains"
+                };
+                return Err(SqlError::unsupported(format!(
+                    "{name} has no geography form in PostGIS, which refuses `{name}(geography, ...)` as a missing function. Drop the ::geography cast: both engines answer {name} on the flat lon/lat plane."
+                )))
+            }
+            SpatialPredicate::Within | SpatialPredicate::Contains if !argument_srid => {
+                return Err(SqlError::unsupported(
+                    "this shape has no SRID. The column is SRID 4326 and a bare ST_MakePoint or ST_MakeEnvelope is SRID 0, which PostGIS refuses as mixed SRID geometries. Give it the SRID: `ST_SetSRID(ST_MakePoint(lon, lat), 4326)` or `ST_MakeEnvelope(xmin, ymin, xmax, ymax, 4326)`.",
+                ))
+            }
+            _ => {}
+        }
         Ok(Predicate::Spatial {
             predicate,
             column,
@@ -582,10 +618,12 @@ impl Parser {
         })
     }
 
-    /// `::geography` / `::geometry` / `::vector`, read and dropped: the unit
-    /// semantics of a predicate here come from the predicate, not the cast
-    /// (`GeometryFilter`'s own documentation, `src/query/mod.rs`).
+    /// `::geography` / `::geometry` / `::vector` and the scalar casts. Nothing
+    /// is converted; what is kept is WHICH spatial type the chain ended on,
+    /// in `last_geo_cast`, because PostGIS picks a distance's unit from it
+    /// and the spatial forms below have to agree with PostGIS.
     fn optional_cast(&mut self) -> SqlResult2<()> {
+        self.last_geo_cast = None;
         while self.eat(&Tok::Cast) {
             let at = self.here();
             let Some(word) = self.word() else {
@@ -604,6 +642,11 @@ impl Parser {
             if word == "DOUBLE" {
                 self.expect_word("PRECISION")?;
             }
+            match word.as_str() {
+                "GEOGRAPHY" => self.last_geo_cast = Some(GeoCast::Geography),
+                "GEOMETRY" => self.last_geo_cast = Some(GeoCast::Geometry),
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -617,6 +660,8 @@ impl Parser {
 
     fn geo_argument_inner(&mut self) -> SqlResult2<GeoArg> {
         self.guard_word()?;
+        self.last_geo_cast = None;
+        self.last_geo_srid = false;
         let argument = match self.word().as_deref() {
             Some("ST_SETSRID") => {
                 self.bump();
@@ -633,6 +678,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
+                self.last_geo_srid = true;
                 inner
             }
             Some("ST_MAKEPOINT") => {
@@ -664,6 +710,7 @@ impl Parser {
                 self.expect(&Tok::Comma)?;
                 let maxlat = self.literal()?;
                 if self.eat(&Tok::Comma) {
+                    self.last_geo_srid = true;
                     match self.bump() {
                         Tok::Num(n, _) if n == 4326.0 => {}
                         other => {
@@ -687,11 +734,23 @@ impl Parser {
                 self.expect(&Tok::LParen)?;
                 let json = self.literal()?;
                 self.expect(&Tok::RParen)?;
+                // GeoJSON is WGS84 by its own specification, and PostGIS
+                // gives the result SRID 4326.
+                self.last_geo_srid = true;
                 GeoArg::GeoJson(json)
             }
-            _ => GeoArg::GeoJson(self.literal()?),
+            _ => {
+                self.last_geo_srid = true;
+                GeoArg::GeoJson(self.literal()?)
+            }
         };
+        // `ST_SetSRID(ST_MakePoint(..)::geography, 4326)` keeps the inner
+        // cast; a trailing cast of its own overrides it.
+        let inner = self.last_geo_cast;
         self.optional_cast()?;
+        if self.last_geo_cast.is_none() {
+            self.last_geo_cast = inner;
+        }
         Ok(argument)
     }
 
@@ -794,6 +853,9 @@ impl Parser {
                     PExpr::Div(Box::new(left), Box::new(self.expression(2)?))
                 }
                 (2, Tok::VecCosine | Tok::VecL2 | Tok::VecDot) => {
+                    // The left column's cast, read before the right side
+                    // parses and overwrites it.
+                    let left_cast = self.last_geo_cast;
                     let op = match self.peek() {
                         Tok::VecCosine => VecOp::Cosine,
                         Tok::VecL2 => VecOp::L2,
@@ -809,7 +871,15 @@ impl Parser {
                         self.word().as_deref(),
                         Some("ST_SETSRID") | Some("ST_MAKEPOINT") | Some("ST_POINT")
                     ) {
-                        PExpr::Geo(self.geo_argument()?)
+                        let point = self.geo_argument()?;
+                        if left_cast != Some(GeoCast::Geography)
+                            && self.last_geo_cast != Some(GeoCast::Geography)
+                        {
+                            return Err(SqlError::unsupported(
+                                "`<->` to a point needs geography here. On geometry PostGIS orders by DEGREES, which stretches east-west distances away from the equator. sekejap orders by metres only, so write `geom <-> ST_MakePoint(lon, lat)::geography`, which PostGIS also orders by metres.",
+                            ));
+                        }
+                        PExpr::Geo(point)
                     } else {
                         self.expression(3)?
                     };
@@ -905,8 +975,17 @@ impl Parser {
                         self.expect(&Tok::LParen)?;
                         let column = self.name()?;
                         self.optional_cast()?;
+                        let column_cast = self.last_geo_cast;
                         self.expect(&Tok::Comma)?;
-                        let point = match self.geo_argument()? {
+                        let argument = self.geo_argument()?;
+                        if column_cast != Some(GeoCast::Geography)
+                            && self.last_geo_cast != Some(GeoCast::Geography)
+                        {
+                            return Err(SqlError::unsupported(
+                                "ST_Distance needs geography here. On geometry PostGIS returns DEGREES for SRID 4326 (0.02, not 2,200 m). sekejap returns metres only, so write `ST_Distance(geom, ST_MakePoint(lon, lat)::geography)`, which PostGIS also returns in metres.",
+                            ));
+                        }
+                        let point = match argument {
                             GeoArg::Point(point) => point,
                             _ => {
                                 return Err(SqlError::unsupported(

@@ -269,12 +269,14 @@ db.query("""
 
 A `GEOMETRY` column holds a shape (a point, line, or polygon), typed with its
 SRID. With a spatial index you can ask distance and containment questions.
+Distances follow PostGIS: `::geography` makes them metres, so the same query
+gives the same answer in both.
 
 ```python
 # Restaurants within 5 km of a point (longitude, latitude).
 db.query("""
     SELECT name FROM restaurants
-    WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690), 5000.0)
+    WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 5000.0)
 """)
 ```
 
@@ -341,7 +343,7 @@ db.query("""
     WHERE open_now = true
       AND price BETWEEN 40000 AND 90000                             -- price range (IDR)
       AND protein_g >= 25                                           -- enough protein
-      AND ST_DWithin(geometry, ST_MakePoint(115.168, -8.690), 5000.0) -- within 5 km (metres)
+      AND ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 5000.0) -- within 5 km (metres)
       AND to_tsvector('simple', description) @@ to_tsquery('simple', 'grilled & healthy') -- matches the craving
     ORDER BY 0.6 * bm25(description, 'grilled healthy')             -- text relevance
            + 0.4 * (1 - (embedding <=> '[0.7,0.3,0.0,0.0]'))        -- taste similarity
@@ -472,7 +474,7 @@ FROM GRAPH_TABLE (base MATCH
 ORDER BY rating DESC
 
 -- Spatial, vector, and text
-SELECT * FROM places   WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690), 5000.0)
+SELECT * FROM places   WHERE ST_DWithin(geometry, ST_MakePoint(115.168, -8.690)::geography, 5000.0)
 SELECT * FROM tourists ORDER BY taste <=> '[0.9, 0.1, 0.0, 0.0]' LIMIT 5
 
 -- Inspect the database
@@ -495,7 +497,7 @@ let db = Db::open("./bali")?;
 
 // Restaurants within 3 km of a point (longitude, latitude, metres).
 let nearby = db.query(
-    "SELECT name FROM restaurants WHERE ST_DWithin(geometry, ST_MakePoint($1, $2), $3)",
+    "SELECT name FROM restaurants WHERE ST_DWithin(geometry, ST_MakePoint($1, $2)::geography, $3)",
     &[json!(115.168), json!(-8.690), json!(3000.0)],
 )?;
 

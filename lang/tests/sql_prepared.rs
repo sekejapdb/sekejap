@@ -334,7 +334,7 @@ fn radius_oracle(
 fn a_point_radius_rebinds_its_centre_and_its_distance() {
     let (_dir, f) = open();
     let sql =
-        "SELECT _key FROM place WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint($1, $2), 4326), $3)";
+        "SELECT _key FROM place WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)";
     let (lon, lat, radius) = (107.61, -6.91, 20_000.0);
     let second = [Param::Float(lon), Param::Float(lat), Param::Float(radius)];
     let (prepared, got) = rebound(
@@ -392,7 +392,7 @@ fn a_rectangle_over_a_point_column_rebinds_its_four_corners() {
 #[test]
 fn a_geometry_predicate_rebinds_the_geometry_it_compares_against() {
     let (_dir, f) = open();
-    let sql = "SELECT _key FROM place WHERE ST_Contains(plot::geometry, ST_MakePoint($1, $2))";
+    let sql = "SELECT _key FROM place WHERE ST_Contains(plot::geometry, ST_SetSRID(ST_MakePoint($1, $2), 4326))";
     let (lon, lat) = (110.42, -6.97);
     let (prepared, got) = rebound(
         &f.db,
@@ -443,7 +443,7 @@ fn plot_contains(plot: &sekejap_core::collections::Geom, lon: f64, lat: f64) -> 
 #[test]
 fn a_nearest_order_rebinds_its_centre_and_keeps_its_order() {
     let (_dir, f) = open();
-    let sql = "SELECT _key FROM place ORDER BY loc <-> ST_SetSRID(ST_MakePoint($1, $2), 4326) LIMIT 5";
+    let sql = "SELECT _key FROM place ORDER BY loc <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography LIMIT 5";
     let second = [Param::Float(110.42), Param::Float(-6.97)];
     let (prepared, got) = rebound(
         &f.db,
@@ -619,7 +619,7 @@ fn a_per_hop_node_predicate_rebinds_inside_the_traversal() {
 fn a_grouped_count_rebinds_the_predicate_its_groups_are_taken_over() {
     let (_dir, f) = open();
     let sql = "SELECT kind, count(*) AS n FROM place \
-               WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint($1, $2), 4326), $3) GROUP BY kind";
+               WHERE ST_DWithin(loc, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3) GROUP BY kind";
     let (lon, lat, radius) = (110.42, -6.97, 25_000.0);
     let second = [
         Param::Float(lon),

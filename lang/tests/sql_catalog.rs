@@ -1245,7 +1245,7 @@ fn a_predicate_the_row_list_cannot_answer_is_refused_rather_than_scanned() {
             "no aggregate driver",
         ),
         (
-            "SELECT name FROM db_tables ORDER BY name <-> ST_MakePoint(1, 2)",
+            "SELECT name FROM db_tables ORDER BY name <-> ST_MakePoint(1, 2)::geography",
             "names an index",
         ),
     ] {
