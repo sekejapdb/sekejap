@@ -1489,6 +1489,7 @@ fn family_name(family: IndexFamily) -> &'static str {
         IndexFamily::QuantizedVector => "quantized_vector",
         IndexFamily::SpatialPoint => "spatial_point",
         IndexFamily::SpatialGeometry => "spatial_geometry",
+        IndexFamily::VamanaGraph => "vamana_graph",
     }
 }
 

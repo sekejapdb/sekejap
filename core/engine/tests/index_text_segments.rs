@@ -366,13 +366,14 @@ fn the_packed_tier_is_admitted_only_behind_its_own_feature_bit() {
     let older = dir.path().join("older-reader");
     copy_dir(&path, &older);
     // The probe has to name a bit NO released mask implements. This release
-    // implements 0x001 through 0x2000 (typed, graph, vector, spatial, text,
+    // implements 0x0001 through 0x8000 (typed, graph, vector, spatial, text,
     // quantized, segments, per-index tree, geometry, drop, expression,
-    // declared spellings, column rules, live row counts:
-    // `SUPPORTED_LOGICAL_FEATURES`), and 0x4000 is RESERVED for the parallel
-    // semi-join item, so the unknown-bit probe is 0x8000 -- it moves with
-    // that mask, as it moved to 0x2000 when the column rules landed.
-    set_features(&older, 0x2051 | 0x8000);
+    // declared spellings, column rules, live row counts, graph endpoint sets
+    // and the VAMANA GRAPH: `SUPPORTED_LOGICAL_FEATURES`), so the unknown-bit
+    // probe is 0x20000 -- it moves with that mask, as it moved to 0x8000 when
+    // the column rules landed and to 0x10000 when the vamana graph took
+    // 0x8000 for itself.
+    set_features(&older, 0x2051 | 0x20000);
     let before = files(&older);
     assert!(matches!(
         Database::open(&older, cfg()),

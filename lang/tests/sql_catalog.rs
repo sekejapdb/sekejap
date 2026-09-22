@@ -89,12 +89,13 @@ fn open() -> (TempDir, Database) {
     db.sql(
         "CREATE TABLE place (name TEXT, population BIGINT, \
          score DOUBLE PRECISION, open BOOLEAN, tags JSONB, born TIMESTAMPTZ, \
-         opened_on DATE, spot GEOMETRY(Point, 4326), plot GEOMETRY, emb VECTOR(4))",
+         opened_on DATE, spot GEOMETRY(Point, 4326), plot GEOMETRY, emb VECTOR(4)) \
+         WITH (index: none)",
         &[],
     )
     .unwrap();
     db.sql(
-        "CREATE TABLE note (body TEXT NOT NULL, place_key TEXT)",
+        "CREATE TABLE note (body TEXT NOT NULL, place_key TEXT) WITH (index: none)",
         &[],
     )
     .unwrap();
@@ -1310,7 +1311,8 @@ fn explain_names_the_rows_driver_and_states_what_it_cost() {
 fn the_rows_a_view_answers_track_a_catalog_change() {
     let (_dir, mut db) = open();
     let before = rows(&mut db, "SELECT name FROM db_tables").1.len();
-    db.sql("CREATE TABLE extra (n BIGINT)", &[]).unwrap();
+    db.sql("CREATE TABLE extra (n BIGINT) WITH (index: none)", &[])
+        .unwrap();
     assert_eq!(
         rows(&mut db, "SELECT name FROM db_tables").1.len(),
         before + 1,

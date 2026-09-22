@@ -875,6 +875,7 @@ fn index_statement(table: &str, index: &IndexInfo) -> String {
         IndexFamily::SpatialPoint | IndexFamily::SpatialGeometry => format!("gist ({target})"),
         IndexFamily::ExactVector => format!("exact ({target})"),
         IndexFamily::QuantizedVector => format!("quantized ({target} vector_cosine_ops)"),
+        IndexFamily::VamanaGraph => format!("vamana ({target} vector_cosine_ops)"),
     };
     format!(
         "CREATE {unique}INDEX {} ON {table} USING {method}",

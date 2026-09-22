@@ -504,6 +504,7 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
             IndexFamily::SpatialPoint => crate::index::spatial::point::SPATIAL_FEATURE,
             IndexFamily::SpatialGeometry => crate::index::spatial::geometry_index::GEOMETRY_FEATURE,
             IndexFamily::Text => crate::index::text::TEXT_FEATURE,
+            IndexFamily::VamanaGraph => crate::index::vector::graph::VAMANA_FEATURE,
         };
         if !header
             .indexes

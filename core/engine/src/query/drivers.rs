@@ -71,6 +71,19 @@ pub(super) enum DriverPlan {
     QuantizedVector {
         info: IndexInfo,
     },
+    /// Walk the vamana graph's `0x7D` node keyspace in key order, skipping
+    /// the graph header at sequence 0.
+    ///
+    /// This is NOT how the graph is searched -- the search is
+    /// `Database::scan_vamana`, which walks EDGES and reads a few hundred
+    /// records instead of the keyspace. This driver exists for the one plan
+    /// the graph walk cannot serve: a query whose candidates come from the
+    /// ORDER index while a filter still has to be tested per candidate. Then
+    /// the node record is where the candidate's int8 codes live, and reading
+    /// them in key order beats a point get each.
+    VamanaVector {
+        info: IndexInfo,
+    },
     /// Walk the external-key mapping keyspace. `predicate` is a range over
     /// the raw key bytes (`Empty`/`Range` only -- see `CompiledFilter::Key`);
     /// `position` is the filter position it certifies, or `None` when the
@@ -134,6 +147,7 @@ impl DriverPlan {
             Self::Text { prepared, .. } => QueryDriver::Text(prepared.info.id),
             Self::ExactVector { info } => QueryDriver::ExactVector(info.id),
             Self::QuantizedVector { info } => QueryDriver::QuantizedVector(info.id),
+            Self::VamanaVector { info } => QueryDriver::VamanaVector(info.id),
             Self::Keys { .. } => QueryDriver::Keys,
             Self::Membership { position } => QueryDriver::Membership { filter: *position },
         }
@@ -170,6 +184,7 @@ pub(super) fn driver_key(driver: &DriverPlan) -> QueryResult<DriverKey> {
         DriverPlan::Membership { .. } => Ok(DriverKey::Entity),
         DriverPlan::ExactVector { .. }
         | DriverPlan::QuantizedVector { .. }
+        | DriverPlan::VamanaVector { .. }
         | DriverPlan::Nearest { .. } => Err(invalid_query(
             "driver order needs a driver that walks in an order of its own",
         )),
@@ -1222,6 +1237,17 @@ pub(super) struct QuantizedVectorCursor<'a> {
     pub(super) done: bool,
 }
 
+pub(super) struct VamanaVectorCursor<'a> {
+    pub(super) inner: RangeIter<'a>,
+    pub(super) prefix: Vec<u8>,
+    pub(super) info: IndexInfo,
+    /// The head length of this index's node records: the candidate carries
+    /// the head alone, which is byte-identical to a quantized entry, so
+    /// everything downstream scores it with the code it already had.
+    pub(super) head: usize,
+    pub(super) done: bool,
+}
+
 pub(super) struct TextPostingCursor<'a> {
     pub(super) inner: crate::index::text::TermPostings<'a>,
     /// The posting the merge is standing on: document AND term frequency.
@@ -1323,6 +1349,7 @@ pub(super) enum DriverCursor<'a> {
     Text(TextCursor<'a>),
     Vector(VectorCursor<'a>),
     QuantizedVector(QuantizedVectorCursor<'a>),
+    VamanaVector(VamanaVectorCursor<'a>),
     Keys(KeysCursor<'a>),
     Ids(std::vec::IntoIter<(EntityId, Option<Arc<crate::index::graph::EdgeRef>>)>),
 }

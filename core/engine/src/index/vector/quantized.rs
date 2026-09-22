@@ -20,6 +20,10 @@ pub(crate) const OPTIONS: u8 = 0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApproxVectorMethod {
     SymmetricInt8ScanV1,
+    /// The Vamana/DiskANN graph walk of `crate::index::vector::graph`: a
+    /// greedy best-first search over the `0x7D` adjacency, then the same f32
+    /// rerank this family does.
+    VamanaGraphV1,
 }
 
 #[derive(Clone, Copy)]

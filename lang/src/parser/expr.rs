@@ -200,6 +200,39 @@ impl Parser {
         }
         let at = self.here();
         let column = self.name()?;
+        // `payload->>'status' = 'live'`: the ONE JSON path form that becomes
+        // an index range. It is read here rather than refused here because
+        // `refuse::TABLE` still lists `->>` and `guard_operator` still
+        // refuses it in every other position -- a SELECT list, an ORDER BY, a
+        // GROUP BY. `->`, `#>` and `#>>` are not read anywhere: they fall
+        // through to the guard below and are refused by name.
+        if matches!(self.peek(), Tok::LongArrow) {
+            self.bump();
+            let member = self.json_member()?;
+            let what = format!("{column}->>'{member}'");
+            // Only a COMPARISON continues the Tier-1 shape. `->>` standing
+            // anywhere else -- a bare boolean leaf, a function argument --
+            // is the row function that is not built, and is refused by NAME
+            // from the table rather than reported as a missing token.
+            if !matches!(
+                self.peek(),
+                Tok::Eq | Tok::Ne | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge
+            ) {
+                return Err(refuse::refuse("->>"));
+            }
+            let op = self.comparison(&what)?;
+            if op != CmpOp::Eq {
+                return Err(SqlError::unsupported(format!(
+                    "{what} {} v: the expression index over a JSON member stores the member's TEXT, and QL_CONTRACT §4.1 rewrites the EQUALITY over such an expression to an index equality. An ordering comparison over an extracted value is not that, and there is no atomic that answers it index-side",
+                    op.written()
+                )));
+            }
+            let value = self.literal()?;
+            return Ok(Predicate::TextFn {
+                column,
+                shape: TextShape::JsonEq { member, value },
+            });
+        }
         // A cast on the left of a predicate (`plot::geometry`) is PostGIS's
         // way of choosing the planar overload; the unit semantics here come
         // from the predicate itself, so the cast is read and dropped. A cast

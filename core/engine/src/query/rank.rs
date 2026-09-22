@@ -600,24 +600,27 @@ pub(super) fn approximate_vector_score<C: FnMut() -> bool>(
     metric: VectorMetric,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<(f64, [u8; 6])>> {
+    let dimension = crate::query::plan::approximate_dimension(info)?;
     let value = candidate.quantized(info.id).map(<[u8]>::to_vec);
     let value = match value {
         Some(value) => value,
         None => {
             meter.charge(WorkResource::VectorLocators, 1)?;
-            let Some(value) = db
-                .store()?
-                .get(&crate::index::vector::quantized::entry_key(
-                    info.id,
-                    candidate.id.sequence,
-                ))?
-            else {
+            // The two approximate families hold the same HEAD -- locator,
+            // scale, int8 codes -- in two keyspaces. A vamana node record
+            // carries an adjacency tail after it, which nothing here reads.
+            let key = if info.family == IndexFamily::VamanaGraph {
+                crate::index::vector::graph::node_key(info.id, candidate.id.sequence)
+            } else {
+                crate::index::vector::quantized::entry_key(info.id, candidate.id.sequence)
+            };
+            let Some(mut value) = db.store()?.get(&key)? else {
                 return Ok(None);
             };
+            value.truncate(crate::index::vector::graph::head_len(dimension));
             value
         }
     };
-    let dimension = crate::index::vector::quantized::dimension(info)?;
     meter.charge(
         WorkResource::VectorLanes,
         u64::try_from(dimension).map_err(invalid_query)?,
@@ -644,7 +647,7 @@ pub(super) fn rerank_quantized_vector<C: FnMut() -> bool>(
     metric: VectorMetric,
     meter: &mut WorkMeter<'_, C>,
 ) -> QueryResult<Option<f64>> {
-    let dimension = crate::index::vector::quantized::dimension(info)?;
+    let dimension = crate::query::plan::approximate_dimension(info)?;
     // This probe covers historical layout/ordinal validation and the compact
     // entry re-read used for the authoritative consistency check.
     meter.charge(WorkResource::VectorLocators, 1)?;

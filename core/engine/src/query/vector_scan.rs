@@ -207,6 +207,71 @@ impl PreparedQuery<'_> {
                 }
                 Ok(Some((winners, None)))
             }
+            // The GRAPH walk: the whole point of this family. The records
+            // it reads are the nodes within `ef` hops of the query, not the
+            // corpus, so the ceiling below bounds a few hundred reads rather
+            // than one per row.
+            (
+                CompiledOrder::ApproximateVector {
+                    info,
+                    query,
+                    metric,
+                    ef,
+                    ..
+                },
+                DriverPlan::VamanaVector { .. },
+            ) => {
+                let dim = u64::try_from(crate::index::vector::graph::dimension(info)?)
+                    .map_err(invalid_query)?;
+                let after = self.vector_after()?;
+                let k = (*ef).min(held.max(1));
+                let ceiling = scan_ceiling(meter, dim, WorkResource::VectorLocators);
+                let mut budget = None;
+                let result = {
+                    let mut progress =
+                        vector_scan_progress(meter, &mut budget, dim, WorkResource::VectorLocators);
+                    self.db.scan_vamana(
+                        info.id,
+                        query,
+                        *metric,
+                        k,
+                        *ef,
+                        after,
+                        ceiling,
+                        &mut progress,
+                    )
+                };
+                if let Some(error) = budget {
+                    return Err(error);
+                }
+                let result = result?;
+                let reranked = u64::try_from(result.reranked).map_err(invalid_query)?;
+                meter.charge(WorkResource::VectorSidecars, reranked)?;
+                meter.charge(WorkResource::VectorLanes, reranked.saturating_mul(dim))?;
+                let bound = result.hits.len().max(1);
+                let mut winners = Winners::new();
+                for hit in result.hits {
+                    let entry = HeapEntry {
+                        key: RankKey {
+                            value: RankValue::Score(hit.distance.to_bits()),
+                            id: hit.id,
+                        },
+                        descending: false,
+                        row: None,
+                        edge: None,
+                    };
+                    winners.push(bound, entry);
+                }
+                Ok(Some((
+                    winners,
+                    Some(ApproximationDiagnostics {
+                        method: result.method,
+                        ef: result.ef,
+                        examined: result.examined,
+                        reranked: result.reranked,
+                    }),
+                )))
+            }
             (
                 CompiledOrder::ApproximateVector {
                     info,

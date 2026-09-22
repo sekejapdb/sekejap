@@ -77,6 +77,14 @@ predicated write are refused through all three doors and are written as
 `TIMESTAMPTZ` and `DATE` spellings are in the catalog and not only the
 `Kind::Int` underneath them:
 
+`WITH (index: none)` on both shapes is deliberate. Every eligible column of a
+table is indexed when the table is created
+(`docs/lang/INDEX_CONTRACT.md`), so a fixture that said nothing would hold
+indexes this document does not list, and `place.note` -- whose whole job is to
+be the column a refusal can name -- would have one. The fixture therefore opts
+out once per shape and declares each index by hand, which is what makes the
+index tables below exactly what the database holds.
+
 ```sql
 CREATE TABLE posts_example (
     title TEXT,
@@ -90,7 +98,7 @@ CREATE TABLE posts_example (
     loc GEOMETRY(Point, 4326),
     area GEOMETRY(Polygon, 4326),
     emb VECTOR(4)
-);
+) WITH (index: none);
 DROP TABLE posts_example
 ```
 
@@ -121,7 +129,7 @@ Indexes on `posts`:
 | `posts_loc` | gist | `loc` |
 | `posts_area` | gist | `area` |
 | `posts_emb` | exact | `emb` |
-| `posts_emb_ann` | diskann (quantized) | `emb`, `vector_cosine_ops` |
+| `posts_emb_ann` | diskann (the vamana graph family) | `emb`, `vector_cosine_ops` |
 
 ## 3. `people` and the graph
 
@@ -173,7 +181,7 @@ CREATE TABLE place_example (
     emb VECTOR(4),
     tag TEXT,
     note TEXT
-);
+) WITH (index: none);
 DROP TABLE place_example
 ```
 

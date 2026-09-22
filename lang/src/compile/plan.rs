@@ -758,11 +758,15 @@ pub(crate) enum CompiledIndex {
     Scalar { field: String, unique: bool },
     /// An EXPRESSION scalar index over `lower(field)`.
     LowerScalar { field: String },
+    /// An EXPRESSION scalar index over `field->>'member'`, the TEXT at one
+    /// member of a `JSONB` column.
+    JsonScalar { field: String, member: String },
     Text { field: String },
     Point { field: String },
     Geometry { field: String },
     ExactVector { field: String },
     QuantizedVector { field: String },
+    VamanaGraph { field: String },
 }
 
 /// What one `ALTER TABLE` action became: a descriptor rewrite, or a rename.
@@ -775,6 +779,12 @@ pub(crate) enum CompiledAlter {
         declared: Vec<(String, String)>,
         rules: Vec<(String, ColumnRule)>,
         drop_indexes: Vec<(IndexId, String)>,
+        /// The AUTOMATIC indexes of `docs/lang/INDEX_CONTRACT.md` this
+        /// rewrite creates AFTER the layout is repointed: the one an
+        /// `ADD COLUMN` of an eligible kind earns, and the ones a
+        /// `RENAME COLUMN` re-earns under the new name. Empty for every
+        /// other action, and for a column no family covers.
+        create_indexes: Vec<(String, CompiledIndex)>,
     },
     /// `RENAME TO`: one name record, and the `CollectionId` does not change.
     Rename { to: String },
@@ -1137,6 +1147,7 @@ impl WritePlan {
                         declared,
                         rules,
                         drop_indexes,
+                        create_indexes,
                     } => {
                         // The contract's DROP COLUMN drops the column's index
                         // with it. It is the ordinary bounded drop, committed
@@ -1150,6 +1161,16 @@ impl WritePlan {
                             db.commit()?;
                         }
                         db.alter_collection_rules(collection, fields, declared, rules)?;
+                        db.commit()?;
+                        // And the mirror of that: a column the layout now HAS
+                        // gets the index `docs/lang/INDEX_CONTRACT.md` gives
+                        // it, after the layout is repointed and never before
+                        // -- `validate_indexed_layout` refuses an index over a
+                        // field the layout has not got. The build is the same
+                        // `build_index` a `CREATE INDEX` runs.
+                        for (index, method) in create_indexes {
+                            build_index(db, collection, &index, &method)?;
+                        }
                     }
                 }
                 db.commit()?;
@@ -1235,6 +1256,13 @@ fn build_index(
         CompiledIndex::LowerScalar { field } => {
             db.create_expression_index(collection, name, field, IndexExpr::Lower, false)?
         }
+        CompiledIndex::JsonScalar { field, member } => db.create_expression_index(
+            collection,
+            name,
+            field,
+            IndexExpr::JsonText(member.clone()),
+            false,
+        )?,
         CompiledIndex::Text { field } => db.create_text_index(collection, name, field)?,
         CompiledIndex::Point { field } => db.create_point_index(collection, name, field)?,
         CompiledIndex::Geometry { field } => db.create_geometry_index(collection, name, field)?,
@@ -1244,6 +1272,7 @@ fn build_index(
         CompiledIndex::QuantizedVector { field } => {
             db.create_quantized_vector_index(collection, name, field)?
         }
+        CompiledIndex::VamanaGraph { field } => db.create_vamana_index(collection, name, field)?,
     };
     db.commit()?;
     db.build_index_to_ready(id, 256)?;

@@ -371,6 +371,19 @@ impl<'a> DriverCursor<'a> {
                     done: false,
                 }))
             }
+            DriverPlan::VamanaVector { info } => {
+                let prefix = crate::index::vector::graph::node_prefix(info.id);
+                let inner = db.store()?.range(&prefix).map_err(Error::from)?;
+                Ok(Self::VamanaVector(VamanaVectorCursor {
+                    inner,
+                    prefix,
+                    head: crate::index::vector::graph::head_len(
+                        crate::index::vector::graph::dimension(info)?,
+                    ),
+                    info: info.clone(),
+                    done: false,
+                }))
+            }
             DriverPlan::Keys { predicate, position } => {
                 let prefix = prefix(0x20, collection);
                 let mut start = prefix.clone();
@@ -420,6 +433,7 @@ impl<'a> DriverCursor<'a> {
             Self::Text(cursor) => cursor.next(meter),
             Self::Vector(cursor) => cursor.next(meter),
             Self::QuantizedVector(cursor) => cursor.next(meter),
+            Self::VamanaVector(cursor) => cursor.next(meter),
             Self::Keys(cursor) => cursor.next(meter),
             Self::Ids(ids) => Ok(ids.next().map(|(id, edge)| Candidate {
                 edge,
@@ -1150,5 +1164,47 @@ impl QuantizedVectorCursor<'_> {
                 sequence,
             })
         }))
+    }
+}
+
+impl VamanaVectorCursor<'_> {
+    pub(super) fn next<C: FnMut() -> bool>(
+        &mut self,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<Candidate>> {
+        loop {
+            if self.done {
+                return Ok(None);
+            }
+            meter.charge(WorkResource::VectorLocators, 1)?;
+            let Some(row) = self.inner.next() else {
+                self.done = true;
+                return Ok(None);
+            };
+            let (key, value) = row.map_err(Error::from)?;
+            if !key.starts_with(&self.prefix) {
+                self.done = true;
+                return Ok(None);
+            }
+            let mut at = self.prefix.len();
+            let sequence = read_ordered(&key, &mut at)?;
+            if at != key.len() {
+                return Err(corrupt_query("vamana node key"));
+            }
+            // Sequence 0 is the graph header, not a node: no entity has it.
+            if sequence == 0 {
+                continue;
+            }
+            let Some(head) = value.get(..self.head) else {
+                return Err(corrupt_query("vamana node record length"));
+            };
+            return Ok(Some(Candidate {
+                carried: Some(CarriedKey::Quantized(self.info.id, head.to_vec())),
+                ..Candidate::bare(EntityId {
+                    collection: self.info.collection,
+                    sequence,
+                })
+            }));
+        }
     }
 }

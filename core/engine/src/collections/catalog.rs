@@ -8,7 +8,12 @@ pub(super) const REGISTRY: u8 = 4;
 pub(super) const COLLECTION_INDEX: u8 = 5;
 pub(super) const INDEX_NAME: u8 = 0x11;
 pub(crate) const SCALAR: u8 = 0x70;
-pub(super) const MAX_INDEXES: usize = 64;
+/// The most indexes one collection may hold. Widened from `pub(super)` for
+/// `lang`: the AUTOMATIC indexes of `docs/lang/INDEX_CONTRACT.md` are decided
+/// while a `CREATE TABLE` compiles, and a table too wide to carry them must
+/// be refused with the number rather than part-built and refused by the
+/// engine half way down the column list.
+pub const MAX_INDEXES: usize = 64;
 /// First (largest) commit group a sorted build tries. A version-2 index packs
 /// its first run at this group and only at this group; a later attempt, after
 /// an allowance refusal halved it, takes the ascending-put path instead.
@@ -34,6 +39,25 @@ pub(super) const INDEX_TREE_FEATURE: u64 = 0x80;
 /// reading the index as an ordinary one over the source field, which would
 /// answer `col = 'Home'` from keys that hold `'home'` (Law 8).
 pub(super) const EXPRESSION_FEATURE: u64 = 0x400;
+/// The collection header bit that says this database contains at least one
+/// JSON-PATH expression index -- `IndexExpr::JsonText`, a scalar index whose
+/// stored value is `col->>'member'` over a `JSONB` column (descriptor
+/// version 4).
+///
+/// It is a SECOND line behind [`EXPRESSION_FEATURE`], and it is taken rather
+/// than skipped. The descriptor version alone would already stop an older
+/// binary -- version 4 is outside the `(1, 1 | 2 | 3)` family/version pairs
+/// `decode` admits -- but that refusal happens when a DESCRIPTOR is read,
+/// which is deep inside admission and reads as "index family 1 encoding 4"
+/// rather than as "this file is newer than this build". The bit refuses the
+/// file whole at `admit_features`, before a byte of it is touched, with the
+/// sentence every other additive change uses. Law 8 asks for the refusal that
+/// cannot be mistaken for corruption, and this is it.
+///
+/// Monotone and set only by a CREATE that records a JSON-path expression.
+/// `0x8000` is deliberately left free for the graph vector family that is
+/// landing beside this work; this is the bit above it.
+pub const JSON_EXPRESSION_FEATURE: u64 = 0x10000;
 /// Default for new `Database` handles: whether an index CREATED through that
 /// handle gets its own tree. Like the cell-encoding create switch, it decides
 /// what is created, never what can be opened. Both layouts are read and
@@ -86,6 +110,10 @@ pub enum IndexFamily {
     Text,
     QuantizedVector,
     SpatialGeometry,
+    /// The Vamana/DiskANN graph over quantized codes
+    /// (`crate::index::vector::graph`): descriptor family byte 7, keyspace
+    /// `0x7D`, feature bit `0x8000`.
+    VamanaGraph,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct IndexInfo {
@@ -113,32 +141,91 @@ pub struct IndexInfo {
     /// lives in the index and nowhere else.
     pub expression: Option<IndexExpr>,
 }
+impl IndexInfo {
+    /// The declared [`Kind`] of the SOURCE field, which is `kind` for an
+    /// ordinary index and the expression's input kind for an expression one.
+    pub(crate) fn source_kind(&self) -> Kind {
+        self.expression
+            .as_ref()
+            .map_or_else(|| self.kind.clone(), IndexExpr::source_kind)
+    }
+}
 /// The expression an expression index stores.
 ///
 /// The set is CLOSED and each member is O(value bytes) per write, which is
 /// what keeps the per-write hook bounded (Law 1). `Lower` is the one
 /// `docs/lang/QL_CONTRACT.md` §4.1 names: `lower(col) = x` rewrites to a scalar
-/// range only when an index over `lower(col)` exists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// range only when an index over `lower(col)` exists. [`IndexExpr::JsonText`]
+/// is the second: `col->>'name'` over a `JSONB` column, which is the one JSON
+/// path form `docs/lang/INDEX_CONTRACT.md` makes filterable.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IndexExpr {
     Lower,
+    /// `col->>'name'`: the TEXT at ONE member of a JSON object, the operator
+    /// PostgreSQL spells `->>`. The member name travels in the descriptor
+    /// beside the variant byte (descriptor version 4), because two indexes
+    /// over two members of one column are two different indexes and the
+    /// planner tells them apart by this string.
+    ///
+    /// One member, not a path array: `#>`/`#>>` walk a path and stay refused
+    /// by name, and `->` returns JSON rather than text and has no scalar key.
+    JsonText(String),
 }
 impl IndexExpr {
-    pub fn written(self) -> &'static str {
+    /// The expression as a statement writes it, without its source field.
+    pub fn written(&self) -> String {
         match self {
-            Self::Lower => "lower",
+            Self::Lower => "lower".to_owned(),
+            Self::JsonText(member) => format!("->>'{member}'"),
         }
     }
-    fn byte(self) -> u8 {
+    /// The whole target a `CREATE INDEX` would write for this expression over
+    /// `field`, parenthesised the way the statement has to write it.
+    pub fn target(&self, field: &str) -> String {
+        match self {
+            Self::Lower => format!("lower({field})"),
+            Self::JsonText(member) => format!("({field}->>'{member}')"),
+        }
+    }
+    /// The declared [`Kind`] the SOURCE field must have. It is NOT the kind
+    /// the index KEYS are: `lower(col)` reads text and stores text, while
+    /// `col->>'m'` reads a `Json` column and stores `Text`.
+    pub(crate) fn source_kind(&self) -> Kind {
+        match self {
+            Self::Lower => Kind::Text,
+            Self::JsonText(_) => Kind::Json,
+        }
+    }
+    /// The kind of the VALUE this expression stores, which is the kind the
+    /// scalar key encoding uses.
+    pub(crate) fn stored_kind(&self) -> Kind {
+        match self {
+            Self::Lower | Self::JsonText(_) => Kind::Text,
+        }
+    }
+    /// The descriptor encoding version that carries this variant's tail.
+    ///
+    /// Version 3 is the one-byte tail that shipped; version 4 is that byte
+    /// plus a length-prefixed member name. A variant gets a version, never a
+    /// choice of one, so a descriptor's version and its tail cannot disagree.
+    pub(crate) fn descriptor_version(&self) -> u16 {
+        match self {
+            Self::Lower => 3,
+            Self::JsonText(_) => 4,
+        }
+    }
+    fn byte(&self) -> u8 {
         match self {
             Self::Lower => 1,
+            Self::JsonText(_) => 2,
         }
     }
-    fn from_byte(b: u8) -> Result<Option<Self>> {
-        match b {
-            0 => Ok(None),
-            1 => Ok(Some(Self::Lower)),
-            _ => Err(Error::Unsupported("index expression".into())),
+    /// The feature bit a file carrying this expression declares, BESIDE
+    /// [`EXPRESSION_FEATURE`], or zero when the shipped bit covers it.
+    pub(crate) fn feature(&self) -> u64 {
+        match self {
+            Self::Lower => 0,
+            Self::JsonText(_) => JSON_EXPRESSION_FEATURE,
         }
     }
     /// The derived value this index stores for a source value.
@@ -148,10 +235,43 @@ impl IndexExpr {
     /// function in `lang/src/functions.rs`, so the index and the row path
     /// cannot disagree about what `lower(col)` is. A non-string value passes
     /// through unchanged -- `lower` of a number is the number.
-    pub(crate) fn apply(self, value: Option<&Value>) -> Option<Value> {
+    ///
+    /// `JsonText` is TOTAL over every document a `JSONB` column can hold, and
+    /// its rule is written once here because the write path, the verifier and
+    /// the per-candidate filter all call it:
+    ///
+    /// | at the member | stored |
+    /// | --- | --- |
+    /// | a JSON string | that string, unchanged |
+    /// | a JSON number | its canonical JSON text (`1`, `-2.5`) |
+    /// | `true` / `false` | `true` / `false` |
+    /// | JSON `null` | the NULL key |
+    /// | the member is ABSENT | the NULL key |
+    /// | an object or an array | the NULL key |
+    /// | the COLUMN is null or missing | the NULL key |
+    ///
+    /// The NULL key is `[0]` (`src/store/scalar_key.rs`), the one key missing
+    /// and null already share, and no equality against a value can name it:
+    /// `scalar_key::encode` gives every non-null Text key a `4` tag byte. So
+    /// a row whose member is absent is not findable by `col->>'m' = <any
+    /// value>`, which is the rule the extraction owes the reader. Collapsing
+    /// object and array to the NULL key rather than to their serialisation is
+    /// a SACRIFICE (Law 4): PostgreSQL's `->>` returns the serialised JSON
+    /// there, and a serialisation is a second encoding this format would then
+    /// have to freeze -- key order, spacing, number form -- for a value no
+    /// equality in this slice can usefully name.
+    pub(crate) fn apply(&self, value: Option<&Value>) -> Option<Value> {
         match (self, value) {
             (Self::Lower, Some(Value::String(s))) => Some(Value::String(s.to_lowercase())),
-            (_, other) => other.cloned(),
+            (Self::Lower, other) => other.cloned(),
+            (Self::JsonText(member), Some(document)) => Some(match document.get(member.as_str()) {
+                Some(Value::String(s)) => Value::String(s.clone()),
+                Some(Value::Number(n)) => Value::String(n.to_string()),
+                Some(Value::Bool(b)) => Value::String(if *b { "true" } else { "false" }.to_owned()),
+                // Absent, JSON null, object, array: the one NULL key.
+                _ => Value::Null,
+            }),
+            (Self::JsonText(_), None) => Some(Value::Null),
         }
     }
 }
@@ -220,7 +340,7 @@ fn kind_byte(k: &Kind) -> Result<u8> {
 fn encode_tree(b: &mut Vec<u8>, i: &IndexInfo) -> Result<()> {
     match (i.encoding_version, i.tree) {
         (1, None) => Ok(()),
-        (2 | 3, Some(t)) => {
+        (2 | 3 | 4, Some(t)) => {
             if t.id < 2 {
                 return Err(invalid("per-index tree id 0/1 is reserved"));
             }
@@ -238,15 +358,23 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
     if i.tree.is_none() && i.encoding_version != 1 {
         return Err(invalid("index descriptor version does not match its tree"));
     }
-    // Version 3 is version 2 plus a one-byte expression tail, and only the
-    // scalar family carries one: an expression index is a scalar index whose
-    // value is derived.
-    if (i.encoding_version == 3) != (i.expression.is_some())
-        || (i.expression.is_some() && i.family != IndexFamily::Scalar)
-    {
-        return Err(invalid(
-            "an expression index is a version-3 scalar descriptor and nothing else",
-        ));
+    // Version 3 is version 2 plus a one-byte expression tail, version 4 is
+    // that byte plus a length-prefixed member name, and only the scalar
+    // family carries either: an expression index is a scalar index whose
+    // value is derived. The VARIANT chooses the version (`descriptor_version`)
+    // rather than the caller, so a tail can never be written under a version
+    // that does not describe it.
+    if i.encoding_version >= 3 || i.expression.is_some() {
+        let version = i
+            .expression
+            .as_ref()
+            .map(IndexExpr::descriptor_version)
+            .unwrap_or_default();
+        if version != i.encoding_version || i.family != IndexFamily::Scalar {
+            return Err(invalid(
+                "an expression index is a version-3 or version-4 scalar descriptor and nothing else",
+            ));
+        }
     }
     let mut b = i.id.0.to_be_bytes().to_vec();
     b.extend(i.collection.0.to_be_bytes());
@@ -329,6 +457,24 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
             b.push(st);
             b.extend(cursor.to_be_bytes());
         }
+        IndexFamily::VamanaGraph => {
+            let Kind::Vector(dimension) = i.kind else {
+                return Err(invalid("vamana graph index requires a vector field"));
+            };
+            if !(1..=crate::vector_quant::MAX_DIMENSION).contains(&dimension) || i.unique {
+                return Err(invalid("invalid vamana graph descriptor options"));
+            }
+            b.push(7);
+            b.extend(i.encoding_version.to_be_bytes());
+            b.extend(u32::try_from(dimension).map_err(invalid)?.to_be_bytes());
+            b.push(crate::index::vector::quantized::QUANTIZER_VERSION);
+            b.push(crate::index::vector::graph::GRAPH_VERSION);
+            b.push(crate::index::vector::graph::DEGREE as u8);
+            b.extend(crate::index::vector::graph::ALPHA_HUNDREDTHS.to_be_bytes());
+            b.push(crate::index::vector::graph::OPTIONS);
+            b.push(st);
+            b.extend(cursor.to_be_bytes());
+        }
         IndexFamily::QuantizedVector => {
             let Kind::Vector(dimension) = i.kind else {
                 return Err(invalid("quantized vector index requires a vector field"));
@@ -349,8 +495,21 @@ pub(super) fn encode(i: &IndexInfo) -> Result<Vec<u8>> {
         b.extend((s.len() as u16).to_be_bytes());
         b.extend(s.as_bytes());
     }
-    if let Some(expression) = i.expression {
+    if let Some(expression) = &i.expression {
         b.push(expression.byte());
+        // The variant's own tail. A version-4 expression carries the member
+        // name as the same length-prefixed string the name and the field use,
+        // so one reader (`string`) reads all three and one limit -- 1..=128
+        // UTF-8 bytes -- governs all three.
+        if let IndexExpr::JsonText(member) = expression {
+            if member.is_empty() || member.len() > 128 {
+                return Err(invalid(
+                    "a JSON member name requires 1..128 UTF-8 bytes",
+                ));
+            }
+            b.extend((member.len() as u16).to_be_bytes());
+            b.extend(member.as_bytes());
+        }
     }
     packet(MAGIC, &b)
 }
@@ -367,12 +526,13 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
     let collection = CollectionId(u32::from_be_bytes(b[8..12].try_into().unwrap()));
     let version = u16::from_be_bytes(b[13..15].try_into().unwrap());
     let family = match (b[12], version) {
-        (1, 1 | 2 | 3) => IndexFamily::Scalar,
+        (1, 1 | 2 | 3 | 4) => IndexFamily::Scalar,
         (2, 1) => IndexFamily::ExactVector,
         (3, 1 | 2) => IndexFamily::SpatialPoint,
         (4, 1) => IndexFamily::Text,
         (5, 1) => IndexFamily::QuantizedVector,
         (6, 1) => IndexFamily::SpatialGeometry,
+        (7, 1) => IndexFamily::VamanaGraph,
         _ => {
             return Err(Error::Unsupported(format!(
                 "index family {} encoding {version}",
@@ -463,6 +623,30 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
             }
             (Kind::Text, false, 23, 24, 32)
         }
+        IndexFamily::VamanaGraph => {
+            if b.len() < 34 {
+                return Err(corrupt("short vamana graph index descriptor"));
+            }
+            let dimension = u32::from_be_bytes(b[15..19].try_into().unwrap()) as usize;
+            if !(1..=crate::vector_quant::MAX_DIMENSION).contains(&dimension) {
+                return Err(corrupt("vamana graph index dimension"));
+            }
+            // The graph's SHAPE is part of its descriptor: a binary whose
+            // degree or alpha differ would maintain a graph it did not build,
+            // so it refuses the file rather than reading it (Law 8).
+            if b[19] != crate::index::vector::quantized::QUANTIZER_VERSION
+                || b[20] != crate::index::vector::graph::GRAPH_VERSION
+                || usize::from(b[21]) != crate::index::vector::graph::DEGREE
+                || u16::from_be_bytes(b[22..24].try_into().unwrap())
+                    != crate::index::vector::graph::ALPHA_HUNDREDTHS
+                || b[24] != crate::index::vector::graph::OPTIONS
+            {
+                return Err(Error::Unsupported(
+                    "vamana graph quantizer/version/degree/alpha/options".into(),
+                ));
+            }
+            (Kind::Vector(dimension), false, 25, 26, 34)
+        }
         IndexFamily::QuantizedVector => {
             if b.len() < 30 {
                 return Err(corrupt("short quantized vector index descriptor"));
@@ -479,7 +663,7 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
             (Kind::Vector(dimension), false, 21, 22, 30)
         }
     };
-    let tree = if version == 2 || version == 3 {
+    let tree = if matches!(version, 2 | 3 | 4) {
         let tail = b
             .get(at..at + 6)
             .ok_or_else(|| corrupt("short per-index tree descriptor tail"))?;
@@ -502,30 +686,50 @@ pub(super) fn decode(b: &[u8]) -> Result<IndexInfo> {
         2 if cursor == 0 => IndexState::Dropping,
         _ => return Err(Error::Unsupported("index lifecycle state/cursor".into())),
     };
-    let mut string = || -> Result<String> {
+    // The name, the field and a version-4 expression's member name are the
+    // same length-prefixed string under the same 1..=128-byte limit. It is a
+    // function rather than a closure over `at` because the expression tail
+    // below reads `at` directly between two of these calls.
+    fn string(b: &[u8], at: &mut usize) -> Result<String> {
         let size = b
-            .get(at..at + 2)
+            .get(*at..*at + 2)
             .ok_or_else(|| corrupt("index string size"))?;
-        at += 2;
+        *at += 2;
         let n = u16::from_be_bytes(size.try_into().unwrap()) as usize;
         if n == 0 || n > 128 {
             return Err(corrupt("index name/field length"));
         }
         let bytes = b
-            .get(at..at + n)
+            .get(*at..*at + n)
             .ok_or_else(|| corrupt("index string bytes"))?;
-        at += n;
+        *at += n;
         Ok(std::str::from_utf8(bytes).map_err(corrupt)?.to_owned())
-    };
-    let name = string()?;
-    let field = string()?;
-    let expression = if version == 3 {
+    }
+    let name = string(b, &mut at)?;
+    let field = string(b, &mut at)?;
+    let expression = if matches!(version, 3 | 4) {
         let byte = *b.get(at).ok_or_else(|| corrupt("index expression tail"))?;
         at += 1;
-        Some(
-            IndexExpr::from_byte(byte)?
-                .ok_or_else(|| corrupt("version-3 index descriptor without an expression"))?,
-        )
+        let expression = match byte {
+            1 => IndexExpr::Lower,
+            2 => IndexExpr::JsonText(string(b, &mut at)?),
+            0 => {
+                return Err(corrupt(
+                    "version-3/4 index descriptor without an expression",
+                ))
+            }
+            _ => return Err(Error::Unsupported("index expression".into())),
+        };
+        // The variant chooses the version, so a tail read under the wrong one
+        // is a descriptor this build must not act on: `lower` under version 4
+        // or a JSON member under version 3 would each put a reader's idea of
+        // the tail's LENGTH one field out of step with the writer's.
+        if expression.descriptor_version() != version {
+            return Err(Error::Unsupported(
+                "index expression encoding version".into(),
+            ));
+        }
+        Some(expression)
     } else {
         None
     };
@@ -607,10 +811,22 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
                 "spatial geometry descriptor without feature admission",
             ));
         }
+        if i.family == IndexFamily::VamanaGraph
+            && h.features & crate::index::vector::graph::VAMANA_FEATURE == 0
+        {
+            return Err(corrupt("vamana graph descriptor without feature admission"));
+        }
         if i.expression.is_some() && h.features & EXPRESSION_FEATURE == 0 {
             return Err(corrupt(
                 "expression index descriptor without feature admission",
             ));
+        }
+        if let Some(feature) = i.expression.as_ref().map(IndexExpr::feature) {
+            if feature != 0 && h.features & feature == 0 {
+                return Err(corrupt(
+                    "JSON path expression index descriptor without feature admission",
+                ));
+            }
         }
         if i.tree.is_some() && h.features & INDEX_TREE_FEATURE == 0 {
             return Err(corrupt(
@@ -638,8 +854,12 @@ pub(super) fn validate_catalog(s: &PageWalStore, h: Option<IndexHeader>) -> Resu
             |copy| layout_key(c.layout, copy),
             |b| Layout::from_descriptor(b).map_err(corrupt),
         )?;
+        // The layout has to offer the index's SOURCE field. For an
+        // expression index that is not `i.kind`: `col->>'m'` reads a `Json`
+        // column and stores `Text`.
+        let source = i.source_kind();
         if l.id != u64::from(c.layout)
-            || !l.fields.iter().any(|(n, k)| n == &i.field && k == &i.kind)
+            || !l.fields.iter().any(|(n, k)| n == &i.field && k == &source)
         {
             return Err(corrupt("index field/layout mismatch"));
         }
@@ -978,18 +1198,32 @@ impl Database {
             .find(|(n, _)| n == field)
             .map(|(_, k)| k.clone())
             .ok_or_else(|| invalid("index field must be declared"))?;
-        if !matches!(expression, IndexExpr::Lower) || kind != Kind::Text {
-            return Err(invalid("lower(col) is an expression over a TEXT field"));
+        if kind != expression.source_kind() {
+            return Err(invalid(match expression {
+                IndexExpr::Lower => "lower(col) is an expression over a TEXT field",
+                IndexExpr::JsonText(_) => {
+                    "col->>'member' is an expression over a JSONB field"
+                }
+            }));
         }
-        kind_byte(&kind)?;
+        if let IndexExpr::JsonText(member) = &expression {
+            if member.is_empty() || member.len() > 128 {
+                return Err(invalid("a JSON member name requires 1..128 UTF-8 bytes"));
+            }
+        }
+        // The index KEYS are the expression's value, not the column's: a
+        // `col->>'m'` index over a `Json` column holds Text keys.
+        let stored = expression.stored_kind();
+        kind_byte(&stored)?;
+        let feature = EXPRESSION_FEATURE | expression.feature();
         self.create_index_full(
             c,
             name,
             field,
-            kind,
+            stored,
             unique,
             IndexFamily::Scalar,
-            EXPRESSION_FEATURE,
+            feature,
             true,
             Some(expression),
         )
@@ -1092,19 +1326,21 @@ impl Database {
             kind,
             unique,
             state: IndexState::Building { after: 0 },
-            encoding_version: match (expression.is_some(), tree.is_some()) {
-                (true, true) => 3,
-                (false, true) => 2,
+            encoding_version: match (expression.as_ref(), tree.is_some()) {
+                // The VARIANT chooses the version: `lower` is 3, a JSON
+                // member name is 4.
+                (Some(expression), true) => expression.descriptor_version(),
+                (None, true) => 2,
                 // An expression index needs its own tree: the version that
                 // carries the expression tail is the version that carries the
                 // tree tail, so a handle with per-index trees turned off
                 // cannot create one.
-                (true, false) => {
+                (Some(_), false) => {
                     return Err(invalid(
-                        "an expression index requires a per-index tree (descriptor version 3)",
+                        "an expression index requires a per-index tree (descriptor version 3 or 4)",
                     ))
                 }
-                (false, false) => 1,
+                (None, false) => 1,
             },
             tree,
             expression,
@@ -1160,7 +1396,11 @@ impl Database {
     }
     pub(super) fn validate_indexed_layout(&self, c: CollectionId, l: &Layout) -> Result<()> {
         for i in self.list_indexes(c)? {
-            if !l.fields.iter().any(|(n, k)| n == &i.field && k == &i.kind) {
+            // An expression index's `kind` is the kind of the VALUE it
+            // stores, which for `col->>'m'` is Text over a `Json` column. The
+            // layout has to keep offering the SOURCE kind.
+            let source = i.source_kind();
+            if !l.fields.iter().any(|(n, k)| n == &i.field && k == &source) {
                 return Err(invalid(
                     "drop indexed field's indexes completely before removing/retyping it",
                 ));
@@ -1229,6 +1469,10 @@ impl Database {
                 crate::index::vector::quantized::maintain_entry(self, i, id, new_vectors, fresh)?;
                 continue;
             }
+            if i.family == IndexFamily::VamanaGraph {
+                crate::index::vector::graph::maintain_node(self, i, id, new_vectors, fresh)?;
+                continue;
+            }
             if i.family == IndexFamily::SpatialPoint {
                 crate::index::spatial::point::maintain_point(self, i, id, old, new)?;
                 continue;
@@ -1246,7 +1490,7 @@ impl Database {
             // row already carries: no row byte changes and no second read
             // happens.
             let derived = |doc: &Value| -> Result<Vec<u8>> {
-                match i.expression {
+                match &i.expression {
                     None => scalar_key::encode(&i.kind, doc.get(&i.field)),
                     Some(expression) => {
                         let value = expression.apply(doc.get(&i.field));
@@ -1310,7 +1554,7 @@ impl Database {
                 return Err(invalid("historical indexed scalar field changed kind"))
             }
         };
-        match i.expression {
+        match &i.expression {
             None => scalar_key::encode_into(&i.kind, value.as_ref(), out),
             Some(expression) => {
                 let source = value;
@@ -1321,11 +1565,14 @@ impl Database {
                     // lowercasing can make a string LONGER in bytes -- `İ`
                     // (U+0130, 2 bytes) lowers to `i` + U+0307 (3 bytes) --
                     // so a source value inside the 1024-byte text key limit
-                    // can have an image outside it. The row is written and
-                    // the INDEX cannot hold it; there is no shorter key that
-                    // is still the expression's value, so it is refused
-                    // rather than truncated to a key that would answer
-                    // `lower(col) = x` with the wrong rows (Law 8).
+                    // can have an image outside it. A JSON member reaches the
+                    // same wall from the other side: the COLUMN's 1024-byte
+                    // limit does not apply to a document, so `col->>'m'` can
+                    // name a string longer than any Text column could hold.
+                    // The row is written and the INDEX cannot hold it; there
+                    // is no shorter key that is still the expression's value,
+                    // so it is refused rather than truncated to a key that
+                    // would answer the predicate with the wrong rows (Law 8).
                     let source_bytes = source
                         .as_ref()
                         .and_then(Value::as_str)
@@ -1333,8 +1580,8 @@ impl Database {
                     let image_bytes = value.as_ref().and_then(Value::as_str).map_or(0, |s| s.len());
                     if image_bytes > source_bytes {
                         invalid(format!(
-                            "{}(col) of this value is {image_bytes} UTF-8 bytes where the value itself is {source_bytes}, and a scalar Text index key holds at most 1024: Unicode lowercasing can lengthen a string, so an expression index over lower(col) cannot accept every value the column can. Shorten the value or drop the expression index",
-                            expression.written()
+                            "the expression index over `{}` derives a value of {image_bytes} UTF-8 bytes from this row, and a scalar Text index key holds at most 1024. There is no shorter key that is still the expression's value. Shorten the value or drop the expression index",
+                            expression.target(&i.field)
                         ))
                     } else {
                         error
@@ -1350,6 +1597,7 @@ impl Database {
             Scalar(Vec<u8>),
             ExactVector(Option<[u8; 6]>),
             QuantizedVector(Option<Vec<u8>>),
+            VamanaGraph(Option<Vec<u8>>),
             SpatialPoint(Option<crate::index::spatial::point::PointEntry>),
             SpatialGeometry(Vec<crate::index::spatial::geometry_index::GeometryEntry>),
             Text(Option<crate::text_analyzer::Analysis>),
@@ -1397,6 +1645,9 @@ impl Database {
                 ),
                 IndexFamily::QuantizedVector => BuiltEntry::QuantizedVector(
                     crate::index::vector::quantized::build_entry(self, &i, eid, &value)?,
+                ),
+                IndexFamily::VamanaGraph => BuiltEntry::VamanaGraph(
+                    crate::index::vector::graph::build_head(self, &i, eid, &value)?,
                 ),
                 IndexFamily::SpatialPoint => BuiltEntry::SpatialPoint(
                     crate::index::spatial::point::build_point_entry(self, &i, eid, &value)?,
@@ -1463,6 +1714,14 @@ impl Database {
                         &value,
                     )?,
                     BuiltEntry::QuantizedVector(None) => {}
+                    // The late build IS the insert path: linking a row the
+                    // build has reached is the same call a write makes, so
+                    // there is no second construction algorithm that could
+                    // disagree with the live one.
+                    BuiltEntry::VamanaGraph(Some(head)) => {
+                        crate::index::vector::graph::build_link(self, &i, seq, head)?
+                    }
+                    BuiltEntry::VamanaGraph(None) => {}
                     BuiltEntry::SpatialPoint(Some(point)) => {
                         self.index_put(&mut i, &point.key, &point.value)?
                     }
@@ -2144,6 +2403,7 @@ impl Database {
                 IndexFamily::Scalar => ikey(SCALAR, id),
                 IndexFamily::ExactVector => crate::index::vector::exact::locator_prefix(id),
                 IndexFamily::QuantizedVector => crate::index::vector::quantized::entry_prefix(id),
+                IndexFamily::VamanaGraph => crate::index::vector::graph::node_prefix(id),
                 IndexFamily::SpatialPoint => crate::index::spatial::point::posting_prefix(id),
                 IndexFamily::SpatialGeometry => crate::index::spatial::geometry_index::posting_prefix(id),
                 IndexFamily::Text => unreachable!(),

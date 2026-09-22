@@ -463,6 +463,14 @@ pub(super) fn prepare_vector(
     Ok((info, query.to_vec(), norm))
 }
 
+/// The declared dimension of whichever approximate family this index is.
+pub(super) fn approximate_dimension(info: &IndexInfo) -> QueryResult<usize> {
+    Ok(match info.family {
+        IndexFamily::VamanaGraph => crate::index::vector::graph::dimension(info)?,
+        _ => crate::index::vector::quantized::dimension(info)?,
+    })
+}
+
 fn prepare_approximate_vector(
     db: &Database,
     collection: CollectionId,
@@ -474,14 +482,28 @@ fn prepare_approximate_vector(
     if !(1..=crate::collections::catalog::MAX_RESULTS).contains(&ef) {
         return Err(invalid_query("approximate vector ef requires 1..=65536"));
     }
-    let info = require_family_index(
-        db,
-        collection,
-        id,
-        IndexFamily::QuantizedVector,
-        "quantized-vector",
-    )?;
-    let dimension = crate::index::vector::quantized::dimension(&info)?;
+    // Two families answer an APPROXIMATE vector order: the quantized scan
+    // and the vamana graph. They share this order because they share its
+    // meaning -- an `ef`-bounded shortlist of int8 candidates, reranked
+    // exactly against the f32 sidecars -- and differ only in how the
+    // shortlist is found. What differs per family is stated where it is
+    // spent: the driver, the scan and the per-candidate score.
+    let info = db.index_info_cached(id)?;
+    if info.collection != collection {
+        return Err(invalid_query("query index belongs to another collection"));
+    }
+    if !matches!(
+        info.family,
+        IndexFamily::QuantizedVector | IndexFamily::VamanaGraph
+    ) {
+        return Err(invalid_query(
+            "query requires a quantized-vector or vamana-graph index",
+        ));
+    }
+    if info.state != IndexState::Ready {
+        return Err(invalid_query("query index is not ready"));
+    }
+    let dimension = approximate_dimension(&info)?;
     if query.len() != dimension || query.iter().any(|lane| !lane.is_finite()) {
         return Err(invalid_query(
             "query vector has wrong dimension or non-finite lane",
@@ -1648,9 +1670,13 @@ impl Database {
                 CompiledOrder::ExactVector { info, .. } => {
                     Ok(DriverPlan::ExactVector { info: info.clone() })
                 }
-                CompiledOrder::ApproximateVector { info, .. } => {
-                    Ok(DriverPlan::QuantizedVector { info: info.clone() })
-                }
+                CompiledOrder::ApproximateVector { info, .. } => Ok(
+                    if info.family == IndexFamily::VamanaGraph {
+                        DriverPlan::VamanaVector { info: info.clone() }
+                    } else {
+                        DriverPlan::QuantizedVector { info: info.clone() }
+                    },
+                ),
                 CompiledOrder::Bm25(prepared) => Ok(DriverPlan::Text {
                     prepared: prepared.clone(),
                     position: None,
@@ -1955,7 +1981,8 @@ impl Database {
             DriverPlan::Nearest { certifies, .. } => *certifies,
             DriverPlan::Entities
             | DriverPlan::ExactVector { .. }
-            | DriverPlan::QuantizedVector { .. } => None,
+            | DriverPlan::QuantizedVector { .. }
+            | DriverPlan::VamanaVector { .. } => None,
         };
         let mut membership = filters.iter().map(|_| MembershipSet::Ineligible).collect::<Vec<_>>();
         for (position, filter) in filters.iter().enumerate() {

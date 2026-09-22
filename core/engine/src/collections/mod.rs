@@ -116,6 +116,13 @@ pub use crate::index::vector::exact::{VectorCandidates, VectorHit, VectorMetric}
 pub use crate::index::vector::quantized::{
     ApproxVectorMethod, ApproxVectorResult, QuantizedVectorCandidates,
 };
+/// The vamana graph family's declared shape, named once so a test, a
+/// capacity table and a fixture cannot disagree with the engine about it.
+pub use crate::index::vector::graph::{
+    ALPHA_HUNDREDTHS as VAMANA_ALPHA_HUNDREDTHS, BUILD_SEARCH_LIST as VAMANA_BUILD_SEARCH_LIST,
+    DEGREE as VAMANA_DEGREE, GRAPH_VERSION as VAMANA_GRAPH_VERSION, MAX_DEGREE as VAMANA_MAX_DEGREE,
+    VAMANA_ENTRY, VAMANA_FEATURE,
+};
 pub use crate::query::{
     AggValue, Accumulator, AggregateFn, AggregateInput, AggregatePlanDescription, AggregateRequest,
     AggregateShape, CountSource, GroupCmp, GroupKey, GroupOrder, GroupPage, GroupPredicate, GroupRow,
@@ -135,8 +142,8 @@ pub use crate::query::{
 };
 pub use catalog::{
     create_index_trees, set_create_index_trees, IndexExpr, IndexFamily, IndexId, IndexInfo,
-    IndexState,
-    IndexTree, ScalarPredicate,
+    IndexState, JSON_EXPRESSION_FEATURE,
+    IndexTree, ScalarPredicate, MAX_INDEXES,
 };
 pub use column_rules::{ColumnRule, DefaultValue, COLUMN_RULES_FEATURE};
 pub use drop_collection::{DropMode, DropPhase, DropProgress, DropState, MAX_DROP_BATCH};
@@ -783,8 +790,11 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// `0x40` packed text posting segments; `0x80` per-index B-trees; `0x100`
 /// geometry index; `0x200` DROPPING collections; `0x400` expression index;
 /// `0x800` declared-type catalog tail; `0x1000` COLUMN RULES catalog tail;
-/// `0x2000` live row-count records; `0x4000` graph ENDPOINT SETS.
-/// The mask is therefore `0x7fff`.
+/// `0x2000` live row-count records; `0x4000` graph ENDPOINT SETS; `0x8000`
+/// the VAMANA GRAPH keyspace `0x7D` ([`crate::index::vector::graph`]);
+/// `0x10000` JSON-path expression indexes (`IndexExpr::JsonText`, descriptor
+/// version 4).
+/// The mask is therefore `0x1ffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -811,7 +821,9 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | DECLARED_FEATURE
     | column_rules::COLUMN_RULES_FEATURE
     | row_count::ROW_COUNT_FEATURE
-    | crate::index::graph::endpoints::ENDPOINT_FEATURE;
+    | crate::index::graph::endpoints::ENDPOINT_FEATURE
+    | crate::index::vector::graph::VAMANA_FEATURE
+    | catalog::JSON_EXPRESSION_FEATURE;
 /// One header's feature word against the mask a binary implements.
 ///
 /// Split out of [`parse_header`] so a test can put an OLDER mask in place of
@@ -2721,7 +2733,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x7fff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1ffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -2742,14 +2754,17 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x7fff
+            0x1ffff
         );
-        // One bit past the mask is a future family: refused whole, and as
+        // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
-        // `0x8000` is the next bit up, implemented by no build yet.
+        // The probe is always the next bit above the mask. Both the vamana
+        // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
+        // landed together, so the mask is contiguous through bit 16 and the
+        // first unclaimed bit is `0x20000`.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x8000)),
-            Err(Error::Unsupported(m)) if m.contains("0xffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x20000)),
+            Err(Error::Unsupported(m)) if m.contains("0x3ffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -2782,7 +2797,7 @@ mod tests {
         // And a bit past every implemented family is refused by this build
         // too.
         assert!(matches!(
-            admit_features(1 | 0x8000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x20000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }

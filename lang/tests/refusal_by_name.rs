@@ -136,7 +136,11 @@ const NATURAL_POSITION: &[(&str, &str)] = &[
     ),
     // ── §4.1: the JSON path operators stand between a column and a key ───
     ("->", "SELECT _id FROM place WHERE tag -> 'a' = 'b'"),
-    ("->>", "SELECT _id FROM place WHERE tag ->> 'a' = 'b'"),
+    // `->>` is Tier 1 in TWO positions -- the target of a `CREATE INDEX`, and
+    // a WHERE equality that matches such an index -- so the statement that
+    // shows it refused by name is one in NEITHER: a select list
+    // (`docs/lang/INDEX_CONTRACT.md`).
+    ("->>", "SELECT tag ->> 'a' FROM place"),
     ("#>", "SELECT _id FROM place WHERE tag #> 'a' = 'b'"),
     ("#>>", "SELECT _id FROM place WHERE tag #>> 'a' = 'b'"),
     // ── §4.4: the geometry functions stand in the select list ────────────
@@ -324,7 +328,11 @@ fn the_projection_expression_constructs_are_refused_by_name_in_both_positions() 
         ("SELECT ST_Perimeter(plot) FROM place", "ST_PERIMETER", 2),
         ("SELECT ST_Centroid(plot) FROM place", "ST_CENTROID", 2),
         ("SELECT _id FROM place WHERE tag -> 'a' = 'b'", "->", 2),
-        ("SELECT _id FROM place WHERE tag ->> 'a' = 'b'", "->>", 2),
+        // `->>` in a select list: the position that is still the row function
+        // nothing builds. In a WHERE over a JSONB column it is Tier 1 and
+        // rides the expression index (`lang/tests/sql_json_path.rs`).
+        ("SELECT tag ->> 'a' FROM place", "->>", 2),
+        ("SELECT _id FROM place WHERE tag ->> 'a'", "->>", 2),
         ("SELECT _id FROM place WHERE tag #> 'a' = 'b'", "#>", 2),
         ("SELECT _id FROM place WHERE tag #>> 'a' = 'b'", "#>>", 2),
     ] {

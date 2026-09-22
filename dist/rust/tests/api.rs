@@ -256,7 +256,7 @@ fn collections_and_describe_report_the_catalog() {
     let tmp = dir();
     let db = Db::open(tmp.path()).expect("open");
     db.execute(
-        "CREATE TABLE posts (title TEXT, views INT, at TIMESTAMPTZ)",
+        "CREATE TABLE posts (title TEXT, views INT, at TIMESTAMPTZ) WITH (index: none)",
         &[],
     )
     .expect("create");

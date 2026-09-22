@@ -412,6 +412,7 @@ pub enum QueryDriver {
     Text(IndexId),
     ExactVector(IndexId),
     QuantizedVector(IndexId),
+    VamanaVector(IndexId),
     Keys,
     /// The membership set of one boolean filter position, walked in ascending
     /// entity id. Chosen only when no other conjunct and no order names a

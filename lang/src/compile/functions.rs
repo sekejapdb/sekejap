@@ -304,6 +304,35 @@ impl Compiler<'_> {
         shape: &TextShape,
     ) -> SqlResult2<OwnedFilter> {
         let what = shape.written(column);
+        // `col->>'m' = v` is the ONE shape whose column is not TEXT: it reads
+        // a JSONB column and the index holds the member's text. It is
+        // answered from the expression index over that same member and from
+        // nothing else -- a different member, or no index, is a refusal that
+        // names the index it would need, never a scan (QL_CONTRACT §6).
+        if let TextShape::JsonEq { member, value } = shape {
+            if !matches!(self.kind_of(c, column)?, Kind::Json) {
+                return Err(SqlError::unsupported(format!(
+                    "{what}: `->>` extracts from a JSONB column, and `{column}` is not one"
+                )));
+            }
+            let index = self.index_for_expression(
+                c,
+                column,
+                IndexFamily::Scalar,
+                Some(IndexExpr::JsonText(member.clone())),
+                &format!(
+                    "an expression index `CREATE INDEX ... ON t (({column}->>'{member}'))`"
+                ),
+            )?;
+            self.rewrites.push(format!(
+                "{what} -> scalar equality on the expression index over `{column}->>'{member}'` (index-side)"
+            ));
+            return Ok(OwnedFilter::Scalar {
+                index,
+                predicate: OwnedScalarFilter::Eq(Scalar::Text(self.text_of(value)?)),
+                fills: Vec::new(),
+            });
+        }
         if !matches!(self.kind_of(c, column)?, Kind::Text) {
             return Err(SqlError::unsupported(format!(
                 "{what}: `{column}` is not a TEXT column, and a text-key range is over text keys"
@@ -330,6 +359,8 @@ impl Compiler<'_> {
             Ok(if lowered { text.to_lowercase() } else { text })
         };
         let predicate = match shape {
+            // Answered above: it is the one shape whose column is JSONB.
+            TextShape::JsonEq { .. } => unreachable!("JsonEq returns above"),
             TextShape::LowerEq { value } => OwnedScalarFilter::Eq(Scalar::Text(literal(self, value)?)),
             TextShape::LowerPrefix { value, .. } | TextShape::Prefix { value, .. } => {
                 let raw = literal(self, value)?;

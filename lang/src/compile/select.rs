@@ -431,8 +431,17 @@ impl Compiler<'_> {
                     fill,
                 })
             }
-            (None, None, _) => Err(SqlError::engine(format!(
-                "no vector index on `{column}`: a vector order names either the exact family (page-order sidecar scan) or the quantized one (compact scan then f32 rerank)"
+            // NOT `SqlError::Engine`, for the reason `index_for_expression`
+            // is not either (QL_CONTRACT §7 item 9): "there is no index that
+            // can answer this" is a NAMED refusal, and an `Engine` error
+            // reaches a PostgreSQL client as `XX000 internal_error`, the one
+            // code a client RETRIES. Under
+            // `docs/lang/INDEX_CONTRACT.md` this is the refusal a caller is
+            // most likely to meet -- `VECTOR` is the one column kind that is
+            // still declared -- so it is the one that must not look like a
+            // transient fault.
+            (None, None, _) => Err(SqlError::unsupported(format!(
+                "no vector index on `{column}`: a vector order names either the exact family (page-order sidecar scan) or the quantized one (compact scan then f32 rerank). `CREATE INDEX i ON t USING exact ({column})` or `USING quantized ({column})`; docs/lang/INDEX_CONTRACT.md says why this one is not automatic"
             ))),
         }
     }

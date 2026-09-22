@@ -844,6 +844,7 @@ pub fn verify_indexed_source(
                     IndexFamily::SpatialPoint => crate::index::spatial::point::SPATIAL_FEATURE,
                     IndexFamily::SpatialGeometry => crate::index::spatial::geometry_index::GEOMETRY_FEATURE,
                     IndexFamily::Text => crate::index::text::TEXT_FEATURE,
+                    IndexFamily::VamanaGraph => crate::index::vector::graph::VAMANA_FEATURE,
                 };
                 if header.features & required == 0 {
                     return Err(corrupt("index descriptor lacks required feature bit"));
@@ -906,10 +907,14 @@ pub fn verify_indexed_source(
             parse_catalog,
         )?;
         let l = layout(|k| run.read(k), c.layout)?;
+        // The SOURCE kind, which is `info.kind` for an ordinary index and the
+        // expression's input kind for an expression one: `col->>'m'` reads a
+        // `Json` column and stores `Text`.
+        let source = info.source_kind();
         if !l
             .fields
             .iter()
-            .any(|(n, k)| n == &info.field && k == &info.kind)
+            .any(|(n, k)| n == &info.field && k == &source)
         {
             return Err(corrupt("indexed field/layout mismatch"));
         }
@@ -963,6 +968,7 @@ pub fn verify_indexed_source(
                     | 0x7a
                     | 0x7b
                     | 0x7c
+                    | 0x7d
                     | 0x7e
             )
         );
@@ -972,7 +978,9 @@ pub fn verify_indexed_source(
                 key.first()
             )));
         }
-        let Some(tag @ (0x70 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7b | 0x7c)) =
+        let Some(
+            tag @ (0x70 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7b | 0x7c | 0x7d),
+        ) =
             key.first().copied()
         else {
             return Ok(());
@@ -985,6 +993,7 @@ pub fn verify_indexed_source(
             0x74 => IndexFamily::SpatialPoint,
             0x79 => IndexFamily::QuantizedVector,
             0x7c => IndexFamily::SpatialGeometry,
+            0x7d => IndexFamily::VamanaGraph,
             _ => IndexFamily::Text,
         };
         match indexes.iter().find(|index| index.id == id) {
@@ -1323,7 +1332,7 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
             // to be derived the same way, or every row whose stored value is
             // not already its own image reads as Derived/Missing here and as
             // an extra posting in `verify_actual`.
-            let derived = i.expression.map(|e| e.apply(value));
+            let derived = i.expression.as_ref().map(|e| e.apply(value));
             let value = derived.as_ref().map_or(value, |v| v.as_ref());
             let encoded = crate::scalar_key::encode(&i.kind, value)?;
             let key = catalog::skey(i, &encoded, id.sequence);
@@ -1390,6 +1399,31 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
                     actual.as_deref(),
                     Some(&expected),
                     "quantized vector entry",
+                )?;
+            }
+        }
+        // The node record's HEAD is derived from the row exactly as the
+        // quantized entry is, so it is checked the same way. Its adjacency
+        // TAIL is derived from no one row -- it is the index's own structure
+        // -- and what is checked about it is the closure invariant, in
+        // `verify_actual` below.
+        IndexFamily::VamanaGraph => {
+            let expected = quantized_expected(run, i, id, l, row)?;
+            if let Some(expected) = expected {
+                let key = crate::index::vector::graph::node_key(i.id, id.sequence);
+                let head = crate::index::vector::graph::head_len(
+                    crate::index::vector::graph::dimension(i)?,
+                );
+                let actual = run.read(&key)?;
+                let actual_head = actual.as_ref().and_then(|value| value.get(..head));
+                run.mismatch(
+                    IssueClass::Derived,
+                    &key,
+                    Some(i.id),
+                    Some(id),
+                    actual_head,
+                    Some(&expected),
+                    "vamana node head",
                 )?;
             }
         }
@@ -1487,6 +1521,10 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
     Ok(())
 }
 
+/// The head both approximate families derive from one row: the locator into
+/// the immutable f32 sidecar and the int8 codes of that sidecar. One
+/// function, because the two families must agree byte for byte about what a
+/// row's code is, and a second derivation could drift from the first.
 fn quantized_expected<F: FnMut(&VerificationIssue)>(
     run: &mut Run<F>,
     index: &IndexInfo,
@@ -1494,7 +1532,10 @@ fn quantized_expected<F: FnMut(&VerificationIssue)>(
     layout: &Layout,
     row: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    let expected_dimension = crate::index::vector::quantized::dimension(index)?;
+    let expected_dimension = match index.family {
+        IndexFamily::VamanaGraph => crate::index::vector::graph::dimension(index)?,
+        _ => crate::index::vector::quantized::dimension(index)?,
+    };
     let field = field(layout, row, &index.field)?;
     let crate::dense_v3::FieldValue::Vector { ordinal, dimension } = field else {
         return Ok(None);
@@ -1618,7 +1659,7 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
                     // The same derivation as `verify_expected` and
                     // `scalar_build_key_into`: the posting holds the
                     // expression's image of the field, never the field.
-                    let derived = i.expression.map(|x| x.apply(v));
+                    let derived = i.expression.as_ref().map(|x| x.apply(v));
                     let v = derived.as_ref().map_or(v, |x| x.as_ref());
                     let e = crate::scalar_key::encode(&i.kind, v)?;
                     let want = catalog::skey(i, &e, seq);
@@ -1753,6 +1794,135 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
                         expected.as_deref(),
                         "extra/mismatched quantized vector entry",
                     )?;
+                }
+                Ok(())
+            })?;
+        }
+        // Three claims about the `0x7D` keyspace, each against an
+        // INDEPENDENT source: the header is well formed and its entry point
+        // is a node that exists; every node's HEAD is the one the row derives
+        // (the same oracle the quantized family uses); and the neighbour
+        // relation is CLOSED and SYMMETRIC -- every named neighbour has a
+        // record and names this node back. The third is the one that says a
+        // delete stranded no list, and it is paid for in point reads (at most
+        // `DEGREE` per node), which is the budget that exists to bound it.
+        IndexFamily::VamanaGraph => {
+            let dimension = crate::index::vector::graph::dimension(i)?;
+            let p = crate::index::vector::graph::node_prefix(i.id);
+            let end = prefix_end(&p);
+            let source = run.reader.clone();
+            visit(&source, &p, end.as_deref(), |key, value| {
+                run.row(true)?;
+                let mut at = p.len();
+                let seq = match read_ordered(key, &mut at) {
+                    Ok(seq) if at == key.len() => seq,
+                    _ => {
+                        malformed(
+                            run,
+                            IssueClass::Derived,
+                            key,
+                            Some(i.id),
+                            None,
+                            "vamana node key is malformed",
+                        )?;
+                        return Ok(());
+                    }
+                };
+                if seq == 0 {
+                    let header = match crate::index::vector::graph::decode_header(value) {
+                        Ok(header) => header,
+                        Err(_) => {
+                            malformed(
+                                run,
+                                IssueClass::Derived,
+                                key,
+                                Some(i.id),
+                                None,
+                                "vamana graph header is malformed",
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    if header.entry != 0 {
+                        let entry = crate::index::vector::graph::node_key(i.id, header.entry);
+                        if run.read(&entry)?.is_none() {
+                            run.issue(VerificationIssue {
+                                class: IssueClass::Derived,
+                                kind: IssueKind::Missing,
+                                key: entry,
+                                index: Some(i.id),
+                                entity: None,
+                                message: "vamana graph entry point has no node record".into(),
+                            })?;
+                        }
+                    }
+                    return Ok(());
+                }
+                let adjacency = match crate::index::vector::graph::decode_node(value, dimension, seq)
+                {
+                    Ok((head, adjacency)) => {
+                        if let Some((id, layout, row)) = primary_field(run, i, seq)? {
+                            let expected = quantized_expected(run, i, id, &layout, &row)?;
+                            run.mismatch(
+                                IssueClass::Derived,
+                                key,
+                                Some(i.id),
+                                Some(id),
+                                Some(head),
+                                expected.as_deref(),
+                                "extra/mismatched vamana node head",
+                            )?;
+                        }
+                        adjacency
+                    }
+                    Err(_) => {
+                        malformed(
+                            run,
+                            IssueClass::Derived,
+                            key,
+                            Some(i.id),
+                            Some(EntityId {
+                                collection: i.collection,
+                                sequence: seq,
+                            }),
+                            "vamana node record is malformed",
+                        )?;
+                        return Ok(());
+                    }
+                };
+                for neighbour in adjacency.sequences() {
+                    let other = crate::index::vector::graph::node_key(i.id, neighbour);
+                    let Some(bytes) = run.read(&other)? else {
+                        run.issue(VerificationIssue {
+                            class: IssueClass::Derived,
+                            kind: IssueKind::Missing,
+                            key: other,
+                            index: Some(i.id),
+                            entity: Some(EntityId {
+                                collection: i.collection,
+                                sequence: seq,
+                            }),
+                            message: "vamana neighbour list names a node with no record".into(),
+                        })?;
+                        continue;
+                    };
+                    let names_back = crate::index::vector::graph::decode_node(
+                        &bytes, dimension, neighbour,
+                    )
+                    .is_ok_and(|(_, back)| back.sequences().any(|other| other == seq));
+                    if !names_back {
+                        run.issue(VerificationIssue {
+                            class: IssueClass::Derived,
+                            kind: IssueKind::Mismatch,
+                            key: other,
+                            index: Some(i.id),
+                            entity: Some(EntityId {
+                                collection: i.collection,
+                                sequence: seq,
+                            }),
+                            message: "vamana neighbour relation is not symmetric".into(),
+                        })?;
+                    }
                 }
                 Ok(())
             })?;

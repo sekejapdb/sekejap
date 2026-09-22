@@ -1687,7 +1687,9 @@ impl PreparedQuery<'_> {
     fn driver_certifies(&self) -> Option<usize> {
         match &self.driver {
             DriverPlan::Entities | DriverPlan::ExactVector { .. } => None,
-            DriverPlan::QuantizedVector { .. } | DriverPlan::Geometry { .. } => None,
+            DriverPlan::QuantizedVector { .. }
+            | DriverPlan::VamanaVector { .. }
+            | DriverPlan::Geometry { .. } => None,
             DriverPlan::Scalar { position, .. } => *position,
             DriverPlan::Graph { position } => Some(*position),
             DriverPlan::Spatial { position, .. } => Some(*position),
@@ -1774,6 +1776,10 @@ impl PreparedQuery<'_> {
                 "quantized vector index {} ({}), compact scan then f32 rerank",
                 info.name, info.field
             ),
+            DriverPlan::VamanaVector { info } => format!(
+                "vamana graph index {} ({}), node keyspace in key order",
+                info.name, info.field
+            ),
             DriverPlan::Keys { predicate, .. } => format!(
                 "external-key mapping keyspace, {}",
                 scalar_predicate_text(predicate)
@@ -1789,6 +1795,7 @@ impl PreparedQuery<'_> {
             DriverPlan::Entities
                 | DriverPlan::ExactVector { .. }
                 | DriverPlan::QuantizedVector { .. }
+                | DriverPlan::VamanaVector { .. }
         )
     }
 

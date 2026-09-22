@@ -46,16 +46,17 @@ impl Parser {
         // The INDEX SUGAR of QL_CONTRACT §2. `WITH` is the only word that may
         // follow the closing parenthesis, and it opens the clause below
         // rather than ending the statement.
-        let indexes = if self.eat_word("WITH") {
-            self.with_indexes()?
+        let (indexes, automatic) = if self.eat_word("WITH") {
+            self.with_clause()?
         } else {
-            Vec::new()
+            (Vec::new(), Automatic::All)
         };
         Ok(Stmt::CreateTable {
             table,
             columns,
             if_not_exists,
             indexes,
+            automatic,
         })
     }
 
@@ -63,7 +64,8 @@ impl Parser {
     /// contract lists them. A key outside this set is refused BY NAME with
     /// the set written out -- never a bare syntax error, because the whole
     /// point of the sugar is that the caller is told what it can say.
-    const WITH_KEYS: [&'static str; 7] = [
+    const WITH_KEYS: [&'static str; 8] = [
+        "index",
         "hash",
         "range",
         "fulltext",
@@ -83,9 +85,10 @@ impl Parser {
     /// more than once and the pairs accumulate in written order; a pair that
     /// names the same column twice under one family collides on its generated
     /// index name and is refused there (`lang/src/compile/ddl.rs`).
-    fn with_indexes(&mut self) -> SqlResult2<Vec<WithIndex>> {
+    fn with_clause(&mut self) -> SqlResult2<(Vec<WithIndex>, Automatic)> {
         self.expect(&Tok::LParen)?;
         let mut out = Vec::new();
+        let mut automatic: Option<Automatic> = None;
         loop {
             let at = self.here();
             let Some(key) = self.word() else {
@@ -115,6 +118,23 @@ impl Parser {
                     at,
                 ));
             }
+            // `index:` is the one key whose value is NOT a family for the
+            // columns it lists: it says which columns get the AUTOMATIC
+            // indexes of `docs/lang/INDEX_CONTRACT.md`, and `none` is the
+            // word that turns them all off. Written twice it is refused,
+            // because the second spelling would silently replace the first.
+            if key == "index" {
+                if automatic.is_some() {
+                    return Err(SqlError::unsupported(
+                        "CREATE TABLE ... WITH (index: ...) written twice: the key says which columns get their AUTOMATIC index and there is one answer per statement; write one `index:` entry naming every column (docs/lang/INDEX_CONTRACT.md)",
+                    ));
+                }
+                automatic = Some(self.automatic_value(at)?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+                continue;
+            }
             if !self.eat(&Tok::LBracket) {
                 return Err(SqlError::syntax(
                     format!(
@@ -139,7 +159,47 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen)?;
-        Ok(out)
+        Ok((out, automatic.unwrap_or(Automatic::All)))
+    }
+
+    /// The value of the `index:` key: `none`, or a bracketed column list.
+    ///
+    /// `all` is taken as well, because it is the word a reader reaches for
+    /// when they want to say out loud what the default already is, and
+    /// refusing it would be refusing a statement that means exactly what it
+    /// says. `index: []` is `none` written with brackets.
+    fn automatic_value(&mut self, at: usize) -> SqlResult2<Automatic> {
+        if let Some(word) = self.word() {
+            let word = word.to_ascii_lowercase();
+            if word == "none" || word == "all" {
+                self.bump();
+                return Ok(if word == "none" {
+                    Automatic::None
+                } else {
+                    Automatic::All
+                });
+            }
+        }
+        if !self.eat(&Tok::LBracket) {
+            return Err(SqlError::syntax(
+                format!(
+                    "WITH (index: ...) takes `none`, `all`, or a bracketed column list -- `index: none` or `index: [one, two]` -- found `{}`",
+                    self.peek().written()
+                ),
+                at,
+            ));
+        }
+        let mut columns = Vec::new();
+        if !self.eat(&Tok::RBracket) {
+            loop {
+                columns.push(self.name()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RBracket)?;
+        }
+        Ok(Automatic::Only(columns))
     }
 
     fn written_keys() -> String {
@@ -552,7 +612,27 @@ impl Parser {
                     alias: None,
                 }
             }
-            alias @ ("HNSW" | "DISKANN" | "IVFFLAT") => {
+            // `vamana` is the family's own name and `diskann` is the name
+            // the algorithm is published under; both build the GRAPH. `hnsw`
+            // and `ivfflat` name families this engine does not have and stay
+            // aliases of `quantized`, which says so in a notice.
+            "VAMANA" => {
+                let column = self.name()?;
+                self.vector_opclass()?;
+                IndexMethod::Vamana {
+                    column,
+                    alias: None,
+                }
+            }
+            "DISKANN" => {
+                let column = self.name()?;
+                self.vector_opclass()?;
+                IndexMethod::Vamana {
+                    column,
+                    alias: Some("diskann".to_owned()),
+                }
+            }
+            alias @ ("HNSW" | "IVFFLAT") => {
                 let column = self.name()?;
                 self.vector_opclass()?;
                 IndexMethod::Quantized {
@@ -562,7 +642,7 @@ impl Parser {
             }
             "BRIN" | "HASH" => {
                 return Err(SqlError::unsupported(format!(
-                    "USING {method}: the index families are btree, gin, gist, exact and quantized (docs/core/SOURCE_LAYOUT.md, `src/index/`)"
+                    "USING {method}: the index families are btree, gin, gist, exact, quantized and vamana (docs/core/SOURCE_LAYOUT.md, `src/index/`)"
                 )))
             }
             other => {
@@ -590,7 +670,8 @@ impl Parser {
     }
 
     /// `vector_cosine_ops` and its siblings, which name the metric.
-    /// A btree index's target: a column, or `lower(column)`.
+    /// A btree index's target: a column, `lower(column)`, or
+    /// `(column->>'member')`.
     fn index_expression(&mut self) -> SqlResult2<IndexMethod> {
         if self.word().as_deref().map(str::to_ascii_uppercase).as_deref() == Some("LOWER")
             && matches!(self.peek_at(1), Tok::LParen)
@@ -601,7 +682,52 @@ impl Parser {
             self.expect(&Tok::RParen)?;
             return Ok(IndexMethod::LowerBtree(column));
         }
-        Ok(IndexMethod::Btree(self.name()?))
+        // `((payload->>'status'))`: Postgres wants an expression target
+        // parenthesised, and the outer pair is this method's own, so the
+        // inner pair is what stands here.
+        let parenthesised = self.eat(&Tok::LParen);
+        let column = self.name()?;
+        // `->>` is READ here rather than refused here. It is listed in
+        // `refuse::TABLE` and `guard_operator` refuses it everywhere else,
+        // which is the point: the operator compiles in exactly two positions
+        // -- this one, and a WHERE that matches an index built here.
+        if matches!(self.peek(), Tok::LongArrow) {
+            self.bump();
+            let member = self.json_member()?;
+            if parenthesised {
+                self.expect(&Tok::RParen)?;
+            }
+            return Ok(IndexMethod::JsonBtree { column, member });
+        }
+        if parenthesised {
+            self.expect(&Tok::RParen)?;
+        }
+        Ok(IndexMethod::Btree(column))
+    }
+
+    /// The `'member'` of `col->>'member'`: a single-quoted string, and only
+    /// that.
+    ///
+    /// A `$n` parameter is refused rather than accepted: the member is part
+    /// of the IDENTITY of the index a predicate names (`index_for_expression`
+    /// matches on it), and an identity settled at bind time would make the
+    /// same prepared statement name different indexes on different
+    /// executions.
+    pub(super) fn json_member(&mut self) -> SqlResult2<String> {
+        let at = self.here();
+        match self.bump() {
+            Tok::Str(member) if !member.is_empty() && member.len() <= 128 => Ok(member),
+            Tok::Str(_) => Err(SqlError::unsupported(
+                "col->>'member': a JSON member name requires 1..128 UTF-8 bytes, which is the limit the index descriptor holds it under (`core/engine/src/collections/catalog.rs`)",
+            )),
+            other => Err(SqlError::syntax(
+                format!(
+                    "expected a quoted JSON member name after `->>`, found `{}`",
+                    other.written()
+                ),
+                at,
+            )),
+        }
     }
 
     fn vector_opclass(&mut self) -> SqlResult2<()> {

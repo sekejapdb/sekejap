@@ -28,8 +28,8 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("~", Tier::Three, "QL_CONTRACT §3: regex `~` has no index atomic."),
     ("&&", Tier::Two, "QL_CONTRACT §4.4: `&&` with ST_MakeEnvelope is a Bbox filter on the point or geometry index (p3-geometry-io). Not built in this slice; ST_Within against an envelope is the Tier-1 spelling of the same rectangle."),
     ("@>", Tier::Two, "QL_CONTRACT §3: array containment has no Tier-1 atomic in this slice."),
-    ("->", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2). `->` returns the JSON value and `->>` its text; neither becomes an index range without an expression index over the same path."),
-    ("->>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2)."),
+    ("->", Tier::Two, "QL_CONTRACT §4.1: `->` returns the JSON VALUE at a member, not its text, and a JSON value has no scalar index key -- there is nothing for an expression index to store and nothing for an equality to compare. Its text sibling `->>` is Tier 1 in the two positions an index covers: `CREATE INDEX i ON t ((col->>'m'))` and a WHERE equality that matches such an index."),
+    ("->>", Tier::Two, "QL_CONTRACT §4.1: `col->>'m'` compiles in exactly TWO positions -- the target of `CREATE INDEX i ON t ((col->>'m'))`, and a WHERE equality `col->>'m' = v` answered from that index. Everywhere else -- a SELECT list, ORDER BY, GROUP BY, an ordering comparison -- it is a row function over the PROJECTION-EXPRESSION surface (§7 item 5), which is not built."),
     ("#>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2). `#>` walks a path array and is the same missing surface `->` and `->>` name."),
     ("#>>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2). `#>>` walks a path array and returns text; it is the same missing surface `->` and `->>` name."),
     // ── §2 statements ────────────────────────────────────────────────────

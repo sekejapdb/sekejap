@@ -114,11 +114,12 @@ fn one_intact_future_index_encoding_replica_refuses_before_mutation() {
         let mut descriptor = raw.get(&key).unwrap().unwrap();
         assert_eq!(&descriptor[..8], b"E4IDX01\0");
         // Packet header is ten bytes; encoding version follows id/u32/family.
-        // Version 2 is the per-index-tree scalar/spatial layout and version 3
-        // the EXPRESSION layout (`catalog.rs`, `decode`) -- both are written
-        // and read by THIS binary, so the unknown-version probe moved up to 4
-        // exactly as it moved from 2 to 3.
-        descriptor[23..25].copy_from_slice(&4u16.to_be_bytes());
+        // Version 2 is the per-index-tree scalar/spatial layout, version 3
+        // the `lower(col)` EXPRESSION layout and version 4 the JSON-member
+        // one (`catalog.rs`, `decode`) -- all three are written and read by
+        // THIS binary, so the unknown-version probe moved up to 5 exactly as
+        // it moved from 2 to 3 and from 3 to 4.
+        descriptor[23..25].copy_from_slice(&5u16.to_be_bytes());
         reseal(&mut descriptor);
         raw.put(&key, &descriptor).unwrap();
         raw.commit().unwrap();

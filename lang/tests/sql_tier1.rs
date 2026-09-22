@@ -927,7 +927,7 @@ fn create_table_and_create_index_build_a_queryable_collection() {
             day DATE, \
             loc GEOMETRY(Point,4326), \
             area GEOMETRY(Polygon,4326), \
-            emb VECTOR(4))",
+            emb VECTOR(4)) WITH (index: none)",
         &[],
     )
     .unwrap();

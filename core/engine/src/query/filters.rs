@@ -179,7 +179,7 @@ fn selected_field_in(
 /// the driver did not certify is compared field-against-image and every row
 /// whose stored value is not already its own image is dropped.
 fn indexed_value(info: &IndexInfo, value: Value) -> Value {
-    match info.expression {
+    match &info.expression {
         None => value,
         // `apply` is total over `Some`: it returns the image, or the value
         // itself for a kind the expression does not fold.

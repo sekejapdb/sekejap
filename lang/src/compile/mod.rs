@@ -215,7 +215,14 @@ impl Compiler<'_> {
                 columns,
                 if_not_exists,
                 indexes,
-            } => Plan::Write(self.create_table(table, columns, if_not_exists, &indexes)?),
+                automatic,
+            } => Plan::Write(self.create_table(
+                table,
+                columns,
+                if_not_exists,
+                &indexes,
+                &automatic,
+            )?),
             Stmt::CreateIndex {
                 name,
                 table,
@@ -497,9 +504,20 @@ impl Compiler<'_> {
         )))
     }
 
+    /// Resolve a bare index name over the whole catalog.
+    ///
+    /// This used to probe index ids 1..=64 and stop, which silently failed to
+    /// find an index in any database that had ever allocated more than
+    /// sixty-four of them: an id is not reused when an index is dropped, so a
+    /// long-lived database walks past the ceiling and `DROP INDEX <name>`
+    /// then reported that a present index did not exist. It now walks the
+    /// catalog itself, which is the only thing that knows what exists.
     fn index_named(&self, name: &str) -> SqlResult2<Option<IndexId>> {
-        for n in 1..=64u64 {
-            if let Ok(info) = self.db.index_info(IndexId(n)) {
+        for collection in self.db.list_collections().map_err(SqlError::from)? {
+            let Some(c) = self.db.collection(&collection).map_err(SqlError::from)? else {
+                continue;
+            };
+            for info in self.db.list_indexes(c).map_err(SqlError::from)? {
                 if info.name == name {
                     return Ok(Some(info.id));
                 }

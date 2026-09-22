@@ -81,6 +81,7 @@ const DOCS: &[&str] = &[
     "docs/dist/FFI_CONTRACT.md",
     "docs/dist/OPS_CONTRACT.md",
     "docs/lang/QL_CONTRACT.md",
+    "docs/lang/INDEX_CONTRACT.md",
     "docs/lang/EXAMPLE_FIXTURE.md",
     "docs/core/COLLECTIONS.md",
     "docs/core/GRAPH_CONTRACT.md",
@@ -423,7 +424,7 @@ fn build_fixture(path: &Path) -> Result<(), Error> {
             loc GEOMETRY(Point, 4326),
             area GEOMETRY(Polygon, 4326),
             emb VECTOR(4)
-        )",
+        ) WITH (index: none)",
         &[],
     )?;
 
@@ -538,7 +539,7 @@ fn build_place(db: &Db) -> Result<(), Error> {
             emb VECTOR(4),
             tag TEXT,
             note TEXT
-        )",
+        ) WITH (index: none)",
         &[],
     )?;
 
@@ -608,6 +609,11 @@ fn build_place(db: &Db) -> Result<(), Error> {
     }
     // `note` is deliberately left WITHOUT an index, so a predicate over it is
     // refused rather than demoted to a scan and a doc example can show that.
+    // That is what `WITH (index: none)` on the CREATE TABLE above is for:
+    // `docs/lang/INDEX_CONTRACT.md` indexes every eligible column of a table
+    // by default, and the fixture declares its indexes BY HAND so the tables
+    // in `docs/lang/EXAMPLE_FIXTURE.md` are exactly what the database holds
+    // and `note` has nothing over it.
 
     // The `near` chain of §0, in the base graph context: `p000 -> p001 -> …
     // -> p199`, 199 edges, each carrying its own `weight`.

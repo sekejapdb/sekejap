@@ -161,17 +161,37 @@ db.execute("""
 """)
 ```
 
-### 2. Add indexes for the query types you'll use
+### 2. Add the two indexes that are a choice
 
-An index makes a certain kind of lookup fast. You only need the ones your
-queries actually use — a `WHERE` over a column with no index is refused, not
-answered by scanning every row.
+Ordinary columns are already indexed. `TEXT`, `INT`, `REAL`, `BOOLEAN`,
+`TIMESTAMPTZ`, `DATE` and `GEOMETRY` columns get their index when the table is
+created and it is kept up to date on every write, so the tables above can be
+queried as they stand. There was never a decision to make about them: there is
+one way to index a number, and it costs about a microsecond per row to
+maintain.
+
+Two things are a real choice, and you declare those:
 
 ```python
-db.execute("CREATE INDEX ON dishes USING gist (geometry)")                            # location queries
 db.execute("CREATE INDEX ON dishes USING gin  (to_tsvector('simple', description))")  # text relevance
 db.execute("CREATE INDEX ON tourists USING quantized (taste vector_cosine_ops)")      # vector similarity
 ```
+
+Full-text search brings an analyzer and an index roughly the size of the text.
+A vector index is the one genuine trade in the system — an exact index answers
+the true nearest set, a quantized one is an order of magnitude smaller and
+approximate — and nobody can pick for you.
+
+A `WHERE` over a column with no index is still refused rather than answered by
+scanning every row. If you want a wide table to index nothing automatically,
+say so once:
+
+```python
+db.execute("CREATE TABLE events (_key TEXT PRIMARY KEY, payload TEXT) WITH (index: none)")
+```
+
+The full rule, column type by column type, is in
+[`docs/lang/INDEX_CONTRACT.md`](docs/lang/INDEX_CONTRACT.md).
 
 ### 3. Insert data
 
@@ -192,8 +212,8 @@ db.query("SELECT name, home_city FROM tourists WHERE home_city = 'Melbourne'")
 # → { name: "Chloe", home_city: "Melbourne" }
 ```
 
-That's the whole loop: create tables, add the indexes you need, insert rows and
-relationships, and query. The rest of this README shows what each data model can
+That's the whole loop: create tables, declare the two indexes that are a
+choice, insert rows and relationships, and query. The rest of this README shows what each data model can
 do, then how to combine them.
 
 ## The five data models
@@ -348,6 +368,7 @@ db.execute("""
 """)
 db.execute("CREATE INDEX ON diary USING gin       (to_tsvector('simple', reflection))")  # search the text
 db.execute("CREATE INDEX ON diary USING quantized (mood vector_cosine_ops)")             # find similar moods
+# `author`, `place` and `logged_at` were indexed by the CREATE TABLE above.
 
 # "Where did I write about feeling small?" — text search over the entries.
 db.query("""
@@ -384,25 +405,32 @@ db.query("""
 
 ## Indexes
 
-An index speeds up one kind of query. Create only the ones you need.
+An index speeds up one kind of query. Most of them are already there.
 
-| Index | `USING` keyword | Makes this fast |
-|---|---|---|
-| Hash | `hash` | equality: `field = 'x'`, `IN (...)` |
-| B-tree | `btree` | ranges and ordering: `>`, `<`, `BETWEEN`, `ORDER BY` |
-| GIN | `gin` over `to_tsvector(...)` | boolean text match and BM25 ranking |
-| GiST | `gist` | location: `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects` |
-| Exact vector | `exact` | exact nearest neighbour: `<=>`, `<->`, `<#>` ordering |
-| Quantized vector | `quantized` (aliases: `hnsw`, `diskann`, `ivfflat`, `vamana`) | approximate nearest neighbour, faster at scale |
+| Index | `USING` keyword | Makes this fast | |
+|---|---|---|---|
+| Hash | `hash` | equality: `field = 'x'`, `IN (...)` | automatic |
+| B-tree | `btree` | ranges and ordering: `>`, `<`, `BETWEEN`, `ORDER BY` | automatic |
+| GiST | `gist` | location: `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects` | automatic |
+| GIN | `gin` over `to_tsvector(...)` | boolean text match and BM25 ranking | declared |
+| Exact vector | `exact` | exact nearest neighbour: `<=>`, `<->`, `<#>` ordering | declared |
+| Quantized vector | `quantized` (aliases: `hnsw`, `diskann`, `ivfflat`, `vamana`) | approximate nearest neighbour, faster at scale | declared |
 
 ```sql,tour
-CREATE INDEX ON dishes   USING gist       (geometry)
 CREATE INDEX ON dishes   USING gin        (to_tsvector('simple', description))
 CREATE INDEX ON tourists USING quantized  (taste vector_cosine_ops)
 ```
 
+An AUTOMATIC index is created with the table: an ordinary column has one
+implementation and one obvious answer, so you are not asked. A DECLARED one is
+a trade you have to make — an analyzer and a large index for full text, size
+against exactness for vectors. `WITH (index: none)` on the `CREATE TABLE` turns
+the automatic ones off, and `WITH (index: [a, b])` keeps only the columns you
+name; `docs/lang/INDEX_CONTRACT.md` is where the line is drawn and why.
+
 All index types survive a restart and update as you write, so a build only
-happens once, at `CREATE INDEX`.
+happens once — at `CREATE TABLE` for an automatic one, at `CREATE INDEX` for a
+declared one.
 
 ## Interfaces
 

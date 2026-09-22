@@ -37,8 +37,11 @@ use tempfile::TempDir;
 /// reached rather than refused for a missing index, `name` for the fold and
 /// `note` with NO index at all, so a predicate on it has something to name.
 const DDL: &[&str] = &[
+    // `WITH (index: none)` because `docs/lang/INDEX_CONTRACT.md` indexes every
+    // eligible column of a table by default, and `note` has to stay
+    // unindexed for the refusal below to have anything to name.
     "CREATE TABLE place (id TEXT PRIMARY KEY, kind TEXT, name TEXT, note TEXT, \
-     loc GEOMETRY(Point,4326), area GEOMETRY(Polygon,4326))",
+     loc GEOMETRY(Point,4326), area GEOMETRY(Polygon,4326)) WITH (index: none)",
     "CREATE INDEX place_kind ON place USING btree (kind)",
     "CREATE INDEX place_loc ON place USING gist (loc)",
     "CREATE INDEX place_area ON place USING gist (area)",

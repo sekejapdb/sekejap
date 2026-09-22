@@ -93,9 +93,17 @@ and rewrites nothing -- a statement goes to `SqlDatabase::sql` as written.
 
 **A `WHERE` needs an index on the column it filters.** A declared column with
 no index is refused, by name, rather than answered by reading every row: Law 6
-buys no silent scan. This is the first thing a caller meets that no other
-database does, so write the `CREATE INDEX` beside the `CREATE TABLE`. A filter
-on the key needs none -- the key is the tree's own order.
+buys no silent scan. A filter on the key needs none -- the key is the tree's
+own order.
+
+A table declared through SQL usually has the index already. `CREATE TABLE`
+indexes every ordinary column as it creates it (`docs/lang/INDEX_CONTRACT.md`);
+what stays declared is `gin` full text and a `VECTOR` index, where there is a
+real trade to make. `Db::create_collection` is the exception and creates NONE:
+it takes a `FieldKind` list and not a declared SQL type, and the line that
+contract draws -- `SMALLINT` yes, `VECTOR(n)` no -- is drawn over declared
+types. Write the `CREATE INDEX` beside a `create_collection`, or declare the
+collection with `execute("CREATE TABLE ...")` and get them.
 
 The statements those three doors take, run on
 [the example fixture](../lang/EXAMPLE_FIXTURE.md):

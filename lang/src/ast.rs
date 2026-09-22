@@ -184,6 +184,14 @@ pub(super) enum TextShape {
     LowerEq {
         value: Literal,
     },
+    /// `col->>'member' = 'v'`: an equality over the TEXT at one member of a
+    /// `JSONB` column. It needs the expression index
+    /// `CREATE INDEX ... ON t ((col->>'member'))` and is REFUSED without it,
+    /// naming that index (`docs/lang/INDEX_CONTRACT.md`).
+    JsonEq {
+        member: String,
+        value: Literal,
+    },
     LowerPrefix {
         value: Literal,
         /// The spelling the statement used, for the EXPLAIN line.
@@ -677,6 +685,29 @@ pub(super) struct ColumnDef {
     pub(super) rule: Option<ColumnRule>,
 }
 
+/// What the `index:` key of `CREATE TABLE ... WITH (...)` says about the
+/// AUTOMATIC indexes of `docs/lang/INDEX_CONTRACT.md`.
+///
+/// The contract's rule is that an index is DECLARED when there is a decision
+/// and AUTOMATIC when there is not, so the default is [`Automatic::All`] and
+/// the statement says nothing. The two other spellings are the escape the
+/// contract's "What automatic costs, and how to refuse it" section names:
+/// `WITH (index: none)` and `WITH (index: [col, col])`.
+///
+/// It is STATEMENT-SCOPED and nothing about it is stored: no descriptor
+/// field, no feature bit. A later `ALTER TABLE ... ADD COLUMN` of an
+/// eligible kind indexes that column whatever this statement said, because
+/// the catalog carries no memory of the choice.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Automatic {
+    /// No `index:` key: every eligible column gets its family.
+    All,
+    /// `index: none` -- nothing automatic.
+    None,
+    /// `index: [a, b]` -- only these columns, and only if they are eligible.
+    Only(Vec<String>),
+}
+
 /// One `key: [column]` pair of the `CREATE TABLE ... WITH (...)` sugar.
 ///
 /// The parser records the SPELLING; which index family it becomes, and
@@ -746,13 +777,27 @@ pub(super) enum IndexMethod {
     /// `lower(col)`, which is what makes `lower(col) = x` a range rather
     /// than a refusal (QL_CONTRACT §4.1).
     LowerBtree(String),
+    /// `CREATE INDEX i ON t ((col->>'member'))`: the same EXPRESSION scalar
+    /// family over the TEXT at one member of a `JSONB` column, which is what
+    /// makes `col->>'member' = x` a range rather than a refusal
+    /// (`docs/lang/INDEX_CONTRACT.md`).
+    JsonBtree {
+        column: String,
+        member: String,
+    },
     /// `gin(to_tsvector('simple', col))`.
     Gin(String),
     Gist(String),
     Exact(String),
-    /// `quantized(col vector_cosine_ops)`, and its hnsw/diskann/ivfflat
-    /// aliases, which carry the alias name so a notice can say so.
+    /// `quantized(col vector_cosine_ops)`, and its hnsw/ivfflat aliases,
+    /// which carry the alias name so a notice can say so.
     Quantized {
+        column: String,
+        alias: Option<String>,
+    },
+    /// `vamana(col vector_cosine_ops)` and its `diskann` spelling: the
+    /// Vamana/DiskANN GRAPH, a family of its own.
+    Vamana {
         column: String,
         alias: Option<String>,
     },
@@ -814,6 +859,11 @@ pub(super) enum Stmt {
         /// the statement had no `WITH` clause, which is every `CREATE TABLE`
         /// written before this sugar existed.
         indexes: Vec<WithIndex>,
+        /// The `index:` key of the same clause: which columns the statement
+        /// wants the AUTOMATIC indexes of `docs/lang/INDEX_CONTRACT.md` for.
+        /// [`Automatic::All`] when the key is absent, which is every
+        /// `CREATE TABLE` written before that contract.
+        automatic: Automatic,
     },
     CreateIndex {
         name: String,
@@ -960,6 +1010,9 @@ impl TextShape {
     pub(super) fn written(&self, column: &str) -> String {
         match self {
             Self::LowerEq { value } => format!("lower({column}) = {}", value.written()),
+            Self::JsonEq { member, value } => {
+                format!("{column}->>'{member}' = {}", value.written())
+            }
             Self::LowerPrefix { value, written } => {
                 format!("{written} over lower({column}), prefix {}", value.written())
             }

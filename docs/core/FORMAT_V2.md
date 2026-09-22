@@ -144,10 +144,14 @@ The index families follow: `0x70` scalar entries, `0x71`/`0x72` the two graph
 edge directions, `0x73` exact vector, `0x74` spatial point, `0x75`-`0x78` text
 postings / norms / term statistics / corpus statistics, `0x79` quantized
 vector, `0x7A`/`0x7B` packed text segments and norm blocks, `0x7C` geometry
-cells, `0x7E` graph ENDPOINT SETS
+cells, `0x7D` the VAMANA GRAPH's node records
+([core/engine/src/index/vector/graph.rs](../../core/engine/src/index/vector/graph.rs),
+behind `VAMANA_FEATURE = 0x8000`), `0x7E` graph ENDPOINT SETS
 ([core/engine/src/index/graph/endpoints.rs](../../core/engine/src/index/graph/endpoints.rs),
-behind `ENDPOINT_FEATURE = 0x4000`). `0x7D` is free and is reserved for the
-live per-collection row count. Graph, spatial, text and vector-navigation
+behind `ENDPOINT_FEATURE = 0x4000`). The live per-collection row count took
+`0x08` rather than `0x7D`, so `0x7D` was the last free tag in the index run and
+the vamana family is what claimed it. **There is no free tag left below
+`0x7F`.** Graph, spatial, text and vector-navigation
 indexes allocate new, noncolliding namespaces after auditing the complete
 registry; the prior engine's tag values cannot be copied blindly. Each
 persisted index family needs explicit encoding version/catalog descriptors and
@@ -157,6 +161,67 @@ index rebuild. All shipped encodings remain readable **and writable** by newer
 releases under Law 8. Adding a keyspace plus an additive feature bit is the
 only permitted change to the on-disk format under v2. Add immutable fixtures
 when each family ships.
+
+### The vamana graph, as the worked example of this boundary
+
+The Vamana/DiskANN graph is the one family since v2 froze that changed the
+on-disk format, and it changed it in exactly the two ways this section permits
+and in no other:
+
+* **One new keyspace, `0x7D`.** `key = 0x7D || ordered(index id) ||
+  ordered(sequence)`. Sequence 0 is the per-index GRAPH HEADER (version,
+  degree, build search list, alpha, entry point, node count); every other
+  sequence is one node — a HEAD that is byte-for-byte a quantized entry
+  (`locator | scale | int8 codes`) followed by `own:u16 | back:u16` and that
+  many `(neighbour:u64be, distance:f32be)` edges. No existing keyspace, record
+  or descriptor moved a byte.
+* **One additive feature bit, `0x8000`.** Set in the same transaction that
+  creates the first vamana descriptor, never cleared, and
+  `SUPPORTED_LOGICAL_FEATURES` moved from `0x7fff` to `0xffff` with it. A
+  binary whose mask predates the bit refuses such a file WHOLE, at admission,
+  as `Unsupported` and never as corruption
+  (`core/engine/tests/format_vamana_compat.rs`
+  `a_build_that_predates_the_vamana_bit_refuses_the_corpus_by_name_and_changes_no_byte`).
+
+Its immutable fixtures are `docs/format-v2-vamana/`: two independently
+captured corpora (checkpointed and wal-pending), written once by
+[bench/src/bin/vamana_format_fixture.rs](../../bench/src/bin/vamana_format_fixture.rs)
+and never regenerated to make a later engine pass. Each MANIFEST carries the
+generator's own brute-force expected neighbours, so the compatibility suite
+compares the engine against numbers no engine produced.
+
+```sh
+cargo run -p sekejap-bench --release --bin vamana_format_fixture -- docs/format-v2-vamana
+```
+
+**The index DESCRIPTOR's own encoding versions** are the second additive
+register, and the scalar family is the only one that has more than one. A
+version is a TAIL: nothing before it moves, and each version's tail is fixed by
+the thing it carries, never chosen by a writer.
+
+| version | family | tail after the cursor | shipped with |
+|---|---|---|---|
+| 1 | every family | nothing | the original catalog |
+| 2 | scalar, spatial point | `tree_id: u16 BE \|\| root: u32 BE` | `INDEX_TREE_FEATURE = 0x80` |
+| 3 | scalar | version 2's tail, then a one-byte expression tag (`1` = `lower`) | `EXPRESSION_FEATURE = 0x400` |
+| 4 | scalar | version 3's tail with tag `2` = `->>`, then `len: u16 BE \|\| member: UTF-8` (1..=128 bytes) | `JSON_EXPRESSION_FEATURE = 0x10000` |
+
+Version 4 is the JSON-PATH expression index: a scalar index whose stored value
+is `col->>'member'` over a `JSONB` column, added 2026-09-22. The member name
+travels in the descriptor because it is part of the IDENTITY of the index a
+predicate names -- two indexes over two members of one column are two
+different indexes. The variant chooses the version
+(`IndexExpr::descriptor_version`), so a reader that meets tag `2` under
+version 3, or tag `1` under version 4, refuses the descriptor as `Unsupported`
+rather than reading the next field at the wrong offset.
+
+The version alone already stops an older binary -- version 4 is outside the
+`(family 1, version 1 | 2 | 3)` pairs it admits -- and the feature bit is
+taken anyway. That refusal fires when a DESCRIPTOR is read, deep inside
+admission, and reads as "index family 1 encoding 4"; the bit refuses the file
+WHOLE at `admit_features`, before a byte is touched, with the sentence every
+other additive change uses. Law 8 asks for the refusal that cannot be mistaken
+for damage.
 
 ## Fixture provenance
 
@@ -413,7 +478,12 @@ these persistent tags blindly.
   COUNT records of `core/engine/src/collections/row_count.rs` (key tag `0x08`,
   one 16-byte record per collection: `rows: u64 BE || generation: u64 BE`).
   `0x4000` is RESERVED for the parallel semi-join item and is deliberately NOT
-  implemented by this build, so a file that declares it is refused here too. Every bit in it is
+  implemented by this build, so a file that declares it is refused here too.
+  It is `0x17fff` from 2026-09-22, when `JSON_EXPRESSION_FEATURE = 0x10000`
+  was added for the JSON-PATH expression index (descriptor version 4,
+  `IndexExpr::JsonText`); `0x8000` is RESERVED for the graph vector family and
+  is not implemented here, so the mask has a hole in it and a file declaring
+  that bit is refused by this build. Every bit in it is
   the bit-by-bit table in the doc comment above it. It stood at `0xfff`, then
   `0x1fff` from 2026-09-21 when `COLUMN_RULES_FEATURE = 0x1000` was added for
   the per-field COLUMN RULE tail (`DEFAULT`, `NOT NULL`), and is `0x7fff` from
@@ -421,7 +491,9 @@ these persistent tags blindly.
   (`core/engine/src/index/graph/endpoints.rs`). `0x2000` is deliberately
   unimplemented in this mask and is reserved for the live per-collection row
   count, so a file that declares it is refused by this build exactly as any
-  other unknown bit is. Every bit in it is
+  other unknown bit is. `JSON_EXPRESSION_FEATURE = 0x10000` (2026-09-22) took
+  it to `0x17fff`, leaving `0x8000` reserved for the graph vector family.
+  Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as
   `Unsupported` at admission, before a record is read (Law 8). Adding a bit is

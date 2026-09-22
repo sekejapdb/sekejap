@@ -50,6 +50,11 @@ declare is an ordinary application time column: a declared `TIMESTAMPTZ` or
 `DEFAULT now()` fills it when the INSERT does not name it, which is one clock
 read per row.
 
+Both time columns are indexed by the `CREATE TABLE` itself -- a declared
+`TIMESTAMPTZ` or `DATE` is one of the kinds `docs/lang/INDEX_CONTRACT.md`
+indexes without being asked -- so the two range predicates below answer with no
+`CREATE INDEX` between them and the insert:
+
 ```sql
 CREATE TABLE sensor_log (
     sensor TEXT,
@@ -59,8 +64,6 @@ CREATE TABLE sensor_log (
 );
 INSERT INTO sensor_log (_key, sensor, celsius, on_day)
     VALUES ('s1-0001', 's1', 21.5, '2026-01-04');
-CREATE INDEX sensor_log_day ON sensor_log USING btree (on_day);
-CREATE INDEX sensor_log_at ON sensor_log USING btree (observed_at);
 SELECT _key, sensor, on_day FROM sensor_log WHERE on_day = '2026-01-04';
 SELECT _key FROM sensor_log WHERE EXTRACT(YEAR FROM observed_at) >= 2026
 ```

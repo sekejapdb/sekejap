@@ -1288,7 +1288,9 @@ fn expect_zero_primary(combo: &Combo, driver: QueryDriver) -> bool {
         | QueryDriver::Geometry { .. }
         | QueryDriver::Membership { .. }
         | QueryDriver::Graph { .. } => false,
-        QueryDriver::ExactVector(_) | QueryDriver::QuantizedVector(_) => {
+        QueryDriver::ExactVector(_)
+        | QueryDriver::QuantizedVector(_)
+        | QueryDriver::VamanaVector(_) => {
             matches!(combo.order, OwnedOrder::Bm25)
         }
     }

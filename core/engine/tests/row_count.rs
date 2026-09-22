@@ -583,7 +583,8 @@ fn a_write_during_a_half_finished_backfill_still_lands_on_the_walk() {
 
 /// Law 8. A file that declares the bit is refused WHOLE, as `Unsupported`, by
 /// a binary that does not implement the keyspace. The probe here is the
-/// `0x8000` bit, which no build implements yet,
+/// `0x20000` bit, which no build implements yet (`0x8000` is the vamana
+/// graph's),
 /// so the refusal is this build's own production decision and not a
 /// re-implementation of it. `collections::tests::
 /// a_row_count_file_is_unsupported_to_a_binary_that_predates_the_bit` runs
@@ -604,7 +605,7 @@ fn a_file_declaring_a_bit_this_binary_does_not_implement_is_unsupported() {
         let key = [0, 0, copy];
         let mut header = raw.get(&key).unwrap().unwrap();
         let features = u64::from_be_bytes(header[18..26].try_into().unwrap());
-        header[18..26].copy_from_slice(&(features | 0x8000).to_be_bytes());
+        header[18..26].copy_from_slice(&(features | 0x20000).to_be_bytes());
         let end = header.len() - 4;
         let checksum = crc32c::crc32c(&header[..end]).to_le_bytes();
         header[end..].copy_from_slice(&checksum);

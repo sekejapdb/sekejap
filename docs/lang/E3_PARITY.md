@@ -106,7 +106,7 @@ and sekejap's contract does not mention it at any tier (none remain).
 | 46 | `<->`, `<=>`, `<#>` and `VECTOR_L2/COSINE/DOT` | sql.rs:97, usage/queries.md:198 | DONE — `core/engine/src/index/vector/exact.rs` | — |
 | 47 | `<+>` / `VECTOR_L1` (Manhattan) | sql.rs:1686 | CONTRACT-T3 — refuse.rs `<+>` | no atomic; the prior engine loses this |
 | 48 | `ef_search` knob | db.rs:11811 | DONE — `lang/src/compile/mod.rs` (`SET LOCAL`) | — |
-| 49 | `USING vamana (f vector_l2_ops)` index spelling | sql.rs:4157-4165 | DONE — `lang/src/parser/ddl.rs`; `lang/tests/sql_tier1.rs` `create_table_and_create_index_build_a_queryable_collection` | an alias of `quantized` beside `hnsw`/`diskann`/`ivfflat`, with a notice; no new family |
+| 49 | `USING vamana (f vector_l2_ops)` index spelling | sql.rs:4157-4165 | DONE — `lang/src/parser/ddl.rs`; `core/engine/tests/index_vector_vamana.rs`; `lang/tests/sql_tier1.rs` `create_table_and_create_index_build_a_queryable_collection` | a FAMILY of its own now, the Vamana/DiskANN graph (`core/engine/src/index/vector/graph.rs`), sharing the spelling with `diskann`; `hnsw`/`ivfflat` stay aliases of `quantized` |
 
 ### 5. Spatial
 
@@ -276,9 +276,10 @@ exist so the prior engine's hybrid-ranking story (`docs/usage/queries.md:225`) h
 comparable terms in one `ORDER BY` — a weight over an unbounded BM25 is not a
 weight.
 
-**Vector and spatial (2) → §4.5, §4.4, T2.** `USING vamana` joins the
-`quantized` alias list; `POINT()`/`POLYGON()` WKT literals ride the
-`ST_GeomFromText` parser, longitude before latitude, stated.
+**Vector and spatial (2) → §4.5, §4.4, T2.** `USING vamana` names the graph
+family it always spelled, `IndexFamily::VamanaGraph`, and is no longer an alias
+of `quantized`; `POINT()`/`POLYGON()` WKT literals ride the `ST_GeomFromText`
+parser, longitude before latitude, stated.
 
 **Graph (2).** `SHOW EDGES` was T2 over graph contract 2.5's derived triples; it is DONE now.
 `FROM MATCH` is **NOT ADOPTED**: the capability is T1 under

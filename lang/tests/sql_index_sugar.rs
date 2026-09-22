@@ -121,7 +121,7 @@ fn the_sugar_builds_exactly_the_catalog_the_long_hand_statements_build() {
     let said = notice(
         &mut sugar,
         &format!(
-            "CREATE TABLE t ({COLUMNS}) WITH (hash: [name, active], range: [founded, rating], fulltext: [label], spatial: [loc, area], vector: [emb], quantized: [emb])"
+            "CREATE TABLE t ({COLUMNS}) WITH (index: none, hash: [name, active], range: [founded, rating], fulltext: [label], spatial: [loc, area], vector: [emb], quantized: [emb])"
         ),
     );
     assert!(
@@ -133,7 +133,7 @@ fn the_sugar_builds_exactly_the_catalog_the_long_hand_statements_build() {
     // `CREATE INDEX` per named column, written under the names the sugar
     // generates so that the descriptors are comparable name and all.
     let (_hand_dir, mut hand) = open();
-    run(&mut hand, &format!("CREATE TABLE t ({COLUMNS})"));
+    run(&mut hand, &format!("CREATE TABLE t ({COLUMNS}) WITH (index: none)"));
     for statement in [
         "CREATE INDEX t_name_btree ON t USING btree (name)",
         "CREATE INDEX t_active_btree ON t USING btree (active)",
@@ -174,7 +174,7 @@ fn every_key_maps_to_the_family_the_contract_names_and_the_notice_says_so() {
 
     let said = notice(
         &mut db,
-        "CREATE TABLE a (c TEXT) WITH (hash: [c])",
+        "CREATE TABLE a (c TEXT) WITH (index: none, hash: [c])",
     );
     assert!(
         said.contains("`hash` became a `btree` over `c`") && said.contains("a_c_btree"),
@@ -182,14 +182,14 @@ fn every_key_maps_to_the_family_the_contract_names_and_the_notice_says_so() {
     );
     assert_eq!(descriptors(&db, "a")[0].2, IndexFamily::Scalar);
 
-    let said = notice(&mut db, "CREATE TABLE b (c INT) WITH (range: [c])");
+    let said = notice(&mut db, "CREATE TABLE b (c INT) WITH (index: none, range: [c])");
     assert!(
         said.contains("`range` became a `btree` over `c`") && said.contains("b_c_btree"),
         "range names the btree it became: {said}"
     );
     assert_eq!(descriptors(&db, "b")[0].2, IndexFamily::Scalar);
 
-    let said = notice(&mut db, "CREATE TABLE c (t TEXT) WITH (fulltext: [t])");
+    let said = notice(&mut db, "CREATE TABLE c (t TEXT) WITH (index: none, fulltext: [t])");
     assert!(
         said.contains("`fulltext` became a `gin` over `to_tsvector('simple', t)`")
             && said.contains("c_t_gin"),
@@ -197,7 +197,7 @@ fn every_key_maps_to_the_family_the_contract_names_and_the_notice_says_so() {
     );
     assert_eq!(descriptors(&db, "c")[0].2, IndexFamily::Text);
 
-    let said = notice(&mut db, "CREATE TABLE d (t TEXT) WITH (bm25: [t])");
+    let said = notice(&mut db, "CREATE TABLE d (t TEXT) WITH (index: none, bm25: [t])");
     assert!(
         said.contains("`bm25` became a `gin` over `to_tsvector('simple', t)`")
             && said.contains("d_t_gin"),
@@ -207,7 +207,7 @@ fn every_key_maps_to_the_family_the_contract_names_and_the_notice_says_so() {
 
     let said = notice(
         &mut db,
-        "CREATE TABLE e (p GEOMETRY(Point,4326), g GEOMETRY(Polygon,4326)) WITH (spatial: [p, g])",
+        "CREATE TABLE e (p GEOMETRY(Point,4326), g GEOMETRY(Polygon,4326)) WITH (index: none, spatial: [p, g])",
     );
     assert!(
         said.contains("`spatial` became a `gist` over `p`")
@@ -324,7 +324,7 @@ fn a_column_the_table_does_not_declare_is_refused_by_name() {
 #[test]
 fn the_generated_name_is_table_column_family_and_a_collision_is_refused_by_name() {
     let (_dir, mut db) = open();
-    notice(&mut db, "CREATE TABLE t (c TEXT, d INT) WITH (hash: [c])");
+    notice(&mut db, "CREATE TABLE t (c TEXT, d INT) WITH (index: none, hash: [c])");
     assert_eq!(
         descriptors(&db, "t")[0].0,
         "t_c_btree",
@@ -388,7 +388,7 @@ fn a_query_that_needed_one_of_those_indexes_answers_immediately_after_the_single
     let (_dir, mut db) = open();
     notice(
         &mut db,
-        "CREATE TABLE place (name TEXT, kind TEXT, born INT, note TEXT) WITH (hash: [kind], range: [born], fulltext: [name])",
+        "CREATE TABLE place (name TEXT, kind TEXT, born INT, note TEXT) WITH (index: none, hash: [kind], range: [born], fulltext: [name])",
     );
     for (key, name, kind, born) in [
         ("p1", "north mill", "mill", 1901),
@@ -433,13 +433,13 @@ fn a_query_that_needed_one_of_those_indexes_answers_immediately_after_the_single
 #[test]
 fn if_not_exists_over_a_collection_that_is_there_creates_no_index_and_says_so() {
     let (_dir, mut db) = open();
-    notice(&mut db, "CREATE TABLE t (c TEXT, d INT) WITH (hash: [c])");
+    notice(&mut db, "CREATE TABLE t (c TEXT, d INT) WITH (index: none, hash: [c])");
     let said = notice(
         &mut db,
-        "CREATE TABLE IF NOT EXISTS t (c TEXT, d INT) WITH (hash: [d])",
+        "CREATE TABLE IF NOT EXISTS t (c TEXT, d INT) WITH (index: none, hash: [d])",
     );
     assert!(
-        said.contains("already in the catalog") && said.contains("no index of the WITH clause"),
+        said.contains("already in the catalog") && said.contains("nor any index of the WITH clause"),
         "a create that did not happen indexes nothing, and says so: {said}"
     );
     assert_eq!(

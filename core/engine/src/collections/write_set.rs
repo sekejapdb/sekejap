@@ -621,6 +621,11 @@ impl Database {
             | QueryDriver::Text(_)
             | QueryDriver::ExactVector(_)
             | QueryDriver::QuantizedVector(_)
+            // A vamana node's key is its entity sequence, so a write cannot
+            // re-file it. Linking DOES rewrite the neighbours' records, but
+            // it never moves one to another key, so the walk still meets
+            // every sequence exactly once.
+            | QueryDriver::VamanaVector(_)
             | QueryDriver::Graph { .. }
             | QueryDriver::Membership { .. } => return Ok(()),
         };

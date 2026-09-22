@@ -124,12 +124,13 @@ impl Compiler<'_> {
         columns: Vec<ColumnDef>,
         if_not_exists: bool,
         with: &[WithIndex],
+        automatic: &Automatic,
     ) -> SqlResult2<WritePlan> {
         // The catalog probe, run before anything is compiled: a table that is
         // already there is a NOTICE, not a refusal and not a second create.
         if if_not_exists && self.db.collection(&table)?.is_some() {
             return Ok(WritePlan::Notice(format!(
-                "CREATE TABLE IF NOT EXISTS {table}: the collection is already in the catalog, so nothing was created{}",
+                "CREATE TABLE IF NOT EXISTS {table}: the collection is already in the catalog, so nothing was created -- and no AUTOMATIC index either, because a create that did not happen indexes nothing (docs/lang/INDEX_CONTRACT.md){}",
                 if with.is_empty() {
                     String::new()
                 } else {
@@ -138,7 +139,7 @@ impl Compiler<'_> {
                     // nothing. Said out loud, because the whole point of the
                     // clause is that the caller knows what exists.
                     format!(
-                        " -- and no index of the WITH clause was created either; `SHOW INDEXES ON {table}` says what the collection already has"
+                        ", nor any index of the WITH clause; `SHOW INDEXES ON {table}` says what the collection already has"
                     )
                 }
             )));
@@ -188,7 +189,8 @@ impl Compiler<'_> {
                 "PRIMARY KEY on `{table}`: the column is stored as a declared field AND supplies the external key `Database::put` maps, so the key is held twice (battle50k deviation 13)"
             ));
         }
-        let indexes = self.with_indexes(&table, &fields, with)?;
+        let declared_indexes = self.with_indexes(&table, &fields, with)?;
+        let indexes = self.automatic_indexes(&table, &columns, automatic, declared_indexes)?;
         Ok(WritePlan::CreateTable {
             name: table,
             fields,
@@ -255,6 +257,108 @@ impl Compiler<'_> {
                 pair.key, pair.column
             ));
             out.push((name, method));
+        }
+        Ok(out)
+    }
+
+    /// The AUTOMATIC indexes of `docs/lang/INDEX_CONTRACT.md`, appended to
+    /// whatever the `WITH (...)` sugar already declared.
+    ///
+    /// The rule that contract fixes in one line: **an index is DECLARED when
+    /// there is a decision and AUTOMATIC when there is not.** A `SMALLINT`
+    /// has one implementation, costs a few bytes per row, and nobody would
+    /// ever choose differently, so asking for `CREATE INDEX` over it is
+    /// ceremony with nothing behind it. `VECTOR(n)` is the opposite -- exact
+    /// against quantized is recall against hundreds of gigabytes -- and stays
+    /// declared, as does the `gin` text index, which brings an analyzer and
+    /// an index the size of the corpus.
+    ///
+    /// This adds NO atomic and no family: each entry is one of the same
+    /// `create_*_index` calls `CREATE INDEX` compiles to, built by the same
+    /// `build_index` inside the same statement, under the SAME generated name
+    /// `<table>_<column>_<family>` the sugar generates. That shared name is
+    /// what makes an automatic index and a declared one for the same column
+    /// ONE index rather than two: a `WITH (spatial: [loc])` entry and the
+    /// automatic point index over `loc` collide on `t_loc_gist`, and the
+    /// declared one -- which carries its own notice -- is kept.
+    fn automatic_indexes(
+        &mut self,
+        table: &str,
+        columns: &[ColumnDef],
+        automatic: &Automatic,
+        mut out: Vec<(String, CompiledIndex)>,
+    ) -> SqlResult2<Vec<(String, CompiledIndex)>> {
+        let wanted: Vec<&ColumnDef> = match automatic {
+            Automatic::None => Vec::new(),
+            Automatic::All => columns.iter().collect(),
+            Automatic::Only(names) => {
+                let mut picked = Vec::with_capacity(names.len());
+                for name in names {
+                    let Some(column) = columns.iter().find(|c| c.name == *name) else {
+                        return Err(SqlError::unsupported(format!(
+                            "WITH (index: [{name}]): `{name}` is not a column of `{table}`; the key names the columns of this same statement, and nothing else (docs/lang/INDEX_CONTRACT.md)"
+                        )));
+                    };
+                    if automatic_index(&column.name, &column.kind).is_none() {
+                        return Err(SqlError::unsupported(format!(
+                            "WITH (index: [{name}]): `{name}` is declared {} and there is no family this engine gives it without being asked -- a VECTOR column is the one genuine trade (`exact` against `quantized`) and a JSONB column has no family at all. Declare the vector index you want; see docs/lang/INDEX_CONTRACT.md",
+                            column.declared
+                        )));
+                    }
+                    picked.push(column);
+                }
+                picked
+            }
+        };
+        if wanted.is_empty() {
+            return Ok(out);
+        }
+        let taken = self.every_index_name()?;
+        let mut made: Vec<String> = Vec::new();
+        for column in wanted {
+            let Some((family, method)) = automatic_index(&column.name, &column.kind) else {
+                continue;
+            };
+            let name = format!("{table}_{}_{family}", column.name);
+            // The same name the sugar generated: one index, not two. The
+            // declared entry stays, because it is the one the caller wrote
+            // and the one whose notice already named the mapping.
+            if out.iter().any(|(held, _)| *held == name) {
+                continue;
+            }
+            // A generated name held ELSEWHERE in the database would make
+            // `DROP INDEX <name>` ambiguous, which is why the sugar refuses
+            // on it. An automatic index is not worth refusing a `CREATE
+            // TABLE` over, so it is skipped and SAID -- the column is then
+            // unindexed and its predicate is refused, naming it.
+            if taken.iter().any(|held| *held == name) {
+                self.notices.push(format!(
+                    "automatic index on `{}`: the generated name `{name}` is already an index in this database, so it was NOT created and a predicate over `{}` is refused naming the column; write the index by hand with a name of your own",
+                    column.name, column.name
+                ));
+                continue;
+            }
+            made.push(format!(
+                "`{name}` ({family}) over `{}` {}",
+                column.name, column.declared
+            ));
+            out.push((name, method));
+        }
+        if out.len() > sekejap_core::collections::MAX_INDEXES {
+            return Err(SqlError::unsupported(format!(
+                "CREATE TABLE {table}: the automatic indexes of docs/lang/INDEX_CONTRACT.md would be {} and a collection holds at most {} indexes. Name the columns you filter on -- `WITH (index: [a, b, ...])` -- or turn them off with `WITH (index: none)`",
+                out.len(),
+                sekejap_core::collections::MAX_INDEXES
+            )));
+        }
+        if !made.is_empty() {
+            // Nothing is created that the caller was not told about: the same
+            // reason every `WITH` mapping and every key mapping says so.
+            self.notices.push(format!(
+                "CREATE TABLE {table}: {} automatic index(es) -- {} -- created with the collection and maintained on every write (docs/lang/INDEX_CONTRACT.md). `WITH (index: none)` creates none; `WITH (index: [column, ...])` creates only those",
+                made.len(),
+                made.join(", ")
+            ));
         }
         Ok(out)
     }
@@ -336,6 +440,7 @@ impl Compiler<'_> {
         let mut declared = info.declared.clone();
         let mut rules = info.rules.clone();
         let mut drop_indexes = Vec::new();
+        let mut create_indexes: Vec<(String, CompiledIndex)> = Vec::new();
         match action {
             AlterAction::RenameTable { to } => {
                 if self.db.collection(to).map_err(SqlError::from)?.is_some() {
@@ -386,6 +491,27 @@ impl Compiler<'_> {
                     "ADD COLUMN {}: every row written before this commit reads MISSING for it, which is distinct from NULL (QL_CONTRACT §2)",
                     column.name
                 ));
+                // The automatic index of `docs/lang/INDEX_CONTRACT.md`. A
+                // column added by ALTER is a column, and a caller who cannot
+                // filter on it until they write a second statement is in
+                // exactly the position the contract removes. The build runs
+                // over the rows already there, which is what makes the
+                // predicate answer as soon as the statement returns.
+                if let Some((family, method)) = automatic_index(&column.name, &column.kind) {
+                    let name = format!("{table}_{}_{family}", column.name);
+                    if self.every_index_name()?.iter().any(|held| *held == name) {
+                        self.notices.push(format!(
+                            "ADD COLUMN {}: the generated name `{name}` is already an index in this database, so no automatic index was created and a predicate over `{}` is refused naming the column",
+                            column.name, column.name
+                        ));
+                    } else {
+                        self.notices.push(format!(
+                            "ADD COLUMN {}: one automatic index `{name}` ({family}) over `{}` {}, built over the rows already there (docs/lang/INDEX_CONTRACT.md)",
+                            column.name, column.name, column.declared
+                        ));
+                        create_indexes.push((name, method));
+                    }
+                }
             }
             AlterAction::DropColumn { column, if_exists } => {
                 if !fields.iter().any(|(n, _)| n == column) {
@@ -428,11 +554,45 @@ impl Compiler<'_> {
                         reason: "QL_CONTRACT §2: a dense row decodes under the IMMUTABLE layout it was written with, and that layout carries the old name, so every existing row would read MISSING under the new one. Renaming a populated column needs every row rewritten and there is no bounded resumable rewrite atomic. On an empty collection it is the ordinary descriptor rewrite.",
                     });
                 }
+                // An index descriptor carries the field NAME, and there is
+                // no atomic that rewrites it. A HAND-WRITTEN index is
+                // therefore still a refusal naming it: the caller chose that
+                // name and this statement will not silently take it away.
+                //
+                // An AUTOMATIC index is different, and only because the
+                // engine made it: its name is the generated
+                // `<table>_<column>_<family>`, nobody wrote it down, and the
+                // collection is EMPTY -- the rename already refuses over a
+                // populated one -- so the index over the old name holds no
+                // entry. It is dropped and re-earned under the new name in
+                // this same statement, which leaves the column exactly as
+                // indexed as it was.
+                let kind_of = fields
+                    .iter()
+                    .find(|(n, _)| n == from)
+                    .map(|(_, k)| k.clone())
+                    .expect("named() proved the column is there");
+                let generated = automatic_index(from, &kind_of)
+                    .map(|(family, _)| format!("{table}_{from}_{family}"));
                 let held = over(from);
-                if let Some((_, index)) = held.first() {
+                if let Some((_, index)) = held
+                    .iter()
+                    .find(|(_, name)| generated.as_deref() != Some(name.as_str()))
+                {
                     return Err(SqlError::unsupported(format!(
                         "RENAME COLUMN {from}: the index `{index}` names `{from}` in its own descriptor, and there is no atomic that rewrites an index descriptor's field; DROP INDEX {index} first and create it again on `{to}`"
                     )));
+                }
+                if !held.is_empty() {
+                    drop_indexes = held;
+                    if let Some((family, method)) = automatic_index(to, &kind_of) {
+                        let name = format!("{table}_{to}_{family}");
+                        self.notices.push(format!(
+                            "RENAME COLUMN {from} TO {to}: the automatic index `{}` is dropped and re-earned as `{name}` in this same statement -- the collection is empty, which the rename already required, so the index holds no entry to move (docs/lang/INDEX_CONTRACT.md)",
+                            drop_indexes[0].1
+                        ));
+                        create_indexes.push((name, method));
+                    }
                 }
                 let rename = |name: &mut String| {
                     if name == from {
@@ -483,6 +643,7 @@ impl Compiler<'_> {
                 declared,
                 rules,
                 drop_indexes,
+                create_indexes,
             },
         })
     }
@@ -550,6 +711,7 @@ impl Compiler<'_> {
                         declared,
                         rules,
                         drop_indexes,
+                        create_indexes,
                     },
                 ..
             } => {
@@ -602,6 +764,22 @@ impl Compiler<'_> {
                         )
                     }
                 ));
+                out.push_str(&format!(
+                    "automatic: {}
+",
+                    if create_indexes.is_empty() {
+                        "none created -- no column of this rewrite has a family it is given unasked".to_owned()
+                    } else {
+                        format!(
+                            "created after the layout is repointed: {}",
+                            create_indexes
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                ));
             }
             _ => unreachable!("alter_table builds an AlterTable plan or a Notice"),
         }
@@ -637,6 +815,20 @@ impl Compiler<'_> {
                     "an expression index over lower({field}) stores the FOLDED value: `{field} = 'X'` still needs the plain index over `{field}`, and `lower({field}) = 'x'` needs this one"
                 ));
                 CompiledIndex::LowerScalar { field }
+            }
+            IndexMethod::JsonBtree { column, member } => {
+                if !matches!(self.kind_of(c, &column)?, Kind::Json) {
+                    return Err(SqlError::unsupported(format!(
+                        "({column}->>'{member}'): `->>` extracts from a JSONB column, and `{column}` is not one"
+                    )));
+                }
+                self.notices.push(format!(
+                    "an expression index over {column}->>'{member}' stores the TEXT at that member: a member that is absent, JSON null, an object or an array stores the NULL key and no equality can name it (docs/lang/INDEX_CONTRACT.md)"
+                ));
+                CompiledIndex::JsonScalar {
+                    field: column,
+                    member,
+                }
             }
             IndexMethod::Gin(field) => {
                 if !matches!(self.kind_of(c, &field)?, Kind::Text) {
@@ -677,12 +869,91 @@ impl Compiler<'_> {
                 }
                 CompiledIndex::QuantizedVector { field: column }
             }
+            IndexMethod::Vamana { column, alias } => {
+                if !matches!(self.kind_of(c, &column)?, Kind::Vector(_)) {
+                    return Err(SqlError::unsupported(format!(
+                        "vamana({column}): the vamana family indexes a VECTOR column"
+                    )));
+                }
+                if let Some(alias) = alias {
+                    self.notices.push(format!(
+                        "USING {alias} builds the `vamana` family: the Vamana/DiskANN graph over quantized codes, with an f32 rerank"
+                    ));
+                }
+                self.notices.push(
+                    "a vamana index is maintained live on every write and is NOT READY until its build finishes; while it is building a vector order over this column is refused rather than answered from a partial graph (INDEX_CONTRACT)".into(),
+                );
+                CompiledIndex::VamanaGraph { field: column }
+            }
         };
+        // `docs/lang/INDEX_CONTRACT.md`: an automatic index and a
+        // hand-written `CREATE INDEX` for the same column are ONE index, not
+        // two. The generated name is `<table>_<column>_<family>` and the
+        // caller's name is their own, so the two never collide on the name;
+        // what decides is the DESCRIPTOR -- same family, same field, same
+        // expression, same uniqueness. A second index over all four would be
+        // a second copy of the same keys, maintained on every write, and no
+        // statement asks for that on purpose.
+        if let Some(held) = self
+            .db
+            .list_indexes(c)
+            .map_err(SqlError::from)?
+            .into_iter()
+            .find(|info| same_index(&method, info))
+        {
+            return Ok(WritePlan::Notice(format!(
+                "CREATE INDEX {name} ON {table}: `{}` already indexes `{}` in the same family, so nothing was created and `{name}` is not a name this database holds. Every eligible column is indexed when the table is created (docs/lang/INDEX_CONTRACT.md); `SHOW INDEXES ON {table}` says what is there",
+                held.name, held.field
+            )));
+        }
         Ok(WritePlan::CreateIndex {
             collection: c,
             name,
             method,
         })
+    }
+}
+
+/// Whether a compiled index and an index the catalog already holds are the
+/// SAME index: one family, one field, one expression, one uniqueness.
+///
+/// The name is deliberately not part of it. Two names over one descriptor are
+/// two copies of the same keys maintained on every write, which is the cost
+/// `docs/lang/INDEX_CONTRACT.md` weighs and never the thing a caller wants.
+fn same_index(method: &CompiledIndex, info: &IndexInfo) -> bool {
+    match method {
+        CompiledIndex::Scalar { field, unique } => {
+            info.family == IndexFamily::Scalar
+                && info.expression.is_none()
+                && info.field == *field
+                && info.unique == *unique
+        }
+        CompiledIndex::LowerScalar { field } => {
+            info.family == IndexFamily::Scalar
+                && info.expression == Some(IndexExpr::Lower)
+                && info.field == *field
+        }
+        CompiledIndex::JsonScalar { field, member } => {
+            info.family == IndexFamily::Scalar
+                && info.expression == Some(IndexExpr::JsonText(member.clone()))
+                && info.field == *field
+        }
+        CompiledIndex::Text { field } => info.family == IndexFamily::Text && info.field == *field,
+        CompiledIndex::Point { field } => {
+            info.family == IndexFamily::SpatialPoint && info.field == *field
+        }
+        CompiledIndex::Geometry { field } => {
+            info.family == IndexFamily::SpatialGeometry && info.field == *field
+        }
+        CompiledIndex::ExactVector { field } => {
+            info.family == IndexFamily::ExactVector && info.field == *field
+        }
+        CompiledIndex::QuantizedVector { field } => {
+            info.family == IndexFamily::QuantizedVector && info.field == *field
+        }
+        CompiledIndex::VamanaGraph { field } => {
+            info.family == IndexFamily::VamanaGraph && info.field == *field
+        }
     }
 }
 
@@ -696,6 +967,10 @@ impl Compiler<'_> {
 /// | key | family | legal `Kind` |
 /// | --- | --- | --- |
 /// | `hash` | `btree` | Bool, Int, Real, Text |
+///
+/// The eighth key, `index:`, is not in this table because it names no family:
+/// it says which columns get the AUTOMATIC index of
+/// `docs/lang/INDEX_CONTRACT.md`, and it is handled in `automatic_indexes`.
 /// | `range` | `btree` | Bool, Int, Real, Text |
 /// | `fulltext` | `gin` | Text |
 /// | `bm25` | `gin` | Text |
@@ -715,7 +990,7 @@ fn with_family(
 ) -> SqlResult2<(&'static str, CompiledIndex, String)> {
     let refuse = |family: &str, wants: &str| -> SqlError {
         SqlError::unsupported(format!(
-            "WITH ({key}: [{column}]): `{key}` is a `{family}` index and a `{family}` indexes {wants}; `{column}` is declared {kind:?}. The keys are hash, range, fulltext, bm25, spatial, vector, quantized (QL_CONTRACT §2)"
+            "WITH ({key}: [{column}]): `{key}` is a `{family}` index and a `{family}` indexes {wants}; `{column}` is declared {kind:?}. The keys are index, hash, range, fulltext, bm25, spatial, vector, quantized (QL_CONTRACT §2)"
         ))
     };
     Ok(match key {
@@ -800,10 +1075,52 @@ fn with_family(
         }
         other => {
             return Err(SqlError::unsupported(format!(
-                "WITH ({other}: [{column}]): `{other}` is not an index key. The keys are hash, range, fulltext, bm25, spatial, vector, quantized (QL_CONTRACT §2)"
+                "WITH ({other}: [{column}]): `{other}` is not an index key. The keys are index, hash, range, fulltext, bm25, spatial, vector, quantized (QL_CONTRACT §2)"
             )))
         }
     })
+}
+
+/// The index `docs/lang/INDEX_CONTRACT.md` gives a column of this `Kind`
+/// WITHOUT being asked, and the family word its generated name carries.
+///
+/// `None` is the contract's right-hand column: `VECTOR(n)`, where exactness
+/// against size is the one genuine trade in the system, and `JSONB`, which
+/// has no family at all and is a stated gap rather than a decision.
+///
+/// The scalar family already accepts exactly bool/int/real/text
+/// (`core/engine/src/collections/catalog.rs::kind_byte`) and the two spatial
+/// families already follow the declared shape, so this introduces no family,
+/// no keyspace and no feature bit -- it only decides who gets one unasked.
+/// The family words match `with_family`'s, so a `hash`/`range` entry and the
+/// automatic scalar index generate ONE name, and `spatial` and the automatic
+/// point or geometry index generate one name too.
+pub(super) fn automatic_index(
+    column: &str,
+    kind: &Kind,
+) -> Option<(&'static str, CompiledIndex)> {
+    match kind {
+        Kind::Bool | Kind::Int | Kind::Real | Kind::Text => Some((
+            "btree",
+            CompiledIndex::Scalar {
+                field: column.to_owned(),
+                unique: false,
+            },
+        )),
+        Kind::Point => Some((
+            "gist",
+            CompiledIndex::Point {
+                field: column.to_owned(),
+            },
+        )),
+        Kind::Geo => Some((
+            "gist",
+            CompiledIndex::Geometry {
+                field: column.to_owned(),
+            },
+        )),
+        Kind::Json | Kind::Vector(_) => None,
+    }
 }
 
 /// A COLUMN RULE as a `CREATE TABLE` would have written it.

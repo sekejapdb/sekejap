@@ -172,7 +172,7 @@ fn kind_word(kind: &Kind) -> String {
 
 /// The word `db_indexes.family` prints, which is the word `CREATE INDEX`
 /// writes for the family (`USING btree`, `gin`, `gist`, `exact`,
-/// `quantized`), plus `geometry` for the geometry family.
+/// `quantized`, `vamana`), plus `geometry` for the geometry family.
 fn family_word(family: IndexFamily) -> &'static str {
     match family {
         IndexFamily::Scalar => "btree",
@@ -181,6 +181,7 @@ fn family_word(family: IndexFamily) -> &'static str {
         IndexFamily::SpatialGeometry => "geometry",
         IndexFamily::ExactVector => "exact",
         IndexFamily::QuantizedVector => "quantized",
+        IndexFamily::VamanaGraph => "vamana",
     }
 }
 
@@ -667,7 +668,13 @@ struct Index {
     name: String,
     family: IndexFamily,
     field: String,
+    /// The expression as it is written without its field (`lower`,
+    /// `->>'status'`), which is the `db_indexes` column.
     expression: Option<String>,
+    /// The whole target a `CREATE INDEX` writes (`lower(title)`,
+    /// `(meta->>'status')`), which is what `pg_indexes.indexdef` needs: the
+    /// two differ for an expression whose operator is infix.
+    target: String,
     state: IndexState,
     unique: bool,
 }
@@ -730,10 +737,14 @@ fn snapshot(db: &Database, graph: bool) -> SqlResult2<Snapshot> {
             .map_err(SqlError::from)?
             .into_iter()
             .map(|index| Index {
+                target: index
+                    .expression
+                    .as_ref()
+                    .map_or_else(|| index.field.clone(), |e| e.target(&index.field)),
+                expression: index.expression.map(|e| e.written()),
                 name: index.name,
                 family: index.family,
                 field: index.field,
-                expression: index.expression.map(|e| e.written().to_owned()),
                 state: index.state,
                 unique: index.unique,
             })
@@ -1253,10 +1264,7 @@ fn index_attnum(table: &Table, index: &Index) -> String {
 /// with what is there.
 fn index_def(table: &str, index: &Index) -> String {
     let unique = if index.unique { "UNIQUE " } else { "" };
-    let target = match &index.expression {
-        Some(expression) => format!("{expression}({})", index.field),
-        None => index.field.clone(),
-    };
+    let target = &index.target;
     let method = match index.family {
         IndexFamily::Text => format!("gin (to_tsvector('simple', {target}))"),
         family => format!("{} ({target})", family_word(family)),
