@@ -16,6 +16,15 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The feature set every documented build and every worker's test command
+  # uses (AGENTS.md), and the one every frozen golden in the suite was
+  # measured under. A bare `cargo test`/`cargo check` builds the crate's
+  # DEFAULT features instead, which is a different storage layout -- CI ran
+  # that mismatched build for a long time and a page-WAL golden (frames and
+  # bytes one write batch produces) disagreed with it, not with reality.
+  FEATURES: compact-cells,sqlite-balance,keyspace-append,slotref-split
+
 jobs:
   test:
     name: Test (Linux)
@@ -37,7 +46,7 @@ jobs:
       # `--no-fail-fast` because cargo stops at the first failing binary
       # otherwise, and a summary read from that output reports the binaries that
       # did run as though they were all of them.
-      - run: cargo test --release --no-fail-fast
+      - run: cargo test --release --no-fail-fast --features ${{ env.FEATURES }}
       # The one thing the Rust suite cannot prove about the C ABI: that a C
       # COMPILER accepts the generated header and links the library. `make
       # check` compiles examples/smoke.c against the freshly built libsekejap
@@ -65,10 +74,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Seed from the date
         run: echo "SEED=$(date +%Y%m%d%H)" >> $GITHUB_ENV
-      - run: SK_COMPFUZZ_SEED=$SEED SK_COMPFUZZ_ROUNDS=600 cargo test --release --test compaction_agreement_fuzz
-      - run: SK_IDXFUZZ_SEED=$SEED SK_IDXFUZZ_ROUNDS=900 cargo test --release --test index_agreement_fuzz
-      - run: SK_REPFUZZ_SEED=$SEED SK_REPFUZZ_ROUNDS=500 cargo test --release --test replay_agreement_fuzz
-      - run: SK_ENCFUZZ_SEED=$SEED SK_ENCFUZZ_ROUNDS=500 cargo test --release --test encoding_agreement_fuzz
+      - run: SK_COMPFUZZ_SEED=$SEED SK_COMPFUZZ_ROUNDS=600 cargo test --release --features ${{ env.FEATURES }} --test compaction_agreement_fuzz
+      - run: SK_IDXFUZZ_SEED=$SEED SK_IDXFUZZ_ROUNDS=900 cargo test --release --features ${{ env.FEATURES }} --test index_agreement_fuzz
+      - run: SK_REPFUZZ_SEED=$SEED SK_REPFUZZ_ROUNDS=500 cargo test --release --features ${{ env.FEATURES }} --test replay_agreement_fuzz
+      - run: SK_ENCFUZZ_SEED=$SEED SK_ENCFUZZ_ROUNDS=500 cargo test --release --features ${{ env.FEATURES }} --test encoding_agreement_fuzz
 
   windows-compile:
     name: Windows compile check
@@ -81,4 +90,4 @@ jobs:
       # crate and the C ABI cover every downstream Windows artifact (node addon,
       # Python wheels, C/C++/C# bindings) — they all fail here first if a
       # Unix-only symbol leaks into an unconditional path.
-      - run: cargo check -p sekejap -p sekejap-capi
+      - run: cargo check -p sekejap -p sekejap-capi --features ${{ env.FEATURES }}
