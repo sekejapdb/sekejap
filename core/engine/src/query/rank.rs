@@ -309,6 +309,60 @@ pub(super) fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool)
     }
 }
 
+/// The `search_score()` of one candidate, in [0,1].
+///
+/// It reads the same postings the `search()` predicate reads and nothing
+/// else: no row, no norm, no corpus statistic. The qualities are settled at
+/// PREPARE time -- the automaton already knew the edit distance it spent and
+/// the characters the prefix completed -- so per document this is one
+/// presence test per accepted dictionary term and one mean.
+///
+/// `None` means the document does not satisfy the search, which is where a
+/// `ORDER BY` puts it: `eval_score_expr` maps it to `0.0`, below every
+/// document that matched.
+pub(super) fn search_quality<C: FnMut() -> bool>(
+    db: &Database,
+    prepared: &PreparedText,
+    id: EntityId,
+    driven: Option<&TextFrequencies>,
+    scratch: &mut RowScratch,
+    meter: &mut WorkMeter<'_, C>,
+) -> QueryResult<Option<f64>> {
+    if prepared.terms.is_empty() || prepared.groups.is_empty() {
+        return Ok(None);
+    }
+    if prepared.terms.len() > MAX_TEXT_TERMS {
+        return Err(corrupt_query("prepared text query exceeds its term bound"));
+    }
+    let merged = driven.filter(|frequencies| {
+        prepared.driven == Some(frequencies.source)
+            && usize::from(frequencies.len) == prepared.terms.len()
+            && usize::from(frequencies.len) <= INLINE_TEXT_TERMS
+    });
+    scratch.text.present.clear();
+    scratch.text.present.resize(prepared.terms.len(), false);
+    let segments_on = crate::index::text::segments_enabled(db);
+    for (position, term) in prepared.terms.iter().enumerate() {
+        let frequency = match merged {
+            Some(merged) => merged.slots[position],
+            None => {
+                meter.charge(WorkResource::TextPostings, 1)?;
+                crate::index::text::point_posting(
+                    db,
+                    prepared.info.id,
+                    term,
+                    id.sequence,
+                    segments_on,
+                    &mut scratch.norms,
+                )?
+                .unwrap_or(0)
+            }
+        };
+        scratch.text.present[position] = frequency != 0;
+    }
+    Ok(prepared.search_quality(&scratch.text.present))
+}
+
 pub(super) fn text_score<'a, C: FnMut() -> bool>(
     db: &'a Database,
     rows: &mut PrimaryRows<'a>,
@@ -360,6 +414,8 @@ pub(super) fn text_score<'a, C: FnMut() -> bool>(
     }
     scratch.text.frequencies.clear();
     scratch.text.idfs.clear();
+    scratch.text.present.clear();
+    scratch.text.present.resize(prepared.terms.len(), false);
     let segments_on = crate::index::text::segments_enabled(db);
     for (position, (term, &idf)) in prepared.terms.iter().zip(&prepared.idfs).enumerate() {
         let frequency = match merged {
@@ -381,19 +437,16 @@ pub(super) fn text_score<'a, C: FnMut() -> bool>(
             }
         };
         if let Some(frequency) = frequency {
+            scratch.text.present[position] = true;
             scratch.text.frequencies.push(frequency);
             scratch.text.idfs.push(idf);
         }
     }
-    let frequencies = scratch.text.frequencies.as_slice();
-    let idfs = scratch.text.idfs.as_slice();
-    let matched = frequencies.len();
-    if matched == 0
-        || (matches!(prepared.matching, TextMatch::All | TextMatch::Phrase)
-            && matched != prepared.terms.len())
-    {
+    if scratch.text.frequencies.is_empty() || !prepared.admits(&scratch.text.present) {
         return Ok(None);
     }
+    let frequencies = scratch.text.frequencies.as_slice();
+    let idfs = scratch.text.idfs.as_slice();
     if let Some(phrase) = prepared.phrase.as_deref() {
         // Through the PAGE's reader, not a fresh point-get. The text merge
         // hands documents over in ascending sequence, so the rows a phrase

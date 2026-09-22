@@ -70,6 +70,7 @@ enum PExpr {
     Column(String),
     Geo(GeoArg),
     Bm25 { column: String, query: TsQuery },
+    SearchScore,
     StDistance { column: String, point: PointArg },
     /// `col <=> v`, `col <-> v`, `col <#> v`: a DISTANCE, whichever family
     /// the column turns out to belong to.
@@ -529,6 +530,7 @@ fn lower(expr: PExpr) -> SqlResult2<ScoreNode> {
         PExpr::Num(value) => ScoreNode::Lit(value),
         PExpr::Column(column) => ScoreNode::Column(column),
         PExpr::Bm25 { column, query } => ScoreNode::Bm25 { column, query },
+        PExpr::SearchScore => ScoreNode::SearchScore,
         PExpr::StDistance { column, point } => ScoreNode::Distance { column, point },
         PExpr::Distance { column, right, op } => match *right {
             PExpr::Param(n) => ScoreNode::VecDistance {

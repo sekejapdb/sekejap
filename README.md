@@ -264,6 +264,9 @@ A `VECTOR(n)` column holds an embedding — a fixed-length list of numbers that
 captures the "meaning" of something. With a vector index you can find the rows
 whose vectors are closest to a given one, exactly or approximately.
 
+Storing many vectors is mostly a question of how many dimensions you keep, not
+which index you pick: see [planning vector storage](docs/core/VECTOR_CAPACITY.md).
+
 ```python
 # The 5 tourists whose taste is most similar to a given taste vector.
 db.query("""

@@ -351,6 +351,14 @@ pub(crate) enum OwnedScore {
         matching: TextMatch,
         fill: Option<TsQuery>,
     },
+    /// `search_score()`: the [0,1] Score leaf of this statement's `search()`
+    /// predicate. The index and the query are the predicate's own, copied
+    /// here while the `WHERE` compiles, so the two always score the same
+    /// words.
+    SearchScore {
+        index: IndexId,
+        query: String,
+    },
     /// `col <=> v` in an arithmetic ranking is a DISTANCE, and the engine's
     /// leaf is a SIMILARITY (`-distance`). The lowering below writes the
     /// negation, so `1 - (col <=> v)` is the cosine itself, which is the same
@@ -393,6 +401,10 @@ fn with_score<R>(node: &OwnedScore, k: &mut dyn FnMut(&ScoreExpr<'_>) -> R) -> R
             index: *index,
             query,
             matching: *matching,
+        }),
+        OwnedScore::SearchScore { index, query } => k(&ScoreExpr::SearchScore {
+            index: *index,
+            query,
         }),
         OwnedScore::VectorDistance {
             index,
@@ -818,6 +830,11 @@ pub(crate) enum WritePlan {
         /// (QL_CONTRACT §2), recorded in the same descriptor behind the
         /// additive `COLUMN_RULES_FEATURE` bit.
         rules: Vec<(String, ColumnRule)>,
+        /// The `WITH (...)` INDEX SUGAR, already compiled: one
+        /// `(generated name, index)` pair per column the clause named, in
+        /// written order. EMPTY for every `CREATE TABLE` with no `WITH`, and
+        /// that statement runs exactly the code it always ran.
+        indexes: Vec<(String, CompiledIndex)>,
     },
     /// `ALTER TABLE t <action>`: one `alter_collection_rules` commit, or one
     /// `rename_collection` commit. Nothing here is a second rewrite path.
@@ -1056,8 +1073,34 @@ impl WritePlan {
                 fields,
                 declared,
                 rules,
+                indexes,
             } => {
-                db.create_collection_rules(
+                if indexes.is_empty() {
+                    db.create_collection_rules(
+                        &name,
+                        fields,
+                        declared,
+                        rules,
+                        CollectionOptions::default(),
+                    )?;
+                    db.commit()?;
+                    return Ok(SqlResult::Affected(0));
+                }
+                // The INDEX SUGAR of QL_CONTRACT §2. One `create_collection`
+                // and one `create_*_index` per named column -- the same
+                // atomics `CREATE TABLE` and N `CREATE INDEX` call, in the
+                // same order, inside one statement.
+                //
+                // The caller's own uncommitted rows are published FIRST, for
+                // the reason `CREATE INDEX` publishes them: an index build
+                // commits its own steps, and committing someone else's
+                // half-finished work on their behalf is not this statement's
+                // decision. It also draws the line the UNWIND below needs --
+                // everything after this commit belongs to this statement, so
+                // removing it removes nothing of the caller's.
+                db.commit()?;
+                let count = indexes.len();
+                let collection = db.create_collection_rules(
                     &name,
                     fields,
                     declared,
@@ -1065,7 +1108,21 @@ impl WritePlan {
                     CollectionOptions::default(),
                 )?;
                 db.commit()?;
-                SqlResult::Affected(0)
+                let mut built = Vec::new();
+                for (index, method) in indexes {
+                    match build_index(db, collection, &index, &method) {
+                        Ok(()) => built.push(index),
+                        Err(error) => {
+                            return Err(unwind_create_table(
+                                db, collection, &name, &index, &built, error,
+                            ))
+                        }
+                    }
+                }
+                notice(format!(
+                    "CREATE TABLE {name} WITH (...): the collection and {count} index(es) were created by one statement -- {}",
+                    built.join(", ")
+                ))
             }
             Self::AlterTable {
                 collection,
@@ -1105,37 +1162,7 @@ impl WritePlan {
                 method,
             } => {
                 db.commit()?;
-                let id = match &method {
-                    CompiledIndex::Scalar { field, unique } => {
-                        db.create_scalar_index(collection, &name, field, *unique)?
-                    }
-                    CompiledIndex::LowerScalar { field } => db.create_expression_index(
-                        collection,
-                        &name,
-                        field,
-                        IndexExpr::Lower,
-                        false,
-                    )?,
-                    CompiledIndex::Text { field } => db.create_text_index(collection, &name, field)?,
-                    CompiledIndex::Point { field } => {
-                        db.create_point_index(collection, &name, field)?
-                    }
-                    CompiledIndex::Geometry { field } => {
-                        db.create_geometry_index(collection, &name, field)?
-                    }
-                    CompiledIndex::ExactVector { field } => {
-                        db.create_exact_vector_index(collection, &name, field)?
-                    }
-                    CompiledIndex::QuantizedVector { field } => {
-                        db.create_quantized_vector_index(collection, &name, field)?
-                    }
-                };
-                // Postgres hands back a usable index; so does this. The build
-                // is incremental underneath (`build_index_step`), and it is
-                // run to READY here rather than left half-built.
-                db.commit()?;
-                db.build_index_to_ready(id, 256)?;
-                db.commit()?;
+                build_index(db, collection, &name, &method)?;
                 SqlResult::Affected(0)
             }
             Self::DropIndex { index, name } => {
@@ -1180,6 +1207,99 @@ impl WritePlan {
             }
             Self::Notice(text) => notice(text),
         })
+    }
+}
+
+/// One `CREATE INDEX`, created and built to READY.
+///
+/// The ONE place a `CompiledIndex` becomes a `create_*_index` call. Both
+/// `CREATE INDEX` and the `CREATE TABLE ... WITH (...)` sugar of
+/// QL_CONTRACT §2 come through here, so the sugar cannot build an index that
+/// differs from the one the hand-written statement builds: same call, same
+/// arguments, same build to READY.
+///
+/// The caller commits what it holds BEFORE calling. Postgres hands back a
+/// usable index and so does this: the build is incremental underneath
+/// (`build_index_step`) and is run to the end here rather than left
+/// half-built.
+fn build_index(
+    db: &mut Database,
+    collection: CollectionId,
+    name: &str,
+    method: &CompiledIndex,
+) -> SqlResult2<()> {
+    let id = match method {
+        CompiledIndex::Scalar { field, unique } => {
+            db.create_scalar_index(collection, name, field, *unique)?
+        }
+        CompiledIndex::LowerScalar { field } => {
+            db.create_expression_index(collection, name, field, IndexExpr::Lower, false)?
+        }
+        CompiledIndex::Text { field } => db.create_text_index(collection, name, field)?,
+        CompiledIndex::Point { field } => db.create_point_index(collection, name, field)?,
+        CompiledIndex::Geometry { field } => db.create_geometry_index(collection, name, field)?,
+        CompiledIndex::ExactVector { field } => {
+            db.create_exact_vector_index(collection, name, field)?
+        }
+        CompiledIndex::QuantizedVector { field } => {
+            db.create_quantized_vector_index(collection, name, field)?
+        }
+    };
+    db.commit()?;
+    db.build_index_to_ready(id, 256)?;
+    db.commit()?;
+    Ok(())
+}
+
+/// What a `CREATE TABLE ... WITH (...)` does when an index of the clause is
+/// refused after earlier ones were built.
+///
+/// It is ATOMIC IN THE CALLER'S SENSE: the collection and every index this
+/// statement had already committed are REMOVED before the refusal is raised,
+/// so the caller is left with the catalog they had. That is a compensating
+/// removal, not a rollback -- sekejap has one transaction per handle and no
+/// savepoint, and an index build commits its own steps, so there is no
+/// uncommitted state to discard. It is exactly `DROP TABLE <name> CASCADE`,
+/// the same bounded phase machine, run by the statement instead of by hand.
+///
+/// Almost nothing reaches here: an unknown key, an undeclared column, a
+/// family the column's `Kind` cannot carry and a colliding generated name are
+/// all decided while the statement COMPILES, before a byte is written
+/// (`lang/src/compile/ddl.rs::with_indexes`). What is left is the engine
+/// refusing a create or a build -- the index ceiling, or the identity space.
+///
+/// If the removal ITSELF fails, the refusal says so and names the collection:
+/// `begin_drop_collection_mode` has published the DROPPING mark by then, so
+/// the collection is one readers already refuse and one `DROP TABLE` finishes.
+fn unwind_create_table(
+    db: &mut Database,
+    collection: CollectionId,
+    table: &str,
+    refused: &str,
+    built: &[String],
+    error: SqlError,
+) -> SqlError {
+    // Whatever the failed create left uncommitted goes first: the drop below
+    // refuses to run over a handle with pending user writes, and those writes
+    // are this statement's own.
+    let _ = db.rollback();
+    let removal = db
+        .begin_drop_collection_mode(collection, DropMode::Cascade)
+        .and_then(|()| {
+            db.drop_collection_to_end(collection, sekejap_core::collections::MAX_DROP_BATCH)
+        });
+    let made = if built.is_empty() {
+        "no index of the clause had been built".to_owned()
+    } else {
+        format!("the {} index(es) already built ({})", built.len(), built.join(", "))
+    };
+    match removal {
+        Ok(_) => SqlError::unsupported(format!(
+            "CREATE TABLE {table} WITH (...): `{refused}` was refused, so the statement left NOTHING behind -- the collection `{table}` and {made} were removed before this refusal was raised, and the catalog is the one the statement started from. The refusal: {error}"
+        )),
+        Err(second) => SqlError::engine(format!(
+            "CREATE TABLE {table} WITH (...): `{refused}` was refused, and removing what the statement had already built then failed too ({second}). The collection `{table}` carries the DROPPING mark, which every reader refuses; `DROP TABLE {table} CASCADE` resumes the removal from where it stopped. The first refusal: {error}"
+        )),
     }
 }
 
@@ -1387,7 +1507,10 @@ impl OwnedScore {
                 b.rebind(binder)?;
             }
             Self::Neg(inner) => inner.rebind(binder)?,
-            Self::Lit(_) | Self::Scalar { .. } => {}
+            // A `search()` with a `$n` is folded at prepare, so a statement
+            // that reaches a rebind has a CONSTANT search query and this leaf
+            // has nothing to refill.
+            Self::Lit(_) | Self::Scalar { .. } | Self::SearchScore { .. } => {}
         }
         Ok(())
     }

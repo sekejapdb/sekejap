@@ -1,6 +1,8 @@
 # Query language contract — sekejap 0.17
 
-Companion to `docs/core/GRAPH_CONTRACT.md` (engine semantics) and
+Companion to `docs/lang/INDEX_CONTRACT.md` (which indexes exist without
+being asked for, and which you declare), `docs/core/GRAPH_CONTRACT.md` (engine
+semantics) and
 `docs/dist/OPS_CONTRACT.md` (the runtime and ops surface: service mode,
 publish, statement timeout, cancellation, change notifications,
 introspection, bulk load, write trace).
@@ -157,7 +159,7 @@ Test files are `lang/tests/*.rs` unless another crate is written out.
 | `DELETE FROM GRAPH g EDGE type WHERE ...` | T2 | — | delete_edge |
 | `CREATE TABLE`, `CREATE INDEX ... USING {btree,gin,gist,exact,quantized,adjacency}`, `DROP INDEX [IF EXISTS]` | T1 | `sql_tier1.rs::create_table_and_create_index_build_a_queryable_collection` | catalog descriptors |
 | `DROP TABLE [IF EXISTS] name [CASCADE\|RESTRICT]` | T1 | `drop_collection.rs::sql_drop_table_if_exists_and_cascade_end_to_end`, `::a_dropped_collection_leaves_every_keyspace_empty_and_its_name_free`, `::an_interrupted_drop_resumes_to_the_state_an_uninterrupted_one_reaches`, `sql_tier1.rs::drop_table_restricts_on_graph_edges_and_cascades_when_asked` | `begin_drop_collection` publishes a DROPPING mark the readers refuse, then `drop_collection_step(id, budget)` empties the indexes, sidecars, rows and mappings in bounded batches and removes the descriptor last; RESTRICT per graph contract 6.1 |
-| `CREATE TABLE t (...) WITH (hash:[...], range:[...], fulltext:[...], bm25:[...], spatial:[...])` | T2 | — (the parser ends the statement at the closing parenthesis, so the `WITH` clause is a syntax error naming the place, not a tier refusal) | sugar, no new atomic: one `create_collection` followed by one `CREATE INDEX` per named field inside the same statement. `hash` and `range` both map to `btree` with a notice (there is no separate hash family, and a `btree` answers equality); `fulltext` and `bm25` map to `gin`; `spatial` maps to `gist`. |
+| `CREATE TABLE t (...) WITH (hash:[...], range:[...], fulltext:[...], bm25:[...], spatial:[...], vector:[...], quantized:[...])` | T1 | `sql_index_sugar.rs::the_sugar_builds_exactly_the_catalog_the_long_hand_statements_build`, `::every_key_maps_to_the_family_the_contract_names_and_the_notice_says_so`, `::a_family_illegal_for_the_column_kind_is_refused_by_name`, `::an_unknown_key_is_refused_by_name_and_lists_the_keys_that_exist`, `::a_column_the_table_does_not_declare_is_refused_by_name`, `::the_generated_name_is_table_column_family_and_a_collision_is_refused_by_name`, `::a_refusal_part_way_through_the_clause_leaves_neither_the_collection_nor_an_index`, `::a_query_that_needed_one_of_those_indexes_answers_immediately_after_the_single_statement`, `::if_not_exists_over_a_collection_that_is_there_creates_no_index_and_says_so`, `::a_with_clause_that_names_no_key_is_refused_by_name_rather_than_ignored` | sugar, no new atomic: one `create_collection` followed by one `CREATE INDEX` per named field inside the same statement, through the SAME `build_index` call the hand-written statement goes through (`lang/src/compile/plan.rs`). **Why it exists:** §6 refuses a predicate on an unindexed column and that is staying, so a caller who wrote only `CREATE TABLE` had five statements to write before one query answered. This removes the CEREMONY, not the EXPLICITNESS: every indexed column is still named by hand, in one place, and every index is ANNOUNCED. **Grammar:** `WITH (` *key* `:` `[` *column* [`,` *column*]… `]` [`,` *key* `:` `[`…`]`]… `)` after the closing parenthesis of the column list. `=` is accepted for `:`. The column list is BRACKETED and a bare name is a syntax error naming the form, because `hash: a, b` would otherwise read `b` as a second key. **Keys and families:** `hash` → `btree` (there is no separate hash family, and a `btree` answers equality); `range` → `btree` (one scalar family answers equality and range alike); `fulltext` → `gin` over `to_tsvector('simple', col)`; `bm25` → the same `gin` (BM25 is how that one text family SCORES, not a family of its own); `spatial` → `gist`, the point family for a `Kind::Point` column and the geometry family for a `Kind::Geo` one; `vector` → `exact`; `quantized` → `quantized`. A key whose family the column's `Kind` cannot carry — a `gist` on a TEXT column, a `gin` on an INT — is REFUSED by name with the key, the family and the `Kind`; there is no second-best family to fall back to. An unknown key is refused BY NAME with the seven that exist written out, never a bare syntax error, and PostgreSQL's storage parameters (`fillfactor` and the rest) are refused there. **Naming rule:** `<table>_<column>_<family>`, where `<family>` is the family the key BECAME — so `hash: [c]` and `range: [c]` generate one and the same `t_c_btree` and writing both is refused as the collision it is, rather than silently deduped. A generated name that is already an index ANYWHERE in the database is refused too, because `DROP INDEX <name>` resolves a bare name over the whole catalog. **Notices:** ONE per mapping, naming the column, the family it became, why, and the generated name; the statement answers `SqlResult::Notice`, which `dist/src/pg/frames.rs::notice_response` sends, so nothing is created that the caller was not told about. **A refusal part way through leaves NOTHING behind.** Every refusal the compiler can raise — unknown key, undeclared column, illegal family, colliding name — is raised before a byte is written. What is left is a refusal only the engine can raise (the 64-index ceiling, the 128-byte name bound, the identity space), and then the statement REMOVES what it had already committed: `begin_drop_collection_mode(Cascade)` and `drop_collection_to_end`, the same bounded phase machine `DROP TABLE` runs, taking the collection and every index of the clause with it, before the refusal is raised. That is a compensating removal and not a rollback — there is one transaction per handle and no savepoint, and an index build commits its own steps — so the caller's OWN uncommitted rows are committed before the statement begins and are never among what is removed. If the removal itself fails, the refusal says so and names the collection, which carries the DROPPING mark every reader refuses and which one `DROP TABLE ... CASCADE` finishes. |
 | column `DEFAULT now()`, `DEFAULT uuid4()`, `DEFAULT uuid5(namespace, name)` | T1 | `sql_schema.rs::the_three_default_generators_fill_a_column_the_insert_does_not_name`, `::a_default_outside_the_closed_generator_set_is_refused_by_name`, `::the_rules_are_in_the_file_and_answer_after_a_reopen`; `core/engine/tests/column_rules.rs` | a per-field COLUMN RULE recorded in the collection descriptor (`ColumnRule`, `core/engine/src/collections/column_rules.rs`) behind the additive `COLUMN_RULES_FEATURE = 0x1000` (Law 8), filled on the write path when the row is assembled and the field is MISSING. An explicit NULL is a written value and defeats the default, as in PostgreSQL. The generator set is closed and each member is O(1) per row: one clock read shared by every `now()` column of that row, 16 bytes from `getrandom`, one SHA-1 over `namespace`+`name` (RFC 4122 §4.3). `now()` stores UTC microseconds; `uuid4`/`uuid5` store text. An arbitrary expression as a DEFAULT is refused by name -- that is the generated-column row below, under its own keyword. |
 | `GENERATED ALWAYS AS (expr) STORED` | T2 (parsed and REFUSED by name, `lang/src/parser/ddl.rs:89`) | `sql_schema.rs::an_alter_form_with_no_atomic_is_refused_and_names_what_there_is` | the same descriptor slot holds a compiled row expression over other declared fields of the **same** row (the §4.1 / §4.2 row-function set), evaluated once the row is assembled and before the index-maintenance hook, so an index over a generated column is maintained exactly like an index over a written one. An expression that reads another row, an aggregate, or a subquery is T3: those are not row functions and have no per-write atomic. |
 | `NOT NULL` on a column | T1 | `sql_schema.rs::not_null_refuses_a_missing_column_and_an_explicit_null_by_name`, `::add_column_not_null_without_a_default_is_refused_on_a_collection_with_rows`; `sql_catalog.rs::db_columns_reports_the_not_null_a_column_was_declared_with` | a per-field flag in the same descriptor slot as the default, checked when the row is assembled and AFTER the defaults are filled: a value that is MISSING or NULL (sekejap distinguishes them) refuses the write and names the column, and says both are refused. Nothing is written. `ALTER TABLE ... ADD COLUMN ... NOT NULL` with no `DEFAULT` on a non-empty collection is T3 and refused by name: every existing row would read MISSING, so the constraint is false the moment it is recorded. Add the column with a default, or add it nullable and fill it. |
@@ -340,8 +342,8 @@ already built and already charged.
 | `bm25(col, 'query')` as an expression | T1 | `sql_tier1.rs::ts_rank_cd_and_bm25_are_the_same_order`, `::an_arithmetic_order_is_one_score_expression`; `sql_explain.rs::a_score_order_names_every_leaf`; `sql_prepared.rs::a_blended_score_rebinds_every_leaf_of_its_tree` | Score leaf |
 | a text configuration other than `'simple'` | T3 for that statement | `sql_refusals.rs::a_text_configuration_beyond_simple_is_tier_three` | analyzer v1 is language-neutral |
 | `websearch_to_tsquery`, `plainto_tsquery` | T2 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | parsers onto the same filter |
-| `search(col, 'query')` typo-tolerant, prefix on the last token (the prior engine's family; Meilisearch-class) | T2 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | term-dictionary prefix range + bounded Levenshtein automaton over the dictionary; new atomic, no format change |
-| `search_score()` | T2 | — | the Score leaf of the `search()` predicate above, normalised to [0,1]: 1 for an exact term match, decreasing with the edit distance actually spent and with how much of the final token the prefix had to complete. It lands with `search()` and costs nothing extra -- the automaton already knows both numbers. The formula is written down the way BM25's is (§5 deviation 5). |
+| `search(col, 'query')` typo-tolerant, prefix on the last token (the prior engine's family; Meilisearch-class) | T1 | `sql_search.rs::a_typo_tolerant_search_names_the_rows_a_brute_force_walk_of_the_vocabulary_names`, `::the_last_token_of_a_search_completes_as_a_prefix_and_an_earlier_token_does_not`, `::a_search_composes_with_a_scalar_filter_beside_it_and_inside_an_or`, `::explain_names_the_search_driver_its_expanded_terms_and_the_score_leaf`, `::a_truncated_dictionary_walk_reaches_the_client_as_a_notice_that_says_so`; `text_search_typo_tolerance.rs::a_brute_force_levenshtein_over_the_same_corpus_names_the_rows_the_index_walk_names`, `::the_last_token_completes_as_a_prefix_and_the_earlier_tokens_do_not`, `::the_edit_bound_is_none_up_to_four_characters_one_up_to_eight_and_two_beyond` | `TextMatch::Search`: a term-dictionary prefix range plus a BOUNDED Levenshtein walk over the dictionary (`core/engine/src/index/text/fuzzy.rs::expand`), then the posting lists the accepted terms already have. NO format change -- the dictionary is the `TERM_STATS = 0x77` run that a text index has always written, one contiguous sorted key per term, and the postings are `POSTING = 0x75`; no keyspace tag and no feature bit were added. The query's tokens are expanded one at a time and a document matches when EVERY token has one of its accepted terms, which makes this a generalisation of `All` rather than a second filter shape -- so a `search()` leaf HAS a membership set and composes inside `OR`. Two bounds: `edit_bound` spends no edit up to 4 characters, one up to 8 and two beyond (Meilisearch's rule), and the walk stops at 4,096 dictionary entries visited or 64 terms accepted. Hitting either TRUNCATES, and a truncated walk carries a NOTICE that names the cap, the way `SHOW EDGES` does |
+| `search_score()` | T1 | `sql_search.rs::search_score_is_one_for_an_exact_match_and_falls_with_the_edits_and_the_completion`, `::a_search_score_order_descends_and_reaches_every_row_the_predicate_admits`, `::a_search_score_blends_with_bm25_and_a_vector_distance_in_one_order_expression`, `::search_score_without_a_search_in_the_statement_is_refused_by_name`; `text_search_typo_tolerance.rs::an_exact_term_scores_one_an_edit_scores_less_and_a_longer_prefix_scores_more` | `ScoreExpr::SearchScore`, the Score leaf of the `search()` predicate above, normalised to [0,1]: 1 for an exact term match, decreasing with the edit distance actually spent and with how much of the final token the prefix had to complete. It costs nothing extra -- the automaton settled both numbers at prepare, so per document this is one posting presence test per accepted term and one mean, and no row is read. The formula is written down the way BM25's is (§5 deviation 8). `search_score()` in a statement with no `search()`, or with more than one, is REFUSED by name rather than returning a number that means nothing |
 | `bm25_norm(col, 'query', k)` | T2 | — | `bm25(col, q) / (bm25(col, q) + k)` over the existing Score leaf: one arithmetic operation, no extra pass, and strictly monotone in `bm25`, so the order it produces is the order `bm25` produces. It earns a row because a hybrid `ORDER BY` has to weigh a text term against a vector similarity, and a weight over an unbounded BM25 is not a weight; with both terms in [0,1) it is. |
 | `highlight`, `ts_headline` | T2 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | row function |
 | multi-field text index | T2 | — | index over a concatenated stored field today; declared multi-field later |
@@ -378,6 +380,22 @@ already built and already charged.
 5. BM25 stands behind `ts_rank_cd`; the number differs from Postgres and the docs say so.
 6. `USING hnsw|diskann|ivfflat|vamana` are aliases of the quantized family.
 7. A join never executes a pattern; a relation between rows is an edge.
+8. `search_score()` is this engine's own number and has no PostgreSQL counterpart, so it is written down here the
+   way BM25 is. Per query token `i`, the bounded automaton accepted a dictionary term having spent `edits_i` of the
+   `bound_i` that token's length allowed, and the term is `found_i` characters long against the `typed_i` the token
+   wrote. The token's quality is
+
+   ```text
+   quality_i = (1 - edits_i / (bound_i + 1)) * (typed_i / max(typed_i, found_i))
+   ```
+
+   and the document's `search_score()` is the MEAN over tokens of the best quality any accepted term of that token
+   reached in it. Both factors lie in (0,1], so the score does: it is exactly 1 when every token matched a term
+   exactly, it falls strictly with each edit spent, and it falls strictly with each character the final token's
+   prefix had to complete. The second factor is 1 for every token but the last, because only the last completes.
+   `bound_i` is `edit_bound(typed_i)`: 0 up to four characters, 1 up to eight, 2 beyond
+   (`core/engine/src/index/text/fuzzy.rs::edit_bound`, `::quality`). A candidate the search does not admit scores
+   `0.0`, which is where a `Bm25` leaf puts a non-matching candidate too.
 8. Declared TIMESTAMPTZ is stored as UTC microseconds in an Int; no time-zone storage.
 9. `<>` on an edge property is accepted, and so is `<>` on an indexed scalar column. The two get there by different roads, and the difference is worth stating: an edge predicate reads the property out of the posting the hop is standing on, so the complement costs exactly what the predicate costs and no set is involved; a scalar `<>` is the COMPLEMENT of an equality over the membership algebra (`sql_refusals.rs::an_inequality_is_the_complement_of_an_equality`), which is a set, bounded by `WorkResource::MembershipBytes`.
 10. The reaching edge is projected under a reserved `@edge.` prefix (`@edge.weight`), which no unquoted SQL identifier can spell, so it never collides with a declared field. A `COLUMNS (r.weight AS w)` entry compiles to it, and `ORDER BY w` resolves against the pattern's edge aliases before it looks for a column of the far node. An edge column entry and an `ORDER BY` over one are matched to the pattern's edge variable WITHOUT case, as every other name in this dialect is.
@@ -412,13 +430,15 @@ Built, with the test file that pins each:
 6. `DROP TABLE` / `DROP INDEX` as bounded resumable phase machines — `core/engine/src/collections/drop_collection.rs`; `drop_collection.rs`.
 7. The reusable `PreparedSql` and the bounded plan cache — `lang/src/compile/bind.rs`, `dist/rust/src/plans.rs`; `sql_prepared.rs`, `dist/rust/tests/api.rs`.
 8. The PostgreSQL wire over all of it, cursors included as session state — `dist/src/pg/`; `dist/tests/pg_wire.rs`, `dist/tests/pg_server.rs`.
+9. The `CREATE TABLE ... WITH (...)` INDEX SUGAR (§2) — `lang/src/parser/ddl.rs::with_indexes`, `lang/src/compile/ddl.rs::with_indexes` and `::with_family`, `lang/src/compile/plan.rs::build_index` and `::unwind_create_table`; `sql_index_sugar.rs`. It adds no family, no keyspace tag and no feature bit: the seven keys map onto the five families `CREATE INDEX` already builds, and the removal a mid-clause refusal runs is `DROP TABLE`'s own phase machine.
+10. Typo-tolerant `search(col, 'query')` and `search_score()` (§4.6) — the atomic is `core/engine/src/index/text/fuzzy.rs` (a bounded Levenshtein walk of the `0x77` term dictionary that is already on disk, no new keyspace tag and no new feature bit), reached through `TextMatch::Search` and `ScoreExpr::SearchScore`; `core/engine/tests/text_search_typo_tolerance.rs`, `lang/tests/sql_search.rs`.
 
 Not built, in the order the atomics make sense:
 
 1. Graph T2 (§4.3) in the graph-contract order: label alternation, the path accumulators, `ANY SHORTEST`, element identity.
 2. Geometry I/O and `&&` (§4.4): the WKT/WKB readers and writers, `ST_X`/`ST_Y`, the bbox operator, `postgis_version()`.
 3. The MULTI-range date rewrites (`EXTRACT(MONTH ...)`, `EXTRACT(DOW ...)`), which item 3 of the built list now makes possible: the pre-image is a set of ranges and the membership union exists.
-4. Trigram index for `ILIKE` / infix `LIKE`; typo-tolerant `search()` and `search_score()` (§4.6).
+4. Trigram index for `ILIKE` / infix `LIKE` (§3). Typo-tolerant `search()` and `search_score()` (§4.6) are BUILT and moved to the list above as item 11.
 5. A PROJECTION-EXPRESSION surface: `CASE WHEN`, the JSON path operators, `json_array_length`, and `ST_Area` / `ST_Length` / `ST_Perimeter` / `ST_Centroid`. All of them are the same missing piece — a row expression in a select list that is not one of the closed `ROW_FUNCTIONS` names. The SURFACE is still unbuilt. What is no longer missing is the refusal: each spelling now has a `refuse::TABLE` row naming this item, and the expression parser consults the table when it meets a function name or a keyword it does not compile, so every one of them is a Tier-2 refusal by name in a select list and in a `WHERE` (`lang/src/refuse.rs`, `lang/src/parser/expr.rs::primary` and `::row_atom`; `lang/tests/refusal_by_name.rs::the_projection_expression_constructs_are_refused_by_name_in_both_positions`). `#>` and `#>>` needed a lexer token before they could be named at all, and have one.
 6. Key-equality joins (§4.8).
 7. `SHOW STATUS` / `SHOW STORAGE` (`docs/dist/OPS_CONTRACT.md` §6), `EXPLAIN ANALYZE`, `REINDEX` and `COMPACT` as
@@ -524,6 +544,38 @@ CREATE INDEX ex_town_emb_ann ON ex_town USING diskann (emb vector_cosine_ops)
 ```sql
 -- DROP INDEX [IF EXISTS]
 DROP INDEX IF EXISTS ex_town_founded
+```
+
+The four blocks above declare a table and then index it one statement at a
+time. The `WITH (...)` sugar writes the same thing once. It builds the same
+descriptors -- `sql_index_sugar.rs::the_sugar_builds_exactly_the_catalog_the_long_hand_statements_build`
+compares them field by field against the long hand -- under the generated
+names `<table>_<column>_<family>`, and it raises one NOTICE per mapping
+saying which family the key became and why.
+
+```sql
+-- CREATE TABLE ... WITH (...): the table and its indexes in one statement
+CREATE TABLE ex_depot (name TEXT, label TEXT, founded INT, loc GEOMETRY(Point,4326), emb VECTOR(4)) WITH (hash: [name], range: [founded], fulltext: [label], spatial: [loc], vector: [emb])
+```
+
+```sql
+-- and the predicate answers immediately: `ex_depot_founded_btree` is the index it names
+SELECT name FROM ex_depot WHERE founded >= 1900
+```
+
+```sql
+-- what the sugar does NOT remove: `_key` was not named, so the generated names are the only ones
+DROP INDEX ex_depot_emb_exact
+```
+
+```sql refused
+-- refused 0A000: a WITH key outside the seven, refused BY NAME with the seven written out
+CREATE TABLE ex_bad (c TEXT) WITH (gin: [c])
+```
+
+```sql refused
+-- refused 0A000: a family the column's Kind cannot carry -- a gist indexes a Point or a Geo column
+CREATE TABLE ex_bad (c TEXT) WITH (spatial: [c])
 ```
 
 ```sql
@@ -1251,9 +1303,39 @@ SELECT _key FROM place WHERE to_tsvector('simple', body) @@ to_tsquery('simple',
 SELECT _key FROM place WHERE to_tsvector('english', body) @@ to_tsquery('english', 'gardens')
 ```
 
-```sql refused
--- refused 0A000: SEARCH
+```sql
+-- search(col, 'query') is typo-tolerant: this is an exact term
 SELECT _key FROM place WHERE search(body, 'kebun')
+```
+
+```sql
+-- one edit is spent on a five-character token, so a typo still finds it
+SELECT _key FROM place WHERE search(body, 'kebum')
+```
+
+```sql
+-- the LAST token completes as a prefix (search-as-you-type)
+SELECT _key FROM place WHERE search(body, 'keb')
+```
+
+```sql
+-- an earlier token does NOT complete: it matches a whole term, typos aside
+SELECT _key FROM place WHERE search(body, 'kebun saw')
+```
+
+```sql
+-- search_score() is the predicate's own Score leaf, in [0,1], and projects under an alias
+SELECT _key, search_score() AS score FROM place WHERE search(body, 'keb') ORDER BY search_score() DESC LIMIT 5
+```
+
+```sql
+-- a blended order: one key over a bounded text score and a vector similarity
+SELECT _key FROM place WHERE search(body, 'kebun') ORDER BY 0.6 * search_score() + 0.4 * (1 - (emb <=> '[1,0,0,0]'::vector)) DESC LIMIT 5
+```
+
+```sql refused
+-- refused 0A000: SEARCH_SCORE with no search() to score
+SELECT _key FROM place WHERE kind = 'cafe' ORDER BY search_score() DESC
 ```
 
 ```sql refused

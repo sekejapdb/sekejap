@@ -268,6 +268,11 @@ impl<'a> Binder<'a> {
     /// `&` and `|` is an AND/OR tree, which is Tier 2.
     pub(crate) fn tsquery(&self, query: &TsQuery) -> SqlResult2<(String, TextMatch)> {
         let text = self.text_of(&query.source)?;
+        // `search()` names its own match mode: no tsquery operator chooses
+        // it, and no value can turn an ordinary text filter into one.
+        if query.fuzzy {
+            return Ok((text, TextMatch::Search));
+        }
         if !query.tsquery_syntax {
             return Ok((text, TextMatch::Any));
         }

@@ -328,6 +328,15 @@ impl<'a> DriverCursor<'a> {
                 }
                 let carries = streams.len() <= INLINE_TEXT_TERMS;
                 Ok(Self::Text(TextCursor {
+                    // One list of `terms` positions per query TOKEN, lifted
+                    // out of the prepared query so the merge does not hold a
+                    // borrow of it.
+                    groups: prepared
+                        .groups
+                        .iter()
+                        .map(|group| group.iter().map(|accepted| accepted.term).collect())
+                        .collect(),
+                    present: Vec::new(),
                     streams,
                     collection: prepared.info.collection,
                     matching: prepared.matching,
@@ -751,6 +760,42 @@ impl TextCursor<'_> {
         // before the streams are advanced off them.
         let mut slots = [0u32; INLINE_TEXT_TERMS];
         let sequence = match self.matching {
+            // The typo-tolerant merge walks the SAME ascending union `Any`
+            // walks -- one stream per accepted dictionary term -- and then
+            // asks the prepared query's own rule whether the document it
+            // landed on satisfies every query TOKEN. A leapfrog like `All`'s
+            // is not available: a token is satisfied by ANY of its terms, so
+            // no single stream can be seeked to the answer.
+            TextMatch::Search => loop {
+                let Some(sequence) = self
+                    .streams
+                    .iter()
+                    .filter_map(|stream| stream.head.map(|(sequence, _)| sequence))
+                    .min()
+                else {
+                    self.done = true;
+                    return Ok(None);
+                };
+                self.present.clear();
+                self.present.resize(self.streams.len(), false);
+                for (position, stream) in self.streams.iter_mut().enumerate() {
+                    if stream.head.is_some_and(|(at, _)| at == sequence) {
+                        self.present[position] = true;
+                        if let Some(slot) = slots.get_mut(position) {
+                            *slot = stream.head.unwrap().1;
+                        }
+                        stream.advance(meter)?;
+                    }
+                }
+                if self.groups
+                    .iter()
+                    .all(|group| group.iter().any(|term| self.present[*term]))
+                {
+                    break sequence;
+                }
+                meter.charge(WorkResource::TextPostings, 1)?;
+                slots = [0u32; INLINE_TEXT_TERMS];
+            },
             TextMatch::Any => {
                 let Some(sequence) = self
                     .streams

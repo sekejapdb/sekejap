@@ -88,17 +88,24 @@ pub(super) enum SpatialPredicate {
     Contains,
 }
 
-/// The argument of `to_tsquery('simple', ...)` or of `bm25(col, ...)`.
+/// The argument of `to_tsquery('simple', ...)`, of `bm25(col, ...)` or of
+/// `search(col, ...)`.
 ///
 /// Which of `TextMatch::Any`, `All` or `Phrase` it means depends on whether
 /// the text holds `|`, `&` or a quoted phrase, and the text can arrive as a
 /// parameter, so the reading happens in `compile.rs` rather than here.
+/// `search()` is decided here instead, by the spelling: it is the one match
+/// mode a VALUE cannot choose.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct TsQuery {
     pub(super) source: Literal,
     /// True when the statement wrote `to_tsquery`, false for `bm25`, which
     /// takes the words as written with no operator syntax.
     pub(super) tsquery_syntax: bool,
+    /// True when the statement wrote `search(col, 'query')`: the words are
+    /// taken as written, typo-tolerantly, with the LAST one completed as a
+    /// prefix (`docs/lang/QL_CONTRACT.md` §4.6).
+    pub(super) fuzzy: bool,
 }
 
 /// The right-hand side of a date/time comparison: a written literal, or the
@@ -376,6 +383,12 @@ pub(super) enum ScoreNode {
         column: String,
         query: TsQuery,
     },
+    /// `search_score()`: the Score leaf of this statement's own `search()`
+    /// predicate. It carries no column and no query of its own -- the
+    /// predicate in the `WHERE` supplies both, and a statement with no
+    /// `search()` refuses it by name rather than returning a number that
+    /// means nothing.
+    SearchScore,
     /// `col <=> $v` and friends: the DISTANCE, which lowers to the negation
     /// of `ScoreExpr::VectorSimilarity`.
     VecDistance {
@@ -664,6 +677,21 @@ pub(super) struct ColumnDef {
     pub(super) rule: Option<ColumnRule>,
 }
 
+/// One `key: [column]` pair of the `CREATE TABLE ... WITH (...)` sugar.
+///
+/// The parser records the SPELLING; which index family it becomes, and
+/// whether that family is legal for the column's declared `Kind`, is the
+/// compiler's decision (`lang/src/compile/ddl.rs::with_family`), because only
+/// the compiler holds the column list the keys name.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct WithIndex {
+    /// The key as the contract spells it, folded to lower case: `hash`,
+    /// `range`, `fulltext`, `bm25`, `spatial`, `vector`, `quantized`.
+    pub(super) key: String,
+    /// The column the key names, in the case the statement wrote it.
+    pub(super) column: String,
+}
+
 /// The one change an `ALTER TABLE` statement makes. Each is `alter_collection`
 /// underneath: a new immutable `Layout` and a repointed catalog in one commit,
 /// O(fields) and no row rewritten (QL_CONTRACT §2).
@@ -781,6 +809,11 @@ pub(super) enum Stmt {
         /// `IF NOT EXISTS`: a catalog probe decides, and a table that is
         /// already there raises a NOTICE rather than an error.
         if_not_exists: bool,
+        /// The `WITH (...)` INDEX SUGAR, one entry per (key, column) pair in
+        /// the order the statement wrote them (QL_CONTRACT §2). Empty when
+        /// the statement had no `WITH` clause, which is every `CREATE TABLE`
+        /// written before this sugar existed.
+        indexes: Vec<WithIndex>,
     },
     CreateIndex {
         name: String,

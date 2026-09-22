@@ -461,6 +461,26 @@ impl Compiler<'_> {
                     fill,
                 }
             }
+            ScoreNode::SearchScore => match &self.search_leaf {
+                Some(SearchLeaf::One { index, query }) => OwnedScore::SearchScore {
+                    index: *index,
+                    query: query.clone(),
+                },
+                Some(SearchLeaf::Several) => {
+                    return Err(SqlError::Refused {
+                        keyword: "search_score".into(),
+                        tier: Tier::Two,
+                        reason: "QL_CONTRACT §4.6: search_score() is the Score leaf of ONE search() predicate, and this statement writes more than one; there is no spelling that says which, so it is refused rather than bound to whichever compiled last.",
+                    })
+                }
+                None => {
+                    return Err(SqlError::Refused {
+                        keyword: "search_score".into(),
+                        tier: Tier::Two,
+                        reason: "QL_CONTRACT §4.6: search_score() scores the search() predicate of its own statement; with no search() in the WHERE there is nothing to score, and a number with no predicate behind it would mean nothing.",
+                    })
+                }
+            },
             ScoreNode::VecDistance { column, query, op } => {
                 let index =
                     self.index_for(c, column, IndexFamily::ExactVector, "an exact vector index")?;

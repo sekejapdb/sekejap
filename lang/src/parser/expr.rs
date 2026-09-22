@@ -183,6 +183,12 @@ impl Parser {
                 "ST_DWITHIN" | "ST_INTERSECTS" | "ST_WITHIN" | "ST_CONTAINS" | "ST_COVERS"
                 | "ST_CROSSES" => return self.spatial_predicate(),
                 "TO_TSVECTOR" => return self.text_predicate(),
+                // `search(col, 'query')`, guarded on the parenthesis so a
+                // collection whose column is called `search` still means the
+                // column.
+                "SEARCH" if *self.peek_at(1) == Tok::LParen => {
+                    return self.search_predicate()
+                }
                 _ => {}
             }
         }
@@ -459,6 +465,28 @@ impl Parser {
         Ok(TsQuery {
             source,
             tsquery_syntax: true,
+            fuzzy: false,
+        })
+    }
+
+    /// `search(col, 'query')` -- the typo-tolerant predicate of
+    /// `docs/lang/QL_CONTRACT.md` §4.6. No configuration argument: analyzer
+    /// v1 is language-neutral and `'simple'` is the only configuration this
+    /// engine has, so a second argument would be a knob that changes nothing.
+    fn search_predicate(&mut self) -> SqlResult2<Predicate> {
+        self.expect_word("SEARCH")?;
+        self.expect(&Tok::LParen)?;
+        let column = self.name()?;
+        self.expect(&Tok::Comma)?;
+        let source = self.literal()?;
+        self.expect(&Tok::RParen)?;
+        Ok(Predicate::Text {
+            column,
+            query: TsQuery {
+                source,
+                tsquery_syntax: false,
+                fuzzy: true,
+            },
         })
     }
 
@@ -815,6 +843,14 @@ impl Parser {
                         self.expect(&Tok::RParen)?;
                         Ok(PExpr::Bm25 { column, query })
                     }
+                    // `search_score()`: no arguments, because the
+                    // statement's own `search()` predicate is what it scores.
+                    Some("SEARCH_SCORE") => {
+                        self.bump();
+                        self.expect(&Tok::LParen)?;
+                        self.expect(&Tok::RParen)?;
+                        Ok(PExpr::SearchScore)
+                    }
                     Some("BM25") => {
                         self.bump();
                         self.expect(&Tok::LParen)?;
@@ -827,6 +863,7 @@ impl Parser {
                             query: TsQuery {
                                 source,
                                 tsquery_syntax: false,
+                                fuzzy: false,
                             },
                         })
                     }

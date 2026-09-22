@@ -97,6 +97,16 @@ pub(super) struct PreparedText {
     /// the document scanner used to rebuild it per document.
     pub(super) phrase_prefix: Vec<usize>,
     pub(super) matching: TextMatch,
+    /// `TextMatch::Search` only: the bounded dictionary walk's answer. One
+    /// entry per QUERY TOKEN, holding the `terms` positions that token
+    /// accepted with the quality each contributes. A document satisfies the
+    /// search when every group has one of its terms present, which is what
+    /// makes `Search` a generalisation of `All` rather than a second filter
+    /// shape. Empty for every other match mode.
+    pub(super) groups: Vec<Vec<crate::index::text::fuzzy::Accepted>>,
+    /// Did the walk stop at one of its bounds? Carried so `EXPLAIN` can say
+    /// so beside the term count.
+    pub(super) truncated: bool,
     pub(super) dfs: Vec<u64>,
     /// The corpus half of every BM25 score this query can produce, and one
     /// inverse document frequency per term. Both are settled the moment the
@@ -121,6 +131,52 @@ impl PreparedText {
     /// would silently score the wrong documents.
     pub(super) fn same_terms(&self, other: &Self) -> bool {
         self.info.id == other.info.id && self.matching == other.matching && self.terms == other.terms
+    }
+
+    /// Does a document holding exactly these terms satisfy this match?
+    ///
+    /// `present[i]` is whether `terms[i]` has a live posting for the
+    /// document. `Any` needs one, `All` and `Phrase` need every one, and
+    /// `Search` needs one per QUERY TOKEN -- the three rules in one place so
+    /// that the merge, the per-candidate filter and the scorer cannot drift
+    /// apart.
+    pub(super) fn admits(&self, present: &[bool]) -> bool {
+        match self.matching {
+            TextMatch::Any => present.iter().any(|held| *held),
+            TextMatch::All | TextMatch::Phrase => {
+                present.len() == self.terms.len() && present.iter().all(|held| *held)
+            }
+            TextMatch::Search => self
+                .groups
+                .iter()
+                .all(|group| group.iter().any(|accepted| present[accepted.term])),
+        }
+    }
+
+    /// The `search_score()` of a document holding exactly these terms: the
+    /// MEAN over query tokens of the best quality that token's accepted terms
+    /// reached in it.
+    ///
+    /// Every quality lies in (0,1] and an exact term match is 1, so the mean
+    /// lies in (0,1] and is 1 exactly when every token matched a term
+    /// exactly. `None` when the document does not satisfy the search at all.
+    pub(super) fn search_quality(&self, present: &[bool]) -> Option<f64> {
+        if self.groups.is_empty() {
+            return None;
+        }
+        let mut total = 0.0;
+        for group in &self.groups {
+            let best = group
+                .iter()
+                .filter(|accepted| present[accepted.term])
+                .map(|accepted| accepted.score)
+                .fold(f64::NEG_INFINITY, f64::max);
+            if !best.is_finite() {
+                return None;
+            }
+            total += best;
+        }
+        Some(total / self.groups.len() as f64)
     }
 }
 
@@ -163,6 +219,10 @@ pub(super) const MAX_TEXT_TERMS: usize = 64;
 pub(super) struct TextRowScratch {
     pub(super) frequencies: Vec<u32>,
     pub(super) idfs: Vec<f64>,
+    /// One flag per PREPARED term: did this document hold it? `Search` needs
+    /// the uncompacted shape because its match rule is per query TOKEN and a
+    /// token owns several positions of the term list.
+    pub(super) present: Vec<bool>,
 }
 
 /// Everything one page reuses across its candidates, in one place.
@@ -322,7 +382,23 @@ pub(super) fn prepare_text(
     if analysis.terms.len() > 64 {
         return Err(invalid_query("text query exceeds 64 distinct terms"));
     }
-    let terms: Vec<_> = analysis.terms.into_keys().collect();
+    // `Search` does not search the tokens the query wrote: it searches the
+    // dictionary terms the bounded Levenshtein walk accepted for them. The
+    // walk is the atomic (`core/engine/src/index/text/fuzzy.rs`), and what
+    // comes back is already bounded -- at most `fuzzy::MAX_TERMS` terms after
+    // at most `fuzzy::MAX_VISITED` dictionary entries.
+    let expanded = if matching == TextMatch::Search {
+        Some(crate::index::text::fuzzy::expand(db, id, query, &mut || false)?)
+    } else {
+        None
+    };
+    let (terms, groups, truncated) = match expanded {
+        Some(expansion) => (expansion.terms, expansion.groups, expansion.truncated),
+        None => (analysis.terms.into_keys().collect(), Vec::new(), false),
+    };
+    if terms.len() > MAX_TEXT_TERMS {
+        return Err(invalid_query("text query exceeds 64 distinct terms"));
+    }
     let corpus = crate::index::text::read_corpus(db, id)?;
     let mut dfs = Vec::with_capacity(terms.len());
     for term in &terms {
@@ -355,6 +431,8 @@ pub(super) fn prepare_text(
             .unwrap_or_default(),
         phrase,
         matching,
+        groups,
+        truncated,
         dfs,
         weights,
         idfs,

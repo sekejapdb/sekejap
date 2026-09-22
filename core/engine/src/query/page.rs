@@ -1623,7 +1623,24 @@ fn text_predicate_text(prepared: &PreparedText) -> String {
         TextMatch::Any => "any",
         TextMatch::All => "all",
         TextMatch::Phrase => "phrase",
+        TextMatch::Search => "search",
     };
+    if prepared.matching == TextMatch::Search {
+        // A search predicate's term count is the DICTIONARY's answer, not the
+        // query's, so EXPLAIN prints both and says when a bound stopped the
+        // walk. A reader who sees only the expanded count cannot tell a
+        // three-word query that matched 40 terms from one that was cut off.
+        return format!(
+            "search, {} token(s) expanded to {} dictionary term(s){}",
+            prepared.groups.len(),
+            prepared.terms.len(),
+            if prepared.truncated {
+                ", TRUNCATED at the walk's bound"
+            } else {
+                ""
+            }
+        );
+    }
     format!("{matching} of {} term(s)", prepared.terms.len())
 }
 
@@ -1635,6 +1652,11 @@ fn score_leaves(expr: &CompiledScoreExpr, out: &mut Vec<String>) {
         }
         CompiledScoreExpr::Bm25(prepared) => out.push(format!(
             "bm25 {} ({})",
+            prepared.info.name,
+            text_predicate_text(prepared)
+        )),
+        CompiledScoreExpr::SearchScore(prepared) => out.push(format!(
+            "search_score {} ({})",
             prepared.info.name,
             text_predicate_text(prepared)
         )),

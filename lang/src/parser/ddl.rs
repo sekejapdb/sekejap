@@ -43,11 +43,107 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen)?;
+        // The INDEX SUGAR of QL_CONTRACT §2. `WITH` is the only word that may
+        // follow the closing parenthesis, and it opens the clause below
+        // rather than ending the statement.
+        let indexes = if self.eat_word("WITH") {
+            self.with_indexes()?
+        } else {
+            Vec::new()
+        };
         Ok(Stmt::CreateTable {
             table,
             columns,
             if_not_exists,
+            indexes,
         })
+    }
+
+    /// The keys `CREATE TABLE ... WITH (...)` accepts, in the order the
+    /// contract lists them. A key outside this set is refused BY NAME with
+    /// the set written out -- never a bare syntax error, because the whole
+    /// point of the sugar is that the caller is told what it can say.
+    const WITH_KEYS: [&'static str; 7] = [
+        "hash",
+        "range",
+        "fulltext",
+        "bm25",
+        "spatial",
+        "vector",
+        "quantized",
+    ];
+
+    /// `WITH (hash: [a, b], fulltext: [c], spatial: [d])`.
+    ///
+    /// Each key takes a BRACKETED list of column names, which is the spelling
+    /// QL_CONTRACT §2 writes. A bare name without brackets is a syntax error
+    /// that names the form, because `hash: a, b` would otherwise read `b` as
+    /// a second key and refuse it as an unknown one -- a worse message than
+    /// the one that says where the brackets go. The same key may be written
+    /// more than once and the pairs accumulate in written order; a pair that
+    /// names the same column twice under one family collides on its generated
+    /// index name and is refused there (`lang/src/compile/ddl.rs`).
+    fn with_indexes(&mut self) -> SqlResult2<Vec<WithIndex>> {
+        self.expect(&Tok::LParen)?;
+        let mut out = Vec::new();
+        loop {
+            let at = self.here();
+            let Some(key) = self.word() else {
+                return Err(SqlError::unsupported(format!(
+                    "CREATE TABLE ... WITH ({}): the clause takes an index key, and the keys are {} (QL_CONTRACT §2)",
+                    self.peek().written(),
+                    Self::written_keys()
+                )));
+            };
+            self.bump();
+            let key = key.to_ascii_lowercase();
+            if !Self::WITH_KEYS.contains(&key.as_str()) {
+                return Err(SqlError::unsupported(format!(
+                    "CREATE TABLE ... WITH ({key}: ...): `{key}` is not an index key. The keys are {} (QL_CONTRACT §2); PostgreSQL's storage parameters are not among them, because nothing here is settable per table",
+                    Self::written_keys()
+                )));
+            }
+            // `:` is the contract's spelling; `=` is what a hand reaching for
+            // PostgreSQL's `WITH (fillfactor = 70)` writes, and it means the
+            // same thing here, so both are taken.
+            if !self.eat(&Tok::Colon) && !self.eat(&Tok::Eq) {
+                return Err(SqlError::syntax(
+                    format!(
+                        "expected `:` after the WITH key `{key}`, found `{}`",
+                        self.peek().written()
+                    ),
+                    at,
+                ));
+            }
+            if !self.eat(&Tok::LBracket) {
+                return Err(SqlError::syntax(
+                    format!(
+                        "WITH ({key}: ...) takes a bracketed column list -- `{key}: [column]` or `{key}: [one, two]` -- found `{}`",
+                        self.peek().written()
+                    ),
+                    at,
+                ));
+            }
+            loop {
+                out.push(WithIndex {
+                    key: key.clone(),
+                    column: self.name()?,
+                });
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RBracket)?;
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(out)
+    }
+
+    fn written_keys() -> String {
+        Self::WITH_KEYS.join(", ")
     }
 
     /// One column: a name, a type, and the clauses after it. `DEFAULT` and

@@ -110,6 +110,7 @@ pub use crate::index::graph::{
 };
 pub use crate::index::graph::endpoints::{EndpointProgress, ENDPOINT_FEATURE};
 pub use crate::index::spatial::point::{SpatialCandidates, SpatialHit};
+pub use crate::index::text::fuzzy::SearchExpansion;
 pub use crate::index::text::{TextCandidates, TextHit, TextMatch};
 pub use crate::index::vector::exact::{VectorCandidates, VectorHit, VectorMetric};
 pub use crate::index::vector::quantized::{

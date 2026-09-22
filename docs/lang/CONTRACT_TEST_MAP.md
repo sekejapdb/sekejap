@@ -141,6 +141,8 @@ the end keep the two sets apart for that reason.
 | `to_tsvector('simple', col) @@ to_tsquery('simple', 'a \| b')` / `'a & b'` / `'"a b"'` | Text filter Any / All / Phrase (analyzer v1) | `core/engine/tests/index_text.rs` `tiny_ranking_any_all_and_candidate_filter_match_independent_bm25`; `core/engine/tests/index_text.rs` `phrase_is_ordered_contiguous_bounded_and_snapshot_authoritative`; `core/engine/tests/query_multimodel.rs` `phrase_refines_all_term_candidates_before_rank_and_across_drivers`; `core/engine/tests/query_candidate_budget.rs` `a_phrase_scans_the_row_without_a_descent_or_a_term_map` |
 | `ORDER BY ts_rank_cd(...)` | Bm25 order (formula differs from Postgres; documented) | `core/engine/tests/query_candidate_budget.rs` `bm25_scores_match_the_definition_after_the_constants_are_hoisted`; `core/engine/tests/text_score_cost.rs` `scoring_a_term_that_matches_most_of_the_corpus_costs_one_pass_not_one_per_document`; `core/engine/tests/query_score.rs` `score_bm25_leaf_equals_bm25_order` |
 | `bm25(col, 'query')` as an expression | Score leaf | `core/engine/tests/query_score.rs` `score_bm25_leaf_equals_bm25_order`; `core/engine/tests/query_score.rs` `score_hybrid_matches_row_oracle_across_page_sizes`; `core/engine/tests/query_combinations.rs` `hand_picked_surface_combinations` (`hp22_score_hybrid`) |
+| `search(col, 'query')` typo-tolerant, LAST token as a prefix | `TextMatch::Search`: a bounded Levenshtein walk of the `TERM_STATS = 0x77` dictionary that is already on disk (`core/engine/src/index/text/fuzzy.rs::expand`), then the `POSTING = 0x75` lists the accepted terms already have. No keyspace tag and no feature bit added. A document matches when every query TOKEN has one of its accepted terms, so it generalises `All` and has a membership set | `core/engine/tests/text_search_typo_tolerance.rs` `a_brute_force_levenshtein_over_the_same_corpus_names_the_rows_the_index_walk_names`, `the_last_token_completes_as_a_prefix_and_the_earlier_tokens_do_not`, `the_edit_bound_is_none_up_to_four_characters_one_up_to_eight_and_two_beyond`, `a_walk_that_would_pass_its_bound_is_truncated_and_says_so`, `a_search_answers_under_a_query_budget_and_a_refusal_names_its_resource`; SQL: `lang/tests/sql_search.rs` `a_typo_tolerant_search_names_the_rows_a_brute_force_walk_of_the_vocabulary_names`, `the_last_token_of_a_search_completes_as_a_prefix_and_an_earlier_token_does_not`, `a_search_composes_with_a_scalar_filter_beside_it_and_inside_an_or`, `a_truncated_dictionary_walk_reaches_the_client_as_a_notice_that_says_so`, `explain_names_the_search_driver_its_expanded_terms_and_the_score_leaf` |
+| `search_score()` | `ScoreExpr::SearchScore`: the Score leaf of the `search()` predicate, in [0,1] from the edit distance spent and the characters the final token's prefix completed (QL_CONTRACT §5 deviation 8). No row read | `core/engine/tests/text_search_typo_tolerance.rs` `an_exact_term_scores_one_an_edit_scores_less_and_a_longer_prefix_scores_more`; SQL: `lang/tests/sql_search.rs` `search_score_is_one_for_an_exact_match_and_falls_with_the_edits_and_the_completion`, `a_search_score_order_descends_and_reaches_every_row_the_predicate_admits`, `a_search_score_blends_with_bm25_and_a_vector_distance_in_one_order_expression`, `search_score_without_a_search_in_the_statement_is_refused_by_name` |
 
 ### §4.7 Aggregates
 
@@ -162,7 +164,7 @@ with T1, not here.
 | --- | --- | --- |
 | `SELECT ... FROM ALL` | `Collections` concatenation driver in catalog id order; resume `(collection id, inner cursor)`; `LIMIT` stops inside the collection it is reached in; a ranked `ORDER BY` over it is refused | UNPINNED (refused by name; `lang/tests/sql_dml.rs` `from_all_is_refused_by_name_in_both_statements_that_can_write_it` pins the refusal, not the construct) |
 | `DELETE FROM ALL` | the `FROM ALL` driver above, feeding `delete` | UNPINNED (refused by name; `lang/tests/sql_dml.rs` `from_all_is_refused_by_name_in_both_statements_that_can_write_it` pins the refusal, not the construct) |
-| `CREATE TABLE t (...) WITH (hash/range/fulltext/bm25/spatial)` | expansion to `create_collection` + one `CREATE INDEX` per field; hash/range → btree, fulltext/bm25 → gin, spatial → gist | UNPINNED |
+| `CREATE TABLE t (...) WITH (hash/range/fulltext/bm25/spatial/vector/quantized)` | LANDED 2026-09-22 -- now T1; pinned in "Query language §2 index sugar" below | see below |
 | column `DEFAULT now()`, `DEFAULT uuid4()`, `DEFAULT uuid5(ns, name)` | LANDED 2026-09-21 -- now T1; pinned in "Query language §2 schema rows" below | see below |
 | `GENERATED ALWAYS AS (expr) STORED` | compiled row expression over fields of the same row, evaluated before index maintenance so an index over the generated column is maintained | UNPINNED |
 | `NOT NULL` on a column | LANDED 2026-09-21 -- now T1; pinned in "Query language §2 schema rows" below | see below |
@@ -201,7 +203,6 @@ with T1, not here.
 
 | Construct | Atomic to pin | Tests |
 | --- | --- | --- |
-| `search_score()` | Score leaf of `search()`, in [0,1] from the edit distance spent and the prefix completed; lands with `search()` | UNPINNED |
 | `bm25_norm(col, 'query', k)` | `bm25/(bm25+k)` on the existing Score leaf; one operation, no extra pass, strictly monotone so the `bm25` order is unchanged | UNPINNED |
 
 ## Operations contract (`docs/dist/OPS_CONTRACT.md`)
@@ -227,6 +228,25 @@ falsify, not decorate.
 | 9.2 | `CancelRequest` | the protocol's backend-id/secret pair selects the handle of §4; both timeout and cancel return `57014 query_canceled`, told apart by the MESSAGE, not the code (`dist/src/pg/types.rs::CANCELLED_MESSAGE`, `::deadline_message`) | L6 | `dist/tests/pg_server.rs` `a_cancel_from_a_second_client_stops_the_statement_in_flight_with_57014`; `dist/tests/pg_wire.rs` `a_cancel_request_names_the_backend_it_wants_stopped_and_then_closes`, `a_cancelled_statement_arrives_as_57014` |
 | 9.3 | `LISTEN` / `NOTIFY` | one notification per committed batch per listening channel, delivered at end of transaction, none on rollback; a CLIENT-issued `NOTIFY` is refused by name rather than emulated | L6, L1 | `dist/tests/pg_server.rs` `listen_delivers_a_notification_after_a_commit_made_on_another_connection`; `dist/tests/pg_wire.rs` `listen_delivers_one_notification_per_listening_channel_after_each_commit_and_none_before`, `a_client_issued_notify_is_refused_by_name_rather_than_emulated` |
 | 9.4 | what the wire does not get | the constructs the wire refuses by name rather than emulating, as `0A000` | L4 | `dist/tests/pg_wire.rs` `a_refused_construct_arrives_as_0a000_with_the_contracts_named_reason`; `dist/tests/pg_server.rs` `a_refused_construct_reaches_the_client_as_0a000_with_the_contracts_reason` |
+
+## Query language §2 index sugar (landed 2026-09-22)
+
+The `CREATE TABLE t (...) WITH (...)` row, moved from T2 to T1. It adds no
+atomic and no index family: the seven keys map onto the five families
+`CREATE INDEX` already builds, through the same `build_index` call, and the
+removal a mid-clause refusal runs is `DROP TABLE`'s own phase machine.
+
+| Construct | Atomic | Tests |
+| --- | --- | --- |
+| the clause as a whole | one `create_collection_rules` followed by one `create_*_index` + `build_index_to_ready` per named column, in written order, inside one statement (`lang/src/compile/plan.rs::build_index`) | `lang/tests/sql_index_sugar.rs` `the_sugar_builds_exactly_the_catalog_the_long_hand_statements_build` -- the oracle is the long-hand statements in a second database, compared descriptor by descriptor |
+| the key -> family mapping | `hash`/`range` -> `btree` (one scalar family answers equality and range); `fulltext`/`bm25` -> `gin` over `to_tsvector('simple', col)` (BM25 is how that family scores); `spatial` -> `gist`, point or geometry by the column's `Kind`; `vector` -> `exact`; `quantized` -> `quantized` (`lang/src/compile/ddl.rs::with_family`) | `lang/tests/sql_index_sugar.rs` `every_key_maps_to_the_family_the_contract_names_and_the_notice_says_so` |
+| a family the column's `Kind` cannot carry | refused by name with the key, the family and the `Kind`; no fall-back family, because a silent fall-back is the silent scan §6 forbids | `lang/tests/sql_index_sugar.rs` `a_family_illegal_for_the_column_kind_is_refused_by_name` |
+| an unknown key | refused BY NAME with the seven keys that exist written out, never a bare syntax error; PostgreSQL's storage parameters are refused there | `lang/tests/sql_index_sugar.rs` `an_unknown_key_is_refused_by_name_and_lists_the_keys_that_exist`, `a_column_the_table_does_not_declare_is_refused_by_name` |
+| the generated index name | `<table>_<column>_<family>`, the family being the one the key BECAME; a collision inside the clause or with an index held anywhere in the database is refused by name, because `DROP INDEX <name>` resolves a bare name over the whole catalog | `lang/tests/sql_index_sugar.rs` `the_generated_name_is_table_column_family_and_a_collision_is_refused_by_name` |
+| a refusal part way through | every compiler-decidable refusal is raised before a byte is written; an engine refusal after that removes the collection and every index the clause had built, through `begin_drop_collection_mode(Cascade)` + `drop_collection_to_end`, before raising | `lang/tests/sql_index_sugar.rs` `a_refusal_part_way_through_the_clause_leaves_neither_the_collection_nor_an_index` |
+| the notices | one per mapping, naming the column, the family, why, and the generated name; the statement answers `SqlResult::Notice`, which `dist/src/pg/frames.rs::notice_response` sends | `lang/tests/sql_index_sugar.rs` `every_key_maps_to_the_family_the_contract_names_and_the_notice_says_so` |
+| what it does NOT remove | a predicate on a column the clause did not name is still REFUSED by name, never scanned | `lang/tests/sql_index_sugar.rs` `a_query_that_needed_one_of_those_indexes_answers_immediately_after_the_single_statement` |
+| `IF NOT EXISTS` over a collection that is there | the create does not happen, so no index of the clause happens either, and the notice says both | `lang/tests/sql_index_sugar.rs` `if_not_exists_over_a_collection_that_is_there_creates_no_index_and_says_so`, `a_with_clause_that_names_no_key_is_refused_by_name_rather_than_ignored` |
 
 ## Query language §2 schema rows (landed 2026-09-21)
 

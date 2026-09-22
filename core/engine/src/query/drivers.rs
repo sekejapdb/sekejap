@@ -1233,6 +1233,13 @@ pub(super) struct TextPostingCursor<'a> {
 
 pub(super) struct TextCursor<'a> {
     pub(super) streams: Vec<TextPostingCursor<'a>>,
+    /// `TextMatch::Search` only: one list of STREAM positions per query
+    /// token. A document is admitted when every list has one stream standing
+    /// on it. Empty for every other match mode.
+    pub(super) groups: Vec<Vec<usize>>,
+    /// Which streams are standing on the document the merge is looking at,
+    /// reused across documents so the merge allocates nothing per candidate.
+    pub(super) present: Vec<bool>,
     pub(super) collection: CollectionId,
     pub(super) matching: TextMatch,
     pub(super) position: Option<usize>,

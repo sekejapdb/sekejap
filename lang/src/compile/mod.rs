@@ -82,6 +82,16 @@ pub(crate) use rows::RowsPlan;
 
 // ── the compiler ──────────────────────────────────────────────────────────
 
+/// What the `WHERE` gave `search_score()` to score.
+#[derive(Clone, Debug)]
+enum SearchLeaf {
+    One { index: IndexId, query: String },
+    /// Two or more `search()` predicates in one statement. There is one
+    /// `search_score()` spelling and no way to say WHICH predicate it means,
+    /// so it is refused rather than bound to whichever compiled last.
+    Several,
+}
+
 struct Compiler<'a> {
     db: &'a Database,
     params: &'a [super::Param],
@@ -108,6 +118,12 @@ struct Compiler<'a> {
     row_functions: Vec<String>,
     /// `now()` and `current_date`, folded ONCE for the whole statement.
     clock: i64,
+    /// This statement's `search(col, 'query')` leaf, recorded while the
+    /// `WHERE` compiles so that `search_score()` -- which carries neither a
+    /// column nor a query -- can resolve against it afterwards. `None` means
+    /// the statement has no `search()`, and then `search_score()` is REFUSED
+    /// by name instead of returning a number that means nothing.
+    search_leaf: Option<SearchLeaf>,
     /// Why this statement cannot be REFILLED with new parameters, collected
     /// while it compiles. Empty means every `$n` landed in a typed slot.
     /// `RefCell` because the value readers that record a fold take `&self`.
@@ -128,6 +144,7 @@ pub(crate) fn compile(
         index_lists: std::cell::RefCell::new(Vec::new()),
         rewrites: Vec::new(),
         row_functions: Vec::new(),
+        search_leaf: None,
         clock: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX)),
@@ -197,7 +214,8 @@ impl Compiler<'_> {
                 table,
                 columns,
                 if_not_exists,
-            } => Plan::Write(self.create_table(table, columns, if_not_exists)?),
+                indexes,
+            } => Plan::Write(self.create_table(table, columns, if_not_exists, &indexes)?),
             Stmt::CreateIndex {
                 name,
                 table,

@@ -344,6 +344,17 @@ pub enum ScoreExpr<'a> {
         query: &'a str,
         matching: TextMatch,
     },
+    /// The Score leaf of the typo-tolerant [`TextMatch::Search`] predicate
+    /// (`docs/lang/QL_CONTRACT.md` §4.6, `search_score()`), in [0,1].
+    ///
+    /// 1 for a query whose every token matched a dictionary term exactly,
+    /// decreasing with the edit distance the bounded automaton actually spent
+    /// and with the characters the final token's prefix had to complete. Both
+    /// numbers are settled while the query is prepared, so the leaf costs one
+    /// posting presence test per accepted term and reads no row. A candidate
+    /// the search does not admit scores `0.0`, the same way a `Bm25` leaf
+    /// scores a non-matching candidate.
+    SearchScore { index: IndexId, query: &'a str },
     /// Exact-vector similarity. Higher is better: the leaf is `-distance`
     /// from the authoritative f32 sidecar the ExactVector order already
     /// reads. A missing locator scores `f64::NEG_INFINITY` (the worst value

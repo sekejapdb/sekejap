@@ -247,6 +247,7 @@ impl Compiler<'_> {
                     "a `!term` tsquery, whose complement shape is decided by the value",
                 );
                 let stripped = TsQuery {
+                    fuzzy: false,
                     source: Literal::Str(
                         self.binder()
                             .text_of(&query.source)?
@@ -267,7 +268,21 @@ impl Compiler<'_> {
             }
             Predicate::Text { column, query } => {
                 let index = self.index_for(c, column, IndexFamily::Text, "a text index")?;
-                let (text, matching, fill) = self.tsquery_slot(query)?;
+                let (text, matching, mut fill) = self.tsquery_slot(query)?;
+                if matching == TextMatch::Search {
+                    // A `search()` whose query arrives as a `$n` is FOLDED,
+                    // not slotted. The expansion the value produces is what
+                    // the plan holds -- its terms, and whether the walk hit a
+                    // bound and owes the client a notice -- so refilling the
+                    // slot would keep the old dictionary answer and the old
+                    // notice for new words.
+                    self.folds(
+                        &query.source,
+                        "search(), whose dictionary expansion and its truncation notice are decided by the value",
+                    );
+                    fill = None;
+                    self.note_search(index, &text)?;
+                }
                 OwnedFilter::Text {
                     index,
                     query: text,
@@ -314,6 +329,41 @@ impl Compiler<'_> {
             literal: literal.clone(),
         });
         Ok((key, fill))
+    }
+
+    /// Record this statement's `search()` leaf, and say so when the bounded
+    /// dictionary walk it compiles to was TRUNCATED.
+    ///
+    /// Two things happen here, both of them once per `search()`:
+    ///
+    /// * `search_score()` in the `ORDER BY` or the select list resolves
+    ///   against this leaf. Written twice in one statement, the second
+    ///   `search()` leaves `search_score()` with no single predicate to
+    ///   score, and it is refused by name rather than scored by whichever
+    ///   one happened to be compiled last.
+    /// * A walk that stopped at one of its bounds reaches the client as a
+    ///   NOTICE that names the cap, the way `SHOW EDGES` reports a capped
+    ///   graph shape instead of returning a short answer that looks
+    ///   complete.
+    fn note_search(&mut self, index: IndexId, query: &str) -> SqlResult2<()> {
+        let expansion = self
+            .db
+            .search_expansion(index, query)
+            .map_err(SqlError::from)?;
+        if expansion.truncated {
+            self.notices.push(format!(
+                "search() stopped at its bound ({} dictionary entries visited of {} allowed, {} terms kept of {} allowed): the terms below are the best matches found up to that cap, not every term within the edit bound",
+                expansion.visited, expansion.visit_cap, expansion.terms, expansion.term_cap
+            ));
+        }
+        self.search_leaf = match self.search_leaf.take() {
+            None => Some(SearchLeaf::One {
+                index,
+                query: query.to_owned(),
+            }),
+            Some(_) => Some(SearchLeaf::Several),
+        };
+        Ok(())
     }
 
     /// One tsquery AND its slot. Both halves of the answer -- the terms and

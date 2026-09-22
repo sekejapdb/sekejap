@@ -47,6 +47,17 @@ pub enum TextMatch {
     /// Ordered, contiguous analyzer-v1 tokens. Candidate generation intersects
     /// distinct terms; authoritative primary text decides exact membership.
     Phrase,
+    /// TYPO-TOLERANT, with the LAST token completed as a prefix
+    /// (`docs/lang/QL_CONTRACT.md` §4.6, `search(col, 'query')`).
+    ///
+    /// The query's tokens are expanded against the term dictionary by the
+    /// bounded Levenshtein walk in [`fuzzy`], and a document matches when
+    /// EVERY token has at least one of its accepted dictionary terms present.
+    /// With one accepted term per token that is exactly [`TextMatch::All`],
+    /// which is the mode this one generalises; it reads no row, adds no
+    /// keyspace tag and adds no feature bit, because the dictionary it walks
+    /// and the postings it hands back are both already on disk.
+    Search,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -85,6 +96,7 @@ pub(crate) struct Corpus {
     pub(super) tokens: u64,
 }
 
+pub mod fuzzy;
 pub(crate) mod segments;
 mod unicode_v1;
 
@@ -1887,6 +1899,32 @@ impl Database {
         Ok(id)
     }
 
+    /// What `search(col, 'query')` expands to against this index's term
+    /// dictionary, WITHOUT preparing a query.
+    ///
+    /// The one reason it exists: a truncated walk must reach the client as a
+    /// NOTICE rather than as a short answer that looks complete, and the
+    /// notice is written where a statement is compiled
+    /// (`sekejap-lang`), one layer above the prepared query. The walk is
+    /// bounded by [`fuzzy::MAX_VISITED`] dictionary entries, so asking is
+    /// cheap and asking twice is bounded twice.
+    pub fn search_expansion(&self, id: IndexId, query: &str) -> Result<fuzzy::SearchExpansion> {
+        let index = self.index_info(id)?;
+        descriptor(&index)?;
+        if index.state != IndexState::Ready {
+            return Err(invalid("index is not ready"));
+        }
+        let expansion = fuzzy::expand(self, id, query, &mut || false)?;
+        Ok(fuzzy::SearchExpansion {
+            tokens: expansion.tokens.len(),
+            terms: expansion.terms.len(),
+            visited: expansion.visited,
+            truncated: expansion.truncated,
+            visit_cap: fuzzy::MAX_VISITED,
+            term_cap: fuzzy::MAX_TERMS,
+        })
+    }
+
     /// Exact BM25 over distinct analyzer-v1 query terms. `max_examined`
     /// counts posting advances and terminal prefix probes in merge mode.
     /// Filtered mode counts one candidate/norm probe plus one point probe per
@@ -1926,7 +1964,22 @@ impl Database {
         if k == 0 || analysis.terms.is_empty() {
             return Ok(Vec::new());
         }
-        let terms: Vec<_> = analysis.terms.keys().map(String::as_str).collect();
+        // The typo-tolerant mode replaces the query's own tokens with the
+        // dictionary terms the bounded walk accepted for them, and keeps the
+        // groups: a document matches when every token has one of its terms.
+        let expansion = if matching == TextMatch::Search {
+            Some(fuzzy::expand(self, id, query, &mut cancelled)?)
+        } else {
+            None
+        };
+        if expansion.as_ref().is_some_and(|e| e.terms.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let owned: Vec<&str> = match &expansion {
+            Some(expansion) => expansion.terms.iter().map(String::as_str).collect(),
+            None => analysis.terms.keys().map(String::as_str).collect(),
+        };
+        let terms = owned;
         let corpus = read_corpus(self, id)?;
         let mut dfs = Vec::with_capacity(terms.len());
         for term in &terms {
@@ -1936,6 +1989,16 @@ impl Database {
             }
             dfs.push(df);
         }
+        let groups = expansion.as_ref().map(|expansion| expansion.groups.clone());
+        let satisfied = |present: &[bool]| -> bool {
+            match (&groups, matching) {
+                (Some(groups), _) => groups
+                    .iter()
+                    .all(|group| group.iter().any(|accepted| present[accepted.term])),
+                (None, TextMatch::All | TextMatch::Phrase) => present.iter().all(|held| *held),
+                (None, _) => present.iter().any(|held| *held),
+            }
+        };
         let mut examined = 0usize;
         let segments_on = segments_enabled(self);
         let mut norms = TextScratch::default();
@@ -1951,19 +2014,18 @@ impl Database {
                     };
                     let mut frequencies = Vec::new();
                     let mut matched_dfs = Vec::new();
-                    for (term, &df) in terms.iter().zip(&dfs) {
+                    let mut present = vec![false; terms.len()];
+                    for (at, (term, &df)) in terms.iter().zip(&dfs).enumerate() {
                         spend(&mut examined, max_examined, &mut cancelled)?;
                         if let Some(frequency) =
                             point_posting(self, id, term, entity.sequence, segments_on, &mut norms)?
                         {
+                            present[at] = true;
                             frequencies.push(frequency);
                             matched_dfs.push(df);
                         }
                     }
-                    if frequencies.is_empty()
-                        || (matches!(matching, TextMatch::All | TextMatch::Phrase)
-                            && frequencies.len() != terms.len())
-                    {
+                    if frequencies.is_empty() || !satisfied(&present) {
                         continue;
                     }
                     if let Some(phrase) = phrase.as_deref() {
@@ -2015,9 +2077,8 @@ impl Database {
                         }
                     }
                     let matched = frequencies.iter().filter(|tf| **tf != 0).count();
-                    if matches!(matching, TextMatch::All | TextMatch::Phrase)
-                        && matched != terms.len()
-                    {
+                    let present: Vec<bool> = frequencies.iter().map(|tf| *tf != 0).collect();
+                    if !satisfied(&present) {
                         continue;
                     }
                     let length = read_norm_cached(self, id, sequence, &mut norms)?

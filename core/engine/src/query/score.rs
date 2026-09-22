@@ -10,6 +10,9 @@ pub(super) enum CompiledScoreExpr {
         info: IndexInfo,
     },
     Bm25(PreparedText),
+    /// `search_score()`: the same `PreparedText` a `TextMatch::Search`
+    /// predicate prepares, scored by its own [0,1] formula rather than BM25.
+    SearchScore(PreparedText),
     VectorSimilarity {
         info: IndexInfo,
         query: Vec<f32>,
@@ -50,6 +53,9 @@ impl CompiledScoreExpr {
         match self {
             Self::Lit(_) | Self::VectorSimilarity { .. } => false,
             Self::Bm25(prepared) => prepared.phrase.is_some(),
+            // A search score is the automaton's own numbers over the
+            // postings: no row, ever.
+            Self::SearchScore(_) => false,
             Self::Scalar { info } => match driver {
                 DriverPlan::Scalar {
                     info: driving, ..
@@ -74,7 +80,7 @@ impl CompiledScoreExpr {
 
     pub(super) fn mark_text_driven(&mut self, driving: &PreparedText, source: TextSource, carries: bool) {
         match self {
-            Self::Bm25(prepared) => {
+            Self::Bm25(prepared) | Self::SearchScore(prepared) => {
                 prepared.driven = (carries && prepared.same_terms(driving)).then_some(source);
             }
             Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) => {
@@ -128,6 +134,16 @@ pub(super) fn compile_score_expr(
             leaf(leaves)?;
             Ok(CompiledScoreExpr::Bm25(prepare_text(
                 db, collection, *index, query, *matching,
+            )?))
+        }
+        ScoreExpr::SearchScore { index, query } => {
+            leaf(leaves)?;
+            Ok(CompiledScoreExpr::SearchScore(prepare_text(
+                db,
+                collection,
+                *index,
+                query,
+                TextMatch::Search,
             )?))
         }
         ScoreExpr::VectorSimilarity {
@@ -226,6 +242,15 @@ pub(super) fn eval_score_expr<'a, C: FnMut() -> bool>(
             candidate.text.as_ref(),
             row,
             encoded,
+            scratch,
+            meter,
+        )?
+        .unwrap_or(0.0)),
+        CompiledScoreExpr::SearchScore(prepared) => Ok(search_quality(
+            db,
+            prepared,
+            candidate.id,
+            candidate.text.as_ref(),
             scratch,
             meter,
         )?

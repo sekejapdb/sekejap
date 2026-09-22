@@ -113,7 +113,6 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("PLAINTO_TSQUERY", Tier::Two, "QL_CONTRACT §4.6: websearch_to_tsquery and plainto_tsquery are parsers onto the same Text filter."),
     ("TS_HEADLINE", Tier::Two, "QL_CONTRACT §4.6: ts_headline is a row function."),
     ("HIGHLIGHT", Tier::Two, "QL_CONTRACT §4.6: highlight is a row function."),
-    ("SEARCH", Tier::Two, "QL_CONTRACT §4.6: typo-tolerant search() needs a term-dictionary prefix range plus a bounded Levenshtein automaton over the dictionary -- a new atomic, no format change."),
     // ── §4.7 aggregates ──────────────────────────────────────────────────
     // count/sum/min/max/avg, GROUP BY, HAVING and DISTINCT moved from this
     // table to Tier 1 with `src/query/aggregate.rs`: the atomic they named
