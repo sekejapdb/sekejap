@@ -1,4 +1,5 @@
 {
+  "adjacency_keyspace_tag": 127,
   "checkpointed": false,
   "collection": "points",
   "declared_features": 40961,
@@ -229,7 +230,7 @@
     {
       "bytes": 8192,
       "name": "data",
-      "sha256": "7ca1fd128b74fa86374a85b1aefe5086853dcaf759ceddbdca0a1cf9e9b467c5"
+      "sha256": "d06527a70136f7f825d22b2c33c033d0791f62bca0dd59b555d5bb39f5b55643"
     },
     {
       "bytes": 0,
@@ -274,12 +275,12 @@
     {
       "bytes": 96,
       "name": "readers.lock",
-      "sha256": "86ab3ef204bb5460ce0e6f2278fcfc7bd4c100aa71a6ffefda299dce4fe8f589"
+      "sha256": "2aaa79b5c3dede8c868314d4b7a79e60ee6a802c2b8cd98a9cca73e761ef1ab5"
     },
     {
-      "bytes": 957264,
+      "bytes": 1073296,
       "name": "wal",
-      "sha256": "6e4f344afc4a70db5cbd036ccb537f4c244ab01f23a28d2885d8d6f87b21d695"
+      "sha256": "c11a5092937c58f01345c30380d6f60f108e57442217c920ee2967919c93be35"
     },
     {
       "bytes": 0,
@@ -605,7 +606,7 @@
   "keyspace_tag": 125,
   "metric": "cosine",
   "rows": 300,
-  "supported_logical_features": 65535,
+  "supported_logical_features": 131071,
   "vectors": {
     "1": [
       -0.1118726134300232,

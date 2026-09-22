@@ -111,8 +111,8 @@ pub enum IndexFamily {
     QuantizedVector,
     SpatialGeometry,
     /// The Vamana/DiskANN graph over quantized codes
-    /// (`crate::index::vector::graph`): descriptor family byte 7, keyspace
-    /// `0x7D`, feature bit `0x8000`.
+    /// (`crate::index::vector::graph`): descriptor family byte 7, keyspaces
+    /// `0x7D` (node heads) and `0x7F` (adjacency), feature bit `0x8000`.
     VamanaGraph,
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -2399,27 +2399,45 @@ impl Database {
         let (keys, end) = if i.family == IndexFamily::Text {
             crate::index::text::drop_batch(self, id, batch)?
         } else {
-            let p = match i.family {
-                IndexFamily::Scalar => ikey(SCALAR, id),
-                IndexFamily::ExactVector => crate::index::vector::exact::locator_prefix(id),
-                IndexFamily::QuantizedVector => crate::index::vector::quantized::entry_prefix(id),
-                IndexFamily::VamanaGraph => crate::index::vector::graph::node_prefix(id),
-                IndexFamily::SpatialPoint => crate::index::spatial::point::posting_prefix(id),
-                IndexFamily::SpatialGeometry => crate::index::spatial::geometry_index::posting_prefix(id),
+            // Most families own ONE range. The vamana graph owns two -- the
+            // node heads under `0x7D` and the adjacency records under `0x7F`
+            // -- so the batch is filled from them in order and the step is
+            // only done when both are empty. A drop that reclaimed one and
+            // left the other would leave a keyspace no descriptor names.
+            let prefixes: Vec<Vec<u8>> = match i.family {
+                IndexFamily::Scalar => vec![ikey(SCALAR, id)],
+                IndexFamily::ExactVector => vec![crate::index::vector::exact::locator_prefix(id)],
+                IndexFamily::QuantizedVector => {
+                    vec![crate::index::vector::quantized::entry_prefix(id)]
+                }
+                IndexFamily::VamanaGraph => vec![
+                    crate::index::vector::graph::node_prefix(id),
+                    crate::index::vector::graph::adjacency_prefix(id),
+                ],
+                IndexFamily::SpatialPoint => vec![crate::index::spatial::point::posting_prefix(id)],
+                IndexFamily::SpatialGeometry => {
+                    vec![crate::index::spatial::geometry_index::posting_prefix(id)]
+                }
                 IndexFamily::Text => unreachable!(),
             };
             let mut keys = Vec::new();
             let mut end = true;
-            for row in self.index_range(&i, &p)?.into_iter().flatten() {
-                let (k, _) = row?;
-                if !k.starts_with(&p) {
-                    break;
-                }
+            for p in &prefixes {
                 if keys.len() == batch {
                     end = false;
                     break;
                 }
-                keys.push(k);
+                for row in self.index_range(&i, p)?.into_iter().flatten() {
+                    let (k, _) = row?;
+                    if !k.starts_with(p) {
+                        break;
+                    }
+                    if keys.len() == batch {
+                        end = false;
+                        break;
+                    }
+                    keys.push(k);
+                }
             }
             (keys, end)
         };

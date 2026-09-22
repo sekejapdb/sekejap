@@ -22,8 +22,8 @@ use kernel::{
 use sekejap_core::{
     collections::{
         CollectionOptions, Database, VectorMetric, SUPPORTED_LOGICAL_FEATURES,
-        VAMANA_ALPHA_HUNDREDTHS, VAMANA_BUILD_SEARCH_LIST, VAMANA_DEGREE, VAMANA_ENTRY,
-        VAMANA_FEATURE, VAMANA_GRAPH_VERSION,
+        VAMANA_ADJACENCY, VAMANA_ALPHA_HUNDREDTHS, VAMANA_BUILD_SEARCH_LIST, VAMANA_DEGREE,
+        VAMANA_ENTRY, VAMANA_FEATURE, VAMANA_GRAPH_VERSION,
     },
     internal::logical_features,
     Kind,
@@ -241,6 +241,7 @@ fn write_fixture(dir: &Path, seed: u64, checkpointed: bool) -> Value {
         "format": "sekejap-disk-format-v2",
         "family": "vamana_graph",
         "keyspace_tag": VAMANA_ENTRY,
+        "adjacency_keyspace_tag": VAMANA_ADJACENCY,
         "feature_bit": VAMANA_FEATURE,
         "supported_logical_features": SUPPORTED_LOGICAL_FEATURES,
         "graph": {

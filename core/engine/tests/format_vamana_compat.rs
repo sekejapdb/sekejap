@@ -1,11 +1,17 @@
-//! Compatibility qualification for the VAMANA GRAPH family: keyspace `0x7D`,
-//! logical feature bit `0x8000`.
+//! Compatibility qualification for the VAMANA GRAPH family: keyspaces `0x7D`
+//! (node heads) and `0x7F` (adjacency), logical feature bit `0x8000`.
 //!
-//! `docs/format-v2-vamana/` is a PRESERVED reference corpus, written once by
+//! `docs/format-v2-vamana/` is a PRESERVED reference corpus, written by
 //! `bench/src/bin/vamana_format_fixture.rs` and never regenerated to make a
 //! later engine pass. Missing or changed fixtures fail qualification. Every
 //! database operation here is on a unique temporary COPY; on macOS TMPDIR
 //! must be under <scratch>
+//!
+//! It was regenerated ONCE, when the adjacency moved out of the node record
+//! into keyspace `0x7F`. That is the one thing a fixture may be regenerated
+//! for: the family had not shipped, so the corpus pinned a layout no release
+//! ever wrote. Nothing about the family has shipped since, and from here the
+//! corpus is fixed.
 //!
 //! The ORACLE is the fixture's own MANIFEST, whose expected nearest
 //! neighbours were computed by brute force in the generator from the f32
@@ -19,7 +25,7 @@ use sekejap_core::{
         verification::{verify_indexed_source, VerificationLimits},
         ApproxVectorMethod, Database, Error, IndexFamily, IndexId, IndexState, VectorMetric,
         SUPPORTED_LOGICAL_FEATURES, VAMANA_ALPHA_HUNDREDTHS, VAMANA_BUILD_SEARCH_LIST,
-        VAMANA_DEGREE, VAMANA_ENTRY, VAMANA_FEATURE, VAMANA_GRAPH_VERSION,
+        VAMANA_ADJACENCY, VAMANA_DEGREE, VAMANA_ENTRY, VAMANA_FEATURE, VAMANA_GRAPH_VERSION,
     },
     internal::{admit_logical_features, logical_features},
 };
@@ -32,7 +38,7 @@ use std::{
 
 const FIXTURES: &str = "../../docs/format-v2-vamana";
 /// Locks the preserved corpus, its per-fixture checksums and its oracles.
-const INDEX_SHA256: &str = "21ed742b7d437cfdb599e2bbb1b911871ac7ed285ac63671e8aeedbcd103c1ee";
+const INDEX_SHA256: &str = "29ef3916f99fe246179c20aa248293eebd8bbf0bccf1ccefe6b9ca484cec3aa9";
 
 fn cfg() -> Config {
     Config {
@@ -157,6 +163,10 @@ fn the_preserved_vamana_corpus_opens_and_answers_its_own_brute_force_oracle() {
         // implements: a graph whose degree or alpha differed would be a graph
         // this binary did not build.
         assert_eq!(fx.manifest["keyspace_tag"].as_u64().unwrap(), u64::from(VAMANA_ENTRY));
+        assert_eq!(
+            fx.manifest["adjacency_keyspace_tag"].as_u64().unwrap(),
+            u64::from(VAMANA_ADJACENCY)
+        );
         assert_eq!(fx.manifest["feature_bit"].as_u64().unwrap(), VAMANA_FEATURE);
         assert_eq!(fx.manifest["graph"]["version"].as_u64().unwrap(), u64::from(VAMANA_GRAPH_VERSION));
         assert_eq!(fx.manifest["graph"]["degree"].as_u64().unwrap() as usize, VAMANA_DEGREE);

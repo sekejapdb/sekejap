@@ -262,7 +262,7 @@ impl Parser {
     }
 
     /// The generator a `DEFAULT` names. The set is CLOSED (QL_CONTRACT §2):
-    /// `now()`, `uuid4()`, `uuid5(namespace, name)` and the Postgres
+    /// `now()`, `ulid()`, `uuid4()`, `uuid5(namespace, name)` and the Postgres
     /// spellings of those three. Anything else -- a literal, an arithmetic
     /// expression, a call this engine does not have -- is refused by name,
     /// because a default that is an expression is the generated-column row
@@ -271,7 +271,7 @@ impl Parser {
         let at = self.here();
         let Some(word) = self.word() else {
             return Err(SqlError::unsupported(format!(
-                "DEFAULT {}: the generator set is closed -- now(), uuid4(), uuid5(namespace, name) -- and an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2",
+                "DEFAULT {}: the generator set is closed -- now(), ulid(), uuid4(), uuid5(namespace, name) -- and an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2",
                 self.peek().written()
             )));
         };
@@ -290,6 +290,10 @@ impl Parser {
             "UUID4" | "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => {
                 no_args(self)?;
                 Ok(DefaultValue::Uuid4)
+            }
+            "ULID" => {
+                no_args(self)?;
+                Ok(DefaultValue::Ulid)
             }
             "UUID5" | "UUID_GENERATE_V5" => {
                 self.expect(&Tok::LParen)?;
@@ -326,7 +330,7 @@ impl Parser {
                 })
             }
             other => Err(SqlError::unsupported(format!(
-                "DEFAULT {other}: the generator set is closed -- now(), uuid4(), uuid5(namespace, name) -- and each member is O(1) per row; an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2"
+                "DEFAULT {other}: the generator set is closed -- now(), ulid(), uuid4(), uuid5(namespace, name) -- and each member is O(1) per row; an arbitrary expression is the GENERATED ALWAYS row of QL_CONTRACT §2"
             ))),
         }
     }

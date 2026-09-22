@@ -62,14 +62,16 @@ every entry. The first two are **linear** — they look at every entry of the
 column — and the third is not.
 
 The index is on top of the column. These are the index's own bytes per row,
-measured over the `0x73`, `0x79` and `0x7D` keyspaces of a real database
-(`bench/src/bin/vamana_bench.rs`, 128 lanes, key bytes included):
+measured over the `0x73`, `0x79` and `0x7D`/`0x7F` keyspaces of a real database
+(`bench/src/bin/vamana_bench.rs`, 128 lanes, key bytes included). A `vamana`
+row is TWO records under one feature bit — its HEAD in `0x7D` and its
+neighbour list in `0x7F` — so it pays a second key:
 
 | family | per row, formula | at 128 lanes | at 1024 lanes | at 4096 lanes |
 |---|---|---|---|---|
 | `exact` | key + a 6-byte locator | ~17 B | ~17 B | ~17 B |
 | `quantized` | key + 6 + 8 + `n` | 148 B | 1.0 kB | 4.1 kB |
-| `vamana` | key + 6 + 8 + `n` + 4 + 12·degree | 655–872 B | 1.6–1.9 kB | 4.7–4.9 kB |
+| `vamana` | 2 keys + 6 + 8 + `n` + 4 + 12·degree | 666–883 B | 1.6–1.9 kB | 4.7–4.9 kB |
 
 `vamana`'s spread is its degree: a neighbour list is pruned back to R = 48 and
 may grow to 96 before the next prune, so the occupancy sits between 48 and 96

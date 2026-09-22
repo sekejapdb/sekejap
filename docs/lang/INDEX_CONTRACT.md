@@ -62,16 +62,33 @@ intent, and the refusal that names the families is doing its job.
 |---|---|---|---|---|
 | `exact` | `USING exact (emb)` | every f32 sidecar | EXACT | 8 (a 6-byte locator plus its key) |
 | `quantized` | `USING quantized (emb vector_cosine_ops)`, and `hnsw`/`ivfflat` | every int8 entry | approximate shortlist, f32 reranked | 148 |
-| `vamana` | `USING vamana (emb vector_cosine_ops)`, and `diskann` | the nodes within the search list's reach | approximate shortlist, f32 reranked | 872 |
+| `vamana` | `USING vamana (emb vector_cosine_ops)`, and `diskann` | the nodes within the search list's reach | approximate shortlist, f32 reranked | 872, in TWO records: a 142-byte head in `0x7D` and the rest as edges in `0x7F` |
 
 **What a write does, per family.** `exact` writes one locator. `quantized`
 writes one entry. `vamana` LINKS the row into the graph: one greedy search
 bounded by the build search list (L = 100), then at most R = 48 neighbour
-records read-modify-written, plus the amortised cost of the neighbour prunes
-the new back edges trigger. A delete UNLINKS: at most R records read and
-written, and the departing node's neighbourhood is reconnected in the same
-step. An update that moved the vector is an unlink followed by a link; one
-that did not touch the vector costs a comparison and nothing else.
+ADJACENCY records read-modify-written, plus the amortised cost of the
+neighbour prunes the new back edges trigger. A delete UNLINKS: at most R
+records read and written, and the departing node's neighbourhood is
+reconnected in the same step. An update that moved the vector is an unlink
+followed by a link; one that did not touch the vector costs a comparison and
+nothing else.
+
+**What a vamana node is, and why the write cost does not grow with the
+dimension.** A node is TWO records under one feature bit: its HEAD — the
+6-byte locator, the quantizer scale and one int8 code per lane, byte for byte
+what a `quantized` entry holds — in keyspace `0x7D`, and its neighbour list —
+at most `4 + 2R * 12 = 1,156` bytes, always inside one page — in keyspace
+`0x7F`. The head is written once, when the node is linked, and is never
+rewritten: an update that moved the vector is an unlink followed by a link.
+So an edge append or a reprune rewrites a few hundred bytes of ONE adjacency
+record and never touches the codes. That matters past 512 lanes, where the
+head alone exceeds a page: with the two in one record an insert at 4,096
+lanes dirtied 2.65 MiB and every build transaction was refused by the
+page-WAL's 16 MiB allowance whatever the batch size; split, the same insert
+dirties about 260 KiB, and the figure is set by R and barely by the
+dimension. The price is one extra point read per node a walk reaches, against
+fewer bytes read per node.
 
 **What a vamana index promises while it is BUILDING.** Nothing, and it says
 so. A graph over part of a corpus answers a different question from a graph
@@ -82,6 +99,19 @@ maintenance and no rebuild, so once it is READY the graph a query walks is
 always the graph the committed rows describe
 (`core/engine/tests/index_vector_vamana.rs`
 `a_build_that_stops_part_way_leaves_the_index_not_ready_and_refuses_to_answer`).
+
+**Which family answers `ORDER BY emb <=> $1`.** The EXACT index answers it
+unless the session has set `ef_search` (or its `diskann.query_search_list_size`
+spelling), because without a shortlist bound there is nothing approximate to
+ask for. Once a bound is named, or when the column has no exact index at all,
+the order is APPROXIMATE and the answer comes from the `vamana` graph if the
+column has one and from `quantized` otherwise — the two mean the same thing,
+an `ef`-bounded shortlist of int8 candidates reranked exactly against the f32
+sidecars, and differ only in how the shortlist is found, so the family a
+caller had to ask for by name is the one that answers. The notice on the
+statement says which did (`lang/tests/sql_vamana_order.rs`). A column with no
+vector index at all is REFUSED by name, and the refusal lists all three
+spellings.
 
 **Where the line between `quantized` and `vamana` falls.** `quantized` reads
 every entry, so its cost grows with the row count and its recall does not

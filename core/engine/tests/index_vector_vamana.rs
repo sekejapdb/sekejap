@@ -14,8 +14,8 @@ use sekejap_core::{
     collections::{
         verification::{verify_indexed_source, VerificationLimits},
         ApproxVectorMethod, CollectionId, CollectionOptions, Database, EntityId, Error, IndexFamily,
-        IndexId, IndexState, VectorHit, VectorMetric, SUPPORTED_LOGICAL_FEATURES, VAMANA_ENTRY,
-        VAMANA_FEATURE, VAMANA_MAX_DEGREE,
+        IndexId, IndexState, VectorHit, VectorMetric, SUPPORTED_LOGICAL_FEATURES,
+        VAMANA_ADJACENCY, VAMANA_ENTRY, VAMANA_FEATURE, VAMANA_MAX_DEGREE,
     },
     internal::{admit_logical_features, logical_features},
     pagewal::PageWalStore,
@@ -211,15 +211,12 @@ fn clean(path: &Path) {
     assert!(report.complete && report.clean, "{report:?}");
 }
 
-/// The structural claim, checked from the RAW keyspace rather than from any
-/// engine walk: every node names neighbours that exist, every named
-/// neighbour names it back, no list is longer than the declared degree, and
-/// the header's entry point is a node that is there.
-fn structure(path: &Path, index: IndexId, nodes: usize) {
-    let raw = PageWalStore::open(path, false, 1 << 20).unwrap();
-    let mut prefix = vec![VAMANA_ENTRY];
+/// Every record of one keyspace of one index, by sequence, read from the RAW
+/// store rather than through any engine walk.
+fn keyspace(raw: &PageWalStore, tag: u8, index: IndexId) -> BTreeMap<u64, Vec<u8>> {
+    let mut prefix = vec![tag];
     prefix.extend(ordered(index.0));
-    let mut records: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut records = BTreeMap::new();
     for row in raw.range(&prefix).unwrap() {
         let (key, value) = row.unwrap();
         if !key.starts_with(&prefix) {
@@ -227,29 +224,52 @@ fn structure(path: &Path, index: IndexId, nodes: usize) {
         }
         records.insert(read_ordered(&key[prefix.len()..]), value);
     }
+    records
+}
+
+/// The structural claim, checked from the RAW keyspaces rather than from any
+/// engine walk: every node record is exactly one HEAD and nothing more, the
+/// two keyspaces hold exactly the same sequences, every node names
+/// neighbours that exist, every named neighbour names it back, no list is
+/// longer than the declared degree, and the header's entry point is a node
+/// that is there.
+fn structure(path: &Path, index: IndexId, nodes: usize) {
+    let raw = PageWalStore::open(path, false, 1 << 20).unwrap();
+    let mut records = keyspace(&raw, VAMANA_ENTRY, index);
+    let lists = keyspace(&raw, VAMANA_ADJACENCY, index);
     let header = records.remove(&0).expect("graph header record");
     assert_eq!(header.len(), 30, "graph header length");
     let entry = u64::from_be_bytes(header[6..14].try_into().unwrap());
     let count = u64::from_be_bytes(header[14..22].try_into().unwrap());
     assert_eq!(count as usize, nodes, "graph header node count");
     assert_eq!(records.len(), nodes, "node records");
+    assert_eq!(lists.len(), nodes, "adjacency records");
+    assert!(
+        records.keys().eq(lists.keys()),
+        "the node and adjacency keyspaces hold different sequences"
+    );
     if nodes > 0 {
         assert!(records.contains_key(&entry), "entry point has no record");
     }
     let head = 6 + 8 + DIM;
-    let mut edges: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    // The node record IS the head: an adjacency tail here would be the
+    // layout this split exists to remove.
     for (seq, value) in &records {
-        let own = u16::from_be_bytes(value[head..head + 2].try_into().unwrap()) as usize;
-        let back = u16::from_be_bytes(value[head + 2..head + 4].try_into().unwrap()) as usize;
+        assert_eq!(value.len(), head, "node record {seq} is not one head");
+    }
+    let mut edges: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (seq, value) in &lists {
+        let own = u16::from_be_bytes(value[..2].try_into().unwrap()) as usize;
+        let back = u16::from_be_bytes(value[2..4].try_into().unwrap()) as usize;
         assert!(
             own + back <= VAMANA_MAX_DEGREE,
             "degree {} at {seq}",
             own + back
         );
-        assert_eq!(value.len(), head + 4 + (own + back) * 12, "record length");
+        assert_eq!(value.len(), 4 + (own + back) * 12, "record length");
         let mut list = Vec::new();
         for at in 0..own + back {
-            let off = head + 4 + at * 12;
+            let off = 4 + at * 12;
             let neighbour = u64::from_be_bytes(value[off..off + 8].try_into().unwrap());
             assert_ne!(neighbour, *seq, "self loop at {seq}");
             assert!(

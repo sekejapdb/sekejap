@@ -42,6 +42,22 @@ pub enum DefaultValue {
         namespace: [u8; 16],
         name: String,
     },
+    /// `ulid()`: a 48-bit millisecond timestamp followed by eighty random
+    /// bits, rendered as twenty-six Crockford base32 characters.
+    ///
+    /// It exists beside `uuid4()` because the two behave oppositely in this
+    /// engine. A key is the B-tree's own order, and the per-keyspace append
+    /// hint (`core/kernel/src/btree.rs`, the `keyspace-append` feature)
+    /// remembers the rightmost leaf of each tag: an ASCENDING key appends
+    /// next to the last one, and a uniformly random key lands anywhere and
+    /// splits pages across the whole tree. A ULID's leading timestamp makes
+    /// it ascending in plain text, because Crockford base32 preserves order,
+    /// so it keeps a UUID's freedom from coordination while writing like a
+    /// sequence. It is also twenty-six bytes against a UUID's thirty-six,
+    /// which is repeated in every index entry and both ends of every edge.
+    ///
+    /// The clock is the same one `now()` reads, once per row.
+    Ulid,
 }
 
 /// The rule slot of one field: a default, a NOT NULL flag, or both. A slot
@@ -80,6 +96,7 @@ pub const COLUMN_RULES_FEATURE: u64 = 0x1000;
 const DEFAULT_NOW: u8 = 1;
 const DEFAULT_UUID4: u8 = 2;
 const DEFAULT_UUID5: u8 = 3;
+const DEFAULT_ULID: u8 = 4;
 const RULE_NOT_NULL: u8 = 1;
 const RULE_HAS_DEFAULT: u8 = 2;
 
@@ -106,6 +123,7 @@ pub(super) fn encode_rule(out: &mut Vec<u8>, field: &str, rule: &ColumnRule) -> 
     match &rule.default {
         None => {}
         Some(DefaultValue::Now) => out.push(DEFAULT_NOW),
+        Some(DefaultValue::Ulid) => out.push(DEFAULT_ULID),
         Some(DefaultValue::Uuid4) => out.push(DEFAULT_UUID4),
         Some(DefaultValue::Uuid5 { namespace, name }) => {
             if name.len() > 255 {
@@ -136,6 +154,7 @@ pub(super) fn decode_rule(
         Some(match read(1)?[0] {
             DEFAULT_NOW => DefaultValue::Now,
             DEFAULT_UUID4 => DefaultValue::Uuid4,
+            DEFAULT_ULID => DefaultValue::Ulid,
             DEFAULT_UUID5 => {
                 let mut namespace = [0u8; 16];
                 namespace.copy_from_slice(&read(16)?);
@@ -180,8 +199,8 @@ pub(super) fn check_rules(
                     "DEFAULT now() on `{field}`: a stored instant is Kind::Int microseconds, and `{field}` is {other:?}"
                 )))
             }
-            (Some(DefaultValue::Uuid4 | DefaultValue::Uuid5 { .. }), Kind::Text) => {}
-            (Some(DefaultValue::Uuid4 | DefaultValue::Uuid5 { .. }), other) => {
+            (Some(DefaultValue::Uuid4 | DefaultValue::Uuid5 { .. } | DefaultValue::Ulid), Kind::Text) => {}
+            (Some(DefaultValue::Uuid4 | DefaultValue::Uuid5 { .. } | DefaultValue::Ulid), other) => {
                 return Err(invalid(format!(
                     "DEFAULT uuid4()/uuid5() on `{field}`: a UUID is written as text, and `{field}` is {other:?}"
                 )))
@@ -218,6 +237,9 @@ impl Database {
                     Value::from(*now.get_or_insert_with(|| self.clock.unix_micros()))
                 }
                 DefaultValue::Uuid4 => Value::from(uuid4()?),
+                DefaultValue::Ulid => Value::from(ulid(
+                    *now.get_or_insert_with(|| self.clock.unix_micros()),
+                )?),
                 DefaultValue::Uuid5 { namespace, name } => {
                     Value::from(uuid5(namespace, name.as_bytes()))
                 }
@@ -273,6 +295,35 @@ fn uuid4() -> Result<String> {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     Ok(format_uuid(&b))
+}
+
+/// A ULID: forty-eight bits of millisecond timestamp, then eighty random
+/// bits, in twenty-six Crockford base32 characters.
+///
+/// Crockford base32 is chosen by the ULID specification precisely because its
+/// alphabet is in ASCII order, so the text sorts the way the bytes do and a
+/// range over the key is a range over time.
+fn ulid(now_micros: i64) -> Result<String> {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let millis = now_micros.max(0) as u128 / 1000;
+    let mut random = [0u8; 10];
+    getrandom::fill(&mut random)
+        .map_err(|e| Error::Kernel(kernel::Error::Io(std::io::Error::other(e.to_string()))))?;
+    // 48 bits of time in the high half, 80 bits of randomness in the low.
+    // The ten byte-shifts below ARE the shift into the high half: pre-shifting
+    // here as well would push the timestamp out of the 128 bits and leave a
+    // ULID that is all randomness and does not ascend.
+    let mut value: u128 = millis & ((1u128 << 48) - 1);
+    for b in random {
+        value = (value << 8) | b as u128;
+    }
+    // 26 characters of five bits each covers 130 bits; the top four are zero.
+    let mut out = [0u8; 26];
+    for i in (0..26).rev() {
+        out[i] = ALPHABET[(value & 0x1f) as usize];
+        value >>= 5;
+    }
+    Ok(String::from_utf8(out.to_vec()).expect("the alphabet is ASCII"))
 }
 
 /// RFC 4122 §4.3: SHA-1 over the namespace bytes followed by the name bytes,

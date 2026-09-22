@@ -1275,9 +1275,44 @@ fn build_index(
         CompiledIndex::VamanaGraph { field } => db.create_vamana_index(collection, name, field)?,
     };
     db.commit()?;
-    db.build_index_to_ready(id, 256)?;
+    db.build_index_to_ready(id, build_chunk_rows(method))?;
     db.commit()?;
     Ok(())
+}
+
+/// The largest build transaction the engine will ever take on: `MAX_BATCH`
+/// in `core/engine/src/collections/catalog.rs`.
+const BUILD_CHUNK_ROWS: usize = 256;
+/// The chunk a VAMANA build takes, and why it is not that.
+///
+/// A chunk is not a batch size a caller tunes. It is the SMALLEST
+/// transaction `build_index_to_ready` can fall back to: the driver groups
+/// chunks by measuring what the last group cost and halves the group when
+/// the page-WAL refuses one, and at a group of one the chunk IS the
+/// transaction, so a refusal there is returned to the caller.
+///
+/// Every other family's build writes ONE derived record per row -- a scalar
+/// entry, a quantized entry, a posting -- so `BUILD_CHUNK_ROWS` rows is a
+/// transaction of `BUILD_CHUNK_ROWS` small records. The vamana graph links
+/// each row into the graph instead: up to `1 + 2R` records per row, its own
+/// head and adjacency plus an appended edge in every neighbour it chose and
+/// every neighbour a prune displaced, and at a wide vector the head alone is
+/// a page. A chunk of the same row count is therefore a transaction two
+/// orders of magnitude larger, and the fall-back floor has to be lower for
+/// the driver to have anywhere to fall back TO.
+///
+/// This is not what makes a wide build fit -- the record layout is
+/// (`core/engine/src/index/vector/graph.rs`, `0x7D` heads and `0x7F`
+/// adjacency). It is what stops a hardcoded 256 from being the thing that
+/// decides, which is what it was: the atomic caller could pass a smaller
+/// chunk and this path could not.
+const VAMANA_CHUNK_ROWS: usize = 32;
+
+fn build_chunk_rows(method: &CompiledIndex) -> usize {
+    match method {
+        CompiledIndex::VamanaGraph { .. } => VAMANA_CHUNK_ROWS,
+        _ => BUILD_CHUNK_ROWS,
+    }
 }
 
 /// What a `CREATE TABLE ... WITH (...)` does when an index of the clause is

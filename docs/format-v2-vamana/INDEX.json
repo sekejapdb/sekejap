@@ -3,13 +3,13 @@
   "fixtures": [
     {
       "checkpointed": true,
-      "manifest_sha256": "43483bd11678d1bb2694aa78854d1a498068181dc77105552231648ebbf2b00c",
+      "manifest_sha256": "2c6ffd9da6d46813c4a2e67a8f9e1973f8348cce639baad822a0aaf31079f08d",
       "name": "checkpointed",
       "rows": 300
     },
     {
       "checkpointed": false,
-      "manifest_sha256": "0ab21f4ceb59ddf91c7cbf6eb370d2dc8b01775fa2e4ef2873e13a96baf75533",
+      "manifest_sha256": "a541ec670b1f7bd0a7853ac3184d77804aa337cb776639da0e84d70a9db329cd",
       "name": "wal-pending",
       "rows": 300
     }

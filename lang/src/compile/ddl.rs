@@ -399,6 +399,9 @@ impl Compiler<'_> {
             Some(DefaultValue::Uuid4) => self.notices.push(format!(
                 "DEFAULT uuid4() on `{column}`: sixteen bytes from the operating system per row, RFC 4122 version 4 -- a value the database chose, so an INSERT that wants its own writes it"
             )),
+            Some(DefaultValue::Ulid) => self.notices.push(format!(
+                "DEFAULT ulid() on `{column}`: a millisecond timestamp then eighty random bits, twenty-six Crockford base32 characters. It ASCENDS, so as a key it appends beside the last row instead of splitting pages across the tree the way a random uuid4() does, and it is ten bytes shorter"
+            )),
             Some(DefaultValue::Uuid5 { .. }) => self.notices.push(format!(
                 "DEFAULT uuid5(...) on `{column}`: RFC 4122 version 5 over a FIXED namespace and name, so every row that takes the default takes the SAME uuid -- it is deterministic, not unique"
             )),
@@ -1130,6 +1133,7 @@ pub(super) fn written_rule(rule: &ColumnRule) -> String {
         None => {}
         Some(DefaultValue::Now) => parts.push("DEFAULT now()".to_owned()),
         Some(DefaultValue::Uuid4) => parts.push("DEFAULT uuid4()".to_owned()),
+        Some(DefaultValue::Ulid) => parts.push("DEFAULT ulid()".to_owned()),
         Some(DefaultValue::Uuid5 { name, .. }) => {
             parts.push(format!("DEFAULT uuid5(<namespace>, '{name}')"));
         }

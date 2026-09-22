@@ -72,7 +72,8 @@ pub(super) enum DriverPlan {
         info: IndexInfo,
     },
     /// Walk the vamana graph's `0x7D` node keyspace in key order, skipping
-    /// the graph header at sequence 0.
+    /// the graph header at sequence 0. The adjacency keyspace `0x7F` is not
+    /// touched: this driver wants codes, not edges.
     ///
     /// This is NOT how the graph is searched -- the search is
     /// `Database::scan_vamana`, which walks EDGES and reads a few hundred

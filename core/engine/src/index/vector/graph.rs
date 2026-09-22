@@ -8,7 +8,7 @@
 //! living on disk; HNSW's tower of layers assumes the graph is resident in
 //! RAM and is the wrong premise for this engine.
 //!
-//! WHAT IS ON DISK. One record per node in the `0x7D` keyspace, behind the
+//! WHAT IS ON DISK. TWO records per node, in TWO keyspaces, both behind the
 //! additive feature bit `0x8000`:
 //!
 //! ```text
@@ -16,9 +16,12 @@
 //! value, sequence == 0 -- the GRAPH HEADER of that index:
 //!         version:u8 | degree:u8 | build list:u16be | alpha*100:u16be
 //!       | entry:u64be | nodes:u64be | entry chosen at:u64be
-//! value, sequence > 0 -- one NODE:
-//!         locator:6 | scale:f64le | codes:i8[dim]        <- the HEAD
-//!       | own:u16be | back:u16be
+//! value, sequence > 0 -- one node's HEAD, and nothing else:
+//!         locator:6 | scale:f64le | codes:i8[dim]
+//!
+//! key   = 0x7F || ordered(index id) || ordered(sequence)
+//! value -- that node's ADJACENCY:
+//!         own:u16be | back:u16be
 //!       | (neighbour:u64be, distance:f32be) * (own + back)
 //! ```
 //!
@@ -26,9 +29,31 @@
 //! the same locator into the immutable `0x60` f32 sidecar and the same
 //! symmetric int8 codes. So the head is DERIVED from the row and is checked
 //! against it -- at rerank, in `verify_indexed_source` and at build -- exactly
-//! as the quantized family's entry is (Law 5). The adjacency tail is not
-//! derived from any one row: it is the index's own structure, and what
-//! verification checks about it is the structural invariant below.
+//! as the quantized family's entry is (Law 5). The adjacency is not derived
+//! from any one row: it is the index's own structure, and what verification
+//! checks about it is the structural invariant below.
+//!
+//! WHY THE TWO ARE APART, which is the whole reason this file has two
+//! keyspaces rather than one. The head's length is the DIMENSION: at 4,096
+//! lanes it is 4,110 bytes, larger than a 4,096-byte page, so a node whose
+//! head and adjacency shared one record lived in an overflow chain. Every
+//! back edge an insert appends is a read-modify-write of a NEIGHBOUR, and
+//! rewriting a shared record rewrote the codes and the whole chain with them
+//! -- `R = 48` neighbours times the chain, per insert. Measured at 4,096
+//! lanes over a 600-node graph, one insert appended 2,780,624 bytes of WAL
+//! (2.65 MiB), so a build of any batch size was refused by the page-WAL's
+//! 16 MiB managed-byte allowance and halving the batch could not help: the
+//! cost was never per row. Split, an edge append rewrites ONE adjacency
+//! record -- at most `4 + 2R * 12 = 1,156` bytes, one page, never a chain --
+//! and the codes are not touched at all. The head is written ONCE, when the
+//! node is linked, and is immutable for the node's life: an update that moved
+//! the vector is an unlink followed by a link, not a rewrite.
+//!
+//! The price, stated: a node the walk reaches costs TWO point reads instead
+//! of one. The bytes read go DOWN (a 4,110-byte head plus a 1,156-byte
+//! adjacency against a 5,270-byte chained record), the seeks go up by one per
+//! node, and both keyspaces are keyed by the same `(index, sequence)` so the
+//! two reads descend the same shape of tree.
 //!
 //! THE STRUCTURAL INVARIANT, one sentence: the neighbour relation is
 //! SYMMETRIC and closed. If `a` names `b` then `b` names `a`, no list names a
@@ -57,10 +82,19 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 /// by any binary whose `SUPPORTED_LOGICAL_FEATURES` predates it, as
 /// `Unsupported` and with no byte of the source changed (Law 8).
 pub const VAMANA_FEATURE: u64 = 0x8000;
-/// The new keyspace. `docs/core/FORMAT_V2.md` records it as the only free tag
-/// in the index run, and a new keyspace plus an additive bit is the only
-/// change format v2 permits.
+/// The node keyspace: the graph header at sequence 0, and one node HEAD per
+/// sequence after it. `docs/core/FORMAT_V2.md` records it, and a new keyspace
+/// plus an additive bit is the only change format v2 permits.
 pub const VAMANA_ENTRY: u8 = 0x7D;
+/// The ADJACENCY keyspace, under the same feature bit.
+///
+/// A second tag rather than a tail on the node record, because the head's
+/// length is the dimension and the adjacency's is the degree: sharing one
+/// record made every edge append rewrite the codes, and past a page it
+/// rewrote an overflow chain (see the module comment). `0x7F` was the last
+/// free tag in the index run; `docs/core/FORMAT_V2.md`'s Extension boundary
+/// records it as taken.
+pub const VAMANA_ADJACENCY: u8 = 0x7F;
 /// Node-record and header encoding version. Frozen.
 pub const GRAPH_VERSION: u8 = 1;
 pub(crate) const OPTIONS: u8 = 0;
@@ -72,8 +106,9 @@ pub(crate) const OPTIONS: u8 = 0;
 /// to 0.84 at a search list of 40 and from 0.88 to 0.92 at 100 when R went
 /// from 32 to 48, for 872 bytes per row instead of 641 and about half again
 /// as many records read per query. 64 was not measured to pay for the page
-/// density it costs: an edge is 12 bytes, so a 128-lane node at R=48 is about
-/// 870 bytes and four of them share a 4 KiB page.
+/// density it costs: an edge is 12 bytes, so at R=48 a neighbour list is
+/// about 580 bytes on its own and seven of them share a 4 KiB page of the
+/// `0x7F` keyspace.
 ///
 /// It is also the unit every cost in this file is stated in: an insert is
 /// O(L + R) reads and O(R) writes, a delete O(R) of each.
@@ -201,6 +236,21 @@ pub(crate) fn node_key(id: IndexId, sequence: u64) -> Vec<u8> {
     key
 }
 
+pub(crate) fn adjacency_prefix(id: IndexId) -> Vec<u8> {
+    let mut key = vec![VAMANA_ADJACENCY];
+    key.extend(ordered(id.0));
+    key
+}
+
+/// One node's adjacency record. Keyed by the same `(index, sequence)` the
+/// node's head is, so the two reads descend the same shape of tree and a
+/// walk that has one sequence has both keys without another lookup.
+pub(crate) fn adjacency_key(id: IndexId, sequence: u64) -> Vec<u8> {
+    let mut key = adjacency_prefix(id);
+    key.extend(ordered(sequence));
+    key
+}
+
 /// The header record's key: sequence 0, which no entity can have, so the
 /// header sorts first inside the index's own range and shares its lifetime.
 pub(crate) fn header_key(id: IndexId) -> Vec<u8> {
@@ -304,9 +354,11 @@ pub(crate) fn decode_header(b: &[u8]) -> Result<GraphHeader> {
     })
 }
 
-pub(crate) fn encode_node(head: &[u8], adjacency: &Adjacency) -> Vec<u8> {
-    let mut b = Vec::with_capacity(head.len() + 4 + adjacency.len() * EDGE);
-    b.extend_from_slice(head);
+/// One node's adjacency record: at most `4 + 2R * EDGE` bytes, which is
+/// 1,156 at `R = 48` and therefore always inside one page. This is the ONLY
+/// record an edge append or a reprune rewrites.
+fn encode_adjacency(adjacency: &Adjacency) -> Vec<u8> {
+    let mut b = Vec::with_capacity(4 + adjacency.len() * EDGE);
     b.extend((adjacency.own.len() as u16).to_be_bytes());
     b.extend((adjacency.back.len() as u16).to_be_bytes());
     for edge in adjacency.own.iter().chain(adjacency.back.iter()) {
@@ -316,34 +368,47 @@ pub(crate) fn encode_node(head: &[u8], adjacency: &Adjacency) -> Vec<u8> {
     b
 }
 
-/// Split one node record into its derived head and its adjacency.
+/// Check one node record and hand back the head it is.
 ///
-/// Every structural rule a single record can carry is checked HERE, so a
-/// walk that reads a record never has to trust it: degrees inside `DEGREE`,
-/// no self-loop, no duplicate, no zero sequence, no trailing bytes. What one
-/// record cannot see -- that the neighbour exists and names this node back --
-/// is the closure `verify_indexed_source` checks.
-pub(crate) fn decode_node(value: &[u8], dimension: usize, own: u64) -> Result<(&[u8], Adjacency)> {
+/// The value IS the head now, so this checks exactly what the quantized
+/// family checks of its own entry -- the locator decodes, the codes decode,
+/// and there is not one trailing byte -- and nothing else. What no single
+/// record can see is checked elsewhere: the head against the row it derives
+/// from at rerank and in `verify_indexed_source`, the adjacency by
+/// [`decode_adjacency`], and the closure by verification.
+pub(crate) fn decode_head(value: &[u8], dimension: usize) -> Result<&[u8]> {
     let head = head_len(dimension);
-    if value.len() < head + 4 {
+    if value.len() != head {
         return Err(corrupt("vamana node record length"));
     }
     crate::index::vector::exact::decode_locator(&value[..6])?;
     vector_quant::decode(&value[6..head], dimension)
         .map_err(|_| corrupt("vamana node record codec"))?;
-    let own_degree = usize::from(u16::from_be_bytes(value[head..head + 2].try_into().unwrap()));
-    let back_degree = usize::from(u16::from_be_bytes(
-        value[head + 2..head + 4].try_into().unwrap(),
-    ));
+    Ok(value)
+}
+
+/// Decode one node's adjacency record.
+///
+/// Every structural rule a single record can carry is checked HERE, so a
+/// walk that reads one never has to trust it: degrees inside [`MAX_DEGREE`],
+/// no self-loop, no duplicate, no zero sequence, no trailing bytes. What one
+/// record cannot see -- that the neighbour exists and names this node back --
+/// is the closure `verify_indexed_source` checks.
+pub(crate) fn decode_adjacency(value: &[u8], own: u64) -> Result<Adjacency> {
+    if value.len() < 4 {
+        return Err(corrupt("vamana adjacency record length"));
+    }
+    let own_degree = usize::from(u16::from_be_bytes(value[..2].try_into().unwrap()));
+    let back_degree = usize::from(u16::from_be_bytes(value[2..4].try_into().unwrap()));
     let degree = own_degree + back_degree;
-    if degree > MAX_DEGREE || value.len() != head + 4 + degree * EDGE {
+    if degree > MAX_DEGREE || value.len() != 4 + degree * EDGE {
         return Err(corrupt("vamana node degree"));
     }
     let mut adjacency = Adjacency {
         own: Vec::with_capacity(own_degree),
         back: Vec::with_capacity(back_degree),
     };
-    let mut at = head + 4;
+    let mut at = 4;
     for position in 0..degree {
         let seq = u64::from_be_bytes(value[at..at + 8].try_into().unwrap());
         let distance = f32::from_be_bytes(value[at + 8..at + 12].try_into().unwrap());
@@ -364,7 +429,7 @@ pub(crate) fn decode_node(value: &[u8], dimension: usize, own: u64) -> Result<(&
             return Err(corrupt("vamana node duplicate neighbour"));
         }
     }
-    Ok((&value[..head], adjacency))
+    Ok(adjacency)
 }
 
 /// The codes of one head, as the hot int8 kernel wants them.
@@ -498,25 +563,57 @@ fn put_header(db: &mut Database, id: IndexId, header: GraphHeader) -> Result<()>
     Ok(())
 }
 
+/// One node's head, without its adjacency: what a rerank and a verification
+/// want, and one point read rather than two.
+fn read_head(
+    db: &Database,
+    id: IndexId,
+    dimension: usize,
+    seq: u64,
+) -> Result<Option<Vec<u8>>> {
+    let Some(bytes) = db.store()?.get(&node_key(id, seq))? else {
+        return Ok(None);
+    };
+    decode_head(&bytes, dimension)?;
+    Ok(Some(bytes))
+}
+
+/// One node's adjacency. A node whose head exists always has one, even when
+/// it is empty: the two keyspaces hold exactly the same sequences, which is
+/// what lets verification say a missing one is damage rather than a shape.
+fn read_adjacency(db: &Database, id: IndexId, seq: u64) -> Result<Option<Adjacency>> {
+    let Some(bytes) = db.store()?.get(&adjacency_key(id, seq))? else {
+        return Ok(None);
+    };
+    decode_adjacency(&bytes, seq).map(Some)
+}
+
 pub(crate) fn read_record(
     db: &Database,
     id: IndexId,
     dimension: usize,
     seq: u64,
 ) -> Result<Option<Record>> {
-    let Some(bytes) = db.store()?.get(&node_key(id, seq))? else {
+    let Some(head) = read_head(db, id, dimension, seq)? else {
         return Ok(None);
     };
-    let (head, adjacency) = decode_node(&bytes, dimension, seq)?;
-    Ok(Some(Record {
-        head: head.to_vec(),
-        adjacency,
-    }))
+    let adjacency = read_adjacency(db, id, seq)?
+        .ok_or_else(|| corrupt("vamana node has no adjacency record"))?;
+    Ok(Some(Record { head, adjacency }))
 }
 
-fn put_record(db: &mut Database, id: IndexId, seq: u64, record: &Record) -> Result<()> {
-    let value = encode_node(&record.head, &record.adjacency);
-    db.writer()?.put(&node_key(id, seq), &value)?;
+/// Write the node's HEAD. Called once, when the node is linked: the head is
+/// immutable for the node's life, and keeping it out of the edge path is the
+/// whole point of the split.
+fn put_head(db: &mut Database, id: IndexId, seq: u64, head: &[u8]) -> Result<()> {
+    db.writer()?.put(&node_key(id, seq), head)?;
+    Ok(())
+}
+
+/// Write one node's ADJACENCY. At most 1,156 bytes, whatever the dimension.
+fn put_adjacency(db: &mut Database, id: IndexId, seq: u64, adjacency: &Adjacency) -> Result<()> {
+    let value = encode_adjacency(adjacency);
+    db.writer()?.put(&adjacency_key(id, seq), &value)?;
     Ok(())
 }
 
@@ -539,10 +636,14 @@ impl Pending {
         self.dirty.insert(seq);
         self.held.get_mut(&seq)
     }
+    /// Write back what changed, which is ADJACENCY and never a head. A head
+    /// is written once by [`link_node`] and never rewritten, so a flush of
+    /// `R` dirty neighbours costs `R` records of at most 1,156 bytes each
+    /// whatever the dimension is.
     fn flush(&self, db: &mut Database, id: IndexId) -> Result<()> {
         for seq in &self.dirty {
             if let Some(record) = self.held.get(seq) {
-                put_record(db, id, *seq, record)?;
+                put_adjacency(db, id, *seq, &record.adjacency)?;
             }
         }
         Ok(())
@@ -582,7 +683,8 @@ fn fetch(
 /// the symmetry.
 ///
 /// COST: one read per candidate (at most `MAX_DEGREE`, once, cached in
-/// `pending`) and one write per endpoint whose edge was dropped.
+/// `pending`) and one ADJACENCY write per endpoint whose edge was dropped.
+/// No head is written here, at any dimension.
 fn prune_neighbour(
     db: &Database,
     index: &IndexInfo,
@@ -664,8 +766,10 @@ struct Reached {
 /// reached, not the corpus. A node is read at most once -- `seen` is checked
 /// before the read, not after -- so the walk is bounded by the number of
 /// distinct nodes within `list` hops of the query, which at `list = 40` over
-/// a 20,000-node graph is on the order of 500 records where the linear family
-/// reads 20,000.
+/// a 20,000-node graph is on the order of 500 nodes where the linear family
+/// reads 20,000. A node costs TWO point reads since the adjacency moved into
+/// its own keyspace -- its head and its list -- and fewer bytes than the one
+/// chained record it replaced.
 #[allow(clippy::too_many_arguments)]
 fn greedy_search(
     db: &Database,
@@ -834,10 +938,13 @@ fn head_distance(left: &[u8], right: &[u8], dimension: usize) -> Option<f64> {
 ///
 /// COST, stated: ONE greedy search at `BUILD_SEARCH_LIST` (its records read
 /// are the search's own bound, not the corpus), then at most `DEGREE`
-/// read-modify-writes for the back edges and at most `DEGREE` more for the
-/// edges those displaced, plus the node itself and the header. So O(L + R)
-/// reads and O(R) writes per insert, with no term in the number of rows. The
-/// entry-point refresh adds `SAMPLE` reads once per DOUBLING of the graph.
+/// read-modify-writes of ADJACENCY records for the back edges and at most
+/// `DEGREE` more for the edges those displaced, plus this node's own head
+/// and adjacency and the header. So O(L + R) reads and O(R) writes per
+/// insert, with no term in the number of rows and -- because an adjacency
+/// record is at most 1,156 bytes -- no term in the DIMENSION beyond the one
+/// head this insert writes. The entry-point refresh adds `SAMPLE` reads once
+/// per DOUBLING of the graph.
 pub(crate) fn link_node(
     db: &mut Database,
     index: &IndexInfo,
@@ -850,11 +957,8 @@ pub(crate) fn link_node(
     }
     let mut header = read_header(db, index.id)?;
     if header.nodes == 0 {
-        let record = Record {
-            head,
-            adjacency: Adjacency::default(),
-        };
-        put_record(db, index.id, seq, &record)?;
+        put_head(db, index.id, seq, &head)?;
+        put_adjacency(db, index.id, seq, &Adjacency::default())?;
         return put_header(
             db,
             index.id,
@@ -937,14 +1041,22 @@ pub(crate) fn link_node(
             header.entry_at = header.nodes;
         }
     }
+    // The HEAD is written here and never again: it is the only record this
+    // insert writes whose size is the dimension, and the edge repair above
+    // cannot reach it. It lands with the flush, after the entry-point
+    // refresh, so the sample this insert takes is over the graph as it was --
+    // the same set of nodes the single-record layout sampled.
+    let head = pending.get(seq).expect("held above").head.as_slice();
+    put_head(db, index.id, seq, head)?;
     pending.flush(db, index.id)?;
     put_header(db, index.id, header)
 }
 
 /// Unlink one node, leaving no list naming it.
 ///
-/// COST, stated: at most `DEGREE` reads and `DEGREE` writes plus the header,
-/// and `DEGREE^2` int8 distances in memory for the consolidation. There is no
+/// COST, stated: at most `DEGREE` reads and `DEGREE` ADJACENCY writes, plus
+/// this node's two records and the header, and
+/// `DEGREE^2` int8 distances in memory for the consolidation. There is no
 /// term in the number of rows, and that is what the SYMMETRIC invariant buys:
 /// the lists that name this node are exactly the lists it names, so finding
 /// them is a read of its own record rather than a walk of the keyspace.
@@ -1033,7 +1145,11 @@ pub(crate) fn unlink_node(db: &mut Database, index: &IndexInfo, seq: u64) -> Res
         header.entry = 0;
         header.entry_at = 0;
     }
+    // Both of the node's records go, in this transaction: the two keyspaces
+    // hold exactly the same sequences, and a delete that left one behind
+    // would be the damage verification is written to find.
     db.writer()?.delete(&node_key(index.id, seq))?;
+    db.writer()?.delete(&adjacency_key(index.id, seq))?;
     pending.flush(db, index.id)?;
     put_header(db, index.id, header)
 }
@@ -1141,8 +1257,8 @@ fn sample_medoid(db: &Database, index: &IndexInfo, dimension: usize) -> Result<O
         if !seen.insert(seq) {
             continue;
         }
-        let (head, _) = decode_node(&value, dimension, seq)?;
-        sample.push((seq, head.to_vec()));
+        decode_head(&value, dimension)?;
+        sample.push((seq, value));
     }
     let mut best: Option<(u64, f64)> = None;
     for (seq, head) in &sample {

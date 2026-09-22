@@ -455,7 +455,7 @@ fn alter_table_add_column_of_an_eligible_kind_gets_its_index() {
 }
 
 #[test]
-fn a_vector_column_gets_nothing_automatically_and_its_predicate_names_both_families() {
+fn a_vector_column_gets_nothing_automatically_and_its_predicate_names_every_family() {
     let (_dir, mut db) = open();
     run(&mut db, "CREATE TABLE vec (label TEXT, emb VECTOR(4))");
     assert_eq!(
@@ -475,8 +475,9 @@ fn a_vector_column_gets_nothing_automatically_and_its_predicate_names_both_famil
     assert!(
         said.contains("no vector index on `emb`")
             && said.contains("exact")
-            && said.contains("quantized"),
-        "the refusal names BOTH families, because that is the decision it is asking for: {said}"
+            && said.contains("quantized")
+            && said.contains("vamana"),
+        "the refusal names ALL THREE families, because that is the decision it is asking for: {said}"
     );
 
     // And a JSONB column is the contract's stated gap: no family covers it,

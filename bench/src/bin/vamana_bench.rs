@@ -247,7 +247,10 @@ fn main() {
             }));
         }
         drop(db);
-        let graph_bytes = keyspace_bytes(&path, 0x7D, graph);
+        // The vamana family owns TWO keyspaces: the node heads under `0x7D`
+        // and the adjacency records under `0x7F`. Its bytes per row is both.
+        let graph_bytes =
+            keyspace_bytes(&path, 0x7D, graph) + keyspace_bytes(&path, 0x7F, graph);
         let linear_bytes = keyspace_bytes(&path, 0x79, linear);
         println!(
             "{}",
@@ -258,7 +261,7 @@ fn main() {
                 "build_seconds": {"quantized": linear_build, "vamana": graph_build},
                 "bytes_per_row": {
                     "quantized_0x79": linear_bytes as f64 / rows as f64,
-                    "vamana_0x7D": graph_bytes as f64 / rows as f64,
+                    "vamana_0x7D_and_0x7F": graph_bytes as f64 / rows as f64,
                 },
                 "vamana": graph_rows,
                 "quantized": linear_rows,

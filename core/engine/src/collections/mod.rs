@@ -121,7 +121,7 @@ pub use crate::index::vector::quantized::{
 pub use crate::index::vector::graph::{
     ALPHA_HUNDREDTHS as VAMANA_ALPHA_HUNDREDTHS, BUILD_SEARCH_LIST as VAMANA_BUILD_SEARCH_LIST,
     DEGREE as VAMANA_DEGREE, GRAPH_VERSION as VAMANA_GRAPH_VERSION, MAX_DEGREE as VAMANA_MAX_DEGREE,
-    VAMANA_ENTRY, VAMANA_FEATURE,
+    VAMANA_ADJACENCY, VAMANA_ENTRY, VAMANA_FEATURE,
 };
 pub use crate::query::{
     AggValue, Accumulator, AggregateFn, AggregateInput, AggregatePlanDescription, AggregateRequest,
@@ -791,7 +791,8 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// geometry index; `0x200` DROPPING collections; `0x400` expression index;
 /// `0x800` declared-type catalog tail; `0x1000` COLUMN RULES catalog tail;
 /// `0x2000` live row-count records; `0x4000` graph ENDPOINT SETS; `0x8000`
-/// the VAMANA GRAPH keyspace `0x7D` ([`crate::index::vector::graph`]);
+/// the VAMANA GRAPH keyspaces `0x7D` (node heads) and `0x7F` (adjacency)
+/// ([`crate::index::vector::graph`]);
 /// `0x10000` JSON-path expression indexes (`IndexExpr::JsonText`, descriptor
 /// version 4).
 /// The mask is therefore `0x1ffff`.

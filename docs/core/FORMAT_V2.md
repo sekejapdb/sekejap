@@ -148,10 +148,13 @@ cells, `0x7D` the VAMANA GRAPH's node records
 ([core/engine/src/index/vector/graph.rs](../../core/engine/src/index/vector/graph.rs),
 behind `VAMANA_FEATURE = 0x8000`), `0x7E` graph ENDPOINT SETS
 ([core/engine/src/index/graph/endpoints.rs](../../core/engine/src/index/graph/endpoints.rs),
-behind `ENDPOINT_FEATURE = 0x4000`). The live per-collection row count took
+behind `ENDPOINT_FEATURE = 0x4000`), and `0x7F` the VAMANA GRAPH's ADJACENCY
+records — the same family and the same `VAMANA_FEATURE = 0x8000`, in a second
+keyspace because the two records have different lifetimes and different sizes
+(below). The live per-collection row count took
 `0x08` rather than `0x7D`, so `0x7D` was the last free tag in the index run and
-the vamana family is what claimed it. **There is no free tag left below
-`0x7F`.** Graph, spatial, text and vector-navigation
+the vamana family is what claimed it. **The index run is now FULL: `0x7F` was
+the last free tag and the vamana family took it too.** Graph, spatial, text and vector-navigation
 indexes allocate new, noncolliding namespaces after auditing the complete
 registry; the prior engine's tag values cannot be copied blindly. Each
 persisted index family needs explicit encoding version/catalog descriptors and
@@ -168,13 +171,32 @@ The Vamana/DiskANN graph is the one family since v2 froze that changed the
 on-disk format, and it changed it in exactly the two ways this section permits
 and in no other:
 
-* **One new keyspace, `0x7D`.** `key = 0x7D || ordered(index id) ||
-  ordered(sequence)`. Sequence 0 is the per-index GRAPH HEADER (version,
-  degree, build search list, alpha, entry point, node count); every other
-  sequence is one node — a HEAD that is byte-for-byte a quantized entry
-  (`locator | scale | int8 codes`) followed by `own:u16 | back:u16` and that
-  many `(neighbour:u64be, distance:f32be)` edges. No existing keyspace, record
-  or descriptor moved a byte.
+* **Two new keyspaces, `0x7D` and `0x7F`, under ONE feature bit.**
+  `key = 0x7D || ordered(index id) || ordered(sequence)`. Sequence 0 is the
+  per-index GRAPH HEADER (version, degree, build search list, alpha, entry
+  point, node count); every other sequence is one node's HEAD, which is
+  byte-for-byte a quantized entry (`locator:6 | scale:f64le | int8 codes`)
+  and nothing else. That node's neighbour list is a SEPARATE record,
+  `key = 0x7F || ordered(index id) || ordered(sequence)`, holding
+  `own:u16be | back:u16be` and that many `(neighbour:u64be, distance:f32be)`
+  edges. The two keyspaces hold exactly the same sequences: a node has one
+  record in each, a delete removes both, and `verify_indexed_source` checks
+  that claim in both directions. No existing keyspace, record or descriptor
+  moved a byte.
+
+  **Why two records and not one.** The head's length is the DIMENSION: at
+  4,096 lanes it is 4,110 bytes, larger than a 4,096-byte page, so a single
+  record spanning both lived in an overflow chain. Every back edge an insert
+  appends is a read-modify-write of a NEIGHBOUR, and rewriting a shared
+  record rewrote that neighbour's codes and its whole chain — `R = 48` times
+  per insert. Measured at 4,096 lanes over a 600-node graph, one insert
+  appended 2,780,624 bytes of WAL (2.65 MiB), so a build transaction of any
+  size was refused by the page-WAL's 16 MiB managed-byte allowance and
+  halving the batch could not help: the cost was never per row. Split, the
+  same insert appended 265,216 bytes, an adjacency record is at most
+  `4 + 2R * 12 = 1,156` bytes and therefore always inside one page, and the
+  head is written ONCE when the node is linked and never rewritten
+  (`core/engine/tests/index_vector_vamana_layout.rs`).
 * **One additive feature bit, `0x8000`.** Set in the same transaction that
   creates the first vamana descriptor, never cleared, and
   `SUPPORTED_LOGICAL_FEATURES` moved from `0x7fff` to `0xffff` with it. A
@@ -184,7 +206,7 @@ and in no other:
   `a_build_that_predates_the_vamana_bit_refuses_the_corpus_by_name_and_changes_no_byte`).
 
 Its immutable fixtures are `docs/format-v2-vamana/`: two independently
-captured corpora (checkpointed and wal-pending), written once by
+captured corpora (checkpointed and wal-pending) at the layout above, written by
 [bench/src/bin/vamana_format_fixture.rs](../../bench/src/bin/vamana_format_fixture.rs)
 and never regenerated to make a later engine pass. Each MANIFEST carries the
 generator's own brute-force expected neighbours, so the compatibility suite

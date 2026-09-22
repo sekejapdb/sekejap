@@ -40,7 +40,7 @@
 //! edge directions, `0x73` exact vector, `0x74` spatial point, `0x75`-`0x78`
 //! text postings/norms/term stats/corpus stats, `0x79` quantized vector,
 //! `0x7A`/`0x7B` text segments and norm blocks, `0x7C` geometry cells.
-//! `0x7D` is the first free byte and is left free DELIBERATELY: a parallel
+//! `0x7D` was the first free byte and was left free DELIBERATELY: a parallel
 //! worker is adding a live row count under feature bit `0x2000`, one bit
 //! below this module's, and taking the tag one above keeps the two from
 //! colliding. `0x7E` is the tag this module takes.

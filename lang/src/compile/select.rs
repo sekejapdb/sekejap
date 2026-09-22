@@ -398,19 +398,33 @@ impl Compiler<'_> {
                 .map(|info| info.id)
         };
         let exact = ready(IndexFamily::ExactVector);
-        let quantized = ready(IndexFamily::QuantizedVector);
+        // TWO families answer an APPROXIMATE vector order, and they mean the
+        // same thing by it: an `ef`-bounded shortlist of int8 candidates,
+        // reranked exactly against the f32 sidecars
+        // (`core/engine/src/query/plan.rs::prepare_approximate_vector`). They
+        // differ only in how the shortlist is found -- the vamana graph walks
+        // the nodes its search list reaches, the quantized family scans every
+        // entry -- so a column that has BOTH is answered by the graph: it is
+        // the one a caller had to ask for by name, and it is the one whose
+        // cost does not grow with the corpus. The notice says which answered,
+        // because the two differ in what they cost and not in what they mean.
+        let approximate = ready(IndexFamily::VamanaGraph)
+            .map(|index| (index, "vamana graph index"))
+            .or_else(|| {
+                ready(IndexFamily::QuantizedVector).map(|index| (index, "quantized index"))
+            });
         let ef = EF_SEARCH.with(Cell::get);
-        match (exact, quantized, ef) {
+        match (exact, approximate, ef) {
             (Some(index), _, None) => Ok(OwnedOrder::ExactVector {
                 index,
                 query,
                 metric,
                 fill,
             }),
-            (_, Some(index), ef) => {
+            (_, Some((index, family)), ef) => {
                 let ef = ef.unwrap_or(DEFAULT_EF);
                 self.notices.push(format!(
-                    "ORDER BY a vector distance on `{column}` is APPROXIMATE (ef={ef}): the quantized index answers it, and the shortlist bounds the whole result set of this prepared query"
+                    "ORDER BY a vector distance on `{column}` is APPROXIMATE (ef={ef}): the {family} answers it, and the shortlist bounds the whole result set of this prepared query"
                 ));
                 Ok(OwnedOrder::ApproximateVector {
                     index,
@@ -441,7 +455,7 @@ impl Compiler<'_> {
             // still declared -- so it is the one that must not look like a
             // transient fault.
             (None, None, _) => Err(SqlError::unsupported(format!(
-                "no vector index on `{column}`: a vector order names either the exact family (page-order sidecar scan) or the quantized one (compact scan then f32 rerank). `CREATE INDEX i ON t USING exact ({column})` or `USING quantized ({column})`; docs/lang/INDEX_CONTRACT.md says why this one is not automatic"
+                "no vector index on `{column}`: a vector order names the exact family (page-order sidecar scan), the quantized one (compact scan then f32 rerank) or the vamana graph (a walk of the nodes the search list reaches, then the same f32 rerank). `CREATE INDEX i ON t USING exact ({column})`, `USING quantized ({column})` or `USING vamana ({column})`; docs/lang/INDEX_CONTRACT.md says why this one is not automatic"
             ))),
         }
     }

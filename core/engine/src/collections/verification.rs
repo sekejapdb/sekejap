@@ -970,6 +970,7 @@ pub fn verify_indexed_source(
                     | 0x7c
                     | 0x7d
                     | 0x7e
+                    | 0x7f
             )
         );
         if !known {
@@ -979,7 +980,8 @@ pub fn verify_indexed_source(
             )));
         }
         let Some(
-            tag @ (0x70 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7b | 0x7c | 0x7d),
+            tag @ (0x70 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7b | 0x7c | 0x7d
+                | 0x7f),
         ) =
             key.first().copied()
         else {
@@ -993,7 +995,9 @@ pub fn verify_indexed_source(
             0x74 => IndexFamily::SpatialPoint,
             0x79 => IndexFamily::QuantizedVector,
             0x7c => IndexFamily::SpatialGeometry,
-            0x7d => IndexFamily::VamanaGraph,
+            // Both of the vamana family's keyspaces: the node heads and the
+            // adjacency records that were split out of them.
+            0x7d | 0x7f => IndexFamily::VamanaGraph,
             _ => IndexFamily::Text,
         };
         match indexes.iter().find(|index| index.id == id) {
@@ -1402,26 +1406,22 @@ fn verify_expected<F: FnMut(&VerificationIssue)>(
                 )?;
             }
         }
-        // The node record's HEAD is derived from the row exactly as the
-        // quantized entry is, so it is checked the same way. Its adjacency
-        // TAIL is derived from no one row -- it is the index's own structure
-        // -- and what is checked about it is the closure invariant, in
-        // `verify_actual` below.
+        // The node record IS the HEAD, derived from the row exactly as the
+        // quantized entry is, so it is compared whole and the same way. The
+        // ADJACENCY record beside it is derived from no one row -- it is the
+        // index's own structure -- and what is checked about it is the
+        // closure invariant, in `verify_actual` below.
         IndexFamily::VamanaGraph => {
             let expected = quantized_expected(run, i, id, l, row)?;
             if let Some(expected) = expected {
                 let key = crate::index::vector::graph::node_key(i.id, id.sequence);
-                let head = crate::index::vector::graph::head_len(
-                    crate::index::vector::graph::dimension(i)?,
-                );
                 let actual = run.read(&key)?;
-                let actual_head = actual.as_ref().and_then(|value| value.get(..head));
                 run.mismatch(
                     IssueClass::Derived,
                     &key,
                     Some(i.id),
                     Some(id),
-                    actual_head,
+                    actual.as_deref(),
                     Some(&expected),
                     "vamana node head",
                 )?;
@@ -1798,14 +1798,20 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
                 Ok(())
             })?;
         }
-        // Three claims about the `0x7D` keyspace, each against an
-        // INDEPENDENT source: the header is well formed and its entry point
-        // is a node that exists; every node's HEAD is the one the row derives
-        // (the same oracle the quantized family uses); and the neighbour
-        // relation is CLOSED and SYMMETRIC -- every named neighbour has a
-        // record and names this node back. The third is the one that says a
+        // FOUR claims about the family's two keyspaces, each against an
+        // INDEPENDENT source: the `0x7D` header is well formed and its entry
+        // point is a node that exists; every `0x7D` node record IS the HEAD
+        // the row derives (the same oracle the quantized family uses); every
+        // node has exactly one `0x7F` adjacency record and every adjacency
+        // record has its node; and the neighbour relation is CLOSED and
+        // SYMMETRIC -- every named neighbour has a node record and names this
+        // node back in ITS adjacency record. The last is the one that says a
         // delete stranded no list, and it is paid for in point reads (at most
         // `DEGREE` per node), which is the budget that exists to bound it.
+        //
+        // The two keyspaces are walked separately because they are separate
+        // ranges; keying both by the same `(index, sequence)` is what lets
+        // each walk name the other's key without a search.
         IndexFamily::VamanaGraph => {
             let dimension = crate::index::vector::graph::dimension(i)?;
             let p = crate::index::vector::graph::node_prefix(i.id);
@@ -1858,9 +1864,8 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
                     }
                     return Ok(());
                 }
-                let adjacency = match crate::index::vector::graph::decode_node(value, dimension, seq)
-                {
-                    Ok((head, adjacency)) => {
+                match crate::index::vector::graph::decode_head(value, dimension) {
+                    Ok(head) => {
                         if let Some((id, layout, row)) = primary_field(run, i, seq)? {
                             let expected = quantized_expected(run, i, id, &layout, &row)?;
                             run.mismatch(
@@ -1873,7 +1878,6 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
                                 "extra/mismatched vamana node head",
                             )?;
                         }
-                        adjacency
                     }
                     Err(_) => {
                         malformed(
@@ -1889,37 +1893,102 @@ fn verify_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexInfo) 
                         )?;
                         return Ok(());
                     }
+                }
+                // One node, one adjacency record. A node without one is a
+                // half-written link, which nothing may walk over silently.
+                let list = crate::index::vector::graph::adjacency_key(i.id, seq);
+                if run.read(&list)?.is_none() {
+                    run.issue(VerificationIssue {
+                        class: IssueClass::Derived,
+                        kind: IssueKind::Missing,
+                        key: list,
+                        index: Some(i.id),
+                        entity: Some(EntityId {
+                            collection: i.collection,
+                            sequence: seq,
+                        }),
+                        message: "vamana node has no adjacency record".into(),
+                    })?;
+                }
+                Ok(())
+            })?;
+            let a = crate::index::vector::graph::adjacency_prefix(i.id);
+            let end = prefix_end(&a);
+            let source = run.reader.clone();
+            visit(&source, &a, end.as_deref(), |key, value| {
+                run.row(true)?;
+                let mut at = a.len();
+                let seq = match read_ordered(key, &mut at) {
+                    Ok(seq) if at == key.len() && seq != 0 => seq,
+                    _ => {
+                        malformed(
+                            run,
+                            IssueClass::Derived,
+                            key,
+                            Some(i.id),
+                            None,
+                            "vamana adjacency key is malformed",
+                        )?;
+                        return Ok(());
+                    }
                 };
+                let entity = EntityId {
+                    collection: i.collection,
+                    sequence: seq,
+                };
+                let adjacency = match crate::index::vector::graph::decode_adjacency(value, seq) {
+                    Ok(adjacency) => adjacency,
+                    Err(_) => {
+                        malformed(
+                            run,
+                            IssueClass::Derived,
+                            key,
+                            Some(i.id),
+                            Some(entity),
+                            "vamana adjacency record is malformed",
+                        )?;
+                        return Ok(());
+                    }
+                };
+                // An adjacency record whose node is gone is the other half of
+                // the same claim: the two keyspaces hold the same sequences.
+                let node = crate::index::vector::graph::node_key(i.id, seq);
+                if run.read(&node)?.is_none() {
+                    run.issue(VerificationIssue {
+                        class: IssueClass::Derived,
+                        kind: IssueKind::Missing,
+                        key: node,
+                        index: Some(i.id),
+                        entity: Some(entity),
+                        message: "vamana adjacency record has no node record".into(),
+                    })?;
+                    return Ok(());
+                }
                 for neighbour in adjacency.sequences() {
                     let other = crate::index::vector::graph::node_key(i.id, neighbour);
-                    let Some(bytes) = run.read(&other)? else {
+                    if run.read(&other)?.is_none() {
                         run.issue(VerificationIssue {
                             class: IssueClass::Derived,
                             kind: IssueKind::Missing,
                             key: other,
                             index: Some(i.id),
-                            entity: Some(EntityId {
-                                collection: i.collection,
-                                sequence: seq,
-                            }),
+                            entity: Some(entity),
                             message: "vamana neighbour list names a node with no record".into(),
                         })?;
                         continue;
-                    };
-                    let names_back = crate::index::vector::graph::decode_node(
-                        &bytes, dimension, neighbour,
-                    )
-                    .is_ok_and(|(_, back)| back.sequences().any(|other| other == seq));
+                    }
+                    let back = crate::index::vector::graph::adjacency_key(i.id, neighbour);
+                    let names_back = run.read(&back)?.is_some_and(|bytes| {
+                        crate::index::vector::graph::decode_adjacency(&bytes, neighbour)
+                            .is_ok_and(|back| back.sequences().any(|other| other == seq))
+                    });
                     if !names_back {
                         run.issue(VerificationIssue {
                             class: IssueClass::Derived,
                             kind: IssueKind::Mismatch,
-                            key: other,
+                            key: back,
                             index: Some(i.id),
-                            entity: Some(EntityId {
-                                collection: i.collection,
-                                sequence: seq,
-                            }),
+                            entity: Some(entity),
                             message: "vamana neighbour relation is not symmetric".into(),
                         })?;
                     }

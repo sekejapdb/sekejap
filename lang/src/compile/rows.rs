@@ -858,6 +858,7 @@ fn default_spelling(value: &DefaultValue) -> String {
     match value {
         DefaultValue::Now => "now()".into(),
         DefaultValue::Uuid4 => "uuid4()".into(),
+        DefaultValue::Ulid => "ulid()".into(),
         DefaultValue::Uuid5 { .. } => "uuid5(namespace, name)".into(),
     }
 }

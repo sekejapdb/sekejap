@@ -1,4 +1,5 @@
 {
+  "adjacency_keyspace_tag": 127,
   "checkpointed": true,
   "collection": "points",
   "declared_features": 40961,
@@ -227,9 +228,9 @@
   "field": "embedding",
   "files": [
     {
-      "bytes": 303104,
+      "bytes": 368640,
       "name": "data",
-      "sha256": "4e17a84a7568b5950882999942583fc0449013b8c935e41982d5670073979d76"
+      "sha256": "b8a624a82d284a631ec547effd901f3aa7ef1221e6ab0cf7954250e5cb5fe18a"
     },
     {
       "bytes": 0,
@@ -274,7 +275,7 @@
     {
       "bytes": 96,
       "name": "readers.lock",
-      "sha256": "1807c90ae897be733bea1259e0904c117707edffb362faf06ef901eb046e4134"
+      "sha256": "ab85d3e8db1f460a51e06fa595a221bf4f1995bbad06159d4200b3789bff6427"
     },
     {
       "bytes": 0,
@@ -605,7 +606,7 @@
   "keyspace_tag": 125,
   "metric": "cosine",
   "rows": 300,
-  "supported_logical_features": 65535,
+  "supported_logical_features": 131071,
   "vectors": {
     "1": [
       -0.05298227071762085,
