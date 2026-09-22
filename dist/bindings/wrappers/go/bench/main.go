@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	sekejap "github.com/sekejapdb/sekejap/wrappers/go"
+	sekejap "github.com/sekejapdb/sekejap/dist/bindings/wrappers/go"
 )
 
 func main() {
@@ -16,9 +16,9 @@ func main() {
 
 	db, _ := sekejap.Open(dir)
 	defer db.Close()
-	db.Execute("CREATE TABLE t (_key TEXT PRIMARY KEY, v INTEGER)")
+	db.Execute("CREATE TABLE t (key TEXT PRIMARY KEY, v INTEGER)")
 	for i := 0; i < 1000; i++ {
-		db.Execute(fmt.Sprintf("INSERT INTO t (_key, v) VALUES ('k%d', %d)", i, i))
+		db.Execute("INSERT INTO t (key, v) VALUES ($1, $2)", fmt.Sprintf("k%d", i), i)
 	}
 
 	n := 50000

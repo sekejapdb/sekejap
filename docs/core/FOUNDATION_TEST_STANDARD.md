@@ -98,14 +98,15 @@ reopen; continuous sampled peaks; issued bytes; peak/loaded expansion factor.
 File-system samples are lower bounds. An enforced cap needs synchronous
 admission checks and fault tests, not merely a sampler.
 
-The bounded expansion target is an explicit cap **2x the loaded footprint**
-for stable-population churn. Declare the absolute bytes before mutation starts.
+The bounded expansion target is an explicit cap **2x the loaded footprint** for
+stable-population churn. Declare the absolute bytes before mutation starts.
 Small-fixture startup overhead must be reported separately, never concealed by
 silently increasing this multiplier. Exceeding the cap must refuse safely;
 completing the workload under the cap is a separate usability gate. Report
-SQLite's observed peak beside E4 even if SQLite has no equivalent total-file cap.
-Final plateau: cycles 10–12 must not show ongoing file growth beyond a declared
-one-page/metadata rounding allowance. Rebuild/VACUUM is a separate measured arm.
+SQLite's observed peak beside sekejap even if SQLite has no equivalent
+total-file cap. Final plateau: cycles 10–12 must not show ongoing file growth
+beyond a declared one-page/metadata rounding allowance. Rebuild/VACUUM is a
+separate measured arm.
 
 ## Promotion and evidence retention
 
@@ -126,7 +127,7 @@ python3 tools/run_foundation.py large <scratch>
 ```
 
 `lean` runs pager/fault/repair, codec/schema/collection and inherited kernel
-regressions, then four 1K-row E4/SQLite smoke arms. `scale` performs three
+regressions, then four 1K-row sekejap/SQLite smoke arms. `scale` performs three
 rotated repetitions at 10K, 100K and 1M rows; `large` is a one-run 10M
 confirmation, not three-repetition acceptance. Both are runnable in the
 authorized Pi artifact area; Pi benchmark processes have a 128 MiB
@@ -146,20 +147,22 @@ separately. Every changed key is checked, and final reopen streams an exact
 value/order/membership oracle using O(changes) state.
 
 Report absolute times, largest/smallest ratios, adjacent ratios and the
-descriptive exponent `log(cost ratio)/log(population ratio)` for time and E4
-issued reads/writes. E4 FileIo calls are buffered requests, not physical media
-I/O. SQLite cache events exclude checkpoint VFS work and must not be presented
-as equivalent counters. Phase-boundary sizes are not peak-space evidence.
-A passing workload oracle is distinct from passing Law 2. Measured latency
-growth cannot be hidden by SQLite parity or by defining an acceptable exponent
-after seeing the results. The strict law remains unchanged; unresolved growth
-must remain an explicit qualification failure or pending investigation.
+descriptive exponent `log(cost ratio)/log(population ratio)` for time and for
+issued reads/writes. The engine's FileIo calls are buffered requests, not
+physical media I/O. SQLite cache events exclude checkpoint VFS work and must
+not be presented as equivalent counters. Phase-boundary sizes are not
+peak-space evidence. A passing workload oracle is distinct from passing Law 2.
+Measured latency growth cannot be hidden by SQLite parity or by defining an
+acceptable exponent after seeing the results. The strict law remains unchanged;
+unresolved growth must remain an explicit qualification failure or pending
+investigation.
 
-Current E4, experimental E4 and native SQLite are named separately in every
-table. One representation or backend cannot be substituted silently. Primitive
-page-WAL proof does not authorize SQL, graph or multimodel-index implementation.
-All applicable gates, full integration tests and Pi checks must pass before
-promotion. Record unimplemented categories as PENDING, not passing by omission.
-Preserve source archives, binaries, raw reports, logs, fault evidence and one
-representative comparison set. Delete only verified disposable generated data
-after recording its manifest. tracker owns live status.
+The current build, any experimental build and native SQLite are named
+separately in every table. One representation or backend cannot be substituted
+silently. Primitive page-WAL proof does not authorize SQL, graph or
+multimodel-index implementation. All applicable gates, full integration tests
+and Pi checks must pass before promotion. Record unimplemented categories as
+PENDING, not passing by omission. Preserve source archives, binaries, raw
+reports, logs, fault evidence and one representative comparison set. Delete
+only verified disposable generated data after recording its manifest. tracker
+owns live status.

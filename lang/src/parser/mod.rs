@@ -85,6 +85,11 @@ enum PExpr {
     Neg(Box<PExpr>),
 }
 
+/// The value a client GUC reports. See `parser/catalog.rs`.
+pub(crate) fn client_guc(name: &str) -> Option<&'static str> {
+    catalog::guc(name)
+}
+
 pub(super) fn parse(text: &str) -> SqlResult2<Stmt> {
     let mut parser = Parser {
         tokens: tokenize(text)?,
@@ -94,6 +99,7 @@ pub(super) fn parse(text: &str) -> SqlResult2<Stmt> {
     let statement = parser.statement()?;
     parser.eat(&Tok::Semicolon);
     if !matches!(parser.peek(), Tok::Eof) {
+        parser.guard_here()?;
         return Err(SqlError::syntax(
             "one statement per call; the text continues after the first",
             parser.here(),
@@ -106,6 +112,7 @@ pub(super) fn parse(text: &str) -> SqlResult2<Stmt> {
 // when this was one file, and are bound here so that they still are.
 use super::{is_key_column, Tier, ID_COLUMN, KEY_COLUMN, MAX_GRAPH_DEPTH};
 
+mod catalog;
 mod ddl;
 mod dml;
 mod expr;
@@ -160,6 +167,12 @@ impl Parser {
         if self.eat(want) {
             return Ok(());
         }
+        // The token the statement actually wrote may be a LISTED construct
+        // standing where this one was expected -- `MATCH TRAIL (` is the
+        // shape. The table is the authority there, so it is asked before a
+        // place is named: a construct with a tier and a reason is refused by
+        // name, and only text the table does not know is a syntax error.
+        self.guard_here()?;
         Err(SqlError::syntax(
             format!(
                 "expected `{}`, found `{}`",
@@ -192,11 +205,7 @@ impl Parser {
         if self.eat_word(want) {
             return Ok(());
         }
-        if let Some(word) = self.word() {
-            if let Some(error) = self.listed(&word) {
-                return Err(error);
-            }
-        }
+        self.guard_here()?;
         Err(SqlError::syntax(
             format!(
                 "expected `{want}`, found `{}`",
@@ -250,12 +259,29 @@ impl Parser {
         let spelling = match self.peek() {
             Tok::Overlaps => "&&",
             Tok::ContainsOp => "@>",
+            Tok::Arrow => "->",
             Tok::LongArrow => "->>",
+            Tok::HashArrow => "#>",
+            Tok::HashLongArrow => "#>>",
             Tok::VecL1 => "<+>",
             Tok::Tilde => "~",
             _ => return Ok(()),
         };
         Err(refuse::refuse(spelling))
+    }
+
+    /// Refuse whatever stands at the cursor -- word or operator -- if the
+    /// Tier-2/3 table lists it.
+    ///
+    /// This is the ONE sweep the contract's "refused by name" rule needs: a
+    /// listed construct is refused wherever a statement can write it, rather
+    /// than wherever someone remembered to test for it by hand. Every place
+    /// that would otherwise name a position -- [`Parser::expect`],
+    /// [`Parser::expect_word`], a SELECT's tail, the end of a statement --
+    /// asks this first.
+    fn guard_here(&self) -> SqlResult2<()> {
+        self.guard_word()?;
+        self.guard_operator()
     }
 
     fn deeper(&mut self) -> SqlResult2<()> {
@@ -310,6 +336,56 @@ impl Parser {
         Ok(parts.pop().expect("at least one name part"))
     }
 
+    /// A relation name in a `FROM`, keeping the schema qualifier when the
+    /// qualifier names one of the two catalog schemas.
+    ///
+    /// `docs/lang/QL_CONTRACT.md` §2 puts `CREATE SCHEMA` and a real schema
+    /// segment in Tier 2, so there is exactly one user schema and
+    /// `public.t` MEANS `t` -- the qualifier is read and dropped, which is
+    /// what [`Parser::name`] already did everywhere. The two exceptions are
+    /// `pg_catalog` and `information_schema`: those qualifiers SELECT a
+    /// relation rather than decorate one, and `information_schema.tables` is
+    /// not the collection `tables`, so the qualified spelling is kept and
+    /// `catalog::relation` resolves it.
+    fn source_name(&mut self) -> SqlResult2<String> {
+        let at = self.here();
+        let first = self.name_part(at)?;
+        if !self.eat(&Tok::Dot) {
+            return Ok(first);
+        }
+        let second = self.name_part(at)?;
+        if self.eat(&Tok::Dot) {
+            return Err(refuse::refuse("CREATE SCHEMA"));
+        }
+        let qualifier = first.to_ascii_lowercase();
+        if qualifier == "pg_catalog" || qualifier == "information_schema" {
+            return Ok(format!("{qualifier}.{second}"));
+        }
+        Ok(second)
+    }
+
+    /// One segment of a dotted name, with the Tier-2/3 table consulted for a
+    /// bare word exactly as [`Parser::name`] consults it.
+    fn name_part(&mut self, at: usize) -> SqlResult2<String> {
+        match self.peek().clone() {
+            Tok::Word(word) => {
+                if let Some(error) = self.listed(&word.to_ascii_uppercase()) {
+                    return Err(error);
+                }
+                self.bump();
+                Ok(word)
+            }
+            Tok::Quoted(word) => {
+                self.bump();
+                Ok(word)
+            }
+            other => Err(SqlError::syntax(
+                format!("expected a name, found `{}`", other.written()),
+                at,
+            )),
+        }
+    }
+
     // ── statements ───────────────────────────────────────────────────────
 
     fn statement(&mut self) -> SqlResult2<Stmt> {
@@ -320,7 +396,13 @@ impl Parser {
             ));
         };
         match word.as_str() {
-            "SELECT" => Ok(Stmt::Select(Box::new(self.select()?))),
+            "SELECT" => {
+                if let Some(items) = self.session_select()? {
+                    return Ok(Stmt::SessionRows(items));
+                }
+                Ok(Stmt::Select(Box::new(self.select()?)))
+            }
+            "SHOW" => self.show(),
             "EXPLAIN" => {
                 self.bump();
                 // `EXPLAIN ANALYZE` and `EXPLAIN (FORMAT ...)` name options
@@ -409,7 +491,7 @@ impl Parser {
                 let _ = self.eat_word("TRANSACTION") || self.eat_word("WORK");
                 Ok(Stmt::Rollback)
             }
-            "SET" => self.set_local(),
+            "SET" | "RESET" => self.set_local(),
             other => match self.listed(other) {
                 Some(error) => Err(error),
                 None => Err(SqlError::syntax(
@@ -420,33 +502,6 @@ impl Parser {
         }
     }
 
-    fn set_local(&mut self) -> SqlResult2<Stmt> {
-        self.expect_word("SET")?;
-        let _ = self.eat_word("LOCAL") || self.eat_word("SESSION");
-        let mut name = self.name()?;
-        // `diskann.query_search_list_size` arrives as two dotted names, and
-        // `name()` keeps only the last segment; the knob is the whole thing.
-        if name.eq_ignore_ascii_case("query_search_list_size")
-            || name.eq_ignore_ascii_case("query_rescore")
-        {
-            name = format!("diskann.{name}");
-        }
-        if !self.eat(&Tok::Eq) {
-            self.expect_word("TO")?;
-        }
-        let value = if let Some(word) = self.word() {
-            match word.as_str() {
-                "ON" | "OFF" | "DEFAULT" => {
-                    self.bump();
-                    Literal::Str(word.to_ascii_lowercase())
-                }
-                _ => self.literal()?,
-            }
-        } else {
-            self.literal()?
-        };
-        Ok(Stmt::SetLocal { name, value })
-    }
 
 }
 

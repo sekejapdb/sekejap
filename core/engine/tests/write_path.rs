@@ -15,9 +15,6 @@ fn wal_bytes_limit(err: &Error) -> bool {
 #[test]
 fn pinned_reader_grows_wal_until_cap_then_refuses_cleanly_and_recovers() {
     let tmp = std::env::temp_dir();
-    assert!(tmp.starts_with("<scratch>")
-        || tmp.starts_with("<scratch>")
-        || tmp.starts_with("<scratch>"));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let config = Config { budget_bytes: 1<<20, io: IoMode::Buffered, sync: SyncMode::Full };

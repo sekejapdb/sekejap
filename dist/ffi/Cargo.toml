@@ -1,0 +1,55 @@
+[package]
+name = "sekejap-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository = "https://github.com/sekejapdb/sekejap"
+description = "The C ABI of sekejap: one extern \"C\" surface over the published `sekejap` crate, for Swift, Kotlin, Dart, Go and C/C++"
+
+# `tests/abi.rs` is compiled as this crate's own test module (see the bottom
+# of `src/lib.rs`), not as an integration test: an integration test would need
+# an `rlib` alongside the C library, and an `rlib` named `libsekejap` collides
+# with the published crate's. The C library's real linkage is covered where it
+# belongs, by `make check` compiling `examples/smoke.c` against it.
+autotests = false
+homepage = "https://github.com/sekejapdb/sekejap"
+readme = "README.md"
+keywords = ["database", "ffi", "capi", "embedded", "bindings"]
+categories = ["external-ffi-bindings", "database"]
+
+[lib]
+# `libsekejap.{dylib,so,a}` -- cdylib for dlopen and FFI, staticlib for
+# embedding. The file name is the crate's identity on every platform, so it
+# is `sekejap` and not `sekejap_capi`.
+name = "sekejap"
+crate-type = ["cdylib", "staticlib"]
+path = "src/lib.rs"
+
+# The published crate, and nothing else. This layer adds no execution: every
+# function below is one call on `sekejap::Db` plus a JSON encode
+# (`docs/LAYERS.md`, `docs/dist/RUST_API.md`).
+[dependencies]
+# Renamed here only so the lib target -- whose name MUST be `sekejap`, since
+# that is `libsekejap` on disk -- and its dependency do not claim one name in
+# the test binaries. `use sekejap_rs as sekejap;` in src/lib.rs gives the
+# published crate its own name back everywhere inside this one.
+sekejap-rs = { package = "sekejap", path = "../rust", version = "0.17.0" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[build-dependencies]
+# Regenerates include/sekejap.h from the extern "C" surface on every build, so
+# the header cannot drift from the Rust functions. Best-effort: a cbindgen
+# failure warns and the COMMITTED header stays authoritative.
+cbindgen = "0.27"
+
+[dev-dependencies]
+tempfile = "3"
+
+# The four storage features `docs/LAYERS.md` names, forwarded to the published
+# crate so the library ships the configuration every E4 test group runs under.
+[features]
+default = ["compact-cells", "sqlite-balance", "keyspace-append", "slotref-split"]
+sqlite-balance = ["sekejap-rs/sqlite-balance"]
+compact-cells = ["sekejap-rs/compact-cells"]
+keyspace-append = ["sekejap-rs/keyspace-append"]
+slotref-split = ["sekejap-rs/slotref-split"]

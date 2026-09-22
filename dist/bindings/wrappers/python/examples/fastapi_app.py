@@ -1,78 +1,106 @@
-"""sekejap + FastAPI — an embedded multi-model database behind a web API.
+"""sekejap behind a FastAPI service -- the database runs in the web process.
 
-The engine runs in-process with the server: no database service to deploy.
+sekejap is embedded: there is no database server to deploy beside this one.
+The handle is opened in SERVICE mode, which is what gives parallel readers a
+published snapshot, a statement timeout and the commit-time change feed
+(`docs/dist/OPS_CONTRACT.md` §1-§5); ``sekejap::Db`` is ``Send + Sync``, so
+one handle serves every request.
 
-Run:
+Run::
+
     pip install sekejap fastapi uvicorn
-    uvicorn fastapi_app:app --port 8000
+    SEKEJAP_DIRECTORY=./data uvicorn fastapi_app:app --port 8000
 
-Try:
-    curl 'localhost:8000/near?m=20000'
-    curl 'localhost:8000/similar'
-    curl 'localhost:8000/search?q=grilled+healthy'
+Try::
+
+    curl 'localhost:8000/venues'
+    curl 'localhost:8000/venues/the_tote'
+    curl 'localhost:8000/venues?suburb=Fitzroy'
+    curl 'localhost:8000/bands/the_vines/played_at'
 """
-import json
+
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from sekejap import DB
+from fastapi import FastAPI, HTTPException
 
-db: DB | None = None
+from sekejap import Db, Direction, SekejapError
+
+db = None
+
+VENUES = [
+    {"name": "name", "kind": "text"},
+    {"name": "suburb", "kind": "text"},
+    {"name": "capacity", "kind": "int"},
+]
+BANDS = [{"name": "name", "kind": "text"}]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db
-    db = DB()  # in-memory demo; DB("./data") for a persistent directory
-    db.execute(
-        "CREATE TABLE places (_key TEXT PRIMARY KEY, name TEXT, "
-        "description TEXT, geometry GEO, emb VECTOR)"
-    )
-    db.execute("CREATE INDEX ON places USING spatial (geometry)")
-    db.execute("CREATE INDEX ON places USING hnsw (emb)")
-    db.execute("CREATE INDEX ON places USING bm25 (description)")
-    rows = [
-        ("uluwatu", "Uluwatu Temple", "clifftop sea temple, sunset kecak dance",
-         115.087, -8.829, [1.0, 0.0]),
-        ("kuta", "Kuta Beach", "long sandy beach, surf schools, sunsets",
-         115.168, -8.720, [0.0, 1.0]),
-        ("ubud", "Ubud Center", "rice terraces, healthy cafes, yoga",
-         115.263, -8.507, [0.9, 0.1]),
-    ]
-    db.begin_bulk()
-    for key, name, desc, lon, lat, emb in rows:
-        db.put(f"places/{key}", json.dumps({
-            "_collection": "places", "_key": key, "name": name,
-            "description": desc,
-            "geometry": {"type": "Point", "coordinates": [lon, lat]},
-        }))
-        db.put_vector(f"places/{key}", "emb", emb)
-    db.end_bulk()
-    yield
-    db.close()
+    directory = os.environ.get("SEKEJAP_DIRECTORY", "./data")
+    db = Db.open_service(directory)
+    # A statement that runs longer than a second is refused rather than
+    # holding a request open: service mode is what makes that available.
+    db.statement_timeout_ms(1_000)
+    if not db.collections():
+        db.create_collection("venues", VENUES)
+        db.create_collection("bands", BANDS)
+        db.put_many(
+            "venues",
+            {
+                "the_tote": {"name": "The Tote", "suburb": "Collingwood", "capacity": 300},
+                "old_bar": {"name": "The Old Bar", "suburb": "Fitzroy", "capacity": 120},
+            },
+        )
+        db.put_many("bands", {"the_vines": {"name": "The Vines"}})
+        db.link("bands", "the_vines", "played_at", "venues", "the_tote")
+    try:
+        yield
+    finally:
+        db.close()
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-@app.get("/near")
-def near(m: float = 5000.0):
-    """Places within m metres of Uluwatu."""
-    hits = db.query(
-        "SELECT name FROM places WHERE ST_DWithin(geometry, POINT(115.087 -8.829), $1)",
-        [m],
+@app.get("/venues")
+def venues(suburb: str | None = None):
+    """Every venue, or the ones in one suburb. The filter is a $1 parameter."""
+    if suburb is None:
+        return db.query("SELECT _key, name, capacity FROM venues")
+    return db.query(
+        "SELECT _key, name, capacity FROM venues WHERE suburb = $1", [suburb]
     )
-    return [json.loads(h.payload) for h in hits]
 
 
-@app.get("/similar")
-def similar():
-    """The 2 places most similar to the [1, 0] embedding."""
-    hits = db.query("SELECT name FROM places WHERE VECTOR_NEAR(emb, [1.0, 0.0], 2)")
-    return [json.loads(h.payload) for h in hits]
+@app.get("/venues/{key}")
+def venue(key: str):
+    """One document by collection and key. A MISS is a 404, not an error."""
+    document = db.get("venues", key)
+    if document is None:
+        raise HTTPException(status_code=404, detail="no venue %r" % key)
+    return document
 
 
-@app.get("/search")
-def search(q: str):
-    """Ranked text search over descriptions."""
-    return [{"key": k, "score": s} for k, s in db.bm25_search("description", q, 10)]
+@app.post("/venues/{key}")
+def put_venue(key: str, document: dict):
+    """One write, committed before the response is built."""
+    try:
+        db.put("venues", key, document)
+    except SekejapError as failure:
+        raise HTTPException(status_code=400, detail=failure.message) from failure
+    return {"written": key}
+
+
+@app.get("/bands/{key}/played_at")
+def played_at(key: str):
+    """The venues one hop away, along the `played_at` edge."""
+    return db.neighbours("bands", key, "played_at", Direction.OUTGOING)
+
+
+@app.get("/storage")
+def storage():
+    """The bytes on disk, straight from the store."""
+    return db.storage()

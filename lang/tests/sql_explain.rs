@@ -590,12 +590,16 @@ fn line<'a>(text: &'a str, prefix: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{text}"))
 }
 
+/// `count(*)` over a whole collection reads the LIVE ROW COUNT record: the
+/// plan still names the walk it would have taken, and the `count:` line says
+/// which of the two actually answered. Every counter a walk would charge
+/// stays at zero.
 #[test]
-fn agg_count_all_is_streaming_over_the_key_order_driver_and_reads_no_row() {
+fn agg_count_all_reads_the_live_record_and_says_so() {
     let (_dir, mut f) = open();
     let text = explain(&mut f, "SELECT count(*) FROM place", &[]);
     println!("{text}");
-    assert_eq!(line(&text, "shape: "), "shape: streaming");
+    assert_eq!(line(&text, "count: "), "count: live record");
     assert!(text.contains("driver: Keys"), "{text}");
     assert_eq!(line(&text, "group: "), "group: none -- one group over every candidate");
     assert!(
@@ -603,8 +607,15 @@ fn agg_count_all_is_streaming_over_the_key_order_driver_and_reads_no_row() {
         "count(*) reads no column:\n{text}"
     );
     assert_eq!(counter(&text, "primary_reads"), 0);
-    assert_eq!(counter(&text, "groups"), 1);
+    assert_eq!(counter(&text, "key_postings"), 0, "no enumeration:\n{text}");
+    assert_eq!(counter(&text, "groups"), 0, "no accumulator set was opened");
     assert_eq!(rows_of(&text), 1, "one group");
+    // A count with a FILTER is unchanged: it walks, and says so.
+    let filtered = explain(&mut f, "SELECT count(*) FROM place WHERE kind = 'city'", &[]);
+    assert!(
+        !filtered.lines().any(|l| l.starts_with("count: ")),
+        "a filtered count is not a whole-collection count:\n{filtered}"
+    );
 }
 
 #[test]

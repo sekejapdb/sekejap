@@ -1,7 +1,7 @@
 {
   "name": "sekejap",
   "version": "0.17.0",
-  "description": "Embedded graph-first multi-model database — Node.js & React Native binding",
+  "description": "Embedded graph-first multi-model database — Node.js binding over the C ABI (libsekejap)",
   "license": "MIT OR Apache-2.0",
   "repository": "github:sekejapdb/sekejap",
   "homepage": "https://sekejap.life",
@@ -12,8 +12,8 @@
     "spatial",
     "embedded",
     "multi-model",
-    "typescript",
-    "react-native"
+    "sql",
+    "ffi"
   ],
   "main": "index.js",
   "types": "index.d.ts",
@@ -21,28 +21,16 @@
     ".": {
       "types": "./index.d.ts",
       "default": "./index.js"
-    },
-    "./orm": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    },
-    "./orm/react": {
-      "types": "./dist/react.d.ts",
-      "default": "./dist/react.js"
     }
   },
   "files": [
     "index.js",
     "index.d.ts",
-    "*.node",
-    "dist/",
+    "native/",
     "README.md"
   ],
-  "napi": {
-    "name": "sekejap"
-  },
   "engines": {
-    "node": ">= 16"
+    "node": ">= 18"
   },
   "os": [
     "darwin",
@@ -54,23 +42,10 @@
     "arm64"
   ],
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:orm": "tsc -p orm/tsconfig.build.json",
-    "test:orm": "tsx orm/orm.test.ts"
+    "test": "node test.cjs",
+    "bench": "node bench.cjs"
   },
-  "peerDependencies": {
-    "react": ">=17"
-  },
-  "peerDependenciesMeta": {
-    "react": {
-      "optional": true
-    }
-  },
-  "devDependencies": {
-    "@napi-rs/cli": "^2.18.0",
-    "@types/node": "^20.19.43",
-    "@types/react": "^18.3.31",
-    "tsx": "^4.19.0",
-    "typescript": "^5.6.3"
+  "dependencies": {
+    "koffi": "^2.9.0 || ^3.0.0"
   }
 }

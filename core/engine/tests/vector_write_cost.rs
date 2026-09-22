@@ -267,9 +267,17 @@ fn the_index_maintenance_of_a_bulk_write_writes_exactly_what_it_wrote_before() {
     // of a 32-lane vector, one batch, one commit. A change to either number
     // is a change to what a live-index vector write puts on disk and has to
     // be argued for, not absorbed.
+    //
+    // Re-frozen on 2026-09-22 for the live row count
+    // (`core/engine/src/collections/row_count.rs`): the batch's commit now
+    // also puts the collection's `0x08` count record, and in the indexed
+    // tree that one small key moved a leaf split so the batch dirtied one
+    // page FEWER (77 -> 76 frames, one 4,144-byte frame less). The bare
+    // batch did not move at all, so the index maintenance below is the same
+    // work it was; only where a split fell changed.
     assert_eq!(
         (indexed.frames, indexed.bytes),
-        (77, 323_232),
+        (76, 319_088),
         "the live-index batch's page-WAL frames and bytes moved"
     );
     assert_eq!(

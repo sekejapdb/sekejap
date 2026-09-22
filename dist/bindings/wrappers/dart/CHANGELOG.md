@@ -1,36 +1,54 @@
-## 0.13.3
+# Changelog
 
-* Smaller native library — release builds now strip debug symbols and use LTO
-  (link-time optimization). No changes to the Dart/Flutter API.
+## 0.17.0
 
-## 0.13.2
+The wrapper is now **`dart:ffi` over the sekejap C ABI**. It is a rewrite, not
+an upgrade: every call has a new spelling.
 
-* Maintenance release — coordinated version bump across all sekejap language
-  packages. No changes to the Dart/Flutter API since 0.13.1.
+### Changed
 
-## 0.13.1
+- **The binding.** `flutter_rust_bridge` over a Rust glue crate is gone; the
+  package binds `libsekejap` (`dist/ffi`, contract `docs/dist/C_ABI.md`)
+  directly with `dart:ffi`. All 59 C functions are exposed, one Dart call each.
+- **Pure Dart.** The package no longer depends on Flutter and is no longer a
+  Flutter plugin. It works unchanged in a Dart CLI, a server and a Flutter app.
+  Its one dependency is `package:ffi`.
+- **A row is a collection and a key**, not one slug string: `db.put('dish',
+  'd1', {…})`, `db.get('dish', 'd1')`.
+- **Handles are classes.** `Db`, `Statement`, `Scan`, `Transaction`, each freed
+  by its own `close()` and all of them before the `Db` they borrow.
+- **Errors are exceptions.** A failure throws `SekejapException` carrying both
+  channels of the ABI: the closed `SekejapStatus` and the message
+  `sekejap_last_error` wrote on this thread. A miss stays `null`.
 
-* **Fix native build in a clean Flutter app.** The published `rust/Cargo.toml` no
-  longer inherits `version`/`edition` from a workspace root (which doesn't exist in
-  the pub.dev package cache) and depends on the core crate from the registry — so a
-  from-source build is self-contained instead of failing with "failed to find a
-  workspace root". Native binaries are precompiled in CI and downloaded at build
-  time, so a clean `flutter pub add sekejap` needs no Rust toolchain and no manual
-  framework wiring.
-* Real README with runnable examples for the full API (`initSekejap`, `dbOpen`,
-  `dbExecute`, `dbPut`, `dbQuery`, `dbQueryParams`, `dbPrepare`/`dbQueryPrepared`, `dbLink`).
-* Example app rewritten as a real CRUD notes app (add / list / delete backed by the DB).
-* `initSekejap(libraryPath:)` — load an explicit native library for standalone Dart / `dart test`.
-* Documented the testing story (Flutter `integration_test` vs standalone Dart with `libraryPath`).
-* Lowered the SDK floor to Dart `>=3.4.0` / Flutter `>=3.22.0` for broader adoption.
+### Removed
 
-## 0.13.0
+- `flutter_rust_bridge` and the generated `lib/src/rust/` bindings, and the
+  `rust/` glue crate (`sekejap_ffi`) they were generated from. The C ABI is
+  the binding now, and the header is generated from `dist/ffi/src/lib.rs`.
+- **cargokit** and the `android/`, `ios/`, `linux/`, `macos/`, `windows/`
+  plugin folders. They existed to build the glue crate from source on a
+  consumer's machine; there is no glue crate to build. Ship the platform's
+  `libsekejap` with the app instead — see the README.
+- `dbNew` (an in-memory database). sekejap is disk-first and has no in-memory
+  store; `Db.openMemory()` keeps the name and refuses with the reason.
+- **The typed model layer** — `@SekejapEntity`, `Collection`, `Query`,
+  `Filter`, `Sekejap.open(schema:)` — and the `sekejap_generator` package that
+  generated it. It was a second front end over the old Rust glue's API and does
+  not describe the 0.17 surface. The wrapper mirrors the C functions one to
+  one; a typed layer over these calls is separate work.
+- `dbSetWalSync` and the mobile profile call. Store configuration is set at
+  open, once: `Db.openWithConfig(path, StoreConfig(sync: SyncMode.normal))`.
+- `watchChanges`. The change feed has a service behind it now:
+  `Db.openService`, `subscribe`, `nextChange`, `unsubscribe`.
 
-* Initial public release of the Dart & Flutter bindings for sekejap — an embedded
-  graph-first, multi-model database (SQL + graph + vector + spatial) with a native
-  Rust core.
-* Async API over `flutter_rust_bridge`: `dbOpen`/`dbNew`, `dbExecute`, `dbQuery`,
-  `dbQueryParams`, `dbPut`/`dbGet`/`dbContains`, `dbLink`/`dbUnlink`, `dbCompact`/`dbSync`.
-* Prepared statements: `dbPrepare` + `dbQueryPrepared` (compile once, run with varying `$1` params).
-* Native library precompiled in CI and downloaded at build time via cargokit — no Rust
-  toolchain required to use the package.
+### Added
+
+- Service mode: `Db.openService`, `subscribe`/`nextChange`/`unsubscribe`,
+  `statementTimeoutMs`, `cancel`, `clearInterrupt`.
+- Transactions: `db.transaction()` with `put`, `delete`, `link`, `execute`,
+  `commit`, `rollback`.
+- Paged walks: `db.scan(collection)` and `db.stream(sql, params, pageRows)`.
+- The catalog: `createCollection`, `dropCollection`, `collections`,
+  `describe`, `countRows`, `scanCountRows`, `scanCountEdges`.
+- `checkpoint`, `publish`, `storage`, `explain`.

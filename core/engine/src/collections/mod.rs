@@ -96,6 +96,7 @@ const INDEX_HEADER_MAGIC: &[u8; 8] = b"E4COLL2\0";
 pub(crate) mod catalog;
 pub(crate) mod column_rules;
 pub(crate) mod drop_collection;
+pub(crate) mod row_count;
 mod write_set;
 pub mod rebuild;
 mod sort;
@@ -104,9 +105,10 @@ pub mod verification;
 // `crate::query`; every name this module has ever exported still leaves the
 // crate through `sekejap_core::collections`.
 pub use crate::index::graph::{
-    BfsRequest, Cmp, Direction, Edge, EdgeBudget, EdgeKey, EdgePredicate, EdgeRef, EdgeTypeId,
-    GraphContextId, NeighborRequest, NewEdge, TraversalNode, TraversalResult,
+    BfsRequest, Cmp, Direction, Edge, EdgeBudget, EdgeKey, EdgePredicate, EdgeRef, EdgeShape,
+    EdgeTypeId, GraphContextId, NeighborRequest, NewEdge, TraversalNode, TraversalResult,
 };
+pub use crate::index::graph::endpoints::{EndpointProgress, ENDPOINT_FEATURE};
 pub use crate::index::spatial::point::{SpatialCandidates, SpatialHit};
 pub use crate::index::text::{TextCandidates, TextHit, TextMatch};
 pub use crate::index::vector::exact::{VectorCandidates, VectorHit, VectorMetric};
@@ -115,7 +117,7 @@ pub use crate::index::vector::quantized::{
 };
 pub use crate::query::{
     AggValue, Accumulator, AggregateFn, AggregateInput, AggregatePlanDescription, AggregateRequest,
-    AggregateShape, GroupCmp, GroupKey, GroupOrder, GroupPage, GroupPredicate, GroupRow,
+    AggregateShape, CountSource, GroupCmp, GroupKey, GroupOrder, GroupPage, GroupPredicate, GroupRow,
     PreparedAggregate,
 };
 /// The stated charge interval between two reads of the wall clock when a
@@ -137,6 +139,7 @@ pub use catalog::{
 };
 pub use column_rules::{ColumnRule, DefaultValue, COLUMN_RULES_FEATURE};
 pub use drop_collection::{DropMode, DropPhase, DropProgress, DropState, MAX_DROP_BATCH};
+pub use row_count::{RowCountProgress, RowCountRecord, ROW_COUNT_FEATURE};
 pub use write_set::{
     DeleteMode, PatchValue, UpdatePatch, WriteAction, WriteProgress, WriteRequest,
     MAX_PATCH_COLUMNS, MAX_WRITE_BATCH, RESTRICT_ROW_PROBE_SEEKS,
@@ -366,6 +369,15 @@ pub struct Database {
     /// what is written, only WHO calls `commit`: the OUTERMOST `end_bulk`,
     /// once, instead of the caller after every write.
     bulk_depth: u32,
+    /// The uncommitted row-count arithmetic of the open transaction, one
+    /// entry per collection this transaction has touched. Read once per
+    /// collection per transaction, written once per collection at commit,
+    /// discarded by a rollback. See `row_count.rs`.
+    row_counts: row_count::PendingCounts,
+    /// Where a bounded [`Database::backfill_row_counts`] has got to. It lives
+    /// on the handle for the same reason the sequence does: the handle is the
+    /// only thing that can move it.
+    row_count_backfill: Option<row_count::Backfill>,
     /// The one collection whose descriptor carries a DROPPING mark, if any.
     ///
     /// Read at open and after a rollback, and only when the collection header
@@ -375,7 +387,46 @@ pub struct Database {
     /// -- can do it with an `Option` comparison rather than three descriptor
     /// reads per endpoint.
     pub(crate) dropping: Option<CollectionId>,
+    /// Whether this handle's writes maintain the ENDPOINT SETS
+    /// (`src/index/graph/endpoints.rs`), once asked.
+    ///
+    /// `Some(true)` is "the file declares `ENDPOINT_FEATURE`, or it held no
+    /// edge at all when the first one was written and now does"; `Some(false)`
+    /// is "this file's edges PREDATE the sets, so a set built from here on
+    /// would be incomplete and must not be believed". `None` is "not asked
+    /// yet". It is a cache of one range seek over the edge keyspace, taken at
+  	/// most once per handle while the bit is clear, and `rollback` clears it
+    /// because a rollback re-reads the durable header the answer rests on.
+    pub(crate) endpoint_state: Cell<Option<bool>>,
+    /// Where `backfill_endpoint_sets` resumes: the first edge key the next
+    /// call reads. `None` is "from the start", which is also where a reopen
+    /// puts it -- the pass is idempotent, so a lost cursor costs a re-walk
+    /// and nothing else.
+    pub(crate) endpoint_backfill_at: Option<Vec<u8>>,
+    pub(crate) endpoint_backfill_seen: u64,
+    pub(crate) endpoint_backfill_written: u64,
+    /// Endpoint keys this OPEN TRANSACTION has already put.
+    ///
+    /// The same saving `link_many` gets inside one batch, for the one-edge-
+    /// at-a-time path: a corpus that writes three edges out of one row files
+    /// that row's outgoing key once instead of three times, and a row that is
+    /// the destination of several edges in one transaction files its incoming
+    /// key once. Putting a key that is already in this transaction changes
+    /// nothing, so skipping the put is free; the entry is dropped when the
+    /// key is DELETED in the same transaction, and the whole set is cleared
+    /// by a commit and by a rollback, so it never outlives the transaction it
+    /// describes.
+    ///
+    /// SACRIFICE (Law 4): it is bounded at [`ENDPOINT_MEMO`] entries. Past
+    /// that the memo stops growing and the extra puts come back -- which is
+    /// the behaviour with no memo at all, so it is never worse.
+    pub(crate) endpoint_written: BTreeSet<Vec<u8>>,
 }
+
+/// Endpoint keys one transaction remembers having written. 8,192 keys is
+/// ~200 KiB and covers a commit window far larger than the 256-row batch
+/// every loader here uses.
+pub(crate) const ENDPOINT_MEMO: usize = 8192;
 
 /// One collection's worth of identities this handle handed out.
 ///
@@ -730,8 +781,9 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// exact vector; `0x8` spatial point; `0x10` text; `0x20` quantized vector;
 /// `0x40` packed text posting segments; `0x80` per-index B-trees; `0x100`
 /// geometry index; `0x200` DROPPING collections; `0x400` expression index;
-/// `0x800` declared-type catalog tail; `0x1000` COLUMN RULES catalog tail.
-/// The mask is therefore `0x1fff`.
+/// `0x800` declared-type catalog tail; `0x1000` COLUMN RULES catalog tail;
+/// `0x2000` live row-count records; `0x4000` graph ENDPOINT SETS.
+/// The mask is therefore `0x7fff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -756,7 +808,9 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | crate::index::spatial::geometry_index::GEOMETRY_FEATURE
     | drop_collection::DROP_FEATURE
     | DECLARED_FEATURE
-    | column_rules::COLUMN_RULES_FEATURE;
+    | column_rules::COLUMN_RULES_FEATURE
+    | row_count::ROW_COUNT_FEATURE
+    | crate::index::graph::endpoints::ENDPOINT_FEATURE;
 /// One header's feature word against the mask a binary implements.
 ///
 /// Split out of [`parse_header`] so a test can put an OLDER mask in place of
@@ -889,6 +943,9 @@ fn validate_features(s: &PageWalStore, header: Option<IndexHeader>) -> Result<()
     crate::index::graph::validate_graph(
         s,
         header.is_some_and(|h| h.features & crate::index::graph::GRAPH_FEATURE != 0),
+        header.is_some_and(|h| {
+            h.features & crate::index::graph::endpoints::ENDPOINT_FEATURE != 0
+        }),
     )
 }
 /// The typed refusal the page-WAL runs before it normalizes or creates
@@ -922,9 +979,9 @@ impl Database {
         Self::create_inner(path.as_ref(), config, Some(limits))
     }
     fn create_inner(path: &Path, config: Config, limits: Option<ResourceLimits>) -> Result<Self> {
-        let cache = check_config(&config).map_err(Error::Unsupported)?;
+        let (cache, sync) = check_config(&config).map_err(Error::Unsupported)?;
         let limits = limits.map(check_limits).transpose()?;
-        let store = Backend::create(path, cache, limits)?;
+        let store = Backend::create(path, cache, sync, limits)?;
         let mut db = Self::wrap(store, false, limits, None);
         db.write_header(1, 1)?;
         db.commit()?;
@@ -936,14 +993,14 @@ impl Database {
     /// the source byte-for-byte untouched.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let path = path.as_ref();
-        let cache = check_config(&config).map_err(Error::Unsupported)?;
+        let (cache, sync) = check_config(&config).map_err(Error::Unsupported)?;
         if path.join("data").exists() && !path.join("writer.lock").exists() {
             return Err(Error::Unsupported(
                 "not a V2 page-WAL typed-collection database (no writer.lock)".into(),
             ));
         }
         let detail = RefCell::new(None);
-        let store = Backend::open(path, cache, |s| typed_check(s, &detail));
+        let store = Backend::open(path, cache, sync, |s| typed_check(s, &detail));
         let store = match store {
             Ok(s) => s,
             Err(k) => return Err(detail.into_inner().unwrap_or_else(|| Error::from(k))),
@@ -963,7 +1020,10 @@ impl Database {
     /// defers (never blocks) the writer's checkpoint; a persisted `readers`
     /// bound is enforced by the slot index.
     pub fn open_snapshot(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        let cache = check_config(&config).map_err(Error::Unsupported)?;
+        // A snapshot issues no barrier of its own, so the mode is not
+        // carried onto the read-only handle; the config is still checked so
+        // an unsupported one is refused at every door.
+        let (cache, _sync) = check_config(&config).map_err(Error::Unsupported)?;
         let detail = RefCell::new(None);
         let limits = std::cell::Cell::new(None);
         let index_header = std::cell::Cell::new(None);
@@ -1021,7 +1081,14 @@ impl Database {
             create_index_trees: catalog::create_index_trees(),
             user_writes_pending: false,
             bulk_depth: 0,
+            row_counts: Default::default(),
+            row_count_backfill: None,
             dropping: None,
+            endpoint_state: Cell::new(None),
+            endpoint_backfill_at: None,
+            endpoint_backfill_seen: 0,
+            endpoint_backfill_written: 0,
+            endpoint_written: BTreeSet::new(),
         }
     }
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
@@ -1524,6 +1591,11 @@ impl Database {
             self.persist_catalog(&c)?;
             self.write_sequence(c.id, 1)?;
             self.writer()?.put(&name_key(name), &cid.to_be_bytes())?;
+            // A collection that has just been created holds no rows, so its
+            // live count is 0 and needs no walk to establish. The record and
+            // `ROW_COUNT_FEATURE` ride this same transaction, which is what
+            // makes the bit and the first record one durable fact.
+            self.seed_row_count(c.id, 0)?;
             self.write_header(next_c, next_l)?;
             Ok(c.id)
         })();
@@ -1932,6 +2004,10 @@ impl Database {
             if old.is_none() {
                 self.writer()?
                     .put(&mapping_key(c.id, key), &ordered(id.sequence))?;
+                // A NEW row. A REPLACE writes the same row key and changes no
+                // count, which is why this sits inside the same branch the
+                // mapping does.
+                self.note_row_inserted(c.id)?;
             }
             Ok(id)
         })();
@@ -2037,6 +2113,7 @@ impl Database {
             self.writer()?.delete(&row_key(e.entity.id))?;
             self.writer()?.delete(&mapping_key(c, key))?;
             self.note_deleted(e.entity.id);
+            self.note_row_removed(e.entity.id)?;
             Ok(true)
         })();
         self.finish(result)
@@ -2056,15 +2133,22 @@ impl Database {
             done: false,
         })
     }
-    /// One atomic transaction, durable with a FULL barrier and published to
-    /// every snapshot opened afterwards. The committed WAL is folded into the
-    /// data file by `checkpoint`, automatically once it reaches 4 MiB (or half
-    /// the remaining allowance) and no reader holds a slot.
+    /// One atomic transaction, durable under this database's `SyncMode` and
+    /// published to every snapshot opened afterwards. The committed WAL is
+    /// folded into the data file by `checkpoint`, automatically once it
+    /// reaches 4 MiB (or half the remaining allowance) and no reader holds a
+    /// slot.
     pub fn commit(&mut self) -> Result<()> {
         self.ready_write()?;
         self.user_writes_pending = false;
+        // The endpoint-key memo describes ONE transaction and this is its
+        // end; see the field.
+        self.endpoint_written.clear();
         let r = (|| {
             self.flush_sequence()?;
+            // One tree put per touched collection, into the same transaction
+            // as the rows it counts, before the barrier. See `row_count.rs`.
+            self.flush_row_counts()?;
             self.writer()?.commit()?;
             Ok(())
         })();
@@ -2099,12 +2183,21 @@ impl Database {
         // can be handed out again. Everything the map claims about those ids
         // was learned in the discarded transaction; drop the lot.
         self.allocated.clear();
+        // The deltas were counting rows this rollback is discarding.
+        self.discard_row_counts();
         self.user_writes_pending = false;
         // A rollback discards the working tree, so there is nothing for an
         // open bulk scope to commit and no caller left to close it: the
         // counter goes back to zero with the rows it was batching.
         self.bulk_depth = 0;
         self.dropping = None;
+        // The emptiness answer and the backfill cursor were both learned in
+        // the discarded transaction; the header is re-read below.
+        self.endpoint_state.set(None);
+        self.endpoint_backfill_at = None;
+        self.endpoint_backfill_seen = 0;
+        self.endpoint_backfill_written = 0;
+        self.endpoint_written.clear();
         self.failed = true;
         self.store.rollback()?;
         if let Some(l) = self.limits {
@@ -2233,14 +2326,6 @@ mod tests {
         }
     }
     fn setup() -> (tempfile::TempDir, Database, CollectionId, EntityId) {
-        assert!(
-            (std::env::temp_dir().starts_with("<scratch>")
-                || std::env::temp_dir()
-                    .starts_with("<scratch>")
-                || std::env::temp_dir()
-                    .starts_with("<scratch>")
-                || std::env::temp_dir().starts_with("<scratch>"))
-        );
         let t = tempfile::tempdir().unwrap();
         let mut db = Database::create(t.path().join("db"), cfg()).unwrap();
         let c = db
@@ -2509,10 +2594,30 @@ mod tests {
     }
     #[test]
     fn plain_header_payload_is_the_eight_byte_form_and_future_versions_refuse() {
-        let (_t, db, _, _) = setup();
+        // The PLAIN form is what a database with no logical feature in it
+        // carries: a fresh file before its first collection, and every
+        // preserved compatibility fixture. A database this build creates a
+        // COLLECTION in carries the INDEX form, because the live row-count
+        // record and its `ROW_COUNT_FEATURE` ride that creation
+        // (`row_count.rs`), so the plain form is read off a fresh file here
+        // and not off a populated one.
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::create(t.path().join("plain"), cfg()).unwrap();
         let raw = db.store().unwrap().get(&[0, 0, 0]).unwrap().unwrap();
         let payload = unpack(&raw, HEADER_MAGIC).unwrap();
         assert_eq!(payload.len(), HEADER_PLAIN);
+        assert_eq!(parse_header(&raw).unwrap().indexes, None);
+        // And the first collection turns it into the INDEX form, once.
+        let mut db = db;
+        db.create_collection("t", vec![("n".into(), Kind::Int)], Default::default())
+            .unwrap();
+        db.commit().unwrap();
+        let indexed = db.store().unwrap().get(&[0, 0, 0]).unwrap().unwrap();
+        assert_eq!(&indexed[..8], INDEX_HEADER_MAGIC);
+        assert_eq!(
+            parse_header(&indexed).unwrap().indexes.unwrap().features,
+            1 | row_count::ROW_COUNT_FEATURE
+        );
         let mut future = raw.clone();
         future[6] = b'9';
         let crc = crc32c::crc32c(&future[..PAD - 4]).to_le_bytes();
@@ -2615,7 +2720,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1fff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x7fff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -2636,13 +2741,48 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x1fff
+            0x7fff
         );
         // One bit past the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
+        // `0x8000` is the next bit up, implemented by no build yet.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x2000)),
-            Err(Error::Unsupported(m)) if m.contains("0x3fff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x8000)),
+            Err(Error::Unsupported(m)) if m.contains("0xffff")
+        ));
+    }
+    /// Law 8 for the live row count, the same shape the declared-type bit's
+    /// test has. The keyspace is new, so a binary that predates it must
+    /// refuse a file that declares the bit whole, at admission, as
+    /// `Unsupported` -- never read it and answer `count(*)` from a walk while
+    /// leaving records it does not maintain.
+    ///
+    /// The older binary is spelled as the mask it carried -- this build's
+    /// mask with [`row_count::ROW_COUNT_FEATURE`] taken out -- and put
+    /// through the same `admit_features` decision `parse_header` makes, so
+    /// the test exercises the production rule rather than a copy of it.
+    #[test]
+    fn a_row_count_file_is_unsupported_to_a_binary_that_predates_the_bit() {
+        assert_eq!(row_count::ROW_COUNT_FEATURE, 0x2000);
+        assert_eq!(
+            SUPPORTED_LOGICAL_FEATURES & row_count::ROW_COUNT_FEATURE,
+            0x2000
+        );
+        let older = SUPPORTED_LOGICAL_FEATURES & !row_count::ROW_COUNT_FEATURE;
+        let written = 1 | row_count::ROW_COUNT_FEATURE;
+        // This build opens the file it writes.
+        admit_features(written, SUPPORTED_LOGICAL_FEATURES).unwrap();
+        // The binary that predates the bit refuses it whole, and as
+        // Unsupported.
+        assert!(matches!(
+            admit_features(written, older),
+            Err(Error::Unsupported(m)) if m.contains("0x2001")
+        ));
+        // And a bit past every implemented family is refused by this build
+        // too.
+        assert!(matches!(
+            admit_features(1 | 0x8000, SUPPORTED_LOGICAL_FEATURES),
+            Err(Error::Unsupported(_))
         ));
     }
     /// A declared type is a name beside a FIELD, so dropping the field drops

@@ -46,7 +46,7 @@ Both source sizes were unchanged: **2,629,632 B** at 10K and **10,424,320 B** at
   Its value reader bounds allocation before reading an overflow chain and
   validates every page, bounds and whole-value CRC. The same streamed overflow
   validator serves R1 salvage.
-- `RecoveryCodec`: E4 owns keyspace classification, layout-ID extraction and
+- `RecoveryCodec`: sekejap owns keyspace classification, layout-ID extraction and
   typed decoding. A decoder receives key, page and generation context so a
   future resolver can identify external dependencies. The default `DenseV3`
   handles the current compact entity namespace; a test substitutes another
@@ -81,7 +81,7 @@ is refused. Failed attempts and the source remain available.
 
 All exported records carry **candidate membership**. This pass neither deduplicates
 historical leaf versions nor reconstructs WAL/current membership. JSONL is a
-derived export for inspection, not E4's on-disk database representation. It is
+derived export for inspection, not sekejap's on-disk database representation. It is
 not published over the source or merged automatically into R1's verified subset.
 
 ## Commands and artifacts
@@ -138,7 +138,7 @@ The full feature-enabled workspace passed **291 tests, 0 failures, 0 ignored**
 (`recovery-r2-workspace.log`). The 7 schema and 14 R1 recovery tests also passed
 with default features (`recovery-r2-default.log`). Logs are under
 `<scratch>/`. Three mutation checks caught disabled descriptor
-CRC, conflict handling and whole-overflow-value CRC checks. E3 remains untouched.
+CRC, conflict handling and whole-overflow-value CRC checks. The prior engine's source remains untouched.
 
 **Normal storage tax added by R2: 0 bytes.** Existing descriptor payload in
 these two-layout fixtures is 6 × 2,081 = 12,486 bytes, or 1.249 B/entity at 10K

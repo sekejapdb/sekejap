@@ -1,17 +1,37 @@
 // swift-tools-version:5.9
-// SwiftPM binding for sekejap over the C ABI (../c, libsekejap).
+// SwiftPM binding for sekejap 0.17.0 over the C ABI
+// (dist/ffi, crate sekejap-capi, lib name `sekejap` -> libsekejap.{dylib,a}).
 //
-// Build libsekejap first: `cargo build --release -p sekejap-capi`, then
-// `swift test` / `swift build` from this directory.
+// This manifest never runs cargo: libsekejap is built by the coordinator (or,
+// for a normal out-of-worktree checkout, by `cargo build --release -p
+// sekejap-capi`) and linked as a prebuilt library. The directory that holds
+// it is resolved as:
+//   1. $SEKEJAP_LIB_DIR, when set -- a flat directory of
+//      libsekejap.{dylib,a} + include/sekejap.h + sekejap.pc, exactly what
+//      `swift build`/`swift test` in this worktree point it at.
+//   2. Otherwise <repo root>/target/release, the layout an in-tree
+//      `cargo build --release -p sekejap-capi` produces.
+//
+// The header (Sources/CSekejap/sekejap.h) is a symlink straight into
+// dist/ffi/include/, the committed, cbindgen-generated header that
+// docs/dist/C_ABI.md is the contract for -- never a vendored copy that can
+// drift from it.
 import PackageDescription
 import Foundation
 
-// Absolute path to the workspace's release build dir, so the linker finds
-// libsekejap and bakes an rpath — `swift test` works with no env vars.
-let libDir = URL(fileURLWithPath: #filePath)
-    .deletingLastPathComponent()                       // wrappers/swift
-    .appendingPathComponent("../../target/release")     // → <root>/target/release
-    .standardizedFileURL.path
+let libDir: String = {
+    if let override = ProcessInfo.processInfo.environment["SEKEJAP_LIB_DIR"] {
+        return override
+    }
+    return URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()                            // .../dist/bindings/wrappers/swift
+        .appendingPathComponent("../../../../target/release")   // -> <repo root>/target/release
+        .standardizedFileURL.path
+}()
+
+let sekejapLinkerSettings: [LinkerSetting] = [
+    .unsafeFlags(["-L\(libDir)", "-Xlinker", "-rpath", "-Xlinker", libDir])
+]
 
 let package = Package(
     name: "Sekejap",
@@ -19,32 +39,29 @@ let package = Package(
         .library(name: "Sekejap", targets: ["Sekejap"])
     ],
     targets: [
-        // The C ABI, exposed to Swift via a module map (Sources/CSekejap).
+        // The C ABI, exposed to Swift via a module map over dist/ffi/include/sekejap.h.
         .systemLibrary(name: "CSekejap", path: "Sources/CSekejap"),
 
-        // Idiomatic Swift wrapper.
+        // Idiomatic Swift wrapper: one class per handle (Db, Statement, Scan, Tx),
+        // mirroring the 59 sekejap_* functions one to one (docs/dist/C_ABI.md).
         .target(
             name: "Sekejap",
             dependencies: ["CSekejap"],
-            linkerSettings: [
-                .unsafeFlags(["-L\(libDir)", "-Xlinker", "-rpath", "-Xlinker", libDir])
-            ]
+            linkerSettings: sekejapLinkerSettings
         ),
 
+        // Inherits the library target's linker settings transitively.
         .testTarget(name: "SekejapTests", dependencies: ["Sekejap"]),
 
-        // Micro-benchmark executable: `swift run -c release bench`.
+        // Cross-wrapper micro-benchmark: `swift run -c release bench`.
         .executableTarget(
             name: "bench",
             dependencies: ["Sekejap"],
-            linkerSettings: [
-                .unsafeFlags(["-L\(libDir)", "-Xlinker", "-rpath", "-Xlinker", libDir])
-            ]
+            linkerSettings: sekejapLinkerSettings
         ),
 
-        // For distribution, replace CSekejap with a prebuilt xcframework:
-        // .binaryTarget(name: "CSekejap",
-        //     url: "https://github.com/sekejapdb/sekejap/releases/download/v0.13.0/libsekejap.xcframework.zip",
-        //     checksum: "…"),
+        // For distribution (build-swift-xcframework in .github/workflows/release.yml):
+        // replace CSekejap with a prebuilt libsekejap.xcframework binaryTarget
+        // (url + checksum), shipping the same dist/ffi/include/sekejap.h inside it.
     ]
 )

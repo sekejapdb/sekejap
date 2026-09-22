@@ -281,13 +281,24 @@ fn directory_bytes(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// The rebuild destination keeps `SyncMode::Full`, not the crate default.
+/// A rebuild is the path that replaces a database: its output is verified
+/// against an independent walk of the source and then published, and the
+/// source it was rebuilt from may be deleted right after. That output is
+/// worth the drive-cache barrier even where ordinary commits are not, and a
+/// rebuild's cost is already dominated by the copy, not by its commits.
 fn create_destination_store(
     destination: &Path,
     cache_bytes: usize,
     compact_cells: bool,
 ) -> Result<PageWalStore> {
-    PageWalStore::create_with_compact_cells(destination, cache_bytes, compact_cells)
-        .map_err(Error::from)
+    PageWalStore::create_with_compact_cells(
+        destination,
+        cache_bytes,
+        compact_cells,
+        kernel::store::SyncMode::Full,
+    )
+    .map_err(Error::from)
 }
 
 fn marker(path: &Path, name: &str, bytes: &[u8]) -> Result<()> {
@@ -415,6 +426,12 @@ struct Metadata {
     indexes: Vec<IndexInfo>,
     graph_header: Option<(crate::index::graph::GraphHeader, Vec<u8>)>,
     graph_names: Vec<(u8, crate::index::graph::GraphName, Vec<u8>)>,
+    /// The collections the SOURCE carries a live row-count record for. The
+    /// destination gets one for exactly those, with the number recomputed
+    /// from the rows it copied. A source with none gets none: a rebuild
+    /// copies a database, it does not enable a representation the source did
+    /// not have.
+    row_counted: Vec<CollectionId>,
 }
 
 fn collect_metadata(source: &SourceView) -> Result<Metadata> {
@@ -534,6 +551,21 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         }
         graph_header = Some((decoded, bytes));
     }
+    // Which collections the source keeps a live row count for. Probed once
+    // per collection, and only when the file declares the bit, so a database
+    // written before the feature pays nothing.
+    let mut row_counted = Vec::new();
+    if header
+        .indexes
+        .is_some_and(|value| value.features & row_count::ROW_COUNT_FEATURE != 0)
+    {
+        for (catalog, _) in &catalogs {
+            if let Some(bytes) = source.get(&row_count::row_count_key(catalog.id))? {
+                row_count::decode(&bytes)?;
+                row_counted.push(catalog.id);
+            }
+        }
+    }
     Ok(Metadata {
         header,
         catalogs,
@@ -541,6 +573,7 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         indexes: decoded_indexes,
         graph_header,
         graph_names,
+        row_counted,
     })
 }
 
@@ -647,6 +680,7 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
                 | 5
                 | 6
                 | 7
+                | row_count::ROW_COUNT
                 | 0x10
                 | 0x11
                 | 0x12
@@ -666,6 +700,7 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
                 | 0x7a
                 | 0x7b
                 | 0x7c
+                | 0x7e
         ) {
             return Err(Error::Unsupported(format!(
                 "index rebuild does not understand key tag {tag:#x}"
@@ -686,6 +721,22 @@ fn validate_namespaces(source: &SourceView, metadata: &Metadata) -> Result<()> {
                     if id == 0 || id >= u64::from(metadata.header.next_layout) {
                         return Err(corrupt("layout descriptor identity/allocator"));
                     }
+                }
+            }
+            row_count::ROW_COUNT => {
+                let mut at = 1;
+                let id = u32::try_from(read_ordered(key, &mut at)?).map_err(corrupt)?;
+                if at != key.len() || id == 0 || id >= metadata.header.next_collection {
+                    return Err(corrupt("live row count record identity/allocator"));
+                }
+                if metadata
+                    .header
+                    .indexes
+                    .is_none_or(|h| h.features & row_count::ROW_COUNT_FEATURE == 0)
+                {
+                    return Err(corrupt(
+                        "live row count keyspace exists without its feature bit",
+                    ));
                 }
             }
             1 | 2 => {
@@ -743,10 +794,15 @@ fn copy_primary_rows(
     source: &SourceView,
     destination: &mut Destination,
     metadata: &Metadata,
-) -> Result<u64> {
+) -> Result<(u64, BTreeMap<CollectionId, u64>)> {
     let mut rows = 0u64;
+    // The live row count, RECOMPUTED from the rows actually copied rather
+    // than carried over from the source's own record. A rebuild that copied
+    // the record would reproduce a wrong number as faithfully as a right one.
+    let mut live: BTreeMap<CollectionId, u64> = BTreeMap::new();
     source.visit(&[0x40], Some(&[0x41]), |key, row| {
         let id = row_id(key)?;
+        *live.entry(id.collection).or_default() += 1;
         let (_, next) = metadata
             .catalogs
             .iter()
@@ -800,7 +856,7 @@ fn copy_primary_rows(
             .ok_or_else(|| corrupt("primary row count overflow"))?;
         Ok(())
     })?;
-    Ok(rows)
+    Ok((rows, live))
 }
 
 fn copy_vector_sidecars(
@@ -851,6 +907,15 @@ fn copy_graph(
         return Ok(0);
     };
     let mut edges = 0u64;
+    // Law 5: the ENDPOINT SETS are RECOMPUTED from the authoritative primary
+    // edges, never copied. A key in the source that no edge justifies is
+    // simply not written into the destination, which is what makes a rebuild
+    // a repair rather than a copy of the damage.
+    let endpoints = metadata
+        .header
+        .indexes
+        .is_some_and(|h| h.features & crate::index::graph::endpoints::ENDPOINT_FEATURE != 0);
+    let mut endpoint_keys: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     source.visit(
         &[crate::index::graph::PRIMARY_EDGE],
         Some(&tag_end(crate::index::graph::PRIMARY_EDGE)),
@@ -873,12 +938,26 @@ fn copy_graph(
                 &crate::index::graph::edge_key(crate::index::graph::REVERSE_EDGE, edge),
                 &[],
             )?;
+            if endpoints {
+                for (dir, entity) in crate::index::graph::endpoints::ends(edge) {
+                    endpoint_keys.insert(crate::index::graph::endpoints::endpoint_key(
+                        edge.context,
+                        edge.edge_type,
+                        dir,
+                        entity,
+                    ));
+                }
+            }
             edges = edges
                 .checked_add(1)
                 .ok_or_else(|| corrupt("graph edge count overflow"))?;
             Ok(())
         },
     )?;
+    // Ascending, each key once: the same order the backfill writes them in.
+    for key in &endpoint_keys {
+        destination.put(key, &[])?;
+    }
     source.visit(
         &[crate::index::graph::REVERSE_EDGE],
         Some(&tag_end(crate::index::graph::REVERSE_EDGE)),
@@ -1046,7 +1125,16 @@ pub fn rebuild_derived_indexes(
         pending: 0,
     };
     seed_metadata(&mut destination, &metadata)?;
-    let primary_rows = copy_primary_rows(&source, &mut destination, &metadata)?;
+    let (primary_rows, live_rows) = copy_primary_rows(&source, &mut destination, &metadata)?;
+    for id in &metadata.row_counted {
+        destination.put(
+            &row_count::row_count_key(*id),
+            &row_count::encode(row_count::RowCountRecord {
+                rows: live_rows.get(id).copied().unwrap_or(0),
+                generation: 1,
+            }),
+        )?;
+    }
     let vector_sidecars = copy_vector_sidecars(&source, &mut destination, &metadata)?;
     let primary_edges = copy_graph(&source, &mut destination, &metadata)?;
     destination.finish()?;

@@ -39,11 +39,11 @@ impl FileIo for FaultFile {
     fn sync_full_primitive(&self)->&'static str{self.inner.sync_full_primitive()}
 }
 fn hooked(p:&Path,plan:Arc<Mutex<Plan>>)->PageWalStore {
-    PageWalStore::open_with(p,false,32<<10,|p|{
+    PageWalStore::open_with(p,false,32<<10,|p,sync|{
         let wrap=|name|->Arc<dyn FileIo>{let (inner,_)=io::open_file(&p.join(name),IoMode::Buffered).unwrap();
             fs::copy(p.join(name),p.join(name).with_extension("durable")).unwrap();
             Arc::new(FaultFile{inner:inner.into(),name,plan:plan.clone(),path:p.join(name)})};
-        Pager::from_files(wrap("data"),wrap("wal"))
+        Pager::from_files(wrap("data"),wrap("wal"),sync)
     }).unwrap()
 }
 fn value(i:u64,v:u8)->Vec<u8>{let mut b=vec![v;256];b[..8].copy_from_slice(&i.to_le_bytes());b}

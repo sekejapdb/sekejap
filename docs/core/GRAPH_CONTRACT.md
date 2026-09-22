@@ -1,4 +1,4 @@
-# Graph contract — sekejap-e4 Phase 2
+# Graph contract — sekejap Phase 2
 
 Decided 2026-09-20 with the owner. This document states what the graph IS and
 how a traversal behaves. It states no syntax: the query language (SGQL, the
@@ -47,6 +47,20 @@ native, not a layer declared over tables.
     collections an edge type connects) are derived from written edges, so a
     tool sees the graph shape without any declaration.
 2.6 Updating an edge's properties is an in-place rewrite of its posting.
+2.7 ENDPOINT SETS (SHIPPED, additive `ENDPOINT_FEATURE = 0x4000`, keyspace
+    tag `0x7E`): a DERIVED keyspace holding one key per DISTINCT entity that
+    has at least one edge of a given (context, type, direction), keyed
+    `tag | context | type | direction | entity`. It answers "which entities
+    have such an edge" -- the semi-join `EXISTS (SELECT 1 FROM t WHERE
+    t.source = c._key)` -- in one contiguous range with one posting per
+    entity, instead of the edge walk's one seek per matched entity. It is
+    maintained on the write path: a NEW edge files both its ends, a REMOVED
+    edge gives up an end only when that entity's LAST edge of that (context,
+    type, direction) goes, proved by one bounded range probe of the edge
+    keyspace per end. A file whose edges predate the sets carries none,
+    declares nothing, and takes the walk until
+    `Database::backfill_endpoint_sets` builds them once. The edges stay
+    authoritative; the set is rebuilt from them, never the other way round.
 
 ## 3. Contexts
 
@@ -178,7 +192,7 @@ L8 Element identity and typed properties are additive feature bits; old files
 
 ## 8. Deferred, with the reason
 
-- Columnar fast lane as a hidden second store (e1): replaced by 2.4.
+- Columnar fast lane as a hidden second store, as the prior engine had: replaced by 2.4.
 - Edge-property indexes: allowed by the model, not built until a measured
   query needs one.
 - Per-edge-type property schemas beyond 2.4, multi-context traversal, weighted

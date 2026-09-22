@@ -1,95 +1,105 @@
-from .sekejap import DB as _NativeDB, Hit, EdgeHit
-from ._dataframe import DataFrameAccessor
+"""sekejap for Python -- the `libsekejap` C ABI, bound with ctypes.
 
-__all__ = ["DB", "Hit", "EdgeHit", "DataFrameAccessor"]
+sekejap is an embedded, disk-first, multi-model database: documents addressed
+by COLLECTION and KEY, SQL with ``$n`` parameters over the same rows, typed
+edges between them, and vector and spatial fields in the one store.
+
+This package is pure Python. It carries no compiled extension of its own: it
+loads ``libsekejap`` -- the shared library built from ``dist/ffi``, whose
+contract is ``docs/dist/C_ABI.md`` -- and calls its 59 entry points through
+``ctypes``. A platform wheel ships that library inside the package; an
+install from the source distribution finds one through ``$SEKEJAP_LIBRARY``
+or on the platform loader path.
+
+::
+
+    from sekejap import Db
+
+    with Db("./data") as db:
+        db.create_collection("venues", [{"name": "suburb", "kind": "text"}])
+        db.put("venues", "fitzroy_town_hall", {"suburb": "Fitzroy"})
+        for row in db.query("SELECT _key FROM venues WHERE suburb = $1", ["Fitzroy"]):
+            print(row["_key"])
+
+Handles, one per opaque pointer in the ABI: :class:`Db`, :class:`Statement`,
+:class:`Scan`, :class:`Tx`. Each is a context manager, and closing a
+:class:`Db` closes every handle taken from it first.
+
+This is NOT the 0.16 Python API. ``DB``, ``Hit``, ``EdgeHit`` and the
+slug-addressed ``put``/``link`` of the PyO3 extension are gone, because the
+0.17 surface addresses a row by collection and key and answers a query with
+plain ``dict`` rows. Code written against 0.16 fails at import rather than
+silently meaning something else.
+"""
+
+from ._db import (
+    Busy,
+    Corrupt,
+    Db,
+    Direction,
+    Invalid,
+    IoFailure,
+    Refused,
+    Scan,
+    SekejapError,
+    Statement,
+    Status,
+    Tx,
+    UnknownRow,
+    Unsupported,
+    format_version,
+    last_error,
+    last_error_code,
+    library_path,
+    open_memory,
+    version,
+)
+from ._ffi import SEKEJAP_LIBRARY_ENV, LibraryNotFound
+
+__all__ = [
+    "Db",
+    "Statement",
+    "Scan",
+    "Tx",
+    "Direction",
+    "Status",
+    "SekejapError",
+    "Refused",
+    "Corrupt",
+    "Unsupported",
+    "IoFailure",
+    "Invalid",
+    "Busy",
+    "UnknownRow",
+    "LibraryNotFound",
+    "SEKEJAP_LIBRARY_ENV",
+    "version",
+    "format_version",
+    "library_path",
+    "last_error",
+    "last_error_code",
+    "open_memory",
+    "DataFrameAccessor",
+]
+
+__version__ = "0.17.0"
 
 
-class DB(_NativeDB):
-    """
-    sekejap embedded database.
+def _dataframe_accessor(self):
+    """Pandas integration namespace (``db.df``). pandas is imported only here."""
+    from ._dataframe import DataFrameAccessor
 
-    Open / create::
+    return DataFrameAccessor(self)
 
-        from sekejap import DB
-        import json
 
-        db = DB()                   # in-memory
-        db = DB("./data")           # persistent (WAL-backed)
+Db.df = property(_dataframe_accessor)
 
-    Basic node and edge operations::
 
-        db.put("venues/fitzroy_town_hall",
-               '{"_collection":"venues","_key":"fitzroy_town_hall","suburb":"Fitzroy"}')
-        db.link("bands/the_vines", "venues/fitzroy_town_hall", "played_at")
+def __getattr__(name):
+    # `DataFrameAccessor` is advertised but not imported until it is asked
+    # for, so `import sekejap` never reaches for pandas.
+    if name == "DataFrameAccessor":
+        from ._dataframe import DataFrameAccessor
 
-    Standard SELECT::
-
-        hits = db.query("SELECT * FROM venues WHERE suburb = 'Fitzroy'")
-        for h in hits:
-            print(json.loads(h.payload))
-
-    Graph aggregate::
-
-        hits = db.query('''
-            SELECT b._key AS venue, COUNT(a) AS performances
-            FROM MATCH (a:bands)-[r:played_at]->(b:venues)
-            GROUP BY b._key ORDER BY performances DESC LIMIT 10
-        ''')
-
-    PATH_* aggregates (operate on a named edge attribute along the path)::
-
-        hits = db.query('''
-            SELECT b._key AS dest, PATH_PRODUCT(r.weight) AS reliability
-            FROM MATCH (a:venues)-[r:route_to*1..3]->(b:venues)
-            WHERE a._key = 'melbourne_cbd'
-        ''')
-
-    CASE WHEN::
-
-        hits = db.query('''
-            SELECT b._key AS venue,
-                   CASE WHEN p.length = 1 THEN 'direct' ELSE 'multi-hop' END AS tier
-            FROM MATCH p = (a:bands)-[r:played_at]->(b:venues)
-        ''')
-
-    Shortest path (returns a row with path fields, 0 rows if unreachable)::
-
-        hits = db.query('''
-            SELECT a.suburb AS from_name, b.suburb AS to_name, length(r) AS hops
-            FROM MATCH SHORTEST (a)-[r*]->(b)
-            WHERE a._key = 'venues/fitzroy_town_hall'
-              AND b._key = 'venues/melbourne_cbd'
-        ''')
-        if hits:
-            print(f"hops: {json.loads(hits[0].payload)['hops']}")
-
-    Multi-FROM cross-join::
-
-        hits = db.query('''
-            SELECT b._key AS venue, e._key AS event
-            FROM MATCH ('bands/the_vines')-[:played_at]->(b), events AS e
-        ''')
-
-    Introspection::
-
-        hits = db.show("SHOW TABLES")                  # [{name, count}, ...]
-        hits = db.show("SHOW EDGES")                   # [{from, type, to, count}, ...]
-        hits = db.show("SHOW EDGES FROM bands")        # [{from, type, count}, ...]
-        hits = db.show("SHOW venues")                  # [{field, type, source}, ...]
-        for h in hits:
-            print(json.loads(h.payload))
-
-    Pandas / dataframe integration::
-
-        df = db.df.query("SELECT * FROM venues")
-        db.df.load_nodes(df, "venues")
-    """
-
-    @property
-    def df(self) -> DataFrameAccessor:
-        """Pandas / dataframe integration namespace (``db.df``)."""
-        try:
-            return self._df_accessor
-        except AttributeError:
-            self._df_accessor = DataFrameAccessor(self)
-            return self._df_accessor
+        return DataFrameAccessor
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))

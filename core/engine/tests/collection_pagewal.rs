@@ -425,7 +425,11 @@ fn unsupported_sources_are_refused_before_any_byte_changes() {
     for i in 0..3 {
         let mut h = s.get(&[0, 0, i]).unwrap().unwrap();
         assert_eq!(h.len(), 2081);
-        assert_eq!(&h[..8], b"E4COLL1\0");
+        // `E4COLL1` is the PLAIN envelope and `E4COLL2` the INDEX one; every
+        // database with a collection in it carries the second, because the
+        // live row-count record rides `create_collection`. The version byte
+        // is what this case makes newer, whichever envelope it is in.
+        assert!(&h[..6] == b"E4COLL" && h[7] == 0, "{:?}", &h[..8]);
         h[6] = b'9';
         let n = h.len();
         let crc = crc32c::crc32c(&h[..n - 4]).to_le_bytes();
@@ -441,12 +445,23 @@ fn unsupported_sources_are_refused_before_any_byte_changes() {
     assert!(matches!(Database::open_snapshot(&catalog, cfg()), Err(Error::Unsupported(_))));
     assert_eq!(files(&catalog), before, "refusal precedes tail normalization and file creation");
     // 5. Configurations this path cannot honour are refused up front.
+    // A WEAKER BARRIER IS NOT ONE OF THEM. All three `SyncMode`s are
+    // honoured at every publication point of the page-WAL, and `Normal` is
+    // the default of the published crate; which primitive ran is readable
+    // from `IoCounters::sync_full_calls` / `sync_data_calls`
+    // (`core/engine/tests/sync_modes.rs`). What is still refused is what the
+    // path has no way to do: unbuffered I/O, and a pool the B-tree cannot
+    // descend and split with.
     let good = d.path().join("good");
     drop(seeded(&good));
     let before = core_files(&good);
+    for sync in [SyncMode::Full, SyncMode::Normal, SyncMode::Off] {
+        let ok = Config { sync, ..cfg() };
+        Database::open(&good, ok).unwrap();
+        Database::open_snapshot(&good, ok).unwrap();
+    }
+    assert_eq!(core_files(&good), before, "opening under each mode changes no file");
     for bad in [
-        Config { sync: SyncMode::Off, ..cfg() },
-        Config { sync: SyncMode::Normal, ..cfg() },
         Config { io: IoMode::Direct, ..cfg() },
         Config { budget_bytes: 4096, ..cfg() },
     ] {

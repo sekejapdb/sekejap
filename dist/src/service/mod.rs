@@ -548,6 +548,29 @@ impl WriterGuard<'_> {
         }
     }
 
+    /// Record that an EDGE of `edge_type` was linked or unlinked, for a
+    /// caller that wrote through [`WriterGuard::database`]. The companion of
+    /// [`WriterGuard::note_collection`], and there for the same reason: the
+    /// graph atomics take an edge type NAME and intern it, so a caller that
+    /// links through the engine handle has the identity only after the call.
+    pub fn note_edge_type(&mut self, edge_type: EdgeTypeId) {
+        if self.service.subscribers.listening() {
+            self.batch.note_edge_type(edge_type);
+        }
+    }
+
+    /// Record that a statement run through [`WriterGuard::database`] moved
+    /// `rows`, for a caller that compiles its own plan and therefore cannot
+    /// go through [`WriterGuard::sql`]. Lands in
+    /// [`ChangeEvent::unnamed_writes`](super::ChangeEvent::unnamed_writes),
+    /// which is exactly the count of writes this feed could not attribute to
+    /// a collection.
+    pub fn note_unnamed_write(&mut self, rows: u64) {
+        if self.service.subscribers.listening() {
+            self.batch.note_unnamed_write(rows);
+        }
+    }
+
     /// Put one row, recorded.
     pub fn put(&mut self, collection: CollectionId, key: &str, doc: &Value) -> Result<EntityId> {
         let id = self.db.put(collection, key, doc)?;

@@ -152,6 +152,16 @@ fn format_aggregate(plan: &AggregatePlanDescription) -> String {
     if let Some(reason) = &plan.fell_back {
         out.push_str(&format!("fell back: {reason}\n"));
     }
+    // A whole-collection `count(*)` is the one aggregate whose answer can be
+    // READ instead of walked. Every other aggregate prints no `count:` line,
+    // because for them there is nothing to choose between.
+    if let Some(count) = plan.count {
+        out.push_str(&format!("count: {}\n", count.written()));
+        out.push_str(match count {
+            sekejap_core::collections::CountSource::LiveRecord => "  note:  the collection carries a LIVE ROW COUNT record, maintained by the write path inside the same transaction as the rows, so the answer is ONE get: no candidate is walked, no posting is read and no row is touched\n",
+            sekejap_core::collections::CountSource::Walk => "  note:  this collection has no live row-count record -- a database written before the feature, or one the backfill has not reached -- so the count is the complete enumeration of the external-key mapping keyspace, one step per row\n",
+        });
+    }
     match &plan.group {
         None => out.push_str("group: none -- one group over every candidate\n"),
         Some((key, source)) => out.push_str(&format!("group: {key} -> {source}\n")),

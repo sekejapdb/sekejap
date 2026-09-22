@@ -186,6 +186,12 @@ impl Parser {
                 _ => {}
             }
         }
+        // `1 <> 1`, `1 = 1`: a predicate with no column, folded to its truth
+        // value here. pgjdbc writes `WHERE 1<>1 LIMIT 1` to learn a result's
+        // columns without fetching a row.
+        if let Some(predicate) = self.constant_predicate()? {
+            return Ok(predicate);
+        }
         let at = self.here();
         let column = self.name()?;
         // A cast on the left of a predicate (`plot::geometry`) is PostGIS's
@@ -907,13 +913,13 @@ impl Parser {
                     if matches!(upper.as_str(), "AS" | "FROM") {
                         return false;
                     }
-                    if ROW_FUNCTIONS.contains(&upper.as_str()) {
+                    if self.row_function_at(&upper, at) {
                         return true;
                     }
                 }
                 Tok::Word(word) => {
                     let upper = word.to_ascii_uppercase();
-                    if ROW_FUNCTIONS.contains(&upper.as_str()) {
+                    if self.row_function_at(&upper, at) {
                         return true;
                     }
                 }
@@ -921,6 +927,22 @@ impl Parser {
             }
             at += 1;
         }
+    }
+
+    /// True when the word `ahead` tokens along is a §4.1 / §4.2 function
+    /// CALL rather than a column that happens to share its name.
+    ///
+    /// The distinction is the parenthesis. `position` and `left` and `right`
+    /// are function names AND perfectly ordinary column names -- the catalog
+    /// view `db_columns` has a `position` column -- so a bare word is a
+    /// column and `word(` is a call. The exceptions are the three §4.2 forms
+    /// the standard spells WITHOUT parentheses: `current_date`,
+    /// `current_timestamp` and `interval '1 day'`.
+    fn row_function_at(&self, upper: &str, ahead: usize) -> bool {
+        if matches!(upper, "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "INTERVAL") {
+            return true;
+        }
+        ROW_FUNCTIONS.contains(&upper) && matches!(self.peek_at(ahead + 1), Tok::LParen)
     }
 
     /// True when the cursor stands on a §4.1 / §4.2 function CALL.
@@ -1147,6 +1169,35 @@ impl Parser {
 
     /// The comparison operator after a function call, with the call named in
     /// the error when there is none.
+    /// `<number> <cmp> <number>` -- a predicate that names no column --
+    /// folded to its truth value. `None` when the cursor is not on one.
+    fn constant_predicate(&mut self) -> SqlResult2<Option<Predicate>> {
+        let Tok::Num(left, _) = self.peek().clone() else {
+            return Ok(None);
+        };
+        if !matches!(
+            self.peek_at(1),
+            Tok::Eq | Tok::Ne | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge
+        ) {
+            return Ok(None);
+        }
+        self.bump();
+        let op = self.comparison("a constant")?;
+        let Tok::Num(right, _) = self.bump() else {
+            return Err(SqlError::unsupported(
+                "a predicate with no column compares two NUMBERS: that is the `WHERE 1<>1` a driver writes to read a result's columns without a row",
+            ));
+        };
+        Ok(Some(Predicate::Constant(match op {
+            CmpOp::Eq => left == right,
+            CmpOp::Ne => left != right,
+            CmpOp::Lt => left < right,
+            CmpOp::Le => left <= right,
+            CmpOp::Gt => left > right,
+            CmpOp::Ge => left >= right,
+        })))
+    }
+
     fn comparison(&mut self, what: &str) -> SqlResult2<CmpOp> {
         let at = self.here();
         let op = match self.peek() {

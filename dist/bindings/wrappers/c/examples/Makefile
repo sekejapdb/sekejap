@@ -1,70 +1,36 @@
-# Build and run the sekejap C ABI examples.
+# Build the sekejap C ABI and run the tour against it.
 #
-#   make test      build libsekejap + compile/run test.c (asserts the C ABI)
-#   make asan      same, under AddressSanitizer (catches C-side memory bugs)
-#   make server    build libsekejap w/ engine + compile/run server.c (threads)
-#   make install   copy lib + header + sekejap.pc into $(PREFIX) (default /usr/local)
+#   make tour      # cargo build + compile tour.c + run it
 #   make clean
 #
-# The library is the workspace cargo build output. Static vs dynamic: we link the
-# dynamic lib and set the loader path at run time (portable, no install needed).
+# The header and the library both come from dist/ffi; nothing here builds a
+# second copy of either.
 
-CARGO      ?= cargo
-CC         ?= cc
-CFLAGS     ?= -std=gnu11 -Wall -Wextra -O2
-PREFIX     ?= /usr/local
+CARGO   ?= cargo
+CC      ?= cc
+# Appended, not assigned: an environment CFLAGS keeps its flags and gets
+# these as well.
+override CFLAGS += -std=gnu11 -Wall -Wextra -O2
 
-# Workspace target dir (three levels up from wrappers/c/examples).
-TARGET_DIR ?= ../../../target/release
-INCLUDE    := ../include
+FFI              := ../../../../ffi
+CARGO_TARGET_DIR ?= ../../../../../target
+TARGET_DIR       := $(CARGO_TARGET_DIR)/release
 
-UNAME := $(shell uname)
-ifeq ($(UNAME),Darwin)
-  LIBEXT := dylib
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
   LOADER := DYLD_LIBRARY_PATH
 else
-  LIBEXT := so
   LOADER := LD_LIBRARY_PATH
 endif
-LIB := $(TARGET_DIR)/libsekejap.$(LIBEXT)
 
-.PHONY: test asan server lib lib-engine install clean
+.PHONY: lib tour clean
 
-# ── libsekejap (default surface) ────────────────────────────────────────────
 lib:
 	$(CARGO) build --release -p sekejap-capi
 
-# ── libsekejap with the concurrent Engine handle ────────────────────────────
-lib-engine:
-	$(CARGO) build --release -p sekejap-capi --features engine
-
-# ── compile + run the assert-based C test ───────────────────────────────────
-test: lib
-	$(CC) $(CFLAGS) test.c -I $(INCLUDE) -L $(TARGET_DIR) -lsekejap -o test
-	$(LOADER)=$(TARGET_DIR) ./test
-
-# ── compile + run the five-stop tour (SQL, graph, spatial, vector, hybrid) ──
 tour: lib
-	$(CC) $(CFLAGS) tour.c -I $(INCLUDE) -L $(TARGET_DIR) -lsekejap -o tour
-	$(LOADER)=$(TARGET_DIR) ./tour
-
-# ── same, under AddressSanitizer (instruments the C side) ───────────────────
-asan: lib
-	$(CC) $(CFLAGS) -fsanitize=address -g test.c -I $(INCLUDE) -L $(TARGET_DIR) -lsekejap -o test_asan
-	$(LOADER)=$(TARGET_DIR) ./test_asan
-
-# ── the concurrent server demo (needs the engine feature + -DSEKEJAP_ENGINE) ─
-server: lib-engine
-	$(CC) $(CFLAGS) -DSEKEJAP_ENGINE server.c -I $(INCLUDE) -L $(TARGET_DIR) -lsekejap -lpthread -o server
-	$(LOADER)=$(TARGET_DIR) ./server
-
-# ── install like a system C library ─────────────────────────────────────────
-install: lib
-	install -d $(PREFIX)/lib $(PREFIX)/include $(PREFIX)/lib/pkgconfig
-	install -m 644 $(LIB) $(PREFIX)/lib/
-	install -m 644 $(INCLUDE)/sekejap.h $(PREFIX)/include/
-	sed 's|@PREFIX@|$(PREFIX)|' sekejap.pc.in > $(PREFIX)/lib/pkgconfig/sekejap.pc
-	@echo "installed to $(PREFIX). consumers: cc app.c \$$(pkg-config --cflags --libs sekejap)"
+	$(CC) $(CFLAGS) tour.c -I $(FFI)/include -L $(TARGET_DIR) -lsekejap -o $(TARGET_DIR)/sekejap_tour
+	$(LOADER)=$(TARGET_DIR) $(TARGET_DIR)/sekejap_tour
 
 clean:
-	rm -f test test_asan server
+	rm -f $(TARGET_DIR)/sekejap_tour

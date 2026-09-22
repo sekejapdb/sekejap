@@ -27,23 +27,29 @@ pub const WAL_BOUND: u64 = 16 << 20;
 pub const MIN_CACHE: usize = 64 << 10;
 
 /// Map a public `Config` onto the page-WAL path, or say why it cannot be.
-/// Only buffered I/O and a FULL barrier at publication exist on this path;
-/// a weaker request is refused rather than silently upgraded, so every run
-/// is benchmarked as what it is.
-pub fn check_config(cfg: &Config) -> std::result::Result<usize, String> {
+///
+/// All three `SyncMode`s are honoured here: the page-WAL issues `sync_full`
+/// for `Full`, `sync_data` for `Normal` and no barrier for `Off`, at every
+/// one of its publication points, and the default a caller gets from
+/// `sekejap::Db::open` is `Normal` -- what SQLite with `fullfsync` off and
+/// PostgreSQL with a plain `fsync` give. An earlier draft refused anything
+/// but `Full` "so every run is benchmarked as what it is"; that intent is
+/// now served by `IoCounters::sync_full_calls` / `sync_data_calls`, which
+/// say which primitive actually ran, and by `FileIo::sync_full_primitive`,
+/// which names it per platform. A label a measurement can read off the run
+/// is stronger than a mode the storage layer refuses to accept.
+///
+/// `IoMode::Direct` is still refused -- the page-WAL has no unbuffered path
+/// to fall back to -- and so is a budget below `MIN_CACHE`, which the B-tree
+/// cannot descend and split with.
+pub fn check_config(cfg: &Config) -> std::result::Result<(usize, SyncMode), String> {
     if !matches!(cfg.io, IoMode::Buffered) {
         return Err("page-WAL collections support IoMode::Buffered only".into());
-    }
-    if !matches!(cfg.sync, SyncMode::Full) {
-        return Err(
-            "page-WAL collections publish every commit with a FULL barrier; request SyncMode::Full"
-                .into(),
-        );
     }
     if cfg.budget_bytes < MIN_CACHE {
         return Err(format!("cache budget below {MIN_CACHE} bytes"));
     }
-    Ok(cfg.budget_bytes)
+    Ok((cfg.budget_bytes, cfg.sync))
 }
 
 /// Accept a policy only when each field is enforced on this path:
@@ -91,8 +97,13 @@ impl Backend {
     }
     /// Create a database. With limits, the persisted cap is `data + wal` and
     /// the runtime allowances are installed before any collection byte lands.
-    pub fn create(dir: &Path, cache: usize, limits: Option<ResourceLimits>) -> Result<Self> {
-        let mut store = PageWalStore::open(dir, true, cache)?;
+    pub fn create(
+        dir: &Path,
+        cache: usize,
+        sync: SyncMode,
+        limits: Option<ResourceLimits>,
+    ) -> Result<Self> {
+        let mut store = PageWalStore::open_sync(dir, true, cache, sync)?;
         if let Some(l) = limits {
             store.set_cap(l.data_bytes + l.wal_bytes)?;
             store.set_runtime_limits(l.data_bytes, l.wal_bytes, l.tracked_pages as usize)?;
@@ -105,9 +116,10 @@ impl Backend {
     pub fn open(
         dir: &Path,
         cache: usize,
+        sync: SyncMode,
         check: impl FnOnce(&PageWalStore) -> Result<()>,
     ) -> Result<Self> {
-        Ok(Self::wrap(PageWalStore::open_validated(dir, false, cache, check)?))
+        Ok(Self::wrap(PageWalStore::open_validated(dir, false, cache, sync, check)?))
     }
     /// Admit a reader; `check` runs on the admitted view (on the quiescent
     /// path before any coordination file is created) and returns the
@@ -201,8 +213,8 @@ impl Backend {
         self.write_fault()?;
         self.store.tree_pack(tree_id, sorted, fill, scratch)
     }
-    /// Durable (FULL barrier) and published through the hint: visible to
-    /// every snapshot admitted afterwards.
+    /// Durable under this store's `SyncMode` and published through the hint:
+    /// visible to every snapshot admitted afterwards.
     pub fn commit(&mut self) -> Result<()> {
         self.store.commit()
     }

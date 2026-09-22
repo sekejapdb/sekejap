@@ -1,18 +1,29 @@
-// Package sekejap is a Go binding to the sekejap embedded database — a graph-first,
-// multi-model engine (SQL + graph + spatial + vector + full-text) — via cgo over
-// the C ABI (wrappers/c, libsekejap).
+// Package sekejap is a Go binding to the sekejap embedded database -- a
+// graph-first, multi-model engine (SQL + graph + spatial + vector +
+// full-text) -- via cgo over the stable C ABI (dist/ffi, libsekejap).
 //
-// Build requirement: libsekejap must be built first:
+// Rows are addressed by collection + key, not by one slug string. Documents,
+// query parameters and result rows all cross the boundary as JSON: a method
+// ending in JSON hands back (or takes) the raw string sekejap uses, and the
+// method of the same name without the suffix marshals it into idiomatic Go
+// -- map[string]any for a row or a document, `any` for a value to write.
+//
+// sekejap::Db is Send+Sync, so one *DB may be called from many goroutines at
+// once. A *Stmt, a *Scan and a *Tx derived from it are each for ONE
+// goroutine at a time, and must be freed before the *DB they came from is
+// closed.
+//
+// # Build
+//
+// libsekejap must be built or installed first (docs/dist/C_ABI.md §5):
 //
 //	cargo build --release -p sekejap-capi
 //
-// The cgo directives below point at the workspace build output and embed an rpath
-// so binaries find the shared library at run time without LD_LIBRARY_PATH.
+// The link flags live in build-tagged files: cgo_pkgconfig.go (default,
+// resolves libsekejap via pkg-config for an installed consumer) and
+// cgo_dev.go (the `sekejap_dev` build tag, links against this repo's own
+// build output for in-repo work).
 package sekejap
-
-// The link flags live in build-tagged files: cgo_pkgconfig.go (default, resolves
-// libsekejap via pkg-config for installed consumers) and cgo_dev.go (the
-// `sekejap_dev` tag, links against the monorepo build output for in-repo work).
 
 // #include <stdlib.h>
 // #include "sekejap.h"
@@ -20,16 +31,24 @@ import "C"
 
 import (
 	"encoding/json"
-	"errors"
 	"runtime"
 	"unsafe"
 )
 
-// DB is an open sekejap database handle. Not safe for concurrent use from
-// multiple goroutines (it wraps single-threaded CoreDB); serialize access, or use
-// the engine handle once exposed. Call Close when done.
+// DB is an open sekejap database handle. Call Close when done; every Stmt,
+// Scan and Tx taken from it must be freed first.
 type DB struct {
 	ptr *C.SekejapDb
+}
+
+// Config is sekejap_open_with_config's store configuration. Every field is
+// optional; a nil/empty field keeps sekejap's own default. IO is
+// "buffered" or "direct"; Sync is "full" (sekejap's default), "normal" or
+// "off".
+type Config struct {
+	BudgetBytes *int64 `json:"budget_bytes,omitempty"`
+	IO          string `json:"io,omitempty"`
+	Sync        string `json:"sync,omitempty"`
 }
 
 // Open opens (or creates) a database at the given directory path.
@@ -38,27 +57,56 @@ func Open(path string) (*DB, error) {
 	defer C.free(unsafe.Pointer(cpath))
 	ptr := C.sekejap_open(cpath)
 	if ptr == nil {
-		return nil, errors.New("sekejap: open failed")
+		return nil, lastError()
 	}
-	db := &DB{ptr: ptr}
-	runtime.SetFinalizer(db, (*DB).Close)
-	return db, nil
+	return newDB(ptr), nil
 }
 
-// OpenPaged opens a database in paged (mmap) mode — fast startup regardless of size.
-func OpenPaged(path string) (*DB, error) {
+// OpenWithConfig opens (or creates) a database under a store configuration.
+// A nil config is sekejap's own default.
+func OpenWithConfig(path string, config *Config) (*DB, error) {
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
-	ptr := C.sekejap_open_paged(cpath)
-	if ptr == nil {
-		return nil, errors.New("sekejap: open_paged failed")
+	var cconfig *C.char
+	if config != nil {
+		j, err := json.Marshal(config)
+		if err != nil {
+			return nil, err
+		}
+		cconfig = C.CString(string(j))
+		defer C.free(unsafe.Pointer(cconfig))
 	}
-	db := &DB{ptr: ptr}
-	runtime.SetFinalizer(db, (*DB).Close)
-	return db, nil
+	ptr := C.sekejap_open_with_config(cpath, cconfig)
+	if ptr == nil {
+		return nil, lastError()
+	}
+	return newDB(ptr), nil
 }
 
-// Close frees the handle. Safe to call more than once.
+// OpenService opens the database in SERVICE mode: one writer, parallel
+// readers on a published snapshot, and the change feed, the statement
+// timeout and the cancel family (docs/dist/OPS_CONTRACT.md §1-§5). Those
+// calls -- StatementTimeout, Cancel, ClearInterrupt, Subscribe, NextChange,
+// Unsubscribe -- answer only on a handle opened this way; on any other
+// handle they are refused by name.
+func OpenService(path string) (*DB, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	ptr := C.sekejap_open_service(cpath)
+	if ptr == nil {
+		return nil, lastError()
+	}
+	return newDB(ptr), nil
+}
+
+func newDB(ptr *C.SekejapDb) *DB {
+	db := &DB{ptr: ptr}
+	runtime.SetFinalizer(db, (*DB).Close)
+	return db
+}
+
+// Close frees the handle. Safe to call more than once. Uncommitted work is
+// discarded: a close is not a commit.
 func (db *DB) Close() {
 	if db.ptr != nil {
 		C.sekejap_close(db.ptr)
@@ -67,201 +115,177 @@ func (db *DB) Close() {
 	}
 }
 
-// Execute runs a mutating statement (CREATE / INSERT / UPDATE / DELETE / ALTER /
-// BEGIN / COMMIT / edge insert). Returns the number of affected rows.
-func (db *DB) Execute(sql string) (int64, error) {
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-	n := int64(C.sekejap_execute(db.ptr, csql))
-	if n < 0 {
-		return 0, db.lastError()
-	}
-	return n, nil
-}
+// Version returns the library version, as MAJOR.MINOR.PATCH.
+func Version() string { return C.GoString(C.sekejap_version()) }
 
-// QueryJSON runs a SELECT and returns the raw JSON-array result string.
-func (db *DB) QueryJSON(sql string) (string, error) {
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-	out := C.sekejap_query(db.ptr, csql)
-	if out == nil {
-		return "", db.lastError()
-	}
-	defer C.sekejap_string_free(out)
-	return C.GoString(out), nil
-}
+// FormatVersion returns the disk format this build reads and writes.
+func FormatVersion() int32 { return int32(C.sekejap_format_version()) }
 
-// Query runs a SELECT and returns the rows decoded into a slice of maps.
-func (db *DB) Query(sql string) ([]map[string]any, error) {
-	js, err := db.QueryJSON(sql)
+// ---- documents ----------------------------------------------------------
+
+// Put writes one document, committed before this call returns. doc is
+// marshaled to JSON; if the marshaled object carries a _key member, it must
+// equal key. A collection that is not in the catalog is a failure, not an
+// implicit create -- declare it first with CreateCollection.
+func (db *DB) Put(collection, key string, doc any) error {
+	j, err := json.Marshal(doc)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return decodeRows(js)
+	return db.PutJSON(collection, key, string(j))
 }
 
-// QueryParams runs a parameterized SELECT ($1, $2, …) with params bound from the
-// given values — the injection-safe way to pass user input.
-func (db *DB) QueryParams(sql string, params ...any) ([]map[string]any, error) {
-	pj, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
-	}
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-	cpj := C.CString(string(pj))
-	defer C.free(unsafe.Pointer(cpj))
-	out := C.sekejap_query_params(db.ptr, csql, cpj)
-	if out == nil {
-		return nil, db.lastError()
-	}
-	defer C.sekejap_string_free(out)
-	return decodeRows(C.GoString(out))
-}
-
-// Stmt is a prepared (compiled) query. Create with DB.Prepare, run with
-// DB.QueryPrepared, free with Close. Reusable for the same query shape with
-// different parameter values.
-type Stmt struct {
-	ptr *C.SekejapStmt
-}
-
-// Prepare compiles sql (with $1, $2, … placeholders) into a reusable prepared
-// statement — parsed once, executed many times.
-func (db *DB) Prepare(sql string) (*Stmt, error) {
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-	ptr := C.sekejap_prepare(db.ptr, csql)
-	if ptr == nil {
-		return nil, db.lastError()
-	}
-	s := &Stmt{ptr: ptr}
-	runtime.SetFinalizer(s, (*Stmt).Close)
-	return s, nil
-}
-
-// QueryPreparedJSON runs a prepared statement, binding params, and returns the raw
-// JSON-array result string.
-func (db *DB) QueryPreparedJSON(stmt *Stmt, params ...any) (string, error) {
-	pj, err := json.Marshal(params)
-	if err != nil {
-		return "", err
-	}
-	cpj := C.CString(string(pj))
-	defer C.free(unsafe.Pointer(cpj))
-	out := C.sekejap_query_prepared(db.ptr, stmt.ptr, cpj)
-	if out == nil {
-		return "", db.lastError()
-	}
-	defer C.sekejap_string_free(out)
-	return C.GoString(out), nil
-}
-
-// QueryPrepared runs a prepared statement and decodes the rows into a slice of maps.
-func (db *DB) QueryPrepared(stmt *Stmt, params ...any) ([]map[string]any, error) {
-	js, err := db.QueryPreparedJSON(stmt, params...)
-	if err != nil {
-		return nil, err
-	}
-	return decodeRows(js)
-}
-
-// Close frees the prepared statement. Safe to call more than once.
-func (s *Stmt) Close() {
-	if s.ptr != nil {
-		C.sekejap_stmt_free(s.ptr)
-		s.ptr = nil
-		runtime.SetFinalizer(s, nil)
-	}
-}
-
-// Put inserts or replaces one node by slug ("collection/key") with a JSON payload.
-func (db *DB) Put(slug, payloadJSON string) error {
-	cslug := C.CString(slug)
-	defer C.free(unsafe.Pointer(cslug))
-	cjson := C.CString(payloadJSON)
-	defer C.free(unsafe.Pointer(cjson))
-	if C.sekejap_put(db.ptr, cslug, cjson) != 0 {
-		return db.lastError()
+// PutJSON is Put, taking the document as a JSON object already encoded.
+func (db *DB) PutJSON(collection, key, documentJSON string) error {
+	ccol, ckey, cdoc := C.CString(collection), C.CString(key), C.CString(documentJSON)
+	defer C.free(unsafe.Pointer(ccol))
+	defer C.free(unsafe.Pointer(ckey))
+	defer C.free(unsafe.Pointer(cdoc))
+	if C.sekejap_put(db.ptr, ccol, ckey, cdoc) != 0 {
+		return lastError()
 	}
 	return nil
 }
 
-// Get fetches one node's payload by slug as a JSON string; ok is false if absent.
-func (db *DB) Get(slug string) (payload string, ok bool, err error) {
-	cslug := C.CString(slug)
-	defer C.free(unsafe.Pointer(cslug))
-	out := C.sekejap_get(db.ptr, cslug)
+// PutRow is one row of a PutMany batch.
+type PutRow struct {
+	Key string `json:"key"`
+	Doc any    `json:"doc"`
+}
+
+// PutMany writes many documents into one collection under ONE commit,
+// returning the rows written. A failure stores none of the batch.
+func (db *DB) PutMany(collection string, rows []PutRow) (int64, error) {
+	j, err := json.Marshal(rows)
+	if err != nil {
+		return 0, err
+	}
+	return db.PutManyJSON(collection, string(j))
+}
+
+// PutManyJSON is PutMany, taking the rows already encoded as a JSON array of
+// {"key": "...", "doc": { ... }}.
+func (db *DB) PutManyJSON(collection, rowsJSON string) (int64, error) {
+	ccol, crows := C.CString(collection), C.CString(rowsJSON)
+	defer C.free(unsafe.Pointer(ccol))
+	defer C.free(unsafe.Pointer(crows))
+	return count(C.sekejap_put_many(db.ptr, ccol, crows))
+}
+
+// Get reads one document, decoded into a map keyed by field name (with
+// _key set to the row's external key). ok is false for a clean miss.
+func (db *DB) Get(collection, key string) (map[string]any, bool, error) {
+	js, ok, err := db.GetJSON(collection, key)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(js), &doc); err != nil {
+		return nil, false, err
+	}
+	return doc, true, nil
+}
+
+// GetJSON is Get, returning the document as raw JSON text.
+func (db *DB) GetJSON(collection, key string) (payload string, ok bool, err error) {
+	ccol, ckey := C.CString(collection), C.CString(key)
+	defer C.free(unsafe.Pointer(ccol))
+	defer C.free(unsafe.Pointer(ckey))
+	out := C.sekejap_get(db.ptr, ccol, ckey)
 	if out == nil {
-		// Clean miss clears last_error; a real error sets it.
-		if e := db.lastError(); e != nil && e.Error() != "sekejap: unknown error" {
-			return "", false, e
+		if lastErrorIsOk() {
+			return "", false, nil
 		}
-		return "", false, nil
+		return "", false, lastError()
 	}
 	defer C.sekejap_string_free(out)
 	return C.GoString(out), true, nil
 }
 
-// Link creates a plain edge from -> to of the given type (slugs are "collection/key").
-func (db *DB) Link(from, to, edgeType string) error {
-	cf, ct, ce := C.CString(from), C.CString(to), C.CString(edgeType)
-	defer C.free(unsafe.Pointer(cf))
-	defer C.free(unsafe.Pointer(ct))
-	defer C.free(unsafe.Pointer(ce))
-	if C.sekejap_link(db.ptr, cf, ct, ce) != 0 {
-		return db.lastError()
+// Exists reports whether a row with the given collection and key exists.
+func (db *DB) Exists(collection, key string) (bool, error) {
+	ccol, ckey := C.CString(collection), C.CString(key)
+	defer C.free(unsafe.Pointer(ccol))
+	defer C.free(unsafe.Pointer(ckey))
+	return tribool(C.sekejap_exists(db.ptr, ccol, ckey))
+}
+
+// Delete removes one row and every edge that touches it, committed.
+// Reports whether the row was there.
+func (db *DB) Delete(collection, key string) (bool, error) {
+	ccol, ckey := C.CString(collection), C.CString(key)
+	defer C.free(unsafe.Pointer(ccol))
+	defer C.free(unsafe.Pointer(ckey))
+	return tribool(C.sekejap_delete(db.ptr, ccol, ckey))
+}
+
+// ---- scans ----------------------------------------------------------------
+
+// Scan is a paged walk, of one collection (DB.Scan) or of one statement's
+// answer (DB.QueryOpen). Free it with Close, before closing the DB it was
+// opened on.
+type Scan struct {
+	ptr      *C.SekejapScan
+	fromScan bool // true: sekejap_scan_open; false: sekejap_query_open
+}
+
+// Scan opens a walk of one collection in stable id order. It holds at most
+// pageRows rows at a time (0 means sekejap's default of 256).
+func (db *DB) Scan(collection string, pageRows uintptr) (*Scan, error) {
+	ccol := C.CString(collection)
+	defer C.free(unsafe.Pointer(ccol))
+	ptr := C.sekejap_scan_open(db.ptr, ccol, C.uintptr_t(pageRows))
+	if ptr == nil {
+		return nil, lastError()
 	}
-	return nil
+	s := &Scan{ptr: ptr, fromScan: true}
+	runtime.SetFinalizer(s, (*Scan).Close)
+	return s, nil
 }
 
-// LinkMeta creates an edge carrying attributes (a JSON object).
-func (db *DB) LinkMeta(from, to, edgeType, metaJSON string) error {
-	cf, ct, ce, cm := C.CString(from), C.CString(to), C.CString(edgeType), C.CString(metaJSON)
-	defer C.free(unsafe.Pointer(cf))
-	defer C.free(unsafe.Pointer(ct))
-	defer C.free(unsafe.Pointer(ce))
-	defer C.free(unsafe.Pointer(cm))
-	if C.sekejap_link_meta(db.ptr, cf, ct, ce, cm) != 0 {
-		return db.lastError()
+// Next returns the next page of documents, decoded into maps. ok is false
+// at the end of the walk.
+func (s *Scan) Next() ([]map[string]any, bool, error) {
+	js, ok, err := s.NextJSON()
+	if err != nil || !ok {
+		return nil, ok, err
 	}
-	return nil
+	rows, err := decodeRows(js)
+	return rows, err == nil, err
 }
 
-// Contains reports whether a node with the given slug exists.
-func (db *DB) Contains(slug string) bool {
-	cslug := C.CString(slug)
-	defer C.free(unsafe.Pointer(cslug))
-	return C.sekejap_contains(db.ptr, cslug) == 1
-}
-
-// NodeCount returns the number of nodes.
-func (db *DB) NodeCount() int64 { return int64(C.sekejap_node_count(db.ptr)) }
-
-// EdgeCount returns the number of edges.
-func (db *DB) EdgeCount() int64 { return int64(C.sekejap_edge_count(db.ptr)) }
-
-// Compact truncates the WAL, rewrites payloads/topology, and reclaims RAM.
-func (db *DB) Compact() error {
-	if C.sekejap_compact(db.ptr) != 0 {
-		return db.lastError()
+// NextJSON is Next, returning the page as a raw JSON array.
+func (s *Scan) NextJSON() (js string, ok bool, err error) {
+	var out *C.char
+	if s.fromScan {
+		out = C.sekejap_scan_next(s.ptr)
+	} else {
+		out = C.sekejap_query_next(s.ptr)
 	}
-	return nil
-}
-
-// Version returns the library version.
-func Version() string {
-	return C.GoString(C.sekejap_version())
-}
-
-func (db *DB) lastError() error {
-	msg := C.sekejap_last_error(db.ptr)
-	if msg == nil {
-		return errors.New("sekejap: unknown error")
+	if out == nil {
+		if lastErrorIsOk() {
+			return "", false, nil
+		}
+		return "", false, lastError()
 	}
-	defer C.sekejap_string_free(msg)
-	return errors.New("sekejap: " + C.GoString(msg))
+	defer C.sekejap_string_free(out)
+	return C.GoString(out), true, nil
 }
+
+// Close closes the walk and frees it. Safe to call more than once.
+func (s *Scan) Close() {
+	if s.ptr != nil {
+		if s.fromScan {
+			C.sekejap_scan_close(s.ptr)
+		} else {
+			C.sekejap_query_close(s.ptr)
+		}
+		s.ptr = nil
+		runtime.SetFinalizer(s, nil)
+	}
+}
+
+// ---- shared helpers ---------------------------------------------------
 
 func decodeRows(js string) ([]map[string]any, error) {
 	var rows []map[string]any
@@ -269,4 +293,19 @@ func decodeRows(js string) ([]map[string]any, error) {
 		return nil, err
 	}
 	return rows, nil
+}
+
+// paramsJSON marshals a variadic parameter list into the JSON array the C
+// ABI expects, or a nil *C.char for no parameters (NULL means "no
+// parameters" on the wire). The caller frees the returned pointer with
+// C.free, if it is not nil.
+func paramsJSON(params []any) (*C.char, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	j, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+	return C.CString(string(j)), nil
 }

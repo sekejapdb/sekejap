@@ -1,5 +1,5 @@
 [workspace]
-members = ["core/kernel", "core/engine", "lang", "dist", "dist/rust", "bench"]
+members = ["core/kernel", "core/engine", "lang", "dist", "dist/rust", "dist/ffi", "bench"]
 default-members = ["core/engine"]
 resolver = "2"
 

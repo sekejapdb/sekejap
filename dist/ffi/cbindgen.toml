@@ -1,0 +1,51 @@
+# cbindgen configuration for sekejap-capi (dist/ffi). Drives build.rs and a
+# manual `cbindgen --output include/sekejap.h`. The header preamble below is
+# the e1 one, edited for the 0.17 surface: same ownership rules, same
+# sentinels, sekejap's own function list.
+
+language = "C"
+include_guard = "SEKEJAP_H"
+tab_width = 4
+style = "type"
+cpp_compat = true          # wrap in extern "C" for C++ consumers
+documentation = true
+documentation_style = "c99"
+
+header = """
+/*
+ * sekejap.h -- the C ABI of sekejap (https://sekejap.life)
+ *
+ * AUTO-GENERATED from dist/ffi/src/lib.rs by cbindgen. Do not edit by hand.
+ * The contract this header carries is docs/dist/C_ABI.md.
+ *
+ * One extern "C" surface over the published `sekejap` crate
+ * (docs/dist/RUST_API.md), for binding from Swift, Kotlin/JNI, Dart
+ * (dart:ffi), Go (cgo) and plain C/C++.
+ *
+ * Ownership: SekejapDb*, SekejapStmt*, SekejapTx* and SekejapScan* are opaque
+ * (an open/begin call creates one, the matching close/free call destroys it).
+ * Any char* the library RETURNS is yours -- free it once with
+ * sekejap_string_free, except sekejap_version, which points into static
+ * program data. Strings you PASS IN are borrowed UTF-8 and are never freed
+ * here.
+ *
+ * Errors: NULL for a failed pointer return, -1 for a failed integer return.
+ * sekejap_last_error(db) is the message and sekejap_last_error_code(db) is
+ * the closed enum a wrapper maps without parsing text; both read a
+ * THREAD-LOCAL slot, so a failed open with no handle still reports.
+ * No Rust panic crosses the boundary.
+ *
+ * Documents, parameters and rows are JSON text: a document is a JSON object,
+ * a parameter list is a JSON array, and an answer is a JSON array of objects
+ * keyed by column name.
+ */
+"""
+
+[export]
+prefix = ""
+
+[parse]
+parse_deps = false         # the sekejap handles are foreign -> emitted opaque
+
+[enum]
+prefix_with_name = true

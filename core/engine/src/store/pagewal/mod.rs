@@ -1,7 +1,7 @@
 //! Page-image WAL store: the selected V2 storage path for typed collections
 //! (docs/core/V2_COLLECTION_INTEGRATION.md). One writer per database, guarded by
 //! `writer.lock`. A transaction is PUBLISHED only after its commit frame's
-//! FULL barrier returned AND the writer recorded `(floor, tx, end)` in the
+//! barrier returned AND the writer recorded `(floor, tx, end)` in the
 //! two-copy publication hint inside `readers.lock`; readers beside a live
 //! writer are bounded to exactly that prefix and never guess, clamp or fall
 //! back. With no writer alive a reader derives the committed state from the
@@ -11,8 +11,17 @@
 //! gate and every slot, so no reader's page image is rewritten or its WAL
 //! frames reset underneath it. Frame, header and page formats are the
 //! accepted `E4PWAL02` layout and are unchanged by this integration.
+//!
+//! The barrier each of those publication points issues is the `SyncMode` the
+//! store was opened with, not a constant: `Full` issues `sync_full` (the
+//! drive-cache barrier, `fcntl(F_FULLFSYNC)` on macOS), `Normal` issues
+//! `sync_data` (`fdatasync` on Linux, plain `fsync` on macOS), `Off` issues
+//! none. `Normal` is the default of the published crate and is what SQLite
+//! with `fullfsync` off and PostgreSQL with a plain `fsync` give. Ordering is
+//! identical in all three: only the strength of the barrier changes, and
+//! `IoCounters::sync_full_calls` / `sync_data_calls` say which primitive ran.
 use kernel::{btree::{BTree, RangeIter, ReverseRangeIter}, budget::MemoryBudget, io::{self, FileIo, IoMode, Barrier},
-    page::{PageMut, PageRef, PageKind}, pool::BufferPool, recover::CandidateReader, Error, Result};
+    page::{PageMut, PageRef, PageKind}, pool::BufferPool, recover::CandidateReader, store::SyncMode, Error, Result};
 use std::{cell::Cell, collections::BTreeMap, fs::File, path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering}}};
 
@@ -197,6 +206,19 @@ pub struct IoCounters {
     pub wal_bytes_written: u64,
     pub data_bytes_written: u64,
     pub dirty_pages_flushed: u64,
+    /// Barriers actually issued as `sync_full` -- the drive-cache barrier,
+    /// `fcntl(F_FULLFSYNC)` on macOS and `File::sync_all` elsewhere. The
+    /// per-site counters above say WHERE a barrier was placed; this and
+    /// `sync_data_calls` say WHICH PRIMITIVE ran, which the site names
+    /// cannot, since they were named when every site was `sync_full`. Under
+    /// `SyncMode::Full` this equals the sum of the site counters plus the two
+    /// barriers a create issues before a handle exists; under `Normal`
+    /// `sync_data_calls` does; under `Off` both are zero.
+    pub sync_full_calls: u64,
+    /// Barriers actually issued as `sync_data` -- `fdatasync` on Linux, plain
+    /// `fsync` on macOS: durable against an OS or process crash, not against
+    /// a loss of power to a drive whose own cache lied.
+    pub sync_data_calls: u64,
     /// High-water mark, in frames, of the largest SINGLE transaction this
     /// handle has published (its page frames plus its commit frame). A
     /// transaction is refused whole once it passes the managed-byte
@@ -232,6 +254,8 @@ impl IoCounters {
             wal_bytes_written: self.wal_bytes_written.saturating_sub(prev.wal_bytes_written),
             data_bytes_written: self.data_bytes_written.saturating_sub(prev.data_bytes_written),
             dirty_pages_flushed: self.dirty_pages_flushed.saturating_sub(prev.dirty_pages_flushed),
+            sync_full_calls: self.sync_full_calls.saturating_sub(prev.sync_full_calls),
+            sync_data_calls: self.sync_data_calls.saturating_sub(prev.sync_data_calls),
             // A watermark has no difference to take: the larger of two
             // readings IS the reading for the interval that ends later.
             max_transaction_frames: self.max_transaction_frames,
@@ -250,6 +274,8 @@ struct IoAcc {
     metadata_fsyncs: AtomicU64,
     wal_bytes_written: AtomicU64,
     data_bytes_written: AtomicU64,
+    sync_full_calls: AtomicU64,
+    sync_data_calls: AtomicU64,
     max_transaction_frames: AtomicU64,
 }
 impl IoAcc {
@@ -266,6 +292,8 @@ impl IoAcc {
             metadata_fsyncs: AtomicU64::new(0),
             wal_bytes_written: AtomicU64::new(0),
             data_bytes_written: AtomicU64::new(0),
+            sync_full_calls: AtomicU64::new(0),
+            sync_data_calls: AtomicU64::new(0),
             max_transaction_frames: AtomicU64::new(0),
         }
     }
@@ -285,6 +313,8 @@ impl IoAcc {
             wal_bytes_written: g(&self.wal_bytes_written),
             data_bytes_written: g(&self.data_bytes_written),
             dirty_pages_flushed: 0,
+            sync_full_calls: g(&self.sync_full_calls),
+            sync_data_calls: g(&self.sync_data_calls),
             max_transaction_frames: g(&self.max_transaction_frames),
         }
     }
@@ -297,9 +327,35 @@ struct Pager {
     // `finish_open`. Lock order: `state` before `hint`.
     hint: Mutex<Option<Arc<dyn FileIo>>>,
     io: IoAcc,
+    /// The barrier every publication point of this handle issues. Carried
+    /// from the `Config` the store was opened with; a read-only handle keeps
+    /// the value it was admitted with and never issues a barrier at all.
+    sync: SyncMode,
 }
 impl Pager {
-    fn initialize(dir: &Path, features:u64) -> Result<()> {
+    /// The one place a page-WAL publication point turns a `SyncMode` into a
+    /// barrier. `site` is incremented when a barrier was actually issued, so
+    /// the existing per-site counters keep meaning "a barrier was placed
+    /// here"; `sync_full_calls`/`sync_data_calls` record which primitive ran.
+    /// Every site calls this, so a mode can never be honoured at five of the
+    /// six and hard-coded at the sixth.
+    fn barrier(io:&IoAcc, sync:SyncMode, f:&dyn FileIo, site:Option<&AtomicU64>) -> Result<()> {
+        match sync {
+            SyncMode::Full => {f.sync_full()?;IoAcc::add(&io.sync_full_calls,1);}
+            SyncMode::Normal => {f.sync_data()?;IoAcc::add(&io.sync_data_calls,1);}
+            SyncMode::Off => return Ok(()),
+        }
+        if let Some(c)=site {IoAcc::add(c,1);}
+        Ok(())
+    }
+    fn barrier_at(&self, f:&dyn FileIo, site:Option<&AtomicU64>) -> Result<()> {
+        Self::barrier(&self.io, self.sync, f, site)
+    }
+    /// Lay down the two metadata copies and the empty WAL. No `Pager` exists
+    /// yet, so the barriers here are counted by the caller into the handle
+    /// that is about to open these files; the returned pair is
+    /// (`sync_full_calls`, `sync_data_calls`) this create issued.
+    fn initialize(dir: &Path, features:u64, sync:SyncMode) -> Result<(u64,u64)> {
         let mut identity = [0;16];
         getrandom::fill(&mut identity).map_err(|e| std::io::Error::other(e.to_string()))?;
         let h = Header { root:0, free:0, cap:u64::MAX, identity, tx:0, features };
@@ -308,23 +364,26 @@ impl Pager {
         if data.len()? != 0 || wal.len()? != 0 { return Err(bad("initialize found existing bytes")); }
         data.write_at(&h.page(0)?, 0)?;
         data.write_at(&h.page(1)?, PAGE as u64)?;
-        data.sync_full()?;
+        let counts=IoAcc::new();
+        Self::barrier(&counts,sync,&*data,None)?;
         if disk_header(&*data)? != Some(h) { return Err(bad("initial metadata verification")); }
-        wal.sync_full()?;
-        data.sync_dir()
+        Self::barrier(&counts,sync,&*wal,None)?;
+        data.sync_dir()?;
+        let c=counts.snapshot();
+        Ok((c.sync_full_calls,c.sync_data_calls))
     }
-    fn open(dir: &Path) -> Result<Arc<Self>> {
+    fn open(dir: &Path, sync:SyncMode) -> Result<Arc<Self>> {
         let (data,_)=io::open_file(&dir.join("data"),IoMode::Buffered)?;
         let (wal,_)=io::open_file(&dir.join("wal"),IoMode::Buffered)?;
         let data:Arc<dyn FileIo>=Arc::from(data);let wal:Arc<dyn FileIo>=Arc::from(wal);
-        Self::from_files(data, wal)
+        Self::from_files(data, wal, sync)
     }
-    fn from_files(data:Arc<dyn FileIo>, wal:Arc<dyn FileIo>) -> Result<Arc<Self>> {
+    fn from_files(data:Arc<dyn FileIo>, wal:Arc<dyn FileIo>, sync:SyncMode) -> Result<Arc<Self>> {
         let state=Self::inspect(&*data,&*wal)?;
-        Ok(Self::with_state(data,wal,state))
+        Ok(Self::with_state(data,wal,state,sync))
     }
-    fn with_state(data:Arc<dyn FileIo>, wal:Arc<dyn FileIo>, state:State) -> Arc<Self> {
-        Arc::new(Self{data,wal,state:Mutex::new(state),readers:Arc::new(AtomicUsize::new(0)),hint:Mutex::new(None),io:IoAcc::new()})
+    fn with_state(data:Arc<dyn FileIo>, wal:Arc<dyn FileIo>, state:State, sync:SyncMode) -> Arc<Self> {
+        Arc::new(Self{data,wal,state:Mutex::new(state),readers:Arc::new(AtomicUsize::new(0)),hint:Mutex::new(None),io:IoAcc::new(),sync})
     }
     // Only the fully validated writer opener may normalize an uncommitted
     // tail. Under the gate (`held` when the opener took it before claiming
@@ -340,7 +399,7 @@ impl Pager {
         if self.wal.len()? != end { self.wal.set_len(end)?; }
         // A prefix recovered after a failed barrier is made durable before any
         // reader can be pointed at it.
-        self.wal.sync_full()?;IoAcc::add(&self.io.wal_fsyncs_open,1);
+        self.barrier_at(&*self.wal,Some(&self.io.wal_fsyncs_open))?;
         let (hint_io,_)=io::open_file(&dir.join(GATE),IoMode::Buffered)?;
         *self.hint.lock().unwrap()=Some(Arc::from(hint_io));
         let mut s=self.state.lock().unwrap();
@@ -467,7 +526,7 @@ impl Pager {
         }
         Ok(())
     }
-    // Publication order: commit frame, FULL barrier, hint, then the in-memory
+    // Publication order: commit frame, barrier, hint, then the in-memory
     // swap. A reader in any process can only be pointed at a prefix whose
     // barrier returned. If copy 0 of the hint failed, nothing is published:
     // readers and this handle stay on the previous transaction. If copy 0
@@ -483,7 +542,7 @@ impl Pager {
         // and the allowance is checked against their sum, so this is the
         // number a caller sizing its own transactions has to stay under.
         self.io.max_transaction_frames.fetch_max((s.end-s.last_commit)/FRAME as u64,Ordering::Relaxed);
-        self.wal.sync_full()?;IoAcc::add(&self.io.wal_fsyncs_commit,1);
+        self.barrier_at(&*self.wal,Some(&self.io.wal_fsyncs_commit))?;
         let (tx,end)=(s.tx,s.end);
         let r=self.write_hint(&mut s,tx,end);
         if s.hint_published {
@@ -509,7 +568,7 @@ impl Pager {
             IoAcc::add(&self.io.data_pages_written_at_checkpoint,1);IoAcc::add(&self.io.data_bytes_written,PAGE as u64);
             if fault==1 {std::process::exit(86);}
         }
-        self.data.set_len(s.pages as u64*PAGE as u64)?;self.data.sync_full()?;IoAcc::add(&self.io.data_fsyncs_checkpoint,1);
+        self.data.set_len(s.pages as u64*PAGE as u64)?;self.barrier_at(&*self.data,Some(&self.io.data_fsyncs_checkpoint))?;
         if fault==2 {std::process::exit(86);}
         // Independent read-back precedes dropping the WAL. Cost is measured.
         for (&p,&off) in &s.latest {
@@ -521,11 +580,11 @@ impl Pager {
         }
         // Advance the checkpoint floor only after its data is durable and
         // verified. `metadata_write_order` replaces the damaged or older copy
-        // first. That copy is FULL-synced before the other is touched, so a
+        // first. That copy is barriered before the other is touched, so a
         // crash never leaves zero valid headers. The second copy is written
         // and read back but not synced: a crash may leave it torn or stale,
         // which `disk_header` already accepts by selecting the newer valid
-        // copy. Copy 1 rides the next data-file FULL sync (the following
+        // copy. Copy 1 rides the next data-file barrier (the following
         // checkpoint's page copy-back). The WAL is truncated without a FULL
         // sync (option 3): leftover pre-truncate frames are idempotent under
         // the identity + transaction-floor binding on open, and every open
@@ -539,14 +598,14 @@ impl Pager {
             let page = header.page(no)?;
             self.data.write_at(&page,no as u64*PAGE as u64)?;IoAcc::add(&self.io.data_bytes_written,PAGE as u64);
             if (fault==5&&step==0)||(fault==6&&step==1) {std::process::exit(86);}
-            if step==0 { self.data.sync_full()?;IoAcc::add(&self.io.metadata_fsyncs,1); }
+            if step==0 { self.barrier_at(&*self.data,Some(&self.io.metadata_fsyncs))?; }
             let mut actual=[0;PAGE];self.data.read_at(&mut actual,no as u64*PAGE as u64)?;
             if actual != page { return Err(bad("checkpoint metadata read-back mismatch")); }
             Header::decode(&actual,no)?;
         }
         if fault==3 {std::process::exit(86);}
         // Fault 7 (option 3): snapshot the committed WAL, truncate without a
-        // WAL FULL sync, then put the pre-truncate bytes back so reopen sees
+        // WAL barrier, then put the pre-truncate bytes back so reopen sees
         // case (b) — leftover frames of the just-absorbed floor, not a stale
         // earlier incarnation.
         let mut lost_truncate=None;
@@ -679,7 +738,12 @@ fn enforce_reader_bound(slot:&ReaderSlot,bound:Option<usize>)->Result<()>{
 fn admit_quiescent(dir:&Path,owner:File,cache:usize,check:impl FnOnce(&PageWalStore)->Result<Option<usize>>)->Result<PageWalStore>{
     let data:Arc<dyn FileIo>=io::open_file_readonly(&dir.join("data"))?.into();
     let wal:Arc<dyn FileIo>=io::open_file_readonly(&dir.join("wal"))?.into();
-    let pager=Pager::from_files(data,wal)?;
+    // A read-only handle issues no barrier at any point: its files refuse
+    // both primitives outright, and `finish_open`, `publish` and
+    // `checkpoint_with_crash` are writer paths. The mode carried here is
+    // therefore inert; `Full` keeps a reader that somehow reached a
+    // publication point refused rather than silently doing nothing.
+    let pager=Pager::from_files(data,wal,SyncMode::Full)?;
     let mut store=snapshot_store(&pager,None,dir,cache,None)?;
     let bound=check(&store)?;
     create_coordination(dir)?;
@@ -711,7 +775,8 @@ fn admit_live(dir:&Path,cache:usize,check:impl FnOnce(&PageWalStore)->Result<Opt
     if state.last_commit!=end || state.tx-1!=hint.published_tx {
         return Err(unavailable("publication hint does not name a commit at its bound"));
     }
-    let pager=Pager::with_state(data,wal,state);
+    // Inert, as in `admit_quiescent`: a reader never reaches a barrier.
+    let pager=Pager::with_state(data,wal,state,SyncMode::Full);
     drop(gate);
     let store=snapshot_store(&pager,None,dir,cache,Some(slot))?;
     let bound=check(&store)?;
@@ -772,13 +837,24 @@ pub struct PageWalStore {
     tags:kernel::btree::TagHints,
 }
 impl PageWalStore {
+    /// Open (or create) a writer under the STRONGEST barrier. The page-WAL
+    /// honours all three `SyncMode`s -- see `open_sync` -- and the published
+    /// crate defaults to `Normal`; this three-argument spelling stays `Full`
+    /// so a fault or format fixture that wants the drive-cache barrier keeps
+    /// asking for nothing. A caller that carries a `Config` uses `open_sync`.
     pub fn open(dir:&Path,create:bool,cache:usize)->Result<Self>{
-        Self::open_inner(dir,create,cache,None,Pager::open,|_|Ok(()))
+        Self::open_sync(dir,create,cache,SyncMode::Full)
+    }
+    /// Open (or create) a writer whose every publication point issues the
+    /// barrier `sync` names: `Full` -> `sync_full`, `Normal` -> `sync_data`,
+    /// `Off` -> none. Ordering is the same in all three.
+    pub fn open_sync(dir:&Path,create:bool,cache:usize,sync:SyncMode)->Result<Self>{
+        Self::open_inner(dir,create,cache,None,sync,Pager::open,|_|Ok(()))
     }
     /// Explicit new-database codec, without changing the process default.
     /// Rebuilds preserve their source's codec even beside unrelated creates.
-    pub(crate) fn create_with_compact_cells(dir:&Path,cache:usize,compact:bool)->Result<Self>{
-        Self::open_inner(dir,true,cache,Some(if compact {COMPACT_CELLS} else {0}),Pager::open,|_|Ok(()))
+    pub(crate) fn create_with_compact_cells(dir:&Path,cache:usize,compact:bool,sync:SyncMode)->Result<Self>{
+        Self::open_inner(dir,true,cache,Some(if compact {COMPACT_CELLS} else {0}),sync,Pager::open,|_|Ok(()))
     }
     /// Managed bytes sufficient to create an empty tree and persist its cap:
     /// three pages, root/header/commit frames, then cap-header/commit frames.
@@ -789,11 +865,11 @@ impl PageWalStore {
     /// created. A layer above (typed collections) refuses an unsupported
     /// catalog here without any byte of the source changing; a refused open
     /// releases the writer lock untouched.
-    pub fn open_validated(dir:&Path,create:bool,cache:usize,check:impl FnOnce(&Self)->Result<()>)->Result<Self>{
-        Self::open_inner(dir,create,cache,None,Pager::open,check)
+    pub fn open_validated(dir:&Path,create:bool,cache:usize,sync:SyncMode,check:impl FnOnce(&Self)->Result<()>)->Result<Self>{
+        Self::open_inner(dir,create,cache,None,sync,Pager::open,check)
     }
-    fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path)->Result<Arc<Pager>>)->Result<Self>{
-        Self::open_inner(dir,create,cache,None,opener,|_|Ok(()))
+    fn open_with(dir:&Path,create:bool,cache:usize,opener:impl FnOnce(&Path,SyncMode)->Result<Arc<Pager>>)->Result<Self>{
+        Self::open_inner(dir,create,cache,None,SyncMode::Full,opener,|_|Ok(()))
     }
     fn new_pool(file:Arc<dyn FileIo>,cache:usize,writer:bool)->Result<BufferPool>{
         let pool=BufferPool::new(file,Arc::new(MemoryBudget::new(cache)),cache/PAGE)?;
@@ -805,7 +881,8 @@ impl PageWalStore {
     /// encode, but decode both families unconditionally, so this is only
     /// meaningful on a writer's pool.
     fn install_codec(pool:&BufferPool,features:u64){ pool.set_compact_cells(features & COMPACT_CELLS != 0); }
-    fn open_inner(dir:&Path,create:bool,cache:usize,create_codec:Option<u64>,opener:impl FnOnce(&Path)->Result<Arc<Pager>>,
+    fn open_inner(dir:&Path,create:bool,cache:usize,create_codec:Option<u64>,sync:SyncMode,
+        opener:impl FnOnce(&Path,SyncMode)->Result<Arc<Pager>>,
         check:impl FnOnce(&Self)->Result<()>)->Result<Self>{
         if create {
             // A create makes the directory, so a half-made one can never be
@@ -836,8 +913,14 @@ impl PageWalStore {
         // A quiescent reader admission holds this shared for one bounded
         // scan; a writer arriving in that window is refused, not queued.
         if !io::try_lock_exclusive(&lock)?{return Err(Error::WriterLocked);}
-        if create { Pager::initialize(dir,create_codec.unwrap_or_else(create_features))?; }
-        let pager=opener(dir)?;let file:Arc<dyn FileIo>=pager.clone();
+        let created=if create { Some(Pager::initialize(dir,create_codec.unwrap_or_else(create_features),sync)?) } else { None };
+        let pager=opener(dir,sync)?;let file:Arc<dyn FileIo>=pager.clone();
+        // The create's two barriers were issued before this handle existed.
+        // Fold them in so the handle's counters cover every barrier its own
+        // database has ever seen, which is what the six-site oracle counts.
+        if let Some((full,data))=created {
+            IoAcc::add(&pager.io.sync_full_calls,full);IoAcc::add(&pager.io.sync_data_calls,data);
+        }
         // Every SUPPORTED feature set is writable by every build of this
         // release; `Header::decode_slot` already refused anything outside it.
         // The writer adopts the database's declared encoding instead of
@@ -1087,8 +1170,9 @@ impl PageWalStore {
         // it, so `!dirty` means not one byte has changed since the last
         // acknowledged commit. Publishing anyway rewrote the meta page with
         // the root it already carried, appended a 4 KiB commit frame for it
-        // and issued a FULL barrier -- on macOS `fcntl(F_FULLFSYNC)`, measured
-        // at 11.9 ms on the reference volume against 1.45 ms for `fsync`.
+        // and issued a barrier -- under `SyncMode::Full` on macOS that is
+        // `fcntl(F_FULLFSYNC)`, measured at 11.9 ms on the reference volume
+        // against 1.45 ms for the `fsync` `Normal` issues there.
         // Nothing observable followed from it: readers were already on this
         // transaction, and the next transaction number is not a promise to
         // anyone.

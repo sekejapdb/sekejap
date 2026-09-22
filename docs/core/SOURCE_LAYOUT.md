@@ -10,8 +10,9 @@ layer owns what and how to run each layer's tests; this document is the module
 map inside them. The crate a path belongs to reads off its first segment:
 `core/kernel/` is `kernel`, `core/engine/` is `sekejap-core` (lib
 `sekejap_core`), `lang/` is `sekejap-lang` (lib `sekejap_lang`), `dist/` is
-`sekejap-dist`, `dist/rust/` is `sekejap` (the PUBLISHED crate name), `bench/`
-is `sekejap-bench`.
+`sekejap-dist`, `dist/rust/` is `sekejap` (the PUBLISHED crate name),
+`dist/ffi/` is `sekejap-capi` (lib `sekejap`, so `libsekejap` on disk),
+`bench/` is `sekejap-bench`.
 
 Contract documents referenced below: `docs/core/GRAPH_CONTRACT.md`,
 `docs/lang/QL_CONTRACT.md` (the query-language contract, drafted 2026-09-20;
@@ -45,6 +46,7 @@ current headings are numbered `## 1.` through `## 7.`),
 | `core/engine/src/collections/mod.rs` | `Database`, `CollectionId`, `EntityId`, `Kind`-typed collections, put/get/delete, the catalog and header records, and every public re-export the crate has ever offered from `collections`. The catalog record also carries the DECLARED SQL spellings of the columns whose `Kind` does not name them (`TIMESTAMPTZ`, `DATE`: both `Kind::Int`), behind flag bit 2 of its own frozen flags byte. | `docs/core/COLLECTIONS.md`; `docs/lang/QL_CONTRACT.md` §4.2 |
 | `core/engine/src/collections/catalog.rs` | The index catalog: `IndexInfo`/`IndexId`/`IndexFamily`/`IndexState`/`IndexExpr`, index create/drop, the index trees, scalar keys (`skey`) and index maintenance on write. An EXPRESSION index is a scalar index whose stored value is a closed function of its declared field (descriptor version 3, `EXPRESSION_FEATURE`). | `docs/core/COLLECTIONS.md`; `docs/lang/QL_CONTRACT.md` §4.1 |
 | `core/engine/src/collections/column_rules.rs` | The per-field COLUMN RULE slot: `ColumnRule`/`DefaultValue`, the catalog record's RULES tail and its `CATALOG_RULES` flag bit, the additive `COLUMN_RULES_FEATURE` bit, the write-path application (defaults filled into a MISSING field, then the NOT NULL check), and the RFC 4122 UUID generators with the SHA-1 they need. | `docs/lang/QL_CONTRACT.md` §2 (`DEFAULT`, `NOT NULL`) |
+| `core/engine/src/collections/row_count.rs` | The LIVE ROW COUNT: one record per collection (key tag `0x08`, value `rows: u64 \|\| generation: u64`), the per-transaction delta the write path accumulates and `commit` writes once per touched collection, `Database::row_count`, `Database::backfill_row_counts` (the bounded, resumable build for a database that has none) and the additive `ROW_COUNT_FEATURE` bit. | `docs/core/FORMAT_V2.md`; `docs/lang/QL_CONTRACT.md` §4.7 (`count(*)`) |
 | `core/engine/src/collections/drop_collection.rs` | Removing a collection: `DropMode`/`DropPhase`/`DropState`/`DropProgress`, `begin_drop_collection[_mode]`, `drop_collection_step`, the `DROP_FEATURE` bit and the descriptor's DROPPING tail. | `docs/lang/QL_CONTRACT.md` §2 (`DROP TABLE`); `docs/core/GRAPH_CONTRACT.md` §6.1 |
 | `core/engine/src/collections/write_set.rs` | Bounded, resumable writes over a CANDIDATE SET: `Database::delete_where` / `update_where` / `write_where`, `WriteRequest`/`WriteAction`/`WriteProgress`, `UpdatePatch`/`PatchValue` (the `&mut dyn FnMut(&Value) -> Result<Value>` closure boundary a row expression crosses), `DeleteMode` and the per-row GRAPH_CONTRACT 6.1 RESTRICT preflight. Also the bulk write scope `begin_bulk` / `end_bulk`, whose outermost close commits. | `docs/lang/QL_CONTRACT.md` §2 (`UPDATE ... WHERE`, `DELETE ... WHERE`, `BEGIN BULK`); `docs/core/GRAPH_CONTRACT.md` §6.1; `docs/dist/OPS_CONTRACT.md` §7 |
 | `core/engine/src/collections/rebuild.rs` | Offline rebuild of a database into a fresh file, sorted index builds included. Public as `collections::rebuild`. | `docs/core/COLLECTIONS.md` |
@@ -68,6 +70,8 @@ current headings are numbered `## 1.` through `## 7.`),
 | `core/engine/src/index/spatial/geometry.rs` | The GeoJSON geometry model and its predicates. Public as `sekejap_core::spatial_geometry`. | `docs/core/SPATIAL_FUNCTIONS.md` |
 | `core/engine/src/index/spatial/math.rs` | Geodesic distance, radius bounds, Hilbert ranges. Public as `sekejap_core::spatial_math`. | `docs/core/SPATIAL_FUNCTIONS.md` |
 | `core/engine/src/index/graph/mod.rs` | Typed edges, edge/context names, the graph header, bounded neighbour and BFS traversals, the per-hop edge predicates and the reaching edge each result binds, cascade delete. | `docs/core/GRAPH_CONTRACT.md` §4.1-4.3 |
+| `core/engine/src/index/graph/mod.rs` (catalog readers) | `Database::graph_names`, the name dictionary read as catalog data (one entry per interned edge type and graph context, capped at 4,096 per kind, no edge read); `Database::edge_shape`, the catalog's EDGE-TYPE ROWS -- one entry per distinct `(context, type, from collection, to collection)` derived from written edges, one descent per distinct `(source entity, context, type, destination collection)` and capped, with truncation reported. | `docs/core/GRAPH_CONTRACT.md` 2.5, 3.4; `docs/lang/QL_CONTRACT.md` §1 (catalog) |
+| `core/engine/src/index/graph/endpoints.rs` | The ENDPOINT SETS (tag `0x7E`, additive `ENDPOINT_FEATURE = 0x4000`): one key per DISTINCT entity with at least one edge of a (context, type, direction), the write-path maintenance on both ends of a new and of a removed edge, `Database::backfill_endpoint_sets` for a database whose edges predate them, and the read `Database::edge_endpoints` answers a semi-join from. | `docs/core/GRAPH_CONTRACT.md` §4.1; `docs/lang/QL_CONTRACT.md` §3 (semi-join) |
 
 The scalar index family has no directory: its keys are `store::scalar_key`,
 its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
@@ -92,9 +96,11 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 
 | Module | Atomic | Contract |
 | --- | --- | --- |
+| `lang/src/catalog.rs` | The CATALOG SURFACE as VIRTUAL ROWS: the relation directory (`db_tables`, `db_columns`, `db_indexes`, `db_edges`, `db_contexts`; `information_schema.{schemata,tables,columns,table_constraints,key_column_usage}`; `pg_catalog.{pg_namespace,pg_class,pg_attribute,pg_type,pg_index,pg_indexes,pg_description,pg_constraint,pg_tables}`; PostGIS `geometry_columns` and `spatial_ref_sys`), the PostgreSQL type OIDs each column is described with, the synthetic object OID, and the builders that compute every row at PREPARE from `list_collections` / `collection_info` / `list_indexes` / `row_count` / `graph_names` / `edge_shape`. Nothing is stored. | `docs/lang/QL_CONTRACT.md` §1 (catalog); `docs/dist/PG_SURFACE.md` |
 | `lang/src/lexer.rs` | The tokenizer: every operator PostgreSQL and its extensions spell, so a refusal can NAME what it refuses. | `docs/lang/QL_CONTRACT.md` §1 |
 | `lang/src/ast.rs` | The shape of the text: statements, predicates, order keys, row expressions. Nothing here knows about indexes. | `docs/lang/QL_CONTRACT.md` §2 |
 | `lang/src/parser/mod.rs` | The token stream, the `Parser` struct, statement dispatch and the shared helpers; `flatten_and` and `lower`. | `docs/lang/QL_CONTRACT.md` §2, §3 |
+| `lang/src/parser/catalog.rs` | The statements a PostgreSQL client writes that have no collection in them: the FROM-less `SELECT` of session facts (`version()`, `current_schema()`, `current_user`, `pg_backend_pid()`, `current_setting()`, `SELECT 1`), the `SHOW` family, and the closed list of client GUCs a driver `SET`s on connect with the constant each reports. | `docs/lang/QL_CONTRACT.md` §2; `docs/dist/PG_SURFACE.md` §3-§5 |
 | `lang/src/parser/select.rs` | `SELECT`: select list, `GROUP BY`, `HAVING`, aggregate calls. | `docs/lang/QL_CONTRACT.md` §2, §3 |
 | `lang/src/parser/expr.rs` | `WHERE`, the boolean tree, `ORDER BY` arithmetic, the §4.1/§4.2 function predicates and row expressions, literals and casts. | `docs/lang/QL_CONTRACT.md` §2, §3 |
 | `lang/src/parser/graph_table.rs` | `GRAPH_TABLE` patterns, quantifiers, `COLUMNS`. | `docs/lang/QL_CONTRACT.md` §2, §3 |
@@ -104,6 +110,7 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 | `lang/src/compile/plan.rs` | `SelectPlan`, `OwnedFilter`/`OwnedOrder`, the borrowed-view builders, `WritePlan`. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/compile/aggregate.rs` | `AggregatePlan` and `GROUP BY`/`DISTINCT`/accumulator compilation. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/compile/row.rs` | Row functions over projected values (`CompiledRow`, `iso_text`). | `docs/lang/QL_CONTRACT.md` §4, §6 |
+| `lang/src/compile/rows.rs` | The `Rows` DRIVER: a bounded in-memory row source the compiler builds at prepare, and the one thing the catalog surface adds to the plan. `RowsPlan`, the per-row predicate evaluator (`RowFilter`), the `ORDER BY` / `DISTINCT` / `LIMIT` over the list, the §4.1 string row functions over a catalog column, the `SHOW` forms and `SHOW CREATE TABLE`, and the EXPLAIN that names the driver and the row count. The bound is the catalog's size; nothing resumes because the whole relation fits in one answer by construction. | `docs/lang/QL_CONTRACT.md` §1 (catalog), §2 (`SHOW`); `docs/dist/PG_SURFACE.md` |
 | `lang/src/compile/select.rs` | Select list, projection, `ORDER BY`, vector order, score expressions. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/compile/boolean.rs` | `where_filter` (the boolean tree), `semi_join`, negated tsquery. | `docs/lang/QL_CONTRACT.md` §4, §6 |
 | `lang/src/compile/predicates.rs` | `filter()` and its scalar, text and spatial leaves. | `docs/lang/QL_CONTRACT.md` §4, §6 |
@@ -120,8 +127,8 @@ its catalog entry is `collections::catalog`, and its walk is `query::drivers`.
 
 `docs/dist/OPS_CONTRACT.md` §1-§5, built here because an operator surface
 belongs to `dist` and because composing `Database` handles is exactly what
-this layer is for. `dist/src/cli/` (the operator binaries) and
-`dist/src/pg/` (declared, not built) are listed in `docs/LAYERS.md`.
+this layer is for. `dist/src/cli/` (the operator binaries) is listed in
+`docs/LAYERS.md`; `dist/src/pg/` has its own section below.
 
 | Module | Atomic | Contract |
 | --- | --- | --- |
@@ -130,6 +137,23 @@ this layer is for. `dist/src/cli/` (the operator binaries) and
 | `dist/src/service/interrupt.rs` | `InterruptHandle`: the cloneable `Arc<AtomicBool>` a second thread holds, sticky until cleared, one relaxed load per charge. | `docs/dist/OPS_CONTRACT.md` §4 |
 | `dist/src/service/changes.rs` | The change feed: `ChangeEvent`, `ChangedKey`, `Receiver`, the per-subscriber bounded queue (`CHANGE_QUEUE_BOUND` = 256) and the per-event key cap (`CHANGE_KEY_CAP` = 1,024), the `PendingBatch` accumulator a commit drains and a rollback drops, and `Subscribers::deliver`, which never waits for a slow subscriber. | `docs/dist/OPS_CONTRACT.md` §5 |
 | `dist/tests/service.rs` | One test per rule §1-§5 states, with the oracle held in the test process: the L6 reader, the measured publish window, the `Deadline` refusal and its elapsed microseconds, the cross-thread cancel, one event per commit and none on rollback, the counted `lagged` drop, and the second-writer refusals. | `docs/dist/OPS_CONTRACT.md` §1-§5, `docs/core/FOUNDATION_TEST_STANDARD.md` L3, L4, L6 |
+
+## `dist/src/pg/` -- the PostgreSQL wire protocol
+
+`docs/dist/WIRE_CONTRACT.md` over `docs/dist/OPS_CONTRACT.md` §9, built here
+because the surface a stock PostgreSQL client connects to is a distribution
+surface. It adds no execution: every statement compiles through
+`sekejap_lang` and runs on the engine's own atomics over `dist/src/service/`.
+
+| File | What is in it | Contract |
+|---|---|---|
+| `dist/src/pg/connection.rs` | `Connection`, the whole protocol engine, SANS-IO: `feed(&[u8]) -> Vec<u8>`, the startup exchange, the simple and extended query flows, portals with row limits, the `DECLARE`/`FETCH`/`MOVE`/`CLOSE` cursors and the two ceilings a HELD answer is bounded by (`CURSOR_ROW_CAP`, `CURSOR_BYTES_CAP`), the transaction block over `WriterGuard`, the session GUCs, `LISTEN` over the change feed, `BackendKey` and `CancelToken`, and the named refusal `NOTIFY_REFUSAL`. | `docs/dist/WIRE_CONTRACT.md` §1, §2, §4, §5, §6, §7; `docs/dist/OPS_CONTRACT.md` §9; `docs/lang/QL_CONTRACT.md` §2 |
+| `dist/src/pg/frames.rs` | The BYTES and nothing else: every backend and frontend message type, the framing writers, `FieldDescription`, `TransactionStatus`, and the `Reader` whose every COUNT is checked against `remaining()` before it is believed. | `docs/dist/WIRE_CONTRACT.md` §1 |
+| `dist/src/pg/types.rs` | The `pg_type` OID table (`oid::*`, including the two SYNTHETIC ones for `geometry` and `vector`), `type_size` / `type_name`, the declared-spelling and `Kind` mappings, the text and binary encodings of one cell, `$n` decoding, and the SQLSTATE map (`wire_error`). | `docs/dist/WIRE_CONTRACT.md` §3, §8; `docs/dist/PG_SURFACE.md` |
+| `dist/src/pg/server.rs` | The transport: `bind` (which refuses a non-loopback address without `allow_remote`), `serve` over `std::thread::scope`, `Backends` (the `(pid, secret)` registry a `CancelRequest` is routed through), `Shutdown`, and `SecretStream`. | `docs/dist/WIRE_CONTRACT.md` §1.1, §4, §9 |
+| `dist/src/cli/pg_server.rs` | The `sekejap-pg` binary: arg parsing, one `ServiceDatabase` for the process, the publish interval set to zero so a session reads its own writes. | `docs/dist/WIRE_CONTRACT.md` §0, §7 |
+| `dist/tests/pg_wire.rs` | The bytes, a frame at a time, with every frame built in the test. | `docs/dist/WIRE_CONTRACT.md` §10 |
+| `dist/tests/pg_server.rs` | END-TO-END: the real binary on a free localhost port, driven by the `postgres` crate and by `psql`. | `docs/dist/WIRE_CONTRACT.md` §10 |
 
 ## `dist/rust/src/` -- the published crate
 
@@ -147,6 +171,23 @@ a composition of calls `core`, `lang` and `dist` already export.
 | `dist/rust/src/error.rs` | `Error` and `Result`: one error type, with a refusal that carries both what was asked for and why there is no atomic. | `docs/dist/RUST_API.md` §8 |
 | `dist/rust/src/plans.rs` | The bounded prepared-plan cache (`PlanCache`, `CacheStats`, the three ceilings fixed at open) and `Statement`, the statement a caller prepares by hand: parsed at `Db::prepare`, compiled on its first bind, rebound after. | `docs/lang/QL_CONTRACT.md` §2; `docs/dist/RUST_API.md` §3 |
 | `dist/rust/tests/api.rs` | One test per section of `RUST_API.md`, against a `BTreeMap`/`BTreeSet` oracle held in the test process. | `docs/dist/RUST_API.md`, `docs/core/FOUNDATION_TEST_STANDARD.md` L1, L4, L8 |
+
+## `dist/ffi/` -- the C ABI
+
+`docs/dist/C_ABI.md`, built here because the surface a foreign runtime links
+is the outermost layer's, and kept a separate crate because a `cdylib` and the
+published `rlib` are different artifacts with different consumers. It depends
+on `sekejap` and `serde_json` and on nothing else.
+
+| Module | Atomic | Contract |
+| --- | --- | --- |
+| `dist/ffi/src/lib.rs` | The whole `extern "C"` surface, 59 functions: the four opaque handles (`SekejapDb`, `SekejapStmt`, `SekejapTx`, `SekejapScan`), the thread-local error slot and its total mapping from `sekejap::Error` onto the closed `SekejapStatus`, the four `catch_unwind` guards that keep a panic off the boundary, the JSON encode and decode for documents, parameters, rows, the catalog, the store configuration and the change event, and the four symbols kept as REFUSALS so a caller reaching for them gets a name and a reason. | `docs/dist/C_ABI.md`; `docs/dist/FFI_CONTRACT.md` §0, §2, §8 |
+| `dist/ffi/build.rs` | Regenerates `include/sekejap.h` from the surface with cbindgen on every build; a cbindgen failure warns and the committed header stays authoritative. | `docs/dist/C_ABI.md` §5 |
+| `dist/ffi/cbindgen.toml` | The header preamble -- the ownership rules and the sentinels a C reader sees first -- and the C99 style the generator emits. | `docs/dist/C_ABI.md` §1 |
+| `dist/ffi/include/sekejap.h` | The generated header, committed as the artifact a consumer includes and as the fallback when cbindgen is not installed. | `docs/dist/C_ABI.md` §4 |
+| `dist/ffi/Makefile`, `dist/ffi/sekejap.pc.in` | Build, `check` (compile and RUN `examples/smoke.c`), and install the library, the header and the pkg-config file a consumer resolves them with. | `docs/dist/C_ABI.md` §5 |
+| `dist/ffi/examples/smoke.c` | The shortest C program that opens, declares, writes, queries, links, counts and closes, with every check reported and a non-zero exit on a failure. Run by `make check`. | `docs/dist/C_ABI.md` |
+| `dist/ffi/tests/abi.rs` | The ABI exercised through its C signatures with `CString`/`CStr`: the round trip against a `BTreeMap` oracle, the JSON shapes, every error path's sentinel AND code, the scan at three page sizes, the prepared rebind, commit and rollback, the service calls refused in single mode, ten thousand strings taken and freed, and one handle serving two threads. | `docs/dist/C_ABI.md`, `docs/core/FOUNDATION_TEST_STANDARD.md` L1, L4, L8 |
 
 ## `core/engine/src/faults/` -- in-crate fault injection
 
@@ -178,6 +219,23 @@ lives here so every fault suite is in one place:
 6. `PreparedQuery::a_filter_reads_the_row` and `filters_are_row_pure` in
    `core/engine/src/query/page.rs` decide whether the new filter forces a row read; both
    must name it.
+
+**A new CATALOG RELATION (a `db_*` row or a `pg_catalog` view).**
+1. Its column list, with one PostgreSQL type OID per column, goes in
+   `lang/src/catalog.rs` beside the others, and the relation goes in
+   `RELATIONS` with the schema a statement may qualify it with.
+2. Its builder goes in `catalog::build`, as an arm keyed on
+   `(schema, name)`. It reads `Snapshot`, which reads the catalog ONCE; a
+   relation that needs a reader the snapshot does not have adds it there, not
+   in the arm, so one statement pays each reader once.
+3. If the relation is NOT catalog-bounded, its cap is a named constant in the
+   same file and a truncated answer returns a NOTICE that says it stopped.
+   `db_edges` and `EDGE_SHAPE_SEEKS` are the one example.
+4. Its columns and its OIDs go in `docs/dist/PG_SURFACE.md` §8, and the
+   statements a client writes against it in §10.
+5. A `pg_catalog` relation sekejap will NOT have goes in `catalog::NOT_PROVIDED`
+   and in `lang/src/refuse.rs` instead, so a `SELECT` naming it is refused by
+   name rather than answered with an empty set that reads as a fact.
 
 **A new `QueryOrder`.**
 1. The variant goes on `QueryOrder` in `core/engine/src/query/mod.rs`.

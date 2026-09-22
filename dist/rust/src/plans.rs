@@ -253,21 +253,30 @@ impl<'a> Statement<'a> {
             compiles,
         } = self;
         *binds += 1;
-        db.write(|database| {
-            match compiled.as_mut() {
-                Some(prepared) => {
-                    if !prepared.rebindable() {
-                        *compiles += 1;
+        db.in_transaction(|tx| {
+            let rows = {
+                let database = tx.database();
+                match compiled.as_mut() {
+                    Some(prepared) => {
+                        if !prepared.rebindable() {
+                            *compiles += 1;
+                        }
+                        prepared.bind(database, &params)?;
                     }
-                    prepared.bind(database, &params)?;
+                    None => {
+                        *compiles += 1;
+                        *compiled = Some(prepare_sql(database, sql, &params)?);
+                    }
                 }
-                None => {
-                    *compiles += 1;
-                    *compiled = Some(prepare_sql(database, sql, &params)?);
-                }
-            }
-            let prepared = compiled.as_ref().expect("just bound");
-            expect_affected(prepared.run_mut(database)?, sql)
+                let prepared = compiled.as_ref().expect("just bound");
+                expect_affected(prepared.run_mut(database)?, sql)?
+            };
+            // A prepared write runs a COMPILED plan, and the recorded path
+            // takes statement TEXT, so the feed cannot attribute this to a
+            // collection. It is counted where the feed says such writes are
+            // counted rather than going unreported.
+            tx.note_unnamed_write(rows);
+            Ok(rows)
         })
     }
 

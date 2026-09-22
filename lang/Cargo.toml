@@ -3,18 +3,23 @@ name = "sekejap-lang"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+description = "The sekejap query language: SQL over the engine, with prepared statements and a pg_catalog surface"
+repository = "https://github.com/sekejapdb/sekejap"
+homepage = "https://github.com/sekejapdb/sekejap"
+readme = "README.md"
+keywords = ["sql", "database", "query", "parser", "catalog"]
+categories = ["database-implementations", "parser-implementations"]
 
 [lib]
 name = "sekejap_lang"
 path = "src/lib.rs"
 
 [dependencies]
-sekejap-core = { path = "../core/engine" }
+sekejap-core = { path = "../core/engine", version = "0.17.0" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [dev-dependencies]
-kernel = { package = "sekejap-kernel", path = "../core/kernel", features = ["test-support"] }
+kernel = { package = "sekejap-kernel", path = "../core/kernel", version = "0.17.0", features = ["test-support"] }
 tempfile = "3"
 
 [features]

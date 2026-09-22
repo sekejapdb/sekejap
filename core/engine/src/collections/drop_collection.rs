@@ -51,6 +51,7 @@
 //! code and opens in every older binary.
 use super::*;
 use crate::collections::catalog::{COLLECTION_INDEX, INDEX_NAME};
+use crate::index::graph::endpoints::DROP_PROBE_SEEKS;
 use crate::index::graph::{PRIMARY_EDGE, REVERSE_EDGE};
 
 /// The collection-header bit that says one catalog record in this file
@@ -483,6 +484,26 @@ impl Database {
                 }
             }
         }
+        // The ENDPOINT SET keyspace is the one keyspace of this collection
+        // that is NOT one contiguous range: a `0x7E` key is filed by
+        // (context, type, direction) first and by its entity second. So the
+        // probe seeks per RUN -- one descent per distinct triple present,
+        // bounded by the graph's name dictionary and not by its edges -- and
+        // says so when it gives up rather than claiming the keyspace empty.
+        // See `Database::collection_has_endpoint_key`.
+        let (found, truncated) = self.collection_has_endpoint_key(c.id)?;
+        if found {
+            return Err(corrupt(format!(
+                "drop of `{}` reached its last step with its graph endpoint-set keyspace not empty",
+                c.name
+            )));
+        }
+        if truncated {
+            return Err(invalid(format!(
+                "drop of `{}` cannot prove its graph endpoint-set keyspace empty: more than {DROP_PROBE_SEEKS} distinct (context, edge type, direction) runs",
+                c.name
+            )));
+        }
         let removed = 3 + 3 + 3 + 1;
         let total = state.removed + removed;
         // A buffered sequence for this collection would be flushed by the
@@ -491,6 +512,10 @@ impl Database {
             self.sequence = None;
         }
         self.writer()?.delete(&name_key(&c.name))?;
+        // The live row-count record of a collection that no longer exists.
+        // Its keyspace is one key, so there is nothing to probe: it goes with
+        // the name and the replicas.
+        self.remove_row_count(c.id)?;
         for copy in 0..3 {
             self.writer()?.delete(&replica_key(1, c.id.0, copy))?;
             self.writer()?.delete(&replica_key(2, c.id.0, copy))?;

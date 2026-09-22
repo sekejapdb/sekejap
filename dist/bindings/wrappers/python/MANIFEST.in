@@ -1,0 +1,15 @@
+# What the SOURCE distribution carries: the wrapper, its tests, its examples
+# and its Makefile. No native library -- an sdist is pure Python, and a
+# library inside one would be a library for the wrong machine.
+#
+# The wheel is the other half of the pair: a wheel job copies `libsekejap`
+# into `python/sekejap/_lib/` first, and `[tool.setuptools.package-data]`
+# puts it in the wheel. Build the sdist from a tree with no staged library
+# (`make sdist` removes one), because a MANIFEST rule that pruned it here
+# would take it out of the wheel as well.
+include README.md
+include Makefile
+include bench.py
+graft examples
+graft tests
+global-exclude __pycache__ *.py[cod]

@@ -198,6 +198,33 @@ pub enum GroupOrder {
     Accumulator { at: usize, direction: SortDirection },
 }
 
+/// Where a `count(*)` with no filter and no group got its number.
+///
+/// A count over a whole collection is the one aggregate whose answer is
+/// already written down: `collections/row_count.rs` keeps a live record per
+/// collection, maintained by the write path inside the same transaction as
+/// the rows. When the collection has one, the answer is ONE get -- no
+/// candidate, no posting, no primary read. When it has not (a database
+/// written before the feature, or a collection the backfill has not reached),
+/// the walk is the one this engine always took, unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountSource {
+    /// The complete enumeration of the collection: the external-key mapping
+    /// keyspace, one posting step per row.
+    Walk,
+    /// The live row-count record: one get.
+    LiveRecord,
+}
+
+impl CountSource {
+    pub fn written(self) -> &'static str {
+        match self {
+            Self::Walk => "walk",
+            Self::LiveRecord => "live record",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregateShape {
     Streaming,
@@ -933,6 +960,19 @@ impl Database {
             (driver, _) => driver,
         };
 
+        // ... and it is also the one case whose answer is already written
+        // down. `collections/row_count.rs` keeps a live count per collection,
+        // maintained by the write path in the same transaction as the rows,
+        // so a collection that has a record answers this request with ONE
+        // get: no candidate is walked, no posting is read and no row is
+        // touched. A collection with no record takes the walk above,
+        // unchanged. Anything with a filter or a group never reaches here.
+        let live_count = if count_all {
+            self.row_count(request.collection)?
+        } else {
+            None
+        };
+
         // A group key over a scalar index asks for that index's own order, so
         // `CandidateDriver::Auto` can choose it when nothing cheaper drives --
         // which is exactly when the groups arrive contiguous. With a filter
@@ -1073,6 +1113,8 @@ impl Database {
             after: None,
             done: false,
             pending: None,
+            count_all,
+            live_count,
         })
     }
 }
@@ -1109,6 +1151,13 @@ pub struct PreparedAggregate<'db> {
     /// A HASHED aggregate's finished groups, in order, front first. `Some`
     /// once the single fold has run.
     pending: Option<Vec<GroupRow>>,
+    /// True when this request is `count(*)` over a whole collection: no
+    /// filter, no group, and every accumulator a `count(*)`. It is the one
+    /// request whose answer can be read rather than walked.
+    count_all: bool,
+    /// The live row-count record's number, read once at prepare. `Some` only
+    /// when `count_all` holds AND the collection has a record.
+    live_count: Option<u64>,
 }
 
 /// What one group is while it is being folded.
@@ -1286,6 +1335,36 @@ impl PreparedAggregate<'_> {
         budget.groups = budget.groups.min(self.groups_cap);
         let mut meter = WorkMeter::new(budget, &mut cancelled);
         meter.check_cancelled()?;
+
+        // The live record, when there is one. The number was read at prepare,
+        // so this page walks nothing: every counter it reports is zero, which
+        // is the whole point of the record. It is one group, once, and then
+        // the aggregate is done.
+        if let Some(rows) = self.live_count {
+            if self.done {
+                return Ok(GroupPage {
+                    groups: Vec::new(),
+                    done: true,
+                    work: meter.used,
+                });
+            }
+            self.done = true;
+            self.groups_seen = 1;
+            self.emitted = self.emitted.saturating_add(1);
+            return Ok(GroupPage {
+                groups: vec![GroupRow {
+                    key: None,
+                    values: self
+                        .accumulators
+                        .iter()
+                        .map(|_| AggValue::Count(rows))
+                        .collect(),
+                }],
+                done: true,
+                work: meter.used,
+            });
+        }
+
         self.query.ensure_membership_sets(&mut meter)?;
 
         let remaining = self
@@ -2168,6 +2247,13 @@ impl PreparedAggregate<'_> {
                     )
                 })
                 .collect(),
+            count: self.count_all.then(|| {
+                if self.live_count.is_some() {
+                    CountSource::LiveRecord
+                } else {
+                    CountSource::Walk
+                }
+            }),
             groups_seen: self.groups_seen,
             groups_cap: self.groups_cap,
             total_limit: self.total_limit,
@@ -2259,6 +2345,9 @@ pub struct AggregatePlanDescription {
     /// One `(accumulator, source)` pair per accumulator, in request order.
     pub accumulators: Vec<(String, String)>,
     pub having: Vec<String>,
+    /// Where a whole-collection `count(*)` got its number. `None` for every
+    /// other aggregate, which is unchanged by the live record.
+    pub count: Option<CountSource>,
     pub groups_seen: u64,
     /// The engine's own ceiling on live accumulator sets.
     pub groups_cap: u64,

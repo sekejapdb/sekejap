@@ -2,19 +2,20 @@
 
 The internal Rust API is `e4_prototype::collections::Database`. It layers a
 persistent catalog, external-key index and typed CRUD over the V2 page-WAL
-store (`pagewal::PageWalStore`, `E4PWAL02`; selected in
-`src/store/mod.rs` (the layout restructure at `f5e4c7e` moved this out of
-`src/collection_backend.rs`; re-exported under that name still), contract in
+store (`pagewal::PageWalStore`, `E4PWAL02`; selected in `src/store/mod.rs` (the
+layout restructure at `f5e4c7e` moved this out of `src/collection_backend.rs`;
+re-exported under that name still), contract in
 [V2_COLLECTION_INTEGRATION.md](V2_COLLECTION_INTEGRATION.md)). The inherited
 kernel `Store` is no longer a collection backend. Statements below that name
 the old engine's behaviour were rewritten in the 2026-09-16 pass; the key,
 record, layout and catalog encodings are unchanged. This is the boundary for
-adapting E3 interfaces. It does not implement HTTP or a deployment package;
-Tier-1 SQL now has a parser and compiler (`lang/src/`, `docs/lang/QL_CONTRACT.md`),
-and scalar indexes and graph adjacency are both live (`src/collections/catalog.rs`,
-`src/index/graph/mod.rs`). The eight laws in CONTRACT.md are
-unchanged; this slice is not a claim that all have passed, and the backend
-switch is unvalidated until the parent's Linux run.
+adapting the prior engine's interfaces -- the release sekejap replaces, whose
+sources are kept on branch `e1`. It does not implement HTTP or a deployment
+package; Tier-1 SQL now has a parser and compiler (`lang/src/`,
+`docs/lang/QL_CONTRACT.md`), and scalar indexes and graph adjacency are both
+live (`src/collections/catalog.rs`, `src/index/graph/mod.rs`). The eight laws
+in CONTRACT.md are unchanged; this slice is not a claim that all have passed,
+and the backend switch is unvalidated until the parent's Linux run.
 
 ## API example
 
@@ -23,13 +24,19 @@ changed sidecars. Scalar-only updates retain unchanged embeddings; validation,
 stable identity and snapshot behavior remain intact. See the
 [write-path benchmark and fixed-budget regression](WRITE_PATH.md).
 
-```rust,no_run
-use e4_prototype::{collections::{CollectionOptions, Database}, Kind};
-use kernel::store::Config;
+<!-- doc_example: collections_typed_collection -->
+```rust
+use sekejap::core::collections::{CollectionOptions, Database};
+use sekejap::core::Kind;
+use sekejap::Db;
 use serde_json::json;
 
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
-let mut db = Database::create("<scratch>", Config::default())?;
+let dir = std::env::temp_dir().join("sekejap-collections-example");
+let _ = std::fs::remove_dir_all(&dir);
+// `Db::config()` is `SyncMode::Full`, which is the one barrier the
+// page-WAL store accepts: a weaker mode is refused, never downgraded.
+let mut db = Database::create(&dir, Db::config())?;
+
 let people = db.create_collection(
     "people",
     vec![
@@ -40,22 +47,41 @@ let people = db.create_collection(
     ],
     CollectionOptions { timestamps: true }, // Default::default() means OFF
 )?;
-let id = db.put(people, "person/alice", &json!({
-    "name": "Alice",
-    "profile": {"roles": ["operator"], "sensor": null},
-    "position": {"type": "Point", "coordinates": [144.75, -37.5]},
-    "embedding": [0.5, 1.0, -2.0],
-    "observed_at": 1788888800
-}))?;
+// A field the declaration does not name -- `observed_at` -- is kept in
+// the row's extras map: a declaration is a floor, not a fence.
+let id = db.put(
+    people,
+    "person/alice",
+    &json!({
+        "name": "Alice",
+        "profile": { "roles": ["operator"], "sensor": null },
+        "position": { "type": "Point", "coordinates": [144.75, -37.5] },
+        "embedding": [0.5, 1.0, -2.0],
+        "observed_at": 1788888800,
+    }),
+)?;
 db.commit()?;
-db.update(people, "person/alice", &json!({"name": "Alice Tan"}))?;
+
+// A shallow merge. Identity survives it, and the unchanged vector
+// sidecar is not rewritten.
+db.update(people, "person/alice", &json!({ "name": "Alice Tan" }))?;
 db.commit()?;
-assert_eq!(db.get(people, "person/alice")?.unwrap().id, id);
+let row = db.get(people, "person/alice")?.expect("the row");
+assert_eq!(row.id, id);
+assert_eq!(row.document["name"], json!("Alice Tan"));
+assert_eq!(row.document["embedding"], json!([0.5, 1.0, -2.0]));
+
+// The managed fields are the engine's, written because this collection
+// was created with `timestamps: true`.
+assert!(row.document.get("_created_unix").is_some());
+assert!(row.document.get("_updated_unix").is_some());
+
+// One entity at a time: a scan never holds the collection.
 for entity in db.scan(people, None)? {
-    let entity = entity?; // Stream one entity at a time.
+    let entity = entity?;
     println!("{}", entity.key);
 }
-# Ok(()) }
+Ok(())
 ```
 
 `open`, `open_snapshot`, `create_limited`, `collection`, `collection_info`,
@@ -85,7 +111,7 @@ handles that may be opened by path in this or another process.
   uncommitted ID to another system as a durable identity.
 - A document must be an object. Declared fields use typed slots; undeclared
   fields remain typed binary values in the extras lane. Missing and null are
-  distinct. JSON text is never persisted in E4.
+  distinct. JSON text is never persisted here.
 - `__e4_key`, `_id`, `_key` and `_collection` are reserved at the top level.
   Identity belongs to the entity envelope, not a caller-supplied payload.
 - Vectors have a declared dimension and f32 lane representation. Values narrow
@@ -95,11 +121,12 @@ handles that may be opened by path in this or another process.
   to that collection. Holding an iterator borrows its database; it cannot be
   mutated through that handle during iteration.
 
-E3 contracts reused here include stable upsert identity, one membership per
-entity, explicit missing-update failure and snapshot immutability. E3's
-`db.rs` `MembershipBatch` inspired the fixed one-collection sequence buffer.
-E3 source is unchanged. E4 intentionally makes collection scope explicit;
-this is an adapter boundary, not source compatibility with every E3 method.
+Contracts reused from the prior engine include stable upsert identity, one
+membership per entity, explicit missing-update failure and snapshot
+immutability. Its `db.rs` `MembershipBatch` inspired the fixed one-collection
+sequence buffer. That source is unchanged. sekejap intentionally makes
+collection scope explicit; this is an adapter boundary, not source
+compatibility with every method the earlier design had.
 
 ## Transactions and failure
 
@@ -218,7 +245,7 @@ lookup even when leaf contents survive. Multiple copies do not guarantee normal
 opening after an arbitrary ancestor failure. Root-independent recovery uses
 verified leaves without those ancestors:
 
-```rust,ignore
+```rust,signatures
 recover_typed_candidates(source, destination, &CollectionRecovery, options)?;
 ```
 

@@ -1,4 +1,4 @@
-# sekejap-e4
+# sekejap
 
 ## North Star — the 8 laws
 
@@ -17,8 +17,8 @@
    matters: a person opening their data on a phone waits, and a load they will
    not sit through is a failure however correct it is. State the per-row cost,
    and state it against the device class this is for — not against a server.
-8. **Compatibility is permanent** — newer E4 releases must read and write
-   databases from earlier released E4 formats, including their schemas,
+8. **Compatibility is permanent** — newer sekejap releases must read and write
+   databases from earlier released sekejap formats, including their schemas,
    identities, relationships, typed values and persisted indexes. A minor or
    patch update must not require migration, export/import, or an index rebuild
    merely to keep using an existing database. Improvements must preserve the
@@ -33,11 +33,12 @@ The model is SQLite's [backward-compatibility policy](https://www.sqlite.org/for
 new engines keep reading and writing old databases while new storage features
 may require newer engines.
 
-- **Scope starts at the first declared stable E4 format.** Name that baseline
-  before release and retain support for it in subsequent E4 releases. This is
-  not an E1/E3 data-migration requirement, nor a claim that prototype formats
-  are already stable. A major version number does not excuse dropping support
-  for an earlier released E4 format.
+- **Scope starts at the first declared stable sekejap format.** Name that
+  baseline before release and retain support for it in subsequent sekejap
+  releases. This is not a promise to migrate data written by the prototype
+  formats that came before it, nor a claim that those prototype formats are
+  already stable. A major version number does not excuse dropping support for
+  an earlier released sekejap format.
 - **Data and indexes share the promise.** Version pages, records, catalog and
   index encodings explicitly. Existing index formats remain readable and
   writable; faster algorithms can use them without forcing a rebuild. New
@@ -63,7 +64,8 @@ may require newer engines.
 
 The law is adopted; current implementation compliance is **not yet qualified**.
 Track it as `L8-COMPAT` in `docs/FOUNDATION_GATES.json`. Historical evidence
-below was seeded from E3 and does not establish E4 compliance with this law.
+below was seeded from prototype builds and does not establish this release's
+compliance with this law.
 
 ## Architectural decisions
 
@@ -72,18 +74,22 @@ without a number beside it is an opinion; these all have numbers.
 
 STORAGE
 - **D1 one file, one pager, one btree, row in the leaf** — SQLite's skeleton
-  (everything incl. schema = btrees in one paged file). e1 touched 8 structures
-  per write and ran 26x slower than SQLite; e3 beats SQLite on every arm.
+  (everything incl. schema = btrees in one paged file). The prior engine this
+  one replaces -- a separate storage design, the one app still runs, and
+  called "the prior engine" throughout this document -- touched 8 structures
+  per write and ran 26x slower than SQLite; sekejap beats SQLite on every arm.
 - **D2 page size 4096** — ablated 4K/8K/16K: 4K best scattered-insert time and
   read granularity for seek+short-range (RCA's shape).
 - **D3 keys big-endian, tag byte first** — byte order = numeric order, so every
   "all X of Y" is one contiguous range scan; tags never interleave.
-- **D4 extensibility = new key tags, never new files/structures** — the
-  anti-e1 rule. Vector/fulltext/spatial are keyspaces, not sidecars.
+- **D4 extensibility = new key tags, never new files/structures** — the rule
+  that keeps out the sidecar sprawl of the prior engine. Vector/fulltext/
+  spatial are keyspaces, not sidecars.
 - **D5 overflow chains for values > ~4KB** — vlen sentinel 0xFFFF, marker
   [total|head|whole-value crc], chain = ordinary checksummed pages. One
   primitive for embeddings (1536-dim = 6KB) and big RCA payloads; per-feature
-  chunking/quantization-as-limitation rejected (the e1 rot pattern). Blast
+  chunking/quantization-as-limitation rejected (the pattern that rotted the
+  prior engine). Blast
   radius: one record, tested (49/50 survive a damaged chain).
 
 WRITE PATH
@@ -100,8 +106,9 @@ WRITE PATH
   needed size). Guard = append at rightmost leaf only; scattered keeps
   balanced splits (unguarded variants regressed amplification, caught by the
   pinned test).
-- **D10 blind writes; no read-before-write** — e1 paid a full descent per
-  insert. The one read-before-write op is relabel, priced separately.
+- **D10 blind writes; no read-before-write** — the prior engine paid a full
+  descent per insert. The one read-before-write op is relabel, priced
+  separately.
 - **D11 bulk load = external sort -> pack pages once -> skip WAL -> swap root**
   — DuckDB's dock. 1.72 vs 8.49 us/node on identical scattered input; each
   byte written once. It REPLACES the tree (load/rebuild, never append).
@@ -114,9 +121,9 @@ WRITE PATH
 GRAPH
 - **D13 dense sequential u64 ids from the allocator; uuid/slug via extkey,
   resolved once at query entry** — the id policy IS the clustering policy:
-  sequential vs hashed ids = 4.2 vs 90.3 reads per trace query (21.5x). e1
-  hashed slugs and could never be fast. Allocator rides the commit (crash-safe,
-  never reuses an id -- tested).
+  sequential vs hashed ids = 4.2 vs 90.3 reads per trace query (21.5x). The
+  prior engine hashed slugs and could never be fast. Allocator rides the commit
+  (crash-safe, never reuses an id -- tested).
 - **D14 edge = (src, ty, dst) key; ty BETWEEN src and dst** — a typed hop is a
   narrower range, not a filter. Adjacency is physically contiguous: 1.1 page
   reads/hop flat across store sizes.
@@ -135,8 +142,8 @@ READ PATH
   whole-leaf batching then cost graph hops 2-3x (a 3-edge hop copied a
   130-entry leaf). The threshold keeps hops at 0.002ms AND ranges fast.
 - **D18 zero-alloc fold (for_each_ref) for counting/filtering scans** — two
-  Vec allocs per row was the last 1.9x vs SQLite; fold = 5.5ns/key; e3 now
-  wins every mini-mega query.
+  Vec allocs per row was the last 1.9x vs SQLite; fold = 5.5ns/key; the
+  engine now wins every mini-mega query.
 - **D19 property indexes = 0x0A keyspace with order-preserving 8-byte
   encodings (i64 sign-flip, f64 bit-trick, desc variants)** — equality, range
   and top-k are all range scans; caller writes index entries (blind), update
@@ -146,9 +153,9 @@ READ PATH
   ladder each OS lies about differently (Linux fdatasync / macOS fsync +
   F_FULLFSYNC / Windows FlushFileBuffers); direct I/O = O_DIRECT / F_NOCACHE /
   FILE_FLAG_NO_BUFFERING. Everything above the trait is pure byte-offset Rust.
-  Windows/Android/ARM-Linux are COMPILE-VERIFIED (cargo check per target,
-  bench/check_targets.sh -- every phase leaves them green) and enforced by
-  kernel/tests/platform_invariant.rs, which fails the build if platform code
+  Windows/Android/ARM-Linux are COMPILE-VERIFIED (`cargo check` per target --
+  every phase leaves them green) and enforced by
+  `core/kernel/tests/platform_invariant.rs`, which fails the build if platform code
   appears outside io.rs. Stated non-claim: durability on Windows/Android is
   UNVERIFIED until the suite runs on real hardware; their sync collapses to
   the strong barrier (FlushFileBuffers / sync_all) -- conservative, stated.
@@ -156,7 +163,8 @@ READ PATH
   os_win.c fsyncs no directories either). FILE_FLAG_NO_BUFFERING is the
   direct-I/O upgrade path; basic posture degrades to Buffered and reports.
 - **D20 no global ANN in core** — vectors serve candidate RESCORING (point
-  reads by id). A resident HNSW is RAM ∝ store (e1/app wound, Law 1).
+  reads by id). A resident HNSW is RAM ∝ store: the wound the prior engine
+  carries in its app deployment, and what Law 1 exists to forbid.
   Ceiling for a change-buffer-style alternative measured 1.83x buffered.
 - **D22 vectors are catalog-fixed-dim f32-LE rows in 0x05** — one dim per
   store (CAT_VEC_DIM, set by the first set_vec), mismatch refused before
@@ -253,8 +261,9 @@ READ PATH
 
 - **D30 full-text lives as FACT-03 said, plus three earned decisions** —
   (a) the HEAD is row-per-(term,doc): appending to packed values is
-  read-modify-write (the e1 BM25 wound), rows are blind and searchable the
-  instant they land; folds pack rows into value-per-term segments.
+  read-modify-write, which is what the prior engine's BM25 paid on every
+  posting update; rows here are blind and searchable the instant they land,
+  and folds pack rows into value-per-term segments.
   (b) every posting CARRIES (tf, doc_len): BM25 does zero length lookups
   -- the 1M term query paid 200K cold point-gets (10.8s) before this.
   (c) `Store::delete_prefix`: one WAL record, parent-path walk, whole-match
@@ -274,7 +283,8 @@ READ PATH
   7.4ms at 1M when re-celled, the scan itself was 0.6ms all along),
   coarse 8 bits, ONE world-bucket posting for continent-scale shapes
   (the corner-clip shortcut missed interior queries — oracle-caught).
-  Exact tier: e1's PostGIS-parity math (Vincenty/authalic, live-PostGIS
+  Exact tier: the prior engine's PostGIS-parity math (Vincenty/authalic,
+  live-PostGIS
   fixtures to 1e-6); haversine decides outside a 0.6% band, Vincenty only
   the boundary. Point fast path: degenerate bbox = the point — zero
   payload reads. set_geo refuses out-of-range coords BEFORE the WAL
@@ -330,7 +340,7 @@ TurboQuant/turbovec (clones in reference/, gitignored):
   Encoding is per-vector, write-blind, zero training — the retrain/drift
   machinery PQ forces on Lance/DiskANN does not exist. Recall beats PQ at
   equal bits; codes SIMD-scan at 3.4x FAISS FastScan (turbovec kernels).
-- Candidate generation = scanning code rows; e3's existing rescore (D23) is
+- Candidate generation = scanning code rows; the engine's existing rescore (D23) is
   already the exact tier. A navigation graph, when scan stops being enough,
   co-locates {code | fp vector | neighbor ids} in ONE fixed row per node
   (DiskANN sector layout; Qdrant CompressedWithVectors; diskann-bftree =
@@ -407,7 +417,7 @@ ranges.** Dug from Meilisearch/milli (LMDB = our shape), tantivy, typesense
 
 **Space is a key discipline too: Hilbert-curve cell keys in the btree; the
 R-tree is refused, on PostGIS's own evidence.** Dug from PostGIS, SQLite
-rtree, e1's grid:
+rtree, and the grid of the prior engine this one replaces:
 
 - PostGIS's fast index build sorts geometries by a HILBERT CURVE of the
   bbox centroid (their own sortable hash) — the R-tree camp's best build
@@ -420,20 +430,23 @@ rtree, e1's grid:
   genuine edge, recovered). Values carry PostGIS's 16-byte
   outward-rounded f32 bbox — box filtering never touches the geometry
   payload (their recheck=false trick); exact math only on survivors.
-- Exact tier: e1's geo.rs ports wholesale (WGS84 Vincenty + authalic area,
+- Exact tier: the prior engine's geo.rs ports wholesale (WGS84 Vincenty +
+  authalic area,
   PostGIS-geography metres, equal to PostGIS to float precision — already
   battle-tested). PIP: bbox filter, then rings read from payload rows via
   UNCACHED chain reads; per-polygon interval tree built per QUERY, never
-  resident (e1 cached parsed rings resident — RAM ∝ polygons — refused).
+  resident (that design cached parsed rings resident — RAM ∝ polygons —
+  refused).
 - kNN: best-first expanding cell rings, exact Vincenty rescore — same
   two-tier shape as vectors (cheap tier narrows, exact tier answers).
-- e1's grid already converged here the hard way: its packed cell file
-  folded at O(N^1.95) and was retrofitted onto btree records + overlay;
-  e3 starts where e1 arrived.
+- The prior engine's grid already converged here the hard way: its packed
+  cell file folded at O(N^1.95) and was retrofitted onto btree records +
+  overlay; sekejap starts where that design arrived.
 
-## The hybrid scoring contract (e1 semantics, target for 3-sql)
+## The hybrid scoring contract (the prior engine's semantics, target for 3-sql)
 
-e1's `ScoreExpr` is the pipeline's last element and e3 adopts it as-is: an
+The prior engine's `ScoreExpr` is the pipeline's last element and sekejap
+adopts it as-is: an
 arithmetic expression tree (+,-,*,/) over per-candidate atoms — BM25(field,
 q), BM25_NORM (saturation s/(s+k), bounded [0,1] to blend with cosine),
 SEARCH_SCORE, VECTOR_{COSINE,L2,DOT,L1}, ST_DISTANCE (PostGIS-geography
@@ -442,9 +455,10 @@ metres), payload fields, literals — evaluated per candidate in ORDER BY:
 structural obligation on every family: expose score(id, query) as a cheap
 point evaluation once candidates exist, and per-FIELD statistics where the
 atom is per-field. Candidates may come from any family; scoring never
-re-runs retrieval. GROUP BY: e1 already ships PG-semantics aggregation
-(COUNT/SUM/AVG/MIN/MAX, HAVING, the PG "must appear in GROUP BY" error,
-PATH_* aggregates) — it PORTS in 3-sql; e3's implementation preference:
+re-runs retrieval. GROUP BY: the prior engine already ships PG-semantics
+aggregation (COUNT/SUM/AVG/MIN/MAX, HAVING, the PG "must appear in GROUP BY"
+error, PATH_* aggregates) — it PORTS in 3-sql; the implementation preference
+here:
 stream aggregation over index order when the group key is a key prefix
 (RAM O(1)), hash-grouping (RAM ∝ groups, named) otherwise.
 
@@ -453,8 +467,10 @@ stream aggregation over index order when the group key is a key prefix
 The paper demo (a sub-1B LLM assistant on Pi-5-class hardware) advances
 on its own track in the research workspace, never gating engine phases.
 iot-1 (2026-08-26): a TEMPORARY pyo3 binding over this kernel -- kept
-OUT of this repo because e3 inherits the public repo structure
-(wrappers/, Actions) from e1 at replacement time. Gate passed in the
+OUT of this repo because sekejap inherits the public repo structure
+(the wrappers, the Actions) from the prior engine at replacement time. In THIS
+tree those
+live at `dist/bindings/wrappers/` and `.github/workflows/`. Gate passed in the
 linux/arm64 Pi-5 sim (4cpu/2GB): all five demo tools through the real
 engine; plus a zero-training YOLO11n vision probe (7.5 fps CPU) writing
 sightings into the store and recalling them by text query.
@@ -466,8 +482,8 @@ Goal: RCA → hybrid query → shared-node multi-perspective KG. My needs first.
 - Phase 2 ✓ graph layer. Gate: 4 arms below.
 - Phase 2b: ctx migration, property indexes, vector, fulltext, spatial — each a
   keyspace, each gated.
-- Phase 3: port e1's SGQL on top. Non-goals until then: global ANN, wrappers,
-  server, SQL.
+- Phase 3: port the prior engine's SGQL on top. Non-goals until then: global
+  ANN, wrappers, server, SQL.
 Loop discipline: ≤5 ablations per phase, one variable each; every test proven
 to fail on a planted bug before trusted; stale-binary check before any A/B.
 
@@ -536,7 +552,7 @@ Sacrifices (Law 4): perspective edges +8B/key both directions (base pays 0) · m
 writes (+57% measured, optional) · props opaque until 2b · BFS visited-set ∝
 reachable (inherent; caller bounds depth).
 
-## Big values (the e1 lesson, decided before it repeats)
+## Big values (the prior engine's lesson, decided before it repeats)
 
 The kernel refuses records over ~4KB (one page). Two core needs break that
 ceiling: **embeddings** (1536-dim f32 = 6,144B; app uses >1024 dims) and
@@ -544,8 +560,8 @@ ceiling: **embeddings** (1536-dim f32 = 6,144B; app uses >1024 dims) and
 vector problem -- it is a kernel gap that vector merely hits first.
 
 Per-feature workarounds (chunking in the graph layer, quantization as a FORCED
-policy, truncation) are exactly how e1 rotted: local hacks every reader must
-know about. Rejected.
+policy, truncation) are exactly how the prior engine rotted: local hacks every
+reader must know about. Rejected.
 
 Both reference engines solved it in core, verified in source:
 - SQLite `btreeInt.h`: payload beyond a threshold spills to an OVERFLOW CHAIN
@@ -554,7 +570,7 @@ Both reference engines solved it in core, verified in source:
 - DuckDB `string_uncompressed.hpp`: `BIG_STRING_MARKER` + overflow blocks; a
   marker (block_id, offset) points out of the segment.
 
-DECISION: overflow chains in the e3 kernel (phase 2c), before any keyspace
+DECISION: overflow chains in the kernel (phase 2c), before any keyspace
 grows around the limitation. Law 5: overflow pages are ordinary pages --
 checksummed, blast radius stays one record. Quantization (f16/i8) then becomes
 an optimization a caller chooses, never a limitation they obey.
@@ -565,9 +581,12 @@ A write never blocks or degrades a read. Mechanism: D26. `open_snapshot`
 serves the newest published generation, byte-stable for its whole life,
 beside a live writer, zero coordination. The gate in counter form: a pinned
 reader's answers AND disk-read counts are identical solo vs interleaved
-with writer epochs updating the very keys being read (kernel/tests/
-snapshot.rs, mutation-checked). Wall-clock witness with machine-contention
-control in kernel/src/bin/snapbench.rs.
+with writer epochs updating the very keys being read
+(`core/kernel/tests/snapshot.rs`, mutation-checked). The wall-clock witness
+with its machine-contention control was `kernel/src/bin/snapbench.rs`; the
+layers restructure left every binary in one place, `bench/src/bin/`, and that
+one is not among the 31 there -- its record is the numbers it produced, which
+are in this file and in `docs/`.
 
 ## Phases (revised after the big-values contemplation)
 
@@ -601,17 +620,19 @@ control in kernel/src/bin/snapbench.rs.
     2n-freelist ✓ D34 + the 2h bug find     gate PASSED: overwrite churn byte-flat; text
                                             1M queries up to 15x faster (dead pages were
                                             a QUERY TAX); starved-reader pin gate green
-    3-sql ✓       port e1 SGQL             gates PASSED 2026-08-28: integration 362/367
-                                            (5 = physical-format, ignore-gated); e1-CLI
-                                            differential ZERO ASYMMETRY (78 stmts); venue
-                                            workload THROUGH SQL, COUNTS AGREE at 100K+1M
-                                            capped; kernel 182/0; frozen files byte-equal
-    4a-repo-shape adopt e1's layout          layout adopted; core+kernel green in it, and
+    3-sql ✓       port the prior SGQL      gates PASSED 2026-08-28: integration 362/367
+                                            (5 = physical-format, ignore-gated); the
+                                            prior engine's CLI differential ZERO
+                                            ASYMMETRY (78 stmts); venue workload THROUGH
+                                            SQL, COUNTS AGREE at 100K+1M capped; kernel
+                                            182/0; frozen files byte-equal
+    4a-repo-shape adopt the prior layout     layout adopted; core+kernel green in it, and
                                              WINDOWS PORTABILITY RESTORED (the CI shape
-                                             e1 carries caught it immediately); wrappers,
-                                             CLI and C ABI staged, blocked on two named
-                                             architectural gaps below
-    4b..4f        skcli / capi / wrappers   per-language, each gated on its own e1 tests
+                                             the prior engine carries caught it at once);
+                                             wrappers, CLI and C ABI staged, blocked on
+                                             two named architectural gaps below
+    4b..4f        skcli / capi / wrappers   per-language, each gated on the prior
+                                            engine's own tests
 
 ## The keyspace invariant (added 2026-08-29, after it was violated)
 
@@ -689,8 +710,8 @@ all data, the fill returned to 7 and the cost vanished.
 
 ## Phase 4 findings (what adopting the shape revealed)
 
-Two blockers, both architectural, both discovered by compiling e1's real
-wrapper code against this core rather than by reading it:
+Two blockers, both architectural, both discovered by compiling the prior
+engine's real wrapper code against this core rather than by reading it:
 
 1. **The core is not `Send + Sync`.** The graph sits behind
    `Rc<RefCell<Graph>>` -- a phase-3 porting device (index handles needed
@@ -712,7 +733,7 @@ wrapper code against this core rather than by reading it:
 After the boundary methods landed, the python wrapper's error list is
 exactly four items and every one is named: two `Send` bounds (blocker 1)
 and the two `explain` entry points we deliberately do not ship. Nothing
-unaccounted for remains between this core and e1's wrapper code -- which
+unaccounted for remains between this core and that wrapper code -- which
 is the real deliverable of 4a: the gap is now a decision list, not a
 discovery problem. When the python slice runs, its `explain` methods come
 off the wrapper rather than a stub going into the core.
@@ -721,9 +742,10 @@ Smaller findings, resolved in 4a:
 
 - **Windows**: the kernel did not compile off Unix -- the 2n reader table
   called `libc::flock` directly. Replaced with std's file lock (same
-  contract, and the only form that exists on Windows). `cargo check -p
-  sekejap -p kernel --target x86_64-pc-windows-msvc` is now clean; the
-  kernel suite is unchanged at 182/0. Without the reader table a writer
+  contract, and the only form that exists on Windows). The cross-check is
+  now `cargo check -p sekejap-core -p sekejap-kernel --target
+  x86_64-pc-windows-msvc`, and it was clean; the kernel suite was unchanged
+  at 182/0. Without the reader table a writer
   must assume a reader at generation 0 and page recycling stops for good,
   so this was not a cosmetic gap.
 - **`kernel::Error` had no `Display`** -- it is what a wrapper user
@@ -731,14 +753,19 @@ Smaller findings, resolved in 4a:
   way out is (Law 5 is mostly met through these strings).
 - **The predecessor's lab equipment is not carried over**: 58 examples and
   26 benches measured ITS internals (compaction phases, residency of
-  structures that no longer exist). This engine has its own under
-  `bench/`, `kernel/src/bin/` and `examples/`. Keeping harnesses that
+  structures that no longer exist). This engine has its own, and after the
+  layers restructure they are all in ONE place: the 31 binaries of
+  `bench/src/bin/` in the crate `sekejap-bench`, run as
+  `cargo run -p sekejap-bench --release --bin <name>`. Keeping harnesses that
   cannot compile, or "fixing" them to measure something else under the
   same name, would both be worse than not shipping them.
 - **`docs/usage/` survives unchanged** (it documents the query surface,
   which is identical); `docs/developer/` describes the previous storage
   engine and now says so at the top of each affected page, pending a
-  rewrite.
+  rewrite. *Neither directory exists in this tree: sekejap's documentation is
+  `docs/core/`, `docs/lang/` and `docs/dist/`, and the query surface is
+  `docs/lang/QL_CONTRACT.md` with every example run by
+  `dist/rust/tests/doc_examples.rs`.*
 - **CI is honest**: the four agreement fuzzers named in the previous
   workflow do not exist here. Three of them (index, compaction, replay)
   state invariants this engine owes just as much and are worth porting;
@@ -750,35 +777,55 @@ Awaiting a decision (not blocking):
 - The `USING hnsw` index keyword is kept for source compatibility, but the
   implementation is Vamana; the shipped README still explains it as HNSW.
   Rename, alias, or reword -- a naming call, not an engine one.
+  *Decided in sekejap:* `docs/lang/QL_CONTRACT.md` §4.5 and §5 deviation 6 make
+  `hnsw`, `diskann`, `ivfflat` and `vamana` ALIASES of the one family this
+  engine has, `quantized`, each accepted with a notice that says so. There is
+  no separate HNSW here and the contract says it in the row.
 - Three package files still point at a retired homepage
   (`sekejap.<retired>.com`) and one at a retired Maven coordinate, while
   the live ones are `sekejap.life` and `life.sekejap`. Stale in the
   predecessor too. Copyright holders left untouched -- that is a legal
   identity, not a build detail.
 
-## Phase 3 named deviations (e1 parity ledger)
+## Phase 3 named deviations (the prior-engine parity ledger)
 
-Method: e1's sql.rs + query.rs are BYTE-FROZEN copies; every difference
-in behaviour must therefore live at the storage boundary and be named
-here. e1's own 46 test files are the parity oracle (integration.rs =
-367 tests, e1's full surface).
+**This section is the ledger of an EARLIER PORT, kept as a record. It is not a
+statement about what sekejap ships now.** That port froze the prior engine's
+`sql.rs` and `query.rs` and named every difference the new storage boundary
+forced; sekejap went on to write its own language instead (`lang/`,
+`docs/lang/QL_CONTRACT.md`) and its own parity ledger
+(`docs/lang/E3_PARITY.md`). Two lines below are explicitly FALSE of the
+current release and are left in place because they are true of what they
+describe: `USING gist` is a real index family here, not a refusal with
+directions to `gin`; and a collection may declare more than one `VECTOR(n)`
+field. Every "0.17" in this section is that port's numbering of its own
+release, not this workspace's version.
+
+Method: the prior engine's sql.rs + query.rs are BYTE-FROZEN copies; every
+difference in behaviour must therefore live at the storage boundary and be
+named here. Its own 46 test files are the parity oracle (integration.rs =
+367 tests, the whole surface it exposed).
 
 Accepted, by design (the engine underneath IS the difference):
-- SET WAL_MODE takes logical|physical (e1: json|binary). Both accepted;
+- SET WAL_MODE takes logical|physical (the prior engine: json|binary). Both
+  accepted;
   the kernel WAL satisfies both contracts, the knob renames honestly.
 - hnsw_* build knobs (m, ef_construction) are accepted and ignored: the
   vector tier is Vamana over btree rows (D32), which has no such knobs.
   The METRIC argument is honoured exactly (per-field registry, kernel
   rescore) -- an L2 build must rank by L2, and does.
-- One vector field per store in 0.17 (e1 allowed several); refused with
+- One vector field per store in 0.17 (the prior engine allowed several);
+  refused with
   a message, not silently merged.
-- CREATE INDEX ... USING gist is REFUSED with directions to gin. e3 has
-  no GiST machinery; aliasing gin under the name would be dishonest.
+- CREATE INDEX ... USING gist is REFUSED with directions to gin. That port
+  had no GiST machinery; aliasing gin under the name would be dishonest.
 - SEARCH typo => n forces the per-token edit budget past the kernel's
-  length ladder (e1 semantics; the ladder alone gives 4-char tokens 0).
+  length ladder (the prior engine's semantics; the ladder alone gives
+  4-char tokens 0).
 - 5 integration tests are unportable BY DESIGN, not failures: they open
-  e1's physical artifacts (snapshot.json headers, wal.log format, vector
-  .bin sidecars) which do not exist in e3's single-file page format:
+  the prior engine's physical artifacts (snapshot.json headers, wal.log
+  format, vector .bin sidecars) which do not exist in the single-file page
+  format here:
   snapshot_v2_header_present_and_reopens, snapshot_legacy_headerless_
   still_opens, logical_wal_smaller_than_physical, sql_txn_wal_
   incomplete_discarded, disk_vector_store_phase6_compact_skips_json_
@@ -787,32 +834,35 @@ Accepted, by design (the engine underneath IS the difference):
 
 Awaiting sign-off (recorded, not yet decided):
 - RENAME TABLE rewrites slugs; hashes change, so old-hash edges and
-  vectors are not re-pointed (e1 shares the weakness -- verify).
+  vectors are not re-pointed (the prior engine shares the weakness --
+  verify).
 - Edge-attribute BINDINGS inside MATCH patterns: VERIFIED 2026-08-28 by
   the CLI differential (bind, project e.year, filter e.year > n, read
-  back after UPDATE-by-predicate -- all byte-identical to e1).
+  back after UPDATE-by-predicate -- all byte-identical to the prior engine).
 - EXPLAIN / EXPLAIN ANALYZE: REFUSED honestly (user decision 2026-08-28,
-  same posture as gist): e3 has no explain entry points and we ship only
+  same posture as gist): there are no explain entry points and we ship only
   what really exists -- no anticipatory surface. skcli's EXPLAIN arm gets
   a refusal message with directions, not a stub.
 
 ## Verdicts (numbers live in bench/)
 
-- 3-sql (2026-08-28): e1's SGQL surface runs on the e3 kernel with sql.rs
+- 3-sql (2026-08-28): the prior engine's SGQL surface runs on this kernel
+  with sql.rs
   and query.rs BYTE-FROZEN -- every behavioural difference had to surface
   at the storage boundary, and each one is either fixed or named in the
   phase-3 ledger above. Three oracles agreed before the phase closed:
-  e1's own 46 test files (362/367, the 5 = physical format), e1's real
-  CLI over a 78-statement corpus (zero asymmetry, skcli's renderer
+  the prior engine's own 46 test files (362/367, the 5 = physical format),
+  its real CLI over a 78-statement corpus (zero asymmetry, skcli's renderer
   verbatim on both sides), and SQLite on the venue workload through SQL
   (COUNTS AGREE at 100K and 1M, capped 500Mi/2cpu). Bugs the port
   unearthed IN THE KERNEL: vecquant code_len truncated to zero for dims
   <= 2 (pad floor 64 fixed it); the instant-search edit ladder needed a
-  forced-budget override for e1's typo => n. Named perf losses, phase 5:
+  forced-budget override for the prior engine's typo => n. Named perf losses,
+  phase 5:
   aggregate COUNTs 47-186x behind SQLite at 1M capped and sort_limit 42s
   (try_index_order_limit probes node_data() per index entry -- a kernel
-  point-get, random order, 1M of them under a 500Mi cache; e1 answers
-  the same probe from a RAM map); venue store 1.06GB vs SQLite 138MB
+  point-get, random order, 1M of them under a 500Mi cache; the prior engine
+  answers the same probe from a RAM map); venue store 1.06GB vs SQLite 138MB
   (JSON rows + 4 indexes + dual edge rows). Point 0.85ms / 1-hop 0.16ms
   / 3-hop 0.75ms at 1M capped stay healthy.
 
@@ -838,7 +888,7 @@ Awaiting sign-off (recorded, not yet decided):
   1M 6415 -> 146.9ms (SQLite: 4.0s / ~87-174s); geo 1M file 406 ->
   218MB. One-shot text 1M file ~unchanged (1.51GB; frees pending,
   nothing reuses them before exit — vacuum is phase 5's shrink).
-  Every 2m speed number is thereby superseded in e3's favour.
+  Every 2m speed number is thereby superseded in the engine's favour.
 
 - 2m atomic-checkpoint: one binary, capped pod, 100K+1M, sizes in every
   cell. TIME (1M): base 3.8/27.2s seq/scat; graph build 23.6s, 3-hop x200
@@ -855,15 +905,15 @@ Awaiting sign-off (recorded, not yet decided):
   never reuses freed pages. Measured: text live 64MB vs 1.52GB file at
   1M (95% dead; live is SMALLER than FTS5's 127.6MB); reuse_probe grows
   ~3.9MB per 5K-doc fold round, linearly, forever. Vector 100K sizes,
-  same data: sqlite-vec 632MB (no index), e3 1.25GB (2.0x raw, three
+  same data: sqlite-vec 632MB (no index), sekejap 1.25GB (2.0x raw, three
   tiers INCLUDING the dead space; ~800MB projected post-freelist),
   Qdrant ~1.17GB (collection delta; its storage also held 2.9GB of
   residue from deleted collections), Kuzu 2.33GB uncapped (its capped
   ingest OOMed at two pool sizes; uncapped it answered 20ms @ 0.650 at
   defaults). Fix designed, LMDB freeDB shape: free-with-generation at
   checkpoint, reader table for oldest-live-gen, allocate freelist-first
-  -- inline accounting, NO periodic job (the e1 compaction is not coming
-  back). Harness bugs fixed en route: graphbench materialized 8M edge
+  -- inline accounting, NO periodic job (the prior engine's compaction job is
+  not coming back). Harness bugs fixed en route: graphbench materialized 8M edge
   pairs (~700MB -- the pod OOM was the BENCH); a concurrent sizes pod
   contaminated one nav sweep (protocol violated, arm re-run). Fold WAL
   bound (D32 note): 25K-insert checkpoint interval, wal saws 0-600MB at
@@ -873,7 +923,7 @@ Awaiting sign-off (recorded, not yet decided):
   384-dim vector, point geometry; word-for-word mirrored corpus).
   Candidates: one body search, top 2000. Expression: Bm25(title)*0.4 +
   Bm25Norm(body,k=1)*0.3 + cosine*0.2 + 1000/(1000+ST_DISTANCE)*0.1.
-  e3 one-pass 231.7ms; the naive app-side shape (two full searches
+  sekejap one-pass 231.7ms; the naive app-side shape (two full searches
   materialized + per-candidate atoms) 266.8ms and the two arms' top-10
   AGREE (the naive arm is a second oracle at scale). SQLite, same
   corpus and shape minus the vector atom it cannot express (FTS5 bm25
@@ -900,7 +950,7 @@ Awaiting sign-off (recorded, not yet decided):
   Dense 1M (~977 near-ties/cluster): scan COLLAPSES to 0.300 @ 1.7s
   while the walk reaches 0.805 @ 485ms — each tier covers the other's
   failure mode (walk: dense; scan: uniform 1.000 where the walk gets
-  0.81). Uniform capped: e3 scan 481ms @ 1.000 vs Qdrant 4823ms @
+  0.81). Uniform capped: sekejap scan 481ms @ 1.000 vs Qdrant 4823ms @
   0.985. Cache knob 64->256MB: uniform ~1.8x latency, recall
   bit-identical. SIMD (autovec + LANE4 table): encode 49.6->28us/vec,
   scan 1993->496ns/code. Ablations 3/5: autovec restructure, LANE4,
@@ -915,7 +965,8 @@ Awaiting sign-off (recorded, not yet decided):
   reference, never noise. Fold 14.0ms/vec at 1M-CD single-threaded
   (Qdrant capped ingest+index: 15-25ms/vec).
 
-- 2i spatial (D31): capped pod, identical coordinates. e3 vs SQLite rtree:
+- 2i spatial (D31): capped pod, identical coordinates. sekejap vs SQLite
+  rtree:
   ingest 0.4/11.0s vs 2.2/50.7s (5.5x/4.6x); bbox 0.03/0.29ms vs
   0.13/1.10ms; kNN 0.09/0.17ms vs 0.17/0.17ms; radius 0.30/6.80ms vs
   0.54/3.08ms — wins at 100K, the ONE loss at 1M (2.2x, cold scattered
@@ -962,9 +1013,9 @@ Awaiting sign-off (recorded, not yet decided):
   oversample, reader reuse).
 - 2g vector index (D27): all four gates on the cluster, HARD CAP 500Mi/2cpu
   (the constrained-first discipline, D25). Vector-first nearest-10 at 1536-d,
-  identical bytes: e3 0.50/1.98/3.35/6.80s at 100K/250K/500K/1M vs SQLite
+  identical bytes: sekejap 0.50/1.98/3.35/6.80s at 100K/250K/500K/1M vs SQLite
   chunked+numpy 6.1/14.5/31.5/66.2s = 7-12x, recall 0.900; 4x faster than
-  e3 own exact scan. Ingest A/B same pod: index costs 1.9x incr / 2.7x bulk
+  sekejap's own exact scan. Ingest A/B same pod: index costs 1.9x incr / 2.7x bulk
   vs 2e (encode math), file +17% -- still 5.2-5.7x faster than SQLite
   ingesting WITHOUT an index. Graph-query regressions unchanged (3-hop
   0.019ms, hybrid 0.233s/100 -- both at-or-better). Ablations 3/5: encoder
@@ -991,14 +1042,14 @@ Awaiting sign-off (recorded, not yet decided):
   per-residency validated bit). Found on the way: an empty control store
   controlled nothing; cache-warm readers made a no-shadowing mutation
   survive two gate versions -- both harness bugs fixed and documented.
-- 2e vector: ingest ladder 50K-500K x 1536-dim vs SQLite blob column, e3 wins
-  every rung (incr 31.9s vs 187.4s @500K = 5.9x, bulk 27.1s; file 7% smaller).
-  Exponent stated honestly: e3's I/O is exactly linear (writes and bytes 2x
+- 2e vector: ingest ladder 50K-500K x 1536-dim vs SQLite blob column, sekejap
+  wins every rung (incr 31.9s vs 187.4s @500K = 5.9x, bulk 27.1s; file 7% smaller).
+  Exponent stated honestly: sekejap's I/O is exactly linear (writes and bytes 2x
   per rung, reads=1) but wall time is N^1.5 because the SSD's sustained-write
   rate decays (raw dd alone is N^1.57 on the same range); SQLite's N^1.04 is
   CPU-bound at 22MB/s, below the device knee. Hybrid RCA query (bfs depth-3
   -> prop filter -> rescore top-10, 200K nodes, 100 seeds, checksums
-  identical both engines): e3 22ms/query vs SQLite+numpy 88ms = 4.0x; build
+  identical both engines): sekejap 22ms/query vs SQLite+numpy 88ms = 4.0x; build
   21.5s vs 58.3s. app gate: 600MB of vectors through an 8MiB pool, live
   heap flat 0.25MiB at 25K and 100K alike; rescore PEAK-delta < 1MiB, PEAK
   tracked inside alloc() after point-sampling missed a 30MB transient.
@@ -1008,7 +1059,7 @@ Awaiting sign-off (recorded, not yet decided):
   in 172.6s bulk / 229.4s incr vs SQLite 3065.3s = 17.8x/13.4x, exponents
   ~N^1 BOTH engines there -- no SLC knee on that device, confirming the Mac
   curve was the device, not the engine.
-- Phase 1 gate: e3 beats SQLite every arm (seq 2.5x, scat 2.1x, bulk N^0.98);
+- Phase 1 gate: sekejap beats SQLite every arm (seq 2.5x, scat 2.1x, bulk N^0.98);
   DuckDB+PK OOMs at 1M under the shared 64MiB cap (Law 1 result).
 - Phase 2 gate: (a) 1.21→1.47 reads/hop across 4x store ✓ (b) 3-hop RCA vs
   SQLite recursive CTE, warm both: equal-or-better everywhere, 1.3x @5M ✓
@@ -1020,7 +1071,7 @@ Awaiting sign-off (recorded, not yet decided):
   truncated >64KB values entering the log. Ladder re-run 10K..5M: seq N^0.91,
   scat N^1.21, both better than 2b ref; bulk-5M slowdown bisected to disk
   space (42GB->11GB free), not code. Ablations: 0 of 5.
-- 2b property index: e3 now wins EVERY mini-mega query. sort 29.5ms->0.005
+- 2b property index: sekejap now wins EVERY mini-mega query. sort 29.5ms->0.005
   (par), compound 25.2->0.047 (5.8x FASTER than SQLite), range 27.4->0.45
   (3.2x faster), eq 4.2->0.19 (2.8x faster); graph untouched 0.002/0.023.
   The last 1.9x was two Vec allocs per row: for_each_ref folds borrows
@@ -1036,7 +1087,7 @@ Awaiting sign-off (recorded, not yet decided):
   OS-cache pressure; machinery counters unchanged) -- caught by re-running the
   gate, fixed by splitting base/perspective tags, numbers restored exactly.
   Ablations spent: 2 of 5.
-- mini-mega (e1's workload, 200K, vs SQLite-indexed & Kùzu): e3 wins all
-  graph/point ops (1-hop 276x vs Kùzu; 3-hop 3x vs SQLite, 44x vs Kùzu);
-  loses property filters to SQLite's indexes where e3 has none yet (2b targets:
-  range 18x, sort 4900x, compound 92x). Kùzu wins only the OLAP range scan.
+- mini-mega (the prior engine's workload, 200K, vs SQLite-indexed & Kùzu):
+  sekejap wins all graph/point ops (1-hop 276x vs Kùzu; 3-hop 3x vs SQLite,
+  44x vs Kùzu); loses property filters to SQLite's indexes where sekejap has
+  none yet (2b targets: range 18x, sort 4900x, compound 92x). Kùzu wins only the OLAP range scan.

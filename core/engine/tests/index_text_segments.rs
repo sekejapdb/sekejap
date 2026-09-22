@@ -348,14 +348,17 @@ fn the_packed_tier_is_admitted_only_behind_its_own_feature_bit() {
     let plain = dir.path().join("head-only");
     let (db, _, index) = heads(&plain);
     drop(db);
-    assert_eq!(features(&plain), 0x11, "a head-only file gained a feature");
+    // `0x2000` is the live row-count record every `create_collection` writes
+    // (`collections/row_count.rs`); the head-only file is asserted to have
+    // gained nothing BEYOND it.
+    assert_eq!(features(&plain), 0x2011, "a head-only file gained a feature");
     assert_eq!(segment_count(&plain, index), 0);
 
     // A packed build sets it.
     let path = dir.path().join("packed");
     let (db, _, index) = packed(&path);
     drop(db);
-    assert_eq!(features(&path), 0x51, "the packed build did not set 0x40");
+    assert_eq!(features(&path), 0x2051, "the packed build did not set 0x40");
     assert!(segment_count(&path, index) > 0);
 
     // An engine whose supported mask predates 0x40 sees an unknown bit and
@@ -363,12 +366,13 @@ fn the_packed_tier_is_admitted_only_behind_its_own_feature_bit() {
     let older = dir.path().join("older-reader");
     copy_dir(&path, &older);
     // The probe has to name a bit NO released mask implements. This release
-    // implements 0x001 through 0x1000 (typed, graph, vector, spatial, text,
+    // implements 0x001 through 0x2000 (typed, graph, vector, spatial, text,
     // quantized, segments, per-index tree, geometry, drop, expression,
-    // declared spellings, column rules: `SUPPORTED_LOGICAL_FEATURES`), so the
-    // unknown-bit probe is the next one up and moves with that mask -- 0x100
-    // is the geometry family and 0x1000 the column rules now, both admitted.
-    set_features(&older, 0x51 | 0x2000);
+    // declared spellings, column rules, live row counts:
+    // `SUPPORTED_LOGICAL_FEATURES`), and 0x4000 is RESERVED for the parallel
+    // semi-join item, so the unknown-bit probe is 0x8000 -- it moves with
+    // that mask, as it moved to 0x2000 when the column rules landed.
+    set_features(&older, 0x2051 | 0x8000);
     let before = files(&older);
     assert!(matches!(
         Database::open(&older, cfg()),
@@ -380,7 +384,7 @@ fn the_packed_tier_is_admitted_only_behind_its_own_feature_bit() {
     // reader that would not understand it.
     let hidden = dir.path().join("hidden");
     copy_dir(&path, &hidden);
-    set_features(&hidden, 0x11);
+    set_features(&hidden, 0x2011);
     let before = files(&hidden);
     assert!(matches!(Database::open(&hidden, cfg()), Err(Error::Corrupt(_))));
     assert_eq!(files(&hidden), before, "a refusal changed the source");

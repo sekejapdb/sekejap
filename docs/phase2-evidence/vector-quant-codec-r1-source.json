@@ -1,5 +1,0 @@
-{
-  "source": "src/vector_quant.rs",
-  "sha256": "f1655ff0f846b3d3096f6539a666371fc8d741860fa128920db1b8ddcac020fb",
-  "validation": "standalone rustc --edition2021 --test;6puretests;noDBI/O"
-}

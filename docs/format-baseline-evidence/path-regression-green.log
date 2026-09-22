@@ -1,8 +1,0 @@
-test_dotdot_alias_rejected_without_creation (__main__.ArtifactPathTests) ... ok
-test_nested_new_parent_rejected_without_creation (__main__.ArtifactPathTests) ... ok
-test_symlink_parent_rejected_without_creation (__main__.ArtifactPathTests) ... ok
-
-----------------------------------------------------------------------
-Ran 3 tests in 0.020s
-
-OK

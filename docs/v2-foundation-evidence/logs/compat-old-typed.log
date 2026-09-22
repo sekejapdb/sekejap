@@ -1,2 +1,0 @@
-COMMAND: <scratch> legacy-replay <scratch> <scratch> --explicit-test-mode
-legacy-replay: old typed decoder read 5 entities from 37 replayed KV pairs (encoding test only, not a migration guarantee)

@@ -22,6 +22,12 @@ pub use kernel::store::{Config, SyncMode};
 /// `kernel::page`; this is a re-export, not a copy.
 /// See `docs/core/FORMAT_V2.md`.
 pub use kernel::FORMAT_VERSION;
+/// The store's own error, as `collections::Error::Kernel` carries it. It
+/// leaves the crate here for the same reason `Config` does: a caller that
+/// must CLASSIFY every error a call can return -- the C ABI's error code
+/// (`docs/dist/C_ABI.md`) is one -- cannot name this variant's payload
+/// without reaching past the layer it depends on.
+pub use kernel::Error as KernelError;
 pub(crate) use crate::index::text::analyzer as text_analyzer;
 pub(crate) use crate::index::vector::quant as vector_quant;
 pub(crate) use crate::store::{dense_v3, scalar_key};

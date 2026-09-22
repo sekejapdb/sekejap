@@ -27,7 +27,7 @@ use kernel::{
     store::{Config, SyncMode},
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tempfile::TempDir;
 
 fn config() -> Config {
@@ -92,6 +92,32 @@ const INDEX_ENTRY_TAGS: [u8; 11] = [
 const ROW_TAGS: [u8; 3] = [0x20, 0x40, 0x60];
 /// The two halves of the edge keyspace, keyed by the NEAR endpoint.
 const EDGE_TAGS: [u8; 2] = [0x71, 0x72];
+/// The graph ENDPOINT SET keyspace:
+/// `tag | context | type | direction | collection | sequence`
+/// (`core/engine/src/index/graph/endpoints.rs`).
+const ENDPOINT_TAG: u8 = 0x7e;
+
+/// The endpoint key one (context, type, direction, entity) is filed under,
+/// spelled here from the encoding rather than asked of the engine.
+fn endpoint_key(context: u64, edge_type: u64, dir: u8, collection: u64, sequence: u64) -> Vec<u8> {
+    let mut k = vec![ENDPOINT_TAG];
+    k.extend(ordered(context));
+    k.extend(ordered(edge_type));
+    k.push(dir);
+    k.extend(ordered(collection));
+    k.extend(ordered(sequence));
+    k
+}
+
+/// The six integers of a primary edge key: source, context, type, destination.
+fn edge_fields(key: &[u8]) -> Option<[u64; 6]> {
+    let mut at = 1;
+    let mut out = [0u64; 6];
+    for slot in &mut out {
+        *slot = read_ordered(key, &mut at)?;
+    }
+    (at == key.len()).then_some(out)
+}
 
 /// What the test knows about the collection it is about to drop, so it can
 /// classify keys without asking the engine anything afterwards.
@@ -159,10 +185,28 @@ impl Owned {
                 let mut at = 1;
                 read_ordered(key, &mut at).is_some_and(|id| self.indexes.contains(&id))
             }
+            // A graph ENDPOINT SET key belongs to the collection whose row
+            // it names. It is DERIVED from the edge keyspace, so a key of
+            // ANOTHER collection can also go when this drop took that
+            // entity's last edge of its (context, type, direction); the
+            // oracle covers those separately with `surviving_endpoint_keys`.
+            ENDPOINT_TAG => {
+                let mut at = 1;
+                let Some(_context) = read_ordered(key, &mut at) else {
+                    return false;
+                };
+                let Some(_edge_type) = read_ordered(key, &mut at) else {
+                    return false;
+                };
+                at += 1;
+                read_ordered(key, &mut at) == Some(cid)
+            }
             // collection->index mapping: [5][ordered collection][ordered index]
             5 => key.starts_with(&tagged(5, self.id.0)),
             // index name mapping: [0x11][ordered collection][name]
             0x11 => key.starts_with(&tagged(0x11, self.id.0)),
+            // the live row-count record: [8][ordered collection]
+            8 => key == tagged(8, self.id.0),
             _ => false,
         }
     }
@@ -734,7 +778,7 @@ fn the_drop_removes_exactly_the_collections_records_and_nothing_else() {
     }
     for tag in [
         0u8, 1, 2, 3, 4, 5, 0x10, 0x11, 0x20, 0x40, 0x60, 0x71, 0x72, 0x73, 0x77, 0x78, 0x7a,
-        0x7b,
+        0x7b, ENDPOINT_TAG,
     ] {
         assert!(
             families.get(&tag).is_some_and(|n| *n > 0),
@@ -770,10 +814,31 @@ fn the_drop_removes_exactly_the_collections_records_and_nothing_else() {
     let db = Database::open(&path, config()).unwrap();
     let after = dump(&db);
 
+    // The graph ENDPOINT SET keys a SURVIVING edge still justifies, derived
+    // here from the primary edge keys of the pre-drop dump. A key of another
+    // collection whose only edge touched `place` is one the cascade is right
+    // to take, and this is what tells the two apart.
+    let surviving_endpoints: BTreeSet<Vec<u8>> = before
+        .keys()
+        .filter(|k| k.first() == Some(&0x71) && !owner.owns(k))
+        .filter_map(|k| edge_fields(k))
+        .flat_map(|[sc, ss, context, edge_type, dc, ds]| {
+            [
+                endpoint_key(context, edge_type, 0, sc, ss),
+                endpoint_key(context, edge_type, 1, dc, ds),
+            ]
+        })
+        .collect();
+    assert!(
+        !surviving_endpoints.is_empty(),
+        "the before->after edges must leave endpoint keys behind"
+    );
+
     // Exact, both directions.
     let expected: BTreeMap<_, _> = before
         .iter()
         .filter(|(k, _)| !owner.owns(k))
+        .filter(|(k, _)| k.first() != Some(&ENDPOINT_TAG) || surviving_endpoints.contains(*k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let missing: Vec<_> = expected.keys().filter(|k| !after.contains_key(*k)).collect();

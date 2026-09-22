@@ -8,8 +8,9 @@
 //! publish barrier, the statement timeout, the public cancel and the
 //! commit-time change feed.
 //!
-//! What is declared but not built: [`pg`]. It is named here so the layer's
-//! shape is visible without reading a plan; it carries no implementation.
+//! [`pg`] is the PostgreSQL wire protocol over that service
+//! (`docs/dist/WIRE_CONTRACT.md`, `docs/dist/OPS_CONTRACT.md` §9): a sans-IO
+//! protocol engine, a `std::net` adapter, and the `sekejap-pg` binary.
 //!
 //! Foreign-language wrappers are listed in `bindings/README.md`; none is
 //! built from this workspace.

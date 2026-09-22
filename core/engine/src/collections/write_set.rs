@@ -664,6 +664,7 @@ impl Database {
             self.writer()?.delete(&row_key(id))?;
             self.writer()?.delete(&mapping_key(c, &e.entity.key))?;
             self.note_deleted(id);
+            self.note_row_removed(id)?;
             Ok(true)
         })();
         self.finish(result)

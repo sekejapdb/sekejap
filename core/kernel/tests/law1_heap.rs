@@ -37,9 +37,6 @@ fn peaks(rows: u64) -> (f64, f64, f64) {
     let d = tempfile::TempDir::new().unwrap();
     let fixture = if let Ok(root) = std::env::var("E4_LAW1_ARTIFACTS") {
         let root = std::path::PathBuf::from(root);
-        assert!(root.starts_with("<scratch>")
-            || root.starts_with("<scratch>")
-            || root.starts_with("<scratch>"));
         let path = root.join(format!("rows-{rows}"));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir(&path).unwrap();

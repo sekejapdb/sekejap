@@ -17,7 +17,10 @@ on:
 
 jobs:
   publish:
-    if: false  # gated at the e4 migration: re-opens when this wrapper compiles against the e4 facade (dist/bindings/README.md)
+    if: false  # STILL gated at 0.17: Android has no java.lang.foreign, so this lane needs a JNI shim
+               # written against dist/ffi/include/sekejap.h plus an NDK cross-build of libsekejap.
+               # e1's sekejap_jni crate, its KSP orm and its AAR were removed; the steps below are
+               # e1's recipe, kept for whoever ports the lane (dist/bindings/wrappers/kotlin/README.md).
     name: Publish orm + processor + AAR to Maven Central
     runs-on: ubuntu-latest
     environment:

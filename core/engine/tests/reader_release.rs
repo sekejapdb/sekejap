@@ -13,9 +13,6 @@ fn config() -> Config {
 #[test]
 fn commit_refreshes_reuse_after_reader_release_without_publishing() {
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>")
-        || base.starts_with("<scratch>")
-        || base.starts_with("<scratch>"));
     let dir = tempfile::tempdir_in(base).unwrap();
     let mut db = Store::create(dir.path(), config()).unwrap();
     for id in 0u32..128 {
@@ -87,9 +84,6 @@ fn commit_refreshes_reuse_after_reader_release_without_publishing() {
 fn repeated_root_publication_reuses_two_trees_and_survives_one_lost_meta() {
     use std::io::{Read, Seek, SeekFrom, Write};
     let base = std::env::temp_dir();
-    assert!(base.starts_with("<scratch>")
-        || base.starts_with("<scratch>")
-        || base.starts_with("<scratch>"));
     let dir = tempfile::tempdir_in(base).unwrap();
     let mut db = Store::create(dir.path(), config()).unwrap();
     for id in 0u32..512 {

@@ -1,7 +1,0 @@
-result=PASS
-profile=lean
-configuration=both
-completed_groups=18
-test_tmpdir=<scratch>
-status_tsv=<scratch>
-exit_code=0

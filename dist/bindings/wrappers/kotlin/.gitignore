@@ -1,0 +1,5 @@
+# Build output. e1 committed its jars, its Gradle caches and three Android
+# .so files into the repository; none of that is source.
+build/
+.gradle/
+.kotlin/

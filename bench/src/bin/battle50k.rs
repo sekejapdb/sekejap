@@ -2026,7 +2026,7 @@ fn e4_bulk_reset(dir: &Path, indexed: bool) -> R<(Database, CollectionId)> {
         Config {
             budget_bytes: CACHE_BYTES,
             io: IoMode::Buffered,
-            sync: SyncMode::Full,
+            sync: SyncMode::Normal,
         },
     )?;
     let collection = db.create_collection_declared(
@@ -2380,7 +2380,7 @@ fn load_e4(dir: &Path, corpus: &Corpus) -> R<(E4Ctx, Vec<Value>)> {
         Config {
             budget_bytes: CACHE_BYTES,
             io: IoMode::Buffered,
-            sync: SyncMode::Full,
+            sync: SyncMode::Normal,
         },
     )?;
     // `born_ts` is `born` as the instant it names: the same date, stored the
@@ -2514,7 +2514,7 @@ fn open_e4(dir: &Path) -> R<(E4Ctx, Vec<Value>)> {
         Config {
             budget_bytes: CACHE_BYTES,
             io: IoMode::Buffered,
-            sync: SyncMode::Full,
+            sync: SyncMode::Normal,
         },
     )?;
     let place = db
@@ -2530,6 +2530,19 @@ fn open_e4(dir: &Path) -> R<(E4Ctx, Vec<Value>)> {
     let mut db = db;
     let at_provision = Instant::now();
     let provisioned = provision_functions(&mut db, place, &found, &provision_marker(dir))?;
+    let counted = provision_row_counts(&mut db)?;
+    // The graph ENDPOINT SETS are the same kind of object: a database an
+    // earlier pass built has edges that predate them, so it keeps the old
+    // walk until one bounded pass builds them. The pass is idempotent and
+    // costs two range seeks on a database that already has them.
+    let at_endpoints = Instant::now();
+    let endpoints = provision_endpoint_sets(&mut db)?;
+    if let Some((edges, keys)) = endpoints {
+        eprintln!(
+            "[e4] built the graph endpoint sets: {keys} keys over {edges} edges in {:.1}s",
+            at_endpoints.elapsed().as_secs_f64()
+        );
+    }
     let provision_seconds = at_provision.elapsed().as_secs_f64();
     let found = indexes_of(&db);
     let by_name = |wanted: &str| -> R<IndexId> {
@@ -2583,10 +2596,68 @@ fn open_e4(dir: &Path) -> R<(E4Ctx, Vec<Value>)> {
             "[e4] reopened {}; added `{BORN_TS}`, {IX_BORN_TS}, {IX_NAME} and {IX_KIND_LOWER} in {provision_seconds:.1}s (the function battery's own objects)",
             dir.display()
         );
+    } else if counted {
+        eprintln!("[e4] reopened {}; queries only (live row counts backfilled)", dir.display());
     } else {
         eprintln!("[e4] reopened {}; queries only", dir.display());
     }
     Ok((ctx, stages))
+}
+
+/// Give a reused database its LIVE ROW COUNT records, the same way
+/// `provision_functions` gives it `born_ts`: a database built before the
+/// records existed has none, and `count(*)` would take the walk it always
+/// took while a freshly loaded one reads a record. The two arms have to be
+/// asked the same question about the same representation.
+///
+/// `Database::backfill_row_counts` is bounded and resumable, so this is a
+/// loop with a commit per step; on a database that already has its records
+/// the first call answers `done` and walks nothing. `true` when it wrote any.
+fn provision_row_counts(db: &mut Database) -> R<bool> {
+    let mut written = 0u64;
+    let mut walked = 0u64;
+    loop {
+        let progress = db.backfill_row_counts(BATCH)?;
+        db.commit()?;
+        written += progress.records_written;
+        walked += progress.rows_walked;
+        if progress.done {
+            break;
+        }
+    }
+    if written > 0 {
+        eprintln!("[e4] backfilled {written} live row-count record(s) over {walked} row(s)");
+    }
+    Ok(written > 0)
+}
+
+/// Build the graph ENDPOINT SETS on a reused database that predates them.
+///
+/// `Database::backfill_endpoint_sets` is bounded and resumable, so this is a
+/// loop with a commit per step: the whole pass in one transaction would be a
+/// page-WAL allowance the bench has no reason to ask for. It returns the
+/// edges walked and the keys written, or `None` when the database already
+/// declares the feature (the ordinary case after the first run on one copy).
+fn provision_endpoint_sets(db: &mut Database) -> R<Option<(u64, u64)>> {
+    if db.endpoint_sets_present() {
+        return Ok(None);
+    }
+    let mut edges = 0u64;
+    let mut keys = 0u64;
+    loop {
+        let progress = db.backfill_endpoint_sets(BATCH * 16)?;
+        edges += progress.edges_seen;
+        keys += progress.keys_written;
+        db.commit()?;
+        if progress.done {
+            break;
+        }
+    }
+    if !db.endpoint_sets_present() {
+        // No graph in this database: nothing to build and no bit to set.
+        return Ok(None);
+    }
+    Ok(Some((edges, keys)))
 }
 
 /// Where the resumable provisioning cursor lives: BESIDE the database
@@ -4018,8 +4089,13 @@ fn load_pg(dsn: &str, corpus: &Corpus) -> R<(Client, Vec<Value>)> {
          CREATE EXTENSION IF NOT EXISTS vectorscale;",
     )?;
     // `synchronous_commit` is ON by default on a stock server; it is set
-    // explicitly anyway so the load pays the same per-commit durability
-    // barrier E4's page-WAL pays with `SyncMode::Full`.
+    // explicitly anyway so the load pays a per-commit durability barrier.
+    // Postgres issues an ordinary `fsync` for it, NOT `fcntl(F_FULLFSYNC)`,
+    // which is why the E4 arm runs at `SyncMode::Normal` (`sync_data`): the
+    // same class of primitive. E4's `SyncMode::Full` is the drive-cache
+    // barrier and costs 11.9 ms against 1.45 ms on this volume; matching the
+    // NAME of the setting while paying a barrier eight times dearer is not a
+    // matched arm.
     client.batch_execute(
         "SET synchronous_commit = on;
          DROP TABLE IF EXISTS place;
@@ -5086,9 +5162,11 @@ fn lite_connect(path: &Path) -> R<Connection> {
     let conn = Connection::open(path)?;
     // `journal_mode` answers with a row, so it cannot go through
     // `execute_batch`. DELETE plus FULL is the rollback-journal durability
-    // that matches E4's `SyncMode::Full` and Postgres's
-    // `synchronous_commit = on`: every commit is on the platter before the
-    // next statement runs.
+    // that matches Postgres's `synchronous_commit = on` and E4's
+    // `SyncMode::Normal`: every commit reaches the operating system before the
+    // next statement runs. SQLite leaves `PRAGMA fullfsync` OFF by default, so
+    // on macOS this is `fsync`, not `fcntl(F_FULLFSYNC)`; the E4 arm issues
+    // `sync_data`, the same class of primitive.
     let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("delete") {
         return Err(format!("sqlite refused journal_mode=DELETE and stayed in {mode}").into());
@@ -5614,8 +5692,10 @@ fn sqlite_deviations() -> Vec<Value> {
         deviation(
             "*",
             "DURABILITY AND CACHE ARE MATCHED, PAGE SIZE IS NOT. `journal_mode = DELETE` with \
-             `synchronous = FULL` is the rollback-journal equivalent of E4's SyncMode::Full \
-             and Postgres's synchronous_commit = on, and `cache_size = -8192` is the same 8 \
+             `synchronous = FULL` is the rollback-journal equivalent of E4's SyncMode::Normal \
+             and Postgres's synchronous_commit = on -- all three issue an ordinary fsync-class \
+             barrier per commit, none of them the macOS drive-cache barrier `F_FULLFSYNC`, \
+             which SQLite leaves off by default and E4 reaches with SyncMode::Full, and `cache_size = -8192` is the same 8 \
              MiB budget the E4 arm is given. The page is SQLite's 4096-byte default against \
              E4's own page size and Postgres's 8 KiB block; no arm was retuned for this \
              corpus.",

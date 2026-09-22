@@ -1,11 +1,17 @@
-"""
-sekejap Python REPL / one-shot runner.
+"""A shell over one sekejap directory: ``python -m sekejap``.
 
 Usage::
 
-    python -m sekejap                     # in-memory REPL
-    python -m sekejap ./data              # persistent REPL
-    python -m sekejap ./data "SELECT..."  # one-shot query, print, exit
+    python -m sekejap ./data                     # a prompt on ./data
+    python -m sekejap ./data "SELECT ..."        # run one statement and exit
+    python -m sekejap --service ./data           # open in service mode
+
+sekejap is disk-first, so a directory is required: there is no in-memory
+database to fall back to, and this shell does not invent a temporary one.
+
+Inside the prompt, a line that begins with a backslash is a command and
+anything else is SQL. A statement that returns rows is printed as a table; one
+that writes prints the rows it moved.
 """
 
 from __future__ import annotations
@@ -15,459 +21,172 @@ import json
 import sys
 import time
 
-from . import DB, Hit
+from . import Db, SekejapError, __version__, format_version, version
+
+_MAX_WIDTH = 52
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-_MAX_COL = 52
-_MIN_COL = 4
-
-
-def _fmt_duration(ns: int) -> str:
-    if ns < 1_000:
-        return f"{ns} ns"
-    elif ns < 1_000_000:
-        return f"{ns / 1_000:.2f} µs"
-    elif ns < 1_000_000_000:
-        return f"{ns / 1_000_000:.2f} ms"
-    else:
-        return f"{ns / 1_000_000_000:.3f} s"
-
-
-def _cell(v: object) -> str:
-    if isinstance(v, str):
-        return v
-    if v is None:
+def _cell(value):
+    if value is None:
         return ""
-    return json.dumps(v, ensure_ascii=False)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
-def _trunc(s: str, maxw: int) -> str:
-    if len(s) <= maxw:
-        return s
-    return s[:maxw - 1] + "…"
+def _clip(text, width):
+    return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def _print_table(hits: list[Hit], elapsed_ns: int) -> None:
-    timing = _fmt_duration(elapsed_ns)
-    n = len(hits)
+def _duration(seconds):
+    if seconds < 1e-3:
+        return "%.0f us" % (seconds * 1e6)
+    if seconds < 1.0:
+        return "%.2f ms" % (seconds * 1e3)
+    return "%.3f s" % seconds
 
-    if not hits:
-        print(f"(0 rows)  [{timing}]")
+
+def print_table(rows, elapsed):
+    """Rows as the C ABI hands them over: objects keyed by column name."""
+    if not rows:
+        print("(0 rows)  [%s]" % _duration(elapsed))
         return
+    columns = []
+    for row in rows:
+        for column in row:
+            if column not in columns:
+                columns.append(column)
+    # A column MISSING in a row is omitted from that row, because missing is
+    # not null; an empty cell here is exactly that.
+    cells = [[_clip(_cell(row.get(column)), _MAX_WIDTH) for column in columns] for row in rows]
+    widths = [
+        max(len(_clip(column, _MAX_WIDTH)), *(len(row[index]) for row in cells))
+        for index, column in enumerate(columns)
+    ]
+    line = "-+-".join("-" * width for width in widths)
+    print(" | ".join(_clip(c, _MAX_WIDTH).ljust(w) for c, w in zip(columns, widths)))
+    print(line)
+    for row in cells:
+        print(" | ".join(cell.ljust(width) for cell, width in zip(row, widths)))
+    print("(%d row%s)  [%s]" % (len(rows), "" if len(rows) == 1 else "s", _duration(elapsed)))
 
-    # Collect columns from first hit's payload
-    columns: list[str] = []
-    payloads: list[dict] = []
-    for hit in hits:
-        if hit.payload:
-            try:
-                d = json.loads(hit.payload)
-                if isinstance(d, dict):
-                    for k in d:
-                        if k not in columns:
-                            columns.append(k)
-                    payloads.append(d)
-                else:
-                    payloads.append({})
-            except Exception:
-                payloads.append({})
-        else:
-            payloads.append({})
 
-    if not columns:
-        # Slug-only fallback
-        slug_w = max((len(h.slug) for h in hits), default=5)
-        slug_w = min(max(slug_w, len("_slug")), _MAX_COL)
-        line = "─" * (slug_w + 2)
-        print(f"┌{line}┐")
-        print(f"│ {'_slug':<{slug_w}} │")
-        print(f"├{line}┤")
-        for hit in hits:
-            print(f"│ {_trunc(hit.slug, _MAX_COL):<{slug_w}} │")
-        print(f"└{line}┘")
-        row_word = "row" if n == 1 else "rows"
-        print(f"{n} {row_word}  [{timing}]")
+_HELP = """\
+\\h, \\?            this help
+\\d                 the collections in the catalog
+\\d <collection>    the declared shape of one collection, and its rows
+\\n <collection> <key> [type]   the rows one hop away
+\\e <statement>     the plan the engine would build
+\\s                 the bytes on disk
+\\q                 quit
+anything else      SQL, run with no parameters"""
+
+
+def run_statement(db, text):
+    """One statement: rows if it returns them, a count if it writes."""
+    started = time.perf_counter()
+    try:
+        rows = db.query(text)
+    except SekejapError as failure:
+        if failure.code.name not in ("INVALID", "UNSUPPORTED"):
+            raise
+        # A writing statement is not a row-returning one; try it as a write
+        # before reporting the first failure, which may have been about that.
+        try:
+            moved = db.execute(text)
+        except SekejapError:
+            raise failure
+        print("%d row(s)  [%s]" % (moved, _duration(time.perf_counter() - started)))
         return
-
-    # Column widths
-    widths = [max(len(c), _MIN_COL) for c in columns]
-    for row in payloads:
-        for i, col in enumerate(columns):
-            v = _cell(row.get(col))
-            w = min(len(v), _MAX_COL)
-            if w > widths[i]:
-                widths[i] = w
-
-    top = "┬".join("─" * (w + 2) for w in widths)
-    mid = "┼".join("─" * (w + 2) for w in widths)
-    bot = "┴".join("─" * (w + 2) for w in widths)
-
-    print(f"┌{top}┐")
-    hdr = "│".join(f" {c:<{w}} " for c, w in zip(columns, widths))
-    print(f"│{hdr}│")
-    print(f"├{mid}┤")
-
-    for row in payloads:
-        cells = "│".join(
-            f" {_trunc(_cell(row.get(col)), _MAX_COL):<{w}} "
-            for col, w in zip(columns, widths)
-        )
-        print(f"│{cells}│")
-
-    print(f"└{bot}┘")
-    row_word = "row" if n == 1 else "rows"
-    print(f"{n} {row_word}  [{timing}]")
+    print_table(rows, time.perf_counter() - started)
 
 
-def _run_sql(db: DB, sql: str) -> None:
-    first = sql.split()[0].upper() if sql.split() else ""
-    t0 = time.perf_counter_ns()
-    if first in ("SELECT", "MATCH"):
-        try:
-            hits = db.query(sql)
-            elapsed = time.perf_counter_ns() - t0
-            _print_table(hits, elapsed)
-        except Exception as e:
-            print(f"error: {e}", file=sys.stderr)
-    elif first == "EXPLAIN":
-        try:
-            rest = sql[len("EXPLAIN"):].lstrip()
-            analyze = rest.split()[0].upper() == "ANALYZE" if rest.split() else False
-            plan_sql = rest[len("ANALYZE"):].lstrip() if analyze else rest
-            hits = db.explain(plan_sql, analyze)
-            elapsed = time.perf_counter_ns() - t0
-            _print_table(hits, elapsed)
-        except Exception as e:
-            print(f"error: {e}", file=sys.stderr)
-    elif first in (
-        "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "REINDEX",
-        "COMPACT", "SET", "BEGIN", "COMMIT", "ROLLBACK",
-    ):
-        try:
-            n = db.execute(sql)
-            elapsed = time.perf_counter_ns() - t0
-            timing = _fmt_duration(elapsed)
-            if n == 0:
-                print(f"ok  [{timing}]")
-            elif n == 1:
-                print(f"ok — 1 row affected  [{timing}]")
-            else:
-                print(f"ok — {n} rows affected  [{timing}]")
-        except Exception as e:
-            print(f"error: {e}", file=sys.stderr)
-    elif first == "SHOW":
-        try:
-            hits = db.show(sql)
-            elapsed = time.perf_counter_ns() - t0
-            _print_table(hits, elapsed)
-        except Exception as e:
-            print(f"error: {e}", file=sys.stderr)
-    else:
-        print(
-            "unknown statement — supported: SELECT MATCH EXPLAIN SHOW INSERT UPDATE"
-            " DELETE CREATE DROP ALTER REINDEX COMPACT SET BEGIN COMMIT ROLLBACK",
-            file=sys.stderr,
-        )
-
-
-def _run_dot(db: DB, label: list[str], line: str) -> bool:
-    """Handle a .command. Returns False if the user wants to quit."""
-    parts = line.split(maxsplit=1)
-    cmd = parts[0].lower()
-
-    if cmd in (".quit", ".q", ".exit"):
+def run_command(db, line):
+    """A backslash command. Returns False when the shell should stop."""
+    parts = line.split()
+    command, arguments = parts[0], parts[1:]
+    if command in ("\\q", "\\quit"):
         return False
-
-    elif cmd == ".help":
-        print("""
-sekejap dot commands
-────────────────────
-.open <path>        open (or create) a persistent DB
-.tables             list all collections
-.schema [name]      show CREATE TABLE DDL
-.compact            flush snapshot, truncate WAL
-.stats              show node / edge / collection counts
-.edges              show full graph schema
-.edges <col>        show distinct edge types leaving a collection
-.help               show this help
-.quit / .q / .exit  exit
-
-SQL — standard (end each statement with ;)
-──────────────────────────────────────────
-SELECT * FROM collection [WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n];
-INSERT INTO collection (_key, field, ...) VALUES ('key', val, ...);
-UPDATE collection SET field = val [WHERE ...];
-DELETE FROM collection [WHERE ...];
-CREATE TABLE collection (_key TEXT PRIMARY KEY, field TYPE);
-ALTER TABLE collection ADD COLUMN field TYPE;
-ALTER TABLE collection DROP COLUMN field;
-ALTER TABLE collection RENAME COLUMN old TO new;
-ALTER TABLE collection RENAME TO new_name;
-REINDEX ON collection USING method (field);
-
-SQL — graph aggregate — SELECT FROM MATCH form
-───────────────────────────────────────────────
-SELECT expr AS alias [, ...]
-FROM MATCH (a:col)-[r:rel]->(b:col)
-    [WHERE a._key = 'val']
-    [GROUP BY col] [ORDER BY col [DESC]] [LIMIT n];
-
-Return expressions
-──────────────────
-var._key, var.field         node / edge field
-COUNT(var)                  number of paths
-SUM(var.field)              numeric sum
-AVG(var.field)              numeric mean
-MIN(var.field)              minimum
-MAX(var.field)              maximum
-length(p)                   hop count of a path variable (MATCH p = ...)
-nodes(p)                    JSON array of node slugs along the path
-relationships(p)            JSON array of edge objects {from,to,type,attrs}
-PATH_PRODUCT(r.weight)      product of a named edge attribute along the path
-PATH_AVG / PATH_SUM / PATH_MIN / PATH_MAX(r.field)
-PATH_FIRST(p.nodes)         first element of a path array
-PATH_LAST(p.nodes)          last element of a path array
-JSON_ARRAY_LENGTH(p.nodes)  length of a path array
-CASE WHEN var.field = val THEN lit ELSE lit END
-NOW()                       current Unix timestamp (integer)
-AGE_DAYS(var.field)         days since epoch field
-AGE_HOURS(var.field)        hours since epoch field
-
-Shortest path
-─────────────
-MATCH SHORTEST (a)-[r*]->(b)
-    WHERE a._key = 'col/key1' AND b._key = 'col/key2';
-
-Introspection
-─────────────
-SHOW TABLES;
-SHOW EDGES;
-SHOW EDGES FROM collection;
-SHOW EDGES FROM col1 TO col2;
-SHOW <collection>;
-
-Filters: =  !=  >  <  >=  <=  BETWEEN n AND n  IN (...)  LIKE  IS NULL
-Spatial: ST_DWithin  ST_Contains  ST_Within  ST_Intersects  ST_DISTANCE_KM(a,b)
-Vector:  WHERE VECTOR_NEAR(field, [f32, ...], k)
-         VECTOR_COSINE(a,b)  VECTOR_L2(a,b)  VECTOR_DOT(a,b)  VECTOR_L1(a,b)
-         a <=> b  a <-> b  a <#> b  a <+> b
-""")
-
-    elif cmd == ".open":
-        path = parts[1].strip() if len(parts) > 1 else ""
-        if not path:
-            print("usage: .open <path>", file=sys.stderr)
+    elif command in ("\\h", "\\?", "\\help"):
+        print(_HELP)
+    elif command == "\\d":
+        if arguments:
+            shape = db.describe(arguments[0])
+            if shape is None:
+                print("no collection named %r" % arguments[0])
+            else:
+                print(json.dumps(shape, indent=2, sort_keys=True))
         else:
-            try:
-                new_db = DB(path)
-                # Can't rebind outer db (PyO3 class) — swap internals via close+reopen trick.
-                # For simplicity, inform the user they need to restart.
-                print(f"note: .open not supported after startup in Python REPL — "
-                      f"restart with: python -m sekejap {path}")
-            except Exception as e:
-                print(f"error: {e}", file=sys.stderr)
-
-    elif cmd == ".tables":
-        hits = db.show("SHOW TABLES")
-        if hits:
-            print(f"{'name':<30} {'count'}")
-            print("-" * 38)
-            for h in hits:
-                if h.payload:
-                    import json as _json
-                    d = _json.loads(h.payload)
-                    print(f"{d.get('name', ''):<30} {d.get('count', 0)}")
+            for name in db.collections():
+                print("%-32s %d rows" % (name, db.count_rows(name)))
+    elif command == "\\n":
+        if len(arguments) < 2:
+            print("usage: \\n <collection> <key> [edge type]")
         else:
-            print("(no collections)")
-
-    elif cmd == ".schema":
-        target = parts[1].strip() if len(parts) > 1 else ""
-        names = [target] if target else db.collection_names()
-        found = False
-        for name in names:
-            hits = db.show(f"SHOW {name}")
-            if hits:
-                import json as _json
-                print(f"-- {name}")
-                print(f"{'field':<25} {'type':<15} {'source'}")
-                print("-" * 50)
-                for h in hits:
-                    if h.payload:
-                        d = _json.loads(h.payload)
-                        pk = " (PK)" if d.get("primary_key") else ""
-                        print(f"{d.get('field',''):<25} {d.get('type',''):<15} {d.get('source','')}{pk}")
-                print()
-                found = True
-            elif target:
-                print(f"-- no data found for '{name}'")
-                found = True
-        if not found:
-            print("(no collections found)")
-
-    elif cmd == ".compact":
-        try:
-            db.compact()
-            print("compacted")
-        except Exception as e:
-            print(f"error: {e}", file=sys.stderr)
-
-    elif cmd == ".stats":
-        print(f"nodes       : {db.node_count()}")
-        print(f"edges       : {db.edge_count()}")
-        print(f"collections : {len(db.collection_names())}")
-
-    elif cmd == ".edges":
-        import json as _json
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        sql = f"SHOW EDGES FROM {arg}" if arg else "SHOW EDGES"
-        hits = db.show(sql)
-        if not hits:
-            print("(no edges)")
-        elif arg:
-            print(f"{'type':<20} {'count'}")
-            print("-" * 28)
-            for h in hits:
-                if h.payload:
-                    d = _json.loads(h.payload)
-                    print(f"{d.get('type',''):<20} {d.get('count', 0)}")
-        else:
-            print(f"{'from':<25} {'type':<20} {'to':<25} {'count'}")
-            print("-" * 78)
-            for h in hits:
-                if h.payload:
-                    d = _json.loads(h.payload)
-                    print(f"{d.get('from',''):<25} {d.get('type',''):<20} {d.get('to',''):<25} {d.get('count',0)}")
-
+            edge_type = arguments[2] if len(arguments) > 2 else None
+            for row in db.neighbours(arguments[0], arguments[1], edge_type):
+                print("%s/%s %s" % (row["collection"], row["key"], json.dumps(row["document"])))
+    elif command == "\\e":
+        print(db.explain(line[len(command):].strip()))
+    elif command == "\\s":
+        print(json.dumps(db.storage(), indent=2, sort_keys=True))
     else:
-        print(f"unknown command: {cmd}  (try .help)", file=sys.stderr)
-
+        print("unknown command %r -- \\h for the list" % command)
     return True
 
 
-# ── Script runner ─────────────────────────────────────────────────────────────
-
-def _run_script(db: DB, script: str) -> None:
-    label: list[str] = []
-    buf = ""
-    in_str = False
-    str_char = "\0"
-
-    for line in script.splitlines():
-        trimmed = line.strip()
-
-        if not in_str and not buf.strip() and trimmed.startswith("."):
-            if not _run_dot(db, label, trimmed):
-                return
-            continue
-
-        if not in_str and (not trimmed or trimmed.startswith("--")):
-            continue
-
-        for ch in trimmed:
-            if not in_str and ch in ("'", '"'):
-                in_str = True
-                str_char = ch
-                buf += ch
-            elif in_str and ch == str_char:
-                in_str = False
-                buf += ch
-            elif ch == ";" and not in_str:
-                stmt = buf.strip()
-                buf = ""
-                if stmt:
-                    _run_sql(db, stmt)
-            else:
-                buf += ch
-
-        if buf.strip():
-            buf += " "
-
-    stmt = buf.strip()
-    if stmt:
-        _run_sql(db, stmt)
-
-
-# ── REPL ──────────────────────────────────────────────────────────────────────
-
-def _repl(db: DB, label: str) -> None:
-    try:
-        import readline  # noqa: F401 — enables line editing on Unix
-    except ImportError:
-        pass
-
-    print(f"sekejap  —  {label}")
-    print("type .help for commands, .quit to exit\n")
-
-    buf = ""
-    label_list: list[str] = [label]
-
-    while True:
-        prompt = "sekejap> " if not buf.strip() else "      ...> "
-        try:
-            line = input(prompt)
-        except EOFError:
-            print()
-            break
-        except KeyboardInterrupt:
-            print()
-            buf = ""
-            continue
-
-        trimmed = line.strip()
-        if not trimmed:
-            continue
-
-        if trimmed.startswith("."):
-            buf = ""
-            if not _run_dot(db, label_list, trimmed):
-                break
-            continue
-
-        if buf:
-            buf += " "
-        buf += trimmed
-
-        if buf.rstrip().endswith(";"):
-            sql = buf.rstrip().rstrip(";").strip()
-            buf = ""
-            if sql:
-                _run_sql(db, sql)
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="python -m sekejap",
-        description="sekejap embedded DB — REPL and one-shot runner",
+def repl(db):
+    print(
+        "sekejap %s (wrapper %s), disk format %d, on %s"
+        % (version(), __version__, format_version(), db.path)
     )
-    parser.add_argument("path", nargs="?", default=None,
-                        help="DB directory path (omit for in-memory)")
-    parser.add_argument("sql", nargs="?", default=None,
-                        help="SQL statement or script to run and exit")
-    args = parser.parse_args(argv)
+    print("\\h for help, \\q to quit")
+    while True:
+        try:
+            line = input("sekejap> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not line:
+            continue
+        try:
+            if line.startswith("\\"):
+                if not run_command(db, line):
+                    return 0
+            else:
+                run_statement(db, line)
+        except SekejapError as failure:
+            print("%s: %s" % (failure.code.name.lower(), failure.message))
 
-    db = DB(args.path)
-    label = args.path or ":memory:"
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="python -m sekejap", description=__doc__)
+    parser.add_argument("directory", help="the sekejap directory to open")
+    parser.add_argument("statement", nargs="?", help="run one statement and exit")
+    parser.add_argument(
+        "--service",
+        action="store_true",
+        help="open in service mode: one writer, parallel readers, the change feed",
+    )
+    arguments = parser.parse_args(argv)
 
     try:
-        if args.sql:
-            _run_script(db, args.sql)
+        db = Db(arguments.directory, service=arguments.service)
+    except SekejapError as failure:
+        print("%s: %s" % (failure.code.name.lower(), failure.message), file=sys.stderr)
+        return 1
+    try:
+        if arguments.statement:
+            try:
+                run_statement(db, arguments.statement)
+            except SekejapError as failure:
+                print("%s: %s" % (failure.code.name.lower(), failure.message), file=sys.stderr)
+                return 1
             return 0
-
-        import sys as _sys
-        if not _sys.stdin.isatty():
-            script = _sys.stdin.read()
-            _run_script(db, script)
-            return 0
-
-        _repl(db, label)
-        return 0
+        return repl(db)
     finally:
         db.close()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

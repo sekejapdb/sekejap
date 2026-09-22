@@ -38,6 +38,13 @@ jobs:
       # otherwise, and a summary read from that output reports the binaries that
       # did run as though they were all of them.
       - run: cargo test --release --no-fail-fast
+      # The one thing the Rust suite cannot prove about the C ABI: that a C
+      # COMPILER accepts the generated header and links the library. `make
+      # check` compiles examples/smoke.c against the freshly built libsekejap
+      # and runs it, so a header that cbindgen renames or mistypes fails here
+      # rather than in a binding's build (docs/dist/C_ABI.md).
+      - name: C ABI - compile and run a C consumer against the header
+        run: make -C dist/ffi check
 
   # The agreement fuzzers on a seed nobody has run before.
   #

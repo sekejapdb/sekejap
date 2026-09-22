@@ -7,6 +7,12 @@ license.workspace = true
 # The package is `sekejap-kernel` (the crates.io name); the library target keeps
 # the name `kernel`, which is how every dependent and every test of this crate
 # has always imported it.
+description = "The storage kernel of sekejap: a disk-first B-tree over a page-WAL, with typed packed pages and crash recovery"
+repository = "https://github.com/sekejapdb/sekejap"
+homepage = "https://github.com/sekejapdb/sekejap"
+readme = "README.md"
+keywords = ["database", "btree", "storage", "wal", "embedded"]
+categories = ["database-implementations", "filesystem"]
 [lib]
 name = "kernel"
 

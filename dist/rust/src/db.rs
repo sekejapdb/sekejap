@@ -62,13 +62,48 @@ impl Db {
     }
 
     /// The store configuration this crate opens with when the caller names
-    /// none: `kernel::store::Config` with `SyncMode::Full`, which is the one
-    /// barrier the page WAL accepts -- every commit is published with a full
-    /// barrier, and a weaker mode is REFUSED by the store rather than
-    /// quietly downgraded.
+    /// none: `kernel::store::Config` with [`SyncMode::Normal`], so every
+    /// commit is published with a data barrier -- `fdatasync` on Linux, plain
+    /// `fsync` on macOS. That is the barrier SQLite issues with `fullfsync`
+    /// off (its default everywhere) and the one PostgreSQL issues with a
+    /// plain `fsync`, so a sekejap database and one of those two, opened
+    /// with nothing named, promise the same thing and cost comparable time.
+    ///
+    /// WHAT `Normal` PROMISES: every acknowledged commit survives a process
+    /// crash, a kill, and an operating-system panic or reboot, because the
+    /// bytes are out of the page cache and in the drive's hands before the
+    /// commit returns. WHAT IT DOES NOT: it does not flush the drive's own
+    /// write cache, so a sudden loss of power to a drive that acknowledged a
+    /// write it had not yet persisted can lose recently acknowledged
+    /// commits. Nothing is left half-written either way -- a torn or missing
+    /// tail is truncated at the last complete commit frame on the next open
+    /// -- but that tail can be shorter than what was acknowledged.
+    ///
+    /// ASKING FOR THE STRONGER BARRIER: name it.
+    ///
+    /// ```no_run
+    /// use sekejap::{Db, Config, SyncMode};
+    /// let db = Db::open_with("/tmp/example", Config { sync: SyncMode::Full, ..Db::config() })?;
+    /// # Ok::<(), sekejap::Error>(())
+    /// ```
+    ///
+    /// [`SyncMode::Full`] issues the strongest barrier the platform has --
+    /// on macOS `fcntl(F_FULLFSYNC)`, which flushes the drive's own write
+    /// cache, and elsewhere `fsync` -- so an acknowledged commit survives a
+    /// power cut as well. It costs 11.9 ms against 1.45 ms for `Normal` on
+    /// the volume the write-path measurements were taken on, which at bulk
+    /// sizes is over 90% of a write's wall time. [`SyncMode::Off`] issues no
+    /// barrier and is for throwaway and rebuildable data only.
+    ///
+    /// All three are honoured end to end, at the kernel store
+    /// (`core/kernel/src/store.rs`) and at every publication point of the
+    /// page-WAL collection backend (`core/engine/src/store/pagewal/mod.rs`).
+    /// Which primitive actually ran is readable per handle:
+    /// `Database::io_counters()` reports `sync_full_calls` and
+    /// `sync_data_calls` separately.
     pub fn config() -> Config {
         Config {
-            sync: SyncMode::Full,
+            sync: SyncMode::Normal,
             ..Config::default()
         }
     }
@@ -186,9 +221,23 @@ impl Db {
 
     /// One write, committed before it returns: durability per call
     /// (`docs/dist/RUST_API.md` §6). A failure rolls the call back whole.
+    ///
+    /// The body holds the ENGINE handle, which in service mode is the
+    /// unrecorded one: what it writes is durable but invisible to the §5
+    /// change feed. It is the path for the CATALOG calls, which the feed
+    /// does not model. Every call that moves ROWS or EDGES goes through
+    /// [`Db::in_transaction`] instead.
     pub(crate) fn write<T>(&self, body: impl FnOnce(&mut Database) -> Result<T>) -> Result<T> {
+        self.in_transaction(|tx| body(tx.database()))
+    }
+
+    /// One transaction, committed before it returns and rolled back whole on
+    /// a failure. The body holds the [`Tx`], whose writes are RECORDED: in
+    /// service mode they reach the change feed, the statement timeout and
+    /// the cancel of `docs/dist/OPS_CONTRACT.md` §3-§5.
+    pub(crate) fn in_transaction<T>(&self, body: impl FnOnce(&mut Tx<'_>) -> Result<T>) -> Result<T> {
         let mut tx = self.transaction()?;
-        match body(tx.database()) {
+        match body(&mut tx) {
             Ok(value) => {
                 tx.commit()?;
                 Ok(value)
@@ -243,10 +292,7 @@ impl Db {
     pub fn put<'a>(&self, addr: impl Into<Addr<'a>>, document: &Value) -> Result<EntityId> {
         let addr = addr.into();
         let doc = strip_key(document, addr.key)?;
-        self.write(|db| {
-            let id = collection_id(db, addr.collection)?;
-            Ok(db.put(id, addr.key, &doc)?)
-        })
+        self.in_transaction(|tx| tx.put(addr, &doc))
     }
 
     /// Write many documents into one collection under ONE commit.
@@ -256,17 +302,7 @@ impl Db {
         rows: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<usize> {
         let rows: Vec<(String, Value)> = rows.into_iter().collect();
-        let prepared = rows
-            .iter()
-            .map(|(key, doc)| strip_key(doc, key))
-            .collect::<Result<Vec<_>>>()?;
-        self.write(|db| {
-            let id = collection_id(db, collection)?;
-            for ((key, _), doc) in rows.iter().zip(&prepared) {
-                db.put(id, key, doc)?;
-            }
-            Ok(rows.len())
-        })
+        self.in_transaction(|tx| tx.put_many(collection, rows))
     }
 
     /// Read one document, with `_key` set. `None` is a miss, never an error.
@@ -297,12 +333,7 @@ impl Db {
     /// there.
     pub fn delete<'a>(&self, addr: impl Into<Addr<'a>>) -> Result<bool> {
         let addr = addr.into();
-        self.write(|db| {
-            let Some(id) = db.collection(addr.collection)? else {
-                return Ok(false);
-            };
-            Ok(db.delete(id, addr.key)?)
-        })
+        self.in_transaction(|tx| tx.delete(addr))
     }
 
     /// Walk a collection in stable id order, one page of rows at a time.
@@ -418,17 +449,7 @@ impl Db {
     /// Run one writing statement and commit. Returns the rows it moved; a
     /// statement that only raises a notice returns zero.
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
-        let params = params_of(params);
-        let out = self.write(|db| {
-            let result = db.sql(sql, &params)?;
-            expect_affected(result, sql)
-        });
-        // A writing statement list includes DDL, and a DDL statement changes
-        // the layout every cached plan was compiled against.
-        if Self::changes_the_catalog(sql) {
-            self.catalog_changed();
-        }
-        out
+        self.in_transaction(|tx| tx.execute(sql, params))
     }
 
     /// Run one row-returning statement and assemble its answer.
@@ -526,16 +547,7 @@ impl Db {
         properties: &Value,
     ) -> Result<()> {
         let (from, to) = (from.into(), to.into());
-        self.write(|db| {
-            let source = entity_id(db, from)?;
-            let destination = entity_id(db, to)?;
-            // The graph keyspace is an additive feature bit, set on the
-            // first edge and idempotent afterwards: a database that never
-            // links carries no graph header.
-            db.enable_graph()?;
-            db.link(source, edge_type, destination, "", properties)?;
-            Ok(())
-        })
+        self.in_transaction(|tx| tx.link_with(from, edge_type, to, properties))
     }
 
     /// Remove one edge. `false` if there was no such edge.
@@ -546,14 +558,7 @@ impl Db {
         to: impl Into<Addr<'b>>,
     ) -> Result<bool> {
         let (from, to) = (from.into(), to.into());
-        self.write(|db| {
-            if db.scan_count_edges()? == 0 {
-                return Ok(false);
-            }
-            let source = entity_id(db, from)?;
-            let destination = entity_id(db, to)?;
-            Ok(db.unlink(source, edge_type, destination, "")?)
-        })
+        self.in_transaction(|tx| tx.unlink(from, edge_type, to))
     }
 
     /// The rows one hop away, in one direction, under a complete-or-error
@@ -666,12 +671,36 @@ impl Db {
                 fields,
                 indexes,
                 timestamps: info.timestamps,
+                rows: db.row_count(id)?,
             }))
         })
     }
 
-    /// Count the rows of one collection BY WALKING them. E4 keeps no O(1)
-    /// row counter (`docs/dist/OPS_CONTRACT.md` §6.1); the name says so.
+    /// The rows of one collection, from the LIVE ROW COUNT record when the
+    /// database keeps one and from the walk when it does not.
+    ///
+    /// The record is maintained by the write path inside the same transaction
+    /// as the rows, so reading it is one `get` and the answer is exact. A
+    /// database written before the record existed, or a collection a
+    /// `Database::backfill_row_counts` has not reached, has none: then this
+    /// is [`Db::scan_count_rows`], with the walk that name promises.
+    /// [`Db::describe`]'s `rows` field is the one that tells the two apart
+    /// without paying for either.
+    pub fn count_rows(&self, collection: &str) -> Result<u64> {
+        self.read(|db| {
+            let Some(id) = db.collection(collection)? else {
+                return Err(Error::UnknownCollection(collection.to_owned()));
+            };
+            match db.row_count(id)? {
+                Some(rows) => Ok(rows),
+                None => count_rows(db, id),
+            }
+        })
+    }
+
+    /// Count the rows of one collection BY WALKING them, whether or not the
+    /// database keeps a live record. The explicit walk; [`Db::count_rows`] is
+    /// the one that reads the record when there is one.
     pub fn scan_count_rows(&self, collection: &str) -> Result<u64> {
         self.read(|db| {
             let Some(id) = db.collection(collection)? else {
@@ -785,9 +814,14 @@ impl Tx<'_> {
     pub fn put<'a>(&mut self, addr: impl Into<Addr<'a>>, document: &Value) -> Result<EntityId> {
         let addr = addr.into();
         let doc = strip_key(document, addr.key)?;
-        let db = self.database();
-        let id = collection_id(db, addr.collection)?;
-        Ok(db.put(id, addr.key, &doc)?)
+        let id = collection_id(self.database(), addr.collection)?;
+        match &mut self.inner {
+            TxInner::Single(g) => Ok(g.put(id, addr.key, &doc)?),
+            // The RECORDED write path: in service mode a put is one entry in
+            // the §5 change feed, delivered by the commit that made it
+            // durable.
+            TxInner::Service(g) => Ok(g.put(id, addr.key, &doc)?),
+        }
     }
 
     /// Write many documents into one collection.
@@ -796,12 +830,18 @@ impl Tx<'_> {
         collection: &str,
         rows: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<usize> {
-        let db = self.database();
-        let id = collection_id(db, collection)?;
+        let id = collection_id(self.database(), collection)?;
         let mut written = 0;
         for (key, doc) in rows {
             let doc = strip_key(&doc, &key)?;
-            db.put(id, &key, &doc)?;
+            match &mut self.inner {
+                TxInner::Single(g) => {
+                    g.put(id, &key, &doc)?;
+                }
+                TxInner::Service(g) => {
+                    g.put(id, &key, &doc)?;
+                }
+            }
             written += 1;
         }
         Ok(written)
@@ -810,11 +850,13 @@ impl Tx<'_> {
     /// Delete one row.
     pub fn delete<'a>(&mut self, addr: impl Into<Addr<'a>>) -> Result<bool> {
         let addr = addr.into();
-        let db = self.database();
-        let Some(id) = db.collection(addr.collection)? else {
+        let Some(id) = self.database().collection(addr.collection)? else {
             return Ok(false);
         };
-        Ok(db.delete(id, addr.key)?)
+        match &mut self.inner {
+            TxInner::Single(g) => Ok(g.delete(id, addr.key)?),
+            TxInner::Service(g) => Ok(g.delete(id, addr.key)?),
+        }
     }
 
     /// Link two rows with a typed edge in the base graph context.
@@ -839,8 +881,16 @@ impl Tx<'_> {
         let db = self.database();
         let source = entity_id(db, from)?;
         let destination = entity_id(db, to)?;
+        // The graph keyspace is an additive feature bit, set on the first
+        // edge and idempotent afterwards: a database that never links carries
+        // no graph header.
         db.enable_graph()?;
-        db.link(source, edge_type, destination, "", properties)?;
+        // The atomic takes the edge type by NAME and interns it, so the
+        // identity the feed records exists only once the link has been made.
+        let key = db.link(source, edge_type, destination, "", properties)?;
+        if let TxInner::Service(g) = &mut self.inner {
+            g.note_edge_type(key.edge_type);
+        }
         Ok(())
     }
 
@@ -858,17 +908,41 @@ impl Tx<'_> {
         }
         let source = entity_id(db, from)?;
         let destination = entity_id(db, to)?;
-        Ok(db.unlink(source, edge_type, destination, "")?)
+        let type_id = db.edge_type(edge_type)?;
+        let removed = db.unlink(source, edge_type, destination, "")?;
+        if removed {
+            if let (TxInner::Service(g), Some(type_id)) = (&mut self.inner, type_id) {
+                g.note_edge_type(type_id);
+            }
+        }
+        Ok(removed)
     }
 
     /// Run one writing statement. Not durable until [`Tx::commit`].
+    ///
+    /// In service mode the statement goes through the service's own writer,
+    /// which is what puts it under the §3 statement timeout and the §4
+    /// cancel and what counts it in the feed's `unnamed_writes`. That is
+    /// also where `BEGIN`, `COMMIT` and `ROLLBACK` as SQL are refused
+    /// (`docs/dist/RUST_API.md` §6): the service owns the barrier.
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         let params = params_of(params);
-        let result: SqlResult = self.database().sql(sql, &params)?;
+        let result: SqlResult = match &mut self.inner {
+            TxInner::Single(g) => g.sql(sql, &params)?,
+            TxInner::Service(g) => g.sql(sql, &params)?,
+        };
         if Db::changes_the_catalog(sql) {
             self.db.catalog_changed();
         }
         expect_affected(result, sql)
+    }
+
+    /// Record that a statement run through [`Tx::database`] moved `rows`,
+    /// for the change feed. Nothing to do in single mode, which has no feed.
+    pub fn note_unnamed_write(&mut self, rows: u64) {
+        if let TxInner::Service(g) = &mut self.inner {
+            g.note_unnamed_write(rows);
+        }
     }
 
     /// Make everything written through this transaction durable.
@@ -994,5 +1068,70 @@ fn count_rows(db: &Database, id: CollectionId) -> Result<u64> {
             return Ok(seen);
         }
         after = last;
+    }
+}
+
+#[cfg(test)]
+mod default_barrier_tests {
+    use super::*;
+
+    fn temp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    /// The default `Db::open` gives is `SyncMode::Normal` -- the barrier
+    /// SQLite issues with `fullfsync` off and PostgreSQL with a plain
+    /// `fsync`, so an unconfigured sekejap database promises what an
+    /// unconfigured one of those two promises. It was `Full` before, which
+    /// made every default-configured comparison against them a comparison
+    /// between different durability guarantees.
+    ///
+    /// Asserted on the barrier the store ACTUALLY issued, not only on the
+    /// field: `Db::config()` naming `Normal` proves nothing if the page-WAL
+    /// goes on hard-coding `sync_full`, which is what it did.
+    #[test]
+    fn the_default_a_caller_gets_from_db_open_is_normal() {
+        assert_eq!(Db::config().sync, SyncMode::Normal);
+        let d = temp();
+        let db = Db::open(d.path().join("db")).unwrap();
+        db.create_collection("c", &[("name", crate::FieldKind::Text)]).unwrap();
+        db.put(("c", "k0"), &serde_json::json!({"name": "a"})).unwrap();
+        let c = db.write(|d| Ok(d.io_counters()?)).unwrap();
+        assert_eq!(c.sync_full_calls, 0, "the default must not place the drive-cache barrier");
+        assert!(c.sync_data_calls > 0, "the default must place a data barrier at every commit");
+    }
+
+    /// `Full` stays available and stays honoured: the whole point of moving
+    /// the default is that the stronger barrier is a choice a caller can
+    /// still make in one line.
+    #[test]
+    fn open_with_full_is_honoured() {
+        let d = temp();
+        let db = Db::open_with(
+            d.path().join("db"),
+            Config { sync: SyncMode::Full, ..Db::config() },
+        )
+        .unwrap();
+        db.create_collection("c", &[("name", crate::FieldKind::Text)]).unwrap();
+        db.put(("c", "k0"), &serde_json::json!({"name": "a"})).unwrap();
+        let c = db.write(|d| Ok(d.io_counters()?)).unwrap();
+        assert!(c.sync_full_calls > 0, "open_with(Full) must place drive-cache barriers");
+        assert_eq!(c.sync_data_calls, 0, "Full must never fall back to the weaker barrier");
+    }
+
+    /// `Off` is reachable too, and is observably neither of the other two.
+    #[test]
+    fn open_with_off_places_no_barrier_at_all() {
+        let d = temp();
+        let db = Db::open_with(
+            d.path().join("db"),
+            Config { sync: SyncMode::Off, ..Db::config() },
+        )
+        .unwrap();
+        db.create_collection("c", &[("name", crate::FieldKind::Text)]).unwrap();
+        db.put(("c", "k0"), &serde_json::json!({"name": "a"})).unwrap();
+        let c = db.write(|d| Ok(d.io_counters()?)).unwrap();
+        assert_eq!((c.sync_full_calls, c.sync_data_calls), (0, 0));
+        assert_eq!(db.get(("c", "k0")).unwrap().unwrap()["name"], serde_json::json!("a"));
     }
 }

@@ -1,3 +1,0 @@
-group	configuration	cargo_exit_code	log_exit_code	harness_exit_code	elapsed_seconds	log	reason
-default-full-workspace	default	0	0	0	475	<scratch>	ok
-retained-full-workspace	retained	0	0	0	480	<scratch>	ok

@@ -1,7 +1,7 @@
 # V2 foundation benchmark protocol — 2026-09-16
 
 `bench/src/bin/v2_foundation_bench.rs` is a fair, streaming, mixed-data comparison
-of E4 typed collections (`e4_prototype::collections::Database`, its actual
+of sekejap's typed collections (`e4_prototype::collections::Database`, its actual
 public API) against SQLite with typed columns and one JSONB field, at
 default N = 1,000,000 rows. It is a new, independently owned binary; it does
 not modify `src/collections.rs`, Cargo.toml, the kernel, or any existing
@@ -27,7 +27,7 @@ One collection, `people`, with fields:
 | profile | Json | nested object: languages array, preferences object, tags array with a null, household object |
 | vector | Vector(dim) | default dim = 8, override with `V2_VECTOR_DIM` |
 
-The external key (E4's `put(collection, key, doc)` key; SQLite's
+The external key (sekejap's `put(collection, key, doc)` key; SQLite's
 `external_key` unique column) is a plain string, not part of the typed
 document. Content is a **pure function of a `slot: u64` and a
 `version: u64`** (same convention as `person()` in `bench/src/bin/people.rs` and
@@ -38,14 +38,20 @@ larger smoke/scale values) never requires an in-memory table of documents.
 
 Vector values are pre-rounded to their f32 representation before being
 placed in the expected JSON (`(x as f32) as f64`), because both engines
-store vector lanes as exact f32: E4's dense_v3 vector keyspace (see D22 in
+store vector lanes as exact f32: sekejap's dense_v3 vector keyspace (see D22 in
 CONTRACT.md) and the SQLite arm's `vector BLOB` of little-endian f32. This
 avoids spurious verification failures from f64-vs-f32 rounding that would
 not reflect a real difference between the engines.
 
 ## SQLite schema (typed columns + one JSONB field, not the whole document)
 
-```sql
+This is the COMPARISON ARM's schema, in SQLite's dialect, recorded as it was
+run. It is not sekejap SQL and the documentation harness does not execute it:
+`INTEGER PRIMARY KEY`, `UNIQUE` and `BLOB` are SQLite's, and the bracketed
+line is a note about which columns the timestamps mode adds rather than
+syntax.
+
+```text
 CREATE TABLE people(
   id INTEGER PRIMARY KEY,
   external_key TEXT NOT NULL UNIQUE,
@@ -74,7 +80,7 @@ JSONB, matching the instruction not to duplicate the whole document as JSON.
 
 - 8 MiB cache: kernel `Config::budget_bytes = 8<<20`; SQLite
   `PRAGMA cache_size=-8192`.
-- `SyncMode::Full` for E4; `PRAGMA synchronous=FULL`, `fullfsync=ON`,
+- `SyncMode::Full` for sekejap; `PRAGMA synchronous=FULL`, `fullfsync=ON`,
   `checkpoint_fullfsync=ON` for SQLite (inert on Linux/non-macOS but kept
   for parity with every other benchmark already in this repo, which sets
   these unconditionally).
@@ -83,7 +89,7 @@ JSONB, matching the instruction not to duplicate the whole document as JSON.
   at the end of every phase.
 - **`PRAGMA wal_autocheckpoint=1000`** (env `V2_SQLITE_AUTOCHECKPOINT`,
   default 1000 pages ≈ 4 MiB at the shared 4096-byte page size) is the main
-  SQLite policy, chosen to match E4's own automatic page-WAL fold, which
+  SQLite policy, chosen to match sekejap's own automatic page-WAL fold, which
   happens near its internal allowance, roughly 4 MiB (`src/pagewal.rs`).
   An earlier version of this benchmark used `wal_autocheckpoint=0`
   (unbounded WAL growth between explicit checkpoints), which the parent
@@ -94,13 +100,13 @@ JSONB, matching the instruction not to duplicate the whole document as JSON.
   SQLite comparator. Both engines' **actual observed policy** (not just the
   PRAGMA/config we requested) is queried and recorded in the JSON report
   under `initial_policy` and, after reopen, `reopened_policy` — SQLite via
-  `PRAGMA wal_autocheckpoint`/`synchronous`/`journal_mode`; E4 as a fixed
+  `PRAGMA wal_autocheckpoint`/`synchronous`/`journal_mode`; sekejap as a fixed
   description of its automatic-fold behavior, since it has no equivalent
   runtime-queryable pragma today.
 - In addition to each engine's own automatic policy, an **explicit
   checkpoint step** runs after every phase and once more at the very end,
   timed separately from write time (`checkpoint_seconds`, never folded into
-  `seconds`). For E4 this calls the new public `Database::checkpoint() ->
+  `seconds`). For sekejap this calls the new public `Database::checkpoint() ->
   Result<bool>`; the returned `bool` — whether the fold **completed** or
   was **deferred** (e.g. by a live reader) — is recorded per phase as
   `checkpoint_completed`. For SQLite it is `PRAGMA wal_checkpoint(TRUNCATE)`,
@@ -124,7 +130,7 @@ JSONB, matching the instruction not to duplicate the whole document as JSON.
   a fresh identity's `created` and `updated` both equal its own creation
   phase's time; an existing identity's `created` never changes on a
   subsequent update, while its `updated` advances to the update's phase
-  time. E4 gets this for free through `Database::set_clock` and its own
+  time. sekejap gets this for free through `Database::set_clock` and its own
   existing `created = old-or-now` / `updated = max(now, created, previous)`
   logic; the SQLite arm computes the same `now` value directly and only
   ever writes `updated` (never `created`) in its `UPDATE` statement, so an
@@ -141,7 +147,7 @@ JSONB, matching the instruction not to duplicate the whole document as JSON.
   `Database`/`Connection` before constructing the replacement. An earlier
   revision wrote `*d = Database::open(path, cfg())?;` through a
   `&mut Database`: Rust evaluates the right-hand `open()` call before the
-  assignment, so the *old* handle — and, for E4, its `writer.lock` — was
+  assignment, so the *old* handle — and, for sekejap, its `writer.lock` — was
   still held open at that point, which would fail the new open with
   `WriterLocked` against a real page-WAL database rather than a real
   close-then-reopen. Neither engine uses an in-memory placeholder to paper
@@ -173,8 +179,8 @@ JSONB, matching the instruction not to duplicate the whole document as JSON.
   `disk()` walks, so total/peak space is now measured completely for that
   arm. Creation order differs by engine because `Database::create` creates
   its directory itself with a bare `fs::create_dir` (fails if the directory
-  already exists; see `PageWalStore::open`): for the E4 arm, the env vars
-  are set to a not-yet-existing path first (E4 does not read them during
+  already exists; see `PageWalStore::open`): for the sekejap arm, the env vars
+  are set to a not-yet-existing path first (sekejap does not read them during
   creation) and the `tmp` directory itself is created immediately after
   `Database::create` returns and the directory exists; for the SQLite arm,
   both the arm directory and its `tmp` subdirectory are created up front
@@ -184,13 +190,13 @@ JSONB, matching the instruction not to duplicate the whole document as JSON.
 
 ## Named asymmetry (recorded, not hidden)
 
-`Database::put()` (E4's only write entry point available on the public
+`Database::put()` (sekejap's only write entry point available on the public
 API) always performs its own internal existence lookup as part of its
 upsert contract (`load_entity` before `write_entity`). The SQLite arm's
 driver already knows, from the phase's own logic, whether a given operation
 is a create or an update, and issues a plain `INSERT` or a keyed `UPDATE`
 accordingly — it does not perform an equivalent existence lookup. This is
-less SQLite-side work per write than E4's API requires per call, and it is
+less SQLite-side work per write than sekejap's API requires per call, and it is
 recorded here explicitly rather than presented as identical work. A more
 "unfair-to-SQLite" alternative (a generic `INSERT ... ON CONFLICT DO
 UPDATE`) was rejected because it would require a redundant round-trip that
@@ -234,7 +240,7 @@ every phase, which is what makes the oracle a pure, streaming function.
 Live population is N at every phase except phase 3 (`delete_only`), where it
 is exactly `N - |D|` — the visible density drop the instructions ask for.
 Reinsert/mixed-replacement keys (`person/reinsert-*`, `person/mixed{1,2}-*`)
-are never reused from a deleted slot's old identity; E4's own sequence
+are never reused from a deleted slot's old identity; sekejap's own sequence
 allocator is monotonic per collection and never reuses a sequence number
 (see `collections.rs`'s `allocate`), and the SQLite arm mirrors this with a
 monotonically increasing `next_id` counter that is only advanced on a
@@ -255,7 +261,7 @@ documents), while still checking every field of every row exactly
 - **exact expected id, not merely increasing**. An earlier revision only
   asserted `id > previous`, which cannot catch an id that is wrong but
   still larger than the last one. The oracle now independently derives the
-  *exact* id each row must have, from E4's own sequence-allocation contract
+  *exact* id each row must have, from sekejap's own sequence-allocation contract
   (a per-collection monotonic counter that advances only on a genuine
   create) mirrored exactly by the SQLite arm's `next_id`: a surviving
   original slot keeps its load-time id `slot + 1`; each later group's fresh
@@ -274,7 +280,7 @@ documents), while still checking every field of every row exactly
 - an accumulated CRC32C over id/key/document bytes, in addition to the
   per-row equality, as a second, independent check *within* one engine's
   run — and, explicitly, **across** the two engines: `main()` compares
-  E4's and SQLite's accumulated CRC32C for every phase and after reopen
+  sekejap's and SQLite's accumulated CRC32C for every phase and after reopen
   (`cross_check_crc`) and fails loudly if they differ. Both arms serialize
   id (`to_le_bytes`), key (UTF-8 bytes) and document (`serde_json::to_vec`)
   identically, so if both engines truly match the same oracle their CRCs
@@ -289,7 +295,7 @@ Per phase, the JSON report includes: exact operation counts
 their intermediate commits, excluding checkpoint and verification),
 `checkpoint_seconds` and `checkpoint_completed` from the separate explicit
 checkpoint step described above, `checkpoint` (the engine-specific
-checkpoint detail — E4's `completed` bool, SQLite's busy/wal_frames/
+checkpoint detail — sekejap's `completed` bool, SQLite's busy/wal_frames/
 checkpointed_frames), cumulative write seconds, cumulative checkpoint
 seconds and their sum (`cumulative_engine_seconds`), a 1&nbsp;ms-sampled
 peak logical/allocated size (explicitly a **lower bound**, not a guaranteed
@@ -389,7 +395,7 @@ V2_SQLITE_AUTOCHECKPOINT=0 ./target/release/v2_foundation_bench /authorized/path
   that the integration is adding; this binary cannot build before that
   method lands.
 
-## The 50K battle: two E4 arms per run, frozen Postgres and SQLite references
+## The 50K battle: two sekejap arms per run, frozen Postgres and SQLite references
 
 `bench/src/bin/battle50k.rs` is a different measurement from the one above:
 not raw writes, but forty-one QUERY cases over a fixed 50,000-row corpus that
@@ -417,9 +423,9 @@ SQLite cannot express is reported as `n/a: <reason>`, never skipped, and the
 statement each case ran is in the report's `sql` field and in
 `<dump>/<case>/statement.sql`.
 
-### Postgres and SQLite are constants; E4 is what moves
+### Postgres and SQLite are constants; sekejap is what moves
 
-Both external engines are frozen. Rerunning them once per E4 pass measures
+Both external engines are frozen. Rerunning them once per sekejap pass measures
 two engines that did not change, and costs a running Postgres server for a
 number that did not move. `<scratch>/` holds
 `pg-50k.json` and `sqlite-50k.json` beside a `README.md` and a
@@ -460,6 +466,6 @@ printed with the row count they agreed on. Row-count agreement on every
 filter case is the precondition: a latency ratio between two arms that
 answered different questions is not a measurement. Then the approximate
 recall-vs-latency sweeps, then every arm's deviations, then **ANOMALIES** —
-every case where E4 is slower than Postgres or than SQLite, worst ratio
+every case where sekejap is slower than Postgres or than SQLite, worst ratio
 first, and every disagreement. That last section is what the battery exists
 for.

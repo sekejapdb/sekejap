@@ -1,2 +1,24 @@
 /target/
 
+
+# Built artefacts of the language wrappers are never tracked (they filled the
+# disk of every worker copy; a wrapper is rebuilt from source on release).
+dist/bindings/wrappers/**/node_modules/
+dist/bindings/wrappers/**/build/
+dist/bindings/wrappers/**/target/
+dist/bindings/wrappers/**/*.dSYM/
+dist/bindings/wrappers/**/*.aar
+dist/bindings/wrappers/**/*.so
+dist/bindings/wrappers/**/*.dylib
+dist/bindings/wrappers/**/*.a
+dist/bindings/wrappers/**/*.node
+
+# owner's local scratch and research directories — never tracked
+/.brainstorm/
+/.docs.backup/
+/.workbench/
+/android-libs/
+/eval/
+/.DS_Store
+/TODO.md
+/.sekejap.cases.raw.md

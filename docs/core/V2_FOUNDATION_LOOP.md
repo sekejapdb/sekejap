@@ -109,12 +109,12 @@ fully specified in
 [`docs/core/V2_BENCHMARK_PROTOCOL.md`](V2_BENCHMARK_PROTOCOL.md) and are
 preserved unchanged here — only the results below are new. Cache 8 MiB,
 `SyncMode::Full`, batch 1000, `wal_autocheckpoint=1000` pages for SQLite. One
-sequential E4-then-SQLite run per variant, on the same Linux server; no
+sequential sekejap-then-SQLite run per variant, on the same Linux server; no
 repeated/averaged runs and no isolated timestamp-generation-cost claim
 (content generation is included in write time for both
 engines identically; oracle verification time is real but excluded from
 these totals and reported separately). No VACUUM/rebuild in either arm.
-Native API differences (e.g. E4's `put()` always performing its own
+Native API differences (e.g. sekejap's `put()` always performing its own
 existence lookup vs. SQLite's driver-known INSERT/UPDATE) are named in the
 protocol doc, not repeated here. **This measures raw mixed-CRUD throughput
 and disk footprint only — full multimodel query/SELECT performance is not
@@ -151,8 +151,8 @@ All disk values below use decimal MB (1 MB = 1,000,000 bytes).
 | mixed_round_1 | 100,000 | 200,000 | 100,000 | 17.461 | 8.136 | 23.139 | 9.714 |
 | mixed_round_2 | 100,000 | 200,000 | 100,000 | 19.063 | 9.676 | 21.759 | 10.150 |
 
-Write-time-only sum (the seven `seconds` values above): off E4 121.184 /
-SQLite 53.080; on E4 126.249 / SQLite 57.791.
+Write-time-only sum (the seven `seconds` values above): off sekejap 121.184 /
+SQLite 53.080; on sekejap 126.249 / SQLite 57.791.
 
 ### Checkpoint and reopen (separate from write time and from each other)
 
@@ -166,8 +166,8 @@ SQLite 53.080; on E4 126.249 / SQLite 57.791.
 Every per-phase and final checkpoint reports `completed: true`/no busy
 readers on both engines in both runs — no deferred checkpoint in this run.
 Oracle verification (excluded from every total above, reported separately):
-cumulative verify seconds — off E4 93.255 / SQLite 98.748; on E4 107.179 /
-SQLite 112.709; reopen verify — off E4 13.460 / SQLite 14.913; on E4 15.710 /
+cumulative verify seconds — off sekejap 93.255 / SQLite 98.748; on sekejap 107.179 /
+SQLite 112.709; reopen verify — off sekejap 13.460 / SQLite 14.913; on sekejap 15.710 /
 SQLite 16.340.
 
 ### Disk: logical vs. allocated (1 ms-sampled peaks are a lower bound, not a
@@ -186,7 +186,7 @@ guaranteed maximum)
 peaks report `sample_errors: 0`. Final allocated settles close to final
 logical in every arm, but that does **not** erase the transient allocation
 pressure recorded mid-run above — it is a real, if temporary, disk-budget
-event on both engines, worse on E4 in the timestamps-on run. The peak allocated value in
+event on both engines, worse on sekejap in the timestamps-on run. The peak allocated value in
 every case above lands in `mixed_round_1` or `mixed_round_2` (the phases
 combining create+update+delete), on both engines.
 

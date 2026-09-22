@@ -63,6 +63,7 @@ mod graph_table;
 mod plan;
 mod predicates;
 mod row;
+mod rows;
 mod select;
 // `functions.rs` carries the §4.1 / §4.2 range rewrites. The module is
 // named `range_rewrites` because the name `functions` is already taken
@@ -77,6 +78,7 @@ use row::*;
 pub(crate) use aggregate::AggregatePlan;
 pub(crate) use bind::{Binder, Rebind};
 pub(crate) use plan::{Plan, SelectPlan};
+pub(crate) use rows::RowsPlan;
 
 // ── the compiler ──────────────────────────────────────────────────────────
 
@@ -143,14 +145,26 @@ pub(crate) fn compile(
 impl Compiler<'_> {
     fn statement(&mut self, statement: Stmt) -> SqlResult2<Plan> {
         Ok(match statement {
-            Stmt::Select(select) => match self.aggregate(&select)? {
-                Some(plan) => Plan::Aggregate(plan),
-                None => Plan::Select(self.select(*select)?),
+            // A `FROM` that names a CATALOG relation takes the `Rows`
+            // driver: the statement is an ordinary SELECT whose candidates
+            // are a bounded list the compiler builds here (`rows.rs`).
+            Stmt::Select(select) => match Self::catalog_source(&select) {
+                Some(relation) => Plan::Rows(self.catalog_select(relation, *select, false)?),
+                None => match self.aggregate(&select)? {
+                    Some(plan) => Plan::Aggregate(plan),
+                    None => Plan::Select(self.select(*select)?),
+                },
             },
-            Stmt::Explain(select) => match self.aggregate(&select)? {
-                Some(plan) => Plan::ExplainAggregate(plan),
-                None => Plan::Explain(self.select(*select)?),
+            Stmt::Explain(select) => match Self::catalog_source(&select) {
+                Some(relation) => Plan::Rows(self.catalog_select(relation, *select, true)?),
+                None => match self.aggregate(&select)? {
+                    Some(plan) => Plan::ExplainAggregate(plan),
+                    None => Plan::Explain(self.select(*select)?),
+                },
             },
+            Stmt::SessionRows(items) => Plan::Rows(self.session_rows(&items)?),
+            Stmt::Show(show) => Plan::Rows(self.show(&show)?),
+            Stmt::SetGuc { name, value } => Plan::Write(self.set_guc(&name, &value)),
             Stmt::Insert {
                 table,
                 columns,
@@ -231,6 +245,26 @@ impl Compiler<'_> {
 }
 
 impl Compiler<'_> {
+    /// A client GUC a driver sent on connect.
+    ///
+    /// Accepted as a NOTICE that names the knob and the value. There is
+    /// nothing to set: a connection is a process here and the session holds
+    /// no settings object, so a silent `SET` would read as one that took
+    /// effect. `SHOW <name>` answers the same knob from the constant in
+    /// `parser/catalog.rs`, which is the value this engine actually has --
+    /// `client_encoding` is `UTF8` because text is stored as UTF-8 and there
+    /// is no other encoding, not because a `SET` said so.
+    fn set_guc(&mut self, name: &str, value: &str) -> WritePlan {
+        match crate::parser::client_guc(name) {
+            Some(have) => WritePlan::Notice(format!(
+                "SET {name} = {value}: accepted and not stored. A connection is a process here and there is no session settings table, so this engine's {name} is and stays `{have}`; `SHOW {name}` reports it"
+            )),
+            None => WritePlan::Notice(format!(
+                "SET {name} = {value}: accepted and not stored. `{name}` is not a knob this engine has, and nothing was changed"
+            )),
+        }
+    }
+
     fn set_local(&mut self, name: &str, value: &Literal) -> SqlResult2<WritePlan> {
         let lower = name.to_ascii_lowercase();
         match lower.as_str() {
@@ -426,13 +460,23 @@ impl Compiler<'_> {
                 }
             }
         }
-        Err(SqlError::engine(if building {
-            format!("{what} on `{field}` is still building; run it to READY before a query can use it")
-        } else {
-            format!(
-                "{what} on `{field}` does not exist. QL_CONTRACT §6: every Tier-1 predicate on an indexed field is answered index-side, so the predicate compiles to a filter that NAMES an index; without one there is nothing to name"
-            )
-        }))
+        if building {
+            return Err(SqlError::engine(format!(
+                "{what} on `{field}` is still building; run it to READY before a query can use it"
+            )));
+        }
+        // NOT `SqlError::Engine`. "there is no index that can answer this
+        // predicate" is a NAMED refusal -- QL_CONTRACT §6 wrote the sentence
+        // and §7 item 9 wrote the code -- and an `Engine` error reaches a
+        // PostgreSQL client as `XX000 internal_error`, which is the one code
+        // a client RETRIES. `Unsupported` carries the same sentence and is
+        // `0A000 feature_not_supported`, the code the contract's own §8 block
+        // claims for it. Raised here, at the one chokepoint every index
+        // family passes through, so scalar, expression, text, point,
+        // geometry and vector all say it the same way.
+        Err(SqlError::unsupported(format!(
+            "{what} on `{field}` does not exist. QL_CONTRACT §6: every Tier-1 predicate on an indexed field is answered index-side, so the predicate compiles to a filter that NAMES an index; without one there is nothing to name"
+        )))
     }
 
     fn index_named(&self, name: &str) -> SqlResult2<Option<IndexId>> {

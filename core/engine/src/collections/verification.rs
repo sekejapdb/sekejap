@@ -588,6 +588,110 @@ fn verify_layouts<F: FnMut(&VerificationIssue)>(
 }
 /// Verify the newest committed source without opening a writer or ordinary
 /// snapshot. Issues stream to `emit`; only the bounded preview is retained.
+/// Every live row-count record against the INDEPENDENT tally of the primary
+/// keyspace this pass just walked.
+///
+/// Three findings, all `Corrupt` class and all named:
+///
+/// * a record whose number is not the walk's -- the one the feature exists to
+///   make impossible, because the record and the rows it counts ride the same
+///   transaction;
+/// * a record for a collection the catalog does not hold, which is a key the
+///   collection drop should have removed;
+/// * a record in a file whose header does not declare
+///   [`row_count::ROW_COUNT_FEATURE`], which would be a keyspace an older
+///   binary is not told about.
+///
+/// A collection with NO record is not a finding. A database written before
+/// the feature has none, and a backfill is allowed to be half done: what is
+/// forbidden is a record that lies, not the absence of one.
+fn verify_row_counts<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    catalogs: &[(Catalog, u64)],
+    live_rows: &BTreeMap<CollectionId, u64>,
+    ih: Option<IndexHeader>,
+) -> Result<()> {
+    let declared = ih.is_some_and(|h| h.features & row_count::ROW_COUNT_FEATURE != 0);
+    let source = run.reader.clone();
+    let mut found: BTreeMap<CollectionId, u64> = BTreeMap::new();
+    visit(
+        &source,
+        &[row_count::ROW_COUNT],
+        Some(&[row_count::ROW_COUNT + 1]),
+        |key, value| {
+            run.row(true)?;
+            let mut at = 1;
+            let raw = read_ordered(key, &mut at)?;
+            let id = CollectionId(u32::try_from(raw).map_err(corrupt)?);
+            if at != key.len() || id.0 == 0 {
+                return Err(corrupt("live row count record key"));
+            }
+            if !declared {
+                run.issue(VerificationIssue {
+                    class: IssueClass::Catalog,
+                    kind: IssueKind::Extra,
+                    key: key.to_vec(),
+                    index: None,
+                    entity: None,
+                    message: "live row count record in a file that does not declare the feature"
+                        .into(),
+                })?;
+                return Ok(());
+            }
+            let record = match row_count::decode(value) {
+                Ok(record) => record,
+                Err(_) => {
+                    run.issue(VerificationIssue {
+                        class: IssueClass::Catalog,
+                        kind: IssueKind::Malformed,
+                        key: key.to_vec(),
+                        index: None,
+                        entity: None,
+                        message: "live row count record is malformed".into(),
+                    })?;
+                    return Ok(());
+                }
+            };
+            found.insert(id, record.rows);
+            Ok(())
+        },
+    )?;
+    for (id, rows) in &found {
+        let Some((catalog, _)) = catalogs.iter().find(|(c, _)| c.id == *id) else {
+            run.issue(VerificationIssue {
+                class: IssueClass::Catalog,
+                kind: IssueKind::Extra,
+                key: row_count::row_count_key(*id),
+                index: None,
+                entity: None,
+                message: "live row count record for a collection the catalog does not hold".into(),
+            })?;
+            continue;
+        };
+        // A DROPPING collection is mid-drop: its rows are being removed in
+        // committed steps and its record goes in the last one, so a number
+        // that is ahead of the surviving rows is the drop working, not damage.
+        if catalog.drop.is_some() {
+            continue;
+        }
+        let walked = live_rows.get(id).copied().unwrap_or(0);
+        if *rows != walked {
+            run.issue(VerificationIssue {
+                class: IssueClass::Catalog,
+                kind: IssueKind::Mismatch,
+                key: row_count::row_count_key(*id),
+                index: None,
+                entity: None,
+                message: format!(
+                    "live row count record says {rows} row(s); an independent walk of `{}` found {walked}",
+                    catalog.name
+                ),
+            })?;
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_indexed_source(
     path: impl AsRef<Path>,
     limits: VerificationLimits,
@@ -839,6 +943,7 @@ pub fn verify_indexed_source(
                     | 5
                     | 6
                     | 7
+                    | 8
                     | 0x10
                     | 0x11
                     | 0x12
@@ -858,6 +963,7 @@ pub fn verify_indexed_source(
                     | 0x7a
                     | 0x7b
                     | 0x7c
+                    | 0x7e
             )
         );
         if !known {
@@ -916,10 +1022,15 @@ pub fn verify_indexed_source(
         .filter(|i| i.state == IndexState::Ready)
         .cloned()
         .collect::<Vec<_>>();
+    // The INDEPENDENT walk the live row-count records are checked against:
+    // one tally per collection, counted from the primary keyspace this pass
+    // is already walking, never from the record it is about to judge.
+    let mut live_rows: BTreeMap<CollectionId, u64> = BTreeMap::new();
     let source = run.reader.clone();
     visit(&source, &[0x40], Some(&[0x41]), |key, row| {
         run.row(false)?;
         let id = row_id(key)?;
+        *live_rows.entry(id.collection).or_default() += 1;
         let lid = layout_id(row)?;
         if lid >= header.next_layout {
             return Err(corrupt("row layout exceeds allocator"));
@@ -994,12 +1105,16 @@ pub fn verify_indexed_source(
         Ok(())
     })?;
     verify_sidecars_and_mappings(&mut run)?;
+    verify_row_counts(&mut run, &catalogs, &live_rows, ih)?;
     for i in &ready {
         verify_actual(&mut run, i)?;
     }
     verify_graph(
         &mut run,
         ih.is_some_and(|h| h.features & crate::index::graph::GRAPH_FEATURE != 0),
+        ih.is_some_and(|h| {
+            h.features & crate::index::graph::endpoints::ENDPOINT_FEATURE != 0
+        }),
     )?;
     if ih.is_some_and(|h| h.features & crate::index::graph::GRAPH_FEATURE != 0) {
         run.report.limitations.push("A primary edge and its reverse deleted together is indistinguishable from a legitimate unlink without an external manifest or operation log.");
@@ -2453,7 +2568,39 @@ fn verify_text_actual<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, i: &IndexI
     Ok(())
 }
 
-fn verify_graph<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, enabled: bool) -> Result<()> {
+/// The graph family, and the ENDPOINT SETS derived from it.
+///
+/// Law 5: the endpoint keyspace is compared against an INDEPENDENT walk of
+/// the authoritative primary edges -- the set of
+/// `(context, type, direction, entity)` this function derives here, from the
+/// edges, exactly as `endpoints.rs` claims the write path maintains it. A key
+/// the edges do not justify is an `Extra` finding; an edge with no key is a
+/// `Missing` one. Neither is read back from the engine's own second reading
+/// of the keyspace.
+fn verify_graph<F: FnMut(&VerificationIssue)>(
+    run: &mut Run<F>,
+    enabled: bool,
+    endpoints_enabled: bool,
+) -> Result<()> {
+    if !endpoints_enabled {
+        let source = run.reader.clone();
+        let tag = crate::index::graph::endpoints::ENDPOINT_ENTRY;
+        let mut present = false;
+        visit(&source, &[tag], Some(&tag_end(tag)), |_, _| {
+            present = true;
+            Ok(())
+        })?;
+        if present {
+            run.issue(VerificationIssue {
+                class: IssueClass::Catalog,
+                kind: IssueKind::Mismatch,
+                key: vec![tag],
+                index: None,
+                entity: None,
+                message: "graph endpoint keys exist without the endpoint feature".into(),
+            })?;
+        }
+    }
     let graph_header = if !enabled {
         for tag in [
             crate::index::graph::GRAPH_HEADER,
@@ -2639,6 +2786,7 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, enabled: bool) -
         )?;
         Some(header)
     };
+    let mut derived: BTreeSet<Vec<u8>> = BTreeSet::new();
     let p = [crate::index::graph::PRIMARY_EDGE];
     let source = run.reader.clone();
     visit(&source, &p, Some(&tag_end(p[0])), |key, value| {
@@ -2700,6 +2848,16 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, enabled: bool) -
             Some(&[]),
             "graph reverse marker missing",
         )?;
+        if endpoints_enabled {
+            for (dir, entity) in crate::index::graph::endpoints::ends(edge) {
+                derived.insert(crate::index::graph::endpoints::endpoint_key(
+                    edge.context,
+                    edge.edge_type,
+                    dir,
+                    entity,
+                ));
+            }
+        }
         Ok(())
     })?;
     let p = [crate::index::graph::REVERSE_EDGE];
@@ -2752,5 +2910,56 @@ fn verify_graph<F: FnMut(&VerificationIssue)>(run: &mut Run<F>, enabled: bool) -
         }
         Ok(())
     })?;
+    if endpoints_enabled {
+        let tag = crate::index::graph::endpoints::ENDPOINT_ENTRY;
+        let source = run.reader.clone();
+        let mut stored: BTreeSet<Vec<u8>> = BTreeSet::new();
+        visit(&source, &[tag], Some(&tag_end(tag)), |key, value| {
+            run.row(true)?;
+            if crate::index::graph::endpoints::parse_endpoint_key(key).is_err() {
+                run.issue(VerificationIssue {
+                    class: IssueClass::Derived,
+                    kind: IssueKind::Malformed,
+                    key: key.to_vec(),
+                    index: None,
+                    entity: None,
+                    message: "graph endpoint key is malformed".into(),
+                })?;
+                return Ok(());
+            }
+            if !value.is_empty() {
+                run.issue(VerificationIssue {
+                    class: IssueClass::Derived,
+                    kind: IssueKind::Mismatch,
+                    key: key.to_vec(),
+                    index: None,
+                    entity: None,
+                    message: "graph endpoint key carries a value".into(),
+                })?;
+            }
+            stored.insert(key.to_vec());
+            Ok(())
+        })?;
+        for key in stored.difference(&derived) {
+            run.issue(VerificationIssue {
+                class: IssueClass::Derived,
+                kind: IssueKind::Extra,
+                key: key.clone(),
+                index: None,
+                entity: None,
+                message: "graph endpoint key names an entity with no such edge".into(),
+            })?;
+        }
+        for key in derived.difference(&stored) {
+            run.issue(VerificationIssue {
+                class: IssueClass::Derived,
+                kind: IssueKind::Missing,
+                key: key.clone(),
+                index: None,
+                entity: None,
+                message: "graph endpoint key missing for an entity that has such an edge".into(),
+            })?;
+        }
+    }
     Ok(())
 }

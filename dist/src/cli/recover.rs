@@ -129,7 +129,9 @@ fn run() -> sekejap_core::Result<()> {
         [command, source, destination] if command == "salvage" => {
             let started = Instant::now();
             let r = recover_to(Path::new(source), Path::new(destination), Config {
-                budget_bytes: 8 << 20, io: IoMode::Buffered, sync: SyncMode::Full,
+                // Salvage output takes the default barrier; the source it was
+                // salvaged from is untouched and can be salvaged again.
+                budget_bytes: 8 << 20, io: IoMode::Buffered, sync: SyncMode::Normal,
             })?;
             let value = json!({"version":r.version,"source":r.source,"destination":r.destination,
                 "database":r.database,"class":format!("{:?}",r.class),"elapsed_seconds":started.elapsed().as_secs_f64(),

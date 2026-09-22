@@ -1,4 +1,4 @@
-# Architecture — sekejap-e4 at HEAD
+# Architecture — sekejap at HEAD
 
 One read of the engine as it stands. Behaviour is stated by
 `docs/core/GRAPH_CONTRACT.md` and `docs/lang/QL_CONTRACT.md`. Module homes are
@@ -76,7 +76,7 @@ opened after commit sees the new generation; one opened before does not.
 Coordination is the slot/hint protocol in `src/store/pagewal/mod.rs`, not a
 reader lock on the writer.
 
-On **50,000 rows, this Mac, 2026-09-20**, load was 2,282.493 ms (E4) vs
+On **50,000 rows, this Mac, 2026-09-20**, load was 2,282.493 ms (sekejap) vs
 2,120.315 ms (Postgres), ratio 1.076×; checkpoint 0.703 ms vs 635.421 ms;
 on-disk 41.242 MiB vs 58.430 MiB.
 
@@ -143,7 +143,7 @@ overrides a packed block; `tf = 0` is the posting tombstone. BM25 (`k1=1.2`,
 `b=0.75`, version 1) ranks; `TextMatch::{Any, All, Phrase}`. Phrase membership
 is refined from the primary text.
 
-On **50,000 rows, this Mac, 2026-09-20**, `text_one` median 1,065.625 µs (E4)
+On **50,000 rows, this Mac, 2026-09-20**, `text_one` median 1,065.625 µs (sekejap)
 vs 8,153.083 µs (Postgres), 930,877 matching postings counted, AGREE;
 `text_top10` overlap 3/10 because BM25 ≠ `ts_rank_cd`.
 
@@ -372,7 +372,7 @@ each on how the engine meets it, and what is unqualified.
 | 8 Compatibility | Additive feature bits (`GRAPH_FEATURE`, `TEXT_FEATURE`, `SEGMENT_FEATURE`, `GEOMETRY_FEATURE`, `INDEX_TREE_FEATURE`, …); unknown bits refuse; old files without a bit open with the prior encoding. | `L8-COMPAT` remains PENDING (`docs/core/FOUNDATION_TEST_STANDARD.md`); element identity and typed edge properties are specified as future additive bits. |
 
 Scale table (Mac, 1,000 changes including commit and ending checkpoint, from
-`docs/FOUNDATION_SCALING.md`), milliseconds E4 / SQLite:
+`docs/FOUNDATION_SCALING.md`), milliseconds sekejap / SQLite:
 
 | Population | Locality | Insert | Update | Delete |
 | --- | --- | ---: | ---: | ---: |

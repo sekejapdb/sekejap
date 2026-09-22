@@ -3,6 +3,18 @@ use super::*;
 impl Compiler<'_> {
     pub(super) fn filter(&mut self, c: CollectionId, predicate: &Predicate) -> SqlResult2<OwnedFilter> {
         Ok(match predicate {
+            // `WHERE 1 <> 1` over a STORED collection. There is no filter
+            // atomic that admits or rejects every candidate without reading
+            // one, so the shape is refused by name rather than emulated by a
+            // scan that returns everything or a LIMIT 0 that returns nothing
+            // -- either would be an answer with a different meaning
+            // (FOUNDATION_TEST_STANDARD law 8). It IS accepted over the
+            // catalog views, whose driver is an in-memory row list.
+            Predicate::Constant(value) => {
+                return Err(SqlError::unsupported(format!(
+                    "`{value}` as a whole predicate over a stored collection: a constant admits or rejects every row and there is no driver that answers that without walking the collection. The shape is accepted over the catalog views (`pg_catalog.*`, `information_schema.*`, `db_*`), whose rows are a bounded list built at prepare -- which is where a driver's `WHERE 1<>1` column probe is aimed"
+                )))
+            }
             Predicate::Compare { column, op, value } => {
                 // `t >= '1950-01-01'` over a declared TIMESTAMPTZ/DATE is a
                 // §4.2 rewrite: the literal is read to stored microseconds

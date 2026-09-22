@@ -34,11 +34,11 @@ WAL/durability, corruption bounds and the new concurrent I/O regression.
 
 The older `kernel::recover::recover` remains a low-level forensic regression
 path, with an explicit warning that it can resurrect stale rows. It is not
-used by the new command. E3 source and its tracker journey were not changed.
+used by the new command. The prior engine's source and its tracker journey were not changed.
 
 ## Concrete workflow
 
-Build from the E4 root:
+Build from the repository root:
 
 ```sh
 cargo build --release --offline --features sqlite-balance,compact-cells --bin recover
@@ -102,7 +102,7 @@ recovery activity. Retained expected/observed files are named in
 `<scratch>` and
 `recovery-r1-workspace-final.log`.
 
-`tools/nocache_probe.c` then reproduced the symptom independently of Rust/E4:
+`tools/nocache_probe.c` then reproduced the symptom independently of Rust and sekejap:
 8 native threads, 200 fresh-file round trips each, zero/distinctive payloads,
 aligned and ordinary buffers, `pwrite → fsync → pread`. On this macOS + USB
 APFS scratch stack, F_NOCACHE had **23 mismatches / 1,600** (13 aligned, 10
@@ -116,7 +116,7 @@ Apple documents F_NOCACHE as a control for data caching
 ([fcntl documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html));
 the local experiments establish the observed failure, not that documentation.
 
-E4 now refuses the macOS uncached path and uses its existing explicitly
+sekejap now refuses the macOS uncached path and uses its existing explicitly
 reported `Buffered` fallback. **Sacrifice:** a macOS caller requesting Direct
 uses the OS cache until a reliable support boundary is demonstrated. Other
 platform implementations are unchanged. P1 and P2 already used Buffered,

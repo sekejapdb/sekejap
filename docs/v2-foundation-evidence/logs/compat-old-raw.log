@@ -1,3 +1,0 @@
-COMMAND: <scratch> verify-raw <scratch>
-checkpointed: raw PageWalStore opened and scanned 37 entries (structural check only, not typed-reader compatibility)
-wal_pending: raw PageWalStore opened and scanned 37 entries (structural check only, not typed-reader compatibility)

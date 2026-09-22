@@ -8,7 +8,7 @@ fn creation_cap_headroom_covers_both_codecs_and_cache_sizes() {
     for compact in [false, true] {
         for cache in [2 * PAGE, 64 << 10] {
             let path = root.path().join(format!("{compact}-{cache}"));
-            let mut db = PageWalStore::create_with_compact_cells(&path, cache, compact).unwrap();
+            let mut db = PageWalStore::create_with_compact_cells(&path, cache, compact, SyncMode::Full).unwrap();
             let cap = PageWalStore::creation_cap_headroom();
             db.set_cap(cap).unwrap();
             let managed = fs::metadata(path.join("data")).unwrap().len()
@@ -37,7 +37,7 @@ fn explicit_codecs_are_independent_of_concurrent_default_creates() {
                     let path = root.join(format!("{mode:?}-{round}"));
                     let mut db = match mode {
                         Some(compact) => {
-                            PageWalStore::create_with_compact_cells(&path, 64 << 10, compact)
+                            PageWalStore::create_with_compact_cells(&path, 64 << 10, compact, SyncMode::Full)
                         }
                         None => PageWalStore::open(&path, true, 64 << 10),
                     }
@@ -90,7 +90,7 @@ fn explicit_create_refuses_existing_directory_without_changing_bytes_or_default(
         files
     };
     let before = inventory();
-    assert!(PageWalStore::create_with_compact_cells(&path, 64 << 10, original == 0).is_err());
+    assert!(PageWalStore::create_with_compact_cells(&path, 64 << 10, original == 0, SyncMode::Full).is_err());
     assert_eq!(inventory(), before);
     assert_eq!(create_features(), original);
 }

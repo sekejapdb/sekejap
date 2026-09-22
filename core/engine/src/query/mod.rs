@@ -48,7 +48,7 @@ mod vector_scan;
 
 pub use aggregate::{
     AggValue, Accumulator, AggregateFn, AggregateInput, AggregatePlanDescription, AggregateRequest,
-    AggregateShape, GroupCmp, GroupKey, GroupOrder, GroupPage, GroupPredicate, GroupRow,
+    AggregateShape, CountSource, GroupCmp, GroupKey, GroupOrder, GroupPage, GroupPredicate, GroupRow,
     PreparedAggregate,
 };
 pub use page::PreparedQuery;

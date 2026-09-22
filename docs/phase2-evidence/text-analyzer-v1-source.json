@@ -1,9 +1,0 @@
-{
-  "unicode": "17.0.0",
-  "generator": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-  "files": {
-    "src/text_analyzer.rs": "b48bb79e8c38445e5903f5a2dfdfa09db17bbf1294f868365e9ed2f185edb0ed",
-    "src/text_unicode_v1.rs": "f42fe65faafc0d8922dc58c2d94ef86299d359eaba16562ae4c30ec59fe63aa4",
-    "tools/generate_text_unicode_v1.rs": "6f387e9724ced3a3f3e06db034c8d8e231b224d510fbf14236b1d5b58497e71a"
-  }
-}

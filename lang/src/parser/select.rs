@@ -40,8 +40,20 @@ impl Parser {
             self.bump();
             Source::All
         } else {
-            let table = self.name()?;
+            let table = self.source_name()?;
             if self.eat_word("AS") {
+                let _ = self.name()?;
+            } else if matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_))
+                && !matches!(
+                    self.word().as_deref(),
+                    Some("WHERE") | Some("GROUP") | Some("HAVING") | Some("ORDER")
+                        | Some("LIMIT") | Some("OFFSET") | Some("UNION") | Some("JOIN")
+                        | Some("INNER") | Some("LEFT") | Some("RIGHT") | Some("FULL")
+                        | Some("CROSS") | Some("NATURAL") | Some("WINDOW")
+                ) {
+                // A bare table alias (`FROM pg_class c`). Read and dropped
+                // for the same reason `AS` is: one source, so a qualified
+                // column has one thing it can mean.
                 let _ = self.name()?;
             }
             Source::Table(table)
@@ -106,12 +118,12 @@ impl Parser {
         } else {
             None
         };
-        if self.word().as_deref() == Some("OFFSET") {
-            return Err(refuse::refuse("OFFSET"));
-        }
-        if self.word().as_deref() == Some("UNION") {
-            return Err(refuse::refuse("UNION"));
-        }
+        // The statement's tail. NOT a list of words tested by hand: whatever
+        // stands here, `refuse::TABLE` is the authority on it, so `OFFSET`,
+        // `UNION`, `INTERSECT`, `EXCEPT` and every row added later are
+        // refused by name with their own tier and reason rather than ending
+        // the statement as a syntax error (QL_CONTRACT §2, §7 item 10).
+        self.guard_here()?;
         Ok(SelectStmt {
             items,
             source,
@@ -156,6 +168,7 @@ impl Parser {
                 Some("HAVING" | "ORDER" | "LIMIT" | "OFFSET" | "UNION")
             )
         {
+            self.guard_here()?;
             return Err(SqlError::unsupported(format!(
                 "GROUP BY {column}: the only grouping expression this slice accepts is `col` or `col / n`"
             )));

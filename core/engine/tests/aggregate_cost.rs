@@ -715,10 +715,17 @@ fn count_star_by_an_indexed_group_reads_no_row() {
     assert_eq!(got.work.groups, 1, "one accumulator set is alive at a time");
 }
 
-/// `count(*)` with no group at all: the mapping keyspace is the driver and
-/// the count needs nothing else.
+/// `count(*)` with no group at all: the collection keeps a LIVE ROW COUNT
+/// record, so the answer is ONE get and the walk does not happen. No
+/// candidate, no posting, no row.
+///
+/// The walk this replaced -- `ROWS + 1` key postings over the external-key
+/// mapping keyspace -- is still what a database with no record takes, and
+/// `core/engine/tests/row_count.rs`
+/// `a_count_star_on_a_bit_clear_database_still_walks_the_mapping_keyspace`
+/// holds it to exactly that number.
 #[test]
-fn count_all_over_the_whole_collection_reads_no_row() {
+fn count_all_over_the_whole_collection_reads_the_live_record() {
     let (_dir, f) = open();
     let got = run(
         &f.db,
@@ -740,10 +747,11 @@ fn count_all_over_the_whole_collection_reads_no_row() {
     assert_eq!(got.work.primary_reads, 0, "count(*) reads no row");
     assert_eq!(got.work.row_decodes, 0);
     assert_eq!(
-        got.work.key_postings,
-        ROWS as u64 + 1,
-        "the mapping keyspace is the enumeration, plus the peek that runs off its end"
+        got.work.key_postings, 0,
+        "the live row-count record is one get, not an enumeration"
     );
+    assert_eq!(got.work.candidates, 0, "and no candidate is walked");
+    assert_eq!(got.work.scalar_postings, 0);
 }
 
 /// The three OTHER shapes that need no row: `count(col)`, `min(col)` and

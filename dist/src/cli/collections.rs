@@ -22,7 +22,8 @@ fn cfg() -> Config {
     Config {
         budget_bytes: 8 << 20,
         io: IoMode::Buffered,
-        sync: SyncMode::Full,
+        // `sekejap::Db::open`'s default barrier (SQLite/PostgreSQL parity).
+        sync: SyncMode::Normal,
     }
 }
 struct FixedClock;

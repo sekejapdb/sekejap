@@ -3,8 +3,13 @@ name = "sekejap-dist"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
 default-run = "sekejap"
+description = "The sekejap distribution layer: the service wrapper, the Postgres wire server and the command line"
+repository = "https://github.com/sekejapdb/sekejap"
+homepage = "https://github.com/sekejapdb/sekejap"
+readme = "README.md"
+keywords = ["database", "postgres", "server", "wire", "cli"]
+categories = ["database-implementations", "command-line-utilities"]
 
 [lib]
 name = "sekejap_dist"
@@ -42,16 +47,25 @@ path = "src/cli/entry.rs"
 name = "lifecycle"
 path = "src/cli/lifecycle.rs"
 
+[[bin]]
+name = "sekejap-pg"
+path = "src/cli/pg_server.rs"
+
 [dependencies]
-sekejap-core = { path = "../core/engine" }
-sekejap-lang = { path = "../lang" }
-kernel = { package = "sekejap-kernel", path = "../core/kernel" }
+sekejap-core = { path = "../core/engine", version = "0.17.0" }
+sekejap-lang = { path = "../lang", version = "0.17.0" }
+kernel = { package = "sekejap-kernel", path = "../core/kernel", version = "0.17.0" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 crc32c = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
+# The END-TO-END test of `sekejap-pg` drives the server with a real
+# PostgreSQL client rather than with frames this repository wrote, so the
+# thing under test is the protocol and not this file's idea of it. Already a
+# workspace dependency for the `popsim postgres` bench arm.
+postgres = "0.19"
 
 [features]
 sqlite-balance = ["sekejap-core/sqlite-balance", "sekejap-lang/sqlite-balance"]

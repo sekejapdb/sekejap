@@ -3,7 +3,33 @@ use super::*;
 impl Compiler<'_> {
     // ── SELECT ───────────────────────────────────────────────────────────
 
-    pub(super) fn select(&mut self, statement: SelectStmt) -> SqlResult2<SelectPlan> {
+    pub(super) fn select(&mut self, mut statement: SelectStmt) -> SqlResult2<SelectPlan> {
+        // A CONSTANT at the top of the WHERE is folded here rather than
+        // compiled into a filter: `WHERE 1=1` is no predicate at all, and
+        // `WHERE 1<>1` is a statement that returns no rows, which is a
+        // `LIMIT 0` -- a plan whose driver is never stepped. Neither
+        // emulates anything; the truth value was decided by the parser and
+        // there is nothing left for an index to answer. (pgjdbc writes
+        // `SELECT * FROM t WHERE 1<>1 LIMIT 1` to learn a result's COLUMNS
+        // without fetching a row.) A constant nested inside an `OR` or a
+        // `NOT` is not this shape and is refused by name in
+        // `predicates.rs`, where the leaf is compiled.
+        let mut always_false = false;
+        statement.predicates.retain(|expr| match expr {
+            Expr::Leaf(Predicate::Constant(value)) => {
+                always_false |= !*value;
+                false
+            }
+            _ => true,
+        });
+        if always_false {
+            self.notices.push(
+                "a constant FALSE predicate: the statement returns no rows, so it compiles to LIMIT 0 -- no driver is stepped and no row is read"
+                    .to_owned(),
+            );
+            statement.limit = Some(0);
+        }
+        let statement = statement;
         let (c, graph_filter, graph_columns) = match &statement.source {
             Source::Table(name) => (collection(self.db, name)?, None, None),
             Source::All => {

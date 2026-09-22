@@ -1,8 +1,8 @@
-# E4 recovery contract — R1, 2026-09-10
+# Recovery contract — R1, 2026-09-10
 
 This specifies the foundation gate; individual implementation claims require
 passing evidence in RECOVERY_MATRIX.json and the tracker task notes. P1/P2
-size results do not imply this gate passed. No legacy E3 documents are inputs.
+size results do not imply this gate passed. No documents from the prior engine are inputs.
 
 ## Fault model and honest outcomes
 

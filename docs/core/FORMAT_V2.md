@@ -16,8 +16,8 @@ What that means, in four sentences the rest of this document only elaborates:
   build implements is refused before a record is read.
 - **A change to the physical layout, the WAL protocol or a shipped encoding
   would be v3, and is not expected.**
-- **There is no v1.** sekejap has never published a v1 file and reads no e1
-  file. See [What v2 is not](#what-v2-is-not).
+- **There is no v1.** sekejap has never published a v1 file, and reads no
+  file written by the engine it replaces. See [What v2 is not](#what-v2-is-not).
 
 [CONTRACT.md](../CONTRACT.md) remains the policy authority; Law 8 is the law
 this document serves. [FORMAT_BASELINE.md](FORMAT_BASELINE.md) records the
@@ -74,14 +74,14 @@ published crate's re-export and for a database created through `Db::open`.
 
 ## What v2 is not
 
-- **There is no v1.** No sekejap release ever published a v1 file. The e4
+- **There is no v1.** No sekejap release ever published a v1 file. The
   pre-release corpus carried zero in bytes 18-19 because those bytes were
   reserved; a zero stamp is refused by the same sentence as any other
   non-2 value, naming 0.
-- **sekejap reads no e1 file.** e1 (`sekejap-0.16.5`) is a different engine
-  with different persistent key tags — E4's collection-name tag `0x10` is E3's
-  geometry tag, to take one — and nothing in this build attempts to interpret
-  one.
+- **sekejap reads no file written by the prior engine.** That engine,
+  published as `sekejap-0.16.5`, is a different design with different
+  persistent key tags — the collection-name tag `0x10` here is its geometry
+  tag, to take one — and nothing in this build attempts to interpret one.
 - **There is no silent conversion.** A file that is not v2 is named and
   refused with every byte where it was. An engine that could be wrong about
   what a file is has no business rewriting it (Law 3), and a refusal that
@@ -136,19 +136,27 @@ coordination and snapshot admission code.
 
 ## Extension boundary
 
-Current key allocation includes collection metadata/replicas, layout keys,
-collection names (`0x10`), external-key mappings (`0x20`), entity rows (`0x40`)
-and vector payloads (`0x60`) in
+Current key allocation includes collection metadata/replicas, layout keys, live
+row-count records (`0x08`), collection names (`0x10`), external-key mappings
+(`0x20`), entity rows (`0x40`) and vector payloads (`0x60`) in
 [core/engine/src/collections/mod.rs](../../core/engine/src/collections/mod.rs).
-Graph, spatial, text and vector-navigation indexes allocate new, noncolliding
-namespaces after auditing the complete registry; E3 tag values cannot be
-copied blindly. Each persisted index family needs explicit encoding
-version/catalog descriptors and any required feature declaration before it
-ships. Enabling a new representation is explicit; ordinary upgrades may not
-silently convert a database or force an index rebuild. All shipped encodings
-remain readable **and writable** by newer releases under Law 8. Adding a
-keyspace plus an additive feature bit is the only permitted change to the
-on-disk format under v2. Add immutable fixtures when each family ships.
+The index families follow: `0x70` scalar entries, `0x71`/`0x72` the two graph
+edge directions, `0x73` exact vector, `0x74` spatial point, `0x75`-`0x78` text
+postings / norms / term statistics / corpus statistics, `0x79` quantized
+vector, `0x7A`/`0x7B` packed text segments and norm blocks, `0x7C` geometry
+cells, `0x7E` graph ENDPOINT SETS
+([core/engine/src/index/graph/endpoints.rs](../../core/engine/src/index/graph/endpoints.rs),
+behind `ENDPOINT_FEATURE = 0x4000`). `0x7D` is free and is reserved for the
+live per-collection row count. Graph, spatial, text and vector-navigation
+indexes allocate new, noncolliding namespaces after auditing the complete
+registry; the prior engine's tag values cannot be copied blindly. Each
+persisted index family needs explicit encoding version/catalog descriptors and
+any required feature declaration before it ships. Enabling a new representation
+is explicit; ordinary upgrades may not silently convert a database or force an
+index rebuild. All shipped encodings remain readable **and writable** by newer
+releases under Law 8. Adding a keyspace plus an additive feature bit is the
+only permitted change to the on-disk format under v2. Add immutable fixtures
+when each family ships.
 
 ## Fixture provenance
 
@@ -186,7 +194,7 @@ non-ASCII; one deleted key; one deleted-then-reinserted key), 80 events
 | compact-on-wal-pending | on | no | no | 522144 | 8192 | 513856 |
 | limited-checkpointed | off | yes | yes (`E4LIMIT1`) | 249952 | 249856 | 0 |
 
-Total including manifests: about 3.1 MiB. The sizes are unchanged from the e4
+Total including manifests: about 3.1 MiB. The sizes are unchanged from the
 pre-release corpus: the stamp occupies two bytes that were already there.
 
 `docs/format-v2-baseline/` holds a second, independently captured corpus of
@@ -217,7 +225,7 @@ identities, including absence of deleted/retired IDs.
 The legacy generator deletes its output directory first. The explicit capture
 mode in [tools/format_reference_compat.py](../../tools/format_reference_compat.py)
 wraps it with fresh staging and refuses an existing destination; it pins the
-e4 pre-release reference revision and so qualifies that historical capture,
+pre-release reference revision and so qualifies that historical capture,
 not a v2 one. Ordinary tests never invoke either generator.
 
 Run with TMPDIR pointing to an existing isolated directory in the authorized
@@ -254,12 +262,12 @@ they are. They do not supersede anything above.
 Until 2026-09-21 the envelope was called **e4-format-v1**, a named *storage
 baseline* rather than a published format: engine commit
 `59d1cbc770284f160ffda53cc1ee545167733d11`, declared 2026-09-16, with the
-fixture corpora `docs/format-v1-fixtures` and `docs/format-v1-baseline` and
-the suite `core/engine/tests/format_v1_compat.rs`. e4 was never published, so
-no file of that name was ever in a user's hands. On 2026-09-21 the owner
-declared the envelope as it stood to be sekejap disk format v2, stamped it
-into page bytes 18-19, regenerated both corpora with the stamped binary, and
-removed the pre-release corpora. The paragraphs below were
+fixture corpora `docs/format-v1-fixtures` and `docs/format-v1-baseline` and the
+suite `core/engine/tests/format_v1_compat.rs`. That baseline was never
+published, so no file of that name was ever in a user's hands. On 2026-09-21
+the owner declared the envelope as it stood to be sekejap disk format v2,
+stamped it into page bytes 18-19, regenerated both corpora with the stamped
+binary, and removed the pre-release corpora. The paragraphs below were
 `docs/core/FORMAT_FREEZE.md`, folded here when that file was removed.
 
 ### Current boundary — 2026-09-16 (superseded by the v2 declaration above)
@@ -316,12 +324,12 @@ frozen format.
 - The product goal is strong **combined multimodel SELECT queries**, not
   matching SQLite's insert/update speed. About 1.75× SQLite write time can be
   acceptable when demonstrated query benefits justify it. This is conditional
-  acceptance, not an unmeasured claim that E4 already has those benefits.
+  acceptance, not an unmeasured claim that sekejap already has those benefits.
 - Prefer a stable disk format across binary upgrades. Provide explicit
   **EXPORT / IMPORT** commands as well; routine upgrades should not depend on
   manual export/import. Their lossless scope must include identities, schemas,
   relationships, typed values, timestamp policy and index definitions.
-- Preserve the E1/E3 interface direction: SQL, embedded/library APIs, CLI,
+- Preserve the interface direction the prior engine set: SQL, embedded/library APIs, CLI,
   language/device bindings and network adapters. Do not reduce the product
   scope to the current raw-KV prototype or one interface.
 - The format contract includes persisted **index encodings and metadata**,
@@ -334,13 +342,14 @@ veto. The reservation candidate was reverted under that earlier criterion;
 this clarification does not automatically restore it or prove its disk cap.
 Its measured tradeoff remains available for the integrated product decision.
 
-E3 source inspection: `core/kernel/src/keys.rs` defines graph, property, text,
-spatial and vector-navigation keyspaces; `README.md`, `wrappers/README.md`
-and `docs/usage/connectivity.md` describe the interface surface. Wrapper
-presence/documentation is not fresh proof of every platform's working status.
-E4's collection tags overlap E3 meanings (for example E4 collection name tag
-`0x10` versus E3 geometry tag `0x10`). Reuse algorithms/interfaces through an
-explicit namespace mapping, never copy these persistent tags blindly.
+Prior-engine source inspection: `core/kernel/src/keys.rs` defines graph,
+property, text, spatial and vector-navigation keyspaces; `README.md`,
+`wrappers/README.md` and `docs/usage/connectivity.md` describe the interface
+surface. Wrapper presence/documentation is not fresh proof of every platform's
+working status. The collection tags here overlap the prior engine's meanings
+(for example the collection-name tag `0x10` versus its geometry tag `0x10`).
+Reuse algorithms/interfaces through an explicit namespace mapping, never copy
+these persistent tags blindly.
 
 ### Historical shape and candidate-r3 boundary
 
@@ -397,9 +406,22 @@ explicit namespace mapping, never copy these persistent tags blindly.
 - The LOGICAL index feature word is a separate, additive register from the
   physical `E4PWAL02` bits, and its one definition is
   `SUPPORTED_LOGICAL_FEATURES` in `core/engine/src/collections/mod.rs`, with
-  the bit-by-bit table in the doc comment above it. It stood at `0xfff` and is
-  `0x1fff` from 2026-09-21, when `COLUMN_RULES_FEATURE = 0x1000` was added for
-  the per-field COLUMN RULE tail (`DEFAULT`, `NOT NULL`). Every bit in it is
+  the bit-by-bit table in the doc comment above it. It stood at `0xfff`, became
+  `0x1fff` on 2026-09-21 when `COLUMN_RULES_FEATURE = 0x1000` was added for
+  the per-field COLUMN RULE tail (`DEFAULT`, `NOT NULL`), and is `0x7fff` from
+  2026-09-21, when `ROW_COUNT_FEATURE = 0x2000` was added for the LIVE ROW
+  COUNT records of `core/engine/src/collections/row_count.rs` (key tag `0x08`,
+  one 16-byte record per collection: `rows: u64 BE || generation: u64 BE`).
+  `0x4000` is RESERVED for the parallel semi-join item and is deliberately NOT
+  implemented by this build, so a file that declares it is refused here too. Every bit in it is
+  the bit-by-bit table in the doc comment above it. It stood at `0xfff`, then
+  `0x1fff` from 2026-09-21 when `COLUMN_RULES_FEATURE = 0x1000` was added for
+  the per-field COLUMN RULE tail (`DEFAULT`, `NOT NULL`), and is `0x7fff` from
+  2026-09-21 with `ENDPOINT_FEATURE = 0x4000`, the graph ENDPOINT SETS
+  (`core/engine/src/index/graph/endpoints.rs`). `0x2000` is deliberately
+  unimplemented in this mask and is reserved for the live per-collection row
+  count, so a file that declares it is refused by this build exactly as any
+  other unknown bit is. Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as
   `Unsupported` at admission, before a record is read (Law 8). Adding a bit is
@@ -447,7 +469,7 @@ explicit namespace mapping, never copy these persistent tags blindly.
    evidence in [V2_FOUNDATION_LOOP.md](V2_FOUNDATION_LOOP.md)) — a
    functional-improvement retention, not a stable format freeze or production
    release; the accepted `64b6663` commit itself does not contain this
-   integration. Map E3's index families and interface semantics onto this
+   integration. Map the prior engine's index families and interface semantics onto this
    path; qualify representative persisted indexes before declaring the
    combined format frozen. Do not claim raw-KV or single-process typed-CRUD
    tests cover indexed collections, cross-process concurrency at scale, or

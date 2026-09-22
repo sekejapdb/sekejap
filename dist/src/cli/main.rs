@@ -21,7 +21,8 @@ fn cfg() -> Config {
     Config {
         budget_bytes: CACHE,
         io: IoMode::Buffered,
-        sync: SyncMode::Full,
+        // `sekejap::Db::open`'s default barrier (SQLite/PostgreSQL parity).
+        sync: SyncMode::Normal,
     }
 }
 fn layout(dim: usize) -> Layout {
@@ -762,14 +763,7 @@ mod storage_tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
     fn directory() -> tempfile::TempDir {
-        let p = std::env::temp_dir();
-        assert!(
-            p.starts_with("<scratch>")
-                || p.starts_with("<scratch>")
-                || p.starts_with("<scratch>"),
-            "Set TMPDIR under an authorized E4 artifact directory for storage tests"
-        );
-        tempfile::tempdir_in(p).unwrap()
+        tempfile::tempdir().unwrap()
     }
     #[test]
     fn descriptor_leaf_damage_recovers_without_reading_damaged_copy() {

@@ -70,6 +70,10 @@ pub(super) enum Tok {
     Arrow,
     /// `->>`
     LongArrow,
+    /// `#>`, the JSON path operator
+    HashArrow,
+    /// `#>>`, the JSON path operator that returns text
+    HashLongArrow,
     /// `<-`
     BackArrow,
     /// `~`, the POSIX regex match
@@ -123,6 +127,8 @@ impl Tok {
             Self::VecL1 => "<+>".into(),
             Self::Arrow => "->".into(),
             Self::LongArrow => "->>".into(),
+            Self::HashArrow => "#>".into(),
+            Self::HashLongArrow => "#>>".into(),
             Self::BackArrow => "<-".into(),
             Self::Tilde => "~".into(),
             Self::Question => "?".into(),
@@ -287,12 +293,14 @@ pub(super) fn tokenize(text: &str) -> SqlResult2<Vec<Token>> {
                     (b'<', Some(b'#'), Some(b'>')) => (Tok::VecDot, 3),
                     (b'<', Some(b'+'), Some(b'>')) => (Tok::VecL1, 3),
                     (b'-', Some(b'>'), Some(b'>')) => (Tok::LongArrow, 3),
+                    (b'#', Some(b'>'), Some(b'>')) => (Tok::HashLongArrow, 3),
                     (b'<', Some(b'>'), _) => (Tok::Ne, 2),
                     (b'<', Some(b'='), _) => (Tok::Le, 2),
                     (b'<', Some(b'-'), _) => (Tok::BackArrow, 2),
                     (b'>', Some(b'='), _) => (Tok::Ge, 2),
                     (b'!', Some(b'='), _) => (Tok::Ne, 2),
                     (b'-', Some(b'>'), _) => (Tok::Arrow, 2),
+                    (b'#', Some(b'>'), _) => (Tok::HashArrow, 2),
                     (b':', Some(b':'), _) => (Tok::Cast, 2),
                     (b'|', Some(b'|'), _) => (Tok::Concat, 2),
                     (b'&', Some(b'&'), _) => (Tok::Overlaps, 2),

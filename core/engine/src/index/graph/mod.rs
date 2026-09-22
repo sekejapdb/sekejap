@@ -12,6 +12,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub mod endpoints;
+
 pub(crate) const GRAPH_FEATURE: u64 = 2;
 pub(crate) const GRAPH_HEADER: u8 = 0x06;
 pub(crate) const NAME_DESCRIPTOR: u8 = 0x07;
@@ -60,6 +62,19 @@ pub struct EdgeKey {
 pub struct Edge {
     pub key: EdgeKey,
     pub properties: Value,
+}
+
+/// One row of the graph SHAPE: an edge type, the context it was written in,
+/// and the two collections it connects. See [`Database::edge_shape`].
+///
+/// Ordered by `(context, edge type, from, to)`, which is the order the
+/// deduplicating set produces and therefore the order a listing prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EdgeShape {
+    pub context: GraphContextId,
+    pub edge_type: EdgeTypeId,
+    pub from: CollectionId,
+    pub to: CollectionId,
 }
 
 /// One edge of a [`Database::link_many`] batch: the two endpoints and the
@@ -438,12 +453,17 @@ pub struct EdgeBudget {
     pub put_reverse_pages: u64,
     pub finish_ns: u64,
     pub finish_pages: u64,
+    /// The ENDPOINT SET keys of a NEW edge: two puts, or nothing at all when
+    /// the edge was already on disk or the file carries no sets
+    /// (`index/graph/endpoints.rs`).
+    pub endpoint_keys_ns: u64,
+    pub endpoint_keys_pages: u64,
 }
 
 impl EdgeBudget {
     /// `(label, nanoseconds, page accesses)` for every stage, in the order
     /// `put_edge` runs them.
-    pub fn stages(&self) -> [(&'static str, u64, u64); 8] {
+    pub fn stages(&self) -> [(&'static str, u64, u64); 9] {
         [
             ("header+ids", self.header_ns, self.header_pages),
             ("endpoints", self.endpoints_ns, self.endpoint_pages),
@@ -452,6 +472,7 @@ impl EdgeBudget {
             ("key build", self.keybuild_ns, self.keybuild_pages),
             ("put 0x71", self.put_primary_ns, self.put_primary_pages),
             ("put 0x72", self.put_reverse_ns, self.put_reverse_pages),
+            ("put 0x7E", self.endpoint_keys_ns, self.endpoint_keys_pages),
             ("finish", self.finish_ns, self.finish_pages),
         ]
     }
@@ -814,7 +835,8 @@ fn validate_name_input(name: &str, what: &str) -> Result<()> {
 
 /// Bounded admission of graph metadata. Relationship rows deliberately are
 /// not scanned here; their exact key/value and mirror are checked when read.
-pub(crate) fn validate_graph(s: &PageWalStore, enabled: bool) -> Result<()> {
+pub(crate) fn validate_graph(s: &PageWalStore, enabled: bool, endpoints_enabled: bool) -> Result<()> {
+    endpoints::validate_endpoint_sets(s, endpoints_enabled)?;
     if !enabled {
         // A single prefix probe per family is bounded. Edge rows are
         // authoritative data and must never become invisible merely because
@@ -1017,6 +1039,136 @@ impl Database {
         Ok(self.lookup_graph_name(0, name)?.map(EdgeTypeId))
     }
 
+    /// Every INTERNED edge-type name and every interned graph-context name,
+    /// each with the identity it was interned under, in key order.
+    ///
+    /// The graph's name dictionary read as CATALOG DATA, which is what
+    /// `docs/core/GRAPH_CONTRACT.md` 2.5 and 3.4 call it: an edge type is
+    /// interned on first use and a context descriptor is catalog data, so a
+    /// tool can list both without reading one edge. This walks the
+    /// name-lookup keyspace (tag `0x12`, `kind || name` -> identity), which
+    /// holds ONE entry per name; the dictionary is capped at 4,096 names per
+    /// kind by `create_graph_name`, so the walk is at most 8,192 entries and
+    /// reads no edge, no row and no index.
+    ///
+    /// The base graph is not in the dictionary: it has no descriptor and no
+    /// name (`graph_context_name` spells it `(base graph)`), so a caller that
+    /// wants it in a listing adds it.
+    ///
+    /// Empty, not an error, on a database whose graph feature was never
+    /// enabled: no dictionary is not a corrupt dictionary.
+    pub fn graph_names(
+        &self,
+    ) -> Result<(Vec<(EdgeTypeId, String)>, Vec<(GraphContextId, String)>)> {
+        let mut types = Vec::new();
+        let mut contexts = Vec::new();
+        if !self
+            .index_header
+            .is_some_and(|header| header.features & GRAPH_FEATURE != 0)
+        {
+            return Ok((types, contexts));
+        }
+        self.graph_header()?;
+        for row in self.store()?.range(&[NAME_LOOKUP])? {
+            let (key, value) = row?;
+            if key.first() != Some(&NAME_LOOKUP) {
+                break;
+            }
+            if key.len() < 2 || key[1] > 1 {
+                return Err(corrupt("graph name lookup key"));
+            }
+            if types.len() + contexts.len() > (MAX_NAMES as usize) * 2 {
+                return Err(corrupt("graph name dictionary bound exceeded"));
+            }
+            let name = std::str::from_utf8(&key[2..])
+                .map_err(|_| corrupt("graph name lookup encoding"))?
+                .to_owned();
+            let mut at = 0;
+            let id = read_ordered(&value, &mut at)?;
+            if at != value.len() || id == 0 {
+                return Err(corrupt("graph name lookup value"));
+            }
+            if key[1] == 0 {
+                types.push((EdgeTypeId(id), name));
+            } else {
+                contexts.push((GraphContextId(id), name));
+            }
+        }
+        Ok((types, contexts))
+    }
+
+    /// The catalog's EDGE-TYPE ROWS: which collections an edge type connects,
+    /// in which context, derived from written edges.
+    ///
+    /// `docs/core/GRAPH_CONTRACT.md` 2.5 states this exactly -- "the catalog's
+    /// edge-type rows (which collections an edge type connects) are derived
+    /// from written edges, so a tool sees the graph shape without any
+    /// declaration" -- and this is the reader for it. One entry per DISTINCT
+    /// `(source collection, context, edge type, destination collection)`,
+    /// ascending, without duplicates.
+    ///
+    /// **The bound, stated.** The primary edge keyspace is
+    /// `tag | source | context | type | destination`, and the source's
+    /// SEQUENCE sits between the collection and the context, so a triple is
+    /// not a key prefix: the walk pays one descent per distinct
+    /// `(source entity, context, type, destination collection)` and seeks
+    /// past each such run rather than stepping through its edges. It is
+    /// therefore proportional to the SOURCE ENTITIES that have edges, never
+    /// to the edges, and it is capped: at most `cap` descents, after which it
+    /// returns what it found with `true` for truncated. A caller that prints
+    /// these rows says so -- `docs/lang/QL_CONTRACT.md` §2 labels the
+    /// `SHOW EDGES` counts a scan for the same reason.
+    pub fn edge_shape(&self, cap: usize) -> Result<(Vec<EdgeShape>, bool)> {
+        if !self
+            .index_header
+            .is_some_and(|header| header.features & GRAPH_FEATURE != 0)
+        {
+            return Ok((Vec::new(), false));
+        }
+        let h = self.graph_header()?;
+        let mut found: BTreeSet<EdgeShape> = BTreeSet::new();
+        let mut truncated = false;
+        let mut from = vec![PRIMARY_EDGE];
+        let mut seeks = 0usize;
+        loop {
+            if seeks >= cap {
+                truncated = true;
+                break;
+            }
+            seeks += 1;
+            let Some(row) = self.store()?.range(&from)?.next() else {
+                break;
+            };
+            let (key, _) = row?;
+            if key.first() != Some(&PRIMARY_EDGE) {
+                break;
+            }
+            let edge = parse_edge_key(&key, PRIMARY_EDGE)?;
+            self.validate_stored_edge_ids(h, edge)?;
+            found.insert(EdgeShape {
+                edge_type: edge.edge_type,
+                context: edge.context,
+                from: edge.source.collection,
+                to: edge.destination.collection,
+            });
+            // Past every remaining edge of this (source, context, type) whose
+            // destination is in the SAME collection: the destination's
+            // collection is the first component of its identity, so
+            // `destination collection + 1` is the next distinct triple.
+            let Some(next) = u64::from(edge.destination.collection.0).checked_add(1) else {
+                break;
+            };
+            from = edge_prefix(
+                PRIMARY_EDGE,
+                edge.source,
+                Some(edge.context),
+                Some(edge.edge_type),
+            );
+            from.extend(ordered(next));
+        }
+        Ok((found.into_iter().collect(), truncated))
+    }
+
     /// Every entity of `collection` that has AT LEAST ONE edge of
     /// `edge_type` in `context`, ascending, without duplicates.
     ///
@@ -1055,6 +1207,23 @@ impl Database {
         cancelled: C,
     ) -> Result<Vec<EntityId>> {
         let mut cancelled = cancelled;
+        // The ENDPOINT SET answers this question directly when the file
+        // carries one: one posting per distinct entity in one contiguous
+        // range, no seek over an edge (`index/graph/endpoints.rs`). A file
+        // that does not carry one takes the walk below, which is what every
+        // release before the set took.
+        if self.endpoint_sets_present() {
+            self.graph_header()?;
+            return self.endpoints_from_set(
+                collection,
+                context,
+                edge_type,
+                direction,
+                max_ids,
+                budget,
+                &mut cancelled,
+            );
+        }
         let meter = &mut crate::query::WorkMeter::new(budget, &mut cancelled);
         let tag = match direction {
             Direction::Outgoing => PRIMARY_EDGE,
@@ -1249,7 +1418,9 @@ impl Database {
         Ok(())
     }
 
-    fn preflight_edge_pair(&self, key: EdgeKey) -> Result<()> {
+    /// Returns whether the pair exists. See
+    /// `preflight_unless_provably_absent` for why the caller wants to know.
+    fn preflight_edge_pair(&self, key: EdgeKey) -> Result<bool> {
         let mut scratch = Vec::with_capacity(EDGE_KEY_BYTES);
         edge_key_into(&mut scratch, PRIMARY_EDGE, key);
         let primary = self.store()?.get(&scratch)?;
@@ -1262,11 +1433,11 @@ impl Database {
                 if !marker.is_empty() {
                     return Err(corrupt("nonempty reverse edge marker"));
                 }
+                Ok(true)
             }
-            (None, None) => {}
-            _ => return Err(corrupt("graph primary/reverse mismatch")),
+            (None, None) => Ok(false),
+            _ => Err(corrupt("graph primary/reverse mismatch")),
         }
-        Ok(())
     }
 
     /// Both halves of an edge, written immediately.
@@ -1322,9 +1493,13 @@ impl Database {
     /// record depends on them, and `src/collections/verification.rs`'s
     /// `verify_actual` still finds a mismatch it can reach. What is lost is
     /// an early warning, not a repair.
-    fn preflight_unless_provably_absent(&self, key: EdgeKey) -> Result<()> {
+    /// Returns whether the pair is ALREADY on disk, which is what tells the
+    /// endpoint sets whether this edge is NEW: a new edge files its two ends,
+    /// a repeated one files nothing. The answer is free -- it is the probe
+    /// this method already ran -- and a provably absent pair is provably new.
+    fn preflight_unless_provably_absent(&self, key: EdgeKey) -> Result<bool> {
         if self.edge_provably_absent(key) {
-            return Ok(());
+            return Ok(false);
         }
         self.preflight_edge_pair(key)
     }
@@ -1356,8 +1531,19 @@ impl Database {
         {
             return Err(invalid("encoded edge exceeds configured record limit"));
         }
-        self.preflight_unless_provably_absent(key)?;
-        let result = self.write_edge_pair(key, &bytes).map(|()| key);
+        let existed = self.preflight_unless_provably_absent(key)?;
+        let result = (|| {
+            // Inside the closure, because it can WRITE the header that turns
+            // the feature on, and a failed write must poison this handle.
+            // Before `write_edge_pair`, because it probes the edge keyspace
+            // for emptiness: see `endpoints.rs`.
+            let maintain = self.endpoint_maintenance()?;
+            self.write_edge_pair(key, &bytes)?;
+            if maintain && !existed {
+                self.insert_endpoint_keys(key)?;
+            }
+            Ok(key)
+        })();
         self.finish(result)
     }
 
@@ -1408,6 +1594,9 @@ impl Database {
         }
         let h = self.graph_header()?;
         let result = (|| {
+            // Once for the batch, and before any write of it, for the reason
+            // `put_edge` calls it where it does.
+            let maintain = self.endpoint_maintenance()?;
             // One identity check for the whole batch: the context and the type
             // are the batch's, so `validate_edge_ids` has one answer for it.
             self.validate_edge_ids(
@@ -1458,8 +1647,26 @@ impl Database {
             // batch can read a primary this same batch wrote without its
             // reverse, and the probes walk the keyspace once instead of
             // jumping between two stretches of it per edge.
+            //
+            // The probe's answer is also what says which edges are NEW, so
+            // the ENDPOINT SET keys of the batch cost no read of their own.
+            // They are DEDUPLICATED across the batch -- a source with three
+            // new edges files one key, not three -- and written last, in
+            // ascending key order.
+            let mut endpoint_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
             for i in &order {
-                self.preflight_unless_provably_absent(keys[*i])?;
+                let existed = self.preflight_unless_provably_absent(keys[*i])?;
+                if maintain && !existed {
+                    let key = keys[*i];
+                    for (dir, entity) in endpoints::ends(key) {
+                        endpoint_keys.insert(endpoints::endpoint_key(
+                            key.context,
+                            key.edge_type,
+                            dir,
+                            entity,
+                        ));
+                    }
+                }
             }
             let mut scratch = Vec::with_capacity(EDGE_KEY_BYTES);
             for i in &order {
@@ -1472,6 +1679,15 @@ impl Database {
                 scratch.clear();
                 edge_key_into(&mut scratch, REVERSE_EDGE, keys[*i]);
                 self.writer()?.put(&scratch, &[])?;
+            }
+            for key in endpoint_keys {
+                if self.endpoint_written.contains(&key) {
+                    continue;
+                }
+                self.writer()?.put(&key, &[])?;
+                if self.endpoint_written.len() < crate::collections::ENDPOINT_MEMO {
+                    self.endpoint_written.insert(key);
+                }
             }
             Ok(keys)
         })();
@@ -1534,7 +1750,9 @@ impl Database {
             return Err(invalid("encoded edge exceeds configured record limit"));
         }
         lap!(encode_ns, encode_pages);
-        self.preflight_unless_provably_absent(key)?;
+        let started = self.endpoint_maintenance();
+        let maintain = self.finish(started)?;
+        let existed = self.preflight_unless_provably_absent(key)?;
         lap!(preflight_ns, preflight_pages);
         let primary = edge_key(PRIMARY_EDGE, key);
         let reverse = edge_key(REVERSE_EDGE, key);
@@ -1543,6 +1761,10 @@ impl Database {
         lap!(put_primary_ns, put_primary_pages);
         self.writer()?.put(&reverse, &[])?;
         lap!(put_reverse_ns, put_reverse_pages);
+        if maintain && !existed {
+            self.insert_endpoint_keys(key)?;
+        }
+        lap!(endpoint_keys_ns, endpoint_keys_pages);
         let out = self.finish(Ok(key));
         lap!(finish_ns, finish_pages);
         budget.edges += 1;
@@ -1624,8 +1846,9 @@ impl Database {
             edge_type: EdgeTypeId(type_id),
             destination,
         };
-        self.preflight_unless_provably_absent(key)?;
+        let existed = self.preflight_unless_provably_absent(key)?;
         let result = (|| {
+            let maintain = self.endpoint_maintenance()?;
             for name in &names {
                 self.save_graph_name(name)?;
             }
@@ -1633,6 +1856,9 @@ impl Database {
                 self.save_graph_header(h)?;
             }
             self.write_edge_pair(key, &bytes)?;
+            if maintain && !existed {
+                self.insert_endpoint_keys(key)?;
+            }
             Ok(key)
         })();
         self.finish(result)
@@ -1674,9 +1900,15 @@ impl Database {
         if reverse.as_deref() != Some(&[]) {
             return Err(corrupt("missing/nonempty reverse edge marker"));
         }
+        let maintain = self.endpoint_sets_present();
         let result = (|| {
             if !self.writer()?.delete(&primary_key)? || !self.writer()?.delete(&reverse_key)? {
                 return Err(corrupt("edge disappeared during delete"));
+            }
+            // AFTER the delete, so the probe cannot find the edge it is
+            // retiring. One bounded range probe per end; see `endpoints.rs`.
+            if maintain {
+                self.remove_endpoint_keys_if_last(key)?;
             }
             Ok(true)
         })();
@@ -2519,13 +2751,19 @@ impl Database {
     pub(crate) fn cascade_graph_delete(&mut self, entity: EntityId) -> Result<()> {
         let edges = self.preflight_incident_edges(entity)?;
         let result = (|| {
-            for edge in edges {
-                if !self.writer()?.delete(&edge_key(PRIMARY_EDGE, edge))?
-                    || !self.writer()?.delete(&edge_key(REVERSE_EDGE, edge))?
+            for edge in &edges {
+                if !self.writer()?.delete(&edge_key(PRIMARY_EDGE, *edge))?
+                    || !self.writer()?.delete(&edge_key(REVERSE_EDGE, *edge))?
                 {
                     return Err(corrupt("incident edge disappeared during cascade"));
                 }
             }
+            // Every incident edge is gone before a single endpoint key is
+            // probed, so the deleted entity's own keys all go and each
+            // neighbour's goes only if this cascade took its last edge. The
+            // probes are deduplicated: a node with 200 incident edges of one
+            // type probes its own end once, not 200 times.
+            self.remove_endpoint_keys_for(&edges)?;
             Ok(())
         })();
         self.finish(result)

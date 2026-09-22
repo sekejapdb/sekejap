@@ -1,1 +1,1 @@
-../../../c/include/sekejap.h
+../../../../../ffi/include/sekejap.h

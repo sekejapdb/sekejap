@@ -11,9 +11,9 @@
     <RootNamespace>Sekejap</RootNamespace>
 
     <PackageId>Sekejap</PackageId>
-    <Version>0.16.2</Version>
+    <Version>0.17.0</Version>
     <Authors>sekejap</Authors>
-    <Description>Embedded graph-first multi-model database (SQL + graph + spatial + vector + full-text) for .NET and Unity, over the sekejap C ABI.</Description>
+    <Description>Embedded multi-model database (SQL + graph + spatial + vector + full-text) for .NET and Unity, over the sekejap 0.17 C ABI: collections addressed by name + key, JSON documents, $n SQL parameters, links and bounded graph neighbours.</Description>
     <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://sekejap.life</PackageProjectUrl>
     <RepositoryUrl>https://github.com/sekejapdb/sekejap</RepositoryUrl>

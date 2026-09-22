@@ -38,7 +38,10 @@ fn cfg() -> Config {
     Config {
         budget_bytes: 8 << 20,
         io: IoMode::Buffered,
-        sync: SyncMode::Full,
+        // The default barrier. This harness runs sekejap beside SQLite, so
+        // the two must issue the same class of barrier to be comparable:
+        // SQLite leaves `fullfsync` off, which is this.
+        sync: SyncMode::Normal,
     }
 }
 fn layout() -> Layout {

@@ -68,6 +68,20 @@ impl Compiler<'_> {
                     "a semi-join on `{table}.{column}`: an edge type's columns are `source` and `destination`, which are the two ends the edge keyspace is filed by"
                 )));
             };
+            // Which of the two the engine took, printed rather than
+            // guessed: a file that carries the ENDPOINT SETS answers from one
+            // posting per distinct entity, a file written before them takes
+            // the seek-per-entity walk of the edge keyspace
+            // (`core/engine/src/index/graph/endpoints.rs`).
+            self.notices.push(if db.endpoint_sets_present() {
+                format!(
+                    "semi-join over `{table}.{column}`: endpoint set -- one posting per distinct entity in one range"
+                )
+            } else {
+                format!(
+                    "semi-join over `{table}.{column}`: edge walk -- this file carries no endpoint sets, so the walk seeks past each matched entity's edges (Database::backfill_endpoint_sets builds them once)"
+                )
+            });
             let cancelled = &mut *self.cancelled;
             return Ok(db.edge_endpoints(
                 c,

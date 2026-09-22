@@ -1,43 +1,38 @@
-# sekejap C ABI — examples
+# C examples
 
-Runnable C programs that link `libsekejap` and exercise the [C ABI](../include/sekejap.h).
-This is how you verify the library from C, the same way you'd test SQLite.
+Runnable C programs that link `libsekejap` and drive the C ABI. The header
+they include is [`dist/ffi/include/sekejap.h`](../../../../ffi/include/sekejap.h)
+and the contract it carries is
+[`docs/dist/C_ABI.md`](../../../../../docs/dist/C_ABI.md).
 
-## Run them
-
-```bash
-make test      # build libsekejap + compile & run test.c (asserts the whole ABI)
-make asan      # same, under AddressSanitizer (catches C-side memory bugs)
-make server    # build with the engine feature + run server.c (4 reader threads + writer)
+```sh
+make tour       # build libsekejap, compile tour.c against it, run it
 make clean
 ```
 
-`make test` compiles `test.c` against `../include/sekejap.h`, links the release
-`libsekejap`, and runs it — you should see `OK: all sekejap C ABI assertions passed`.
-
 ## Files
 
-- **`test.c`** — open a DB, DDL + SQL insert, direct `put`/`link`, a parameterized
-  (injection-safe) query, introspection, and the error path — all checked with `assert`.
-- **`server.c`** — the concurrent story: one thread-safe `SekejapEngine*` shared by
-  4 reader threads while the main thread writes, then a durable final count. Needs the
-  `engine` feature (the Makefile builds `--features engine` and compiles with
-  `-DSEKEJAP_ENGINE`).
-- **`Makefile`** — builds the lib via cargo, compiles the examples, sets the loader
-  path to run them; also `make install` (lib + header + pkg-config into `$(PREFIX)`).
-- **`sekejap.pc.in`** — pkg-config template; `make install` fills in the prefix so
-  consumers build with `cc app.c $(pkg-config --cflags --libs sekejap)`.
+- **`tour.c`** -- the five stops of the surface in one program: documents and
+  the paged scan, SQL with `$n` parameters and a prepared statement, the graph,
+  a transaction that commits and one that rolls back, and the catalog. Every
+  step is checked, and a failed check is a non-zero exit.
+- **`Makefile`** -- builds the library with cargo and compiles against
+  `dist/ffi/include`, setting the loader path so nothing has to be installed
+  first.
+
+The shortest program, the one `cd dist/ffi && make check` compiles and runs on
+every build, is `dist/ffi/examples/smoke.c`.
 
 ## Using it in your own project
 
-After `make install` (default `PREFIX=/usr/local`):
+After `cd dist/ffi && make install` (default `PREFIX=/usr/local`):
 
-```bash
+```sh
 cc my_app.c $(pkg-config --cflags --libs sekejap) -o my_app
 ```
 
-Or point directly at the build tree without installing:
+Or point straight at the build tree:
 
-```bash
-cc my_app.c -I path/to/wrappers/c/include -L path/to/target/release -lsekejap -o my_app
+```sh
+cc my_app.c -I dist/ffi/include -L target/release -lsekejap -o my_app
 ```

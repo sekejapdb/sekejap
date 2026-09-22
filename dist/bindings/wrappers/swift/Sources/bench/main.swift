@@ -3,15 +3,15 @@ import Foundation
 import Sekejap
 
 let dir = NSTemporaryDirectory() + "skbench-swift-\(UUID().uuidString)"
-let db = try! SekejapDB(path: dir)
-try! db.execute("CREATE TABLE t (_key TEXT PRIMARY KEY, v INTEGER)")
+let db = try! Db(path: dir)
+try! db.createCollection("t", fields: [Db.FieldSpec(name: "v", kind: "int")])
 for i in 0..<1000 {
-    try! db.execute("INSERT INTO t (_key, v) VALUES ('k\(i)', \(i))")
+    try! db.put("t", "k\(i)", document: ["v": i])
 }
 
 let n = Int(ProcessInfo.processInfo.environment["N"] ?? "50000")!
 let sql = "SELECT v FROM t WHERE _key = 'k500'"
-_ = try! db.query(sql) // warm
+_ = try! db.query(sql)  // warm
 
 let start = Date()
 for _ in 0..<n { _ = try! db.query(sql) }

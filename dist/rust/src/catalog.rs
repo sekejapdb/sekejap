@@ -12,6 +12,15 @@ pub struct Collection {
     pub indexes: Vec<Index>,
     /// Whether the collection stamps its rows with created/updated times.
     pub timestamps: bool,
+    /// The LIVE row count, when the database keeps one for this collection.
+    ///
+    /// `None` is not "no rows": it is "this database has no live row-count
+    /// record for this collection", which is every database written before
+    /// the record existed and every collection a
+    /// `Database::backfill_row_counts` has not reached. Then the number costs
+    /// a walk, and [`crate::Db::scan_count_rows`] is the call that says so in
+    /// its name.
+    pub rows: Option<u64>,
 }
 
 impl Collection {

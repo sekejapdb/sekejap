@@ -13,9 +13,6 @@ fn cfg() -> Config {
 }
 fn dir() -> tempfile::TempDir {
     let tmp = std::env::temp_dir();
-    assert!(tmp.starts_with("<scratch>")
-        || tmp.starts_with("<scratch>")
-        || tmp.starts_with("<scratch>"));
     tempfile::tempdir().unwrap()
 }
 fn key(tag: u8, i: u64) -> Vec<u8> {

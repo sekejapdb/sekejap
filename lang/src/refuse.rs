@@ -28,7 +28,10 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("~", Tier::Three, "QL_CONTRACT §3: regex `~` has no index atomic."),
     ("&&", Tier::Two, "QL_CONTRACT §4.4: `&&` with ST_MakeEnvelope is a Bbox filter on the point or geometry index (p3-geometry-io). Not built in this slice; ST_Within against an envelope is the Tier-1 spelling of the same rectangle."),
     ("@>", Tier::Two, "QL_CONTRACT §3: array containment has no Tier-1 atomic in this slice."),
+    ("->", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2). `->` returns the JSON value and `->>` its text; neither becomes an index range without an expression index over the same path."),
     ("->>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2)."),
+    ("#>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2). `#>` walks a path array and is the same missing surface `->` and `->>` name."),
+    ("#>>", Tier::Two, "QL_CONTRACT §4.1: JSON path extraction is a row function (p3 item 2). `#>>` walks a path array and returns text; it is the same missing surface `->` and `->>` name."),
     // ── §2 statements ────────────────────────────────────────────────────
     ("JOIN", Tier::Two, "QL_CONTRACT §4.8: INNER/LEFT JOIN on key equality is a key lookup per driving row, scheduled after GROUP BY; a join on a non-key column and FULL OUTER JOIN are Tier 3 (they need a hash join with spill). A pattern is never compiled to a join."),
     ("OFFSET", Tier::Two, "QL_CONTRACT §5 deviation 4: OFFSET is a keyset continuation, never a skip count. The continuation is the prepared query's own next page; a skip count would read and discard rows, which is work proportional to the skip."),
@@ -51,6 +54,8 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     // `lang/src/functions.rs`: they are row functions over projected values,
     // and `lower(col) = x` / `LIKE 'x%'` / `starts_with` are index ranges.
     // What is left here is what still has no atomic.
+    ("CASE", Tier::Two, "QL_CONTRACT §4.1: `CASE WHEN <cond> THEN <value> [WHEN ...] [ELSE <value>] END` is a row expression -- one row in, one value out -- and it waits on the PROJECTION-EXPRESSION surface (§7 item 5), the same surface the JSON path operators and ST_Area wait on. In a WHERE it is row-bound and never becomes an index range, so §6 does not allow it to be taken as a scan."),
+    ("JSON_ARRAY_LENGTH", Tier::Two, "QL_CONTRACT §4.1: json_array_length is a row function over the binary JSON the row codec already decodes, and it waits on the PROJECTION-EXPRESSION surface (§7 item 5) with `CASE WHEN` and the JSON path operators."),
     ("REGEXP_REPLACE", Tier::Three, "QL_CONTRACT §4.1: regexp_* has no atomic."),
     ("REGEXP_MATCH", Tier::Three, "QL_CONTRACT §4.1: regexp_* has no atomic."),
     ("COALESCE", Tier::Two, "QL_CONTRACT §4.1: a row function on projected values; a text index spans one declared field, so the concatenation Postgres builds with coalesce is a stored field here (battle50k deviation 1)."),
@@ -94,6 +99,10 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("ST_X", Tier::Two, "QL_CONTRACT §4.4: coordinate accessors are pure I/O functions (p3-geometry-io); a lon/lat rectangle is ST_Within against an envelope here, which is PointFilter::Bbox."),
     ("ST_Y", Tier::Two, "QL_CONTRACT §4.4: coordinate accessors are pure I/O functions (p3-geometry-io); a lon/lat rectangle is ST_Within against an envelope here, which is PointFilter::Bbox."),
     ("ST_SIMPLIFY", Tier::Two, "QL_CONTRACT §4.4: a pure function on the QGIS render path (p3-geometry-io)."),
+    ("ST_AREA", Tier::Two, "QL_CONTRACT §4.4: ST_Area is a pure function over the geometry the row already decodes (`core/engine/src/index/spatial/geometry.rs`, re-exported as `sekejap_core::spatial_geometry`); what is missing is the PROJECTION-EXPRESSION surface over it (§7 item 5), not the computation."),
+    ("ST_LENGTH", Tier::Two, "QL_CONTRACT §4.4: ST_Length is a pure function over the geometry the row already decodes (`core/engine/src/index/spatial/geometry.rs`, re-exported as `sekejap_core::spatial_geometry`); what is missing is the PROJECTION-EXPRESSION surface over it (§7 item 5), not the computation."),
+    ("ST_PERIMETER", Tier::Two, "QL_CONTRACT §4.4: ST_Perimeter is a pure function over the geometry the row already decodes (`core/engine/src/index/spatial/geometry.rs`, re-exported as `sekejap_core::spatial_geometry`); what is missing is the PROJECTION-EXPRESSION surface over it (§7 item 5), not the computation."),
+    ("ST_CENTROID", Tier::Two, "QL_CONTRACT §4.4: ST_Centroid is a pure function over the geometry the row already decodes (`core/engine/src/index/spatial/geometry.rs`, re-exported as `sekejap_core::spatial_geometry`); what is missing is the PROJECTION-EXPRESSION surface over it (§7 item 5), not the computation."),
     // ── §4.5 vector ──────────────────────────────────────────────────────
     ("<+>", Tier::Three, "QL_CONTRACT §4.5: `<+>` L1, halfvec, sparsevec and binary quantization operators have no atomic."),
     ("VECTOR_DIMS", Tier::Two, "QL_CONTRACT §4.5: vector_dims/vector_norm/l2_normalize are row functions."),
@@ -123,9 +132,32 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("LEAD", Tier::Three, "QL_CONTRACT §4.7: window functions have no atomic."),
     ("NTILE", Tier::Three, "QL_CONTRACT §4.7: window functions have no atomic."),
     // ── §2 catalog surface ───────────────────────────────────────────────
-    ("VERSION", Tier::Two, "QL_CONTRACT §2: version(), postgis_version() and current_schema() are fixed rows (p3-pg-surface)."),
-    ("POSTGIS_VERSION", Tier::Two, "QL_CONTRACT §2: version(), postgis_version() and current_schema() are fixed rows (p3-pg-surface)."),
-    ("CURRENT_SCHEMA", Tier::Two, "QL_CONTRACT §2: version(), postgis_version() and current_schema() are fixed rows (p3-pg-surface)."),
+    //
+    // `version()`, `db_version()`, `current_schema()`, `current_database()`,
+    // `current_user` and `pg_backend_pid()` left this table for Tier 1 with
+    // `catalog.rs`: they are fixed rows, and a fixed row is an atomic.
+    // `postgis_version()` stays, because what it would have to report is a
+    // PostGIS function surface (`ST_AsBinary`, `ST_GeomFromWKB`, the `&&`
+    // operator) that is not built -- a version string for an absent library
+    // is the one answer worse than a refusal.
+    ("POSTGIS_VERSION", Tier::Two, "QL_CONTRACT §2 and §4.4: postgis_version() is a fixed row (p3-pg-surface), and it is withheld until the geometry I/O it advertises exists (p3-geometry-io): a client reads it as a PROMISE that ST_AsBinary, ST_GeomFromWKB and `&&` answer, and they do not. `SELECT version()`, geometry_columns and spatial_ref_sys are answered."),
+    // The `pg_catalog` relations this surface does NOT provide. Listed here
+    // rather than answered empty: an empty `pg_settings` reads as "this
+    // server has no settings", which is false, and the eighth law of
+    // FOUNDATION_TEST_STANDARD refuses with a named reason instead. The same
+    // list, with these reasons, is `catalog::NOT_PROVIDED` and
+    // `docs/dist/PG_SURFACE.md`.
+    ("PG_PROC", Tier::Three, "QL_CONTRACT §2 (catalog): e4 has no function catalog -- the §4.1/§4.2 functions are compiled by `lang`, not registered rows, so there is nothing to list. Provided instead: pg_class, pg_attribute, pg_type, pg_namespace, pg_index, pg_indexes, pg_constraint, pg_tables, pg_description."),
+    ("PG_SETTINGS", Tier::Three, "QL_CONTRACT §2 (catalog): e4 has no GUC table. A connection is a process here; the client settings a driver sends are accepted as notices and each answers `SHOW <name>` from a constant."),
+    ("PG_ROLES", Tier::Three, "QL_CONTRACT §2 (catalog): e4 has no authentication and no role catalog -- the process that opened the file is the only user there is."),
+    ("PG_AUTHID", Tier::Three, "QL_CONTRACT §2 (catalog): e4 has no authentication and no role catalog -- the process that opened the file is the only user there is."),
+    ("PG_DATABASE", Tier::Three, "QL_CONTRACT §2 (catalog): e4 is one database per file and there is no cluster to list. `SELECT current_database()` names this one."),
+    ("PG_ENUM", Tier::Three, "QL_CONTRACT §2 (catalog): e4 has no enum types -- a column's `Kind` is one of eight and none of them is user-defined."),
+    ("PG_OPERATOR", Tier::Three, "QL_CONTRACT §2 (catalog): operators are compiled by `lang` against the index families a predicate names; there is no operator catalog to read."),
+    ("PG_AM", Tier::Three, "QL_CONTRACT §2 (catalog): an index family is an `IndexFamily`, a closed set in the collection catalog, not an access-method row. `db_indexes` and `pg_indexes` name the family of each index."),
+    ("PG_TRIGGER", Tier::Three, "QL_CONTRACT §2: triggers have no atomic, so there is no trigger catalog."),
+    ("PG_REWRITE", Tier::Three, "QL_CONTRACT §2: a user `CREATE VIEW` is Tier 3 (a query rewrite at prepare is a second planner path), so there is no rule catalog."),
+    ("PG_STAT_ACTIVITY", Tier::Three, "QL_CONTRACT §2 (catalog): there is no connection table -- a connection is a process here."),
 ];
 
 /// The reason a rewrite whose pre-image is a SET of ranges carries.

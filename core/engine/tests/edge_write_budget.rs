@@ -189,10 +189,16 @@ fn writing_one_edge_allocates_a_bounded_number_of_times() {
         )
     });
     result.unwrap();
+    // Three buffers for the edge itself -- the two keys and the encoded
+    // properties -- and two more for the ENDPOINT SET keys this edge files,
+    // one per end (`core/engine/src/index/graph/endpoints.rs`). The eleventh
+    // slot is the memo's own B-tree node, which is allocated once per
+    // transaction and may or may not land on this call.
     assert!(
-        count <= 8,
-        "writing one relationship allocated {count} times; the two keys and the \
-         encoded properties are three buffers, not one per integer in them"
+        count <= 11,
+        "writing one relationship allocated {count} times; the two keys, the \
+         encoded properties and the two endpoint keys are five buffers, not one \
+         per integer in them"
     );
 }
 
@@ -319,6 +325,13 @@ fn a_reopened_handle_proves_nothing_about_rows_it_did_not_allocate() {
 /// must reach its leaves through the hint, not through a descent. The sources
 /// are DISJOINT from the warm-up's, so every put is a new record -- replacing
 /// an existing edge is not an append and is not what this measures.
+///
+/// FOUR runs now, not two: a NEW edge also files its two ENDPOINT SET keys
+/// (`core/engine/src/index/graph/endpoints.rs`), one under `0x7E | ctx | type
+/// | 0` keyed by the source and one under `... | 1` keyed by the destination.
+/// Both ascend with this loop, so both are appends the per-keyspace hint can
+/// serve, and the measured cost per edge moved from under three page accesses
+/// to 5.42 -- four hinted appends rather than two, not four descents.
 #[test]
 fn an_ascending_edge_run_reaches_its_leaves_without_descending() {
     const EDGES: u64 = 2_000;
@@ -343,9 +356,9 @@ fn an_ascending_edge_run_reaches_its_leaves_without_descending() {
     let served = hits - hits0;
     eprintln!(
         "{pages:.3} page accesses per edge; the per-keyspace hint served {served} of \
-         {} attempts over {} edge-row puts, and {} puts found no slot",
+         {} attempts over {} puts (two edge rows and two endpoint keys per edge), and {} puts found no slot",
         attempts - attempts0,
-        EDGES * 2,
+        EDGES * 4,
         misses - misses0
     );
     // Not all of them, and the gap is a named one. An edge run's top leaf is
@@ -356,13 +369,13 @@ fn an_ascending_edge_run_reaches_its_leaves_without_descending() {
     // split for the same reason. Measured: 88.7% of the 200K load's
     // forward-edge puts served, 1.75 page accesses against 4.40.
     assert!(
-        served >= EDGES * 2 * 8 / 10,
-        "the per-keyspace hint served only {served} of the {} edge-row puts",
-        EDGES * 2
+        served >= EDGES * 4 * 8 / 10,
+        "the per-keyspace hint served only {served} of the {} puts an edge makes",
+        EDGES * 4
     );
     assert!(
-        pages <= 3.0,
-        "an edge over two ascending runs took {pages:.2} page accesses; two hinted \
-         appends are two, and before the hint two descents were about 8.7"
+        pages <= 6.0,
+        "an edge over four ascending runs took {pages:.2} page accesses; four hinted \
+         appends are four, and before the hint two descents alone were about 8.7"
     );
 }

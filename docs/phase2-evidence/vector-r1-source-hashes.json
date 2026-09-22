@@ -1,9 +1,0 @@
-{
-  "Cargo.toml": "da992b4a23e533db79611ab04efab1089db3ccac58add9af8eb73cd1d49b6b36",
-  "Cargo.lock": "10fdead06dd710020911470c7db959f158e999f0f90c70bd5f2b2704eebddee1",
-  "src/collections.rs": "332ea24fcda3da0cf00471a929e2cb43266cf074d6bbe01e5152f55eb53c2c67",
-  "src/dense_v3.rs": "c0dadbea091330b50fbb48d0afeeaf859ee94f475b4dfb3755ffa6e50ac60304",
-  "src/indexes.rs": "f8828241c0395f5265aec9b1ca2986bf3226d6d52a75acdc7387f2e2cffb6f5a",
-  "src/vector_indexes.rs": "8a8cbb043dd94af9c7555577c759fcfcecdc2379fe4238cbe5c7e6eff523740b",
-  "tests/index_vector.rs": "079e0e7859beedf1f073e05b383a23eb980ab8b8e9a3f5a304e7f8df43673d75"
-}

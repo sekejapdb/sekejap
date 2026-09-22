@@ -245,6 +245,16 @@ pub(super) enum Predicate {
         table: String,
         column: String,
     },
+    /// A predicate with no column at all: `1 <> 1`, `1 = 1`. Folded to its
+    /// truth value by the parser.
+    ///
+    /// pgjdbc sends `SELECT ... WHERE 1<>1 LIMIT 1` to learn a result's
+    /// COLUMNS without fetching a row, so this is a shape a driver actually
+    /// writes. It is accepted over the catalog views of `catalog.rs`, whose
+    /// driver is an in-memory row list a constant can select none of; over a
+    /// stored collection it is refused by name, because there is no filter
+    /// atomic that admits or rejects every candidate without reading one.
+    Constant(bool),
     /// A §4.2 date/time function folded into scalar ranges over `column`.
     Time { column: String, shape: TimeShape },
     /// A §4.1 string function folded into a text-key range over `column`.
@@ -560,6 +570,65 @@ pub(super) enum SetValue {
     Row(RowExpr),
 }
 
+/// One item of a SELECT with no FROM: a session fact, or a literal.
+///
+/// A driver asks these before it has a catalog to ask anything else of --
+/// pgjdbc on connect, psql for its prompt, QGIS for the provider
+/// description -- so they are answered from constants and never touch the
+/// store. `docs/lang/QL_CONTRACT.md` §2 row "SELECT version() ...".
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum SessionItem {
+    /// `version()`: the PostgreSQL-shaped string drivers parse.
+    Version,
+    /// `db_version()`: the same fact without the PostgreSQL costume.
+    DbVersion,
+    CurrentSchema,
+    CurrentDatabase,
+    /// `current_user`, `session_user`, `current_role`, bare `user`.
+    CurrentUser,
+    /// `pg_backend_pid()`: this process's id, which is what a connection is
+    /// here.
+    BackendPid,
+    /// `current_setting('name')`: the client GUC's value.
+    Setting(String),
+    Lit(Literal),
+}
+
+impl SessionItem {
+    /// The column name the answer carries when the statement wrote no alias.
+    pub(super) fn column(&self) -> String {
+        match self {
+            Self::Version => "version".into(),
+            Self::DbVersion => "db_version".into(),
+            Self::CurrentSchema => "current_schema".into(),
+            Self::CurrentDatabase => "current_database".into(),
+            Self::CurrentUser => "current_user".into(),
+            Self::BackendPid => "pg_backend_pid".into(),
+            Self::Setting(_) => "current_setting".into(),
+            Self::Lit(_) => "?column?".into(),
+        }
+    }
+}
+
+/// A `SHOW ...` statement: `docs/lang/QL_CONTRACT.md` §2 makes each one fixed
+/// sugar over the `db_*` catalog rows, so every form here names the relation
+/// it reads and adds no atomic.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Show {
+    /// `SHOW TABLES` -> `db_tables`.
+    Tables,
+    /// `SHOW INDEXES [ON t]` -> `db_indexes`, optionally one table's.
+    Indexes(Option<String>),
+    /// `SHOW EDGES` -> `db_edges`.
+    Edges,
+    /// `SHOW CREATE TABLE t`: the DDL that would build `t` again.
+    CreateTable(String),
+    /// `SHOW <name>`: one collection's columns if the catalog has that
+    /// collection, otherwise the client GUC of that name. Which it is can
+    /// only be decided against the catalog, so the parser keeps the word.
+    Name(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Source {
     Table(String),
@@ -760,6 +829,18 @@ pub(super) enum Stmt {
         name: String,
         value: Literal,
     },
+    /// `SET <client guc> = <anything>`: the connect-time chatter a driver
+    /// sends (`client_encoding`, `DateStyle`, `TimeZone`, `application_name`,
+    /// `search_path`, `extra_float_digits`). Accepted as a NOTICE that names
+    /// the knob and the value: the session has nothing to set, and a silent
+    /// `SET` would read as one that took effect.
+    SetGuc {
+        name: String,
+        value: String,
+    },
+    /// A `SELECT` with no `FROM`.
+    SessionRows(Vec<(SessionItem, Option<String>)>),
+    Show(Show),
 }
 
 // ── how a compiled form spells itself back ────────────────────────────────

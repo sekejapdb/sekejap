@@ -328,9 +328,32 @@ fn the_three_counts_are_scans_and_agree_with_the_oracle() {
     assert_eq!(db.scan_count_all_rows().expect("all"), rows);
     assert_eq!(db.scan_count_edges().expect("edges"), edges.len() as u64);
 
+    // `count_rows` reads the LIVE ROW COUNT record this database keeps, and
+    // has to agree with the walk on every collection -- that is the whole
+    // claim the record makes. `describe` reports the same number without
+    // paying for either.
+    assert_eq!(db.count_rows("people").expect("people"), 30);
+    assert_eq!(db.count_rows("posts").expect("posts"), 17);
+    assert_eq!(
+        db.describe("people").expect("describe").expect("present").rows,
+        Some(30)
+    );
+    assert_eq!(
+        db.describe("posts").expect("describe").expect("present").rows,
+        Some(17)
+    );
+    // And it follows a delete, still without a walk.
+    assert!(db.delete(("posts", "p0")).expect("delete"));
+    assert_eq!(db.count_rows("posts").expect("posts"), 16);
+    assert_eq!(db.scan_count_rows("posts").expect("posts"), 16);
+
     // A count of a collection that is not there is a refusal by name, not a
     // zero: zero is an answer and this is not one.
     match db.scan_count_rows("absent") {
+        Err(Error::UnknownCollection(name)) => assert_eq!(name, "absent"),
+        other => panic!("expected UnknownCollection, got {other:?}"),
+    }
+    match db.count_rows("absent") {
         Err(Error::UnknownCollection(name)) => assert_eq!(name, "absent"),
         other => panic!("expected UnknownCollection, got {other:?}"),
     }

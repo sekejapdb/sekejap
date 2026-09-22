@@ -106,9 +106,9 @@ fn barrier_failure_after_the_frame_write_hides_the_transaction_until_rollback() 
     let wal: Arc<dyn FileIo> = io::open_file(&p.join("wal"), IoMode::Buffered).unwrap().0.into();
     let flaky = Flaky::new(wal);
     let hooked = flaky.clone();
-    let mut s = PageWalStore::open_with(&p, false, CACHE, move |d| {
+    let mut s = PageWalStore::open_with(&p, false, CACHE, move |d, sync| {
         let (data, _) = io::open_file(&d.join("data"), IoMode::Buffered)?;
-        Pager::from_files(data.into(), hooked)
+        Pager::from_files(data.into(), hooked, sync)
     })
     .unwrap();
     s.put(b"a", b"v2").unwrap();
@@ -266,10 +266,10 @@ fn writer_recovery_window_never_serves_a_stale_hint_to_a_live_reader() {
     let outcome: Arc<Mutex<Option<std::result::Result<Vec<u8>, String>>>> = Arc::new(Mutex::new(None));
     let handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     let (dir, o, h) = (p.clone(), outcome.clone(), handle.clone());
-    let mut s = PageWalStore::open_with(&p, false, CACHE, move |d| {
+    let mut s = PageWalStore::open_with(&p, false, CACHE, move |d, sync| {
         let (data, _) = io::open_file(&d.join("data"), IoMode::Buffered)?;
         let (wal, _) = io::open_file(&d.join("wal"), IoMode::Buffered)?;
-        let pager = Pager::from_files(data.into(), wal.into())?;
+        let pager = Pager::from_files(data.into(), wal.into(), sync)?;
         let (dir2, o2) = (dir.clone(), o.clone());
         *h.lock().unwrap() = Some(std::thread::spawn(move || {
             let r = PageWalStore::open_snapshot(&dir2, CACHE).map(|r| a(&r)).map_err(|e| format!("{e:?}"));

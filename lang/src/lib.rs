@@ -98,6 +98,7 @@
 //! ```
 
 mod ast;
+pub mod catalog;
 mod compile;
 mod explain;
 mod functions;
@@ -367,8 +368,12 @@ impl PreparedSql {
                 | compile::Plan::ExplainAggregate(aggregate) => aggregate.rebind(&binder),
                 // A write folds its document and a notice holds no value, so
                 // neither carries a slot; a rebindable one is one with no
-                // parameter at all.
-                compile::Plan::Write(_) | compile::Plan::ExplainText(_) => Ok(()),
+                // parameter at all. A `Rows` plan is the same case: its
+                // filter ran while it compiled, so a statement with a `$n`
+                // in it is marked not rebindable and never reaches here.
+                compile::Plan::Write(_)
+                | compile::Plan::ExplainText(_)
+                | compile::Plan::Rows(_) => Ok(()),
             };
         }
         let statement = self.statement.clone().ok_or_else(|| {
@@ -405,15 +410,19 @@ impl PreparedSql {
             compile::Plan::Aggregate(aggregate) | compile::Plan::ExplainAggregate(aggregate) => {
                 &aggregate.columns
             }
+            compile::Plan::Rows(rows) => &rows.columns,
             _ => &[],
         }
     }
 
     pub fn is_select(&self) -> bool {
-        matches!(
-            &self.plan,
-            compile::Plan::Select(_) | compile::Plan::Aggregate(_)
-        )
+        match &self.plan {
+            compile::Plan::Select(_) | compile::Plan::Aggregate(_) => true,
+            // A catalog view, a `SHOW` and a `SELECT` with no `FROM` all
+            // answer with rows; an `EXPLAIN` of one answers with its plan.
+            compile::Plan::Rows(rows) => !rows.explain,
+            _ => false,
+        }
     }
 
     /// True when this statement folds rows into groups rather than returning
@@ -492,12 +501,49 @@ impl PreparedSql {
         page_rows: usize,
         body: &mut dyn FnMut(&SqlRow) -> Result<()>,
     ) -> Result<()> {
+        self.for_each_row_with(db, page_rows, QueryBudget::unlimited(), &mut || false, body)
+    }
+
+    /// [`PreparedSql::for_each_row`] under the caller's own budget and
+    /// cancellation, handed to EVERY page rather than only to the compile.
+    ///
+    /// [`PreparedSql::for_each_row`] is this with `QueryBudget::unlimited()`
+    /// and a cancel that never fires, which is all a caller could ask for
+    /// until a server had to put a statement of the caller's ON A WIRE: the
+    /// PostgreSQL surface (`dist/src/pg/`) owes `statement_timeout`
+    /// (`docs/dist/OPS_CONTRACT.md` §3) and `CancelRequest` (§4) on a walk
+    /// that produces the STATEMENT's columns, and `ServiceDatabase::scan`
+    /// produces the ENGINE's projected fields instead.
+    pub fn for_each_row_with(
+        &self,
+        db: &Database,
+        page_rows: usize,
+        budget: QueryBudget,
+        cancelled: &mut dyn FnMut() -> bool,
+        body: &mut dyn FnMut(&SqlRow) -> Result<()>,
+    ) -> Result<()> {
+        // A catalog relation, `SHOW`, or the session rows: a bounded list
+        // built at prepare (`docs/dist/PG_SURFACE.md`), handed out row by row.
+        // There is no walk to charge and nothing to cancel between two rows.
+        if let compile::Plan::Rows(rows) = &self.plan {
+            if rows.explain {
+                return Err(SqlError::unsupported(
+                    "an EXPLAIN pages no rows: it is one text answer",
+                ));
+            }
+            if let SqlResult::Rows { rows, .. } = rows.answer() {
+                for row in &rows {
+                    body(row)?;
+                }
+            }
+            return Ok(());
+        }
         let select = self.select_plan().ok_or_else(|| {
             SqlError::unsupported("this statement is not a row SELECT and pages no rows")
         })?;
         select.with_query(db, &mut |prepared| {
             loop {
-                let page = prepared.next_page(page_rows, QueryBudget::unlimited(), || false)?;
+                let page = prepared.next_page(page_rows, budget, &mut *cancelled)?;
                 for row in &page.rows {
                     body(&select.row(db, row)?)?;
                 }
@@ -509,6 +555,52 @@ impl PreparedSql {
         })
     }
 
+    /// Page a compiled AGGREGATE under the caller's own budget and
+    /// cancellation, handing each folded group to `body` as this statement's
+    /// columns.
+    ///
+    /// The aggregate twin of [`PreparedSql::for_each_row_with`], and here
+    /// for the same reason: `PreparedSql::run` folds an aggregate under
+    /// `QueryBudget::unlimited()`, so without this a `statement_timeout`
+    /// (`docs/dist/OPS_CONTRACT.md` §3) would reach a `COUNT(*)`'s COMPILE
+    /// and not its WALK.
+    pub fn for_each_group_with(
+        &self,
+        db: &Database,
+        page_rows: usize,
+        budget: QueryBudget,
+        cancelled: &mut dyn FnMut() -> bool,
+        body: &mut dyn FnMut(&SqlRow) -> Result<()>,
+    ) -> Result<()> {
+        let aggregate = self.aggregate_plan().ok_or_else(|| {
+            SqlError::unsupported("this statement does not fold rows and pages no groups")
+        })?;
+        aggregate.with_aggregate(db, &mut |prepared| {
+            loop {
+                let page = prepared.next_page(page_rows, budget, &mut *cancelled)?;
+                for group in &page.groups {
+                    body(&aggregate.row(group))?;
+                }
+                if page.done || page.groups.is_empty() {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// The collection a row SELECT reads, for a caller that must describe the
+    /// statement's columns before it runs: the PostgreSQL wire surface types
+    /// a `RowDescription` from the collection's DECLARED column types
+    /// (`CollectionInfo::declared`), which is the only place a
+    /// `TIMESTAMPTZ`, a `GEOMETRY` or a `VECTOR` is distinguishable from the
+    /// `Kind` it is stored as.
+    ///
+    /// `None` for every statement that is not a row SELECT.
+    pub fn source_collection(&self) -> Option<CollectionId> {
+        self.select_plan().map(|select| select.collection)
+    }
+
     /// Run this compiled statement to exhaustion and assemble its answer.
     ///
     /// The reading half of [`SqlDatabase::sql`], for a statement prepared
@@ -518,6 +610,11 @@ impl PreparedSql {
     pub fn run(&self, db: &Database) -> Result<SqlResult> {
         match &self.plan {
             compile::Plan::Select(_) | compile::Plan::Aggregate(_) => self.rows(db),
+            compile::Plan::Rows(rows) => Ok(if rows.explain {
+                SqlResult::Explain(rows.render())
+            } else {
+                rows.answer()
+            }),
             compile::Plan::Explain(select) => Ok(SqlResult::Explain(explain::render(
                 db,
                 select,
@@ -763,6 +860,11 @@ impl SqlDatabase for Database {
                 Ok(SqlResult::Explain(text))
             }
             compile::Plan::ExplainText(text) => Ok(SqlResult::Explain(text)),
+            compile::Plan::Rows(rows) => Ok(if rows.explain {
+                SqlResult::Explain(rows.render())
+            } else {
+                rows.answer()
+            }),
             compile::Plan::ExplainAggregate(aggregate) => {
                 let text = explain::render_aggregate(self, &aggregate, &notices, &rebind)?;
                 Ok(SqlResult::Explain(text))

@@ -782,9 +782,10 @@ fn prepared_query_drivers_read_the_index_tree() {
 fn an_unconfigured_handle_creates_the_layout_the_compat_corpus_declares() {
     /// The mask a scalar-only collection must require of a reader: the base
     /// logical bit plus the per-index-tree bit.
-    const SCALAR_REQUIRES: u64 = 1 | 0x80;
+    // `0x2000` is the live row-count record `create_collection` writes.
+    const SCALAR_REQUIRES: u64 = 1 | 0x80 | 0x2000;
     /// The same for a collection that also carries a spatial index.
-    const SCALAR_AND_SPATIAL_REQUIRE: u64 = 1 | 8 | 0x80;
+    const SCALAR_AND_SPATIAL_REQUIRE: u64 = 1 | 8 | 0x80 | 0x2000;
 
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("default");

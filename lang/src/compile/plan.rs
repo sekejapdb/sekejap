@@ -1212,6 +1212,11 @@ pub(crate) enum Plan {
     Explain(SelectPlan),
     Aggregate(AggregatePlan),
     ExplainAggregate(AggregatePlan),
+    /// A statement whose driver is the bounded in-memory row list of
+    /// `rows.rs`: a catalog view, a `SHOW`, a `SELECT` with no `FROM`.
+    /// `RowsPlan::explain` says whether the answer is the rows or the plan
+    /// that produced them.
+    Rows(RowsPlan),
     Write(WritePlan),
     /// An EXPLAIN whose statement is not a query: the text is the plan, and
     /// nothing is run to produce it.

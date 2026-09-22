@@ -1,49 +1,60 @@
-/// Dart & Flutter bindings for **sekejap** — an embedded graph-first,
-/// multi-model database (SQL + graph + vector + spatial) with a native Rust core.
+/// Dart bindings for **sekejap** -- an embedded graph-first, multi-model
+/// database (SQL + graph + vector + spatial).
 ///
-/// Call [initSekejap] once before using the database:
+/// The binding is `dart:ffi` over the C ABI of `libsekejap`
+/// (`docs/dist/C_ABI.md`): one class per C handle -- [Db], [Statement],
+/// [Scan], [Transaction] -- and one method per C function. Documents,
+/// parameters and rows are Dart's own JSON types.
 ///
 /// ```dart
-/// await initSekejap();
-/// final db = await dbOpen(path: '/tmp/mydb');
-/// await dbExecute(db: db, sql: 'CREATE TABLE t (_key TEXT PRIMARY KEY, v INT)');
-/// await dbExecute(db: db, sql: "INSERT INTO t (_key, v) VALUES ('a', 42)");
-/// final rows = await dbQuery(db: db, sql: 'SELECT * FROM t');
+/// import 'package:sekejap/sekejap.dart';
+///
+/// void main() {
+///   final db = Db.open('/tmp/mydb');
+///   db.createCollection('dish', const [
+///     FieldSpec('name', FieldKind.text),
+///     FieldSpec('price', FieldKind.integer),
+///   ]);
+///   db.put('dish', 'd1', {'_key': 'd1', 'name': 'nasi goreng', 'price': 45000});
+///
+///   final cheap = db.query(
+///       'SELECT name, price FROM dish WHERE price < \$1 ORDER BY price', [90000]);
+///   print(cheap); // [{name: nasi goreng, price: 45000}]
+///
+///   db.close();
+/// }
 /// ```
 ///
-/// In a Flutter app the native library is bundled and found automatically. For
-/// standalone Dart (CLI, `dart test`), pass [initSekejap]'s `libraryPath` to a
-/// `libsekejap_ffi.{dylib,so,dll}` you built (`cargo build -p sekejap_ffi`) or
-/// downloaded.
+/// The wrapper builds no native code. It loads a `libsekejap` that is already
+/// on the machine, in this order: the path given to [useSekejapLibrary], the
+/// `SEKEJAP_LIBRARY` environment variable, the running process, then the
+/// platform's plain library name. See the README for where each one comes
+/// from.
 library;
 
-import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
-    show ExternalLibrary;
-
-import 'src/rust/frb_generated.dart';
-
-export 'src/rust/api/simple.dart';
-export 'src/rust/frb_generated.dart' show RustLib;
-export 'src/watch.dart' show watchChanges;
-
-// Typed model layer.
-export 'src/annotations.dart';
-export 'src/orm/filter.dart' show Filter, Col;
-export 'src/orm/query.dart' show Query, GeoPoint, VectorMetric;
-export 'src/orm/collection.dart' show Collection;
-export 'src/orm/database.dart' show Sekejap, EntitySchema;
-
-/// Initialise the native library. Safe to call more than once (later calls are
-/// no-ops).
-///
-/// - In a **Flutter app**, omit [libraryPath] — the bundled library is located
-///   automatically.
-/// - In **standalone Dart / tests**, pass [libraryPath] to a built
-///   `libsekejap_ffi.{dylib,so,dll}`.
-Future<void> initSekejap({String? libraryPath}) async {
-  if (RustLib.instance.initialized) return;
-  await RustLib.init(
-    externalLibrary:
-        libraryPath != null ? ExternalLibrary.open(libraryPath) : null,
-  );
-}
+export 'src/db.dart' show Db;
+export 'src/library.dart' show useSekejapLibrary, sekejapLibraryLoaded;
+export 'src/scan.dart' show Scan, ScanPaging;
+export 'src/statement.dart' show Statement;
+export 'src/status.dart'
+    show
+        Rebindable,
+        SekejapDirection,
+        SekejapException,
+        SekejapLibraryNotFound,
+        SekejapStatus;
+export 'src/tx.dart' show Transaction;
+export 'src/types.dart'
+    show
+        ChangeEvent,
+        ChangedKey,
+        CollectionDescription,
+        FieldInfo,
+        FieldKind,
+        FieldSpec,
+        IndexInfo,
+        IoMode,
+        Neighbour,
+        StorageBytes,
+        StoreConfig,
+        SyncMode;

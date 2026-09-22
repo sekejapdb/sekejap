@@ -8,10 +8,16 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let context = self.name()?;
         self.expect_word("MATCH")?;
-        if let Some(word) = self.word() {
-            if word == "ANY" || word == "ALL" || word == "SHORTEST" {
-                return Err(refuse::refuse("ANY SHORTEST"));
-            }
+        // A pattern MODE word stands exactly here in SQL/PGQ -- `MATCH TRAIL
+        // (...)`, `MATCH ANY SHORTEST (...)` -- so the table is asked before
+        // the `(` is demanded, and the word is refused as ITSELF: `ALL
+        // SHORTEST` used to come back named `ANY SHORTEST` because one hand
+        // written `if` covered both (§4.3, §7 item 10).
+        self.guard_here()?;
+        if matches!(self.word().as_deref(), Some("ANY" | "ALL" | "SHORTEST")) {
+            // A path-selector word the table has no two-word row for. It is
+            // the shortest-path atomic it is asking for either way.
+            return Err(refuse::refuse("ANY SHORTEST"));
         }
         // (a:coll WHERE a.key = $1)
         self.expect(&Tok::LParen)?;
