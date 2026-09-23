@@ -6,6 +6,18 @@ on:
       - "v*"
   workflow_dispatch: {}   # allow manual runs from the Actions UI (test publishes)
 
+# Every artifact this workflow builds ships STRIPPED and LINK-TIME OPTIMISED,
+# as e1's did (`strip = true`, `lto = true`). The workspace's own
+# `[profile.release]` keeps `debug = 1` so benchmarks can be profiled, and
+# 0.17.0/0.17.1 inherited it: the Linux .so was 47.6 MB, 40.9 MB of it debug
+# sections, and the npm package reached 145 MB and never appeared on npm.
+# Measured with these three: Linux .so 3.8 MB, macOS .dylib 3.7 MB, and every
+# wrapper's tests pass against them. Local builds are unaffected.
+env:
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+  CARGO_PROFILE_RELEASE_LTO: "true"
+
 jobs:
   # ── Single source of truth: the pushed tag must equal Cargo.toml's version ──
   # [workspace.package].version drives every wrapper (Rust/Python inherit it,
@@ -528,16 +540,46 @@ jobs:
           for name in "${!DEST[@]}"; do
             tar -xzf "artifacts/libsekejap-$name.tar.gz" -C artifacts
             mkdir -p "native/${DEST[$name]}/lib"
-            cp "artifacts/libsekejap-$name/lib/"* "native/${DEST[$name]}/lib/"
+            # The SHARED library only: koffi loads it at run time. The tarball
+            # also carries the static library for C and Swift, which Node never
+            # uses and which was 82% of the 0.17.1 package.
+            cp artifacts/libsekejap-$name/lib/*.so artifacts/libsekejap-$name/lib/*.dylib \
+               artifacts/libsekejap-$name/lib/*.dll "native/${DEST[$name]}/lib/" 2>/dev/null || true
+            ls "native/${DEST[$name]}/lib/" | grep -qE '\.(so|dylib|dll)$' \
+              || { echo "::error::no shared library for $name"; exit 1; }
           done
           rm -rf artifacts
           find native -type f
+      - name: The package must be small enough for npm to keep
+        # npm accepted 0.17.1's 145 MB upload, reported "+ contributor@example.invalid" and
+        # never listed it. Refuse here, loudly, before the registry can do that.
+        working-directory: dist/bindings/wrappers/node
+        run: |
+          SIZE=$(npm pack --dry-run --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s)[0].size))')
+          echo "packed size: $SIZE bytes"
+          if [ "$SIZE" -gt $((50 * 1024 * 1024)) ]; then
+            echo "::error::npm package is $SIZE bytes; the ceiling is 50 MiB"
+            exit 1
+          fi
       - name: Publish
         # `files` in package.json ships index.js + index.d.ts + native/ + README.md.
         working-directory: dist/bindings/wrappers/node
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: The version must be on npm
+        # `npm publish` exiting 0 is not the registry listing the version.
+        working-directory: dist/bindings/wrappers/node
+        run: |
+          VERSION="${{ needs.verify-version.outputs.version }}"
+          for i in $(seq 1 30); do
+            if npm view "sekejap@$VERSION" version >/dev/null 2>&1; then
+              echo "sekejap@$VERSION is on npm"; exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::npm accepted sekejap@$VERSION but does not list it after 10 minutes"
+          exit 1
 
   # ── Kotlin/JVM → Maven Central. Bundles the per-platform native libs (from
   # build-native-libs) into resources so the published jar is self-contained. ─

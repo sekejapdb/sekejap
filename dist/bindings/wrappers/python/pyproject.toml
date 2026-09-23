@@ -16,7 +16,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sekejap"                      # the PyPI identity; keep it
-version = "0.17.1"                    # [workspace.package].version of the repository
+version = "0.17.2"                    # [workspace.package].version of the repository
 description = "sekejap -- an embedded multi-model database: documents, SQL, graph, vector, spatial, in one file"
 readme = "README.md"
 requires-python = ">=3.8"
