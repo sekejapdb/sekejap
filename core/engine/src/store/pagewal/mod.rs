@@ -109,11 +109,11 @@ fn create_coordination(dir:&Path)->Result<()>{
 }
 fn open_existing(dir:&Path,name:&str)->Result<File>{ Ok(File::open(dir.join(name))?) }
 /// A held reader admission. Dropping it releases the slot.
-struct ReaderSlot{_file:File,index:usize}
+struct ReaderSlot{_file:io::Locked,index:usize}
 fn take_slot(dir:&Path)->Result<ReaderSlot>{
     for index in 0..READER_SLOTS {
         let f=open_existing(dir,&slot_name(index))?;
-        if io::try_lock_exclusive(&f)? { return Ok(ReaderSlot{_file:f,index}); }
+        if io::try_lock_exclusive(&f)? { return Ok(ReaderSlot{_file:io::Locked::held(f),index}); }
     }
     Err(Error::ResourceLimit("page-WAL permits at most eight snapshots"))
 }
@@ -123,16 +123,16 @@ fn take_slot(dir:&Path)->Result<ReaderSlot>{
 // reader therefore waits for a checkpoint in flight instead of finding every
 // slot transiently taken, and never observes a half-written hint pair from a
 // truncation. Reads after admission do no coordination at all.
-fn gate_shared(dir:&Path)->Result<File>{ let g=open_existing(dir,GATE)?;io::lock_shared(&g)?;Ok(g) }
-struct CheckpointGuard{_files:Vec<File>}
+fn gate_shared(dir:&Path)->Result<io::Locked>{ let g=open_existing(dir,GATE)?;io::lock_shared(&g)?;Ok(io::Locked::held(g)) }
+struct CheckpointGuard{_files:Vec<io::Locked>}
 fn exclude_readers(dir:&Path)->Result<Option<CheckpointGuard>>{
     let gate=open_existing(dir,GATE)?;
     if !io::try_lock_exclusive(&gate)?{return Ok(None);}
-    let mut files=vec![gate];
+    let mut files=vec![io::Locked::held(gate)];
     for index in 0..READER_SLOTS {
         let f=open_existing(dir,&slot_name(index))?;
         if !io::try_lock_exclusive(&f)?{return Ok(None);}
-        files.push(f);
+        files.push(io::Locked::held(f));
     }
     Ok(Some(CheckpointGuard{_files:files}))
 }
@@ -392,9 +392,9 @@ impl Pager {
     // reader cannot be admitted anywhere in this window, so a hint left
     // behind by a crash (derived, deliberately unsynced) is never served
     // beside a later durable commit it does not name.
-    fn finish_open(&self, dir:&Path, held:Option<File>) -> Result<()> {
+    fn finish_open(&self, dir:&Path, held:Option<io::Locked>) -> Result<()> {
         create_coordination(dir)?;
-        let gate=match held { Some(g)=>g, None=>{ let g=open_existing(dir,GATE)?;io::lock_exclusive(&g)?;g } };
+        let gate=match held { Some(g)=>g, None=>{ let g=open_existing(dir,GATE)?;io::lock_exclusive(&g)?;io::Locked::held(g) } };
         let end = self.state.lock().unwrap().last_commit;
         if self.wal.len()? != end { self.wal.set_len(end)?; }
         // A prefix recovered after a failed barrier is made durable before any
@@ -710,7 +710,7 @@ impl FileIo for View {
     fn sync_full_primitive(&self)->&'static str{"read only"}
     fn sync_dir(&self)->Result<()>{Err(Error::ReadOnly)}
 }
-fn snapshot_store(pager:&Arc<Pager>,lock:Option<Arc<File>>,dir:&Path,cache:usize,slot:Option<ReaderSlot>)->Result<PageWalStore>{
+fn snapshot_store(pager:&Arc<Pager>,lock:Option<Arc<io::Locked>>,dir:&Path,cache:usize,slot:Option<ReaderSlot>)->Result<PageWalStore>{
     let s=pager.state.lock().unwrap();
     pager.readers.fetch_update(Ordering::SeqCst,Ordering::SeqCst,|n|if n<READER_SLOTS{Some(n+1)}else{None})
         .map_err(|_|Error::ResourceLimit("page-WAL permits at most eight snapshots"))?;
@@ -735,7 +735,7 @@ fn enforce_reader_bound(slot:&ReaderSlot,bound:Option<usize>)->Result<()>{
 // Strict inspection of the files is the committed state a writer would
 // recover; the hint is not consulted. Nothing is created before the typed
 // check passed; the check's reader bound is applied after the slot is taken.
-fn admit_quiescent(dir:&Path,owner:File,cache:usize,check:impl FnOnce(&PageWalStore)->Result<Option<usize>>)->Result<PageWalStore>{
+fn admit_quiescent(dir:&Path,owner:io::Locked,cache:usize,check:impl FnOnce(&PageWalStore)->Result<Option<usize>>)->Result<PageWalStore>{
     let data:Arc<dyn FileIo>=io::open_file_readonly(&dir.join("data"))?.into();
     let wal:Arc<dyn FileIo>=io::open_file_readonly(&dir.join("wal"))?.into();
     // A read-only handle issues no barrier at any point: its files refuse
@@ -824,7 +824,7 @@ const TREE_HINTS: usize = 8;
 
 pub struct PageWalStore {
     pager:Option<Arc<Pager>>,pool:BufferPool,root:u32,last:Cell<Option<u32>>,hits:Cell<u64>,attempts:Cell<u64>,
-    poisoned:bool,dirty:bool,_lock:Option<Arc<File>>,dir:PathBuf,cache:usize,slot:Option<ReaderSlot>,
+    poisoned:bool,dirty:bool,_lock:Option<Arc<io::Locked>>,dir:PathBuf,cache:usize,slot:Option<ReaderSlot>,
     limits:(u64,u64,usize),reader_files:Option<(Arc<dyn FileIo>,Arc<dyn FileIo>)>,
     hints:[(Cell<u16>,Cell<Option<u32>>);TREE_HINTS],hint_turn:Cell<usize>,
     /// Per-KEYSPACE append hints, shared by every tree this handle opens.
@@ -908,11 +908,12 @@ impl PageWalStore {
         // quiescent admission (writer.lock shared -> gate shared) cannot
         // deadlock: this side never waits while holding the gate. Without a
         // gate file, live readers fail closed until `finish_open` created it.
-        let held=if dir.join(GATE).exists() { let g=open_existing(dir,GATE)?;io::lock_exclusive(&g)?;Some(g) } else { None };
+        let held=if dir.join(GATE).exists() { let g=open_existing(dir,GATE)?;io::lock_exclusive(&g)?;Some(io::Locked::held(g)) } else { None };
         let lock=std::fs::OpenOptions::new().read(true).write(true).create(create).truncate(false).open(dir.join("writer.lock"))?;
         // A quiescent reader admission holds this shared for one bounded
         // scan; a writer arriving in that window is refused, not queued.
         if !io::try_lock_exclusive(&lock)?{return Err(Error::WriterLocked);}
+        let lock=io::Locked::held(lock);
         let created=if create { Some(Pager::initialize(dir,create_codec.unwrap_or_else(create_features),sync)?) } else { None };
         let pager=opener(dir,sync)?;let file:Arc<dyn FileIo>=pager.clone();
         // The create's two barriers were issued before this handle existed.
@@ -955,7 +956,7 @@ impl PageWalStore {
     pub fn open_snapshot_validated(dir:&Path,cache:usize,check:impl FnOnce(&Self)->Result<Option<usize>>)->Result<Self>{
         for name in ["data","wal","writer.lock"] { std::fs::metadata(dir.join(name))?; }
         let owner=open_existing(dir,"writer.lock")?;
-        if io::try_lock_shared(&owner)? { admit_quiescent(dir,owner,cache,check) }
+        if io::try_lock_shared(&owner)? { admit_quiescent(dir,io::Locked::held(owner),cache,check) }
         else { drop(owner);admit_live(dir,cache,check) }
     }
     pub fn dir(&self)->&Path{&self.dir}

@@ -145,7 +145,10 @@ impl ReaderSlot {
 
 impl Drop for ReaderSlot {
     fn drop(&mut self) {
-        if !self.persistent { let _ = std::fs::remove_file(&self.path); } // lock releases with the fd
+        if !self.persistent { let _ = std::fs::remove_file(&self.path); }
+        // Released by unlock, not by the close that follows: a child process
+        // may hold a copy of this descriptor for an instant (`io::Locked`).
+        let _ = self._file.unlock();
     }
 }
 
@@ -181,6 +184,7 @@ pub(crate) fn live_generations(db: &Path) -> Option<Vec<u64>> {
                 if !entry.file_name().to_string_lossy().starts_with("fixed-") {
                     let _ = std::fs::remove_file(&path);
                 }
+                let _ = f.unlock();
                 continue;
             }
             Ok(false) => {

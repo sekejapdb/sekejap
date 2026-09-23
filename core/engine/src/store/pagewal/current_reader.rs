@@ -74,7 +74,7 @@ pub struct CurrentSourceReader {
     compact_cells: bool,
     limits: CurrentReaderLimits,
     fingerprint: SourceFingerprint,
-    _writer_lock: File,
+    _writer_lock: io::Locked,
 }
 
 #[derive(Default)]
@@ -217,6 +217,7 @@ impl CurrentSourceReader {
         if !io::try_lock_exclusive(&writer_lock)? {
             return Err(Error::WriterLocked);
         }
+        let writer_lock = io::Locked::held(writer_lock);
         let data: Arc<dyn FileIo> = io::open_recovery_source(&dir.join("data"))?.into();
         let wal: Arc<dyn FileIo> = io::open_recovery_source(&dir.join("wal"))?.into();
         let fingerprint = fingerprint_dir(&dir, limits)?;

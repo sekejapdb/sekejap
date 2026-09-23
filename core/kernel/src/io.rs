@@ -128,6 +128,9 @@ impl Drop for PosixFile {
         if let (Some(path), Some(identity)) =
             (self.writer_path.take(), self.writer_identity.take())
         {
+            // This descriptor holds the writer's OS lock; release it by
+            // unlock, not by the close that follows (see `Locked`).
+            let _ = self.f.unlock();
             let mut paths = writer_paths().lock().unwrap();
             if paths.get(&path) == Some(&identity) { paths.remove(&path); }
         }
@@ -604,3 +607,40 @@ pub fn lock_shared(f: &std::fs::File) -> std::io::Result<()> { f.lock_shared() }
 
 /// Blocking exclusive lock: waits only for admissions in flight.
 pub fn lock_exclusive(f: &std::fs::File) -> std::io::Result<()> { f.lock() }
+
+/// A file whose OS lock is RELEASED BY AN EXPLICIT UNLOCK when this is
+/// dropped, not by closing the descriptor.
+///
+/// An OS file lock belongs to the open file, and a child process started by
+/// ANY thread of this process inherits a copy of every descriptor for the
+/// instant between fork and exec. Closing our descriptor leaves the lock held
+/// by that copy until the child execs, so a database closed and reopened
+/// while anything spawns a subprocess could be refused as "already has an
+/// active writer", and a checkpoint could find a reader slot "held". Measured
+/// with the standard library alone -- one thread locking, closing and
+/// relocking a file 20,000 times while another starts child processes -- 45
+/// to 116 relocks per run were refused when the lock was released by close,
+/// and 0 when it was released by unlock first: an unlock acts on the open
+/// file itself, which the inherited copy shares. So every lock this engine
+/// holds past the statement that took it is held through this type.
+pub struct Locked(std::fs::File);
+
+impl Locked {
+    /// Hold `f`, which the caller has just locked (shared or exclusive).
+    pub fn held(f: std::fs::File) -> Self {
+        Self(f)
+    }
+}
+
+impl std::ops::Deref for Locked {
+    type Target = std::fs::File;
+    fn deref(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}

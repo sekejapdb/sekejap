@@ -82,6 +82,7 @@ pub fn recover_to(source:&Path,destination:&Path,max_value_bytes:usize)->Result<
     if destination.exists(){return Err(bad("repair destination already exists"));}
     let lock=File::open(source.join("writer.lock"))?;
     if !io::try_lock_exclusive(&lock)?{return Err(Error::WriterLocked);}
+    let _lock=io::Locked::held(lock);
     let data:Arc<dyn FileIo>=io::open_recovery_source(&source.join("data"))?.into();
     let wal:Arc<dyn FileIo>=io::open_recovery_source(&source.join("wal"))?.into();
     let before=[fingerprint(&*data)?,fingerprint(&*wal)?];
