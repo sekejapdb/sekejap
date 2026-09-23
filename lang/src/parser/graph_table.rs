@@ -21,9 +21,13 @@ impl Parser {
         }
         // (a:coll WHERE a.key = $1)
         self.expect(&Tok::LParen)?;
-        let _seed_variable = self.name()?;
+        let seed_variable = self.name()?;
         let seed_collection = self.element_label()?;
-        self.expect_word("WHERE")?;
+        if !self.eat_word("WHERE") {
+            return Err(SqlError::unsupported(format!(
+                "GRAPH_TABLE ({seed_variable}:{seed_collection}) has no starting key. A pattern starts at ONE row named by its key -- `({seed_variable}:{seed_collection} WHERE {seed_variable}._key = '...')` -- and walks out from it; starting at every row of `{seed_collection}` would read the whole table, which sekejap does not do silently (QL_CONTRACT §6)"
+            )));
+        }
         // `name()` reads `a._key` and keeps the last segment, so the element
         // variable in front of the field is already accounted for.
         let field = self.name()?;
@@ -46,7 +50,7 @@ impl Parser {
         self.expect(&Tok::RParen)?;
         let (hop, edge_variable) = self.graph_hop()?;
         self.expect(&Tok::LParen)?;
-        let _target_variable = self.name()?;
+        let target_variable = self.name()?;
         let target_collection = self.element_label()?;
         // The far element's inline WHERE: the per-hop node prune of
         // GRAPH_CONTRACT 4.3, not a post-filter on completed matches. It is
@@ -67,6 +71,7 @@ impl Parser {
             // is a field of the far NODE, `r.weight` a property of the EDGE
             // the pattern bound. The two namespaces are told apart by the
             // variable, which is why this keeps it.
+            let at = self.here();
             let (qualifier, field) = self.qualified_name()?;
             // Case-insensitively, as every other name comparison in this
             // parser is: `R.weight` against a pattern that bound `r` is the
@@ -75,6 +80,31 @@ impl Parser {
                 .as_deref()
                 .zip(edge_variable.as_deref())
                 .is_some_and(|(written, bound)| written.eq_ignore_ascii_case(bound));
+            // Every other qualifier must be the FAR node's. A match row
+            // carries the far node and the edge that reached it, and nothing
+            // of the seed, so `a.name` over a pattern seeded at `a` used to
+            // read the FAR node's `name` and return it under the seed's
+            // label: a wrong answer that looked right. It is refused now,
+            // and so is a variable the pattern never bound.
+            if let Some(written) = qualifier.as_deref().filter(|_| !edge) {
+                if written.eq_ignore_ascii_case(&seed_variable) {
+                    return Err(SqlError::unsupported(format!(
+                        "COLUMNS ({written}.{field}): `{written}` is the starting node, and a match row carries only the far node `{target_variable}` and the edge it was reached by. The starting row is the one named by its key, so read it with its own SELECT; returning its fields per match is not in this slice"
+                    )));
+                }
+                if !written.eq_ignore_ascii_case(&target_variable) {
+                    return Err(SqlError::syntax(
+                        format!(
+                            "COLUMNS ({written}.{field}): `{written}` is not a variable of this pattern; it binds `{seed_variable}`, `{target_variable}`{}",
+                            edge_variable
+                                .as_deref()
+                                .map(|e| format!(" and the edge `{e}`"))
+                                .unwrap_or_default()
+                        ),
+                        at,
+                    ));
+                }
+            }
             let item = if edge {
                 GraphColumn::Edge(field.clone())
             } else if field == super::ID_COLUMN {

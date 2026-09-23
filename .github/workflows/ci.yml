@@ -56,6 +56,16 @@ jobs:
       # rather than in a binding's build (docs/dist/C_ABI.md).
       - name: C ABI - compile and run a C consumer against the header
         run: make -C dist/ffi check
+      # README.md's Python, every block run as written against the library
+      # (dist/bindings/wrappers/python/tests/test_readme.py). Its SQL is
+      # checked row for row by dist/rust/tests/readme_correctness.rs above.
+      - name: README - run every Python block against the library
+        run: |
+          cargo build --release -p sekejap-capi --features ${{ env.FEATURES }}
+          python3 -m pip install --quiet pytest pandas
+          SEKEJAP_LIBRARY=$PWD/target/release/libsekejap.so \
+          PYTHONPATH=dist/bindings/wrappers/python/python \
+            python3 -m pytest dist/bindings/wrappers/python/tests -q
 
   # The agreement fuzzers on a seed nobody has run before.
   #

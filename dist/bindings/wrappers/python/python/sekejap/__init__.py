@@ -58,6 +58,7 @@ from ._ffi import SEKEJAP_LIBRARY_ENV, LibraryNotFound
 
 __all__ = [
     "Db",
+    "DB",
     "Statement",
     "Scan",
     "Tx",
@@ -93,6 +94,10 @@ def _dataframe_accessor(self):
 
 
 Db.df = property(_dataframe_accessor)
+
+# e1 exported the handle as ``DB``, and its README taught ``from sekejap import
+# DB``. The same class under both names, so code written for e1 imports here.
+DB = Db
 
 
 def __getattr__(name):

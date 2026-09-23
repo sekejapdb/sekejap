@@ -87,12 +87,14 @@ def test_open_with_a_store_configuration_is_accepted(tmp_path):
 
 
 def test_a_store_configuration_this_build_will_not_honour_is_refused_by_name(tmp_path):
-    # `sync: off` is not a knob a page-WAL collection can turn: the refusal
-    # arrives as Unsupported with the sentence, never as a silent Full.
+    # The three sync modes are honoured (`off` included, since SyncMode grew
+    # Normal and Off); a value that is none of them is refused by name,
+    # never quietly read as one of the three.
+    for mode in ("full", "normal", "off"):
+        Db(str(tmp_path / mode), config={"sync": mode}).close()
     with pytest.raises(SekejapError) as failure:
-        Db(str(tmp_path / "unsynced"), config={"sync": "off"})
-    assert failure.value.code is Status.UNSUPPORTED
-    assert "SyncMode::Full" in failure.value.message
+        Db(str(tmp_path / "sometimes"), config={"sync": "sometimes"})
+    assert '"full", "normal" or "off"' in failure.value.message
 
 
 def test_create_collection_answers_created_then_already_there(db):

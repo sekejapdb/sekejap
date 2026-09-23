@@ -175,6 +175,7 @@ Two things are a real choice, and you declare those:
 ```python
 db.execute("CREATE INDEX ON dishes USING gin  (to_tsvector('simple', description))")  # text relevance
 db.execute("CREATE INDEX ON tourists USING quantized (taste vector_cosine_ops)")      # vector similarity
+db.execute("CREATE INDEX ON dishes USING exact (embedding)")                          # exact similarity
 ```
 
 Full-text search brings an analyzer and an index roughly the size of the text.
@@ -198,6 +199,8 @@ The full rule, column type by column type, is in
 ```python
 db.execute("INSERT INTO tourists (_key, name, home_city, arrival) VALUES ('chloe', 'Chloe', 'Melbourne', '2024-06-01')")
 db.execute("INSERT INTO tourists (_key, name, home_city, arrival) VALUES ('aiym',  'Aiym',  'Almaty',    '2024-06-02')")
+
+db.execute("INSERT INTO flights (_key, airline, duration_hours) VALUES ('qf-mel', 'Qantas', 6)")
 
 # A relationship (edge): tourist "chloe" flew on flight "qf-mel".
 db.link("tourists", "chloe", "flew_on", "flights", "qf-mel")
@@ -253,17 +256,21 @@ The pattern reads left to right: start at a `tourists` row (`t`), follow a
 `flew_on` edge, arrive at a `flights` row (`f`). The arrow direction matters —
 `-[:e]->` follows edges forward, `<-[:e]-` follows them backward.
 
-You can follow a chain of several hops, and `{1,2}` means "between 1 and 2 hops":
+You can follow the same kind of edge for several hops, and `{1,2}` means
+"between 1 and 2 hops":
 
 ```python
-# Places reachable within 2 "near" hops of somewhere Chloe visited.
+# Tourists within 2 "similar_taste" hops of Chloe.
+db.link("tourists", "chloe", "similar_taste", "tourists", "aiym")
 db.query("""
-    SELECT DISTINCT place
+    SELECT tourist
     FROM GRAPH_TABLE (base MATCH
-        (c:tourists WHERE c._key = 'chloe')-[:visited]->(m:places)-[:near]->{1,2}(p:places)
-        COLUMNS (p._key AS place))
+        (c:tourists WHERE c._key = 'chloe')-[:similar_taste]->{1,2}(t:tourists)
+        COLUMNS (t.name AS tourist))
 """)
 ```
+
+A pattern starts at one row, named by its key, and walks out from it.
 
 ### Location (spatial)
 
@@ -336,10 +343,8 @@ ranked by how well it fits both the words she typed and her taste.
 
 ```python
 db.query("""
-    SELECT restaurant, dish, price
-    FROM GRAPH_TABLE (base MATCH
-        (r:restaurants)-[:serves]->(d:dishes)
-        COLUMNS (r.name AS restaurant, d.name AS dish, d.price AS price, d._key AS dish_key))
+    SELECT name, price
+    FROM dishes
     WHERE open_now = true
       AND price BETWEEN 40000 AND 90000                             -- price range (IDR)
       AND protein_g >= 25                                           -- enough protein
@@ -352,8 +357,8 @@ db.query("""
 """)
 ```
 
-The `WHERE` clause narrows the results using the graph, spatial, scalar, and
-text models. The `ORDER BY` combines a text score and a vector score into one
+The `WHERE` clause narrows the results using the spatial, scalar, and text
+models. The `ORDER BY` combines a text score and a vector score into one
 ranking. The whole thing is one statement.
 
 A second example — **a personal journal** where each entry records a place, a
@@ -416,7 +421,8 @@ An index speeds up one kind of query. Most of them are already there.
 | GiST | `gist` | location: `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects` | automatic |
 | GIN | `gin` over `to_tsvector(...)` | boolean text match and BM25 ranking | declared |
 | Exact vector | `exact` | exact nearest neighbour: `<=>`, `<->`, `<#>` ordering | declared |
-| Quantized vector | `quantized` (aliases: `hnsw`, `diskann`, `ivfflat`, `vamana`) | approximate nearest neighbour, faster at scale | declared |
+| Quantized vector | `quantized` (aliases: `hnsw`, `ivfflat`) | approximate nearest neighbour over compact codes | declared |
+| Vamana graph | `vamana` (alias: `diskann`) | approximate nearest neighbour by a graph walk that skips most rows | declared |
 
 ```sql,tour
 CREATE INDEX ON dishes   USING gin        (to_tsvector('simple', description))
@@ -458,13 +464,11 @@ FROM GRAPH_TABLE (base MATCH
     (a:places WHERE a._key = 'seminyak-beach')-[:near]->{1,3}(dest:places)
     COLUMNS (dest._key AS place))
 
--- Aggregation over a pattern: COUNT / SUM / AVG / MIN / MAX, and COUNT(DISTINCT ...)
-SELECT place, cities
-FROM GRAPH_TABLE (base MATCH
-    (p:places)<-[:visited]-(t:tourists)
-    COLUMNS (p._key AS place, t.home_city AS city))
-GROUP BY place
-ORDER BY COUNT(DISTINCT city) DESC
+-- Aggregation: COUNT / SUM / AVG / MIN / MAX, grouped
+SELECT category, COUNT(*) AS n, AVG(rating) AS avg_rating
+FROM places
+GROUP BY category
+ORDER BY n DESC
 
 -- Edge properties: an inline WHERE on the edge, and its fields in COLUMNS
 SELECT visitor, rating

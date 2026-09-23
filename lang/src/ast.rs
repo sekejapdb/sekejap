@@ -866,7 +866,9 @@ pub(super) enum Stmt {
         automatic: Automatic,
     },
     CreateIndex {
-        name: String,
+        /// `None` for Postgres's `CREATE INDEX ON t ...`: the compiler
+        /// generates `<table>_<column>_<family>`, the automatic indexes' rule.
+        name: Option<String>,
         table: String,
         method: IndexMethod,
     },

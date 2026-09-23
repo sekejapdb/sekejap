@@ -3,7 +3,6 @@ name = "sekejap-dist"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-default-run = "sekejap"
 description = "The sekejap distribution layer: the service wrapper, the Postgres wire server and the command line"
 repository = "https://github.com/sekejapdb/sekejap"
 homepage = "https://github.com/sekejapdb/sekejap"
@@ -15,8 +14,11 @@ categories = ["database-implementations", "command-line-utilities"]
 name = "sekejap_dist"
 path = "src/lib.rs"
 
+# The P0 storage benchmark. It was the binary named `sekejap` until the SQL
+# shell took the name (`dist/rust/src/bin/sekejap.rs`), which is what the
+# README and e1's `skcli` mean by it.
 [[bin]]
-name = "sekejap"
+name = "p0_bench"
 path = "src/cli/main.rs"
 
 [[bin]]

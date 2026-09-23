@@ -565,7 +565,13 @@ impl Parser {
                 "CREATE INDEX CONCURRENTLY: an E4 build is already incremental (`build_index_step`) and a writer is single",
             ));
         }
-        let name = self.name()?;
+        // The name is optional, as in Postgres: `CREATE INDEX ON t ...`.
+        // `ON` is reserved there, so it can never be the index's own name.
+        let name = if self.word().as_deref() == Some("ON") {
+            None
+        } else {
+            Some(self.name()?)
+        };
         self.expect_word("ON")?;
         let table = self.name()?;
         // `CREATE INDEX i ON t (lower(col))` -- an EXPRESSION index, written

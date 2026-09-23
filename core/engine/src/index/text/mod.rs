@@ -1787,6 +1787,14 @@ pub(crate) struct Bm25Weights {
 
 /// The corpus half of the score, once per query.
 pub(crate) fn bm25_weights(corpus: Corpus) -> Result<Bm25Weights> {
+    // An EMPTY corpus is a new or emptied table, not a damaged one: it has no
+    // postings, so these weights score nothing, and a ranked query over it is
+    // zero rows. It used to be refused as Corrupt, which a caller cannot tell
+    // from real damage. Documents without tokens, or tokens without
+    // documents, is still a contradiction and still refused.
+    if corpus.documents == 0 && corpus.tokens == 0 {
+        return Ok(Bm25Weights { average: 1.0 });
+    }
     if corpus.documents == 0 || corpus.tokens == 0 {
         return Err(corrupt("text corpus statistics cannot score postings"));
     }

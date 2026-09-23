@@ -811,7 +811,7 @@ impl Compiler<'_> {
 
     pub(super) fn create_index(
         &mut self,
-        name: String,
+        name: Option<String>,
         table: &str,
         method: IndexMethod,
     ) -> SqlResult2<WritePlan> {
@@ -903,6 +903,33 @@ impl Compiler<'_> {
                     "a vamana index is maintained live on every write and is NOT READY until its build finishes; while it is building a vector order over this column is refused rather than answered from a partial graph (INDEX_CONTRACT)".into(),
                 );
                 CompiledIndex::VamanaGraph { field: column }
+            }
+        };
+        // An unnamed `CREATE INDEX ON t ...` takes the name the automatic
+        // indexes and the WITH sugar generate, `<table>_<column>_<family>`,
+        // so the one rule names every index this database made up itself.
+        let name = match name {
+            Some(name) => name,
+            None => {
+                let (field, family) = match &method {
+                    CompiledIndex::Scalar { field, .. } => (field.clone(), "btree"),
+                    CompiledIndex::LowerScalar { field } => (format!("lower_{field}"), "btree"),
+                    CompiledIndex::JsonScalar { field, member } => {
+                        (format!("{field}_{member}"), "btree")
+                    }
+                    CompiledIndex::Text { field } => (field.clone(), "gin"),
+                    CompiledIndex::Point { field } | CompiledIndex::Geometry { field } => {
+                        (field.clone(), "gist")
+                    }
+                    CompiledIndex::ExactVector { field } => (field.clone(), "exact"),
+                    CompiledIndex::QuantizedVector { field } => (field.clone(), "quantized"),
+                    CompiledIndex::VamanaGraph { field } => (field.clone(), "vamana"),
+                };
+                let name = format!("{table}_{field}_{family}");
+                self.notices.push(format!(
+                    "CREATE INDEX ON {table}: no name was given, so the index is named `{name}` (<table>_<column>_<family>, the rule the automatic indexes follow)"
+                ));
+                name
             }
         };
         // `docs/lang/INDEX_CONTRACT.md`: an automatic index and a
