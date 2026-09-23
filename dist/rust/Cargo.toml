@@ -11,9 +11,9 @@ keywords = ["database", "embedded", "graph", "vector", "sql"]
 categories = ["database", "database-implementations", "embedded"]
 
 [dependencies]
-sekejap-core = { path = "../../core/engine", version = "0.17.0" }
-sekejap-lang = { path = "../../lang", version = "0.17.0" }
-sekejap-dist = { path = "..", version = "0.17.0" }
+sekejap-core = { path = "../../core/engine", version = "0.17.1" }
+sekejap-lang = { path = "../../lang", version = "0.17.1" }
+sekejap-dist = { path = "..", version = "0.17.1" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [dev-dependencies]

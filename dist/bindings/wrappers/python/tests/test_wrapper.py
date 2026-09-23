@@ -55,7 +55,7 @@ def people(db):
 
 
 def test_the_wrapper_reports_the_library_version_and_disk_format():
-    assert sekejap.version() == "0.17.0"
+    assert sekejap.version() == "0.17.1"
     assert sekejap.format_version() == 2
     assert sekejap.library_path()
 

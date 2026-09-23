@@ -901,7 +901,7 @@ fn version_starts_with_postgresql_because_drivers_parse_it() {
     let (_dir, mut db) = open();
     let (columns, answer) = rows(&mut db, "SELECT version()");
     assert_eq!(columns, ["version"]);
-    assert_eq!(text_at(&answer[0], 0), "PostgreSQL 16.0 (sekejap 0.17.0)");
+    assert_eq!(text_at(&answer[0], 0), concat!("PostgreSQL 16.0 (sekejap ", env!("CARGO_PKG_VERSION"), ")"));
     assert!(
         text_at(&answer[0], 0).starts_with("PostgreSQL "),
         "a driver reads the major number out of this string to choose its catalog queries; the engine that answered goes in the parenthesis"
@@ -909,7 +909,7 @@ fn version_starts_with_postgresql_because_drivers_parse_it() {
     // The same fact without the costume, for a caller that is not a driver.
     let (columns, answer) = rows(&mut db, "SELECT db_version()");
     assert_eq!(columns, ["db_version"]);
-    assert_eq!(text_at(&answer[0], 0), "sekejap 0.17.0");
+    assert_eq!(text_at(&answer[0], 0), concat!("sekejap ", env!("CARGO_PKG_VERSION")));
 }
 
 #[test]

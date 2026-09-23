@@ -2,7 +2,7 @@ name: sekejap
 description: >-
   Embedded graph-first multi-model database (SQL + graph + vector + spatial).
   dart:ffi bindings over the sekejap C ABI, for Dart and Flutter.
-version: 0.17.0
+version: 0.17.1
 homepage: https://sekejap.life
 repository: https://github.com/sekejapdb/sekejap
 topics:

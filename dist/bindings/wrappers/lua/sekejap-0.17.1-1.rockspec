@@ -1,11 +1,11 @@
 package = "sekejap"
-version = "0.17.0-1"
+version = "0.17.1-1"
 source = {
    -- TODO before `luarocks upload`: point this at the sekejap repository's
-   -- real git origin and the v0.17.0 tag; this placeholder was written
+   -- real git origin and the v0.17.1 tag; this placeholder was written
    -- without access to that remote.
    url = "git+https://github.com/sekejapdb/sekejap.git",
-   tag = "v0.17.0",
+   tag = "v0.17.1",
 }
 description = {
    summary = "A Lua C module over sekejap's C ABI -- SQL, graph, spatial, vector and full-text in one embedded store.",

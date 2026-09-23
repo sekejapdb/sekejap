@@ -21,7 +21,7 @@ class SekejapJavaInteropTest {
         val log = JavaTour.run(dir)
         for (line in log) println("java: $line")
 
-        assertContains(log, "version=0.17.0")
+        assertContains(log, "version=0.17.1")
         assertContains(log, "format=2")
         assertContains(log, "get=true")
         assertContains(log, "exists=true")

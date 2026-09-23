@@ -23,6 +23,12 @@ libc   = "0.2"
 [dependencies.tempfile]
 version = "3"
 
+# Windows file locks are byte-range locks, and std's whole-file lock blocks
+# every other handle's reads and writes of the file: see `io::os_lock`.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"]
+
 [features]
 default = []
 write-trace = []

@@ -130,7 +130,7 @@ impl Drop for PosixFile {
         {
             // This descriptor holds the writer's OS lock; release it by
             // unlock, not by the close that follows (see `Locked`).
-            let _ = self.f.unlock();
+            let _ = unlock(&self.f);
             let mut paths = writer_paths().lock().unwrap();
             if paths.get(&path) == Some(&identity) { paths.remove(&path); }
         }
@@ -578,35 +578,123 @@ mod tests {
 /// acquired; Ok(false) = held by a live process. The lock dies with the fd
 /// -- crash-safe by construction. Platform code lives HERE (the 2d rule).
 pub fn try_lock_exclusive(f: &std::fs::File) -> std::io::Result<bool> {
-    // std's file lock rather than raw flock: same contract on Unix, and it is
-    // the only form that EXISTS on Windows (LockFileEx underneath). The hand-
-    // rolled flock made the whole kernel un-compilable off Unix, which the
-    // reader table cannot afford -- without it the writer must assume a reader
-    // at generation 0 and page recycling stops for good.
-    match f.try_lock() {
-        Ok(()) => Ok(true),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
-    }
+    os_lock::lock(f, true, false)
 }
 
 /// Shared counterpart of `try_lock_exclusive`: Ok(false) when an exclusive
-/// holder is alive. Read-only handles suffice on every supported platform.
-/// Used by the page-WAL reader admission (ownership probe, admission gate).
+/// holder exists.
 pub fn try_lock_shared(f: &std::fs::File) -> std::io::Result<bool> {
-    match f.try_lock_shared() {
-        Ok(()) => Ok(true),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
-    }
+    os_lock::lock(f, false, false)
 }
 
 /// Blocking shared lock: waits only for an exclusive holder's critical
-/// section (the page-WAL writer's tail truncation or checkpoint).
-pub fn lock_shared(f: &std::fs::File) -> std::io::Result<()> { f.lock_shared() }
+/// section.
+pub fn lock_shared(f: &std::fs::File) -> std::io::Result<()> {
+    os_lock::lock(f, false, true).map(|_| ())
+}
 
 /// Blocking exclusive lock: waits only for admissions in flight.
-pub fn lock_exclusive(f: &std::fs::File) -> std::io::Result<()> { f.lock() }
+pub fn lock_exclusive(f: &std::fs::File) -> std::io::Result<()> {
+    os_lock::lock(f, true, true).map(|_| ())
+}
+
+/// Release a lock taken by any function above. Always this, never
+/// `File::unlock`: on Windows the lock is a byte range and only the same
+/// range releases it.
+pub fn unlock(f: &std::fs::File) -> std::io::Result<()> {
+    os_lock::unlock(f)
+}
+
+/// The OS lock under every function above.
+///
+/// Unix: std's file lock, which is `flock` -- advisory, whole-file, and
+/// blind to reads and writes, so a lock file can also carry data (the
+/// page-WAL gate holds the publication hint) and be read and written by
+/// other handles while it is locked.
+///
+/// Windows: a lock is a BYTE RANGE, and it is mandatory: std's whole-file
+/// lock refuses every other handle's read and write of the file, this
+/// process's own included ("The process cannot access the file because
+/// another process has locked a portion of the file"). That made a database
+/// impossible to open on Windows, because the writer writes the publication
+/// hint through one handle into the gate another handle holds. So Windows
+/// locks ONE byte far past any data this engine writes, SQLite's approach
+/// (its lock bytes sit at 1 GiB), and every lock -- shared or exclusive --
+/// conflicts only with other locks, never with I/O.
+#[cfg(not(windows))]
+mod os_lock {
+    pub fn lock(f: &std::fs::File, exclusive: bool, wait: bool) -> std::io::Result<bool> {
+        let outcome = match (exclusive, wait) {
+            (true, true) => return f.lock().map(|_| true),
+            (false, true) => return f.lock_shared().map(|_| true),
+            (true, false) => f.try_lock(),
+            (false, false) => f.try_lock_shared(),
+        };
+        match outcome {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+    pub fn unlock(f: &std::fs::File) -> std::io::Result<()> {
+        f.unlock()
+    }
+}
+
+#[cfg(windows)]
+mod os_lock {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    /// Far beyond any file this engine writes, and inside the range every
+    /// Windows filesystem accepts for a lock.
+    const LOCK_BYTE: u64 = 0x7fff_ffff_0000_0000;
+
+    fn region() -> OVERLAPPED {
+        // SAFETY: OVERLAPPED is plain data; zero is its documented initial state.
+        let mut o: OVERLAPPED = unsafe { std::mem::zeroed() };
+        o.Anonymous.Anonymous.Offset = LOCK_BYTE as u32;
+        o.Anonymous.Anonymous.OffsetHigh = (LOCK_BYTE >> 32) as u32;
+        o
+    }
+
+    pub fn lock(f: &std::fs::File, exclusive: bool, wait: bool) -> std::io::Result<bool> {
+        let mut flags = 0;
+        if exclusive {
+            flags |= LOCKFILE_EXCLUSIVE_LOCK;
+        }
+        if !wait {
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+        }
+        let mut o = region();
+        // SAFETY: a live handle, a one-byte range, and an OVERLAPPED that
+        // outlives this synchronous call.
+        let ok = unsafe { LockFileEx(f.as_raw_handle() as _, flags, 0, 1, 0, &mut o) };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if !wait && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            return Ok(false);
+        }
+        Err(error)
+    }
+
+    pub fn unlock(f: &std::fs::File) -> std::io::Result<()> {
+        let mut o = region();
+        // SAFETY: as in `lock`; the range is the one `lock` took.
+        let ok = unsafe { UnlockFileEx(f.as_raw_handle() as _, 0, 1, 0, &mut o) };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
 
 /// A file whose OS lock is RELEASED BY AN EXPLICIT UNLOCK when this is
 /// dropped, not by closing the descriptor.
@@ -641,6 +729,6 @@ impl std::ops::Deref for Locked {
 
 impl Drop for Locked {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let _ = unlock(&self.0);
     }
 }

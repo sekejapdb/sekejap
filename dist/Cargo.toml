@@ -58,12 +58,14 @@ name = "sekejap-pg"
 path = "src/cli/pg_server.rs"
 
 [dependencies]
-sekejap-core = { path = "../core/engine", version = "0.17.0" }
-sekejap-lang = { path = "../lang", version = "0.17.0" }
-kernel = { package = "sekejap-kernel", path = "../core/kernel", version = "0.17.0" }
+sekejap-core = { path = "../core/engine", version = "0.17.1" }
+sekejap-lang = { path = "../lang", version = "0.17.1" }
+kernel = { package = "sekejap-kernel", path = "../core/kernel", version = "0.17.1" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
-crc32c = "0.6"
+# Only the dev-bench benchmarks use these two: the library, the C ABI and
+# every binding built on them compile neither SQLite nor crc32c.
+rusqlite = { version = "0.32", features = ["bundled", "functions"], optional = true }
+crc32c = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -77,7 +79,7 @@ postgres = "0.19"
 # The internal benchmarks (p0_bench, collections, entry, lifecycle) write only
 # under the project volume they were measured on, so they are built on
 # request, never by `cargo install sekejap-dist`.
-dev-bench = []
+dev-bench = ["dep:rusqlite", "dep:crc32c"]
 sqlite-balance = ["sekejap-core/sqlite-balance", "sekejap-lang/sqlite-balance"]
 compact-cells = ["sekejap-core/compact-cells", "sekejap-lang/compact-cells"]
 keyspace-append = ["sekejap-core/keyspace-append", "sekejap-lang/keyspace-append"]

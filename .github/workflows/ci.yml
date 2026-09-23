@@ -92,7 +92,7 @@ jobs:
       - run: SK_ENCFUZZ_SEED=$SEED SK_ENCFUZZ_ROUNDS=500 cargo test --release --features ${{ env.FEATURES }} --test encoding_agreement_fuzz
 
   windows-compile:
-    name: Windows compile check
+    name: Windows build and run
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,3 +103,15 @@ jobs:
       # Python wheels, C/C++/C# bindings) — they all fail here first if a
       # Unix-only symbol leaks into an unconditional path.
       - run: cargo check -p sekejap -p sekejap-capi --features ${{ env.FEATURES }}
+      # Compiling was never enough: at the first 0.17.0 tag a database could
+      # not be OPENED on Windows (a whole-file lock on the gate refused the
+      # writer's own hint write; kernel::io::os_lock). So the library is built
+      # and RUN here: the Python wrapper's tests and every README Python block.
+      - name: Run the Python wrapper and the README against the library
+        shell: bash
+        run: |
+          cargo build --release -p sekejap-capi --features ${{ env.FEATURES }}
+          python -m pip install --quiet pytest pandas
+          SEKEJAP_LIBRARY="$PWD/target/release/sekejap.dll" \
+          PYTHONPATH=dist/bindings/wrappers/python/python \
+            python -m pytest dist/bindings/wrappers/python/tests -q
