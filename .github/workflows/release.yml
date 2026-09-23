@@ -92,9 +92,11 @@ jobs:
 
   publish-rust-cli:
     # GATED. This job publishes a crate named `sekejap-cli`, which does not
-    # exist in this workspace: at 0.17.0 the command line is the `sekejap`
-    # binary of `sekejap-dist` (dist/src/cli), published with that crate by
-    # the job above. Re-open this only if a separate CLI crate is added back.
+    # exist in this workspace: at 0.17.0 the SQL shell is the `sekejap`
+    # binary of the `sekejap` crate (dist/rust/src/bin/sekejap.rs, e1's
+    # skcli), published with that crate by the job above, so
+    # `cargo install sekejap` installs it. Re-open this only if a separate CLI
+    # crate is added back.
     if: false
     name: Publish Rust CLI
     runs-on: ubuntu-latest

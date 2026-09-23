@@ -308,7 +308,9 @@ void main() {
     final db = openFresh('refusal');
     declareDish(db);
     try {
-      db.query('SHOW TABLES');
+      // JOIN has no atomic behind it and is refused by name (README,
+      // "SQL"); SHOW TABLES, which this used to be, answers since 0.17.
+      db.query('SELECT name FROM dish JOIN dish AS other ON dish._key = other._key');
       fail('a Tier-2/Tier-3 construct must not answer');
     } on SekejapException catch (e) {
       expect(e.message, isNotEmpty,

@@ -20,6 +20,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "p0_bench"
 path = "src/cli/main.rs"
+required-features = ["dev-bench"]
 
 [[bin]]
 name = "recover"
@@ -32,6 +33,7 @@ path = "src/cli/collection_inspect.rs"
 [[bin]]
 name = "collections"
 path = "src/cli/collections.rs"
+required-features = ["dev-bench"]
 
 [[bin]]
 name = "control_tree_audit"
@@ -44,10 +46,12 @@ path = "src/cli/pagewal_repair.rs"
 [[bin]]
 name = "entry"
 path = "src/cli/entry.rs"
+required-features = ["dev-bench"]
 
 [[bin]]
 name = "lifecycle"
 path = "src/cli/lifecycle.rs"
+required-features = ["dev-bench"]
 
 [[bin]]
 name = "sekejap-pg"
@@ -70,6 +74,10 @@ tempfile = "3"
 postgres = "0.19"
 
 [features]
+# The internal benchmarks (p0_bench, collections, entry, lifecycle) write only
+# under the project volume they were measured on, so they are built on
+# request, never by `cargo install sekejap-dist`.
+dev-bench = []
 sqlite-balance = ["sekejap-core/sqlite-balance", "sekejap-lang/sqlite-balance"]
 compact-cells = ["sekejap-core/compact-cells", "sekejap-lang/compact-cells"]
 keyspace-append = ["sekejap-core/keyspace-append", "sekejap-lang/keyspace-append"]
