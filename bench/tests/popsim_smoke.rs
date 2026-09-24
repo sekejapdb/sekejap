@@ -151,7 +151,7 @@ fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
     let root = std::env::temp_dir().join(format!("popsim-reuse-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let dsn = std::env::var("POPSIM_PG_DSN")
-        .unwrap_or_else(|_| "postgres://127.0.0.1:55432/postgres".to_string());
+        .unwrap_or_else(|_| "host=127.0.0.1 port=55432 user=postgres dbname=postgres".to_string());
     let pg_reachable = postgres::Client::connect(&dsn, postgres::NoTls).is_ok();
     let pass = |which, reuse| {
         let mut options = Options::new(which, ROWS, &root);
@@ -205,7 +205,7 @@ fn a_reuse_pass_answers_exactly_what_the_build_pass_answered() {
 #[test]
 fn postgres_arm_answers_the_same_questions_as_e4() -> Result<(), Box<dyn std::error::Error>> {
     let dsn = std::env::var("POPSIM_PG_DSN")
-        .unwrap_or_else(|_| "postgres://127.0.0.1:55432/postgres".to_string());
+        .unwrap_or_else(|_| "host=127.0.0.1 port=55432 user=postgres dbname=postgres".to_string());
     if postgres::Client::connect(&dsn, postgres::NoTls).is_err() {
         eprintln!(
             "SKIP postgres_arm_answers_the_same_questions_as_e4: no server reachable at {dsn}"

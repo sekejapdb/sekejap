@@ -551,8 +551,8 @@ jobs:
           rm -rf artifacts
           find native -type f
       - name: The package must be small enough for npm to keep
-        # npm accepted 0.17.1's 145 MB upload, reported "+ contributor@example.invalid" and
-        # never listed it. Refuse here, loudly, before the registry can do that.
+        # npm can accept a very large upload, report it published, and take
+        # hours to list it. Refuse here, loudly, before the registry is involved.
         working-directory: dist/bindings/wrappers/node
         run: |
           SIZE=$(npm pack --dry-run --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s)[0].size))')

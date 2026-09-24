@@ -10,7 +10,7 @@ WGS84, rings implicitly closed), implemented in
 Two oracles:
 
 - Unit table below: live server `POSTGIS="3.4.3 e365945" ... GEOS="3.9.0" PROJ="7.2.1"`
-  (`SELECT PostGIS_Full_Version()` on `postgres://127.0.0.1:55432/postgres`),
+  (`SELECT PostGIS_Full_Version()` on the local PostGIS server named by `POPSIM_PG_DSN`),
   fixture `tests/fixtures/spatial_postgis.json`, suite
   `tests/spatial_geometry_postgis.rs`.
 - Conformance (section below): PostGIS 3.6.4 (`POSTGIS="3.6.4 94d984b"` PGSQL=160

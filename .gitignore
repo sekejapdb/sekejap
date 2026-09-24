@@ -19,7 +19,7 @@ dist/bindings/wrappers/**/*.node
 /.workbench/
 /android-libs/
 /eval/
-/.DS_Store
+.DS_Store
 /TODO.md
 /.sekejap.cases.raw.md
 

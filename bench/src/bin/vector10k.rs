@@ -331,7 +331,7 @@ fn default_work_dir() -> PathBuf {
 /// default server.
 fn default_dsn() -> String {
     std::env::var("SEKEJAP_BENCH_PG_DSN")
-        .unwrap_or_else(|_| "postgres://127.0.0.1:5432/postgres".into())
+        .unwrap_or_else(|_| "host=127.0.0.1 port=5432 user=postgres dbname=postgres".into())
 }
 
 const ARMS: [&str; 7] = [

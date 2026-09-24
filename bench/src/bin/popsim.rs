@@ -22,9 +22,8 @@
 //!
 //! THE THIRD ARM: POSTGRES/POSTGIS
 //!
-//!   `postgres` targets a real server (default DSN
-//!   `postgres://127.0.0.1:55432/postgres`, override with
-//!   `--dsn`). `<fresh-dir>` holds only the JSON report; the data lives in a
+//!   `postgres` targets a real server named by `--dsn` or the
+//!   `POPSIM_PG_DSN` environment variable (there is no built-in default). `<fresh-dir>` holds only the JSON report; the data lives in a
 //!   FRESH per-run database (`popsim_<rows>_<unix-secs>`), created off the
 //!   `--dsn` connection so repeated runs never see a stale index or a leftover
 //!   row from a previous size. Schema, index set and load cadence mirror the
@@ -1560,7 +1559,6 @@ fn load_lite(root: &Path, rows: u64, batch: u64, cache_bytes: usize) -> R<(Conne
 
 // ── the postgres arm ──────────────────────────────────────────────────────
 
-const DEFAULT_PG_DSN: &str = "postgres://127.0.0.1:55432/postgres";
 
 /// Swap the trailing `/database` segment of a DSN for a freshly created one.
 fn dsn_with_db(dsn: &str, db: &str) -> String {
@@ -2212,7 +2210,12 @@ pub fn run_arm(options: &Options) -> R<Value> {
             files = file_map(&db_root);
         }
         Arm::Postgres => {
-            let dsn_base = options.dsn.as_deref().unwrap_or(DEFAULT_PG_DSN);
+            let dsn_base = options
+                .dsn
+                .clone()
+                .or_else(|| std::env::var("POPSIM_PG_DSN").ok())
+                .ok_or("the postgres arm needs --dsn or POPSIM_PG_DSN")?;
+            let dsn_base = dsn_base.as_str();
             let (mut client, s, dsn, db_name) = if options.reuse {
                 open_pg(&db_root, dsn_base)?
             } else {

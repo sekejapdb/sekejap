@@ -247,7 +247,7 @@ fn centroid_distance_matches_postgis_when_both_centroids_are_point_like() {
 /// returns) when no server answers, exactly like `tests/popsim_smoke.rs`.
 #[test]
 fn live_server_reverifies_a_sample_of_the_fixture() {
-    let dsn = std::env::var("POPSIM_PG_DSN").unwrap_or_else(|_| "postgres://127.0.0.1:55432/postgres".to_string());
+    let dsn = std::env::var("POPSIM_PG_DSN").unwrap_or_else(|_| "host=127.0.0.1 port=55432 user=postgres dbname=postgres".to_string());
     let mut client = match postgres::Client::connect(&dsn, postgres::NoTls) {
         Ok(c) => c,
         Err(_) => {
