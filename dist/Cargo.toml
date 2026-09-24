@@ -58,9 +58,9 @@ name = "sekejap-pg"
 path = "src/cli/pg_server.rs"
 
 [dependencies]
-sekejap-core = { path = "../core/engine", version = "0.17.2" }
-sekejap-lang = { path = "../lang", version = "0.17.2" }
-kernel = { package = "sekejap-kernel", path = "../core/kernel", version = "0.17.2" }
+sekejap-core = { path = "../core/engine", version = "0.17.3" }
+sekejap-lang = { path = "../lang", version = "0.17.3" }
+kernel = { package = "sekejap-kernel", path = "../core/kernel", version = "0.17.3" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 # Only the dev-bench benchmarks use these two: the library, the C ABI and
 # every binding built on them compile neither SQLite nor crc32c.

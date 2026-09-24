@@ -33,7 +33,7 @@ path = "src/lib.rs"
 # that is `libsekejap` on disk -- and its dependency do not claim one name in
 # the test binaries. `use sekejap_rs as sekejap;` in src/lib.rs gives the
 # published crate its own name back everywhere inside this one.
-sekejap-rs = { package = "sekejap", path = "../rust", version = "0.17.2" }
+sekejap-rs = { package = "sekejap", path = "../rust", version = "0.17.3" }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [build-dependencies]

@@ -755,7 +755,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sekejap"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "sekejap-core",
  "sekejap-dist",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "sekejap-bench"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "crc32c",
  "postgres",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "sekejap-capi"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "cbindgen",
  "sekejap",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "sekejap-core"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "crc32c",
  "geographiclib-rs",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "sekejap-dist"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "crc32c",
  "postgres",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "sekejap-kernel"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "crc32c",
  "libc",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "sekejap-lang"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "sekejap-core",
  "sekejap-kernel",

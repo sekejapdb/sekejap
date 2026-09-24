@@ -1,9 +1,9 @@
 package = "sekejap"
-version = "0.17.2-1"
+version = "0.17.3-1"
 source = {
    -- the sekejap repository and the release tag this rockspec builds
    url = "git+https://github.com/sekejapdb/sekejap.git",
-   tag = "v0.17.2",
+   tag = "v0.17.3",
 }
 description = {
    summary = "A Lua C module over sekejap's C ABI -- SQL, graph, spatial, vector and full-text in one embedded store.",
