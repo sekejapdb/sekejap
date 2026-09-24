@@ -1,7 +1,7 @@
 //! What one page of a query is allowed to COST, measured rather than timed.
 //!
-//! The four properties below are the ones the loop-3 root-cause note found
-//! broken (`.insert-loop/loop3/ROOTCAUSE-query-per-row-constant.md`), each
+//! The four properties below are the ones an earlier root-cause analysis of
+//! the per-row query constant found broken, each
 //! stated as work the engine reports about itself -- candidates examined,
 //! primary rows read, buffer-pool accesses, heap allocations -- so a
 //! regression names the cause instead of showing up as a slower stopwatch on

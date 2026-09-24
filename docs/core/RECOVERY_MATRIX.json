@@ -10,7 +10,7 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>"
+      "evidence": "<artifact dir>/recovery-r1-validated.log"
     },
     {
       "id": "overflow-crossed",
@@ -20,7 +20,7 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>"
+      "evidence": "<artifact dir>/recovery-r1-validated.log"
     },
     {
       "id": "overflow-truncate",
@@ -30,7 +30,7 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>"
+      "evidence": "<artifact dir>/recovery-r1-validated.log"
     },
     {
       "id": "leaf-kind",
@@ -39,7 +39,7 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>"
+      "evidence": "<artifact dir>/recovery-r1-validated.log"
     },
     {
       "id": "cell-length",
@@ -48,7 +48,7 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>"
+      "evidence": "<artifact dir>/recovery-r1-validated.log"
     },
     {
       "id": "root-damage",
@@ -57,7 +57,7 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>",
+      "evidence": "<artifact dir>/recovery-r1-validated.log",
       "scope": "Verified reachable subset only; rootless cells exported as candidates. Full current-membership reconstruction remains open."
     },
     {
@@ -68,7 +68,7 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>"
+      "evidence": "<artifact dir>/recovery-r1-validated.log"
     },
     {
       "id": "layout-ancestors",
@@ -77,8 +77,8 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>",
-      "retained_run": "<scratch>",
+      "evidence": "<artifact dir>/recovery-r2-workspace.log",
+      "retained_run": "<artifact dir>/schema-r2-cli/results.json",
       "scope": "10K/40K, two immutable layouts, three copies each. Rootless candidate export; all-copy loss preserves surviving raw values and reports missing IDs; current membership is not established."
     },
     {
@@ -88,8 +88,8 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>",
-      "retained_run": "<scratch>",
+      "evidence": "<artifact dir>/recovery-r2-workspace.log",
+      "retained_run": "<artifact dir>/schema-r2-cli/results.json",
       "scope": "10K/40K, two immutable layouts, three copies each. Rootless candidate export; all-copy loss preserves surviving raw values and reports missing IDs; current membership is not established."
     },
     {
@@ -100,7 +100,7 @@
         5
       ],
       "state": "passed",
-      "evidence": "<scratch>"
+      "evidence": "<artifact dir>/recovery-r1-validated.log"
     },
     {
       "id": "io-failure",
@@ -152,5 +152,5 @@
     "schema_resource_limit_and_archive_validation_preserve_evidence",
     "schema_codec_policy_is_replaceable"
   ],
-  "mutation_evidence": "<scratch>"
+  "mutation_evidence": "<artifact dir>/schema-r2-mutations/results.json"
 }

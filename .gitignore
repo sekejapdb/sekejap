@@ -22,3 +22,9 @@ dist/bindings/wrappers/**/*.node
 /.DS_Store
 /TODO.md
 /.sekejap.cases.raw.md
+
+# Local tooling notes
+/AGENTS.md
+# Python bytecode
+__pycache__/
+*.pyc

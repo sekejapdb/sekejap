@@ -1,9 +1,7 @@
 package = "sekejap"
 version = "0.17.2-1"
 source = {
-   -- TODO before `luarocks upload`: point this at the sekejap repository's
-   -- real git origin and the v0.17.2 tag; this placeholder was written
-   -- without access to that remote.
+   -- the sekejap repository and the release tag this rockspec builds
    url = "git+https://github.com/sekejapdb/sekejap.git",
    tag = "v0.17.2",
 }
@@ -27,8 +25,7 @@ build = {
    type = "make",
    -- The Makefile builds against a PREBUILT libsekejap (no Rust here): set
    -- SEKEJAP_PREFIX to the directory holding libsekejap.{dylib,so,a} and
-   -- include/sekejap.h if it is not <scratch>
-   -- (this tree's default), e.g.:
+   -- include/sekejap.h if it is not /usr/local (the Makefile's default), e.g.:
    --   luarocks make SEKEJAP_PREFIX=/path/to/libsekejap
    build_variables = {
       CC = "$(CC)",

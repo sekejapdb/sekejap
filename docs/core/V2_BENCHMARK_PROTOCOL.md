@@ -427,7 +427,7 @@ statement each case ran is in the report's `sql` field and in
 
 Both external engines are frozen. Rerunning them once per sekejap pass measures
 two engines that did not change, and costs a running Postgres server for a
-number that did not move. `<scratch>/` holds
+number that did not move. `bench50k/frozen/` holds
 `pg-50k.json` and `sqlite-50k.json` beside a `README.md` and a
 `manifest.json` recording the date, the engine versions (`SELECT version()`,
 `SELECT postgis_full_version()`, `pg_extension`, and SQLite's

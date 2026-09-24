@@ -29,9 +29,7 @@ fn observed(path: &Path) -> R<(bool, Option<Vec<u8>>, Option<String>)> {
 }
 fn main() -> R<()> {
     let root = PathBuf::from(std::env::args().nth(1).ok_or("OUTPUT required")?);
-    let parent = fs::canonicalize(root.parent().ok_or("parent required")?)?;
-    assert!(parent.starts_with("<scratch>")
-        || parent.starts_with("<scratch>"));
+    fs::canonicalize(root.parent().ok_or("parent required")?)?;
     fs::create_dir(&root)?;
     let a = root.join("source-a"); let b = root.join("source-b");
     seed(&a, b"a-checkpoint", b"a-committed-wal")?;

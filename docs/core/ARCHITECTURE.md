@@ -6,7 +6,7 @@ One read of the engine as it stands. Behaviour is stated by
 and the on-disk keyspaces. It does not add a law.
 
 Numbers that quote a workload are labelled with metric and scale. The
-multimodel numbers below are from `<scratch>`
+multimodel numbers below are from `bench50k/loop2-compare.txt`
 and are **50,000 rows, this Mac, 2026-09-20**. The storage scale table is the
 Mac arm of `docs/FOUNDATION_SCALING.md` (1,000-change transactions against a
 loaded population).
@@ -362,13 +362,13 @@ each on how the engine meets it, and what is unqualified.
 
 | Law | How the engine meets it | Unqualified |
 | --- | --- | --- |
-| 1 Disk-first | Page-WAL, 8 reader slots, WAL index bounded by tracked pages, membership sets and BFS frontier capped; no database-sized RAM oracle. | Process-wide Pi address-space gate is not re-run this month. |
+| 1 Disk-first | Page-WAL, 8 reader slots, WAL index bounded by tracked pages, membership sets and BFS frontier capped; no database-sized RAM oracle. | Process-wide ARM device address-space gate is not re-run this month. |
 | 2 Cost ∝ change | Ordinary commit writes the transaction's page images, not the collection. Index maintenance is per changed row. Traversal work is the postings of that source/context/type. | Scattered-insert exponent 0.24 (descriptive `log(cost ratio)/log(population ratio)` on the fixed-work 1,000-insert arm). Local insert on the Mac scale table stays 23.28–35.51 ms for 1,000 rows from 10K to 10M population (`docs/FOUNDATION_SCALING.md`). |
 | 3 Nothing fallible may delete | Write new page images, CRC, publish after FULL barrier; checkpoint only with every reader slot; failed repair leaves the source; cascade preflights then deletes pairs. | RESTRICT is the contract default (`docs/core/GRAPH_CONTRACT.md` §6.1) and is not the implemented delete. |
 | 4 Name your sacrifice | Named: 8 bytes/edge if identity lands; reverse mirror doubles edge storage; geometry ≤8 cell postings; quantized codes plus f32 rerank; membership Overflow; `QueryBudget` counters. | Edge identity (8 bytes) is decided, not on disk. |
 | 5 Recoverability | CRC/identity/bounds on frames, cells, packets; corrupt posting is `Corrupt`, not a panic; offset reads bounds-checked; unknown feature refused before mutation. | L5-DAMAGE full matrix is not claimed passed. |
 | 6 Readers | Snapshot readers on the published prefix, byte-stable, eight slots, no writer lock on reads. | Cross-process latency/I/O audit is evidence in `tests/collection_pagewal.rs`, not a device qualification. |
-| 7 Target usability | Bulk load, late index build, live writes with indexes, reopen are implemented paths (`src/collections/{mod,catalog,rebuild}.rs`). | Pi untested this month. |
+| 7 Target usability | Bulk load, late index build, live writes with indexes, reopen are implemented paths (`src/collections/{mod,catalog,rebuild}.rs`). | ARM device untested this month. |
 | 8 Compatibility | Additive feature bits (`GRAPH_FEATURE`, `TEXT_FEATURE`, `SEGMENT_FEATURE`, `GEOMETRY_FEATURE`, `INDEX_TREE_FEATURE`, …); unknown bits refuse; old files without a bit open with the prior encoding. | `L8-COMPAT` remains PENDING (`docs/core/FOUNDATION_TEST_STANDARD.md`); element identity and typed edge properties are specified as future additive bits. |
 
 Scale table (Mac, 1,000 changes including commit and ending checkpoint, from

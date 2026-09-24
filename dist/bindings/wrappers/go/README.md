@@ -21,7 +21,7 @@ API: `Open`/`OpenWithConfig`/`OpenService`, `Put`/`PutMany`/`Get`/`Exists`/
 `Storage`, the service-mode family (`StatementTimeout`, `Cancel`,
 `ClearInterrupt`, `Subscribe`, `NextChange`, `Unsubscribe`), `Version`/
 `FormatVersion`. Every C function in `sekejap.h` has a Go call site; see
-"API mapping" in the worker report for the full table.
+"Approach" below for how the calls map.
 
 Four calls are wrapped but always fail — `OpenMemory`, `TrimMemory`,
 `Compact`, `Show` — because sekejap has no atomic under them
@@ -108,7 +108,7 @@ go run  -tags sekejap_dev ./examples/tour       # the five-model tour
 ```
 
 Without a monorepo Rust build (a prebuilt `libsekejap` from
-`<scratch>/` in this environment, or any release
+a directory such as `/path/to/libsekejap/`, or any release
 tarball), skip the tag and set `PKG_CONFIG_PATH`/`CGO_LDFLAGS` per Install
 above, then `go test ./...` as usual.
 
@@ -150,9 +150,9 @@ resolve a subdirectory module by re-deriving its path from the MODULE NAME
 (`github.com/sekejapdb/sekejap/dist/bindings/wrappers/go` → repo `github.com/sekejapdb/
 sekejap` + subdirectory `wrappers/go`) and then looking for `go.mod` there —
 which, after this move, is no longer where it looks. Keeping the module path
-unchanged (as instructed) means `go get` of this module will not resolve
+unchanged means `go get` of this module will not resolve
 against its real location until either the module path is changed to
 `.../dist/bindings/wrappers/go` (retagged to match) or the repository adds a
 redirect (a `wrappers/go` stub module, or a vanity-import server) pointing
 at this directory. Not fixed here: changing the module path is an API/path
-decision for the coordinator, out of this wrapper-only worker's scope.
+decision for the project, out of scope for this wrapper.

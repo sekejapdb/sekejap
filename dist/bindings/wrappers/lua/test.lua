@@ -3,7 +3,13 @@
 local sekejap = require("sekejap")
 print("sekejap " .. sekejap.version() .. " (format " .. sekejap.format_version() .. ")")
 
-local dir = os.getenv("SEKEJAP_TEST_DIR") or ("<scratch>" .. os.time())
+local dir = os.getenv("SEKEJAP_TEST_DIR")
+if not dir then
+  -- os.tmpname() creates a file; use its unique name for a fresh directory.
+  dir = os.tmpname()
+  os.remove(dir)
+  dir = dir .. "-sekejap-lua-test"
+end
 local db = sekejap.open(dir)
 print("opened " .. dir)
 

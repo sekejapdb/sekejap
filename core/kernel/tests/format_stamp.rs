@@ -35,12 +35,6 @@ fn cfg() -> Config {
 
 fn tempdir() -> tempfile::TempDir {
     let base = std::env::temp_dir();
-    if cfg!(target_os = "macos") {
-        assert!(
-            base.starts_with("<scratch>"),
-            "set TMPDIR under <scratch> before database tests"
-        );
-    }
     tempfile::Builder::new()
         .prefix("format-stamp-")
         .tempdir_in(base)

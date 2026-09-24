@@ -288,7 +288,7 @@ remain separate evidence.
 The first empty implementation failed the public round-trip test. A subsequent
 fault test exposed rollback leaving a damaged reopened handle usable; it failed
 before the fail-closed fix and passes afterward. Red/green logs are retained in
-`<scratch>/`.
+`<artifact dir>/collections-20260911/`.
 
 See [paired collection benchmark results](COLLECTION_RESULTS.md) for the full
 cost of two collection catalogs, stable IDs, external keys, JSON, points,

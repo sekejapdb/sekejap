@@ -1,4 +1,4 @@
-//! Full collection API comparison. Run one arm at a time on scratch.
+//! Full collection API comparison. Run one arm at a time.
 use sekejap_core::{
     collections::{Clock, CollectionId, CollectionOptions, Database},
     Kind, Result,
@@ -431,14 +431,19 @@ fn main() -> Result<()> {
     if !(5..=8).contains(&args.len()) {
         return Err("usage: collections ROOT e4|sqlite ROWS off|on [CYCLES] [load|updates|reinsert|mixed] [none|held|rolling]".into());
     }
-    let root = PathBuf::from(&args[1]);
-    if !(root.starts_with("<scratch>")
-        || root.starts_with("<scratch>"))
+    // ROOT is the artifact directory; `-` takes it from SEKEJAP_BENCH_ROOT.
+    let root = match args[1].as_str() {
+        "-" | "" => PathBuf::from(std::env::var_os("SEKEJAP_BENCH_ROOT").ok_or(
+            "set SEKEJAP_BENCH_ROOT (or pass a directory) for benchmark artifacts",
+        )?),
+        a => PathBuf::from(a),
+    };
+    if root.as_os_str().is_empty()
         || root
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        return Err("scratch artifact root required".into());
+        return Err("benchmark root must be a directory without `..` components".into());
     }
     let sql = match args[2].as_str() {
         "e4" => false,

@@ -4,11 +4,11 @@
 // libsekejap (no mocks). Exercises: open, create a collection, put, get,
 // query with a parameter, scan, prepare + rebind, link + neighbours, tx
 // commit/rollback, count_rows, an error path that surfaces last_error, and
-// close — every leg wrapper-common's brief names.
+// close — every leg of the common wrapper checklist.
 //
-//   SEKEJAP_LIB_DIR=<scratch> node test.cjs
+//   SEKEJAP_LIB_DIR=/path/to/libsekejap node test.cjs
 // or with the library already on the loader's search path:
-//   DYLD_LIBRARY_PATH=<scratch> node test.cjs
+//   DYLD_LIBRARY_PATH=/path/to/libsekejap node test.cjs
 
 const assert = require('assert');
 const os = require('os');

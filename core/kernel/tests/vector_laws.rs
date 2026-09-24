@@ -1,4 +1,4 @@
-//! The app gate. Their production wound: vector ingest made RAM climb
+//! The vector-ingest RAM gate. The failure it guards: vector ingest made RAM climb
 //! with the data. This makes that curve a build failure.
 //!
 //! Counting allocator; 8 MiB pool; 1536-dim f32 vectors (6 KB each, a 2-page
@@ -89,7 +89,7 @@ fn vector_ingest_and_rescore_hold_law_1() {
     eprintln!("rescore heap: {r1:.3}/{r2:.3} MiB for 5K candidates, k=10");
     assert!(
         w2 < w1 * 2.0 + 1.0,
-        "the app curve is back: ingest heap {w1:.2} -> {w2:.2} MiB over 4x vectors"
+        "the vector-ingest RAM curve is back: ingest heap {w1:.2} -> {w2:.2} MiB over 4x vectors"
     );
     // one 6KB vector in flight + top-10 heap; anything near the candidate
     // count (5K x 6KB = 30MB) means rescore is collecting, not streaming

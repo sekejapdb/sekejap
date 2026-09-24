@@ -343,7 +343,19 @@ fn main() -> Result<()> {
         return Err("stage out of range".into());
     }
     let reps: usize = a.get(2).map(|s| s.parse()).transpose()?.unwrap_or(1);
-    let base = PathBuf::from("<scratch>");
+    // usage: entry STAGE [REPS] [ROOT]; ROOT defaults to SEKEJAP_BENCH_ROOT.
+    let base = a
+        .get(3)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("SEKEJAP_BENCH_ROOT").map(PathBuf::from))
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or("set SEKEJAP_BENCH_ROOT (or pass a directory) for benchmark artifacts")?;
+    if base
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("benchmark root must not contain `..` components".into());
+    }
     let run = base.join(format!(
         "entry-s{stage}-{}",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()

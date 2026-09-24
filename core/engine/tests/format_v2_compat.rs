@@ -3,7 +3,7 @@
 //! preserved reference files; this file never regenerates either corpus.
 //!
 //! Missing or changed fixtures fail qualification. Database operations use only
-//! temporary copies; on macOS TMPDIR must be under <scratch>
+//! temporary copies under TMPDIR.
 //!
 //! The contract is `docs/core/FORMAT_V2.md`.
 
@@ -232,12 +232,6 @@ fn verify_manifest_hashes(fx: &Fixture) {
 
 fn copy_fixture(fx: &Fixture, label: &str) -> tempfile::TempDir {
     let base = std::env::temp_dir();
-    if cfg!(target_os = "macos") {
-        assert!(
-            base.starts_with("<scratch>"),
-            "set TMPDIR under <scratch> before database tests"
-        );
-    }
     let dst = tempfile::Builder::new()
         .prefix(&format!("format-v2-{}-{label}-", fx.name))
         .tempdir_in(base)
@@ -844,12 +838,6 @@ fn every_page_and_every_wal_frame_image_of_the_corpus_carries_the_disk_format_st
 #[test]
 fn a_database_this_build_creates_carries_the_stamp_on_pages_zero_and_one_and_on_a_data_page() {
     let base = std::env::temp_dir();
-    if cfg!(target_os = "macos") {
-        assert!(
-            base.starts_with("<scratch>"),
-            "set TMPDIR under <scratch> before database tests"
-        );
-    }
     let work = tempfile::Builder::new()
         .prefix("format-v2-created-")
         .tempdir_in(base)

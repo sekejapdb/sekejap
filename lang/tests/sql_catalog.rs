@@ -1085,8 +1085,7 @@ fn a_schema_qualified_name_resolves_to_the_one_thing_it_can_mean() {
 /// single-relation form this surface serves.
 ///
 /// Collected from e1's `src/pg.rs` shim (the keys it pattern-matched on),
-/// e1's `tests/catalogue_and_ddl.rs`, and
-/// `notes/postgis-killer-features.md` §2. Every one of them must ANSWER --
+/// and e1's `tests/catalogue_and_ddl.rs`. Every one of them must ANSWER --
 /// with rows or with no rows, but never with an error, because a client that
 /// meets an error here stops before it has listed anything.
 ///

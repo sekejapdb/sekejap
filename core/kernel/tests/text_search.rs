@@ -353,7 +353,7 @@ fn fuzzy_terms_match_bruteforce_edit_distance() {
     }
 }
 
-/// The app hybrid-RAG shape: full-text narrows to candidates, vectors
+/// The hybrid-RAG shape: full-text narrows to candidates, vectors
 /// rank the survivors. One flow, two families, exact result checked
 /// against doing both steps by hand.
 #[test]

@@ -136,9 +136,8 @@ DYLD_LIBRARY_PATH=<path-to-target>/release dotnet run    # macOS
 LD_LIBRARY_PATH=<path-to-target>/release  dotnet run     # Linux
 ```
 
-This was NOT run in the authoring environment -- `dotnet` is not installed
-there, so neither `dotnet build` nor `dotnet run` has ever executed against
-this source. Treat every signature above as reviewed against
+This wrapper has not been built or run with `dotnet` yet -- neither
+`dotnet build` nor `dotnet run` has ever executed against this source. Treat every signature above as reviewed against
 `dist/ffi/include/sekejap.h` by hand, not as compiler-checked.
 
 ## Packaging
@@ -157,13 +156,12 @@ this source. Treat every signature above as reviewed against
 ## Publish job
 
 `.github/workflows/release.yml` was not touched by this port (out of scope
-for this pass: this wrapper's directory and one row of
-`dist/bindings/README.md` only). There is currently no `publish-csharp` (or
+for this wrapper). There is currently no `publish-csharp` (or
 `dotnet`/NuGet) job in that workflow to gate or un-gate. Separately, even
-where `brief-wrap-common.md`'s general rule is to un-gate a wrapper's publish
-job once its glue compiles against the header, this wrapper's own brief
-overrides that: `dotnet` is not installed in the authoring environment, so
-nothing here has actually compiled, and a publish job -- gated or not -- must
+where the general rule is to un-gate a wrapper's publish job once its glue
+compiles against the header, this wrapper is an exception: it has not been
+built or run with `dotnet` yet, so nothing here has actually compiled, and a
+publish job -- gated or not -- must
 not be added or enabled on the strength of an unverified port. Whoever adds
 a `publish-csharp` job should gate it (`if: false`, with a comment pointing
 at this README's Status section) until `dotnet build`/`dotnet run` on

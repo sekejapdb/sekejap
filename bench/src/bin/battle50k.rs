@@ -311,8 +311,16 @@ pub const VEC_BULK_ROWS: usize = 1_000;
 /// The scratch collection / table every write case builds and throws away.
 pub const VEC_BULK_OBJECT: &str = "place_bulk";
 
-const DEFAULT_DB_DIR: &str = "<scratch>";
-const DEFAULT_DSN: &str = "postgres://127.0.0.1:5433/e4_bench";
+/// `--db-dir` when the flag is absent: a directory under the system temp dir.
+fn default_db_dir() -> PathBuf {
+    std::env::temp_dir().join("sekejap-bench50k").join("e4-db")
+}
+/// `--dsn` when the flag is absent: `SEKEJAP_BENCH_PG_DSN`, else a local
+/// default server.
+fn default_dsn() -> String {
+    std::env::var("SEKEJAP_BENCH_PG_DSN")
+        .unwrap_or_else(|_| "postgres://127.0.0.1:5432/postgres".into())
+}
 
 // ── the corpus ────────────────────────────────────────────────────────────
 
@@ -737,7 +745,7 @@ pub const BATTERY: [CaseSpec; 43] = [
     CaseSpec { name: "fn_like_prefix", kind: CaseKind::Filter },
     CaseSpec { name: "fn_project_strings", kind: CaseKind::Filter },
     // ── the vector WRITE battery ────────────────────────────────────────
-    // The owner's application writes embeddings in BULK and queries them
+    // A typical embedding application writes vectors in BULK and queries them
     // approximately; the battery above only ever asked the second half. Each
     // of these writes VEC_BULK_ROWS rows of a DIM-lane embedding as ONE
     // batch with ONE commit, into a scratch collection that is rebuilt from
@@ -6252,8 +6260,8 @@ impl Options {
             data: data.into(),
             queries: queries.into(),
             out: out.into(),
-            db_dir: PathBuf::from(DEFAULT_DB_DIR),
-            dsn: DEFAULT_DSN.into(),
+            db_dir: default_db_dir(),
+            dsn: default_dsn(),
             only: None,
             reuse: false,
             graph: false,

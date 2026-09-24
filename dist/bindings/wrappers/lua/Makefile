@@ -5,8 +5,8 @@
 #
 # This directory builds NO Rust. libsekejap.{dylib,so,a} and
 # include/sekejap.h come from SEKEJAP_PREFIX -- the sekejap-capi build
-# (`cargo build --release -p sekejap-capi`) or, in this tree, the prebuilt
-# copy the coordinator publishes at <scratch>
+# (`cargo build --release -p sekejap-capi`) or a prebuilt libsekejap
+# directory such as /path/to/libsekejap/.
 # `sekejap.pc` in that prefix predates the flat layout and points at a
 # nonexistent lib/ subdirectory, so this Makefile does not use pkg-config
 # for sekejap itself -- only for the Lua headers.
@@ -15,7 +15,7 @@
 # at load time, so we use the Lua headers (pkg-config) but do NOT link
 # liblua.
 
-SEKEJAP_PREFIX ?= <scratch>
+SEKEJAP_PREFIX ?= /usr/local
 CABI           := $(SEKEJAP_PREFIX)/include
 LIBDIR         := $(SEKEJAP_PREFIX)
 

@@ -672,13 +672,19 @@ fn merge(mut a: Value, b: Value) -> Value {
 }
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let base = PathBuf::from(
-        args.get(1)
-            .map(String::as_str)
-            .unwrap_or("<scratch>"),
-    );
-    if !base.starts_with("<scratch>") {
-        return Err("benchmark data must live under <scratch>".into());
+    // The first argument (unless it is a flag) or SEKEJAP_BENCH_ROOT.
+    let base = args
+        .get(1)
+        .filter(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("SEKEJAP_BENCH_ROOT").map(PathBuf::from))
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or("set SEKEJAP_BENCH_ROOT (or pass a directory) for benchmark artifacts")?;
+    if base
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("benchmark root must not contain `..` components".into());
     }
     let smoke = args.iter().any(|x| x == "--smoke");
     let run = base.join(format!(

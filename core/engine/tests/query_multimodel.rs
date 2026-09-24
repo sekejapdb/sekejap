@@ -1,4 +1,4 @@
-//! Combined-query acceptance over the deterministic Phase 2 app fixture.
+//! Combined-query acceptance over the deterministic Phase 2 multimodel fixture.
 //! Expected memberships and ranking math below are derived directly from the
 //! fixture rather than from family query helpers.
 use sekejap_core::{
@@ -2926,9 +2926,8 @@ fn a_deleted_point_is_never_returned_by_a_spatial_page_that_no_longer_probes() {
 ///
 /// The fixture's keys are deliberately the REVERSE of insertion/id order
 /// (`m{:05}` counting down as the loop counts up) rather than the zero-padded
-/// ascending keys popsim happens to use -- see `ROOTCAUSE-count-all.md`'s own
-/// warning that popsim's key order coinciding with id order is "a property of
-/// the fixture, not of the engine". A test that passed only because key order
+/// ascending keys popsim happens to use -- popsim's key order coinciding with
+/// id order is "a property of the fixture, not of the engine". A test that passed only because key order
 /// and id order agreed would not be testing the driver at all.
 #[test]
 fn keys_driver_order_matches_an_entity_enumeration_sorted_by_key() {

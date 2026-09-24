@@ -49,8 +49,8 @@ must preserve this baseline rather than replacing its evidence.
 - Toolchain, corpus inventory and hashes: [PROVENANCE.json](format-baseline-evidence/PROVENANCE.json).
   [SHA256SUMS](format-baseline-evidence/SHA256SUMS) covers retained artifacts.
 
-Captured on isolated server Linux, Rust/Cargo 1.97.1, release profile, 2 CPU / 2Gi
-limits and 0.5 CPU request. No production workload or Pi service was changed.
+Captured on an isolated Linux server, Rust/Cargo 1.97.1, release profile, 2 CPU / 2Gi
+limits and 0.5 CPU request. No production workload or device service was changed.
 Generator feature set is default (no optional features); it explicitly creates
 both cell families. The baseline compatibility harness is added as untracked
 source to the frozen checkout; the engine/Cargo sources remain byte-identical.
@@ -100,7 +100,7 @@ coverage; the earlier corruption matrix qualifies the underlying repair API.
 ## Required checks for later engine changes
 
 On Linux, from the repository, choose a fresh authorized artifact directory
-`RUN` under `<scratch>/` (or the authorized Pi area):
+`RUN` on a separate scratch volume:
 
 Recorded as it stood before the v2 declaration; `docs/format-v1-baseline` no
 longer exists and the preserved binaries do not write the disk-format stamp,
@@ -133,5 +133,4 @@ incomplete. The next two attempts stopped on Git ownership and Mac archive
 metadata; a fourth pod was rejected for insufficient CPU request capacity.
 The verified source archive was reused, extraction corrected and request
 reduced; these were infrastructure failures, not failed database results. The
-successful job is `e4-phase1-reference-r5-20260916`, artifact root
-`<scratch>`.
+next job succeeded.

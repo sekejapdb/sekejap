@@ -2,10 +2,12 @@
 """Retained clean/damaged P1 trial; never mutate the benchmark source."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def hashes(folder):
@@ -24,8 +26,9 @@ def hashes(folder):
 def main():
     source, output = map(Path, sys.argv[1:3])
     rows = int(sys.argv[3])
-    if not output.resolve().is_relative_to("<scratch>"):
-        raise ValueError("trial artifacts must stay on scratch")
+    root = Path(os.environ.get("SEKEJAP_BENCH_ROOT", tempfile.gettempdir())).resolve()
+    if not output.resolve().is_relative_to(root):
+        raise ValueError(f"trial artifacts must stay under SEKEJAP_BENCH_ROOT ({root})")
     original = hashes(source)
     output.mkdir()
     binary = Path(__file__).resolve().parents[1] / "target/release/recover"

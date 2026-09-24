@@ -18,7 +18,7 @@ concurrency:
 
 env:
   # The feature set every documented build and every worker's test command
-  # uses (AGENTS.md), and the one every frozen golden in the suite was
+  # uses, and the one every frozen golden in the suite was
   # measured under. A bare `cargo test`/`cargo check` builds the crate's
   # DEFAULT features instead, which is a different storage layout -- CI ran
   # that mismatched build for a long time and a page-WAL golden (frames and

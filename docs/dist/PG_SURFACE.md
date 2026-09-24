@@ -596,7 +596,7 @@ never with an error, because a client that meets an error here stops before
 it has listed anything. They were collected from the prior engine's
 `src/pg.rs` shim (the keys it pattern-matched on), its
 `tests/catalogue_and_ddl.rs`, and
-`notes/postgis-killer-features.md` §2 (the QGIS provider's own SQL).
+the QGIS PostGIS provider's own SQL.
 
 **On connect (pgjdbc / DBeaver 24):** `SELECT version()`,
 `SELECT current_schema()`, `SELECT current_database()`,

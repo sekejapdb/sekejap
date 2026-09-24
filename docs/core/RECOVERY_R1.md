@@ -5,14 +5,14 @@ recovers unaffected records around damaged overflow values, reports damaged
 page extents without trusting their kind bytes, and does not merge obsolete
 CoW leaves into the current tree. Source data, WAL and freelist remain intact.
 This is kernel salvage; typed schema recovery and the complete seven-law gate
-remain open in tracker.
+remain open as tracked tasks.
 
 ## Fail → fix → verify
 
 The first three independent fault oracles failed against the inherited
 in-place recovery: a broken overflow aborted the rebuild, a changed leaf kind
 hid lost rows, and a checkpointed delete was resurrected from an obsolete leaf.
-The red log is `<scratch>`.
+The red log is `<artifact dir>/recovery-r1-initial.log`.
 
 The source-preserving API passes those cases and the expanded 14-test suite:
 crossed valid overflow chains, cycles, wrong identities, missing and truncated
@@ -29,12 +29,12 @@ See `RECOVERY_MATRIX.json` for precise coverage and pending cases.
 Final validation: **284 passed, 0 failed, 0 ignored** in the feature-enabled
 workspace (`recovery-r1-validated.log`); the 14 recovery fault tests also pass
 with default features (`recovery-r1-default.log`). Both logs are under
-`<scratch>/`. The full run includes density, snapshots,
+`<artifact dir>/`. The full run includes density, snapshots,
 WAL/durability, corruption bounds and the new concurrent I/O regression.
 
 The older `kernel::recover::recover` remains a low-level forensic regression
 path, with an explicit warning that it can resurrect stale rows. It is not
-used by the new command. The prior engine's source and its tracker journey were not changed.
+used by the new command. The prior engine's source was not changed.
 
 ## Concrete workflow
 
@@ -42,9 +42,9 @@ Build from the repository root:
 
 ```sh
 cargo build --release --offline --features sqlite-balance,compact-cells --bin recover
-target/release/recover inspect <scratch>
-target/release/recover salvage <scratch> <scratch>
-target/release/recover verify <scratch>
+target/release/recover inspect <artifact dir>/SOURCE
+target/release/recover salvage <artifact dir>/SOURCE <artifact dir>/NEW_RESULT
+target/release/recover verify <artifact dir>/NEW_RESULT
 ```
 
 `inspect` checks physical page CRC/identity; it is not a claim of valid values
@@ -82,7 +82,7 @@ source page. The archive deliberately preserves generic/compact cell framing.
 
 `tools/recovery_trial.py` made clean and damaged copies of the P1 40K large-JSON
 fixture, then exercised all three commands. Output:
-`<scratch>`.
+`<artifact dir>/recovery-r1-trial-40000/results.json`.
 
 | Case | Entities recovered | Catalog records | Named value losses | Repair time |
 |---|---:|---:|---:|---:|
@@ -99,19 +99,19 @@ The damaged source, mutation offset, loss journal and repaired result are retain
 The full suite exposed a direct read returning another file's bytes after a
 zero-page write. Concurrent isolated I/O tests reproduced it without pager or
 recovery activity. Retained expected/observed files are named in
-`<scratch>` and
+`<artifact dir>/recovery-r1-io-isolated.log` and
 `recovery-r1-workspace-final.log`.
 
 `tools/nocache_probe.c` then reproduced the symptom independently of Rust and sekejap:
 8 native threads, 200 fresh-file round trips each, zero/distinctive payloads,
 aligned and ordinary buffers, `pwrite → fsync → pread`. On this macOS + USB
-APFS scratch stack, F_NOCACHE had **23 mismatches / 1,600** (13 aligned, 10
+APFS scratch-volume stack, F_NOCACHE had **23 mismatches / 1,600** (13 aligned, 10
 ordinary); the same buffered control had **0 / 1,600**. Sequential probes had
 no mismatches. This establishes a failure on the tested stack, not whether
 the OS, filesystem or device is ultimately responsible.
 
-Evidence: `<scratch>`
-and `<scratch>`.
+Evidence: `<artifact dir>/nocache-probe-r2/concurrent-results.log`
+and `<artifact dir>/nocache-probe-buffered/results.log`.
 Apple documents F_NOCACHE as a control for data caching
 ([fcntl documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html));
 the local experiments establish the observed failure, not that documentation.

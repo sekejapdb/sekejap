@@ -4,8 +4,7 @@
 //! `docs/format-v2-vamana/` is a PRESERVED reference corpus, written by
 //! `bench/src/bin/vamana_format_fixture.rs` and never regenerated to make a
 //! later engine pass. Missing or changed fixtures fail qualification. Every
-//! database operation here is on a unique temporary COPY; on macOS TMPDIR
-//! must be under <scratch>
+//! database operation here is on a unique temporary COPY under TMPDIR.
 //!
 //! It was regenerated ONCE, when the adjacency moved out of the node record
 //! into keyspace `0x7F`. That is the one thing a fixture may be regenerated
@@ -107,12 +106,6 @@ fn load() -> Vec<Fixture> {
 
 fn copy(fx: &Fixture, label: &str) -> tempfile::TempDir {
     let base = std::env::temp_dir();
-    if cfg!(target_os = "macos") {
-        assert!(
-            base.starts_with("<scratch>"),
-            "set TMPDIR under <scratch> before database tests"
-        );
-    }
     let dst = tempfile::Builder::new()
         .prefix(&format!("vamana-{}-{label}-", fx.name))
         .tempdir_in(base)

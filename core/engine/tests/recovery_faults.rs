@@ -1,4 +1,4 @@
-//! Deterministic, independent corruption oracles. All data stays on scratch.
+//! Deterministic, independent corruption oracles. All data stays under TMPDIR.
 use kernel::{
     io::IoMode,
     store::{Config, Store, SyncMode},

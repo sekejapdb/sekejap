@@ -17,8 +17,8 @@
 //!                                        [--cache-bytes N] [--dsn URL]
 //!
 //! The arm writes its database under `<fresh-dir>/<arm>` and its results to
-//! `<fresh-dir>/popsim-<arm>.json`. `.insert-loop/p2final/popsim_compare.py`
-//! reads the JSONs and prints the comparison (two or three arms).
+//! `<fresh-dir>/popsim-<arm>.json`; the JSONs can be compared side by side
+//! (two or three arms).
 //!
 //! THE THIRD ARM: POSTGRES/POSTGIS
 //!

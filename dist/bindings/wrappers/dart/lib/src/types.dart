@@ -1,8 +1,8 @@
 // The JSON shapes of `docs/dist/C_ABI.md` §2, as Dart types.
 //
 // A document, a parameter list and a row stay `Map<String, Object?>` and
-// `List<Object?>` -- Dart's own JSON types, which is the cheap rendering the
-// wrapper brief asks for. The shapes that are the ABI's own vocabulary -- a
+// `List<Object?>` -- Dart's own JSON types, which is the cheap rendering this
+// wrapper aims for. The shapes that are the ABI's own vocabulary -- a
 // field declaration, a collection description, a neighbour, the bytes on
 // disk, a change event -- get a class, because a caller reads their members by
 // name and a typo in a map key is a run-time surprise.

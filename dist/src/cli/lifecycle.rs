@@ -1,4 +1,5 @@
-//! Lean, deterministic typed lifecycle oracle. All artifacts stay on scratch.
+//! Lean, deterministic typed lifecycle oracle. All artifacts stay under the
+//! benchmark root (a directory argument, or `SEKEJAP_BENCH_ROOT`).
 use sekejap_core::{decode_dense_v3, encode_dense_v3, Kind, Layout, Result};
 use kernel::{
     io::IoMode,
@@ -29,10 +30,20 @@ fn benchmark_limits() -> Result<Option<kernel::limits::ResourceLimits>> {
     }.validate()?;
     Ok(Some(l))
 }
-fn artifact_root_allowed(root: &Path) -> bool {
-    if root.components().any(|c| matches!(c, std::path::Component::ParentDir)) { return false; }
-    root.starts_with("<scratch>")
-        || root.starts_with("<scratch>")
+const BENCH_ROOT_HELP: &str =
+    "set SEKEJAP_BENCH_ROOT (or pass a directory) for benchmark artifacts";
+/// The artifact directory: the command-line argument when given, otherwise
+/// `SEKEJAP_BENCH_ROOT`. Paths with `..` components are refused.
+fn artifact_root(arg: Option<&String>) -> Result<PathBuf> {
+    let root = arg
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("SEKEJAP_BENCH_ROOT").map(PathBuf::from))
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(BENCH_ROOT_HELP)?;
+    if root.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("benchmark root must not contain `..` components".into());
+    }
+    Ok(root)
 }
 fn cfg() -> Config {
     Config {
@@ -536,9 +547,6 @@ fn immutable_sqlite(path: &Path) -> Result<Connection> {
 // A maintenance measurement using existing source-preserving recovery and
 // SQLite VACUUM INTO. It does not install a replacement over either source.
 fn repack_probe(root: &Path, n: u64) -> Result<()> {
-    if !artifact_root_allowed(&root) {
-        return Err("data must stay on scratch".into());
-    }
     std::env::set_var("TMPDIR", root.join("tmp"));
     std::env::set_var("SQLITE_TMPDIR", root.join("tmp"));
     let source = root.join(format!("e4-{n}"));
@@ -615,7 +623,7 @@ fn main() -> Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("--repack-check") {
         return repack_probe(
-            Path::new(args.get(2).ok_or("missing run directory")?),
+            &artifact_root(args.get(2))?,
             args.get(3).ok_or("missing rows")?.parse()?,
         );
     }
@@ -624,10 +632,7 @@ fn main() -> Result<()> {
         Some("--crash-check" | "--policy-crash-check" | "--resource-crash-check")
     ) {
         let policy = args[1] == "--policy-crash-check";
-        let root = Path::new(args.get(2).ok_or("missing crash run directory")?);
-        if !artifact_root_allowed(&root) {
-            return Err("data must stay on scratch".into());
-        }
+        let root = &artifact_root(args.get(2))?;
         fs::create_dir(root)?;
         fs::create_dir(root.join("tmp"))?;
         std::env::set_var("TMPDIR", root.join("tmp"));
@@ -640,13 +645,9 @@ fn main() -> Result<()> {
         )?;
         return Ok(());
     }
-    let root = PathBuf::from(
-        args.get(1)
-            .ok_or("usage: lifecycle <scratch> [rows]")?,
-    );
-    if !artifact_root_allowed(&root) {
-        return Err("data must stay on scratch".into());
-    }
+    // usage: lifecycle [NEW_RUN_DIR] [rows]; NEW_RUN_DIR defaults to
+    // SEKEJAP_BENCH_ROOT and must not exist yet.
+    let root = artifact_root(args.get(1))?;
     fs::create_dir(&root)?;
     fs::create_dir(root.join("tmp"))?;
     std::env::set_var("TMPDIR", root.join("tmp"));

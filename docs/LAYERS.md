@@ -118,7 +118,7 @@ A single test file is `-p <crate> --test <name>`; a single binary is
 The eight-law lean gate is unchanged in what it runs and how it is invoked:
 
 ```sh
-python3 tools/run_foundation.py lean <scratch>
+python3 tools/run_foundation.py lean <a new artifact directory>
 ```
 
 Its command groups live in `docs/FOUNDATION_LEAN_GROUPS.json`. The engine

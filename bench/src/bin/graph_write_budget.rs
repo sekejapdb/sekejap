@@ -286,10 +286,10 @@ fn main() -> R<()> {
     let mut args = env::args().skip(1);
     let jsonl = args
         .next()
-        .unwrap_or_else(|| "<scratch>".into());
+        .ok_or("usage: graph_write_budget <places.jsonl> <db-dir> [flags]")?;
     let root = args
         .next()
-        .unwrap_or_else(|| "<scratch>".into());
+        .ok_or("usage: graph_write_budget <places.jsonl> <db-dir> [flags]")?;
     let mut limit = usize::MAX;
     let mut commit_every = BATCH;
     let mut many = false;

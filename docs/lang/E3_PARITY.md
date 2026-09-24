@@ -2,7 +2,7 @@
 
 **What this compares, and why the comparison still matters.** "The prior
 engine" throughout this file is the release sekejap replaces: a separate
-storage design with its own SQL surface, the one app still runs. Its
+storage design with its own SQL surface, the one a production deployment of the prior engine still runs. Its
 sources are kept on branch `e1` (`git show e1:<path>`) and are never edited.
 The comparison matters because that release has live users: every capability
 it ships is either served here, named in a contract at a tier, or refused in

@@ -20,6 +20,12 @@ SEED = 20260919
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "core" / "engine" / "tests" / "fixtures" / "postgis_conformance.json"
 
+# The PostGIS server is reached with `docker exec <container> psql`; override
+# the container, role and database with PGCONTAINER, PGUSER and PGDATABASE.
+PGCONTAINER = os.environ.get("PGCONTAINER", "postgis")
+PGUSER = os.environ.get("PGUSER", "postgres")
+PGDATABASE = os.environ.get("PGDATABASE", "e4_bench")
+
 M_PER_DEG_LAT = 110540.0  # metres per degree of latitude (WGS84-ish mid)
 
 
@@ -150,12 +156,12 @@ def psql(sql: str) -> str:
             "docker",
             "exec",
             "-i",
-            "postgis",
+            PGCONTAINER,
             "psql",
             "-U",
-            "postgres",
+            PGUSER,
             "-d",
-            "e4_bench",
+            PGDATABASE,
             "-At",
             "-v",
             "ON_ERROR_STOP=1",
@@ -177,12 +183,12 @@ def psql_c(sql: str) -> str:
         [
             "docker",
             "exec",
-            "postgis",
+            PGCONTAINER,
             "psql",
             "-U",
-            "postgres",
+            PGUSER,
             "-d",
-            "e4_bench",
+            PGDATABASE,
             "-At",
             "-c",
             sql,

@@ -58,7 +58,7 @@ impl FileIo for AuditIo {
     }
 }
 #[test]
-#[ignore = "large forensic probe; explicit scratch TMPDIR required"]
+#[ignore = "large forensic probe; set TMPDIR to a large scratch volume"]
 fn store_churn_audits_last_issued_page_write() {
     let d = tempfile::tempdir().unwrap();
     let (f, _) = crate::io::open_file(&d.path().join("data"), IoMode::Buffered).unwrap();

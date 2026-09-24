@@ -324,9 +324,9 @@ cargo test --features compact-cells,sqlite-balance --test format_v2_compat -- --
 cargo test --features compact-cells,sqlite-balance,keyspace-append,slotref-split --test format_v2_compat -- --test-threads=1
 ```
 
-Mac database execution remains subject to [AGENTS.md](../../AGENTS.md)'s reboot
-and independent I/O-control requirement. Its scratch path must be under
-`<scratch>/`.
+Mac database execution remains subject to a reboot
+and independent I/O-control requirement. Its scratch path must be under a
+separate scratch volume.
 
 ## Inherited kernel Store
 
@@ -405,8 +405,8 @@ frozen format.
 
 #### Owner requirements clarified after the pause
 
-- First consumers are **app and app**. Pi-specific research can wait;
-  target-device support remains in scope, but Pi benchmark convergence is not
+- First consumers are **downstream applications**. Device-specific research can wait;
+  target-device support remains in scope, but device benchmark convergence is not
   the immediate release objective.
 - The product goal is strong **combined multimodel SELECT queries**, not
   matching SQLite's insert/update speed. About 1.75× SQLite write time can be
@@ -596,6 +596,6 @@ The reservation evaluation finished: 96 comparison arms verified, and the
 candidate was reverted under the former timing criterion. Its source patch and
 measurements are retained in `RESERVATION_LOOP.md` and linked artifacts.
 Do not start another broad raw-write optimization search before resolving the
-format/interface scope above. Establish representative app/app mixed
+format/interface scope above. Establish representative consumer-application mixed
 queries as the product benchmark before claiming the conditional write/query
 tradeoff has been earned.

@@ -1477,15 +1477,15 @@ fn a_range_wider_than_the_old_vec_budget_still_takes_the_set_path() {
 // -- KD: CandidateDriver::Keys ------------------------------------------
 //
 // The external-key mapping keyspace (`mapping_key`, collections.rs:382) is
-// E4's counterpart of SQLite's automatic `(_key, rowid)` covering index --
-// see `.insert-loop/loop3/ROOTCAUSE-count-all.md`. `CandidateDriver::Keys`
+// E4's counterpart of SQLite's automatic `(_key, rowid)` covering index.
+// `CandidateDriver::Keys`
 // enumerates it directly instead of the primary rows.
 
 /// A full key enumeration touches the mapping leaves, not the primary rows.
 ///
 /// BEFORE (`CandidateDriver::Entities`, still exercised here for the
 /// comparison): one primary read per row, walking the >384 B wide rows this
-/// fixture writes -- the same shape `ROOTCAUSE-count-all.md` measured as one
+/// fixture writes -- the same shape an earlier count-all root-cause measured as one
 /// primary leaf per ~25 rows at popsim's narrower 150 B row width, so a wider
 /// row here fits fewer per leaf still. AFTER (`CandidateDriver::Keys`): the
 /// mapping entry (~10 B key + a handful of header/value bytes) is the only
@@ -1593,9 +1593,8 @@ const KD_DELETE_STRIDE: u64 = 7;
 /// `i` maps to a key that DECREASES as `i` increases -- key order is the
 /// reverse of insertion/id order, so a test that passes here cannot be
 /// passing by accident the way `wide_fixture`'s zero-padded, id-ordered keys
-/// could (see `ROOTCAUSE-count-all.md`'s note that popsim's own keys happen
-/// to coincide with id order, "a property of the fixture, not of the
-/// engine").
+/// could (popsim's own keys happen to coincide with id order, "a property
+/// of the fixture, not of the engine").
 fn kd_key(i: u64) -> String {
     format!("u{:05}", KD_ROWS + 1 - i)
 }

@@ -34,7 +34,7 @@ make test       # runs test.lua against it
 `lua`) and links a PREBUILT `libsekejap` -- **no `cargo` command runs in
 this directory**. It reads `libsekejap.{dylib,so,a}` and
 `include/sekejap.h` from `$SEKEJAP_PREFIX` (default
-`<scratch>`, this tree's coordinator-built copy);
+`/usr/local`);
 point it elsewhere with e.g. `make SEKEJAP_PREFIX=/path/to/libsekejap`, or
 build that prefix yourself with `cargo build --release -p sekejap-capi`
 from the repository root and pass its `target/release` output directory.
@@ -144,7 +144,7 @@ no atomic for (`db:compact()`, `db:trim_memory()`, `db:show()`,
 ## Test
 
 `test.lua` (`make test`) runs the checklist end to end against a real
-directory under `<scratch>/` (override with
+temporary directory from `os.tmpname()` (override with
 `SEKEJAP_TEST_DIR`): open, create a collection (plus a scalar index and a
 duplicate-create check), put, get (hit and clean miss), a `$n`-parameter
 query, a paged scan to its end, prepare + rebind with two different
@@ -189,7 +189,5 @@ luarocks make sekejap-0.17.0-1.rockspec
 luarocks upload sekejap-0.17.0-1.rockspec --api-key=<your-api-key>
 ```
 
-`sekejap-0.17.0-1.rockspec`'s `source.url` is a placeholder
-(`git+https://github.com/sekejapdb/sekejap.git`, tag `v0.17.0`) written
-without access to the repository's real git origin -- point it at the
-actual origin before `luarocks upload`.
+The rockspec's `source.url` is the sekejap repository
+(`git+https://github.com/sekejapdb/sekejap.git`) at the release tag.

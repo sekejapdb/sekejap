@@ -2052,7 +2052,9 @@ fn query_engine_surface_combinations() {
         failures.len(),
         elapsed.as_secs()
     );
-    let _ = std::fs::write("<scratch>", sidecar);
+    let summary_path = std::env::temp_dir().join("combo-summary.txt");
+    let failures_path = std::env::temp_dir().join("combo-failures.txt");
+    let _ = std::fs::write(&summary_path, sidecar);
     let mut lines = String::new();
     for f in &failures {
         lines.push_str(&format!(
@@ -2060,11 +2062,12 @@ fn query_engine_surface_combinations() {
             f.name, f.kind, f.hypothesis, f.combo, f.expected, f.actual
         ));
     }
-    let _ = std::fs::write("<scratch>", lines);
+    let _ = std::fs::write(&failures_path, lines);
     assert!(
         failures.is_empty(),
-        "{} combination(s) failed (ran {ran}); see stderr and <scratch>",
-        failures.len()
+        "{} combination(s) failed (ran {ran}); see stderr and {}",
+        failures.len(),
+        failures_path.display()
     );
 }
 

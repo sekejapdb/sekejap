@@ -75,7 +75,7 @@ without a number beside it is an opinion; these all have numbers.
 STORAGE
 - **D1 one file, one pager, one btree, row in the leaf** — SQLite's skeleton
   (everything incl. schema = btrees in one paged file). The prior engine this
-  one replaces -- a separate storage design, the one app still runs, and
+  one replaces -- a separate storage design, the one a production deployment of the prior engine still runs, and
   called "the prior engine" throughout this document -- touched 8 structures
   per write and ran 26x slower than SQLite; sekejap beats SQLite on every arm.
 - **D2 page size 4096** — ablated 4K/8K/16K: 4K best scattered-insert time and
@@ -164,7 +164,7 @@ READ PATH
   direct-I/O upgrade path; basic posture degrades to Buffered and reports.
 - **D20 no global ANN in core** — vectors serve candidate RESCORING (point
   reads by id). A resident HNSW is RAM ∝ store: the wound the prior engine
-  carries in its app deployment, and what Law 1 exists to forbid.
+  carries in its production deployment, and what Law 1 exists to forbid.
   Ceiling for a change-buffer-style alternative measured 1.83x buffered.
 - **D22 vectors are catalog-fixed-dim f32-LE rows in 0x05** — one dim per
   store (CAT_VEC_DIM, set by the first set_vec), mismatch refused before
@@ -187,7 +187,7 @@ READ PATH
   structure.
 - **D25 weighted training: constrained-first benchmarking** — the engine's
   power must emerge at the DEFAULT budget or smaller. Every gate, ablation
-  and O-factor ladder runs disk-based (64 MiB or less; app gate: 8 MiB);
+  and O-factor ladder runs disk-based (64 MiB or less; vector-ingest RAM gate: 8 MiB);
   an optimization that only wins when cached is rejected. Read counts (DIAG)
   are the judge, wall time the witness. RAM is the super-charge, reported
   as a separate bonus row (default-cache vs big-cache), never as the
@@ -464,20 +464,20 @@ stream aggregation over index order when the group key is a key prefix
 
 ## The demo track (iot-*, outside the phase ladder)
 
-The paper demo (a sub-1B LLM assistant on Pi-5-class hardware) advances
-on its own track in the research workspace, never gating engine phases.
+The demo (a sub-1B LLM assistant on ARM single-board-computer-class hardware)
+advances on its own track, never gating engine phases.
 iot-1 (2026-08-26): a TEMPORARY pyo3 binding over this kernel -- kept
 OUT of this repo because sekejap inherits the public repo structure
 (the wrappers, the Actions) from the prior engine at replacement time. In THIS
 tree those
 live at `dist/bindings/wrappers/` and `.github/workflows/`. Gate passed in the
-linux/arm64 Pi-5 sim (4cpu/2GB): all five demo tools through the real
+linux/arm64 single-board-computer sim (4cpu/2GB): all five demo tools through the real
 engine; plus a zero-training YOLO11n vision probe (7.5 fps CPU) writing
 sightings into the store and recalling them by text query.
 
 ## Strategy
 
-Goal: RCA → hybrid query → shared-node multi-perspective KG. My needs first.
+Goal: RCA → hybrid query → shared-node multi-perspective KG.
 - Phase 1 ✓ base: pager, WAL, btree, bulk. Gate: 50K→5M vs SQLite.
 - Phase 2 ✓ graph layer. Gate: 4 arms below.
 - Phase 2b: ctx migration, property indexes, vector, fulltext, spatial — each a
@@ -555,7 +555,7 @@ reachable (inherent; caller bounds depth).
 ## Big values (the prior engine's lesson, decided before it repeats)
 
 The kernel refuses records over ~4KB (one page). Two core needs break that
-ceiling: **embeddings** (1536-dim f32 = 6,144B; app uses >1024 dims) and
+ceiling: **embeddings** (1536-dim f32 = 6,144B; production deployments use >1024 dims) and
 **RCA payloads** (a log/trace event exceeds 4KB routinely). This is not a
 vector problem -- it is a kernel gap that vector merely hits first.
 
@@ -594,7 +594,7 @@ are in this file and in `docs/`.
                                             refusal, blast radius 1 record, laws flat
     2d-io ✓       FileIo trait (D21)        gate PASSED: win/android/arm compile-verified,
                                             platform-leak invariant test
-    2e-vector ✓   0x05 keyspace, cat dim    gate PASSED: app RAM-flat, ingest ladder won
+    2e-vector ✓   0x05 keyspace, cat dim    gate PASSED: vector RAM-flat, ingest ladder won
                                             every rung, hybrid RCA 4x, ablations 1/5
     2f-snapshot ✓ CoW epochs + dual meta    gate PASSED: zero added reads (counter form),
                                             byte-stable readers, CoW write tax unmeasurable
@@ -1050,7 +1050,7 @@ Awaiting sign-off (recorded, not yet decided):
   CPU-bound at 22MB/s, below the device knee. Hybrid RCA query (bfs depth-3
   -> prop filter -> rescore top-10, 200K nodes, 100 seeds, checksums
   identical both engines): sekejap 22ms/query vs SQLite+numpy 88ms = 4.0x; build
-  21.5s vs 58.3s. app gate: 600MB of vectors through an 8MiB pool, live
+  21.5s vs 58.3s. vector-ingest RAM gate: 600MB of vectors through an 8MiB pool, live
   heap flat 0.25MiB at 25K and 100K alike; rescore PEAK-delta < 1MiB, PEAK
   tracked inside alloc() after point-sampling missed a 30MB transient.
   Ablations: 1 of 5 (coalesced uncached chain pread, 245->217us per cold 6KB

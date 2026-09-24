@@ -9,8 +9,12 @@ set -u
 N=${N:-50000}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="$ROOT/target/release"
-# JDK ≤ 22 for Kotlin (Kotlin 2.0.20 crashes on JDK 26); adjust if needed.
-JDK22="${JDK22:-<home>/}"
+# JDK ≤ 22 for Kotlin (Kotlin 2.0.20 crashes on JDK 26); set JDK22 or JAVA_HOME.
+JDK22="${JDK22:-${JAVA_HOME:-}}"
+if [ -z "$JDK22" ]; then
+  echo "set JDK22 (or JAVA_HOME) to a JDK <= 22 home for the Kotlin run" >&2
+  exit 1
+fi
 
 echo "building libsekejap (release)…"
 ( cd "$ROOT" && cargo build --release -p sekejap-capi -q ) || { echo "cargo build failed"; exit 1; }

@@ -466,8 +466,7 @@ fn process_memory_limits() -> Value {
 }
 /// Post-reboot audit; benchmark executable is retained separately.
 pub(super) fn verify_saved(args: &[String]) -> Result<()> {
-    let root = Path::new(args.first().ok_or("missing matrix directory")?);
-    if !artifact_root_allowed(root) { return Err("data must stay in the authorized workspace".into()); }
+    let root = &artifact_root(args.first())?;
     let mut pairs = Vec::new();
     let mut paths = fs::read_dir(root)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?;
     paths.sort();
@@ -521,10 +520,7 @@ pub(super) fn verify_saved(args: &[String]) -> Result<()> {
     Ok(())
 }
 pub(super) fn run(args: &[String]) -> Result<()> {
-    let root = Path::new(args.first().ok_or("missing run directory")?);
-    if !artifact_root_allowed(root) {
-        return Err("data must stay on scratch".into());
-    }
+    let root = &artifact_root(args.first())?;
     let sizes = if let Some(n) = args.get(1) {
         vec![n.parse::<u64>()?]
     } else {

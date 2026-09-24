@@ -2,8 +2,8 @@
 //!
 //! This file began as the reproduction for the 1,000,000-row atomic-arm
 //! failure (`phase2_multimodel_bench e4 1000000 32 <dir>/db atomic none` exited
-//! 1 with `Error: NotFound("index")` and no stdout.json, server job
-//! e4-p2-1m-20260918, commit aeeae13). The sequence it drives is the bench's:
+//! 1 with `Error: NotFound("index")` and no stdout.json in a Linux benchmark
+//! run, commit aeeae13). The sequence it drives is the bench's:
 //!
 //! ```text
 //!   create_scalar_index(...)     // writes the REGISTRY row, does NOT commit

@@ -34,8 +34,8 @@ function resolveLibPath() {
     throw new Error(`sekejap: unsupported platform '${process.platform}'`);
   }
 
-  // 2. A directory holding just the library (what the coordinator's
-  //    prebuilt <scratch>/ looks like, and what
+  // 2. A directory holding just the library (what a prebuilt
+  //    /path/to/libsekejap/ directory looks like, and what
   //    build-native-libs's tarball unpacks to as lib/).
   const dirs = [];
   if (process.env.SEKEJAP_LIB_DIR) dirs.push(process.env.SEKEJAP_LIB_DIR);

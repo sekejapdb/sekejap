@@ -2,13 +2,13 @@
 // SwiftPM binding for sekejap 0.17.0 over the C ABI
 // (dist/ffi, crate sekejap-capi, lib name `sekejap` -> libsekejap.{dylib,a}).
 //
-// This manifest never runs cargo: libsekejap is built by the coordinator (or,
-// for a normal out-of-worktree checkout, by `cargo build --release -p
+// This manifest never runs cargo: libsekejap comes from a prebuilt libsekejap
+// directory (or, for a normal checkout, from `cargo build --release -p
 // sekejap-capi`) and linked as a prebuilt library. The directory that holds
 // it is resolved as:
 //   1. $SEKEJAP_LIB_DIR, when set -- a flat directory of
 //      libsekejap.{dylib,a} + include/sekejap.h + sekejap.pc, exactly what
-//      `swift build`/`swift test` in this worktree point it at.
+//      `swift build`/`swift test` in this checkout point it at.
 //   2. Otherwise <repo root>/target/release, the layout an in-tree
 //      `cargo build --release -p sekejap-capi` produces.
 //

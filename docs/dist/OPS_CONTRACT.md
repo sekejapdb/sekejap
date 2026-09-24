@@ -782,7 +782,7 @@ feature and never appears on the wire.
 | L4 Name costs | `SHOW STATUS`, `SHOW STORAGE` and `write_trace` are the instruments; each states what is O(1) and what is a scan. | §6, §8 |
 | L5 Recoverability | Not this document's surface. Introspection reports state; it never repairs it, and no statement here is a recovery path. | — |
 | L6 Readers | Service mode is L6 made visible at the API; the staleness window is its stated bound; the change feed is the signal that a new generation exists; a cancel touches no writer. | §1, §2, §4, §5 |
-| L7 Target usability | The service form is the shape a Pi gateway runs; the bulk-load scope is the import path L7 gates on. | §1, §7 |
+| L7 Target usability | The service form is the shape an ARM device gateway runs; the bulk-load scope is the import path L7 gates on. | §1, §7 |
 | L8 Release compatibility | Nothing here changes the disk format. The one persisted addition in the companion contract — per-field defaults, generated expressions and `NOT NULL` in the descriptor — is an additive feature bit; a file without it opens unchanged. | — |
 
 ## 11. Order of work

@@ -1,7 +1,7 @@
 # Recovery contract — R1, 2026-09-10
 
 This specifies the foundation gate; individual implementation claims require
-passing evidence in RECOVERY_MATRIX.json and the tracker task notes. P1/P2
+passing evidence in RECOVERY_MATRIX.json. P1/P2
 size results do not imply this gate passed. No documents from the prior engine are inputs.
 
 ## Fault model and honest outcomes
@@ -81,7 +81,7 @@ silently trust a partial output. Publication remains separate from salvage.
   stated minimum instead of secretly exceeding them.
 - Size costs of redundant schema/current-membership evidence are measured.
   Checkpoint is not VACUUM; file shrinking is a separate verified replacement.
-- Benchmark data/fault fixtures/results live on scratch. Existing 20M artifacts
+- Benchmark data/fault fixtures/results live on a separate scratch volume. Existing 20M artifacts
   are read-only evidence; destructive tests operate on independent small copies.
 
 ## Seven-law executable acceptance matrix
@@ -108,8 +108,8 @@ independent clean fixtures/operation logs, including known deleted keys.
 ## Audit at loop start (open defects, not accepted sacrifices)
 
 This is the original R1 audit. Scoped implementation progress and remaining
-limits are recorded in RECOVERY_R1.md, RECOVERY_R2.md and the live tracker
-journey; the historical list below is not a current status board.
+limits are recorded in RECOVERY_R1.md, RECOVERY_R2.md and the live task
+tracker; the historical list below is not a current status board.
 
 - Damaged overflow aborts the low-level rebuild of unrelated healthy rows.
 - Failed page CRC is classified using its untrusted kind byte; flipping Leaf
@@ -125,5 +125,5 @@ journey; the historical list below is not a current status board.
 - Existing padded schema replicas are discoverable through lookup paths only;
   losing all descriptors cannot be solved by inferring names from rows.
 
-tracker: recovery-contract -> fault-corpus -> overflow-salvage/layout-recovery/
+Task sequence: recovery-contract -> fault-corpus -> overflow-salvage/layout-recovery/
 structural-salvage -> safe-repair. Other law gates remain explicit tasks.

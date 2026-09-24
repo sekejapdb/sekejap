@@ -57,13 +57,13 @@ include it in total job time; never hide maintenance after stopping the timer.
 
 | Law | Category | Required falsifiable evidence |
 |---|---|---|
-| 1 Disk-first | L1-MEM | Fixed cache plus bounded WAL lookup, transaction state, free-page state and reader state; hard process budget on Pi; scaling beyond RAM; no database-sized in-memory oracle |
+| 1 Disk-first | L1-MEM | Fixed cache plus bounded WAL lookup, transaction state, free-page state and reader state; hard process budget on the ARM device; scaling beyond RAM; no database-sized in-memory oracle |
 | 2 Work proportional to change | L2-WORK | Same changed rows across N ladder, page reads/writes and metadata touched; bounded lookup/checkpoint debt; no whole-database scan at ordinary commit |
 | 3 Nothing fallible may delete | L3-ATOMIC | Kill/error at append, commit barrier, checkpoint copy, verification and log reset; acknowledged state exact; failed repair leaves source hash unchanged; uncertain commit is explicit |
 | 4 Name costs | L4-COST | All timing/space/RAM categories, side files, temporary files, retained versions, actual sync settings, cache limits and unsupported semantics |
 | 5 Recoverability | L5-DAMAGE | CRC/identity/bounds on every unit; torn versus corrupt WAL; corrupt root/leaf/overflow/schema/free metadata; independent salvage with no stale resurrection; all-replica loss explicitly reported |
 | 6 Readers | L6-READ | New readers see latest acknowledged commit; old readers remain byte-stable; concurrent writer/checkpoint; no writer lock on reads; coordination and latency/I/O effects explicitly audited, including processes |
-| 7 Target usability | L7-DEVICE | Mac + authorized Pi load/live-write/reopen evidence; bulk import, late-indexing and actual indexed live-write gates remain PENDING until those features exist |
+| 7 Target usability | L7-DEVICE | Mac + ARM device load/live-write/reopen evidence; bulk import, late-indexing and actual indexed live-write gates remain PENDING until those features exist |
 | 8 Release compatibility | L8-COMPAT | Immutable fixtures from released binaries: newer read/write/reopen and committed-WAL recovery; exact typed, schema, relationship and index-query results; minor rollback with unchanged features; unknown-format refusal leaves source files unchanged; no mandatory migration/index rebuild on update |
 
 L8 fixtures must identify their writer release, enabled persistent features,
@@ -121,16 +121,16 @@ once. This is fast regression feedback, not a claim that all laws pass.
 Run from the project root, using a fresh artifact directory each time:
 
 ```sh
-python3 tools/run_foundation.py lean <scratch>
-python3 tools/run_foundation.py scale <scratch>
-python3 tools/run_foundation.py large <scratch>
+python3 tools/run_foundation.py lean <a new artifact directory>/lean
+python3 tools/run_foundation.py scale <a new artifact directory>/scale
+python3 tools/run_foundation.py large <a new artifact directory>/large
 ```
 
 `lean` runs pager/fault/repair, codec/schema/collection and inherited kernel
 regressions, then four 1K-row sekejap/SQLite smoke arms. `scale` performs three
 rotated repetitions at 10K, 100K and 1M rows; `large` is a one-run 10M
 confirmation, not three-repetition acceptance. Both are runnable in the
-authorized Pi artifact area; Pi benchmark processes have a 128 MiB
+ARM device's artifact area; ARM device benchmark processes have a 128 MiB
 address-space limit. Source/log/binary hashes and structured reports accompany
 each run. Existing typed tests still use the older collection Store.
 
@@ -161,8 +161,8 @@ The current build, any experimental build and native SQLite are named
 separately in every table. One representation or backend cannot be substituted
 silently. Primitive page-WAL proof does not authorize SQL, graph or
 multimodel-index implementation. All applicable gates, full integration tests
-and Pi checks must pass before promotion. Record unimplemented categories as
+and ARM device checks must pass before promotion. Record unimplemented categories as
 PENDING, not passing by omission. Preserve source archives, binaries, raw
 reports, logs, fault evidence and one representative comparison set. Delete
-only verified disposable generated data after recording its manifest. tracker
-owns live status.
+only verified disposable generated data after recording its manifest. The live task
+tracker owns live status.

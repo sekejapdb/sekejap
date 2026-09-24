@@ -319,9 +319,20 @@ const PAGE: usize = 8_192;
 /// by the two supplementary rows.
 const SUBVECTOR_LANES: usize = 2_000;
 
-const DEFAULT_OUT_DIR: &str = "<scratch>";
-const DEFAULT_WORK_DIR: &str = "<scratch>";
-const DEFAULT_DSN: &str = "postgres://127.0.0.1:55433/postgres";
+/// `--out-dir` when the flag is absent: a directory under the system temp dir.
+fn default_out_dir() -> PathBuf {
+    std::env::temp_dir().join("sekejap-bench50k")
+}
+/// `--work` when the flag is absent.
+fn default_work_dir() -> PathBuf {
+    default_out_dir().join("vector10k-work")
+}
+/// `--dsn` when the flag is absent: `SEKEJAP_BENCH_PG_DSN`, else a local
+/// default server.
+fn default_dsn() -> String {
+    std::env::var("SEKEJAP_BENCH_PG_DSN")
+        .unwrap_or_else(|_| "postgres://127.0.0.1:5432/postgres".into())
+}
 
 const ARMS: [&str; 7] = [
     "e4-atomic-exact",
@@ -2177,7 +2188,7 @@ fn write_report(path: &Path, rows: &[ArmRow], meta: &Value, deviations: &[Value]
     out.push_str(&format!(
         "Generated {} on {} · sekejap commit `{}` · {}\n\n",
         meta["generated"].as_str().unwrap_or("?"),
-        meta["host"].as_str().unwrap_or("?"),
+        meta["platform"].as_str().unwrap_or("?"),
         meta["commit"].as_str().unwrap_or("?"),
         meta["pg_version"].as_str().unwrap_or("postgres: not reached")
     ));
@@ -2574,9 +2585,9 @@ fn usage() -> String {
 fn parse(args: &[String]) -> R<Options> {
     let mut options = Options {
         rewrite_report: None,
-        out_dir: PathBuf::from(DEFAULT_OUT_DIR),
-        work_dir: PathBuf::from(DEFAULT_WORK_DIR),
-        dsn: DEFAULT_DSN.to_owned(),
+        out_dir: default_out_dir(),
+        work_dir: default_work_dir(),
+        dsn: default_dsn(),
         ef: DEFAULT_EF,
         only: None,
         keep: false,
@@ -2853,7 +2864,7 @@ fn run() -> R<()> {
 
     let meta = json!({
         "generated": chrono_like_now(),
-        "host": hostname(),
+        "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         "commit": git_commit(Path::new(".")),
         "rows": ROWS,
         "dimension": DIM,
@@ -2922,11 +2933,3 @@ fn chrono_like_now() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".into())
-}

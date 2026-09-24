@@ -9,7 +9,7 @@
 //! handle's fresh-identity map by the time the edges are written.
 //!
 //!     cargo run --release --features compact-cells,sqlite-balance,\
-//!         keyspace-append,slotref-split --bin g2_budget -- [rows] [edges]
+//!         keyspace-append,slotref-split --bin g2_budget -- <rows> <edges> <db-dir>
 
 use sekejap_core::{
     collections::{
@@ -111,7 +111,8 @@ fn main() -> R<()> {
     let mut args = env::args().skip(1);
     let rows: u64 = args.next().map_or(Ok(200_000), |a| a.parse())?;
     let edges: u64 = args.next().map_or(Ok(99_840), |a| a.parse())?;
-    let root = Path::new("<scratch>");
+    let root = args.next().map(std::path::PathBuf::from).ok_or("usage: g2_budget <rows> <edges> <db-dir>")?;
+    let root = root.as_path();
     let build = Instant::now();
     let mut f = load(root, rows)?;
     let fixture_s = build.elapsed().as_secs_f64();

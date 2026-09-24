@@ -6,7 +6,7 @@ final class SekejapTests: XCTestCase {
         NSTemporaryDirectory() + "sekejap-swift-\(tag)-\(UUID().uuidString)"
     }
 
-    /// The wrapper's own end-to-end pass, per brief-wrap-common.md: open,
+    /// The wrapper's own end-to-end pass, per the common wrapper checklist: open,
     /// create a collection, put, get, query with a parameter, scan,
     /// prepare + rebind, link + neighbours, tx commit/rollback, count_rows,
     /// an error path that surfaces last_error, close.

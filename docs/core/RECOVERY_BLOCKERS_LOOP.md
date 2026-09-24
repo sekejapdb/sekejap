@@ -41,8 +41,8 @@ The six identity tests specifically verify that:
 
 The broader `recovery_faults` integration suite was first attempted in the
 macOS sandbox, where its fixture allocator could not create
-`<scratch>`. That attempt stopped during fixture
-setup and was not recovery evidence. The server resume below supersedes this
+`<artifact dir>/test-tmp`. That attempt stopped during fixture
+setup and was not recovery evidence. The Linux resume below supersedes this
 specific deferral. The page-WAL pilot remains isolated from the collection
 engine, and release fixtures across binaries are still required.
 
@@ -50,7 +50,7 @@ No benchmark, interface, or multimodel-index work was included in this loop.
 
 ## Linux resume evidence — 2026-09-16
 
-server Job `e4-recovery-tests-20260915-v4` completed with `FINAL_EXIT=0` from
+A Kubernetes benchmark server job completed with `FINAL_EXIT=0` from
 tested source archive SHA-256
 `9729f1b5b72afff0bba0056700bedb91692f747793ba387644dcb509c02f8153`.
 Both the default build and `compact-cells,sqlite-balance` build passed all six

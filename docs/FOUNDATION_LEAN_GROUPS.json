@@ -147,8 +147,8 @@
         "kernel",
         "io"
       ],
-      "coverage": "Typed round trips, opt-in timestamps, reopen and platform isolation; runnable on Pi; typed collection tests now exercise the integrated page-WAL store rather than the inherited kernel Store (collection_pagewal), including resource-policy (E4LIMIT1) enforcement and schema-layout evolution",
-      "remaining": "Bulk import, late indexing and indexed live writes remain pending; device (Pi/app-scale) qualification of the integrated path is untested in this lean group"
+      "coverage": "Typed round trips, opt-in timestamps, reopen and platform isolation; runnable on ARM device; typed collection tests now exercise the integrated page-WAL store rather than the inherited kernel Store (collection_pagewal), including resource-policy (E4LIMIT1) enforcement and schema-layout evolution",
+      "remaining": "Bulk import, late indexing and indexed live writes remain pending; device-scale qualification of the integrated path is untested in this lean group"
     },
     {
       "law": 8,

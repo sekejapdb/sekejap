@@ -348,10 +348,7 @@ fn arm_space(
     Ok(out)
 }
 pub(super) fn run(args: &[String]) -> Result<()> {
-    let root = Path::new(args.first().ok_or("missing run directory")?);
-    if !root.starts_with("<scratch>") {
-        return Err("data must stay on scratch".into());
-    }
+    let root = &artifact_root(args.first())?;
     let sizes = if let Some(n) = args.get(1) {
         vec![n.parse::<u64>()?]
     } else {

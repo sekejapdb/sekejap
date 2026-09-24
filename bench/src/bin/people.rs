@@ -1,4 +1,5 @@
-//! Streaming, three-arm population benchmark. Database artifacts stay on scratch.
+//! Streaming, three-arm population benchmark. Database artifacts go under the
+//! directory named by `SEKEJAP_BENCH_ROOT` (default: the system temp dir).
 use sekejap_core::*;
 use kernel::{
     io::IoMode,
@@ -449,7 +450,10 @@ fn main() -> Result<()> {
     if n == 0 {
         return Err("rows must be positive".into());
     }
-    let root = PathBuf::from(format!("<scratch>", now()));
+    let base = std::env::var_os("SEKEJAP_BENCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let root = base.join(format!("people-{n}-{}", now()));
     fs::create_dir(&root)?;
     let tmp = root.join("tmp");
     fs::create_dir(&tmp)?;

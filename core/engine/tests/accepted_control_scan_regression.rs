@@ -7,8 +7,10 @@ fn accepted_control_scan_matches_point_reads_after_six_mixed_rounds() {
     use kernel::{btree::BTree, budget::MemoryBudget, io::open_recovery_source,
         meta::Meta, pool::BufferPool};
     use std::{cell::Cell, path::PathBuf, sync::Arc};
-    let path = std::env::var_os("E4_CONTROL_FIXTURE").map(PathBuf::from).unwrap_or_else(||
-        PathBuf::from("<scratch>"));
+    let Some(path) = std::env::var_os("E4_CONTROL_FIXTURE").map(PathBuf::from) else {
+        eprintln!("skipping: set E4_CONTROL_FIXTURE to the retained qualification database directory");
+        return;
+    };
     let pool = BufferPool::new(open_recovery_source(&path.join("data")).unwrap().into(),
         Arc::new(MemoryBudget::new(8 << 20)), 2048).unwrap();
     let meta = Meta::read_latest(&pool).unwrap();

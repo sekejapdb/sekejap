@@ -12,7 +12,7 @@ measured against.
 FROZEN REFERENCES. Postgres and SQLite are CONSTANTS of this battery: they
 are not being changed by the work under measurement, so rerunning them per
 E4 pass measures the same two engines again. A run of
-`<scratch>` holds `pg-50k.json` and
+`$SEKEJAP_BENCH_ROOT/bench50k/frozen` (or `--frozen <dir>`) holds `pg-50k.json` and
 `sqlite-50k.json` with a `README.md` and a `manifest.json` recording the
 date, the engine versions, the machine, the corpus SHA-256 and the exact
 commands that produced them. An invocation that names no postgres and no
@@ -61,6 +61,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 
 
 UNIT_MS = "ms"
@@ -78,8 +79,11 @@ HEADLINE_RECALL = 0.95
 # Where the frozen Postgres and SQLite references live, and what they are
 # called inside it. Postgres and SQLite are constants of this battery; an E4
 # pass compares against these instead of rerunning two engines that did not
-# change. Overridable with --frozen.
-FROZEN_DIR = "<scratch>"
+# change. Rooted at SEKEJAP_BENCH_ROOT (default: the system temp dir);
+# overridable with --frozen.
+FROZEN_DIR = os.path.join(
+    os.environ.get("SEKEJAP_BENCH_ROOT", tempfile.gettempdir()), "bench50k", "frozen"
+)
 FROZEN_FILES = {"postgres": "pg-50k.json", "sqlite": "sqlite-50k.json"}
 FROZEN_MANIFEST = "manifest.json"
 

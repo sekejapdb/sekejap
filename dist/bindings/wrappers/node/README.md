@@ -24,8 +24,8 @@ before). Two reasons:
    the sekejap shared library at `require()` time. There is no `cargo build`,
    no `node-gyp`, and no per-Node-ABI addon to rebuild — the wrapper itself
    is pure JS, and only `libsekejap.{dylib,so,dll}` is platform-specific.
-2. **`node-ffi-napi`/`ref-napi` are gone.** They were the other candidate the
-   brief named, but `node-ffi-napi` is unpublished from the npm registry
+2. **`node-ffi-napi`/`ref-napi` are gone.** They were the other candidate
+   considered, but `node-ffi-napi` is unpublished from the npm registry
    (`npm view node-ffi-napi` → 404) and its `ref-napi` dependency compiles a
    native addon of its own — the opposite of what "no native build" needs.
    koffi is the smaller, actively maintained port: one dependency, prebuilt,
@@ -168,7 +168,7 @@ on that ORM. All of it is gone:
   `TEXT PRIMARY KEY` column — see `lang/src/compile/ddl.rs`: names starting
   with `_` are reserved in `CREATE TABLE`).
 - **`test.cjs`, `test_prepared.cjs`, `bench.cjs`** — kept as a single
-  `test.cjs` (every leg wrapper-common's brief names: open, create,
+  `test.cjs` (every leg of the common wrapper checklist: open, create,
   put/get, a parameterized query, scan, prepare+rebind, link+neighbours,
   tx commit/rollback, count_rows, an error path, close) and a rewritten
   `bench.cjs` (same shape, `Db.get` instead of a SQL SELECT by `_key`,
@@ -186,7 +186,7 @@ a function`).
 ## Tests
 
 ```sh
-export SEKEJAP_LIB_DIR=<scratch>   # or SEKEJAP_LIB_PATH
+export SEKEJAP_LIB_DIR=/path/to/libsekejap   # or SEKEJAP_LIB_PATH
 npm install
 npm test
 npm run bench     # optional

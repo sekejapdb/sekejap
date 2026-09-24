@@ -1,6 +1,6 @@
 # VECTOR10K — 10,000 rows × 4,096 dimensions, seven arms
 
-Generated 2026-09-22T14:14:09Z on <host> · sekejap commit `c933e5d` · PostgreSQL 16.15 (Debian 16.15-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+Generated 2026-09-22T14:14:09Z · sekejap commit `c933e5d` · PostgreSQL 16.15 (Debian 16.15-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
 
 ## Read this before the table
 

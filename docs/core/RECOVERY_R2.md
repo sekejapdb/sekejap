@@ -88,8 +88,8 @@ not published over the source or merged automatically into R1's verified subset.
 
 ```sh
 cargo build --release --offline --features sqlite-balance,compact-cells --bin recover
-target/release/recover schema <scratch> <scratch>
-target/release/recover verify <scratch>
+target/release/recover schema <artifact dir>/SOURCE <artifact dir>/NEW_SCHEMA_RESULT
+target/release/recover verify <artifact dir>/NEW_SCHEMA_RESULT
 ```
 
 The result contains `layouts/`, `records.raw`, `unresolved.raw`,
@@ -117,13 +117,13 @@ derived export rather than the authoritative raw evidence.
 
 Retained evidence:
 
-- `<scratch>/`: damaged fixtures, independent
+- `<artifact dir>/schema-r2-10000-40000/`: damaged fixtures, independent
   fixture oracles and initial library exports.
-- `<scratch>`: all eight command runs,
+- `<artifact dir>/schema-r2-cli/results.json`: all eight command runs,
   source hashes and verification. Use these result directories with the current
   verification command. The run also flipped an export byte, confirmed rejection,
   restored it and successfully reverified.
-- `<scratch>`: three guards
+- `<artifact dir>/schema-r2-mutations/results.json`: three guards
   disabled separately; all caused the intended runtime test failure. Original
   sources were restored after each run.
 
@@ -137,7 +137,7 @@ resource limits, archive corruption/bounds and replacement codec policy.
 The full feature-enabled workspace passed **291 tests, 0 failures, 0 ignored**
 (`recovery-r2-workspace.log`). The 7 schema and 14 R1 recovery tests also passed
 with default features (`recovery-r2-default.log`). Logs are under
-`<scratch>/`. Three mutation checks caught disabled descriptor
+`<artifact dir>/`. Three mutation checks caught disabled descriptor
 CRC, conflict handling and whole-overflow-value CRC checks. The prior engine's source remains untouched.
 
 **Normal storage tax added by R2: 0 bytes.** Existing descriptor payload in

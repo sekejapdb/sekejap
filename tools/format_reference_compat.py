@@ -83,8 +83,9 @@ def new_artifact_path(path):
     # creating even an intermediate parent directory.
     path = path.resolve(strict=False)
     assert not path.exists(), f"refusing to replace existing artifact: {path}"
-    if sys.platform == "darwin":
-        assert path.is_relative_to(Path("<scratch>")), "Mac database artifacts must be on scratch"
+    root = os.environ.get("SEKEJAP_BENCH_ROOT")
+    if root:
+        assert path.is_relative_to(Path(root).resolve()), "database artifacts must be under SEKEJAP_BENCH_ROOT"
     return path
 
 

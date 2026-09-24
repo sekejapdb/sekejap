@@ -2,20 +2,20 @@
   "version": "F1",
   "prototype": "stable-page page-image WAL",
   "production_promotable": false,
-  "verdict": "Retain optional compact ordinary cells and bounded existing-neighbor redistribution for repeatable density improvement after full Pi/server suites and 162 exact benchmark arms pass. Fresh 400K mixed speed improvements are 4.1% Pi and 7.0% server, not the earlier 17%/10% claim. The 100K scattered size case is now within 1.10x SQLite; scattered latency, resize, reader progress, repair and typed page-WAL integration remain open. server allocated-space sampling reaches 2.387x loaded size for compact E4 despite logical peaks near 1.14x: physical allocation admission is not proven. No whole-engine promotion. See NATIVE_REQUALIFICATION.md.",
+  "verdict": "Retain optional compact ordinary cells and bounded existing-neighbor redistribution for repeatable density improvement after full ARM device/Linux server suites and 162 exact benchmark arms pass. Fresh 400K mixed speed improvements are 4.1% ARM device and 7.0% Linux server, not the earlier 17%/10% claim. The 100K scattered size case is now within 1.10x SQLite; scattered latency, resize, reader progress, repair and typed page-WAL integration remain open. Linux server allocated-space sampling reaches 2.387x loaded size for compact E4 despite logical peaks near 1.14x: physical allocation admission is not proven. No whole-engine promotion. See NATIVE_REQUALIFICATION.md.",
   "laws": [
     {
       "id": "L1-MEM",
       "law": 1,
       "status": "PENDING",
-      "passed": "8MiB ordinary cache, 16MiB WAL bound, persisted disk cap and eight-snapshot admission; Pi benchmark arms under 128MiB address-space limit",
+      "passed": "8MiB ordinary cache, 16MiB WAL bound, persisted disk cap and eight-snapshot admission; ARM device benchmark arms under 128MiB address-space limit",
       "remaining": "Aggregate cache/index/allocator accounting; complete record/reader policy and repair-resource admission"
     },
     {
       "id": "L2-WORK",
       "law": 2,
       "status": "FAIL",
-      "passed": "Fixed 1000-operation insert/update/delete ladder: 10K/100K/1M three rotations and 10M single confirmation on Mac/Pi; exact streamed state oracles and data/WAL issued-I/O counters. Local work is approximately stable; no whole-database complexity claim.",
+      "passed": "Fixed 1000-operation insert/update/delete ladder: 10K/100K/1M three rotations and 10M single confirmation on Mac/ARM device; exact streamed state oracles and data/WAL issued-I/O counters. Local work is approximately stable; no whole-database complexity claim.",
       "remaining": "Scattered insertion shows repeated latency and issued-I/O growth; strict flat-latency law is not met. Diagnose packing/cache/tree costs without relaxing the law. See FOUNDATION_SCALING.md."
     },
     {
@@ -29,28 +29,28 @@
       "id": "L4-COST",
       "law": 4,
       "status": "PASS",
-      "passed": "Explicit source/binaries, layer, timings, peaks, native sync settings, Pi RSS and named limitations",
+      "passed": "Explicit source/binaries, layer, timings, peaks, native sync settings, ARM device RSS and named limitations",
       "remaining": "No full-engine qualification implied"
     },
     {
       "id": "L5-DAMAGE",
       "law": 5,
       "status": "FAIL",
-      "passed": "Independent read-only scan and committed WAL overlay; current/candidate separation; leaf/overflow/root/meta/free fixtures; exact source preservation and verified 100K repair on Mac/Pi Expected frame CRC rejects checksum-valid stale WAL versions; red/green snapshot and checkpoint regression.",
+      "passed": "Independent read-only scan and committed WAL overlay; current/candidate separation; leaf/overflow/root/meta/free fixtures; exact source preservation and verified 100K repair on Mac/ARM device Expected frame CRC rejects checksum-valid stale WAL versions; red/green snapshot and checkpoint regression.",
       "remaining": "Corrupt-WAL-region salvage currently refuses; rootless current-membership proof, typed schema dependencies, truncation/unreadable-extent and full mutation/fault corpus remain open"
     },
     {
       "id": "L6-READ",
       "law": 6,
       "status": "PENDING",
-      "passed": "Old/new functional snapshots, bounded admission, persisted-cap refusal, short-reader sustained progress under 2x on Mac/Pi",
+      "passed": "Old/new functional snapshots, bounded admission, persisted-cap refusal, short-reader sustained progress under 2x on Mac/ARM device",
       "remaining": "Cross-process readers, zero-coordination/latency/I/O regression gate; surviving reader still prevents replacement writer opening"
     },
     {
       "id": "L7-DEVICE",
       "law": 7,
       "status": "PENDING",
-      "passed": "Mac/Pi raw-KV load, live writes, reopen and sustained churn",
+      "passed": "Mac/ARM device raw-KV load, live writes, reopen and sustained churn",
       "remaining": "Complete typed collection integration; bulk and indexed live writes/late indexing remain pending"
     },
     {
@@ -113,7 +113,7 @@
     {
       "id": "W-CAP",
       "status": "PENDING",
-      "remaining": "Mac/Pi 10K/40K/100K update-only none/held/whole-round/5K-rolling cases measured, 48 arms; full mixed/resize/batch/allocated-space matrix remains pending"
+      "remaining": "Mac/ARM device 10K/40K/100K update-only none/held/whole-round/5K-rolling cases measured, 48 arms; full mixed/resize/batch/allocated-space matrix remains pending"
     },
     {
       "id": "W-REPAIR",
@@ -141,7 +141,7 @@
       "state_comparisons": 76,
       "tests": "129 kernel + 11 pilot test entries (one subprocess helper)"
     },
-    "Pi": {
+    "ARM device": {
       "arms": 18,
       "state_comparisons": 42,
       "tests": "11 pilot test entries; four deliberate child exits; no full kernel suite this run"
@@ -255,7 +255,7 @@
         "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
       }
     ],
-    "Pi": [
+    "ARM device": [
       {
         "case": "load-100k",
         "time_target": "PASS",
@@ -341,7 +341,7 @@
         "evidence": "FOUNDATION_SCALING_RESULTS.json; worst separately timed insert/update/delete phase; 1000 changes each. 10M is diagnostic."
       }
     ],
-    "Pi native requalification": [
+    "ARM device native requalification": [
       {
         "case": "fixed-10000-local",
         "time_target": "PASS",
@@ -451,7 +451,7 @@
         "evidence": "Three rotations; raw KV; docs/NATIVE_REQUALIFICATION_RESULTS.json"
       }
     ],
-    "server native requalification": [
+    "Linux server native requalification": [
       {
         "case": "fixed-10000-local",
         "time_target": "FAIL",
@@ -566,12 +566,12 @@
     {
       "id": "CONTROL-SCAN",
       "status": "FAIL",
-      "remaining": "Unresolved; earlier failed endpoints differ by one stale checksum-valid page with matching parent pointers. A follow-up independently reproduces stale buffered I/O on Mac/scratch using C without E4; identical Pi/server C controls pass. Concurrent instrumented E4 also catches read-versus-last-write mismatches. This establishes an external I/O failure class, not the exact cause of every historical failure. Requalify the frozen candidate on native storage; do not declare the older Store fixed. See SCAN_IO_ISOLATION.md. Full corrected baseline/candidate workspace suites and 200K/800K exact shuffled oracles now pass on both Linux hosts. Historical Mac causality and post-reboot Mac I/O qualification remain separate; do not infer that every old failure is resolved."
+      "remaining": "Unresolved; earlier failed endpoints differ by one stale checksum-valid page with matching parent pointers. A follow-up independently reproduces stale buffered I/O on the Mac scratch volume using C without E4; identical ARM device/Linux server C controls pass. Concurrent instrumented E4 also catches read-versus-last-write mismatches. This establishes an external I/O failure class, not the exact cause of every historical failure. Requalify the frozen candidate on native storage; do not declare the older Store fixed. See SCAN_IO_ISOLATION.md. Full corrected baseline/candidate workspace suites and 200K/800K exact shuffled oracles now pass on both Linux hosts. Historical Mac causality and post-reboot Mac I/O qualification remain separate; do not infer that every old failure is resolved."
     },
     {
       "id": "ALLOC-CAP",
       "status": "FAIL",
-      "remaining": "server overlayfs reports candidate allocated peak 263061504 bytes from 110202880 loaded bytes (2.387x); baseline and SQLite also exceed 2x. Logical admission is not a proven filesystem/physical allocation bound. Pi measured peaks remain about 1.14x. Identify allocation semantics and qualify a genuine disk-full budget before claiming the 2x physical guarantee. Follow-up controls identify unwritten XFS extents beyond EOF beneath the server OverlayFS PVC. Batched explicit reservation around unchanged E4 cuts fresh worst sampled allocation from 263716864 to 126877696 bytes; its median mutation times remain below 1.5x SQLite on both Linux hosts. This diagnostic does not account reservation against the engine cap: a 4096-byte file receives 1048576 allocated bytes. No runtime change; integrate bounded reservation admission and validate refusal/recovery plus any required filesystem allocation boundary before claiming a physical guarantee. See ALLOCATION_LOOP.md."
+      "remaining": "The Linux server's overlayfs reports candidate allocated peak 263061504 bytes from 110202880 loaded bytes (2.387x); baseline and SQLite also exceed 2x. Logical admission is not a proven filesystem/physical allocation bound. ARM device measured peaks remain about 1.14x. Identify allocation semantics and qualify a genuine disk-full budget before claiming the 2x physical guarantee. Follow-up controls identify unwritten XFS extents beyond EOF beneath the Linux server's OverlayFS volume. Batched explicit reservation around unchanged E4 cuts fresh worst sampled allocation from 263716864 to 126877696 bytes; its median mutation times remain below 1.5x SQLite on both Linux hosts. This diagnostic does not account reservation against the engine cap: a 4096-byte file receives 1048576 allocated bytes. No runtime change; integrate bounded reservation admission and validate refusal/recovery plus any required filesystem allocation boundary before claiming a physical guarantee. See ALLOCATION_LOOP.md."
     }
   ],
   "qualification_v2": {
@@ -648,7 +648,7 @@
           "sha256": "b0f60f967adba91b0b13050b529b1c20e47f3bc27ae42f8370f91f701949926e"
         }
       },
-      "Pi": {
+      "ARM device": {
         "arms": {
           "pagewal-v2": {
             "mutation_seconds": 74.00348541,
