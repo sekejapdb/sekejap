@@ -1104,3 +1104,187 @@ fn terminate_closes_the_session_and_rolls_back_a_transaction_still_open() {
         "a close is not a commit: the open batch rolled back"
     );
 }
+
+// ── geometry I/O ─────────────────────────────────────────────────────────
+
+/// The raw bytes of each cell of a `DataRow`: a binary `bytea` is not text.
+fn raw_cells(frame: &Frame) -> Vec<Option<Vec<u8>>> {
+    let count = i16::from_be_bytes([frame.body[0], frame.body[1]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut at = 2usize;
+    for _ in 0..count {
+        let len = i32::from_be_bytes(frame.body[at..at + 4].try_into().unwrap());
+        at += 4;
+        if len < 0 {
+            out.push(None);
+            continue;
+        }
+        out.push(Some(frame.body[at..at + len as usize].to_vec()));
+        at += len as usize;
+    }
+    out
+}
+
+fn geometry_service() -> Fixture {
+    let dir = TempDir::new().expect("a temp dir");
+    let path = dir.path().join("db");
+    {
+        use sekejap_lang::SqlDatabase;
+        let mut db = Database::create(&path, config()).expect("create");
+        db.sql("CREATE TABLE shape (g GEOMETRY(Point,4326))", &[])
+            .expect("create");
+        db.sql(
+            "INSERT INTO shape (_key, g) VALUES ('a', ST_GeomFromText('POINT(1 2)', 4326))",
+            &[],
+        )
+        .expect("insert");
+        db.commit().expect("commit");
+    }
+    let service = ServiceDatabase::open(&path, config()).expect("open service");
+    service.set_publish_interval(Duration::ZERO);
+    Fixture { _dir: dir, service }
+}
+
+/// PostGIS's bytes for `POINT(1 2)` in NDR WKB.
+const POINT_1_2_NDR: &str = "0101000000000000000000f03f0000000000000040";
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+        .collect()
+}
+
+/// QGIS reads a layer as `ST_AsBinary(geom, 'NDR')` through a BINARY
+/// result, so the column is described as `bytea` before the first row and
+/// the cell is the WKB itself. A text result is PostgreSQL's hex form.
+#[test]
+fn st_asbinary_is_a_bytea_column_raw_in_binary_and_hex_in_text() {
+    let fixture = geometry_service();
+    let mut connection = connect(&fixture.service, 1);
+
+    let mut batch = parse_message("g1", "SELECT ST_AsBinary(g, 'NDR') FROM shape", &[]);
+    batch.extend_from_slice(&describe_message(b'S', "g1"));
+    batch.extend_from_slice(&bind_message("q1", "g1", &[], &[1]));
+    batch.extend_from_slice(&execute_message("q1", 0));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    let description = first(&got, b'T').expect("RowDescription");
+    assert_eq!(columns(description)[0].1, oid::BYTEA);
+    let row = got.iter().find(|f| f.typ == b'D').expect("a row");
+    assert_eq!(
+        raw_cells(row)[0].as_deref(),
+        Some(unhex(POINT_1_2_NDR).as_slice())
+    );
+
+    let got = ask(&mut connection, "SELECT ST_AsBinary(g) FROM shape");
+    assert_eq!(columns(first(&got, b'T').unwrap())[0].1, oid::BYTEA);
+    assert_eq!(rows_of(&got)[0][0], Some(format!("\\x{POINT_1_2_NDR}")));
+}
+
+/// QGIS writes an edited shape as `ST_GeomFromWKB($n::bytea, 4326)`. A
+/// `bytea` parameter arrives either as hex text or, in binary format, as the
+/// bytes; both store the same point.
+#[test]
+fn a_bytea_parameter_writes_a_shape_in_text_and_in_binary_format() {
+    let fixture = geometry_service();
+    let mut connection = connect(&fixture.service, 1);
+    let sql = "INSERT INTO shape (_key, g) VALUES ($1, ST_GeomFromWKB($2::bytea, 4326))";
+
+    let hex = format!("\\x{POINT_1_2_NDR}");
+    let mut batch = parse_message("w1", sql, &[oid::TEXT, oid::BYTEA]);
+    batch.extend_from_slice(&bind_message(
+        "",
+        "w1",
+        &[Some(b"t"), Some(hex.as_bytes())],
+        &[],
+    ));
+    batch.extend_from_slice(&execute_message("", 0));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(
+        first(&got, b'E').is_none(),
+        "{:?}",
+        first(&got, b'E').map(error_fields)
+    );
+
+    // The same statement with the WKB in BINARY format.
+    let wkb = unhex(POINT_1_2_NDR);
+    let mut body = Vec::new();
+    cstring(&mut body, "");
+    cstring(&mut body, "w1");
+    body.extend_from_slice(&2i16.to_be_bytes()); // two parameter formats
+    body.extend_from_slice(&0i16.to_be_bytes()); // $1 text
+    body.extend_from_slice(&1i16.to_be_bytes()); // $2 binary
+    body.extend_from_slice(&2i16.to_be_bytes());
+    for param in [b"b".as_slice(), wkb.as_slice()] {
+        body.extend_from_slice(&(param.len() as i32).to_be_bytes());
+        body.extend_from_slice(param);
+    }
+    body.extend_from_slice(&0i16.to_be_bytes());
+    let mut batch = framed(b'B', &body);
+    batch.extend_from_slice(&execute_message("", 0));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert!(
+        first(&got, b'E').is_none(),
+        "{:?}",
+        first(&got, b'E').map(error_fields)
+    );
+
+    let got = ask(&mut connection, "SELECT _key, ST_AsText(g) FROM shape");
+    let rows = rows_of(&got);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    for row in rows {
+        assert_eq!(row[1], Some("POINT(1 2)".to_owned()), "{row:?}");
+    }
+}
+
+/// A layer outside `public`, spelled the way QGIS spells it: quoted, and
+/// qualified by its schema, found through `geometry_columns` first.
+#[test]
+fn a_layer_in_a_named_schema_is_found_and_drawn_through_the_wire() {
+    let fixture = geometry_service();
+    let mut connection = connect(&fixture.service, 1);
+    for statement in [
+        "CREATE SCHEMA gis",
+        "CREATE TABLE gis.parcels (shape GEOMETRY(Polygon,4326))",
+        "INSERT INTO gis.parcels (_key, shape) VALUES ('p1', ST_GeomFromText('POLYGON((0 0,1 0,1 1,0 1,0 0))', 4326))",
+    ] {
+        let got = ask(&mut connection, statement);
+        assert!(first(&got, b'E').is_none(), "`{statement}`: {:?}", first(&got, b'E').map(error_fields));
+    }
+    let got = ask(
+        &mut connection,
+        "SELECT f_table_schema, f_table_name, srid FROM geometry_columns WHERE f_table_schema = 'gis'",
+    );
+    assert_eq!(
+        rows_of(&got),
+        vec![vec![Some("gis".to_owned()), Some("parcels".to_owned()), Some("4326".to_owned())]]
+    );
+    let got = ask(
+        &mut connection,
+        "SELECT ST_AsBinary(\"shape\", 'NDR') FROM \"gis\".\"parcels\" WHERE \"shape\" && ST_MakeEnvelope(-1, -1, 2, 2, 4326)",
+    );
+    assert_eq!(columns(first(&got, b'T').unwrap())[0].1, oid::BYTEA);
+    assert_eq!(rows_of(&got).len(), 1);
+}
+
+/// The canvas query: `&&` against the envelope QGIS is drawing.
+#[test]
+fn the_canvas_query_answers_through_the_wire() {
+    let fixture = geometry_service();
+    let mut connection = connect(&fixture.service, 1);
+    let got = ask(
+        &mut connection,
+        "SELECT ST_AsBinary(g, 'NDR') FROM shape WHERE g && ST_MakeEnvelope(0, 0, 5, 5, 4326)",
+    );
+    assert_eq!(rows_of(&got).len(), 1);
+    let got = ask(
+        &mut connection,
+        "SELECT ST_AsBinary(g, 'NDR') FROM shape WHERE g && ST_MakeEnvelope(10, 10, 15, 15, 4326)",
+    );
+    assert_eq!(rows_of(&got).len(), 0);
+    let got = ask(&mut connection, "SELECT postgis_version()");
+    assert!(rows_of(&got)[0][0].as_deref().unwrap().starts_with("3.4 "));
+}

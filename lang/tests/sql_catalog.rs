@@ -1050,8 +1050,7 @@ fn show_create_table_prints_ddl_that_names_every_column_and_index() {
 #[test]
 fn a_schema_qualified_name_resolves_to_the_one_thing_it_can_mean() {
     let (_dir, mut db) = open();
-    // `public.t` IS `t`: there is one user schema (CREATE SCHEMA is Tier 2),
-    // so the qualifier is read and dropped.
+    // `public.t` IS `t`: a bare name resolves in `public`.
     let (_, qualified) = rows(&mut db, "SELECT _key FROM public.place");
     let (_, bare) = rows(&mut db, "SELECT _key FROM place");
     assert_eq!(qualified, bare);
@@ -1217,14 +1216,6 @@ fn a_pg_catalog_relation_this_surface_does_not_have_is_refused_by_name() {
         }
         assert!(!reason.is_empty(), "`{name}` has no reason in the list");
     }
-    // postgis_version() is refused for the same rule and says what it is
-    // waiting on, because a version string for an absent library is read as
-    // a promise that the library answers.
-    let error = refuse(&mut db, "SELECT _id FROM place WHERE postgis_version");
-    assert!(
-        format!("{error}").contains("p3-geometry-io"),
-        "{error}"
-    );
 }
 
 #[test]

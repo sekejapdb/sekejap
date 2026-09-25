@@ -5,7 +5,26 @@ impl Parser {
     pub(super) fn create(&mut self) -> SqlResult2<Stmt> {
         self.expect_word("CREATE")?;
         match self.word().as_deref() {
-            Some("SCHEMA") => Err(refuse::refuse("CREATE SCHEMA")),
+            Some("SCHEMA") => {
+                self.bump();
+                let if_not_exists = if self.eat_word("IF") {
+                    self.expect_word("NOT")?;
+                    self.expect_word("EXISTS")?;
+                    true
+                } else {
+                    false
+                };
+                let name = self.name()?;
+                if self.word().as_deref() == Some("AUTHORIZATION") {
+                    return Err(SqlError::unsupported(
+                        "CREATE SCHEMA ... AUTHORIZATION: there are no roles; the process that opened the file is the only user",
+                    ));
+                }
+                Ok(Stmt::CreateSchema {
+                    name,
+                    if_not_exists,
+                })
+            }
             Some("VIEW") | Some("MATERIALIZED") => Err(refuse::refuse("CREATE VIEW")),
             Some("TRIGGER") => Err(refuse::refuse("CREATE TRIGGER")),
             Some("PROPERTY") => Err(refuse::refuse("CREATE PROPERTY GRAPH")),
@@ -33,7 +52,7 @@ impl Parser {
         } else {
             false
         };
-        let table = self.name()?;
+        let table = self.table_name()?;
         self.expect(&Tok::LParen)?;
         let mut columns = Vec::new();
         loop {
@@ -365,7 +384,7 @@ impl Parser {
                 "ALTER TABLE ONLY: there is no inheritance here, so ONLY names a distinction the catalog has not got",
             ));
         }
-        let table = self.name()?;
+        let table = self.table_name()?;
         let action = self.alter_action()?;
         if self.eat(&Tok::Comma) {
             return Err(SqlError::unsupported(
@@ -573,7 +592,7 @@ impl Parser {
             Some(self.name()?)
         };
         self.expect_word("ON")?;
-        let table = self.name()?;
+        let table = self.table_name()?;
         // `CREATE INDEX i ON t (lower(col))` -- an EXPRESSION index, written
         // the way Postgres writes one. `USING btree (lower(col))` is the same
         // index with the method spelled out (QL_CONTRACT §4.1).
@@ -779,7 +798,7 @@ impl Parser {
             "TABLE" => {
                 self.bump();
                 let if_exists = self.if_exists()?;
-                let table = self.name()?;
+                let table = self.table_name()?;
                 // Postgres spells the two behaviours this way and RESTRICT is
                 // its default too; here the restriction is graph edges rather
                 // than foreign keys (GRAPH_CONTRACT 6.1).
@@ -800,6 +819,18 @@ impl Parser {
                 let if_exists = self.if_exists()?;
                 let name = self.name()?;
                 Ok(Stmt::DropIndex { name, if_exists })
+            }
+            "SCHEMA" => {
+                self.bump();
+                let if_exists = self.if_exists()?;
+                let name = self.name()?;
+                if self.eat_word("CASCADE") {
+                    return Err(SqlError::unsupported(
+                        "DROP SCHEMA ... CASCADE: each table is its own bounded, resumable drop, so drop them with DROP TABLE and then the schema; one statement would hide a partial removal",
+                    ));
+                }
+                let _ = self.eat_word("RESTRICT");
+                Ok(Stmt::DropSchema { name, if_exists })
             }
             other => Err(SqlError::unsupported(format!(
                 "DROP {other}: DROP TABLE and DROP INDEX are the catalog's own"

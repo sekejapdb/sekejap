@@ -108,7 +108,7 @@ mod refuse;
 
 use sekejap_core::collections::{
     CollectionId, Database, EntityId, Error, OrderValue, PreparedAggregate, PreparedQuery,
-    ProjectedValue, QueryBudget, QueryError, QueryPage, QueryWork,
+    ProjectedValue, QueryBudget, QueryError, QueryPage, QueryWork, PUBLIC_SCHEMA,
 };
 use serde_json::Value;
 use std::fmt;
@@ -412,6 +412,19 @@ impl PreparedSql {
             }
             compile::Plan::Rows(rows) => &rows.columns,
             _ => &[],
+        }
+    }
+
+    /// The SQL type of column `at` when a row function decides it -- `BYTEA`
+    /// for `ST_AsBinary`, `FLOAT8` for `ST_X` -- and `None` when the column
+    /// is a declared field (whose type the catalog holds) or text. A wire
+    /// describes a result with this before any row exists.
+    pub fn column_type(&self, at: usize) -> Option<&'static str> {
+        match &self.plan {
+            compile::Plan::Select(select) | compile::Plan::Explain(select) => {
+                select.column_type(at)
+            }
+            _ => None,
         }
     }
 
@@ -977,7 +990,54 @@ impl RunWork {
 
 /// The collection a name refers to, or an error that names it.
 pub(crate) fn collection(db: &Database, name: &str) -> SqlResult2<CollectionId> {
-    db.collection(name)
-        .map_err(SqlError::from)?
-        .ok_or_else(|| SqlError::engine(format!("no collection named `{name}`")))
+    find(db, name)?.ok_or_else(|| {
+        SqlError::engine(format!("no collection named `{}`", shown_table(name)))
+    })
+}
+
+/// A table name as the parser records it: bare for a table in `public`, and
+/// `schema` NUL `table` for one in a named schema. NUL cannot occur in a
+/// PostgreSQL identifier, so no written name can be mistaken for a
+/// qualified one -- a quoted `"a.b"` is the table `a.b` in `public`.
+pub(crate) const SCHEMA_SEPARATOR: char = '\u{0}';
+
+/// `schema.table`, as the parser records it.
+pub(crate) fn qualified(schema: &str, table: String) -> String {
+    if schema.eq_ignore_ascii_case(PUBLIC_SCHEMA) {
+        table
+    } else {
+        format!("{schema}{SCHEMA_SEPARATOR}{table}")
+    }
+}
+
+/// `(schema, table)` of a recorded name.
+pub(crate) fn split_table(name: &str) -> (&str, &str) {
+    name.split_once(SCHEMA_SEPARATOR)
+        .unwrap_or((PUBLIC_SCHEMA, name))
+}
+
+/// A recorded name as a statement would write it: `table`, or
+/// `schema.table`.
+pub(crate) fn shown_table(name: &str) -> String {
+    match name.split_once(SCHEMA_SEPARATOR) {
+        Some((schema, table)) => format!("{schema}.{table}"),
+        None => name.to_owned(),
+    }
+}
+
+/// The stem a generated index name starts with. Index names are one
+/// namespace across the whole database here, so a table in a named schema
+/// carries its schema into the name: `sales_orders_total_btree` beside
+/// `orders_total_btree`.
+pub(crate) fn index_stem(name: &str) -> String {
+    match name.split_once(SCHEMA_SEPARATOR) {
+        Some((schema, table)) => format!("{schema}_{table}"),
+        None => name.to_owned(),
+    }
+}
+
+/// The collection a recorded name refers to, if there is one.
+pub(crate) fn find(db: &Database, name: &str) -> SqlResult2<Option<CollectionId>> {
+    let (schema, table) = split_table(name);
+    db.collection_in(schema, table).map_err(SqlError::from)
 }

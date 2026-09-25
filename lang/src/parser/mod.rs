@@ -11,6 +11,7 @@ use super::functions::{self, TimeUnit};
 use super::lexer::{tokenize, Tok, Token};
 use super::refuse;
 use super::{SqlError, SqlResult2};
+use sekejap_core::spatial_io::ByteOrder;
 use sekejap_core::Kind;
 
 /// The §4.1 / §4.2 function names this parser reads as ROW functions or, in a
@@ -43,6 +44,33 @@ const ROW_FUNCTIONS: &[&str] = &[
     "POSITION",
     "STRPOS",
     "STARTS_WITH",
+    // §4.4 geometry OUTPUT functions: pure translations of the row's shape.
+    "ST_ASBINARY",
+    "ST_ASEWKB",
+    "ST_ASTEXT",
+    "ST_ASEWKT",
+    "ST_ASGEOJSON",
+    "ST_X",
+    "ST_Y",
+    "ST_SRID",
+];
+
+/// The geometry CONSTRUCTORS a value position reads in `INSERT ... VALUES`
+/// and `UPDATE ... SET` (QL_CONTRACT §4.4). The same set a spatial
+/// predicate's argument reads.
+const GEO_CONSTRUCTORS: &[&str] = &[
+    "ST_MAKEPOINT",
+    "ST_POINT",
+    "ST_SETSRID",
+    "ST_MAKEENVELOPE",
+    "ST_GEOMFROMGEOJSON",
+    "ST_GEOMFROMWKB",
+    "ST_WKBTOSQL",
+    "ST_GEOMFROMEWKB",
+    "ST_GEOMFROMTEXT",
+    "ST_GEOMETRYFROMTEXT",
+    "ST_WKTTOSQL",
+    "ST_GEOMFROMEWKT",
 ];
 
 /// The reason a `LIKE` that is not a pure prefix carries. Named here because
@@ -352,37 +380,49 @@ impl Parser {
             }
         }
         if parts.len() > 2 {
-            return Err(refuse::refuse("CREATE SCHEMA"));
+            return Err(three_part_name());
         }
         Ok(parts.pop().expect("at least one name part"))
     }
 
-    /// A relation name in a `FROM`, keeping the schema qualifier when the
-    /// qualifier names one of the two catalog schemas.
+    /// A TABLE name where a statement names one: `t`, `public.t` (which is
+    /// `t`) or `schema.t`, recorded as [`super::qualified`] spells it.
+    pub(super) fn table_name(&mut self) -> SqlResult2<String> {
+        let at = self.here();
+        let first = self.name_part(at)?;
+        if !self.eat(&Tok::Dot) {
+            return no_nul(first, at);
+        }
+        let second = self.name_part(at)?;
+        if self.eat(&Tok::Dot) {
+            return Err(three_part_name());
+        }
+        Ok(super::qualified(&no_nul(first, at)?, no_nul(second, at)?))
+    }
+
+    /// A relation name in a `FROM`.
     ///
-    /// `docs/lang/QL_CONTRACT.md` §2 puts `CREATE SCHEMA` and a real schema
-    /// segment in Tier 2, so there is exactly one user schema and
-    /// `public.t` MEANS `t` -- the qualifier is read and dropped, which is
-    /// what [`Parser::name`] already did everywhere. The two exceptions are
-    /// `pg_catalog` and `information_schema`: those qualifiers SELECT a
-    /// relation rather than decorate one, and `information_schema.tables` is
-    /// not the collection `tables`, so the qualified spelling is kept and
-    /// `catalog::relation` resolves it.
+    /// `public.t` MEANS `t`, and `schema.t` is the table `t` of that named
+    /// schema, recorded as [`super::qualified`] spells it. The two catalog
+    /// schemas are the exception: `pg_catalog` and `information_schema`
+    /// SELECT a relation rather than decorate one, and
+    /// `information_schema.tables` is not the collection `tables`, so the
+    /// qualified spelling is kept and `catalog::relation` resolves it.
     fn source_name(&mut self) -> SqlResult2<String> {
         let at = self.here();
         let first = self.name_part(at)?;
         if !self.eat(&Tok::Dot) {
-            return Ok(first);
+            return no_nul(first, at);
         }
         let second = self.name_part(at)?;
         if self.eat(&Tok::Dot) {
-            return Err(refuse::refuse("CREATE SCHEMA"));
+            return Err(three_part_name());
         }
         let qualifier = first.to_ascii_lowercase();
         if qualifier == "pg_catalog" || qualifier == "information_schema" {
             return Ok(format!("{qualifier}.{second}"));
         }
-        Ok(second)
+        Ok(super::qualified(&no_nul(first, at)?, no_nul(second, at)?))
     }
 
     /// One segment of a dotted name, with the Tier-2/3 table consulted for a
@@ -585,4 +625,22 @@ fn lower(expr: PExpr) -> SqlResult2<ScoreNode> {
             ))
         }
     })
+}
+
+/// `database.schema.table`: one database per file, so there is no database
+/// to name, and a column reference with a schema in it has no table alias
+/// to resolve against.
+fn three_part_name() -> SqlError {
+    SqlError::unsupported(
+        "a three-part name: a file is one database, so a name is `table` or `schema.table`",
+    )
+}
+
+/// A name with a NUL in it: PostgreSQL refuses one, and the qualified-name
+/// spelling (`super::SCHEMA_SEPARATOR`) relies on it never occurring.
+fn no_nul(name: String, at: usize) -> SqlResult2<String> {
+    if name.contains(super::SCHEMA_SEPARATOR) {
+        return Err(SqlError::syntax("a name cannot contain NUL", at));
+    }
+    Ok(name)
 }

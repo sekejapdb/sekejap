@@ -117,9 +117,9 @@ and sekejap's contract does not mention it at any tier (none remain).
 | 52 | `ST_Distance(f, POINT(…))` as an ORDER BY term | sql.rs:3288 | DONE — `lang/src/lib.rs:62` | — |
 | 53 | `ST_Area`, `ST_Length`, `ST_Perimeter` as predicates | sql.rs:3003-3016 | CONTRACT-T2 — §4.4 (listed T1 as row fns, not in the slice grammar) | projection-expression evaluator |
 | 54 | `ST_Centroid(f)` | sql.rs:2231 | CONTRACT-T2 — §4.4 | same |
-| 55 | `ST_AsGeoJSON(f)` in the SELECT list | sql.rs:2237-2241 | CONTRACT-T2 — refuse.rs `ST_ASTEXT` family (p3-geometry-io) | — |
-| 56 | `ST_GeomFromGeoJSON('…')` inside INSERT VALUES | sql.rs:1816-1822 | DONE as a WHERE-SIDE geometry argument — `lang/src/parser/expr.rs`; `lang/tests/sql_tier1.rs` `the_four_geometry_predicates_match_the_direct_request`, `lang/tests/sql_prepared.rs` `a_geometry_predicate_rebinds_the_geometry_it_compares_against`. Inside `INSERT ... VALUES` it stays CONTRACT-T2 | an INSERT writes a geometry as its GeoJSON document today; the function form in value position needs the I/O surface (p3-geometry-io) |
-| 57 | `POINT(lon lat)` / `POLYGON((…))` literal syntax | sql.rs:2931 | CONTRACT-T2 — QL §4.4 | the `ST_GeomFromText` WKT parser (p3-geometry-io) reached without the function name; I/O only. Axis order is longitude then latitude, stated |
+| 55 | `ST_AsGeoJSON(f)` in the SELECT list | sql.rs:2237-2241 | DONE — `lang/src/compile/row.rs`; `lang/tests/sql_geometry_io.rs` `every_shape_written_as_wkb_reads_back_as_postgis_prints_it` | printed as PostGIS 3.4 prints it, 9 decimals by default |
+| 56 | `ST_GeomFromGeoJSON('…')` inside INSERT VALUES | sql.rs:1816-1822 | DONE — `lang/src/parser/dml.rs` (`value_literal`); `lang/tests/sql_geometry_io.rs` `every_writing_form_postgis_reads_stores_the_same_point` | every geometry constructor is read as a written value in `INSERT ... VALUES` and `UPDATE ... SET`, with SRID 4326 required as PostGIS requires it |
+| 57 | `POINT(lon lat)` / `POLYGON((…))` literal syntax | sql.rs:2931 | DONE as a QUOTED literal — `'POINT(lon lat)'`, `'SRID=4326;POLYGON((…))'`, hex EWKB or GeoJSON, read as PostgreSQL reads a `geometry` literal (`lang/src/compile/mod.rs::geom_from_text`); `lang/tests/sql_geometry_io.rs` `every_writing_form_postgis_reads_stores_the_same_point`. The unquoted spelling stays a syntax error, as it is in PostgreSQL | axis order longitude then latitude, stated |
 
 ### 6. Graph
 

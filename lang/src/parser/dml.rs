@@ -11,7 +11,7 @@ impl Parser {
                 reason: "QL_CONTRACT §2: `INSERT INTO GRAPH g EDGE type (...) VALUES` compiles to put_edge; the spelling is still open and nothing is built in this slice.",
             });
         }
-        let table = self.name()?;
+        let table = self.table_name()?;
         self.expect(&Tok::LParen)?;
         let mut columns = Vec::new();
         loop {
@@ -27,7 +27,7 @@ impl Parser {
             self.expect(&Tok::LParen)?;
             let mut values = Vec::new();
             loop {
-                values.push(self.literal()?);
+                values.push(self.value_literal()?);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -75,7 +75,7 @@ impl Parser {
                 reason: "QL_CONTRACT §2: `UPDATE GRAPH g EDGE type SET ...` is an edge posting rewrite; not built in this slice.",
             });
         }
-        let table = self.name()?;
+        let table = self.table_name()?;
         self.expect_word("SET")?;
         let mut assignments = Vec::new();
         loop {
@@ -144,7 +144,7 @@ impl Parser {
                 cascade,
             });
         }
-        let table = self.name()?;
+        let table = self.table_name()?;
         // `DELETE FROM t WHERE _key = ...` is the single-key atomic:
         // `Database::delete` by key, with no candidate walk to prepare.
         if self.word().as_deref() == Some("WHERE") {
@@ -194,7 +194,33 @@ impl Parser {
     /// checked against the column's declared `Kind` while the statement
     /// compiles. Anything else is a §4.1 / §4.2 ROW EXPRESSION over the same
     /// row, which reaches the engine as the `UpdatePatch` closure boundary.
+    /// True when the cursor stands on a geometry constructor CALL.
+    fn at_geo_constructor(&self) -> bool {
+        self.word()
+            .is_some_and(|word| GEO_CONSTRUCTORS.contains(&word.as_str()))
+            && matches!(self.peek_at(1), Tok::LParen)
+    }
+
+    /// A value to WRITE: a literal, or a geometry constructor. A constructor
+    /// is read only here and in `SET`, where the value is a document field;
+    /// in a comparison it would be a different question.
+    fn value_literal(&mut self) -> SqlResult2<Literal> {
+        if !self.at_geo_constructor() {
+            return self.literal();
+        }
+        let argument = self.geo_argument()?;
+        if !self.last_geo_srid {
+            return Err(SqlError::unsupported(
+                "this shape has no SRID. A geometry column here is SRID 4326, and PostGIS refuses to store a shape of another SRID in it. Give it the SRID: `ST_SetSRID(ST_MakePoint(lon, lat), 4326)` or `ST_GeomFromWKB(bytes, 4326)`.",
+            ));
+        }
+        Ok(Literal::Geo(Box::new(argument)))
+    }
+
     fn set_value(&mut self) -> SqlResult2<SetValue> {
+        if self.at_geo_constructor() {
+            return Ok(SetValue::Lit(self.value_literal()?));
+        }
         if self.plain_literal_ahead() {
             return Ok(SetValue::Lit(self.literal()?));
         }

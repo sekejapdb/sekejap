@@ -1,6 +1,37 @@
 # Changelog
 
-## 0.17.0 (unreleased)
+## Unreleased
+
+### Geometry I/O
+
+- Shapes are read and written in the forms PostGIS uses: `ST_AsBinary`,
+  `ST_AsEWKB`, `ST_AsText`, `ST_AsEWKT`, `ST_AsGeoJSON`, `ST_X`, `ST_Y` and
+  `ST_SRID` in a select list; `ST_GeomFromWKB`, `ST_GeomFromEWKB`,
+  `ST_GeomFromText` and `ST_GeomFromEWKT` in a predicate and as a value in
+  `INSERT` and `UPDATE`. A quoted WKT, hex EWKB or GeoJSON literal is read the
+  way PostgreSQL reads a `geometry` literal. Every byte and string is checked
+  against PostGIS 3.4.
+- `col && <shape>` compares bounding boxes on the spatial index, with PostGIS's
+  float4 edges.
+- Over the PostgreSQL wire, `ST_AsBinary` is a `bytea` column, sent as raw bytes
+  in a binary result, and a `bytea` parameter is accepted.
+- `postgis_version()` answers `3.4 USE_GEOS=0 USE_PROJ=0 USE_STATS=0`.
+- Storage does not change.
+
+### Schemas
+
+- `CREATE SCHEMA` and `DROP SCHEMA` (RESTRICT), and `schema.table` wherever a
+  statement names a table. The same table name can exist in two schemas.
+- `pg_namespace`, `information_schema` and `geometry_columns` report each
+  table's schema, so a GIS or database client lists a layer under its schema.
+- A bare name resolves in `public`; `SET search_path` is still a notice.
+- A database that never names a schema is unchanged. The first schema sets a
+  new feature bit, so a release older than this one refuses that file as
+  unsupported rather than misreading it.
+- A quoted column name is now accepted as a function argument
+  (`ST_AsBinary("geom", 'NDR')`), which is how QGIS writes it.
+
+## 0.17.0
 
 0.17.0 replaces the engine. The storage layer, the data model, the API and the
 on-disk format are all new, and the release opens three surfaces sekejap did not
@@ -118,8 +149,7 @@ configuration passed to open.
 ### Not in this release
 
 The React Native binding is not ported. The Kotlin Android artifact needs a JNI
-and NDK lane. Geometry is not yet read or written as WKB or EWKB, so QGIS cannot
-round-trip it. `JOIN` is refused, which is what DBeaver's schema tree asks for.
+and NDK lane. `JOIN` is refused, which is what DBeaver's schema tree asks for.
 `NOTIFY` is not implemented.
 
 ## 0.16.5 and earlier

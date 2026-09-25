@@ -561,7 +561,6 @@ and a `SELECT` naming one is refused BY NAME.
 | `pg_trigger` | triggers are Tier 3: no atomic |
 | `pg_rewrite` | a user `CREATE VIEW` is Tier 3: a query rewrite at prepare is a second planner path |
 | `pg_stat_activity` | there is no connection table: a connection is a process |
-| `postgis_version()` | withheld until the geometry I/O it advertises exists (p3-geometry-io). A client reads the string as a PROMISE that `ST_AsBinary`, `ST_GeomFromWKB` and `&&` answer, and they do not |
 
 Each of them, refused:
 
@@ -580,8 +579,11 @@ SELECT oid, proname FROM pg_proc
 SELECT datname FROM pg_database
 ```
 
-```sql refused
--- refused 0A000: postgis_version()
+`postgis_version()` IS answered, and says what it promises: the geometry I/O
+(`ST_AsBinary`, `ST_GeomFromWKB`, `ST_AsText`, `ST_GeomFromText`) and `&&`
+are served; GEOS and PROJ are not, so the flags say `USE_GEOS=0 USE_PROJ=0`.
+
+```sql
 SELECT postgis_version()
 ```
 
@@ -715,16 +717,24 @@ SELECT c.relname, c.relkind FROM pg_catalog.pg_class c LIMIT 5
 
 ## 11. Schema qualification
 
-`docs/lang/QL_CONTRACT.md` §2 places `CREATE SCHEMA` and a real schema segment
-in Tier 2 (p2-schema-segment), so there is exactly one user schema:
+A table belongs to one schema: `public`, unless it was created in a named one
+(`CREATE SCHEMA s`, `CREATE TABLE s.t ...`, `docs/lang/QL_CONTRACT.md` §2).
 
-* `public.t` IS `t` -- the qualifier is read and dropped.
+* `public.t` IS `t`, and `s.t` is the table `t` of schema `s`.
+* A bare name resolves in `public` only. `SET search_path` is accepted as a
+  notice and stores nothing, so a table in a named schema is written
+  qualified -- which is how QGIS and DBeaver write every name anyway.
+* `pg_namespace`, `information_schema.schemata` and every relation with a
+  schema column (`information_schema.tables`, `.columns`, `pg_class`,
+  `pg_tables`, `pg_indexes`, `geometry_columns`) report the table's own
+  schema. A named schema has an `oid` hashed from its name; `public`,
+  `pg_catalog` and `information_schema` keep PostgreSQL's fixed ids.
 * `pg_catalog.x` and bare `x` are the same relation; `pg_catalog` is on every
   session's `search_path` implicitly, as in PostgreSQL.
 * `information_schema.tables` and `information_schema.columns` resolve ONLY
   when qualified. Their bare spellings are ordinary names a collection may
   have, and a collection named `tables` must keep meaning itself.
-* Three dotted segments are the `CREATE SCHEMA` refusal, unchanged.
+* Three dotted segments are refused: a file is one database.
 
 ```sql
 SELECT _key, title FROM public.posts LIMIT 2;

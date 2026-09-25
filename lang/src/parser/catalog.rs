@@ -112,6 +112,7 @@ impl Parser {
                     Some(SessionItem::CurrentUser)
                 }
                 "PG_BACKEND_PID" => Some(SessionItem::BackendPid),
+                "POSTGIS_VERSION" => Some(SessionItem::PostgisVersion),
                 _ => None,
             };
             if let Some(item) = item {
@@ -186,7 +187,7 @@ impl Parser {
         }
         if self.eat_word("INDEXES") || self.eat_word("INDEX") {
             let table = if self.eat_word("ON") {
-                Some(self.name()?)
+                Some(self.table_name()?)
             } else {
                 None
             };

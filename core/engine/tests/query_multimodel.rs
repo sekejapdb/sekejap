@@ -3485,6 +3485,7 @@ fn geometry_predicate(row: &Geom, predicate: &GeometryFilter) -> bool {
         GeometryFilter::Intersects(q) => spatial_geometry::intersects(row, q),
         GeometryFilter::Within(q) => spatial_geometry::within(row, q),
         GeometryFilter::Contains(q) => spatial_geometry::contains(row, q),
+        GeometryFilter::Overlaps(q) => spatial_geometry::bbox_overlaps(row, q),
         GeometryFilter::DWithin { geometry: q, metres } => {
             spatial_geometry::dwithin_m(row, q, *metres)
         }

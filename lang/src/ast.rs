@@ -4,6 +4,7 @@
 
 use super::functions::TimeUnit;
 use sekejap_core::collections::ColumnRule;
+use sekejap_core::spatial_io::ByteOrder;
 use sekejap_core::Kind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +42,11 @@ pub(super) enum Literal {
     /// `(SELECT col FROM t WHERE _key = <literal>)` -- a scalar subquery,
     /// which is a constant by the time the outer statement runs.
     Subquery(Box<ScalarSubquery>),
+    /// A geometry CONSTRUCTOR in value position -- `ST_GeomFromWKB($1, 4326)`,
+    /// `ST_SetSRID(ST_MakePoint(x, y), 4326)` -- which the parser reads only
+    /// in `INSERT ... VALUES` and `UPDATE ... SET`. Its value is the GeoJSON
+    /// document a geometry column stores.
+    Geo(Box<GeoArg>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,8 +82,20 @@ pub(super) enum GeoArg {
         maxlon: Literal,
         maxlat: Literal,
     },
-    /// A GeoJSON document, as a literal or through `ST_GeomFromGeoJSON`.
+    /// A geometry literal: through `ST_GeomFromGeoJSON`, or written bare the
+    /// way PostgreSQL reads a `geometry` literal -- a GeoJSON document, the
+    /// hex EWKB a geometry column prints, or (E)WKT.
     GeoJson(Literal),
+    /// `ST_GeomFromWKB` / `ST_GeomFromEWKB` (hex `bytea`, with or without
+    /// `\x`) and `ST_GeomFromText` / `ST_GeomFromEWKT`.
+    Encoded { source: Literal, format: GeoFormat },
+}
+
+/// The encoding an [`GeoArg::Encoded`] source is written in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GeoFormat {
+    Wkb,
+    Wkt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +104,8 @@ pub(super) enum SpatialPredicate {
     Intersects,
     Within,
     Contains,
+    /// `col && <shape>`: planar bounding boxes intersect.
+    Overlaps,
 }
 
 /// The argument of `to_tsquery('simple', ...)`, of `bm25(col, ...)` or of
@@ -379,6 +399,42 @@ pub(super) enum RowExpr {
     Sub(Box<RowExpr>, Box<RowExpr>),
     /// `a || b`, which is `concat` written as an operator.
     Concat(Box<RowExpr>, Box<RowExpr>),
+    /// A geometry OUTPUT function over one geometry (QL_CONTRACT §4.4).
+    Geo { func: GeoFunc, arg: Box<RowExpr> },
+}
+
+/// The geometry output functions: pure translations of the shape the row
+/// already decoded, one row in, one value out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeoFunc {
+    /// `ST_AsBinary(g [, 'NDR' | 'XDR'])`: OGC WKB, a `bytea`.
+    AsBinary(ByteOrder),
+    /// `ST_AsEWKB(g [, 'NDR' | 'XDR'])`: PostGIS EWKB with SRID 4326.
+    AsEwkb(ByteOrder),
+    /// `ST_AsText(g)`.
+    AsText,
+    /// `ST_AsEWKT(g)`: `SRID=4326;` and the WKT.
+    AsEwkt,
+    /// `ST_AsGeoJSON(g [, maxdecimaldigits])`, 9 decimals by default.
+    AsGeoJson(usize),
+    X,
+    Y,
+    Srid,
+}
+
+impl GeoFunc {
+    pub(crate) fn written(self) -> &'static str {
+        match self {
+            Self::AsBinary(_) => "st_asbinary",
+            Self::AsEwkb(_) => "st_asewkb",
+            Self::AsText => "st_astext",
+            Self::AsEwkt => "st_asewkt",
+            Self::AsGeoJson(_) => "st_asgeojson",
+            Self::X => "st_x",
+            Self::Y => "st_y",
+            Self::Srid => "st_srid",
+        }
+    }
 }
 
 /// An arithmetic `ORDER BY` expression: one key, per deviation 3.
@@ -612,6 +668,9 @@ pub(super) enum SessionItem {
     BackendPid,
     /// `current_setting('name')`: the client GUC's value.
     Setting(String),
+    /// `postgis_version()`: the PostGIS release whose I/O surface is served
+    /// (`catalog::POSTGIS_VERSION`).
+    PostgisVersion,
     Lit(Literal),
 }
 
@@ -626,6 +685,7 @@ impl SessionItem {
             Self::CurrentUser => "current_user".into(),
             Self::BackendPid => "pg_backend_pid".into(),
             Self::Setting(_) => "current_setting".into(),
+            Self::PostgisVersion => "postgis_version".into(),
             Self::Lit(_) => "?column?".into(),
         }
     }
@@ -892,6 +952,17 @@ pub(super) enum Stmt {
         name: String,
         if_exists: bool,
     },
+    /// `CREATE SCHEMA [IF NOT EXISTS] name` (QL_CONTRACT §2).
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP SCHEMA [IF EXISTS] name [RESTRICT]`. RESTRICT is the only form:
+    /// a schema that holds a table is refused, naming it.
+    DropSchema {
+        name: String,
+        if_exists: bool,
+    },
     AlterTable {
         table: String,
         action: AlterAction,
@@ -946,6 +1017,7 @@ impl Literal {
             Self::Str(text) => format!("'{text}'"),
             Self::Param(n) => format!("${n}"),
             Self::Subquery(_) => "(SELECT ...)".into(),
+            Self::Geo(_) => "<geometry>".into(),
         }
     }
 }
@@ -1060,6 +1132,7 @@ impl RowExpr {
             Self::Add(a, b) => format!("({} + {})", a.written(), b.written()),
             Self::Sub(a, b) => format!("({} - {})", a.written(), b.written()),
             Self::Concat(a, b) => format!("({} || {})", a.written(), b.written()),
+            Self::Geo { func, arg } => format!("{}({})", func.written(), arg.written()),
         }
     }
 }

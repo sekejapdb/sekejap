@@ -98,7 +98,7 @@
 //! `plot_dwithin_1km` 289, key for key.
 
 use geographiclib_rs::{Geodesic, InverseGeodesic, PolygonArea, Winding};
-use kernel::spatial::Geom;
+use kernel::spatial::{BoxF, Geom};
 
 /// Planar-predicate boundary tolerance, in degrees. The fixture's boundary
 /// cases (a point placed exactly at a polygon vertex or edge midpoint) are
@@ -543,6 +543,24 @@ fn strictly_interior(pt: [f64; 2], b: &Geom) -> bool {
     match b {
         Geom::Polygon(rings) => contains_point_polygon(rings, pt[0], pt[1]),
         Geom::MultiPolygon(ps) => ps.iter().any(|rings| contains_point_polygon(rings, pt[0], pt[1])),
+        _ => false,
+    }
+}
+
+/// `a && b` — planar bounding boxes intersect, edges included.
+///
+/// PostGIS compares FLOAT4 boxes rounded outward, not the doubles, so a
+/// point a ten-billionth of a degree past an edge still overlaps. The boxes
+/// here are rounded the same way ([`BoxF::from_f64`], the geometry index's
+/// own box), so the two agree on exactly those edge cases
+/// (`tests/spatial_io.rs`, `bbox_overlap_answers_what_postgis_answers_for_every_pair`).
+/// The box is planar: a line from 170° to -170° spans the whole map, as it
+/// does in PostGIS.
+pub fn bbox_overlaps(a: &Geom, b: &Geom) -> bool {
+    match (a.bbox(), b.bbox()) {
+        (Some((ax0, ax1, ay0, ay1)), Some((bx0, bx1, by0, by1))) => {
+            BoxF::from_f64(ax0, ax1, ay0, ay1).intersects(&BoxF::from_f64(bx0, bx1, by0, by1))
+        }
         _ => false,
     }
 }

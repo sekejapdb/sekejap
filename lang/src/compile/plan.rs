@@ -608,6 +608,16 @@ impl SelectPlan {
         self.outputs.iter().any(|output| *output == Output::Key)
     }
 
+    /// The SQL type column `at` has when the source collection's declared
+    /// fields cannot say: a row function that returns a `bytea`, a number.
+    /// `None` leaves the caller to the declared field of the same name.
+    pub(crate) fn column_type(&self, at: usize) -> Option<&'static str> {
+        match self.outputs.get(at)? {
+            Output::Row(function) => self.functions[*function].output_type(),
+            _ => None,
+        }
+    }
+
     /// One returned row, as this statement's columns.
     pub(crate) fn row(&self, db: &Database, row: &QueryRow) -> SqlResult2<SqlRow> {
         let mut key = None;
@@ -862,6 +872,11 @@ pub(crate) enum WritePlan {
         index: IndexId,
         name: String,
     },
+    /// `CREATE SCHEMA`: one record, `Database::create_schema`.
+    CreateSchema { name: String },
+    /// `DROP SCHEMA`: `Database::drop_schema`, which refuses a schema that
+    /// still holds a table.
+    DropSchema { name: String },
     /// `DROP TABLE [IF EXISTS] name [CASCADE|RESTRICT]`: the DROPPING mark,
     /// then bounded steps to the end. Nothing here is a second removal path --
     /// it is `begin_drop_collection` and `drop_collection_step`, the same
@@ -1086,13 +1101,17 @@ impl WritePlan {
                 indexes,
             } => {
                 if indexes.is_empty() {
-                    db.create_collection_rules(
-                        &name,
-                        fields,
-                        declared,
-                        rules,
-                        CollectionOptions::default(),
-                    )?;
+                    {
+                        let (schema, table) = crate::split_table(&name);
+                        db.create_collection_in(
+                            schema,
+                            table,
+                            fields,
+                            declared,
+                            rules,
+                            CollectionOptions::default(),
+                        )?;
+                    }
                     db.commit()?;
                     return Ok(SqlResult::Affected(0));
                 }
@@ -1110,8 +1129,10 @@ impl WritePlan {
                 // removing it removes nothing of the caller's.
                 db.commit()?;
                 let count = indexes.len();
-                let collection = db.create_collection_rules(
-                    &name,
+                let (schema, table) = crate::split_table(&name);
+                let collection = db.create_collection_in(
+                    schema,
+                    table,
                     fields,
                     declared,
                     rules,
@@ -1184,6 +1205,18 @@ impl WritePlan {
             } => {
                 db.commit()?;
                 build_index(db, collection, &name, &method)?;
+                SqlResult::Affected(0)
+            }
+            Self::CreateSchema { name } => {
+                db.commit()?;
+                db.create_schema(&name)?;
+                db.commit()?;
+                SqlResult::Affected(0)
+            }
+            Self::DropSchema { name } => {
+                db.commit()?;
+                db.drop_schema(&name)?;
+                db.commit()?;
                 SqlResult::Affected(0)
             }
             Self::DropIndex { index, name } => {
@@ -1484,6 +1517,9 @@ impl OwnedFilter {
                             radius_metres: binder.f64_of(metres)?,
                         },
                         PointFill::Bbox(argument) => PointFilter::Bbox(binder.bounds_of(argument)?),
+                        PointFill::Overlaps(argument) => {
+                            PointFilter::Bbox(binder.overlap_bounds_of(argument)?)
+                        }
                     };
                 }
             }
@@ -1496,6 +1532,7 @@ impl OwnedFilter {
                         SpatialPredicate::Intersects => GeometryFilter::Intersects(geometry),
                         SpatialPredicate::Within => GeometryFilter::Within(geometry),
                         SpatialPredicate::Contains => GeometryFilter::Contains(geometry),
+                        SpatialPredicate::Overlaps => GeometryFilter::Overlaps(geometry),
                         SpatialPredicate::DWithin => GeometryFilter::DWithin {
                             geometry,
                             metres: match &fill.metres {

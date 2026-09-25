@@ -211,6 +211,9 @@ pub struct CollectionInfo {
     /// [`column_rules`] module. Empty for every collection that declares
     /// none, which is every collection written before the slot existed.
     pub rules: Vec<(String, ColumnRule)>,
+    /// The schema the collection belongs to: `public` unless it was created
+    /// in a named one ([`Database::create_collection_in`]).
+    pub schema: String,
 }
 pub trait Clock: Send + Sync {
     fn unix_seconds(&self) -> i64;
@@ -248,6 +251,10 @@ pub(crate) struct Catalog {
     /// See [`CollectionInfo::rules`]. Recorded behind flag bit 3 of the same
     /// frozen flags byte, behind `COLUMN_RULES_FEATURE` at admission.
     pub(crate) rules: Vec<(String, ColumnRule)>,
+    /// The named schema this collection belongs to; `None` is `public`.
+    /// Recorded behind flag bit 4 ([`CATALOG_SCHEMA`]), behind
+    /// [`SCHEMA_FEATURE`] at admission.
+    pub(crate) schema: Option<String>,
     /// `Some` exactly while `begin_drop_collection` has published a DROPPING
     /// mark that `drop_collection_step` has not yet finished. It is the
     /// committed cursor of the drop: the phase it reached and how many
@@ -576,6 +583,92 @@ pub(crate) fn name_key(name: &str) -> Vec<u8> {
     k.extend_from_slice(name.as_bytes());
     k
 }
+/// The schema every collection belongs to when its catalog record names none
+/// -- every collection written before named schemas existed, and every one
+/// created without a schema since.
+pub const PUBLIC_SCHEMA: &str = "public";
+/// The byte that opens a NAMED SCHEMA's entries in the name keyspace and
+/// separates the schema from the table inside one. `0xFF` never occurs in
+/// UTF-8, so no public name -- which is the bare UTF-8 after the tag -- can
+/// begin with it, and no schema or table name can contain it: the three kinds
+/// of `0x10` key cannot collide.
+///
+/// - `0x10 || name` -- a table in `public` (unchanged since the first release);
+/// - `0x10 || 0xFF || schema` -- a named schema, value empty;
+/// - `0x10 || 0xFF || schema || 0xFF || name` -- a table in that schema,
+///   value the four-byte collection id, as for a public name.
+///
+/// Every named-schema key sorts after every public one, and a schema's own
+/// record sorts first among its tables.
+pub(crate) const SCHEMA_MARK: u8 = 0xFF;
+/// The name-keyspace entry of `name` inside `schema`. `None` is `public`.
+pub(crate) fn name_key_in(schema: Option<&str>, name: &str) -> Vec<u8> {
+    match schema {
+        None => name_key(name),
+        Some(schema) => {
+            let mut k = schema_key(schema);
+            k.push(SCHEMA_MARK);
+            k.extend_from_slice(name.as_bytes());
+            k
+        }
+    }
+}
+/// The record that says a named schema exists.
+pub(crate) fn schema_key(schema: &str) -> Vec<u8> {
+    let mut k = vec![0x10, SCHEMA_MARK];
+    k.extend_from_slice(schema.as_bytes());
+    k
+}
+/// One `0x10` key, read back: a public table, a named schema, or a table in
+/// a named schema.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NameEntry<'a> {
+    Table { schema: Option<&'a str>, name: &'a str },
+    Schema(&'a str),
+}
+fn name_utf8(b: &[u8]) -> Result<&str> {
+    let s = std::str::from_utf8(b).map_err(|_| corrupt("collection-name encoding"))?;
+    if s.is_empty() {
+        return Err(corrupt("empty collection or schema name"));
+    }
+    Ok(s)
+}
+pub(crate) fn parse_name_key(k: &[u8]) -> Result<NameEntry<'_>> {
+    let utf8 = name_utf8;
+    match k {
+        [0x10, SCHEMA_MARK, rest @ ..] => match rest.iter().position(|b| *b == SCHEMA_MARK) {
+            None => Ok(NameEntry::Schema(utf8(rest)?)),
+            Some(at) => Ok(NameEntry::Table {
+                schema: Some(utf8(&rest[..at])?),
+                name: utf8(&rest[at + 1..])?,
+            }),
+        },
+        [0x10, rest @ ..] => Ok(NameEntry::Table {
+            schema: None,
+            name: utf8(rest)?,
+        }),
+        _ => Err(corrupt("collection-name key tag")),
+    }
+}
+/// The names a user schema may not take. `public` exists already;
+/// `pg_catalog`, `information_schema` and every `pg_` name are PostgreSQL's
+/// own, which it refuses as "unacceptable schema name" for the same reason:
+/// a client resolves them to the system catalog.
+fn check_schema_name(schema: &str) -> Result<()> {
+    if schema.is_empty() || schema.len() > 63 {
+        return Err(invalid("a schema name must contain 1..63 UTF-8 bytes"));
+    }
+    let lower = schema.to_ascii_lowercase();
+    if lower == PUBLIC_SCHEMA
+        || lower == "information_schema"
+        || lower.starts_with("pg_")
+    {
+        return Err(invalid(format!(
+            "unacceptable schema name `{schema}`: `public`, `information_schema` and the `pg_` prefix are reserved"
+        )));
+    }
+    Ok(())
+}
 fn replica_key(tag: u8, id: u32, copy: u8) -> Vec<u8> {
     let mut k = vec![tag, copy];
     k.extend(ordered(id as u64));
@@ -640,6 +733,22 @@ pub(crate) const CATALOG_DECLARED: u8 = 4;
 /// tail. See `column_rules.rs`; it is that module's `CATALOG_RULES`, named
 /// here beside the two bits it follows so the byte reads in one place.
 pub(crate) use column_rules::CATALOG_RULES;
+/// Bit 4 of the same frozen flags byte: the record carries a SCHEMA tail,
+/// the named schema the collection belongs to. Placed in the flags byte for
+/// the reason the three bits before it were: a binary that predates it
+/// refuses the record rather than reading the tail as part of the name. It
+/// is the second line behind [`SCHEMA_FEATURE`].
+pub(crate) const CATALOG_SCHEMA: u8 = 16;
+/// The collection header bit that says this database holds a NAMED SCHEMA:
+/// a schema record, or a catalog record with the [`CATALOG_SCHEMA`] tail.
+///
+/// Additive and monotone, like every bit before it: set in the transaction
+/// of the first `create_schema`, never cleared, so a file that has ever held
+/// a named schema is refused WHOLE, as `Unsupported`, by a binary that
+/// predates the bit -- which would otherwise meet a `0x10 || 0xFF` key it
+/// cannot read. A file that never names a schema does not carry it and opens
+/// everywhere it opened before.
+pub const SCHEMA_FEATURE: u64 = 0x20000;
 /// The collection header bit that says this database's catalog carries at
 /// least one DECLARED-TYPE pair, i.e. at least one record with the
 /// [`CATALOG_DECLARED`] tail.
@@ -661,14 +770,15 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
         u8::from(c.timestamps)
             | if c.drop.is_some() { CATALOG_DROPPING } else { 0 }
             | if c.declared.is_empty() { 0 } else { CATALOG_DECLARED }
-            | if c.rules.is_empty() { 0 } else { CATALOG_RULES },
+            | if c.rules.is_empty() { 0 } else { CATALOG_RULES }
+            | if c.schema.is_none() { 0 } else { CATALOG_SCHEMA },
     );
     if let Some(d) = c.drop {
         b.push(d.phase.byte());
         b.push(d.mode.byte());
         b.extend_from_slice(&d.removed.to_be_bytes());
     }
-    if c.declared.is_empty() && c.rules.is_empty() {
+    if c.declared.is_empty() && c.rules.is_empty() && c.schema.is_none() {
         b.extend_from_slice(c.name.as_bytes());
     } else {
         // With a tail the name can no longer be "the rest of the packet", so
@@ -702,12 +812,19 @@ fn catalog_bytes(c: &Catalog) -> Result<Vec<u8>> {
                 column_rules::encode_rule(&mut b, field, rule)?;
             }
         }
+        if let Some(schema) = &c.schema {
+            check_schema_name(schema)?;
+            b.push(schema.len() as u8);
+            b.extend_from_slice(schema.as_bytes());
+        }
     }
     packet(CATALOG_MAGIC, &b)
 }
 fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     let b = unpack(b, CATALOG_MAGIC)?;
-    if b.len() < 10 || b[8] & !(1 | CATALOG_DROPPING | CATALOG_DECLARED | CATALOG_RULES) != 0 {
+    if b.len() < 10
+        || b[8] & !(1 | CATALOG_DROPPING | CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA) != 0
+    {
         return Err(corrupt("catalog fields"));
     }
     let id = u32::from_be_bytes(b[..4].try_into().unwrap());
@@ -728,7 +845,8 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
     };
     let mut declared = Vec::new();
     let mut rules = Vec::new();
-    let name = if b[8] & (CATALOG_DECLARED | CATALOG_RULES) == 0 {
+    let mut schema = None;
+    let name = if b[8] & (CATALOG_DECLARED | CATALOG_RULES | CATALOG_SCHEMA) == 0 {
         std::str::from_utf8(&b[at..]).map_err(corrupt)?.to_owned()
     } else {
         let mut read = |n: usize| -> Result<&[u8]> {
@@ -757,6 +875,12 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
                 rules.push(column_rules::decode_rule(|n| read(n).map(<[u8]>::to_vec))?);
             }
         }
+        if b[8] & CATALOG_SCHEMA != 0 {
+            let n = read(1)?[0] as usize;
+            let named = std::str::from_utf8(read(n)?).map_err(corrupt)?.to_owned();
+            check_schema_name(&named).map_err(|_| corrupt("catalog schema tail"))?;
+            schema = Some(named);
+        }
         if at != b.len() {
             return Err(corrupt("catalog declared type tail"));
         }
@@ -773,6 +897,7 @@ fn parse_catalog(b: &[u8]) -> Result<Catalog> {
         drop,
         declared,
         rules,
+        schema,
     })
 }
 /// The kernel's own `E4LIMIT1` record: a damaged one is corruption, a valid
@@ -794,8 +919,8 @@ fn decode_limits(b: &[u8]) -> Result<ResourceLimits> {
 /// the VAMANA GRAPH keyspaces `0x7D` (node heads) and `0x7F` (adjacency)
 /// ([`crate::index::vector::graph`]);
 /// `0x10000` JSON-path expression indexes (`IndexExpr::JsonText`, descriptor
-/// version 4).
-/// The mask is therefore `0x1ffff`.
+/// version 4); `0x20000` named schemas ([`SCHEMA_FEATURE`]).
+/// The mask is therefore `0x3ffff`.
 /// Every one is additive: set in the same transaction as the first record
 /// that uses it, never cleared, and a file that declares a bit outside this
 /// mask is refused as `Unsupported` at admission (Law 8).
@@ -824,7 +949,8 @@ pub const SUPPORTED_LOGICAL_FEATURES: u64 = 1
     | row_count::ROW_COUNT_FEATURE
     | crate::index::graph::endpoints::ENDPOINT_FEATURE
     | crate::index::vector::graph::VAMANA_FEATURE
-    | catalog::JSON_EXPRESSION_FEATURE;
+    | catalog::JSON_EXPRESSION_FEATURE
+    | SCHEMA_FEATURE;
 /// One header's feature word against the mask a binary implements.
 ///
 /// Split out of [`parse_header`] so a test can put an OLDER mask in place of
@@ -1462,6 +1588,13 @@ impl Database {
         {
             return Err(corrupt("DROPPING catalog record without feature admission"));
         }
+        if c.schema.is_some()
+            && !self
+                .index_header
+                .is_some_and(|h| h.features & SCHEMA_FEATURE != 0)
+        {
+            return Err(corrupt("schema-qualified catalog record without feature admission"));
+        }
         *self.catalog_cache.borrow_mut() = Some(c.clone());
         Ok(c)
     }
@@ -1561,7 +1694,31 @@ impl Database {
         rules: Vec<(String, ColumnRule)>,
         options: CollectionOptions,
     ) -> Result<CollectionId> {
+        self.create_collection_in(PUBLIC_SCHEMA, name, fields, declared, rules, options)
+    }
+    /// The same creation, inside `schema`. `public` is every collection's
+    /// schema unless it names another; a named schema must exist
+    /// ([`Database::create_schema`]). The schema goes in the catalog record's
+    /// own tail and in the name key; no row byte, no index key and no
+    /// collection id depends on it.
+    pub fn create_collection_in(
+        &mut self,
+        schema: &str,
+        name: &str,
+        fields: Vec<(String, Kind)>,
+        declared: Vec<(String, String)>,
+        rules: Vec<(String, ColumnRule)>,
+        options: CollectionOptions,
+    ) -> Result<CollectionId> {
         self.user_write()?;
+        let schema = if schema == PUBLIC_SCHEMA {
+            None
+        } else {
+            if !self.schema_exists(schema)? {
+                return Err(invalid(format!("schema `{schema}` does not exist")));
+            }
+            Some(schema.to_owned())
+        };
         for (field, _) in &declared {
             if !fields.iter().any(|(n, _)| n == field) {
                 return Err(invalid("a declared type names a field of the collection"));
@@ -1571,7 +1728,10 @@ impl Database {
         if name.is_empty() || name.len() > 255 {
             return Err(invalid("collection name must contain 1..255 UTF-8 bytes"));
         }
-        if self.collection(name)?.is_some() {
+        if self
+            .collection_in(schema.as_deref().unwrap_or(PUBLIC_SCHEMA), name)?
+            .is_some()
+        {
             return Err(Error::AlreadyExists);
         }
         let (cid, lid) = self.header()?;
@@ -1590,6 +1750,7 @@ impl Database {
             drop: None,
             declared,
             rules,
+            schema,
         };
         let result = (|| {
             // The feature bit rides the same transaction as the first record
@@ -1604,7 +1765,8 @@ impl Database {
             self.persist_layout(&layout)?;
             self.persist_catalog(&c)?;
             self.write_sequence(c.id, 1)?;
-            self.writer()?.put(&name_key(name), &cid.to_be_bytes())?;
+            self.writer()?
+                .put(&name_key_in(c.schema.as_deref(), name), &cid.to_be_bytes())?;
             // A collection that has just been created holds no rows, so its
             // live count is 0 and needs no walk to establish. The record and
             // `ROW_COUNT_FEATURE` ride this same transaction, which is what
@@ -1630,30 +1792,142 @@ impl Database {
         if c.name == name {
             return Ok(());
         }
-        if self.collection(name)?.is_some() {
+        // A rename stays inside the collection's schema, as `ALTER TABLE
+        // s.t RENAME TO u` does in PostgreSQL.
+        let schema = c.schema.clone();
+        if self
+            .collection_in(schema.as_deref().unwrap_or(PUBLIC_SCHEMA), name)?
+            .is_some()
+        {
             return Err(Error::AlreadyExists);
         }
         let old = std::mem::replace(&mut c.name, name.to_owned());
         let result = (|| {
             self.persist_catalog(&c)?;
-            self.writer()?.put(&name_key(name), &id.0.to_be_bytes())?;
-            self.writer()?.delete(&name_key(&old))?;
+            self.writer()?
+                .put(&name_key_in(schema.as_deref(), name), &id.0.to_be_bytes())?;
+            self.writer()?.delete(&name_key_in(schema.as_deref(), &old))?;
             Ok(())
         })();
         self.finish(result)
     }
+    /// The collection called `name` in `public`.
     pub fn collection(&self, name: &str) -> Result<Option<CollectionId>> {
-        let Some(b) = self.store()?.get(&name_key(name))? else {
+        self.collection_in(PUBLIC_SCHEMA, name)
+    }
+    /// The collection called `name` in `schema`. One point read.
+    pub fn collection_in(&self, schema: &str, name: &str) -> Result<Option<CollectionId>> {
+        let named = (schema != PUBLIC_SCHEMA).then_some(schema);
+        if named.is_some_and(|s| s.as_bytes().contains(&SCHEMA_MARK))
+            || name.as_bytes().contains(&SCHEMA_MARK)
+        {
+            return Ok(None);
+        }
+        let Some(b) = self.store()?.get(&name_key_in(named, name))? else {
             return Ok(None);
         };
         if b.len() != 4 {
             return Err(corrupt("collection-name mapping"));
         }
         let id = CollectionId(u32::from_be_bytes(b.try_into().unwrap()));
-        if self.catalog(id)?.name != name {
+        let c = self.catalog(id)?;
+        if c.name != name || c.schema.as_deref() != named {
             return Err(corrupt("collection-name identity"));
         }
         Ok(Some(id))
+    }
+    /// True when `schema` is `public` or a named schema this database holds.
+    pub fn schema_exists(&self, schema: &str) -> Result<bool> {
+        if schema == PUBLIC_SCHEMA {
+            return Ok(true);
+        }
+        if schema.is_empty() || schema.as_bytes().contains(&SCHEMA_MARK) {
+            return Ok(false);
+        }
+        Ok(self.store()?.get(&schema_key(schema))?.is_some())
+    }
+    /// `CREATE SCHEMA`: one record, and [`SCHEMA_FEATURE`] in the same
+    /// transaction. O(1).
+    pub fn create_schema(&mut self, schema: &str) -> Result<()> {
+        // A refusal leaves no write pending: the checks run before the
+        // write is opened.
+        self.ready_write()?;
+        check_schema_name(schema)?;
+        if schema.as_bytes().contains(&SCHEMA_MARK) {
+            return Err(invalid("a schema name is UTF-8"));
+        }
+        if self.schema_exists(schema)? {
+            return Err(Error::AlreadyExists);
+        }
+        self.user_write()?;
+        let result = (|| {
+            self.enable_logical_feature(SCHEMA_FEATURE)?;
+            self.writer()?.put(&schema_key(schema), &[])?;
+            Ok(())
+        })();
+        self.finish(result)
+    }
+    /// `DROP SCHEMA` (RESTRICT): the record, once no collection is in it. A
+    /// schema that still holds one is refused, naming it -- the caller drops
+    /// its collections first, each through the bounded drop. The feature bit
+    /// stays: it is monotone.
+    pub fn drop_schema(&mut self, schema: &str) -> Result<()> {
+        self.ready_write()?;
+        if schema == PUBLIC_SCHEMA {
+            return Err(invalid("schema `public` cannot be dropped"));
+        }
+        if !self.schema_exists(schema)? {
+            return Err(invalid(format!("schema `{schema}` does not exist")));
+        }
+        let mut prefix = schema_key(schema);
+        prefix.push(SCHEMA_MARK);
+        if let Some(row) = self.store()?.range(&prefix)?.next() {
+            let (k, _) = row?;
+            if k.starts_with(&prefix) {
+                let held = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
+                return Err(invalid(format!(
+                    "schema `{schema}` still holds `{held}`: drop its collections first (DROP SCHEMA ... CASCADE is not built)"
+                )));
+            }
+        }
+        self.user_write()?;
+        let result = (|| {
+            self.writer()?.delete(&schema_key(schema))?;
+            Ok(())
+        })();
+        self.finish(result)
+    }
+    /// Every schema: `public` and each named one, in name order. Bounded by
+    /// the number of schemas and collections, which the catalog bounds.
+    pub fn list_schemas(&self) -> Result<Vec<String>> {
+        let mut out = vec![PUBLIC_SCHEMA.to_owned()];
+        let prefix = [0x10u8, SCHEMA_MARK];
+        for row in self.store()?.range(&prefix)? {
+            let (k, _) = row?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if let NameEntry::Schema(schema) = parse_name_key(&k)? {
+                out.push(schema.to_owned());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+    /// Every collection as `(schema, name)`, public ones first, in key order.
+    pub fn list_qualified_collections(&self) -> Result<Vec<(String, String)>> {
+        let prefix = [0x10u8];
+        let mut out = Vec::new();
+        for row in self.store()?.range(&prefix)? {
+            let (k, _) = row?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if let NameEntry::Table { schema, name } = parse_name_key(&k)? {
+                out.push((schema.unwrap_or(PUBLIC_SCHEMA).to_owned(), name.to_owned()));
+            }
+        }
+        Ok(out)
     }
     /// Every collection name the catalog holds, in key order.
     ///
@@ -1662,11 +1936,13 @@ impl Database {
     /// row. It is bounded by the number of collections, which the catalog
     /// bounds; it reads no row and opens no index.
     pub fn list_collections(&self) -> Result<Vec<String>> {
+        // Public names are every `0x10` key BEFORE the first `0xFF`, which
+        // opens the named schemas; the walk stops there.
         let prefix = [0x10u8];
         let mut out = Vec::new();
         for row in self.store()?.range(&prefix)? {
             let (k, _) = row?;
-            if !k.starts_with(&prefix) {
+            if !k.starts_with(&prefix) || k.get(1) == Some(&SCHEMA_MARK) {
                 break;
             }
             match std::str::from_utf8(&k[1..]) {
@@ -1687,6 +1963,7 @@ impl Database {
             timestamps: c.timestamps,
             declared: c.declared,
             rules: c.rules,
+            schema: c.schema.unwrap_or_else(|| PUBLIC_SCHEMA.to_owned()),
         })
     }
     pub fn alter_collection(
@@ -2734,7 +3011,7 @@ mod tests {
     /// a new family bit fails this test until every reporter is updated.
     #[test]
     fn supported_logical_feature_mask_is_the_only_definition() {
-        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x1ffff);
+        assert_eq!(SUPPORTED_LOGICAL_FEATURES, 0x3ffff);
         let header = |features| {
             header_bytes(HeaderInfo {
                 next_collection: 1,
@@ -2755,17 +3032,17 @@ mod tests {
                 .indexes
                 .unwrap()
                 .features,
-            0x1ffff
+            0x3ffff
         );
         // A bit outside the mask is a future family: refused whole, and as
         // Unsupported rather than corruption, because the bytes are intact.
         // The probe is always the next bit above the mask. Both the vamana
         // graph (`0x8000`) and the JSON-path expression index (`0x10000`)
-        // landed together, so the mask is contiguous through bit 16 and the
-        // first unclaimed bit is `0x20000`.
+        // landed together, and named schemas took `0x20000`, so the mask is
+        // contiguous through bit 17 and the first unclaimed bit is `0x40000`.
         assert!(matches!(
-            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x20000)),
-            Err(Error::Unsupported(m)) if m.contains("0x3ffff")
+            parse_header(&header(SUPPORTED_LOGICAL_FEATURES | 0x40000)),
+            Err(Error::Unsupported(m)) if m.contains("0x7ffff")
         ));
     }
     /// Law 8 for the live row count, the same shape the declared-type bit's
@@ -2796,9 +3073,9 @@ mod tests {
             Err(Error::Unsupported(m)) if m.contains("0x2001")
         ));
         // And a bit past every implemented family is refused by this build
-        // too.
+        // too. `0x20000` is named schemas now, so the probe is `0x40000`.
         assert!(matches!(
-            admit_features(1 | 0x20000, SUPPORTED_LOGICAL_FEATURES),
+            admit_features(1 | 0x40000, SUPPORTED_LOGICAL_FEATURES),
             Err(Error::Unsupported(_))
         ));
     }
@@ -2889,6 +3166,7 @@ mod tests {
         // Second line: the frozen flags byte. It refuses the record, but the
         // class is Corrupt, which is why it cannot be the only line.
         let record = catalog_bytes(&Catalog {
+            schema: None,
             id: CollectionId(1),
             name: "t".into(),
             layout: 1,

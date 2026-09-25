@@ -130,8 +130,8 @@ A function in the table above that has no Tier-1 spelling is REFUSED by name,
 with the reason, rather than answered from a second implementation:
 
 ```sql refused
--- refused 0A000: ST_AsText
-SELECT ST_AsText(loc) FROM posts LIMIT 1
+-- refused 0A000: ST_Area
+SELECT ST_Area(area) FROM posts LIMIT 1
 ```
 
 ```sql refused

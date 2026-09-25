@@ -12,6 +12,7 @@ fn geometry_predicate_matches(predicate: &GeometryFilter, row: &Geom) -> bool {
             geometry: query,
             metres,
         } => spatial_geometry::dwithin_m(row, query, *metres),
+        GeometryFilter::Overlaps(query) => spatial_geometry::bbox_overlaps(row, query),
     }
 }
 

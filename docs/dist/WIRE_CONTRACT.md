@@ -204,7 +204,8 @@ itself as speaking:
 | `jsonb` | compact JSON |
 | `timestamptz` | ISO-8601, as `sekejap_lang` already prints a declared TIMESTAMPTZ (`lang/src/compile/row.rs`) |
 | `vector` | pgvector's `[a,b,c]` |
-| `geometry` | **GeoJSON text, today.** EWKB is the `p3-geometry-io` follow-up and is named here so it is not discovered later. |
+| `geometry` | GeoJSON text. A client that wants the bytes asks for them: `ST_AsBinary(g)` / `ST_AsEWKB(g)` is a `bytea` column (below). |
+| `bytea` | `\x` and lower-case hex, PostgreSQL's `bytea_output = hex`; in a BINARY result, the bytes themselves. This is how QGIS reads `ST_AsBinary(geom, 'NDR')` through a binary cursor. A `bytea` parameter is read in either form. |
 | `_id` | `"<collection>:<sequence>"`, the same spelling `dist/rust/src/rows.rs:100` gives it |
 | MISSING and NULL | SQL NULL, which the wire spells as a length of `-1` and not as a zero-length value |
 
@@ -419,7 +420,7 @@ already flattened them.
 | **`JOIN` over the catalog views** | The views themselves ARE on this build and answer rows over the wire (`docs/dist/PG_SURFACE.md`). What is not built is `JOIN`, so the multi-relation form a schema tree emits is refused `0A000` naming `JOIN`; a single-relation catalog query answers. |
 | **`COPY`** | No `CopyInResponse` / `CopyData`. `OPS_CONTRACT` §7's bulk-load scope is the atomic it would ride; until that is built there is nothing to stream into. |
 | **`NOTIFY`** | §5 above. |
-| **Binary `geometry` / `vector`** | Their synthetic OIDs are not in the binary set; a binary request gets the TEXT bytes. EWKB is `p3-geometry-io`. |
+| **Binary `geometry` / `vector`** | Their synthetic OIDs are not in the binary set; a binary request gets the TEXT bytes. The binary WKB of a shape is `ST_AsBinary`, a `bytea` (`dist/tests/pg_wire.rs::st_asbinary_is_a_bytea_column_raw_in_binary_and_hex_in_text`). |
 | **Transactional DDL, savepoints, two-phase commit** | sekejap has one transaction per handle and no savepoint. |
 | **`SELECT` with no `FROM`** | Except the fixed session rows below: `sekejap_lang` has no statement shape for it. |
 | **Service mode and publish as wire statements** | `OPS_CONTRACT` §9.4: a connection is served by the process that opened the service, and the staleness window is a property of that process, not of the protocol. `--publish-interval` is the operator's knob. |

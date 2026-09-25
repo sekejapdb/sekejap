@@ -141,9 +141,19 @@ impl Compiler<'_> {
                 Value::from(vector)
             }
             Kind::Point | Kind::Geo => {
+                // Text is read the way PostgreSQL reads a `geometry` literal:
+                // GeoJSON is stored as written, hex EWKB and (E)WKT as the
+                // GeoJSON document of the shape they spell.
                 let document = match value {
-                    Value::String(text) => serde_json::from_str::<Value>(&text)
-                        .map_err(|e| SqlError::Parameter(format!("`{column}`: GeoJSON: {e}")))?,
+                    Value::String(text) if text.trim_start().starts_with('{') => {
+                        serde_json::from_str::<Value>(&text).map_err(|e| {
+                            SqlError::Parameter(format!("`{column}`: GeoJSON: {e}"))
+                        })?
+                    }
+                    Value::String(text) => geom_to_json(
+                        &geom_from_text(&text)
+                            .map_err(|e| SqlError::Parameter(format!("`{column}`: {e}")))?,
+                    ),
                     other => other,
                 };
                 // Parsed once here so a bad geometry is refused by the

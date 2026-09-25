@@ -137,7 +137,8 @@ coordination and snapshot admission code.
 ## Extension boundary
 
 Current key allocation includes collection metadata/replicas, layout keys, live
-row-count records (`0x08`), collection names (`0x10`), external-key mappings
+row-count records (`0x08`), collection names (`0x10`; named schemas and their
+tables under `0x10 0xFF`, behind `SCHEMA_FEATURE = 0x20000`), external-key mappings
 (`0x20`), entity rows (`0x40`) and vector payloads (`0x60`) in
 [core/engine/src/collections/mod.rs](../../core/engine/src/collections/mod.rs).
 The index families follow: `0x70` scalar entries, `0x71`/`0x72` the two graph
@@ -515,6 +516,13 @@ these persistent tags blindly.
   count, so a file that declares it is refused by this build exactly as any
   other unknown bit is. `JSON_EXPRESSION_FEATURE = 0x10000` (2026-09-22) took
   it to `0x17fff`, leaving `0x8000` reserved for the graph vector family.
+  `SCHEMA_FEATURE = 0x20000` (2026-09-25) is NAMED SCHEMAS, and the mask is
+  `0x3ffff`: a schema record `0x10 || 0xFF || schema` (value empty), a table
+  in a named schema `0x10 || 0xFF || schema || 0xFF || name` (value the
+  collection id), and catalog flag bit 4 (`CATALOG_SCHEMA`) with a
+  `len: u8 || schema: UTF-8` tail. `0xFF` never occurs in UTF-8, so no public
+  name -- the bare UTF-8 after the tag, unchanged -- can collide with either.
+  A file that never names a schema carries none of it.
   Every bit in it is
   additive: set in the same transaction as the first record that needs it,
   never cleared, and a file declaring a bit outside the mask is refused as

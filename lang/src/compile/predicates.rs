@@ -423,6 +423,12 @@ impl Compiler<'_> {
                         fill: geo_is_bound(argument)
                             .then(|| PointFill::Bbox(argument.clone())),
                     }),
+                    SpatialPredicate::Overlaps => Ok(OwnedFilter::Point {
+                        index,
+                        predicate: PointFilter::Bbox(self.binder().overlap_bounds_of(argument)?),
+                        fill: geo_is_bound(argument)
+                            .then(|| PointFill::Overlaps(argument.clone())),
+                    }),
                     other => Err(SqlError::unsupported(format!(
                         "{other:?} on a Point column: the point atomics are PointFilter::Bbox (ST_Within against an envelope) and PointFilter::Radius (ST_DWithin)"
                     ))),
@@ -447,6 +453,7 @@ impl Compiler<'_> {
                     SpatialPredicate::Intersects => GeometryFilter::Intersects(geometry),
                     SpatialPredicate::Within => GeometryFilter::Within(geometry),
                     SpatialPredicate::Contains => GeometryFilter::Contains(geometry),
+                    SpatialPredicate::Overlaps => GeometryFilter::Overlaps(geometry),
                 };
                 let fill = bound.then(|| GeomFill {
                     predicate,
@@ -459,6 +466,9 @@ impl Compiler<'_> {
                     fill,
                 })
             }
+            // `&&` over anything else is array overlap, which has no atomic:
+            // the table's refusal names it.
+            _ if predicate == SpatialPredicate::Overlaps => Err(refuse::refuse("&&")),
             other => Err(SqlError::unsupported(format!(
                 "`{column}` is declared {other:?}; a spatial predicate needs a Point or a Geo column"
             ))),

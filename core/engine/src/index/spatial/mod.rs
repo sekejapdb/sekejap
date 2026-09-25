@@ -3,5 +3,6 @@
 //! walks share. See docs/core/SPATIAL_FUNCTIONS.md.
 pub mod geometry;
 pub mod geometry_index;
+pub mod io;
 pub mod math;
 pub mod point;

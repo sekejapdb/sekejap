@@ -66,6 +66,15 @@ pub const USER: &str = "postgres";
 /// `PostgreSQL`.
 pub const VERSION: &str = concat!("PostgreSQL 16.0 (sekejap ", env!("CARGO_PKG_VERSION"), ")");
 
+/// `postgis_version()`, in the shape PostGIS prints it: the release whose
+/// function surface is served, then the build flags. A client reads it as a
+/// promise, so the flags say what is NOT here: no GEOS (the overlay
+/// functions are Tier 3), no PROJ (`ST_Transform` is Tier 2), no planner
+/// statistics. What IS here is the geometry I/O (`ST_AsBinary`,
+/// `ST_GeomFromWKB`, `ST_AsText`, `ST_GeomFromText`), `&&`, and the §4.4
+/// predicates.
+pub const POSTGIS_VERSION: &str = "3.4 USE_GEOS=0 USE_PROJ=0 USE_STATS=0";
+
 /// `db_version()`: the same fact without the PostgreSQL costume, for a
 /// caller that is not a driver.
 pub const DB_VERSION: &str = concat!("sekejap ", env!("CARGO_PKG_VERSION"));
@@ -610,6 +619,9 @@ const NULL: SqlValue = SqlValue::Null;
 struct Snapshot {
     /// `(name, id, rows, fields, indexes)` per collection, in catalog order.
     tables: Vec<Table>,
+    /// The NAMED schemas, empty ones included; `public` and the two catalog
+    /// schemas are always there and are not listed.
+    schemas: Vec<String>,
     /// True when `db_edges` stopped at its cap rather than at the end.
     edges_truncated: bool,
     edges: Vec<(String, String, String, String)>,
@@ -618,6 +630,8 @@ struct Snapshot {
 
 struct Table {
     name: String,
+    /// `public`, or the named schema the collection belongs to.
+    schema: String,
     id: CollectionId,
     rows: Option<u64>,
     /// `(field, kind, declared, not_null, has_default, default spelling)`.
@@ -692,8 +706,14 @@ fn default_spelling(value: &DefaultValue) -> String {
 /// edge column, so the ordinary catalog views never pay the edge probe.
 fn snapshot(db: &Database, graph: bool) -> SqlResult2<Snapshot> {
     let mut tables = Vec::new();
-    for name in db.list_collections().map_err(SqlError::from)? {
-        let Some(id) = db.collection(&name).map_err(SqlError::from)? else {
+    let mut schemas = Vec::new();
+    for schema in db.list_schemas().map_err(SqlError::from)? {
+        if schema != PUBLIC {
+            schemas.push(schema);
+        }
+    }
+    for (schema, name) in db.list_qualified_collections().map_err(SqlError::from)? {
+        let Some(id) = db.collection_in(&schema, &name).map_err(SqlError::from)? else {
             // A name whose catalog entry went away between the two reads is
             // not an error: the listing is a walk, not a transaction.
             continue;
@@ -753,6 +773,7 @@ fn snapshot(db: &Database, graph: bool) -> SqlResult2<Snapshot> {
         tables.push(Table {
             rows: db.row_count(id).map_err(SqlError::from)?,
             name,
+            schema,
             id,
             fields,
             indexes,
@@ -774,7 +795,7 @@ fn snapshot(db: &Database, graph: bool) -> SqlResult2<Snapshot> {
             tables
                 .iter()
                 .find(|t| t.id == id)
-                .map_or_else(|| format!("collection {}", id.0), |t| t.name.clone())
+                .map_or_else(|| format!("collection {}", id.0), Table::shown)
         };
         for row in shape {
             let edge_type = types
@@ -794,10 +815,44 @@ fn snapshot(db: &Database, graph: bool) -> SqlResult2<Snapshot> {
     }
     Ok(Snapshot {
         tables,
+        schemas,
         edges,
         edges_truncated,
         contexts,
     })
+}
+
+impl Table {
+    /// The name as a statement writes it: `t`, or `schema.t` outside `public`.
+    fn shown(&self) -> String {
+        if self.schema == PUBLIC {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.schema, self.name)
+        }
+    }
+
+    /// The object id `pg_class` gives it. A public table keeps the id it has
+    /// always had; a table in a named schema is hashed with its schema, so
+    /// `public.orders` and `sales.orders` are two relations.
+    fn oid(&self) -> i64 {
+        object_oid(&self.shown())
+    }
+
+    fn namespace(&self) -> i64 {
+        namespace_oid(&self.schema)
+    }
+}
+
+/// `pg_namespace.oid` of a schema: the fixed ids PostgreSQL gives its own
+/// three, and a hash of the name for a named one.
+fn namespace_oid(schema: &str) -> i64 {
+    match schema {
+        PUBLIC => NS_PUBLIC,
+        "pg_catalog" => NS_PG_CATALOG,
+        "information_schema" => NS_INFORMATION_SCHEMA,
+        named => object_oid(&format!("{named}{}", '\u{0}')),
+    }
 }
 
 /// The name the base graph is listed under. `GRAPH_CONTRACT` 3.1: a context
@@ -827,7 +882,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .iter()
             .map(|t| {
                 vec![
-                    text(&t.name),
+                    text(t.shown()),
                     int(i64::from(t.id.0)),
                     t.rows.map_or(NULL, |n| int(n as i64)),
                     int(t.fields.len() as i64),
@@ -840,7 +895,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .flat_map(|t| {
                 t.fields.iter().enumerate().map(move |(at, f)| {
                     vec![
-                        text(&t.name),
+                        text(t.shown()),
                         text(&f.name),
                         text(kind_word(&f.kind)),
                         text(f.declared_sql()),
@@ -857,7 +912,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .flat_map(|t| {
                 t.indexes.iter().map(move |i| {
                     vec![
-                        text(&t.name),
+                        text(t.shown()),
                         text(&i.name),
                         text(family_word(i.family)),
                         text(&i.field),
@@ -889,10 +944,12 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
 
         ("information_schema", "schemata") => [PUBLIC, "pg_catalog", "information_schema"]
             .iter()
+            .map(|schema| (*schema).to_owned())
+            .chain(snapshot.schemas.iter().cloned())
             .map(|schema| {
                 vec![
                     text(DATABASE),
-                    text(*schema),
+                    text(schema),
                     text(USER),
                     NULL,
                     NULL,
@@ -907,7 +964,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .map(|t| {
                 vec![
                     text(DATABASE),
-                    text(PUBLIC),
+                    text(&t.schema),
                     text(&t.name),
                     text("BASE TABLE"),
                     NULL,
@@ -929,7 +986,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
                     let (_, typname) = pg_type_of(&f.kind, f.declared.as_deref());
                     vec![
                         text(DATABASE),
-                        text(PUBLIC),
+                        text(&t.schema),
                         text(&t.name),
                         text(&f.name),
                         int(at as i64 + 1),
@@ -953,10 +1010,10 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .map(|t| {
                 vec![
                     text(DATABASE),
-                    text(PUBLIC),
+                    text(&t.schema),
                     text(format!("{}_pkey", t.name)),
                     text(DATABASE),
-                    text(PUBLIC),
+                    text(&t.schema),
                     text(&t.name),
                     text("PRIMARY KEY"),
                     text("NO"),
@@ -971,10 +1028,10 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .map(|t| {
                 vec![
                     text(DATABASE),
-                    text(PUBLIC),
+                    text(&t.schema),
                     text(format!("{}_pkey", t.name)),
                     text(DATABASE),
-                    text(PUBLIC),
+                    text(&t.schema),
                     text(&t.name),
                     text(super::KEY_COLUMN),
                     int(1),
@@ -983,22 +1040,20 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             })
             .collect(),
 
-        ("pg_catalog", "pg_namespace") => [
-            (NS_PUBLIC, PUBLIC),
-            (NS_PG_CATALOG, "pg_catalog"),
-            (NS_INFORMATION_SCHEMA, "information_schema"),
-        ]
-        .iter()
-        .map(|(oid, name)| vec![int(*oid), text(*name), int(OWNER), NULL])
-        .collect(),
+        ("pg_catalog", "pg_namespace") => [PUBLIC, "pg_catalog", "information_schema"]
+            .iter()
+            .map(|schema| (*schema).to_owned())
+            .chain(snapshot.schemas.iter().cloned())
+            .map(|name| vec![int(namespace_oid(&name)), text(name), int(OWNER), NULL])
+            .collect(),
         ("pg_catalog", "pg_class") => snapshot
             .tables
             .iter()
             .map(|t| {
                 vec![
-                    int(object_oid(&t.name)),
+                    int(t.oid()),
                     text(&t.name),
-                    int(NS_PUBLIC),
+                    int(t.namespace()),
                     int(0),
                     int(OWNER),
                     int(0),
@@ -1028,7 +1083,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .tables
             .iter()
             .flat_map(|t| {
-                let relid = object_oid(&t.name);
+                let relid = t.oid();
                 t.fields.iter().enumerate().map(move |(at, f)| {
                     let (oid, _) = pg_type_of(&f.kind, f.declared.as_deref());
                     vec![
@@ -1084,7 +1139,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .tables
             .iter()
             .flat_map(|t| {
-                let relid = object_oid(&t.name);
+                let relid = t.oid();
                 t.indexes.iter().map(move |i| {
                     vec![
                         int(object_oid(&i.name)),
@@ -1112,11 +1167,11 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
                     .iter()
                     .map(move |i| {
                         vec![
-                            text(PUBLIC),
+                            text(&t.schema),
                             text(&t.name),
                             text(&i.name),
                             NULL,
-                            text(index_def(&t.name, i)),
+                            text(index_def(&t.shown(), i)),
                         ]
                     })
             })
@@ -1129,14 +1184,14 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .iter()
             .map(|t| {
                 vec![
-                    int(object_oid(&format!("{}_pkey", t.name))),
+                    int(object_oid(&format!("{}_pkey", t.shown()))),
                     text(format!("{}_pkey", t.name)),
-                    int(NS_PUBLIC),
+                    int(t.namespace()),
                     text("p"),
                     SqlValue::Bool(false),
                     SqlValue::Bool(false),
                     SqlValue::Bool(true),
-                    int(object_oid(&t.name)),
+                    int(t.oid()),
                     int(0),
                     int(0),
                     text("1"),
@@ -1148,7 +1203,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
             .iter()
             .map(|t| {
                 vec![
-                    text(PUBLIC),
+                    text(&t.schema),
                     text(&t.name),
                     text(USER),
                     NULL,
@@ -1170,7 +1225,7 @@ pub fn build(db: &Database, relation: &CatalogRelation) -> SqlResult2<(Vec<Vec<S
                     .map(move |f| {
                         vec![
                             text(DATABASE),
-                            text(PUBLIC),
+                            text(&t.schema),
                             text(&t.name),
                             text(&f.name),
                             int(2),

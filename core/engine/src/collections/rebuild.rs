@@ -432,6 +432,10 @@ struct Metadata {
     /// copies a database, it does not enable a representation the source did
     /// not have.
     row_counted: Vec<CollectionId>,
+    /// The named schemas the source holds, empty ones included. A table's
+    /// schema rides its catalog record; an EMPTY schema is only its record,
+    /// so it is carried here or it would not survive the rebuild.
+    schemas: Vec<String>,
 }
 
 fn collect_metadata(source: &SourceView) -> Result<Metadata> {
@@ -567,6 +571,33 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
             }
         }
     }
+    let mut schemas = Vec::new();
+    if header
+        .indexes
+        .is_some_and(|value| value.features & SCHEMA_FEATURE != 0)
+    {
+        source.visit(&[0x10, SCHEMA_MARK], Some(&[0x11]), |key, value| {
+            if let NameEntry::Schema(schema) = parse_name_key(key)? {
+                if !value.is_empty() {
+                    return Err(corrupt("schema record value"));
+                }
+                if schemas.len() == source.limits.max_metadata {
+                    return Err(Error::Kernel(kernel::Error::ResourceLimit(
+                        "index rebuild schema budget exceeded",
+                    )));
+                }
+                schemas.push(schema.to_owned());
+            }
+            Ok(())
+        })?;
+    }
+    for (catalog, _) in &catalogs {
+        if let Some(schema) = &catalog.schema {
+            if !schemas.contains(schema) {
+                return Err(corrupt("collection names a schema the source does not hold"));
+            }
+        }
+    }
     Ok(Metadata {
         header,
         catalogs,
@@ -575,12 +606,16 @@ fn collect_metadata(source: &SourceView) -> Result<Metadata> {
         graph_header,
         graph_names,
         row_counted,
+        schemas,
     })
 }
 
 fn seed_metadata(destination: &mut Destination, metadata: &Metadata) -> Result<()> {
     let header = header_bytes(metadata.header)?;
     put_replicas(destination, |copy| vec![0, 0, copy], &header)?;
+    for schema in &metadata.schemas {
+        destination.put(&schema_key(schema), &[])?;
+    }
     for (catalog, next) in &metadata.catalogs {
         let bytes = catalog_bytes(catalog)?;
         put_replicas(
@@ -594,7 +629,7 @@ fn seed_metadata(destination: &mut Destination, metadata: &Metadata) -> Result<(
             |copy| replica_key(2, catalog.id.0, copy),
             &bytes,
         )?;
-        let name = name_key(&catalog.name);
+        let name = name_key_in(catalog.schema.as_deref(), &catalog.name);
         if destination.store.get(&name)?.is_some() {
             return Err(corrupt(
                 "duplicate collection name in authoritative catalog",

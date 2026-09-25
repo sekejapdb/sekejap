@@ -77,7 +77,8 @@ const NATURAL_POSITION: &[(&str, &str)] = &[
         "CREATE VIEW",
         "CREATE VIEW v AS SELECT _id FROM place WHERE kind = 'park'",
     ),
-    ("CREATE SCHEMA", "CREATE SCHEMA warehouse"),
+    // `CREATE SCHEMA` left the table with named schemas
+    // (`lang/tests/sql_schema_segment.rs`).
     // ── §4.3: a pattern MODE word stands between MATCH and the pattern ────
     (
         "TRAIL",
@@ -148,10 +149,6 @@ const NATURAL_POSITION: &[(&str, &str)] = &[
     ("ST_LENGTH", "SELECT ST_Length(plot) FROM place"),
     ("ST_PERIMETER", "SELECT ST_Perimeter(plot) FROM place"),
     ("ST_CENTROID", "SELECT ST_Centroid(plot) FROM place"),
-    ("ST_ASTEXT", "SELECT ST_AsText(plot) FROM place"),
-    ("ST_ASBINARY", "SELECT ST_AsBinary(plot) FROM place"),
-    ("ST_X", "SELECT ST_X(loc) FROM place"),
-    ("ST_Y", "SELECT ST_Y(loc) FROM place"),
     ("ST_SIMPLIFY", "SELECT ST_Simplify(plot, 0.1) FROM place"),
     ("ST_BUFFER", "SELECT ST_Buffer(plot, 0.1) FROM place"),
     ("ST_UNION", "SELECT ST_Union(plot, plot) FROM place"),
@@ -169,12 +166,9 @@ const NATURAL_POSITION: &[(&str, &str)] = &[
     ),
     ("ST_TRANSFORM", "SELECT ST_Transform(plot, 3857) FROM place"),
     ("ST_ASMVT", "SELECT ST_AsMVT(plot) FROM place"),
-    (
-        "ST_GEOMFROMTEXT",
-        "SELECT ST_GeomFromText('POINT(1 2)') FROM place",
-    ),
-    ("ST_GEOMFROMWKB", "SELECT ST_GeomFromWKB(name) FROM place"),
-    ("POSTGIS_VERSION", "SELECT postgis_version()"),
+    // `ST_AsText`, `ST_AsBinary`, `ST_X`, `ST_Y`, `ST_GeomFromText`,
+    // `ST_GeomFromWKB` and `postgis_version()` left the table with the
+    // geometry I/O (`lang/tests/sql_geometry_io.rs`).
     // ── §4.5 / §4.6: row functions and query parsers ─────────────────────
     ("VECTOR_DIMS", "SELECT vector_dims(emb) FROM place"),
     ("VECTOR_NORM", "SELECT vector_norm(emb) FROM place"),

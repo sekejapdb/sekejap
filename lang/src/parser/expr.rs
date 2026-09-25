@@ -137,7 +137,7 @@ impl Parser {
             }
         }
         self.expect_word("FROM")?;
-        let table = self.name()?;
+        let table = self.table_name()?;
         self.expect_word("WHERE")?;
         let column = self.name()?;
         if !self.eat(&Tok::Eq) {
@@ -238,6 +238,23 @@ impl Parser {
         // from the predicate itself, so the cast is read and dropped. A cast
         // to DATE is NOT dropped: `t::date = 'lit'` is one day's range.
         let cast_to_date = self.date_cast()?;
+        // `geom && <shape>`: the one position `&&` is Tier 1 (QL_CONTRACT
+        // §4.4). Everywhere else the guard below still refuses it by name.
+        if !cast_to_date && matches!(self.peek(), Tok::Overlaps) {
+            self.bump();
+            let argument = self.geo_argument()?;
+            if !self.last_geo_srid {
+                return Err(SqlError::unsupported(
+                    "this shape has no SRID. The column is SRID 4326 and a bare ST_MakePoint or ST_MakeEnvelope is SRID 0, which PostGIS refuses as mixed SRID geometries. Give it the SRID: `ST_MakeEnvelope(xmin, ymin, xmax, ymax, 4326)`.",
+                ));
+            }
+            return Ok(Predicate::Spatial {
+                predicate: SpatialPredicate::Overlaps,
+                column,
+                argument,
+                metres: None,
+            });
+        }
         self.guard_operator()?;
         if cast_to_date {
             let op = self.comparison(&format!("{column}::date"))?;
@@ -394,7 +411,7 @@ impl Parser {
             self.bump();
             let subject = self.name()?;
             self.expect_word("FROM")?;
-            let table = self.name()?;
+            let table = self.table_name()?;
             if !self.eat(&Tok::RParen) {
                 return Err(SqlError::syntax(
                     format!(
@@ -632,7 +649,7 @@ impl Parser {
             self.bump();
             match word.as_str() {
                 "GEOGRAPHY" | "GEOMETRY" | "VECTOR" | "TEXT" | "FLOAT8" | "DOUBLE" | "INT"
-                | "INTEGER" | "BIGINT" | "REAL" => {}
+                | "INTEGER" | "BIGINT" | "REAL" | "BYTEA" => {}
                 other => {
                     return Err(SqlError::unsupported(format!(
                         "cast `::{other}` has no Tier-1 meaning here"
@@ -651,7 +668,7 @@ impl Parser {
         Ok(())
     }
 
-    fn geo_argument(&mut self) -> SqlResult2<GeoArg> {
+    pub(super) fn geo_argument(&mut self) -> SqlResult2<GeoArg> {
         self.deeper()?;
         let result = self.geo_argument_inner();
         self.shallower();
@@ -739,9 +756,45 @@ impl Parser {
                 self.last_geo_srid = true;
                 GeoArg::GeoJson(json)
             }
+            Some(
+                word @ ("ST_GEOMFROMWKB" | "ST_WKBTOSQL" | "ST_GEOMFROMEWKB" | "ST_GEOMFROMTEXT"
+                | "ST_GEOMETRYFROMTEXT" | "ST_WKTTOSQL" | "ST_GEOMFROMEWKT"),
+            ) => {
+                let format = if word.contains("WKB") {
+                    GeoFormat::Wkb
+                } else {
+                    GeoFormat::Wkt
+                };
+                // The E-forms carry their SRID inside the value; the plain
+                // forms take it as a second argument or have none (SRID 0).
+                let extended = word.contains("FROME");
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let source = self.literal()?;
+                let mut srid = extended;
+                if !extended && self.eat(&Tok::Comma) {
+                    match self.bump() {
+                        Tok::Num(n, _) if n == 4326.0 => srid = true,
+                        other => {
+                            return Err(SqlError::unsupported(format!(
+                                "{}(..., {}): storage is WGS84; ST_Transform is Tier 2",
+                                word.to_ascii_lowercase(),
+                                other.written()
+                            )))
+                        }
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                self.last_geo_srid = srid;
+                GeoArg::Encoded { source, format }
+            }
             _ => {
+                let literal = self.literal()?;
+                // A bare literal is SRID 4326 when it says nothing else: a
+                // GeoJSON document is WGS84 by definition, and the SRID an
+                // EWKB or EWKT literal names is checked when it is read.
                 self.last_geo_srid = true;
-                GeoArg::GeoJson(self.literal()?)
+                GeoArg::GeoJson(literal)
             }
         };
         // `ST_SetSRID(ST_MakePoint(..)::geography, 4326)` keeps the inner
@@ -1412,6 +1465,10 @@ impl Parser {
                 "TEXT" | "VARCHAR" => RowExpr::CastText(Box::new(expr)),
                 "TIMESTAMPTZ" | "TIMESTAMP" => expr,
                 "INT" | "INTEGER" | "BIGINT" | "REAL" | "FLOAT8" => expr,
+                // A geometry is already a geometry; the unit question a cast
+                // answers in a predicate does not arise for an output
+                // function, and `bytea` is what the WKB functions return.
+                "GEOMETRY" | "GEOGRAPHY" | "BYTEA" => expr,
                 "DOUBLE" => {
                     self.expect_word("PRECISION")?;
                     expr
@@ -1436,6 +1493,13 @@ impl Parser {
         if matches!(self.peek(), Tok::Num(_, _) | Tok::Str(_) | Tok::Param(_) | Tok::Minus) {
             let literal = self.literal_no_cast()?;
             return self.row_casts(RowExpr::Lit(literal));
+        }
+        // A double-quoted name is always a column: quoting is how a client
+        // says "this is an identifier", and QGIS quotes every one it writes
+        // (`ST_AsBinary("geom", 'NDR')`).
+        if matches!(self.peek(), Tok::Quoted(_)) {
+            let name = self.name()?;
+            return self.row_casts(RowExpr::Column(name));
         }
         let word = match self.word() {
             Some(word) => word.to_ascii_uppercase(),
@@ -1618,6 +1682,68 @@ impl Parser {
                     args,
                 }
             }
+            "ST_ASBINARY" | "ST_ASEWKB" | "ST_ASTEXT" | "ST_ASEWKT" | "ST_ASGEOJSON" | "ST_X"
+            | "ST_Y" | "ST_SRID" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let arg = self.row_expr()?;
+                let option = if self.eat(&Tok::Comma) {
+                    Some(self.bump())
+                } else {
+                    None
+                };
+                self.expect(&Tok::RParen)?;
+                let order = |option: &Option<Tok>| -> SqlResult2<ByteOrder> {
+                    match option {
+                        None => Ok(ByteOrder::Little),
+                        Some(Tok::Str(text)) if text.eq_ignore_ascii_case("NDR") => {
+                            Ok(ByteOrder::Little)
+                        }
+                        Some(Tok::Str(text)) if text.eq_ignore_ascii_case("XDR") => {
+                            Ok(ByteOrder::Big)
+                        }
+                        Some(other) => Err(SqlError::unsupported(format!(
+                            "{}(g, {}): the byte order is 'NDR' or 'XDR'",
+                            word.to_ascii_lowercase(),
+                            other.written()
+                        ))),
+                    }
+                };
+                let func = match word.as_str() {
+                    "ST_ASBINARY" => GeoFunc::AsBinary(order(&option)?),
+                    "ST_ASEWKB" => GeoFunc::AsEwkb(order(&option)?),
+                    "ST_ASGEOJSON" => GeoFunc::AsGeoJson(match option {
+                        None => 9,
+                        Some(Tok::Num(n, true)) if (0.0..=15.0).contains(&n) => n as usize,
+                        Some(other) => {
+                            return Err(SqlError::unsupported(format!(
+                                "st_asgeojson(g, {}): maxdecimaldigits is a whole number from 0 to 15; the options argument is not carried",
+                                other.written()
+                            )))
+                        }
+                    }),
+                    single => {
+                        if let Some(other) = option {
+                            return Err(SqlError::unsupported(format!(
+                                "{}(g, {}) takes one argument",
+                                single.to_ascii_lowercase(),
+                                other.written()
+                            )));
+                        }
+                        match single {
+                            "ST_ASTEXT" => GeoFunc::AsText,
+                            "ST_ASEWKT" => GeoFunc::AsEwkt,
+                            "ST_X" => GeoFunc::X,
+                            "ST_Y" => GeoFunc::Y,
+                            _ => GeoFunc::Srid,
+                        }
+                    }
+                };
+                RowExpr::Geo {
+                    func,
+                    arg: Box::new(arg),
+                }
+            }
             "TRIM" | "BTRIM" => {
                 self.bump();
                 self.expect(&Tok::LParen)?;
@@ -1738,7 +1864,7 @@ impl Parser {
             self.bump();
             let column = self.name()?;
             self.expect_word("FROM")?;
-            let table = self.name()?;
+            let table = self.table_name()?;
             self.expect_word("WHERE")?;
             let key_column = self.name()?;
             if !super::is_key_column(&key_column) {

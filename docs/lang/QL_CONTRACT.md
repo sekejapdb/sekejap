@@ -174,8 +174,8 @@ Test files are `lang/tests/*.rs` unless another crate is written out.
 | `ALTER TABLE t ALTER COLUMN c TYPE new_type` | T1 when the new type maps to the same `Kind` (`INT` <-> `BIGINT`, `REAL` <-> `DOUBLE PRECISION`, `TIMESTAMPTZ` <-> `BIGINT`); T3 when the `Kind` changes, refused by name with BOTH `Kind`s in the refusal | `sql_schema.rs::alter_column_type_is_accepted_within_one_kind_and_refused_across_kinds` | the same-`Kind` case changes the declared spelling and leaves the encoding alone, so it is the descriptor rewrite above. A `Kind` change rewrites every row and re-encodes every scalar index key -- work proportional to the collection, with no bounded resumable atomic today. The shape it would need is the `begin_drop_collection` / `drop_collection_step` phase machine applied to a rewrite; until that exists the form is refused and names this. |
 | `REINDEX [ON t] [USING method (field)]` | T2 | — (not a statement the parser begins; the word is a syntax error naming the place) | rebuild, no new atomic: drop the index tree and rebuild it through the sorted build (`core/engine/src/collections/rebuild.rs`) under the `IndexState` Building/Ready/Dropping machine that already makes a build resumable across a reopen. |
 | `COMPACT` | T2 | — (not a statement the parser begins) | `Database::checkpoint` (`core/engine/src/collections/mod.rs:2156`): fold the committed pages into the data file and reset the WAL. It is reachable as a CALL today (`Db::checkpoint`, `sekejap_checkpoint`), not as a statement. Deviation, stated: `checkpoint` returns `Ok(false)` while any reader in any process holds a slot, so `COMPACT` would report *deferred* and return -- it never waits on a reader, and it is not Postgres `VACUUM`: nothing is reclaimed inside a table. |
-| `CREATE SCHEMA` | T2 (refused by name, `lang/src/refuse.rs`) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | p2-schema-segment |
-| `schema.table` | T1 for the schemas that exist | `sql_catalog.rs::a_schema_qualified_name_resolves_to_the_one_thing_it_can_mean` | there is exactly one user schema while `CREATE SCHEMA` is T2, so `public.t` IS `t` -- the qualifier is read and dropped (`lang/src/parser/mod.rs::source_name`). `pg_catalog.x` and bare `x` are the same relation, as in PostgreSQL, where `pg_catalog` is implicitly on every `search_path`; `information_schema.tables` and `.columns` resolve ONLY qualified, because their bare spellings are ordinary names a collection may have and a collection named `tables` must keep meaning itself. Three dotted segments are still the `CREATE SCHEMA` refusal. |
+| `CREATE SCHEMA [IF NOT EXISTS] s`, `DROP SCHEMA [IF EXISTS] s [RESTRICT]` | T1 | `lang/tests/sql_schema_segment.rs`; `core/engine/tests/schema_segment.rs` | `Database::create_schema` / `drop_schema`: one record in the collection-name keyspace behind the additive `SCHEMA_FEATURE = 0x20000`. `DROP SCHEMA` refuses a schema that still holds a table and names it; `CASCADE` is refused, because each table is its own bounded, resumable drop. `public`, `information_schema` and the `pg_` prefix are reserved, as in PostgreSQL. `AUTHORIZATION` is refused: there are no roles |
+| `schema.table` | T1 | `lang/tests/sql_schema_segment.rs`, `sql_catalog.rs::a_schema_qualified_name_resolves_to_the_one_thing_it_can_mean` | a table belongs to one schema, `public` unless it was created in a named one; the schema is in the catalog record's tail and in the name key, and no row or index key depends on it. `public.t` IS `t`. A bare name resolves in `public` only: `SET search_path` is accepted as a notice and stores nothing, so a table in a named schema is always written qualified. `pg_catalog.x` and bare `x` are the same relation, as in PostgreSQL; `information_schema.tables` and `.columns` resolve ONLY qualified, because a collection named `tables` must keep meaning itself. A rename stays inside its schema. The automatic index of a table in a named schema carries the schema in its generated name (`sales_orders_total_btree`), because index names are one namespace here. Three dotted segments are refused: a file is one database |
 | `CREATE PROPERTY GRAPH name NODE TABLES (...) EDGE TYPES (...)` | T2 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | optional naming of a context + label map; nothing is built |
 | `SET <client setting> = <value>`, `RESET <client setting>`, `SHOW <client setting>` | T1 | `sql_catalog.rs::a_client_setting_is_accepted_as_a_notice_and_read_back_from_a_constant`, `::every_statement_a_client_issues_on_connect_answers_without_an_error` | the connect-time chatter a driver sends (`client_encoding`, `DateStyle`, `TimeZone`, `application_name`, `search_path`, `extra_float_digits`, and the rest of the closed list in `docs/dist/PG_SURFACE.md` §4). A `SET` is accepted as a NOTICE that names the knob and the value and stores NOTHING -- a connection is a process here and there is no session settings object, so a silent `SET` would read as one that took effect. A `SHOW` answers from the constant this engine actually has, which is why `SHOW extra_float_digits` still says `1` after `SET extra_float_digits = 3`. The two knobs that DO change something keep `SET LOCAL` (§4.5). |
 | `BEGIN [READ ONLY]`, `COMMIT`, `ROLLBACK` | T1 | `sql_tier1.rs::rollback_discards_an_uncommitted_write`; `dist/tests/pg_wire.rs::a_transaction_block_reports_its_status_and_a_rollback_leaves_no_row` | one writer, snapshot readers |
@@ -313,18 +313,18 @@ already built and already charged.
 |---|---|---|---|
 | `ST_DWithin(geog, geog, m)` | T1 | `sql_tier1.rs::st_dwithin_on_a_point_column_is_a_radius`, `::the_four_geometry_predicates_match_the_direct_request`; `core/engine/tests/spatial_postgis_conformance.rs` | Point Radius / Geometry DWithin (spheroidal) |
 | `ST_Intersects`, `ST_Within`, `ST_Contains`, `ST_Covers`, `ST_Crosses` | T1 | `sql_tier1.rs::the_four_geometry_predicates_match_the_direct_request`, `::st_within_an_envelope_on_a_point_column_is_a_bbox` | Geometry filters (units per `docs/core/SPATIAL_FUNCTIONS.md`) |
-| `ST_MakePoint(lon, lat)`, `ST_Point`, `ST_SetSRID(g, 4326)`, `ST_MakeEnvelope(w, s, e, n, 4326)`, `ST_GeomFromGeoJSON(text)`, the `::geography` / `::geometry` casts | T1 **in geometry-argument position** | `sql_tier1.rs::st_dwithin_on_a_point_column_is_a_radius`, `::st_within_an_envelope_on_a_point_column_is_a_bbox`, `::the_four_geometry_predicates_match_the_direct_request`; `sql_prepared.rs::a_rectangle_over_a_point_column_rebinds_its_four_corners`, `::a_geometry_predicate_rebinds_the_geometry_it_compares_against` | the constructors a predicate's right-hand side or a distance order's centre is written with. They are NOT general row functions: the parser reads them only where a geometry is expected (`lang/src/parser/expr.rs`), so `SELECT ST_MakePoint(1,2)` is a syntax error. A SRID other than 4326 is refused |
-| `&&` with `ST_MakeEnvelope` | T2 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | Bbox filter on point/geometry index (p3-geometry-io). `ST_Within` against an envelope is the T1 spelling of the same rectangle, and the refusal says so |
+| `ST_MakePoint(lon, lat)`, `ST_Point`, `ST_SetSRID(g, 4326)`, `ST_MakeEnvelope(w, s, e, n, 4326)`, `ST_GeomFromGeoJSON(text)`, the `::geography` / `::geometry` casts | T1 **in geometry-argument position** | `sql_tier1.rs::st_dwithin_on_a_point_column_is_a_radius`, `::st_within_an_envelope_on_a_point_column_is_a_bbox`, `::the_four_geometry_predicates_match_the_direct_request`; `sql_prepared.rs::a_rectangle_over_a_point_column_rebinds_its_four_corners`, `::a_geometry_predicate_rebinds_the_geometry_it_compares_against` | the constructors a predicate's right-hand side or a distance order's centre is written with. They are NOT general row functions: the parser reads them only where a geometry is expected (`lang/src/parser/expr.rs`), so `SELECT ST_MakePoint(1,2)` is a syntax error. They are also read as a WRITTEN value in `INSERT ... VALUES` and `UPDATE ... SET` (`sql_geometry_io.rs`), where the shape must carry SRID 4326, as PostGIS requires for a 4326 column. A SRID other than 4326 is refused |
+| `col && <shape>` | T1 | `sql_geometry_io.rs::overlaps_on_a_geometry_column_answers_what_postgis_answers`, `::overlaps_on_a_point_column_keeps_the_float4_edge`, `::a_prepared_overlap_rebinds_its_envelope`; `core/engine/tests/query_geometry_overlaps.rs` | planar bounding boxes intersect, edges included: `GeometryFilter::Overlaps` on the geometry index, `PointFilter::Bbox` on the point index. The boxes compare as PostGIS's float4 boxes rounded outward, so a point a hair past an edge overlaps in both engines. The shape needs SRID 4326. `&&` anywhere else, or over a non-spatial column, is refused by name |
 | `<->` (kNN, `ORDER BY loc <-> pt::geography`), `ST_Distance(col, pt::geography)` as an order key | T1 | `sql_tier1.rs::the_knn_operator_is_the_distance_order`; `sql_prepared.rs::a_nearest_order_rebinds_its_centre_and_keeps_its_order` | Distance order (point index) |
 | a distance, `<->` or `ST_Intersects` NOT marked geography (no `::geography` on either argument, and for `ST_DWithin` no fourth `true`); `ST_Within`/`ST_Contains` WITH `::geography`, or with a shape of SRID 0 | refused by name, with the spelling to use | `sql_spatial_units.rs` (all five tests) | none: PostGIS reads the first as degrees or the flat plane, and refuses the other two, so an accepted statement means the same thing in PostGIS (`docs/core/SPATIAL_FUNCTIONS.md`, "The unit is the type") |
-| `ST_AsBinary`, `ST_AsEWKB`, `ST_GeomFromWKB`, `ST_GeomFromEWKB`, `ST_AsText`, `ST_GeomFromText`, `ST_AsGeoJSON`, `ST_X`, `ST_Y`, `ST_SRID` | T2 (refused by name where `refuse::TABLE` lists the spelling) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | pure I/O functions; SRID per column (p3-geometry-io) |
-| `POINT(lon lat)`, `POLYGON((lon lat, ...))` as a literal in value position | T2 | — (not a spelling the parser reads; it is a syntax error naming the place) | I/O only: the WKT text parser `ST_GeomFromText` already needs (p3-geometry-io), reached without the function name around it. Axis order is longitude then latitude -- the same order `ST_MakePoint(x, y)` takes and the same order the prior engine writes -- and the contract says so here because the reverse is the classic import bug. |
+| `ST_AsBinary(g [, 'NDR' \| 'XDR'])`, `ST_AsEWKB`, `ST_AsText`, `ST_AsEWKT`, `ST_AsGeoJSON(g [, digits])`, `ST_X`, `ST_Y`, `ST_SRID` as select-list functions; `ST_GeomFromWKB`, `ST_GeomFromEWKB`, `ST_GeomFromText`, `ST_GeomFromEWKT` wherever a geometry argument or a written value goes | T1 | `sql_geometry_io.rs`; `core/engine/tests/spatial_io.rs`, which checks every byte and every string against PostGIS 3.4 (`tools/postgis_wkb_fixture.py`) | pure I/O over `Geom` (`core/engine/src/index/spatial/io.rs`). The WKB functions return `bytea`: printed `\x...` in text and sent as the raw bytes in a binary result. Z/M coordinates, EMPTY and `GEOMETRYCOLLECTION` are refused with the reason, and so is an SRID other than 4326 |
+| a geometry literal -- `'POINT(lon lat)'`, `'SRID=4326;POLYGON((...))'`, hex EWKB, or GeoJSON -- in a geometry argument or a written value | T1 | `sql_geometry_io.rs::every_writing_form_postgis_reads_stores_the_same_point` | read the way PostgreSQL reads a `geometry` literal. Axis order is longitude then latitude -- the same order `ST_MakePoint(x, y)` takes and the same order the prior engine writes -- and the contract says so here because the reverse is the classic import bug. `POINT(lon lat)` WITHOUT quotes stays a syntax error: PostgreSQL does not read it either. |
 | `ST_Area`, `ST_Length`, `ST_Perimeter`, `ST_Centroid` as row functions | T2 (refused by name) | `refusal_by_name.rs::the_projection_expression_constructs_are_refused_by_name_in_both_positions`, `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` (the pure functions exist in `core/engine/src/index/spatial/geometry.rs`, re-exported as `sekejap_core::spatial_geometry`; what is missing is the projection-expression surface over them, and the refusal says so) | pure functions over the geometry the row already decodes |
 | `ST_Simplify`, `ST_SnapToGrid`, `ST_RemoveRepeatedPoints` | T2 (`ST_Simplify` refused by name; the other two are a syntax error) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | pure functions (QGIS render path) |
 | `ST_Transform` | T2 (refused by name; later) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | PROJ; storage stays WGS84 |
 | `ST_Buffer`, `ST_Union`, `ST_Intersection`, `ST_Difference`, `ST_SimplifyPreserveTopology` | T3 (refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | GEOS overlay; no pure-Rust substitute accepted |
 | raster, topology, `ST_AsMVT` | T3 (`ST_AsMVT` refused by name) | `sql_refusals.rs::every_listed_keyword_is_refused_by_name_with_its_tier_and_reason` | no atomic |
-| `postgis_version()` | T2 (refused by name) | `sql_catalog.rs::a_pg_catalog_relation_this_surface_does_not_have_is_refused_by_name` | a fixed row, withheld until the geometry I/O it advertises exists: a client reads it as a PROMISE that `ST_AsBinary`, `ST_GeomFromWKB` and `&&` answer. `geometry_columns` and `spatial_ref_sys` ARE answered (`sql_catalog.rs::geometry_columns_names_every_geometry_column_with_srid_4326`, `::spatial_ref_sys_holds_exactly_one_row_and_it_is_4326`) |
+| `postgis_version()` | T1 | `sql_geometry_io.rs::postgis_version_is_answered_and_says_what_is_not_built` | a fixed row, `3.4 USE_GEOS=0 USE_PROJ=0 USE_STATS=0`: the I/O functions and `&&` it promises are served, and the flags say what is not -- GEOS (the overlay functions, Tier 3) and PROJ (`ST_Transform`, Tier 2). `geometry_columns` and `spatial_ref_sys` are answered too (`sql_catalog.rs::geometry_columns_names_every_geometry_column_with_srid_4326`, `::spatial_ref_sys_holds_exactly_one_row_and_it_is_4326`) |
 
 ### 4.5 Vector (pgvector / pgvectorscale)
 
@@ -448,11 +448,12 @@ Built, with the test file that pins each:
 9. The `CREATE TABLE ... WITH (...)` INDEX SUGAR (§2) — `lang/src/parser/ddl.rs::with_clause`, `lang/src/compile/ddl.rs::with_indexes` and `::with_family`, `lang/src/compile/plan.rs::build_index` and `::unwind_create_table`; `sql_index_sugar.rs`. It adds no family, no keyspace tag and no feature bit: the seven family keys map onto the five families `CREATE INDEX` already builds, and the removal a mid-clause refusal runs is `DROP TABLE`'s own phase machine.
 10. Typo-tolerant `search(col, 'query')` and `search_score()` (§4.6) — the atomic is `core/engine/src/index/text/fuzzy.rs` (a bounded Levenshtein walk of the `0x77` term dictionary that is already on disk, no new keyspace tag and no new feature bit), reached through `TextMatch::Search` and `ScoreExpr::SearchScore`; `core/engine/tests/text_search_typo_tolerance.rs`, `lang/tests/sql_search.rs`.
 11. The AUTOMATIC indexes of `docs/lang/INDEX_CONTRACT.md` and the `index:` key that refuses them (§2) — `lang/src/compile/ddl.rs::automatic_index`, `::automatic_indexes` and `::same_index`, `lang/src/parser/ddl.rs::automatic_value`; `sql_automatic_index.rs`. It adds no family, no keyspace tag and no feature bit either: the scalar family already accepted exactly bool/int/real/text and the two spatial families already followed the declared shape. Measured write cost: about 1.4 µs per index per inserted row, flat in the number of columns.
+12. Geometry I/O and `&&` (§4.4) — `core/engine/src/index/spatial/io.rs` (WKB and EWKB in both byte orders, WKT, EWKT and GeoJSON text, every count checked against the bytes left before anything is allocated), `GeometryFilter::Overlaps` and `spatial_geometry::bbox_overlaps`, the select-list functions in `lang/src/compile/row.rs`, and `postgis_version()`; `core/engine/tests/spatial_io.rs`, `core/engine/tests/query_geometry_overlaps.rs`, `lang/tests/sql_geometry_io.rs`, `dist/tests/pg_wire.rs`. No keyspace tag and no feature bit: storage is unchanged, and a geometry column still stores its GeoJSON document.
 
 Not built, in the order the atomics make sense:
 
 1. Graph T2 (§4.3) in the graph-contract order: label alternation, the path accumulators, `ANY SHORTEST`, element identity.
-2. Geometry I/O and `&&` (§4.4): the WKT/WKB readers and writers, `ST_X`/`ST_Y`, the bbox operator, `postgis_version()`.
+2. *(built)* Geometry I/O and `&&` (§4.4) moved to the list above as item 12.
 3. The MULTI-range date rewrites (`EXTRACT(MONTH ...)`, `EXTRACT(DOW ...)`), which item 3 of the built list now makes possible: the pre-image is a set of ranges and the membership union exists.
 4. Trigram index for `ILIKE` / infix `LIKE` (§3). Typo-tolerant `search()` and `search_score()` (§4.6) are BUILT and moved to the list above as item 11.
 5. A PROJECTION-EXPRESSION surface: `CASE WHEN`, the JSON path operators, `json_array_length`, and `ST_Area` / `ST_Length` / `ST_Perimeter` / `ST_Centroid`. All of them are the same missing piece — a row expression in a select list that is not one of the closed `ROW_FUNCTIONS` names. The SURFACE is still unbuilt. What is no longer missing is the refusal: each spelling now has a `refuse::TABLE` row naming this item, and the expression parser consults the table when it meets a function name or a keyword it does not compile, so every one of them is a Tier-2 refusal by name in a select list and in a `WHERE` (`lang/src/refuse.rs`, `lang/src/parser/expr.rs::primary` and `::row_atom`; `lang/tests/refusal_by_name.rs::the_projection_expression_constructs_are_refused_by_name_in_both_positions`). `#>` and `#>>` needed a lexer token before they could be named at all, and have one.
@@ -663,7 +664,7 @@ DROP TABLE IF EXISTS ex_login RESTRICT
 ```
 
 ```sql
--- schema.table: one user schema, so public.t IS t
+-- schema.table: public.t IS t
 SELECT _key FROM public.place LIMIT 1
 ```
 
@@ -805,9 +806,14 @@ DELETE FROM ALL WHERE born > 1900
 CREATE TABLE ex_generated (id TEXT PRIMARY KEY, n INT, m INT GENERATED ALWAYS AS (n * 2) STORED)
 ```
 
-```sql refused
--- refused 0A000: CREATE SCHEMA
-CREATE SCHEMA app
+```sql
+-- a named schema, a table in it, and both gone again
+CREATE SCHEMA app;
+CREATE TABLE app.ex_note (body TEXT);
+INSERT INTO app.ex_note (_key, body) VALUES ('n1', 'kept apart from public');
+SELECT _key, body FROM app.ex_note;
+DROP TABLE app.ex_note;
+DROP SCHEMA app
 ```
 
 ```sql refused
@@ -1242,24 +1248,24 @@ SELECT _key FROM place WHERE ST_Contains(area::geometry, ST_SetSRID(ST_MakePoint
 SELECT _key FROM place ORDER BY loc <-> ST_SetSRID(ST_MakePoint(106.82, -6.17), 4326)::geography LIMIT 5
 ```
 
-```sql refused
--- refused 0A000: && (ST_Within against an envelope is the Tier-1 spelling of the same rectangle)
+```sql
+-- && is planar bounding boxes, edges included: the query a map canvas sends
 SELECT _key FROM place WHERE loc && ST_MakeEnvelope(106.0, -7.0, 108.0, -6.0, 4326)
 ```
 
-```sql refused
--- refused 0A000: ST_ASTEXT
-SELECT ST_AsText(loc) AS wkt FROM place LIMIT 1
+```sql
+-- the geometry output functions: WKB is a bytea, the rest are text or numbers
+SELECT ST_AsBinary(loc, 'NDR') AS wkb, ST_AsText(loc) AS wkt, ST_X(loc) AS lon, ST_Y(loc) AS lat FROM place LIMIT 1
 ```
 
-```sql refused
--- refused 0A000: ST_GEOMFROMTEXT
-SELECT _key FROM place WHERE ST_Within(loc::geometry, ST_GeomFromText('POLYGON((106 -7,108 -7,108 -6,106 -6,106 -7))', 4326))
+```sql
+-- a shape written as WKT
+SELECT _key FROM place WHERE ST_Contains(area::geometry, ST_GeomFromText('POINT(106.82 -6.17)', 4326))
 ```
 
-```sql refused
--- refused 0A000: ST_X
-SELECT ST_X(loc) AS lon FROM place LIMIT 1
+```sql
+-- the PostGIS release whose I/O is served, and what is not built
+SELECT postgis_version()
 ```
 
 ```sql refused
@@ -1270,11 +1276,6 @@ SELECT _key FROM place WHERE ST_Within(ST_Transform(loc, 3857)::geometry, ST_Mak
 ```sql refused
 -- refused 0A000: ST_BUFFER
 SELECT _key FROM place WHERE ST_Intersects(area, ST_Buffer(ST_SetSRID(ST_MakePoint(106.82, -6.17), 4326), 1))
-```
-
-```sql refused
--- refused 0A000: POSTGIS_VERSION
-SELECT postgis_version()
 ```
 
 ### 8.6 Vector (§4.5)

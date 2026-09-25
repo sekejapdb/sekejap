@@ -25,6 +25,7 @@
 //! for the type the client will not know either way.
 
 use sekejap_core::collections::{Error as CoreError, QueryError, WorkResource};
+use sekejap_core::spatial_io;
 use sekejap_core::Kind;
 use sekejap_lang::{Param, SqlError, SqlValue};
 use serde_json::Value;
@@ -116,6 +117,7 @@ pub fn oid_for_declared(declared: &str) -> Option<i32> {
         "DATE" => oid::DATE,
         "GEOMETRY" | "GEOGRAPHY" | "POINT" => oid::GEOMETRY,
         "VECTOR" => oid::VECTOR,
+        "BYTEA" => oid::BYTEA,
         _ => return None,
     })
 }
@@ -147,8 +149,9 @@ pub fn oid_for_kind(kind: &Kind) -> i32 {
 ///
 /// `_id` is `"<collection>:<sequence>"`, the same spelling
 /// `dist/rust/src/rows.rs:100` gives it, so the wire and the Rust surface
-/// name a row identically. A geometry rides as GeoJSON text; EWKB is the
-/// `p3-geometry-io` follow-up and is named in `docs/dist/WIRE_CONTRACT.md`.
+/// name a row identically. A geometry column rides as GeoJSON text; a client
+/// that wants the bytes asks for them with `ST_AsBinary` / `ST_AsEWKB`, whose
+/// `bytea` value `sekejap_lang` prints in PostgreSQL's hex form (`\x...`).
 pub fn text_of(value: &SqlValue) -> Option<Vec<u8>> {
     Some(match value {
         SqlValue::Missing | SqlValue::Null => return None,
@@ -225,6 +228,13 @@ pub fn encode_cell(value: &SqlValue, type_oid: i32, format: i16) -> Option<Vec<u
             let days = (micros - PG_EPOCH_MICROS).div_euclid(86_400_000_000) as i32;
             days.to_be_bytes().to_vec()
         }
+        // A `bytea` is printed by `sekejap_lang` in PostgreSQL's hex form,
+        // `\x` and the digits; its binary form is the bytes themselves. This
+        // is how QGIS reads `ST_AsBinary` through a binary cursor.
+        (oid::BYTEA, SqlValue::Text(hex)) => match spatial_io::from_hex(hex) {
+            Ok(bytes) => bytes,
+            Err(_) => hex.clone().into_bytes(),
+        },
         // `jsonb`'s binary form is a one-byte version stamp followed by the
         // JSON text. `json`'s is the text alone.
         (oid::JSONB, _) => {
@@ -364,6 +374,9 @@ fn decode_binary_param(bytes: &[u8], type_oid: i32) -> Result<Param, SqlError> {
         oid::JSON => Param::Json(serde_json::from_slice(bytes).map_err(|e| {
             SqlError::Parameter(format!("binary json parameter is not JSON: {e}"))
         })?),
+        // A binary `bytea` is the bytes; `sekejap_lang` reads a `bytea` in
+        // its hex text form, which is what a text-format `bytea` arrives as.
+        oid::BYTEA => Param::Text(format!("\\x{}", spatial_io::to_hex(bytes))),
         // text, varchar, unknown, and the synthetic OIDs: the bytes ARE the
         // text.
         _ => Param::Text(String::from_utf8_lossy(bytes).into_owned()),

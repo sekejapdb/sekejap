@@ -1534,10 +1534,13 @@ fn field_descriptions(db: &Database, prepared: &PreparedSql) -> Vec<FieldDescrip
     prepared
         .columns()
         .iter()
-        .map(|name| {
-            let type_oid = info
-                .as_ref()
-                .and_then(|info| {
+        .enumerate()
+        .map(|(at, name)| {
+            // A row function that decides its own type (`ST_AsBinary` is a
+            // `bytea`) is typed by that, before any same-named field.
+            let computed = prepared.column_type(at).and_then(types::oid_for_declared);
+            let type_oid = computed
+                .or_else(|| info.as_ref().and_then(|info| {
                     info.declared
                         .iter()
                         .find(|(field, _)| field == name)
@@ -1549,7 +1552,7 @@ fn field_descriptions(db: &Database, prepared: &PreparedSql) -> Vec<FieldDescrip
                                 .find(|(field, _)| field == name)
                                 .map(|(_, kind)| types::oid_for_kind(kind))
                         })
-                })
+                }))
                 .unwrap_or(oid::TEXT);
             FieldDescription {
                 name: name.clone(),

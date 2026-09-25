@@ -29,6 +29,7 @@ use sekejap_core::collections::{
     SortDirection, TextMatch, UpdatePatch, VectorMetric, WriteAction, WriteCursor, WriteRequest,
 };
 use sekejap_core::internal::EDGE_FIELD_PREFIX;
+use sekejap_core::spatial_io;
 use sekejap_core::spatial_math::{Bounds, Point};
 use sekejap_core::Kind;
 use serde_json::{Map, Value};
@@ -253,6 +254,31 @@ impl Compiler<'_> {
                     return Err(SqlError::engine(format!("no index named `{name}`")));
                 };
                 Plan::Write(WritePlan::DropIndex { index, name })
+            }
+            Stmt::CreateSchema {
+                name,
+                if_not_exists,
+            } => {
+                if self.db.schema_exists(&name).map_err(SqlError::from)? {
+                    if if_not_exists {
+                        return Ok(Plan::Write(WritePlan::Notice(format!(
+                            "CREATE SCHEMA IF NOT EXISTS {name}: the schema is already there, so nothing was created"
+                        ))));
+                    }
+                    return Err(SqlError::engine(format!("schema `{name}` already exists")));
+                }
+                Plan::Write(WritePlan::CreateSchema { name })
+            }
+            Stmt::DropSchema { name, if_exists } => {
+                if !self.db.schema_exists(&name).map_err(SqlError::from)? {
+                    if if_exists {
+                        return Ok(Plan::Write(WritePlan::Notice(format!(
+                            "DROP SCHEMA IF EXISTS {name}: no such schema"
+                        ))));
+                    }
+                    return Err(SqlError::engine(format!("no schema named `{name}`")));
+                }
+                Plan::Write(WritePlan::DropSchema { name })
             }
             Stmt::AlterTable { table, action } => {
                 Plan::Write(self.alter_table(&table, &action)?)
@@ -513,8 +539,8 @@ impl Compiler<'_> {
     /// then reported that a present index did not exist. It now walks the
     /// catalog itself, which is the only thing that knows what exists.
     fn index_named(&self, name: &str) -> SqlResult2<Option<IndexId>> {
-        for collection in self.db.list_collections().map_err(SqlError::from)? {
-            let Some(c) = self.db.collection(&collection).map_err(SqlError::from)? else {
+        for (schema, collection) in self.db.list_qualified_collections().map_err(SqlError::from)? {
+            let Some(c) = self.db.collection_in(&schema, &collection).map_err(SqlError::from)? else {
                 continue;
             };
             for info in self.db.list_indexes(c).map_err(SqlError::from)? {
@@ -577,8 +603,69 @@ fn parse_vector_literal(text: &str) -> SqlResult2<Vec<f32>> {
         .collect()
 }
 
+/// A geometry written as TEXT, read the way PostgreSQL reads a `geometry`
+/// literal: a GeoJSON document, the hex EWKB a geometry column prints (with
+/// or without `\x`), or WKT / EWKT. An SRID the text names must be 4326.
+pub(crate) fn geom_from_text(text: &str) -> SqlResult2<Geom> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        let document = serde_json::from_str::<Value>(trimmed)
+            .map_err(|e| SqlError::Parameter(format!("GeoJSON: {e}")))?;
+        return geom_from_json(&document);
+    }
+    let hex = trimmed.strip_prefix("\\x").unwrap_or(trimmed);
+    if !hex.is_empty() && hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return geom_from_wkb_hex(trimmed);
+    }
+    geom_from_wkt(trimmed)
+}
+
+/// Hex WKB or EWKB, as `ST_GeomFromWKB` / `ST_GeomFromEWKB` read it.
+pub(crate) fn geom_from_wkb_hex(text: &str) -> SqlResult2<Geom> {
+    let bytes = spatial_io::from_hex(text.trim())
+        .map_err(|e| SqlError::Parameter(format!("WKB: {e}")))?;
+    let decoded =
+        spatial_io::from_wkb(&bytes).map_err(|e| SqlError::Parameter(format!("WKB: {e}")))?;
+    srid_4326(decoded.srid)?;
+    Ok(decoded.geometry)
+}
+
+/// WKT or EWKT, as `ST_GeomFromText` / `ST_GeomFromEWKT` read it.
+pub(crate) fn geom_from_wkt(text: &str) -> SqlResult2<Geom> {
+    let decoded =
+        spatial_io::from_wkt(text).map_err(|e| SqlError::Parameter(format!("WKT: {e}")))?;
+    srid_4326(decoded.srid)?;
+    Ok(decoded.geometry)
+}
+
+/// Storage is WGS84: an SRID a value names must be 4326, and a value that
+/// names none is read as the column's.
+fn srid_4326(srid: Option<i32>) -> SqlResult2<()> {
+    match srid {
+        None | Some(4326) => Ok(()),
+        Some(other) => Err(SqlError::unsupported(format!(
+            "a geometry of SRID {other}: storage is WGS84 (SRID 4326); ST_Transform is Tier 2"
+        ))),
+    }
+}
+
+/// A shape as the GeoJSON document a geometry column stores. Built from the
+/// doubles themselves, not from printed text, so every coordinate -- a
+/// negative zero included -- is stored exactly as it was read.
+pub(crate) fn geom_to_json(geom: &Geom) -> Value {
+    let (kind, coordinates) = match geom {
+        Geom::Point(x, y) => ("Point", serde_json::json!([x, y])),
+        Geom::LineString(c) => ("LineString", serde_json::json!(c)),
+        Geom::Polygon(c) => ("Polygon", serde_json::json!(c)),
+        Geom::MultiPoint(c) => ("MultiPoint", serde_json::json!(c)),
+        Geom::MultiLineString(c) => ("MultiLineString", serde_json::json!(c)),
+        Geom::MultiPolygon(c) => ("MultiPolygon", serde_json::json!(c)),
+    };
+    serde_json::json!({ "type": kind, "coordinates": coordinates })
+}
+
 /// A GeoJSON geometry, as `kernel::spatial::Geom`.
-fn geom_from_json(value: &Value) -> SqlResult2<Geom> {
+pub(crate) fn geom_from_json(value: &Value) -> SqlResult2<Geom> {
     let ty = value
         .get("type")
         .and_then(Value::as_str)

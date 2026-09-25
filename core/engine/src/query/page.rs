@@ -1615,6 +1615,7 @@ fn geometry_predicate_text(predicate: &GeometryFilter) -> String {
         GeometryFilter::DWithin { metres, .. } => {
             format!("ST_DWithin {metres:.1} m (spheroidal)")
         }
+        GeometryFilter::Overlaps(_) => "&& (planar bounding boxes, float4)".to_owned(),
     }
 }
 

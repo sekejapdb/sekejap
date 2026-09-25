@@ -26,7 +26,7 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("ILIKE", Tier::Two, "QL_CONTRACT §3: ILIKE needs the trigram index family (pg_trgm-compatible), a new family under a feature bit."),
     ("SIMILAR TO", Tier::Three, "QL_CONTRACT §3: SIMILAR TO has no index atomic."),
     ("~", Tier::Three, "QL_CONTRACT §3: regex `~` has no index atomic."),
-    ("&&", Tier::Two, "QL_CONTRACT §4.4: `&&` with ST_MakeEnvelope is a Bbox filter on the point or geometry index (p3-geometry-io). Not built in this slice; ST_Within against an envelope is the Tier-1 spelling of the same rectangle."),
+    ("&&", Tier::Two, "QL_CONTRACT §4.4: `&&` is Tier 1 in ONE position -- a WHERE predicate `geom && <shape>` over a Point or geometry column with a spatial index, planar bounding boxes as PostGIS compares them. Array overlap, and `&&` in a SELECT list or an ORDER BY, have no atomic in this slice."),
     ("@>", Tier::Two, "QL_CONTRACT §3: array containment has no Tier-1 atomic in this slice."),
     ("->", Tier::Two, "QL_CONTRACT §4.1: `->` returns the JSON VALUE at a member, not its text, and a JSON value has no scalar index key -- there is nothing for an expression index to store and nothing for an equality to compare. Its text sibling `->>` is Tier 1 in the two positions an index covers: `CREATE INDEX i ON t ((col->>'m'))` and a WHERE equality that matches such an index."),
     ("->>", Tier::Two, "QL_CONTRACT §4.1: `col->>'m'` compiles in exactly TWO positions -- the target of `CREATE INDEX i ON t ((col->>'m'))`, and a WHERE equality `col->>'m' = v` answered from that index. Everywhere else -- a SELECT list, ORDER BY, GROUP BY, an ordering comparison -- it is a row function over the PROJECTION-EXPRESSION surface (§7 item 5), which is not built."),
@@ -41,7 +41,6 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("WITH", Tier::Two, "QL_CONTRACT §2: a non-recursive WITH is materialised once, bounded by QueryBudget rows; WITH RECURSIVE is Tier 3 (recursion is a GRAPH_TABLE pattern)."),
     ("OVER", Tier::Three, "QL_CONTRACT §2 and §4.7: window functions have no atomic."),
     ("CREATE VIEW", Tier::Three, "QL_CONTRACT §2: a user view has no atomic."),
-    ("CREATE SCHEMA", Tier::Two, "QL_CONTRACT §2: CREATE SCHEMA and schema.table are p2-schema-segment."),
     ("CREATE PROPERTY GRAPH", Tier::Two, "QL_CONTRACT §2: CREATE PROPERTY GRAPH optionally names a context and a label map; nothing is built. Not in this slice."),
     ("CREATE TRIGGER", Tier::Three, "QL_CONTRACT §2: triggers have no atomic."),
     ("DECLARE", Tier::Two, "QL_CONTRACT §2: DECLARE ... BINARY CURSOR / FETCH FORWARD / CLOSE are pages over prepare_query (p3-wire)."),
@@ -92,12 +91,6 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     ("ST_SIMPLIFYPRESERVETOPOLOGY", Tier::Three, "QL_CONTRACT §4.4: GEOS overlay; no pure-Rust substitute accepted."),
     ("ST_TRANSFORM", Tier::Two, "QL_CONTRACT §4.4: ST_Transform needs PROJ; storage stays WGS84."),
     ("ST_ASMVT", Tier::Three, "QL_CONTRACT §4.4: raster, topology and ST_AsMVT have no atomic."),
-    ("ST_ASTEXT", Tier::Two, "QL_CONTRACT §4.4: the geometry I/O functions are p3-geometry-io."),
-    ("ST_ASBINARY", Tier::Two, "QL_CONTRACT §4.4: the geometry I/O functions are p3-geometry-io."),
-    ("ST_GEOMFROMTEXT", Tier::Two, "QL_CONTRACT §4.4: the geometry I/O functions are p3-geometry-io."),
-    ("ST_GEOMFROMWKB", Tier::Two, "QL_CONTRACT §4.4: the geometry I/O functions are p3-geometry-io."),
-    ("ST_X", Tier::Two, "QL_CONTRACT §4.4: coordinate accessors are pure I/O functions (p3-geometry-io); a lon/lat rectangle is ST_Within against an envelope here, which is PointFilter::Bbox."),
-    ("ST_Y", Tier::Two, "QL_CONTRACT §4.4: coordinate accessors are pure I/O functions (p3-geometry-io); a lon/lat rectangle is ST_Within against an envelope here, which is PointFilter::Bbox."),
     ("ST_SIMPLIFY", Tier::Two, "QL_CONTRACT §4.4: a pure function on the QGIS render path (p3-geometry-io)."),
     ("ST_AREA", Tier::Two, "QL_CONTRACT §4.4: ST_Area is a pure function over the geometry the row already decodes (`core/engine/src/index/spatial/geometry.rs`, re-exported as `sekejap_core::spatial_geometry`); what is missing is the PROJECTION-EXPRESSION surface over it (§7 item 5), not the computation."),
     ("ST_LENGTH", Tier::Two, "QL_CONTRACT §4.4: ST_Length is a pure function over the geometry the row already decodes (`core/engine/src/index/spatial/geometry.rs`, re-exported as `sekejap_core::spatial_geometry`); what is missing is the PROJECTION-EXPRESSION surface over it (§7 item 5), not the computation."),
@@ -135,11 +128,9 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
     // `version()`, `db_version()`, `current_schema()`, `current_database()`,
     // `current_user` and `pg_backend_pid()` left this table for Tier 1 with
     // `catalog.rs`: they are fixed rows, and a fixed row is an atomic.
-    // `postgis_version()` stays, because what it would have to report is a
-    // PostGIS function surface (`ST_AsBinary`, `ST_GeomFromWKB`, the `&&`
-    // operator) that is not built -- a version string for an absent library
-    // is the one answer worse than a refusal.
-    ("POSTGIS_VERSION", Tier::Two, "QL_CONTRACT §2 and §4.4: postgis_version() is a fixed row (p3-pg-surface), and it is withheld until the geometry I/O it advertises exists (p3-geometry-io): a client reads it as a PROMISE that ST_AsBinary, ST_GeomFromWKB and `&&` answer, and they do not. `SELECT version()`, geometry_columns and spatial_ref_sys are answered."),
+    // `postgis_version()` left this table with the geometry I/O it
+    // advertises (`ST_AsBinary`, `ST_GeomFromWKB`, `&&`): it is a fixed row
+    // now, like `version()`.
     // The `pg_catalog` relations this surface does NOT provide. Listed here
     // rather than answered empty: an empty `pg_settings` reads as "this
     // server has no settings", which is false, and the eighth law of

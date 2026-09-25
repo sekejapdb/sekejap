@@ -231,6 +231,11 @@ pub enum GeometryFilter {
     Within(Geom),
     Contains(Geom),
     DWithin { geometry: Geom, metres: f64 },
+    /// `&&`: the stored shape's planar bounding box meets this shape's box,
+    /// edges included. Boxes are float4 rounded outward, as PostGIS rounds
+    /// them (`spatial_geometry::bbox_overlaps`), so the answer is PostGIS's
+    /// at the edges too. Planar, like `Within` and `Contains`.
+    Overlaps(Geom),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

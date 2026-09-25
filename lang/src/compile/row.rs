@@ -30,6 +30,70 @@ pub(crate) enum CompiledRow {
     Add(Box<CompiledRow>, Box<CompiledRow>),
     Sub(Box<CompiledRow>, Box<CompiledRow>),
     Concat(Box<CompiledRow>, Box<CompiledRow>),
+    /// A §4.4 geometry output function over one shape.
+    Geo { func: GeoFunc, arg: Box<CompiledRow> },
+}
+
+impl CompiledRow {
+    /// The SQL type this expression's value HAS when it is not text, so a
+    /// client is told before the first row (`PreparedSql::column_type`).
+    /// Only the types a caller decodes differently from their text are
+    /// named: a `bytea` travels as raw bytes in a binary result, and QGIS
+    /// reads `ST_AsBinary` exactly that way.
+    pub(crate) fn output_type(&self) -> Option<&'static str> {
+        match self {
+            Self::Geo { func, .. } => match func {
+                GeoFunc::AsBinary(_) | GeoFunc::AsEwkb(_) => Some("BYTEA"),
+                GeoFunc::X | GeoFunc::Y => Some("FLOAT8"),
+                GeoFunc::Srid => Some("INT"),
+                GeoFunc::AsText | GeoFunc::AsEwkt | GeoFunc::AsGeoJson(_) => Some("TEXT"),
+            },
+            _ => None,
+        }
+    }
+}
+
+/// The shape a geometry output function reads: a stored geometry projects
+/// as its GeoJSON document, and a literal argument is read the way a
+/// `geometry` literal is.
+fn want_geom(value: &SqlValue, func: GeoFunc) -> SqlResult2<Geom> {
+    match value {
+        SqlValue::Json(document) => geom_from_json(document),
+        SqlValue::Text(text) => geom_from_text(text),
+        other => Err(SqlError::Parameter(format!(
+            "{}() takes a geometry and the row holds {other:?}",
+            func.written()
+        ))),
+    }
+}
+
+/// A `bytea` value as PostgreSQL prints it in hex output: `\x` and the
+/// digits. The wire sends the raw bytes instead when a binary result is
+/// asked for (`dist/src/pg/types.rs`).
+fn bytea_text(bytes: &[u8]) -> String {
+    format!("\\x{}", spatial_io::to_hex(bytes))
+}
+
+fn geo_function(func: GeoFunc, geom: &Geom) -> SqlResult2<SqlValue> {
+    Ok(match func {
+        GeoFunc::AsBinary(order) => SqlValue::Text(bytea_text(&spatial_io::to_wkb(geom, order))),
+        GeoFunc::AsEwkb(order) => {
+            SqlValue::Text(bytea_text(&spatial_io::to_ewkb(geom, Some(4326), order)))
+        }
+        GeoFunc::AsText => SqlValue::Text(spatial_io::to_wkt(geom)),
+        GeoFunc::AsEwkt => SqlValue::Text(format!("SRID=4326;{}", spatial_io::to_wkt(geom))),
+        GeoFunc::AsGeoJson(decimals) => SqlValue::Text(spatial_io::to_geojson(geom, decimals)),
+        GeoFunc::X | GeoFunc::Y => match geom {
+            Geom::Point(x, y) => SqlValue::Float(if func == GeoFunc::X { *x } else { *y }),
+            _ => {
+                return Err(SqlError::Parameter(format!(
+                    "{}() takes a Point, as it does in PostGIS",
+                    func.written()
+                )))
+            }
+        },
+        GeoFunc::Srid => SqlValue::Int(4326),
+    })
 }
 
 /// NULL propagates the way SQL says it does: any NULL or MISSING input makes
@@ -186,6 +250,13 @@ impl CompiledRow {
                     return Ok(SqlValue::Null);
                 }
                 SqlValue::Text(format!("{}{}", want_text(&x, "||")?, want_text(&y, "||")?))
+            }
+            Self::Geo { func, arg } => {
+                let value = arg.eval(values)?;
+                if nullish(&value) {
+                    return Ok(SqlValue::Null);
+                }
+                return geo_function(*func, &want_geom(&value, *func)?);
             }
         })
     }
@@ -430,6 +501,21 @@ impl Compiler<'_> {
                     };
                 }
                 CompiledRow::Concat(Box::new(left), Box::new(right))
+            }
+            RowExpr::Geo { func, arg } => {
+                if let RowExpr::Column(name) = arg.as_ref() {
+                    let kind = self.kind_of(c, name)?;
+                    if !matches!(kind, Kind::Geo | Kind::Point) {
+                        return Err(SqlError::unsupported(format!(
+                            "{}({name}): `{name}` is declared {kind:?}, not a geometry",
+                            func.written()
+                        )));
+                    }
+                }
+                CompiledRow::Geo {
+                    func: *func,
+                    arg: Box::new(self.row_function(c, arg, fields)?),
+                }
             }
         })
     }

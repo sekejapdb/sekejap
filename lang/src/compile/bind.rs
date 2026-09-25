@@ -72,6 +72,7 @@ impl<'a> Binder<'a> {
                 Param::Vector(v) => Value::from(v.clone()),
                 Param::Json(v) => v.clone(),
             },
+            Literal::Geo(argument) => geom_to_json(&self.geom_of(argument)?),
             Literal::Subquery(query) => {
                 let collection = collection(self.db, &query.table)?;
                 let key = self.text_of(&query.key)?;
@@ -178,16 +179,38 @@ impl<'a> Binder<'a> {
                 );
                 Geom::Polygon(vec![vec![[w, s], [e, s], [e, n], [w, n], [w, s]]])
             }
-            GeoArg::GeoJson(literal) => {
-                let value = self.value_of(literal)?;
-                let document = match value {
-                    Value::String(text) => serde_json::from_str::<Value>(&text)
-                        .map_err(|e| SqlError::Parameter(format!("GeoJSON: {e}")))?,
-                    other => other,
-                };
-                geom_from_json(&document)?
+            GeoArg::GeoJson(literal) => match self.value_of(literal)? {
+                Value::String(text) => geom_from_text(&text)?,
+                document => geom_from_json(&document)?,
+            },
+            GeoArg::Encoded { source, format } => {
+                let text = self.text_of(source)?;
+                match format {
+                    GeoFormat::Wkb => geom_from_wkb_hex(&text)?,
+                    GeoFormat::Wkt => geom_from_wkt(&text)?,
+                }
             }
         })
+    }
+
+    /// The rectangle `col && <shape>` compares a POINT column against, as
+    /// the point index's inclusive `Bounds`.
+    ///
+    /// PostGIS compares float4 boxes rounded outward, so a point overlaps
+    /// the box exactly when its own rounded-down coordinate is not past the
+    /// box's rounded-up edge. On doubles that is: the point is below the
+    /// NEXT float4 after the rounded-up edge. The bounds here are that edge,
+    /// less one double, so the point index answers what PostGIS answers
+    /// (`sql_geometry_io.rs`).
+    pub(crate) fn overlap_bounds_of(&self, argument: &GeoArg) -> SqlResult2<Bounds> {
+        let geometry = self.geom_of(argument)?;
+        let (w, e, s, n) = geometry
+            .bbox()
+            .ok_or_else(|| SqlError::Parameter("&&: the shape has no coordinates".into()))?;
+        let low = |v: f64, floor: f64| float4_reach_below(v).max(floor);
+        let high = |v: f64, ceiling: f64| float4_reach_above(v).min(ceiling);
+        Bounds::new(low(w, -180.0), high(e, 180.0), low(s, -90.0), high(n, 90.0))
+            .map_err(|err| SqlError::engine(format!("&&: {err}")))
     }
 
     pub(crate) fn bounds_of(&self, argument: &GeoArg) -> SqlResult2<Bounds> {
@@ -353,6 +376,31 @@ impl<'a> Binder<'a> {
     }
 }
 
+/// The float4 edge `v` rounds DOWN to (as PostGIS rounds a box's minimum),
+/// and then the lowest double whose own float4 rounding-up still reaches it.
+fn float4_reach_below(v: f64) -> f64 {
+    let mut edge = v as f32;
+    if f64::from(edge) > v {
+        edge = f32::from_bits(if edge > 0.0 { edge.to_bits() - 1 } else { edge.to_bits() + 1 });
+    }
+    // A point's box maximum rounds UP; it meets `edge` when it is above the
+    // float4 just below `edge`.
+    let below = if edge > 0.0 {
+        f32::from_bits(edge.to_bits() - 1)
+    } else if edge == 0.0 {
+        -f32::from_bits(1)
+    } else {
+        f32::from_bits(edge.to_bits() + 1)
+    };
+    let below = f64::from(below);
+    f64::from_bits(if below >= 0.0 { below.to_bits() + 1 } else { below.to_bits() - 1 })
+}
+
+/// The mirror of [`float4_reach_below`] for a box's maximum.
+fn float4_reach_above(v: f64) -> f64 {
+    -float4_reach_below(-v)
+}
+
 /// True when a written value can change between binds -- that is, when it is
 /// a `$n` or holds one. Everything else is a constant of the text and needs
 /// no slot.
@@ -363,6 +411,7 @@ pub(crate) fn literal_is_bound(literal: &Literal) -> bool {
         // not the text's: it is always a slot, and a bind runs the same
         // point-get again rather than serving what a prepare once read.
         Literal::Subquery(_) => true,
+        Literal::Geo(argument) => geo_is_bound(argument),
         _ => false,
     }
 }
@@ -383,6 +432,7 @@ pub(crate) fn geo_is_bound(argument: &GeoArg) -> bool {
             .iter()
             .any(|literal| literal_is_bound(literal)),
         GeoArg::GeoJson(literal) => literal_is_bound(literal),
+        GeoArg::Encoded { source, .. } => literal_is_bound(source),
     }
 }
 
@@ -425,6 +475,8 @@ pub(crate) struct KeyFill {
 pub(crate) enum PointFill {
     Radius { center: PointArg, metres: Literal },
     Bbox(GeoArg),
+    /// `col && <shape>` over a point column.
+    Overlaps(GeoArg),
 }
 
 /// A geometry predicate's slots.

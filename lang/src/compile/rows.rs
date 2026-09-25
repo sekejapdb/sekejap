@@ -670,6 +670,7 @@ impl Compiler<'_> {
                     Some(value) => SqlValue::Text(value.into()),
                     None => SqlValue::Null,
                 },
+                SessionItem::PostgisVersion => SqlValue::Text(catalog::POSTGIS_VERSION.into()),
                 SessionItem::Lit(literal) => self.catalog_value(literal)?,
             });
         }
@@ -705,7 +706,7 @@ impl Compiler<'_> {
             ),
             Show::CreateTable(table) => self.show_create_table(table),
             Show::Name(name) => {
-                if self.db.collection(name).map_err(SqlError::from)?.is_some() {
+                if crate::find(self.db, name)?.is_some() {
                     return self.show_relation(
                         "db_columns",
                         &format!("SHOW {name}"),

@@ -361,7 +361,7 @@ fn verify_collections<F: FnMut(&VerificationIssue)>(
                 },
             }
         }
-        let name = name_key(&canonical.name);
+        let name = name_key_in(canonical.schema.as_deref(), &canonical.name);
         let actual = run.read(&name)?;
         run.mismatch(
             IssueClass::Catalog,
@@ -403,14 +403,52 @@ fn verify_collections<F: FnMut(&VerificationIssue)>(
         Ok(())
     })?;
     let source = run.reader.clone();
+    let schemas_admitted = header
+        .indexes
+        .is_some_and(|h| h.features & SCHEMA_FEATURE != 0);
+    let mut schemas: Vec<String> = Vec::new();
     visit(&source, &[0x10], Some(&[0x11]), |key, value| {
         run.row(true)?;
-        let name = std::str::from_utf8(&key[1..]).map_err(corrupt)?;
+        let (schema, name) = match parse_name_key(key)? {
+            NameEntry::Schema(schema) => {
+                if !schemas_admitted {
+                    return Err(corrupt("schema record without feature admission"));
+                }
+                if !value.is_empty() {
+                    run.issue(VerificationIssue {
+                        class: IssueClass::Catalog,
+                        kind: IssueKind::Malformed,
+                        key: key.to_vec(),
+                        index: None,
+                        entity: None,
+                        message: "schema record value".into(),
+                    })?;
+                }
+                schemas.push(schema.to_owned());
+                return Ok(());
+            }
+            NameEntry::Table { schema, name } => (schema, name),
+        };
+        if schema.is_some() && !schemas.iter().any(|s| Some(s.as_str()) == schema) {
+            // The schema's own record sorts before its tables, so a table
+            // met first names a schema with no record.
+            run.issue(VerificationIssue {
+                class: IssueClass::Catalog,
+                kind: IssueKind::Missing,
+                key: key.to_vec(),
+                index: None,
+                entity: None,
+                message: "collection-name mapping in a schema with no record".into(),
+            })?;
+        }
         if value.len() != 4 {
             return Err(corrupt("collection-name mapping value"));
         }
         let id = CollectionId(u32::from_be_bytes(value.try_into().unwrap()));
-        if !catalogs.iter().any(|(c, _)| c.id == id && c.name == name) {
+        if !catalogs
+            .iter()
+            .any(|(c, _)| c.id == id && c.name == name && c.schema.as_deref() == schema)
+        {
             run.issue(VerificationIssue {
                 class: IssueClass::Catalog,
                 kind: IssueKind::Extra,

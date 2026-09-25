@@ -538,7 +538,8 @@ fn geometry_query_geom(predicate: &GeometryFilter) -> &Geom {
     match predicate {
         GeometryFilter::Intersects(g)
         | GeometryFilter::Within(g)
-        | GeometryFilter::Contains(g) => g,
+        | GeometryFilter::Contains(g)
+        | GeometryFilter::Overlaps(g) => g,
         GeometryFilter::DWithin { geometry, .. } => geometry,
     }
 }

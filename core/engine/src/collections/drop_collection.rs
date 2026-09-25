@@ -511,7 +511,7 @@ impl Database {
         if self.sequence.as_ref().is_some_and(|s| s.collection == c.id) {
             self.sequence = None;
         }
-        self.writer()?.delete(&name_key(&c.name))?;
+        self.writer()?.delete(&name_key_in(c.schema.as_deref(), &c.name))?;
         // The live row-count record of a collection that no longer exists.
         // Its keyspace is one key, so there is nothing to probe: it goes with
         // the name and the replicas.

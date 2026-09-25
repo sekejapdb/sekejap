@@ -7,7 +7,9 @@ pub mod store;
 
 // The public module paths this crate has always offered. The tree below them
 // moved; the names did not, and neither did what they export.
-pub use crate::index::spatial::{geometry as spatial_geometry, math as spatial_math};
+pub use crate::index::spatial::{
+    geometry as spatial_geometry, io as spatial_io, math as spatial_math,
+};
 pub use crate::store as collection_backend;
 pub use crate::store::{pagewal, recovery};
 /// The store configuration `Database::create` and `Database::open` take, and
