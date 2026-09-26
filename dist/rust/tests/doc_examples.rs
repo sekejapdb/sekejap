@@ -12,6 +12,7 @@
 //! |---|---|
 //! | ```` ```sql ```` | a `;`-separated SCRIPT. Every statement runs on the fixture database and must answer without error. |
 //! | ```` ```sql refused ```` | ONE statement that must be REFUSED. The block's first line is `-- refused <SQLSTATE>: <construct>` and the refusal must carry that SQLSTATE. |
+//! | ```` ```sql explain ```` | ONE statement and its `-- expect: <text>` lines. The harness runs `EXPLAIN <statement>`, and each expected text must BEGIN some line of the plan (leading spaces ignored): a prefix, so a counter can change without a doc edit while an operator or a clause cannot disappear unnoticed. |
 //! | ```` ```rust ```` | a RUNNABLE example. It must be claimed by a `<!-- doc_example: <anchor> -->` marker on the line above the fence, and it must equal the body of `#[test] fn doc_<anchor>()` in THIS file, byte for byte after the indentation is trimmed. |
 //! | ```` ```rust,signatures ```` | declarations only -- a type, a struct, a trait, a module list. Ignored. |
 //! | anything else (`sh`, `text`, `json`, `toml`, `rust,ignore`, no info string) | ignored. |
@@ -83,6 +84,8 @@ const DOCS: &[&str] = &[
     "docs/lang/QL_CONTRACT.md",
     "docs/lang/INDEX_CONTRACT.md",
     "docs/lang/EXAMPLE_FIXTURE.md",
+    "docs/lang/GQL_PROFILE.md",
+    "docs/lang/GQL_FEATURES.md",
     "docs/core/COLLECTIONS.md",
     "docs/core/GRAPH_CONTRACT.md",
     "docs/core/SPATIAL_FUNCTIONS.md",
@@ -515,8 +518,127 @@ fn build_fixture(path: &Path) -> Result<(), Error> {
     }
 
     build_place(&db)?;
+    build_tourism(&db)?;
 
     db.close()
+}
+
+/// The sites of the tourism shape: `(key, about, lon, lat, emb, rating)`.
+/// Public place names, a text, a point, a three-lane theme vector
+/// (beach, temple, nature) and a rating.
+const SITES: &[(&str, &str, f64, f64, [f64; 3], i64)] = &[
+    ("uluwatu", "temple on the cliff kecak dance at sunset", 115.0849, -8.8291, [0.3, 0.9, 0.4], 5),
+    ("tanah_lot", "sea temple on a rock at sunset", 115.0868, -8.6212, [0.4, 0.9, 0.3], 5),
+    ("kuta_beach", "surf beach sunset nasi goreng", 115.1686, -8.7180, [1.0, 0.0, 0.1], 4),
+    ("seminyak_beach", "sunset beach shopping", 115.1580, -8.6913, [0.9, 0.0, 0.1], 4),
+    ("sanur_beach", "sunrise beach calm reef", 115.2626, -8.6783, [0.9, 0.1, 0.3], 4),
+    ("nusa_dua_beach", "calm reef snorkel beach", 115.2317, -8.8003, [0.9, 0.0, 0.4], 5),
+    ("jimbaran_bay", "seafood dinner at sunset on the bay", 115.1650, -8.7640, [0.8, 0.0, 0.2], 4),
+    ("ubud_market", "art market and crafts", 115.2626, -8.5069, [0.0, 0.3, 0.3], 4),
+    ("tegallalang", "rice terrace walk", 115.2787, -8.4344, [0.0, 0.1, 1.0], 5),
+    ("besakih", "mother temple on the volcano", 115.4507, -8.3742, [0.0, 1.0, 0.6], 5),
+    ("amed_reef", "reef snorkel volcano view", 115.6600, -8.3470, [0.6, 0.0, 0.8], 4),
+    ("lovina_beach", "dolphins at sunrise", 115.0250, -8.1580, [0.7, 0.0, 0.6], 3),
+];
+
+/// `site -[:route {minutes}]-> site`.
+const ROUTES: &[(&str, &str, i64)] = &[
+    ("kuta_beach", "seminyak_beach", 20),
+    ("seminyak_beach", "tanah_lot", 45),
+    ("kuta_beach", "jimbaran_bay", 20),
+    ("jimbaran_bay", "uluwatu", 30),
+    ("kuta_beach", "sanur_beach", 30),
+    ("sanur_beach", "nusa_dua_beach", 25),
+    ("nusa_dua_beach", "uluwatu", 30),
+    ("sanur_beach", "ubud_market", 50),
+    ("ubud_market", "tegallalang", 20),
+    ("ubud_market", "besakih", 70),
+    ("tegallalang", "besakih", 60),
+    ("besakih", "amed_reef", 60),
+    ("tegallalang", "lovina_beach", 120),
+];
+
+/// Build the tourism shape, the third of `docs/lang/EXAMPLE_FIXTURE.md`, the
+/// one `docs/lang/GQL_PROFILE.md` is written against: sites joined by
+/// routes, troupes and their dancers, travellers and the sites they visited.
+/// Invented troupe, dancer and traveller keys; no business names.
+fn build_tourism(db: &Db) -> Result<(), Error> {
+    for ddl in [
+        "CREATE TABLE site (name TEXT, about TEXT, loc GEOMETRY(Point, 4326), emb VECTOR(3) NOT NULL, rating INT) \
+         WITH (index: none)",
+        "CREATE TABLE troupe (name TEXT) WITH (index: none)",
+        "CREATE TABLE dancer (name TEXT, born INT) WITH (index: none)",
+        "CREATE TABLE traveller (name TEXT) WITH (index: none)",
+    ] {
+        db.execute(ddl, &[])?;
+    }
+    for (key, about, lon, lat, emb, rating) in SITES {
+        db.execute(
+            "INSERT INTO site (_key, name, about, loc, emb, rating) VALUES ($1, $1, $2, $3, $4, $5)",
+            &[
+                json!(key),
+                json!(about),
+                json!(format!("{{\"type\":\"Point\",\"coordinates\":[{lon:.4},{lat:.4}]}}")),
+                json!(emb),
+                json!(rating),
+            ],
+        )?;
+    }
+    for key in ["troupe_a", "troupe_b"] {
+        db.execute("INSERT INTO troupe (_key, name) VALUES ($1, $1)", &[json!(key)])?;
+    }
+    for n in 1..=6 {
+        db.execute(
+            "INSERT INTO dancer (_key, name, born) VALUES ($1, $1, $2)",
+            &[json!(format!("dancer_{n}")), json!(1988 + 2 * n as i64)],
+        )?;
+    }
+    for n in 1..=4 {
+        db.execute("INSERT INTO traveller (_key, name) VALUES ($1, $1)", &[json!(format!("traveller_{n}"))])?;
+    }
+    for ddl in [
+        "CREATE INDEX site_about ON site USING gin (to_tsvector('simple', about))",
+        "CREATE INDEX site_loc ON site USING gist (loc)",
+        "CREATE INDEX site_emb ON site USING exact (emb)",
+        "CREATE INDEX site_emb_quantized ON site USING quantized (emb)",
+        "CREATE INDEX site_rating ON site USING btree (rating)",
+        "CREATE INDEX dancer_born ON dancer USING btree (born)",
+    ] {
+        db.execute(ddl, &[])?;
+    }
+    for (from, to, minutes) in ROUTES {
+        db.link_with(("site", *from), "route", ("site", *to), &json!({ "minutes": minutes }))?;
+    }
+    for (dancer, troupe) in [
+        ("dancer_1", "troupe_a"),
+        ("dancer_2", "troupe_a"),
+        ("dancer_3", "troupe_a"),
+        ("dancer_4", "troupe_b"),
+        ("dancer_5", "troupe_b"),
+        ("dancer_6", "troupe_b"),
+    ] {
+        db.link_with(("dancer", dancer), "member_of", ("troupe", troupe), &json!({}))?;
+    }
+    for (dancer, site) in [
+        ("dancer_1", "uluwatu"),
+        ("dancer_2", "uluwatu"),
+        ("dancer_4", "ubud_market"),
+        ("dancer_5", "tanah_lot"),
+    ] {
+        db.link_with(("dancer", dancer), "performs_at", ("site", site), &json!({}))?;
+    }
+    for (traveller, site, stars) in [
+        ("traveller_1", "kuta_beach", 4),
+        ("traveller_1", "uluwatu", 5),
+        ("traveller_2", "ubud_market", 5),
+        ("traveller_2", "tegallalang", 4),
+        ("traveller_3", "amed_reef", 5),
+        ("traveller_4", "kuta_beach", 3),
+        ("traveller_4", "seminyak_beach", 2),
+    ] {
+        db.link_with(("traveller", traveller), "visited", ("site", site), &json!({ "stars": stars }))?;
+    }
+    Ok(())
 }
 
 /// Build `place` and its `near` chain, the second shape of
@@ -735,6 +857,13 @@ fn every_sql_example_in_the_documentation_runs_on_the_fixture() {
                         Err(e) => failures.push(format!("{doc}:{}: {e}", block.line)),
                     }
                 }
+                "sql explain" => {
+                    let handle = db.get_or_insert_with(|| fixture.open());
+                    match expect_explain(handle, block) {
+                        Ok(()) => answered += 1,
+                        Err(e) => failures.push(format!("{doc}:{}: {e}", block.line)),
+                    }
+                }
                 _ => {}
             }
         }
@@ -794,6 +923,33 @@ fn expect_refusal(db: &Db, block: &Fence) -> Result<(), String> {
             }
         }
     }
+}
+
+/// One `sql explain` block: its statement's `EXPLAIN` must print a line
+/// beginning with each `-- expect:` text.
+fn expect_explain(db: &Db, block: &Fence) -> Result<(), String> {
+    let (expected, statement): (Vec<&str>, Vec<&str>) = block
+        .body
+        .lines()
+        .partition(|line| line.trim_start().starts_with("-- expect:"));
+    let expected: Vec<&str> = expected
+        .iter()
+        .map(|line| line.trim_start().trim_start_matches("-- expect:").trim())
+        .collect();
+    let rest = statement.join("\n");
+    let statement = take_params(1, &rest)?;
+    if expected.is_empty() || statement.text.trim().is_empty() {
+        return Err("a `sql explain` block is one statement and at least one `-- expect:` line".to_owned());
+    }
+    let plan = db
+        .explain(statement.text.trim(), &statement.params)
+        .map_err(|e| format!("`EXPLAIN {}` failed: {e}", one_line(&statement.text)))?;
+    for want in expected {
+        if !plan.lines().any(|line| line.trim_start().starts_with(want)) {
+            return Err(format!("no line of the plan begins with `{want}`:\n{plan}"));
+        }
+    }
+    Ok(())
 }
 
 /// A statement on one line, for a failure message that stays greppable.
@@ -1145,4 +1301,45 @@ fn doc_timestamps_options() -> Result<(), sekejap::Error> {
     Ok(())
 }
 
-
+/// What `docs/lang/GQL_PROFILE.md` SAYS its examples answer, checked: the
+/// harness above only proves they run.
+#[test]
+fn the_gql_profile_answers_what_its_text_says() -> Result<(), sekejap::Error> {
+    let fixture = Fixture::build();
+    let db = fixture.open();
+    let column = |sql: &str, name: &str| -> Result<Vec<serde_json::Value>, sekejap::Error> {
+        Ok(db.query(sql, &[])?.rows.iter().map(|row| row.json(name).unwrap_or(Value::Null)).collect())
+    };
+    // Paths are counted, not endpoints: Besakih twice from Ubud market.
+    let twice = column(
+        "SELECT * FROM GRAPH_TABLE (base MATCH (a IS site WHERE a._key = 'ubud_market')-[:route]->{1,2}(b IS site WHERE b._key = 'besakih') RETURN b._key AS site)",
+        "site",
+    )?;
+    assert_eq!(twice, [json!("besakih"), json!("besakih")]);
+    // A zero lower bound includes the start.
+    let from_besakih = column(
+        "SELECT * FROM GRAPH_TABLE (base MATCH (a IS site WHERE a._key = 'besakih')-[:route]->{0,2}(b IS site) RETURN b._key AS site ORDER BY site)",
+        "site",
+    )?;
+    assert_eq!(from_besakih, [json!("amed_reef"), json!("besakih")]);
+    // A missing seed key is an empty answer.
+    assert!(column(
+        "SELECT * FROM GRAPH_TABLE (base MATCH (a IS site WHERE a._key = 'no_such_site')-[:route]->(b) RETURN b._key AS site)",
+        "site",
+    )?
+    .is_empty());
+    // The fewest routes from Kuta beach to Amed: five sites, four routes
+    // (kuta, sanur, ubud, besakih, amed).
+    let routes = column(
+        "SELECT * FROM GRAPH_TABLE (base MATCH p = ANY SHORTEST (a IS site WHERE a._key = 'kuta_beach')-[:route]->{1,8}(b IS site WHERE b._key = 'amed_reef') RETURN PATH_LENGTH(p) AS routes)",
+        "routes",
+    )?;
+    assert_eq!(routes, [json!(4)]);
+    // Three dancers in each troupe.
+    let dancers = column(
+        "SELECT * FROM GRAPH_TABLE (base MATCH (t IS troupe) CALL (t) { MATCH (t)<-[:member_of]-(d IS dancer) RETURN COUNT(*) AS dancers } RETURN t._key AS troupe, dancers ORDER BY troupe)",
+        "dancers",
+    )?;
+    assert_eq!(dancers, [json!(3), json!(3)]);
+    Ok(())
+}
