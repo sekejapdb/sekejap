@@ -1,7 +1,10 @@
 # GQL query profile: engineering design for milestones M5-M7
 
-Status: DESIGN, not built. Nothing in this document is Tier 1 until a named
-test proves it (`docs/lang/QL_CONTRACT.md`, "The tiers"). It continues
+Status: BUILT; the reference is `docs/lang/GQL_PROFILE.md` and the feature
+registry `docs/lang/GQL_FEATURES.md`. This document is kept as the design
+record: where the built profile differs from it, the reference and
+`QL_CONTRACT.md` are right. Nothing here is Tier 1 unless a named test proves
+it (`docs/lang/QL_CONTRACT.md`, "The tiers"). It continues
 `docs/lang/GQL_PROFILE_DESIGN.md` (M1-M4, "the M1-M4 design" below), keeps its
 section conventions and its open-question numbering (this document starts at
 Q17), and marks every point that is uncertain.

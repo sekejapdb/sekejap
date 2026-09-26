@@ -144,10 +144,17 @@ MATCH` of the prior engine. "The prior engine"
 throughout this contract is the release sekejap replaces -- its own SQL
 surface, still in production, its sources kept on branch `e1`.
 
-**The GQL profile (under construction, M1-M4).** A GQL body inside
+**The GQL profile (M1-M7).** A GQL body inside
 `GRAPH_TABLE` -- `GRAPH_TABLE (g MATCH ... RETURN ...)`, Google's documented
 embedding, with selected ISO/IEC 39075 GQL constructs -- is the ONLY body
-`GRAPH_TABLE` takes; its design is `docs/lang/GQL_PROFILE_DESIGN.md`. M2-E
+`GRAPH_TABLE` takes. The user guide, with runnable examples and the EXPLAIN
+reference, is `docs/lang/GQL_PROFILE.md`; the feature registry (every
+construct and the test that pins it), the mapping to the standards, the
+dialect differences and the unsupported list are
+`docs/lang/GQL_FEATURES.md`, which a test keeps equal to the code
+(`lang/src/gql/registry.rs`). The designs are
+`docs/lang/GQL_PROFILE_DESIGN.md` (M1-M4) and
+`docs/lang/GQL_PROFILE_DESIGN_M5_M7.md`. M2-E
 (owner decision 1) removed the SQL/PGQ `COLUMNS` body of the graph row
 above, with no compatibility alias, once GQL's own tests pinned every
 property the removed body's tests pinned (§4.3 says which, row by row). No

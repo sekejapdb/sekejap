@@ -4,13 +4,14 @@ Every `sql` block in sekejap's documentation is RUN, by
 `dist/rust/tests/doc_examples.rs`, against the one database this document
 describes. A doc example may assume everything below and nothing else.
 
-That database holds TWO SHAPES, because two sets of documents were written
-against two different ones and both sets are kept:
+That database holds THREE SHAPES, because three sets of documents were
+written against three different ones and all are kept:
 
 | shape | collections | edge types | who writes against it |
 |---|---|---|---|
 | the small one | `posts` (12 rows), `people` (4), `readings` (3) | `knows`, `wrote` | `README.md`, `docs/dist/*`, `docs/core/*`, `docs/TIMESTAMPS.md` |
 | the wide one | `place` (200 rows) | `near` | `docs/lang/QL_CONTRACT.md`, whose §0 declares it |
+| the tourism one | `site` (12 rows), `troupe` (2), `dancer` (6), `traveller` (4) | `route`, `member_of`, `performs_at`, `visited` | `docs/lang/GQL_PROFILE.md` |
 
 They share one database and touch none of each other's names, so a block may
 use either and a document may use both. Every collection is in the base graph
@@ -32,8 +33,9 @@ The harness acts on the fence's info string and on nothing else.
 | fence | what happens |
 |---|---|
 | `sql` | a **`;`-separated script**. Its statements run in order on a copy of the fixture, and every one of them must answer without error. |
-| `sql refused` | ONE statement that must be REFUSED. See §5. |
-| `rust` | a RUNNABLE example. See §6. |
+| `sql refused` | ONE statement that must be REFUSED. See §7. |
+| `sql explain` | ONE statement and its `-- expect:` lines, each of which must begin a line of the statement's `EXPLAIN`. See §6. |
+| `rust` | a RUNNABLE example. See §8. |
 | `rust,signatures` | declarations only — a type, a struct, a trait, a module list. Ignored. |
 | everything else (`sh`, `text`, `json`, `toml`, `rust,ignore`, no info string) | ignored. |
 
@@ -243,7 +245,54 @@ where `born BETWEEN 1990 AND 1991`; one `DELETE … CASCADE` removes
 `born = 1993` with its edges. They run in document order on that document's
 own copy of the fixture, which is what §1's isolation rule is for.
 
-## 6. A refused example
+## 6. The tourism shape — what `GQL_PROFILE.md` is written against
+
+Bali sites, the routes between them, troupes and their dancers, and
+travellers with the sites they visited. Site keys are public place names in
+lower case; troupe, dancer and traveller keys are invented.
+
+```text
+site      (name TEXT, about TEXT, loc GEOMETRY(Point, 4326), emb VECTOR(3) NOT NULL, rating INT)
+troupe    (name TEXT)
+dancer    (name TEXT, born INT)
+traveller (name TEXT)
+```
+
+| index | over | family |
+|---|---|---|
+| `site_about` | `to_tsvector('simple', about)` | text |
+| `site_loc` | `loc` | point |
+| `site_emb` | `emb` | exact vector |
+| `site_emb_quantized` | `emb` | quantized vector |
+| `site_rating` | `rating` | B-tree |
+| `dancer_born` | `born` | B-tree |
+
+The twelve sites: `uluwatu`, `tanah_lot`, `kuta_beach`, `seminyak_beach`,
+`sanur_beach`, `nusa_dua_beach`, `jimbaran_bay`, `ubud_market`,
+`tegallalang`, `besakih`, `amed_reef`, `lovina_beach`. `emb` is a theme
+vector (beach, temple, nature); `rating` is 3 to 5.
+
+```text
+site -[:route {minutes}]-> site
+  kuta_beach -> seminyak_beach 20, jimbaran_bay 20, sanur_beach 30
+  seminyak_beach -> tanah_lot 45      jimbaran_bay -> uluwatu 30
+  sanur_beach -> nusa_dua_beach 25, ubud_market 50
+  nusa_dua_beach -> uluwatu 30        ubud_market -> tegallalang 20, besakih 70
+  tegallalang -> besakih 60, lovina_beach 120
+  besakih -> amed_reef 60
+dancer -[:member_of]-> troupe      dancer_1..3 -> troupe_a, dancer_4..6 -> troupe_b
+dancer -[:performs_at]-> site      dancer_1, dancer_2 -> uluwatu; dancer_4 -> ubud_market; dancer_5 -> tanah_lot
+traveller -[:visited {stars}]-> site
+  traveller_1 -> kuta_beach 4, uluwatu 5      traveller_2 -> ubud_market 5, tegallalang 4
+  traveller_3 -> amed_reef 5                  traveller_4 -> kuta_beach 3, seminyak_beach 2
+```
+
+A block fenced `sql explain` holds ONE statement and `-- expect: <text>`
+lines: the harness runs `EXPLAIN` on the statement and each expected text
+must begin some line of the plan (leading spaces ignored), so a counter can
+change without a doc edit while an operator cannot disappear unnoticed.
+
+## 7. A refused example
 
 A construct sekejap has no atomic for is documented by showing it REFUSED, not
 by leaving it out. The block's first line names the SQLSTATE a PostgreSQL
@@ -258,7 +307,7 @@ The harness asserts the statement was refused AND that the refusal carries
 that SQLSTATE, so a construct that quietly starts answering fails the test
 just as loudly as one that starts erroring.
 
-## 7. A runnable Rust example
+## 8. A runnable Rust example
 
 A ```` ```rust ```` block is claimed by an HTML comment on the line above it:
 
@@ -275,7 +324,7 @@ ignored.
 
 Because the block is a function BODY, it ends with `Ok(())` and may use `?`.
 
-## 8. What the fixture deliberately does not have
+## 9. What the fixture deliberately does not have
 
 * No second graph context. `base` is the only one, so a doc example never has
   to explain a context it cannot see.
