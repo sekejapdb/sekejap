@@ -38,7 +38,10 @@
 //!   answer and less work (M6-F,
 //!   `a_top_k_by_distance_reads_the_index_order_and_stops_early`); cosine,
 //!   a descending order and an unlimited sort keep the full sort
-//!   (`only_an_order_the_index_gives_row_for_row_stops_early`);
+//!   (`only_an_order_the_index_gives_row_for_row_stops_early`); over a
+//!   nullable column the ordered top-k keeps PostgreSQL's order -- numbers,
+//!   an all-zero vector's NaN cosine, then the rows with no vector
+//!   (`an_ordered_top_k_puts_nan_then_null_last_as_the_scan_does`);
 //! * `ef_search` is read when an execution opens: one prepared plan answers
 //!   exactly, then APPROXIMATELY under `SET LOCAL ef_search`, then exactly
 //!   again after COMMIT (M6-G, Q29,
@@ -471,7 +474,11 @@ fn a_top_k_by_distance_reads_the_index_order_and_stops_early() {
     // distances (0.8 squared L2, -0.6 inner product): the tie-break key
     // decides, which the early stop must not cut off, since it stops only
     // at a row strictly worse than the worst it keeps.
-    for (op, expected) in [("<->", ["sanur", "nusa-dua"]), ("<#>", ["sanur", "nusa-dua"])] {
+    for (op, expected) in [
+        ("<->", ["sanur", "nusa-dua"]),
+        ("<#>", ["sanur", "nusa-dua"]),
+        ("<=>", ["sanur", "nusa-dua"]),
+    ] {
         let body = |key: &str| {
             format!(
                 "SELECT * FROM GRAPH_TABLE (base MATCH (b IS beach) \
@@ -498,8 +505,6 @@ fn only_an_order_the_index_gives_row_for_row_stops_early() {
     let dir = TempDir::new().unwrap();
     let db = fixture(&dir);
     for body in [
-        // cosine: the engine skips an all-zero vector the expression ranks NULL
-        "MATCH (b IS beach) RETURN b._key AS k, b.emb <=> '[0,1,0]'::vector AS d ORDER BY d LIMIT 2",
         // descending: the far end of the index order
         "MATCH (b IS beach) RETURN b._key AS k, b.emb <-> '[0,1,0]'::vector AS d ORDER BY d DESC LIMIT 2",
         // no limit: there is nothing to stop at
@@ -594,4 +599,34 @@ fn host_form_parameters_are_typed_once() {
     .err()
     .expect("refused");
     assert_eq!(sqlstate(&error), Some("42P08"), "{error}");
+}
+
+#[test]
+fn an_ordered_top_k_puts_nan_then_null_last_as_the_scan_does() {
+    let dir = TempDir::new().unwrap();
+    let mut db = fixture(&dir);
+    db.sql("CREATE TABLE shell (emb VECTOR(2)) WITH (index: none)", &[]).unwrap();
+    for (key, emb) in [("a", Some(vec![1.0, 0.0])), ("b", Some(vec![0.0, 1.0])), ("z", Some(vec![0.0, 0.0])), ("c", None)] {
+        match emb {
+            Some(emb) => db.sql("INSERT INTO shell (_key, emb) VALUES ($1, $2)", &[Param::Text(key.into()), Param::Vector(emb)]),
+            None => db.sql("INSERT INTO shell (_key) VALUES ($1)", &[Param::Text(key.into())]),
+        }
+        .unwrap();
+    }
+    db.sql("COMMIT", &[]).unwrap();
+    db.sql("CREATE INDEX shell_emb ON shell USING exact (emb)", &[]).unwrap();
+    for (limit, expected) in [(3, vec!["a", "b", "z"]), (4, vec!["a", "b", "z", "c"])] {
+        let body = |key: &str| {
+            format!("MATCH (s IS shell) RETURN s._key AS k, s.emb <=> '[1,0]'::vector AS d ORDER BY {key}, k LIMIT {limit}")
+        };
+        let (ordered, scanned) = (body("d"), body("d * 1"));
+        assert!(plan(&db, &ordered, &[]).contains("stops at the first row past"));
+        let rows = run(&db, &ordered, &[]).unwrap();
+        assert_eq!(keys(&rows), expected);
+        assert_eq!(keys(&rows), keys(&run(&db, &scanned, &[]).unwrap()));
+        assert!(float(&rows[2][1]).is_nan(), "the zero vector's cosine distance is NaN");
+        if limit == 4 {
+            assert_eq!(rows[3][1], SqlValue::Null, "no vector, no distance");
+        }
+    }
 }

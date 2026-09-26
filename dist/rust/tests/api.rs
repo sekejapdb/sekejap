@@ -948,3 +948,53 @@ fn a_gql_statement_runs_through_the_sql_calls_with_owner_less_rows() {
     assert_eq!(statement.rebindable(), Some(true));
     assert_eq!(statement.counters(), (3, 1));
 }
+
+/// `SET LOCAL ef_search` lasts for its transaction, however that ends, and a
+/// vector order reads it when it runs (owner decision 2026-09-27; GQL profile
+/// Q29 for SQL too). `ef_search = 1` bounds the approximate shortlist to one
+/// row, so the answer's length says which order ran.
+#[test]
+fn set_local_ef_search_lasts_for_its_transaction_and_a_cached_plan_follows_it() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    db.execute("CREATE TABLE spot (emb VECTOR(2)) WITH (index: none)", &[]).unwrap();
+    for (n, emb) in [[1.0, 0.0], [0.9, 0.1], [0.5, 0.5], [0.0, 1.0]].iter().enumerate() {
+        db.execute("INSERT INTO spot (_key, emb) VALUES ($1, $2)", &[json!(format!("s{n}")), json!(emb)])
+            .unwrap();
+    }
+    db.execute("CREATE INDEX spot_emb ON spot USING exact (emb)", &[]).unwrap();
+    db.execute("CREATE INDEX spot_emb_q ON spot USING quantized (emb)", &[]).unwrap();
+    let top3 = "SELECT _key FROM spot ORDER BY emb <-> '[1,0]' LIMIT 3";
+    // Twice, so the second is the plan cache's hit.
+    assert_eq!(db.query(top3, &[]).unwrap().len(), 3);
+    assert_eq!(db.query(top3, &[]).unwrap().len(), 3);
+    for end in ["commit", "rollback", "drop"] {
+        let mut tx = db.transaction().unwrap();
+        tx.execute("SET LOCAL ef_search = 1", &[]).unwrap();
+        assert_eq!(tx.query(top3, &[]).unwrap().len(), 1, "inside the transaction: approximate");
+        match end {
+            "commit" => tx.commit().unwrap(),
+            "rollback" => tx.rollback().unwrap(),
+            _ => drop(tx),
+        }
+        assert_eq!(db.query(top3, &[]).unwrap().len(), 3, "after {end}: exact, the cached plan included");
+    }
+    // Outside a transaction block, SET LOCAL ends with its own statement.
+    db.execute("SET LOCAL ef_search = 1", &[]).unwrap();
+    assert_eq!(db.query(top3, &[]).unwrap().len(), 3);
+}
+
+/// `Tx::query` reads inside the transaction: it sees the transaction's own
+/// uncommitted writes, as a SELECT after BEGIN does.
+#[test]
+fn a_transaction_reads_its_own_writes_through_query() {
+    let tmp = dir();
+    let db = Db::open(tmp.path()).expect("open");
+    db.execute("CREATE TABLE note (body TEXT)", &[]).unwrap();
+    let mut tx = db.transaction().unwrap();
+    tx.execute("INSERT INTO note (_key, body) VALUES ('n1', 'reef walk')", &[]).unwrap();
+    let rows = tx.query("SELECT _key FROM note WHERE _key = 'n1'", &[]).unwrap();
+    assert_eq!(rows.len(), 1, "the transaction sees its own write");
+    tx.rollback().unwrap();
+    assert_eq!(db.query("SELECT _key FROM note WHERE _key = 'n1'", &[]).unwrap().len(), 0);
+}

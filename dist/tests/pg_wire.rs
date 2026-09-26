@@ -1261,3 +1261,39 @@ fn the_canvas_query_answers_through_the_wire() {
     let got = ask(&mut connection, "SELECT postgis_version()");
     assert!(rows_of(&got)[0][0].as_deref().unwrap().starts_with("3.4 "));
 }
+
+/// `SET LOCAL ef_search` on the wire lasts for its `BEGIN ... COMMIT`
+/// block and no longer, and outside a block it ends with its own statement,
+/// as in PostgreSQL. `ef_search = 1` bounds the approximate shortlist to one
+/// row, so the answer's length says which order ran.
+#[test]
+fn set_local_ef_search_lasts_for_its_transaction_block_on_the_wire() {
+    let dir = TempDir::new().expect("a temp dir");
+    let path = dir.path().join("db");
+    {
+        use sekejap_lang::SqlDatabase;
+        let mut db = Database::create(&path, config()).expect("create");
+        db.sql("CREATE TABLE spot (emb VECTOR(2)) WITH (index: none)", &[]).unwrap();
+        for (n, emb) in ["[1,0]", "[0.9,0.1]", "[0.5,0.5]", "[0,1]"].iter().enumerate() {
+            db.sql(&format!("INSERT INTO spot (_key, emb) VALUES ('s{n}', '{emb}')"), &[]).unwrap();
+        }
+        db.commit().unwrap();
+        db.sql("CREATE INDEX spot_emb ON spot USING exact (emb)", &[]).unwrap();
+        db.sql("CREATE INDEX spot_emb_q ON spot USING quantized (emb)", &[]).unwrap();
+        db.commit().unwrap();
+    }
+    let service = ServiceDatabase::open(&path, config()).expect("open service");
+    service.set_publish_interval(Duration::ZERO);
+    let mut connection = connect(&service, 11);
+    let top3 = "SELECT _key FROM spot ORDER BY emb <-> '[1,0]' LIMIT 3";
+    assert_eq!(rows_of(&ask(&mut connection, top3)).len(), 3, "exact");
+    for end in ["COMMIT", "ROLLBACK"] {
+        let _ = ask(&mut connection, "BEGIN");
+        let _ = ask(&mut connection, "SET LOCAL ef_search = 1");
+        assert_eq!(rows_of(&ask(&mut connection, top3)).len(), 1, "inside the block: approximate");
+        let _ = ask(&mut connection, end);
+        assert_eq!(rows_of(&ask(&mut connection, top3)).len(), 3, "after {end}: exact");
+    }
+    let _ = ask(&mut connection, "SET LOCAL ef_search = 1");
+    assert_eq!(rows_of(&ask(&mut connection, top3)).len(), 3, "outside a block it ended with its statement");
+}
