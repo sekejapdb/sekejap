@@ -876,6 +876,12 @@ pub fn gql_refusals() -> &'static [(&'static str, Tier, &'static str)] {
 /// instead of matching on the text.
 pub use refuse::MULTI_RANGE as MULTI_RANGE_REASON;
 
+/// End this thread's transaction for the settings `SET LOCAL` made
+/// (`ef_search`): a caller that commits, rolls back or drops a transaction
+/// through its own API, not through SQL `COMMIT`/`ROLLBACK`, calls this so a
+/// `SET LOCAL` never outlives its transaction, as in PostgreSQL.
+pub use compile::end_transaction;
+
 /// Parse `text` without compiling it: the half of a prepare that needs
 /// neither a database nor the parameters.
 ///
@@ -1075,7 +1081,7 @@ pub(crate) fn projected(value: &ProjectedValue) -> SqlValue {
 /// The ranking value of a row, as SQL reads it.
 pub(crate) fn order_value(value: &OrderValue) -> SqlValue {
     match value {
-        OrderValue::EntityId | OrderValue::Driver => SqlValue::Null,
+        OrderValue::EntityId | OrderValue::Driver | OrderValue::Missing => SqlValue::Null,
         OrderValue::Scalar(scalar) => match scalar {
             sekejap_core::collections::OwnedScalarValue::Nullish => SqlValue::Null,
             sekejap_core::collections::OwnedScalarValue::Bool(b) => SqlValue::Bool(*b),

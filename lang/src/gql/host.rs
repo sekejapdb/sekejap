@@ -409,12 +409,10 @@ pub(crate) fn vector_value(op: VecOp, left: &BindingValue, right: &BindingValue)
         VecOp::L2 => VectorMetric::SquaredL2,
         VecOp::NegativeDot => VectorMetric::NegativeDot,
     };
-    let value = match vector_distance(&left, &right, metric) {
-        None => BindingValue::Null,
-        // `<->` is the Euclidean distance; the engine keeps its square.
-        Some(squared) if op == VecOp::L2 => BindingValue::Float(squared.sqrt()),
-        Some(distance) => BindingValue::Float(distance),
-    };
+    // `<->` is the Euclidean distance; the engine keeps its square. An
+    // all-zero vector's cosine distance is NaN, as pgvector answers.
+    let distance = vector_distance(&left, &right, metric);
+    let value = BindingValue::Float(if op == VecOp::L2 { distance.sqrt() } else { distance });
     Ok((value, left.len()))
 }
 

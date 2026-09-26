@@ -359,6 +359,7 @@ impl<'a> DriverCursor<'a> {
                     prefix,
                     info: info.clone(),
                     done: false,
+                    rest: None,
                 }))
             }
             DriverPlan::QuantizedVector { info } => {
@@ -1099,23 +1100,96 @@ impl GeometryCursor<'_> {
     }
 }
 
+impl<'a> DriverCursor<'a> {
+    /// Under an exact vector ORDER, make a vector driver also hand over the
+    /// rows its index does not hold, after its own, so they rank last
+    /// (`RankValue::Missing`) instead of never being candidates.
+    pub(super) fn with_rows_without_vector(mut self, db: &'a Database) -> QueryResult<Self> {
+        if let Self::Vector(cursor) = &mut self {
+            if !super::vector_scan::vector_may_be_missing(db, &cursor.info)? {
+                return Ok(self);
+            }
+            let store = db.store()?;
+            let row_prefix = crate::collections::prefix(0x40, cursor.info.collection);
+            let rows = store.range(&row_prefix).map_err(Error::from)?;
+            let locators = store.range(&cursor.prefix).map_err(Error::from)?;
+            cursor.rest = Some(RowsWithoutVector {
+                rows,
+                row_prefix,
+                locators,
+                locator_prefix: cursor.prefix.clone(),
+                next_locator: None,
+                started: false,
+            });
+        }
+        Ok(self)
+    }
+}
+
+impl RowsWithoutVector<'_> {
+    /// The next locator's sequence, or `None` past the last.
+    fn step_locator(&mut self) -> QueryResult<Option<u64>> {
+        let Some(entry) = self.locators.next() else {
+            return Ok(None);
+        };
+        let (key, _) = entry.map_err(Error::from)?;
+        if !key.starts_with(&self.locator_prefix) {
+            return Ok(None);
+        }
+        let mut at = self.locator_prefix.len();
+        Ok(Some(read_ordered(&key, &mut at)?))
+    }
+
+    fn next<C: FnMut() -> bool>(
+        &mut self,
+        collection: CollectionId,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Option<Candidate>> {
+        if !self.started {
+            self.next_locator = self.step_locator()?;
+            self.started = true;
+        }
+        loop {
+            meter.charge(WorkResource::PrimaryReads, 1)?;
+            let Some(entry) = self.rows.next() else {
+                return Ok(None);
+            };
+            let (key, _) = entry.map_err(Error::from)?;
+            if !key.starts_with(&self.row_prefix) {
+                return Ok(None);
+            }
+            let id = crate::collections::row_id_after_prefix(&key, self.row_prefix.len(), collection)?;
+            while self.next_locator.is_some_and(|sequence| sequence < id.sequence) {
+                meter.charge(WorkResource::VectorLocators, 1)?;
+                self.next_locator = self.step_locator()?;
+            }
+            if self.next_locator != Some(id.sequence) {
+                return Ok(Some(Candidate::bare(id)));
+            }
+        }
+    }
+}
+
 impl VectorCursor<'_> {
     pub(super) fn next<C: FnMut() -> bool>(
         &mut self,
         meter: &mut WorkMeter<'_, C>,
     ) -> QueryResult<Option<Candidate>> {
         if self.done {
-            return Ok(None);
+            return match self.rest.as_mut() {
+                Some(rest) => rest.next(self.info.collection, meter),
+                None => Ok(None),
+            };
         }
         meter.charge(WorkResource::VectorLocators, 1)?;
         let Some(row) = self.inner.next() else {
             self.done = true;
-            return Ok(None);
+            return self.next(meter);
         };
         let (key, value) = row.map_err(Error::from)?;
         if !key.starts_with(&self.prefix) {
             self.done = true;
-            return Ok(None);
+            return self.next(meter);
         }
         let mut at = self.prefix.len();
         let sequence = read_ordered(&key, &mut at)?;

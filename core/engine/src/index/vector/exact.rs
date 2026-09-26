@@ -278,10 +278,13 @@ pub(super) fn score_f32_pre(
         }
         at += 1;
     }
+    // pgvector's cosine distance of an all-zero vector is NaN, which sorts
+    // after every number and before NULL; it is a row with a distance, not a
+    // row to drop.
     let mut distance = match metric {
         VectorMetric::SquaredL2 => squared_l2,
         VectorMetric::NegativeDot => -dot,
-        VectorMetric::Cosine if stored_norm == 0.0 => return Ok(None),
+        VectorMetric::Cosine if stored_norm == 0.0 || query_norm == 0.0 => f64::NAN,
         VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
     };
     if distance == 0.0 {
@@ -292,10 +295,10 @@ pub(super) fn score_f32_pre(
 
 /// The distance between two vectors of equal width under `metric`, in the
 /// arithmetic of [`score_f32_pre`] (f64 accumulation): the squared L2
-/// distance, the negative inner product, or `1 - cosine` (`None` when a
-/// vector is all zero). A GQL expression reads it for two vectors it holds
-/// as values (`lang/src/gql/host.rs`).
-pub fn vector_distance(stored: &[f32], query: &[f32], metric: VectorMetric) -> Option<f64> {
+/// distance, the negative inner product, or `1 - cosine` (NaN when a vector
+/// is all zero, as pgvector answers). A GQL expression reads it for two
+/// vectors it holds as values (`lang/src/gql/host.rs`).
+pub fn vector_distance(stored: &[f32], query: &[f32], metric: VectorMetric) -> f64 {
     let (mut dot, mut stored_norm, mut query_norm, mut squared_l2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for (a, b) in stored.iter().zip(query) {
         let (a, b) = (f64::from(*a), f64::from(*b));
@@ -308,10 +311,14 @@ pub fn vector_distance(stored: &[f32], query: &[f32], metric: VectorMetric) -> O
     let distance = match metric {
         VectorMetric::SquaredL2 => squared_l2,
         VectorMetric::NegativeDot => -dot,
-        VectorMetric::Cosine if stored_norm == 0.0 || query_norm == 0.0 => return None,
+        VectorMetric::Cosine if stored_norm == 0.0 || query_norm == 0.0 => f64::NAN,
         VectorMetric::Cosine => 1.0 - dot / (stored_norm.sqrt() * query_norm.sqrt()),
     };
-    Some(if distance == 0.0 { 0.0 } else { distance })
+    if distance == 0.0 {
+        0.0
+    } else {
+        distance
+    }
 }
 
 /// f32 sidecar distance. Widens the query once then scores.

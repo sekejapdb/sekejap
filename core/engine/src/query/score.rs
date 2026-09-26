@@ -269,6 +269,13 @@ pub(super) fn eval_score_expr<'a, C: FnMut() -> bool>(
                 // (Entities) ranks them where ExactVector's driver omits them.
                 return Ok(f64::NEG_INFINITY);
             };
+            // An all-zero vector's cosine distance is NaN (pgvector); a
+            // similarity SCORE keeps it where a vector-less row goes, the
+            // worst, so a hybrid ranking does not change with the order's
+            // NULL/NaN rule.
+            if distance.is_nan() {
+                return Ok(f64::NEG_INFINITY);
+            }
             Ok(-distance)
         }
         CompiledScoreExpr::Distance { info, center } => {

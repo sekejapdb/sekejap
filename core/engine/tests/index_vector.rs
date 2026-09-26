@@ -270,7 +270,9 @@ fn validation_zero_vectors_ties_and_work_bounds_are_explicit() {
         .iter()
         .map(|hit| hit.id)
         .collect::<Vec<_>>(),
-        vec![a, b]
+        // The zero vector's cosine distance is NaN (pgvector), after every
+        // number: it is ranked last, not dropped.
+        vec![a, b, zero]
     );
     assert_eq!(
         query(

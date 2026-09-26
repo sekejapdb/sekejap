@@ -1054,6 +1054,23 @@ pub(super) struct VectorCursor<'a> {
     pub(super) prefix: Vec<u8>,
     pub(super) info: IndexInfo,
     pub(super) done: bool,
+    /// Under an exact vector ORDER, the rows the index does not hold, walked
+    /// after its own: PostgreSQL sorts a NULL vector last rather than
+    /// dropping the row (`DriverCursor::with_rows_without_vector`).
+    pub(super) rest: Option<RowsWithoutVector<'a>>,
+}
+
+/// The collection's rows that have no locator in the index: a merge of the
+/// row walk against the locator walk, both ascending by sequence, so no row
+/// costs a point read.
+pub(super) struct RowsWithoutVector<'a> {
+    pub(super) rows: RangeIter<'a>,
+    pub(super) row_prefix: Vec<u8>,
+    pub(super) locators: RangeIter<'a>,
+    pub(super) locator_prefix: Vec<u8>,
+    /// The next locator's sequence, `None` once the locators are done.
+    pub(super) next_locator: Option<u64>,
+    pub(super) started: bool,
 }
 
 pub(super) struct QuantizedVectorCursor<'a> {

@@ -272,15 +272,14 @@ impl Planner<'_> {
 
     /// Read the seed of `key`'s node in the order of `key`, for a limited
     /// sort whose first key it is (design §3.5 use 2), when the index order
-    /// IS the key's order row for row: an exact vector index under `<->` or
-    /// `<#>` (the engine ranks with the arithmetic `<->` and `<#>` evaluate,
-    /// `vector_distance`), over a NOT NULL column (the index holds no row
-    /// without a vector, where the sort would put a NULL distance last), from
-    /// a seed that is the plan's first operator (it opens once) with only
-    /// streaming operators after it. Ascending only: that is the direction
-    /// of nearness. Cosine is not ordered here: the engine skips an all-zero
-    /// vector that the expression gives NULL for. Anything else keeps the
-    /// scan and the full sort, which are exact too.
+    /// IS the key's order row for row: an exact vector index under `<->`,
+    /// `<=>` or `<#>` (the engine ranks with the arithmetic the expression
+    /// evaluates, `vector_distance`, and puts an all-zero vector's NaN after
+    /// every number and a row with no vector after that, where this sort puts
+    /// NaN and NULL), from a seed that is the plan's first operator (it opens
+    /// once) with only streaming operators after it. Ascending only: that is
+    /// the direction of nearness. Anything else keeps the scan and the full
+    /// sort, which are exact too.
     pub(super) fn order_seed(&mut self, key: &Ex, descending: bool) -> SqlResult2<bool> {
         let Ex::Host(host) = key else { return Ok(false) };
         let HostEx::Vector { op, left, right } = &**host else {
@@ -289,7 +288,7 @@ impl Planner<'_> {
         let metric = match op {
             VecOp::L2 => VectorMetric::SquaredL2,
             VecOp::NegativeDot => VectorMetric::NegativeDot,
-            VecOp::Cosine => return Ok(false),
+            VecOp::Cosine => VectorMetric::Cosine,
         };
         if descending || self.floor != 0 {
             return Ok(false);
@@ -324,7 +323,6 @@ impl Planner<'_> {
             _ => return Ok(false),
         };
         let info = self.db.collection_info(collection).map_err(SqlError::from)?;
-        let not_null = info.rules.iter().any(|(name, rule)| **name == *field && rule.not_null);
         let Some(dimension) = info.layout.fields.iter().find_map(|(name, kind)| match kind {
             Kind::Vector(dimension) if **name == *field => Some(*dimension),
             _ => None,
@@ -332,7 +330,7 @@ impl Planner<'_> {
             return Ok(false);
         };
         let indexes = self.db.list_indexes(collection).map_err(SqlError::from)?;
-        let (Some(index), true) = (ready(&indexes, &field, IndexFamily::ExactVector), not_null) else {
+        let Some(index) = ready(&indexes, &field, IndexFamily::ExactVector) else {
             return Ok(false);
         };
         let approximate = ready(&indexes, &field, IndexFamily::VamanaGraph)

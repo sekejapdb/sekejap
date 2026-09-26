@@ -177,6 +177,7 @@ impl Db {
             Backing::Single(m) => {
                 let mut db = m.into_inner().unwrap_or_else(|e| e.into_inner());
                 let _ = db.rollback();
+                sekejap_lang::end_transaction();
                 Ok(())
             }
             Backing::Service(s) => Ok(s.close()?),
@@ -209,6 +210,7 @@ impl Db {
                 let out = body(&mut guard);
                 if out.is_err() {
                     let _ = guard.rollback();
+                    sekejap_lang::end_transaction();
                 }
                 out
             }
@@ -810,6 +812,16 @@ impl Tx<'_> {
         }
     }
 
+    /// Run one row-returning statement INSIDE this transaction, as a
+    /// `SELECT` after `BEGIN` runs in PostgreSQL: it sees this transaction's
+    /// own writes and what its `SET LOCAL` set (`ef_search`). Not cached --
+    /// the plan cache serves `Db::query`, which runs outside a transaction.
+    pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
+        let params = params_of(params);
+        let result = self.database().sql(sql, &params)?;
+        expect_rows(result, sql)
+    }
+
     /// Write one document. Not durable until [`Tx::commit`].
     pub fn put<'a>(&mut self, addr: impl Into<Addr<'a>>, document: &Value) -> Result<EntityId> {
         let addr = addr.into();
@@ -948,6 +960,8 @@ impl Tx<'_> {
     /// Make everything written through this transaction durable.
     pub fn commit(mut self) -> Result<()> {
         self.done = true;
+        // `SET LOCAL` ends with the transaction, however it ends.
+        sekejap_lang::end_transaction();
         match &mut self.inner {
             TxInner::Single(g) => Ok(g.commit()?),
             TxInner::Service(g) => Ok(g.commit()?),
@@ -957,6 +971,7 @@ impl Tx<'_> {
     /// Discard everything written through this transaction.
     pub fn rollback(mut self) -> Result<()> {
         self.done = true;
+        sekejap_lang::end_transaction();
         match &mut self.inner {
             TxInner::Single(g) => Ok(g.rollback()?),
             TxInner::Service(g) => Ok(g.rollback()?),
@@ -971,6 +986,7 @@ impl Drop for Tx<'_> {
         if self.done {
             return;
         }
+        sekejap_lang::end_transaction();
         match &mut self.inner {
             TxInner::Single(g) => {
                 let _ = g.rollback();

@@ -329,50 +329,36 @@ impl Compiler<'_> {
             .or_else(|| {
                 ready(IndexFamily::QuantizedVector).map(|index| (index, "quantized index"))
             });
+        // The notices say what the answer is if the statement ran NOW, as
+        // EXPLAIN (which prepares afresh) reads it; the run itself decides
+        // again from the knob as it is then (`OwnedOrder::Vector`).
         let ef = EF_SEARCH.with(Cell::get);
         match (exact, approximate, ef) {
-            (Some(index), _, None) => Ok(OwnedOrder::ExactVector {
-                index,
-                query,
-                metric,
-                fill,
-            }),
-            (_, Some((index, family)), ef) => {
+            (Some(_), _, None) => {}
+            (_, Some((_, family)), ef) => {
                 let ef = ef.unwrap_or(DEFAULT_EF);
                 self.notices.push(format!(
                     "ORDER BY a vector distance on `{column}` is APPROXIMATE (ef={ef}): the {family} answers it, and the shortlist bounds the whole result set of this prepared query"
                 ));
-                Ok(OwnedOrder::ApproximateVector {
-                    index,
-                    query,
-                    metric,
-                    ef,
-                    fill,
-                })
             }
-            (Some(index), None, Some(ef)) => {
+            (Some(_), None, Some(ef)) => {
                 self.notices.push(format!(
                     "SET LOCAL ef_search = {ef} was seen but `{column}` has only an exact vector index; the answer is exact and the shortlist bound is unused"
                 ));
-                Ok(OwnedOrder::ExactVector {
-                    index,
-                    query,
-                    metric,
-                    fill,
-                })
             }
-            // NOT `SqlError::Engine`, for the reason `index_for_expression`
-            // is not either (QL_CONTRACT §7 item 9): "there is no index that
-            // can answer this" is a NAMED refusal, and an `Engine` error
-            // reaches a PostgreSQL client as `XX000 internal_error`, the one
-            // code a client RETRIES. Under
-            // `docs/lang/INDEX_CONTRACT.md` this is the refusal a caller is
-            // most likely to meet -- `VECTOR` is the one column kind that is
-            // still declared -- so it is the one that must not look like a
-            // transient fault.
-            (None, None, _) => Err(SqlError::unsupported(format!(
+            (None, None, _) => {}
+        }
+        match (exact, approximate) {
+            (None, None) => Err(SqlError::unsupported(format!(
                 "no vector index on `{column}`: a vector order names the exact family (page-order sidecar scan), the quantized one (compact scan then f32 rerank) or the vamana graph (a walk of the nodes the search list reaches, then the same f32 rerank). `CREATE INDEX i ON t USING exact ({column})`, `USING quantized ({column})` or `USING vamana ({column})`; docs/lang/INDEX_CONTRACT.md says why this one is not automatic"
             ))),
+            (exact, approximate) => Ok(OwnedOrder::Vector {
+                exact,
+                approximate: approximate.map(|(index, _)| index),
+                query,
+                metric,
+                fill,
+            }),
         }
     }
 

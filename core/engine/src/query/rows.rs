@@ -548,6 +548,9 @@ pub(super) fn checked_output_size(row: &QueryRow) -> QueryResult<u64> {
         // A reaching-edge ranking reports a number or nothing.
         OrderValue::Edge(Some(_)) => 9,
         OrderValue::Edge(None) => 1,
+        // A row with nothing to rank by reports that, like an edge with no
+        // property: one tag.
+        OrderValue::Missing => 1,
         // Neither carries a value the caller is charged for: an id-ordered
         // row's key is its id, and a driver-ordered row's place is the
         // candidate stream's, not a value in the row.

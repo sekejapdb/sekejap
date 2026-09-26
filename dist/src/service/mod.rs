@@ -650,6 +650,8 @@ impl WriterGuard<'_> {
     /// the batch already there; a commit that fails emits nothing and leaves
     /// the batch pending, which the guard's drop then rolls back.
     pub fn commit(&mut self) -> Result<()> {
+        // `SET LOCAL` lasts until the transaction ends, however it ends.
+        sekejap_lang::end_transaction();
         self.db.commit()?;
         let event = if self.batch.touched() {
             let event = self.batch.take();
@@ -671,6 +673,7 @@ impl WriterGuard<'_> {
     /// remembers nothing: §5 says a rolled-back batch fires **not at all**.
     pub fn rollback(&mut self) -> Result<()> {
         self.batch.clear();
+        sekejap_lang::end_transaction();
         self.db.rollback()?;
         Ok(())
     }
@@ -680,6 +683,7 @@ impl Drop for WriterGuard<'_> {
     fn drop(&mut self) {
         if self.batch.touched() {
             self.batch.clear();
+            sekejap_lang::end_transaction();
             let _ = self.db.rollback();
         }
     }

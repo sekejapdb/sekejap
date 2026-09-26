@@ -249,7 +249,8 @@ fn vector_distance(stored: &[f32; DIM], query: &[f32], metric: VectorMetric) -> 
     let mut distance = match metric {
         VectorMetric::SquaredL2 => l2,
         VectorMetric::NegativeDot => -dot,
-        VectorMetric::Cosine if sn == 0.0 => return None,
+        // pgvector: the cosine distance of an all-zero vector is NaN.
+        VectorMetric::Cosine if sn == 0.0 || qn == 0.0 => f64::NAN,
         VectorMetric::Cosine => 1.0 - dot / (sn.sqrt() * qn.sqrt()),
     };
     if distance == 0.0 {
@@ -870,6 +871,7 @@ impl<'a> Oracle<'a> {
                     .unwrap_or(0.0);
                 let sim = match row.emb {
                     Some(e) => vector_distance(&e, &self.meta.q_vec, VectorMetric::Cosine)
+                        .filter(|d| !d.is_nan())
                         .map(|d| -d)
                         .unwrap_or(f64::NEG_INFINITY),
                     None => f64::NEG_INFINITY,
@@ -973,13 +975,28 @@ impl<'a> Oracle<'a> {
                     nan_last_cmp(sa, sb, true).then(a.id.cmp(&b.id))
                 });
             }
-            OwnedOrder::ExactVector(metric) | OwnedOrder::ApproxVector(metric) => {
+            // PostgreSQL's order: every row with a vector, nearest first and
+            // a NaN distance after every number, then the rows with none, by
+            // id -- NULL sorts last.
+            OwnedOrder::ExactVector(metric) => {
                 let m = *metric;
-                rows.retain(|r| r.emb.is_some() && vector_distance(&r.emb.unwrap(), &self.meta.q_vec, m).is_some());
+                let distance = |r: &&LiveRow| r.emb.and_then(|e| vector_distance(&e, &self.meta.q_vec, m));
+                rows.sort_by(|a, b| match (distance(a), distance(b)) {
+                    (Some(da), Some(db)) => nan_last_cmp(da, db, false).then(a.id.cmp(&b.id)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.id.cmp(&b.id),
+                });
+            }
+            // An approximate order is pgvector's index scan, which holds no
+            // row without a vector.
+            OwnedOrder::ApproxVector(metric) => {
+                let m = *metric;
+                rows.retain(|r| r.emb.is_some());
                 rows.sort_by(|a, b| {
                     let da = vector_distance(&a.emb.unwrap(), &self.meta.q_vec, m).unwrap();
                     let db = vector_distance(&b.emb.unwrap(), &self.meta.q_vec, m).unwrap();
-                    da.total_cmp(&db).then(a.id.cmp(&b.id))
+                    nan_last_cmp(da, db, false).then(a.id.cmp(&b.id))
                 });
             }
             OwnedOrder::Score(kind) => {

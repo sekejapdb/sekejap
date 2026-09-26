@@ -49,6 +49,20 @@ thread_local! {
     static EF_SEARCH: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
+/// Set (or, `None`, clear) the `ef_search` knob for the rest of this
+/// thread's transaction: what `SET LOCAL ef_search` does when it RUNS, and
+/// what [`end_transaction`] undoes.
+pub(crate) fn set_ef_search(ef: Option<usize>) {
+    EF_SEARCH.with(|cell| cell.set(ef));
+}
+
+/// The end of a transaction on this thread, however it ends: `COMMIT` or
+/// `ROLLBACK` as SQL, or a caller's own commit, rollback or drop of a
+/// transaction handle. `SET LOCAL` lasts until here, as in PostgreSQL.
+pub fn end_transaction() {
+    set_ef_search(None);
+}
+
 /// The `ef_search` knob as this thread holds it now. A GQL execution reads
 /// it when it OPENS, so a cached GQL plan follows the transaction it runs in
 /// (GQL profile Q29).
@@ -346,8 +360,7 @@ impl Compiler<'_> {
                 // `= DEFAULT` clears the knob, which is what RESET means and
                 // what COMMIT does at the end of a transaction.
                 if matches!(value, Literal::Str(text) if text.eq_ignore_ascii_case("default")) {
-                    EF_SEARCH.with(|cell| cell.set(None));
-                    return Ok(WritePlan::Notice(format!(
+                    return Ok(WritePlan::SetEf(None, format!(
                         "SET LOCAL {name} = DEFAULT: the approximate shortlist bound is cleared, so a vector order takes the exact family when the column has one"
                     )));
                 }
@@ -357,8 +370,7 @@ impl Compiler<'_> {
                         "SET LOCAL {name} = {ef}: an approximate shortlist has a positive width"
                     )));
                 }
-                EF_SEARCH.with(|cell| cell.set(Some(ef as usize)));
-                Ok(WritePlan::Notice(format!(
+                Ok(WritePlan::SetEf(Some(ef as usize), format!(
                     "SET LOCAL {name} = {ef}: read as `ef`, the approximate shortlist bound of QueryOrder::ApproximateVector (QL_CONTRACT §4.5; the two knobs are not the same algorithm -- battle50k deviation 12)"
                 )))
             }

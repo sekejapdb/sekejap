@@ -432,17 +432,17 @@ pub(crate) enum OwnedOrder {
         matching: TextMatch,
         fill: Option<TsQuery>,
     },
-    ExactVector {
-        index: IndexId,
+    /// A vector distance order. Which index answers is decided when the
+    /// statement RUNS, from `SET LOCAL ef_search` as the transaction holds it
+    /// then (`compile::ef_search`), so a cached or prepared plan follows the
+    /// transaction it runs in: the approximate index with that `ef` when the
+    /// knob is set, else the exact index, else the approximate one at
+    /// [`DEFAULT_EF`](super::DEFAULT_EF).
+    Vector {
+        exact: Option<IndexId>,
+        approximate: Option<IndexId>,
         query: Vec<f32>,
         metric: VectorMetric,
-        fill: Option<Literal>,
-    },
-    ApproximateVector {
-        index: IndexId,
-        query: Vec<f32>,
-        metric: VectorMetric,
-        ef: usize,
         fill: Option<Literal>,
     },
     Score {
@@ -591,28 +591,32 @@ impl SelectPlan {
                 query,
                 matching: *matching,
             }),
-            OwnedOrder::ExactVector {
-                index,
+            OwnedOrder::Vector {
+                exact,
+                approximate,
                 query,
                 metric,
                 ..
-            } => run(QueryOrder::ExactVector {
-                index: *index,
-                query,
-                metric: *metric,
-            }),
-            OwnedOrder::ApproximateVector {
-                index,
-                query,
-                metric,
-                ef,
-                ..
-            } => run(QueryOrder::ApproximateVector {
-                index: *index,
-                query,
-                metric: *metric,
-                ef: *ef,
-            }),
+            } => match (super::ef_search(), exact, approximate) {
+                (Some(ef), _, Some(index)) => run(QueryOrder::ApproximateVector {
+                    index: *index,
+                    query,
+                    metric: *metric,
+                    ef,
+                }),
+                (_, Some(index), _) => run(QueryOrder::ExactVector {
+                    index: *index,
+                    query,
+                    metric: *metric,
+                }),
+                (_, None, Some(index)) => run(QueryOrder::ApproximateVector {
+                    index: *index,
+                    query,
+                    metric: *metric,
+                    ef: super::DEFAULT_EF,
+                }),
+                (_, None, None) => unreachable!("a vector order names an index"),
+            },
             OwnedOrder::Score { expr, direction } => with_score(expr, &mut |compiled| {
                 run(QueryOrder::Score {
                     expr: compiled,
@@ -752,6 +756,9 @@ pub(crate) enum WritePlan {
     Rollback,
     /// A statement that changed nothing and said so.
     Notice(String),
+    /// `SET LOCAL ef_search = n` (or `= DEFAULT`, `None`): takes effect when
+    /// it RUNS, for the rest of the transaction, and says so.
+    SetEf(Option<usize>, String),
 }
 
 /// One row field as a row expression reads it. `Missing` and `Null` are
@@ -1112,15 +1119,19 @@ impl WritePlan {
             ),
             Self::Commit => {
                 db.commit()?;
-                EF_SEARCH.with(|ef| ef.set(None));
+                super::end_transaction();
                 SqlResult::Affected(0)
             }
             Self::Rollback => {
                 db.rollback()?;
-                EF_SEARCH.with(|ef| ef.set(None));
+                super::end_transaction();
                 SqlResult::Affected(0)
             }
             Self::Notice(text) => notice(text),
+            Self::SetEf(ef, text) => {
+                super::set_ef_search(ef);
+                notice(text)
+            }
         })
     }
 }
@@ -1551,7 +1562,7 @@ impl OwnedOrder {
                     *matching = how;
                 }
             }
-            Self::ExactVector { query, fill, .. } | Self::ApproximateVector { query, fill, .. } => {
+            Self::Vector { query, fill, .. } => {
                 if let Some(literal) = fill {
                     *query = binder.vector_of(literal)?;
                 }

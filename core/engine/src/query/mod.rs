@@ -477,6 +477,10 @@ pub enum OrderValue {
     /// carry one -- which is where such a row sorts, last in either
     /// direction.
     Edge(Option<f64>),
+    /// The row has no value the order ranks by -- no vector under an exact
+    /// vector order -- and sorts after every row that has one, by id, as
+    /// PostgreSQL sorts NULL last.
+    Missing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

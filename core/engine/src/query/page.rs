@@ -822,6 +822,7 @@ impl PreparedQuery<'_> {
                 (CompiledOrder::ExactVector { .. }, RankValue::Score(score)) => {
                     OrderValue::Distance(f64::from_bits(*score))
                 }
+                (CompiledOrder::ExactVector { .. }, RankValue::Missing) => OrderValue::Missing,
                 (CompiledOrder::ApproximateVector { .. }, RankValue::Score(score)) => {
                     OrderValue::Distance(f64::from_bits(*score))
                 }
@@ -1106,7 +1107,7 @@ impl PreparedQuery<'_> {
         } else {
             HashSet::new()
         };
-        let mut driver = DriverCursor::new(
+        let driver = DriverCursor::new(
             self.db,
             self.collection,
             &self.driver,
@@ -1118,6 +1119,13 @@ impl PreparedQuery<'_> {
             geometry_seen,
             &self.membership,
         )?;
+        // An exact vector order keeps the rows with no vector, last, as
+        // PostgreSQL sorts NULL; a vector driver has to walk them too.
+        let mut driver = if matches!(self.order, CompiledOrder::ExactVector { .. }) {
+            driver.with_rows_without_vector(self.db)?
+        } else {
+            driver
+        };
         // Whether a kept candidate should carry its row into the heap.
         let wants_rows = !self.projection.is_empty();
         let db = self.db;

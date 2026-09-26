@@ -106,6 +106,66 @@ impl PreparedQuery<'_> {
     ///
     /// A vector page ranks by score, so its cursor can only be a score key.
     /// Anything else is a prepared query whose order and cursor disagree.
+    /// Where an exact vector order resumes: at the start, after a scored
+    /// row, or past every scored row and after a row with no vector.
+    fn exact_after(&self) -> QueryResult<ExactAfter> {
+        match self.after.as_ref() {
+            Some(RankKey {
+                value: RankValue::Missing,
+                id,
+            }) => Ok(ExactAfter::Missing(*id)),
+            _ => Ok(ExactAfter::Scored(self.vector_after()?)),
+        }
+    }
+
+    /// Up to `need` rows of the order's collection that have NO vector in
+    /// `info`, in id order, after `after` -- the rows an exact vector order
+    /// puts last, where PostgreSQL sorts NULL. Only a page the scored rows
+    /// did not fill comes here, so an order whose LIMIT the vectors fill
+    /// never walks the collection for them. Charges one primary read per row
+    /// walked and one vector locator per locator it looks up.
+    fn rows_without_vector<C: FnMut() -> bool>(
+        &self,
+        info: &IndexInfo,
+        after: Option<EntityId>,
+        need: usize,
+        meter: &mut WorkMeter<'_, C>,
+    ) -> QueryResult<Vec<EntityId>> {
+        let mut out = Vec::new();
+        if need == 0 {
+            return Ok(out);
+        }
+        let store = self.db.store()?;
+        let prefix = crate::collections::prefix(0x40, info.collection);
+        let start = after.map_or_else(|| prefix.clone(), crate::collections::row_key);
+        let mut rows = store.range(&start).map_err(Error::from)?;
+        loop {
+            let id = {
+                let Some((key, _)) = rows.peek_ref().map_err(Error::from)? else {
+                    break;
+                };
+                if !crate::collections::has_prefix(key, &prefix) {
+                    break;
+                }
+                crate::collections::row_id_after_prefix(key, prefix.len(), info.collection)?
+            };
+            rows.step();
+            if after == Some(id) {
+                continue;
+            }
+            meter.charge(WorkResource::PrimaryReads, 1)?;
+            meter.charge(WorkResource::VectorLocators, 1)?;
+            let locator = crate::index::vector::exact::locator_key(info.id, id.sequence);
+            if store.get(&locator).map_err(Error::from)?.is_none() {
+                out.push(id);
+                if out.len() == need {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn vector_after(&self) -> QueryResult<Option<crate::index::vector::exact::VectorAfter>> {
         match self.after.as_ref() {
             None => Ok(None),
@@ -151,7 +211,15 @@ impl PreparedQuery<'_> {
             ) => {
                 let dim =
                     u64::try_from(crate::index::vector::exact::dimension(info)?).map_err(invalid_query)?;
-                let after = self.vector_after()?;
+                // Past every scored row already: only rows with no vector
+                // are left, after the one the last page ended on.
+                let after = match self.exact_after()? {
+                    ExactAfter::Missing(id) => {
+                        let missing = self.rows_without_vector(info, Some(id), held, meter)?;
+                        return Ok(Some((missing_winners(missing), None)));
+                    }
+                    ExactAfter::Scored(after) => after,
+                };
                 // One past what the budget allows, so the scan's own ceiling
                 // trips only after the charge that names the exhausted
                 // resource has been made.
@@ -188,11 +256,19 @@ impl PreparedQuery<'_> {
                     return Err(error);
                 }
                 let hits = scan?;
+                // A page the scored rows did not fill ends with the rows that
+                // have no vector, first ones first -- none when the column is
+                // declared NOT NULL, which then costs no walk.
+                let missing = if hits.len() < held && vector_may_be_missing(self.db, info)? {
+                    self.rows_without_vector(info, None, held - hits.len(), meter)?
+                } else {
+                    Vec::new()
+                };
                 // The scan's own heap was bounded by `held`, so what it hands
                 // back IS the page's winner set: reserving `held` here would
                 // allocate a whole run's worth of rank keys to hold ten.
-                let bound = hits.len().max(1);
-                let mut winners = Winners::new();
+                let bound = (hits.len() + missing.len()).max(1);
+                let mut winners = missing_winners_into(Winners::new(), bound, missing);
                 for hit in hits {
                     let entry = HeapEntry {
                         key: RankKey {
@@ -499,4 +575,45 @@ impl PreparedQuery<'_> {
             }),
         )))
     }
+}
+
+/// True unless `info`'s field is declared NOT NULL, in which case every row
+/// of the collection has a vector and no complement walk is needed.
+pub(super) fn vector_may_be_missing(db: &Database, info: &IndexInfo) -> QueryResult<bool> {
+    let collection = db.collection_info(info.collection)?;
+    Ok(!collection
+        .rules
+        .iter()
+        .any(|(field, rule)| *field == info.field && rule.not_null))
+}
+
+/// Where an exact vector order resumes (`Page::exact_after`).
+enum ExactAfter {
+    Scored(Option<crate::index::vector::exact::VectorAfter>),
+    Missing(EntityId),
+}
+
+/// The winners of a page made only of rows with no vector.
+fn missing_winners(missing: Vec<EntityId>) -> Winners {
+    let bound = missing.len().max(1);
+    missing_winners_into(Winners::new(), bound, missing)
+}
+
+/// `missing` pushed into `winners`, each ranked after every score.
+fn missing_winners_into(mut winners: Winners, bound: usize, missing: Vec<EntityId>) -> Winners {
+    for id in missing {
+        winners.push(
+            bound,
+            HeapEntry {
+                key: RankKey {
+                    value: RankValue::Missing,
+                    id,
+                },
+                descending: false,
+                row: None,
+                edge: None,
+            },
+        );
+    }
+    winners
 }

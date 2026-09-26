@@ -22,6 +22,10 @@ pub(super) enum RankValue {
     /// One reaching edge's numeric property, or `None` when the edge does not
     /// carry one. `None` sorts after every value in either direction.
     EdgeScore(Option<u64>),
+    /// A row with nothing to score -- no vector under an exact vector order.
+    /// It sorts after every score, NaN included, in either direction, as
+    /// PostgreSQL sorts NULL after NaN; rows tied here keep id order.
+    Missing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +296,9 @@ pub(super) fn compare_rank_value(a: &RankValue, b: &RankValue, descending: bool)
                 }
             }
         }
+        (RankValue::Missing, RankValue::Missing) => Ordering::Equal,
+        (RankValue::Missing, RankValue::Score(_)) => Ordering::Greater,
+        (RankValue::Score(_), RankValue::Missing) => Ordering::Less,
         // A property the edge does not carry is worse than every value it
         // does, in either direction: the same place a NaN score takes above.
         (RankValue::EdgeScore(None), RankValue::EdgeScore(None)) => Ordering::Equal,
@@ -738,12 +745,12 @@ pub(super) fn rank_candidate<'a, C: FnMut() -> bool>(
             query_norm,
             metric,
         } => {
-            let Some(distance) =
-                vector_score(db, candidate, info, query, *query_norm, *metric, meter)?
-            else {
-                return Ok(None);
-            };
-            RankValue::Score(distance.to_bits())
+            // A row with no vector is not dropped: it ranks after every
+            // scored row (`RankValue::Missing`), where PostgreSQL puts NULL.
+            match vector_score(db, candidate, info, query, *query_norm, *metric, meter)? {
+                Some(distance) => RankValue::Score(distance.to_bits()),
+                None => RankValue::Missing,
+            }
         }
         CompiledOrder::ApproximateVector { .. } => {
             unreachable!("approximate order uses shortlist then exact rerank")
