@@ -84,14 +84,15 @@ use super::bind::{BoundMatch, BoundPattern, Chain, EdgeOcc, Labels, NodeOcc, Typ
 use super::convert;
 use super::eval::{Host, IndexSeed, Program};
 use super::expr::{Conjunct, Ex};
-use super::schema::{BindingSchema, SlotInfo};
+use super::schema::{BindingSchema, Name, SlotInfo};
 use super::stage::{StageView, TableOp};
+use super::union::Union;
 use super::types::{self, spelling, ParamUse};
 use crate::ast::CmpOp;
 use crate::{Param, SqlError, SqlResult2, SqlValue};
 use sekejap_core::collections::gql::{
-    BindingRow, BindingValue, ExprId, GqlBudget, GqlCursor, GqlPage, OpSpec, PathAutomaton,
-    PathLink, PathSearch, SeedSource, SlotId, StepSpec, Target, ValueType,
+    BindingRow, BindingValue, ExistsMode, ExprId, GqlBudget, GqlCursor, GqlPage, OpSpec,
+    PathAutomaton, PathLink, PathSearch, SeedSource, SlotId, StepSpec, Target, ValueType,
 };
 use sekejap_core::collections::{
     CollectionId, Database, Direction, EdgeTypeId, GraphContextId, IndexFamily, IndexState,
@@ -170,6 +171,21 @@ pub(super) enum Op {
     /// `WHERE` planned, run from each input row; `introduced` are the
     /// slots it allocated, `Null` when nothing matched (`stage.rs`).
     Optional { inner: Vec<Op>, introduced: Box<[SlotId]> },
+    /// `EXISTS { ... }` (M5-C): `inner`, the operators its body planned,
+    /// run from each input row until their first row; `mode` says what that
+    /// answer does to the row (`subquery.rs`).
+    Exists { inner: Vec<Op>, mode: ExistsMode },
+    /// `CALL (...) { ... }` (M5-D, `subquery.rs`): the body's operators, run
+    /// per input row, each row they give written into `outputs`; `columns`
+    /// names the body's projection for `EXPLAIN`.
+    Call {
+        inner: Vec<Op>,
+        outputs: Box<[SlotId]>,
+        columns: Vec<Option<Name>>,
+    },
+    /// `UNION [ALL | DISTINCT]` over stages (M5-E): each branch's
+    /// operators, planned as a stage of their own (`union.rs`).
+    Union(Union),
 }
 
 /// How a seed reaches its start nodes, as `EXPLAIN` names it.
@@ -256,16 +272,7 @@ impl GqlPlan {
                 }
             }
         };
-        let named = |types: &Option<Vec<TypeRef>>| {
-            types.iter().flatten().any(|t| matches!(t, TypeRef::Named(_)))
-        };
-        let unresolved = matches!(context, ContextRef::Named(_))
-            || flat(&planner.ops).into_iter().any(|op| match op {
-                Op::Expand { hop, .. } => named(&hop.types),
-                Op::PathSearch { types, .. } => types.iter().any(named),
-                Op::Reach(reach) => named(reach.types()),
-                _ => false,
-            });
+        let unresolved = matches!(context, ContextRef::Named(_)) || names_unknown(&planner.ops);
         let width = planner.stages[0].schema.row_width();
         let root = if unresolved {
             None
@@ -396,7 +403,7 @@ fn tree(db: &Database, context: &ContextRef, width: u16, ops: &[Op]) -> SqlResul
 }
 
 /// `ops` in turn over `root`, whose rows are `width` slots wide.
-fn chain(
+pub(super) fn chain(
     db: &Database,
     context: Option<GraphContextId>,
     mut root: OpSpec,
@@ -447,6 +454,16 @@ fn chain(
                 inner: Box::new(chain(db, context, OpSpec::Argument { width }, width, inner)?),
                 introduced: introduced.clone(),
             },
+            Op::Exists { inner, mode } => OpSpec::ExistsApply {
+                input,
+                inner: Box::new(chain(db, context, OpSpec::Argument { width }, width, inner)?),
+                mode: *mode,
+            },
+            Op::Call { inner, outputs, .. } => OpSpec::CallApply {
+                input,
+                inner: Box::new(chain(db, context, OpSpec::Argument { width }, width, inner)?),
+                outputs: outputs.clone(),
+            },
             Op::Reach(reach) => reach.spec(db, context, input)?,
             Op::PathSearch {
                 from,
@@ -473,17 +490,41 @@ fn chain(
                 }
             }
             Op::Table(op) => op.spec(input),
+            Op::Union(union) => {
+                let spec = union.spec(db, context, input, width)?;
+                width = union.width;
+                spec
+            }
         };
     }
     Ok(root)
 }
 
-/// Every operator of `ops`, an `OptionalApply`'s inner steps after it.
+/// True when an operator of `ops` -- an `ExistsApply`'s inner steps
+/// ([`flat`]) and a union's branches included -- names an edge type no
+/// write has interned yet.
+fn names_unknown(ops: &[Op]) -> bool {
+    let named = |types: &Option<Vec<TypeRef>>| {
+        types.iter().flatten().any(|t| matches!(t, TypeRef::Named(_)))
+    };
+    flat(ops).into_iter().any(|op| match op {
+        Op::Expand { hop, .. } => named(&hop.types),
+        Op::PathSearch { types, .. } => types.iter().any(named),
+        Op::Reach(reach) => named(reach.types()),
+        Op::Union(union) => union.branches.iter().any(|branch| names_unknown(&branch.ops)),
+        Op::Call { inner, .. } => names_unknown(inner),
+        _ => false,
+    })
+}
+
+/// Every operator of `ops` that one row flow passes, an `OptionalApply`'s
+/// or an `ExistsApply`'s inner steps after it. A union's branches are flows
+/// of their own, not listed here.
 fn flat(ops: &[Op]) -> Vec<&Op> {
     let mut all = Vec::with_capacity(ops.len());
     for op in ops {
         all.push(op);
-        if let Op::Optional { inner, .. } = op {
+        if let Op::Optional { inner, .. } | Op::Exists { inner, .. } = op {
             all.extend(flat(inner));
         }
     }
@@ -988,7 +1029,7 @@ impl Planner<'_> {
             _ => "a scalar index on one label's field answers it".to_owned(),
         };
         SqlError::unsupported(format!(
-            "a label scan of {label} with a predicate on {}: no index answers it, and a scan that reads every row to test it is refused (GQL profile Q5, QL_CONTRACT §6). {create}; or start the pattern from a key (`_key = ...`) or from a bound variable",
+            "a label scan of {label} with a predicate on {}: no index answers it, and a scan that reads every row to test it is refused (GQL profile Q5, QL_CONTRACT §6). {create}; or start the pattern from a key (`_key = ...`) or from a bound variable; or, to scan on purpose, test it after the pattern with FILTER (`MATCH (n IS site) FILTER n.rating > 4` reads every row of the label and is budgeted, design §2.6)",
             field.map_or_else(|| "the node".to_owned(), |f| format!("`{f}`"))
         ))
     }

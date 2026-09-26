@@ -216,6 +216,9 @@ pub(crate) mod sqlstate {
     pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
     /// `22P02 invalid_text_representation`.
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+    /// `42601 syntax_error`: as PostgreSQL, the branches of a `UNION` that
+    /// return different numbers of columns.
+    pub const SYNTAX_ERROR: &str = "42601";
     /// `42P08 ambiguous_parameter`: two uses of one `$n` deduce two types.
     pub const AMBIGUOUS_PARAMETER: &str = "42P08";
     /// `42P10 invalid_column_reference`: a `GROUP BY` or `ORDER BY`

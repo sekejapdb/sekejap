@@ -445,3 +445,58 @@ fn optional_match_prints_with_its_where() {
         "GRAPH_TABLE (g MATCH (optional)-[e]->(b) RETURN optional._key AS k)"
     );
 }
+
+/// M5-A: `OPTIONAL MATCH` holds comma patterns too, optional together, and
+/// prints them the same way a plain `MATCH` does.
+#[test]
+fn optional_match_prints_comma_patterns_together() {
+    assert_eq!(
+        nf("match (a) optional match (a)-[e:wrote]->(s:song), (a)-[:performed]->(s) \
+            RETURN s"),
+        "GRAPH_TABLE (g MATCH (a) OPTIONAL MATCH (a)-[e:wrote]->(s:song), (a)-[:performed]->(s) \
+         RETURN s)"
+    );
+}
+
+/// M5-C: `EXISTS { ... }` prints in ONE spelling: the short form (patterns
+/// and `WHERE`) as the full form's `MATCH`, and a `RETURN` inside, whose
+/// items are ignored (design Q18), not at all.
+#[test]
+fn exists_prints_its_body_as_statements() {
+    let full = "GRAPH_TABLE (g MATCH (a) WHERE EXISTS { MATCH (a)-[e:wrote]->(s:song) WHERE (s.year > 2000) } RETURN a)";
+    assert_eq!(
+        nf("MATCH (a) WHERE exists { (a)-[e:wrote]->(s:song) where s.year > 2000 } RETURN a"),
+        full
+    );
+    assert_eq!(
+        nf("MATCH (a) WHERE EXISTS { MATCH (a)-[e:wrote]->(s:song) WHERE s.year > 2000 RETURN s } RETURN a"),
+        full
+    );
+    assert_eq!(
+        nf("MATCH (a) FILTER NOT EXISTS { MATCH (a)-[e]->(b) LET n = b.y FILTER n > 1 } RETURN a"),
+        "GRAPH_TABLE (g MATCH (a) FILTER (NOT EXISTS { MATCH (a)-[e]->(b) LET n = b.y FILTER (n > 1) }) RETURN a)"
+    );
+}
+
+#[test]
+fn union_prints_one_conjunction_per_chain_and_binds_tighter_than_next() {
+    // `UNION` and `UNION DISTINCT` are one conjunction, printed `UNION`.
+    let distinct = nf("MATCH (a) RETURN a.y AS y UNION DISTINCT MATCH (b) RETURN b.y AS y");
+    assert_eq!(
+        distinct,
+        "GRAPH_TABLE (g MATCH (a) RETURN a.y AS y UNION MATCH (b) RETURN b.y AS y)"
+    );
+    assert_eq!(nf("MATCH (a) RETURN a.y AS y union MATCH (b) RETURN b.y AS y"), distinct);
+    // `A UNION ALL B NEXT C`: the union is one part, NEXT chains parts.
+    assert_eq!(
+        nf("MATCH (a) RETURN a.y AS y UNION ALL MATCH (b) RETURN b.y AS y \
+            UNION ALL RETURN 1 AS y NEXT RETURN COUNT(*) AS n"),
+        "GRAPH_TABLE (g MATCH (a) RETURN a.y AS y UNION ALL MATCH (b) RETURN b.y AS y \
+         UNION ALL RETURN 1 AS y NEXT RETURN COUNT(*) AS n)"
+    );
+    // After NEXT too.
+    assert_eq!(
+        nf("MATCH (a) RETURN a NEXT RETURN a.y AS y UNION RETURN a.z AS y"),
+        "GRAPH_TABLE (g MATCH (a) RETURN a NEXT RETURN a.y AS y UNION RETURN a.z AS y)"
+    );
+}

@@ -18,7 +18,8 @@
 //! * [`Expr`] is the M2 subset plus the M3-C scalar pack: arithmetic,
 //!   `||`, `IS [NOT] NULL`, `IN (...)`, `CASE`, casts, `COALESCE`,
 //!   `NULLIF` and the pack's functions ([`Func`]), plus the vertical
-//!   aggregates of a `RETURN` ([`Expr::Aggregate`], M3-B).
+//!   aggregates of a `RETURN` ([`Expr::Aggregate`], M3-B), and
+//!   `EXISTS { ... }` over a body of statements ([`Expr::Exists`], M5-C).
 //!
 //! `Display` prints the tree back in ONE spelling -- labels with `:`, every
 //! edge bracketed, every binary operator parenthesised, variables folded --
@@ -57,11 +58,22 @@ pub(crate) struct Outer {
     pub(crate) having: Option<Expr>,
 }
 
-/// The stages of a body, separated by `NEXT`: each stage's `RETURN` is the
-/// next stage's working table.
+/// The parts of a body, separated by `NEXT`: each part's rows are the next
+/// part's working table.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Pipeline {
-    pub(crate) stages: Vec<Stage>,
+    pub(crate) parts: Vec<BodyPart>,
+}
+
+/// One part of a body: a stage, or `UNION` over stages (M5-E). `UNION`
+/// binds tighter than `NEXT`: `A UNION B NEXT C` is `(A UNION B) NEXT C`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BodyPart {
+    Stage(Stage),
+    /// `stage UNION [ALL | DISTINCT] stage ...`, with ONE conjunction for
+    /// the chain (a mixed chain is refused by name, `mixed UNION`, P1):
+    /// `all` keeps duplicate rows; `UNION` and `UNION DISTINCT` remove them.
+    Union { branches: Vec<Stage>, all: bool },
 }
 
 /// Zero or more statements, then the `RETURN` that projects the stage.
@@ -74,8 +86,12 @@ pub(crate) struct Stage {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Statement {
     /// `MATCH <pattern>, <pattern> ... [WHERE <expr>]`, or, `optional`,
-    /// `OPTIONAL MATCH <pattern> [WHERE <expr>]`: one pattern (design Q3),
-    /// whose `WHERE` decides whether a match exists.
+    /// `OPTIONAL MATCH <pattern>, <pattern> ... [WHERE <expr>]`: every
+    /// pattern is optional TOGETHER (design Q3 built the single-pattern
+    /// form in M3; M5-A lifts the comma refusal, design Q17), and the
+    /// `WHERE` decides whether a match exists. ISO's block form, `OPTIONAL
+    /// { MATCH ...; MATCH ... }`, is a different construct, refused by
+    /// name (`OPTIONAL block`, P1).
     Match {
         patterns: Vec<PathPattern>,
         where_: Option<Expr>,
@@ -88,6 +104,12 @@ pub(crate) enum Statement {
     Filter(Expr),
     /// `FOR <var> IN <list>`: one row per element of the list.
     For { var: Name, list: Expr },
+    /// `CALL (<imports>) { <stage> }` (M5-D, design §2.4): per input row,
+    /// the body -- one stage, which sees only the imported variables -- runs
+    /// from that row, and each row its `RETURN` gives extends the input row
+    /// with the returned columns (a lateral inner join: an input row the
+    /// body gives no row is dropped). `()` imports nothing.
+    Call { imports: Vec<Name>, body: Box<Stage> },
 }
 
 /// `RETURN [DISTINCT] <item>, ... | * [GROUP BY ...] [ORDER BY ...]
@@ -347,6 +369,12 @@ pub(crate) enum Expr {
     Graph { func: GraphFunc, arg: Box<Expr> },
     /// A list literal `[a, b, ...]`, possibly empty (design Q2).
     List(Vec<Expr>),
+    /// `EXISTS { ... }` (M5-C, design §2.3): whether the body's statements
+    /// give a row. The short form -- patterns and a `WHERE` -- is held as
+    /// its `MATCH`, and a `RETURN` inside, whose items are ignored (Q18),
+    /// is not held. A name the body shares with the outer scope is the
+    /// outer variable; its own variables are local to it (`subquery.rs`).
+    Exists(Vec<Statement>),
 }
 
 /// The path, element and list functions (design §4.4, brief §6): Google's
@@ -451,9 +479,15 @@ impl AggFunc {
 
 impl Expr {
     /// The expressions this one is built from, in written order.
+    ///
+    /// An `EXISTS` body is a scope of its own, so none of it is a child.
     pub(crate) fn children(&self) -> Vec<&Expr> {
         match self {
-            Self::Literal(_) | Self::Param(_) | Self::Var(_) | Self::Property { .. } => Vec::new(),
+            Self::Literal(_)
+            | Self::Param(_)
+            | Self::Var(_)
+            | Self::Property { .. }
+            | Self::Exists(_) => Vec::new(),
             Self::Compare { left, right, .. }
             | Self::Arith { left, right, .. }
             | Self::And(left, right)
@@ -650,11 +684,22 @@ impl fmt::Display for GqlGraphTable {
 
 impl fmt::Display for Pipeline {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (at, stage) in self.stages.iter().enumerate() {
+        for (at, part) in self.parts.iter().enumerate() {
             if at > 0 {
                 f.write_str(" NEXT ")?;
             }
-            write!(f, "{stage}")?;
+            match part {
+                BodyPart::Stage(stage) => write!(f, "{stage}")?,
+                BodyPart::Union { branches, all } => {
+                    let conjunction = if *all { " UNION ALL " } else { " UNION " };
+                    for (at, stage) in branches.iter().enumerate() {
+                        if at > 0 {
+                            f.write_str(conjunction)?;
+                        }
+                        write!(f, "{stage}")?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -704,6 +749,16 @@ impl fmt::Display for Statement {
             }
             Self::Filter(predicate) => write!(f, "FILTER {predicate}"),
             Self::For { var, list } => write!(f, "FOR {var} IN {list}"),
+            Self::Call { imports, body } => {
+                f.write_str("CALL (")?;
+                for (at, name) in imports.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{name}")?;
+                }
+                write!(f, ") {{ {body} }}")
+            }
         }
     }
 }
@@ -992,6 +1047,13 @@ impl fmt::Display for Expr {
                 f.write_str("[")?;
                 list(f, items)?;
                 f.write_str("]")
+            }
+            Self::Exists(statements) => {
+                f.write_str("EXISTS {")?;
+                for statement in statements {
+                    write!(f, " {statement}")?;
+                }
+                f.write_str(" }")
             }
         }
     }

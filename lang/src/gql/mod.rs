@@ -32,7 +32,10 @@
 //! plans the outer SELECT over the relation as one more stage (M3-D).
 //! `elements` holds the path, element and list functions and `horizontal`
 //! the classification and the fold of horizontal aggregates, over a list
-//! per row (M4-D).
+//! per row (M4-D). `subquery` plans an `EXISTS { ... }` as the inner side
+//! of one `ExistsApply`: its scope, its placement, its filter and mark
+//! forms (M5-C). `union` binds and plans `UNION [ALL | DISTINCT]` over the
+//! stages of one part of the body (M5-E).
 
 pub(crate) mod ast;
 mod automaton;
@@ -47,4 +50,6 @@ pub(crate) mod plan;
 mod scalar;
 pub(crate) mod schema;
 mod stage;
+mod subquery;
 mod types;
+mod union;

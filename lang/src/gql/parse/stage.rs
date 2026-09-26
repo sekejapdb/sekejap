@@ -3,7 +3,7 @@
 //! ```text
 //! stage     := statement* return
 //! statement := MATCH pattern (',' pattern)* [WHERE expr]
-//!            | OPTIONAL MATCH pattern [WHERE expr]
+//!            | OPTIONAL MATCH pattern (',' pattern)* [WHERE expr]
 //!            | LET name '=' expr (',' name '=' expr)*
 //!            | FILTER expr
 //!            | FOR name IN expr
@@ -13,11 +13,29 @@
 //!              [OFFSET count] [LIMIT count]
 //! item      := expr [AS name]
 //! count     := integer literal | '$' n
+//!
+//! exists_body := pattern (',' pattern)* [WHERE expr]  -- the short form
+//!              | statement+ [return]                  -- the full form
 //! ```
+//!
+//! An `EXISTS` body (M5-C, design §2.3) is read as statements: the short
+//! form is its `MATCH`. A `RETURN` in the full form is accepted and its
+//! items ignored, as in Google's documented form; an aggregate, `GROUP BY`,
+//! `ORDER BY`, `OFFSET` or `LIMIT` there is refused by name (Q18), because
+//! each changes whether a row exists only in ways a `FILTER` in the body
+//! says plainly.
 //!
 //! The words are keywords only here, by position: `LET`, `FILTER`, `FOR`,
 //! `MATCH` and `OPTIONAL MATCH` where a statement starts, the `RETURN` clauses after the
 //! items. `NEXT` between stages is read by the body (`mod.rs`).
+//!
+//! `OPTIONAL MATCH p1, p2 [WHERE ...]` matches every pattern optional
+//! TOGETHER (M5-A, design Q3 -> Q17): one `WHERE`, and no match for one
+//! pattern empties the whole combined match, exactly like a plain `MATCH`'s
+//! comma patterns (`Planner::matched`, `lang/src/gql/bind.rs::bind_match`).
+//! ISO's block form, `OPTIONAL { MATCH ...; MATCH ... }`, is a different
+//! construct and is not this: `OPTIONAL` not followed by `MATCH` is refused
+//! by name (`OPTIONAL block`, P1, `gql_listed`).
 //!
 //! The outer `SELECT` over a GQL relation (design §5.5) is read here too,
 //! in the GQL dialect, as the `RETURN` of one more stage whose `WHERE` is
@@ -56,6 +74,42 @@ const INEXACT_FROM: f64 = 9_007_199_254_740_992.0;
 
 impl Parser {
     pub(super) fn gql_stage(&mut self) -> SqlResult2<Stage> {
+        let statements = self.gql_statements()?;
+        if !self.eat_word("RETURN") {
+            return Err(self.gql_expected("`MATCH`, `OPTIONAL MATCH`, `LET`, `FILTER`, `FOR` or `RETURN`"));
+        }
+        Ok(Stage {
+            statements,
+            ret: self.gql_return()?,
+        })
+    }
+
+    /// `EXISTS` has been read, the cursor on `{`: the body, as statements.
+    pub(super) fn gql_exists(&mut self) -> SqlResult2<Expr> {
+        self.expect(&Tok::LBrace)?;
+        let starts_a_statement = matches!(
+            self.word().as_deref(),
+            Some("MATCH" | "OPTIONAL" | "LET" | "FILTER" | "FOR" | "CALL")
+        );
+        let statements = if starts_a_statement {
+            let statements = self.gql_statements()?;
+            if self.eat_word("RETURN") {
+                exists_return(&self.gql_return()?)?;
+            }
+            statements
+        } else {
+            vec![self.gql_match(false)?]
+        };
+        if !self.eat(&Tok::RBrace) {
+            return Err(self.gql_expected(
+                "`MATCH`, `OPTIONAL MATCH`, `LET`, `FILTER`, `FOR`, `RETURN` or `}` in the EXISTS body",
+            ));
+        }
+        Ok(Expr::Exists(statements))
+    }
+
+    /// Zero or more statements, up to the first word that starts none.
+    fn gql_statements(&mut self) -> SqlResult2<Vec<Statement>> {
         let mut statements = Vec::new();
         loop {
             if self.eat_word("MATCH") {
@@ -73,26 +127,56 @@ impl Parser {
                     var,
                     list: self.gql_expr()?,
                 });
+            } else if self.eat_word("CALL") {
+                statements.push(self.gql_call_statement()?);
             } else {
-                break;
+                return Ok(statements);
             }
         }
-        if !self.eat_word("RETURN") {
-            return Err(self.gql_expected("`MATCH`, `OPTIONAL MATCH`, `LET`, `FILTER`, `FOR` or `RETURN`"));
+    }
+
+    /// `CALL` has been read: `(imports) { stage }` (design §2.4). The import
+    /// list is required -- `()` imports nothing -- so a bare `CALL { }` is an
+    /// error naming it (Q20); `NEXT` inside the body is refused by name (P1,
+    /// Q22), and so is `OPTIONAL CALL` (P1, Q21, `gql_listed`).
+    fn gql_call_statement(&mut self) -> SqlResult2<Statement> {
+        if !self.eat(&Tok::LParen) {
+            return Err(self.gql_expected(
+                "the import list after CALL: `CALL (a, b) { ... }` names the variables the body sees, `CALL () { ... }` none",
+            ));
         }
-        Ok(Stage {
-            statements,
-            ret: self.gql_return()?,
+        let mut imports = Vec::new();
+        if !self.eat(&Tok::RParen) {
+            loop {
+                imports.push(self.gql_name("an imported variable")?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen)?;
+        }
+        self.expect(&Tok::LBrace)?;
+        let body = self.gql_stage()?;
+        if self.word().as_deref() == Some("NEXT") {
+            return Err(refuse::gql_refuse("NEXT inside CALL"));
+        }
+        if !self.eat(&Tok::RBrace) {
+            return Err(self.gql_expected("`}` to close the CALL body"));
+        }
+        Ok(Statement::Call {
+            imports,
+            body: Box::new(body),
         })
     }
 
-    /// `MATCH`, or `OPTIONAL MATCH` when `optional`, has been read.
+    /// `MATCH`, or `OPTIONAL MATCH` when `optional`, has been read. Every
+    /// comma pattern is optional TOGETHER when `optional` (design Q3 ->
+    /// Q17, M5-A): `Planner::matched` plans them exactly as it does a plain
+    /// `MATCH`'s comma patterns, and the caller wraps the lot in one
+    /// `OptionalApply`.
     fn gql_match(&mut self, optional: bool) -> SqlResult2<Statement> {
         let mut patterns = vec![self.gql_path_pattern()?];
         while self.eat(&Tok::Comma) {
-            if optional {
-                return Err(refuse::gql_refuse("OPTIONAL MATCH with comma patterns"));
-            }
             patterns.push(self.gql_path_pattern()?);
         }
         let where_ = if self.eat_word("WHERE") {
@@ -320,4 +404,25 @@ impl Parser {
             )),
         }
     }
+}
+
+/// Q18: the `RETURN` of an `EXISTS` body, whose items are ignored, holds no
+/// clause that would change whether a row exists.
+fn exists_return(ret: &Return) -> SqlResult2<()> {
+    let clause = if ret.items.iter().any(|item| item.expr.has_aggregate()) {
+        "an aggregate"
+    } else if ret.group_by.is_some() {
+        "GROUP BY"
+    } else if !ret.order_by.is_empty() {
+        "ORDER BY"
+    } else if ret.offset.is_some() {
+        "OFFSET"
+    } else if ret.limit.is_some() {
+        "LIMIT"
+    } else {
+        return Ok(());
+    };
+    Err(SqlError::unsupported(format!(
+        "{clause} in the RETURN of an EXISTS {{ ... }} body: EXISTS asks only whether the body gives a row, and {clause} changes that only in ways a FILTER in the body says plainly (GQL profile Q18); the RETURN's items are ignored, so write the condition as a FILTER"
+    )))
 }

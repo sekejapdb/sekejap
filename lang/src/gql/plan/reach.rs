@@ -159,6 +159,10 @@ impl Reach {
 /// Put a [`Reach`] in place of every `PathSearch` of `ops` that §4.6's
 /// seven rules admit, and record on every other the rule it failed.
 /// `stages` locate each top-level operator's slot schema.
+///
+/// A union's branch (M5-E) is a row flow of its own: the rows the union
+/// reads -- the projection before it, whose columns are bound -- then the
+/// branch's steps, then what follows the union.
 pub(super) fn choose(ops: &mut [Op], program: &Program, stages: &[StageView]) {
     let mut positions = Vec::new();
     for (at, op) in ops.iter().enumerate() {
@@ -167,13 +171,40 @@ pub(super) fn choose(ops: &mut [Op], program: &Program, stages: &[StageView]) {
         positions.extend(std::iter::repeat_n(stage, count));
     }
     let all = flat(ops);
-    let decisions: Vec<Result<Reach, Refusal>> = all
-        .iter()
+    let decided = decisions(&all, 0..all.len(), program, |at| &stages[positions[at]].schema);
+    apply(ops, &mut decided.into_iter());
+    for at in 0..ops.len() {
+        let (before, rest) = ops.split_at_mut(at);
+        let Some((Op::Union(union), after)) = rest.split_first_mut() else { continue };
+        let lead = before
+            .iter()
+            .rev()
+            .find(|op| matches!(op, Op::Project { .. } | Op::Union(_)));
+        let after = flat(after);
+        for branch in &mut union.branches {
+            let steps = flat(&branch.ops);
+            let first = usize::from(lead.is_some());
+            let range = first..first + steps.len();
+            let all: Vec<&Op> = lead.into_iter().chain(steps).chain(after.iter().copied()).collect();
+            let decided = decisions(&all, range, program, |_| &branch.view.schema);
+            apply(&mut branch.ops, &mut decided.into_iter());
+        }
+    }
+}
+
+/// The decision for each `PathSearch` of `all` inside `range`, in order,
+/// each read against the slot schema `schema` gives its position.
+fn decisions<'s>(
+    all: &[&Op],
+    range: std::ops::Range<usize>,
+    program: &Program,
+    schema: impl Fn(usize) -> &'s BindingSchema,
+) -> Vec<Result<Reach, Refusal>> {
+    all.iter()
         .enumerate()
-        .filter(|(_, op)| matches!(op, Op::PathSearch { .. }))
-        .map(|(at, _)| decide(&all, at, program, &stages[positions[at]].schema))
-        .collect();
-    apply(ops, &mut decisions.into_iter());
+        .filter(|(at, op)| range.contains(at) && matches!(op, Op::PathSearch { .. }))
+        .map(|(at, _)| decide(all, at, program, schema(at)))
+        .collect()
 }
 
 /// Replace, in the order [`flat`] lists them, each `PathSearch` by its
@@ -181,7 +212,7 @@ pub(super) fn choose(ops: &mut [Op], program: &Program, stages: &[StageView]) {
 fn apply(ops: &mut [Op], decisions: &mut impl Iterator<Item = Result<Reach, Refusal>>) {
     for op in ops {
         match op {
-            Op::Optional { inner, .. } => apply(inner, decisions),
+            Op::Optional { inner, .. } | Op::Exists { inner, .. } => apply(inner, decisions),
             Op::PathSearch { reach, .. } => {
                 match decisions.next().expect("a decision per search") {
                     Ok(admitted) => *op = Op::Reach(admitted),
@@ -350,6 +381,7 @@ fn bound_before(all: &[&Op], at: usize) -> Vec<SlotId> {
             }
             Op::Reach(reach) => bound.extend(reach.to),
             Op::Project { cols, .. } => bound = (0..cols.len() as u16).map(SlotId).collect(),
+            Op::Union(union) => bound = (0..union.columns).map(SlotId).collect(),
             Op::Table(TableOp::Aggregate { keys, aggs, .. }) => {
                 bound = (0..(keys.len() + aggs.len()) as u16).map(SlotId).collect();
             }
@@ -359,7 +391,8 @@ fn bound_before(all: &[&Op], at: usize) -> Vec<SlotId> {
             Op::Table(TableOp::Unnest { out, .. }) => bound.push(*out),
             // Its inner steps follow it in `flat` order and bind there: the
             // slots it introduces are not bound before they do.
-            Op::Optional { .. } | Op::Filter { .. } | Op::Table(_) => {}
+            Op::Call { outputs, .. } => bound.extend(outputs.iter().copied()),
+            Op::Optional { .. } | Op::Exists { .. } | Op::Filter { .. } | Op::Table(_) => {}
         }
     }
     bound
@@ -380,7 +413,7 @@ fn read_before_projection(
         }
         if matches!(
             op,
-            Op::Project { .. } | Op::Table(TableOp::Aggregate { .. })
+            Op::Project { .. } | Op::Union(_) | Op::Table(TableOp::Aggregate { .. })
         ) {
             return None;
         }
@@ -440,8 +473,12 @@ fn reads(op: &Op, program: &Program) -> Vec<SlotId> {
             TableOp::Sort { keys, .. } => keys.iter().flat_map(|key| expr(&key.expr)).collect(),
             TableOp::Distinct | TableOp::Page { .. } => Vec::new(),
         },
-        // Its inner steps follow it in `flat` order and are read there.
-        Op::Optional { .. } => Vec::new(),
+        // Its inner steps follow it in `flat` order and are read there; a
+        // union's branches are flows of their own (`choose`).
+        Op::Optional { .. } | Op::Exists { .. } | Op::Union(_) => Vec::new(),
+        // A CALL body is not listed in `flat` (its path searches keep the
+        // full search): what it reads, it reads here.
+        Op::Call { inner, .. } => inner.iter().flat_map(|op| reads(op, program)).collect(),
     }
 }
 
@@ -517,6 +554,12 @@ fn consumer(all: &[&Op], at: usize, search: PathSearch) -> Result<&'static str, 
                 }
             }
             Op::Table(TableOp::Distinct) if consumer.is_none() => consumer = Some("a Distinct"),
+            Op::Union(_) => {
+                return refuse(
+                    4,
+                    "a UNION after it reads its rows in branches, which may count them or keep their order",
+                );
+            }
             _ => {}
         }
     }

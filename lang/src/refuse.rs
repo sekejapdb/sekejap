@@ -162,11 +162,6 @@ pub(crate) const TABLE: &[(&str, Tier, &str)] = &[
 /// Tier 2 is a construct a named milestone builds; Tier 3 is one the profile
 /// does not adopt because another spelling already says it.
 pub(crate) const GQL_TABLE: &[(&str, Tier, &str)] = &[
-    // ── M5: brief §11 step 5 ─────────────────────────────────────────────
-    ("OPTIONAL MATCH with comma patterns", Tier::Two, "GQL profile M5: an OPTIONAL MATCH holds one path pattern in this release (design Q3); several comma patterns, optional together, are brief §11 step 5. Write one OPTIONAL MATCH per pattern when each is optional on its own."),
-    ("EXISTS", Tier::Two, "GQL profile M5: EXISTS { ... } is brief §11 step 5."),
-    ("CALL", Tier::Two, "GQL profile M5: CALL (...) { ... } is brief §11 step 5."),
-    ("UNION", Tier::Two, "GQL profile M5: UNION inside a GRAPH_TABLE body is brief §11 step 5."),
     // ── M6: host functions inside a GQL body ─────────────────────────────
     ("host function", Tier::Two, "GQL profile M6: the spatial, vector and full-text host functions and casts (`ST_*`, `::geometry`, `::vector`, `to_tsvector`, `to_tsquery`, `bm25`) are evaluated inside a GQL body with index lineage in M6. The scalar pack (M3-C) is `ABS`, `SQRT`, `POWER`, `EXP`, `LN`, `LOWER`, `UPPER`, `TRIM`, `LENGTH`, `SUBSTRING`, `CONCAT`, `COALESCE`, `NULLIF`, `CAST`/`::`, `CASE`, arithmetic, `||`, `IN` and `IS [NOT] NULL`."),
     // ── P1: after the P0 release ─────────────────────────────────────────
@@ -179,6 +174,10 @@ pub(crate) const GQL_TABLE: &[(&str, Tier, &str)] = &[
     ("label wildcard", Tier::Two, "GQL profile P1: the label wildcard `%` is a P1 construct; write no label to match any element."),
     ("INTERSECT", Tier::Two, "GQL profile P1: INTERSECT inside a GRAPH_TABLE body is a P1 construct."),
     ("EXCEPT", Tier::Two, "GQL profile P1: EXCEPT inside a GRAPH_TABLE body is a P1 construct."),
+    ("OPTIONAL block", Tier::Two, "GQL profile P1: ISO's block form OPTIONAL { MATCH ...; MATCH ... } is a P1 construct (design Q17). OPTIONAL MATCH p1, p2 [WHERE ...] already matches every pattern optional together."),
+    ("OPTIONAL CALL", Tier::Two, "GQL profile P1: OPTIONAL CALL, the left-outer form that keeps an input row its body gives no row, is a P1 construct (design Q21). CALL (...) { ... } drops such a row, as an inner join does."),
+    ("NEXT inside CALL", Tier::Two, "GQL profile P1: a CALL body is one stage (design Q22); NEXT inside it is a P1 construct. Chain stages after the CALL instead."),
+    ("mixed UNION", Tier::Two, "GQL profile P1: one UNION chain takes one conjunction (design Q24); mixing UNION ALL with UNION or UNION DISTINCT needs ISO's parenthesised composite form, a P1 construct."),
     // ── not adopted ──────────────────────────────────────────────────────
     ("PATH_SUM", Tier::Three, "GQL profile, not adopted: a path accumulator is SUM over the path's group variable in a LET (horizontal aggregation, `LET total = SUM(e.cost)`)."),
     ("PATH_PRODUCT", Tier::Three, "GQL profile, not adopted: a path product is EXP(SUM(LN(x))) over the path's group variable in a LET (horizontal aggregation), for strictly positive values."),

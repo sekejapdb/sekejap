@@ -8,9 +8,10 @@
 //! changes: the graph name before the body and the alias after it are read
 //! as SQL reads them.
 //!
-//! * `stage.rs`: the statements and the `RETURN` of a stage; `NEXT`
-//!   separates stages; and the outer `SELECT` over the relation, which is
-//!   read as one more `RETURN` (design §5.5).
+//! * `stage.rs`: the statements and the `RETURN` of a stage; and the outer
+//!   `SELECT` over the relation, which is read as one more `RETURN`
+//!   (design §5.5). `NEXT` separates the parts of a body and `UNION` the
+//!   stages of one part, both read here.
 //! * `pattern.rs`: path patterns, element patterns and labels.
 //! * `expr.rs`: expressions: the M2 subset and the M3-C scalar pack.
 //!
@@ -24,7 +25,7 @@ mod stage;
 #[cfg(test)]
 mod tests;
 
-use super::ast::{GqlGraphTable, Pipeline, Stage};
+use super::ast::{BodyPart, GqlGraphTable, Pipeline};
 use super::schema::Name;
 use crate::lexer::Tok;
 use crate::parser::{Dialect, Parser};
@@ -71,19 +72,45 @@ impl Parser {
         };
         Ok(GqlGraphTable {
             graph,
-            body: Pipeline { stages: body },
+            body: Pipeline { parts: body },
             alias,
             outer: None,
         })
     }
 
-    /// `stage (NEXT stage)*`.
-    fn gql_pipeline(&mut self) -> SqlResult2<Vec<Stage>> {
-        let mut stages = vec![self.gql_stage()?];
+    /// `part (NEXT part)*`.
+    fn gql_pipeline(&mut self) -> SqlResult2<Vec<BodyPart>> {
+        let mut parts = vec![self.gql_part()?];
         while self.eat_word("NEXT") {
-            stages.push(self.gql_stage()?);
+            parts.push(self.gql_part()?);
         }
-        Ok(stages)
+        Ok(parts)
+    }
+
+    /// `part := stage ((UNION [ALL | DISTINCT]) stage)*` (design §2.5):
+    /// `UNION` binds tighter than `NEXT`, and a branch is one stage. One
+    /// chain takes ONE conjunction -- `UNION` and `UNION DISTINCT` are the
+    /// same one -- and mixing it with `UNION ALL` is refused by name
+    /// (`mixed UNION`, P1, design Q24): ISO's parenthesised composite form,
+    /// which would say which applies first, is not built.
+    fn gql_part(&mut self) -> SqlResult2<BodyPart> {
+        let mut branches = vec![self.gql_stage()?];
+        let mut conjunction: Option<bool> = None;
+        while self.eat_word("UNION") {
+            let all = self.eat_word("ALL");
+            if !all {
+                self.eat_word("DISTINCT");
+            }
+            if conjunction.is_some_and(|chain| chain != all) {
+                return Err(refuse::gql_refuse("mixed UNION"));
+            }
+            conjunction = Some(all);
+            branches.push(self.gql_stage()?);
+        }
+        Ok(match conjunction {
+            None => BodyPart::Stage(branches.pop().expect("a part has a stage")),
+            Some(all) => BodyPart::Union { branches, all },
+        })
     }
 
     /// A `COLUMNS (...)` body: the removed SQL/PGQ form (owner decision 1,
@@ -123,11 +150,22 @@ impl Parser {
 
     /// The GQL refusal the word at the cursor carries, two-word forms
     /// first so `ALL SHORTEST` is refused as itself.
+    ///
+    /// `OPTIONAL` not followed by `MATCH` is ISO's block form, `OPTIONAL {
+    /// MATCH ...; MATCH ... }` (design Q17): the comma form already matches
+    /// every pattern optional together (M5-A), so the block form is a named
+    /// P1 row rather than a bare syntax error at the `{`.
     pub(crate) fn gql_listed(&self, word: &str) -> Option<SqlError> {
         for (first, second) in [("ALL", "SHORTEST")] {
             if word == first && self.word_at(1).as_deref() == Some(second) {
                 return Some(refuse::gql_refuse(&format!("{first} {second}")));
             }
+        }
+        if word == "OPTIONAL" && matches!(self.peek_at(1), Tok::LBrace) {
+            return Some(refuse::gql_refuse("OPTIONAL block"));
+        }
+        if word == "OPTIONAL" && self.word_at(1).as_deref() == Some("CALL") {
+            return Some(refuse::gql_refuse("OPTIONAL CALL"));
         }
         refuse::gql_lookup(word)
     }

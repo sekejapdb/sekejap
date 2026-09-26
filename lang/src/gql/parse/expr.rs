@@ -20,6 +20,7 @@
 //!             | SUBSTRING '(' expr FROM expr [FOR expr] ')'
 //!             | COUNT '(' '*' ')' | aggregate '(' [DISTINCT] expr ')'
 //!             | graph_function '(' expr ')' | '[' [expr (',' expr)*] ']'
+//!             | EXISTS '{' exists_body '}'           -- `stage.rs`
 //! literal    := number | string | TRUE | FALSE | NULL
 //! ```
 //!
@@ -323,7 +324,18 @@ impl Parser {
                         self.bump();
                         return self.gql_case();
                     }
-                    "EXISTS" => return Err(refuse::gql_refuse("EXISTS")),
+                    // `EXISTS { ... }`; a word `exists` before anything
+                    // else is an ordinary name, as keywords are by position.
+                    "EXISTS" if matches!(self.peek_at(1), Tok::LBrace) => {
+                        self.bump();
+                        return self.gql_exists();
+                    }
+                    "EXISTS" if matches!(self.peek_at(1), Tok::LParen) => {
+                        return Err(SqlError::syntax(
+                            "`EXISTS` over a graph takes a GQL body in braces, `EXISTS { MATCH ... }`, not a SQL subquery in parentheses",
+                            at,
+                        ))
+                    }
                     // `name(`: a function of the pack, or a construct the GQL
                     // table names (`count(`, `nodes(`). A word WITHOUT a `(`
                     // is an ordinary variable name.

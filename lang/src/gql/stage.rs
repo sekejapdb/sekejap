@@ -38,6 +38,10 @@
 //! and naming it is an error that names the stage that dropped it
 //! (rule 4). A later stage's aggregate folds the whole incoming table.
 //!
+//! **`UNION`.** A part of the body may be a union of stages, planned as
+//! ONE stage of the plan by `union.rs`: each branch binds and plans as a
+//! stage does here, and the union's rows are what the next part reads.
+//!
 //! **The outer `SELECT`** over the relation (design §5.5) is ONE MORE
 //! STAGE, planned after the body's last: its scope is the relation's
 //! columns, its `WHERE` a `Filter` over them -- after the search, never
@@ -49,7 +53,8 @@
 //! and returns values only, since a relation's columns are what SQL reads.
 
 use super::ast::{
-    AggFunc, Count, Expr, Literal, Outer, Pipeline, Return, ReturnItem, Stage, Statement,
+    AggFunc, BodyPart, Count, Expr, Literal, Outer, Pipeline, Return, ReturnItem, Stage,
+    Statement,
 };
 use super::bind::{bind_match, column_name, outer_column_name};
 use super::convert;
@@ -57,6 +62,7 @@ use super::expr::{is_group, Ex, Lowering};
 use super::horizontal::Horizontal;
 use super::plan::{FilterAt, Op, Planner};
 use super::schema::{BindingSchema, Name, Provenance, SlotInfo};
+use super::subquery::{holds_exists, statement_holds_exists};
 use super::types::{aggregate_type, described, spelling};
 use crate::sqlstate::{DATATYPE_MISMATCH, INVALID_COLUMN_REFERENCE, UNDEFINED_COLUMN};
 use crate::{SqlError, SqlResult2};
@@ -75,21 +81,26 @@ pub(crate) struct StageView {
     pub(crate) outer: bool,
 }
 
-/// A stage of the plan: one of the body, or the outer `SELECT`.
+/// A stage of the plan: one of the body, a union of stages (`union.rs`),
+/// or the outer `SELECT`.
 enum Part<'p> {
     Stage(&'p Stage),
+    Union { branches: &'p [Stage], all: bool },
     Outer(&'p Outer),
 }
 
 /// What reads a stage's `RETURN`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Reader {
+pub(super) enum Reader {
     /// The next stage of the body, through `NEXT`.
     Next,
     /// The outer `SELECT`, as the relation's columns.
     Outer,
     /// The caller: the statement's answer.
     Caller,
+    /// The statements after a `CALL`, whose body's `RETURN` adds columns to
+    /// the row (M5-D).
+    Call,
 }
 
 /// An operator of the working-table grammar, as the planner holds it; each
@@ -246,9 +257,15 @@ impl Planner<'_> {
         notices: &mut Vec<String>,
     ) -> SqlResult2<Output> {
         let parts: Vec<Part<'_>> = pipeline
-            .stages
+            .parts
             .iter()
-            .map(Part::Stage)
+            .map(|part| match part {
+                BodyPart::Stage(stage) => Part::Stage(stage),
+                BodyPart::Union { branches, all } => Part::Union {
+                    branches,
+                    all: *all,
+                },
+            })
             .chain(outer.map(Part::Outer))
             .collect();
         let mut input = BindingSchema::default();
@@ -259,14 +276,35 @@ impl Planner<'_> {
         for (at, part) in parts.iter().enumerate() {
             let number = u16::try_from(at + 1)
                 .map_err(|_| SqlError::unsupported("a GQL body of more than 65,535 stages"))?;
+            let reader = match parts.get(at + 1) {
+                None => Reader::Caller,
+                Some(Part::Outer(_)) => Reader::Outer,
+                Some(Part::Stage(_) | Part::Union { .. }) => Reader::Next,
+            };
+            let first_op = self.ops.len();
+            if let Part::Union { branches, all } = part {
+                let (next, columns, out) =
+                    self.union(branches, *all, number, reader, &input, boundary.take(), notices)?;
+                self.stages.push(StageView {
+                    schema: next.clone(),
+                    first_op,
+                    columns,
+                    outer: false,
+                });
+                boundary = Some(first_op);
+                input = next;
+                output = Some(out);
+                continue;
+            }
             self.schema = input;
             self.bound = (0..self.schema.width()).map(|i| SlotId(i as u16)).collect();
-            let first_op = self.ops.len();
             let select;
             let mut having: Option<&Expr> = None;
             let ret = match part {
                 Part::Stage(stage) => {
-                    self.statements(stage, number, notices)?;
+                    let mut patterns = 0u16;
+                    self.statements(&stage.statements, number, &mut patterns, notices)?;
+                    self.return_exists(&stage.ret, number, &mut patterns, notices)?;
                     &stage.ret
                 }
                 Part::Outer(outer) => {
@@ -278,15 +316,11 @@ impl Planner<'_> {
                     select = self.outer_select(&outer.select, having)?;
                     &select
                 }
+                Part::Union { .. } => unreachable!("a union is planned above"),
             };
             if let Some(project) = boundary.take() {
                 self.set_width(project, self.schema.row_width());
             }
-            let reader = match parts.get(at + 1) {
-                None => Reader::Caller,
-                Some(Part::Outer(_)) => Reader::Outer,
-                Some(Part::Stage(_)) => Reader::Next,
-            };
             let is_outer = matches!(part, Part::Outer(_));
             let (next, project, columns, out) = self.ret(ret, number, reader, is_outer, having)?;
             self.stages.push(StageView {
@@ -304,9 +338,13 @@ impl Planner<'_> {
         Ok(output.expect("a body has a stage"))
     }
 
-    fn set_width(&mut self, project: usize, width: u16) {
-        if let Op::Project { width: at, .. } = &mut self.ops[project] {
-            *at = width;
+    /// Fix the row width of the `Project` at `project` -- or of every
+    /// branch of the union there -- to `width`, the reading stage's.
+    pub(super) fn set_width(&mut self, project: usize, width: u16) {
+        match &mut self.ops[project] {
+            Op::Project { width: at, .. } => *at = width,
+            Op::Union(union) => union.set_width(width),
+            _ => {}
         }
     }
 
@@ -337,36 +375,60 @@ impl Planner<'_> {
         Ok(ex)
     }
 
-    fn statements(&mut self, stage: &Stage, number: u16, notices: &mut Vec<String>) -> SqlResult2<()> {
-        let mut patterns = 0u16;
-        for statement in &stage.statements {
+    /// Plan `statements` in order, into stage `number`, whose patterns
+    /// `patterns` numbers; an `EXISTS` body's statements are planned here
+    /// too (`subquery.rs`), into the same stage.
+    pub(super) fn statements(
+        &mut self,
+        statements: &[Statement],
+        number: u16,
+        patterns: &mut u16,
+        notices: &mut Vec<String>,
+    ) -> SqlResult2<()> {
+        for statement in statements {
+            let (width, first_op) = (self.schema.width(), self.ops.len());
+            // Its `EXISTS` tests: those it holds as a top-level conjunct come
+            // out of it, to run after it; the rest read a slot. A statement
+            // that holds none is planned as written, uncopied.
+            let rewritten;
+            let (statement, exists) = if statement_holds_exists(statement) {
+                let (rewrite, exists) = self.exists_before(statement, number, patterns, notices)?;
+                rewritten = rewrite;
+                (rewritten.as_ref(), Some(exists))
+            } else {
+                (Some(statement), None)
+            };
             match statement {
-                Statement::Match {
+                Some(Statement::Match {
                     patterns: written,
                     where_,
-                    optional,
-                } => {
-                    let (width, first_op) = (self.schema.width(), self.ops.len());
+                    ..
+                }) => {
                     let matched = bind_match(
                         self.db,
                         &mut self.schema,
                         written,
                         where_,
-                        &mut patterns,
+                        patterns,
                         &mut self.params,
                         notices,
                     )?;
                     self.matched(matched)?;
-                    if *optional {
-                        self.optional(width, first_op);
-                    }
                 }
-                Statement::Let(assignments) => self.let_(assignments, number)?,
-                Statement::Filter(predicate) => {
+                Some(Statement::Let(assignments)) => self.let_(assignments, number)?,
+                Some(Statement::Filter(predicate)) => {
                     let ex = self.lower(predicate, Horizontal::Allowed, None, Role::Predicate)?;
                     self.filter(vec![ex], FilterAt::Statement);
                 }
-                Statement::For { var, list } => self.for_(var, list, number)?,
+                Some(Statement::For { var, list }) => self.for_(var, list, number)?,
+                Some(Statement::Call { imports, body }) => self.call(imports, body, number, patterns, notices)?,
+                None => {}
+            }
+            if let Some(exists) = exists {
+                self.exists_after(exists, first_op, number, patterns, notices)?;
+            }
+            if let Some(Statement::Match { optional: true, .. }) = statement {
+                self.optional(width, first_op);
             }
         }
         Ok(())
@@ -539,7 +601,7 @@ impl Planner<'_> {
     /// property of which `RETURN` this is, not of who reads it: the body's
     /// LAST stage is read BY the outer SELECT, `reader == Reader::Outer`,
     /// but keeps its own body naming).
-    fn ret(
+    pub(super) fn ret(
         &mut self,
         ret: &Return,
         number: u16,
@@ -563,6 +625,7 @@ impl Planner<'_> {
         let mut items: Vec<Item<'_>> = Vec::new();
         let next = match reader {
             Reader::Next => "the next stage",
+            Reader::Call => "the statements after the CALL",
             Reader::Outer => "the outer SELECT",
             Reader::Caller => "",
         };
@@ -600,7 +663,9 @@ impl Planner<'_> {
         let output: Vec<Name> = items.iter().filter_map(|item| item.name.clone()).collect();
         let mut order = Vec::with_capacity(ret.order_by.len());
         for key in &ret.order_by {
+            // An `EXISTS` reads the stage's row: it is a hidden column.
             let over_output = !key.expr.has_aggregate()
+                && !holds_exists(&key.expr)
                 && names(&key.expr).iter().all(|name| output.contains(name));
             if over_output {
                 order.push(None);
@@ -639,7 +704,7 @@ impl Planner<'_> {
         let mut lowered = Vec::with_capacity(items.len());
         for (at, item) in items.iter().enumerate() {
             let ex = match &item.name {
-                Some(name) if reader != Reader::Next && at < visible => {
+                Some(name) if !matches!(reader, Reader::Next | Reader::Call) && at < visible => {
                     let ex = self.lower(item.expr, Horizontal::Refused, computed.as_deref(), Role::Column(name))?;
                     self.final_column(&ex, name)?;
                     ex

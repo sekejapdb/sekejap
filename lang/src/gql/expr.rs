@@ -413,6 +413,21 @@ impl Lowering<'_> {
                     .map(|item| self.value(item))
                     .collect::<SqlResult2<_>>()?,
             ),
+            // The planner ran it before this expression (`subquery.rs`),
+            // into a slot; anywhere it did not, no row is at hand.
+            Expr::Exists(_) => match self.schema.marked(expr) {
+                Some(slot) => Ex::Slot(slot),
+                None if self.grouped.is_some() => {
+                    return Err(SqlError::unsupported(
+                        "EXISTS { ... } in a grouped RETURN: a row there is a group, and an EXISTS runs per row of the working table; compute it in a LET before the RETURN (`LET has = EXISTS { ... }`) and group by it or aggregate it",
+                    ))
+                }
+                None => {
+                    return Err(SqlError::unsupported(
+                        "EXISTS { ... } runs per row of a stage's working table: write it in a MATCH's WHERE, an element's WHERE, a FILTER, a LET, a FOR or a stage's RETURN; the outer SELECT reads the relation's columns only, so compute it in the body and return it",
+                    ))
+                }
+            },
         })
     }
 
@@ -547,5 +562,7 @@ pub(crate) fn bound_at(provenance: &Provenance) -> String {
         Provenance::Let { stage } => format!("a LET of stage {stage}"),
         Provenance::Unnest { stage } => format!("a FOR of stage {stage}"),
         Provenance::Aggregate { stage } => format!("the grouping of stage {stage}"),
+        Provenance::Exists { stage } => format!("an EXISTS of stage {stage}"),
+        Provenance::Called { stage } => format!("a CALL of stage {stage}"),
     }
 }

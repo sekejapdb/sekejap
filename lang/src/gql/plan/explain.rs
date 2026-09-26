@@ -11,7 +11,7 @@ use super::{flat, Access, ContextRef, FilterAt, GqlPlan, Op};
 use super::super::bind::TypeRef;
 use crate::{SqlError, SqlResult2};
 use sekejap_core::collections::gql::{
-    BindingValue, ExprId, PathLink, PathSearch, SlotId, Target, ValueType,
+    BindingValue, ExistsMode, ExprId, PathLink, PathSearch, SlotId, Target, ValueType,
 };
 use sekejap_core::collections::{CollectionId, Database, Direction};
 
@@ -60,32 +60,15 @@ impl GqlPlan {
                 }
                 out.push_str(&format!("stage {}:\n  slots:\n", at + 1));
             }
-            for at in 0..schema.width() {
-                let slot = SlotId(at as u16);
-                let info = schema.slot(slot);
-                let ty = match &info.ty {
-                    ValueType::List(of) => match &**of {
-                        ValueType::Node(ids) => format!("list of nodes of {}", collections(db, ids)?),
-                        ValueType::Edge(_) => format!("list of edges of {}", edge_label(ops, slot)),
-                        _ => spelling(&info.ty).to_owned(),
-                    },
-                    ValueType::Node(ids) => format!("node of {}", collections(db, ids)?),
-                    ValueType::Edge(_) => format!("edge of {}", edge_label(ops, slot)),
-                    ValueType::Path => "path".to_owned(),
-                    other => spelling(other).to_owned(),
-                };
-                // A group variable is always a list, empty for zero
-                // iterations; an element or a value is null only where the
-                // binder found it may be (`SlotInfo::nullable`).
-                let null = if info.nullable { "nullable" } else { "never null" };
-                let origin = match info.provenance {
-                    Provenance::Returned { stage } => format!("returned by stage {stage}"),
-                    ref other => format!("bound at {}", bound_at(other)),
-                };
-                out.push_str(&format!(
-                    "    {at} {}: {ty}, {null}, {origin}\n",
-                    var(slot, schema)
-                ));
+            slots(db, schema, ops, &mut out)?;
+            // A union's branches each have slots of their own (M5-E).
+            for op in ops {
+                if let Op::Union(union) = op {
+                    for (at, branch) in union.branches.iter().enumerate() {
+                        out.push_str(&format!("  branch {} slots:\n", at + 1));
+                        slots(db, &branch.view.schema, &branch.ops, &mut out)?;
+                    }
+                }
             }
             out.push_str("  operators, first to last:\n");
             for (n, op) in ops.iter().enumerate() {
@@ -112,8 +95,9 @@ impl GqlPlan {
         Ok(out)
     }
 
-    /// One operator of `EXPLAIN`, numbered `n`, and an `OptionalApply`'s
-    /// inner steps after it, numbered `n.1`, `n.2`, ... and indented.
+    /// One operator of `EXPLAIN`, numbered `n`, and an `OptionalApply`'s or
+    /// an `ExistsApply`'s inner steps or a union's branch steps after it,
+    /// numbered `n.1`, `n.2`, ... and indented.
     /// `per_row`: the operator runs again for each input row (a later stage,
     /// or an inner side).
     #[allow(clippy::too_many_arguments)]
@@ -131,9 +115,11 @@ impl GqlPlan {
         let indent = " ".repeat(4 + 2 * n.matches('.').count());
         match op {
             Op::Optional { inner, introduced } => {
+                // An EXISTS body's own variables are nulled too, but no name
+                // reaches them.
                 let named: Vec<String> = introduced
                     .iter()
-                    .filter(|slot| schema.slot(**slot).name.is_some())
+                    .filter(|slot| schema.slot(**slot).name.is_some() && !schema.is_local(**slot))
                     .map(|slot| var(*slot, schema))
                     .collect();
                 let nulls = if named.is_empty() {
@@ -151,6 +137,63 @@ impl GqlPlan {
                 for (at, op) in inner.iter().enumerate() {
                     let n = format!("{n}.{}", at + 1);
                     self.describe_op(op, &n, true, schema, stage, renamed, out);
+                }
+            }
+            Op::Exists { inner, mode } => {
+                let (steps, they, rebuilt) = match inner.len() {
+                    1 => (
+                        format!("step {n}.1 runs from it until its first row"),
+                        "it gives",
+                        "the step is",
+                    ),
+                    k => (
+                        format!("steps {n}.1-{n}.{k} run from it until their first row"),
+                        "they give",
+                        "the steps are",
+                    ),
+                };
+                let (test, answer) = match mode {
+                    ExistsMode::Filter { negated: false } => (
+                        "EXISTS".to_owned(),
+                        format!("the row is kept when {they} one"),
+                    ),
+                    ExistsMode::Filter { negated: true } => (
+                        "NOT EXISTS".to_owned(),
+                        format!("the row is kept when {they} none"),
+                    ),
+                    ExistsMode::Mark { slot } => (
+                        format!("EXISTS into hidden slot {}", var(*slot, schema)),
+                        format!("TRUE when {they} one, FALSE when none, and every row is kept"),
+                    ),
+                };
+                out.push_str(&format!(
+                    "{indent}{n}. ExistsApply {test}: per input row, {steps}; {answer} -- charges nothing itself; {rebuilt} rebuilt for each input row\n"
+                ));
+                for (at, op) in inner.iter().enumerate() {
+                    let n = format!("{n}.{}", at + 1);
+                    self.describe_op(op, &n, true, schema, stage, renamed, out);
+                }
+            }
+            Op::Call { inner, outputs, columns } => {
+                let steps = match inner.len() {
+                    1 => format!("step {n}.1 runs"),
+                    k => format!("steps {n}.1-{n}.{k} run"),
+                };
+                let added: Vec<String> = outputs.iter().map(|slot| var(*slot, schema)).collect();
+                out.push_str(&format!(
+                    "{indent}{n}. CallApply: per input row, {steps} from it to the end; each row they give extends the input row with {}; an input row they give none is dropped -- charges binding_rows; the steps are rebuilt for each input row\n",
+                    added.join(", ")
+                ));
+                // The body's projection is named by the body's own RETURN.
+                let body = StageView {
+                    schema: stage.schema.clone(),
+                    first_op: stage.first_op,
+                    columns: columns.clone(),
+                    outer: false,
+                };
+                for (at, op) in inner.iter().enumerate() {
+                    let n = format!("{n}.{}", at + 1);
+                    self.describe_op(op, &n, true, schema, &body, renamed, out);
                 }
             }
             Op::Seed { out: slot, access, label, .. } => {
@@ -300,6 +343,14 @@ impl GqlPlan {
                 }
             }
             Op::Reach(reach) => out.push_str(&reach.describe(n, &indent, schema, &|id| text(id).clone())),
+            Op::Union(union) => {
+                out.push_str(&format!("{indent}{n}. {}\n", union.describe(n)));
+                let steps = union.branches.iter().flat_map(|branch| branch.ops.iter().map(move |op| (op, branch)));
+                for (at, (op, branch)) in steps.enumerate() {
+                    let n = format!("{n}.{}", at + 1);
+                    self.describe_op(op, &n, union.buffered, &branch.view.schema, &branch.view, renamed, out);
+                }
+            }
             Op::Table(op) => {
                 let line = op.describe(
                     &|id| self.texts[id.0 as usize].clone(),
@@ -309,6 +360,42 @@ impl GqlPlan {
             }
         }
     }
+}
+
+/// The slot lines of `schema`, whose operators are `ops` (one stage's or
+/// one union branch's).
+fn slots(db: &Database, schema: &BindingSchema, ops: &[Op], out: &mut String) -> SqlResult2<()> {
+    for at in 0..schema.width() {
+        let slot = SlotId(at as u16);
+        let info = schema.slot(slot);
+        let ty = match &info.ty {
+            ValueType::List(of) => match &**of {
+                ValueType::Node(ids) => format!("list of nodes of {}", collections(db, ids)?),
+                ValueType::Edge(_) => format!("list of edges of {}", edge_label(ops, slot)),
+                _ => spelling(&info.ty).to_owned(),
+            },
+            ValueType::Node(ids) => format!("node of {}", collections(db, ids)?),
+            ValueType::Edge(_) => format!("edge of {}", edge_label(ops, slot)),
+            ValueType::Path => "path".to_owned(),
+            other => spelling(other).to_owned(),
+        };
+        // A group variable is always a list, empty for zero iterations; an
+        // element or a value is null only where the binder found it may be
+        // (`SlotInfo::nullable`).
+        let null = if info.nullable { "nullable" } else { "never null" };
+        let mut origin = match info.provenance {
+            Provenance::Returned { stage } => format!("returned by stage {stage}"),
+            ref other => format!("bound at {}", bound_at(other)),
+        };
+        if schema.is_local(slot) {
+            origin.push_str(", local to an EXISTS body");
+        }
+        out.push_str(&format!(
+            "    {at} {}: {ty}, {null}, {origin}\n",
+            var(slot, schema)
+        ));
+    }
+    Ok(())
 }
 
 /// The written label of the edge that a hop or a path search of `ops` (one

@@ -13,6 +13,7 @@
 //! PostgreSQL's rule, and it keeps "same name" an equivalence: `Person`,
 //! `PERSON` and `"person"` are one variable, `"Person"` is another.
 
+use super::ast::Expr;
 use crate::sqlstate::DUPLICATE_ALIAS;
 use crate::{SqlError, SqlResult2};
 use sekejap_core::collections::gql::{SlotId, ValueType};
@@ -61,6 +62,12 @@ pub(crate) enum Provenance {
     /// A grouping key or an aggregate of stage `stage`'s `RETURN`: a slot of
     /// the row the grouping produces, before the `RETURN` projects it.
     Aggregate { stage: u16 },
+    /// Whether an `EXISTS` of stage `stage` gave a row: the hidden `BOOLEAN`
+    /// its mark form writes (M5-C).
+    Exists { stage: u16 },
+    /// A column the `RETURN` of a `CALL` body in stage `stage` added to the
+    /// row (M5-D).
+    Called { stage: u16 },
 }
 
 /// What the binder knows about one slot.
@@ -112,6 +119,12 @@ pub(crate) struct BindingSchema {
     /// through `NEXT`, each with the stage (from 1) that dropped it: out of
     /// scope here, and named so in the error (§2.3 rule 4).
     dropped: Vec<(Name, u16)>,
+    /// Slots an `EXISTS` body bound (M5-C): the rows of the body live in
+    /// them while it runs, and after its `}` no name resolves to them.
+    local: Vec<SlotId>,
+    /// Each `EXISTS` planned in its mark form, as written, with the slot
+    /// its answer is written into; an expression reads that slot.
+    marks: Vec<(Expr, SlotId)>,
 }
 
 impl BindingSchema {
@@ -139,12 +152,61 @@ impl BindingSchema {
 
     /// The slot a variable is bound to, if it is bound in this stage.
     pub(crate) fn resolve(&self, name: &Name) -> Option<SlotId> {
-        let at = self
-            .slots
-            .iter()
-            .position(|slot| slot.name.as_ref() == Some(name))?;
         // `add` never allocates past `u16::MAX`.
-        Some(SlotId(at as u16))
+        (0..self.slots.len())
+            .map(|at| SlotId(at as u16))
+            .find(|slot| self.slot(*slot).name.as_ref() == Some(name) && !self.is_local(*slot))
+    }
+
+    /// Put every slot from `from` on out of scope: an `EXISTS` body's own
+    /// variables, once its `}` is read.
+    pub(crate) fn close_from(&mut self, from: usize) {
+        for at in from..self.slots.len() {
+            let slot = SlotId(at as u16);
+            if !self.is_local(slot) {
+                self.local.push(slot);
+            }
+        }
+    }
+
+    /// Put every named slot but `keep` out of scope while a `CALL` body
+    /// binds (M5-D): the body sees only its imports. Answers the mark
+    /// [`Self::reopen`] restores.
+    pub(crate) fn hide_except(&mut self, keep: &[SlotId]) -> usize {
+        let mark = self.local.len();
+        for at in 0..self.slots.len() {
+            let slot = SlotId(at as u16);
+            if self.slots[at].name.is_some() && !keep.contains(&slot) && !self.is_local(slot) {
+                self.local.push(slot);
+            }
+        }
+        mark
+    }
+
+    /// Undo [`Self::hide_except`], together with every slot put out of
+    /// scope since (the body's own `EXISTS` bodies).
+    pub(crate) fn reopen(&mut self, mark: usize) {
+        self.local.truncate(mark);
+    }
+
+    /// True when `slot` belongs to an `EXISTS` body that has ended.
+    pub(crate) fn is_local(&self, slot: SlotId) -> bool {
+        self.local.contains(&slot)
+    }
+
+    /// Record that the `EXISTS` written as `exists` answers in `slot`.
+    pub(crate) fn mark(&mut self, exists: Expr, slot: SlotId) {
+        self.marks.push((exists, slot));
+    }
+
+    /// The slot the latest `EXISTS` written as `exists` answers in, if one
+    /// was planned in this schema.
+    pub(crate) fn marked(&self, exists: &Expr) -> Option<SlotId> {
+        self.marks
+            .iter()
+            .rev()
+            .find(|(written, _)| written == exists)
+            .map(|(_, slot)| *slot)
     }
 
     /// What the binder knows about `slot`. Panics on a slot this schema did
@@ -176,7 +238,11 @@ impl BindingSchema {
 
     /// The named variables bound here, in slot order.
     pub(crate) fn names(&self) -> impl Iterator<Item = &Name> {
-        self.slots.iter().filter_map(|slot| slot.name.as_ref())
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !self.is_local(SlotId(*at as u16)))
+            .filter_map(|(_, slot)| slot.name.as_ref())
     }
 
     /// Record that `name` went out of scope at the `NEXT` after `stage`.
