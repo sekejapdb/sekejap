@@ -24,6 +24,10 @@
 //!   `57014` and the connection answers the next statement
 //!   (`a_cancel_request_*`, `a_statement_timeout_*`), and a portal refused
 //!   that way stays refused (`a_portal_refused_part_way_*`).
+//! * (M6-I) the same pins hold for a hybrid statement (a text-index seed and
+//!   a vector distance, the last of `PAGED`), and its vector `$n` is
+//!   described as pgvector's `vector` and binds from the text form
+//!   (`a_hybrid_statements_vector_parameter_*`);
 //! * an unaliased outer SELECT column is named as PostgreSQL names one
 //!   (M3-D2), in RowDescription before any row exists
 //!   (`an_outer_selects_unaliased_columns_are_named_*`).
@@ -640,7 +644,8 @@ fn declaring_a_gql_cursor_with_a_name_already_open_is_refused_and_leaves_it_unto
 // and leave the connection usable.
 
 /// ```text
-/// person p00..p29 (name, age 20 + i)
+/// person p00..p29 (name, age 20 + i, bio "dancer and singer" for an even i
+///                  else "painter", emb [i, 1]; bio has a text index)
 /// knows  p_i -> p_(i+1),  p_i -> p_(i+2),  p29 -> p00
 /// ```
 fn build_chain() -> Fixture {
@@ -651,20 +656,30 @@ fn build_chain() -> Fixture {
         let person = db
             .create_collection(
                 "person",
-                vec![("name".into(), Kind::Text), ("age".into(), Kind::Int)],
+                vec![
+                    ("name".into(), Kind::Text),
+                    ("age".into(), Kind::Int),
+                    ("bio".into(), Kind::Text),
+                    ("emb".into(), Kind::Vector(2)),
+                ],
                 Default::default(),
             )
             .unwrap();
         let people: Vec<_> = (0..30)
             .map(|i| {
+                let bio = if i % 2 == 0 { "dancer and singer" } else { "painter" };
                 db.put(
                     person,
                     &format!("p{i:02}"),
-                    &json!({"name": format!("person {i}"), "age": 20 + i}),
+                    &json!({"name": format!("person {i}"), "age": 20 + i, "bio": bio, "emb": [i as f32, 1.0]}),
                 )
                 .unwrap()
             })
             .collect();
+        let bio = db.create_text_index(person, "person_bio", "bio").unwrap();
+        db.commit().unwrap();
+        db.build_index_to_ready(bio, 256).unwrap();
+        db.commit().unwrap();
         db.enable_graph().unwrap();
         let knows = db.create_edge_type("knows").unwrap();
         for i in 0..30 {
@@ -684,8 +699,9 @@ fn build_chain() -> Fixture {
     Fixture { _dir: dir, service }
 }
 
-/// GQL statements whose answers span several slices of [`SLICE`] rows.
-const PAGED: [&str; 5] = [
+/// GQL statements whose answers span several slices of [`SLICE`] rows; the
+/// last is hybrid (M6-I): a text-index seed and a per-row vector distance.
+const PAGED: [&str; 6] = [
     "SELECT * FROM GRAPH_TABLE (base MATCH p = (s IS person WHERE s._key = 'p00')\
      -[:knows]->{1,5}(t) RETURN t._key AS t, PATH_LENGTH(p) AS n)",
     "SELECT * FROM GRAPH_TABLE (base MATCH p = ANY SHORTEST (s IS person WHERE s._key = 'p00')\
@@ -697,6 +713,9 @@ const PAGED: [&str; 5] = [
     "SELECT t, n FROM GRAPH_TABLE (base MATCH p = (s IS person WHERE s._key = 'p00')\
      -[:knows]->{1,5}(t) RETURN t._key AS t, PATH_LENGTH(p) AS n) AS g \
      ORDER BY n DESC, t LIMIT 40",
+    "SELECT * FROM GRAPH_TABLE (base MATCH (s IS person WHERE to_tsvector('simple', s.bio) @@ \
+     to_tsquery('simple', 'dancer'))-[:knows]->{1,2}(t) RETURN s._key AS s, t._key AS t, \
+     t.emb <-> '[0,1]'::vector AS d)",
 ];
 
 /// Rows one `Execute` or `FETCH` asks for.
@@ -724,7 +743,7 @@ fn arrived_rows(frames: &[Frame]) -> Vec<Vec<Option<String>>> {
 /// The simple protocol's answer: one streamed execution, in order.
 fn streamed(connection: &mut Connection<'_>, sql: &str) -> Vec<Vec<Option<String>>> {
     let got = frames(&connection.feed(&query(sql)));
-    assert_eq!(types_of(&got).chars().next(), Some('T'), "`{sql}`: {}", types_of(&got));
+    assert_eq!(types_of(&got).chars().next(), Some('T'), "`{sql}`: {} {:?}", types_of(&got), got.iter().find(|f| f.typ == b'E').map(|f| error_fields(f)));
     arrived_rows(&got)
 }
 
@@ -886,4 +905,33 @@ fn a_portal_refused_part_way_stays_refused_and_never_completes() {
     assert_eq!(types_of(&open_portal(&mut connection, "p3", PAGED[0])), "12Z");
     let got = execute_slice(&mut connection, "p3", 0);
     assert!(types_of(&got).ends_with("CZ"), "{}", types_of(&got));
+}
+
+#[test]
+fn a_hybrid_statements_vector_parameter_is_described_as_a_vector_and_binds_from_text() {
+    let fixture = build_chain();
+    let mut connection = connect(&fixture.service);
+    let sql = "SELECT * FROM GRAPH_TABLE (base MATCH (s IS person WHERE \
+               to_tsvector('simple', s.bio) @@ to_tsquery('simple', $2) AND s.age < 23) \
+               RETURN s._key AS k, s.emb <-> $1::vector AS d ORDER BY k)";
+    let mut batch = parse_message("hybrid", sql, &[]);
+    batch.extend_from_slice(&describe_statement("hybrid"));
+    batch.extend_from_slice(&sync_message());
+    let got = frames(&connection.feed(&batch));
+    assert_eq!(types_of(&got), "1tTZ");
+    assert_eq!(parameter_oids(first(&got, b't')), [oid::VECTOR, oid::TEXT]);
+    assert_eq!(
+        columns(first(&got, b'T')),
+        [("k".to_owned(), oid::TEXT), ("d".to_owned(), oid::FLOAT8)]
+    );
+    for (vector, expected) in [("[0,1]", [["p00", "0"], ["p02", "2"]]), ("[2,1]", [["p00", "2"], ["p02", "0"]])] {
+        let mut batch = bind_message("hybrid", &[vector, "dancer"], &[]);
+        batch.extend_from_slice(&execute_message());
+        batch.extend_from_slice(&sync_message());
+        let got = frames(&connection.feed(&batch));
+        assert_eq!(types_of(&got), "2DDCZ", "compiled once, rebound");
+        let expected: Vec<Vec<Option<String>>> =
+            expected.iter().map(|row| row.iter().map(|cell| some(cell)).collect()).collect();
+        assert_eq!(text_rows(&got), expected, "{vector}");
+    }
 }
