@@ -686,7 +686,7 @@ pub struct CaseSpec {
 /// approximate sweeps (`APPROX_BASES`), generated at runtime, one case per
 /// `EF_SWEEP` / `SLS_SWEEP` point, because there is no longer one fixed-ef
 /// case for either to be a fixed entry of.
-pub const BATTERY: [CaseSpec; 43] = [
+pub const BATTERY: [CaseSpec; 44] = [
     CaseSpec { name: "pt_radius", kind: CaseKind::Filter },
     CaseSpec { name: "pt_bbox", kind: CaseKind::Filter },
     CaseSpec { name: "plot_within_box", kind: CaseKind::Filter },
@@ -762,6 +762,12 @@ pub const BATTERY: [CaseSpec; 43] = [
     CaseSpec { name: "graph_2hop_weight", kind: CaseKind::Filter },
     CaseSpec { name: "graph_2hop_born", kind: CaseKind::Filter },
     CaseSpec { name: "graph_1hop_weight_top10", kind: CaseKind::Ranked },
+    // Hybrid inside a graph query (GQL profile M6): the places that match a
+    // term within a radius seed ONE `related` hop, and the distinct places
+    // reached are ranked by cosine distance to the query vector, ties by
+    // key. Every arm asks for the distinct neighbours, so the answer is one
+    // set however many seeds reach a place.
+    CaseSpec { name: "graph_hybrid_top10", kind: CaseKind::Ranked },
 ];
 
 /// One group of an aggregate case, as a line every arm writes the same way:
@@ -1989,8 +1995,73 @@ fn e4_case(ctx: &E4Ctx, corpus: &Corpus, q: &Queries, name: &str, i: usize) -> R
             answer.prepare_us = prepare_us;
             Ok(answer)
         }
+        // Three engine calls, since one traversal takes one seed: the seeds
+        // (text AND radius), one hop from each, then the distinct places
+        // reached ranked through the exact vector index.
+        "graph_hybrid_top10" => {
+            let related = ctx.related.ok_or(GRAPH_NEEDS_LOAD)?;
+            let seeds = e4_ids(
+                ctx,
+                &[
+                    e4_text_filter(ctx.text, &q.terms[i], TextMatch::Any),
+                    e4_radius_filter(ctx.loc, q.radius_centre(i)?, q.radius_metres(i)),
+                ],
+            )?;
+            let mut reached = Vec::new();
+            for seed in seeds {
+                let filters = [QueryFilter::Graph(BfsRequest {
+                    seed,
+                    direction: Direction::Outgoing,
+                    context: GraphContextId::BASE,
+                    edge_type: Some(related),
+                    min_depth: 1,
+                    max_depth: 1,
+                    include_seed: false,
+                    max_visited: 1 << 16,
+                    max_edges: 1 << 18,
+                    result_limit: 1 << 16,
+                    edge_where: &[],
+                    node_where: &[],
+                })];
+                reached.extend(e4_ids(ctx, &filters)?);
+            }
+            reached.sort();
+            reached.dedup();
+            e4_run(
+                ctx,
+                keys,
+                &[QueryFilter::Ids(&reached)],
+                QueryOrder::ExactVector {
+                    index: ctx.emb_exact,
+                    query: &q.vectors[i],
+                    metric: VectorMetric::Cosine,
+                },
+                Some(K),
+            )
+        }
         other => Err(format!("battle50k: no E4 spelling for case `{other}`").into()),
     }
+}
+
+/// Every id `filters` admits, in driver order.
+fn e4_ids(ctx: &E4Ctx, filters: &[QueryFilter<'_>]) -> R<Vec<EntityId>> {
+    let mut prepared = ctx.db.prepare_query(QueryRequest {
+        collection: ctx.place,
+        filters,
+        order: QueryOrder::Driver,
+        projection: Projection::Ids,
+        total_limit: None,
+        driver: CandidateDriver::Auto,
+    })?;
+    let mut ids = Vec::new();
+    loop {
+        let page = prepared.next_page(PAGE, QueryBudget::unlimited(), || false)?;
+        ids.extend(page.rows.iter().map(|row| row.id));
+        if page.done || page.rows.is_empty() {
+            break;
+        }
+    }
+    Ok(ids)
 }
 
 /// What a graph case says when the database it is pointed at has no
@@ -3439,6 +3510,20 @@ fn pg_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(Vec<String
                  ORDER BY r.weight DESC LIMIT {K}"
             ))
         }
+        "graph_hybrid_top10" => {
+            let seed_text = sql_text_match(v, "to_tsvector('simple', a.name || ' ' || a.descr)", &q.terms[i]);
+            let centre = sql_point(v, radius[0], radius[1], true);
+            let seed_radius = sql_dwithin(v, "a.loc", centre, radius[2]);
+            Ok((
+                pg_exact_setup(),
+                format!(
+                    "SELECT \"key\" FROM place WHERE \"key\" IN ( \
+                       SELECT r.destination FROM {RELATED} r JOIN place a ON a.\"key\" = r.source \
+                       WHERE {seed_text} AND {seed_radius}) \
+                     ORDER BY emb <=> {vector}, \"key\" LIMIT {K}"
+                ),
+            ))
+        }
         other => Err(format!("battle50k: no Postgres spelling for case `{other}`").into()),
     }
 }
@@ -3767,6 +3852,20 @@ fn e4sql_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<(String,
                 "SELECT * FROM GRAPH_TABLE (base MATCH \
                  (a IS place WHERE a._key = {seed})<-[r:{RELATED}]-(b IS place) \
                  RETURN b._key AS k, r.weight AS w ORDER BY w DESC LIMIT {K})"
+            )
+        }
+        // The host forms inside the body: text AND radius seed the pattern
+        // through their indexes, the hop runs per seed, and the distinct
+        // places reached are ranked by their exact cosine distance.
+        "graph_hybrid_top10" => {
+            let text = sql_text_match(v, "to_tsvector('simple', a.text)", &q.terms[i]);
+            let centre = sql_point(v, radius[0], radius[1], true);
+            let clause = sql_dwithin(v, "a.loc", centre, radius[2]);
+            let vector = sql_vector(v, &q.vector_literals[i], &q.vectors[i]);
+            format!(
+                "SELECT * FROM GRAPH_TABLE (base MATCH \
+                 (a IS place WHERE {text} AND {clause})-[:{RELATED}]->(b IS place) \
+                 RETURN DISTINCT b._key AS k, b.emb <=> {vector} AS d ORDER BY d, k LIMIT {K})"
             )
         }
         other => return Err(format!("battle50k: no e4-sql spelling for case `{other}`").into()),
@@ -5093,6 +5192,21 @@ fn lite_case(q: &Queries, kinds: &[String], name: &str, i: usize) -> R<LitePlan>
             format!(
                 "SELECT r.source FROM {RELATED} r WHERE r.destination = {seed} \
                  ORDER BY r.weight DESC LIMIT {K}"
+            )
+        }
+        "graph_hybrid_top10" => {
+            let query = v.text(&lite_fts_query(&[&q.terms[i]]));
+            let centre = q.radius_centre(i)?;
+            let lon = v.real(centre.longitude());
+            let lat = v.real(centre.latitude());
+            let metres = v.real(q.radius_metres(i));
+            let vector = v.blob(emb_blob(&q.vectors[i]));
+            format!(
+                "SELECT p.\"key\" FROM place p WHERE p.\"key\" IN ( \
+                   SELECT r.destination FROM {LITE_FTS} JOIN place a ON a.rowid = {LITE_FTS}.rowid \
+                   JOIN {RELATED} r ON r.source = a.\"key\" \
+                   WHERE {LITE_FTS} MATCH {query} AND geo_dist_m(a.lon, a.lat, {lon}, {lat}) <= {metres}) \
+                 ORDER BY vec_cos_dist(p.emb, {vector}), p.\"key\" LIMIT {K}"
             )
         }
         other => return Err(format!("battle50k: no SQLite spelling for case `{other}`").into()),

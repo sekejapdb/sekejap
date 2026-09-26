@@ -911,3 +911,39 @@ fn the_prepared_flag_answers_what_the_unprepared_arm_answers_and_reports_its_med
     // compare table is unchanged.
     assert!(case_of(&plain_report, "kind_eq")["prepared_median_us"].is_null());
 }
+
+/// `graph_hybrid_top10` (GQL profile M6): the three embedded arms load the
+/// `related` edges and answer the same distinct neighbours, in the same
+/// order, for every instance -- a sum that would hide a swapped instance is
+/// not enough, so the first instance's keys are compared too.
+#[test]
+fn the_graph_hybrid_case_answers_the_same_in_every_embedded_arm() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = dir.path().join("places-2000.jsonl");
+    let queries_path = dir.path().join("queries.json");
+    write_corpus_rows(&data, SQLITE_ROWS);
+    write_queries(&queries_path);
+    let mut reports = Vec::new();
+    for (arm, name, db) in [
+        (Arm::E4, "e4", "e4-db"),
+        (Arm::E4Sql, "e4-sql", "e4-sql-db"),
+        (Arm::Sqlite, "sqlite", "place.db"),
+    ] {
+        let mut options = Options::new(arm, &data, &queries_path, dir.path().join(format!("{name}.json")));
+        options.db_dir = dir.path().join(db);
+        options.graph = true;
+        options.only = Some("graph_hybrid".to_owned());
+        let report = run_arm(&options).unwrap_or_else(|e| panic!("the {name} arm runs: {e}"));
+        let case = case_of(&report, "graph_hybrid_top10").clone();
+        reports.push((name, case));
+    }
+    let (_, first) = &reports[0];
+    assert!(
+        first["total_rows"].as_u64().unwrap_or(0) > 0,
+        "the smoke corpus must give the case something to rank: {first}"
+    );
+    for (name, case) in &reports[1..] {
+        assert_eq!(case["total_rows"], first["total_rows"], "{name}: total rows");
+        assert_eq!(case["first_keys"], first["first_keys"], "{name}: the first instance's keys, in order");
+    }
+}
